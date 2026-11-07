@@ -43,7 +43,7 @@ fn prepare_copy<'owner>(
             .unwrap()
     };
     let mut call = event(0);
-    call.number = libc::SYS_fork;
+    call.number = crate::arch::SYS_FORK.unwrap_or(libc::SYS_clone);
     let result = unsafe {
         host.with_native_guest(lease, &services, rpc, &mut call, |tool, guest, _| {
             let mut stack = crate::tool_host::drive_native_ready(guest.stack());
@@ -51,7 +51,7 @@ fn prepare_copy<'owner>(
             tool.saved_stack.store(saved, Ordering::SeqCst);
             drop(stack.commit().unwrap());
             NativeCallbackOutcome::<Result<(), Error>>::Deferred {
-                number: libc::SYS_fork,
+                number: crate::arch::SYS_FORK.unwrap_or(libc::SYS_clone),
                 args: [0; 6],
             }
         })
@@ -79,7 +79,7 @@ fn native_copy_refuses_same_process_without_consuming_the_original() {
     assert_eq!(error.raw_os_error(), Some(libc::ESTALE));
     assert_eq!(
         original.as_ref().unwrap().operation(),
-        (libc::SYS_fork, [0; 6])
+        (crate::arch::SYS_FORK.unwrap_or(libc::SYS_clone), [0; 6])
     );
     let tool = host.tool.lock();
     let probe = tool.as_deref().unwrap().as_ref().unwrap();
@@ -268,7 +268,10 @@ fn native_copy_actual_child_keeps_tool_scratch_rpc_and_lifecycle() {
                 ),
                 Some(-i64::from(libc::EBADF))
             );
-            assert_eq!(pending.operation(), (libc::SYS_fork, [0; 6]));
+            assert_eq!(
+                pending.operation(),
+                (crate::arch::SYS_FORK.unwrap_or(libc::SYS_clone), [0; 6])
+            );
             assert_eq!(drop_order.parent_drops.load(Ordering::SeqCst), 0);
             assert!(!drop_order.child_start_completed.load(Ordering::SeqCst));
             let mut post = event(0);

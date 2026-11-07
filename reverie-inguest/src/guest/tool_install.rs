@@ -40,6 +40,8 @@ use crate::guest::host::HostRuntime;
 use crate::guest::host::ToolHost;
 use crate::guest::installed_tool;
 use crate::guest::instruction::InstructionSubscriptions;
+use crate::guest::isa::Isa;
+use crate::guest::isa::NativeIsa;
 use crate::guest::rpc::CoordinatorRpc;
 use crate::guest::runtime_seam::PatcherRef;
 use crate::guest::runtime_seam::RuntimeSeam;
@@ -317,12 +319,8 @@ where
     };
     crate::guest::instruction::preflight_instruction_faulting(instruction_subscriptions)?;
     let site_patching = host.site_patching()?;
-    let vdso_sites = if site_patching {
-        reverie::vdso::patch_current_vdso(subscriptions)
-    } else {
-        reverie::vdso::patch_current_vdso_trapping(subscriptions).map(|()| Vec::new())
-    }
-    .map_err(|error| io::Error::other(crate::guest::host::describe_reverie_error(&error)))?;
+    let vdso_sites = NativeIsa::patch_current_vdso(subscriptions, site_patching)
+        .map_err(|error| io::Error::other(crate::guest::host::describe_reverie_error(&error)))?;
     let _signal_state =
         crate::guest::signal::prepare_guest_signal_state(instruction_subscriptions)?;
     let syscall_subscriptions = subscriptions.iter_syscalls().collect();

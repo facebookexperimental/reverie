@@ -102,7 +102,12 @@ impl Tool for Probe {
         assert_eq!(guest.thread_state().posts, 0);
         assert_eq!(guest.config(), &71);
         assert_eq!(guest.read_clock()?, 17);
-        assert_eq!(guest.regs().await.rip, 0x1234);
+        assert_eq!(
+            <crate::guest::isa::NativeIsa as crate::guest::isa::Isa>::user_regs_instruction_pointer(
+                &guest.regs().await
+            ),
+            0x1234
+        );
         assert!(guest.has_cpuid_interception());
         guest.thread_state_mut().starts += 1;
         guest.thread_state_mut().order.push(1);

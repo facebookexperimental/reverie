@@ -273,6 +273,50 @@ impl Isa for Aarch64 {
         context.uc_mcontext.sp
     }
 
+    fn user_regs_instruction_pointer(regs: &libc::user_regs_struct) -> u64 {
+        regs.pc
+    }
+
+    fn user_regs_frame_pointer(regs: &libc::user_regs_struct) -> u64 {
+        regs.regs[29]
+    }
+
+    fn set_user_regs_instruction_pointer(regs: &mut libc::user_regs_struct, value: u64) {
+        regs.pc = value;
+    }
+
+    #[cfg(feature = "coordinator-rpc")]
+    fn patch_current_vdso(
+        subscriptions: &reverie::Subscription,
+        _site_patching: bool,
+    ) -> Result<Vec<reverie::vdso::VdsoSyscallSite>, reverie::Error> {
+        // The aarch64 vDSO serves exactly these syscalls natively
+        // (plus rt_sigreturn, which the runtime refuses separately).
+        // Without the process rewrite they would bypass every trap,
+        // so a subscription naming one is refused by name; every
+        // other subscription traps normally and needs no sites.
+        use reverie::syscalls::Sysno;
+        for covered in [
+            Sysno::clock_gettime,
+            Sysno::clock_getres,
+            Sysno::gettimeofday,
+        ] {
+            if subscriptions
+                .iter_syscalls()
+                .any(|number| number == covered)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!(
+                        "vDSO syscall {covered:?} is not interceptable on aarch64                          until the vDSO process rewrite lands"
+                    ),
+                )
+                .into());
+            }
+        }
+        Ok(Vec::new())
+    }
+
     fn instruction_capabilities() -> InstructionCapabilities {
         // Linux/seccomp on aarch64 has no user-mode switch that
         // faults MRS counter/ID reads the way x86 faults CPUID and

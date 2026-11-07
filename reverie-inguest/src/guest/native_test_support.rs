@@ -216,7 +216,9 @@ impl Callback {
             NativeThreadIdentity::from_admitted(pid, tid, tool_pid, tool_tid, image).unwrap()
         };
         let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
-        regs.rip = 0x1234;
+        <crate::guest::isa::NativeIsa as crate::guest::isa::Isa>::set_user_regs_instruction_pointer(
+            &mut regs, 0x1234,
+        );
         Self {
             thread: std::thread::current().id(),
             identity,

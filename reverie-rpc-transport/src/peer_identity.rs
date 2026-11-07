@@ -59,7 +59,7 @@ fn pidfd_get_info(pidfd: &impl AsRawFd) -> std::io::Result<PeerState> {
     let mut info = PidfdInfo::default();
     // SAFETY: `info` is a properly aligned, writable 64-byte struct, which is
     // what this ioctl number tells the kernel to fill.
-    let rc = unsafe { libc::ioctl(pidfd.as_raw_fd(), PIDFD_GET_INFO, &mut info) };
+    let rc = unsafe { libc::ioctl(pidfd.as_raw_fd(), PIDFD_GET_INFO as _, &mut info) };
     if rc != 0 {
         let error = std::io::Error::last_os_error();
         return match error.raw_os_error() {

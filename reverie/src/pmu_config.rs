@@ -6,8 +6,68 @@ use thiserror::Error;
 
 use crate::Errno;
 use crate::perf::Event;
+#[cfg(target_arch = "x86_64")]
 pub use crate::pmu::RcbMetric;
+#[cfg(not(target_arch = "x86_64"))]
+pub use pmu_shim::RcbMetric;
+#[cfg(not(target_arch = "x86_64"))]
+mod pmu_shim {
+    /// Interim non-x86 stand-in for the x86 PMU metric vocabulary:
+    /// no host qualifies, so RCB stays unmeasured there.
+    #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+    pub enum RcbMetric {
+        /// Every retired conditional branch, user mode only.
+        ConditionalBranchesRetiredUserV1,
+    }
+    impl RcbMetric {
+        /// The stable identifier histories store.
+        pub const fn id(self) -> &'static str {
+            match self {
+                Self::ConditionalBranchesRetiredUserV1 => "rcb:cond-retired:user:v1",
+            }
+        }
+        /// The metric a stored identifier names.
+        pub fn from_id(id: &str) -> Option<Self> {
+            match id {
+                "rcb:cond-retired:user:v1" => Some(Self::ConditionalBranchesRetiredUserV1),
+                _ => None,
+            }
+        }
+    }
+    pub struct PmuProfile;
+    impl PmuProfile {
+        pub fn for_family_model(_family_id: u8, _model_id: u8) -> Option<Self> {
+            None
+        }
+        pub fn metric(&self) -> Option<RcbMetric> {
+            None
+        }
+        pub fn raw_rcb_event(&self) -> u64 {
+            0
+        }
+    }
+    pub fn vendor_has_family(_vendor: &str, _family_id: u8) -> bool {
+        false
+    }
+}
 // Used by both the preserved validation diagnostic and its ptrace probe.
+#[cfg(target_arch = "x86_64")]
+fn pmu_vendor_has_family(vendor: &str, family_id: u8) -> bool {
+    crate::pmu::vendor_has_family(vendor, family_id)
+}
+#[cfg(not(target_arch = "x86_64"))]
+fn pmu_vendor_has_family(vendor: &str, family_id: u8) -> bool {
+    pmu_shim::vendor_has_family(vendor, family_id)
+}
+#[cfg(target_arch = "x86_64")]
+fn pmu_profile_for_family_model(family_id: u8, model_id: u8) -> Option<crate::pmu::PmuProfile> {
+    crate::pmu::PmuProfile::for_family_model(family_id, model_id)
+}
+#[cfg(not(target_arch = "x86_64"))]
+fn pmu_profile_for_family_model(family_id: u8, model_id: u8) -> Option<pmu_shim::PmuProfile> {
+    pmu_shim::PmuProfile::for_family_model(family_id, model_id)
+}
+
 #[cfg(target_arch = "x86_64")]
 #[doc(hidden)]
 pub const RETIRED_LOCK_INSTRUCTIONS_EVENT: u64 = 0x510f25;
@@ -463,7 +523,7 @@ impl PmuConfig {
     #[cfg(target_arch = "x86_64")]
     #[doc(hidden)]
     pub fn try_from_family_model(family_id: u8, model_id: u8) -> Option<Self> {
-        crate::pmu::PmuProfile::for_family_model(family_id, model_id).map(|profile| Self {
+        pmu_profile_for_family_model(family_id, model_id).map(|profile| Self {
             rcb_event: profile.raw_rcb_event(),
             skid_margin: profile.default_skid_margin(),
             skid_margin_override: None,
@@ -1169,13 +1229,13 @@ pub fn qualify_host(
     family_id: u8,
     model_id: u8,
 ) -> Result<QualifiedClock, UnqualifiedReason> {
-    if !crate::pmu::vendor_has_family(vendor, family_id) {
+    if !pmu_vendor_has_family(vendor, family_id) {
         return Err(UnqualifiedReason::VendorFamilyNotInTable {
             vendor: vendor.to_owned(),
             family: family_id,
         });
     }
-    let profile = crate::pmu::PmuProfile::for_family_model(family_id, model_id).ok_or(
+    let profile = pmu_profile_for_family_model(family_id, model_id).ok_or(
         UnqualifiedReason::ModelNotInTable {
             family: family_id,
             model: model_id,

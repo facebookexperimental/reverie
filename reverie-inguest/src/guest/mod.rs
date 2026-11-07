@@ -31,33 +31,8 @@ pub mod host;
 pub mod installed_stack;
 #[cfg(feature = "coordinator-rpc")]
 pub mod installed_tool;
-#[cfg(target_arch = "x86_64")]
 pub mod instruction;
 pub mod isa;
-/// CPUID/RDTSC faulting has no aarch64 counterpart in this stage; nothing
-/// can be subscribed there, which the subscription surface reports as-is.
-#[cfg(not(target_arch = "x86_64"))]
-pub mod instruction {
-    use std::io;
-
-    pub use super::event::InstructionSubscriptions;
-    use super::isa::Isa;
-    use super::isa::NativeIsa;
-
-    pub fn any_instruction_subscribed() -> bool {
-        false
-    }
-    /// Runtime admission reaches the native architecture's named
-    /// refusal through the Isa, exactly as on x86-64.
-    pub fn preflight_instruction_faulting(
-        subscriptions: InstructionSubscriptions,
-    ) -> io::Result<()> {
-        NativeIsa::admit_instruction_subscriptions(subscriptions)
-    }
-    pub fn enable_instruction_faulting(subscriptions: InstructionSubscriptions) -> io::Result<()> {
-        NativeIsa::enable_instruction_faulting(subscriptions)
-    }
-}
 #[cfg(feature = "coordinator-rpc")]
 pub mod native_capture;
 #[cfg(feature = "exec-native-injection")]
@@ -93,5 +68,4 @@ pub mod support;
 #[cfg(all(feature = "coordinator-rpc", feature = "rcb-clock"))]
 pub mod tool_install;
 pub mod tool_region;
-#[cfg(target_arch = "x86_64")]
 pub mod trap_dispatch;

@@ -568,6 +568,20 @@ mod tests {
 
     #[test]
     fn decode_recognizes_only_the_faulting_instruction_encodings() {
+        use crate::guest::isa::Isa as _;
+        use crate::guest::isa::NativeIsa;
+        if !NativeIsa::instruction_capabilities().cpuid {
+            // No faulting encodings exist where admission refuses them:
+            // every x86 encoding below must decode to nothing.
+            for bytes in [
+                &[0x0f_u8, 0xa2][..],
+                &[0x0f, 0x31][..],
+                &[0x0f, 0x01, 0xf9][..],
+            ] {
+                assert_eq!(decode_instruction(bytes), None);
+            }
+            return;
+        }
         let decoded =
             |bytes: &[u8]| decode_instruction(bytes).map(|(kind, expected)| (kind, expected.len()));
         assert_eq!(

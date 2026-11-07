@@ -194,6 +194,26 @@ pub trait Isa: Copy + Send + Sync + 'static {
     /// The faulting stack pointer in a kernel fault frame.
     fn fault_stack_pointer(context: &libc::ucontext_t) -> u64;
 
+    /// The instruction pointer in a ptrace-shaped register view
+    /// (backtrace walks start here).
+    fn user_regs_instruction_pointer(regs: &libc::user_regs_struct) -> u64;
+    /// The frame pointer in a ptrace-shaped register view.
+    fn user_regs_frame_pointer(regs: &libc::user_regs_struct) -> u64;
+    /// Replaces the instruction pointer in a ptrace-shaped
+    /// register view (test fixtures build synthetic views).
+    fn set_user_regs_instruction_pointer(regs: &mut libc::user_regs_struct, value: u64);
+    /// Rewrites this process's vDSO for `subscriptions`: patching
+    /// sites when `site_patching`, trapping stubs otherwise.
+    /// Returns the discovered patching sites (empty for trapping).
+    /// An architecture without the process rewrite refuses by name
+    /// exactly the subscriptions its vDSO would otherwise serve
+    /// natively, and accepts the rest with no sites.
+    #[cfg(feature = "coordinator-rpc")]
+    fn patch_current_vdso(
+        subscriptions: &reverie::Subscription,
+        site_patching: bool,
+    ) -> Result<Vec<reverie::vdso::VdsoSyscallSite>, reverie::Error>;
+
     /// Which faulting-instruction controls this architecture can
     /// admit at all. A capable architecture still probes the actual
     /// controls in [`Self::admit_instruction_subscriptions`].

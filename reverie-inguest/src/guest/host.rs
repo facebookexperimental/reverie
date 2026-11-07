@@ -2354,12 +2354,7 @@ fn guest_filter_admitted() -> bool {
 /// status 125, before anything runs, reading no guest memory. Only a syscall
 /// handler's creation can complete in the child.
 fn refuse_creation_outside_handler(number: i64, in_syscall_handler: bool) {
-    if !in_syscall_handler
-        && matches!(
-            number,
-            libc::SYS_fork | libc::SYS_vfork | libc::SYS_clone | libc::SYS_clone3
-        )
-    {
+    if !in_syscall_handler && crate::arch::is_fork_family(number) {
         tool_fatal(
             125,
             &Error::Tool(
@@ -2408,10 +2403,10 @@ impl<T: Tool, R: HostRuntime> InGuest<'_, T, R> {
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-326): Review the plain-fork injection boundary.
 fn is_plain_fork(number: i64, args: [u64; 6]) -> bool {
-    if number == libc::SYS_fork {
+    if Some(number) == crate::arch::SYS_FORK {
         return true;
     }
-    if number == libc::SYS_vfork {
+    if Some(number) == crate::arch::SYS_VFORK {
         return true;
     }
     if number == libc::SYS_clone3 {
@@ -2843,10 +2838,15 @@ fn clone3_record_for(
     const PIDFD: u64 = libc::CLONE_PIDFD as u64;
     const SIGNAL_MASK: u64 = 0xff;
     const SIZE_VER0: usize = 64;
+    // The copying vfork stays a COW fork with the parent waiting: no
+    // CLONE_VM or CLONE_VFORK is applied physically. Fork/vfork numbers
+    // exist only in the x86-64 table (clone shapes on aarch64 arrive as
+    // clone below), so this arm is selected by value, not pattern.
+    if Some(number) == crate::arch::SYS_FORK || Some(number) == crate::arch::SYS_VFORK {
+        record[..8].copy_from_slice(&[PIDFD, pidfd, 0, 0, libc::SIGCHLD as u64, 0, 0, 0]);
+        return Ok(SIZE_VER0);
+    }
     let fields: [u64; 8] = match number {
-        // The copying vfork stays a COW fork with the parent waiting: no
-        // CLONE_VM or CLONE_VFORK is applied physically.
-        libc::SYS_fork | libc::SYS_vfork => [PIDFD, pidfd, 0, 0, libc::SIGCHLD as u64, 0, 0, 0],
         // Legacy clone(flags, stack, parent_tid, child_tid, tls): the CSIGNAL
         // byte becomes exit_signal, and each TID output keeps its own
         // destination, separate from the pidfd output. The plain-fork subset
@@ -3187,12 +3187,15 @@ fn forward_plain_fork(number: i64, args: [u64; 6], guest_pkru: Option<&mut Optio
         reported_creation(hook, number, args, guest_pkru)
     } else {
         let permissions = guest_pkru.as_ref().and_then(|value| **value);
-        let physical = if number == libc::SYS_vfork {
+        let physical = if Some(number) == crate::arch::SYS_VFORK {
             // A real vfork child would run the instrumentation callback on the
             // parent's shared stack. Use a COW fork and preserve vfork's parent
             // suspension until the child exits. Exec remains fail-closed, so exit
-            // is the only supported vfork completion boundary for now.
-            unsafe { crate::trap::raw_syscall6_with_result(libc::SYS_fork, [0; 6], permissions) }
+            // is the only supported vfork completion boundary for now. Only
+            // reachable where the table has fork (vfork is a clone shape on
+            // aarch64 and never takes this branch).
+            let fork_nr = crate::arch::SYS_FORK.expect("vfork exists only beside fork");
+            unsafe { crate::trap::raw_syscall6_with_result(fork_nr, [0; 6], permissions) }
         } else {
             unsafe { crate::trap::raw_syscall6_with_result(number, args, permissions) }
         };
@@ -3201,7 +3204,7 @@ fn forward_plain_fork(number: i64, args: [u64; 6], guest_pkru: Option<&mut Optio
         }
         physical.result
     };
-    if number == libc::SYS_vfork && result > 0 {
+    if Some(number) == crate::arch::SYS_VFORK && result > 0 {
         let mut info = core::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
         loop {
             let waited = unsafe {
@@ -3261,7 +3264,9 @@ fn injected_syscall_guard(
     // not an errno that would corrupt libc's saved break.
     let unsupported_process =
         // AUTONOMOUS-BOT-IMPLEMENTED
-        (matches!(number, libc::SYS_clone | libc::SYS_clone3 | libc::SYS_vfork)
+        ((number == libc::SYS_clone
+            || number == libc::SYS_clone3
+            || Some(number) == crate::arch::SYS_VFORK)
             && !is_plain_fork(number, args))
         // AUTONOMOUS-BOT-IMPLEMENTED
         || matches!(number, libc::SYS_execve | libc::SYS_execveat);
@@ -3813,7 +3818,10 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
         }
 
         // AUTONOMOUS-BOT-IMPLEMENTED
-        if matches!(number, libc::SYS_clone | libc::SYS_clone3 | libc::SYS_vfork) {
+        if number == libc::SYS_clone
+            || number == libc::SYS_clone3
+            || Some(number) == crate::arch::SYS_VFORK
+        {
             // A typed refusal, so the Tool can tell this from a clone that
             // Linux failed: the in-guest runtime runs one thread of the guest
             // and has no thread or vfork-child creation to forward.
@@ -4153,10 +4161,10 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
         let native = self.native.as_ref()?;
         let regs = native.services.regs().ok()?;
         let mut frames = vec![reverie::Frame {
-            ip: regs.rip,
+            ip: NativeIsa::user_regs_instruction_pointer(&regs),
             is_signal: false,
         }];
-        let mut fp = regs.rbp;
+        let mut fp = NativeIsa::user_regs_frame_pointer(&regs);
         while frames.len() < 256 {
             if fp == 0 || !fp.is_multiple_of(std::mem::align_of::<u64>() as u64) {
                 break;
@@ -4414,7 +4422,7 @@ mod process_owner_tests {
             let mut subscription =
                 reverie::Subscription::from_iter([Sysno::write, Sysno::getpid, Sysno::getppid]);
             if config.1 {
-                subscription.syscall(Sysno::fork);
+                subscription.syscall(Sysno::clone);
             }
             subscription
         }
@@ -4812,7 +4820,7 @@ mod process_owner_tests {
             tid: parent_tid,
             attempts: 0,
         };
-        let mut call = event(libc::SYS_fork, [0; 6]);
+        let mut call = event(crate::arch::SYS_FORK.unwrap_or(libc::SYS_clone), [0; 6]);
         finish_fork_child(
             &host,
             parent_lease,
@@ -5272,7 +5280,11 @@ mod tests {
     /// does not.
     #[test]
     fn only_the_guests_own_errors_reach_the_guest() {
-        for number in [libc::SYS_fork, libc::SYS_clone, libc::SYS_clone3] {
+        for number in [
+            crate::arch::SYS_FORK.unwrap_or(libc::SYS_clone),
+            libc::SYS_clone,
+            libc::SYS_clone3,
+        ] {
             assert!(errno_is_the_guests(number, libc::EAGAIN));
             assert!(errno_is_the_guests(number, libc::ENOSPC));
             for errno in [
@@ -5286,8 +5298,14 @@ mod tests {
             }
         }
         assert!(errno_is_the_guests(libc::SYS_clone3, libc::E2BIG));
-        assert!(!errno_is_the_guests(libc::SYS_fork, libc::E2BIG));
-        assert!(!errno_is_the_guests(libc::SYS_fork, libc::ENOSYS));
+        assert!(!errno_is_the_guests(
+            crate::arch::SYS_FORK.unwrap_or(libc::SYS_clone),
+            libc::E2BIG
+        ));
+        assert!(!errno_is_the_guests(
+            crate::arch::SYS_FORK.unwrap_or(libc::SYS_clone),
+            libc::ENOSYS
+        ));
     }
 
     /// Linux range-checks a whole clone3 record before reading any of it: a

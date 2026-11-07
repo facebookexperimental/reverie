@@ -1117,23 +1117,23 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-inguest/src/guest/instruction.rs",
-        24918,
-        "8c52f1d54dd6b13914f5fe6eb8f7d094a6a882078de5999e45aecbdaa73a7885",
+        25458,
+        "98417972e3a1db14435f9e235b841b838b32a201c278780fbb0bd6a9d79169d5",
     ),
     (
         "reverie-inguest/src/guest/isa.rs",
-        14510,
-        "32498a5b2d0430f6461e8ddaba09077d099493ebe573f20bad2c328cd9f2538c",
+        15627,
+        "f7c8ae886b4b8450ce4ca7867bdcbfa7890a7d89b679e7e6a421a56fc7497724",
     ),
     (
         "reverie-inguest/src/guest/isa/aarch64.rs",
-        16069,
-        "18d2f143b0bf5159aab22f677d23cffbdc52344a6e03390dcccd6cc6ba8c0239",
+        17629,
+        "735c5827a1ed85f6808733887dfe2ce568fd777b46d1851685ce58e6a06470bf",
     ),
     (
         "reverie-inguest/src/guest/isa/x86_64.rs",
-        30491,
-        "d62280b3f3a4c3fad040531004eca09df6f38021113bb9a13da8efbc49e06e4c",
+        31237,
+        "eb8cff672a8a84060132a67070a9d4a16e323e8725ca2977c63035fb228521cf",
     ),
     (
         "reverie-inguest/src/guest/runtime_mask.rs",
@@ -1152,8 +1152,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-inguest/src/guest/tool_install.rs",
-        25848,
-        "80bb4d540979ad5cfb183faaf8fc74866893e729532f0a14df83bc1b900ba928",
+        25792,
+        "db0f63022089ae68baa3b775d0c0759126ba90c5e8d877582c486d2ceb26cd9b",
     ),
     (
         "reverie-inguest/src/signal.rs",
@@ -1392,8 +1392,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-inguest/src/guest/mod.rs",
-        3370,
-        "df5350ea56e3e1bb565c56179f09a9b9a5e700ceccad8894d58f78281a5e4f42",
+        2422,
+        "c92177576ab8dda0aa36876075877e35ff98e5acae1b0c1b67539e28317aab49",
     ),
     (
         "reverie-inguest/src/guest/rpc.rs",
@@ -1402,8 +1402,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-inguest/src/guest/host.rs",
-        237269,
-        "dd5cd39f11eb0dc442a14a06d64111659ff42265c245a1da7788bf952819130c",
+        238147,
+        "ed0bdcbeaa5cb02fd09164249b963d8b16a8d35164728ca265e283ae0f41816c",
     ),
     (
         "reverie-inguest/src/guest/host_linux.rs",
@@ -1427,8 +1427,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie/src/lib.rs",
-        7263,
-        "c8c23b8628a83099732be4e58530ab70685837821fccbb27447830a5bf726cc3",
+        7201,
+        "1c657bd9280262618b1ce11e0bc7a7aec2af748c409fb9de3b118657cd390cb5",
     ),
     (
         "reverie/src/perf.rs",
@@ -1443,8 +1443,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     // invented number. Size/digest cover both reviewed changes.
     (
         "reverie/src/pmu_config.rs",
-        74723,
-        "ab1ea2a92c58a0a49bbd5f700d5bf303917802c4143645f015fa8047b0e463d3",
+        76782,
+        "637c6fa142ed96a215675e072f2c48152ca3fe11f18a4a0e6d8eaa4bf7124029",
     ),
     (
         "reverie/src/in_guest_rcb.rs",
@@ -1458,8 +1458,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-inguest/src/guest/clock.rs",
-        25871,
-        "d353ba4ec2ea2225de34e5e6fceed12ff864183fa35ba004a7e63bcfa0125907",
+        25951,
+        "34d773ff0b576151381353320eedc4a082ebabd081a1c6d59871470c91a5a503",
     ),
     (
         "reverie-inguest/src/lifecycle.rs",
@@ -1540,8 +1540,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie/src/tool.rs",
-        79939,
-        "d0ece0753a03016c9c6c3136bb04861b63e374d87012ca0d1b0eeae4b59fb8ab",
+        80301,
+        "89ae1888619a96b89c1adbcd6703b55c78af093de55f6a2e362af152c4fff321",
     ),
 ];
 // Native Detcore's fixed-gate publication ordering is a separately declared

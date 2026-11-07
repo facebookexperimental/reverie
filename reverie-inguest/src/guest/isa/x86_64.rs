@@ -514,6 +514,30 @@ impl Isa for X86_64 {
         context.uc_mcontext.gregs[libc::REG_RSP as usize] as u64
     }
 
+    fn user_regs_instruction_pointer(regs: &libc::user_regs_struct) -> u64 {
+        regs.rip
+    }
+
+    fn user_regs_frame_pointer(regs: &libc::user_regs_struct) -> u64 {
+        regs.rbp
+    }
+
+    fn set_user_regs_instruction_pointer(regs: &mut libc::user_regs_struct, value: u64) {
+        regs.rip = value;
+    }
+
+    #[cfg(feature = "coordinator-rpc")]
+    fn patch_current_vdso(
+        subscriptions: &reverie::Subscription,
+        site_patching: bool,
+    ) -> Result<Vec<reverie::vdso::VdsoSyscallSite>, reverie::Error> {
+        if site_patching {
+            reverie::vdso::patch_current_vdso(subscriptions)
+        } else {
+            reverie::vdso::patch_current_vdso_trapping(subscriptions).map(|()| Vec::new())
+        }
+    }
+
     fn instruction_capabilities() -> InstructionCapabilities {
         InstructionCapabilities {
             cpuid: true,

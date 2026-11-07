@@ -563,7 +563,10 @@ mod tests {
             initialize_rcb_clock_with(|| Ok(counter), true).unwrap();
             let before = unsafe { &*RCB_CLOCK.get() }.descriptor();
             let first = read_guest_rcb_clock().unwrap();
-            let mut dup = event(libc::SYS_dup2, [0, before as u64, 0, 0, 0, 0]);
+            let mut dup = event(
+                crate::arch::SYS_DUP2.unwrap_or(libc::SYS_dup3),
+                [0, before as u64, 0, 0, 0, 0],
+            );
             assert!(!unsafe { protect_runtime_descriptors(&mut dup, true) });
             let after = unsafe { &*RCB_CLOCK.get() }.descriptor();
             assert_ne!(after, before);

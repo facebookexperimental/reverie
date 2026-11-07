@@ -532,7 +532,11 @@ mod tests {
             })
         };
         for number in [libc::SYS_read, libc::SYS_getpid, libc::SYS_write] {
-            let mut event = TrapEvent::new(number, [0; 6], 0x1002);
+            let mut event = TrapEvent::new(
+                number,
+                [0; 6],
+                0x1000 + crate::guest::isa::NativeIsa::SYSCALL_LEN,
+            );
             dispatcher.dispatch(&mut event);
             if number == libc::SYS_getpid {
                 assert_eq!(event.result(), Some(-i64::from(libc::EOPNOTSUPP)));
@@ -561,7 +565,11 @@ mod tests {
                 replace: true,
             })
         };
-        let mut event = TrapEvent::new(libc::SYS_read, [0; 6], 0x1002);
+        let mut event = TrapEvent::new(
+            libc::SYS_read,
+            [0; 6],
+            0x1000 + crate::guest::isa::NativeIsa::SYSCALL_LEN,
+        );
         dispatcher.dispatch(&mut event);
         assert_eq!(
             *dispatcher.seam.seen.lock().unwrap(),
@@ -590,7 +598,12 @@ mod tests {
         assert_eq!(event.result(), None);
         assert_eq!(
             calls(&dispatcher),
-            ["path Sigsys", "intercept 39", "site 0x1002", "patch 0x1000"]
+            [
+                "path Sigsys".to_string(),
+                format!("intercept {}", libc::SYS_getpid),
+                "site 0x1002".to_string(),
+                "patch 0x1000".to_string(),
+            ]
         );
     }
 
@@ -603,14 +616,14 @@ mod tests {
         assert_eq!(
             calls(&dispatcher),
             [
-                "path Sigsys",
-                "intercept 39",
-                "site 0x1002",
-                "patch 0x1000",
-                "fallback 39",
-                "continuation?",
-                "refusal 39",
-                "path FallbackRefusal",
+                "path Sigsys".to_string(),
+                format!("intercept {}", libc::SYS_getpid),
+                "site 0x1002".to_string(),
+                "patch 0x1000".to_string(),
+                format!("fallback {}", libc::SYS_getpid),
+                "continuation?".to_string(),
+                format!("refusal {}", libc::SYS_getpid),
+                "path FallbackRefusal".to_string(),
             ]
         );
     }
@@ -624,13 +637,13 @@ mod tests {
         assert_eq!(
             calls(&dispatcher),
             [
-                "path Sigsys",
-                "intercept 39",
-                "site 0x1002",
-                "patch 0x1000",
-                "fallback 39",
-                "refusal 39",
-                "path FallbackRefusal",
+                "path Sigsys".to_string(),
+                format!("intercept {}", libc::SYS_getpid),
+                "site 0x1002".to_string(),
+                "patch 0x1000".to_string(),
+                format!("fallback {}", libc::SYS_getpid),
+                format!("refusal {}", libc::SYS_getpid),
+                "path FallbackRefusal".to_string(),
             ]
         );
     }
@@ -646,7 +659,13 @@ mod tests {
             "the interceptor's result stands"
         );
         assert_eq!(event.resume_address(), None);
-        assert_eq!(calls(&dispatcher), ["path Sigsys", "intercept 39"]);
+        assert_eq!(
+            calls(&dispatcher),
+            [
+                "path Sigsys".to_string(),
+                format!("intercept {}", libc::SYS_getpid)
+            ]
+        );
     }
     #[test]
     fn a_direct_event_never_reaches_the_site_methods() {
@@ -658,12 +677,12 @@ mod tests {
         assert_eq!(
             calls(&dispatcher),
             [
-                "path Sigsys",
-                "intercept 39",
-                "fallback 39",
-                "continuation?",
-                "refusal 39",
-                "path FallbackRefusal",
+                "path Sigsys".to_string(),
+                format!("intercept {}", libc::SYS_getpid),
+                format!("fallback {}", libc::SYS_getpid),
+                "continuation?".to_string(),
+                format!("refusal {}", libc::SYS_getpid),
+                "path FallbackRefusal".to_string(),
             ]
         );
     }

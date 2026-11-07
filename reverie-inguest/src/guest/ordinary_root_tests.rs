@@ -143,6 +143,13 @@ fn ordinary_root_handoff_preserves_first_event_and_normal_fields() {
     // syscall, physical guest, private permit or coordinator request is used.
     let root = raw_pid(libc::SYS_gettid);
     for instruction in [false, true] {
+        if instruction
+            && !<crate::guest::isa::NativeIsa as crate::guest::isa::Isa>::instruction_capabilities()
+                .rdtsc
+        {
+            // No instruction event can be admitted on this architecture.
+            continue;
+        }
         let (mut host, _peer) = host_at(root);
         host.prepare_ordinary_root_state(|config, pid, state| {
             assert_eq!(*config, 71);
@@ -160,11 +167,15 @@ fn ordinary_root_handoff_preserves_first_event_and_normal_fields() {
         };
         for _ in 0..2 {
             if instruction {
+                use crate::guest::isa::Isa as _;
+                use crate::guest::isa::NativeIsa;
                 let mut context = RegisterContext::default();
                 context.instruction_pointer = 0x1234;
                 unsafe { host.dispatch_instruction(InstructionEventKind::Rdtsc, &mut context) };
-                assert_eq!(context.rax, 97);
-                assert_eq!(context.rdx, 0);
+                let view = NativeIsa::user_regs_from_context(&context);
+                let (low, args) = NativeIsa::event_from_user_regs(&view);
+                assert_eq!(low, 97);
+                assert_eq!(args[2], 0);
             } else {
                 let mut event = SyscallEvent {
                     number: libc::SYS_getpid,

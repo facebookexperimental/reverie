@@ -27,9 +27,7 @@ use crate::Tid;
 use crate::error::Errno;
 use crate::error::Error;
 use crate::guest::Guest;
-#[cfg(target_arch = "x86_64")]
 use crate::rdtsc::Rdtsc;
-#[cfg(target_arch = "x86_64")]
 use crate::rdtsc::RdtscResult;
 
 /// Static stream role of a Tool, independent of mutable run configuration.
@@ -1028,15 +1026,28 @@ pub trait Tool: Send + Sync + Default {
     /// NOTE:
     ///  * This is never called by default unless cpuid events are subscribed
     ///    to.
-    ///  * This is only available on x86_64.
-    #[cfg(target_arch = "x86_64")]
+    ///  * Delivered only where instruction faulting is admitted
+    ///    (x86_64 today); other architectures refuse the subscription.
     async fn handle_cpuid_event<T: Guest<Self>>(
         &self,
         _guest: &mut T,
         eax: u32,
         ecx: u32,
     ) -> Result<raw_cpuid::CpuIdResult, Errno> {
-        Ok(raw_cpuid::cpuid!(eax, ecx))
+        #[cfg(target_arch = "x86_64")]
+        {
+            Ok(raw_cpuid::cpuid!(eax, ecx))
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = (eax, ecx);
+            Ok(raw_cpuid::CpuIdResult {
+                eax: 0,
+                ebx: 0,
+                ecx: 0,
+                edx: 0,
+            })
+        }
     }
 
     /// rdtsc/rdtscp is trapped, the tool should implement this function to
@@ -1045,8 +1056,8 @@ pub trait Tool: Send + Sync + Default {
     /// NOTE:
     ///  * This is never called by default unless rdtsc events are subscribed
     ///    to.
-    ///  * This is only available on x86_64.
-    #[cfg(target_arch = "x86_64")]
+    ///  * Delivered only where instruction faulting is admitted
+    ///    (x86_64 today); other architectures refuse the subscription.
     async fn handle_rdtsc_event<T: Guest<Self>>(
         &self,
         _guest: &mut T,

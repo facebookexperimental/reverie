@@ -90,7 +90,6 @@ mod mapping_capture;
 pub mod native_syscall;
 mod process_signal_control;
 pub mod provider;
-#[cfg(target_arch = "x86_64")]
 mod rdtsc;
 mod regs;
 /// Nonserialized ownership for private input and physical native attempts.
@@ -126,7 +125,6 @@ pub use inherited_input::*;
 pub use mapping_capture::*;
 pub use process::ExitStatus;
 pub use process::Pid;
-#[cfg(target_arch = "x86_64")]
 pub use rdtsc::*;
 pub use regs::RegDisplay;
 pub use regs::RegDisplayOptions;
