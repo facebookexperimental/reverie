@@ -18649,7 +18649,7 @@ fn derive_no_installation_scope_evidence(
         .current_build
         .as_ref()
         .ok_or("no-scope allocation needs actual current-build witness")?;
-    let cohort = no_scope_build_features(build)?;
+    no_scope_build_features(build)?;
     let compiled_sources_sha256 =
         sha256(&serde_json::to_vec(sources.record()).map_err(|e| e.to_string())?);
     require(
