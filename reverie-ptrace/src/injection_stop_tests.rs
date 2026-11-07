@@ -628,7 +628,7 @@ type RunOutcome = (
     reverie::ExitStatus,
     Vec<u8>,
     Vec<Observation>,
-    (u64, u64, u64),
+    (u64, u64, u64, u64),
 );
 
 async fn run_once(mode: Mode, force_stepped: bool) -> RunOutcome {
@@ -637,6 +637,7 @@ async fn run_once(mode: Mode, force_stepped: bool) -> RunOutcome {
         private_transports(Sysno::write),
         private_transports(Sysno::close),
         private_transports(Sysno::rt_sigprocmask),
+        private_transports(Sysno::futex),
     );
     let fixture = Fixture::new(mode);
     let mut command = Command::new(&fixture.path);
@@ -727,6 +728,7 @@ async fn run_once(mode: Mode, force_stepped: bool) -> RunOutcome {
         private_transports(Sysno::write) - transports_before.0,
         private_transports(Sysno::close) - transports_before.1,
         private_transports(Sysno::rt_sigprocmask) - transports_before.2,
+        private_transports(Sysno::futex) - transports_before.3,
     );
     (output.status, output.stdout, log, transports)
 }
@@ -746,22 +748,21 @@ async fn run(mode: Mode) {
         (stepped.0, &stepped.1, &stepped.2),
         "{mode:?} differs between in-place and stepped transports"
     );
-    // (writes, closes, sigprocmasks) on the private page, per transport.
+    // (writes, closes, sigprocmasks, futexes) on the private page, per transport.
     let expected_transports = match mode {
-        Mode::Replace => ((0, 0, 0), (1, 0, 0)),
-        Mode::ReplaceNumber => ((0, 0, 0), (0, 1, 0)),
-        Mode::ReplaceThenPrivate => ((1, 0, 0), (2, 0, 0)),
-        Mode::ReplaceWithPendingSignal => ((0, 0, 1), (1, 0, 1)),
-        Mode::SameThenPrivate => ((1, 1, 0), (1, 1, 0)),
+        Mode::Replace => ((0, 0, 0, 0), (1, 0, 0, 0)),
+        Mode::ReplaceNumber => ((0, 0, 0, 0), (0, 1, 0, 0)),
+        Mode::ReplaceThenPrivate => ((1, 0, 0, 0), (2, 0, 0, 0)),
+        Mode::ReplaceWithPendingSignal => ((0, 0, 1, 0), (1, 0, 1, 0)),
+        Mode::ReplaceInterruptedRestart => ((0, 0, 0, 0), (0, 0, 0, 1)),
+        Mode::SameThenPrivate => ((1, 1, 0, 0), (1, 1, 0, 0)),
         // A divergent tail injection has no exit stop to restore at,
         // so it takes the private page on both transports.
-        Mode::TailOther => ((1, 0, 0), (1, 0, 0)),
-        Mode::TailSame | Mode::ReplaceInterruptedRestart | Mode::InheritedTrapRewrite => {
-            ((0, 0, 0), (0, 0, 0))
-        }
-        Mode::PostExec => ((0, 1, 0), (0, 1, 0)),
-        Mode::PostExecTail => ((1, 1, 0), (1, 1, 0)),
-        Mode::Emulate | Mode::EmulateErrno => ((0, 0, 0), (0, 0, 0)),
+        Mode::TailOther => ((1, 0, 0, 0), (1, 0, 0, 0)),
+        Mode::TailSame | Mode::InheritedTrapRewrite => ((0, 0, 0, 0), (0, 0, 0, 0)),
+        Mode::PostExec => ((0, 1, 0, 0), (0, 1, 0, 0)),
+        Mode::PostExecTail => ((1, 1, 0, 0), (1, 1, 0, 0)),
+        Mode::Emulate | Mode::EmulateErrno => ((0, 0, 0, 0), (0, 0, 0, 0)),
     };
     assert_eq!(
         (in_place.3, stepped.3),

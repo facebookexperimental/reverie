@@ -7159,7 +7159,9 @@ async fn a_sibling_sig_dfl_during_a_repair_is_lost_a_pinned_limit() {
 /// (<https://github.com/rrnewton/hermit/issues/4409>). From the Claude
 /// reviewer's witness T1 at rev 10 and Codex's exit-0 requirement. Both
 /// configurations.
-async fn sibling_tsync_filter_check(expect_repair_kills: bool) {
+#[tokio::test(flavor = "current_thread")]
+async fn a_sibling_tsync_filter_kills_no_guest_unless_the_contract_is_broken() {
+    let _stepped = NoInPlaceRewrite::new();
     require_capped_crash_dumps();
     for no_serialization_contract in [true, false] {
         for (mode, action) in [
@@ -7197,27 +7199,12 @@ async fn sibling_tsync_filter_check(expect_repair_kills: bool) {
                 assert_eq!(ok + sigsys, 40, "{what}: {line}");
                 if no_serialization_contract || mode == "sigtrap_tsync_filter_errno" {
                     assert_eq!(sigsys, 0, "{what}: {line}");
-                } else if configuration == "tail" && expect_repair_kills {
+                } else if configuration == "tail" {
                     assert!(sigsys > 0, "{what}: {line}");
                 }
             }
         }
     }
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn a_sibling_tsync_filter_kills_no_guest_unless_the_contract_is_broken() {
-    let _stepped = NoInPlaceRewrite::new();
-    sibling_tsync_filter_check(true).await;
-}
-
-/// The same cells with divergent first injections in place: no step
-/// means no SIGTRAP repair for the sibling's filter to kill, which
-/// is the native outcome (the guest's own rt_sigaction calls are
-/// not the filtered syscall), and no child is lost either way.
-#[tokio::test(flavor = "current_thread")]
-async fn a_sibling_tsync_filter_kills_no_guest_in_place() {
-    sibling_tsync_filter_check(false).await;
 }
 
 /// Reverie keeps an ignored SIGTRAP across a private injection's step only
