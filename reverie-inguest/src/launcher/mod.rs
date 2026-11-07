@@ -2856,6 +2856,71 @@ ran_text: .ascii "ran"
     }
 
     #[test]
+    fn malformed_elf_after_ident_fails_closed() {
+        // The short/non-ELF tolerance ends at a complete ident:
+        // a file that claims ELF64/ELF32 and then truncates its
+        // header or points its program headers past EOF is an
+        // uninspectable ELF, and the launch must refuse rather
+        // than classify it as not static.
+        // MUTATION ARM: mapping a post-ident read error to
+        // Ok(false) makes every case here return not-static
+        // instead of Err.
+        fn elf64_header(phoff: u64) -> Vec<u8> {
+            let mut bytes = vec![0u8; 64];
+            bytes[..4].copy_from_slice(b"\x7fELF");
+            bytes[4] = 2;
+            bytes[32..40].copy_from_slice(&phoff.to_ne_bytes());
+            bytes[54..56].copy_from_slice(&56u16.to_ne_bytes());
+            bytes[56..58].copy_from_slice(&1u16.to_ne_bytes());
+            bytes
+        }
+        fn elf32_header(phoff_low: u16) -> Vec<u8> {
+            let mut bytes = vec![0u8; 52];
+            bytes[..4].copy_from_slice(b"\x7fELF");
+            bytes[4] = 1;
+            bytes[28..30].copy_from_slice(&phoff_low.to_ne_bytes());
+            bytes[42..44].copy_from_slice(&32u16.to_ne_bytes());
+            bytes[44..46].copy_from_slice(&1u16.to_ne_bytes());
+            bytes
+        }
+
+        let dir = short_socket_tempdir();
+        let elf64 = elf64_header(4096);
+        let mut cases: Vec<(&str, Vec<u8>)> = [20usize, 32, 63]
+            .into_iter()
+            .map(|len| {
+                (
+                    match len {
+                        20 => "truncated-elf64-20",
+                        32 => "truncated-elf64-32",
+                        _ => "truncated-elf64-63",
+                    },
+                    elf64[..len].to_vec(),
+                )
+            })
+            .collect();
+        cases.push(("elf64-phoff-past-eof", elf64));
+        cases.push(("elf32-phoff-past-eof", elf32_header(4096)));
+
+        for (name, bytes) in cases {
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes).unwrap();
+            let error = target_is_static(&path).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::UnexpectedEof,
+                "{name}: {error}"
+            );
+            let error = refuse_static_target(&path, &[]).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::UnexpectedEof,
+                "{name}: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn static_target_refused_before_spawn_marker_absent() {
         let dir = short_socket_tempdir();
         let marker = dir.path().join("marker");
