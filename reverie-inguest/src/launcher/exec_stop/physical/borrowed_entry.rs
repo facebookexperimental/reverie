@@ -143,6 +143,27 @@ impl VerifiedReady {
     pub fn reserved_signals(&self) -> u64 {
         self.reserved_signals
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(pid: safeptrace::Pid, terminal_ip: u64, reserved_signals: u64) -> Self {
+        Self {
+            pid,
+            terminal_ip,
+            reserved_signals,
+        }
+    }
+}
+
+/// Exact release-token recheck: the token must name this child
+/// and the exact initialized stop the observer recorded for this
+/// mapping. Pure data comparison; it proves nothing beyond the
+/// token's own observer predicate.
+pub(super) fn ready_token_matches(
+    ready: &VerifiedReady,
+    pid: safeptrace::Pid,
+    initialized_stop: Option<(u64, u64)>,
+) -> bool {
+    ready.pid == pid && initialized_stop == Some((ready.terminal_ip, ready.reserved_signals))
 }
 
 /// A prepared mapping after successful restore and detach. The guest is
@@ -422,6 +443,13 @@ impl PreparedMapping<'_> {
         Ok(())
     }
 
+    /// Test-only view of the handover latches a refused release
+    /// must leave unset: `(failed, handover_started)`.
+    #[cfg(test)]
+    pub(crate) fn handover_flags_for_test(&self) -> (bool, bool) {
+        (self.entry.failed, self.entry.handover_started)
+    }
+
     async fn bootstrap_observe(
         &mut self,
         coordinates: &BootstrapEntryCoordinates,
@@ -533,9 +561,15 @@ impl PreparedMapping<'_> {
                     self.entry.event = Some(event);
                     self.entry.wait = None;
                 }
-                Ok(Wait::Exited(_, status)) => {
-                    self.entry.terminal = Some(status);
+                Ok(Wait::Exited(pid, status)) => {
                     self.entry.wait = None;
+                    handover::store_same_generation_terminal(
+                        &mut self.entry.terminal,
+                        pid,
+                        self.owner.generation.pid(),
+                        status,
+                        "mapped_entry_foreign_terminal",
+                    )?;
                     return Err("mapped_entry_early_exit".into());
                 }
                 Err(error) => return Err(error.into()), // original driver retained
@@ -955,6 +989,39 @@ mod tests {
         let back = spec.coordinates();
         assert_eq!(back.entry, coordinates.entry);
         assert_eq!(back.terminal_int3, coordinates.terminal_int3);
+    }
+
+    #[test]
+    fn ready_token_recheck_requires_exact_pid_terminal_and_reserved() {
+        let pid = safeptrace::Pid::from_raw(4242);
+        let reserved = 1_u64 << (libc::SIGSYS - 1);
+        let ready = VerifiedReady {
+            pid,
+            terminal_ip: 0x4010_2400,
+            reserved_signals: reserved,
+        };
+        let exact = Some((ready.terminal_ip(), ready.reserved_signals()));
+        assert!(ready_token_matches(&ready, pid, exact));
+        // Each mismatch class refuses separately.
+        assert!(!ready_token_matches(
+            &ready,
+            safeptrace::Pid::from_raw(4243),
+            exact
+        ));
+        assert!(!ready_token_matches(
+            &ready,
+            pid,
+            Some((ready.terminal_ip() + 1, reserved))
+        ));
+        assert!(!ready_token_matches(
+            &ready,
+            pid,
+            Some((
+                ready.terminal_ip(),
+                reserved | (1_u64 << (libc::SIGSEGV - 1))
+            ))
+        ));
+        assert!(!ready_token_matches(&ready, pid, None));
     }
 
     fn put_i32(bytes: &mut [u8; 128], offset: usize, value: i32) {

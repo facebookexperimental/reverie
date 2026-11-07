@@ -1787,6 +1787,132 @@ mod tests {
         }
 
         #[test]
+        fn release_after_ready_mismatch_returns_unspent_mapping() {
+            use crate::launcher::exec_stop::physical::VerifiedReady;
+
+            let runtime = synthetic_runtime();
+            let descriptor = descriptor_words(&runtime);
+            let geometry = geometry(&descriptor);
+            let runtime_file = memfd(&runtime, true).unwrap();
+            let handoff_file = memfd(&[], false).unwrap();
+            let input_file = memfd(INERT_PACKET, true).unwrap();
+            let watched = watched_guest(&runtime_file, &handoff_file, &input_file);
+            let stop = next_exec(watched);
+            let pid = stop.pid();
+            let original_regs = register_words(stop.entry().regs());
+            let original_mask = stop.entry().signal_mask();
+            let image = validated(&runtime);
+            let captured = stop.capture_initial_inputs().unwrap();
+            let copied = stop
+                .prepare_copied_inputs(
+                    &captured,
+                    &image,
+                    &CopiedInputRequest {
+                        roles: geometry.roles,
+                        free_band: geometry.free_band,
+                        layout_address: RUNTIME_WINDOW.start + 512,
+                        copied_address: geometry.copied_address,
+                        copied_capacity: geometry.copied_capacity,
+                        control_address: geometry.control,
+                        relay_address: geometry.relay,
+                        filter_scratch: geometry.filter_scratch,
+                    },
+                )
+                .unwrap();
+            // SAFETY: same held-generation XSAVE read as the
+            // preparation witnesses above.
+            let pkru = unsafe { stop.entry().xstate().pkru() }.expect("stopped PKRU");
+            let wire = build_wire(
+                &image,
+                &descriptor,
+                &geometry,
+                &copied,
+                &WireContext {
+                    pid: pid.as_raw() as u64,
+                    regs: original_regs,
+                    mask: original_mask,
+                    input_fd: input_file.as_raw_fd() as u64,
+                    pkru,
+                },
+            )
+            .unwrap();
+            let role_bytes = geometry.roles[3].end - geometry.roles[3].start - 2 * PAGE;
+            handoff_file.write_all_at(&wire, 0).unwrap();
+            handoff_file.set_len(role_bytes).unwrap();
+            seal_file(&handoff_file).unwrap();
+            let preparation = Preparation {
+                runtime_fd: runtime_file.as_fd(),
+                runtime_bytes: &runtime,
+                layout_address: RUNTIME_WINDOW.start + 512,
+                handoff_fd: handoff_file.as_fd(),
+                handoff_bytes: &wire,
+                handoff_address: geometry.roles[3].start + PAGE,
+                input_fd: input_file.as_fd(),
+                free_band: geometry.free_band,
+                filter_scratch: geometry.filter_scratch,
+            };
+            // SAFETY: original ptracer thread, inherited immutable
+            // descriptors, genuine captured context, as in
+            // prepare_and_cancel. Preparation only; the mismatched
+            // release below refuses before any restore or entry.
+            let prepared = match unsafe { stop.prepare_mapping(preparation) } {
+                Ok(prepared) => prepared,
+                Err(failure) => panic!(
+                    "preparation refused: {} cleanup={:?}",
+                    failure.error,
+                    failure.cleanup()
+                ),
+            };
+            let wrong = VerifiedReady::for_test(
+                pid,
+                RUNTIME_WINDOW.start + 8192,
+                1_u64 << (libc::SIGSYS - 1),
+            );
+            let tokio = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap();
+            // SAFETY: the token names no recorded initialized stop
+            // for this mapping, so release must refuse at its
+            // recheck before any physical change.
+            let failure = tokio.block_on(async {
+                match unsafe {
+                    prepared
+                        .release_after_ready(
+                            wrong,
+                            std::time::Instant::now() + std::time::Duration::from_secs(30),
+                        )
+                        .await
+                } {
+                    Ok(_) => panic!("mismatched release unexpectedly detached"),
+                    Err(failure) => failure,
+                }
+            });
+            assert!(
+                failure
+                    .error
+                    .to_string()
+                    .contains("mapped_ready_token_mismatch"),
+                "unexpected release refusal: {}",
+                failure.error
+            );
+            let mapping = failure.into_mapping();
+            assert_eq!(
+                mapping.handover_flags_for_test(),
+                (false, false),
+                "mismatch must leave failed and handover_started unset"
+            );
+            let observed = mapping.diagnostic_observation().unwrap();
+            assert_eq!(observed.registers, original_regs);
+            assert!(observed.xstate_exact);
+            let cancelled = match mapping.cancel() {
+                Ok(cancelled) => cancelled,
+                Err(retained) => panic!("cancel unconfirmed: {:?}", retained.cleanup()),
+            };
+            assert!(cancelled.cleanup.confirmed);
+        }
+
+        #[test]
         fn preparation_parts_refuse_foreign_context() {
             use crate::launcher::exec_stop::physical::prepare_mapping_parts;
 

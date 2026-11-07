@@ -99,9 +99,11 @@ impl<'fd> PreparedMapping<'fd> {
         ready: VerifiedReady,
         operation_deadline: Instant,
     ) -> std::result::Result<ReleasedPreparedMapping<'fd>, Box<ReleaseFailure<'fd>>> {
-        if self.owner.generation.pid() != ready.pid
-            || self.entry.initialized_stop != Some((ready.terminal_ip, ready.reserved_signals))
-        {
+        if !ready_token_matches(
+            &ready,
+            self.owner.generation.pid(),
+            self.entry.initialized_stop,
+        ) {
             return Err(Box::new(ReleaseFailure::new(
                 "mapped_ready_token_mismatch".into(),
                 self,
@@ -416,11 +418,14 @@ impl<'fd> PreparedMapping<'fd> {
                 self.entry.wait = None;
             }
             Wait::Exited(pid, status) => {
-                self.entry.terminal = Some(status);
                 self.entry.wait = None;
-                if pid != self.owner.generation.pid() {
-                    return Err("mapped_handover_foreign_terminal".into());
-                }
+                store_same_generation_terminal(
+                    &mut self.entry.terminal,
+                    pid,
+                    self.owner.generation.pid(),
+                    status,
+                    "mapped_handover_foreign_terminal",
+                )?;
             }
         }
         self.entry_thread()?;
@@ -475,6 +480,24 @@ pub(super) async fn wait_retained_driver(
     })
 }
 
+/// Store a terminal status only when it names this retained
+/// generation. A foreign terminal is refused by name and the
+/// slot stays empty, so a retried wait can never record it as
+/// this child's confirmed reap.
+pub(super) fn store_same_generation_terminal(
+    slot: &mut Option<ExitStatus>,
+    pid: safeptrace::Pid,
+    generation: safeptrace::Pid,
+    status: ExitStatus,
+    foreign_error: &'static str,
+) -> Result<()> {
+    if pid != generation {
+        return Err(foreign_error.into());
+    }
+    *slot = Some(status);
+    Ok(())
+}
+
 fn restoration_facts(control: &[u8; 384], original_mask: u64, reserved: u64) -> bool {
     qualified_reserved_set(reserved)
         && control_word(control, 10) == original_mask
@@ -514,6 +537,35 @@ mod tests {
             assert!(!restoration_facts(&changed, mask, reserved), "field {i}");
         }
         assert!(!restoration_facts(&c, mask, 0));
+    }
+    #[test]
+    fn foreign_terminal_is_never_stored_for_a_retried_wait() {
+        let generation = safeptrace::Pid::from_raw(4242);
+        let mut slot = None;
+        let error = store_same_generation_terminal(
+            &mut slot,
+            safeptrace::Pid::from_raw(4243),
+            generation,
+            ExitStatus::Exited(0),
+            "mapped_handover_foreign_terminal",
+        )
+        .expect_err("foreign terminal must refuse");
+        assert!(
+            error
+                .to_string()
+                .contains("mapped_handover_foreign_terminal"),
+            "unexpected foreign-terminal refusal: {error}"
+        );
+        assert_eq!(slot, None, "foreign status must not reach the retry slot");
+        store_same_generation_terminal(
+            &mut slot,
+            generation,
+            generation,
+            ExitStatus::Exited(7),
+            "mapped_handover_foreign_terminal",
+        )
+        .unwrap();
+        assert_eq!(slot, Some(ExitStatus::Exited(7)));
     }
     // A real direct child held by its stdin pipe, with exactly one retained
     // safeptrace driver. std::process never waits after that driver is created.
