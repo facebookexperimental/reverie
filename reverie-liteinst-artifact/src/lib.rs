@@ -23622,6 +23622,25 @@ const DETCORE_VALIDATE_TEMPLATES: &[DetcoreValidateTemplate] = &[
         ],
         transfers: &[(8, 1)],
     },
+    DetcoreValidateTemplate {
+        role: "fixed_tls_fn_once",
+        hex: "50488d3da0f18800e803d97e00488d801001000059c3",
+        operands: &[
+            DetcoreValidateOperand {
+                displacement: 4,
+                next: 8,
+                key: "fixed_publication_tls_descriptor",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 9,
+                next: 13,
+                key: "fixed_tls_get_addr_plt",
+                got: false,
+            },
+        ],
+        transfers: &[(8, 1)],
+    },
     // Actual default Detcore cfg repair: complete330, SHA256 c0484e3f71e5455efdfab9d78ceca3ed3470ffb02663a55e2e9977b11e478cce.
     DetcoreValidateTemplate {
         role: "fixed_native_from_native",
