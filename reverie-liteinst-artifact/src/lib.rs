@@ -19905,10 +19905,12 @@ fn validate_fixed_backing_evidence_in_source_context(
         FIXED_REQUIRED_ROLES
             .iter()
             .all(|role| backing.functions.contains_key(*role))
-            && FIXED_PUBLICATION_REQUIRED_ROLES.iter().all(|role| {
-                backing.functions.contains_key(*role)
-                    && backing.allocator_transfers.contains_key(*role)
-            })
+            && fixed_required_publication_roles(backing.functions.keys().map(String::as_str))
+                .iter()
+                .all(|role| {
+                    backing.functions.contains_key(*role)
+                        && backing.allocator_transfers.contains_key(*role)
+                })
             && backing.functions.keys().eq(backing.function_sha256.keys())
             && backing
                 .function_sha256
@@ -19942,7 +19944,7 @@ fn validate_existing_allocator_tls_boundary(
             && canonical_rust_symbol(&tls.tls_cell.name).as_deref() == Some(FIXED_TLS_CELL_ROLE)
             && match image_kind {
                 FixedImageKind::Standalone => {
-                    matches!(tls.tls_cell.address, 0x40 | 0x48 | 0x80 | 0x88)
+                    matches!(tls.tls_cell.address, 0x30 | 0x40 | 0x48 | 0x80 | 0x88)
                 }
                 FixedImageKind::Detcore => {
                     matches!(
@@ -19991,7 +19993,7 @@ fn validate_existing_allocator_tls_boundary(
             resolution == "local_relative_readonly_function_pointer"
                 && (tls.tls_cell.address == 0x48
                     || (image_kind == FixedImageKind::Standalone
-                        && matches!(tls.tls_cell.address, 0x40 | 0x80)))
+                        && matches!(tls.tls_cell.address, 0x30 | 0x40 | 0x80)))
                 && edge.local_got_slot.is_none()
                 && tls
                     .local_chain
@@ -20048,7 +20050,7 @@ fn validate_existing_allocator_tls_boundary(
         _ => return Err("Fixed TLS local function-pointer evidence is inconsistent".into()),
     }
     if image_kind == FixedImageKind::Standalone
-        && matches!(tls.tls_cell.address, 0x40 | 0x80)
+        && matches!(tls.tls_cell.address, 0x30 | 0x40 | 0x80)
         && tls.local_key_object.is_some()
     {
         let try_with = tls.local_chain.get("fixed_tls_try_with");
@@ -20061,7 +20063,13 @@ fn validate_existing_allocator_tls_boundary(
                     .is_some_and(|key| key != 0 && key.is_multiple_of(8))
                 && tls.local_key_transfer.as_ref().is_some_and(|edge| {
                     try_with.is_some_and(|caller| {
-                        caller.address.checked_add(0x15) == Some(edge.instruction)
+                        let call_offset = match (tls.tls_cell.address, caller.size) {
+                            (0x30, 235) => Some(0x18),
+                            (0x40 | 0x80, 175) => Some(0x15),
+                            _ => None,
+                        };
+                        call_offset.and_then(|offset| caller.address.checked_add(offset))
+                            == Some(edge.instruction)
                     })
                 })
                 && tls
@@ -45226,6 +45234,31 @@ mod tests {
         unknown["legacy_exemption"] = serde_json::json!(true);
         assert!(serde_json::from_value::<AllocatorBackingEvidence>(unknown).is_err());
         fixed_native_syscall_controls(&backing);
+        // Paired controls for the two newer-main routes the current-build
+        // port must not drop: scalar publication role selection, and the
+        // standalone Existing TLS cell at 0x30.
+        let mut scalar = backing.clone();
+        for role in FIXED_PUBLICATION_REQUIRED_ROLES.iter().copied() {
+            scalar.functions.remove(role);
+            scalar.function_sha256.remove(role);
+            scalar.allocator_transfers.remove(role);
+        }
+        for (index, role) in FIXED_SCALAR_PUBLICATION_REQUIRED_ROLES.iter().enumerate() {
+            scalar.functions.insert(
+                role.to_string(),
+                function(role, 0x4000 + index as u64 * 0x20),
+            );
+            scalar
+                .function_sha256
+                .insert(role.to_string(), "0".repeat(64));
+            scalar.allocator_transfers.insert(role.to_string(), vec![]);
+        }
+        validate_fixed_backing_evidence(&scalar).unwrap();
+        let mut cell30 = backing.clone();
+        if let AllocatorInstallationEvidence::Existing(boundary) = &mut cell30.tls_boundary {
+            boundary.tls_cell.address = 0x30;
+        }
+        validate_fixed_backing_evidence(&cell30).unwrap();
     }
 
     // Structural data controls only. No fabricated record is put in an opaque
