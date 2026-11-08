@@ -1,8 +1,10 @@
 //! Host-side copied input data. This does not construct an execution-eligible
 //! handoff: complete source-qualified code/site/binding records and a
-//! combined producer that computes the expected configuration digest and
-//! stamps an HLISUC01 packet into an admitted handoff still do not exist
-//! here; [`build_init_packet`] only encodes caller-supplied values.
+//! combined producer that computes the expected digests and seals an
+//! admitted handoff still do not exist here. [`build_init_packet`] only
+//! encodes caller-supplied values, and [`stamp_init_packet`] only writes
+//! host-validated packet bytes into a caller-owned blob and re-verifies
+//! table 3; neither admits, seals, maps, or releases anything.
 
 use reverie_loader::artifact::RUNTIME_WINDOW;
 use reverie_loader::artifact::TOOL_REGION;
@@ -445,15 +447,51 @@ fn build_data(
     })
 }
 
+/// Which birth a packet was stamped for, from the host's birth
+/// record. The packet protocol in HLSCAL01 table 3 is selected
+/// by this route, never by inspecting packet magic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InitPacketBirthKind {
+    /// First-image birth: no predecessor state deposit.
+    FirstImage,
+    /// Successor birth: a predecessor state deposit is expected.
+    Successor,
+}
+
+impl InitPacketBirthKind {
+    fn state_expected(self) -> bool {
+        matches!(self, Self::Successor)
+    }
+}
+
+/// The host's independent expectations for one packet: which
+/// birth it was stamped for and the exact digests from the
+/// registration/frozen records. Grouped so the two digests
+/// cannot be swapped at a call site.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InitPacketExpectation {
+    /// Birth kind from the host's birth record.
+    pub birth_kind: InitPacketBirthKind,
+    /// Expected SHA-256 of the exact canonical configuration bytes.
+    pub expected_config_digest: [u8; 32],
+    /// Expected SHA-256 of the exact predecessor state bytes;
+    /// all zero for a first-image birth.
+    pub expected_state_digest: [u8; 32],
+}
+
 /// Host-validated contents of one HLISUC01 successor-init packet
 /// (the schema in `reverie_loader::init_packet`).
-/// Validation is syntactic plus one digest equality; it is not
-/// admission, which stays with the coordinator-side one-use
-/// InitialImage redemption against the watched birth. The fields
-/// are private so only [`validate_init_packet`] can mint one.
+/// Validation is syntactic plus birth-kind and digest equality;
+/// it is not admission, which stays with the coordinator-side
+/// one-use InitialImage redemption against the watched birth.
+/// The fields are private so only [`validate_init_packet`] can
+/// mint one, and the exact validated bytes are retained so a
+/// stamper can only write bytes that were validated.
 pub struct ValidatedInitPacket {
     state_expected: bool,
+    expected_state_digest: [u8; 32],
     redemption: Vec<u8>,
+    packet_bytes: Vec<u8>,
 }
 
 impl ValidatedInitPacket {
@@ -466,10 +504,24 @@ impl ValidatedInitPacket {
         self.state_expected
     }
 
+    /// Expected SHA-256 of the exact predecessor state bytes,
+    /// verbatim from the packet. All zero when no state deposit
+    /// is expected.
+    pub fn expected_state_digest(&self) -> [u8; 32] {
+        self.expected_state_digest
+    }
+
     /// Exact bounded redemption bytes to present for InitialImage
     /// redemption, verbatim from the packet.
     pub fn redemption(&self) -> &[u8] {
         &self.redemption
+    }
+
+    /// Exact complete packet bytes that were validated, verbatim.
+    /// This is the only byte string a stamper may write for this
+    /// validation.
+    pub fn packet_bytes(&self) -> &[u8] {
+        &self.packet_bytes
     }
 }
 
@@ -484,17 +536,15 @@ fn init_packet_error(error: reverie_loader::init_packet::Error) -> Box<dyn std::
     }
 }
 
-/// Build one exact HLISUC01 packet. The
-/// caller computes `expected_config_digest` with
+/// Build one exact HLISUC01 packet for `expectation`. The caller
+/// computes `expected_config_digest` with
 /// `reverie_rpc_transport::initial_image::config_digest` over the
-/// final, canonical configuration bytes; this helper never hashes
-/// and never supplies a digest of its own.
-pub fn build_init_packet(
-    state_expected: bool,
-    expected_config_digest: &[u8; 32],
-    redemption: &[u8],
-) -> Result<Vec<u8>> {
-    let flags = if state_expected {
+/// final, canonical configuration bytes, and takes
+/// `expected_state_digest` only from frozen predecessor state
+/// bytes; this helper never hashes and never supplies a digest
+/// of its own.
+pub fn build_init_packet(expectation: InitPacketExpectation, redemption: &[u8]) -> Result<Vec<u8>> {
+    let flags = if expectation.birth_kind.state_expected() {
         reverie_loader::init_packet::FLAG_STATE_EXPECTED
     } else {
         0
@@ -503,30 +553,98 @@ pub fn build_init_packet(
     let written = reverie_loader::init_packet::encode_into(
         &mut buffer,
         flags,
-        expected_config_digest,
+        &expectation.expected_config_digest,
+        &expectation.expected_state_digest,
         redemption,
     )
     .map_err(init_packet_error)?;
     Ok(buffer[..written].to_vec())
 }
 
-/// Host-validate one HLISUC01 packet against the independently
-/// expected configuration digest (same computation contract as
-/// [`build_init_packet`]). A packet whose embedded digest differs
-/// is refused as `init_packet_config_digest_mismatch` before any
-/// preparation step may consume it.
+/// Host-validate one HLISUC01 packet against the host's birth
+/// record and independently expected digests (same computation
+/// contract as [`build_init_packet`]). A packet stamped for the
+/// other birth kind is refused as
+/// `init_packet_birth_kind_mismatch`; embedded digest
+/// differences are refused as
+/// `init_packet_config_digest_mismatch` or
+/// `init_packet_state_digest_mismatch`, before any preparation
+/// step may consume the packet.
 pub fn validate_init_packet(
     packet: &[u8],
-    expected_config_digest: &[u8; 32],
+    expectation: InitPacketExpectation,
 ) -> Result<ValidatedInitPacket> {
     let decoded = reverie_loader::init_packet::decode(packet).map_err(init_packet_error)?;
-    if decoded.expected_config_digest() != *expected_config_digest {
+    if decoded.state_expected() != expectation.birth_kind.state_expected() {
+        return Err("init_packet_birth_kind_mismatch".into());
+    }
+    if decoded.expected_config_digest() != expectation.expected_config_digest {
         return Err("init_packet_config_digest_mismatch".into());
+    }
+    if decoded.expected_state_digest() != expectation.expected_state_digest {
+        return Err("init_packet_state_digest_mismatch".into());
     }
     Ok(ValidatedInitPacket {
         state_expected: decoded.state_expected(),
+        expected_state_digest: decoded.expected_state_digest(),
         redemption: decoded.redemption().to_vec(),
+        packet_bytes: packet.to_vec(),
     })
+}
+
+fn stamp_handoff_error(error: reverie_loader::handoff::Error) -> Box<dyn std::error::Error> {
+    format!("init_packet_stamp_handoff: {error:?}").into()
+}
+
+/// Re-parse a serialized blob and require its table 3 to be
+/// exactly the validated packet bytes. A blob carrying any
+/// other bytes there is refused as `init_packet_table3_mismatch`
+/// rather than sealed or consumed.
+fn verify_serialized_init_packet(
+    bytes: &[u8],
+    address: u64,
+    validated: &ValidatedInitPacket,
+) -> Result<()> {
+    let view = handoff::View::parse(bytes, address).map_err(stamp_handoff_error)?;
+    let stamped = view.table(3).map_err(stamp_handoff_error)?.bytes();
+    if stamped != validated.packet_bytes() {
+        return Err("init_packet_table3_mismatch".into());
+    }
+    Ok(())
+}
+
+/// Host-validate `candidate`, serialize the caller-owned blob in
+/// `bytes` with table 3 replaced by the exact validated packet
+/// bytes, then re-parse the blob and byte-compare table 3
+/// against those bytes. The `packet` field of `tables` is not
+/// used; `header.tables[3]` must already declare the validated
+/// packet length. Validation happens before any byte is
+/// written, so a refused candidate leaves `bytes` unchanged.
+/// This stamps data only: it does not seal, map, admit, or
+/// release the blob.
+pub fn stamp_init_packet(
+    candidate: &[u8],
+    expectation: InitPacketExpectation,
+    header: &handoff::Header,
+    tables: handoff::TableData<'_>,
+    address: u64,
+    bytes: &mut [u8],
+) -> Result<ValidatedInitPacket> {
+    let validated = validate_init_packet(candidate, expectation)?;
+    let stamped = handoff::TableData {
+        maps: tables.maps,
+        code: tables.code,
+        sites: tables.sites,
+        packet: validated.packet_bytes(),
+        env: tables.env,
+        aux: tables.aux,
+        program_name: tables.program_name,
+        dev_null: tables.dev_null,
+        tool_init: tables.tool_init,
+    };
+    handoff::serialize(header, &stamped, address, bytes).map_err(stamp_handoff_error)?;
+    verify_serialized_init_packet(bytes, address, &validated)?;
+    Ok(validated)
 }
 
 impl InitialExecStop<'_> {

@@ -25,9 +25,15 @@ pub use input_data::CopiedInputLocations;
 #[cfg(feature = "loader-private-runtime")]
 pub use input_data::CopiedInputRequest;
 #[cfg(feature = "loader-private-runtime")]
+pub use input_data::InitPacketBirthKind;
+#[cfg(feature = "loader-private-runtime")]
+pub use input_data::InitPacketExpectation;
+#[cfg(feature = "loader-private-runtime")]
 pub use input_data::ValidatedInitPacket;
 #[cfg(feature = "loader-private-runtime")]
 pub use input_data::build_init_packet;
+#[cfg(feature = "loader-private-runtime")]
+pub use input_data::stamp_init_packet;
 #[cfg(feature = "loader-private-runtime")]
 pub use input_data::validate_init_packet;
 #[cfg(feature = "stage1a-probe")]

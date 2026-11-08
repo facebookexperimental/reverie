@@ -21,11 +21,12 @@
 //! initialization packet. The distinct magic prevents either
 //! codec from interpreting the other protocol's bytes.
 //!
-//! The packet carries exactly the three launch-bound values the
+//! The packet carries exactly the four launch-bound values the
 //! successor entry needs before InitialImage redemption: the
-//! expected configuration digest, the bounded redemption bytes,
-//! and whether a predecessor state deposit is expected. It is
-//! data only: decoding grants no admission, mapping, or
+//! expected configuration digest, the expected state digest,
+//! the bounded redemption bytes, and whether a predecessor
+//! state deposit is expected. It is data only: decoding grants
+//! no admission, mapping, or
 //! execution authority. Admission remains the coordinator-side
 //! watched-birth `InitialImageAdmission` consumption; the
 //! expected digest must additionally match the delivered
@@ -37,15 +38,17 @@
 //! ```text
 //! offset  size  field
 //! 0       8     magic "HLISUC01"
-//! 8       2     version (1)
+//! 8       2     version (2)
 //! 10      2     flags (bit 0: state expected; all other bits 0)
 //! 12      2     redemption length (1..=256)
 //! 14      2     reserved, must be 0
 //! 16      32    expected configuration digest (SHA-256 bytes)
-//! 48      N     redemption bytes
+//! 48      32    expected state digest (SHA-256 bytes; all-zero
+//!               when the state-expected flag is clear)
+//! 80      N     redemption bytes
 //! ```
 //!
-//! The total packet length is exactly `48 + redemption length`
+//! The total packet length is exactly `80 + redemption length`
 //! and never exceeds the table-3 bound of 4096 bytes. This module
 //! allocates nothing, dereferences no numeric address, and
 //! invokes no syscall.
@@ -53,9 +56,11 @@
 /// Packet magic at offset 0.
 pub const MAGIC: [u8; 8] = *b"HLISUC01";
 /// Only supported packet revision; no fallback decoding occurs.
-pub const VERSION: u16 = 1;
+/// Version 1 packets are refused: this revision is the first
+/// with a producer, and the state digest is not optional.
+pub const VERSION: u16 = 2;
 /// Fixed header length before the redemption bytes.
-pub const HEADER_LEN: usize = 48;
+pub const HEADER_LEN: usize = 80;
 /// Flag bit: a predecessor state deposit is expected for this birth.
 /// A clear bit only says no deposit is expected; it does not by
 /// itself prove a first-image birth, and a successor entry must
@@ -74,7 +79,7 @@ pub const fn encoded_len(redemption_len: usize) -> Option<usize> {
     if redemption_len == 0 || redemption_len > MAX_REDEMPTION_LEN {
         return None;
     }
-    // 48 + 256 <= 4096 always; kept checked so the bound lives in
+    // 80 + 256 <= 4096 always; kept checked so the bound lives in
     // exactly one place if either constant ever moves.
     match HEADER_LEN.checked_add(redemption_len) {
         Some(total) if total <= MAX_PACKET_LEN => Some(total),
@@ -92,7 +97,9 @@ pub enum Error {
     Version,
     /// Reserved field is nonzero.
     Reserved,
-    /// A flag bit outside this revision's defined set is set.
+    /// A flag bit outside this revision's defined set is set, or
+    /// the state digest is nonzero while the state-expected
+    /// flag is clear.
     Flags,
     /// Redemption length is zero or above [`MAX_REDEMPTION_LEN`],
     /// or the output buffer cannot hold the encoded packet.
@@ -104,6 +111,7 @@ pub enum Error {
 pub struct InitPacket<'a> {
     flags: u16,
     expected_config_digest: [u8; 32],
+    expected_state_digest: [u8; 32],
     redemption: &'a [u8],
 }
 
@@ -122,6 +130,14 @@ impl<'a> InitPacket<'a> {
         self.expected_config_digest
     }
 
+    /// Expected SHA-256 of the exact predecessor state bytes
+    /// the coordinator will deliver, as carried. All zero when
+    /// no state deposit is expected; hashing the delivered
+    /// state is the consumer's existing check.
+    pub fn expected_state_digest(&self) -> [u8; 32] {
+        self.expected_state_digest
+    }
+
     /// Bounded launcher-defined redemption bytes, verbatim.
     pub fn redemption(&self) -> &'a [u8] {
         self.redemption
@@ -137,7 +153,12 @@ fn read_u16(packet: &[u8], offset: usize) -> Result<u16, Error> {
 /// unknown flags, and nonzero reserved fields are refusals, not
 /// ignored extensions.
 pub fn decode(packet: &[u8]) -> Result<InitPacket<'_>, Error> {
-    if packet.len() < HEADER_LEN || packet.len() > MAX_PACKET_LEN {
+    // The version is named before the fixed-length checks so a
+    // version 1 packet (whose 48-byte header is shorter than
+    // this revision's) refuses as `Version`, never as a generic
+    // truncation. Ten bytes cover magic plus version without
+    // slicing past the input.
+    if packet.len() < 10 || packet.len() > MAX_PACKET_LEN {
         return Err(Error::Format);
     }
     if packet[..8] != MAGIC {
@@ -145,6 +166,9 @@ pub fn decode(packet: &[u8]) -> Result<InitPacket<'_>, Error> {
     }
     if read_u16(packet, 8)? != VERSION {
         return Err(Error::Version);
+    }
+    if packet.len() < HEADER_LEN {
+        return Err(Error::Format);
     }
     let flags = read_u16(packet, 10)?;
     if flags & !KNOWN_FLAGS != 0 {
@@ -160,9 +184,15 @@ pub fn decode(packet: &[u8]) -> Result<InitPacket<'_>, Error> {
     }
     let mut expected_config_digest = [0u8; 32];
     expected_config_digest.copy_from_slice(&packet[16..48]);
+    let mut expected_state_digest = [0u8; 32];
+    expected_state_digest.copy_from_slice(&packet[48..80]);
+    if flags & FLAG_STATE_EXPECTED == 0 && expected_state_digest != [0u8; 32] {
+        return Err(Error::Flags);
+    }
     Ok(InitPacket {
         flags,
         expected_config_digest,
+        expected_state_digest,
         redemption: &packet[HEADER_LEN..total],
     })
 }
@@ -174,9 +204,12 @@ pub fn encode_into(
     out: &mut [u8],
     flags: u16,
     expected_config_digest: &[u8; 32],
+    expected_state_digest: &[u8; 32],
     redemption: &[u8],
 ) -> Result<usize, Error> {
-    if flags & !KNOWN_FLAGS != 0 {
+    if flags & !KNOWN_FLAGS != 0
+        || (flags & FLAG_STATE_EXPECTED == 0 && *expected_state_digest != [0u8; 32])
+    {
         return Err(Error::Flags);
     }
     let total = encoded_len(redemption.len()).ok_or(Error::Bounds)?;
@@ -190,6 +223,7 @@ pub fn encode_into(
     out[12..14].copy_from_slice(&redemption_len.to_le_bytes());
     out[14..16].copy_from_slice(&0u16.to_le_bytes());
     out[16..48].copy_from_slice(expected_config_digest);
+    out[48..80].copy_from_slice(expected_state_digest);
     out[HEADER_LEN..total].copy_from_slice(redemption);
     Ok(total)
 }
@@ -199,10 +233,21 @@ mod tests {
     use super::*;
 
     const DIGEST: [u8; 32] = [0x5a; 32];
+    const STATE_DIGEST: [u8; 32] = [0xa5; 32];
+    const NO_STATE_DIGEST: [u8; 32] = [0; 32];
+
+    fn state_digest_for(flags: u16) -> [u8; 32] {
+        if flags & FLAG_STATE_EXPECTED != 0 {
+            STATE_DIGEST
+        } else {
+            NO_STATE_DIGEST
+        }
+    }
 
     fn encoded(flags: u16, redemption: &[u8]) -> ([u8; MAX_PACKET_LEN], usize) {
         let mut buf = [0u8; MAX_PACKET_LEN];
-        let len = encode_into(&mut buf, flags, &DIGEST, redemption).unwrap();
+        let state_digest = state_digest_for(flags);
+        let len = encode_into(&mut buf, flags, &DIGEST, &state_digest, redemption).unwrap();
         (buf, len)
     }
 
@@ -212,12 +257,18 @@ mod tests {
         let packet = decode(&buf[..len]).unwrap();
         assert!(packet.state_expected());
         assert_eq!(packet.expected_config_digest(), DIGEST);
+        assert_eq!(packet.expected_state_digest(), STATE_DIGEST);
         assert_eq!(packet.redemption(), b"launch-nonce-1");
         assert_eq!(len, HEADER_LEN + 14);
+        // Field placement is exact, not merely self-consistent:
+        // state digest at 48..80, redemption from byte 80.
+        assert_eq!(&buf[48..80], STATE_DIGEST);
+        assert_eq!(&buf[80..len], b"launch-nonce-1");
 
         let (buf, len) = encoded(0, b"n");
         let packet = decode(&buf[..len]).unwrap();
         assert!(!packet.state_expected());
+        assert_eq!(packet.expected_state_digest(), NO_STATE_DIGEST);
         assert_eq!(packet.redemption(), b"n");
     }
 
@@ -236,7 +287,7 @@ mod tests {
         assert_eq!(decode(&buf[..len]), Err(Error::Format));
 
         let (mut buf, len) = encoded(0, b"x");
-        buf[8..10].copy_from_slice(&2u16.to_le_bytes());
+        buf[8..10].copy_from_slice(&1u16.to_le_bytes());
         assert_eq!(decode(&buf[..len]), Err(Error::Version));
 
         let (mut buf, len) = encoded(0, b"x");
@@ -247,8 +298,11 @@ mod tests {
         buf[10..12].copy_from_slice(&0x8000u16.to_le_bytes());
         assert_eq!(decode(&buf[..len]), Err(Error::Flags));
 
-        let mut out = [0u8; 64];
-        assert_eq!(encode_into(&mut out, 0x2, &DIGEST, b"x"), Err(Error::Flags));
+        let mut out = [0u8; 128];
+        assert_eq!(
+            encode_into(&mut out, 0x2, &DIGEST, &NO_STATE_DIGEST, b"x"),
+            Err(Error::Flags)
+        );
     }
 
     #[test]
@@ -261,15 +315,18 @@ mod tests {
         );
 
         let mut out = [0u8; MAX_PACKET_LEN];
-        assert_eq!(encode_into(&mut out, 0, &DIGEST, b""), Err(Error::Bounds));
+        assert_eq!(
+            encode_into(&mut out, 0, &DIGEST, &NO_STATE_DIGEST, b""),
+            Err(Error::Bounds)
+        );
         let too_long = [0u8; MAX_REDEMPTION_LEN + 1];
         assert_eq!(
-            encode_into(&mut out, 0, &DIGEST, &too_long),
+            encode_into(&mut out, 0, &DIGEST, &NO_STATE_DIGEST, &too_long),
             Err(Error::Bounds)
         );
         let mut short = [0u8; HEADER_LEN];
         assert_eq!(
-            encode_into(&mut short, 0, &DIGEST, b"abcd"),
+            encode_into(&mut short, 0, &DIGEST, &NO_STATE_DIGEST, b"abcd"),
             Err(Error::Bounds)
         );
 
@@ -333,6 +390,44 @@ mod tests {
         let (mut oversized, _) = encoded(0, b"abcd");
         oversized[12..14].copy_from_slice(&257u16.to_le_bytes());
         assert_eq!(decode(&oversized[..HEADER_LEN + 257]), Err(Error::Bounds));
+    }
+
+    #[test]
+    fn refuses_v1_packets_as_version_at_both_size_bounds() {
+        // Hand-built version 1 shape (48-byte header, no state
+        // digest): the shortest v1 packet is below this
+        // revision's header length and the longest above it;
+        // both must name the version, with no fallback decode.
+        for redemption_len in [1usize, MAX_REDEMPTION_LEN] {
+            let mut packet = [0u8; 48 + MAX_REDEMPTION_LEN];
+            packet[..8].copy_from_slice(&MAGIC);
+            packet[8..10].copy_from_slice(&1u16.to_le_bytes());
+            packet[10..12].copy_from_slice(&FLAG_STATE_EXPECTED.to_le_bytes());
+            packet[12..14].copy_from_slice(&(redemption_len as u16).to_le_bytes());
+            packet[16..48].copy_from_slice(&DIGEST);
+            assert_eq!(
+                decode(&packet[..48 + redemption_len]),
+                Err(Error::Version),
+                "redemption_len {redemption_len}"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_nonzero_state_digest_when_no_state_is_expected() {
+        // Every single nonzero state-digest byte refuses while
+        // the flag is clear, on both the decode and encode side.
+        let (valid, len) = encoded(0, b"x");
+        for byte in 48..80 {
+            let mut packet = valid;
+            packet[byte] = 1;
+            assert_eq!(decode(&packet[..len]), Err(Error::Flags), "byte {byte}");
+        }
+        let mut out = [0u8; MAX_PACKET_LEN];
+        assert_eq!(
+            encode_into(&mut out, 0, &DIGEST, &STATE_DIGEST, b"x"),
+            Err(Error::Flags)
+        );
     }
 
     #[test]

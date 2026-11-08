@@ -380,51 +380,139 @@ fn genuine_captured_stop_uses_the_host_bridge_and_remains_unchanged_until_cancel
     assert!(stop.cancel().unwrap().confirmed);
 }
 
+const CONFIG_DIGEST: [u8; 32] = [0x11u8; 32];
+const STATE_DIGEST: [u8; 32] = [0x33u8; 32];
+const NO_STATE_DIGEST: [u8; 32] = [0u8; 32];
+const SUCCESSOR: InitPacketExpectation = InitPacketExpectation {
+    birth_kind: InitPacketBirthKind::Successor,
+    expected_config_digest: CONFIG_DIGEST,
+    expected_state_digest: STATE_DIGEST,
+};
+const FIRST_IMAGE: InitPacketExpectation = InitPacketExpectation {
+    birth_kind: InitPacketBirthKind::FirstImage,
+    expected_config_digest: CONFIG_DIGEST,
+    expected_state_digest: NO_STATE_DIGEST,
+};
+
 #[test]
 fn init_packet_build_validate_round_trip() {
-    let digest = [0x11u8; 32];
-    let packet = build_init_packet(true, &digest, b"birth-nonce").unwrap();
+    let packet = build_init_packet(SUCCESSOR, b"birth-nonce").unwrap();
     // The packet bytes are exactly the loader codec's bytes.
     let decoded = reverie_loader::init_packet::decode(&packet).unwrap();
     assert!(decoded.state_expected());
-    let validated = validate_init_packet(&packet, &digest).unwrap();
+    assert_eq!(decoded.expected_state_digest(), STATE_DIGEST);
+    let validated = validate_init_packet(&packet, SUCCESSOR).unwrap();
     assert!(validated.state_expected());
+    assert_eq!(validated.expected_state_digest(), STATE_DIGEST);
     assert_eq!(validated.redemption(), b"birth-nonce");
+    assert_eq!(validated.packet_bytes(), packet.as_slice());
 
-    let packet = build_init_packet(false, &digest, b"first-image").unwrap();
-    let validated = validate_init_packet(&packet, &digest).unwrap();
+    let packet = build_init_packet(FIRST_IMAGE, b"first-image").unwrap();
+    let validated = validate_init_packet(&packet, FIRST_IMAGE).unwrap();
     assert!(!validated.state_expected());
+    assert_eq!(validated.expected_state_digest(), NO_STATE_DIGEST);
+    assert_eq!(validated.packet_bytes(), packet.as_slice());
 }
 
 #[test]
 fn init_packet_digest_mismatch_is_named_refusal() {
-    let packet = build_init_packet(true, &[0x11u8; 32], b"nonce").unwrap();
-    let error = validate_init_packet(&packet, &[0x22u8; 32])
-        .err()
-        .unwrap()
-        .to_string();
+    let packet = build_init_packet(SUCCESSOR, b"nonce").unwrap();
+    let error = validate_init_packet(
+        &packet,
+        InitPacketExpectation {
+            expected_config_digest: [0x22u8; 32],
+            ..SUCCESSOR
+        },
+    )
+    .err()
+    .unwrap()
+    .to_string();
     assert_eq!(error, "init_packet_config_digest_mismatch");
 
     // A mismatch in any single digest byte must still refuse:
-    // the comparison covers all 32 bytes, including byte 0 and
+    // each comparison covers all 32 bytes, including byte 0 and
     // byte 31, either of which a shortened compare could skip.
     for i in 0..32 {
-        let mut one_byte_off = [0x11u8; 32];
+        let mut one_byte_off = CONFIG_DIGEST;
         one_byte_off[i] ^= 1;
-        let error = validate_init_packet(&packet, &one_byte_off)
-            .err()
-            .unwrap()
-            .to_string();
+        let error = validate_init_packet(
+            &packet,
+            InitPacketExpectation {
+                expected_config_digest: one_byte_off,
+                ..SUCCESSOR
+            },
+        )
+        .err()
+        .unwrap()
+        .to_string();
         assert_eq!(error, "init_packet_config_digest_mismatch", "byte {i}");
+
+        let mut one_byte_off = STATE_DIGEST;
+        one_byte_off[i] ^= 1;
+        let error = validate_init_packet(
+            &packet,
+            InitPacketExpectation {
+                expected_state_digest: one_byte_off,
+                ..SUCCESSOR
+            },
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert_eq!(error, "init_packet_state_digest_mismatch", "byte {i}");
     }
 }
 
 #[test]
+fn init_packet_birth_kind_mismatch_is_named_refusal() {
+    // A successor packet presented for a first-image birth, and
+    // the reverse, refuse host-side before any stamping.
+    let successor = build_init_packet(SUCCESSOR, b"nonce").unwrap();
+    let error = validate_init_packet(
+        &successor,
+        InitPacketExpectation {
+            birth_kind: InitPacketBirthKind::FirstImage,
+            ..SUCCESSOR
+        },
+    )
+    .err()
+    .unwrap()
+    .to_string();
+    assert_eq!(error, "init_packet_birth_kind_mismatch");
+
+    let first_image = build_init_packet(FIRST_IMAGE, b"nonce").unwrap();
+    let error = validate_init_packet(
+        &first_image,
+        InitPacketExpectation {
+            birth_kind: InitPacketBirthKind::Successor,
+            ..FIRST_IMAGE
+        },
+    )
+    .err()
+    .unwrap()
+    .to_string();
+    assert_eq!(error, "init_packet_birth_kind_mismatch");
+
+    // Building a first-image packet with a nonzero state digest
+    // is the same flag/digest inconsistency at encode time.
+    let error = build_init_packet(
+        InitPacketExpectation {
+            expected_state_digest: STATE_DIGEST,
+            ..FIRST_IMAGE
+        },
+        b"nonce",
+    )
+    .err()
+    .unwrap()
+    .to_string();
+    assert_eq!(error, "init_packet_flags");
+}
+
+#[test]
 fn init_packet_each_error_variant_is_a_named_refusal() {
-    let digest = [0x11u8; 32];
-    let valid = build_init_packet(true, &digest, b"nonce").unwrap();
+    let valid = build_init_packet(SUCCESSOR, b"nonce").unwrap();
     let named = |packet: &[u8]| {
-        validate_init_packet(packet, &digest)
+        validate_init_packet(packet, SUCCESSOR)
             .err()
             .unwrap()
             .to_string()
@@ -463,9 +551,184 @@ fn init_packet_each_error_variant_is_a_named_refusal() {
 fn init_packet_malformed_is_named_refusal() {
     // The stage-1a probe placeholder is preparation-only data,
     // never an admitted init packet.
-    let error = validate_init_packet(b"PREPARATION_ONLY_NOT_HLIINIT1", &[0u8; 32])
+    let error = validate_init_packet(
+        b"PREPARATION_ONLY_NOT_HLIINIT1",
+        InitPacketExpectation {
+            expected_config_digest: [0u8; 32],
+            expected_state_digest: [0u8; 32],
+            ..SUCCESSOR
+        },
+    )
+    .err()
+    .unwrap()
+    .to_string();
+    assert_eq!(error, "init_packet_format");
+
+    // Ordinary-packet-shaped bytes (frozen plain bytes only; the
+    // ordinary protocol is not decoded here) refuse under the
+    // successor codec rather than being reinterpreted.
+    let mut ordinary = vec![0u8; 128];
+    ordinary[..8].copy_from_slice(b"HLIINIT1");
+    let error = validate_init_packet(&ordinary, SUCCESSOR)
         .err()
         .unwrap()
         .to_string();
     assert_eq!(error, "init_packet_format");
+}
+
+const STAMP_ADDRESS: u64 = 0x10_0000;
+const STAMP_BLOB_LEN: usize = 4096;
+
+// Minimal complete HLSCAL01 blob inputs for the stamp helper:
+// data only, with no mapping or source authority claimed.
+struct StampFixture {
+    header: handoff::Header,
+    maps: Vec<Map>,
+    code: Vec<handoff::Code>,
+    sites: Vec<handoff::SiteRecord>,
+    env: Vec<u64>,
+    aux: Vec<u64>,
+    tool_init: Vec<u64>,
+}
+
+impl StampFixture {
+    fn tables(&self) -> handoff::TableData<'_> {
+        handoff::TableData {
+            maps: &self.maps,
+            code: &self.code,
+            sites: &self.sites,
+            // Deliberately not the packet: the stamp helper must
+            // write only the validated bytes, never this slice.
+            packet: b"placeholder-not-stamped",
+            env: &self.env,
+            aux: &self.aux,
+            program_name: b"prog\0",
+            dev_null: b"/dev/null\0",
+            tool_init: &self.tool_init,
+        }
+    }
+}
+
+fn stamp_fixture(packet_len: usize) -> StampFixture {
+    let mut tables = core::array::from_fn(|_| handoff::Table {
+        offset: 0,
+        count: 0,
+        stride: 0,
+    });
+    let mut cursor = handoff::HEADER_BYTES as u64;
+    for (index, (count, stride)) in [
+        (1u64, 32u64),
+        (1, 16),
+        (1, 32),
+        (packet_len as u64, 1),
+        (1, 8),
+        (2, 8),
+        (5, 1),
+        (10, 1),
+        (1, 8),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        tables[index] = handoff::Table {
+            offset: cursor,
+            count,
+            stride,
+        };
+        cursor = (cursor + count * stride).next_multiple_of(8);
+    }
+    assert!(cursor <= STAMP_BLOB_LEN as u64);
+    let mut scalars = [0u64; 16];
+    scalars[0] = 1;
+    scalars[11] = 4096;
+    scalars[13] = STAMP_ADDRESS + tables[7].offset;
+    StampFixture {
+        header: handoff::Header {
+            prefix: [
+                handoff::MAGIC,
+                handoff::VERSION,
+                STAMP_BLOB_LEN as u64,
+                handoff::HEADER_BYTES as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+            binding: [[0; 4]; 5],
+            roles: [Extent { start: 0, end: 0 }; 5],
+            registers: [0; 27],
+            scalars,
+            tables,
+            tls: [0; 12],
+        },
+        maps: vec![Map {
+            start: 0,
+            end: 0,
+            protection: 0,
+            flags: 0,
+        }],
+        code: vec![handoff::Code { start: 0, end: 0 }],
+        sites: vec![handoff::SiteRecord {
+            syscall_ip: 0x5000,
+            return_ip: 0x5002,
+            number: 158,
+            operation: 1,
+        }],
+        env: vec![0],
+        aux: vec![0, 0],
+        tool_init: vec![0x5002],
+    }
+}
+
+#[test]
+fn stamp_init_packet_serializes_exactly_the_validated_bytes() {
+    let packet = build_init_packet(SUCCESSOR, b"birth-nonce").unwrap();
+    let fixture = stamp_fixture(packet.len());
+    let mut bytes = vec![0u8; STAMP_BLOB_LEN];
+    let validated = stamp_init_packet(
+        &packet,
+        SUCCESSOR,
+        &fixture.header,
+        fixture.tables(),
+        STAMP_ADDRESS,
+        &mut bytes,
+    )
+    .unwrap();
+    assert_eq!(validated.packet_bytes(), packet.as_slice());
+    let view = handoff::View::parse(&bytes, STAMP_ADDRESS).unwrap();
+    assert_eq!(view.table(3).unwrap().bytes(), packet.as_slice());
+    verify_serialized_init_packet(&bytes, STAMP_ADDRESS, &validated).unwrap();
+
+    // Any later byte change inside table 3 is a named mismatch
+    // at re-parse, never a silently different stamped packet.
+    let offset = usize::try_from(view.table_address(3).unwrap() - STAMP_ADDRESS).unwrap();
+    bytes[offset] ^= 1;
+    let error = verify_serialized_init_packet(&bytes, STAMP_ADDRESS, &validated)
+        .err()
+        .unwrap()
+        .to_string();
+    assert_eq!(error, "init_packet_table3_mismatch");
+}
+
+#[test]
+fn stamp_init_packet_refused_candidate_leaves_blob_unchanged() {
+    let packet = build_init_packet(SUCCESSOR, b"birth-nonce").unwrap();
+    let fixture = stamp_fixture(packet.len());
+    let mut bytes = vec![0xeeu8; STAMP_BLOB_LEN];
+    let error = stamp_init_packet(
+        &packet,
+        InitPacketExpectation {
+            expected_config_digest: [0x22u8; 32],
+            ..SUCCESSOR
+        },
+        &fixture.header,
+        fixture.tables(),
+        STAMP_ADDRESS,
+        &mut bytes,
+    )
+    .err()
+    .unwrap()
+    .to_string();
+    assert_eq!(error, "init_packet_config_digest_mismatch");
+    assert!(bytes.iter().all(|byte| *byte == 0xee));
 }
