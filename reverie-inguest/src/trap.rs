@@ -90,6 +90,47 @@ pub fn fixed_gate_region() -> Option<(u64, u64)> {
     fixed_gates_published().then_some((FIXED_GATE_BASE, FIXED_GATE_BASE + FIXED_GATE_BYTES))
 }
 
+/// Whether `addr` lies in runtime-owned text a lazy promoter must
+/// never patch: the published fixed-gate region (when sealed), the
+/// pages holding the trusted and guest syscall gate instructions,
+/// the fixed signal-restorer entry, and the SIGSYS handler entry.
+/// Flipping any of these would break the runtime's own syscall
+/// path, including the promoter's store path itself.
+pub fn is_runtime_text(addr: u64) -> bool {
+    if let Some((lo, hi)) = fixed_gate_region()
+        && addr >= lo
+        && addr < hi
+    {
+        return true;
+    }
+    let ips = [
+        trusted_gate().syscall_ip,
+        trusted_gate().return_ip,
+        guest_syscall_gate().syscall_ip,
+        guest_syscall_gate().return_ip,
+        sigsys_handler as *const () as usize as u64,
+        FIXED_SIGNAL_RESTORER_ENTRY,
+        // The private (non-fixed-gate) signal restorer actually in
+        // use when fixed gates are unpublished, and its reported
+        // return IP: patching either breaks every signal return.
+        crate::signal::signal_restorer(),
+        crate::signal::signal_restorer_return_ip(),
+    ];
+    if ips.contains(&addr) {
+        return true;
+    }
+    // Page-granular cover: gate/handler text shares pages with the
+    // exact instruction addresses above; deny the whole pages so a
+    // site a few bytes into the same page cannot slip through.
+    if let Ok(page) = crate::arch::page_size()
+        && page.is_power_of_two()
+    {
+        let page_base = addr & !(page - 1);
+        return ips.iter().any(|ip| ip & !(page - 1) == page_base);
+    }
+    false
+}
+
 /// Prepare the optional page using legacy bootstrap syscalls, RW then RX.
 /// Collision refuses; no existing mapping is adopted. Publication is permanent.
 ///
@@ -571,6 +612,12 @@ impl PendingPromotions {
 
     fn try_record(&self, site: u64) -> PendingPromotionRecord {
         use core::sync::atomic::Ordering;
+        // The promoter's own island SVCs are not candidates: they
+        // are already "known" by construction, and recording them
+        // would burn lifetime table capacity on every flip.
+        if promotion_island_denied(site) {
+            return PendingPromotionRecord::AlreadyKnown;
+        }
         if !self.ensure_owner(false) {
             self.contended_dropped.fetch_add(1, Ordering::Relaxed);
             return PendingPromotionRecord::Contended;
@@ -631,6 +678,66 @@ impl PendingPromotions {
 #[cfg(target_arch = "aarch64")]
 static PENDING_PROMOTIONS: PendingPromotions = PendingPromotions::new();
 
+/// Island ranges whose trapped SVCs must never consume a pending
+/// slot. The current island shape re-executes SVC on every promoted
+/// call, so without this denylist each flip would permanently burn
+/// table capacity on its own island. Ranges live outside the
+/// fork-reset table contents: island mappings survive fork at the
+/// same addresses, so the denylist stays correct in the child.
+#[cfg(target_arch = "aarch64")]
+const PROMOTION_ISLAND_CAPACITY: usize = 64;
+#[cfg(target_arch = "aarch64")]
+static PROMOTION_ISLANDS: [core::sync::atomic::AtomicU64; PROMOTION_ISLAND_CAPACITY * 2] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; PROMOTION_ISLAND_CAPACITY * 2];
+#[cfg(target_arch = "aarch64")]
+static PROMOTION_ISLAND_LEN: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(target_arch = "aarch64")]
+fn promotion_island_denied(site: u64) -> bool {
+    use core::sync::atomic::Ordering;
+    let len = PROMOTION_ISLAND_LEN.load(Ordering::Acquire);
+    for i in 0..len {
+        let lo = PROMOTION_ISLANDS[i * 2].load(Ordering::Acquire);
+        let hi = PROMOTION_ISLANDS[i * 2 + 1].load(Ordering::Acquire);
+        if site >= lo && site < hi {
+            return true;
+        }
+    }
+    false
+}
+
+/// Register one island payload range `[lo, hi)` whose SVCs are the
+/// promoter's own, never promotion candidates. Ordinary context
+/// only (called by the promoter before the flip that makes the
+/// island reachable). Returns false when the fixed range table is
+/// full; the caller must then refuse the flip rather than let the
+/// island burn pending-table slots.
+#[cfg(target_arch = "aarch64")]
+pub fn register_pending_promotion_island(lo: u64, hi: u64) -> bool {
+    use core::sync::atomic::Ordering;
+    if lo >= hi {
+        return false;
+    }
+    // Dedup exact ranges so fork re-registration is idempotent.
+    let len = PROMOTION_ISLAND_LEN.load(Ordering::Acquire);
+    for i in 0..len {
+        if PROMOTION_ISLANDS[i * 2].load(Ordering::Acquire) == lo
+            && PROMOTION_ISLANDS[i * 2 + 1].load(Ordering::Acquire) == hi
+        {
+            return true;
+        }
+    }
+    let idx = PROMOTION_ISLAND_LEN.fetch_add(1, Ordering::AcqRel);
+    if idx >= PROMOTION_ISLAND_CAPACITY {
+        PROMOTION_ISLAND_LEN.fetch_sub(1, Ordering::AcqRel);
+        return false;
+    }
+    PROMOTION_ISLANDS[idx * 2].store(lo, Ordering::Release);
+    PROMOTION_ISLANDS[idx * 2 + 1].store(hi, Ordering::Release);
+    true
+}
+
 /// Record the first observation of a candidate lazy-promotion site without
 /// allocating or waiting in signal context.
 ///
@@ -639,6 +746,38 @@ static PENDING_PROMOTIONS: PendingPromotions = PendingPromotions::new();
 #[cfg(target_arch = "aarch64")]
 pub fn record_pending_promotion_site(site: u64) -> PendingPromotionRecord {
     PENDING_PROMOTIONS.try_record(site)
+}
+
+/// Remove one previously registered island range (exact match).
+/// The promoter calls this when an admitted flip attempt is
+/// refused before its branch lands, so refused attempts never
+/// burn lifetime range slots and a stale range cannot hide real
+/// guest SVC sites later mapped at the same address. Returns
+/// false when the exact range was not registered.
+#[cfg(target_arch = "aarch64")]
+pub fn unregister_pending_promotion_island(lo: u64, hi: u64) -> bool {
+    use core::sync::atomic::Ordering;
+    let len = PROMOTION_ISLAND_LEN.load(Ordering::Acquire);
+    for i in 0..len {
+        if PROMOTION_ISLANDS[i * 2].load(Ordering::Acquire) == lo
+            && PROMOTION_ISLANDS[i * 2 + 1].load(Ordering::Acquire) == hi
+        {
+            // Swap-remove with the last range. A handler racing
+            // this may briefly see either set; both are safe (a
+            // missed deny costs one pending slot, a stale deny
+            // only delays one promotion to a later drain).
+            let last = len - 1;
+            if i != last {
+                let llo = PROMOTION_ISLANDS[last * 2].load(Ordering::Acquire);
+                let lhi = PROMOTION_ISLANDS[last * 2 + 1].load(Ordering::Acquire);
+                PROMOTION_ISLANDS[i * 2].store(llo, Ordering::Release);
+                PROMOTION_ISLANDS[i * 2 + 1].store(lhi, Ordering::Release);
+            }
+            PROMOTION_ISLAND_LEN.store(last, Ordering::Release);
+            return true;
+        }
+    }
+    false
 }
 
 /// Remove up to `out.len()` pending sites in first-observed order and
@@ -1446,6 +1585,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn runtime_text_covers_gates_and_handler() {
+        assert!(is_runtime_text(trusted_gate().syscall_ip));
+        assert!(is_runtime_text(trusted_gate().return_ip));
+        assert!(is_runtime_text(guest_syscall_gate().syscall_ip));
+        assert!(is_runtime_text(sigsys_handler as *const () as usize as u64));
+        assert!(is_runtime_text(crate::signal::signal_restorer()));
+        assert!(is_runtime_text(crate::signal::signal_restorer_return_ip()));
+        assert!(!is_runtime_text(0x1000));
+    }
+
+    #[test]
     fn trusted_gate_addresses_are_populated_and_ordered() {
         let gate = trusted_gate();
         assert_ne!(gate.syscall_ip, 0);
@@ -1978,6 +2128,35 @@ mod aarch64_gate_tests {
             raw_syscall6(libc::SYS_exit_group, [0, 0, 0, 0, 0, 0]);
         }
         unreachable!("exit_group through the gate returned")
+    }
+
+    #[test]
+    fn pending_promotions_skip_registered_island_ranges() {
+        assert!(register_pending_promotion_island(0x9000_0000, 0x9000_1000));
+        // Re-registration of the same range is idempotent.
+        assert!(register_pending_promotion_island(0x9000_0000, 0x9000_1000));
+        assert!(!register_pending_promotion_island(0x1000, 0x1000));
+        let table = PendingPromotions::new();
+        // Island-interior SVCs consume no slot and count as known.
+        assert_eq!(
+            table.try_record(0x9000_0040),
+            PendingPromotionRecord::AlreadyKnown
+        );
+        assert_eq!(table.stats().pending, 0);
+        assert_eq!(table.stats().recorded_new, 0);
+        // Range bounds: lo inclusive, hi exclusive, outside unaffected.
+        assert_eq!(
+            table.try_record(0x9000_0000),
+            PendingPromotionRecord::AlreadyKnown
+        );
+        assert_eq!(
+            table.try_record(0x9000_1000),
+            PendingPromotionRecord::NewSite
+        );
+        assert_eq!(
+            table.try_record(0x8fff_fffc),
+            PendingPromotionRecord::NewSite
+        );
     }
 
     #[test]
