@@ -127,9 +127,10 @@
         "rss_baseline_bytes": 1000000000,
         "hard_mem_max_bytes": 16000000000,
         "classification": "cpu-bound",
-        "preferred_inner_jobs": 1
+        "preferred_inner_jobs": 16
       },
-      "jobs_flag": ""
+      "jobs_flag": "",
+      "jobs_env": "CARGO_BUILD_JOBS"
     },
     {
       "group": "test",
