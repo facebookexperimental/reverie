@@ -18445,11 +18445,9 @@ fn refuse_unauthenticated_tls_access(
             // fs-segment forms landing inside a cell.
             let fs_imm = if rest.len() >= 9
                 && rest[0] == 0x64
-                && (matches!(rest[1], 0x8a | 0x8b | 0x88 | 0x89)
-                    && rest[2] == 0x04
-                    && rest[3] == 0x25
+                && (matches!(rest[1], 0x88..=0x8b) && rest[2] == 0x04 && rest[3] == 0x25
                     || matches!(rest[1], 0x48 | 0x4c)
-                        && matches!(rest[2], 0x8a | 0x8b | 0x88 | 0x89)
+                        && matches!(rest[2], 0x88..=0x8b)
                         && rest[3] == 0x04
                         && rest[4] == 0x25)
             {
