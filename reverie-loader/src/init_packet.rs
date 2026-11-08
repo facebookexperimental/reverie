@@ -44,7 +44,7 @@
 //! 14      2     reserved, must be 0
 //! 16      32    expected configuration digest (SHA-256 bytes)
 //! 48      32    expected state digest (SHA-256 bytes; all-zero
-//!               when the state-expected flag is clear)
+//!               iff the state-expected flag is clear)
 //! 80      N     redemption bytes
 //! ```
 //!
@@ -98,8 +98,9 @@ pub enum Error {
     /// Reserved field is nonzero.
     Reserved,
     /// A flag bit outside this revision's defined set is set, or
-    /// the state digest is nonzero while the state-expected
-    /// flag is clear.
+    /// the state digest is not all-zero exactly when the
+    /// state-expected flag is clear (nonzero while clear, or
+    /// all-zero while set).
     Flags,
     /// Redemption length is zero or above [`MAX_REDEMPTION_LEN`],
     /// or the output buffer cannot hold the encoded packet.
@@ -131,7 +132,7 @@ impl<'a> InitPacket<'a> {
     }
 
     /// Expected SHA-256 of the exact predecessor state bytes
-    /// the coordinator will deliver, as carried. All zero when
+    /// the coordinator will deliver, as carried. All zero iff
     /// no state deposit is expected; hashing the delivered
     /// state is the consumer's existing check.
     pub fn expected_state_digest(&self) -> [u8; 32] {
@@ -186,7 +187,7 @@ pub fn decode(packet: &[u8]) -> Result<InitPacket<'_>, Error> {
     expected_config_digest.copy_from_slice(&packet[16..48]);
     let mut expected_state_digest = [0u8; 32];
     expected_state_digest.copy_from_slice(&packet[48..80]);
-    if flags & FLAG_STATE_EXPECTED == 0 && expected_state_digest != [0u8; 32] {
+    if (flags & FLAG_STATE_EXPECTED == 0) != (expected_state_digest == [0u8; 32]) {
         return Err(Error::Flags);
     }
     Ok(InitPacket {
@@ -208,7 +209,7 @@ pub fn encode_into(
     redemption: &[u8],
 ) -> Result<usize, Error> {
     if flags & !KNOWN_FLAGS != 0
-        || (flags & FLAG_STATE_EXPECTED == 0 && *expected_state_digest != [0u8; 32])
+        || (flags & FLAG_STATE_EXPECTED == 0) != (*expected_state_digest == [0u8; 32])
     {
         return Err(Error::Flags);
     }
@@ -369,7 +370,7 @@ mod tests {
                     0..=7 => assert_eq!(result, Err(Error::Format), "byte {byte} bit {bit}"),
                     8 | 9 => assert_eq!(result, Err(Error::Version), "byte {byte} bit {bit}"),
                     10 if bit == 0 => {
-                        assert!(result.unwrap().state_expected(), "byte {byte} bit {bit}")
+                        assert_eq!(result, Err(Error::Flags), "byte {byte} bit {bit}")
                     }
                     10 | 11 => assert_eq!(result, Err(Error::Flags), "byte {byte} bit {bit}"),
                     12 => assert_eq!(result, Err(Error::Format), "byte {byte} bit {bit}"),
@@ -428,6 +429,29 @@ mod tests {
             encode_into(&mut out, 0, &DIGEST, &STATE_DIGEST, b"x"),
             Err(Error::Flags)
         );
+    }
+
+    #[test]
+    fn refuses_zero_state_digest_when_state_is_expected() {
+        // Encode side: the reviewer's probe shape must not emit
+        // an 81-byte successor packet with no state digest.
+        let mut out = [0u8; MAX_PACKET_LEN];
+        assert_eq!(
+            encode_into(
+                &mut out,
+                FLAG_STATE_EXPECTED,
+                &DIGEST,
+                &NO_STATE_DIGEST,
+                b"x"
+            ),
+            Err(Error::Flags)
+        );
+
+        // Decode side: hand-built equivalent bytes (a flag-clear
+        // packet's flag set, leaving its digest all zero).
+        let (mut packet, len) = encoded(0, b"x");
+        packet[10..12].copy_from_slice(&FLAG_STATE_EXPECTED.to_le_bytes());
+        assert_eq!(decode(&packet[..len]), Err(Error::Flags));
     }
 
     #[test]
