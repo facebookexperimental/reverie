@@ -148,6 +148,84 @@ impl<'a> InitPacket<'a> {
     }
 }
 
+/// A decoded HLISUC01 packet accepted specifically for the
+/// successor route. Unlike [`InitPacket`], this view exists
+/// only when a predecessor state deposit is expected. It is
+/// data only and grants no admission, mapping, or execution
+/// authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SuccessorInitPacket<'a> {
+    packet: InitPacket<'a>,
+}
+
+impl<'a> SuccessorInitPacket<'a> {
+    /// The exact decoded packet view, including its
+    /// state-expected flag.
+    pub fn packet(&self) -> InitPacket<'a> {
+        self.packet
+    }
+
+    /// Expected SHA-256 of the exact canonical configuration bytes.
+    pub fn expected_config_digest(&self) -> [u8; 32] {
+        self.packet.expected_config_digest()
+    }
+
+    /// Expected SHA-256 of the exact predecessor state bytes.
+    pub fn expected_state_digest(&self) -> [u8; 32] {
+        self.packet.expected_state_digest()
+    }
+
+    /// Bounded launcher-defined redemption bytes, verbatim.
+    pub fn redemption(&self) -> &'a [u8] {
+        self.packet.redemption()
+    }
+}
+
+/// Failure to decode a packet specifically for the successor route.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SuccessorInitPacketError {
+    /// The bytes are not an exact HLISUC01 packet.
+    Packet(Error),
+    /// The packet is valid HLISUC01, but its state-expected flag
+    /// is clear and therefore it is not a successor packet.
+    StateNotExpected,
+}
+
+impl SuccessorInitPacketError {
+    /// Stable refusal name used by host and guest diagnostics.
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::Packet(Error::Format) => "init_packet_format",
+            Self::Packet(Error::Version) => "init_packet_version",
+            Self::Packet(Error::Reserved) => "init_packet_reserved",
+            Self::Packet(Error::Flags) => "init_packet_flags",
+            Self::Packet(Error::Bounds) => "init_packet_bounds",
+            Self::StateNotExpected => "init_packet_state_not_expected",
+        }
+    }
+}
+
+impl From<Error> for SuccessorInitPacketError {
+    fn from(error: Error) -> Self {
+        Self::Packet(error)
+    }
+}
+
+/// Decode one exact HLISUC01 packet for the successor route.
+/// The route is selected by the caller, never by inspecting
+/// magic; this function then refuses a valid packet whose
+/// state-expected flag is clear rather than reinterpreting it
+/// as a first-image packet.
+pub fn decode_successor(
+    packet: &[u8],
+) -> Result<SuccessorInitPacket<'_>, SuccessorInitPacketError> {
+    let packet = decode(packet)?;
+    if !packet.state_expected() {
+        return Err(SuccessorInitPacketError::StateNotExpected);
+    }
+    Ok(SuccessorInitPacket { packet })
+}
+
 fn state_digest_matches_flag(flags: u16, expected_state_digest: &[u8; 32]) -> bool {
     (flags & FLAG_STATE_EXPECTED != 0) != (*expected_state_digest == [0u8; 32])
 }
@@ -468,6 +546,74 @@ mod tests {
         let (mut packet, len) = encoded(FLAG_STATE_EXPECTED, b"x");
         packet[48..80].fill(0);
         assert_eq!(decode(&packet[..len]), Err(Error::Flags));
+    }
+
+    #[test]
+    fn successor_packet_exposes_distinct_packet_facts() {
+        let (packet, len) = encoded(FLAG_STATE_EXPECTED, b"birth-nonce");
+        let decoded = decode_successor(&packet[..len]).unwrap();
+        assert_eq!(decoded.expected_config_digest(), DIGEST);
+        assert_eq!(decoded.expected_state_digest(), STATE_DIGEST);
+        assert_eq!(decoded.redemption(), b"birth-nonce");
+        assert!(decoded.packet().state_expected());
+
+        for byte in [0, 31] {
+            let mut state_digest = NO_STATE_DIGEST;
+            state_digest[byte] = 1;
+            let mut packet = [0u8; MAX_PACKET_LEN];
+            let len = encode_into(
+                &mut packet,
+                FLAG_STATE_EXPECTED,
+                &DIGEST,
+                &state_digest,
+                b"nonce",
+            )
+            .unwrap();
+            let decoded = decode_successor(&packet[..len]).unwrap();
+            assert_eq!(decoded.expected_state_digest(), state_digest, "byte {byte}");
+        }
+    }
+
+    #[test]
+    fn successor_packet_refuses_first_image_packet() {
+        let (packet, len) = encoded(0, b"nonce");
+        let error = decode_successor(&packet[..len]).unwrap_err();
+        assert_eq!(error, SuccessorInitPacketError::StateNotExpected);
+        assert_eq!(error.name(), "init_packet_state_not_expected");
+    }
+
+    #[test]
+    fn successor_packet_maps_each_loader_error_to_its_name() {
+        let (valid, len) = encoded(FLAG_STATE_EXPECTED, b"nonce");
+        let named = |packet: &[u8]| decode_successor(packet).unwrap_err().name();
+
+        let mut packet = valid;
+        packet[0] ^= 1;
+        assert_eq!(named(&packet[..len]), "init_packet_format");
+        assert_eq!(
+            named(b"PREPARATION_ONLY_NOT_HLIINIT1"),
+            "init_packet_format"
+        );
+
+        let mut ordinary = [0u8; 128];
+        ordinary[..8].copy_from_slice(b"HLIINIT1");
+        assert_eq!(named(&ordinary), "init_packet_format");
+
+        let mut packet = valid;
+        packet[8..10].copy_from_slice(&1u16.to_le_bytes());
+        assert_eq!(named(&packet[..len]), "init_packet_version");
+
+        let mut packet = valid;
+        packet[15] = 1;
+        assert_eq!(named(&packet[..len]), "init_packet_reserved");
+
+        let mut packet = valid;
+        packet[10] |= 0b0000_0010;
+        assert_eq!(named(&packet[..len]), "init_packet_flags");
+
+        let mut packet = valid;
+        packet[12..14].copy_from_slice(&0u16.to_le_bytes());
+        assert_eq!(named(&packet[..HEADER_LEN]), "init_packet_bounds");
     }
 
     #[test]

@@ -401,6 +401,11 @@ fn init_packet_build_validate_round_trip() {
     let decoded = reverie_loader::init_packet::decode(&packet).unwrap();
     assert!(decoded.state_expected());
     assert_eq!(decoded.expected_state_digest(), STATE_DIGEST);
+    let successor = reverie_loader::init_packet::decode_successor(&packet).unwrap();
+    assert_eq!(successor.expected_config_digest(), CONFIG_DIGEST);
+    assert_eq!(successor.expected_state_digest(), STATE_DIGEST);
+    assert_eq!(successor.redemption(), b"birth-nonce");
+
     let validated = validate_init_packet(&packet, SUCCESSOR).unwrap();
     assert!(validated.state_expected());
     assert_eq!(validated.expected_state_digest(), STATE_DIGEST);
@@ -408,6 +413,9 @@ fn init_packet_build_validate_round_trip() {
     assert_eq!(validated.packet_bytes(), packet.as_slice());
 
     let packet = build_init_packet(FIRST_IMAGE, b"first-image").unwrap();
+    let error = reverie_loader::init_packet::decode_successor(&packet).unwrap_err();
+    assert_eq!(error.name(), "init_packet_state_not_expected");
+
     let validated = validate_init_packet(&packet, FIRST_IMAGE).unwrap();
     assert!(!validated.state_expected());
     assert_eq!(validated.expected_state_digest(), NO_STATE_DIGEST);
