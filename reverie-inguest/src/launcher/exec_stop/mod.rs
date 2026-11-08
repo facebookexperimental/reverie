@@ -507,7 +507,9 @@ fn drain_and_capture(
 /// supervisor detaches with `SIGCONT` as its restored guest's
 /// release signal. Group stops it encountered while seized were
 /// cleared before release; the detach signal is not their clearing
-/// mechanism.
+/// mechanism. It flushes a stop signal queued while the stop was
+/// held, and stays pending in the new image if the guest blocks
+/// SIGCONT.
 fn release_restored(
     task: Stopped,
     context: &EntryContext,

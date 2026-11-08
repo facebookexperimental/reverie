@@ -25,12 +25,20 @@
 //!   or ticket state of its own: successor admission belongs
 //!   entirely to the caller's hook.
 //!
-//! While watched, guest signal deliveries are forwarded unchanged
-//! and a guest group stop is cleared while still seized with this
-//! supervisor's real `SIGCONT`, whose delivery is then forwarded
-//! (a supervised guest is not job-controlled). Only the initial
-//! pre-exec window keeps the stricter handshake ownership proof.
-//! The watched path
+//! Stop policy: a supervised guest is not job-controlled. While
+//! watched, guest signal deliveries are forwarded unchanged and
+//! a guest group stop is continued at once: the supervisor sends
+//! its own real `SIGCONT` while still seized, consumes the notify
+//! trap, and forwards that SIGCONT delivery. The guest therefore
+//! observes a SIGCONT from the supervisor pid (including a
+//! handler, if installed), queued stop signals are flushed by
+//! that generation, and the stop lasts zero guest-visible time;
+//! this differs from native job control, where the guest would
+//! remain stopped until some other sender continues it. Only the
+//! initial pre-exec window keeps the stricter handshake ownership
+//! proof. After `release_detached`, the detached wait is
+//! terminal-only: a guest that then stops itself is reported as
+//! an unexpected post-detach stop and cancelled. The watched path
 //! follows one thread-group leader: an exec event whose former
 //! tid is not the watched leader fails closed; fork-following and
 //! thread supervision are not part of this module.
@@ -269,7 +277,7 @@ fn require_group_stop_clear_trap(task: &Stopped, pid: safeptrace::Pid) -> Result
     let expected = libc::SIGTRAP | (libc::PTRACE_EVENT_STOP << 8);
     if info.si_signo != libc::SIGTRAP || info.si_code != expected || sender != pid.as_raw() {
         return Err(format!(
-            "exec supervisor encountered unexpected group-stop clear trap before exec: si_signo={}, si_code={}, sender={sender}",
+            "exec supervisor encountered unexpected group-stop clear trap: si_signo={}, si_code={}, sender={sender}",
             info.si_signo, info.si_code
         )
         .into());
@@ -277,22 +285,24 @@ fn require_group_stop_clear_trap(task: &Stopped, pid: safeptrace::Pid) -> Result
     Ok(())
 }
 
-/// A group-stop trap's siginfo names the stop signal in both its
-/// signal number and the low byte of its ptrace-event code, with
-/// the stopped child as sender. Require that exact shape before
-/// treating an `Event::Stop` as a group stop of the named kind.
+/// Classify a PTRACE_EVENT_STOP trap by its siginfo. A SIGCONT
+/// notify trap names SIGTRAP; a genuine group stop names its stop
+/// signal in both the signal number and the low byte of the code.
+/// The stopped child is the sender of the trap siginfo in both
+/// cases. Returns the validated signal number.
 #[allow(unsafe_code)]
-fn require_group_stop_trap(
+fn classify_group_stop_trap(
     task: &Stopped,
     pid: safeptrace::Pid,
-    expected_signals: &[i32],
     refusal: &'static str,
-) -> Result<()> {
+) -> Result<i32> {
     let info = task.getsiginfo()?;
     // SAFETY: this is the just-read Linux siginfo for the current stop.
     let sender = unsafe { info.si_pid() };
-    if !expected_signals.contains(&info.si_signo)
-        || info.si_code != info.si_signo | (libc::PTRACE_EVENT_STOP << 8)
+    if !matches!(
+        info.si_signo,
+        libc::SIGTRAP | libc::SIGSTOP | libc::SIGTSTP | libc::SIGTTIN | libc::SIGTTOU
+    ) || info.si_code != info.si_signo | (libc::PTRACE_EVENT_STOP << 8)
         || sender != pid.as_raw()
     {
         return Err(format!(
@@ -301,7 +311,7 @@ fn require_group_stop_trap(
         )
         .into());
     }
-    Ok(())
+    Ok(info.si_signo)
 }
 
 /// Wait for the child's handshake stop after seize. A group stop
@@ -315,12 +325,17 @@ fn wait_initial_stop(running: Running, pid: safeptrace::Pid) -> Result<(Stopped,
     match trace::wait(running)? {
         Wait::Stopped(task, event) => match event {
             Event::Stop => {
-                require_group_stop_trap(
+                let signo = classify_group_stop_trap(
                     &task,
                     pid,
-                    &[libc::SIGSTOP],
                     "exec supervisor encountered unexpected handshake group stop",
                 )?;
+                if signo != libc::SIGSTOP {
+                    return Err(format!(
+                        "exec supervisor encountered unexpected handshake group stop: si_signo={signo}"
+                    )
+                    .into());
+                }
                 Ok((task, true))
             }
             Event::Signal(Signal::SIGSTOP) => {
@@ -701,16 +716,16 @@ enum NextExec {
 /// exit. Before the first exec, only this supervisor's own
 /// group-stop-clearing SIGCONT trap/delivery may be suppressed.
 /// Afterwards guest signal deliveries are forwarded unchanged; a
-/// guest group stop is cleared while still seized with this
-/// supervisor's real `SIGCONT`, and that SIGCONT's delivery is
-/// forwarded so the guest sees ordinary job-control continuation.
+/// guest group stop is continued at once with this supervisor's
+/// real `SIGCONT`, whose delivery is forwarded. The stop lasts
+/// zero guest-visible time and the guest observes a SIGCONT from
+/// the supervisor pid.
 fn wait_watched(
     mut running: Running,
     pid: safeptrace::Pid,
     pre_first_exec: bool,
     group_stop_clear_pending: &mut bool,
 ) -> Result<NextExec> {
-    let mut guest_group_stop_clear_pending = false;
     loop {
         match trace::wait(running)? {
             Wait::Exited(_, status) => return Ok(NextExec::Finished(status)),
@@ -745,16 +760,6 @@ fn wait_watched(
                         .into(),
                 );
             }
-            Wait::Stopped(task, Event::Stop) if guest_group_stop_clear_pending => {
-                require_group_stop_clear_trap(&task, pid)?;
-                running = task.resume(None)?;
-            }
-            Wait::Stopped(task, Event::Signal(Signal::SIGCONT))
-                if guest_group_stop_clear_pending =>
-            {
-                guest_group_stop_clear_pending = false;
-                running = task.resume(Some(Signal::SIGCONT))?;
-            }
             Wait::Stopped(task, Event::Signal(signal)) => {
                 running = task.resume(Some(signal))?;
             }
@@ -762,23 +767,30 @@ fn wait_watched(
                 running = task.resume_raw(raw)?;
             }
             Wait::Stopped(task, Event::Stop) => {
+                // Classify by siginfo, with no pending flag: every
+                // SIGCONT to a seized task arms a SIGTRAP notify
+                // trap, whether or not the guest was stopped, and a
+                // SIGCONT delivery need not reach the traced leader.
+                let signo = classify_group_stop_trap(
+                    &task,
+                    pid,
+                    "exec supervisor encountered unexpected watched stop trap",
+                )?;
+                if signo == libc::SIGTRAP {
+                    running = task.resume(None)?;
+                    continue;
+                }
                 if pre_first_exec {
                     return Err(
                         "exec supervisor encountered unexpected group stop before exec".into(),
                     );
                 }
-                require_group_stop_trap(
-                    &task,
-                    pid,
-                    &[libc::SIGSTOP, libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU],
-                    "exec supervisor encountered unexpected watched group stop",
-                )?;
                 // A signal injected on the group-stop resume would be
                 // ignored and leave the natural-parent stop report
-                // for after detach. Generate a real SIGCONT instead,
-                // then forward its delivery above.
+                // for after detach. Generate a real SIGCONT instead;
+                // its notify trap is consumed above and its delivery
+                // reaches the general signal arm.
                 send_own_sigcont(pid)?;
-                guest_group_stop_clear_pending = true;
                 running = task.resume(None)?;
             }
             Wait::Stopped(_task, other_event) => {
@@ -1018,8 +1030,9 @@ impl<'fd> SuccessorStop<'fd> {
         // Detach with SIGCONT, like the dormant path. Group stops
         // encountered while watched were already cleared while
         // seized, so this detach signal is not what clears their
-        // natural-parent reports; it is the restored guest's
-        // release signal at this exec stop.
+        // natural-parent reports. It flushes a stop signal queued
+        // while this successor stop was held; if the guest blocks
+        // SIGCONT, the detach SIGCONT stays pending in the new image.
         let result = hook(task, &context, &boundary)
             .and_then(|task| super::release_restored(task, &context, Some(Signal::SIGCONT)));
         match result {
@@ -1221,6 +1234,35 @@ mod tests {
     }
 
     #[test]
+    fn watched_foreign_sigcont_during_group_stop_clear_is_refused() {
+        let watched = Supervisor::spawn_watched_inner(
+            request("/bin/true", &["true"]),
+            CleanupReceipt::default(),
+            &mut |_| std::thread::sleep(Duration::from_millis(100)),
+            &mut |pid| {
+                let pid_arg = pid.as_raw().to_string();
+                assert!(
+                    std::process::Command::new("/bin/kill")
+                        .args(["-CONT", &pid_arg])
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+            },
+        )
+        .unwrap();
+        let pid = watched.pid();
+        let failure = watched.wait_next().unwrap_err();
+        assert!(
+            failure.error.to_string().contains("unowned SIGCONT"),
+            "unexpected failure: {}",
+            failure.error
+        );
+        assert!(failure.cleanup().confirmed);
+        assert!(!Path::new(&format!("/proc/{}", pid.as_raw())).exists());
+    }
+
+    #[test]
     fn supervisor_sigqueue_sigcont_during_group_stop_clear_is_refused() {
         let mut injected_pid = None;
         let failure = Supervisor::spawn_inner(
@@ -1337,6 +1379,139 @@ mod tests {
             .unwrap();
         let outcome = detached.wait().unwrap();
         assert_eq!(outcome.status, ExitStatus::Exited(0));
+        assert!(outcome.cleanup.confirmed);
+    }
+
+    fn rearm_until_finished(mut watched: WatchedSupervisor<'_>) -> WatchedOutcome {
+        loop {
+            match watched.wait_next().unwrap() {
+                WatchedStep::Exec(stop) => {
+                    watched = stop
+                        .rearm_and_resume(|task, _entry, _boundary| Ok(task))
+                        .unwrap();
+                }
+                WatchedStep::Finished(outcome) => return outcome,
+            }
+        }
+    }
+
+    #[test]
+    fn watched_guest_self_sigcont_runs_to_completion() {
+        let watched = Supervisor::spawn_watched(
+            request("/bin/sh", &["sh", "-c", "kill -CONT $$; exec /bin/true"]),
+            CleanupReceipt::default(),
+        )
+        .unwrap();
+        let outcome = rearm_until_finished(watched);
+        assert_eq!(outcome.status, ExitStatus::Exited(0));
+        assert!(outcome.cleanup.confirmed);
+    }
+
+    #[test]
+    fn watched_foreign_tstp_then_cont_runs_to_completion() {
+        let watched = Supervisor::spawn_watched(
+            request("/bin/sh", &["sh", "-c", "sleep 0.3; exec /bin/true"]),
+            CleanupReceipt::default(),
+        )
+        .unwrap();
+        let stop = match watched.wait_next().unwrap() {
+            WatchedStep::Exec(stop) => stop,
+            WatchedStep::Finished(outcome) => {
+                panic!("expected the shell exec stop, got terminal {outcome:?}")
+            }
+        };
+        let watched = stop
+            .rearm_and_resume(|task, _entry, _boundary| Ok(task))
+            .unwrap();
+        let pid = watched.pid().as_raw().to_string();
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(
+                std::process::Command::new("/bin/kill")
+                    .args(["-TSTP", &pid])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+            assert!(
+                std::process::Command::new("/bin/kill")
+                    .args(["-CONT", &pid])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        });
+        let outcome = rearm_until_finished(watched);
+        sender.join().unwrap();
+        assert_eq!(outcome.status, ExitStatus::Exited(0));
+        assert!(outcome.cleanup.confirmed);
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn watched_blocked_sigcont_guest_entrypoint() {
+        if std::env::var_os("REVERIE_SUPERVISOR_BLOCKED_SIGCONT_GUEST").is_none() {
+            return;
+        }
+        // SAFETY: this process is the dedicated watched guest; block
+        // SIGCONT on this thread, stop it twice, then replace the
+        // image. No other test thread shares this process.
+        unsafe {
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            assert_eq!(libc::sigemptyset(&mut set), 0);
+            assert_eq!(libc::sigaddset(&mut set, libc::SIGCONT), 0);
+            assert_eq!(
+                libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()),
+                0
+            );
+            assert_eq!(libc::raise(libc::SIGSTOP), 0);
+            assert_eq!(libc::raise(libc::SIGSTOP), 0);
+        }
+        let error =
+            std::os::unix::process::CommandExt::exec(&mut std::process::Command::new("/bin/true"));
+        panic!("blocked-SIGCONT guest exec failed: {error}");
+    }
+
+    #[test]
+    fn watched_blocked_sigcont_two_stops_run_to_completion() {
+        let exe = std::env::current_exe().unwrap();
+        let args: Vec<OsString> = [
+            exe.as_os_str().to_owned(),
+            OsString::from(
+                "launcher::exec_stop::supervisor::tests::watched_blocked_sigcont_guest_entrypoint",
+            ),
+            OsString::from("--exact"),
+            OsString::from("--nocapture"),
+        ]
+        .to_vec();
+        let env = [(
+            OsString::from("REVERIE_SUPERVISOR_BLOCKED_SIGCONT_GUEST"),
+            OsString::from("1"),
+        )];
+        let request = PreparedExec::new(&exe, &args, &env, None, Vec::new()).unwrap();
+        let watched = Supervisor::spawn_watched(request, CleanupReceipt::default()).unwrap();
+        let outcome = rearm_until_finished(watched);
+        assert_eq!(outcome.status, ExitStatus::Exited(0));
+        assert!(outcome.cleanup.confirmed);
+    }
+
+    #[test]
+    fn watched_guest_sees_forwarded_sigcont_handler() {
+        let watched = Supervisor::spawn_watched(
+            request(
+                "/bin/sh",
+                &[
+                    "sh",
+                    "-c",
+                    "trap 'exit 7' CONT; kill -STOP $$; sleep 0.3; exit 0",
+                ],
+            ),
+            CleanupReceipt::default(),
+        )
+        .unwrap();
+        let outcome = rearm_until_finished(watched);
+        assert_eq!(outcome.status, ExitStatus::Exited(7));
         assert!(outcome.cleanup.confirmed);
     }
 
