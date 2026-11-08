@@ -61,6 +61,23 @@ pub(crate) fn owner_cell() -> *mut core::cell::Cell<*mut Continuation> {
     OWNER.with(|cell| cell as *const core::cell::Cell<*mut Continuation> as *mut _)
 }
 
+/// The one outlined access site for the READY cell (see
+/// `tool_callback_active_cell` in super::support).
+#[inline(never)]
+pub(crate) fn ready_cell() -> *mut core::cell::Cell<bool> {
+    READY.with(|cell| cell as *const core::cell::Cell<bool> as *mut _)
+}
+
+fn ready_get() -> bool {
+    // SAFETY: this thread's own cell, used only on this thread.
+    unsafe { (*ready_cell()).get() }
+}
+
+fn ready_set(value: bool) {
+    // SAFETY: this thread's own cell, used only on this thread.
+    unsafe { (*ready_cell()).set(value) }
+}
+
 /// The one outlined access site for the PENDING cell. The address is
 /// type-erased so the retained-accessor table in super::support does
 /// not name the private Pending type.
@@ -562,7 +579,7 @@ pub fn initialize_with_stack_backing(backing: StackBacking) -> io::Result<()> {
             return Err(io::Error::from_raw_os_error(libc::EEXIST));
         }
     }
-    READY.set(true);
+    ready_set(true);
     Ok(())
 }
 
@@ -578,7 +595,7 @@ pub(crate) fn prepare(instruction: u64) -> Option<u64> {
 /// Reserve the existing single activation without overwriting a pending one.
 /// Kept separate from frame capture so its reentry contract remains testable.
 fn prepare_pending(request: Pending) -> Option<u64> {
-    if !READY.get() || pending_get().is_some() {
+    if !ready_get() || pending_get().is_some() {
         return None;
     }
     pending_set(Some(request));
@@ -1079,7 +1096,7 @@ mod tests {
                 .spawn(|| {
                     assert!(owner_get().is_null());
                     initialize_owner().unwrap();
-                    assert!(READY.get());
+                    assert!(ready_get());
                     assert_ne!(owner_get() as usize, 0);
                     assert_ne!(owner_get() as usize, first_stack);
                 })

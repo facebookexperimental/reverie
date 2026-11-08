@@ -482,11 +482,11 @@ pub(crate) fn tool_callback_active_cell() -> *mut core::sync::atomic::AtomicBool
     TOOL_CALLBACK_ACTIVE.with(|active| active as *const core::sync::atomic::AtomicBool as *mut _)
 }
 
-/// Retention for the four authenticated TLS cell accessors: holding
+/// Retention for the five authenticated TLS cell accessors: holding
 /// their addresses here keeps each outlined access site in the built
 /// image whatever code generation does with its callers.
 #[allow(dead_code)]
-struct RetainedTlsCellAccessors([*const (); 4]);
+struct RetainedTlsCellAccessors([*const (); 5]);
 
 // SAFETY: the table holds only function addresses, never dereferenced.
 unsafe impl Sync for RetainedTlsCellAccessors {}
@@ -497,6 +497,7 @@ static RETAINED_TLS_CELL_ACCESSORS: RetainedTlsCellAccessors = RetainedTlsCellAc
     super::alloc::dispatch_depth_cell as *const (),
     super::continuation::owner_cell as *const (),
     super::continuation::pending_cell as *const (),
+    super::continuation::ready_cell as *const (),
 ]);
 
 pub fn tool_callback_active() -> bool {

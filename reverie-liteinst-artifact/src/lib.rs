@@ -1149,8 +1149,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     // Bind the signal-mask gate and every changed native-source premise of it.
     (
         "reverie-inguest/src/guest/continuation.rs",
-        45939,
-        "3172b2feecca8cccd71b7947cee90fa830bae90fc8c3f1f32c948f0f8e438607",
+        46467,
+        "08309a0f057ecd3f4ce8f3c5dbf066ca6a9d5b7e66d143104df1ce014b196896",
     ),
     (
         "reverie-inguest/src/guest/instruction.rs",
@@ -4000,7 +4000,7 @@ const NO_INSTALLATION_SCOPE_SOURCE: (&str, u64, &str) = (
     26462,
     "799b94da011fa6d9313a296a74592fd060c12dd8543176ff4d56e7f82abb02bc",
 );
-/// The four authenticated TLS cell accessors of a no-scope image, as
+/// The five authenticated TLS cell accessors of a no-scope image, as
 /// (accessor, cell) canonical-name pairs. Every read and write of
 /// these cells in the source routes through one #[inline(never)]
 /// accessor per cell, so the built image holds exactly one TLS
@@ -4010,7 +4010,7 @@ const NO_INSTALLATION_SCOPE_SOURCE: (&str, u64, &str) = (
 /// cell, never recorded here, so TLS layout drift in either
 /// repository cannot break or widen recognition. These are other
 /// TLS, never allocator-operation targets or isolation credit.
-const NO_SCOPE_TLS_CELL_ACCESSORS: [(&str, &str); 4] = [
+const NO_SCOPE_TLS_CELL_ACCESSORS: [(&str, &str); 5] = [
     (
         "_RNvNtNtCs_15reverie_inguest5guest7support25tool_callback_active_cell",
         "_RNvNCNKNvNtNtCs_15reverie_inguest5guest7support20TOOL_CALLBACK_ACTIVE0s_023___RUST_STD_INTERNAL_VAL",
@@ -4026,6 +4026,10 @@ const NO_SCOPE_TLS_CELL_ACCESSORS: [(&str, &str); 4] = [
     (
         "_RNvNtNtCs_15reverie_inguest5guest5alloc19dispatch_depth_cell",
         "_RNvNCNKNvNtNtCs_15reverie_inguest5guest5alloc14DISPATCH_DEPTH0s_023___RUST_STD_INTERNAL_VAL",
+    ),
+    (
+        "_RNvNtNtCs_15reverie_inguest5guest12continuation10ready_cell",
+        "_RNvNCNKNvNtNtCs_15reverie_inguest5guest12continuation5READY0s_023___RUST_STD_INTERNAL_VAL",
     ),
 ];
 
@@ -18921,7 +18925,7 @@ fn refuse_tainted_tls_access(
     Ok(())
 }
 
-/// Defense in depth for the four authenticated TLS cells: refuse,
+/// Defense in depth for the five authenticated TLS cells: refuse,
 /// naming the site and the cell, any access to a cell that does not
 /// occur inside one of its authenticated accessors. Absolute
 /// fs:[disp32] operands are decoded at every executable byte start,
@@ -47309,7 +47313,7 @@ mod tests {
                         binding: sym::STB_LOCAL,
                         visibility: sym::STV_DEFAULT,
                     },
-                    cell_offset: [0x199, 0x180, 0x28, 0x190][index],
+                    cell_offset: [0x199, 0x180, 0x28, 0x190, 0x1a8][index],
                     module_slot: 0x3300,
                     plt_address: 0x1810,
                     sha256: "9".repeat(64),
@@ -47468,7 +47472,7 @@ mod tests {
         let mut cell_name_offsets = Vec::new();
         // One synthetic TLS layout; the census must bind each getter's
         // offset from these cell symbols, whatever layout is chosen.
-        let fixture_offsets = [0x199_u64, 0x180, 0x28, 0x190];
+        let fixture_offsets = [0x199_u64, 0x180, 0x28, 0x190, 0x1a8];
         for (index, (canonical, cell_canonical)) in
             NO_SCOPE_TLS_CELL_ACCESSORS.into_iter().enumerate()
         {
@@ -47491,7 +47495,7 @@ mod tests {
             }
             // The named cell itself: a unique local TLS symbol whose
             // value is the offset the thunk must encode.
-            let cell_row = 0x4000 + (index + 5) * 24;
+            let cell_row = 0x4000 + (index + 6) * 24;
             for (offset, width, value) in [
                 (0, 4, cell_name_offsets[index] as u64),
                 (4, 1, sym::STT_TLS as u64),
@@ -47592,7 +47596,7 @@ mod tests {
         base[0x5500..0x5500 + section_names.len()].copy_from_slice(section_names);
         for (index, name, kind, flags, address, size, link, entry) in [
             (1, ".plt", 1, 6, 0x1800, 32, 0, 16),
-            (2, ".symtab", 2, 0, 0x4000, 216, 3, 24),
+            (2, ".symtab", 2, 0, 0x4000, 264, 3, 24),
             (3, ".strtab", 3, 0, 0x6000, static_names.len() as u64, 0, 0),
             (4, ".dynsym", 11, 2, 0x4400, 48, 5, 24),
             (5, ".dynstr", 3, 2, 0x4600, dynamic_names.len() as u64, 0, 0),
@@ -47642,7 +47646,7 @@ mod tests {
             )
         };
         let good = census(&base).expect("complete physical no-scope census positive");
-        assert_eq!(good.other_tls_getters.len(), 4);
+        assert_eq!(good.other_tls_getters.len(), 5);
         // A second real layout (today's native OFF image) is accepted
         // unchanged: each getter's offset is bound from its own TLS
         // cell symbol, so moving every cell keeps the census green.
@@ -47650,10 +47654,10 @@ mod tests {
         for (index, offset) in [0x191_u64, 0x110, 0x0, 0x188].into_iter().enumerate() {
             let address = 0x1500 + index * 0x40;
             put(&mut relaid, address + 16, 4, offset);
-            put(&mut relaid, 0x4000 + (index + 5) * 24 + 8, 8, offset);
+            put(&mut relaid, 0x4000 + (index + 6) * 24 + 8, 8, offset);
         }
         let relaid = census(&relaid).expect("second TLS layout census positive");
-        assert_eq!(relaid.other_tls_getters.len(), 4);
+        assert_eq!(relaid.other_tls_getters.len(), 5);
         // A getter whose encoded offset disagrees with its own named
         // cell (here: another cell's offset) is refused.
         let mut wrong_offset = base.clone();
@@ -47667,7 +47671,7 @@ mod tests {
         let mut wrong_static = base.clone();
         put(
             &mut wrong_static,
-            0x4000 + 5 * 24,
+            0x4000 + 6 * 24,
             4,
             cell_name_offsets[1] as u64,
         );
@@ -47700,13 +47704,13 @@ mod tests {
         let mut global_cell = base.clone();
         put(
             &mut global_cell,
-            0x4000 + 6 * 24 + 4,
+            0x4000 + 7 * 24 + 4,
             1,
             ((sym::STB_GLOBAL << 4) | sym::STT_TLS) as u64,
         );
         assert!(census(&global_cell).is_err(), "global TLS cell must refuse");
         let mut empty_cell = base.clone();
-        put(&mut empty_cell, 0x4000 + 6 * 24 + 16, 8, 0);
+        put(&mut empty_cell, 0x4000 + 7 * 24 + 16, 8, 0);
         assert!(
             census(&empty_cell).is_err(),
             "zero-size TLS cell must refuse"
@@ -47770,7 +47774,7 @@ mod tests {
                 .expect("unrelated module-base offset census positive")
                 .other_tls_getters
                 .len(),
-            4
+            5
         );
         // Register-copied, clobber-surviving and position-shifted
         // module-base accesses refuse as well: the base value, not
@@ -47804,7 +47808,7 @@ mod tests {
                 .expect("unrelated register-copied offset census positive")
                 .other_tls_getters
                 .len(),
-            4
+            5
         );
         // The retained-base form from real codegen: the base is
         // copied to a callee-saved register, rax is then overwritten
@@ -47855,7 +47859,7 @@ mod tests {
                 .expect("unrelated fs-segment offset census positive")
                 .other_tls_getters
                 .len(),
-            4
+            5
         );
         // The non-REX byte-load fs form carries its displacement one
         // byte earlier than the REX form; both must refuse.
@@ -47938,7 +47942,7 @@ mod tests {
                 );
             }
         }
-        for index in 0..4 {
+        for index in 0..NO_SCOPE_TLS_CELL_ACCESSORS.len() {
             let row = 0x4000 + (index + 1) * 24;
             let address = 0x1500 + index * 0x40;
             for alteration in 0..5 {
@@ -47964,9 +47968,9 @@ mod tests {
                 );
             }
             let mut duplicate = base.clone();
-            let extra = 0x4000 + 5 * 24;
+            let extra = 0x4000 + 6 * 24;
             duplicate.copy_within(row..row + 24, extra);
-            put(&mut duplicate, 0x8000 + 2 * 64 + 32, 8, 144);
+            put(&mut duplicate, 0x8000 + 2 * 64 + 32, 8, 264);
             assert!(
                 census(&duplicate).is_err(),
                 "duplicate complete getter{index}"
