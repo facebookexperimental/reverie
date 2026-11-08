@@ -428,11 +428,14 @@ impl<T: Tool, R: HostRuntime> ToolHost<T, R> {
     /// dispatch currently holding the state lock, is refused without replacing
     /// anything. No production backend calls this inactive input seam.
     pub fn restore_current_thread_state(&self, state: T::ThreadState) -> io::Result<()> {
+        // Read the occupancy mirror, not the lock: momentary
+        // contention (a writer updating the slot) must not read as a
+        // pending successor and spuriously refuse a legitimate
+        // restore (same misread the dh-n6qjq dispatch probes had).
         #[cfg(feature = "exec-private-successor")]
         if self
-            .prepared_exec
-            .try_lock()
-            .is_none_or(|pending| pending.is_some())
+            .prepared_exec_pending
+            .load(core::sync::atomic::Ordering::Acquire)
         {
             return Err(io::Error::other(
                 "successor lifecycle state is not complete",
@@ -1009,6 +1012,15 @@ where
     /// dispatch itself is the multi-threaded probe here, and plain
     /// contention on the empty slot is not a pending successor
     /// (dh-n6qjq).
+    ///
+    /// This runs *before* `begin_dispatch`, deliberately. The window
+    /// between it and a concurrent restore publishing the pending
+    /// state is closed by the restore's own preconditions, not by
+    /// `begin_install` — which checks only `active_dispatches` and so
+    /// cannot stop a dispatch that has passed this probe but not yet
+    /// incremented: `restore_prepared_exec_state` requires the root
+    /// thread's identity and runs single-threaded before loader
+    /// entry, so no sibling ordinary dispatch is live then.
     #[cfg(feature = "exec-private-successor")]
     fn refuse_if_prepared_exec_pending(&self) {
         if self
@@ -4830,6 +4842,43 @@ mod process_owner_tests {
                 );
             },
             0,
+        );
+    }
+
+    /// The restore seam's twin of the dispatch regression: the
+    /// empty `prepared_exec` slot being *locked* by a sibling must
+    /// not read as a pending successor there either. The pre-fix
+    /// `try_lock().is_none_or(..)` refuses a legitimate restore
+    /// with "successor lifecycle state is not complete" for exactly
+    /// the duration of the contention.
+    #[cfg(feature = "exec-private-successor")]
+    #[test]
+    fn restore_current_thread_state_with_prepared_exec_slot_under_contention_completes() {
+        let _test = TEST_LOCK.lock().unwrap();
+        let (host, _peer) = host(false, false);
+        let host = std::sync::Arc::new(host);
+        let pid = raw_pid(libc::SYS_getpid).as_raw();
+        let tid = with_empty_prepared_exec_slot_locked(&host, || {
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        let tid = raw_pid(libc::SYS_gettid).as_raw();
+                        host.restore_current_thread_state(State {
+                            pid,
+                            tid,
+                            attempts: 7,
+                        })
+                        .unwrap();
+                        tid
+                    })
+                    .join()
+                    .unwrap()
+            })
+        });
+        assert_eq!(
+            host.states.with_state(tid, |state| state.unwrap().attempts),
+            7,
+            "the restored state must publish under slot contention"
         );
     }
 
