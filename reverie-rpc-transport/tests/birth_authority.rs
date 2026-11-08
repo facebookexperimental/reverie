@@ -238,23 +238,26 @@ fn close_resolver_orderings() {
     let successor_image = NativeImageConnection::Successor {
         ticket: ticket.0.to_vec(),
     };
-    // Issued successor EOF is held pending, not accepted.
-    authority
-        .connection_closed(admitted(), &successor_image)
-        .unwrap();
-    assert_eq!(authority.pending_eof_count(), 1);
+    // Unknown and Issued Successor EOFs are contradictions: refused
+    // at EOF time, never held pending.
+    assert!(
+        authority
+            .connection_closed(
+                admitted(),
+                &NativeImageConnection::Successor {
+                    ticket: vec![9; 32],
+                },
+            )
+            .is_err()
+    );
+    assert!(
+        authority
+            .connection_closed(admitted(), &successor_image)
+            .is_err()
+    );
+    assert_eq!(authority.pending_eof_count(), 0);
     assert_eq!(authority.accepted_eof_count(), 1);
-    // An unknown ticket likewise remains pending/unaccepted.
-    authority
-        .connection_closed(
-            admitted(),
-            &NativeImageConnection::Successor {
-                ticket: vec![9; 32],
-            },
-        )
-        .unwrap();
-    assert_eq!(authority.pending_eof_count(), 2);
-    // Redemption resolves only the exact successor image.
+    // The genuine EOF after redemption is then accepted.
     authority
         .redeem(
             own_pidfd(),
@@ -265,15 +268,47 @@ fn close_resolver_orderings() {
             },
         )
         .unwrap();
-    assert_eq!(authority.pending_eof_count(), 1);
+    authority
+        .connection_closed(admitted(), &successor_image)
+        .unwrap();
+    assert_eq!(authority.pending_eof_count(), 0);
     assert_eq!(authority.accepted_eof_count(), 2);
+    authority.finish().unwrap();
 
-    // Watch-terminal fact accepts a fresh Initial EOF.
+    // Initial pending, then terminal: accepted by the watch fact.
     let authority2 = make_authority();
-    authority2.record_watch_terminal();
     authority2.connection_closed(admitted(), &initial).unwrap();
+    assert_eq!(authority2.pending_eof_count(), 1);
+    authority2.record_watch_terminal().unwrap();
     assert_eq!(authority2.accepted_eof_count(), 1);
     assert_eq!(authority2.pending_eof_count(), 0);
+    assert_eq!(authority2.refused_eof_count(), 0);
+
+    // No fact ever arrives: finish gives the visible refusal.
+    let authority3 = make_authority();
+    authority3.connection_closed(admitted(), &initial).unwrap();
+    assert!(authority3.finish().is_err());
+    assert_eq!(authority3.accepted_eof_count(), 0);
+    assert_eq!(authority3.pending_eof_count(), 0);
+    assert_eq!(authority3.refused_eof_count(), 1);
+}
+
+#[test]
+fn initial_eof_after_issue_accepted_at_once() {
+    let authority = make_authority();
+    authority.record_initial_consumed(admitted()).unwrap();
+    let captured = Arc::new(Mutex::new(None));
+    let _expected = stage_and_stop(
+        &authority,
+        frame_tool_state(b"after-issue").unwrap(),
+        &captured,
+    );
+    let initial = NativeImageConnection::Initial;
+    authority.connection_closed(admitted(), &initial).unwrap();
+    assert_eq!(authority.accepted_eof_count(), 1);
+    assert_eq!(authority.pending_eof_count(), 0);
+    assert!(authority.connection_closed(admitted(), &initial).is_err());
+    authority.finish().unwrap();
 }
 
 struct Watch;
@@ -382,6 +417,18 @@ async fn scalar_stream_initial_stage_stop_successor_end_to_end() {
         client_authority.complete(ticket).unwrap();
         drop(client);
         drop(initial);
+        // Let the server's close hooks run, then take the verdict.
+        for _ in 0..200 {
+            if client_authority.accepted_eof_count() >= 2
+                && client_authority.pending_eof_count() == 0
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(client_authority.pending_eof_count(), 0);
+        assert_eq!(client_authority.accepted_eof_count(), 2);
+        client_authority.finish().unwrap();
     });
     match tokio::time::timeout(WAIT, client).await {
         Ok(Ok(())) => {}

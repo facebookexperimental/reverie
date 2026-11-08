@@ -320,16 +320,24 @@ struct StopRecord {
     ticket: Option<ExecTicket>,
 }
 
+struct MailboxEntry {
+    framed_tool: Vec<u8>,
+    /// Exec ordinal this snapshot was staged for, derived by the
+    /// authority at stage time (never supplied by the guest).
+    exec_ordinal: u64,
+}
+
 struct Inner {
     initial_used: bool,
     initial_redemption: Vec<u8>,
     config_digest: [u8; 32],
-    mailbox: Option<Vec<u8>>,
+    mailbox: Option<MailboxEntry>,
     registry: ExecTicketRegistry<SpikeProof, SpikeBinding>,
     stops: Vec<StopRecord>,
     watch_terminal: bool,
     closed: Vec<NativeImageConnection>,
     pending_eof: Vec<NativeImageConnection>,
+    refused_eof: Vec<NativeImageConnection>,
 }
 
 impl Inner {
@@ -338,6 +346,7 @@ impl Inner {
             NativeImageConnection::Initial => {
                 self.watch_terminal
                     || self.mailbox.is_some()
+                    || !self.stops.is_empty()
                     || self.stops.iter().any(|stop| {
                         stop.ticket.is_some_and(|ticket| {
                             matches!(
@@ -420,6 +429,7 @@ impl BirthAuthority {
                 watch_terminal: false,
                 closed: Vec::new(),
                 pending_eof: Vec::new(),
+                refused_eof: Vec::new(),
             }),
         })
     }
@@ -464,10 +474,16 @@ impl BirthAuthority {
         self.check_admitted(admitted)?;
         check_framed_tool_budget(&framed_tool)?;
         let mut inner = self.lock();
-        if !inner.initial_used {
+        if !inner.initial_used || inner.watch_terminal {
             return Err(ExecControlError::Transition);
         }
-        inner.mailbox = Some(framed_tool);
+        // Staging always targets the next exec stop: the snapshot is
+        // captured by the predecessor before that exec occurs.
+        let exec_ordinal = inner.stops.len() as u64 + 1;
+        inner.mailbox = Some(MailboxEntry {
+            framed_tool,
+            exec_ordinal,
+        });
         inner.resolve_pending_eof();
         Ok(())
     }
@@ -501,6 +517,7 @@ impl BirthAuthority {
             exec_ordinal: ordinal,
             ticket: None,
         });
+        inner.resolve_pending_eof();
         Ok(SuccessorStop {
             birth: self.key,
             exec_ordinal: ordinal,
@@ -528,7 +545,11 @@ impl BirthAuthority {
         if inner.stops[stop_index].ticket.is_some() {
             return Err(ExecControlError::Transition);
         }
-        let framed = inner.mailbox.take().ok_or(ExecControlError::Unavailable)?;
+        let entry = inner.mailbox.take().ok_or(ExecControlError::Unavailable)?;
+        if entry.exec_ordinal != stop.exec_ordinal {
+            return Err(ExecControlError::Identity);
+        }
+        let framed = entry.framed_tool;
         let binding = SpikeBinding {
             owner: self.key.process_id,
             config: inner.config_digest,
@@ -574,9 +595,6 @@ impl BirthAuthority {
             Ok(packet.expected)
         })();
         self.proof_state.lock().unwrap().expected_runtime = None;
-        if result.is_ok() {
-            inner.resolve_pending_eof();
-        }
         match result {
             Ok(expected) => Ok(expected),
             Err(error) => {
@@ -590,18 +608,35 @@ impl BirthAuthority {
 
     /// Host-only completion at verified Ready.
     pub fn complete(&self, ticket: ExecTicket) -> Result<(), ExecControlError> {
-        let mut inner = self.lock();
-        inner.registry.complete(self.key.process_id, ticket)?;
-        inner.resolve_pending_eof();
-        Ok(())
+        self.lock().registry.complete(self.key.process_id, ticket)
     }
 
-    /// Recorded actual watch death/exit. Never call this on EOF.
-    pub fn record_watch_terminal(&self) {
+    /// Record whole-birth watch death/exit and settle pending EOFs.
+    /// Never call this on EOF. Any entry no recorded fact accepts
+    /// is moved to the visible refused set and reported as an error.
+    pub fn record_watch_terminal(&self) -> Result<(), ExecControlError> {
         let mut inner = self.lock();
         inner.watch_terminal = true;
         inner.registry.died();
         inner.resolve_pending_eof();
+        Self::refuse_still_pending(&mut inner)
+    }
+
+    /// Owner-called end-of-birth verdict, with no timed wait. Any
+    /// EOF still pending becomes a visible refused EOF and an error.
+    pub fn finish(&self) -> Result<(), ExecControlError> {
+        let mut inner = self.lock();
+        inner.resolve_pending_eof();
+        Self::refuse_still_pending(&mut inner)
+    }
+
+    fn refuse_still_pending(inner: &mut Inner) -> Result<(), ExecControlError> {
+        if inner.pending_eof.is_empty() {
+            return Ok(());
+        }
+        let mut refused = std::mem::take(&mut inner.pending_eof);
+        inner.refused_eof.append(&mut refused);
+        Err(ExecControlError::Transition)
     }
 
     /// EOFs accepted on a recorded fact so far.
@@ -612,6 +647,11 @@ impl BirthAuthority {
     /// EOFs held pending a recorded fact (not yet accepted).
     pub fn pending_eof_count(&self) -> usize {
         self.lock().pending_eof.len()
+    }
+
+    /// EOFs visibly refused at terminal/finish.
+    pub fn refused_eof_count(&self) -> usize {
+        self.lock().refused_eof.len()
     }
 
     /// Retained stage for host/test evidence.
@@ -692,43 +732,19 @@ impl SuccessorAdmission for BirthAuthority {
         if inner.closed.contains(image) || inner.pending_eof.contains(image) {
             return Err(io::Error::other("birth authority duplicate EOF"));
         }
-        let accepted = inner.close_accepted(image)
-            || match image {
-                NativeImageConnection::Initial => {
-                    inner.watch_terminal
-                        || inner.stops.iter().any(|stop| {
-                            stop.ticket.is_some_and(|ticket| {
-                                matches!(
-                                    inner.registry.stage(ticket),
-                                    Some(
-                                        ExecStage::Issued
-                                            | ExecStage::Redeemed
-                                            | ExecStage::Completed
-                                    )
-                                )
-                            })
-                        })
-                }
-                NativeImageConnection::Successor { ticket } => {
-                    let Ok(ticket) = <[u8; 32]>::try_from(ticket.as_slice()) else {
-                        return Err(io::Error::other("birth authority EOF ticket shape"));
-                    };
-                    matches!(
-                        inner.registry.stage(ExecTicket(ticket)),
-                        Some(
-                            ExecStage::Redeemed
-                                | ExecStage::Completed
-                                | ExecStage::Failed
-                                | ExecStage::Dead
-                        )
-                    )
-                }
-            };
+        // A real Successor connection is tagged by the server only
+        // after that exact ticket redeemed on it, so no later fact
+        // can justify an EOF in any other stage. Refuse it now.
+        if matches!(image, NativeImageConnection::Successor { .. }) && !inner.close_accepted(image)
+        {
+            return Err(io::Error::other("birth authority EOF refused"));
+        }
+        let accepted = inner.close_accepted(image);
         if accepted {
             inner.closed.push(image.clone());
         } else {
             // Linux closes CLOEXEC descriptors in begin_new_exec()
-            // (fs/exec.c close_cloexec_files) before the exec stop is
+            // (fs/exec.c close_cloexec_files/do_close_on_exec) before
             // reported by ptrace_event(PTRACE_EVENT_EXEC), so an
             // Initial EOF can legitimately arrive first. Hold it
             // pending a recorded fact; no timed wait is used.
