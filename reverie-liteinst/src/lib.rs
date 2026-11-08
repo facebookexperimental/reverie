@@ -31,6 +31,7 @@ pub mod generic_fixture;
 mod initial_image_stats;
 #[cfg(feature = "liteinst")]
 mod interior_entry;
+#[cfg(any(target_arch = "aarch64", test))]
 pub mod lazy_promote;
 #[cfg(feature = "liteinst")]
 mod liteinst_census;
