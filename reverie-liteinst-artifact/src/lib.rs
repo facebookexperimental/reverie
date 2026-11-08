@@ -1339,13 +1339,13 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-inguest/Cargo.toml",
-        5690,
-        "99748fa5ce04bf02949d520049f8c3f900ef9e3b611cf09a16973edf591004fe",
+        5797,
+        "883a6cf22f4c77650af6604ae06d536bb506a43575fd5f2df95a25713b078849",
     ),
     (
         "reverie-inguest/src/lib.rs",
-        11792,
-        "2d3a8d6906a102cce3627d3b42ff87a334480807b44af14beaa4e60e7eeb78d4",
+        11818,
+        "d7fe544f55cb3d3e94f4c1b571df480483a8b384a6cc0e9dfc919649fae3787c",
     ),
     (
         "reverie-syscalls/Cargo.toml",
@@ -38439,6 +38439,16 @@ mod tests {
                 "reverie/src/guest.rs",
                 81764,
                 "b8e45c8b40b0e711fdd01a4a71bbd671c4debcfd1977d44d920446067119dc3a",
+            ),
+            (
+                "reverie-inguest/src/lib.rs",
+                11792,
+                "2d3a8d6906a102cce3627d3b42ff87a334480807b44af14beaa4e60e7eeb78d4",
+            ),
+            (
+                "reverie-inguest/Cargo.toml",
+                5690,
+                "99748fa5ce04bf02949d520049f8c3f900ef9e3b611cf09a16973edf591004fe",
             ),
             (
                 "reverie-inguest/src/guest/tool_install.rs",
