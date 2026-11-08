@@ -18379,6 +18379,7 @@ struct DecodedInstruction {
     lea: bool,
     call: bool,
     ret: bool,
+    hint: bool,
 }
 
 struct ParsedModRm {
@@ -18497,6 +18498,16 @@ fn decode_instruction(bytes: &[u8]) -> DecodedInstruction {
             decoded.length = at;
             return decoded;
         }
+        if matches!(second, 0x38 | 0x3a) {
+            // Three-byte opcode map: one more opcode byte, then the
+            // ModRM; the 0x3a map adds an imm8 after it.
+            let Some(ParsedModRm { memory, end, .. }) = parse_modrm(bytes, at + 1, rex) else {
+                return decoded;
+            };
+            decoded.memory = memory;
+            decoded.length = end + usize::from(second == 0x3a);
+            return decoded;
+        }
         // Nearly every other two-byte opcode carries a ModRM byte;
         // its memory operand is real even when the destination is a
         // vector register, so decode it generically and only assign
@@ -18513,6 +18524,9 @@ fn decode_instruction(bytes: &[u8]) -> DecodedInstruction {
             return decoded;
         };
         decoded.memory = memory;
+        // Hint and NOP forms (0f 0d, 0f 18..1f) carry a syntactically
+        // valid memory operand that the CPU never accesses.
+        decoded.hint = second == 0x0d || (0x18..=0x1f).contains(&second);
         decoded.register_write = if matches!(second, 0xb6 | 0xb7 | 0xbe | 0xbf | 0xaf) {
             Some(reg)
         } else if (0x90..=0x97).contains(&second) && mode == 3 {
@@ -18527,7 +18541,7 @@ fn decode_instruction(bytes: &[u8]) -> DecodedInstruction {
         0x00, 0x01, 0x02, 0x03, 0x08, 0x09, 0x0a, 0x0b, 0x10, 0x11, 0x12, 0x13, 0x18, 0x19, 0x1a,
         0x1b, 0x20, 0x21, 0x22, 0x23, 0x28, 0x29, 0x2a, 0x2b, 0x30, 0x31, 0x32, 0x33, 0x38, 0x39,
         0x3a, 0x3b, 0x63, 0x69, 0x6b, 0x80, 0x81, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8a,
-        0x8b, 0x8d, 0xc0, 0xc1, 0xc6, 0xc7, 0xd0, 0xd1, 0xd2, 0xd3, 0xf6, 0xf7, 0xfe, 0xff,
+        0x8b, 0x8d, 0x8f, 0xc0, 0xc1, 0xc6, 0xc7, 0xd0, 0xd1, 0xd2, 0xd3, 0xf6, 0xf7, 0xfe, 0xff,
     ];
     if MODRM_OPCODES.contains(&opcode) {
         let Some(ParsedModRm {
@@ -18638,6 +18652,21 @@ fn decode_instruction(bytes: &[u8]) -> DecodedInstruction {
         }
         0x70..=0x7f | 0xeb => {
             decoded.length = at + 1;
+        }
+        0xa8 => {
+            decoded.length = at + 1;
+        }
+        0xa9 => {
+            decoded.length = at + 4;
+        }
+        0xc8 => {
+            decoded.length = at + 3;
+        }
+        0xe0..=0xe3 => {
+            decoded.length = at + 1;
+        }
+        0xa0..=0xa3 => {
+            decoded.length = at + 8;
         }
         0xe9 => {
             decoded.length = at + 4;
@@ -18877,7 +18906,7 @@ fn refuse_tainted_tls_access(
             }
             let decoded = decode_instruction(&code[pos..]);
             let address = vaddr + pos as u64;
-            if let Some(memory) = decoded.memory {
+            if let Some(memory) = decoded.memory.filter(|_| !decoded.hint) {
                 let base_tainted = memory.base.is_some_and(|base| tainted[base as usize]);
                 let index_tainted = memory.index.is_some_and(|index| tainted[index as usize]);
                 if (base_tainted || index_tainted) && memory.displacement >= 0 {
