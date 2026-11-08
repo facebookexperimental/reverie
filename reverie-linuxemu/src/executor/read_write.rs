@@ -827,6 +827,26 @@ fn host_random_pool_ready() -> bool {
     unsafe { libc::getrandom(std::ptr::null_mut(), 0, libc::GRND_NONBLOCK) == 0 }
 }
 
+/// The finite set of local filesystems whose regular files and directories
+/// `admit_host_read_zero` admits under the backend's existing filesystem-I/O
+/// contract. Pseudo, FUSE and network filesystems stay outside it.
+pub(super) fn zero_read_local_filesystem(f_type: libc::c_long) -> bool {
+    // Overlayfs adds no wait to that contract: ovl_read_iter returns 0 for an
+    // empty iterator before it resolves or opens the real upper or lower file,
+    // so a lower-only file is neither read nor copied up. Its directories use
+    // generic_read_dir (EISDIR), as on the other three.
+    // Linux v6.12 fs/overlayfs/file.c, ovl_read_iter:
+    // https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/fs/overlayfs/file.c#L278
+    // https://github.com/rrnewton/reverie/issues/1354
+    matches!(
+        f_type,
+        libc::TMPFS_MAGIC
+            | libc::EXT4_SUPER_MAGIC
+            | libc::BTRFS_SUPER_MAGIC
+            | libc::OVERLAYFS_SUPER_MAGIC
+    )
+}
+
 /// Refuse unsupported external waits before creating a reader or injecting a
 /// host read. A zero-count read that waited in the host would hold the
 /// executor's task there, out of the Tool's sight, where a Tool that keeps its
@@ -908,10 +928,7 @@ fn admit_host_read_zero(file: &std::fs::File, guest_fd: i32, address: u64) -> cr
     }
     let filesystem = unsafe { filesystem.assume_init() };
     if matches!(stat.st_mode & libc::S_IFMT, libc::S_IFREG | libc::S_IFDIR)
-        && matches!(
-            filesystem.f_type,
-            libc::TMPFS_MAGIC | libc::EXT4_SUPER_MAGIC | libc::BTRFS_SUPER_MAGIC
-        )
+        && zero_read_local_filesystem(filesystem.f_type)
     {
         return Ok(());
     }

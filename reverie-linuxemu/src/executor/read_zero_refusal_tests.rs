@@ -413,4 +413,510 @@ mod read_zero_refusal_tests {
             assert_read_zero_canaries(&memory);
         }
     }
+
+    #[test]
+    fn read_zero_local_filesystem_set_admits_overlayfs_and_no_pseudo_filesystem() {
+        // The mount-free half of the overlayfs admission: the same finite set
+        // admit_host_read_zero consults, by superblock magic.
+        for f_type in [
+            libc::TMPFS_MAGIC,
+            libc::EXT4_SUPER_MAGIC,
+            libc::BTRFS_SUPER_MAGIC,
+            libc::OVERLAYFS_SUPER_MAGIC,
+        ] {
+            assert!(
+                zero_read_local_filesystem(f_type),
+                "local filesystem {f_type:#x}"
+            );
+        }
+        for f_type in [
+            libc::PROC_SUPER_MAGIC,
+            libc::SYSFS_MAGIC,
+            libc::DEBUGFS_MAGIC,
+            libc::CGROUP2_SUPER_MAGIC,
+            libc::FUSE_SUPER_MAGIC,
+            libc::NFS_SUPER_MAGIC,
+            ANON_INODE_FS_MAGIC,
+        ] {
+            assert!(
+                !zero_read_local_filesystem(f_type),
+                "filesystem {f_type:#x} must stay outside the local-file admission"
+            );
+        }
+    }
+
+    /// Each overlayfs descriptor the mount test opens: a name, a path below
+    /// the private tmpfs, and its open flags. Lower-only `lfile` is opened only
+    /// for reading, so it stays lower-only; a write-only open copies `wfile` up.
+    const OVERLAY_CASES: [(&str, &str, libc::c_int); 11] = [
+        ("lower-only file", "merged/lfile", libc::O_RDONLY),
+        (
+            "lower-only file nonblocking",
+            "merged/lfile",
+            libc::O_RDONLY | libc::O_NONBLOCK,
+        ),
+        (
+            "lower-only file noatime",
+            "merged/lfile",
+            libc::O_RDONLY | libc::O_NOATIME,
+        ),
+        ("lower-only file path", "merged/lfile", libc::O_PATH),
+        ("copied-up file write-only", "merged/wfile", libc::O_WRONLY),
+        (
+            "copied-up file write-only append",
+            "merged/wfile",
+            libc::O_WRONLY | libc::O_APPEND,
+        ),
+        ("upper file read-write", "merged/ufile", libc::O_RDWR),
+        (
+            "upper file read-write append",
+            "merged/ufile",
+            libc::O_RDWR | libc::O_APPEND,
+        ),
+        ("empty upper file", "merged/empty", libc::O_RDONLY),
+        (
+            "lower-only directory",
+            "merged/ldir",
+            libc::O_RDONLY | libc::O_DIRECTORY,
+        ),
+        (
+            "upper directory nonblocking",
+            "merged/udir",
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NONBLOCK,
+        ),
+    ];
+
+    /// Setup steps whose refusal means this host cannot mount overlayfs
+    /// rootlessly; any other failure is a test failure.
+    const OVERLAY_CAPABILITY_STEPS: [&str; 6] = [
+        "unshare(CLONE_NEWUSER | CLONE_NEWNS)",
+        "write /proc/self/setgroups",
+        "write /proc/self/uid_map",
+        "write /proc/self/gid_map",
+        "mount tmpfs",
+        "mount overlay",
+    ];
+    const OVERLAY_SETUP_STEPS: [&str; 4] = [
+        "mkdir layer",
+        "create layer file",
+        "open overlay file",
+        "sendmsg",
+    ];
+
+    struct OverlayFixture {
+        files: Vec<(&'static str, libc::c_int, std::fs::File)>,
+        /// O_PATH upper-layer directory, to observe copy-up.
+        upper: std::fs::File,
+        _mount_point: TestDir,
+    }
+
+    /// Opens OVERLAY_CASES in a forked child that has its own user and mount
+    /// namespaces, on overlayfs whose layers are a private tmpfs, and returns
+    /// them over SCM_RIGHTS. An open file keeps its detached mount alive after
+    /// the child exits. Err names the refused step when the host cannot mount
+    /// overlayfs without privilege.
+    fn overlay_fixture() -> Result<OverlayFixture, String> {
+        use std::ffi::CString;
+        use std::os::fd::OwnedFd;
+        use std::os::unix::ffi::OsStrExt;
+
+        let mount_point = TestDir::new();
+        let root = mount_point.0.as_os_str().as_bytes().to_vec();
+        let path = |suffix: &str| {
+            let mut bytes = root.clone();
+            bytes.push(b'/');
+            bytes.extend_from_slice(suffix.as_bytes());
+            CString::new(bytes).unwrap()
+        };
+        let root_path = CString::new(root.clone()).unwrap();
+        let directories = [
+            "lower",
+            "lower/ldir",
+            "upper",
+            "upper/udir",
+            "work",
+            "merged",
+        ]
+        .map(path);
+        let layer_files = [
+            ("lower/lfile", b"ABCDEFGH".as_slice()),
+            ("lower/wfile", b"ABCDEFGH".as_slice()),
+            ("upper/ufile", b"ABCDEFGH".as_slice()),
+            ("upper/empty", b"".as_slice()),
+        ]
+        .map(|(name, contents)| (path(name), contents));
+        let merged = path("merged");
+        let display = mount_point.0.display();
+        let options = CString::new(format!(
+            "lowerdir={display}/lower,upperdir={display}/upper,workdir={display}/work"
+        ))
+        .unwrap();
+        let opens: Vec<(CString, libc::c_int)> = OVERLAY_CASES
+            .iter()
+            .map(|(_, suffix, flags)| (path(suffix), *flags))
+            .chain(std::iter::once((
+                path("upper"),
+                libc::O_PATH | libc::O_DIRECTORY,
+            )))
+            .collect();
+        // SAFETY: geteuid and getegid have no preconditions.
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        let uid_map = format!("0 {uid} 1").into_bytes();
+        let gid_map = format!("0 {gid} 1").into_bytes();
+        let mut opened = vec![-1_i32; opens.len()];
+        let rights = std::mem::size_of_val(opened.as_slice()) as u32;
+        // SAFETY: CMSG_SPACE is a pure size computation.
+        let space = unsafe { libc::CMSG_SPACE(rights) } as usize;
+        let mut control = vec![0_u64; space.div_ceil(8)];
+        let mut sockets = [-1; 2];
+        // SAFETY: sockets has room for both new descriptors.
+        assert_eq!(
+            unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                    0,
+                    sockets.as_mut_ptr(),
+                )
+            },
+            0
+        );
+        // SAFETY: each new descriptor is owned exactly once.
+        let (parent_socket, child_socket) = unsafe {
+            (
+                OwnedFd::from_raw_fd(sockets[0]),
+                OwnedFd::from_raw_fd(sockets[1]),
+            )
+        };
+
+        // SAFETY: the child makes only system calls on buffers built above,
+        // then leaves through _exit; it never allocates, unwinds or returns.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork: {}", std::io::Error::last_os_error());
+        if child == 0 {
+            unsafe {
+                let socket = child_socket.as_raw_fd();
+                let send = |words: [i32; 2], fds: &[i32], control: &mut [u64]| {
+                    let mut iov = libc::iovec {
+                        iov_base: words.as_ptr() as *mut libc::c_void,
+                        iov_len: std::mem::size_of_val(&words),
+                    };
+                    let mut message: libc::msghdr = std::mem::zeroed();
+                    message.msg_iov = &mut iov;
+                    message.msg_iovlen = 1;
+                    if !fds.is_empty() {
+                        message.msg_control = control.as_mut_ptr().cast();
+                        message.msg_controllen = libc::CMSG_SPACE(rights) as usize;
+                        let header = libc::CMSG_FIRSTHDR(&message);
+                        (*header).cmsg_level = libc::SOL_SOCKET;
+                        (*header).cmsg_type = libc::SCM_RIGHTS;
+                        (*header).cmsg_len = libc::CMSG_LEN(rights) as usize;
+                        std::ptr::copy_nonoverlapping(
+                            fds.as_ptr(),
+                            libc::CMSG_DATA(header).cast::<i32>(),
+                            fds.len(),
+                        );
+                    }
+                    libc::sendmsg(socket, &message, 0) == std::mem::size_of_val(&words) as isize
+                };
+                let fail = |step: i32, control: &mut [u64]| -> ! {
+                    let errno = *libc::__errno_location();
+                    send([step + 1, errno], &[], control);
+                    libc::_exit(0)
+                };
+                let write_all = |name: &std::ffi::CStr, bytes: &[u8]| {
+                    let fd = libc::open(name.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+                    fd >= 0
+                        && libc::write(fd, bytes.as_ptr().cast(), bytes.len())
+                            == bytes.len() as isize
+                        && libc::close(fd) == 0
+                };
+                if libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) != 0 {
+                    fail(0, &mut control);
+                }
+                if !write_all(c"/proc/self/setgroups", b"deny") {
+                    fail(1, &mut control);
+                }
+                if !write_all(c"/proc/self/uid_map", &uid_map) {
+                    fail(2, &mut control);
+                }
+                if !write_all(c"/proc/self/gid_map", &gid_map) {
+                    fail(3, &mut control);
+                }
+                if libc::mount(
+                    c"tmpfs".as_ptr(),
+                    root_path.as_ptr(),
+                    c"tmpfs".as_ptr(),
+                    libc::MS_NOSUID | libc::MS_NODEV,
+                    c"size=1m".as_ptr().cast(),
+                ) != 0
+                {
+                    fail(4, &mut control);
+                }
+                for directory in &directories {
+                    if libc::mkdir(directory.as_ptr(), 0o755) != 0 {
+                        fail(6, &mut control);
+                    }
+                }
+                for (name, contents) in &layer_files {
+                    let fd = libc::open(
+                        name.as_ptr(),
+                        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
+                        0o644,
+                    );
+                    if fd < 0
+                        || libc::write(fd, contents.as_ptr().cast(), contents.len())
+                            != contents.len() as isize
+                        || libc::close(fd) != 0
+                    {
+                        fail(7, &mut control);
+                    }
+                }
+                if libc::mount(
+                    c"overlay".as_ptr(),
+                    merged.as_ptr(),
+                    c"overlay".as_ptr(),
+                    0,
+                    options.as_ptr().cast(),
+                ) != 0
+                {
+                    fail(5, &mut control);
+                }
+                for (slot, (name, flags)) in opened.iter_mut().zip(&opens) {
+                    *slot = libc::open(name.as_ptr(), *flags | libc::O_CLOEXEC);
+                    if *slot < 0 {
+                        fail(8, &mut control);
+                    }
+                }
+                if !send([0, 0], &opened, &mut control) {
+                    fail(9, &mut control);
+                }
+                libc::_exit(0);
+            }
+        }
+        drop(child_socket);
+        let mut words = [0_i32; 2];
+        let mut iov = libc::iovec {
+            iov_base: words.as_mut_ptr().cast(),
+            iov_len: std::mem::size_of_val(&words),
+        };
+        // SAFETY: zeroed is a valid empty msghdr; every pointer set below
+        // refers to a live local buffer of the stated length.
+        let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+        message.msg_iov = &mut iov;
+        message.msg_iovlen = 1;
+        message.msg_control = control.as_mut_ptr().cast();
+        message.msg_controllen = space;
+        // SAFETY: message describes writable local buffers.
+        let received = unsafe {
+            libc::recvmsg(
+                parent_socket.as_raw_fd(),
+                &mut message,
+                libc::MSG_CMSG_CLOEXEC,
+            )
+        };
+        let received_error = std::io::Error::last_os_error();
+        let mut status = 0;
+        // SAFETY: child is this test's own unreaped child.
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "overlay fixture child status {status:#x}"
+        );
+        assert_eq!(
+            received,
+            std::mem::size_of_val(&words) as isize,
+            "overlay fixture reply: {received_error}"
+        );
+        if words[0] != 0 {
+            let step = (words[0] - 1) as usize;
+            let error = std::io::Error::from_raw_os_error(words[1]);
+            if let Some(name) = OVERLAY_CAPABILITY_STEPS.get(step) {
+                return Err(format!("{name} failed: {error}"));
+            }
+            panic!(
+                "overlay fixture {} failed: {error}",
+                OVERLAY_SETUP_STEPS[step - OVERLAY_CAPABILITY_STEPS.len()]
+            );
+        }
+        assert_eq!(message.msg_flags & libc::MSG_CTRUNC, 0);
+        // SAFETY: recvmsg filled message's control buffer.
+        unsafe {
+            let header = libc::CMSG_FIRSTHDR(&message);
+            assert!(!header.is_null());
+            assert_eq!((*header).cmsg_level, libc::SOL_SOCKET);
+            assert_eq!((*header).cmsg_type, libc::SCM_RIGHTS);
+            assert_eq!((*header).cmsg_len, libc::CMSG_LEN(rights) as usize);
+            std::ptr::copy_nonoverlapping(
+                libc::CMSG_DATA(header).cast::<i32>(),
+                opened.as_mut_ptr(),
+                opened.len(),
+            );
+        }
+        // SAFETY: SCM_RIGHTS installed each descriptor anew in this process.
+        let mut files: Vec<std::fs::File> = opened
+            .iter()
+            .map(|&fd| unsafe { std::fs::File::from_raw_fd(fd) })
+            .collect();
+        let upper = files.pop().unwrap();
+        Ok(OverlayFixture {
+            files: OVERLAY_CASES
+                .iter()
+                .zip(files)
+                .map(|((name, _, flags), file)| (*name, *flags, file))
+                .collect(),
+            upper,
+            _mount_point: mount_point,
+        })
+    }
+
+    #[test]
+    fn read_zero_overlayfs_files_and_directories_are_admitted_with_native_results() {
+        // https://github.com/rrnewton/reverie/issues/1354: diffutils' cmp -n
+        // ends with read(fd, buf, 0) on a file that may live on overlayfs.
+        let fixture = match overlay_fixture() {
+            Ok(fixture) => fixture,
+            Err(reason) => {
+                println!(
+                    "SKIP read_zero_overlayfs: this host cannot mount overlayfs without privilege ({reason}); \
+                     read_zero_local_filesystem_set_admits_overlayfs_and_no_pseudo_filesystem still checks the admission"
+                );
+                return;
+            }
+        };
+        for (name, flags, file) in &fixture.files {
+            let raw = file.as_raw_fd();
+            let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+            // SAFETY: the fixture owns raw; statfs storage is writable.
+            assert_eq!(unsafe { libc::fstatfs(raw, filesystem.as_mut_ptr()) }, 0);
+            let filesystem = unsafe { filesystem.assume_init() };
+            assert_eq!(filesystem.f_type, libc::OVERLAYFS_SUPER_MAGIC, "{name}");
+            let path = flags & libc::O_PATH != 0;
+            let directory = flags & libc::O_DIRECTORY != 0;
+            let readable = !path && flags & libc::O_ACCMODE != libc::O_WRONLY;
+            let seekable = !path && !directory;
+            // A nonzero position must survive every zero-count read.
+            let position = if seekable {
+                // SAFETY: raw is a live descriptor owned by the fixture.
+                let end = unsafe { libc::lseek(raw, 0, libc::SEEK_END) };
+                assert!(end >= 0);
+                unsafe { libc::lseek(raw, end.min(3), libc::SEEK_SET) }
+            } else {
+                -1
+            };
+            for inherited in [false, true] {
+                for with_context in [false, true] {
+                    // A dup shares the open-file description and its position,
+                    // so the host takes the shared-position lock.
+                    let alias = file.try_clone().unwrap();
+                    let alias_raw = alias.as_raw_fd();
+                    let mut state = test_state(&std::env::current_dir().unwrap());
+                    let fd = if inherited {
+                        state.stdin = Some(alias);
+                        state.stdin_entry_id = Arc::new(());
+                        0
+                    } else {
+                        state.files.insert(3, alias);
+                        state
+                            .fd_entry_ids
+                            .insert(3, Arc::new(crate::elf::FdEntry::default()));
+                        3
+                    };
+                    let mut memory = read_zero_memory();
+                    let registry = Arc::new(crate::terminal_read::ReadRegistry::default());
+                    for high in [0, READ_ZERO_HIGH_FD] {
+                        for address in READ_ZERO_ADDRESSES {
+                            let expected = if !readable {
+                                negative_errno(libc::EBADF)
+                            } else if address >= 0x8000_0000_0000_0000 {
+                                negative_errno(libc::EFAULT)
+                            } else if directory {
+                                negative_errno(libc::EISDIR)
+                            } else {
+                                0
+                            };
+                            assert_eq!(
+                                native_read_zero(high | alias_raw as u64, address),
+                                expected,
+                                "native {name} address={address:#x}"
+                            );
+                            let request = SyscallRequest::new(
+                                libc::SYS_read as u64,
+                                [high | fd as u64, address, 0, 0, 0, 0],
+                            );
+                            let mut context = read_zero_terminal_context(&memory, registry.clone());
+                            let action = execute_basic_syscall_with_read_context(
+                                &mut memory,
+                                &mut state,
+                                &request,
+                                None,
+                                None,
+                                with_context.then_some((&mut context, read_zero_task())),
+                            );
+                            let label = format!(
+                                "{name}: inherited={inherited} context={with_context} fd={:#x} address={address:#x}",
+                                high | fd as u64
+                            );
+                            match action {
+                                SyscallAction::Continue {
+                                    result,
+                                    segment: None,
+                                } => assert_eq!(result, expected, "{label}"),
+                                SyscallAction::Continue { .. } => {
+                                    panic!("{label}: zero read changed segment")
+                                }
+                                SyscallAction::Exit(status) => {
+                                    panic!("{label}: zero read exited: {status:?}")
+                                }
+                                SyscallAction::Failure(error) => {
+                                    panic!("{label}: zero read failed: {error}")
+                                }
+                            }
+                            registry.teardown_result().unwrap();
+                            registry.rearm_after_exec();
+                            assert_read_zero_canaries(&memory);
+                            if seekable {
+                                // SAFETY: raw is a live descriptor owned by the fixture.
+                                assert_eq!(
+                                    unsafe { libc::lseek(raw, 0, libc::SEEK_CUR) },
+                                    position,
+                                    "{label}: position"
+                                );
+                            }
+                        }
+                    }
+                    let retained = if inherited {
+                        state.stdin.as_ref()
+                    } else {
+                        state.files.get(&3)
+                    };
+                    assert_eq!(retained.unwrap().as_raw_fd(), alias_raw, "{name}");
+                }
+            }
+        }
+        let in_upper = |entry: &std::ffi::CStr| {
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+            // SAFETY: upper is an O_PATH directory the fixture owns; entry is
+            // NUL-terminated and stat is writable.
+            unsafe {
+                libc::fstatat(
+                    fixture.upper.as_raw_fd(),
+                    entry.as_ptr(),
+                    stat.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                ) == 0
+            }
+        };
+        // ovl_read_iter returns before it opens the real file: nothing above
+        // copied the lower-only entries up. The write-only open did.
+        assert!(
+            !in_upper(c"lfile"),
+            "a zero-count read copied up a lower-only file"
+        );
+        assert!(
+            !in_upper(c"ldir"),
+            "a zero-count read copied up a lower-only directory"
+        );
+        assert!(in_upper(c"wfile"), "fixture: a write-only open copies up");
+    }
 }
