@@ -29,6 +29,32 @@ pub fn successor_init_packet<'a>(
     reverie_loader::init_packet::decode_successor(packet)
 }
 
+/// A source of exact mapped scalar inputs whose table 3 can be
+/// decoded for the successor entry. Implementors only identify
+/// those inputs; the shared default performs the decode. This
+/// is data only and selects no protocol by inspecting magic.
+pub trait SuccessorPacketSource<'a> {
+    /// Exact mapped scalar inputs retained by this source.
+    fn successor_inputs(&self) -> &ProductionMappedInputs<'a>;
+
+    /// Decode this source's exact table-3 bytes as HLISUC01 for
+    /// the successor route.
+    fn successor_init_packet(
+        &self,
+    ) -> Result<
+        reverie_loader::init_packet::SuccessorInitPacket<'a>,
+        reverie_loader::init_packet::SuccessorInitPacketError,
+    > {
+        successor_init_packet(self.successor_inputs())
+    }
+}
+
+impl<'a> SuccessorPacketSource<'a> for ProductionMappedInputs<'a> {
+    fn successor_inputs(&self) -> &ProductionMappedInputs<'a> {
+        self
+    }
+}
+
 /// Local bridge only: copy every exact original word into the consumer's native
 /// register value. Never reference the handoff as a `libc::user_regs_struct`.
 /// The host still owns original xstate and the actual stopped generation.
@@ -368,6 +394,32 @@ mod tests {
             )
         );
         assert_eq!(error.name(), "init_packet_format");
+    }
+
+    #[test]
+    fn scalar_successor_packet_source_delegate_reads_exact_table3() {
+        let packet = encoded_init_packet(
+            reverie_loader::init_packet::FLAG_STATE_EXPECTED,
+            [0x33; 32],
+            b"birth-nonce",
+        );
+        let (bytes, expected) = fixture_with_packet(&packet);
+        let input = ProductionMappedInputs::decode(&bytes, expected).unwrap();
+        let decoded = input.successor_init_packet().unwrap();
+        assert_eq!(decoded.expected_config_digest(), [0x11; 32]);
+        assert_eq!(decoded.expected_state_digest(), [0x33; 32]);
+        assert_eq!(decoded.redemption(), b"birth-nonce");
+        assert!(decoded.packet().state_expected());
+
+        let first_image = encoded_init_packet(0, [0; 32], b"nonce");
+        let (bytes, expected) = fixture_with_packet(&first_image);
+        let input = ProductionMappedInputs::decode(&bytes, expected).unwrap();
+        let error = input.successor_init_packet().unwrap_err();
+        assert_eq!(
+            error,
+            reverie_loader::init_packet::SuccessorInitPacketError::StateNotExpected
+        );
+        assert_eq!(error.name(), "init_packet_state_not_expected");
     }
 
     #[test]

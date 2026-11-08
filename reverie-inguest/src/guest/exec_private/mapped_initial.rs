@@ -828,20 +828,7 @@ impl MappedToolPrelude {
     pub fn packet(&self) -> &[u8] {
         self.input.packet
     }
-    /// Decode this route's exact table-3 bytes as the successor
-    /// entry's HLISUC01 packet. The distinct successor entry
-    /// selects this method by route; it never selects a protocol
-    /// by inspecting magic. The returned facts are data only:
-    /// this call performs no RPC admission exchange, control
-    /// publication, Tool installation, or Ready transition.
-    pub fn successor_init_packet(
-        &self,
-    ) -> Result<
-        reverie_loader::init_packet::SuccessorInitPacket<'static>,
-        reverie_loader::init_packet::SuccessorInitPacketError,
-    > {
-        mapped_scalar::successor_init_packet(&self.input.scalar)
-    }
+
     /// Real sole native leader, physically captured before libc startup.
     pub fn native_tid(&self) -> i32 {
         self.input.layout.owner_tid
@@ -904,5 +891,11 @@ impl MappedToolPrelude {
             .map_err(std::io::Error::from_raw_os_error)?;
         super::publish_control_slot(c)?;
         Ok(InitialImageControl::new(c as usize))
+    }
+}
+
+impl mapped_scalar::SuccessorPacketSource<'static> for MappedToolPrelude {
+    fn successor_inputs(&self) -> &ProductionMappedInputs<'static> {
+        &self.input.scalar
     }
 }
