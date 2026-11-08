@@ -458,8 +458,10 @@ pub struct ValidatedInitPacket {
 
 impl ValidatedInitPacket {
     /// Whether this birth is a successor expecting a predecessor
-    /// state deposit. Absence means an explicitly typed first
-    /// image, never an inference from a missing deposit later.
+    /// state deposit. A clear value only says no deposit is
+    /// expected; it does not by itself prove a first-image birth,
+    /// and a successor entry must refuse it rather than
+    /// reinterpret it as an ordinary birth.
     pub fn state_expected(&self) -> bool {
         self.state_expected
     }

@@ -6,14 +6,20 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! HLISUC01 successor-init packet for the exec-stop successor
-//! route. Placement in the HLSCAL01 handoff is pending in the
-//! joint E2-1/P1a record; table 3 currently carries the ordinary
-//! initialization packet (see [`crate::handoff`]).
+//! HLISUC01 successor-init packet. On the exec-stop successor
+//! route it occupies HLSCAL01 table 3; a first-image blob's
+//! table 3 carries the tool-defined ordinary initialization
+//! packet instead (see [`crate::handoff`]). Which protocol a
+//! blob's table 3 carries is fixed by the image entry that runs
+//! plus the host's birth record, never selected by inspecting
+//! magic. The ordinary entry reads table 3 only as the
+//! tool-defined ordinary packet and the successor entry only
+//! as HLISUC01; wrong-protocol bytes in either reader are a
+//! terminal named refusal with no fallback decode.
 //!
-//! This schema is distinct from the ordinary HLIINIT1 packet.
-//! The distinct magic prevents either codec from interpreting
-//! the other protocol's bytes.
+//! This schema is distinct from the tool-defined ordinary
+//! initialization packet. The distinct magic prevents either
+//! codec from interpreting the other protocol's bytes.
 //!
 //! The packet carries exactly the three launch-bound values the
 //! successor entry needs before InitialImage redemption: the
@@ -51,8 +57,9 @@ pub const VERSION: u16 = 1;
 /// Fixed header length before the redemption bytes.
 pub const HEADER_LEN: usize = 48;
 /// Flag bit: a predecessor state deposit is expected for this birth.
-/// Absence means a first-image birth, never an inference from a
-/// missing deposit at fetch time.
+/// A clear bit only says no deposit is expected; it does not by
+/// itself prove a first-image birth, and a successor entry must
+/// refuse it rather than reinterpret it as an ordinary birth.
 pub const FLAG_STATE_EXPECTED: u16 = 1 << 0;
 /// Every flag bit defined by this revision.
 const KNOWN_FLAGS: u16 = FLAG_STATE_EXPECTED;

@@ -1,4 +1,5 @@
-//! Scalar first-image input codec. Numeric validation is not physical authority.
+//! Scalar input codec for first-image and successor generations.
+//! Numeric validation is not physical authority.
 //! This module allocates nothing, dereferences no numeric address and invokes
 //! no syscall. All integers are x86-64 little-endian, including digest words.
 //! Views borrow retained bytes; no native struct or enum is cast from bytes.
@@ -8,7 +9,8 @@ use core::num::NonZeroUsize;
 // Fixed local record construction; const evaluation creates no runtime panic.
 const WORD_STRIDE: NonZeroUsize = NonZeroUsize::new(8).unwrap();
 
-/// Wire discriminator, distinct from the ordinary HLNI packet.
+/// Wire discriminator, distinct from the tool-defined ordinary
+/// initialization packet.
 pub const MAGIC: u64 = u64::from_le_bytes(*b"HLSCAL01");
 /// Only supported wire revision. This unpublished candidate replaces the earlier
 /// unpublished117-word candidate; no deployed wire compatibility is claimed.
@@ -35,7 +37,7 @@ pub struct Header {
     /// TID, control addr/size, relay addr/size, fd, PKRU, mask, TCB, handler,
     /// independent gate reference addr/size, GNU stack bytes, actual final-ELF dev-null address, two zero words.
     pub scalars: [u64; 16],
-    /// Maps, code, relay sites, HLNI packet, envp words, raw aux words,
+    /// Maps, code, relay sites, birth packet (route-selected), envp words, raw aux words,
     /// program-name bytes, dev-null bytes and exact ToolInit post-syscall PCs;
     /// offsets relative to blob start. Table8 contains sorted unique LEu64 PCs.
     pub tables: [Table; 9],
@@ -525,7 +527,7 @@ impl<'a> Bootstrap<'a> {
             operation,
         })
     }
-    /// Original packet bytes; neither HLIINIT1 admission nor ownership is proved.
+    /// Original birth-packet bytes for this route; neither admission nor ownership is proved.
     pub fn packet(self) -> Result<&'a [u8], Error> {
         self.table_bytes(3)
     }
@@ -897,7 +899,7 @@ pub struct TableData<'a> {
     pub code: &'a [Code],
     /// Numeric bootstrap syscall tuples, decoded lazily by `View::site`.
     pub sites: &'a [SiteRecord],
-    /// Exact ordinary initialization packet bytes, not an admission receipt.
+    /// Exact birth-packet bytes for this route, not an admission receipt.
     pub packet: &'a [u8],
     /// Already placed environment pointers followed by their terminating zero.
     pub env: &'a [u64],
