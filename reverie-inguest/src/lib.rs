@@ -59,6 +59,7 @@ compile_error!("reverie-inguest requires Linux x86-64 or aarch64");
 
 pub mod arch;
 pub mod bootstrap;
+pub mod bootstrap_recipe;
 pub mod dispatch;
 pub mod fmt;
 pub mod fork;

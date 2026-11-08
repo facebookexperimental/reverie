@@ -30,7 +30,12 @@
 //! `-fno-jump-tables` from https://github.com/rrnewton/hermit/pull/5293
 //! (landed as 38111a07), placed immediately after
 //! `-mcmodel=large` (minibeads dh-1fz4b); it removes the one
-//! compiler jump table in `make_private_stack.constprop.0`.
+//! compiler jump table in `make_private_stack.constprop.0`. The
+//! flag list itself is not duplicated here: the checker compiles
+//! with `reverie_inguest::bootstrap_recipe::BOOTSTRAP_RECIPE`,
+//! the single source of truth next to the sources. Hermit's
+//! producer still carries its own copy today; adopting the export
+//! there is a later Hermit pin-bump follow-up.
 //!
 //! Scope of this prototype, stated plainly:
 //!
@@ -63,7 +68,26 @@
 //!   instructions are an inventory, not a control-flow proof.
 //! * Callee-saved registers are trusted across direct calls under
 //!   the SysV ABI assumption for hand-written zone-B asm; that
-//!   preservation is not proven here.
+//!   preservation is not proven here. The same trust extends to
+//!   indirect calls to internal helpers whose write set this
+//!   checker computes only from the modelled successors (CG2).
+//! * Register rewrites performed by the kernel or a signal handler
+//!   are not modelled: an `int3` in a callee, or a handler that
+//!   resumes with altered registers, can change values this checker
+//!   treats as preserved.
+//! * An fs-prefixed `clzero` (and other instructions whose FS use
+//!   iced-x86 does not surface as a memory operand above) is not
+//!   refused by the FS-operand check.
+//! * Any unit can declare its own `.gate` section; the checker
+//!   trusts the section name for the direct-syscall inventory and
+//!   does not prove the bytes are the fixed gate.
+//! * In the current-exe (PIE test binary) unit, a numeric `movabs`
+//!   or absolute `lea` that lands inside the scanned section is
+//!   tracked as a section-qualified LocalAddress even though the
+//!   PIE load base makes the literal value differ at runtime.
+//! * The copies of the fs/kernel-state/maps code linked into the
+//!   excluded `private-runner.c` PIE are not scanned; only the
+//!   bootstrap-image units above are.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -444,6 +468,11 @@ fn native_gate_return_ok(
             section,
             address,
         }) => {
+            // The unit/section equality here is redundant with the exact
+            // (unit, section, address) instruction-starts lookup below:
+            // dropping it (mutant M5) can only remove a false refusal,
+            // never admit a new target, so M5 is equivalent and needs
+            // no killer case. It stays as a stated precondition.
             *unit == range.unit
                 && *section == range.section
                 && instruction_starts.contains(&(*unit, *section, *address))
@@ -826,6 +855,67 @@ fn is_inside_swap_symbol(
     })
 }
 
+/// Resolved [fixed_gate_template, fixed_gate_template_end) bounds for the
+/// unit that defines them (either spelling), if both symbols are defined
+/// in the same section.
+fn gate_template_bounds(
+    units: &[UnitSummary],
+    range: &ScanRange,
+) -> Option<(usize, usize, u64, u64)> {
+    for (start_name, end_name) in [
+        ("fixed_gate_template", "fixed_gate_template_end"),
+        (
+            "reverie_inguest_fixed_gate_template",
+            "reverie_inguest_fixed_gate_template_end",
+        ),
+    ] {
+        let Some((start_unit, start_symbol)) = find_defined_symbol(units, range.unit, start_name)
+        else {
+            continue;
+        };
+        let Some((end_unit, end_symbol)) = find_defined_symbol(units, range.unit, end_name) else {
+            continue;
+        };
+        let (Some(start_section), Some(end_section)) = (start_symbol.section, end_symbol.section)
+        else {
+            continue;
+        };
+        if start_unit == end_unit
+            && start_section == end_section
+            && start_symbol.address < end_symbol.address
+        {
+            return Some((
+                start_unit,
+                start_section,
+                start_symbol.address,
+                end_symbol.address,
+            ));
+        }
+    }
+    None
+}
+
+/// True when `location` lies inside the fixed gate template but is not a
+/// recognized gate start (the caller checks gate starts first). When the
+/// template bounds are absent, any target inside a `.gate` section counts:
+/// without bounds there is no sound way to admit an interior target.
+fn is_inside_gate_template(
+    units: &[UnitSummary],
+    range: &ScanRange,
+    location: (usize, usize, u64),
+) -> bool {
+    if let Some((unit, section, start, end)) = gate_template_bounds(units, range) {
+        return location.0 == unit
+            && location.1 == section
+            && start <= location.2
+            && location.2 < end;
+    }
+    units[location.0]
+        .sections
+        .iter()
+        .any(|section| section.index == location.1 && section.name == ".gate")
+}
+
 fn classify_direct_edge(
     units: &[UnitSummary],
     ranges: &[ScanRange],
@@ -836,6 +926,15 @@ fn classify_direct_edge(
     instruction_starts: &BTreeSet<(usize, usize, u64)>,
 ) -> DirectEdge {
     if let Some(relocation) = relocations.first() {
+        // Classify by resolved (unit, section, address) first: an alias of
+        // a gate start (template+0x7c, a same-address local label, a
+        // section+addend form) is the gate start, whatever symbol the
+        // relocation names.
+        if let Some(location) = relocation_target_location(units, range, relocation)
+            && gate_kind_for_location(units, range, location).is_some()
+        {
+            return DirectEdge::RecognizedSwap;
+        }
         if SWAP_SYMBOLS.contains(&relocation.target_name.as_str()) {
             let location = relocation_target_location(units, range, relocation);
             let symbol_start = relocation_symbol_start(units, range, relocation);
@@ -851,7 +950,14 @@ fn classify_direct_edge(
         if !instruction_starts.contains(&location) {
             return DirectEdge::UndecodedTarget;
         }
-        if is_inside_swap_symbol(units, range, location) {
+        // Transfers from outside the template into its interior refuse;
+        // the gate's own internal transfers (e.g. the guest entry's jump
+        // to its syscall leaf inside the template) stay internal.
+        let source = (range.unit, range.section, instruction.ip());
+        if (!is_inside_gate_template(units, range, source)
+            && is_inside_gate_template(units, range, location))
+            || is_inside_swap_symbol(units, range, location)
+        {
             return DirectEdge::Outgoing;
         }
         if relocation.target_defined || global_defined.contains(relocation.target_name.as_str()) {
@@ -864,7 +970,15 @@ fn classify_direct_edge(
     if target == FIXED_NATIVE_ENTRY || target == FIXED_GUEST_ENTRY {
         return DirectEdge::RecognizedSwap;
     }
-    if is_inside_swap_symbol(units, range, (range.unit, range.section, target)) {
+    let target_location = (range.unit, range.section, target);
+    if gate_kind_for_location(units, range, target_location).is_some() {
+        return DirectEdge::RecognizedSwap;
+    }
+    let source = (range.unit, range.section, instruction.ip());
+    if (!is_inside_gate_template(units, range, source)
+        && is_inside_gate_template(units, range, target_location))
+        || is_inside_swap_symbol(units, range, target_location)
+    {
         return DirectEdge::Outgoing;
     }
     if instruction_starts.contains(&(range.unit, range.section, target)) {
@@ -1053,24 +1167,29 @@ fn collect_branch_sources(
                         .insert(key, tracked.clone());
                 }
             }
-            let direct_gate = instruction.op_count() > 0
+            // The R12 continuation edge exists only for jmp-form Native
+            // gates. Call-form native gates are refused in scan_branch (a
+            // call pushes a return address the R12 continuation can ret
+            // through, which this model does not track), and OtherSwap
+            // gates return with `ret`, so an R12 edge for them is spurious
+            // and lets dead code verify (CG5).
+            let native_gate_jump = gate_jump
+                && tracked_gate_kind(
+                    units,
+                    range,
+                    tracked.get(&full_register(instruction.op_register(0))),
+                ) == Some(GateKind::Native);
+            let direct_native_gate = instruction.mnemonic() == Mnemonic::Jmp
+                && instruction.op_count() > 0
                 && matches!(
                     instruction.op_kind(0),
                     OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64
                 )
                 && resolved_branch_location(units, ranges, range, &instruction, &inside, &tracked)
                     .is_some_and(|location| {
-                        gate_kind_for_location(units, range, location).is_some()
+                        gate_kind_for_location(units, range, location) == Some(GateKind::Native)
                     });
-            let call_gate = instruction.mnemonic() == Mnemonic::Call
-                && instruction.op_count() > 0
-                && instruction.op_kind(0) == OpKind::Register
-                && tracked_gate(
-                    units,
-                    range,
-                    tracked.get(&full_register(instruction.op_register(0))),
-                );
-            if state_known && (gate_jump || direct_gate || call_gate) {
+            if state_known && (native_gate_jump || direct_native_gate) {
                 let return_key = match tracked.get(&Register::R12) {
                     Some(Tracked::LocalAddress {
                         unit,
@@ -1292,6 +1411,37 @@ fn compute_may_write(
             continue;
         };
         let relocations: Vec<&RelocInfo> = section.relocations.iter().collect();
+        // In-range direct branch targets are join points: the linear
+        // tracked state there is not the meet of the incoming states, so
+        // a value established on the fall-through path (including in dead
+        // code after an unconditional jump, N6a) must not resolve an
+        // indirect branch at or after the join. Clearing tracked state at
+        // join points is the conservative meet with the unknown incoming
+        // state; unresolved indirect branches then write every register
+        // through the existing unknown path.
+        let branch_targets: BTreeSet<u64> = {
+            let mut targets = BTreeSet::new();
+            let mut pre = Decoder::with_ip(64, bytes, range.start, DecoderOptions::NONE);
+            let mut pre_instruction = Instruction::default();
+            while pre.can_decode() {
+                pre.decode_out(&mut pre_instruction);
+                if pre_instruction.is_invalid() {
+                    break;
+                }
+                if pre_instruction.op_count() > 0
+                    && matches!(
+                        pre_instruction.op_kind(0),
+                        OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64
+                    )
+                {
+                    let target = pre_instruction.near_branch_target();
+                    if range.start <= target && target < range.end {
+                        targets.insert(target);
+                    }
+                }
+            }
+            targets
+        };
         let mut decoder = Decoder::with_ip(64, bytes, range.start, DecoderOptions::NONE);
         let mut instruction = Instruction::default();
         let mut tracked: BTreeMap<Register, Tracked> = BTreeMap::new();
@@ -1329,6 +1479,9 @@ fn compute_may_write(
                 local_writes.extend([Register::RAX, Register::RCX, Register::R11]);
             }
             let inside = relocation_inside(&relocations, &instruction, section.address);
+            if instruction.ip() != range.start && branch_targets.contains(&instruction.ip()) {
+                tracked.clear();
+            }
             let gate_jump = instruction.mnemonic() == Mnemonic::Jmp
                 && instruction.op_count() > 0
                 && instruction.op_kind(0) == OpKind::Register
@@ -1384,7 +1537,7 @@ fn compute_may_write(
                     None => {}
                 }
             }
-            if gate_kind.is_some() {
+            if gate_kind == Some(GateKind::Native) {
                 let return_location = match tracked.get(&Register::R12) {
                     Some(Tracked::LocalAddress {
                         unit,
@@ -1427,7 +1580,6 @@ fn compute_may_write(
             );
             falls_through =
                 after_instruction(&instruction, &mut tracked, gate_jump, falls_through, keep);
-            let _ = instruction_starts;
         }
         if falls_through
             && let Some(next) = ranges
@@ -1745,6 +1897,21 @@ fn scan_branch(
                     .is_some_and(|location| {
                         gate_kind_for_location(units, range, location) == Some(GateKind::Native)
                     }));
+            if native_direct && instruction.mnemonic() == Mnemonic::Call {
+                // A call pushes the post-call address; a `ret` in the R12
+                // continuation would land there with the continuation's
+                // registers, which the post-call state does not model.
+                // Production has no call-form native gate, so refuse the
+                // form outright (CG1 family).
+                report.refuse(
+                    &unit.label,
+                    &range.symbol,
+                    offset,
+                    "indirect-branch",
+                    "call-form native-entry gate transfer is refused (unmodelled return path)",
+                );
+                return;
+            }
             if native_direct && !native_gate_return_ok(range, tracked, instruction_starts) {
                 report.refuse(
                     &unit.label,
@@ -1806,6 +1973,18 @@ fn scan_branch(
                 })
                 .flatten();
             let gate_kind = tracked_gate_kind(units, range, register_target.flatten());
+            if instruction.mnemonic() == Mnemonic::Call && gate_kind == Some(GateKind::Native) {
+                // Call-form native gate: refused outright, see the direct
+                // form above (CG1 family).
+                report.refuse(
+                    &unit.label,
+                    &range.symbol,
+                    offset,
+                    "indirect-branch",
+                    "call-form native-entry gate transfer is refused (unmodelled return path)",
+                );
+                return;
+            }
             let native_gate_return_ok = gate_kind == Some(GateKind::Native)
                 && native_gate_return_ok(range, tracked, instruction_starts);
             if (gate_kind == Some(GateKind::Native) && native_gate_return_ok)
@@ -1880,28 +2059,18 @@ fn compile_object_with_delta(
         .filter(|compiler| !compiler.is_empty())
         .unwrap_or_else(|| "cc".into());
     let mut command = Command::new(compiler);
-    // Hermit liteinst-runtime-build/artifact.rs production recipe,
-    // in its order, including -fno-jump-tables from
-    // https://github.com/rrnewton/hermit/pull/5293 (landed as
-    // 38111a07). The without-flag form exists only to pin the
-    // jump-table violation that dh-1fz4b removes.
-    command.args([
-        "-O2",
-        "-g",
-        "-Wall",
-        "-Wextra",
-        "-Werror",
-        "-fno-stack-protector",
-        "-fno-builtin",
-        "-ffreestanding",
-        "-fno-asynchronous-unwind-tables",
-        "-fcf-protection=branch",
-        "-mcmodel=large",
-    ]);
-    if jump_tables_delta {
-        command.arg("-fno-jump-tables");
+    // The production recipe is reverie-inguest's own exported
+    // BOOTSTRAP_RECIPE (single source of truth; Hermit's
+    // liteinst-runtime-build/artifact.rs adopts it in a later pin
+    // bump). The without-flag form exists only to pin the
+    // jump-table violation that dh-1fz4b removes: it is the recipe
+    // minus its one -fno-jump-tables flag, in the same order.
+    for flag in reverie_inguest::bootstrap_recipe::BOOTSTRAP_RECIPE {
+        if !jump_tables_delta && *flag == "-fno-jump-tables" {
+            continue;
+        }
+        command.arg(flag);
     }
-    command.args(["-fno-pic", "-fno-pie", "-DEXEC_PRIVATE_BOOTSTRAP_IMAGE"]);
     command.arg("-c");
     command.args(extra);
     command.arg(source).arg("-o").arg(&output_path);
@@ -2104,7 +2273,13 @@ fn update_tracked(
                     }
                 }
             }
-            Mnemonic::Lea if instruction.op_count() > 1 => {
+            Mnemonic::Lea
+                if instruction.op_count() > 1 && is_64bit_gpr(instruction.op_register(0)) =>
+            {
+                // Only a 64-bit destination establishes the tracked
+                // address: a 16/32-bit lea truncates (or zero-extends a
+                // truncated) value, so the full register does not hold
+                // the computed address at an arbitrary load base.
                 let base = instruction.memory_base();
                 let index = instruction.memory_index();
                 let address_forming =
@@ -2946,6 +3121,272 @@ fn checker_refuses_each_injected_tls_and_control_violation() {
             Vec::new(),
             "indirect-branch",
         ),
+        (
+            "n9a-direct-gate-template-jmp",
+            "zone_b_n9a.S",
+            ".section .gate,\"ax\",@progbits\n.globl fixed_gate_template\nfixed_gate_template:\n .fill 0x7c,1,0x90\n.globl fixed_native_entry\nfixed_native_entry:\n syscall\n .fill 4,1,0x90\n jmp *%r12\n .fill 16,1,0x90\n.globl fixed_gate_template_end\nfixed_gate_template_end:\n.text\n.globl zone_b_mutant\nzone_b_mutant:\n mov %rdi,%r12\n jmp fixed_gate_template+0x7c\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "n9b-direct-gate-template-call",
+            "zone_b_n9b.S",
+            ".section .gate,\"ax\",@progbits\n.globl fixed_gate_template\nfixed_gate_template:\n .fill 0x7c,1,0x90\n.globl fixed_native_entry\nfixed_native_entry:\n syscall\n .fill 4,1,0x90\n jmp *%r12\n .fill 16,1,0x90\n.globl fixed_gate_template_end\nfixed_gate_template_end:\n.text\n.globl zone_b_mutant\nzone_b_mutant:\n mov %rdi,%r12\n call fixed_gate_template+0x7c\n ret\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "n9c-direct-gate-leaf-jmp",
+            "zone_b_n9c.S",
+            ".section .gate,\"ax\",@progbits\n.globl fixed_gate_template\nfixed_gate_template:\n .fill 0x7c,1,0x90\n.globl fixed_native_entry\nfixed_native_entry:\n syscall\n .fill 4,1,0x90\n jmp *%r12\n .fill 16,1,0x90\n.globl fixed_gate_template_end\nfixed_gate_template_end:\n.text\n.globl zone_b_mutant\nzone_b_mutant:\n mov %rdi,%r12\n jmp fixed_gate_template+0x82\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "unrecognized-outgoing-edge",
+        ),
+        (
+            "n3c-gate-mid-jmp",
+            "zone_b_n3c.S",
+            ".section .gate,\"ax\",@progbits\n.globl fixed_gate_template\nfixed_gate_template:\n .fill 0x7c,1,0x90\n.globl fixed_native_entry\nfixed_native_entry:\n syscall\n .fill 4,1,0x90\n jmp *%r12\n .fill 16,1,0x90\n.globl fixed_gate_template_end\nfixed_gate_template_end:\n.text\n.globl zone_b_mutant\nzone_b_mutant:\n mov %rdi,%r12\n jmp fixed_gate_template+0x80\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "unrecognized-outgoing-edge",
+        ),
+        (
+            "n9e-same-section-gate-jmp",
+            "zone_b_n9e.S",
+            ".section .gate,\"ax\",@progbits\n.globl fixed_gate_template\nfixed_gate_template:\n .fill 0x7c,1,0x90\n.globl fixed_native_entry\nfixed_native_entry:\n syscall\n .fill 4,1,0x90\n jmp *%r12\n .fill 16,1,0x90\n.globl fixed_gate_template_end\nfixed_gate_template_end:\n.globl zone_b_mutant\nzone_b_mutant:\n mov %rdi,%r12\n jmp fixed_native_entry\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "n9f-local-alias-gate-jmp",
+            "zone_b_n9f.S",
+            ".section .gate,\"ax\",@progbits\n.globl fixed_gate_template\nfixed_gate_template:\n .fill 0x7c,1,0x90\n.Lzb_gate_alias:\n.globl fixed_native_entry\nfixed_native_entry:\n syscall\n .fill 4,1,0x90\n jmp *%r12\n .fill 16,1,0x90\n.globl fixed_gate_template_end\nfixed_gate_template_end:\n.section .text.other,\"ax\",@progbits\n.globl zone_b_mutant\nzone_b_mutant:\n mov %rdi,%r12\n jmp .Lzb_gate_alias\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "cg1-call-gate-numeric",
+            "zone_b_cg1.S",
+            ".text\n.globl zone_b_mutant\nzone_b_mutant:\n movabs $zone_b_target,%rbx\n lea .Lzb_cont(%rip),%r12\n movabs $0x50000000007c,%rcx\n call *%rcx\n jmp *%rbx\n.Lzb_cont:\n mov %rdi,%rbx\n ret\n.globl zone_b_target\nzone_b_target:\n ret\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "cg1c-call-gate-relocated",
+            "zone_b_cg1c.S",
+            ".section .gate,\"ax\",@progbits\n.globl fixed_gate_template\nfixed_gate_template:\n .fill 0x7c,1,0x90\n.globl fixed_native_entry\nfixed_native_entry:\n syscall\n .fill 4,1,0x90\n jmp *%r12\n .fill 16,1,0x90\n.globl fixed_gate_template_end\nfixed_gate_template_end:\n.text\n.globl zone_b_mutant\nzone_b_mutant:\n movabs $zone_b_target,%rbx\n lea .Lzb_cont(%rip),%r12\n movabs $fixed_native_entry,%rcx\n call *%rcx\n jmp *%rbx\n.Lzb_cont:\n mov %rdi,%rbx\n ret\n.globl zone_b_target\nzone_b_target:\n ret\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "cg1e-call-gate-direct",
+            "zone_b_cg1e.S",
+            ".section .gate,\"ax\",@progbits\n.globl fixed_gate_template\nfixed_gate_template:\n .fill 0x7c,1,0x90\n.globl fixed_native_entry\nfixed_native_entry:\n syscall\n .fill 4,1,0x90\n jmp *%r12\n .fill 16,1,0x90\n.globl fixed_gate_template_end\nfixed_gate_template_end:\n.text\n.globl zone_b_mutant\nzone_b_mutant:\n movabs $zone_b_target,%rbx\n lea .Lzb_cont(%rip),%r12\n call fixed_native_entry\n jmp *%rbx\n.Lzb_cont:\n mov %rdi,%rbx\n ret\n.globl zone_b_target\nzone_b_target:\n ret\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "dr1-call-gate-double-return",
+            "zone_b_dr1.S",
+            ".text\n.globl zone_b_mutant\nzone_b_mutant:\n movabs $zone_b_target,%rax\n lea .Lzb_ret(%rip),%r12\n movabs $0x50000000007c,%rcx\n call *%rcx\n jmp *%rax\n.Lzb_ret:\n ret\n.globl zone_b_target\nzone_b_target:\n ret\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "n2-call-gate-continuation",
+            "zone_b_n2.S",
+            ".text\n.globl zone_b_mutant\nzone_b_mutant:\n mov %rsi,%r10\n lea .Lzb_x(%rip),%r12\n movabs $0x50000000007c,%rcx\n call *%rcx\n ret\n.Lzb_x:\n jmp *%r10\n.globl zone_b_other\nzone_b_other:\n movabs $zone_b_target,%r10\n jmp .Lzb_x\n.globl zone_b_target\nzone_b_target:\n ret\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "n2b-call-gate-relocated-continuation",
+            "zone_b_n2b.S",
+            ".section .gate,\"ax\",@progbits\n.globl fixed_gate_template\nfixed_gate_template:\n .fill 0x7c,1,0x90\n.globl fixed_native_entry\nfixed_native_entry:\n syscall\n .fill 4,1,0x90\n jmp *%r12\n .fill 16,1,0x90\n.globl fixed_gate_template_end\nfixed_gate_template_end:\n.text\n.globl zone_b_mutant\nzone_b_mutant:\n mov %rsi,%r10\n lea .Lzb_x(%rip),%r12\n movabs $fixed_native_entry,%rcx\n call *%rcx\n ret\n.Lzb_x:\n jmp *%r10\n.globl zone_b_other\nzone_b_other:\n movabs $zone_b_target,%r10\n jmp .Lzb_x\n.globl zone_b_target\nzone_b_target:\n ret\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "n2-jmp-gate-continuation",
+            "zone_b_n2jmp.S",
+            ".text\n.globl zone_b_mutant\nzone_b_mutant:\n mov %rsi,%r10\n lea .Lzb_x(%rip),%r12\n movabs $0x50000000007c,%rcx\n jmp *%rcx\n ret\n.Lzb_x:\n jmp *%r10\n.globl zone_b_other\nzone_b_other:\n movabs $zone_b_target,%r10\n jmp .Lzb_x\n.globl zone_b_target\nzone_b_target:\n ret\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "cg5-otherswap-call-spurious-edge",
+            "zone_b_cg5.S",
+            ".text\n.globl zone_b_mutant\nzone_b_mutant:\n movabs $zone_b_target,%r10\n lea .Lzb_x(%rip),%r12\n movabs $0x500000000100,%rcx\n call *%rcx\n ret\n mov %rdi,%r10\n.Lzb_x:\n jmp *%r10\n.globl zone_b_target\nzone_b_target:\n ret\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "n6a-maywrite-deadcode-resolve",
+            "zone_b_n6a.S",
+            ".text\n.globl zone_b_mutant\nzone_b_mutant:\n movabs $zone_b_helper,%r10\n call *%r10\n jmp *%r10\n.size zone_b_mutant,.-zone_b_mutant\n.globl zone_b_helper\nzone_b_helper:\n movabs $zone_b_writer,%rax\n jmp 1f\n movabs $zone_b_other,%rax\n1: jmp *%rax\n.size zone_b_helper,.-zone_b_helper\n.globl zone_b_writer\nzone_b_writer:\n xor %r10d,%r10d\n ret\n.size zone_b_writer,.-zone_b_writer\n.globl zone_b_other\nzone_b_other:\n ret\n.size zone_b_other,.-zone_b_other\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "n6b-maywrite-join-ret",
+            "zone_b_n6b.S",
+            ".text\n.globl zone_b_mutant\nzone_b_mutant:\n movabs $zone_b_helper,%r10\n call *%r10\n jmp *%r10\n.size zone_b_mutant,.-zone_b_mutant\n.globl zone_b_helper\nzone_b_helper:\n movabs $zone_b_writer,%rax\n jmp 1f\n ret\n1: jmp *%rax\n.size zone_b_helper,.-zone_b_helper\n.globl zone_b_writer\nzone_b_writer:\n xor %r10d,%r10d\n ret\n.size zone_b_writer,.-zone_b_writer\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "n6c-maywrite-gate-after-jmp",
+            "zone_b_n6c.S",
+            ".text\n.globl zone_b_mutant\nzone_b_mutant:\n movabs $zone_b_helper,%rax\n call *%rax\n jmp *%rax\n.size zone_b_mutant,.-zone_b_mutant\n.globl zone_b_helper\nzone_b_helper:\n jmp 1f\n1: lea 2f(%rip),%r12\n movabs $0x50000000007c,%r11\n jmp *%r11\n2: ret\n.size zone_b_helper,.-zone_b_helper\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "n6d-maywrite-join-two-values",
+            "zone_b_n6d.S",
+            ".text\n.globl zone_b_mutant\nzone_b_mutant:\n movabs $zone_b_helper,%r10\n call *%r10\n jmp *%r10\n.size zone_b_mutant,.-zone_b_mutant\n.globl zone_b_helper\nzone_b_helper:\n movabs $zone_b_writer,%rax\n test %edi,%edi\n je 1f\n movabs $zone_b_other,%rax\n1: jmp *%rax\n.size zone_b_helper,.-zone_b_helper\n.globl zone_b_writer\nzone_b_writer:\n xor %r10d,%r10d\n ret\n.size zone_b_writer,.-zone_b_writer\n.globl zone_b_other\nzone_b_other:\n ret\n.size zone_b_other,.-zone_b_other\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "n1b-maywrite-gate-next-split",
+            "zone_b_n1b.S",
+            ".text\n.globl zone_b_mutant\nzone_b_mutant:\n movabs $zone_b_helper,%r10\n call *%r10\n jmp *%r10\n.size zone_b_mutant,.-zone_b_mutant\n.globl zone_b_helper\nzone_b_helper:\n lea 1f(%rip),%r12\n movabs $0x50000000007c,%rcx\n jmp *%rcx\n1: xor %r10d,%r10d\nzb_helper_mid:\n ret\n.size zone_b_helper,.-zone_b_helper\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "n1c-maywrite-gate-earlier-range",
+            "zone_b_n1c.S",
+            ".text\n.globl zone_b_writer\nzone_b_writer:\n xor %r10d,%r10d\n ret\n.size zone_b_writer,.-zone_b_writer\n.globl zone_b_helper\nzone_b_helper:\n lea zone_b_writer(%rip),%r12\n movabs $0x50000000007c,%rcx\n jmp *%rcx\n.size zone_b_helper,.-zone_b_helper\n.globl zone_b_mutant\nzone_b_mutant:\n movabs $zone_b_helper,%r10\n call *%r10\n jmp *%r10\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "n8a-maywrite-gate-following-symbol",
+            "zone_b_n8a.S",
+            ".text\n.globl zone_b_mutant\nzone_b_mutant:\n movabs $zone_b_helper,%r10\n call *%r10\n jmp *%r10\n.size zone_b_mutant,.-zone_b_mutant\n.globl zone_b_helper\nzone_b_helper:\n lea zb_after(%rip),%r12\n movabs $0x50000000007c,%rcx\n jmp *%rcx\n.size zone_b_helper,.-zone_b_helper\n.globl zb_after\nzb_after:\n xor %r10d,%r10d\n ret\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "n8b-maywrite-gate-other-function-label",
+            "zone_b_n8b.S",
+            ".text\n.globl zone_b_mutant\nzone_b_mutant:\n movabs $zone_b_helper,%r10\n call *%r10\n jmp *%r10\n.size zone_b_mutant,.-zone_b_mutant\n.globl zone_b_helper\nzone_b_helper:\n lea zb_writer_mid(%rip),%r12\n movabs $0x50000000007c,%rcx\n jmp *%rcx\n.size zone_b_helper,.-zone_b_helper\n.globl zone_b_other\nzone_b_other:\n ret\nzb_writer_mid:\n xor %r10d,%r10d\n ret\n.size zone_b_other,.-zone_b_other\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "n8c-maywrite-gate-other-section",
+            "zone_b_n8c.S",
+            ".text\n.globl zone_b_mutant\nzone_b_mutant:\n movabs $zone_b_helper,%r10\n call *%r10\n jmp *%r10\n.size zone_b_mutant,.-zone_b_mutant\n.globl zone_b_helper\nzone_b_helper:\n lea zone_b_writer(%rip),%r12\n movabs $0x50000000007c,%rcx\n jmp *%rcx\n.size zone_b_helper,.-zone_b_helper\n.section .text.other,\"ax\",@progbits\n.globl zone_b_writer\nzone_b_writer:\n xor %r10d,%r10d\n ret\n.size zone_b_writer,.-zone_b_writer\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "n4-maywrite-guest-entry-numeric",
+            "zone_b_n4.S",
+            ".text\n.globl zone_b_mutant\nzone_b_mutant:\n movabs $zone_b_helper,%r10\n call *%r10\n jmp *%r10\n.size zone_b_mutant,.-zone_b_mutant\n.globl zone_b_helper\nzone_b_helper:\n movabs $0x500000000100,%rcx\n jmp *%rcx\n.size zone_b_helper,.-zone_b_helper\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "n10a-maywrite-guest-entry-relocated",
+            "zone_b_n10a.S",
+            ".text\n.globl zone_b_mutant\nzone_b_mutant:\n movabs $zone_b_helper,%r10\n call *%r10\n jmp *%r10\n.size zone_b_mutant,.-zone_b_mutant\n.globl zone_b_helper\nzone_b_helper:\n movabs $reverie_inguest_trusted_syscall,%rcx\n jmp *%rcx\n.size zone_b_helper,.-zone_b_helper\n.globl reverie_inguest_trusted_syscall\nreverie_inguest_trusted_syscall:\n .fill 16,1,0x90\n ret\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "mw-n1c-join-tail-jmp",
+            "zone_b_mwn1c.S",
+            ".text\n.globl zone_b_mutant\nzone_b_mutant:\n movabs $zone_b_helper,%r10\n call *%r10\n jmp *%r10\n.size zone_b_mutant,.-zone_b_mutant\n.globl zone_b_helper\nzone_b_helper:\n movabs $zone_b_writer,%rax\n test %edi,%edi\n jne 1f\n ret\n1: jmp *%rax\n.size zone_b_helper,.-zone_b_helper\n.globl zone_b_writer\nzone_b_writer:\n xor %r10d,%r10d\n ret\n.size zone_b_writer,.-zone_b_writer\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "mw-n1d-dead-tail-jmp",
+            "zone_b_mwn1d.S",
+            ".text\n.globl zone_b_mutant\nzone_b_mutant:\n movabs $zone_b_helper,%r10\n call *%r10\n jmp *%r10\n.size zone_b_mutant,.-zone_b_mutant\n.globl zone_b_helper\nzone_b_helper:\n movabs $zone_b_writer,%rax\n jmp 1f\n1: jmp *%rax\n.size zone_b_helper,.-zone_b_helper\n.globl zone_b_writer\nzone_b_writer:\n xor %r10d,%r10d\n ret\n.size zone_b_writer,.-zone_b_writer\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "mw-n1e-handler-tail-jmp",
+            "zone_b_mwn1e.S",
+            ".text\n.globl zone_b_mutant\nzone_b_mutant:\n movabs $zone_b_helper,%r10\n call *%r10\n jmp *%r10\n.size zone_b_mutant,.-zone_b_mutant\n.globl zone_b_helper\nzone_b_helper:\n lea zb_sigsys_handler(%rip),%rax\n jmp *%rax\n.size zone_b_helper,.-zone_b_helper\n.globl zb_sigsys_handler\nzb_sigsys_handler:\n xor %r10d,%r10d\n ret\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "l1-lea-r12w",
+            "zone_b_l1.S",
+            ".text\n.globl zone_b_mutant\nzone_b_mutant:\n mov %rdi,%r12\n lea .Lzb_next(%rip),%r12w\n movabs $0x50000000007c,%rcx\n jmp *%rcx\n.Lzb_next:\n ret\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "l2-lea-r12d",
+            "zone_b_l2.S",
+            ".text\n.globl zone_b_mutant\nzone_b_mutant:\n mov %rdi,%r12\n lea .Lzb_next(%rip),%r12d\n movabs $0x50000000007c,%rcx\n jmp *%rcx\n.Lzb_next:\n ret\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "l3-lea-eax",
+            "zone_b_l3.S",
+            ".text\n.globl zone_b_mutant\nzone_b_mutant:\n lea zone_b_target(%rip),%eax\n jmp *%rax\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n.text\n.globl zone_b_target\nzone_b_target:\n ret\n.size zone_b_target,.-zone_b_target\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "l4-lea-ax",
+            "zone_b_l4.S",
+            ".text\n.globl zone_b_mutant\nzone_b_mutant:\n mov %rdi,%rax\n lea zone_b_target(%rip),%ax\n jmp *%rax\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n.text\n.globl zone_b_target\nzone_b_target:\n ret\n.size zone_b_target,.-zone_b_target\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "l5-lea-ecx",
+            "zone_b_l5.S",
+            ".text\n.globl zone_b_mutant\nzone_b_mutant:\n mov %rdi,%rcx\n lea zone_b_target(%rip),%ecx\n jmp *%rcx\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n.text\n.globl zone_b_target\nzone_b_target:\n ret\n.size zone_b_target,.-zone_b_target\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "b2-lea-absolute-r12",
+            "zone_b_b2.S",
+            ".text\n.globl zone_b_mutant\nzone_b_mutant:\n lea 0x14,%r12\n movabs $0x50000000007c,%rcx\n jmp *%rcx\n ret\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "k8-lea-size32-reloc",
+            "zone_b_k8.S",
+            ".text\n.globl zone_b_mutant\nzone_b_mutant:\n lea 0(%rip),%rax\n .reloc .-4, R_X86_64_SIZE32, zone_b_target\n jmp *%rax\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n.text\n.globl zone_b_target\nzone_b_target:\n ret\n.size zone_b_target,.-zone_b_target\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "k8b-lea-pc32-nobase",
+            "zone_b_k8b.S",
+            ".text\n.globl zone_b_mutant\nzone_b_mutant:\n lea 0,%rax\n .reloc .-4, R_X86_64_PC32, zone_b_target-4\n jmp *%rax\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n.text\n.globl zone_b_target\nzone_b_target:\n ret\n.size zone_b_target,.-zone_b_target\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "k8c-lea-gotpcrel",
+            "zone_b_k8c.S",
+            ".text\n.globl zone_b_mutant\nzone_b_mutant:\n lea zone_b_target@GOTPCREL(%rip),%rax\n jmp *%rax\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n.text\n.globl zone_b_target\nzone_b_target:\n ret\n.size zone_b_target,.-zone_b_target\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "k12-r12-mid-instruction",
+            "zone_b_k12.S",
+            ".text\n.globl zone_b_mutant\nzone_b_mutant:\n lea zone_b_target+1(%rip),%r12\n movabs $0x50000000007c,%rcx\n jmp *%rcx\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n.text\n.globl zone_b_target\nzone_b_target:\n mov $0x12345678,%eax\n ret\n.size zone_b_target,.-zone_b_target\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
     ];
     let mut missing = Vec::new();
     for (label, filename, contents, extra, expected) in cases {
@@ -2971,6 +3412,90 @@ fn checker_refuses_each_injected_tls_and_control_violation() {
     assert!(
         missing.is_empty(),
         "missing refusals:\n{}",
+        missing.join("\n")
+    );
+}
+
+#[test]
+fn production_set_refuses_gate_alias_call_and_deadcode_probes() {
+    std::hint::black_box(reverie_inguest::guest::exec_private::physical_syscall as *const ());
+    let scratch = Scratch::new("production-set-probes");
+    let probes: Vec<(&str, &str, &str, &str)> = vec![
+        (
+            "ps-n9a-template-jmp",
+            "zone_b_ps_n9a.S",
+            ".text\n.globl zone_b_mutant\nzone_b_mutant:\n mov %rdi,%r12\n jmp fixed_gate_template+0x7c\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
+            "indirect-branch",
+        ),
+        (
+            "ps-n9c-template-leaf-jmp",
+            "zone_b_ps_n9c.S",
+            ".text\n.globl zone_b_mutant\nzone_b_mutant:\n mov %rdi,%r12\n jmp fixed_gate_template+0x82\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
+            "unrecognized-outgoing-edge",
+        ),
+        (
+            "ps-cg1c-call-gate-relocated",
+            "zone_b_ps_cg1c.S",
+            ".text\n.globl zone_b_mutant\nzone_b_mutant:\n movabs $zone_b_target,%rbx\n lea .Lzb_cont(%rip),%r12\n movabs $fixed_native_entry,%rcx\n call *%rcx\n jmp *%rbx\n.Lzb_cont:\n mov %rdi,%rbx\n ret\n.globl zone_b_target\nzone_b_target:\n ret\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
+            "indirect-branch",
+        ),
+        (
+            "ps-n6a-deadcode-resolve",
+            "zone_b_ps_n6a.S",
+            ".text\n.globl zone_b_mutant\nzone_b_mutant:\n movabs $zone_b_helper,%r10\n call *%r10\n jmp *%r10\n.size zone_b_mutant,.-zone_b_mutant\n.globl zone_b_helper\nzone_b_helper:\n movabs $zone_b_writer,%rax\n jmp 1f\n movabs $zone_b_other,%rax\n1: jmp *%rax\n.size zone_b_helper,.-zone_b_helper\n.globl zone_b_writer\nzone_b_writer:\n xor %r10d,%r10d\n ret\n.size zone_b_writer,.-zone_b_writer\n.globl zone_b_other\nzone_b_other:\n ret\n.size zone_b_other,.-zone_b_other\n.section .note.GNU-stack,\"\",@progbits\n",
+            "indirect-branch",
+        ),
+        (
+            "ps-l1-lea-r12w",
+            "zone_b_ps_l1.S",
+            ".text\n.globl zone_b_mutant\nzone_b_mutant:\n mov %rdi,%r12\n lea .Lzb_next(%rip),%r12w\n movabs $0x50000000007c,%rcx\n jmp *%rcx\n.Lzb_next:\n ret\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
+            "indirect-branch",
+        ),
+    ];
+    let mut missing = Vec::new();
+    for (label, filename, contents, expected) in probes {
+        let mut units = clean_native_units_with(&scratch.0, true);
+        let probe_bytes = compile_source(&scratch.0, label, filename, contents, &[]);
+        units.push(summarize(label, &probe_bytes).expect("parse production-set probe"));
+        let exe_bytes =
+            fs::read(std::env::current_exe().unwrap()).expect("read current test binary");
+        let exe = summarize("current-exe:exec_private_asm", &exe_bytes)
+            .expect("parse current test binary");
+        let exe_index = units.len();
+        let exe_range = current_exe_asm_range(exe_index, &exe)
+            .expect("required exec_private asm symbols must be present in the test binary");
+        units.push(exe);
+        let mut ranges = Vec::new();
+        for (index, unit) in units.iter().enumerate().take(exe_index) {
+            ranges.extend(function_ranges(index, unit));
+        }
+        ranges.push(exe_range);
+        let report = check_units(&units, &ranges);
+        let kinds: BTreeSet<&str> = report
+            .violations
+            .iter()
+            .filter(|violation| violation.unit == label)
+            .map(|violation| violation.kind)
+            .collect();
+        println!(
+            "ZONE-B EXPECTED-FAIL {label} (production set): {} kinds={kinds:?}",
+            report.summary()
+        );
+        if !kinds.contains(expected) {
+            missing.push(format!(
+                "production-set probe {label} must refuse with {expected}, got {kinds:?}: {:?}",
+                report.violations
+            ));
+        }
+        assert_eq!(
+            report.gate_leaf_uses.get("fixed_native_entry"),
+            Some(&1),
+            "{label}: production gate leaf must still be counted exactly once"
+        );
+    }
+    assert!(
+        missing.is_empty(),
+        "missing production-set refusals:\n{}",
         missing.join("\n")
     );
 }
