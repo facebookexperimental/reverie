@@ -18,12 +18,19 @@
 //! This implements the recommended own-object design from
 //! `2026-11-07-tls-cell-accessor-census-e-vs-c.md` section
 //! "Proposed zone-B check": compile the zone-B translation units
-//! into their own relocatable objects with the stack protector and
-//! jump tables disabled, then refuse the object set if it contains
-//! a TLS relocation, TLS symbol/section, FS-relative memory
-//! operand (including the `%fs:0x28` canary), an unresolved
-//! outgoing edge other than a recognized swap/gate entry, or an
-//! unrecognized indirect branch.
+//! into their own relocatable objects with the production recipe
+//! from Hermit `liteinst-runtime-build/artifact.rs`, then refuse
+//! the object set if it contains a TLS relocation, TLS
+//! symbol/section, FS-relative memory operand (including the
+//! `%fs:0x28` canary), an unresolved outgoing edge other than a
+//! recognized swap/gate entry, or an unrecognized indirect
+//! branch.
+//!
+//! The compile recipe below is the production recipe plus one
+//! named proposed delta, `-fno-jump-tables`, which removes the
+//! one compiler jump table in `make_private_stack.constprop.0`.
+//! That flag is not yet in the Hermit producer; adding it there is
+//! tracked in minibeads as dh-1fz4b and is not claimed here.
 //!
 //! Scope of this prototype, stated plainly:
 //!
@@ -42,7 +49,18 @@
 //! * Reading the FS segment register itself with `mov` (no
 //!   memory operand) is a selector snapshot and does not touch
 //!   TLS memory. FS-relative memory operands, FS segment writes
-//!   and FS-base instructions refuse everywhere.
+//!   and FS-base instructions refuse everywhere outside the fixed
+//!   gate entries inventoried below.
+//! * FS can still move through the gate: an `arch_prctl` syscall
+//!   made through the fixed native gate can set FS, and a gate
+//!   `ARCH_GET_FS` result can be dereferenced afterward. This
+//!   checker does not inventory those sites; allowed FS-moving
+//!   sites need a separate named inventory.
+//! * GS-relative operands and GS-base instructions are not
+//!   checked. `push; ret` and `lret`/`iretq` transfer shapes are
+//!   not modeled as indirect branches.
+//! * Tracked fixed-gate transfers and the three exact gate-leaf
+//!   instructions are an inventory, not a control-flow proof.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -85,16 +103,7 @@ const SWAP_SYMBOLS: &[&str] = &[
     "reverie_inguest_fixed_trusted_syscall",
 ];
 
-/// Assembly leaves whose indirect transfer is the recognized
-/// gate or terminal handoff itself, inventoried by exact symbol.
-const INDIRECT_GATE_EXCEPTIONS: &[&str] = &[
-    "fixed_gate_template",
-    "fixed_native_entry",
-    "private_native_syscall",
-    "private_native_terminal",
-    "private_enter_tool_loader",
-    "private_runner_resume",
-];
+const DIRECT_KERNEL_ENTRY_EXEMPTIONS: &[&str] = &["fixed_native_entry", "fixed_signal_restorer"];
 
 const TLS_RELOCATIONS: &[object::elf::RelocationType] = &[
     object::elf::R_X86_64_DTPMOD64,
@@ -140,6 +149,7 @@ struct Report {
     violations: Vec<Violation>,
     instructions: usize,
     recognized_indirect: usize,
+    internal_movabs_indirect: usize,
     internal_edges: usize,
     units: Vec<String>,
     skipped_musl_only: Vec<&'static str>,
@@ -165,11 +175,12 @@ impl Report {
 
     fn summary(&self) -> String {
         format!(
-            "units={} instructions={} internal_edges={} recognized_indirect={} \
-             violations={} skipped_musl_only={:?}",
+            "units={} instructions={} internal_edges={} internal_movabs_indirect={} \
+             recognized_indirect={} violations={} skipped_musl_only={:?}",
             self.units.len(),
             self.instructions,
             self.internal_edges,
+            self.internal_movabs_indirect,
             self.recognized_indirect,
             self.violations.len(),
             self.skipped_musl_only,
@@ -194,8 +205,10 @@ struct RelocInfo {
     r_type: object::elf::RelocationType,
     target_name: String,
     target_section: Option<usize>,
+    target_address: u64,
     target_kind: Option<SymbolKind>,
     target_defined: bool,
+    addend: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -255,34 +268,45 @@ fn summarize(label: &str, bytes: &[u8]) -> Result<UnitSummary, String> {
                 RelocationFlags::Elf { r_type } => r_type,
                 _ => object::elf::RelocationType(0),
             };
-            let (target_name, target_section, target_kind, target_defined) =
+            let (target_name, target_section, target_address, target_kind, target_defined) =
                 match relocation.target() {
                     RelocationTarget::Symbol(index) => match file.symbol_by_index(index) {
                         Ok(symbol) => (
                             symbol.name().unwrap_or_default().to_owned(),
                             symbol.section_index().map(|index| index.0),
+                            symbol.address(),
                             Some(symbol.kind()),
                             !symbol.is_undefined(),
                         ),
-                        Err(_) => (String::new(), None, None, false),
+                        Err(_) => (String::new(), None, 0, None, false),
                     },
                     RelocationTarget::Section(index) => {
-                        let name = file
-                            .section_by_index(index)
-                            .and_then(|section| section.name().map(str::to_owned))
-                            .unwrap_or_default();
-                        (name, Some(index.0), Some(SymbolKind::Section), true)
+                        let section = file.section_by_index(index).ok();
+                        let name = section
+                            .as_ref()
+                            .and_then(|section| section.name().ok())
+                            .unwrap_or_default()
+                            .to_owned();
+                        (
+                            name,
+                            Some(index.0),
+                            section.map_or(0, |section| section.address()),
+                            Some(SymbolKind::Section),
+                            true,
+                        )
                     }
-                    RelocationTarget::Absolute => (String::new(), None, None, false),
-                    _ => (String::new(), None, None, false),
+                    RelocationTarget::Absolute => (String::new(), None, 0, None, false),
+                    _ => (String::new(), None, 0, None, false),
                 };
             relocations.push(RelocInfo {
                 offset,
                 r_type,
                 target_name,
                 target_section,
+                target_address,
                 target_kind,
                 target_defined,
+                addend: relocation.addend(),
             });
         }
         sections.push(SectionInfo {
@@ -303,10 +327,33 @@ fn summarize(label: &str, bytes: &[u8]) -> Result<UnitSummary, String> {
     })
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Tracked {
     Address(u64),
-    Symbol(String),
+    Relocated { name: String, defined: bool },
+    Handler,
+}
+
+fn full_register(register: Register) -> Register {
+    match register {
+        Register::AL | Register::AH | Register::AX | Register::EAX => Register::RAX,
+        Register::CL | Register::CH | Register::CX | Register::ECX => Register::RCX,
+        Register::DL | Register::DH | Register::DX | Register::EDX => Register::RDX,
+        Register::BL | Register::BH | Register::BX | Register::EBX => Register::RBX,
+        Register::SPL | Register::SP | Register::ESP => Register::RSP,
+        Register::BPL | Register::BP | Register::EBP => Register::RBP,
+        Register::SIL | Register::SI | Register::ESI => Register::RSI,
+        Register::DIL | Register::DI | Register::EDI => Register::RDI,
+        Register::R8L | Register::R8W | Register::R8D => Register::R8,
+        Register::R9L | Register::R9W | Register::R9D => Register::R9,
+        Register::R10L | Register::R10W | Register::R10D => Register::R10,
+        Register::R11L | Register::R11W | Register::R11D => Register::R11,
+        Register::R12L | Register::R12W | Register::R12D => Register::R12,
+        Register::R13L | Register::R13W | Register::R13D => Register::R13,
+        Register::R14L | Register::R14W | Register::R14D => Register::R14,
+        Register::R15L | Register::R15W | Register::R15D => Register::R15,
+        other => other,
+    }
 }
 
 fn tracked_gate(target: Option<&Tracked>) -> bool {
@@ -314,21 +361,67 @@ fn tracked_gate(target: Option<&Tracked>) -> bool {
         Some(Tracked::Address(address)) => {
             *address == FIXED_NATIVE_ENTRY || *address == FIXED_GUEST_ENTRY
         }
-        Some(Tracked::Symbol(name)) => SWAP_SYMBOLS.contains(&name.as_str()),
-        None => false,
+        Some(Tracked::Relocated { name, .. }) => SWAP_SYMBOLS.contains(&name.as_str()),
+        Some(Tracked::Handler) | None => false,
     }
 }
 
-fn symbol_at(units: &[UnitSummary], address: u64) -> Option<&str> {
-    units
+fn tracked_internal_movabs(target: Option<&Tracked>, global_defined: &BTreeSet<&str>) -> bool {
+    match target {
+        Some(Tracked::Relocated { name, defined }) => {
+            *defined || global_defined.contains(name.as_str())
+        }
+        _ => false,
+    }
+}
+
+fn meet_states(states: Vec<BTreeMap<Register, Tracked>>) -> BTreeMap<Register, Tracked> {
+    let mut iter = states.into_iter();
+    let Some(mut meet) = iter.next() else {
+        return BTreeMap::new();
+    };
+    for state in iter {
+        meet.retain(|register, value| state.get(register) == Some(value));
+    }
+    meet
+}
+
+fn symbol_at_unit(unit: &UnitSummary, address: u64) -> Option<&str> {
+    unit.symbols
         .iter()
-        .flat_map(|unit| unit.symbols.iter())
         .find(|symbol| {
             !symbol.undefined
                 && symbol.address == address
-                && matches!(symbol.kind, SymbolKind::Text | SymbolKind::Label)
+                && matches!(
+                    symbol.kind,
+                    SymbolKind::Text | SymbolKind::Label | SymbolKind::Unknown
+                )
         })
         .map(|symbol| symbol.name.as_str())
+}
+
+fn find_defined_symbol<'a>(
+    units: &'a [UnitSummary],
+    current_unit: usize,
+    name: &str,
+) -> Option<(usize, &'a SymbolInfo)> {
+    if let Some(symbol) = units[current_unit]
+        .symbols
+        .iter()
+        .find(|symbol| !symbol.undefined && symbol.name == name)
+    {
+        return Some((current_unit, symbol));
+    }
+    units
+        .iter()
+        .enumerate()
+        .filter(|(_, unit)| unit.relocatable)
+        .find_map(|(index, unit)| {
+            unit.symbols
+                .iter()
+                .find(|symbol| symbol.global && !symbol.undefined && symbol.name == name)
+                .map(|symbol| (index, symbol))
+        })
 }
 
 fn check_units(units: &[UnitSummary], ranges: &[ScanRange]) -> Report {
@@ -336,8 +429,12 @@ fn check_units(units: &[UnitSummary], ranges: &[ScanRange]) -> Report {
         units: units.iter().map(|unit| unit.label.clone()).collect(),
         ..Report::default()
     };
+    // Cross-unit resolution is only for the relocatable zone-B
+    // object set; symbols that happen to exist in the linked test
+    // binary never make a zone-B edge internal.
     let global_defined: BTreeSet<&str> = units
         .iter()
+        .filter(|unit| unit.relocatable)
         .flat_map(|unit| unit.symbols.iter())
         .filter(|symbol| symbol.global && !symbol.undefined)
         .map(|symbol| symbol.name.as_str())
@@ -423,8 +520,9 @@ fn check_units(units: &[UnitSummary], ranges: &[ScanRange]) -> Report {
         }
     }
 
+    let starts = instruction_starts(units, ranges);
     for range in ranges {
-        scan_range(units, ranges, range, &global_defined, &mut report);
+        scan_range(units, ranges, range, &global_defined, &starts, &mut report);
     }
     report
 }
@@ -459,18 +557,48 @@ fn function_ranges(unit_index: usize, unit: &UnitSummary) -> Vec<ScanRange> {
             });
             continue;
         }
-        for (position, symbol) in starts.iter().enumerate() {
-            let end = if symbol.size > 0 {
-                symbol.address + symbol.size
-            } else if let Some(next) = starts
-                .iter()
-                .skip(position + 1)
-                .find(|next| next.address > symbol.address)
+        // Partition the whole section at symbol starts. A range
+        // deliberately extends to the next symbol (or section end)
+        // instead of stopping at st_size, so bytes after `.size`
+        // are decoded rather than silently skipped.
+        let mut unique_starts: Vec<&SymbolInfo> = Vec::new();
+        for symbol in starts {
+            if symbol.address < section.address
+                || symbol.address >= section.address + section.data.len() as u64
             {
-                next.address
-            } else {
-                section.address + section.data.len() as u64
-            };
+                continue;
+            }
+            match unique_starts
+                .last_mut()
+                .filter(|current| current.address == symbol.address)
+            {
+                Some(current)
+                    if matches!(current.kind, SymbolKind::Unknown)
+                        && !matches!(symbol.kind, SymbolKind::Unknown) =>
+                {
+                    *current = symbol;
+                }
+                Some(_) => {}
+                None => unique_starts.push(symbol),
+            }
+        }
+        if let Some(first) = unique_starts.first()
+            && first.address > section.address
+        {
+            ranges.push(ScanRange {
+                unit: unit_index,
+                section: section.index,
+                start: section.address,
+                end: first.address,
+                symbol: section.name.clone(),
+            });
+        }
+        for (position, symbol) in unique_starts.iter().enumerate() {
+            let end = unique_starts
+                .get(position + 1)
+                .map_or(section.address + section.data.len() as u64, |next| {
+                    next.address
+                });
             if end > symbol.address {
                 ranges.push(ScanRange {
                     unit: unit_index,
@@ -490,6 +618,38 @@ enum DirectEdge {
     Internal,
     RecognizedSwap,
     Outgoing,
+    UndecodedTarget,
+}
+
+fn relocation_target_location(
+    units: &[UnitSummary],
+    range: &ScanRange,
+    relocation: &RelocInfo,
+) -> Option<(usize, usize, u64)> {
+    let adjustment = if matches!(
+        relocation.r_type,
+        object::elf::R_X86_64_PC32 | object::elf::R_X86_64_PLT32
+    ) {
+        4_i64
+    } else {
+        0
+    };
+    let displacement = relocation.addend.wrapping_add(adjustment);
+    if relocation.target_defined {
+        let section = relocation.target_section?;
+        return Some((
+            range.unit,
+            section,
+            relocation.target_address.wrapping_add(displacement as u64),
+        ));
+    }
+    let (unit, symbol) = find_defined_symbol(units, range.unit, &relocation.target_name)?;
+    let section = symbol.section?;
+    Some((
+        unit,
+        section,
+        symbol.address.wrapping_add(displacement as u64),
+    ))
 }
 
 fn classify_direct_edge(
@@ -499,28 +659,20 @@ fn classify_direct_edge(
     instruction: &Instruction,
     relocations: &[&RelocInfo],
     global_defined: &BTreeSet<&str>,
+    instruction_starts: &BTreeSet<(usize, usize, u64)>,
 ) -> DirectEdge {
     if let Some(relocation) = relocations.first() {
         if SWAP_SYMBOLS.contains(&relocation.target_name.as_str()) {
             return DirectEdge::RecognizedSwap;
         }
-        if global_defined.contains(relocation.target_name.as_str()) {
-            return DirectEdge::Internal;
+        let Some(location) = relocation_target_location(units, range, relocation) else {
+            return DirectEdge::Outgoing;
+        };
+        if !instruction_starts.contains(&location) {
+            return DirectEdge::UndecodedTarget;
         }
-        if relocation.target_defined {
-            if let Some(section) = relocation.target_section
-                && units[range.unit]
-                    .sections
-                    .iter()
-                    .any(|candidate| candidate.index == section)
-            {
-                return DirectEdge::Internal;
-            }
-            if relocation.target_kind == Some(SymbolKind::Text)
-                || relocation.target_kind == Some(SymbolKind::Label)
-            {
-                return DirectEdge::Internal;
-            }
+        if relocation.target_defined || global_defined.contains(relocation.target_name.as_str()) {
+            return DirectEdge::Internal;
         }
         return DirectEdge::Outgoing;
     }
@@ -529,22 +681,53 @@ fn classify_direct_edge(
     if target == FIXED_NATIVE_ENTRY || target == FIXED_GUEST_ENTRY {
         return DirectEdge::RecognizedSwap;
     }
+    if instruction_starts.contains(&(range.unit, range.section, target)) {
+        return DirectEdge::Internal;
+    }
     if ranges
         .iter()
         .filter(|candidate| !units[range.unit].relocatable || candidate.unit == range.unit)
         .any(|candidate| candidate.start <= target && target < candidate.end)
     {
-        return DirectEdge::Internal;
+        return DirectEdge::UndecodedTarget;
     }
-    if let Some(name) = symbol_at(units, target) {
-        if SWAP_SYMBOLS.contains(&name) {
-            return DirectEdge::RecognizedSwap;
-        }
-        if global_defined.contains(name) {
-            return DirectEdge::Internal;
-        }
+    if let Some(name) = symbol_at_unit(&units[range.unit], target)
+        && SWAP_SYMBOLS.contains(&name)
+    {
+        return DirectEdge::RecognizedSwap;
     }
     DirectEdge::Outgoing
+}
+
+fn instruction_starts(
+    units: &[UnitSummary],
+    ranges: &[ScanRange],
+) -> BTreeSet<(usize, usize, u64)> {
+    let mut starts = BTreeSet::new();
+    for range in ranges {
+        let Some(section) = units[range.unit]
+            .sections
+            .iter()
+            .find(|section| section.index == range.section)
+        else {
+            continue;
+        };
+        let start = range.start.saturating_sub(section.address) as usize;
+        let end = range.end.saturating_sub(section.address) as usize;
+        let Some(bytes) = section.data.get(start..end.min(section.data.len())) else {
+            continue;
+        };
+        let mut decoder = Decoder::with_ip(64, bytes, range.start, DecoderOptions::NONE);
+        let mut instruction = Instruction::default();
+        while decoder.can_decode() {
+            decoder.decode_out(&mut instruction);
+            if instruction.is_invalid() {
+                break;
+            }
+            starts.insert((range.unit, range.section, instruction.ip()));
+        }
+    }
+    starts
 }
 
 fn relocation_inside<'a>(
@@ -566,6 +749,7 @@ fn scan_range(
     ranges: &[ScanRange],
     range: &ScanRange,
     global_defined: &BTreeSet<&str>,
+    instruction_starts: &BTreeSet<(usize, usize, u64)>,
     report: &mut Report,
 ) {
     let unit = &units[range.unit];
@@ -596,9 +780,40 @@ fn scan_range(
         return;
     };
     let relocations: Vec<&RelocInfo> = section.relocations.iter().collect();
+    // Preliminary source snapshots for direct targets in this
+    // range. The main pass meets these with the fallthrough
+    // state, so a movabs on only one incoming path cannot lend
+    // its tracked value to the target.
+    let mut branch_sources: BTreeMap<u64, BTreeMap<u64, BTreeMap<Register, Tracked>>> =
+        BTreeMap::new();
+    {
+        let mut pre_decoder = Decoder::with_ip(64, bytes, range.start, DecoderOptions::NONE);
+        let mut pre_instruction = Instruction::default();
+        let mut pre_tracked: BTreeMap<Register, Tracked> = BTreeMap::new();
+        while pre_decoder.can_decode() {
+            pre_decoder.decode_out(&mut pre_instruction);
+            if pre_instruction.is_invalid() {
+                break;
+            }
+            let pre_inside = relocation_inside(&relocations, &pre_instruction, section.address);
+            if pre_instruction.op_count() > 0
+                && matches!(
+                    pre_instruction.op_kind(0),
+                    OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64
+                )
+            {
+                branch_sources
+                    .entry(pre_instruction.near_branch_target())
+                    .or_default()
+                    .insert(pre_instruction.ip(), pre_tracked.clone());
+            }
+            update_tracked(unit, &pre_instruction, &pre_inside, &mut pre_tracked);
+        }
+    }
     let mut decoder = Decoder::with_ip(64, bytes, range.start, DecoderOptions::NONE);
     let mut instruction = Instruction::default();
     let mut tracked: BTreeMap<Register, Tracked> = BTreeMap::new();
+    let mut previous_falls_through = true;
     while decoder.can_decode() {
         decoder.decode_out(&mut instruction);
         report.instructions += 1;
@@ -613,6 +828,16 @@ fn scan_range(
             );
             break;
         }
+        if let Some(sources) = branch_sources.get(&instruction.ip()) {
+            let mut candidates: Vec<_> = sources.values().cloned().collect();
+            if instruction.ip() == range.start {
+                candidates.push(BTreeMap::new());
+            } else if previous_falls_through {
+                candidates.push(tracked.clone());
+            }
+            tracked = meet_states(candidates);
+            previous_falls_through = true;
+        }
         let inside = relocation_inside(&relocations, &instruction, section.address);
         let has_memory = (0..instruction.op_count()).any(|index| {
             matches!(
@@ -621,6 +846,9 @@ fn scan_range(
                     | OpKind::MemorySegSI
                     | OpKind::MemorySegESI
                     | OpKind::MemorySegRSI
+                    | OpKind::MemorySegDI
+                    | OpKind::MemorySegEDI
+                    | OpKind::MemorySegRDI
                     | OpKind::MemoryESDI
                     | OpKind::MemoryESEDI
                     | OpKind::MemoryESRDI
@@ -664,6 +892,15 @@ fn scan_range(
                 "FS segment register operand outside the named selector snapshot",
             );
         }
+        if instruction.mnemonic() == Mnemonic::Lfs {
+            report.refuse(
+                &unit.label,
+                &range.symbol,
+                offset,
+                "fs-segment-write",
+                "lfs implicitly writes the FS segment selector/base",
+            );
+        }
         if matches!(
             instruction.mnemonic(),
             Mnemonic::Wrfsbase | Mnemonic::Rdfsbase
@@ -690,7 +927,7 @@ fn scan_range(
         };
         if let Some(entry) = direct_kernel_entry
             && section.name != ".gate"
-            && !range.symbol.starts_with("fixed_")
+            && !DIRECT_KERNEL_ENTRY_EXEMPTIONS.contains(&range.symbol.as_str())
         {
             report.refuse(
                 &unit.label,
@@ -700,6 +937,10 @@ fn scan_range(
                 format!("{entry} instruction outside the fixed gate"),
             );
         }
+        let gate_jump = instruction.mnemonic() == Mnemonic::Jmp
+            && instruction.op_count() > 0
+            && instruction.op_kind(0) == OpKind::Register
+            && tracked_gate(tracked.get(&full_register(instruction.op_register(0))));
         scan_branch(
             units,
             ranges,
@@ -708,10 +949,47 @@ fn scan_range(
             &instruction,
             &inside,
             global_defined,
+            instruction_starts,
             &tracked,
             report,
         );
-        update_tracked(&instruction, &inside, &mut tracked);
+        if instruction.op_count() > 0
+            && matches!(
+                instruction.op_kind(0),
+                OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64
+            )
+        {
+            branch_sources
+                .entry(instruction.near_branch_target())
+                .or_default()
+                .insert(instruction.ip(), tracked.clone());
+        }
+        update_tracked(unit, &instruction, &inside, &mut tracked);
+        previous_falls_through = match instruction.mnemonic() {
+            Mnemonic::Ret => {
+                tracked.clear();
+                false
+            }
+            Mnemonic::Jmp if gate_jump => {
+                tracked.retain(|register, _| {
+                    matches!(
+                        full_register(*register),
+                        Register::RBX
+                            | Register::RBP
+                            | Register::R12
+                            | Register::R13
+                            | Register::R14
+                            | Register::R15
+                    )
+                });
+                true
+            }
+            Mnemonic::Jmp => {
+                tracked.clear();
+                false
+            }
+            _ => previous_falls_through,
+        };
     }
 }
 
@@ -724,6 +1002,7 @@ fn scan_branch(
     instruction: &Instruction,
     relocations: &[&RelocInfo],
     global_defined: &BTreeSet<&str>,
+    instruction_starts: &BTreeSet<(usize, usize, u64)>,
     tracked: &BTreeMap<Register, Tracked>,
     report: &mut Report,
 ) {
@@ -739,10 +1018,28 @@ fn scan_branch(
     }
     match instruction.op_kind(0) {
         OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64 => {
-            match classify_direct_edge(units, ranges, range, instruction, relocations, global_defined) {
+            match classify_direct_edge(
+                units,
+                ranges,
+                range,
+                instruction,
+                relocations,
+                global_defined,
+                instruction_starts,
+            ) {
                 DirectEdge::Internal | DirectEdge::RecognizedSwap => {
                     report.internal_edges += 1;
                 }
+                DirectEdge::UndecodedTarget => report.refuse(
+                    &unit.label,
+                    &range.symbol,
+                    offset,
+                    "direct-target-not-instruction-start",
+                    format!(
+                        "direct control transfer to {:#x} does not land on a decoded instruction start",
+                        instruction.near_branch_target()
+                    ),
+                ),
                 DirectEdge::Outgoing => report.refuse(
                     &unit.label,
                     &range.symbol,
@@ -757,26 +1054,36 @@ fn scan_branch(
         }
         OpKind::Register | OpKind::Memory => {
             let register_target = (instruction.op_kind(0) == OpKind::Register)
-                .then(|| tracked.get(&instruction.op_register(0)));
-            let handler_call = matches!(register_target, Some(Some(Tracked::Address(address)))
-                if symbol_at(units, *address).is_some_and(|name| name.contains("handler")));
-            let gate_leaf = INDIRECT_GATE_EXCEPTIONS.contains(&range.symbol.as_str());
-            let post_swap_handler_call = instruction.mnemonic() == Mnemonic::Call
-                && (range.symbol == "exec_private_asm_block"
-                    || range.symbol.contains("private_lifecycle_call"));
-            if tracked_gate(register_target.flatten())
-                || handler_call
-                || gate_leaf
-                || post_swap_handler_call
-            {
+                .then(|| tracked.get(&full_register(instruction.op_register(0))));
+            let handler_call = matches!(
+                register_target,
+                Some(Some(Tracked::Handler))
+            ) || matches!(register_target, Some(Some(Tracked::Address(address)))
+                if symbol_at_unit(unit, *address)
+                    .is_some_and(|name| {
+                        name.contains("sigsys_handler")
+                            || name.contains("instruction_sigsegv_handler")
+                    }));
+            let exact_gate_leaf = instruction.mnemonic() == Mnemonic::Jmp
+                && instruction.op_kind(0) == OpKind::Register
+                && matches!(
+                    (range.symbol.as_str(), instruction.op_register(0)),
+                    ("fixed_native_entry", Register::R12)
+                        | ("private_enter_tool_loader", Register::RAX)
+                        | ("private_runner_resume", Register::R13)
+                );
+            if tracked_gate(register_target.flatten()) || handler_call || exact_gate_leaf {
                 report.recognized_indirect += 1;
+            } else if tracked_internal_movabs(register_target.flatten(), global_defined) {
+                report.internal_movabs_indirect += 1;
+                report.internal_edges += 1;
             } else {
                 report.refuse(
                     &unit.label,
                     &range.symbol,
                     offset,
                     "indirect-branch",
-                    "indirect branch is not a tracked fixed-gate transfer or named gate leaf",
+                    "indirect branch is not a tracked fixed-gate/internal transfer or exact gate-leaf instruction",
                 );
             }
         }
@@ -807,26 +1114,28 @@ impl Drop for Scratch {
 
 fn compile_object(directory: &Path, label: &str, source: &Path, extra: &[&str]) -> Vec<u8> {
     let output_path = directory.join(format!("{label}.o"));
-    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut command = Command::new("cc");
+    // Hermit liteinst-runtime-build/artifact.rs production recipe,
+    // in its order, plus the one named proposed delta at the end.
     command.args([
-        "-std=gnu11",
         "-O2",
+        "-g",
         "-Wall",
         "-Wextra",
         "-Werror",
         "-fno-stack-protector",
-        "-fno-jump-tables",
         "-fno-builtin",
-        "-fno-pie",
-        "-fno-pic",
+        "-ffreestanding",
         "-fno-asynchronous-unwind-tables",
-        "-ffunction-sections",
-        "-fdata-sections",
-        "-nostdlib",
+        "-fcf-protection=branch",
+        "-mcmodel=large",
+        "-fno-pic",
+        "-fno-pie",
+        "-DEXEC_PRIVATE_BOOTSTRAP_IMAGE",
+        // Proposed producer delta; tracked in minibeads.
+        "-fno-jump-tables",
         "-c",
     ]);
-    command.arg("-I").arg(manifest.join("native_exec"));
     command.args(extra);
     command.arg(source).arg("-o").arg(&output_path);
     let output = command.output().expect("run zone-B object compiler");
@@ -855,9 +1164,15 @@ fn clean_native_units(directory: &Path) -> Vec<UnitSummary> {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let native = manifest.join("native_exec");
     let specs: Vec<(&str, PathBuf, Vec<&str>)> = vec![
+        ("private-entry", native.join("private-entry.S"), Vec::new()),
         (
             "private-bootstrap",
             native.join("private-bootstrap.c"),
+            Vec::new(),
+        ),
+        (
+            "private-fs-bootstrap",
+            native.join("private-fs.S"),
             Vec::new(),
         ),
         (
@@ -866,12 +1181,6 @@ fn clean_native_units(directory: &Path) -> Vec<UnitSummary> {
             Vec::new(),
         ),
         ("private-maps", native.join("private-maps.c"), Vec::new()),
-        ("private-entry", native.join("private-entry.S"), Vec::new()),
-        (
-            "private-fs-bootstrap",
-            native.join("private-fs.S"),
-            vec!["-DEXEC_PRIVATE_BOOTSTRAP_IMAGE"],
-        ),
     ];
     specs
         .iter()
@@ -936,18 +1245,48 @@ fn current_exe_asm_range(unit_index: usize, unit: &UnitSummary) -> Option<ScanRa
     })
 }
 
+fn clear_tracked(tracked: &mut BTreeMap<Register, Tracked>, registers: &[Register]) {
+    for register in registers {
+        tracked.remove(&full_register(*register));
+    }
+}
+
 fn update_tracked(
+    unit: &UnitSummary,
     instruction: &Instruction,
     relocations: &[&RelocInfo],
     tracked: &mut BTreeMap<Register, Tracked>,
 ) {
+    match instruction.mnemonic() {
+        Mnemonic::Cpuid => clear_tracked(
+            tracked,
+            &[Register::RAX, Register::RBX, Register::RCX, Register::RDX],
+        ),
+        Mnemonic::Syscall | Mnemonic::Sysenter => {
+            clear_tracked(tracked, &[Register::RAX, Register::RCX, Register::R11])
+        }
+        Mnemonic::Rdpkru => clear_tracked(tracked, &[Register::RAX, Register::RCX, Register::RDX]),
+        Mnemonic::Xchg | Mnemonic::Xadd => {
+            for index in 0..instruction.op_count() {
+                if instruction.op_kind(index) == OpKind::Register {
+                    tracked.remove(&full_register(instruction.op_register(index)));
+                }
+            }
+        }
+        _ => {}
+    }
+    if matches!(instruction.mnemonic(), Mnemonic::Call | Mnemonic::Jmp) {
+        return;
+    }
     if instruction.op_count() == 0 || instruction.op_kind(0) != OpKind::Register {
         return;
     }
-    let destination = instruction.op_register(0);
-    let value = if let Some(relocation) = relocations.first() {
-        (!relocation.target_name.is_empty())
-            .then(|| Tracked::Symbol(relocation.target_name.clone()))
+    let destination = full_register(instruction.op_register(0));
+    let value = if matches!(instruction.mnemonic(), Mnemonic::Mov | Mnemonic::Lea) {
+        relocations.first().map(|relocation| Tracked::Relocated {
+            name: relocation.target_name.clone(),
+            defined: relocation.target_defined,
+        })
     } else {
         None
     };
@@ -955,11 +1294,22 @@ fn update_tracked(
         Mnemonic::Mov => match instruction.op_kind(1) {
             OpKind::Immediate64 => Some(Tracked::Address(instruction.immediate64())),
             OpKind::Immediate32 => Some(Tracked::Address(u64::from(instruction.immediate32()))),
-            OpKind::Register => tracked.get(&instruction.op_register(1)).cloned(),
+            OpKind::Immediate16 => Some(Tracked::Address(u64::from(instruction.immediate16()))),
+            OpKind::Immediate8 => Some(Tracked::Address(u64::from(instruction.immediate8()))),
+            OpKind::Register => tracked
+                .get(&full_register(instruction.op_register(1)))
+                .cloned(),
             _ => None,
         },
         Mnemonic::Lea if instruction.is_ip_rel_memory_operand() => {
-            Some(Tracked::Address(instruction.ip_rel_memory_address()))
+            let address = instruction.ip_rel_memory_address();
+            if symbol_at_unit(unit, address).is_some_and(|name| {
+                name.contains("sigsys_handler") || name.contains("instruction_sigsegv_handler")
+            }) {
+                Some(Tracked::Handler)
+            } else {
+                Some(Tracked::Address(address))
+            }
         }
         _ => None,
     });
@@ -1108,7 +1458,127 @@ fn checker_refuses_each_injected_tls_and_control_violation() {
             Vec::new(),
             "unresolved-outgoing",
         ),
+        (
+            "plain-syscall",
+            "zone_b_plain_syscall.S",
+            ".text\n.globl zone_b_mutant\n.type zone_b_mutant,@function\nzone_b_mutant:\n syscall\n ret\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "direct-syscall-outside-gate",
+        ),
+        (
+            "fs-segment-write",
+            "zone_b_fs_write.S",
+            ".text\n.globl zone_b_mutant\n.type zone_b_mutant,@function\nzone_b_mutant:\n mov %ax,%fs\n ret\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "fs-segment-write",
+        ),
+        (
+            "fs-base-instruction",
+            "zone_b_fs_base.S",
+            ".text\n.globl zone_b_mutant\n.type zone_b_mutant,@function\nzone_b_mutant:\n rdfsbase %rax\n ret\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "fs-base-instruction",
+        ),
+        (
+            "lfs-write",
+            "zone_b_lfs.S",
+            ".text\n.globl zone_b_mutant\n.type zone_b_mutant,@function\nzone_b_mutant:\n lfs (%rsi),%eax\n ret\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "fs-segment-write",
+        ),
+        (
+            "maskmovdqu-fs",
+            "zone_b_maskmovdqu.S",
+            ".text\n.globl zone_b_mutant\n.type zone_b_mutant,@function\nzone_b_mutant:\n .byte 0x64,0x66,0x0f,0xf7,0xc1\n ret\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "fs-operand",
+        ),
+        (
+            "fixed-prefix-syscall",
+            "zone_b_fixed_prefix.S",
+            ".text\n.globl fixed_zb_evil\n.type fixed_zb_evil,@function\nfixed_zb_evil:\n syscall\n ret\n.size fixed_zb_evil,.-fixed_zb_evil\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "direct-syscall-outside-gate",
+        ),
+        (
+            "gate-leaf-indirect",
+            "zone_b_gate_leaf_indirect.S",
+            ".text\n.globl private_native_terminal\n.type private_native_terminal,@function\nprivate_native_terminal:\n jmp *%rdi\n.size private_native_terminal,.-private_native_terminal\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "rust-asm-indirect-call",
+            "zone_b_rust_asm_call.S",
+            ".text\n.globl reverie_inguest_private_lifecycle_call\n.type reverie_inguest_private_lifecycle_call,@function\nreverie_inguest_private_lifecycle_call:\n call *%r14\n ret\n.size reverie_inguest_private_lifecycle_call,.-reverie_inguest_private_lifecycle_call\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "tracked-subregister-clobber",
+            "zone_b_tracked_subregister.S",
+            ".text\n.globl zone_b_mutant\n.type zone_b_mutant,@function\nzone_b_mutant:\n movabs $0x50000000007c,%rax\n mov $0,%eax\n jmp *%rax\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "tracked-cpuid-clobber",
+            "zone_b_tracked_cpuid.S",
+            ".text\n.globl zone_b_mutant\n.type zone_b_mutant,@function\nzone_b_mutant:\n movabs $0x50000000007c,%rax\n cpuid\n jmp *%rax\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "tracked-skipped-movabs",
+            "zone_b_tracked_skipped.S",
+            ".text\n.globl zone_b_mutant\n.type zone_b_mutant,@function\nzone_b_mutant:\n test %edi,%edi\n je 1f\n movabs $0x50000000007c,%rax\n1: jmp *%rax\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "movabs-outside-zone",
+            "zone_b_movabs_outside.S",
+            ".text\n.globl zone_b_mutant\n.type zone_b_mutant,@function\nzone_b_mutant:\n movabs $zone_b_external,%rax\n call *%rax\n ret\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "rodata-code-direct-call",
+            "zone_b_rodata_code.S",
+            ".text\n.globl zone_b_mutant\n.type zone_b_mutant,@function\nzone_b_mutant:\n call zone_b_rodata_code\n ret\n.size zone_b_mutant,.-zone_b_mutant\n.section .rodata.zbcode,\"a\",@progbits\n.globl zone_b_rodata_code\n.type zone_b_rodata_code,@function\nzone_b_rodata_code:\n syscall\n ret\n.size zone_b_rodata_code,.-zone_b_rodata_code\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "direct-target-not-instruction-start",
+        ),
+        (
+            "bytes-past-size",
+            "zone_b_past_size.S",
+            ".text\n.globl zone_b_mutant\n.type zone_b_mutant,@function\nzone_b_mutant:\n ret\n.size zone_b_mutant,.-zone_b_mutant\n syscall\n ret\n.globl zone_b_after\n.type zone_b_after,@function\nzone_b_after:\n ret\n.size zone_b_after,.-zone_b_after\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "direct-syscall-outside-gate",
+        ),
+        (
+            "mid-instruction-target",
+            "zone_b_mid_instruction.S",
+            ".text\n.globl zone_b_mutant\n.type zone_b_mutant,@function\nzone_b_mutant:\n jmp zone_b_target+1\n.size zone_b_mutant,.-zone_b_mutant\n.globl zone_b_target\n.type zone_b_target,@function\nzone_b_target:\n mov $0x12345678,%eax\n ret\n.size zone_b_target,.-zone_b_target\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "direct-target-not-instruction-start",
+        ),
+        (
+            "tls-section",
+            "zone_b_tls_section.S",
+            ".section .tbss,\"awT\",@nobits\n.globl zone_b_tls_section\nzone_b_tls_section:\n .zero 8\n.text\n.globl zone_b_mutant\n.type zone_b_mutant,@function\nzone_b_mutant:\n ret\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "tls-section",
+        ),
+        (
+            "tls-symbol",
+            "zone_b_tls_symbol.c",
+            "_Thread_local int zone_b_tls_symbol;\nint zone_b_mutant(void) { return 0; }\n",
+            Vec::new(),
+            "tls-symbol",
+        ),
     ];
+    let mut missing = Vec::new();
     for (label, filename, contents, extra, expected) in cases {
         let bytes = compile_source(&scratch.0, label, filename, contents, &extra);
         let report = check_single(label, &bytes);
@@ -1122,10 +1592,16 @@ fn checker_refuses_each_injected_tls_and_control_violation() {
             report.summary(),
             report.violations.first()
         );
-        assert!(
-            kinds.contains(expected),
-            "mutant {label} must refuse with {expected}, got {kinds:?}: {:?}",
-            report.violations
-        );
+        if !kinds.contains(expected) {
+            missing.push(format!(
+                "mutant {label} must refuse with {expected}, got {kinds:?}: {:?}",
+                report.violations
+            ));
+        }
     }
+    assert!(
+        missing.is_empty(),
+        "missing refusals:\n{}",
+        missing.join("\n")
+    );
 }
