@@ -26,11 +26,10 @@
 //! recognized swap/gate entry, or an unrecognized indirect
 //! branch.
 //!
-//! The compile recipe below is the production recipe plus one
-//! named proposed delta, `-fno-jump-tables`, which removes the
-//! one compiler jump table in `make_private_stack.constprop.0`.
-//! That flag is not yet in the Hermit producer; adding it there is
-//! tracked in minibeads as dh-1fz4b and is not claimed here.
+//! The compile recipe below is the production recipe including
+//! `-fno-jump-tables` immediately after `-mcmodel=large`
+//! (minibeads dh-1fz4b), which removes the one compiler jump
+//! table in `make_private_stack.constprop.0`.
 //!
 //! Scope of this prototype, stated plainly:
 //!
@@ -61,6 +60,9 @@
 //!   not modeled as indirect branches.
 //! * Tracked fixed-gate transfers and the three exact gate-leaf
 //!   instructions are an inventory, not a control-flow proof.
+//! * Callee-saved registers are trusted across direct calls under
+//!   the SysV ABI assumption for hand-written zone-B asm; that
+//!   preservation is not proven here.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -333,9 +335,14 @@ fn summarize(label: &str, bytes: &[u8]) -> Result<UnitSummary, String> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Tracked {
     Address(u64),
+    LocalAddress {
+        section: usize,
+        address: u64,
+    },
     Relocated {
         name: String,
         location: Option<(usize, usize, u64)>,
+        symbol_start: Option<(usize, usize, u64)>,
     },
     Handler,
 }
@@ -362,25 +369,53 @@ fn full_register(register: Register) -> Register {
     }
 }
 
-fn tracked_gate(target: Option<&Tracked>) -> bool {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GateKind {
+    Native,
+    OtherSwap,
+}
+
+fn tracked_gate_kind(target: Option<&Tracked>) -> Option<GateKind> {
     match target {
-        Some(Tracked::Address(address)) => {
-            *address == FIXED_NATIVE_ENTRY || *address == FIXED_GUEST_ENTRY
+        Some(Tracked::Address(FIXED_NATIVE_ENTRY)) => Some(GateKind::Native),
+        Some(Tracked::Address(FIXED_GUEST_ENTRY)) => Some(GateKind::OtherSwap),
+        Some(Tracked::Relocated {
+            name,
+            location,
+            symbol_start,
+        }) if SWAP_SYMBOLS.contains(&name.as_str())
+            && location.is_some()
+            && *location == *symbol_start =>
+        {
+            if name == "fixed_native_entry" {
+                Some(GateKind::Native)
+            } else {
+                Some(GateKind::OtherSwap)
+            }
         }
-        Some(Tracked::Relocated { name, .. }) => SWAP_SYMBOLS.contains(&name.as_str()),
-        Some(Tracked::Handler) | None => false,
+        _ => None,
     }
+}
+
+fn tracked_gate(target: Option<&Tracked>) -> bool {
+    tracked_gate_kind(target).is_some()
 }
 
 fn tracked_internal_movabs(
     target: Option<&Tracked>,
+    ranges: &[ScanRange],
     instruction_starts: &BTreeSet<(usize, usize, u64)>,
 ) -> bool {
     match target {
         Some(Tracked::Relocated {
             location: Some(location),
             ..
-        }) => instruction_starts.contains(location),
+        }) => {
+            instruction_starts.contains(location)
+                && ranges
+                    .iter()
+                    .any(|range| (range.unit, range.section, range.start) == *location)
+        }
         _ => false,
     }
 }
@@ -531,13 +566,25 @@ fn check_units(units: &[UnitSummary], ranges: &[ScanRange]) -> Report {
     }
 
     let starts = instruction_starts(units, ranges);
+    let may_write = compute_may_write(units, ranges, &starts);
     let mut branch_sources: BranchSources = BTreeMap::new();
+    let mut converged = false;
     for _ in 0..16 {
-        let next = collect_branch_sources(units, ranges, &starts, &branch_sources);
+        let next = collect_branch_sources(units, ranges, &starts, &branch_sources, &may_write);
         if next == branch_sources {
+            converged = true;
             break;
         }
         branch_sources = next;
+    }
+    if !converged && let Some(first) = ranges.first() {
+        report.refuse(
+            &units[first.unit].label,
+            &first.symbol,
+            0,
+            "branch-state-not-converged",
+            "branch source fixed point still changed after 16 rounds",
+        );
     }
     for range in ranges {
         scan_range(
@@ -547,6 +594,7 @@ fn check_units(units: &[UnitSummary], ranges: &[ScanRange]) -> Report {
             &global_defined,
             &starts,
             &branch_sources,
+            &may_write,
             &mut report,
         );
     }
@@ -678,6 +726,40 @@ fn relocation_target_location(
     ))
 }
 
+fn relocation_symbol_start(
+    units: &[UnitSummary],
+    range: &ScanRange,
+    relocation: &RelocInfo,
+) -> Option<(usize, usize, u64)> {
+    if relocation.target_defined {
+        let section = relocation.target_section?;
+        return Some((range.unit, section, relocation.target_address));
+    }
+    let (unit, symbol) = find_defined_symbol(units, range.unit, &relocation.target_name)?;
+    let section = symbol.section?;
+    Some((unit, section, symbol.address))
+}
+
+fn is_inside_swap_symbol(
+    units: &[UnitSummary],
+    range: &ScanRange,
+    location: (usize, usize, u64),
+) -> bool {
+    SWAP_SYMBOLS.iter().any(|swap| {
+        let Some((swap_unit, symbol)) = find_defined_symbol(units, range.unit, swap) else {
+            return false;
+        };
+        let Some(section) = symbol.section else {
+            return false;
+        };
+        let end = symbol.address + symbol.size.max(1);
+        location.0 == swap_unit
+            && location.1 == section
+            && symbol.address < location.2
+            && location.2 < end
+    })
+}
+
 fn classify_direct_edge(
     units: &[UnitSummary],
     ranges: &[ScanRange],
@@ -689,13 +771,22 @@ fn classify_direct_edge(
 ) -> DirectEdge {
     if let Some(relocation) = relocations.first() {
         if SWAP_SYMBOLS.contains(&relocation.target_name.as_str()) {
-            return DirectEdge::RecognizedSwap;
+            let location = relocation_target_location(units, range, relocation);
+            let symbol_start = relocation_symbol_start(units, range, relocation);
+            return if location.is_some() && location == symbol_start {
+                DirectEdge::RecognizedSwap
+            } else {
+                DirectEdge::Outgoing
+            };
         }
         let Some(location) = relocation_target_location(units, range, relocation) else {
             return DirectEdge::Outgoing;
         };
         if !instruction_starts.contains(&location) {
             return DirectEdge::UndecodedTarget;
+        }
+        if is_inside_swap_symbol(units, range, location) {
+            return DirectEdge::Outgoing;
         }
         if relocation.target_defined || global_defined.contains(relocation.target_name.as_str()) {
             return DirectEdge::Internal;
@@ -706,6 +797,9 @@ fn classify_direct_edge(
     let target = instruction.near_branch_target();
     if target == FIXED_NATIVE_ENTRY || target == FIXED_GUEST_ENTRY {
         return DirectEdge::RecognizedSwap;
+    }
+    if is_inside_swap_symbol(units, range, (range.unit, range.section, target)) {
+        return DirectEdge::Outgoing;
     }
     if instruction_starts.contains(&(range.unit, range.section, target)) {
         return DirectEdge::Internal;
@@ -764,6 +858,7 @@ fn after_instruction(
     tracked: &mut BTreeMap<Register, Tracked>,
     gate_jump: bool,
     falls_through: bool,
+    keep_after_call: Option<Register>,
 ) -> bool {
     match instruction.mnemonic() {
         Mnemonic::Ret => {
@@ -788,27 +883,23 @@ fn after_instruction(
             tracked.clear();
             false
         }
-        Mnemonic::Call
-            if instruction.op_count() > 0
-                && matches!(
-                    instruction.op_kind(0),
-                    OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64
-                ) =>
-        {
-            clear_tracked(
-                tracked,
-                &[
-                    Register::RAX,
-                    Register::RCX,
-                    Register::RDX,
-                    Register::RSI,
-                    Register::RDI,
-                    Register::R8,
-                    Register::R9,
-                    Register::R10,
-                    Register::R11,
-                ],
-            );
+        Mnemonic::Call => {
+            let caller_saved = [
+                Register::RAX,
+                Register::RCX,
+                Register::RDX,
+                Register::RSI,
+                Register::RDI,
+                Register::R8,
+                Register::R9,
+                Register::R10,
+                Register::R11,
+            ];
+            let preserved = keep_after_call.and_then(|register| tracked.remove(&register));
+            clear_tracked(tracked, &caller_saved);
+            if let (Some(register), Some(value)) = (keep_after_call, preserved) {
+                tracked.insert(register, value);
+            }
             true
         }
         _ => falls_through,
@@ -820,6 +911,7 @@ fn collect_branch_sources(
     ranges: &[ScanRange],
     instruction_starts: &BTreeSet<(usize, usize, u64)>,
     previous: &BranchSources,
+    may_write: &MayWriteSets,
 ) -> BranchSources {
     let mut sources: BranchSources = BTreeMap::new();
     let mut info_factory = InstructionInfoFactory::new();
@@ -899,7 +991,22 @@ fn collect_branch_sources(
                 &mut tracked,
                 &mut info_factory,
             );
-            falls_through = after_instruction(&instruction, &mut tracked, gate_jump, falls_through);
+            let keep_after_call = call_keep_register(
+                units,
+                ranges,
+                range,
+                &instruction,
+                &inside,
+                &tracked,
+                may_write,
+            );
+            falls_through = after_instruction(
+                &instruction,
+                &mut tracked,
+                gate_jump,
+                falls_through,
+                keep_after_call,
+            );
             if matches!(instruction.mnemonic(), Mnemonic::Ret)
                 || (instruction.mnemonic() == Mnemonic::Jmp && !gate_jump)
             {
@@ -908,6 +1015,215 @@ fn collect_branch_sources(
         }
     }
     sources
+}
+
+type RangeKey = (usize, usize, u64);
+type MayWriteSets = BTreeMap<RangeKey, BTreeSet<Register>>;
+
+fn all_gprs() -> BTreeSet<Register> {
+    [
+        Register::RAX,
+        Register::RCX,
+        Register::RDX,
+        Register::RBX,
+        Register::RSP,
+        Register::RBP,
+        Register::RSI,
+        Register::RDI,
+        Register::R8,
+        Register::R9,
+        Register::R10,
+        Register::R11,
+        Register::R12,
+        Register::R13,
+        Register::R14,
+        Register::R15,
+    ]
+    .into_iter()
+    .collect()
+}
+
+fn tracked_call_target(
+    units: &[UnitSummary],
+    ranges: &[ScanRange],
+    range: &ScanRange,
+    instruction: &Instruction,
+    relocations: &[&RelocInfo],
+    tracked: &BTreeMap<Register, Tracked>,
+) -> Option<RangeKey> {
+    if instruction.op_count() == 0 {
+        return None;
+    }
+    let location = match instruction.op_kind(0) {
+        OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64 => relocations
+            .first()
+            .and_then(|relocation| relocation_target_location(units, range, relocation))
+            .unwrap_or((range.unit, range.section, instruction.near_branch_target())),
+        OpKind::Register => match tracked.get(&full_register(instruction.op_register(0)))? {
+            Tracked::Relocated {
+                location: Some(location),
+                ..
+            } => *location,
+            Tracked::LocalAddress { section, address } => (range.unit, *section, *address),
+            Tracked::Address(address) => ranges
+                .iter()
+                .find(|candidate| candidate.unit == range.unit && candidate.start == *address)
+                .map(|candidate| (candidate.unit, candidate.section, candidate.start))?,
+            Tracked::Handler => return None,
+            Tracked::Relocated { location: None, .. } => return None,
+        },
+        _ => return None,
+    };
+    ranges
+        .iter()
+        .any(|candidate| (candidate.unit, candidate.section, candidate.start) == location)
+        .then_some(location)
+}
+
+fn call_keep_register(
+    units: &[UnitSummary],
+    ranges: &[ScanRange],
+    range: &ScanRange,
+    instruction: &Instruction,
+    relocations: &[&RelocInfo],
+    tracked: &BTreeMap<Register, Tracked>,
+    may_write: &MayWriteSets,
+) -> Option<Register> {
+    if instruction.mnemonic() != Mnemonic::Call
+        || instruction.op_count() == 0
+        || instruction.op_kind(0) != OpKind::Register
+    {
+        return None;
+    }
+    let register = full_register(instruction.op_register(0));
+    let target = tracked_call_target(units, ranges, range, instruction, relocations, tracked)?;
+    let writes = may_write.get(&target)?;
+    (!writes.contains(&register)).then_some(register)
+}
+
+fn compute_may_write(
+    units: &[UnitSummary],
+    ranges: &[ScanRange],
+    instruction_starts: &BTreeSet<RangeKey>,
+) -> MayWriteSets {
+    let mut writes: MayWriteSets = BTreeMap::new();
+    let mut calls: BTreeMap<RangeKey, BTreeSet<RangeKey>> = BTreeMap::new();
+    let mut unknown: BTreeSet<RangeKey> = BTreeSet::new();
+    let mut info_factory = InstructionInfoFactory::new();
+
+    for range in ranges {
+        let key = (range.unit, range.section, range.start);
+        let unit = &units[range.unit];
+        let Some(section) = unit
+            .sections
+            .iter()
+            .find(|section| section.index == range.section)
+        else {
+            unknown.insert(key);
+            continue;
+        };
+        let start = range.start.saturating_sub(section.address) as usize;
+        let end = range.end.saturating_sub(section.address) as usize;
+        let Some(bytes) = section.data.get(start..end.min(section.data.len())) else {
+            unknown.insert(key);
+            continue;
+        };
+        let relocations: Vec<&RelocInfo> = section.relocations.iter().collect();
+        let mut decoder = Decoder::with_ip(64, bytes, range.start, DecoderOptions::NONE);
+        let mut instruction = Instruction::default();
+        let mut tracked: BTreeMap<Register, Tracked> = BTreeMap::new();
+        let mut local_writes: BTreeSet<Register> = BTreeSet::new();
+        let mut local_calls: BTreeSet<RangeKey> = BTreeSet::new();
+        let mut falls_through = true;
+        while decoder.can_decode() {
+            decoder.decode_out(&mut instruction);
+            if instruction.is_invalid() {
+                unknown.insert(key);
+                break;
+            }
+            {
+                let info = info_factory
+                    .info_options(&instruction, InstructionInfoOptions::NO_MEMORY_USAGE);
+                local_writes.extend(
+                    info.used_registers()
+                        .iter()
+                        .filter(|used| {
+                            matches!(
+                                used.access(),
+                                OpAccess::Write
+                                    | OpAccess::CondWrite
+                                    | OpAccess::ReadWrite
+                                    | OpAccess::ReadCondWrite
+                            )
+                        })
+                        .map(|used| full_register(used.register())),
+                );
+            }
+            if matches!(
+                instruction.mnemonic(),
+                Mnemonic::Syscall | Mnemonic::Sysenter | Mnemonic::Int
+            ) {
+                local_writes.extend([Register::RAX, Register::RCX, Register::R11]);
+            }
+            let inside = relocation_inside(&relocations, &instruction, section.address);
+            let gate_jump = instruction.mnemonic() == Mnemonic::Jmp
+                && instruction.op_count() > 0
+                && instruction.op_kind(0) == OpKind::Register
+                && tracked_gate(tracked.get(&full_register(instruction.op_register(0))));
+            if instruction.mnemonic() == Mnemonic::Call {
+                match tracked_call_target(units, ranges, range, &instruction, &inside, &tracked) {
+                    Some(target) => {
+                        local_calls.insert(target);
+                    }
+                    None => {
+                        unknown.insert(key);
+                    }
+                }
+            }
+            let keep = (instruction.mnemonic() == Mnemonic::Call
+                && instruction.op_count() > 0
+                && instruction.op_kind(0) == OpKind::Register)
+                .then(|| full_register(instruction.op_register(0)));
+            update_tracked(
+                units,
+                range,
+                &instruction,
+                &inside,
+                &mut tracked,
+                &mut info_factory,
+            );
+            falls_through =
+                after_instruction(&instruction, &mut tracked, gate_jump, falls_through, keep);
+            let _ = instruction_starts;
+        }
+        writes.insert(key, local_writes);
+        calls.insert(key, local_calls);
+    }
+
+    for key in unknown {
+        writes.insert(key, all_gprs());
+    }
+    loop {
+        let mut changed = false;
+        for (caller, callees) in &calls {
+            let mut merged = writes.get(caller).cloned().unwrap_or_default();
+            for callee in callees {
+                if let Some(callee_writes) = writes.get(callee) {
+                    merged.extend(callee_writes.iter().copied());
+                } else {
+                    merged.extend(all_gprs());
+                }
+            }
+            if writes.get(caller) != Some(&merged) {
+                writes.insert(*caller, merged);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    writes
 }
 
 fn relocation_inside<'a>(
@@ -924,6 +1240,7 @@ fn relocation_inside<'a>(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scan_range(
     units: &[UnitSummary],
     ranges: &[ScanRange],
@@ -931,6 +1248,7 @@ fn scan_range(
     global_defined: &BTreeSet<&str>,
     instruction_starts: &BTreeSet<(usize, usize, u64)>,
     branch_sources: &BranchSources,
+    may_write: &MayWriteSets,
     report: &mut Report,
 ) {
     let unit = &units[range.unit];
@@ -1104,6 +1422,15 @@ fn scan_range(
             &tracked,
             report,
         );
+        let keep_after_call = call_keep_register(
+            units,
+            ranges,
+            range,
+            &instruction,
+            &inside,
+            &tracked,
+            may_write,
+        );
         update_tracked(
             units,
             range,
@@ -1117,6 +1444,7 @@ fn scan_range(
             &mut tracked,
             gate_jump,
             previous_falls_through,
+            keep_after_call,
         );
     }
 }
@@ -1183,15 +1511,7 @@ fn scan_branch(
         OpKind::Register | OpKind::Memory => {
             let register_target = (instruction.op_kind(0) == OpKind::Register)
                 .then(|| tracked.get(&full_register(instruction.op_register(0))));
-            let handler_call = matches!(
-                register_target,
-                Some(Some(Tracked::Handler))
-            ) || matches!(register_target, Some(Some(Tracked::Address(address)))
-                if symbol_at_unit(unit, *address)
-                    .is_some_and(|name| {
-                        name.contains("sigsys_handler")
-                            || name.contains("instruction_sigsegv_handler")
-                    }));
+            let handler_call = matches!(register_target, Some(Some(Tracked::Handler)));
             let exact_gate_leaf = (instruction.mnemonic() == Mnemonic::Jmp
                 && instruction.op_kind(0) == OpKind::Register)
                 .then(|| {
@@ -1214,13 +1534,44 @@ fn scan_branch(
                     }
                 })
                 .flatten();
-            if tracked_gate(register_target.flatten()) || handler_call || exact_gate_leaf.is_some()
+            let gate_kind = tracked_gate_kind(register_target.flatten());
+            let native_relocated = matches!(
+                register_target,
+                Some(Some(Tracked::Relocated { name, .. })) if name == "fixed_native_entry"
+            );
+            let native_gate_return_ok = gate_kind == Some(GateKind::Native)
+                && match tracked.get(&Register::R12) {
+                    Some(Tracked::LocalAddress { section, address }) => {
+                        *section == range.section && *address == instruction.next_ip()
+                    }
+                    Some(Tracked::Relocated {
+                        location: Some(location),
+                        ..
+                    }) => {
+                        *location == (range.unit, range.section, instruction.next_ip())
+                    }
+                    _ => false,
+                };
+            if (gate_kind == Some(GateKind::Native)
+                && (!native_relocated || native_gate_return_ok))
+                || gate_kind == Some(GateKind::OtherSwap)
+                || handler_call
+                || exact_gate_leaf.is_some()
             {
                 report.recognized_indirect += 1;
                 if let Some(name) = exact_gate_leaf {
                     *report.gate_leaf_uses.entry(name).or_default() += 1;
                 }
-            } else if tracked_internal_movabs(register_target.flatten(), instruction_starts) {
+            } else if gate_kind == Some(GateKind::Native) && native_relocated {
+                report.refuse(
+                    &unit.label,
+                    &range.symbol,
+                    offset,
+                    "indirect-branch",
+                    "native-entry gate jump without r12 tracked as the section-qualified next instruction",
+                );
+            } else if tracked_internal_movabs(register_target.flatten(), ranges, instruction_starts)
+            {
                 report.internal_movabs_indirect += 1;
                 report.internal_edges += 1;
             } else {
@@ -1275,7 +1626,8 @@ fn compile_object_with_delta(
         .unwrap_or_else(|| "cc".into());
     let mut command = Command::new(compiler);
     // Hermit liteinst-runtime-build/artifact.rs production recipe,
-    // in its order, plus the one named proposed delta at the end.
+    // in its order. The without-flag form below exists only to
+    // pin the jump-table violation that dh-1fz4b removes.
     command.args([
         "-O2",
         "-g",
@@ -1288,14 +1640,11 @@ fn compile_object_with_delta(
         "-fno-asynchronous-unwind-tables",
         "-fcf-protection=branch",
         "-mcmodel=large",
-        "-fno-pic",
-        "-fno-pie",
-        "-DEXEC_PRIVATE_BOOTSTRAP_IMAGE",
     ]);
     if jump_tables_delta {
-        // Proposed producer delta; tracked in minibeads dh-1fz4b.
         command.arg("-fno-jump-tables");
     }
+    command.args(["-fno-pic", "-fno-pie", "-DEXEC_PRIVATE_BOOTSTRAP_IMAGE"]);
     command.arg("-c");
     command.args(extra);
     command.arg(source).arg("-o").arg(&output_path);
@@ -1454,13 +1803,37 @@ fn update_tracked(
         established = match instruction.mnemonic() {
             Mnemonic::Mov if instruction.op_count() > 1 => {
                 if let Some(relocation) = relocations.first() {
-                    (instruction.op_kind(1) == OpKind::Immediate64).then(|| Tracked::Relocated {
-                        name: relocation.target_name.clone(),
-                        location: relocation_target_location(units, range, relocation),
-                    })
+                    (instruction.op_kind(1) == OpKind::Immediate64
+                        && relocation.r_type == object::elf::R_X86_64_64)
+                        .then(|| Tracked::Relocated {
+                            name: relocation.target_name.clone(),
+                            location: relocation_target_location(units, range, relocation),
+                            symbol_start: relocation_symbol_start(units, range, relocation),
+                        })
                 } else {
                     match instruction.op_kind(1) {
-                        OpKind::Immediate64 => Some(Tracked::Address(instruction.immediate64())),
+                        OpKind::Immediate64 => {
+                            let address = instruction.immediate64();
+                            let local = (!unit.relocatable)
+                                .then(|| {
+                                    unit.sections
+                                        .iter()
+                                        .find(|section| section.index == range.section)
+                                })
+                                .flatten()
+                                .filter(|section| {
+                                    section.address <= address
+                                        && address < section.address + section.data.len() as u64
+                                });
+                            if let Some(section) = local {
+                                Some(Tracked::LocalAddress {
+                                    section: section.index,
+                                    address,
+                                })
+                            } else {
+                                Some(Tracked::Address(address))
+                            }
+                        }
                         OpKind::Register
                             if is_64bit_gpr(instruction.op_register(0))
                                 && is_64bit_gpr(instruction.op_register(1)) =>
@@ -1474,10 +1847,26 @@ fn update_tracked(
                 }
             }
             Mnemonic::Lea if instruction.op_count() > 1 => {
-                if let Some(relocation) = relocations.first() {
-                    Some(Tracked::Relocated {
+                let base = instruction.memory_base();
+                let index = instruction.memory_index();
+                let address_forming =
+                    matches!(base, Register::None | Register::RIP) && index == Register::None;
+                if !address_forming {
+                    None
+                } else if let Some(relocation) = relocations.first() {
+                    let type_ok = match relocation.r_type {
+                        object::elf::R_X86_64_PC32 | object::elf::R_X86_64_PLT32 => {
+                            base == Register::RIP
+                        }
+                        object::elf::R_X86_64_32 | object::elf::R_X86_64_32S => {
+                            base == Register::None
+                        }
+                        _ => false,
+                    };
+                    type_ok.then(|| Tracked::Relocated {
                         name: relocation.target_name.clone(),
                         location: relocation_target_location(units, range, relocation),
+                        symbol_start: relocation_symbol_start(units, range, relocation),
                     })
                 } else if instruction.is_ip_rel_memory_operand() {
                     let address = instruction.ip_rel_memory_address();
@@ -1487,8 +1876,16 @@ fn update_tracked(
                     }) {
                         Some(Tracked::Handler)
                     } else {
-                        Some(Tracked::Address(address))
+                        Some(Tracked::LocalAddress {
+                            section: range.section,
+                            address,
+                        })
                     }
+                } else if base == Register::None {
+                    Some(Tracked::LocalAddress {
+                        section: range.section,
+                        address: instruction.memory_displacement64(),
+                    })
                 } else {
                     None
                 }
@@ -1514,6 +1911,12 @@ fn update_tracked(
             .collect()
     };
     clear_tracked(tracked, &writes);
+    if matches!(
+        instruction.mnemonic(),
+        Mnemonic::Syscall | Mnemonic::Sysenter | Mnemonic::Int
+    ) {
+        clear_tracked(tracked, &[Register::RAX, Register::RCX, Register::R11]);
+    }
     if let (Some(destination), Some(value)) = (destination, established) {
         tracked.insert(destination, value);
     }
@@ -1575,7 +1978,7 @@ fn clean_zone_b_objects_pass() {
         "each exact gate-leaf instruction must be used exactly once"
     );
     println!(
-        "ZONE-B PASS clean (production recipe + named -fno-jump-tables delta dh-1fz4b): {}",
+        "ZONE-B PASS clean (production recipe incl. -fno-jump-tables dh-1fz4b): {}",
         report.summary()
     );
 }
@@ -1962,6 +2365,62 @@ fn checker_refuses_each_injected_tls_and_control_violation() {
             "direct-syscall-outside-gate",
         ),
         (
+            "code-symbol-rip-load",
+            "zone_b_code_symbol_rip.S",
+            ".text\n.globl zone_b_mutant\n.type zone_b_mutant,@function\nzone_b_mutant:\n mov zone_b_target(%rip),%rax\n call *%rax\n ret\n.size zone_b_mutant,.-zone_b_mutant\n.globl zone_b_target\n.type zone_b_target,@function\nzone_b_target:\n ret\n.size zone_b_target,.-zone_b_target\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "code-symbol-absolute-load",
+            "zone_b_code_symbol_abs.S",
+            ".text\n.globl zone_b_mutant\n.type zone_b_mutant,@function\nzone_b_mutant:\n movabs zone_b_target,%rax\n call *%rax\n ret\n.size zone_b_mutant,.-zone_b_mutant\n.globl zone_b_target\n.type zone_b_target,@function\nzone_b_target:\n ret\n.size zone_b_target,.-zone_b_target\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "wrong-register-fixed-native-entry",
+            "zone_b_wrong_fixed_native.S",
+            ".section .gate,\"ax\",@progbits\n.globl fixed_native_entry\n.type fixed_native_entry,@function\nfixed_native_entry:\n .fill 6,1,0x90\n jmp *%rdi\n.size fixed_native_entry,.-fixed_native_entry\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "wrong-register-enter-tool-loader",
+            "zone_b_wrong_enter_tool.S",
+            ".text\n.globl private_enter_tool_loader\n.type private_enter_tool_loader,@function\nprivate_enter_tool_loader:\n .fill 0x3a,1,0x90\n jmp *%rdi\n.size private_enter_tool_loader,.-private_enter_tool_loader\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "wrong-register-runner-resume",
+            "zone_b_wrong_runner_resume.S",
+            ".text\n.globl private_runner_resume\n.type private_runner_resume,@function\nprivate_runner_resume:\n .fill 0x108,1,0x90\n jmp *%rdi\n.size private_runner_resume,.-private_runner_resume\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "fixed-native-entry-call-offset-zero",
+            "zone_b_fixed_native_call0.S",
+            ".section .gate,\"ax\",@progbits\n.globl fixed_native_entry\n.type fixed_native_entry,@function\nfixed_native_entry:\n call *%rdi\n.size fixed_native_entry,.-fixed_native_entry\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "one-round-loop",
+            "zone_b_one_round_loop.S",
+            ".text\n.globl zone_b_mutant\n.type zone_b_mutant,@function\nzone_b_mutant:\n movabs $0x50000000007c,%rax\n1: test %edi,%edi\n je 2f\n xor %eax,%eax\n dec %edi\n jmp 1b\n2: jmp *%rax\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "gate-numeric-return-coincidence",
+            "zone_b_gate_numeric_return.S",
+            ".section .gate,\"ax\",@progbits\n.globl fixed_native_entry\n.type fixed_native_entry,@function\nfixed_native_entry:\n syscall\n .fill 4,1,0x90\n jmp *%r12\n.size fixed_native_entry,.-fixed_native_entry\n.text\n.globl zone_b_mutant\n.type zone_b_mutant,@function\nzone_b_mutant:\n movabs $fixed_native_entry,%rcx\n movabs $24,%r12\n jmp *%rcx\n ret\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
             "movabs-rodata-global",
             "zone_b_movabs_rodata.S",
             ".text\n.globl zone_b_mutant\n.type zone_b_mutant,@function\nzone_b_mutant:\n movabs $zone_b_rodata_code,%rax\n call *%rax\n ret\n.size zone_b_mutant,.-zone_b_mutant\n.section .rodata.zbcode,\"a\",@progbits\n.globl zone_b_rodata_code\n.type zone_b_rodata_code,@function\nzone_b_rodata_code:\n mov %fs:0x10,%rax\n syscall\n ret\n.size zone_b_rodata_code,.-zone_b_rodata_code\n.section .note.GNU-stack,\"\",@progbits\n",
@@ -1993,6 +2452,83 @@ fn checker_refuses_each_injected_tls_and_control_violation() {
             "fnptr-absolute-load",
             "zone_b_fnptr_abs.S",
             ".text\n.globl zone_b_mutant\n.type zone_b_mutant,@function\nzone_b_mutant:\n movabs zone_b_fp,%rax\n call *%rax\n ret\n.size zone_b_mutant,.-zone_b_mutant\n.globl zone_b_target\n.type zone_b_target,@function\nzone_b_target:\n ret\n.size zone_b_target,.-zone_b_target\n.data\n.globl zone_b_fp\nzone_b_fp: .quad zone_b_target\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "lea-base-register",
+            "zone_b_lea_base.S",
+            ".text\n.globl zone_b_mutant\n.type zone_b_mutant,@function\nzone_b_mutant:\n lea zone_b_target(%rdi),%rax\n jmp *%rax\n.size zone_b_mutant,.-zone_b_mutant\n.globl zone_b_target\n.type zone_b_target,@function\nzone_b_target:\n ret\n.size zone_b_target,.-zone_b_target\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "lea-index-register",
+            "zone_b_lea_index.S",
+            ".text\n.globl zone_b_mutant\n.type zone_b_mutant,@function\nzone_b_mutant:\n lea zone_b_target(,%rdi,8),%rax\n jmp *%rax\n.size zone_b_mutant,.-zone_b_mutant\n.globl zone_b_target\n.type zone_b_target,@function\nzone_b_target:\n ret\n.size zone_b_target,.-zone_b_target\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "movabs-pc64-relocation",
+            "zone_b_movabs_pc64.S",
+            ".text\n.globl zone_b_mutant\n.type zone_b_mutant,@function\nzone_b_mutant:\n movabs $zone_b_target-.-2,%rax\n jmp *%rax\n.size zone_b_mutant,.-zone_b_mutant\n.globl zone_b_target\n.type zone_b_target,@function\nzone_b_target:\n ret\n.size zone_b_target,.-zone_b_target\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "indirect-call-clobbers-gate",
+            "zone_b_indirect_call_clobber.S",
+            ".text\n.globl zone_b_mutant\n.type zone_b_mutant,@function\nzone_b_mutant:\n movabs $0x50000000007c,%rdx\n movabs $zone_b_helper,%rax\n call *%rax\n jmp *%rdx\n.size zone_b_mutant,.-zone_b_mutant\n.globl zone_b_helper\n.type zone_b_helper,@function\nzone_b_helper:\n xor %edx,%edx\n ret\n.size zone_b_helper,.-zone_b_helper\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "indirect-call-same-register",
+            "zone_b_indirect_call_same.S",
+            ".text\n.globl zone_b_mutant\n.type zone_b_mutant,@function\nzone_b_mutant:\n movabs $0x50000000007c,%rax\n call *%rax\n jmp *%rax\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "midfunction-indirect-target",
+            "zone_b_midfunction.S",
+            ".text\n.globl zone_b_mutant\n.type zone_b_mutant,@function\nzone_b_mutant:\n xor %eax,%eax\n movabs $.Lzone_b_mid,%rcx\n jmp *%rcx\n movabs $0x50000000007c,%rax\n.Lzone_b_mid:\n jmp *%rax\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "gate-syscall-stale-target",
+            "zone_b_gate_syscall_stale.S",
+            ".section .gate,\"ax\",@progbits\n.globl zone_b_mutant\n.type zone_b_mutant,@function\nzone_b_mutant:\n movabs $0x50000000007c,%rax\n syscall\n jmp *%rax\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "gate-int80-stale-target",
+            "zone_b_gate_int80_stale.S",
+            ".section .gate,\"ax\",@progbits\n.globl zone_b_mutant\n.type zone_b_mutant,@function\nzone_b_mutant:\n movabs $0x50000000007c,%rax\n int $0x80\n jmp *%rax\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "swap-symbol-addend",
+            "zone_b_swap_addend.S",
+            ".section .gate,\"ax\",@progbits\n.globl fixed_native_entry\n.type fixed_native_entry,@function\nfixed_native_entry:\n syscall\n .fill 4,1,0x90\n jmp *%r12\n.size fixed_native_entry,.-fixed_native_entry\n.text\n.globl zone_b_mutant\n.type zone_b_mutant,@function\nzone_b_mutant:\n movabs $fixed_native_entry+6,%rcx\n jmp *%rcx\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "direct-swap-addend",
+            "zone_b_direct_swap_addend.S",
+            ".text\n.globl zone_b_mutant\n.type zone_b_mutant,@function\nzone_b_mutant:\n jmp reverie_inguest_trusted_syscall+0x10\n.size zone_b_mutant,.-zone_b_mutant\n.globl reverie_inguest_trusted_syscall\n.type reverie_inguest_trusted_syscall,@function\nreverie_inguest_trusted_syscall:\n .fill 16,1,0x90\n ret\n.size reverie_inguest_trusted_syscall,.-reverie_inguest_trusted_syscall\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "unrecognized-outgoing-edge",
+        ),
+        (
+            "gate-return-register",
+            "zone_b_gate_return.S",
+            ".section .gate,\"ax\",@progbits\n.globl fixed_native_entry\n.type fixed_native_entry,@function\nfixed_native_entry:\n syscall\n .fill 4,1,0x90\n jmp *%r12\n.size fixed_native_entry,.-fixed_native_entry\n.text\n.globl zone_b_mutant\n.type zone_b_mutant,@function\nzone_b_mutant:\n mov %rdi,%r12\n movabs $fixed_native_entry,%rcx\n jmp *%rcx\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
             Vec::new(),
             "indirect-branch",
         ),
@@ -2029,5 +2565,44 @@ fn checker_refuses_each_injected_tls_and_control_violation() {
         missing.is_empty(),
         "missing refusals:\n{}",
         missing.join("\n")
+    );
+}
+
+#[test]
+fn checker_refuses_17_link_backward_chain() {
+    let scratch = Scratch::new("chain17");
+    let mut source = String::from(
+        ".text\n.globl zone_b_mutant\n.type zone_b_mutant,@function\nzone_b_mutant:\n movabs $0x50000000007c,%rax\n jmp .Lzb17\n.Lzb0:\n jmp *%rax\n",
+    );
+    for link in 1..=17 {
+        source.push_str(&format!(".Lzb{link}:\n jmp .Lzb{}\n", link - 1));
+    }
+    source
+        .push_str(".size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n");
+    let bytes = compile_source(
+        &scratch.0,
+        "backward-chain-17",
+        "zone_b_chain17.S",
+        &source,
+        &[],
+    );
+    let report = check_single("backward-chain-17", &bytes);
+    println!(
+        "ZONE-B EXPECTED-FAIL backward-chain-17: {} kinds={:?} first={:?}",
+        report.summary(),
+        report
+            .violations
+            .iter()
+            .map(|violation| violation.kind)
+            .collect::<BTreeSet<_>>(),
+        report.violations.first()
+    );
+    assert!(
+        report
+            .violations
+            .iter()
+            .any(|violation| violation.kind == "branch-state-not-converged"),
+        "17-link chain must refuse as not converged: {:?}",
+        report.violations
     );
 }
