@@ -117,10 +117,23 @@ fn scenario_flip_exec() {
     let outcome = promoter.promote_one(site, &mut stop);
     assert_eq!(outcome, PromoteOutcome::Flipped);
     assert_eq!(stop.acquires, 1, "exactly one acquire settles the flip");
+    assert!(!promoter.mask_failed());
+    assert!(!promoter.unsettled_custody());
     assert_eq!(
         promoter.promote_one(site, &mut stop),
         PromoteOutcome::Refused
     );
+    assert_eq!(promoter.held_sites(), 1);
+    // A fresh refusal (no mapping contains 0x4000) is retained,
+    // never re-queued upstream.
+    assert_eq!(
+        promoter.promote_one(0x4000, &mut stop),
+        PromoteOutcome::Refused
+    );
+    assert_eq!(promoter.retained_refusals(), [0x4000]);
+    // A generation bump is the caller's mapping-change signal;
+    // it must not disturb held custody bookkeeping.
+    promoter.bump_generation();
     assert_eq!(promoter.held_sites(), 1);
     let word = unsafe { (site as *const u32).read_volatile() };
     assert!(is_b(word), "word {word:#010x} is not B");
@@ -177,7 +190,7 @@ fn scenario_custody_sync() {
     println!("PASS custody-sync");
 }
 
-fn scenario_drain_table() {
+fn scenario_drain_table_record() {
     let (p, _page) = svc_page();
     let site = p as u64;
     reverie_inguest::trap::record_pending_promotion_site(site);
@@ -196,11 +209,7 @@ fn scenario_drain_table() {
     assert_eq!(a, b);
     assert!(promoter.drain_pending(&mut stop).is_empty());
     core::mem::forget(promoter);
-    println!("PASS drain-table-denylist");
-}
-
-fn perms_at2(addr: u64) -> String {
-    perms_at(addr)
+    println!("PASS drain-table-record");
 }
 
 fn scenario_toctou() {
@@ -241,10 +250,11 @@ fn scenario_toctou() {
 
 fn scenario_refused_window_no_fallback_by_default() {
     // Default policy: no proc-mem fallback exists to fall into;
-    // the flip here uses the window and succeeds. The fallback
-    // permission itself is unit-tested in-tree (StoreFallback
-    // classification); this scenario pins that the default
-    // promoter holds NO proc-mem permission.
+    // the flip here uses the window and succeeds. The
+    // AllowProcMem path itself is unit-tested in-tree
+    // (lazy_promote::tests::proc_mem_pwrite_failure_completes_to_unpatched
+    // and the RV2 second-lease test); this scenario pins that
+    // the default promoter holds NO proc-mem permission.
     let promoter = LazyPromoter::unattested(1);
     assert_eq!(
         promoter.store_fallback(),
@@ -515,14 +525,111 @@ fn scenario_two_promoters() {
     );
     core::mem::forget(first);
     core::mem::forget(second);
-    println!("PASS rv9-two-promoters");
+    println!("PASS rc9-two-promoters");
+}
+
+fn scenario_drain_table_real_trap() {
+    // Fork-isolated: handler + seccomp are one-way. The child
+    // flips a site through the promoter, then calls it under the
+    // real exact-address filter with a handler that records
+    // candidates exactly like S5a (frame PC - 4). The island SVC
+    // really traps; the denylist must keep it out of the table.
+    extern "C" fn record_handler(
+        _sig: libc::c_int,
+        _info: *mut libc::siginfo_t,
+        ctx: *mut libc::c_void,
+    ) {
+        let ctx = unsafe { &mut *(ctx as *mut libc::ucontext_t) };
+        if let Some(site) = ctx.uc_mcontext.pc.checked_sub(4) {
+            reverie_inguest::trap::record_pending_promotion_site(site);
+        }
+        let pid =
+            unsafe { reverie_inguest::trap::raw_syscall6(libc::SYS_getpid, [0, 0, 0, 0, 0, 0]) };
+        ctx.uc_mcontext.regs[0] = pid as u64;
+        // Frame PC already points past the SVC (at the island's
+        // return branch); do not advance it.
+    }
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0);
+    if pid == 0 {
+        let code = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> i32 {
+            let (p, _page) = svc_page();
+            let site = p as u64;
+            reverie_inguest::trap::record_pending_promotion_site(site);
+            let mut promoter = LazyPromoter::attested(1).unwrap();
+            // Handler first, then the exact-address filter.
+            let mut sa: libc::sigaction = unsafe { core::mem::zeroed() };
+            sa.sa_sigaction = record_handler as *const () as usize;
+            sa.sa_flags = libc::SA_SIGINFO;
+            if unsafe { libc::sigaction(libc::SIGSYS, &sa, core::ptr::null_mut()) } != 0 {
+                return 20;
+            }
+            let filter = reverie_inguest::seccomp::SeccompFilter::for_trusted_gates(
+                reverie_inguest::trap::trusted_gate(),
+                reverie_inguest::trap::guest_syscall_gate(),
+            );
+            let Ok(mut filter) = filter else { return 21 };
+            if unsafe { filter.install() }.is_err() {
+                return 22;
+            }
+            let mut stop = SingleThreadStop {
+                resume_failures: 0,
+                acquires: 0,
+                resumes: 0,
+            };
+            let out = promoter.drain_pending(&mut stop);
+            if out != [(site, PromoteOutcome::Flipped)] {
+                return 23;
+            }
+            let baseline = reverie_inguest::trap::pending_promotion_stats().recorded_new;
+            // Pid through the gate only: std::process::id() issues
+            // its own libc SVC, which would trap and be recorded
+            // as a brand-new candidate site.
+            let pid =
+                unsafe { reverie_inguest::trap::raw_syscall6(libc::SYS_getpid, [0; 6]) };
+            let a = unsafe { call_getpid_site(site) };
+            let b = unsafe { call_getpid_site(site) };
+            if a != pid || b != a {
+                return 24;
+            }
+            // The island SVCs trapped and were recorded as
+            // candidates unless denylisted: recorded_new must not
+            // move, and a second drain must be empty.
+            if reverie_inguest::trap::pending_promotion_stats().recorded_new != baseline {
+                return 25;
+            }
+            if !promoter.drain_pending(&mut stop).is_empty() {
+                return 26;
+            }
+            0
+        }))
+        .unwrap_or(9);
+        // Exit through the trusted gate only: the exact-address
+        // filter traps libc's own _exit SVC, the handler would
+        // spoof it, and glibc's fallthrough then traps fatally.
+        unsafe {
+            reverie_inguest::trap::raw_syscall6(
+                libc::SYS_exit_group,
+                [code as u64, 0, 0, 0, 0, 0],
+            );
+        }
+        unreachable!("exit_group through the gate returned");
+    }
+    let mut status: libc::c_int = 0;
+    assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+    assert!(
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+        "real-trap child status={status:#x} (9=panic, 20=handler, 21=filter build, 22=filter install, 23=drain flip, 24=call result, 25=island recorded, 26=second drain)"
+    );
+    println!("PASS drain-table-real-trap");
 }
 
 fn main() {
     scenario_flip_exec();
     scenario_custody_resume();
     scenario_custody_sync();
-    scenario_drain_table();
+    scenario_drain_table_record();
+    scenario_drain_table_real_trap();
     scenario_toctou();
     scenario_refused_window_no_fallback_by_default();
     scenario_custody_blocks_new_work();

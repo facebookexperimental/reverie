@@ -90,12 +90,6 @@ pub fn fixed_gate_region() -> Option<(u64, u64)> {
     fixed_gates_published().then_some((FIXED_GATE_BASE, FIXED_GATE_BASE + FIXED_GATE_BYTES))
 }
 
-/// Whether `addr` lies in runtime-owned text a lazy promoter must
-/// never patch: the published fixed-gate region (when sealed), the
-/// pages holding the trusted and guest syscall gate instructions,
-/// the fixed signal-restorer entry, and the SIGSYS handler entry.
-/// Flipping any of these would break the runtime's own syscall
-/// path, including the promoter's store path itself.
 /// The exact runtime instruction addresses [`is_runtime_text`]
 /// denies, before page-granular cover. Split out so tests can
 /// assert membership independent of link layout (a page-rule-only
@@ -117,6 +111,12 @@ pub(crate) fn runtime_text_ips() -> [u64; 8] {
     ]
 }
 
+/// Whether `addr` lies in runtime-owned text a lazy promoter must
+/// never patch: the published fixed-gate region (when sealed), the
+/// pages holding the trusted and guest syscall gate instructions,
+/// the fixed signal-restorer entry, and the SIGSYS handler entry.
+/// Flipping any of these would break the runtime's own syscall
+/// path, including the promoter's store path itself.
 pub fn is_runtime_text(addr: u64) -> bool {
     if let Some((lo, hi)) = fixed_gate_region()
         && addr >= lo
@@ -772,10 +772,19 @@ pub fn unregister_pending_promotion_island(lo: u64, hi: u64) -> bool {
         {
             // Empty this slot first (hi := lo makes the range
             // empty), then swap the last range in and only then
-            // shrink the visible length. A racing handler sees,
-            // at worst, the moving range at both slots briefly —
-            // never a torn wide range and never an out-of-bounds
-            // index.
+            // shrink the visible length. This is NOT torn-free: a
+            // racing handler can observe the transient range
+            // [llo, lo_i) (new lo, not-yet-stored hi) or miss the
+            // moving range entirely, because the reader also loads
+            // lo and hi separately. The consequence is liveness
+            // only, never safety: a guest SVC inside the transient
+            // span can be spuriously reported AlreadyKnown once
+            // (it was not inserted, so its next trap records it),
+            // or one island SVC can burn a pending-table slot (the
+            // promoter later refuses it: shared island mappings
+            // are not windowable). No torn range can make a real
+            // site silently patchable or hide one for good, and
+            // the length protocol still bounds every index.
             let last = len - 1;
             PROMOTION_ISLANDS[i * 2 + 1].store(lo, Ordering::Release);
             if i != last {
@@ -2183,6 +2192,80 @@ mod aarch64_gate_tests {
             table.try_record(0x8fff_fffc),
             PendingPromotionRecord::NewSite
         );
+    }
+
+    #[test]
+    fn island_registry_unregisters_middle_last_and_refuses_when_full() {
+        // Re-exec child: the registry is process-global and its
+        // capacity is a lifetime budget, so the full-table leg
+        // needs a fresh process.
+        const CHILD: &str = "REVERIE_S5B_ISLAND_REGISTRY_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let table = PendingPromotions::new();
+            let range = |i: u64| {
+                (
+                    0xb000_0000 + i * 0x1_0000,
+                    0xb000_0000 + i * 0x1_0000 + 0x8000,
+                )
+            };
+            // Middle-slot unregister (swap-remove): register three,
+            // remove the middle; the last range must survive the
+            // swap, the removed one must record as new.
+            for i in 0..3 {
+                let (lo, hi) = range(i);
+                assert!(register_pending_promotion_island(lo, hi));
+            }
+            let (mlo, mhi) = range(1);
+            assert!(unregister_pending_promotion_island(mlo, mhi));
+            assert_eq!(
+                table.try_record(mlo),
+                PendingPromotionRecord::NewSite,
+                "unregistered middle range must record again"
+            );
+            let (llo, lhi) = range(2);
+            assert_eq!(
+                table.try_record(llo),
+                PendingPromotionRecord::AlreadyKnown,
+                "swapped-in last range must stay denylisted"
+            );
+            // Removing it again (not registered) is false.
+            assert!(!unregister_pending_promotion_island(mlo, mhi));
+            // Last-slot unregister: only ranges 0 and 2 remain, and
+            // 2 now sits in the swapped slot; remove range 0, then
+            // range 2 as the final remaining slot.
+            let (flo, fhi) = range(0);
+            assert!(unregister_pending_promotion_island(flo, fhi));
+            assert!(unregister_pending_promotion_island(llo, lhi));
+            assert_eq!(
+                table.try_record(llo),
+                PendingPromotionRecord::NewSite,
+                "last-slot unregister must release the range"
+            );
+            // Capacity: all 64 slots accept, the 65th refuses.
+            for i in 0..64u64 {
+                let (lo, hi) = range(16 + i);
+                assert!(
+                    register_pending_promotion_island(lo, hi),
+                    "slot {i} must accept"
+                );
+            }
+            let (lo, hi) = range(16 + 64);
+            assert!(
+                !register_pending_promotion_island(lo, hi),
+                "65th distinct range must refuse at capacity"
+            );
+            std::process::exit(0);
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "trap::tests::island_registry_unregisters_middle_last_and_refuses_when_full",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
     }
 
     #[test]
