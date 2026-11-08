@@ -1424,8 +1424,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-inguest/src/guest/installed_tool.rs",
-        26031,
-        "84ba271d1e8be5e9cc665f8ce7440bf99064e84b5b9baee55e69a6e1dd5d8068",
+        32266,
+        "975d69761bf762cd259cc64f2b4fcbffaea64a6df4bab8cb4513e0e27d59c6d4",
     ),
     (
         "reverie-inguest/src/guest/mod.rs",
