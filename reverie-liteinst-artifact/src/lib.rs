@@ -69868,8 +69868,8 @@ mod runner_cpu_budget_tests {
     #[test]
     fn wall_deadline_is_the_backstop_for_a_cpu_budgeted_command() {
         let scratch = Scratch::new("wall");
-        let mut runner =
-            Runner::new(scratch.0.join("logs"), Duration::from_secs(1), 1 << 20).unwrap();
+        let wall_budget = Duration::from_secs(1);
+        let mut runner = Runner::new(scratch.0.join("logs"), wall_budget, 1 << 20).unwrap();
         let started = Instant::now();
         let error = runner
             .run_cpu_bounded(
@@ -69886,7 +69886,20 @@ mod runner_cpu_budget_tests {
             ) && error.contains(", CPU used "),
             "{error}"
         );
-        assert!(started.elapsed() < Duration::from_secs(5), "{error}");
+        // The backstop fired at the budget (the error's command wall), and
+        // the call then returns through the product's own bounded cleanup:
+        // 1 s poll-loop cleanup deadline, 250 ms reader drain, and 1 s
+        // cgroup wait-empty. The elapsed bound is three times the sum of
+        // the budget and those bounds: each phase ends on a host wakeup,
+        // whose latency under load is the host's, not the product's, while
+        // three times that sum is still a third of the 30 s sleep the
+        // backstop had to cut short.
+        let cleanup_bounds =
+            Duration::from_secs(1) + Duration::from_millis(250) + Duration::from_secs(1);
+        assert!(
+            started.elapsed() < (wall_budget + cleanup_bounds) * 3,
+            "{error}"
+        );
         let used = runner.command_cpu.last().copied().flatten().unwrap();
         assert!(
             used < Duration::from_millis(500),
