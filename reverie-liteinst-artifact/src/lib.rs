@@ -18744,6 +18744,10 @@ fn fs_absolute_displacement(bytes: &[u8]) -> Option<i64> {
 // Any memory operand whose base or index register is tainted and
 // whose displacement lands inside a cell is refused, wherever in
 // the function it occurs.
+#[allow(
+    clippy::collapsible_if,
+    reason = "also compiled as edition 2021 via #[path]; let-chains unavailable"
+)]
 fn refuse_tainted_tls_access(
     elf: &Elf<'_>,
     bytes: &[u8],
@@ -18962,6 +18966,10 @@ fn refuse_tainted_tls_access(
 /// register taint tracking in refuse_tainted_tls_access. Every
 /// legitimate read and write funnels through an accessor, so any
 /// other hit is a missed access site and refusal is correct.
+#[allow(
+    clippy::collapsible_if,
+    reason = "also compiled as edition 2021 via #[path]; let-chains unavailable"
+)]
 fn refuse_unauthenticated_tls_access(
     elf: &Elf<'_>,
     bytes: &[u8],
