@@ -130,14 +130,23 @@ fn owned_role_name(cell: &TlsCell) -> &str {
     cell.canonical.as_deref().unwrap_or(&cell.name)
 }
 
-// Same bounded Cs<alphanumeric>_ normalization as m1_artifact's private
-// canonical_rust_symbol. Preserve everything else, including LLVM suffixes.
+// Mirrors m1_artifact's private canonical_rust_symbol exactly: strip one
+// terminal `.llvm.<digits>` compiler-uniquifier suffix, then the bounded
+// Cs<alphanumeric>_ disambiguator normalization. No other normalization.
 fn canonical_rust_symbol(name: &str) -> Option<String> {
     if !name.starts_with("_R") {
         return None;
     }
+    let plain = if let Some((plain, suffix)) = name.split_once(".llvm.") {
+        if suffix.is_empty() || !suffix.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        plain
+    } else {
+        name
+    };
     let mut canonical = String::new();
-    let mut remaining = name;
+    let mut remaining = plain;
     while let Some(offset) = remaining.find("Cs") {
         canonical.push_str(&remaining[..offset]);
         remaining = &remaining[offset + 2..];
@@ -328,7 +337,11 @@ fn validate_layout(elf: &Elf<'_>, bytes: &[u8], cells: &[TlsCell]) -> Result<(),
     Ok(())
 }
 
-fn validate_inventory(elf: &Elf<'_>, bytes: &[u8], cells: &[TlsCell]) -> Result<(), String> {
+/// Build the owned-role map, refusing by name if two owned cells
+/// canonicalize to the same role (e.g. plain and `.llvm.<digits>`
+/// spellings of one logical cell). Duplicates must never merge:
+/// distinct storage under one role would split the cell's state.
+fn owned_role_map(cells: &[TlsCell]) -> Result<BTreeMap<&str, &TlsCell>, String> {
     let mut owned = BTreeMap::new();
     for cell in cells.iter().filter(|cell| cell.owned) {
         let role = cell
@@ -340,6 +353,11 @@ fn validate_inventory(elf: &Elf<'_>, bytes: &[u8], cells: &[TlsCell]) -> Result<
             format!("duplicate owned TLS role: {role}"),
         )?;
     }
+    Ok(owned)
+}
+
+fn validate_inventory(elf: &Elf<'_>, bytes: &[u8], cells: &[TlsCell]) -> Result<(), String> {
+    let owned = owned_role_map(cells)?;
     validate_layout(elf, bytes, cells)?;
     let mut differences = Vec::new();
     for (&role, cell) in &owned {
@@ -408,6 +426,71 @@ fn diagnostic(elf: &Elf<'_>, cells: &[TlsCell]) -> String {
             cell.owned, cell.name, cell.canonical).unwrap();
     }
     output
+}
+
+#[test]
+fn canonical_accepts_plain_and_llvm_digit_suffix() {
+    // Raw spellings measured at the same 9220989c content on main
+    // vs the S5b link graph (step-0 leaf dump): identical size,
+    // section and offset; the only difference is the terminal
+    // `.llvm.<digits>` uniquifier LLVM adds when internalizing the
+    // linkonce thread_local definition. Both must canonicalize to
+    // the one pinned INSTALLATION_DEPTH role.
+    let plain = "_RNvNCNKNvNtCs1rQhWfyroWQ_16reverie_liteinst11patch_alloc18INSTALLATION_DEPTH0s_023___RUST_STD_INTERNAL_VAL";
+    let suffixed = "_RNvNCNKNvNtCs2JzmxHtoBnW_16reverie_liteinst11patch_alloc18INSTALLATION_DEPTH0s_023___RUST_STD_INTERNAL_VAL.llvm.15157159769309064832";
+    assert_eq!(canonical_rust_symbol(plain).as_deref(), Some(EXPECTED[0].0));
+    assert_eq!(
+        canonical_rust_symbol(suffixed).as_deref(),
+        Some(EXPECTED[0].0)
+    );
+}
+
+#[test]
+fn duplicate_owned_role_after_suffix_strip_is_refused() {
+    // The uniqueness guard is load-bearing for suffix stripping:
+    // a plain and a suffixed definition of the same logical cell
+    // must be refused as a duplicate role, never merged.
+    fn owned_cell(name: &str) -> TlsCell {
+        TlsCell {
+            table: "symtab",
+            index: 0,
+            symbol: sym::Sym::default(),
+            name: name.to_owned(),
+            canonical: canonical_rust_symbol(name),
+            owned: true,
+        }
+    }
+    let plain = "_RNvNCNKNvNtCs1rQhWfyroWQ_16reverie_liteinst11patch_alloc18INSTALLATION_DEPTH0s_023___RUST_STD_INTERNAL_VAL";
+    let suffixed = "_RNvNCNKNvNtCs2JzmxHtoBnW_16reverie_liteinst11patch_alloc18INSTALLATION_DEPTH0s_023___RUST_STD_INTERNAL_VAL.llvm.15157159769309064832";
+    let err = match owned_role_map(&[owned_cell(plain), owned_cell(suffixed)]) {
+        Ok(_) => panic!("plain + suffixed forms of one cell must be refused"),
+        Err(err) => err,
+    };
+    assert!(
+        err.contains("duplicate owned TLS role"),
+        "refusal must name the duplicate guard: {err}"
+    );
+    assert!(
+        err.contains(EXPECTED[0].0),
+        "refusal must name the role: {err}"
+    );
+}
+
+#[test]
+fn canonical_refuses_malformed_llvm_suffixes() {
+    let plain = "_RNvNCNKNvNtCs1rQhWfyroWQ_16reverie_liteinst11patch_alloc18INSTALLATION_DEPTH0s_023___RUST_STD_INTERNAL_VAL";
+    for bad in [
+        format!("{plain}.llvm."),
+        format!("{plain}.llvm.12a"),
+        format!("{plain}.llvm.12.34"),
+        format!("{plain}.llvm.foreign"),
+    ] {
+        assert_eq!(
+            canonical_rust_symbol(&bad),
+            None,
+            "malformed suffix must not canonicalize: {bad}"
+        );
+    }
 }
 
 fn authenticated_bytes() -> Result<Vec<u8>, String> {
