@@ -6,6 +6,29 @@ use reverie_loader::handoff::Registers;
 pub use reverie_loader::mapped_inputs::ConsumerLayout;
 pub use reverie_loader::mapped_inputs::ProductionMappedInputs;
 
+/// Decode the exact HLSCAL01 table-3 bytes for the successor
+/// entry. The caller selects this route before calling; the
+/// packet protocol is never selected by inspecting magic. This
+/// is data only and performs no RPC, admission, publication,
+/// installation, or Ready transition.
+pub fn successor_init_packet<'a>(
+    inputs: &ProductionMappedInputs<'a>,
+) -> Result<
+    reverie_loader::init_packet::SuccessorInitPacket<'a>,
+    reverie_loader::init_packet::SuccessorInitPacketError,
+> {
+    let packet = inputs
+        .view()
+        .table(3)
+        .map_err(|_| {
+            reverie_loader::init_packet::SuccessorInitPacketError::Packet(
+                reverie_loader::init_packet::Error::Format,
+            )
+        })?
+        .bytes();
+    reverie_loader::init_packet::decode_successor(packet)
+}
+
 /// Local bridge only: copy every exact original word into the consumer's native
 /// register value. Never reference the handoff as a `libc::user_regs_struct`.
 /// The host still owns original xstate and the actual stopped generation.
@@ -71,6 +94,9 @@ mod tests {
     // Numeric synthetic ledger ONLY. No mapping/capture/syscall/adoption is
     // invoked; no tuple is claimed to authenticate an actual ELF or owner.
     fn fixture() -> (Vec<u8>, ConsumerLayout) {
+        fixture_with_packet(&[0; 8])
+    }
+    fn fixture_with_packet(packet: &[u8]) -> (Vec<u8>, ConsumerLayout) {
         let mut b = vec![0; 4096];
         let addr = b.as_ptr() as u64;
         let hand = (addr & !4095) - 4096;
@@ -126,7 +152,7 @@ mod tests {
             (7, 32),
             (1, 16),
             (4, 32),
-            (8, 1),
+            (packet.len() as u64, 1),
             (1, 8),
             (10, 8),
             (8, 1),
@@ -139,6 +165,9 @@ mod tests {
             put(&mut b, 81 + i * 3, offset as u64);
             put(&mut b, 82 + i * 3, count);
             put(&mut b, 83 + i * 3, stride);
+            if i == 3 {
+                b[offset..offset + packet.len()].copy_from_slice(packet);
+            }
             if i == 6 {
                 b[offset..offset + 8].copy_from_slice(b"hermit!\0");
             }
@@ -285,6 +314,62 @@ mod tests {
         );
         assert_eq!(input.view().bytes().as_ptr(), b.as_ptr());
     }
+    fn encoded_init_packet(flags: u16, state_digest: [u8; 32], redemption: &[u8]) -> Vec<u8> {
+        let mut packet = vec![0; reverie_loader::init_packet::MAX_PACKET_LEN];
+        let len = reverie_loader::init_packet::encode_into(
+            &mut packet,
+            flags,
+            &[0x11; 32],
+            &state_digest,
+            redemption,
+        )
+        .unwrap();
+        packet.truncate(len);
+        packet
+    }
+
+    #[test]
+    fn scalar_successor_packet_reads_exact_table3_successor_packet() {
+        let packet = encoded_init_packet(
+            reverie_loader::init_packet::FLAG_STATE_EXPECTED,
+            [0x33; 32],
+            b"birth-nonce",
+        );
+        let (bytes, expected) = fixture_with_packet(&packet);
+        let input = ProductionMappedInputs::decode(&bytes, expected).unwrap();
+        let decoded = successor_init_packet(&input).unwrap();
+        assert_eq!(decoded.expected_config_digest(), [0x11; 32]);
+        assert_eq!(decoded.expected_state_digest(), [0x33; 32]);
+        assert_eq!(decoded.redemption(), b"birth-nonce");
+        assert!(decoded.packet().state_expected());
+    }
+
+    #[test]
+    fn scalar_successor_packet_refuses_first_image_and_ordinary_table3() {
+        let first_image = encoded_init_packet(0, [0; 32], b"nonce");
+        let (bytes, expected) = fixture_with_packet(&first_image);
+        let input = ProductionMappedInputs::decode(&bytes, expected).unwrap();
+        let error = successor_init_packet(&input).unwrap_err();
+        assert_eq!(
+            error,
+            reverie_loader::init_packet::SuccessorInitPacketError::StateNotExpected
+        );
+        assert_eq!(error.name(), "init_packet_state_not_expected");
+
+        let mut ordinary = vec![0; 128];
+        ordinary[..8].copy_from_slice(b"HLIINIT1");
+        let (bytes, expected) = fixture_with_packet(&ordinary);
+        let input = ProductionMappedInputs::decode(&bytes, expected).unwrap();
+        let error = successor_init_packet(&input).unwrap_err();
+        assert_eq!(
+            error,
+            reverie_loader::init_packet::SuccessorInitPacketError::Packet(
+                reverie_loader::init_packet::Error::Format
+            )
+        );
+        assert_eq!(error.name(), "init_packet_format");
+    }
+
     #[test]
     fn scalar_consumer_refuses_wx_overlap_and_wrong_native_sizes() {
         for case in 0..3 {

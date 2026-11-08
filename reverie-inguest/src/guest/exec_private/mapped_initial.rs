@@ -840,7 +840,7 @@ impl MappedToolPrelude {
         reverie_loader::init_packet::SuccessorInitPacket<'static>,
         reverie_loader::init_packet::SuccessorInitPacketError,
     > {
-        reverie_loader::init_packet::decode_successor(self.input.packet)
+        mapped_scalar::successor_init_packet(&self.input.scalar)
     }
     /// Real sole native leader, physically captured before libc startup.
     pub fn native_tid(&self) -> i32 {
