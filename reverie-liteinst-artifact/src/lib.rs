@@ -17855,6 +17855,9 @@ const FIXED_DEV_TLS_CELL_GETTER_HEX: &str =
     "4883ec1848897c24084889742410488d3daba42100e8b6321e00488d80480000004883c418c3";
 const FIXED_DEV_TLS_CELL_GETTER_STABLE_HEX: &str =
     "4883ec1848897c24084889742410488d3df3ca1e00e8866f1b00488d80300000004883c418c3";
+const FIXED_OPTIMIZED_PATCH_ALLOC_STABLE_70_HEX: &str = "41574156415453504889d34989f6ff1514980b004885c074774c8b78204d85ff746e4989c4488d3dcc950b00e84f310b004883b870000000007463498b542410498b0f498d76ff49f7de31c04889cf4801d7723e4801f772394c21f74989f84929d04901d8410f92c14981f801000002410f93c24508ca75194889c8f04d0fb1074889c1b80000000075c14889f8eb0231c04883c4085b415c415e415fc3bf010000004c89f64889da4883c4085b415c415e415fff253e9b0b00";
+const FIXED_OPTIMIZED_TLS_THUNK_STABLE_70_HEX: &str =
+    "50488d3d00930b00e8832e0b00488d807000000059c3";
 const FIXED_DEV_TLS_CELL_GETTER_EVENT_ARGUMENT_HEX: &str =
     "4883ec1848897c24084889742410488d3ddb4a2200e8a6d11e00488d80400000004883c418c3";
 const FIXED_DEV_TLS_CELL_GETTER_DIAGNOSTIC_EVENT_ARGUMENT_HEX: &str =
@@ -17895,6 +17898,16 @@ fn fixed_tls_cell_access_recipe(
         ("fixed_tls_fn_once", 0x48) => (FIXED_OPTIMIZED_TLS_THUNK_HEX, 16, &[(4, 8), (9, 13)]),
         ("fixed_tls_fn_once", 0x88) => (
             FIXED_OPTIMIZED_TLS_THUNK_DIAGNOSTIC_HEX,
+            16,
+            &[(4, 8), (9, 13)],
+        ),
+        ("fixed_patch_alloc", 0x70) => (
+            FIXED_OPTIMIZED_PATCH_ALLOC_STABLE_70_HEX,
+            0x34,
+            &[(0x10, 0x14), (0x28, 0x2c), (0x2d, 0x31), (0xb6, 0xba)],
+        ),
+        ("fixed_tls_fn_once", 0x70) => (
+            FIXED_OPTIMIZED_TLS_THUNK_STABLE_70_HEX,
             16,
             &[(4, 8), (9, 13)],
         ),
@@ -20756,7 +20769,10 @@ fn validate_existing_allocator_tls_boundary(
             && canonical_rust_symbol(&tls.tls_cell.name).as_deref() == Some(FIXED_TLS_CELL_ROLE)
             && match image_kind {
                 FixedImageKind::Standalone => {
-                    matches!(tls.tls_cell.address, 0x30 | 0x40 | 0x48 | 0x80 | 0x88)
+                    matches!(
+                        tls.tls_cell.address,
+                        0x30 | 0x40 | 0x48 | 0x70 | 0x80 | 0x88
+                    )
                 }
                 FixedImageKind::Detcore => {
                     matches!(
@@ -27570,6 +27586,82 @@ const DETCORE_VALIDATE_TEMPLATES: &[DetcoreValidateTemplate] = &[
         }],
         transfers: &[(11, 0)],
     },
+    // Closed actual stable-standalone 0x114a20; complete252B SHA256e6618861767571907ee1d32eef3c4393b422acb6c1998408761f995834e3996a.
+    DetcoreValidateTemplate {
+        role: "fixed_constructor_prepare",
+        hex: "415741564154534883ec284889fb4989e648897c2408488d442408488b7c24084c89742408488b74240848c744240801000000488b5424084c8d7c24104c897c2408488b4c2408e884f3ffff85c07411b8010000004883c4285b415c415e415fc30fb64c2418b80100000084c974e64c8b6424104c89735848b8001000000060000048894424104c89642418884c2420488d1d6915050448895c2408488d442408488b7c24084c897c2408488b742408e8bb25000085c0759749c744244803000000c605301505040048895c2410488d442410488b7c2410e8732500004889c14885c0b8010000000f8467ffffff31c0807910ff0f94c0e959ffffff",
+        operands: &[
+            DetcoreValidateOperand {
+                displacement: 72,
+                next: 76,
+                key: "fixed_native_from_native",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 147,
+                next: 151,
+                key: "fixed_region",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 177,
+                next: 181,
+                key: "fixed_region_publication_set_opaque",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 196,
+                next: 201,
+                key: "fixed_initializing",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 217,
+                next: 221,
+                key: "fixed_region_publication_get_opaque",
+                got: false,
+            },
+        ],
+        transfers: &[(71, 0), (176, 2), (216, 4)],
+    },
+    // Closed actual stable-standalone 0x114c40; complete252B SHA256cc8c8a1ceaed8084eee6108427f8846b370b7b310740e8cdb509ebeb52f80c06.
+    DetcoreValidateTemplate {
+        role: "fixed_generic_prepare",
+        hex: "415741564154534883ec284889fb4989e648897c2408488d442408488b7c24084c89742408488b74240848c744240802000000488b5424084c8d7c24104c897c2408488b4c2408e864f1ffff85c07411b8010000004883c4285b415c415e415fc30fb64c2418b80100000084c974e64c8b6424104c89735848b8001000000060000048894424104c89642418884c2420488d1d4913050448895c2408488d442408488b7c24084c897c2408488b742408e89b23000085c0759749c744244803000000c605101305040048895c2410488d442410488b7c2410e8532300004889c14885c0b8010000000f8467ffffff31c0807910ff0f94c0e959ffffff",
+        operands: &[
+            DetcoreValidateOperand {
+                displacement: 72,
+                next: 76,
+                key: "fixed_native_from_native",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 147,
+                next: 151,
+                key: "fixed_region",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 177,
+                next: 181,
+                key: "fixed_region_publication_set_opaque",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 196,
+                next: 201,
+                key: "fixed_initializing",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 217,
+                next: 221,
+                key: "fixed_region_publication_get_opaque",
+                got: false,
+            },
+        ],
+        transfers: &[(71, 0), (176, 2), (216, 4)],
+    },
 ];
 
 // Distinct from every historical TLS-bearing241B recipe. Measured in the true
@@ -30066,6 +30158,92 @@ const FIXED_NAKED_STABLE_ORDINARY_INCOMING: &[FixedScalarHelperIncoming] = &[
         &[("fixed_native_owner_gettid", 12, false)],
     ),
 ];
+// The stable standalone composition reuses main's backing/metadata
+// templates (94/95, shared with the stable ordinary cohort) and the
+// pinned standalone tuple for every other role except the two 252-byte
+// prepare templates appended above (109/110). Backing/metadata
+// get_opaque calls are at caller+34, and both prepare bodies use their
+// observed caller+71/+176/+216 edges.
+const FIXED_NAKED_STABLE_STANDALONE_COHORT: &[(&str, usize)] = &[
+    ("fixed_region_publication_get_opaque", 67),
+    ("fixed_region_publication_set_opaque", 80),
+    ("fixed_tool_heap_metadata", 95),
+    ("fixed_arena_backing", 94),
+    ("fixed_tool_require_owned", 59),
+    ("fixed_tool_alloc", 60),
+    ("fixed_tool_dealloc", 72),
+    ("fixed_tool_realloc", 73),
+    ("fixed_native_from_native", 78),
+    ("fixed_constructor_prepare", 109),
+    ("fixed_generic_prepare", 110),
+    ("fixed_arena_setup", 82),
+    ("fixed_native_owner_gettid", 79),
+];
+const FIXED_NAKED_STABLE_STANDALONE_INCOMING: &[FixedScalarHelperIncoming] = &[
+    (
+        "fixed_region_publication_get_opaque",
+        &[
+            ("fixed_tool_heap_metadata", 34, false),
+            ("fixed_arena_backing", 34, false),
+            ("fixed_native_from_native", 176, false),
+            ("fixed_constructor_prepare", 216, false),
+            ("fixed_generic_prepare", 216, false),
+        ],
+    ),
+    (
+        "fixed_region_publication_set_opaque",
+        &[
+            ("fixed_constructor_prepare", 176, false),
+            ("fixed_generic_prepare", 176, false),
+        ],
+    ),
+    (
+        "fixed_tool_heap_metadata",
+        &[
+            ("fixed_tool_require_owned", 4, false),
+            ("fixed_tool_alloc", 13, false),
+            ("fixed_tool_dealloc", 4, false),
+            ("fixed_tool_realloc", 26, false),
+        ],
+    ),
+    (
+        "fixed_native_from_native",
+        &[
+            ("fixed_constructor_prepare", 71, false),
+            ("fixed_generic_prepare", 71, false),
+        ],
+    ),
+    (
+        "fixed_arena_setup",
+        &[("fixed_native_from_native", 257, false)],
+    ),
+    (
+        "fixed_native_owner_gettid",
+        &[("fixed_native_from_native", 116, false)],
+    ),
+    (
+        "fixed_arena_mprotect",
+        &[
+            ("fixed_arena_setup", 95, false),
+            ("fixed_arena_setup", 119, false),
+        ],
+    ),
+    (
+        "fixed_setup_bitmap_range",
+        &[
+            ("fixed_arena_setup", 16, false),
+            ("fixed_arena_setup", 44, false),
+            ("fixed_arena_setup", 72, false),
+            ("fixed_arena_setup", 184, false),
+            ("fixed_arena_setup", 207, false),
+            ("fixed_arena_setup", 230, false),
+        ],
+    ),
+    (
+        "fixed_scalar_syscall",
+        &[("fixed_native_owner_gettid", 12, false)],
+    ),
+];
 const FIXED_NAKED_COMPOSITIONS: &[FixedNakedComposition] = &[
     FixedNakedComposition {
         image_kind: FixedImageKind::Standalone,
@@ -30140,13 +30318,36 @@ const FIXED_NAKED_COMPOSITIONS: &[FixedNakedComposition] = &[
         incoming: FIXED_NAKED_STABLE_ORDINARY_INCOMING,
         setup_bitmap_template: Some(105),
     },
+    FixedNakedComposition {
+        image_kind: FixedImageKind::Standalone,
+        native_syscalls: false,
+        cohort: FIXED_NAKED_STABLE_STANDALONE_COHORT,
+        incoming: FIXED_NAKED_STABLE_STANDALONE_INCOMING,
+        setup_bitmap_template: None,
+    },
 ];
-const FIXED_SOURCE_OWNED_TEMPLATE_END: usize = 94;
+// Exclusive end of the source-owned appended template identities
+// (78..END). The contiguous range is a deliberate over-approximation:
+// of main's 94-108, 94-97, 102, 103, 105 and the gettid tail-jmp
+// template at 108 belong to a naked composition, while 98-101, 104,
+// 106 and 107 do not; this stack's stable-standalone prepares follow
+// at 109/110. This departs from main's END=94 and can only add
+// refusals: composition matching does not depend on END, and every
+// naked composition already requires templates 78 and 82 plus either
+// gettid template 79 or its tail successor 108 (the role-keyed
+// witness map cannot hold both for one role). Including 108 is
+// required to preserve the source-owned invariant that any one
+// appended naked identity alone proves publication is present: a
+// lone 108 fragment is routed to the naked composition check instead
+// of through the historical path. A complete tail build already also
+// carries 78 and 82, so including 108 changes no complete build.
+const FIXED_SOURCE_OWNED_TEMPLATE_END: usize = 111;
 
 fn fixed_naked_publication_present(
     witnesses: &BTreeMap<String, AuthenticatedDetcoreOperation>,
 ) -> bool {
-    // Every appended identity belongs to this one source-owned composition,
+    // Any witness in the over-approximating source-owned range above
+    // is treated as proving a naked-owner publication is present,
     // including the same-opcode bitmap's new exact readonly-data profile.
     // A fragment cannot enter a historical cohort through an unchanged leaf.
     witnesses.values().any(|w| {
@@ -45810,6 +46011,25 @@ mod tests {
                 &[(17, 21, 3671976), (22, 26, 3451968)],
             ),
             (
+                "fixed_patch_alloc",
+                675744,
+                "41574156415453504889d34989f6ff1514980b004885c074774c8b78204d85ff746e4989c4488d3dcc950b00e84f310b004883b870000000007463498b542410498b0f498d76ff49f7de31c04889cf4801d7723e4801f772394c21f74989f84929d04901d8410f92c14981f801000002410f93c24508ca75194889c8f04d0fb1074889c1b80000000075c14889f8eb0231c04883c4085b415c415e415fc3bf010000004c89f64889da4883c4085b415c415e415fff253e9b0b00",
+                112,
+                &[
+                    (16, 20, 1435592),
+                    (40, 44, 1435032),
+                    (45, 49, 1409312),
+                    (182, 186, 1436568),
+                ],
+            ),
+            (
+                "fixed_tls_fn_once",
+                676496,
+                "50488d3d00930b00e8832e0b00488d807000000059c3",
+                112,
+                &[(4, 8, 1435032), (9, 13, 1409312)],
+            ),
+            (
                 "fixed_tls_cell_getter",
                 1588208,
                 "4883ec1848897c24084889742410488d3ddb4a2200e8a6d11e00488d80400000004883c418c3",
@@ -45891,7 +46111,7 @@ mod tests {
                 );
             }
             // Even another observed offset cannot substitute for this actual cell.
-            for wrong in [0, 0x40, 0x48, 0x50, 0x80, 0x88, 0x90, u64::MAX] {
+            for wrong in [0, 0x30, 0x40, 0x48, 0x50, 0x70, 0x80, 0x88, 0x90, u64::MAX] {
                 if wrong == offset {
                     continue;
                 }
@@ -61435,6 +61655,96 @@ mod tests {
                     &[(17, 21, "reverie_inguest_trusted_syscall", true)],
                 ),
             ],
+            // STABLE_STANDALONE: the pinned-standalone retained bodies
+            // for the nine unsubstituted roles are byte-identical in
+            // the stable artifact; the four substituted roles below
+            // carry their own retained stable literals and cursors
+            // (backing/metadata reuse main templates 94/95; the two
+            // prepares are templates 109/110).
+            6 => {
+                let mut samples = naked_owner_publication_samples(3);
+                for sample in &mut samples {
+                    match sample.0 {
+                        "fixed_tool_heap_metadata" => {
+                            *sample = (
+                                "fixed_tool_heap_metadata",
+                                95,
+                                "500fb605513d050484c0740431c0eb30488d05493d0504488904244889e0488b3c24e8894d00004885c074e031c9807810ff48b80030020000600000480f44c1488904244889e0488b042459c3",
+                                &[
+                                    0, 1, 8, 10, 12, 14, 16, 23, 27, 30, 34, 39, 42, 44, 46, 50,
+                                    57, 60, 64, 68, 71, 75, 76,
+                                ],
+                                &[
+                                    (4, 8, "fixed_initializing", false),
+                                    (19, 23, "fixed_region", false),
+                                    (35, 39, "fixed_region_publication_get_opaque", false),
+                                ],
+                            );
+                        }
+                        "fixed_arena_backing" => {
+                            *sample = (
+                                "fixed_arena_backing",
+                                94,
+                                "500fb605c13d050484c0740431c9eb2d488d05b93d0504488904244889e0488b3c24e8f94d000031c94885c0740f807810ff488d055f81f5ff480f45c848890c244889e0488b042459c3",
+                                &[
+                                    0, 1, 8, 10, 12, 14, 16, 23, 27, 30, 34, 39, 41, 44, 46, 50,
+                                    57, 61, 65, 68, 72, 73,
+                                ],
+                                &[
+                                    (4, 8, "fixed_initializing", false),
+                                    (19, 23, "fixed_region", false),
+                                    (35, 39, "fixed_region_publication_get_opaque", false),
+                                    (53, 57, "fixed_backing_object", false),
+                                ],
+                            );
+                        }
+                        "fixed_constructor_prepare" => {
+                            *sample = (
+                                "fixed_constructor_prepare",
+                                109,
+                                "415741564154534883ec284889fb4989e648897c2408488d442408488b7c24084c89742408488b74240848c744240801000000488b5424084c8d7c24104c897c2408488b4c2408e884f3ffff85c07411b8010000004883c4285b415c415e415fc30fb64c2418b80100000084c974e64c8b6424104c89735848b8001000000060000048894424104c89642418884c2420488d1d6915050448895c2408488d442408488b7c24084c897c2408488b742408e8bb25000085c0759749c744244803000000c605301505040048895c2410488d442410488b7c2410e8732500004889c14885c0b8010000000f8467ffffff31c0807910ff0f94c0e959ffffff",
+                                &[
+                                    0, 2, 4, 6, 7, 11, 14, 17, 22, 27, 32, 37, 42, 49, 51, 56, 61,
+                                    66, 71, 76, 78, 80, 85, 89, 90, 92, 94, 96, 97, 102, 107, 109,
+                                    111, 116, 120, 127, 130, 135, 140, 144, 151, 156, 161, 166,
+                                    171, 176, 181, 183, 185, 192, 194, 201, 206, 211, 216, 221,
+                                    224, 227, 232, 238, 240, 244, 247,
+                                ],
+                                &[
+                                    (72, 76, "fixed_native_from_native", false),
+                                    (147, 151, "fixed_region", false),
+                                    (177, 181, "fixed_region_publication_set_opaque", false),
+                                    (196, 201, "fixed_initializing", false),
+                                    (217, 221, "fixed_region_publication_get_opaque", false),
+                                ],
+                            );
+                        }
+                        "fixed_generic_prepare" => {
+                            *sample = (
+                                "fixed_generic_prepare",
+                                110,
+                                "415741564154534883ec284889fb4989e648897c2408488d442408488b7c24084c89742408488b74240848c744240802000000488b5424084c8d7c24104c897c2408488b4c2408e864f1ffff85c07411b8010000004883c4285b415c415e415fc30fb64c2418b80100000084c974e64c8b6424104c89735848b8001000000060000048894424104c89642418884c2420488d1d4913050448895c2408488d442408488b7c24084c897c2408488b742408e89b23000085c0759749c744244803000000c605101305040048895c2410488d442410488b7c2410e8532300004889c14885c0b8010000000f8467ffffff31c0807910ff0f94c0e959ffffff",
+                                &[
+                                    0, 2, 4, 6, 7, 11, 14, 17, 22, 27, 32, 37, 42, 49, 51, 56, 61,
+                                    66, 71, 76, 78, 80, 85, 89, 90, 92, 94, 96, 97, 102, 107, 109,
+                                    111, 116, 120, 127, 130, 135, 140, 144, 151, 156, 161, 166,
+                                    171, 176, 181, 183, 185, 192, 194, 201, 206, 211, 216, 221,
+                                    224, 227, 232, 238, 240, 244, 247,
+                                ],
+                                &[
+                                    (72, 76, "fixed_native_from_native", false),
+                                    (147, 151, "fixed_region", false),
+                                    (177, 181, "fixed_region_publication_set_opaque", false),
+                                    (196, 201, "fixed_initializing", false),
+                                    (217, 221, "fixed_region_publication_get_opaque", false),
+                                ],
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+                samples
+            }
             _ => panic!("unknown naked-owner control fixture"),
         }
     }
@@ -61444,7 +61754,7 @@ mod tests {
         mutations: bool,
     ) -> DetcorePublicationControlGraph {
         let samples = naked_owner_publication_samples(case);
-        let native = [false, true, false, false, true, false][case];
+        let native = [false, true, false, false, true, false, false][case];
         let mut targets: BTreeMap<String, u64> = BTreeMap::from([
             ("fixed_initializing".into(), 0x600000),
             ("fixed_region".into(), 0x600008),
@@ -61686,13 +61996,21 @@ mod tests {
                         .find(|(_, _, key, _)| *key == "fixed_native_from_native")
                         .unwrap()
                         .1;
-                    let setter_test = operands
+                    let setter_next = operands
                         .iter()
                         .find(|(_, _, key, _)| *key == "fixed_region_publication_set_opaque")
                         .unwrap()
-                        .1
-                        + 7;
-                    for (at, modrm) in [(owner_test, 0xc0), (setter_test, 0xc9)] {
+                        .1;
+                    // The stable standalone prepare bodies test EAX
+                    // immediately after the setter call; the pinned
+                    // bodies first move the result to ECX and test it
+                    // seven bytes on.
+                    let (setter_test, setter_modrm) = if matches!(index, 109 | 110) {
+                        (setter_next, 0xc0)
+                    } else {
+                        (setter_next + 7, 0xc9)
+                    };
+                    for (at, modrm) in [(owner_test, 0xc0), (setter_test, setter_modrm)] {
                         let mut bad = bytes.clone();
                         assert_eq!(&bad[at..at + 2], &[0x85, modrm]);
                         bad[at] = 0x84;
@@ -61785,13 +62103,13 @@ mod tests {
             )?;
             fixed_detcore_full_result_contract(&g.witnesses, &g.transfers, &g.selected, &g.targets)
         };
-        for case in 0..6 {
-            let kind = if [true, false, false, true, false, false][case] {
+        for case in 0..7 {
+            let kind = if [true, false, false, true, false, false, true][case] {
                 FixedImageKind::Standalone
             } else {
                 FixedImageKind::Detcore
             };
-            let native = [false, true, false, false, true, false][case];
+            let native = [false, true, false, false, true, false, false][case];
             let graph = naked_owner_publication_control_graph(case, true);
             check(&graph, kind, native).unwrap();
             assert_eq!(
@@ -61971,7 +62289,7 @@ mod tests {
                     "unknown or mixed naked-owner publication whole composition"
                 );
             }
-            for other in 0..6 {
+            for other in 0..7 {
                 if other == case {
                     continue;
                 }
@@ -61996,6 +62314,33 @@ mod tests {
                     );
                 }
             }
+        }
+        // Every proper non-empty subset of the four pinned bodies in
+        // an otherwise stable standalone cohort must refuse as a mix:
+        // no composition selects a partially substituted cohort.
+        for mask in 1usize..15 {
+            let mut bad = naked_owner_publication_control_graph(6, false);
+            for (bit, (role, pinned)) in [
+                ("fixed_tool_heap_metadata", 57usize),
+                ("fixed_arena_backing", 58),
+                ("fixed_constructor_prepare", 88),
+                ("fixed_generic_prepare", 92),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if mask & (1 << bit) != 0 {
+                    bad.witnesses.get_mut(role).unwrap().kind =
+                        AuthenticatedDetcoreOperationKind::ValidateTemplate(pinned);
+                }
+            }
+            assert_eq!(
+                check(&bad, FixedImageKind::Standalone, false)
+                    .unwrap_err()
+                    .to_string(),
+                "unknown or mixed naked-owner publication whole composition",
+                "pinned-subset mask {mask:#06b} must refuse"
+            );
         }
     }
 
@@ -63882,6 +64227,32 @@ mod tests {
                 assert!(check(&bad).is_err(), "ordinary direct edge {role}/{mode}");
             }
         }
+    }
+
+    #[test]
+    fn source_owned_template_end_covers_stable_prepare_identities() {
+        for index in [108, 109, 110] {
+            let mut graph = scalar_ordinary_bit_result_control_graph(false);
+            fixed_scalar_publication_syscall_mode(&graph.witnesses, FixedImageKind::Detcore, false)
+                .unwrap();
+            graph.witnesses.get_mut("fixed_arena_backing").unwrap().kind =
+                AuthenticatedDetcoreOperationKind::ValidateTemplate(index);
+            assert_eq!(
+                fixed_scalar_publication_syscall_mode(
+                    &graph.witnesses,
+                    FixedImageKind::Detcore,
+                    false,
+                )
+                .unwrap_err()
+                .to_string(),
+                "unknown or mixed naked-owner publication whole composition",
+                "lone appended naked identity {index} must prove naked publication"
+            );
+        }
+        assert_eq!(
+            FIXED_SOURCE_OWNED_TEMPLATE_END,
+            DETCORE_VALIDATE_TEMPLATES.len()
+        );
     }
 
     #[test]
