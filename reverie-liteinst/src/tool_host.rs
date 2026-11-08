@@ -384,6 +384,19 @@ pub struct MappedSuccessorVerifiedDigests {
 }
 
 #[cfg(all(feature = "loader-private-runtime", any(test, target_env = "musl")))]
+fn mapped_successor_binding_digests<C: serde::Serialize>(
+    config: &C,
+    redemption: &[u8],
+) -> io::Result<([u8; 32], [u8; 32])> {
+    let config_bytes = reverie_rpc_transport::codec::encode(config)
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    Ok((
+        reverie_rpc_transport::initial_image::config_digest(&config_bytes),
+        reverie_rpc_transport::initial_image::config_digest(redemption),
+    ))
+}
+
+#[cfg(all(feature = "loader-private-runtime", any(test, target_env = "musl")))]
 fn check_mapped_successor_binding(
     client_config_digest: [u8; 32],
     packet_config_digest: [u8; 32],
@@ -613,10 +626,10 @@ unsafe fn prepare_tool_mapped_initial_image_with_budget<T: Tool>(
 /// that decode. Obtain `straddler` before constructing or
 /// redeeming any admitted owner. No guest code may have run.
 ///
-/// A packet/decode or digest-binding refusal returns before the
-/// fatal guard is armed so it can be named; the caller must
-/// still treat every such `Err` as terminal. It must not resume
-/// guest code or reuse the consumed preparation after one.
+/// Every `Err` from this function that returns before the
+/// fatal guard is armed can be named; the caller must still
+/// treat it as terminal. It must not resume guest code or
+/// reuse the consumed preparation after one.
 #[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
 pub unsafe fn prepare_tool_mapped_successor_image_validated<T: Tool>(
     straddler: ValidatedStraddlerStaleness,
@@ -636,12 +649,8 @@ pub unsafe fn prepare_tool_mapped_successor_image_validated<T: Tool>(
         .map_err(|error| io::Error::other(error.name()))?;
     let packet_config_digest = packet.expected_config_digest();
     let packet_state_digest = packet.expected_state_digest();
-    let packet_ticket_digest =
-        reverie_rpc_transport::initial_image::config_digest(packet.redemption());
-    let client_config_bytes = reverie_rpc_transport::codec::encode(client.config())
-        .map_err(|error| io::Error::other(error.to_string()))?;
-    let client_config_digest =
-        reverie_rpc_transport::initial_image::config_digest(&client_config_bytes);
+    let (client_config_digest, packet_ticket_digest) =
+        mapped_successor_binding_digests(client.config(), packet.redemption())?;
     let mut initial = publish_after_mapped_successor_binding(
         client_config_digest,
         packet_config_digest,
@@ -1755,13 +1764,14 @@ mod mapped_successor_binding_tests {
     #[test]
     fn mapped_successor_binding_requires_all_three_digests() {
         let (config, packet_config, packet_state, verified) = binding();
-        let packet_ticket = verified.ticket;
-        let wrong_config_digest = reverie_rpc_transport::initial_image::config_digest(
-            &reverie_rpc_transport::codec::encode(&902_u64).unwrap(),
-        );
-        let _ = config;
+        let (client_config_digest, packet_ticket) =
+            mapped_successor_binding_digests(&config, b"birth-nonce").unwrap();
+        assert_eq!(client_config_digest, packet_config);
+        assert_eq!(packet_ticket, verified.ticket);
+        let (wrong_config_digest, _) =
+            mapped_successor_binding_digests(&902_u64, b"birth-nonce").unwrap();
         check_mapped_successor_binding(
-            packet_config,
+            client_config_digest,
             packet_config,
             packet_state,
             packet_ticket,
@@ -1783,7 +1793,7 @@ mod mapped_successor_binding_tests {
         );
 
         let error = check_mapped_successor_binding(
-            packet_config,
+            client_config_digest,
             packet_config,
             packet_state,
             packet_ticket,
@@ -1798,11 +1808,13 @@ mod mapped_successor_binding_tests {
             "mapped successor packet state digest mismatch"
         );
 
+        let (_, wrong_ticket_digest) =
+            mapped_successor_binding_digests(&config, b"wrong-nonce").unwrap();
         let error = check_mapped_successor_binding(
-            packet_config,
+            client_config_digest,
             packet_config,
             packet_state,
-            reverie_rpc_transport::initial_image::config_digest(b"wrong-nonce"),
+            wrong_ticket_digest,
             &verified,
         )
         .unwrap_err();
@@ -1815,11 +1827,10 @@ mod mapped_successor_binding_tests {
     #[test]
     fn mapped_successor_publication_waits_for_binding() {
         let (config, packet_config, packet_state, verified) = binding();
-        let packet_ticket = verified.ticket;
-        let wrong_config_digest = reverie_rpc_transport::initial_image::config_digest(
-            &reverie_rpc_transport::codec::encode(&902_u64).unwrap(),
-        );
-        let _ = config;
+        let (client_config_digest, packet_ticket) =
+            mapped_successor_binding_digests(&config, b"birth-nonce").unwrap();
+        let (wrong_config_digest, _) =
+            mapped_successor_binding_digests(&902_u64, b"birth-nonce").unwrap();
         let published = std::cell::Cell::new(false);
         let error = publish_after_mapped_successor_binding(
             wrong_config_digest,
@@ -1840,7 +1851,7 @@ mod mapped_successor_binding_tests {
         assert!(!published.get());
 
         publish_after_mapped_successor_binding(
-            packet_config,
+            client_config_digest,
             packet_config,
             packet_state,
             packet_ticket,
