@@ -753,23 +753,30 @@ mod tests {
         if std::env::var_os(CHILD).is_some() {
             return None;
         }
+        use std::os::unix::process::CommandExt;
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
             .env(CHILD, "1")
             .env("REVERIE_RPC_TRANSPORT", "mapped")
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
+            // Own process group: the deadline kill below must reach
+            // fork-test grandchildren too, or a wedged grandchild
+            // holds the output pipes open past the bound.
+            .process_group(0)
             .spawn()
             .unwrap();
-        // Bound the child so a wedged refusal path fails this test
-        // instead of hanging the suite.
+        // Bound the whole group so a wedged refusal path fails this
+        // test instead of hanging the suite.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             if child.try_wait().unwrap().is_some() {
                 return Some(child.wait_with_output().unwrap());
             }
             if std::time::Instant::now() >= deadline {
-                let _ = child.kill();
+                // Kill the child's process group (pgid == child pid
+                // under process_group(0)), then reap and drain.
+                unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
                 let out = child.wait_with_output().unwrap();
                 panic!(
                     "isolated component timed out: {}; stdout={}; stderr={}",
