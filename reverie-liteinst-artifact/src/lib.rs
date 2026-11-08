@@ -4000,28 +4000,31 @@ const NO_INSTALLATION_SCOPE_SOURCE: (&str, u64, &str) = (
     26462,
     "799b94da011fa6d9313a296a74592fd060c12dd8543176ff4d56e7f82abb02bc",
 );
-/// Complete22B getters retained in a no-scope image, as (thunk, cell)
-/// canonical-name pairs. The thunk's shape is exact in every byte but
-/// its cell-offset field; the offset itself is bound from the same
-/// ELF's authenticated TLS symbol for the named cell, never recorded
-/// here, so TLS layout drift in either repository cannot break or
-/// widen recognition. These are other TLS, never allocator-operation
-/// targets or isolation credit.
-const NO_SCOPE_OTHER_GETTERS: [(&str, &str); 4] = [
+/// The four authenticated TLS cell accessors of a no-scope image, as
+/// (accessor, cell) canonical-name pairs. Every read and write of
+/// these cells in the source routes through one #[inline(never)]
+/// accessor per cell, so the built image holds exactly one TLS
+/// access per cell, in that function. The accessor's shape is exact
+/// in every byte but its cell-offset field; the offset itself is
+/// bound from the same ELF's authenticated TLS symbol for the named
+/// cell, never recorded here, so TLS layout drift in either
+/// repository cannot break or widen recognition. These are other
+/// TLS, never allocator-operation targets or isolation credit.
+const NO_SCOPE_TLS_CELL_ACCESSORS: [(&str, &str); 4] = [
     (
-        "_RNvYNCNKNvNtNtCs_15reverie_inguest5guest7support20TOOL_CALLBACK_ACTIVE0s_0INtNtNtCs_4core3ops8function6FnOnceTINtNtB1s_6option6OptionQIB27_INtNtNtB1s_4sync6atomic6AtomicbEEEEE9call_onceBc_",
+        "_RNvNtNtCs_15reverie_inguest5guest7support25tool_callback_active_cell",
         "_RNvNCNKNvNtNtCs_15reverie_inguest5guest7support20TOOL_CALLBACK_ACTIVE0s_023___RUST_STD_INTERNAL_VAL",
     ),
     (
-        "_RNvYNCNKNvNtNtCs_15reverie_inguest5guest12continuation5OWNER0s_0INtNtNtCs_4core3ops8function6FnOnceTINtNtB1i_6option6OptionQIB1X_INtNtB1i_4cell4CellONtB8_12ContinuationEEEEE9call_onceBc_",
+        "_RNvNtNtCs_15reverie_inguest5guest12continuation10owner_cell",
         "_RNvNCNKNvNtNtCs_15reverie_inguest5guest12continuation5OWNER0s_023___RUST_STD_INTERNAL_VAL",
     ),
     (
-        "_RNvYNCNKNvNtNtCs_15reverie_inguest5guest12continuation7PENDING0s_0INtNtNtCs_4core3ops8function6FnOnceTINtNtB1k_6option6OptionQIB1Z_INtNtB1k_4cell4CellIB1Z_NtB8_7PendingEEEEEE9call_onceBc_",
+        "_RNvNtNtCs_15reverie_inguest5guest12continuation12pending_cell",
         "_RNvNCNKNvNtNtCs_15reverie_inguest5guest12continuation7PENDING0s_023___RUST_STD_INTERNAL_VAL",
     ),
     (
-        "_RNvYNCNKNvNtNtCs_15reverie_inguest5guest5alloc14DISPATCH_DEPTH0s_0INtNtNtCs_4core3ops8function6FnOnceTINtNtB1k_6option6OptionQIB1Z_INtNtB1k_4cell4CelljEEEEE9call_onceBc_",
+        "_RNvNtNtCs_15reverie_inguest5guest5alloc19dispatch_depth_cell",
         "_RNvNCNKNvNtNtCs_15reverie_inguest5guest5alloc14DISPATCH_DEPTH0s_023___RUST_STD_INTERNAL_VAL",
     ),
 ];
@@ -18355,20 +18358,35 @@ struct NoScopeCensus {
 }
 // Physical census only. The production caller separately requires actual
 // verified sources, actual compiler feature events and the whole101B recipe.
-/// Absence proof for a retained getter whose thunk is not in this
-/// image: refuse, naming the site, if any executable byte start holds
-/// the thunk shape encoding this cell's offset, or any relocation
-/// names the cell. In this code family the thunk is the only access
-/// form for these cells (verified on both image flavors); initial-exec
-/// or GOT forms would arrive as TLS relocations, which the relocation
-/// scan covers by symbol index.
-fn refuse_inlined_tls_access(
+/// Defense in depth for the four authenticated TLS cells: refuse,
+/// naming the site and the cell, any access to a cell that does not
+/// occur inside one of its authenticated accessors. Two access forms
+/// are scanned at every executable byte start: a module-base access
+/// (a lea of the image's authenticated module TLS descriptor plus a
+/// call to the authenticated __tls_get_addr import, followed within
+/// 40 bytes by a [base + imm] operand landing inside a cell), and an
+/// fs-segment access (absolute fs:[imm32], or an fs base load
+/// followed by a [base + imm32] lea or load landing inside a cell).
+/// Every legitimate read and write funnels through an accessor, so
+/// any other hit is a missed access site and refusal is correct.
+fn refuse_unauthenticated_tls_access(
     elf: &Elf<'_>,
     bytes: &[u8],
-    canonical: &str,
-    cell_offset: u64,
-    cell_index: usize,
+    getters: &[UnisolatedTlsGetter],
+    cells: &[(&str, u64, u64)],
 ) -> Result<()> {
+    let module_slot = getters[0].module_slot;
+    let plt_address = getters[0].plt_address;
+    let in_accessor = |address: u64| {
+        getters
+            .iter()
+            .any(|getter| (getter.getter.address..getter.getter.address + 22).contains(&address))
+    };
+    let cell_of = |imm: u64| {
+        cells
+            .iter()
+            .find(|(_, offset, size)| (*offset..offset + size).contains(&imm))
+    };
     for segment in &elf.program_headers {
         if segment.p_type != program_header::PT_LOAD || segment.p_flags & program_header::PF_X == 0
         {
@@ -18377,37 +18395,113 @@ fn refuse_inlined_tls_access(
         let at = loader_meta_usize(segment.p_offset)?;
         let length = loader_meta_usize(segment.p_filesz)?;
         let code = loader_meta_slice(bytes, at, length)?;
-        for (start, candidate) in code.windows(22).enumerate() {
-            if candidate[..4] != [0x50, 0x48, 0x8d, 0x3d]
-                || candidate[8] != 0xe8
-                || candidate[13..16] != [0x48, 0x8d, 0x80]
-                || candidate[20..] != [0x59, 0xc3]
-                || u64::from(u32::from_le_bytes(candidate[16..20].try_into().unwrap()))
-                    != cell_offset
-            {
-                continue;
-            }
+        for start in 0..code.len() {
             let address = segment
                 .p_vaddr
                 .checked_add(start as u64)
-                .ok_or("inlined TLS access address overflows")?;
-            return Err(format!(
-                "other TLS getter {canonical} is absent but its cell at offset {cell_offset:#x} is accessed by an inlined thunk at {address:#x} in no-scope image"
-            ));
+                .ok_or("unauthenticated TLS access address overflows")?;
+            let rest = &code[start..];
+            // Module-base form: lea descriptor; call __tls_get_addr;
+            // then a [base + imm] operand inside a cell.
+            if rest.len() >= 12
+                && rest[..3] == [0x48, 0x8d, 0x3d]
+                && rest[7] == 0xe8
+                && fixed_rip_target(address, rest, 3, 7).ok() == Some(module_slot)
+                && fixed_rip_target(address + 7, &rest[7..], 1, 5).ok() == Some(plt_address)
+                && !in_accessor(address)
+            {
+                for at in 12..rest.len().min(52) {
+                    let ins = &rest[at..];
+                    let imm = if ins.len() >= 7
+                        && matches!(ins[0], 0x48 | 0x49 | 0x4c | 0x4d)
+                        && matches!(ins[1], 0x8b | 0x8d | 0x03 | 0x2b | 0x3b)
+                        && ins[2] >> 6 == 2
+                    {
+                        Some(u64::from(u32::from_le_bytes(ins[3..7].try_into().unwrap())))
+                    } else if ins.len() >= 4
+                        && matches!(ins[0], 0x48 | 0x49 | 0x4c | 0x4d)
+                        && matches!(ins[1], 0x8b | 0x8d | 0x03 | 0x2b | 0x3b)
+                        && ins[2] >> 6 == 1
+                    {
+                        Some(u64::from(ins[3]))
+                    } else if ins.len() >= 3
+                        && matches!(ins[0], 0x48 | 0x49 | 0x4c | 0x4d)
+                        && matches!(ins[1], 0x8b | 0x8d)
+                        && ins[2] == 0x00
+                    {
+                        Some(0)
+                    } else {
+                        None
+                    };
+                    if let Some(imm) = imm {
+                        if let Some((cell, _, _)) = cell_of(imm) {
+                            return Err(format!(
+                                "TLS cell {cell} is accessed by a module-base operand at {address:#x} outside its authenticated accessor in no-scope image"
+                            ));
+                        }
+                    }
+                }
+            }
+            // fs-segment forms landing inside a cell.
+            let fs_imm = if rest.len() >= 9
+                && rest[0] == 0x64
+                && (matches!(rest[1], 0x8a | 0x8b | 0x88 | 0x89)
+                    && rest[2] == 0x04
+                    && rest[3] == 0x25
+                    || matches!(rest[1], 0x48 | 0x4c)
+                        && matches!(rest[2], 0x8a | 0x8b | 0x88 | 0x89)
+                        && rest[3] == 0x04
+                        && rest[4] == 0x25)
+            {
+                let imm_at = if rest[1] == 0x64 { 4 } else { 5 };
+                (rest.len() > imm_at + 4)
+                    .then(|| u32::from_le_bytes(rest[imm_at..imm_at + 4].try_into().unwrap()))
+            } else if rest.len() >= 10
+                && rest[0] == 0x64
+                && rest[1] == 0x80
+                && rest[2] == 0x3c
+                && rest[3] == 0x25
+            {
+                Some(u32::from_le_bytes(rest[4..8].try_into().unwrap()))
+            } else {
+                None
+            };
+            if let Some(imm) = fs_imm {
+                if let Some((cell, _, _)) = cell_of(u64::from(imm)) {
+                    if !in_accessor(address) {
+                        return Err(format!(
+                            "TLS cell {cell} is accessed by an fs-segment operand at {address:#x} outside its authenticated accessor in no-scope image"
+                        ));
+                    }
+                }
+            }
+            if rest.len() >= 9
+                && rest[0] == 0x64
+                && matches!(rest[1], 0x48 | 0x4c)
+                && rest[2] == 0x8b
+                && matches!(rest[3], 0x04 | 0x0c | 0x14 | 0x1c | 0x2c | 0x34 | 0x3c)
+                && rest[4..9] == [0x25, 0, 0, 0, 0]
+                && !in_accessor(address)
+            {
+                let base = ((rest[3] >> 3) & 7) | ((rest[1] & 1) << 3);
+                for at in 9..rest.len().min(41) {
+                    let ins = &rest[at..];
+                    if ins.len() < 7
+                        || !matches!(ins[0], 0x48 | 0x49 | 0x4c | 0x4d)
+                        || !matches!(ins[1], 0x8d | 0x8b)
+                        || ins[2] & 0xc7 != 0x80 | base
+                    {
+                        continue;
+                    }
+                    let imm = u32::from_le_bytes(ins[3..7].try_into().unwrap());
+                    if let Some((cell, _, _)) = cell_of(u64::from(imm)) {
+                        return Err(format!(
+                            "TLS cell {cell} is accessed by an fs-segment operand at {address:#x} outside its authenticated accessor in no-scope image"
+                        ));
+                    }
+                }
+            }
         }
-    }
-    for relocation in elf
-        .dynrelas
-        .iter()
-        .chain(elf.dynrels.iter())
-        .chain(elf.pltrelocs.iter())
-    {
-        require(
-            relocation.r_sym != cell_index,
-            format!(
-                "other TLS getter {canonical} is absent but a relocation names its cell in no-scope image"
-            ),
-        )?;
     }
     Ok(())
 }
@@ -18442,6 +18536,7 @@ fn no_installation_scope_census(
         }
     }
     let mut other_tls_getters = Vec::new();
+    let mut cell_ranges = Vec::new();
     for &(canonical, cell_canonical) in other_getters {
         let candidates: Vec<_> = elf
             .syms
@@ -18455,8 +18550,8 @@ fn no_installation_scope_census(
             })
             .collect();
         require(
-            candidates.len() <= 1,
-            "other TLS getter duplicated in no-scope image",
+            candidates.len() == 1,
+            "TLS cell accessor absent or duplicated in no-scope image",
         )?;
         // Authenticate the named cell first: both the present-getter
         // path and the absence proof bind to it.
@@ -18480,7 +18575,7 @@ fn no_installation_scope_census(
                 "other TLS getter {canonical} cell {cell_canonical} absent or duplicated in no-scope image"
             ),
         )?;
-        let (cell_index, cell_symbol) = cells[0];
+        let cell_symbol = cells[0].1;
         let cell_name = elf
             .strtab
             .get_at(cell_symbol.st_name)
@@ -18497,16 +18592,7 @@ fn no_installation_scope_census(
             ),
         )?;
         let cell_offset = cell_symbol.st_value;
-        if candidates.is_empty() {
-            // The thunk is absent from this image. That is admissible
-            // only with proof that nothing reaches the cell anyway:
-            // no thunk-shaped access to its offset at any executable
-            // byte start, and no relocation naming the cell. An
-            // inlined access refuses by name and site; it is never
-            // silently unpatched.
-            refuse_inlined_tls_access(elf, bytes, canonical, cell_offset, cell_index)?;
-            continue;
-        }
+        cell_ranges.push((cell_canonical, cell_offset, cell_symbol.st_size));
         let symbol = candidates[0];
         require(
             symbol.st_type() == sym::STT_FUNC
@@ -18688,6 +18774,7 @@ fn no_installation_scope_census(
             targets,
         ));
     }
+    refuse_unauthenticated_tls_access(elf, bytes, &other_tls_getters, &cell_ranges)?;
     Ok(NoScopeCensus {
         mappings,
         raw_names_sha256: sha256(&serde_json::to_vec(&raw_names).map_err(|e| e.to_string())?),
@@ -18757,7 +18844,7 @@ fn derive_no_installation_scope_evidence(
         )?;
     }
     authenticate_loader_metadata(elf, bytes)?;
-    let census = no_installation_scope_census(elf, bytes, &NO_SCOPE_OTHER_GETTERS)?;
+    let census = no_installation_scope_census(elf, bytes, &NO_SCOPE_TLS_CELL_ACCESSORS)?;
     Ok(NoInstallationScopeEvidence {
         kind: "no_installation_scope".into(),
         version: 1,
@@ -18862,7 +18949,7 @@ fn validate_no_installation_scope_evidence(
                         name.starts_with("_RNvXs2_NtCs_16reverie_liteinst11patch_alloc")
                     })
             })
-            && proof.other_tls_getters.len() <= NO_SCOPE_OTHER_GETTERS.len()
+            && proof.other_tls_getters.len() == NO_SCOPE_TLS_CELL_ACCESSORS.len()
             && proof
                 .other_tls_getters
                 .windows(2)
@@ -18878,7 +18965,7 @@ fn validate_no_installation_scope_evidence(
         let canonical = canonical_rust_symbol(&getter.getter.name)
             .ok_or("other TLS getter type name malformed")?;
         require(
-            NO_SCOPE_OTHER_GETTERS
+            NO_SCOPE_TLS_CELL_ACCESSORS
                 .iter()
                 .any(|(name, _cell)| *name == canonical.as_str())
                 && retained.insert(canonical)
@@ -46740,7 +46827,7 @@ mod tests {
             installation_symbols: vec![],
             installation_getters: vec![],
             installation_writer_count: 0,
-            other_tls_getters: NO_SCOPE_OTHER_GETTERS
+            other_tls_getters: NO_SCOPE_TLS_CELL_ACCESSORS
                 .iter()
                 .enumerate()
                 .map(|(index, (name, _cell))| UnisolatedTlsGetter {
@@ -46811,10 +46898,7 @@ mod tests {
                 11 => bad.allocation.binding = sym::STB_GLOBAL,
                 12 => bad.allocation_sha256 = "0".repeat(64),
                 13 => bad.mappings[0].flags = 7,
-                14 => {
-                    bad.other_tls_getters[0].getter.name =
-                        bad.other_tls_getters[1].getter.name.clone()
-                }
+                14 => bad.other_tls_getters.pop().map(|_| ()).unwrap(),
                 15 => bad.other_tls_getters[1] = bad.other_tls_getters[0].clone(),
                 16 => bad.other_tls_getters[0].module_slot += 1,
                 17 => bad.other_tls_getters[0].getter.binding = sym::STB_GLOBAL,
@@ -46914,7 +46998,9 @@ mod tests {
         // One synthetic TLS layout; the census must bind each getter's
         // offset from these cell symbols, whatever layout is chosen.
         let fixture_offsets = [0x199_u64, 0x180, 0x28, 0x190];
-        for (index, (canonical, cell_canonical)) in NO_SCOPE_OTHER_GETTERS.into_iter().enumerate() {
+        for (index, (canonical, cell_canonical)) in
+            NO_SCOPE_TLS_CELL_ACCESSORS.into_iter().enumerate()
+        {
             static_offsets.push(static_names.len());
             static_names.extend_from_slice(canonical.replace("Cs_", "Cs1_").as_bytes());
             static_names.push(0);
@@ -47081,7 +47167,7 @@ mod tests {
             no_installation_scope_census(
                 &Elf::parse(bytes).unwrap(),
                 bytes,
-                &NO_SCOPE_OTHER_GETTERS,
+                &NO_SCOPE_TLS_CELL_ACCESSORS,
             )
         };
         let good = census(&base).expect("complete physical no-scope census positive");
@@ -47118,17 +47204,18 @@ mod tests {
             census(&wrong_static).is_err(),
             "getter whose named cell is absent or duplicated must refuse"
         );
-        // Two getters absent with no reference to their cells (their
-        // symbols and thunk bytes both gone) are accepted: the census
-        // records only the getters physically present.
+        // A missing accessor (symbol and bytes both gone) is refused:
+        // every retained cell's access must be present to authenticate.
         let mut absent = base.clone();
         for index in [1_usize, 2] {
             put(&mut absent, 0x4000 + (index + 1) * 24, 4, 0);
             let address = 0x1500 + index * 0x40;
             absent[address..address + 22].fill(0);
         }
-        let absent = census(&absent).expect("absent unreferenced getters census positive");
-        assert_eq!(absent.other_tls_getters.len(), 2);
+        assert!(
+            census(&absent).is_err(),
+            "missing TLS cell accessor must refuse"
+        );
         // The same absence with the thunk bytes left behind (an
         // inlined access to the cell) is refused.
         let mut inlined = base.clone();
@@ -47136,6 +47223,103 @@ mod tests {
         assert!(
             census(&inlined).is_err(),
             "absent getter with an inlined access to its cell must refuse"
+        );
+        // Cell authentication bites: a global, zero-size or
+        // dynsym-present cell refuses even with its accessor present.
+        let mut global_cell = base.clone();
+        put(
+            &mut global_cell,
+            0x4000 + 6 * 24 + 4,
+            1,
+            ((sym::STB_GLOBAL << 4) | sym::STT_TLS) as u64,
+        );
+        assert!(census(&global_cell).is_err(), "global TLS cell must refuse");
+        let mut empty_cell = base.clone();
+        put(&mut empty_cell, 0x4000 + 6 * 24 + 16, 8, 0);
+        assert!(
+            census(&empty_cell).is_err(),
+            "zero-size TLS cell must refuse"
+        );
+        let mut dynamic_cell = base.clone();
+        let cell_raw = NO_SCOPE_TLS_CELL_ACCESSORS[1]
+            .1
+            .replace("Cs_", "Cs1_")
+            .into_bytes();
+        let dyn_at = 0x4600 + dynamic_names.len();
+        dynamic_cell[dyn_at..dyn_at + cell_raw.len()].copy_from_slice(&cell_raw);
+        put(
+            &mut dynamic_cell,
+            0x8000 + 5 * 64 + 32,
+            8,
+            (dynamic_names.len() + cell_raw.len() + 1) as u64,
+        );
+        put(
+            &mut dynamic_cell,
+            0x3818,
+            8,
+            (dynamic_names.len() + cell_raw.len() + 1) as u64,
+        );
+        // Grow a third dynsym entry naming the cell (the TLS import
+        // entry stays intact), with matching section sizes, hash
+        // chain count and version entries.
+        put(&mut dynamic_cell, 0x8000 + 4 * 64 + 32, 8, 72);
+        put(&mut dynamic_cell, 0x8000 + 8 * 64 + 32, 8, 6);
+        put(&mut dynamic_cell, 0x5404, 4, 3);
+        put(&mut dynamic_cell, 0x4430, 4, dynamic_names.len() as u64);
+        put(
+            &mut dynamic_cell,
+            0x4430 + 4,
+            1,
+            ((sym::STB_GLOBAL << 4) | sym::STT_FUNC) as u64,
+        );
+        assert!(
+            census(&dynamic_cell).is_err(),
+            "dynsym-present TLS cell must refuse"
+        );
+        // A module-base access to a cell outside every accessor (the
+        // native_exec_resume_receipt form: lea the module descriptor,
+        // call __tls_get_addr, then [base + offset]) refuses; the same
+        // site at an unrelated offset is accepted.
+        let mut module_witness = base.clone();
+        let witness_at = 0x1700_usize;
+        let mut witness = fixed_hex("488d3d00000000e800000000488b800000000059c30000");
+        rip(&mut witness, witness_at as u64, 3, 7, 0x3300);
+        rip(&mut witness, witness_at as u64, 8, 12, 0x1810);
+        witness[15..19].copy_from_slice(&(fixture_offsets[1] as u32).to_le_bytes());
+        module_witness[witness_at..witness_at + witness.len()].copy_from_slice(&witness);
+        assert!(
+            census(&module_witness).is_err(),
+            "module-base access to a cell outside its accessor must refuse"
+        );
+        let mut module_unrelated = module_witness.clone();
+        module_unrelated[witness_at + 15..witness_at + 19]
+            .copy_from_slice(&0x777_u32.to_le_bytes());
+        assert_eq!(
+            census(&module_unrelated)
+                .expect("unrelated module-base offset census positive")
+                .other_tls_getters
+                .len(),
+            4
+        );
+        // An fs-segment access to a cell outside every accessor
+        // refuses; at an unrelated offset it is accepted.
+        let mut fs_witness = base.clone();
+        let fs_at = 0x1780_usize;
+        let mut fs_access = fixed_hex("64488b042500000000488d800000000059c300000000");
+        fs_access[12..16].copy_from_slice(&(fixture_offsets[1] as u32).to_le_bytes());
+        fs_witness[fs_at..fs_at + fs_access.len()].copy_from_slice(&fs_access);
+        assert!(
+            census(&fs_witness).is_err(),
+            "fs-segment access to a cell outside its accessor must refuse"
+        );
+        let mut fs_unrelated = fs_witness.clone();
+        fs_unrelated[fs_at + 12..fs_at + 16].copy_from_slice(&0x777_u32.to_le_bytes());
+        assert_eq!(
+            census(&fs_unrelated)
+                .expect("unrelated fs-segment offset census positive")
+                .other_tls_getters
+                .len(),
+            4
         );
         assert_eq!(good.loader_writer_count, 2);
         assert!(good.other_getter_pointer_slots.is_empty());
