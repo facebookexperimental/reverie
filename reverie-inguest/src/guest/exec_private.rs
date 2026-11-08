@@ -1395,6 +1395,23 @@ impl InitialImageControl {
 
     #[cfg(any(feature = "coordinator-rpc", test))]
     pub(super) fn begin_lifecycle(&self, host: usize) -> io::Result<InitialLifecyclePermit<'_>> {
+        self.begin_lifecycle_with_selected_restore(host, 0)
+    }
+
+    #[cfg(feature = "coordinator-rpc")]
+    pub(super) fn begin_mapped_successor_lifecycle(
+        &self,
+        host: usize,
+    ) -> io::Result<InitialLifecyclePermit<'_>> {
+        self.begin_lifecycle_with_selected_restore(host, 2)
+    }
+
+    #[cfg(any(feature = "coordinator-rpc", test))]
+    fn begin_lifecycle_with_selected_restore(
+        &self,
+        host: usize,
+        expected_selected_restore: usize,
+    ) -> io::Result<InitialLifecyclePermit<'_>> {
         if self
             .lifecycle
             .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
@@ -1414,6 +1431,7 @@ impl InitialImageControl {
         if self.installation.load(Ordering::Acquire) != 2
             || host == 0
             || self.installed_host.load(Ordering::Acquire) != host
+            || self.selected_restore.load(Ordering::Acquire) != expected_selected_restore
         {
             return Err(io::Error::other(
                 "InitialImage lifecycle lacks its installed host/frontend",
@@ -1423,7 +1441,7 @@ impl InitialImageControl {
         Ok(permit)
     }
 
-    #[cfg(any(feature = "coordinator-rpc", test))]
+    #[cfg(feature = "coordinator-rpc")]
     pub(super) fn begin_mapped_successor_restore(&self, host: usize) -> io::Result<()> {
         if self
             .selected_restore
@@ -1452,12 +1470,12 @@ impl InitialImageControl {
         Ok(())
     }
 
-    #[cfg(any(feature = "coordinator-rpc", test))]
+    #[cfg(feature = "coordinator-rpc")]
     pub(super) fn mapped_successor_restore_completed(&self) {
         self.selected_restore.store(2, Ordering::Release);
     }
 
-    #[cfg(any(feature = "coordinator-rpc", test))]
+    #[cfg(feature = "coordinator-rpc")]
     pub(super) fn mapped_successor_restore_failed(&self) {
         self.selected_restore.store(3, Ordering::Release);
         self.lifecycle.store(3, Ordering::Release);

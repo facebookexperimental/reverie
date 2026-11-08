@@ -241,10 +241,14 @@ pub unsafe fn publish_mapped_successor_tool<T: Tool + 'static, R: HostRuntime>(
     }
 }
 
-/// Run the installed mapped successor's restored-root lifecycle:
-/// post-exec only, then publish that same state for dispatch.
-/// It calls neither `on_initial_image_attached`,
-/// `init_thread_state`, nor `handle_thread_start`.
+/// Run the installed mapped successor's restored-root lifecycle
+/// with the native successor's callback order: post-exec only,
+/// then publish that same state for dispatch. It calls neither
+/// `on_initial_image_attached`, `init_thread_state`, nor
+/// `handle_thread_start`. Only the callback order and
+/// published state are parity; the mapped `ImageGuest` refuses
+/// injection and terminates on register access, unlike the
+/// native successor guest's entry/injection capabilities.
 ///
 /// # Safety
 /// All `initialize_initial_image_lifecycle` premises apply,

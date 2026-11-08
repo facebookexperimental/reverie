@@ -1073,16 +1073,20 @@ where
         result
     }
 
-    /// Run exactly the restored mapped successor's real post-exec
-    /// before loader entry, mirroring the native successor. There
-    /// is no `on_initial_image_attached`, `init_thread_state`,
-    /// thread-start, or syscall callback.
+    /// Run the restored mapped successor's post-exec with the
+    /// same callback order as the native successor. There is no
+    /// `on_initial_image_attached`, `init_thread_state`,
+    /// thread-start, or syscall callback. Only the callback order
+    /// and published state are native parity: the mapped path
+    /// supplies `ImageGuest`, whose injection is unsupported and
+    /// whose register/stack access terminates, unlike the native
+    /// successor guest's entry registers and injection permit.
     #[cfg(feature = "exec-private-init")]
     pub(super) fn initialize_mapped_successor_lifecycle(
         &self,
         control: &super::exec_private::InitialImageControl,
     ) -> io::Result<()> {
-        let permit = control.begin_lifecycle(core::ptr::from_ref(self) as usize)?;
+        let permit = control.begin_mapped_successor_lifecycle(core::ptr::from_ref(self) as usize)?;
         let _scratch_scope = DispatchScratchScope::enter();
         let tid = raw_pid(libc::SYS_gettid);
         if tid != self.root_pid {

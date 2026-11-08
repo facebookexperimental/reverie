@@ -496,6 +496,8 @@ mod tests {
     #[derive(Default)]
     struct ParityTool {
         calls: Arc<Mutex<Vec<&'static str>>>,
+        refuse_post_exec: bool,
+        inject_in_post_exec: bool,
     }
 
     #[reverie::tool]
@@ -530,6 +532,15 @@ mod tests {
             self.calls.lock().unwrap().push("post-exec");
             assert_eq!(*guest.thread_state(), (99, 0x1234_5678_abcd_4321));
             assert_eq!(*guest.config(), 901);
+            if self.refuse_post_exec {
+                return Err(Errno::EPERM);
+            }
+            if self.inject_in_post_exec {
+                assert_eq!(
+                    guest.inject(reverie::syscalls::Getpid::default()).await,
+                    Err(Errno::EOPNOTSUPP)
+                );
+            }
             guest.thread_state_mut().0 += 1;
             Ok(())
         }
@@ -541,10 +552,25 @@ mod tests {
         Box<ToolHost<ParityTool, TestRuntime>>,
         std::thread::JoinHandle<Vec<u64>>,
     ) {
+        parity_host_with(calls, false, false)
+    }
+
+    fn parity_host_with(
+        calls: Arc<Mutex<Vec<&'static str>>>,
+        refuse_post_exec: bool,
+        inject_in_post_exec: bool,
+    ) -> (
+        Box<ToolHost<ParityTool, TestRuntime>>,
+        std::thread::JoinHandle<Vec<u64>>,
+    ) {
         let (rpc, worker) = test_rpc();
         (
             Box::new(ToolHost::new(
-                ParityTool { calls },
+                ParityTool {
+                    calls,
+                    refuse_post_exec,
+                    inject_in_post_exec,
+                },
                 rpc,
                 raw_pid(libc::SYS_getpid),
                 HashSet::from([Sysno::getpid]),
@@ -599,6 +625,141 @@ mod tests {
 
                 assert_eq!(*native_calls.lock().unwrap(), ["post-exec"]);
                 assert_eq!(*mapped_calls.lock().unwrap(), *native_calls.lock().unwrap());
+            },
+            0,
+        );
+    }
+
+    #[test]
+    fn mapped_second_restore_is_refused_by_name() {
+        isolated(
+            || {
+                let calls = Arc::new(Mutex::new(Vec::new()));
+                let (_native, owner) = lifecycle_test_owner();
+                let (host, worker) = parity_host(calls.clone());
+                unsafe { host.bind_initial_image_control(&owner) }.unwrap();
+                unsafe { host.restore_mapped_successor_state((7, 8), &owner) }.unwrap();
+                let error =
+                    unsafe { host.restore_mapped_successor_state((9, 9), &owner) }.unwrap_err();
+                assert_eq!(
+                    error.to_string(),
+                    "InitialImage selected-state restoration attempted twice"
+                );
+                mark_lifecycle_test_frontend_installed(&owner);
+                let error = host
+                    .initialize_mapped_successor_lifecycle(&owner)
+                    .unwrap_err();
+                assert_eq!(
+                    error.to_string(),
+                    "InitialImage lifecycle was attempted twice"
+                );
+                assert!(calls.lock().unwrap().is_empty());
+                assert!(host.states.is_empty());
+                drop(host);
+                assert!(worker.join().unwrap().is_empty());
+            },
+            0,
+        );
+    }
+
+    #[test]
+    fn mapped_refused_post_exec_poisons_lifecycle_restore_and_finish() {
+        isolated(
+            || {
+                let calls = Arc::new(Mutex::new(Vec::new()));
+                let (_native, owner) = lifecycle_test_owner();
+                let (host, worker) = parity_host_with(calls.clone(), true, false);
+                unsafe { host.bind_initial_image_control(&owner) }.unwrap();
+                unsafe { host.restore_mapped_successor_state((99, 0x1234_5678_abcd_4321), &owner) }
+                    .unwrap();
+                mark_lifecycle_test_frontend_installed(&owner);
+                let error = host
+                    .initialize_mapped_successor_lifecycle(&owner)
+                    .unwrap_err();
+                assert_eq!(error.raw_os_error(), Some(libc::EPERM));
+                assert!(host.states.is_empty());
+                assert!(
+                    host.mapped_successor_pending
+                        .load(core::sync::atomic::Ordering::Acquire)
+                );
+                let error = host
+                    .initialize_mapped_successor_lifecycle(&owner)
+                    .unwrap_err();
+                assert_eq!(
+                    error.to_string(),
+                    "InitialImage lifecycle was attempted twice"
+                );
+                assert!(host.states.is_empty());
+                let error = host.restore_current_thread_state((1, 1)).unwrap_err();
+                assert_eq!(
+                    error.to_string(),
+                    "mapped successor lifecycle state is not complete"
+                );
+                let error = owner.finish().unwrap_err();
+                assert_eq!(
+                    error.to_string(),
+                    "InitialImage installed-host lifecycle did not complete"
+                );
+                assert_eq!(*calls.lock().unwrap(), ["post-exec"]);
+                drop(host);
+                assert!(worker.join().unwrap().is_empty());
+            },
+            0,
+        );
+    }
+
+    #[test]
+    fn mapped_successor_post_exec_inject_is_named_unsupported() {
+        isolated(
+            || {
+                let calls = Arc::new(Mutex::new(Vec::new()));
+                let (_native, owner) = lifecycle_test_owner();
+                let (host, worker) = parity_host_with(calls.clone(), false, true);
+                unsafe { host.bind_initial_image_control(&owner) }.unwrap();
+                unsafe { host.restore_mapped_successor_state((99, 0x1234_5678_abcd_4321), &owner) }
+                    .unwrap();
+                mark_lifecycle_test_frontend_installed(&owner);
+                let error = host
+                    .initialize_mapped_successor_lifecycle(&owner)
+                    .unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+                assert_eq!(
+                    error.to_string(),
+                    "InitialImage lifecycle syscall injection is unsupported"
+                );
+                assert!(host.states.is_empty());
+                assert_eq!(*calls.lock().unwrap(), ["post-exec"]);
+                drop(host);
+                assert!(worker.join().unwrap().is_empty());
+            },
+            0,
+        );
+    }
+
+    #[test]
+    fn mapped_restore_refuses_fresh_initial_lifecycle() {
+        isolated(
+            || {
+                let calls = Arc::new(Mutex::new(Vec::new()));
+                let (_native, owner) = lifecycle_test_owner();
+                let (host, worker) = parity_host(calls.clone());
+                unsafe { host.bind_initial_image_control(&owner) }.unwrap();
+                unsafe { host.restore_mapped_successor_state((99, 0x1234_5678_abcd_4321), &owner) }
+                    .unwrap();
+                mark_lifecycle_test_frontend_installed(&owner);
+                let error = host.initialize_initial_image_lifecycle(&owner).unwrap_err();
+                assert_eq!(
+                    error.to_string(),
+                    "InitialImage lifecycle lacks its installed host/frontend"
+                );
+                assert!(calls.lock().unwrap().is_empty());
+                assert!(host.states.is_empty());
+                assert!(
+                    host.mapped_successor_pending
+                        .load(core::sync::atomic::Ordering::Acquire)
+                );
+                drop(host);
+                assert!(worker.join().unwrap().is_empty());
             },
             0,
         );

@@ -1379,8 +1379,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-liteinst/src/lib.rs",
-        25928,
-        "055b2cc3fc37fd070ebcf133dcf76c68314e80d97913870b26857cc8776b7c31",
+        26762,
+        "99910d58ef33187b149d5787900b5d49d68b71a76fdb68b4519e4b17a830a2a5",
     ),
     (
         "reverie-liteinst-preload/Cargo.toml",
@@ -1424,8 +1424,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-inguest/src/guest/installed_tool.rs",
-        32348,
-        "cf446fe11975f45f4ac7c57629d99ae57e8d868eecd55da0c76207cd978462c1",
+        35715,
+        "0119bc667ad13b526a923981f8040a356c159e681c67fae4e8030e2d90da58a9",
     ),
     (
         "reverie-inguest/src/guest/mod.rs",
@@ -1439,8 +1439,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-inguest/src/guest/host.rs",
-        264674,
-        "8fe3ae2b738182c1a48f29a2785235d6cb19a93c17c801f4bd547b11cc6ddf02",
+        272536,
+        "f5a07c8b8d676461499d6a8ee5e6163f7f57033f26c11d7fcec4425f4e362649",
     ),
     (
         "reverie-inguest/src/guest/host_linux.rs",
@@ -1449,8 +1449,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-liteinst/src/tool_host.rs",
-        62210,
-        "3bef11657f7403cfe7e416c89105b1bbc4616f4d0d3654bcf43a077c21cc9af1",
+        77065,
+        "655bedd70ee4da53c55de046e9dd6288875c303dc19a77350fdf4276e4ae64de",
     ),
     (
         "reverie/Cargo.toml",
@@ -38410,6 +38410,26 @@ mod tests {
         // Keep the fixed catalog authoritative and reject their prior tuples.
         assert_eq!(CONTENT_REVERIE_CATALOG.len(), 86);
         for (relative, old_size, old_digest) in [
+            (
+                "reverie-liteinst/src/lib.rs",
+                25928,
+                "055b2cc3fc37fd070ebcf133dcf76c68314e80d97913870b26857cc8776b7c31",
+            ),
+            (
+                "reverie-liteinst/src/tool_host.rs",
+                61723,
+                "7c3d5914e7070ddc89b72afb3ee49ecddded9f105b5fb43810c2ee070dddf3ce",
+            ),
+            (
+                "reverie-inguest/src/guest/host.rs",
+                251928,
+                "16ea9adb9862d42a3cd54f08bdbd8c0cf7f59a793d0ac6fe61ff34008f102e4e",
+            ),
+            (
+                "reverie-inguest/src/guest/installed_tool.rs",
+                32266,
+                "975d69761bf762cd259cc64f2b4fcbffaea64a6df4bab8cb4513e0e27d59c6d4",
+            ),
             (
                 "Cargo.toml",
                 2142,
