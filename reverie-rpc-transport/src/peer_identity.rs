@@ -100,6 +100,32 @@ fn unsupported(error: &std::io::Error) -> RpcError {
     )))
 }
 
+/// Process id named by an already-obtained pidfd, when it is live.
+pub(crate) fn peer_process_id(peer: &impl AsRawFd) -> std::io::Result<Option<i32>> {
+    match pidfd_get_info(peer) {
+        Ok(PeerState::Live(tgid)) => Ok(Some(tgid)),
+        Ok(PeerState::Gone) => Ok(None),
+        Err(error) => {
+            // Kernels before PIDFD_GET_INFO still expose the pid named
+            // by this exact descriptor through its fdinfo entry.
+            let info =
+                match std::fs::read_to_string(format!("/proc/self/fdinfo/{}", peer.as_raw_fd())) {
+                    Ok(info) => info,
+                    Err(_) => return Err(error),
+                };
+            let pid = info
+                .lines()
+                .find_map(|line| line.strip_prefix("Pid:"))
+                .and_then(|value| value.trim().parse::<i32>().ok())
+                .filter(|pid| *pid > 0);
+            match pid {
+                Some(pid) => Ok(Some(pid)),
+                None => Err(error),
+            }
+        }
+    }
+}
+
 /// The identity of the process that opened a connection, from the pidfd the
 /// kernel recorded for it at `connect`. A connection from a process that has
 /// already been reaped is refused: its pidfd can no longer report a pid.
