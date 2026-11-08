@@ -363,9 +363,11 @@ pub enum StoreFallback {
 /// RestoreFailed only after setting that state), so every
 /// post-store error arrives with a non-Unpatched state and is
 /// custody. Store/Sync/Restore failures paired with Unpatched
-/// are therefore unreachable; they classify as plain refusals
-/// here rather than retaining a site no completion path could
-/// settle (which would wedge the global custody count).
+/// are therefore unreachable; in release builds they classify
+/// as plain refusals here rather than retaining a site no
+/// completion path could settle (which would wedge the global
+/// custody count), and in debug builds the debug_assert below
+/// panics so the impossible pairing is caught in tests.
 /// Pre-store custody (a resume shortfall on an Unpatched site:
 /// nothing was written, but executors may still be stopped)
 /// does NOT retain the site — it retains the STOP, which the
@@ -1389,6 +1391,47 @@ mod tests {
         );
     }
 
+    #[cfg(debug_assertions)]
+    #[test]
+    fn classify_rejects_post_store_error_with_unpatched_state() {
+        // The debug_assert is the load-bearing replacement for the
+        // classify asserts deleted with the dead post-store arms:
+        // an Unpatched pairing proves the patcher broke its
+        // state-before-store contract and must be loud, never a
+        // silent refusal. Deleting the debug_assert (or dropping
+        // one error from its list) fails this test.
+        for err in [
+            PatchError::StoreFailed {
+                source: Box::new(PatchError::CacheOpsUnavailable),
+            },
+            PatchError::SyncFailed {
+                source: Box::new(PatchError::CacheOpsUnavailable),
+            },
+            PatchError::RestoreFailed {
+                source: Box::new(PatchError::CacheOpsUnavailable),
+            },
+        ] {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                classify(&err, SiteState::Unpatched)
+            }));
+            let payload = match outcome {
+                Ok(returned) => panic!(
+                    "classify({err:?}, Unpatched) must panic in debug builds, returned {returned:?}"
+                ),
+                Err(payload) => payload,
+            };
+            let msg = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&'static str>().copied())
+                .unwrap_or("");
+            assert!(
+                msg.contains("patcher contract broken"),
+                "{err:?} panicked with unexpected payload: {msg}"
+            );
+        }
+    }
+
     #[test]
     fn mprotect_store_windows_restores_exact_protection() {
         // Serialize mmap placement with the promoter flip tests:
@@ -2129,8 +2172,8 @@ mod tests {
                 assert_eq!(unsafe { (pb as *const u32).read_volatile() }, 0xd400_0001);
                 assert_eq!(perms_at(pb as u64), "r-xp");
                 assert_eq!(
-                    stop.acquires - acq_b,
-                    stop.resumes - res_b,
+                    (stop.acquires - acq_b, stop.resumes - res_b),
+                    (1, 1),
                     "B refusal must release its own lease exactly once"
                 );
                 assert!(!promoter.unsettled_custody());

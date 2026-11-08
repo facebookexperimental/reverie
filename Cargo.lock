@@ -868,12 +868,12 @@ dependencies = [
 [[package]]
 name = "liteinst-aarch64"
 version = "0.2.0"
-source = "git+https://github.com/rrnewton/liteinst2?branch=musearm2%2Farm-patcher-s5b-20261106#5083ef52e11f3549d88de86f2751eb832866fe3a"
+source = "git+https://github.com/rrnewton/liteinst2?rev=4a6092fe5207866b35eb50c152cabcdc0bda0371#4a6092fe5207866b35eb50c152cabcdc0bda0371"
 
 [[package]]
 name = "liteinst-aarch64-patch"
 version = "0.1.0"
-source = "git+https://github.com/rrnewton/liteinst2?branch=musearm2%2Farm-patcher-s5b-20261106#5083ef52e11f3549d88de86f2751eb832866fe3a"
+source = "git+https://github.com/rrnewton/liteinst2?rev=4a6092fe5207866b35eb50c152cabcdc0bda0371#4a6092fe5207866b35eb50c152cabcdc0bda0371"
 dependencies = [
  "libc",
  "liteinst-aarch64",

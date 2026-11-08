@@ -14,6 +14,6 @@ publish = false
 
 [dependencies]
 libc = "0.2.186"
-liteinst-aarch64 = { git = "https://github.com/rrnewton/liteinst2", branch = "musearm2/arm-patcher-s5b-20261106" }
-liteinst-aarch64-patch = { git = "https://github.com/rrnewton/liteinst2", branch = "musearm2/arm-patcher-s5b-20261106", features = ["test-support"] }
+liteinst-aarch64 = { version = "0.2.0", git = "https://github.com/rrnewton/liteinst2", rev = "4a6092fe5207866b35eb50c152cabcdc0bda0371" }
+liteinst-aarch64-patch = { version = "0.1.0", git = "https://github.com/rrnewton/liteinst2", rev = "4a6092fe5207866b35eb50c152cabcdc0bda0371", features = ["test-support"] }
 reverie-inguest = { path = "../../reverie-inguest", default-features = false }

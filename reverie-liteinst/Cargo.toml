@@ -63,8 +63,8 @@ bincode = { version = "2", features = ["serde"] }
 iced-x86 = { version = "1.21.0", default-features = false, features = ["std", "decoder"], optional = true }
 libc = "0.2.186"
 liteinst = { version = "0.2.0", optional = true }
-liteinst-aarch64 = { git = "https://github.com/rrnewton/liteinst2", branch = "musearm2/arm-patcher-s5b-20261106" }
-liteinst-aarch64-patch = { git = "https://github.com/rrnewton/liteinst2", branch = "musearm2/arm-patcher-s5b-20261106" }
+liteinst-aarch64 = { version = "0.2.0", git = "https://github.com/rrnewton/liteinst2", rev = "4a6092fe5207866b35eb50c152cabcdc0bda0371" }
+liteinst-aarch64-patch = { version = "0.1.0", git = "https://github.com/rrnewton/liteinst2", rev = "4a6092fe5207866b35eb50c152cabcdc0bda0371" }
 reverie = { version = "0.5.4", path = "../reverie", package = "reverie-core" }
 reverie-inguest = { version = "0.5.4", path = "../reverie-inguest", default-features = false, features = ["coordinator-rpc", "rcb-clock", "launcher"] }
 reverie-rpc-transport = { version = "0.5.4", path = "../reverie-rpc-transport" }
@@ -77,7 +77,7 @@ tracing = "0.1.41"
 # Cross-crate tests inspect the actual shared collector without exposing fields.
 reverie-inguest = { version = "0.5.4", path = "../reverie-inguest", default-features = false, features = ["native-exec-state-fixture"] }
 goblin = "=0.10.7"
-liteinst-aarch64-patch = { git = "https://github.com/rrnewton/liteinst2", branch = "musearm2/arm-patcher-s5b-20261106", features = ["test-support"] }
+liteinst-aarch64-patch = { version = "0.1.0", git = "https://github.com/rrnewton/liteinst2", rev = "4a6092fe5207866b35eb50c152cabcdc0bda0371", features = ["test-support"] }
 safeptrace = { version = "0.5.4", path = "../safeptrace" }
 sha2 = "0.10.9"
 serde_json = "1"
