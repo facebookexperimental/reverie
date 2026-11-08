@@ -19,9 +19,10 @@ files, memfds, sockets and synthetic proc files. Native Linux supports some
 of these cases. Pipe-only support does not repair general descriptor identity
 through `SCM_RIGHTS` or provide full ioctl parity.
 
-See `pipe_fionread` and its dispatch in
-[`executor.rs`](../reverie-kvm/src/executor.rs), the
-[unit controls](../reverie-kvm/src/pipe_fionread_tests.rs), and the
+See `pipe_fionread` in
+[`executor/socket.rs`](../reverie-linuxemu/src/executor/socket.rs), its dispatch in
+[`executor/ioctl.rs`](../reverie-linuxemu/src/executor/ioctl.rs), the
+[unit controls](../reverie-linuxemu/src/pipe_fionread_tests.rs), and the
 [native/KVM fixture](../reverie-kvm/tests/fixtures/pipe_fionread.c).
 The controls retain complete-buffer checks, non-consumption, capture exclusions,
 transferred aliases, request width and memory-fault behavior.

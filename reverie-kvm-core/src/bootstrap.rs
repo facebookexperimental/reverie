@@ -897,10 +897,11 @@ pub(crate) fn install_user_windows(memory: &mut GuestMemory) -> Result<()> {
 // TODO-HUMAN-REVIEW(PR-266): Review the synthetic vDSO ELF layout and note.
 //
 // Deterministic kernel version advertised by the vDSO note. Encoded as
-// `(major << 16) | (minor << 8) | patch`, this is `LINUX_VERSION_CODE` for the
-// "6.0.0" release the KVM backend reports through `uname(2)` (see
-// reverie-kvm/src/executor.rs). Keeping the value fixed preserves determinism
-// regardless of the real host kernel.
+// `(major << 16) | (minor << 8) | patch`, this is `LINUX_VERSION_CODE` for
+// "6.0.0". It is not tied to `uname(2)`: the executor's `uname` in
+// reverie-linuxemu/src/executor/identity.rs forwards the host's answer, and the
+// Tool decides the release the guest sees. Keeping the value fixed preserves
+// determinism regardless of the real host kernel.
 const GUEST_LINUX_VERSION_MAJOR: u32 = 6;
 const GUEST_LINUX_VERSION_MINOR: u32 = 0;
 const GUEST_LINUX_VERSION_PATCH: u32 = 0;

@@ -43,7 +43,8 @@ blocked-wait interruption, and Hermit's child-exit producer and scheduler
 integration remain outside this API. See the
 [backend signal limits](../reverie-kvm/README.md#bounded-signal-delivery).
 
-Implementation is in [`executor.rs`](../reverie-kvm/src/executor.rs) and
+Implementation is in
+[`executor/sys_signal.rs`](../reverie-linuxemu/src/executor/sys_signal.rs) and
 [`runtime.rs`](../reverie-kvm/src/runtime.rs). The
 [receiver controls](../reverie-kvm/tests/support/child_exit_signals.rs) exercise
 explicit Tool publication separately from native child wait and reaping.
