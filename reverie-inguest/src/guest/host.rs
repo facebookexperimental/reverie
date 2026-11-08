@@ -4806,6 +4806,7 @@ mod process_owner_tests {
         assert_ne!(results[0].0, results[1].0);
     }
 
+    #[cfg(feature = "exec-private-successor")]
     fn isolated(body: impl FnOnce() + std::panic::UnwindSafe, expected: i32) {
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0);
