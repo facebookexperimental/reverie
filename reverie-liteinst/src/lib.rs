@@ -31,6 +31,7 @@ pub mod generic_fixture;
 mod initial_image_stats;
 #[cfg(feature = "liteinst")]
 mod interior_entry;
+pub mod lazy_promote;
 #[cfg(feature = "liteinst")]
 mod liteinst_census;
 #[cfg(feature = "native-exec-state")]

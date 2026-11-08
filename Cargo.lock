@@ -866,6 +866,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "liteinst-aarch64"
+version = "0.2.0"
+source = "git+https://github.com/rrnewton/liteinst2?branch=musearm2%2Farm-patcher-s5b-20261106#58f94f2cbc9b81eb550bbb91fde9c82ce9715bd5"
+
+[[package]]
+name = "liteinst-aarch64-patch"
+version = "0.1.0"
+source = "git+https://github.com/rrnewton/liteinst2?branch=musearm2%2Farm-patcher-s5b-20261106#58f94f2cbc9b81eb550bbb91fde9c82ce9715bd5"
+dependencies = [
+ "libc",
+ "liteinst-aarch64",
+]
+
+[[package]]
 name = "liteinst-x86"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1397,6 +1411,8 @@ dependencies = [
  "iced-x86",
  "libc",
  "liteinst",
+ "liteinst-aarch64",
+ "liteinst-aarch64-patch",
  "reverie-core",
  "reverie-inguest",
  "reverie-rpc-transport",

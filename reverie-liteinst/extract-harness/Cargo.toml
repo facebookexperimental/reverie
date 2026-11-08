@@ -1,0 +1,19 @@
+# Recorded-extraction harness for the aarch64 S5b flip tests:
+# reverie-liteinst itself cannot yet compile for aarch64 (upstream
+# liteinst 0.2.0 and reverie-core pmu gaps), so the byte-identical
+# lazy_promote module is linked here against the real
+# reverie-inguest (no default features) and the patch crates, and
+# run natively or under qemu-aarch64. Not a workspace member.
+[package]
+name = "s5b-extract-harness"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+libc = "0.2.186"
+liteinst-aarch64 = { git = "https://github.com/rrnewton/liteinst2", branch = "musearm2/arm-patcher-s5b-20261106" }
+liteinst-aarch64-patch = { git = "https://github.com/rrnewton/liteinst2", branch = "musearm2/arm-patcher-s5b-20261106", features = ["test-support"] }
+reverie-inguest = { path = "../../reverie-inguest", default-features = false }
