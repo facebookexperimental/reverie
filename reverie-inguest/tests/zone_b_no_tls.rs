@@ -68,10 +68,11 @@
 //!   instructions are an inventory, not a control-flow proof.
 //! * Callee-saved registers are kept across every call,
 //!   unconditionally: the call model clears caller-saved
-//!   registers, and clears the call-target register only when it
-//!   is itself caller-saved or the computed callee write set
-//!   covers it; a callee-saved call target is kept even when the
-//!   callee writes it (cg2r). A callee — direct, indirect, or an
+//!   registers, except that the call-target register, whatever
+//!   its class, is kept whenever the computed callee write set
+//!   does not cover it; a callee-saved call target is therefore
+//!   kept even when the callee writes it (cg2r). A callee —
+//!   direct, indirect, or an
 //!   internal helper (CG2) — that actually clobbers a
 //!   callee-saved register is therefore trusted not to, under the
 //!   SysV ABI assumption for hand-written zone-B asm; that
@@ -602,13 +603,15 @@ fn check_units(units: &[UnitSummary], ranges: &[ScanRange]) -> Report {
 
     // The template bounds are load-bearing for every interior
     // refusal, so their four names must be defined exactly once,
-    // in the single relocatable unit that defines
-    // `fixed_native_entry`. Any other definition — weak, COMMON,
-    // absolute, strong, or a second-spelling pair in another unit —
-    // could shadow, replace or (by disagreeing) silently disable
-    // the bounds, so it refuses outright (ps-x1/ps-x2 families).
-    // Only relocatable units participate, matching the bounds
-    // lookup; the linked test binary's symbols never define bounds.
+    // in the single relocatable unit that defines the global,
+    // sectioned `fixed_native_entry`. Any other definition —
+    // weak, COMMON, absolute, strong, a second-spelling pair in
+    // another unit, or a unit that makes itself an "owner" with a
+    // local `fixed_native_entry` label — could shadow, replace or
+    // (by disagreeing) silently disable the bounds, so it refuses
+    // outright (ps-x1/ps-x2/ps-n13/ps-n4 families). Only
+    // relocatable units participate, matching the bounds lookup;
+    // the linked test binary's symbols never define bounds.
     {
         const BOUND_NAMES: [&str; 4] = [
             "fixed_gate_template",
@@ -616,14 +619,20 @@ fn check_units(units: &[UnitSummary], ranges: &[ScanRange]) -> Report {
             "reverie_inguest_fixed_gate_template",
             "reverie_inguest_fixed_gate_template_end",
         ];
+        // Exactly one owner: the relocatable unit holding the
+        // global, sectioned `fixed_native_entry`. A local label or
+        // a sectionless definition does not make a unit an owner.
         let owners: BTreeSet<usize> = units
             .iter()
             .enumerate()
             .filter(|(_, unit)| unit.relocatable)
             .filter(|(_, unit)| {
-                unit.symbols
-                    .iter()
-                    .any(|symbol| !symbol.undefined && symbol.name == "fixed_native_entry")
+                unit.symbols.iter().any(|symbol| {
+                    symbol.global
+                        && !symbol.undefined
+                        && symbol.section.is_some()
+                        && symbol.name == "fixed_native_entry"
+                })
             })
             .map(|(index, _)| index)
             .collect();
@@ -653,7 +662,7 @@ fn check_units(units: &[UnitSummary], ranges: &[ScanRange]) -> Report {
                 let duplicated = bound_locations
                     .get(symbol.name.as_str())
                     .is_some_and(|locations| locations.len() > 1);
-                if duplicated || !owners.contains(&unit_index) {
+                if duplicated || owners.len() != 1 || !owners.contains(&unit_index) {
                     report.refuse(
                         &unit.label,
                         &symbol.name,
@@ -957,9 +966,12 @@ fn find_global_relocatable_symbol(
         for symbol in &unit.symbols {
             if symbol.global && !symbol.undefined && symbol.name == name {
                 // Sectionless (COMMON/absolute) definitions cannot
-                // locate bounds; skipping them here is safe only
-                // because check_units refuses every such bound-name
-                // definition outright (duplicate-gate-bounds).
+                // locate bounds and are skipped here. check_units
+                // refuses them when they duplicate another definition
+                // or sit outside the owner unit; a unique sectionless
+                // definition in the owner unit (s-n9's absolute _end)
+                // draws no refusal and simply yields no bounds, so
+                // the `.gate` fallback governs instead.
                 let Some(section) = symbol.section else {
                     continue;
                 };
@@ -3671,6 +3683,20 @@ fn checker_refuses_each_injected_tls_and_control_violation() {
             Vec::new(),
             "indirect-branch",
         ),
+        (
+            "s-n9-abs-end-fallback",
+            "zone_b_sn9.S",
+            ".section .gate,\"ax\",@progbits\n.globl fixed_gate_template\nfixed_gate_template:\n .fill 0x7c,1,0x90\n.globl fixed_native_entry\nfixed_native_entry:\n syscall\n .fill 4,1,0x90\n jmp *%r12\n.globl fixed_gate_template_end\n.set fixed_gate_template_end, 0x2000\n.text\n.globl zone_b_mutant\nzone_b_mutant:\n lea fixed_gate_template+0x80(%rip),%r12\n jmp fixed_native_entry\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "s-n4-local-owner-only",
+            "zone_b_sn4.S",
+            ".section .gate,\"ax\",@progbits\n.globl fixed_gate_template\nfixed_gate_template:\n .fill 0x7c,1,0x90\nfixed_native_entry:\n syscall\n .fill 4,1,0x90\n jmp *%r12\n .fill 16,1,0x90\n.globl fixed_gate_template_end\nfixed_gate_template_end:\n.text\n.globl zone_b_mutant\nzone_b_mutant:\n mov %rdi,%r12\n jmp fixed_gate_template+0x82\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "duplicate-gate-bounds",
+        ),
     ];
     let mut missing = Vec::new();
     for (label, filename, contents, extra, expected) in cases {
@@ -3792,7 +3818,7 @@ fn production_set_refuses_gate_alias_call_and_deadcode_probes() {
         (
             "ps-r1b-r12-template-309",
             "zone_b_ps_r1b_r12_template_309.S",
-            ".text\n.globl zone_b_mutant\nzone_b_mutant:\n lea fixed_native_entry+0x28d(%rip),%r12\n movabs $fixed_native_entry,%rcx\n jmp *%rcx\n ret\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
+            ".text\n.globl zone_b_mutant\nzone_b_mutant:\n lea fixed_gate_template+0x309(%rip),%r12\n movabs $fixed_native_entry,%rcx\n jmp *%rcx\n ret\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
             "indirect-branch",
         ),
         (
@@ -3939,6 +3965,30 @@ fn production_set_refuses_gate_alias_call_and_deadcode_probes() {
             ".text\n.globl zone_b_mutant\nzone_b_mutant:\n movabs $zone_b_helper,%r10\n call *%r10\n jmp *%r10\n.size zone_b_mutant,.-zone_b_mutant\n.globl zone_b_helper\nzone_b_helper:\n movabs $zone_b_writer,%rax\n .byte 0xe9\n .long 0\n .reloc .-4, R_X86_64_PC32, .Lzb_join-4\n movabs $zone_b_other,%rax\n.Lzb_join:\n call *%rax\n ret\n.size zone_b_helper,.-zone_b_helper\n.globl zone_b_writer\nzone_b_writer:\n mov %rdi,%r10\n ret\n.size zone_b_writer,.-zone_b_writer\n.globl zone_b_other\nzone_b_other:\n ret\n.size zone_b_other,.-zone_b_other\n.section .note.GNU-stack,\"\",@progbits\n",
             "indirect-branch",
         ),
+        (
+            "ps-n13-owner-duplicate",
+            "zone_b_ps_n13.S",
+            ".data\nfixed_native_entry:\n .quad 0\n.data\n.weak fixed_gate_template\n.globl fixed_gate_template\nfixed_gate_template:\n .quad 0\n.section .gate,\"ax\",@progbits\n.globl reverie_inguest_fixed_gate_template\nreverie_inguest_fixed_gate_template:\n nop\n.globl reverie_inguest_fixed_gate_template_end\nreverie_inguest_fixed_gate_template_end:\n.text\n.globl zone_b_mutant\nzone_b_mutant:\n mov %rdi,%rax\n jmp fixed_signal_restorer+9\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
+            "duplicate-gate-bounds",
+        ),
+        (
+            "ps-n13z-no-weak-control",
+            "zone_b_ps_n13z.S",
+            ".data\nfixed_native_entry:\n .quad 0\n.section .gate,\"ax\",@progbits\n.globl reverie_inguest_fixed_gate_template\nreverie_inguest_fixed_gate_template:\n nop\n.globl reverie_inguest_fixed_gate_template_end\nreverie_inguest_fixed_gate_template_end:\n.text\n.globl zone_b_mutant\nzone_b_mutant:\n mov %rdi,%rax\n jmp fixed_signal_restorer+9\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
+            "unrecognized-outgoing-edge",
+        ),
+        (
+            "ps-n4-local-owner-pair2",
+            "zone_b_ps_n4.S",
+            ".data\nfixed_native_entry:\n .quad 0\n.section .gate,\"ax\",@progbits\n.globl reverie_inguest_fixed_gate_template\nreverie_inguest_fixed_gate_template:\n nop\n.globl reverie_inguest_fixed_gate_template_end\nreverie_inguest_fixed_gate_template_end:\n.text\n.globl zone_b_mutant\nzone_b_mutant:\n mov %rdi,%rax\n jmp fixed_signal_restorer+9\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
+            "duplicate-gate-bounds",
+        ),
+        (
+            "ps-r1b2-entry-addend-309",
+            "zone_b_ps_r1b2_entry_addend_309.S",
+            ".text\n.globl zone_b_mutant\nzone_b_mutant:\n lea fixed_native_entry+0x28d(%rip),%r12\n movabs $fixed_native_entry,%rcx\n jmp *%rcx\n ret\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
+            "indirect-branch",
+        ),
     ];
     let mut missing = Vec::new();
     for (label, filename, contents, expected) in probes {
@@ -3992,6 +4042,65 @@ fn production_set_refuses_gate_alias_call_and_deadcode_probes() {
         missing.is_empty(),
         "missing production-set refusals:\n{}",
         missing.join("\n")
+    );
+}
+
+#[test]
+fn duplicate_bound_symbol_in_owner_unit_refuses() {
+    // Genuine duplicate symbol entries for one bound name inside the
+    // owner unit cannot be produced by the assembler (one entry per
+    // name), so this pins the `duplicated` clause itself: objcopy adds
+    // a second global fixed_gate_template in .data to an otherwise
+    // clean owner fixture. Removing the duplicated clause (keeping
+    // the exactly-one-owner rule) makes this object pass.
+    let scratch = Scratch::new("dup-bound");
+    let bytes = compile_source(
+        &scratch.0,
+        "dup-bound-owner",
+        "zone_b_dup_bound.S",
+        ".section .gate,\"ax\",@progbits\n.globl fixed_gate_template\nfixed_gate_template:\n .fill 0x7c,1,0x90\n.globl fixed_native_entry\nfixed_native_entry:\n syscall\n .fill 4,1,0x90\n jmp *%r12\n .fill 16,1,0x90\n.globl fixed_gate_template_end\nfixed_gate_template_end:\n.data\n.globl zb_data\nzb_data: .quad 0\n.text\n.globl zone_b_mutant\nzone_b_mutant:\n ret\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
+        &[],
+    );
+    let baseline = check_single("dup-bound-owner", &bytes);
+    assert!(
+        baseline
+            .violations
+            .iter()
+            .all(|violation| violation.kind != "duplicate-gate-bounds"),
+        "clean owner fixture must not draw the duplicate refusal: {:?}",
+        baseline.violations
+    );
+    let source_object = scratch.0.join("dup-bound-owner.o");
+    let duplicated_object = scratch.0.join("dup-bound-owner-dup.o");
+    let output = Command::new("objcopy")
+        .args(["--add-symbol", "fixed_gate_template=.data:0,global"])
+        .arg(&source_object)
+        .arg(&duplicated_object)
+        .output()
+        .expect("run objcopy for duplicate bound symbol");
+    assert!(
+        output.status.success(),
+        "objcopy: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let duplicated_bytes = fs::read(&duplicated_object).expect("read duplicated object");
+    let report = check_single("dup-bound-owner", &duplicated_bytes);
+    println!(
+        "ZONE-B EXPECTED-FAIL dup-bound-owner: {} kinds={:?}",
+        report.summary(),
+        report
+            .violations
+            .iter()
+            .map(|violation| violation.kind)
+            .collect::<BTreeSet<_>>()
+    );
+    assert!(
+        report
+            .violations
+            .iter()
+            .any(|violation| violation.kind == "duplicate-gate-bounds"),
+        "duplicate bound symbol in the owner unit must refuse: {:?}",
+        report.violations
     );
 }
 
