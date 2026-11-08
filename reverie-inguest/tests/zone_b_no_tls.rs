@@ -26,11 +26,11 @@
 //! recognized swap/gate entry, or an unrecognized indirect
 //! branch.
 //!
-//! The compile recipe below is the production recipe plus
-//! `-fno-jump-tables` from hermit PR 5293 (pending), placed
-//! immediately after `-mcmodel=large` (minibeads dh-1fz4b); it
-//! removes the one compiler jump table in
-//! `make_private_stack.constprop.0`.
+//! The compile recipe below is the production recipe, including
+//! `-fno-jump-tables` from https://github.com/rrnewton/hermit/pull/5293
+//! (landed as 38111a07), placed immediately after
+//! `-mcmodel=large` (minibeads dh-1fz4b); it removes the one
+//! compiler jump table in `make_private_stack.constprop.0`.
 //!
 //! Scope of this prototype, stated plainly:
 //!
@@ -1881,8 +1881,9 @@ fn compile_object_with_delta(
         .unwrap_or_else(|| "cc".into());
     let mut command = Command::new(compiler);
     // Hermit liteinst-runtime-build/artifact.rs production recipe,
-    // in its order, plus -fno-jump-tables from hermit PR 5293
-    // (pending). The without-flag form exists only to pin the
+    // in its order, including -fno-jump-tables from
+    // https://github.com/rrnewton/hermit/pull/5293 (landed as
+    // 38111a07). The without-flag form exists only to pin the
     // jump-table violation that dh-1fz4b removes.
     command.args([
         "-O2",
@@ -2242,7 +2243,7 @@ fn clean_zone_b_objects_pass() {
         "each exact gate-leaf instruction must be used exactly once"
     );
     println!(
-        "ZONE-B PASS clean (production recipe plus -fno-jump-tables from hermit PR 5293 (pending)): {}",
+        "ZONE-B PASS clean (production recipe, including -fno-jump-tables from https://github.com/rrnewton/hermit/pull/5293 (landed as 38111a07)): {}",
         report.summary()
     );
 }
@@ -2687,6 +2688,20 @@ fn checker_refuses_each_injected_tls_and_control_violation() {
             "indirect-branch",
         ),
         (
+            "maywrite-gate-syscallless-callee",
+            "zone_b_maywrite_gate_nosyscall.S",
+            ".section .gate,\"ax\",@progbits\n.globl fixed_native_entry\n.type fixed_native_entry,@function\nfixed_native_entry:\n ret\n.size fixed_native_entry,.-fixed_native_entry\n.text\n.globl zone_b_mutant\n.type zone_b_mutant,@function\nzone_b_mutant:\n movabs $zone_b_helper,%rcx\n call *%rcx\n jmp *%rcx\n.size zone_b_mutant,.-zone_b_mutant\n.globl zone_b_helper\n.type zone_b_helper,@function\nzone_b_helper:\n lea 1f(%rip),%r12\n movabs $fixed_native_entry,%r11\n jmp *%r11\n1: ret\n.size zone_b_helper,.-zone_b_helper\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
+            "maywrite-gate-relocated-continuation",
+            "zone_b_maywrite_gate_reloc_cont.S",
+            ".section .gate,\"ax\",@progbits\n.globl fixed_native_entry\n.type fixed_native_entry,@function\nfixed_native_entry:\n ret\n.size fixed_native_entry,.-fixed_native_entry\n.text\n.globl zone_b_writer\n.type zone_b_writer,@function\nzone_b_writer:\n xor %r10d,%r10d\n ret\n.size zone_b_writer,.-zone_b_writer\n.globl zone_b_helper\n.type zone_b_helper,@function\nzone_b_helper:\n lea zone_b_writer(%rip),%r12\n movabs $fixed_native_entry,%r11\n jmp *%r11\n ret\n.size zone_b_helper,.-zone_b_helper\n.globl zone_b_mutant\n.type zone_b_mutant,@function\nzone_b_mutant:\n movabs $zone_b_helper,%r10\n call *%r10\n jmp *%r10\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
             "maywrite-no-closure",
             "zone_b_maywrite_closure.S",
             ".text\n.globl zone_b_mutant\n.type zone_b_mutant,@function\nzone_b_mutant:\n movabs $zone_b_helper,%r10\n call *%r10\n jmp *%r10\n.size zone_b_mutant,.-zone_b_mutant\n.globl zone_b_helper\n.type zone_b_helper,@function\nzone_b_helper:\n call zone_b_writer\n ret\n.size zone_b_helper,.-zone_b_helper\n.globl zone_b_writer\n.type zone_b_writer,@function\nzone_b_writer:\n xor %r10d,%r10d\n ret\n.size zone_b_writer,.-zone_b_writer\n.section .note.GNU-stack,\"\",@progbits\n",
@@ -3031,6 +3046,66 @@ fn may_write_tail_successor_writes_kept_register() {
             .get(&(helper.unit, helper.section, helper.start))
             .is_some_and(|registers| registers.contains(&Register::R10)),
         "tail successor must contribute writer R10: {writes:?} ranges={ranges:?}"
+    );
+}
+
+#[test]
+fn may_write_gate_extend_and_continuation_successor_write_kept_register() {
+    let scratch = Scratch::new("maywrite-gate-sets");
+    let syscall_less_gate = compile_source(
+        &scratch.0,
+        "maywrite-gate-extend-unit",
+        "zone_b_maywrite_gate_extend_unit.S",
+        ".section .gate,\"ax\",@progbits\n.globl fixed_native_entry\n.type fixed_native_entry,@function\nfixed_native_entry:\n ret\n.size fixed_native_entry,.-fixed_native_entry\n.text\n.globl zone_b_helper\n.type zone_b_helper,@function\nzone_b_helper:\n lea 1f(%rip),%r12\n movabs $fixed_native_entry,%r11\n jmp *%r11\n1: ret\n.size zone_b_helper,.-zone_b_helper\n.section .note.GNU-stack,\"\",@progbits\n",
+        &[],
+    );
+    let units = vec![summarize("maywrite-gate-extend-unit", &syscall_less_gate).unwrap()];
+    let ranges = function_ranges(0, &units[0]);
+    let starts = instruction_starts(&units, &ranges);
+    let writes = compute_may_write(&units, &ranges, &starts);
+    let helper = ranges
+        .iter()
+        .find(|range| range.symbol == "zone_b_helper")
+        .expect("gate helper range");
+    assert!(
+        writes
+            .get(&(helper.unit, helper.section, helper.start))
+            .is_some_and(|registers| registers.contains(&Register::RCX)),
+        "native gate extend must write RCX even when the gate range has no syscall: {writes:?}"
+    );
+    assert!(
+        writes
+            .get(&(helper.unit, helper.section, helper.start))
+            .is_some_and(|registers| !registers.contains(&Register::R10)),
+        "syscall-less gate fixture must not collapse to unknown/all-GPR: {writes:?}"
+    );
+
+    let continuation = compile_source(
+        &scratch.0,
+        "maywrite-gate-continuation-unit",
+        "zone_b_maywrite_gate_continuation_unit.S",
+        ".section .gate,\"ax\",@progbits\n.globl fixed_native_entry\n.type fixed_native_entry,@function\nfixed_native_entry:\n ret\n.size fixed_native_entry,.-fixed_native_entry\n.text\n.globl zone_b_writer\n.type zone_b_writer,@function\nzone_b_writer:\n xor %r10d,%r10d\n ret\n.size zone_b_writer,.-zone_b_writer\n.globl zone_b_helper\n.type zone_b_helper,@function\nzone_b_helper:\n lea zone_b_writer(%rip),%r12\n movabs $fixed_native_entry,%r11\n jmp *%r11\n ret\n.size zone_b_helper,.-zone_b_helper\n.section .note.GNU-stack,\"\",@progbits\n",
+        &[],
+    );
+    let units = vec![summarize("maywrite-gate-continuation-unit", &continuation).unwrap()];
+    let ranges = function_ranges(0, &units[0]);
+    let starts = instruction_starts(&units, &ranges);
+    let writes = compute_may_write(&units, &ranges, &starts);
+    let helper = ranges
+        .iter()
+        .find(|range| range.symbol == "zone_b_helper")
+        .expect("continuation helper range");
+    assert!(
+        writes
+            .get(&(helper.unit, helper.section, helper.start))
+            .is_some_and(|registers| registers.contains(&Register::R10)),
+        "gate continuation successor must contribute writer R10: {writes:?} ranges={ranges:?}"
+    );
+    assert!(
+        writes
+            .get(&(helper.unit, helper.section, helper.start))
+            .is_some_and(|registers| !registers.contains(&Register::R9)),
+        "relocated continuation fixture must not collapse to unknown/all-GPR: {writes:?}"
     );
 }
 
