@@ -119,6 +119,12 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
         // checks below compare against its connect-time stamps, and a
         // fork child must meet Owner refusal (its stamps are the
         // parent's), not a reconnect. Ordinary sends own fork reset.
+        // The flag is checked before any snapshot: in a fork child
+        // the by_tid map is a copied, possibly mid-rehash map that
+        // must not be walked at all on the way to this refusal.
+        if FORKED_SINCE_LAST_RPC.load(Ordering::Acquire) {
+            return Err(NativeFrameError::Owner);
+        }
         let connection_arc = match &self.connection {
             super::ConnectionOwner::NativeConfiguration => {
                 return Err(NativeFrameError::InFlight);

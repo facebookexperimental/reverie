@@ -59,6 +59,31 @@ impl<T> SpinMutex<T> {
         SpinGuard { mutex: self }
     }
 
+    /// Release the lock unconditionally, whether or not a guard thinks
+    /// it holds it.
+    ///
+    /// # Safety
+    ///
+    /// The caller must prove no live holder can exist in this process
+    /// and no stale guard will drop afterward. The one sound call site
+    /// is a fork child before it creates any thread: the only surviving
+    /// thread is the forking one, every guard another thread held at
+    /// the fork instant belongs to a thread that does not exist here,
+    /// and the surviving thread holds no guard on this mutex at the
+    /// call. Releasing a merely-contended lock would break exclusion.
+    ///
+    /// That liveness proof is not enough on its own: the guarded data
+    /// may have been copied mid-mutation by the dead holder (a hash map
+    /// mid-rehash, a vector mid-push). The caller must additionally
+    /// argue the data is consistent at every stopping point, or must
+    /// not touch the copied contents afterwards (the host registries
+    /// leak-replace their maps instead of clearing them; the Tool
+    /// heaps are quiesced across the fork and never force-unlocked).
+    #[cfg(any(feature = "coordinator-rpc", test))]
+    pub(crate) unsafe fn force_unlock(&self) {
+        self.owner.store(0, Ordering::Release);
+    }
+
     /// Acquire the lock only if it is free now.
     pub fn try_lock(&self) -> Option<SpinGuard<'_, T>> {
         self.owner
@@ -140,6 +165,15 @@ mod tests {
             "a failed attempt released the lock"
         );
         drop(held);
+        // A guard leaked by a thread that no longer exists (the fork
+        // child's view of a sibling's guard) leaves the lock held;
+        // force_unlock is the child's way back in.
+        let leaked = mutex.try_lock().expect("a released lock is acquired");
+        core::mem::forget(leaked);
+        assert_ne!(mutex.owner.load(Ordering::Relaxed), 0);
+        // SAFETY: the leaked guard above stands in for a dead holder;
+        // nothing will ever drop it.
+        unsafe { mutex.force_unlock() };
         let mut again = mutex.try_lock().expect("a released lock is acquired");
         *again += 1;
         drop(again);

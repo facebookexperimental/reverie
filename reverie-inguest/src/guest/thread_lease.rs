@@ -192,15 +192,51 @@ impl<S> ThreadStates<S> {
         }
     }
 
+    /// Force the registry lock open in a fork child whose copy of it
+    /// may have been made mid-hold by a sibling thread that does not
+    /// exist here. Must precede the first registry use in the child
+    /// (the parent lease's retire, `reset_to`).
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`SpinMutex::force_unlock`]: no live holder
+    /// can exist in this process and no stale guard will drop. The
+    /// host calls this from its fork-child reinit, before the child
+    /// creates any thread, on the surviving forking thread, which
+    /// holds no registry guard at that point.
+    pub(super) unsafe fn force_unlock_slots(&self) {
+        // SAFETY: the caller establishes the force-unlock contract.
+        unsafe { self.slots.force_unlock() }
+    }
+
     /// Fork-child reset: this process copy starts over with exactly the
     /// child's state. Any slot leased in the parent copy is abandoned
     /// with the parent's address space; the child's own lease (parent's,
-    /// inherited by fork) must be forgotten by the caller, never checked
-    /// in here.
+    /// inherited by fork) must be abandoned by the caller via
+    /// [`Lease::abandon`], never checked in here.
+    ///
+    /// The copied map is leak-replaced, never cleared or dropped: a
+    /// sibling dispatch may have been mid-insert (mid-rehash) at the
+    /// fork instant, so the copied buckets cannot be traversed, and a
+    /// sibling's state value cannot be dropped mid-mutation either.
+    /// Forgetting the old map leaks its buckets and the dead threads'
+    /// states in the child only; the parent's originals are untouched.
     pub(super) fn reset_to(&self, tid: i32, state: S) {
         let mut slots = self.slots.lock();
-        slots.clear();
+        // Reuse the copied map's hasher (fixed at construction):
+        // a fresh RandomState would issue getrandom through libc,
+        // outside the trusted gate, in the fork child.
+        let hasher = slots.hasher().clone();
+        let copied = core::mem::replace(&mut *slots, HashMap::with_hasher(hasher));
+        core::mem::forget(copied);
         slots.insert(tid, Slot::Available(state));
+    }
+
+    /// Test stand-in for a sibling thread that held the registry lock
+    /// at the fork instant and does not exist in the child.
+    #[cfg(test)]
+    pub(super) fn forget_lock_guard_for_test(&self) {
+        core::mem::forget(self.slots.lock());
     }
 }
 
@@ -219,6 +255,15 @@ impl<'a, S> Lease<'a, S> {
         let state = self.state.take().expect("lease state taken twice");
         self.states.slots.lock().remove(&self.tid);
         state
+    }
+
+    /// Take the state out without touching the registry map (fork
+    /// child: the copied map must not be traversed before
+    /// [`ThreadStates::reset_to`] leak-replaces it, and this lease's
+    /// slot belongs to the parent's copy in any case). With the state
+    /// taken, the lease's own drop is a no-op.
+    pub(super) fn abandon(mut self) -> S {
+        self.state.take().expect("lease state taken twice")
     }
 }
 
@@ -284,6 +329,33 @@ mod tests {
         states.reset_to(3, 30);
         assert_eq!(states.remove(3), Some(30));
         assert!(states.is_empty());
+    }
+
+    #[test]
+    fn force_unlock_slots_recovers_a_copied_locked_registry() {
+        // A sibling thread was inside the registry at the fork instant:
+        // the child's copy of the lock is held by a thread that does not
+        // exist here, and a slot it had leased stays Leased. Leaking the
+        // guard stands in for that dead holder.
+        let states = ThreadStates::<u32>::new();
+        let mut leased = states.checkout(7, || 70).unwrap();
+        *leased.state_mut() += 1;
+        core::mem::forget(leased);
+        let copied = states.slots.lock();
+        core::mem::forget(copied);
+        assert!(states.slots.try_lock().is_none());
+        // SAFETY: the leaked guards above stand in for dead holders;
+        // nothing will ever drop them (the fork-child contract).
+        unsafe { states.force_unlock_slots() };
+        // The dead sibling's leased slot is forgotten with the
+        // copied map by the reset (leaked, never dropped), and the
+        // child's own tid is reusable at once.
+        states.reset_to(3, 30);
+        let mut own = states.checkout_existing(3).expect("reset state present");
+        assert_eq!(*own.state_mut(), 30);
+        drop(own);
+        let mut reused = states.checkout(7, || 71).expect("dead tid reusable");
+        assert_eq!(*reused.state_mut(), 71);
     }
 
     #[test]

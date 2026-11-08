@@ -399,8 +399,9 @@ reverie_inguest_thread_clone:
     // The physical clone runs through the trusted gate (its syscall
     // instruction is the allowlisted one) with R12 as the continuation.
     // The child returns from the syscall with RSP set by the kernel to the
-    // guest stack argument, so after the gate the child path must not
-    // touch the stack until it has switched to the birth stack.
+    // guest stack argument (or, for a stack-less creation, to the
+    // parent's own stack pointer), so after the gate the child path
+    // must not touch the stack until it has switched to the birth stack.
     endbr64
     push r12
     push r13

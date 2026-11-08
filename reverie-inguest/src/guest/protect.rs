@@ -390,7 +390,7 @@ pub(crate) fn replace_recorded_fd(old: libc::c_int, new: libc::c_int) -> io::Res
 /// ends the process with the tool-RPC failure exit (rpc_fatal) -- the
 /// 65th simultaneous guest thread is refused at its first RPC, never
 /// silently unprotected.
-const COORDINATOR_CONN_CAPACITY: usize = 64;
+pub(crate) const COORDINATOR_CONN_CAPACITY: usize = 64;
 
 /// The per-thread coordinator connection descriptors (-1 is a free slot).
 /// Plain descriptors, not pid-packed: connections are process-scoped (any
@@ -433,6 +433,23 @@ pub fn unregister_coordinator_conn_fd(fd: libc::c_int) {
     for slot in &COORDINATOR_CONN_FDS {
         let _ = slot.compare_exchange(fd, -1, Ordering::AcqRel, Ordering::Acquire);
     }
+}
+
+/// Takes every recorded per-thread connection descriptor out of the
+/// registry (fork child: the entries are copies of the parent threads'
+/// connections, which the child closes without ever consulting the
+/// RPC layer's copied connection map). Returns how many were written
+/// to `out`.
+pub fn take_coordinator_conn_fds(out: &mut [libc::c_int; COORDINATOR_CONN_CAPACITY]) -> usize {
+    let mut count = 0;
+    for slot in &COORDINATOR_CONN_FDS {
+        let fd = slot.swap(-1, Ordering::AcqRel);
+        if fd >= 0 {
+            out[count] = fd;
+            count += 1;
+        }
+    }
+    count
 }
 
 /// Rebinds the per-thread coordinator connection record after a move

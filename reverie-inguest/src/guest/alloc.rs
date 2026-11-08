@@ -133,17 +133,18 @@ pub(crate) struct ToolHeapSpan<'a> {
 
 impl ToolHeapSpan<'_> {
     fn lock(&self) -> ToolHeapLock<'_> {
-        while self
-            .metadata
+        Self::acquire(self.metadata)
+    }
+
+    fn acquire(metadata: &ToolHeapMetadata) -> ToolHeapLock<'_> {
+        while metadata
             .locked
             .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
             core::hint::spin_loop();
         }
-        ToolHeapLock {
-            metadata: self.metadata,
-        }
+        ToolHeapLock { metadata }
     }
 
     fn layout_end(&self, block_offset: usize, layout: Layout) -> Option<(*mut u8, usize)> {
@@ -288,7 +289,7 @@ impl ToolHeapSpan<'_> {
     }
 }
 
-struct ToolHeapLock<'a> {
+pub(crate) struct ToolHeapLock<'a> {
     metadata: &'a ToolHeapMetadata,
 }
 
@@ -536,8 +537,12 @@ unsafe impl GlobalAlloc for PrivateToolAllocator {
 ///
 /// Allocation before completed publication or after exhaustion returns null.
 /// This allocator never initializes a reservation or chooses BSS/System. Its
-/// contents and scalar metadata inherit through COW on a quiescent plain fork;
-/// an inherited held lock is not reset or advertised as supported.
+/// contents and scalar metadata inherit through COW on a plain fork the
+/// runtime itself performs: the forwarding path holds this heap's lock
+/// across the physical fork ([`quiesce_for_fork`]), so the child inherits
+/// a consistent free list and a released lock. A fork made around the
+/// runtime (Tool code calling `fork` itself) can still inherit a held
+/// lock; that remains unsupported, exactly as for the Legacy heap.
 pub struct FixedToolAllocator;
 
 impl FixedToolAllocator {
@@ -777,6 +782,60 @@ impl Drop for ToolHeapLock<'_> {
     }
 }
 
+/// Both Tool-heap allocator locks, held across one physical plain fork
+/// (the `pthread_atfork` pattern): while these guards are alive no
+/// sibling dispatch can be inside `allocate`/`deallocate`, so the free
+/// lists the fork copies are consistent by construction — the lock's
+/// acquire/release pairing also orders every sibling list store before
+/// the copy. Force-releasing an inherited held lock in the child would
+/// not give this: a free list copied mid-split or mid-merge can be torn
+/// even though no holder survives.
+#[cfg(any(feature = "coordinator-rpc", test))]
+pub(crate) struct ForkQuiesce {
+    _legacy: ToolHeapLock<'static>,
+    _fixed: Option<ToolHeapLock<'static>>,
+}
+
+/// Take every Tool-heap allocator lock, Legacy first, then the Fixed
+/// span when one is published. A given guest binary's global allocator
+/// routes to exactly one heap, so the two never nest in the opposite
+/// order; both are taken so the physical fork that follows is safe
+/// whichever heap the consumer selected (and for fixture readers).
+///
+/// The caller issues the fork syscall with no allocation between this
+/// call and the guard's drop in either process — allocation here would
+/// spin on the lock the caller itself holds — and drops the guard
+/// immediately after the syscall returns, before any other Rust code
+/// runs in the child. The calling thread cannot already hold a heap
+/// lock: heap critical sections contain no syscall or other trap point,
+/// and fork forwarding never runs inside `allocate`/`deallocate`.
+#[cfg(any(feature = "coordinator-rpc", test))]
+pub(crate) fn quiesce_for_fork() -> ForkQuiesce {
+    // Both spans' metadata are process-lifetime storage (the BSS heap,
+    // and the published ToolRegion mapping), so the guards are 'static.
+    ForkQuiesce {
+        _legacy: ToolHeapSpan::acquire(&TOOL_HEAP.metadata),
+        _fixed: super::tool_region::fixed_tool_heap()
+            .map(|span| ToolHeapSpan::acquire(span.metadata)),
+    }
+}
+
+/// This thread's live dispatch-allocation depth, for birth tests
+/// asserting a parent thread's depth is unchanged by an admission
+/// that ran on its TLS.
+#[cfg(all(test, feature = "coordinator-rpc"))]
+pub(crate) fn dispatch_depth_for_test() -> usize {
+    DISPATCH_DEPTH.get()
+}
+
+/// Take the Legacy Tool heap lock directly (not via
+/// [`quiesce_for_fork`]), so fork-wiring tests can stage a sibling
+/// holder without exercising the code under test to do it.
+#[cfg(all(test, feature = "coordinator-rpc", target_arch = "x86_64"))]
+pub(crate) fn hold_tool_heap_lock_for_test() -> ToolHeapLock<'static> {
+    ToolHeapSpan::acquire(&TOOL_HEAP.metadata)
+}
+
 fn align_up(value: usize, alignment: usize) -> Option<usize> {
     value
         .checked_add(alignment - 1)
@@ -958,6 +1017,123 @@ mod tests {
         let migrated_layout = Layout::from_size_align(128, layout.align()).unwrap();
         // SAFETY: migrated remains owned by TOOL_HEAP after dispatch ends.
         unsafe { allocator.dealloc(migrated, migrated_layout) };
+    }
+
+    /// Real-fork witness for heap quiescence: while sibling threads
+    /// churn allocate/deallocate, forks taken under `quiesce_for_fork`
+    /// produce children whose first dispatch allocation completes
+    /// (no inherited held lock, no torn free list). Each child is
+    /// reaped under a deadline; a hang fails the test instead of
+    /// stalling the suite.
+    #[test]
+    fn fork_under_quiesce_child_allocates() {
+        let _test_guard = test_guard();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let churn: Vec<_> = (0..3)
+            .map(|thread_index| {
+                let stop = std::sync::Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    let allocator = GuestAllocator;
+                    let _scope = enter_dispatch();
+                    let mut iteration = 0usize;
+                    while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                        iteration += 1;
+                        let size = 1 + (thread_index * 131 + iteration * 17) % 2048;
+                        let layout = Layout::from_size_align(size, 64).unwrap();
+                        // SAFETY: layout is valid for this allocator.
+                        let pointer = unsafe { allocator.alloc(layout) };
+                        assert!(!pointer.is_null());
+                        // SAFETY: pointer covers layout.size bytes.
+                        unsafe { pointer.write_bytes(0x5a, layout.size()) };
+                        // SAFETY: pointer is live with layout.
+                        unsafe { allocator.dealloc(pointer, layout) };
+                    }
+                })
+            })
+            .collect();
+        for _ in 0..24 {
+            // SAFETY: fork is issued with the heap locks held and no
+            // allocation in the window; the guard drops immediately on
+            // return in both processes. The child only allocates from
+            // the Tool heap, writes one byte proving a second
+            // allocation reuses freed storage, and _exits.
+            let child = {
+                let quiesce = quiesce_for_fork();
+                let child = unsafe { libc::fork() };
+                drop(quiesce);
+                child
+            };
+            assert!(
+                child >= 0,
+                "fork failed: {}",
+                std::io::Error::last_os_error()
+            );
+            if child == 0 {
+                let allocator = GuestAllocator;
+                let _scope = enter_dispatch();
+                let layout = Layout::from_size_align(512, 64).unwrap();
+                // SAFETY: layout is valid for this allocator.
+                let first = unsafe { allocator.alloc(layout) };
+                let ok = !first.is_null();
+                if ok {
+                    // SAFETY: the heap lock is free here (the first
+                    // allocation above returned), so the cursor reads
+                    // are stable in this single-threaded child.
+                    let cursor_after_first = unsafe { *TOOL_HEAP.metadata.next.get() };
+                    // SAFETY: first covers layout.size bytes.
+                    unsafe { first.write_bytes(0xa5, layout.size()) };
+                    // SAFETY: first is live with layout.
+                    unsafe { allocator.dealloc(first, layout) };
+                    // SAFETY: layout is valid for this allocator.
+                    let second = unsafe { allocator.alloc(layout) };
+                    // The free list must satisfy the second allocation
+                    // without growing the bump cursor. Address
+                    // equality is NOT required: this heap is
+                    // address-ordered first-fit with coalescing, so a
+                    // freed block can merge into a lower-addressed
+                    // neighbor and the next first-fit lands below
+                    // (or on) the first allocation.
+                    // SAFETY: as for cursor_after_first.
+                    let cursor_after_second = unsafe { *TOOL_HEAP.metadata.next.get() };
+                    if second.is_null()
+                        || !super::tool_heap_contains(second)
+                        || second > first
+                        || cursor_after_second != cursor_after_first
+                    {
+                        // SAFETY: _exit avoids inherited atexit state.
+                        unsafe { libc::_exit(72) };
+                    }
+                }
+                // SAFETY: _exit avoids inherited atexit state.
+                unsafe { libc::_exit(if ok { 0 } else { 71 }) };
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let status = loop {
+                let mut status = 0;
+                // SAFETY: `child` is this test's direct child.
+                let waited = unsafe { libc::waitpid(child, &mut status, libc::WNOHANG) };
+                if waited == child {
+                    break status;
+                }
+                if std::time::Instant::now() >= deadline {
+                    // SAFETY: killing this test's direct child.
+                    unsafe { libc::kill(child, libc::SIGKILL) };
+                    // SAFETY: reaping this test's direct child.
+                    unsafe { libc::waitpid(child, &mut status, 0) };
+                    stop.store(true, std::sync::atomic::Ordering::Release);
+                    panic!("fork child hung on its first Tool-heap allocation");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            };
+            assert!(
+                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                "fork child failed with status {status:#x}"
+            );
+        }
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        for thread in churn {
+            thread.join().unwrap();
+        }
     }
 
     #[test]

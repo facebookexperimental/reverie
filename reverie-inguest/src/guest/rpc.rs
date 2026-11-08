@@ -171,29 +171,29 @@ impl<G: GlobalTool> OrdinaryConnections<G> {
         self.by_tid.lock().remove(&tid)
     }
 
-    /// Remove every connection but `keep` (fork child: the other entries
-    /// are copies of the parent's threads' connections, which do not
-    /// exist in the child).
-    /// Take out the connection whose descriptor mirror is `fd`, if any.
-    fn take_by_fd(&self, fd: libc::c_int) -> Option<Arc<ThreadConnection<G>>> {
-        let mut by_tid = self.by_tid.lock();
-        let tid = by_tid
-            .iter()
-            .find(|(_, connection)| connection.fd() == fd)
-            .map(|(tid, _)| *tid)?;
-        by_tid.remove(&tid)
+    /// Leak-replace the whole map (fork child: every entry is a copy of
+    /// a parent thread's connection). The copied map is forgotten
+    /// without iteration or drop — a sibling may have been mid-insert
+    /// at the fork instant, and a copied connection may sit
+    /// mid-exchange — so no inherited connection is ever locked,
+    /// traversed, or dropped here. Their descriptors are closed by
+    /// the caller from the lock-free protect registry and the root
+    /// descriptor mirror, never through these `Arc`s.
+    fn forget_all_for_fork(&self) {
+        // Reuse the copied map's hasher (fixed at construction):
+        // a fresh RandomState would issue getrandom through libc,
+        // outside the trusted gate, in the fork child.
+        let copied = {
+            let mut by_tid = self.by_tid.lock();
+            let hasher = by_tid.hasher().clone();
+            core::mem::replace(&mut *by_tid, HashMap::with_hasher(hasher))
+        };
+        core::mem::forget(copied);
     }
 
-    /// Remove every connection (fork child: all entries are copies of
-    /// the parent's threads' connections, which do not exist here).
-    fn drain_all(&self) -> Vec<Arc<ThreadConnection<G>>> {
-        self.by_tid
-            .lock()
-            .drain()
-            .map(|(_, connection)| connection)
-            .collect()
-    }
-
+    /// Remove every connection but `keep` (the exchange-level fork
+    /// reconnect: entries here were all created in this process, so
+    /// the map is this process's own consistent one).
     fn drain_except(&self, keep: i32) -> Vec<Arc<ThreadConnection<G>>> {
         let mut by_tid = self.by_tid.lock();
         let kept = by_tid.remove(&keep);
@@ -249,6 +249,18 @@ pub struct CoordinatorRpc<G: GlobalTool> {
     /// stamp lags, so reconnect is tied to the connection's own stale
     /// pid rather than the one-shot atfork flag alone.
     fork_generation: AtomicU64,
+    /// The inherited root descriptor a fork child still owes a rebind
+    /// for (-1 when none): the reset forgets the inherited root
+    /// connection without locking it (its lock state may have been
+    /// copied while the parent's root thread was parked mid-exchange,
+    /// so the child must never lock it) but leaves the descriptor
+    /// itself open; the leader's first lazy connection in the child
+    /// runs the reconnect hook against this number and then closes
+    /// it, exactly as the old in-place root reconnect ordered things.
+    /// A leader that never sends again leaves it open for the
+    /// child's lifetime — a bounded one-descriptor leak, accepted
+    /// so the root record never names a closed number.
+    root_rebind_fd: AtomicI32,
     #[cfg(feature = "exec-private-successor")]
     native_failed: AtomicBool,
 }
@@ -286,6 +298,7 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
             on_reconnect: |_, _| Err(io::Error::from_raw_os_error(libc::EPROTO)),
             fork_reset: SpinMutex::new(None),
             fork_generation: AtomicU64::new(0),
+            root_rebind_fd: AtomicI32::new(-1),
             #[cfg(feature = "exec-private-successor")]
             native_failed: AtomicBool::new(false),
         })
@@ -305,6 +318,7 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
             on_reconnect: |_, _| Err(io::Error::from_raw_os_error(libc::EPROTO)),
             fork_reset: SpinMutex::new(None),
             fork_generation: AtomicU64::new(0),
+            root_rebind_fd: AtomicI32::new(-1),
             #[cfg(feature = "exec-private-successor")]
             native_failed: AtomicBool::new(false),
         }
@@ -333,6 +347,28 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
     /// every signal (protect::block_all_signals); no syscall here goes through
     /// libc.
     pub(crate) fn relocate(&self, from: libc::c_int) -> io::Result<libc::c_int> {
+        // In a fork child that has not sent yet, run the reset first:
+        // the snapshot below must never traverse the copied connection
+        // map or lock a copied connection.
+        self.fork_child_reset_if_needed();
+        // A pending root rebind: the inherited root socket is still
+        // open under `from` with no connection object behind it. Move
+        // the socket itself and retarget the rebind, so the leader's
+        // later reconnect hooks and closes the moved number.
+        if from >= 0
+            && self.root_rebind_fd.load(Ordering::Acquire) == from
+            && self.fd.load(Ordering::Acquire) == from
+        {
+            let moved = crate::guest::protect::dup_into_runtime_range(from);
+            if moved < 0 {
+                return Err(io::Error::from_raw_os_error(-moved as i32));
+            }
+            let moved = moved as libc::c_int;
+            self.root_rebind_fd.store(moved, Ordering::Release);
+            self.fd.store(moved, Ordering::Release);
+            crate::guest::protect::replace_coordinator_fd(from, moved)?;
+            return Ok(moved);
+        }
         // Find the owning per-thread connection by its lock-free
         // descriptor mirror, then lock only that one: relocating under
         // an in-flight request would move its socket mid-exchange, so a
@@ -437,6 +473,9 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
             fd: AtomicI32::new(fd),
             transport,
             on_reconnect,
+            fork_reset: SpinMutex::new(None),
+            fork_generation: AtomicU64::new(0),
+            root_rebind_fd: AtomicI32::new(-1),
             #[cfg(feature = "exec-private-successor")]
             native_failed: AtomicBool::new(false),
         })
@@ -465,7 +504,7 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
         Ok(Self {
             connection: ConnectionOwner::Ordinary(OrdinaryConnections::new(
                 tid.as_raw(),
-                RpcConnection::new(pid, client),
+                RpcConnection::new(pid, 0, client),
             )),
             config,
             path: None,
@@ -474,6 +513,7 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
             on_reconnect,
             fork_reset: SpinMutex::new(None),
             fork_generation: AtomicU64::new(0),
+            root_rebind_fd: AtomicI32::new(-1),
             #[cfg(feature = "exec-private-successor")]
             native_failed: AtomicBool::new(false),
         })
@@ -508,6 +548,7 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
             on_reconnect,
             fork_reset: SpinMutex::new(None),
             fork_generation: AtomicU64::new(0),
+            root_rebind_fd: AtomicI32::new(-1),
             #[cfg(feature = "exec-private-successor")]
             native_failed: AtomicBool::new(false),
         })
@@ -520,6 +561,65 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
 pub struct RequestInFlight;
 
 impl<G: GlobalTool> CoordinatorRpc<G> {
+    /// Force this handle's registry locks open in a fork child whose
+    /// copies may have been made mid-hold by sibling threads that do
+    /// not exist here. Per-connection locks are deliberately left
+    /// alone, and no inherited connection is ever locked in the
+    /// child — the root included: when a *non-root* thread forks
+    /// while the root thread is parked inside a blocking exchange,
+    /// the root connection's lock and client were copied mid-exchange
+    /// by a thread that does not exist here. The reset
+    /// ([`Self::fork_child_reset_if_needed`]) therefore forgets every
+    /// inherited connection without locking or dropping it and
+    /// closes sibling sockets from the lock-free protect registry;
+    /// the root descriptor is rebound by the leader's first fresh
+    /// connection (see `root_rebind_fd`).
+    ///
+    /// The two locks released here guard only a pid word and the
+    /// registry map header; the map's copied contents are never
+    /// traversed afterwards (the reset leak-replaces the map), which
+    /// is the data-consistency half of the force-unlock contract.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`SpinMutex::force_unlock`]: no live holder
+    /// can exist in this process and no stale guard will drop. The
+    /// host calls this from its fork-child reinit, before the child
+    /// creates any thread.
+    pub(crate) unsafe fn reinit_after_fork(&self) {
+        // SAFETY: the caller establishes the force-unlock contract.
+        unsafe { self.fork_reset.force_unlock() };
+        if let ConnectionOwner::Ordinary(connections) = &self.connection {
+            // SAFETY: same contract.
+            unsafe { connections.by_tid.force_unlock() };
+        }
+    }
+
+    /// Test stand-in for sibling threads that held this handle's
+    /// registry locks at the fork instant and do not exist in the
+    /// child.
+    #[cfg(test)]
+    pub(crate) fn forget_lock_guards_for_test(&self) {
+        core::mem::forget(self.fork_reset.lock());
+        if let ConnectionOwner::Ordinary(connections) = &self.connection {
+            core::mem::forget(connections.by_tid.lock());
+        }
+    }
+
+    /// Whether both registry locks are free (the wiring test's
+    /// post-reinit assertion, so deleting the host's call to
+    /// [`Self::reinit_after_fork`] is caught).
+    #[cfg(test)]
+    pub(crate) fn registry_locks_free_for_test(&self) -> bool {
+        if self.fork_reset.try_lock().is_none() {
+            return false;
+        }
+        match &self.connection {
+            ConnectionOwner::Ordinary(connections) => connections.by_tid.try_lock().is_some(),
+            ConnectionOwner::NativeConfiguration => true,
+        }
+    }
+
     fn current_tid() -> Pid {
         current_id(libc::SYS_gettid).unwrap_or_else(|_| rpc_fatal(122))
     }
@@ -545,10 +645,29 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
         }
         let pid = current_id(libc::SYS_getpid).unwrap_or_else(|_| rpc_fatal(122));
         let path = self.path.as_deref().unwrap_or_else(|| rpc_fatal(123));
+        // The leader's first connection in a fork child is the new
+        // root: it runs the reconnect hook against the inherited root
+        // descriptor the reset left open, then closes that copy. A
+        // newborn thread sending first must not consume the rebind
+        // (later native-frame root checks name the leader as owner),
+        // so only the leader (tid == pid) takes it.
+        let inherited_root = if tid == pid.as_raw() {
+            self.root_rebind_fd.swap(-1, Ordering::AcqRel)
+        } else {
+            -1
+        };
         let client = connect_ordinary::<G>(path, Pid::from_raw(tid), |new_fd| {
-            crate::guest::protect::register_coordinator_conn_fd(new_fd)
+            if inherited_root >= 0 {
+                let old_fd = self.fd.swap(new_fd, Ordering::AcqRel);
+                (self.on_reconnect)(old_fd, new_fd)
+            } else {
+                crate::guest::protect::register_coordinator_conn_fd(new_fd)
+            }
         })
         .unwrap_or_else(|_| rpc_fatal(reverie_rpc_transport::TOOL_RPC_FAILURE_EXIT_CODE));
+        if inherited_root >= 0 {
+            close_inherited_fd(inherited_root);
+        }
         connections.insert(
             tid,
             RpcConnection::new(pid, self.fork_generation.load(Ordering::Acquire), client),
@@ -586,21 +705,27 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
         if super::exec_private::active() {
             rpc_fatal(reverie_rpc_transport::TOOL_RPC_FAILURE_EXIT_CODE);
         }
-        // Hand the child its inherited root entry, rekeyed to the process
-        // leader (`pid`, whose tid it is): `exchange` then sees the pid
-        // mismatch on it and runs the long-proven reconnect path (root
-        // hook rebind included), while sibling copies close here. The
-        // leader owns the root whoever performs the reset: if an admitted
-        // newborn thread sends first it must open its own connection, not
-        // adopt (and re-stamp) the root, or later native-frame root
-        // checks in this child refuse the leader by owner.
+        // Forget every inherited connection copy without locking,
+        // traversing, or dropping any of them: the copied map may be
+        // mid-rehash and any copied connection (the root above all,
+        // when a non-root thread did the forking) may be mid-exchange.
+        // Sibling sockets close from the lock-free protect registry,
+        // which the atomics keep consistent at every fork stopping
+        // point. The inherited root descriptor stays open as the
+        // pending rebind: the leader's first fresh connection runs
+        // the reconnect hook against it and closes it, so the root
+        // record never names a closed number. The leader owns that
+        // rebind whoever performs the reset — a newborn thread
+        // sending first opens its own connection instead.
         let connections = self.connection.ordinary();
-        let root = connections.take_by_fd(self.fd.load(Ordering::Acquire));
-        let drained = connections.drain_all();
-        close_drained_connections(drained);
-        if let Some(root) = root {
-            connections.by_tid.lock().insert(pid.as_raw(), root);
+        connections.forget_all_for_fork();
+        let mut inherited = [-1; crate::guest::protect::COORDINATOR_CONN_CAPACITY];
+        let count = crate::guest::protect::take_coordinator_conn_fds(&mut inherited);
+        for fd in &inherited[..count] {
+            close_inherited_fd(*fd);
         }
+        self.root_rebind_fd
+            .store(self.fd.load(Ordering::Acquire), Ordering::Release);
         self.fork_generation.fetch_add(1, Ordering::AcqRel);
     }
 
@@ -609,6 +734,9 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
     /// reserved coordinator descriptor record stays, so the number
     /// remains protected for the process's lifetime.
     pub fn close_current_thread(&self) {
+        // A fork child whose leader exits without ever sending still
+        // owes the reset: the copied map must not be traversed here.
+        self.fork_child_reset_if_needed();
         let ConnectionOwner::Ordinary(connections) = &self.connection else {
             return;
         };
@@ -739,15 +867,29 @@ fn close_drained_connections<G: GlobalTool>(drained: Vec<Arc<ThreadConnection<G>
         let fd = other.fd();
         if fd >= 0 {
             crate::guest::protect::unregister_coordinator_conn_fd(fd);
-            let blocked = crate::guest::protect::block_all_signals()
-                .unwrap_or_else(|_| rpc_fatal(reverie_rpc_transport::TOOL_RPC_FAILURE_EXIT_CODE));
-            unsafe { raw_syscall6(libc::SYS_close, [fd as u64, 0, 0, 0, 0, 0]) };
-            crate::guest::protect::record_if_open(fd)
-                .unwrap_or_else(|_| rpc_fatal(reverie_rpc_transport::TOOL_RPC_FAILURE_EXIT_CODE));
-            drop(blocked);
+            close_inherited_fd(fd);
         }
         core::mem::forget(other);
     }
+}
+
+/// Close one inherited coordinator descriptor by number, with every
+/// signal blocked until the number has been checked: a close a guest
+/// seccomp filter faked leaves that number open, and the runtime
+/// then keeps it as its own, so it is neither reachable nor
+/// unreported. The caller owns the protect-registry bookkeeping for
+/// the number (the fork reset's take, or a drained connection's
+/// unregister above).
+fn close_inherited_fd(fd: libc::c_int) {
+    if fd < 0 {
+        return;
+    }
+    let blocked = crate::guest::protect::block_all_signals()
+        .unwrap_or_else(|_| rpc_fatal(reverie_rpc_transport::TOOL_RPC_FAILURE_EXIT_CODE));
+    unsafe { raw_syscall6(libc::SYS_close, [fd as u64, 0, 0, 0, 0, 0]) };
+    crate::guest::protect::record_if_open(fd)
+        .unwrap_or_else(|_| rpc_fatal(reverie_rpc_transport::TOOL_RPC_FAILURE_EXIT_CODE));
+    drop(blocked);
 }
 
 /// Close this child's copy of a parent connection's stream, with every
@@ -757,13 +899,7 @@ fn close_drained_connections<G: GlobalTool>(drained: Vec<Arc<ThreadConnection<G>
 fn close_inherited_stream(stream: GuestRpcStream) {
     match stream {
         GuestRpcStream::Ordinary(stream) => {
-            let inherited_fd = stream.into_raw_fd();
-            let blocked = crate::guest::protect::block_all_signals()
-                .unwrap_or_else(|_| rpc_fatal(reverie_rpc_transport::TOOL_RPC_FAILURE_EXIT_CODE));
-            unsafe { raw_syscall6(libc::SYS_close, [inherited_fd as u64, 0, 0, 0, 0, 0]) };
-            crate::guest::protect::record_if_open(inherited_fd)
-                .unwrap_or_else(|_| rpc_fatal(reverie_rpc_transport::TOOL_RPC_FAILURE_EXIT_CODE));
-            drop(blocked);
+            close_inherited_fd(stream.into_raw_fd());
         }
         // Not reached for mapped either: the fork branch refuses mapped
         // (124) before reconnecting. Defensive.
