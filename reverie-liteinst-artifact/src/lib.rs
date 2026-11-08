@@ -27558,7 +27558,20 @@ const DETCORE_VALIDATE_TEMPLATES: &[DetcoreValidateTemplate] = &[
         ],
         transfers: &[(8, 1)],
     },
+    // Closed actual pinned-root Detcore: bd95719ee7b87d52888f88245f4ee446206b16ad14f3fc65edb2c6927840cbbe; complete16B SHA256a2f14b9e9f20c5a82963701eed8710f88059a1d0fd260be1060aa967fc29b97f.
+    DetcoreValidateTemplate {
+        role: "fixed_native_owner_gettid",
+        hex: "bfba00000031f631d231c9e910e8ffff",
+        operands: &[DetcoreValidateOperand {
+            displacement: 12,
+            next: 16,
+            key: "fixed_scalar_syscall",
+            got: false,
+        }],
+        transfers: &[(11, 0)],
+    },
 ];
+
 // Distinct from every historical TLS-bearing241B recipe. Measured in the true
 // Git840 native OFF DSO c4157195: full101B, b62a329a... before address binding.
 // The only masked fields are the six bound RIP operands below.
@@ -29722,6 +29735,71 @@ const FIXED_NAKED_PINNED_NATIVE_INCOMING: &[FixedScalarHelperIncoming] = &[
         &[("fixed_native_owner_gettid", 12, false)],
     ),
 ];
+const FIXED_NAKED_PINNED_NATIVE_GETTID_TAIL_INCOMING: &[FixedScalarHelperIncoming] = &[
+    (
+        "fixed_region_publication_get_opaque",
+        &[
+            ("fixed_tool_heap_metadata", 59, false),
+            ("fixed_arena_backing", 59, false),
+            ("fixed_native_from_native", 176, false),
+            ("fixed_constructor_prepare", 256, false),
+            ("fixed_generic_prepare", 256, false),
+        ],
+    ),
+    (
+        "fixed_region_publication_set_opaque",
+        &[
+            ("fixed_constructor_prepare", 187, false),
+            ("fixed_generic_prepare", 187, false),
+        ],
+    ),
+    (
+        "fixed_tool_heap_metadata",
+        &[
+            ("fixed_tool_require_owned", 4, false),
+            ("fixed_tool_alloc", 13, false),
+            ("fixed_tool_dealloc", 4, false),
+            ("fixed_tool_realloc", 26, false),
+        ],
+    ),
+    (
+        "fixed_native_from_native",
+        &[
+            ("fixed_constructor_prepare", 82, false),
+            ("fixed_generic_prepare", 82, false),
+        ],
+    ),
+    (
+        "fixed_arena_setup",
+        &[("fixed_native_from_native", 257, false)],
+    ),
+    (
+        "fixed_native_owner_gettid",
+        &[("fixed_native_from_native", 116, false)],
+    ),
+    (
+        "fixed_arena_mprotect",
+        &[
+            ("fixed_arena_setup", 95, false),
+            ("fixed_arena_setup", 119, false),
+        ],
+    ),
+    (
+        "fixed_setup_bitmap_range",
+        &[
+            ("fixed_arena_setup", 16, false),
+            ("fixed_arena_setup", 44, false),
+            ("fixed_arena_setup", 72, false),
+            ("fixed_arena_setup", 184, false),
+            ("fixed_arena_setup", 207, false),
+            ("fixed_arena_setup", 230, false),
+        ],
+    ),
+    (
+        "fixed_scalar_syscall",
+        &[("fixed_native_owner_gettid", 11, false)],
+    ),
+];
 const FIXED_NAKED_PINNED_ORDINARY_COHORT: &[(&str, usize)] = &[
     ("fixed_region_publication_get_opaque", 55),
     ("fixed_region_publication_set_opaque", 81),
@@ -29736,6 +29814,42 @@ const FIXED_NAKED_PINNED_ORDINARY_COHORT: &[(&str, usize)] = &[
     ("fixed_generic_prepare", 93),
     ("fixed_arena_setup", 82),
     ("fixed_native_owner_gettid", 79),
+];
+// The pinned compositions after the native_owner_gettid codegen change:
+// identical roles and premises to the pinned cohorts above, with the
+// tail-jump gettid body (template 108) that the current source produces
+// in the pinned root. The 25-byte call-form compositions stay for the
+// builds that still produce that body; the witness index keeps the two
+// disjoint, so each image matches exactly one composition.
+const FIXED_NAKED_PINNED_NATIVE_GETTID_TAIL_COHORT: &[(&str, usize)] = &[
+    ("fixed_region_publication_get_opaque", 55),
+    ("fixed_region_publication_set_opaque", 81),
+    ("fixed_tool_heap_metadata", 57),
+    ("fixed_arena_backing", 58),
+    ("fixed_tool_require_owned", 59),
+    ("fixed_tool_alloc", 60),
+    ("fixed_tool_dealloc", 61),
+    ("fixed_tool_realloc", 62),
+    ("fixed_native_from_native", 78),
+    ("fixed_constructor_prepare", 89),
+    ("fixed_generic_prepare", 93),
+    ("fixed_arena_setup", 82),
+    ("fixed_native_owner_gettid", 108),
+];
+const FIXED_NAKED_PINNED_ORDINARY_GETTID_TAIL_COHORT: &[(&str, usize)] = &[
+    ("fixed_region_publication_get_opaque", 55),
+    ("fixed_region_publication_set_opaque", 81),
+    ("fixed_tool_heap_metadata", 57),
+    ("fixed_arena_backing", 58),
+    ("fixed_tool_require_owned", 59),
+    ("fixed_tool_alloc", 60),
+    ("fixed_tool_dealloc", 61),
+    ("fixed_tool_realloc", 62),
+    ("fixed_native_from_native", 78),
+    ("fixed_constructor_prepare", 89),
+    ("fixed_generic_prepare", 93),
+    ("fixed_arena_setup", 82),
+    ("fixed_native_owner_gettid", 108),
 ];
 const FIXED_NAKED_PINNED_ORDINARY_INCOMING: &[FixedScalarHelperIncoming] = &[
     (
@@ -29800,6 +29914,71 @@ const FIXED_NAKED_PINNED_ORDINARY_INCOMING: &[FixedScalarHelperIncoming] = &[
     (
         "fixed_scalar_syscall",
         &[("fixed_native_owner_gettid", 12, false)],
+    ),
+];
+const FIXED_NAKED_PINNED_ORDINARY_GETTID_TAIL_INCOMING: &[FixedScalarHelperIncoming] = &[
+    (
+        "fixed_region_publication_get_opaque",
+        &[
+            ("fixed_tool_heap_metadata", 59, false),
+            ("fixed_arena_backing", 59, false),
+            ("fixed_native_from_native", 176, false),
+            ("fixed_constructor_prepare", 256, false),
+            ("fixed_generic_prepare", 256, false),
+        ],
+    ),
+    (
+        "fixed_region_publication_set_opaque",
+        &[
+            ("fixed_constructor_prepare", 187, false),
+            ("fixed_generic_prepare", 187, false),
+        ],
+    ),
+    (
+        "fixed_tool_heap_metadata",
+        &[
+            ("fixed_tool_require_owned", 4, false),
+            ("fixed_tool_alloc", 13, false),
+            ("fixed_tool_dealloc", 4, false),
+            ("fixed_tool_realloc", 26, false),
+        ],
+    ),
+    (
+        "fixed_native_from_native",
+        &[
+            ("fixed_constructor_prepare", 82, false),
+            ("fixed_generic_prepare", 82, false),
+        ],
+    ),
+    (
+        "fixed_arena_setup",
+        &[("fixed_native_from_native", 257, false)],
+    ),
+    (
+        "fixed_native_owner_gettid",
+        &[("fixed_native_from_native", 116, false)],
+    ),
+    (
+        "fixed_arena_mprotect",
+        &[
+            ("fixed_arena_setup", 95, false),
+            ("fixed_arena_setup", 119, false),
+        ],
+    ),
+    (
+        "fixed_setup_bitmap_range",
+        &[
+            ("fixed_arena_setup", 16, false),
+            ("fixed_arena_setup", 44, false),
+            ("fixed_arena_setup", 72, false),
+            ("fixed_arena_setup", 184, false),
+            ("fixed_arena_setup", 207, false),
+            ("fixed_arena_setup", 230, false),
+        ],
+    ),
+    (
+        "fixed_scalar_syscall",
+        &[("fixed_native_owner_gettid", 11, false)],
     ),
 ];
 // The stable Rust 1.97.1 pinned-ordinary composition: identical roles and
@@ -29928,6 +30107,20 @@ const FIXED_NAKED_COMPOSITIONS: &[FixedNakedComposition] = &[
         native_syscalls: false,
         cohort: FIXED_NAKED_PINNED_ORDINARY_COHORT,
         incoming: FIXED_NAKED_PINNED_ORDINARY_INCOMING,
+        setup_bitmap_template: Some(85),
+    },
+    FixedNakedComposition {
+        image_kind: FixedImageKind::Detcore,
+        native_syscalls: true,
+        cohort: FIXED_NAKED_PINNED_NATIVE_GETTID_TAIL_COHORT,
+        incoming: FIXED_NAKED_PINNED_NATIVE_GETTID_TAIL_INCOMING,
+        setup_bitmap_template: Some(85),
+    },
+    FixedNakedComposition {
+        image_kind: FixedImageKind::Detcore,
+        native_syscalls: false,
+        cohort: FIXED_NAKED_PINNED_ORDINARY_GETTID_TAIL_COHORT,
+        incoming: FIXED_NAKED_PINNED_ORDINARY_GETTID_TAIL_INCOMING,
         setup_bitmap_template: Some(85),
     },
     FixedNakedComposition {
@@ -61860,6 +62053,46 @@ mod tests {
                 .to_string(),
             why
         );
+    }
+
+    #[test]
+    fn owner_gettid_tail_jmp_template_matches_uniquely() {
+        // The current pinned-root Detcore body of native_owner_gettid is a
+        // 16-byte tail jump into raw_syscall3 (gettid, 186). It must match
+        // exactly one validate template for its role, by shape.
+        let body: [u8; 16] = [
+            0xbf, 0xba, 0x00, 0x00, 0x00, 0x31, 0xf6, 0x31, 0xd2, 0x31, 0xc9, 0xe9, 0x10, 0xe8,
+            0xff, 0xff,
+        ];
+        let matched: Vec<_> = DETCORE_VALIDATE_TEMPLATES
+            .iter()
+            .filter(|t| {
+                t.role == "fixed_native_owner_gettid"
+                    && fixed_template_shape(
+                        &body,
+                        &fixed_hex(t.hex),
+                        t.operands.iter().map(|op| op.displacement),
+                    )
+            })
+            .collect();
+        assert_eq!(matched.len(), 1, "tail-jmp gettid body must match uniquely");
+        assert_eq!(matched[0].operands.len(), 1);
+        assert_eq!(matched[0].operands[0].key, "fixed_scalar_syscall");
+        // A different syscall number is a different body: no template admits it.
+        let mut mutated = body;
+        mutated[1] = 0xbb;
+        let matched: Vec<_> = DETCORE_VALIDATE_TEMPLATES
+            .iter()
+            .filter(|t| {
+                t.role == "fixed_native_owner_gettid"
+                    && fixed_template_shape(
+                        &mutated,
+                        &fixed_hex(t.hex),
+                        t.operands.iter().map(|op| op.displacement),
+                    )
+            })
+            .collect();
+        assert!(matched.is_empty(), "mutated gettid body must be refused");
     }
 
     #[test]
