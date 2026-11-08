@@ -1062,7 +1062,15 @@ fn collect_branch_sources(
                     .is_some_and(|location| {
                         gate_kind_for_location(units, range, location).is_some()
                     });
-            if state_known && (gate_jump || direct_gate) {
+            let call_gate = instruction.mnemonic() == Mnemonic::Call
+                && instruction.op_count() > 0
+                && instruction.op_kind(0) == OpKind::Register
+                && tracked_gate(
+                    units,
+                    range,
+                    tracked.get(&full_register(instruction.op_register(0))),
+                );
+            if state_known && (gate_jump || direct_gate || call_gate) {
                 let return_key = match tracked.get(&Register::R12) {
                     Some(Tracked::LocalAddress {
                         unit,
@@ -1290,7 +1298,6 @@ fn compute_may_write(
         let mut local_writes: BTreeSet<Register> = BTreeSet::new();
         let mut local_calls: BTreeSet<RangeKey> = BTreeSet::new();
         let mut falls_through = true;
-        let mut last_gate_jump = false;
         while decoder.can_decode() {
             decoder.decode_out(&mut instruction);
             if instruction.is_invalid() {
@@ -1330,17 +1337,33 @@ fn compute_may_write(
                     range,
                     tracked.get(&full_register(instruction.op_register(0))),
                 );
-            let direct_gate = instruction.op_count() > 0
+            let direct_gate_kind = (instruction.op_count() > 0
                 && matches!(
                     instruction.op_kind(0),
                     OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64
+                ))
+            .then(|| {
+                resolved_branch_location(units, ranges, range, &instruction, &inside, &tracked)
+                    .and_then(|location| gate_kind_for_location(units, range, location))
+            })
+            .flatten();
+            let gate_kind = if gate_jump {
+                tracked_gate_kind(
+                    units,
+                    range,
+                    tracked.get(&full_register(instruction.op_register(0))),
                 )
-                && resolved_branch_location(units, ranges, range, &instruction, &inside, &tracked)
-                    .is_some_and(|location| {
-                        gate_kind_for_location(units, range, location).is_some()
-                    });
-            if gate_jump || direct_gate {
-                local_writes.extend([Register::RAX, Register::RCX, Register::R11]);
+            } else {
+                direct_gate_kind
+            };
+            match gate_kind {
+                Some(GateKind::Native) => {
+                    local_writes.extend([Register::RAX, Register::RCX, Register::R11]);
+                }
+                Some(GateKind::OtherSwap) => {
+                    local_writes.extend(all_gprs());
+                }
+                None => {}
             }
             let is_call = instruction.mnemonic() == Mnemonic::Call;
             let is_branch = matches!(instruction.mnemonic(), Mnemonic::Jmp | Mnemonic::Call)
@@ -1355,10 +1378,39 @@ fn compute_may_write(
                         local_calls.insert(target);
                     }
                     Some(_) => {}
-                    None if is_call => {
+                    None if is_call || instruction.mnemonic() == Mnemonic::Jmp => {
                         unknown.insert(key);
                     }
                     None => {}
+                }
+            }
+            if gate_kind.is_some() {
+                let return_location = match tracked.get(&Register::R12) {
+                    Some(Tracked::LocalAddress {
+                        unit,
+                        section,
+                        address,
+                    }) => Some((*unit, *section, *address)),
+                    Some(Tracked::Relocated {
+                        location: Some(location),
+                        ..
+                    }) => Some(*location),
+                    _ => None,
+                };
+                if let Some(location) = return_location
+                    && instruction_starts.contains(&location)
+                    && let Some(target) = ranges
+                        .iter()
+                        .find(|candidate| {
+                            candidate.unit == location.0
+                                && candidate.section == location.1
+                                && candidate.start <= location.2
+                                && location.2 < candidate.end
+                        })
+                        .map(|candidate| (candidate.unit, candidate.section, candidate.start))
+                    && target != key
+                {
+                    local_calls.insert(target);
                 }
             }
             let keep = (instruction.mnemonic() == Mnemonic::Call
@@ -1375,11 +1427,9 @@ fn compute_may_write(
             );
             falls_through =
                 after_instruction(&instruction, &mut tracked, gate_jump, falls_through, keep);
-            last_gate_jump = gate_jump;
             let _ = instruction_starts;
         }
         if falls_through
-            && !last_gate_jump
             && let Some(next) = ranges
                 .iter()
                 .find(|candidate| {
@@ -2283,13 +2333,15 @@ fn rust_asm_block_patch_refuses_through_current_exe_range() {
             .map(|violation| violation.kind)
             .collect::<BTreeSet<_>>()
     );
-    assert!(
-        report.violations.iter().any(|violation| {
-            violation.kind == "indirect-branch" && violation.symbol == "exec_private_asm_block"
-        }),
-        "patched real asm block must refuse call *%rdi: {:?}",
+    assert_eq!(
+        report.violations.len(),
+        1,
+        "patched real asm block must refuse exactly the patched call: {:?}",
         report.violations
     );
+    assert_eq!(report.violations[0].kind, "indirect-branch");
+    assert_eq!(report.violations[0].symbol, "exec_private_asm_block");
+    assert_eq!(report.violations[0].offset, call_offset as u64);
 }
 
 #[test]
@@ -2579,6 +2631,13 @@ fn checker_refuses_each_injected_tls_and_control_violation() {
             "direct-syscall-outside-gate",
         ),
         (
+            "maywrite-gate-continuation",
+            "zone_b_maywrite_gate_cont.S",
+            ".text\n.globl zone_b_mutant\n.type zone_b_mutant,@function\nzone_b_mutant:\n movabs $zone_b_helper,%r10\n call *%r10\n jmp *%r10\n.size zone_b_mutant,.-zone_b_mutant\n.globl zone_b_helper\n.type zone_b_helper,@function\nzone_b_helper:\n lea zone_b_writer(%rip),%r12\n movabs $0x50000000007c,%rcx\n jmp *%rcx\n.size zone_b_helper,.-zone_b_helper\n.globl zone_b_writer\n.type zone_b_writer,@function\nzone_b_writer:\n xor %r10d,%r10d\n ret\n.size zone_b_writer,.-zone_b_writer\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "indirect-branch",
+        ),
+        (
             "maywrite-tail-jmp",
             "zone_b_maywrite_tail.S",
             ".text\n.globl zone_b_mutant\n.type zone_b_mutant,@function\nzone_b_mutant:\n movabs $zone_b_helper,%r10\n call *%r10\n jmp *%r10\n.size zone_b_mutant,.-zone_b_mutant\n.globl zone_b_helper\n.type zone_b_helper,@function\nzone_b_helper:\n jmp zone_b_writer\n.size zone_b_helper,.-zone_b_helper\n.globl zone_b_writer\n.type zone_b_writer,@function\nzone_b_writer:\n xor %r10d,%r10d\n ret\n.size zone_b_writer,.-zone_b_writer\n.section .note.GNU-stack,\"\",@progbits\n",
@@ -2616,14 +2675,14 @@ fn checker_refuses_each_injected_tls_and_control_violation() {
         (
             "maywrite-gate-jmp-callee",
             "zone_b_maywrite_gate.S",
-            ".text\n.globl zone_b_mutant\n.type zone_b_mutant,@function\nzone_b_mutant:\n movabs $0x50000000007c,%rax\n movabs $zone_b_helper,%rcx\n call *%rcx\n jmp *%rax\n.size zone_b_mutant,.-zone_b_mutant\n.globl zone_b_helper\n.type zone_b_helper,@function\nzone_b_helper:\n lea 1f(%rip),%r12\n movabs $0x50000000007c,%r11\n jmp *%r11\n1: ret\n.size zone_b_helper,.-zone_b_helper\n.section .note.GNU-stack,\"\",@progbits\n",
+            ".text\n.globl zone_b_mutant\n.type zone_b_mutant,@function\nzone_b_mutant:\n movabs $zone_b_helper,%rcx\n call *%rcx\n jmp *%rcx\n.size zone_b_mutant,.-zone_b_mutant\n.globl zone_b_helper\n.type zone_b_helper,@function\nzone_b_helper:\n lea 1f(%rip),%r12\n movabs $0x50000000007c,%r11\n jmp *%r11\n1: ret\n.size zone_b_helper,.-zone_b_helper\n.section .note.GNU-stack,\"\",@progbits\n",
             Vec::new(),
             "indirect-branch",
         ),
         (
             "maywrite-gate-relocated-callee",
             "zone_b_maywrite_gate_reloc.S",
-            ".section .gate,\"ax\",@progbits\n.globl fixed_native_entry\n.type fixed_native_entry,@function\nfixed_native_entry:\n syscall\n .fill 4,1,0x90\n jmp *%r12\n.size fixed_native_entry,.-fixed_native_entry\n.text\n.globl zone_b_mutant\n.type zone_b_mutant,@function\nzone_b_mutant:\n movabs $0x50000000007c,%rcx\n movabs $zone_b_helper,%rax\n call *%rax\n jmp *%rcx\n.size zone_b_mutant,.-zone_b_mutant\n.globl zone_b_helper\n.type zone_b_helper,@function\nzone_b_helper:\n lea 1f(%rip),%r12\n movabs $fixed_native_entry,%r11\n jmp *%r11\n1: ret\n.size zone_b_helper,.-zone_b_helper\n.section .note.GNU-stack,\"\",@progbits\n",
+            ".section .gate,\"ax\",@progbits\n.globl fixed_native_entry\n.type fixed_native_entry,@function\nfixed_native_entry:\n syscall\n .fill 4,1,0x90\n jmp *%r12\n.size fixed_native_entry,.-fixed_native_entry\n.text\n.globl zone_b_mutant\n.type zone_b_mutant,@function\nzone_b_mutant:\n movabs $zone_b_helper,%rcx\n call *%rcx\n jmp *%rcx\n.size zone_b_mutant,.-zone_b_mutant\n.globl zone_b_helper\n.type zone_b_helper,@function\nzone_b_helper:\n lea 1f(%rip),%r12\n movabs $fixed_native_entry,%r11\n jmp *%r11\n1: ret\n.size zone_b_helper,.-zone_b_helper\n.section .note.GNU-stack,\"\",@progbits\n",
             Vec::new(),
             "indirect-branch",
         ),
@@ -2946,6 +3005,32 @@ fn may_write_unresolved_and_syscall_callees_write_kept_register() {
             .get(&(helper.unit, helper.section, helper.start))
             .is_some_and(|registers| registers.contains(&Register::RAX)),
         "syscall callee must write RAX: {writes:?}"
+    );
+}
+
+#[test]
+fn may_write_tail_successor_writes_kept_register() {
+    let scratch = Scratch::new("maywrite-tail-unit");
+    let bytes = compile_source(
+        &scratch.0,
+        "maywrite-tail-unit",
+        "zone_b_maywrite_tail_unit.S",
+        ".text\n.globl zone_b_mutant\n.type zone_b_mutant,@function\nzone_b_mutant:\n movabs $zone_b_helper,%r10\n call *%r10\n jmp *%r10\n.size zone_b_mutant,.-zone_b_mutant\n.globl zone_b_helper\n.type zone_b_helper,@function\nzone_b_helper:\n jmp zone_b_writer\n.size zone_b_helper,.-zone_b_helper\n.globl zone_b_writer\n.type zone_b_writer,@function\nzone_b_writer:\n xor %r10d,%r10d\n ret\n.size zone_b_writer,.-zone_b_writer\n.section .note.GNU-stack,\"\",@progbits\n",
+        &[],
+    );
+    let units = vec![summarize("maywrite-tail-unit", &bytes).unwrap()];
+    let ranges = function_ranges(0, &units[0]);
+    let starts = instruction_starts(&units, &ranges);
+    let writes = compute_may_write(&units, &ranges, &starts);
+    let helper = ranges
+        .iter()
+        .find(|range| range.symbol == "zone_b_helper")
+        .expect("helper range");
+    assert!(
+        writes
+            .get(&(helper.unit, helper.section, helper.start))
+            .is_some_and(|registers| registers.contains(&Register::R10)),
+        "tail successor must contribute writer R10: {writes:?} ranges={ranges:?}"
     );
 }
 
