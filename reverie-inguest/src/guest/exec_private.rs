@@ -15,6 +15,8 @@ use std::io;
 #[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
 pub mod mapped_initial;
 
+pub mod tool_tls_registry;
+
 #[cfg(feature = "coordinator-rpc")]
 mod native_io;
 #[cfg(feature = "coordinator-rpc")]
@@ -656,7 +658,16 @@ unsafe fn publish_native_control(control: *mut NativeControl) -> io::Result<()> 
         crate::trap::adopt_authenticated_initial_gate()?;
         verify_bootstrap_signal(control)?;
     }
-    publish_control_slot(control)
+    publish_control_slot(control)?;
+    // Slot 0 of the per-thread Tool TLS registry is this leader, in every
+    // exec-private configuration. Registration cannot fail after the
+    // write-once control slot above unless the sealed native tid is not a
+    // positive kernel tid, which the caller treats as terminal either way.
+    let leader_tid = read(unsafe { &raw const (*control).native_tid });
+    i32::try_from(leader_tid)
+        .ok()
+        .and_then(|tid| tool_tls_registry::register_leader(tid).ok())
+        .ok_or_else(|| io::Error::other("private Tool leader slot registration failed"))
 }
 
 // Same write-once physical pointer for both authenticated image origins.
