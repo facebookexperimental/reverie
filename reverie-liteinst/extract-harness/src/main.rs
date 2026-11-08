@@ -116,7 +116,7 @@ fn scenario_flip_exec() {
     };
     let outcome = promoter.promote_one(site, &mut stop);
     assert_eq!(outcome, PromoteOutcome::Flipped);
-    assert_eq!(stop.acquires, 1, "promoter must acquire before qualify");
+    assert_eq!(stop.acquires, 1, "exactly one acquire settles the flip");
     assert_eq!(
         promoter.promote_one(site, &mut stop),
         PromoteOutcome::Refused
@@ -242,7 +242,7 @@ fn scenario_toctou() {
 fn scenario_refused_window_no_fallback_by_default() {
     // Default policy: no proc-mem fallback exists to fall into;
     // the flip here uses the window and succeeds. The fallback
-    // permission itself is unit-tested in-tree (should_fallback
+    // permission itself is unit-tested in-tree (StoreFallback
     // classification); this scenario pins that the default
     // promoter holds NO proc-mem permission.
     let promoter = LazyPromoter::unattested(1);
@@ -478,6 +478,46 @@ fn scenario_refused_window_default_policy() {
     println!("PASS rv2-refused-window-default");
 }
 
+fn scenario_two_promoters() {
+    // RV9: a second promoter must not resume executors onto the
+    // first promoter's unsynced RWX custody page.
+    SYNC_FAIL_ONCE.store(true, Ordering::SeqCst);
+    let patcher = Patcher::attested_with_sync(sync_fail_once).unwrap();
+    let mut first = LazyPromoter::with_patcher(patcher, 1).unwrap();
+    let (pa, _la) = svc_page();
+    let (pb, _lb) = svc_page();
+    let mut stop = SingleThreadStop {
+        resume_failures: 0,
+        acquires: 0,
+        resumes: 0,
+    };
+    assert_eq!(
+        first.promote_one(pa as u64, &mut stop),
+        PromoteOutcome::CustodyPending
+    );
+    assert_eq!(perms_at(pa as u64), "rwxp");
+    let mut second = LazyPromoter::attested(1).unwrap();
+    let (acq, res) = (stop.acquires, stop.resumes);
+    assert_eq!(
+        second.promote_one(pb as u64, &mut stop),
+        PromoteOutcome::CustodyPending
+    );
+    assert_eq!(
+        (stop.acquires, stop.resumes),
+        (acq, res),
+        "second promoter touched the stop"
+    );
+    let done = first.complete_pending(&mut stop);
+    assert_eq!(done, [(pa as u64, PromoteOutcome::Flipped)]);
+    assert_eq!(
+        second.promote_one(pb as u64, &mut stop),
+        PromoteOutcome::Flipped
+    );
+    core::mem::forget(first);
+    core::mem::forget(second);
+    println!("PASS rv9-two-promoters");
+}
+
 fn main() {
     scenario_flip_exec();
     scenario_custody_resume();
@@ -488,6 +528,7 @@ fn main() {
     scenario_custody_blocks_new_work();
     scenario_retry_requalifies();
     scenario_refused_window_default_policy();
+    scenario_two_promoters();
     scenario_bti_preserved();
     if BTI_SKIPPED.load(Ordering::SeqCst) {
         println!("DONE-WITH-SKIP bti");

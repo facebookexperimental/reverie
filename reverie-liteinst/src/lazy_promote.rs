@@ -218,12 +218,13 @@ impl Drop for MprotectStore {
     }
 }
 
-/// Foreign store via `/proc/self/mem`: no protection window, for
-/// environments where the mprotect window is refused. Unlike
-/// `process_vm_writev` (no FOLL_FORCE: EFAULT on R-X text), proc-mem
-/// writes reach read-only private text and break COW exactly as an
-/// mprotect window store would. Used only after the mprotect
-/// window probe refuses, per the settled try order.
+/// Foreign store via `/proc/self/mem`: no protection window.
+/// Unlike `process_vm_writev` (no FOLL_FORCE: EFAULT on R-X text),
+/// proc-mem writes reach read-only private text and break COW
+/// exactly as an mprotect window store would. Used only under
+/// explicit selector permission (`StoreFallback::AllowProcMem`)
+/// after the mprotect window was refused; never as an
+/// errno-triggered bypass.
 pub struct ProcMemStore {
     addr: u64,
     fd: Option<libc::c_int>,
@@ -322,11 +323,14 @@ pub enum PromoteOutcome {
     /// Refused before any store (mapping, generation, strategy, or
     /// capability); the site word is untouched and stays trapping.
     Refused,
-    /// The store was issued (or may have been) and custody is
-    /// unresolved: sync/resume shortfall, restore failure, or a
-    /// lease that could not be released. Drive
-    /// [`LazyPromoter::complete_pending`];
-    /// never re-drain this site as a fresh candidate.
+    /// Custody is unresolved. Two shapes, told apart by custody
+    /// location: a RETAINED site (its store was issued or may
+    /// have been; drive [`LazyPromoter::complete_pending`]), or
+    /// an unheld candidate the promoter has DEFERRED internally
+    /// (pre-store shortfall or mask failure; it retries at the
+    /// next drain once the blocking custody settles). Either
+    /// way the candidate is promoter-owned: never re-drain it
+    /// as a fresh candidate from the source.
     CustodyPending,
 }
 
@@ -447,10 +451,44 @@ impl Drop for SignalMask {
     }
 }
 
+/// Process-wide post-store custody count (pending sites plus
+/// retained stops, across ALL promoter instances). Custody is a
+/// process property — executors are stopped process-wide — so a
+/// second promoter must never resume onto another promoter's
+/// unsynced RWX page. Constructors remain usable for tests, but
+/// production holds exactly one promoter; this counter is the
+/// backstop that keeps even a second instance safe.
+static GLOBAL_CUSTODY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn custody_enter() {
+    GLOBAL_CUSTODY.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn custody_exit() {
+    GLOBAL_CUSTODY.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn global_custody_held() -> bool {
+    GLOBAL_CUSTODY.load(std::sync::atomic::Ordering::SeqCst) > 0
+}
+
 /// The promoter: patcher + retained sites + island pool. Arenas in
 /// this slice are one island per flipped site (retained by the
 /// `Site` itself); entry-allocator arenas are a sizing follow-up
 /// that does not change this boundary.
+///
+/// Production holds exactly one promoter per process. The
+/// process-wide custody counter is a backstop, not a concurrency
+/// design: while any promoter holds post-store custody, every
+/// promoter refuses work whose paths resume executors.
+///
+/// Caller contract for `CustodyPending`: this type's signal mask
+/// is dropped when the call that returned the outcome returns.
+/// If that outcome is `CustodyPending`, the caller must drive
+/// [`LazyPromoter::complete_pending`] to settlement (or the
+/// patcher's rollback for retained sites) before returning
+/// this thread to guest code that expects its pre-drain signal
+/// mask and executor state.
 pub struct LazyPromoter {
     patcher: Patcher,
     sites: Vec<Site>,
@@ -547,7 +585,8 @@ impl LazyPromoter {
     /// munmap/mmap-replace/mprotect-under-site/exec event the census
     /// observes). Qualification happens under the lease against
     /// this generation, so a bump between drains requalifies every
-    /// later candidate from fresh facts.
+    /// later candidate from fresh facts. Selector/census API: it
+    /// has no internal caller by design.
     pub fn bump_generation(&mut self) {
         self.generation += 1;
     }
@@ -569,7 +608,8 @@ impl LazyPromoter {
     /// page whose word is not yet synced/restored (the W^X
     /// no-resume rule applies across sites, not per site).
     fn custody_blocking(&self) -> bool {
-        self.stop_retained
+        global_custody_held()
+            || self.stop_retained
             || self.sites.iter().any(|s| {
                 matches!(
                     s.state(),
@@ -578,10 +618,43 @@ impl LazyPromoter {
             })
     }
 
+    fn own_pending_custody(&self) -> bool {
+        self.sites.iter().any(|s| {
+            matches!(
+                s.state(),
+                SiteState::SyncPending { .. } | SiteState::RetainedStop { .. }
+            )
+        })
+    }
+
+    fn own_custody_count(&self) -> usize {
+        self.sites
+            .iter()
+            .filter(|s| {
+                matches!(
+                    s.state(),
+                    SiteState::SyncPending { .. } | SiteState::RetainedStop { .. }
+                )
+            })
+            .count()
+            + usize::from(self.stop_retained)
+    }
+
+    fn other_custody_held(&self) -> bool {
+        GLOBAL_CUSTODY.load(std::sync::atomic::Ordering::SeqCst) > self.own_custody_count()
+    }
+
     /// Retry releasing a retained stop. Clears `stop_retained`
     /// ONLY when every executor acknowledged (or the stop reports
     /// none retained by an error-free empty acknowledgement is NOT
     /// enough: empty is a shortfall). Returns true when settled.
+    fn set_stop_retained(&mut self) {
+        if !self.stop_retained {
+            self.stop_retained = true;
+            custody_enter();
+        }
+    }
+
     fn settle_retained_stop(&mut self, stop: &mut dyn StopControl) -> bool {
         if !self.stop_retained {
             return true;
@@ -589,6 +662,7 @@ impl LazyPromoter {
         match stop.resume() {
             Ok(states) if all_acknowledged(&states) => {
                 self.stop_retained = false;
+                custody_exit();
                 true
             }
             _ => false,
@@ -636,7 +710,13 @@ impl LazyPromoter {
         // still be stopped (or a held page is unsynced/RWX), no
         // new work starts — its resumes would release executors
         // onto the custody site's page — and the pending table
-        // is left untouched for a later drain.
+        // is left untouched for a later drain. In particular, do
+        // not settle a retained stop while another custody (this
+        // promoter's pending site or another promoter's) exists:
+        // that settlement is itself a resume.
+        if self.other_custody_held() || self.own_pending_custody() {
+            return Vec::new();
+        }
         if !self.settle_retained_stop(stop) || self.custody_blocking() {
             return Vec::new();
         }
@@ -663,6 +743,15 @@ impl LazyPromoter {
             let outcome = self.promote_one(addr, stop);
             out.push((addr, outcome));
             if outcome == PromoteOutcome::CustodyPending {
+                // The CURRENT candidate joins the backlog too
+                // when nobody retained it (pre-store shortfall,
+                // mask failure): S5a already consumed it from the
+                // source, so this promoter is its only owner.
+                if !self.sites.iter().any(|s| s.addr() == addr)
+                    && !self.retained_refusals.contains(&addr)
+                {
+                    self.deferred.push_back(addr);
+                }
                 // The rest of this batch was already consumed
                 // from the source (S5a's cursor advanced), so the
                 // promoter — not the caller — retains it: backlog
@@ -686,15 +775,28 @@ impl LazyPromoter {
     /// settle back to the original word (rollback completions)
     /// report Refused and are dropped from custody.
     pub fn complete_pending(&mut self, stop: &mut dyn StopControl) -> Vec<(u64, PromoteOutcome)> {
+        self.mask_failed = false;
         let Some(_mask) = SignalMask::block_all() else {
             self.mask_failed = true;
             return Vec::new();
         };
+        // Another promoter's custody blocks even completions here:
+        // every completion path resumes executors. This promoter's
+        // own pending sites are the work to complete, so they do
+        // not trigger this gate. Check it before settling a
+        // separately retained stop for the same reason.
+        if self.other_custody_held() {
+            return Vec::new();
+        }
         let mut out = Vec::new();
-        if !self.settle_retained_stop(stop) {
+        if !self.own_pending_custody() {
+            // With no post-store site anywhere, a separately
+            // retained stop can be settled safely on its own.
+            let _ = self.settle_retained_stop(stop);
             return out;
         }
         let mut settled_unpatched: Vec<u64> = Vec::new();
+        let mut all_settled = true;
         for site in &mut self.sites {
             if !matches!(
                 site.state(),
@@ -702,6 +804,7 @@ impl LazyPromoter {
             ) {
                 continue;
             }
+            let was_pending = true;
             let outcome = match self.patcher.complete_sync(site, stop) {
                 Ok(()) => match site.state() {
                     SiteState::Flipped => PromoteOutcome::Flipped,
@@ -710,12 +813,21 @@ impl LazyPromoter {
                 },
                 Err(ref e) => classify(e, site.state()).0,
             };
+            if was_pending
+                && !matches!(
+                    site.state(),
+                    SiteState::SyncPending { .. } | SiteState::RetainedStop { .. }
+                )
+            {
+                custody_exit();
+            }
             if site.state() == SiteState::Unpatched {
                 settled_unpatched.push(site.addr());
             }
             let settled = outcome != PromoteOutcome::CustodyPending;
             out.push((site.addr(), outcome));
             if !settled {
+                all_settled = false;
                 // Stop at the first unsettled custody: completing
                 // a LATER site would resume executors onto this
                 // site's still-unsynced, possibly RWX page.
@@ -739,6 +851,11 @@ impl LazyPromoter {
                 }
             });
         }
+        if all_settled && !self.other_custody_held() && !self.own_pending_custody() {
+            // A separately retained stop can be settled only once
+            // every site completed above has actually settled.
+            let _ = self.settle_retained_stop(stop);
+        }
         out
     }
 
@@ -750,12 +867,16 @@ impl LazyPromoter {
             self.mask_failed = true;
             return PromoteOutcome::CustodyPending;
         };
+        if self.other_custody_held() || self.own_pending_custody() {
+            // Blocked by another site's custody: do not settle a
+            // retained stop either, because that settlement itself
+            // resumes executors. The candidate is NOT consumed or
+            // retained; the caller still owns it and may retry
+            // after the custody settles. CustodyPending here
+            // describes the promoter's state, not this candidate's.
+            return PromoteOutcome::CustodyPending;
+        }
         if !self.settle_retained_stop(stop) || self.custody_blocking() {
-            // Blocked by another site's custody (or a retained
-            // stop): the candidate is NOT consumed or retained —
-            // the caller still owns it and may retry after the
-            // custody settles. CustodyPending here describes the
-            // promoter's state, not this candidate's.
             return PromoteOutcome::CustodyPending;
         }
         if self.sites.iter().any(|s| s.addr() == addr) || self.retained_refusals.contains(&addr) {
@@ -775,7 +896,7 @@ impl LazyPromoter {
         match stop.resume() {
             Ok(states) if all_acknowledged(&states) => PromoteOutcome::Refused,
             _ => {
-                self.stop_retained = true;
+                self.set_stop_retained();
                 PromoteOutcome::CustodyPending
             }
         }
@@ -899,6 +1020,7 @@ impl LazyPromoter {
                         );
                     }
                     if retain {
+                        custody_enter();
                         self.island_ranges
                             .push((addr, island_range.0, island_range.1));
                         self.sites.push(site);
@@ -906,13 +1028,38 @@ impl LazyPromoter {
                     if outcome == PromoteOutcome::CustodyPending && !retain {
                         // Pre-store resume shortfall: no site custody,
                         // the STOP is retained for settlement.
-                        self.stop_retained = true;
+                        self.set_stop_retained();
                     }
                     return outcome;
                 }
             }
         }
         PromoteOutcome::Refused
+    }
+}
+
+impl Drop for LazyPromoter {
+    fn drop(&mut self) {
+        // Balance the global custody counter for whatever this
+        // instance still holds. (Production promoters are
+        // process-lifetime; this keeps tests and short-lived
+        // instances from poisoning the count.)
+        let pending = self
+            .sites
+            .iter()
+            .filter(|s| {
+                matches!(
+                    s.state(),
+                    SiteState::SyncPending { .. } | SiteState::RetainedStop { .. }
+                )
+            })
+            .count();
+        for _ in 0..pending {
+            custody_exit();
+        }
+        if self.stop_retained {
+            custody_exit();
+        }
     }
 }
 
@@ -1109,6 +1256,7 @@ mod tests {
 
     #[test]
     fn drain_promotes_in_order_and_retains_refusals() {
+        let _serial = PROMOTER_TEST_SERIAL.lock().unwrap();
         // Mapped SVC words, so admission runs real qualification.
         // What refuses here, by architecture: on x86 the island
         // reserve itself (Unsupported, before acquire); on aarch64
@@ -1168,7 +1316,6 @@ mod tests {
         unsafe { libc::munmap(p as *mut libc::c_void, page) };
     }
 
-    #[cfg(target_arch = "aarch64")]
     static PROMOTER_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[cfg(target_arch = "aarch64")]
@@ -1672,35 +1819,339 @@ mod tests {
     }
     #[test]
     fn deferred_batch_survives_custody_block() {
-        // First candidate refuses (retained), second is consumed
-        // from the source in the same batch: it must be deferred
-        // inside the promoter, not dropped. The proof is the
-        // SECOND drain (empty source) still yielding it.
+        let _serial = PROMOTER_TEST_SERIAL.lock().unwrap();
+        // Causal shape: the source is CONSUMED by the first
+        // drain; the first candidate's promotion creates custody
+        // (resume shortfall on its pre-store refusal), so BOTH
+        // candidates must survive inside the promoter. The
+        // second drain's source is genuinely empty — removing
+        // deferred retention makes it yield nothing.
+        struct ShortfallThenRelease {
+            release: std::sync::atomic::AtomicBool,
+        }
+        // SAFETY (test): scripted stop; no executor exists.
+        unsafe impl StopControl for ShortfallThenRelease {
+            fn acquire(&mut self) -> Result<(), PatchError> {
+                Ok(())
+            }
+            fn resume(&mut self) -> Result<Vec<ResumeState>, PatchError> {
+                if self.release.load(std::sync::atomic::Ordering::SeqCst) {
+                    Ok(vec![ResumeState::Released])
+                } else {
+                    Ok(vec![ResumeState::Unknown])
+                }
+            }
+        }
         let mut promoter = LazyPromoter::unattested(1);
-        promoter.stop_retained = true;
-        let mut stop = RefusingStop;
-        // settle will fail (RefusingStop resume returns empty ->
-        // shortfall), so the whole batch defers without source use.
+        let mut stop = ShortfallThenRelease {
+            release: std::sync::atomic::AtomicBool::new(false),
+        };
+        let mut source_calls = 0;
         let first = promoter.drain_and_promote(
             &mut |buf| {
+                source_calls += 1;
                 buf[..2].copy_from_slice(&[0x5000, 0x6000]);
                 2
             },
             &mut stop,
         );
-        assert!(
-            first.is_empty(),
-            "blocked drain must not consume: {first:?}"
+        assert_eq!(
+            first,
+            [
+                (0x5000, PromoteOutcome::CustodyPending),
+                (0x6000, PromoteOutcome::CustodyPending),
+            ]
         );
-        promoter.stop_retained = false;
-        let second = promoter.drain_and_promote(
-            &mut |buf| {
-                buf[..2].copy_from_slice(&[0x5000, 0x6000]);
-                2
-            },
-            &mut stop,
+        assert!(promoter.retained_refusals().is_empty());
+        assert_eq!(promoter.held_sites(), 0);
+        // Settle the stop, then drain from a truly empty source:
+        // both candidates replay from the deferred backlog and
+        // land in retained_refusals.
+        stop.release
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let second = promoter.drain_and_promote(&mut |_buf| 0, &mut stop);
+        assert_eq!(
+            second,
+            [
+                (0x5000, PromoteOutcome::Refused),
+                (0x6000, PromoteOutcome::Refused),
+            ]
         );
-        assert_eq!(second.len(), 2);
+        assert_eq!(source_calls, 1, "second drain must not need the source");
         assert_eq!(promoter.retained_refusals(), [0x5000, 0x6000]);
+        assert_eq!(promoter.held_sites(), 0);
+    }
+    #[test]
+    fn settled_unpatched_site_leaves_custody_and_ranges() {
+        use liteinst_aarch64_patch::flip::FlipRequest;
+        use liteinst_aarch64_patch::site::{StrategyPreference, TrapRoute};
+        let _serial = PROMOTER_TEST_SERIAL.lock().unwrap();
+        struct FailStore {
+            word: *mut u32,
+            fail: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        }
+        // SAFETY (test): the word outlives the site in this test.
+        unsafe impl Send for FailStore {}
+        // SAFETY (test): models a store that can be told to fail;
+        // writes name the same test word throughout.
+        unsafe impl liteinst_aarch64_patch::store::SiteStore for FailStore {
+            fn read_word(&self) -> u32 {
+                unsafe { self.word.read_volatile() }
+            }
+            fn write_addr(&self) -> u64 {
+                self.word as u64
+            }
+            fn begin_write(&mut self) -> Result<(), PatchError> {
+                Ok(())
+            }
+            fn store_word(&mut self, word: u32) -> Result<(), PatchError> {
+                if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(PatchError::Os {
+                        op: "test store",
+                        errno: libc::EIO,
+                    });
+                }
+                unsafe { self.word.write_volatile(word) };
+                Ok(())
+            }
+            fn finish_write(&mut self) -> Result<(), PatchError> {
+                Ok(())
+            }
+        }
+        struct OpenStop;
+        // SAFETY (test): scripted stop; no executor exists.
+        unsafe impl StopControl for OpenStop {
+            fn acquire(&mut self) -> Result<(), PatchError> {
+                Ok(())
+            }
+            fn resume(&mut self) -> Result<Vec<ResumeState>, PatchError> {
+                Ok(vec![ResumeState::Released])
+            }
+        }
+        unsafe fn sync_ok(_rw: *mut u8, _rx: *mut u8, _len: usize) -> Result<(), PatchError> {
+            Ok(())
+        }
+        let baseline = GLOBAL_CUSTODY.load(std::sync::atomic::Ordering::SeqCst);
+        let fail = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut word = 0xd400_0001u32;
+        let addr = 0x1000u64;
+        let mut promoter = LazyPromoter::with_patcher(Patcher::test_with_sync(sync_ok), 7).unwrap();
+        let store = Box::new(FailStore {
+            word: std::ptr::from_mut(&mut word),
+            fail: fail.clone(),
+        });
+        let mut site = unsafe {
+            liteinst_aarch64_patch::site::Site::from_rx(
+                addr,
+                word,
+                facts(addr, Provenance::PrivateFile),
+                store,
+            )
+        }
+        .unwrap();
+        // SAFETY (test): claims a route for this exact site; the
+        // fake stop never executes the word.
+        let route = unsafe { TrapRoute::arm(addr, 0x4c00, 1) };
+        let mut stop = OpenStop;
+        // Pre-acquire to mirror try_promote's lease, then drive a
+        // store-failing flip so the site lands in SyncPending.
+        stop.acquire().unwrap();
+        let outcome = promoter.patcher.flip_preacquired(
+            &mut site,
+            FlipRequest {
+                island: None,
+                strategy: StrategyPreference::TrapOnly,
+                fallback: FallbackPermission::RefuseTrap,
+                trap_route: Some(route),
+                mapping_facts: Some(facts(addr, Provenance::PrivateFile)),
+            },
+            &mut stop,
+        );
+        assert!(matches!(outcome, Err(PatchError::StoreFailed { .. })));
+        assert!(matches!(site.state(), SiteState::SyncPending { .. }));
+        // Install custody exactly as try_promote's retain path does.
+        custody_enter();
+        promoter.island_ranges.push((addr, 0x9000, 0xa000));
+        promoter.sites.push(site);
+        fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        let done = promoter.complete_pending(&mut stop);
+        assert_eq!(done, [(addr, PromoteOutcome::Refused)]);
+        // Settled back to the original word: custody is released —
+        // site dropped, range freed, global counter balanced.
+        assert_eq!(promoter.held_sites(), 0);
+        assert!(promoter.island_ranges.is_empty());
+        assert_eq!(
+            GLOBAL_CUSTODY.load(std::sync::atomic::Ordering::SeqCst),
+            baseline
+        );
+        assert_eq!(word, 0xd400_0001);
+    }
+
+    #[test]
+    fn global_custody_blocks_other_promoters() {
+        let _serial = PROMOTER_TEST_SERIAL.lock().unwrap();
+        let baseline = GLOBAL_CUSTODY.load(std::sync::atomic::Ordering::SeqCst);
+        custody_enter();
+        let mut other = LazyPromoter::unattested(1);
+        assert!(other.custody_blocking());
+        assert!(other.other_custody_held());
+        let mut stop = RefusingStop;
+        assert_eq!(
+            other.promote_one(0x5000, &mut stop),
+            PromoteOutcome::CustodyPending
+        );
+        custody_exit();
+        assert_eq!(
+            GLOBAL_CUSTODY.load(std::sync::atomic::Ordering::SeqCst),
+            baseline
+        );
+    }
+    #[cfg(target_arch = "aarch64")]
+    fn install_window_refusing_filter() {
+        // BPF: mprotect(226) with prot&(W|X)==(W|X) -> ERRNO EACCES;
+        // everything else ALLOW.
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct SockFilter {
+            code: u16,
+            jt: u8,
+            jf: u8,
+            k: u32,
+        }
+        const BPF_LD_W_ABS: u16 = 0x20;
+        const BPF_JMP_JEQ_K: u16 = 0x15;
+        const BPF_ALU_AND_K: u16 = 0x54;
+        const BPF_RET_K: u16 = 0x06;
+        let stmt = |code, k| SockFilter {
+            code,
+            jt: 0,
+            jf: 0,
+            k,
+        };
+        let jump = |code, k, jt, jf| SockFilter { code, jt, jf, k };
+        let prog = [
+            stmt(BPF_LD_W_ABS, 0),
+            jump(BPF_JMP_JEQ_K, 226, 0, 4),
+            stmt(BPF_LD_W_ABS, 32),
+            stmt(BPF_ALU_AND_K, 0x6),
+            jump(BPF_JMP_JEQ_K, 0x6, 0, 1),
+            stmt(BPF_RET_K, 0x0005_0000 | 13),
+            stmt(BPF_RET_K, 0x7fff_0000),
+        ];
+        #[repr(C)]
+        struct SockFprog {
+            len: u16,
+            filter: *const SockFilter,
+        }
+        let fprog = SockFprog {
+            len: prog.len() as u16,
+            filter: prog.as_ptr(),
+        };
+        unsafe {
+            assert_eq!(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), 0);
+            let rc = libc::syscall(libc::SYS_seccomp, 1u32, 0u32, &fprog as *const SockFprog);
+            assert_eq!(rc, 0, "seccomp install failed");
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    struct SecondAcquireAction {
+        page: u64,
+        len: usize,
+        action: String,
+        acquires: u32,
+        resumes: u32,
+    }
+    // SAFETY (test): the stop plays the racing guest on the second
+    // acquire; single-threaded child, page owned by the test.
+    #[cfg(target_arch = "aarch64")]
+    unsafe impl StopControl for SecondAcquireAction {
+        fn acquire(&mut self) -> Result<(), PatchError> {
+            self.acquires += 1;
+            if self.acquires == 2 {
+                unsafe {
+                    match self.action.as_str() {
+                        "rw" => {
+                            libc::mprotect(
+                                self.page as *mut libc::c_void,
+                                self.len,
+                                libc::PROT_READ | libc::PROT_WRITE,
+                            );
+                        }
+                        "fixed" => {
+                            let p = libc::mmap(
+                                self.page as *mut libc::c_void,
+                                self.len,
+                                libc::PROT_READ | libc::PROT_WRITE,
+                                libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                                -1,
+                                0,
+                            );
+                            assert_ne!(p, libc::MAP_FAILED);
+                            (self.page as *mut u32).write_volatile(0x1122_3344);
+                        }
+                        "munmap" => {
+                            libc::munmap(self.page as *mut libc::c_void, self.len);
+                        }
+                        "none" => {
+                            libc::mprotect(
+                                self.page as *mut libc::c_void,
+                                self.len,
+                                libc::PROT_NONE,
+                            );
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+            }
+            Ok(())
+        }
+        fn resume(&mut self) -> Result<Vec<ResumeState>, PatchError> {
+            self.resumes += 1;
+            Ok(vec![ResumeState::Released])
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn retry_requalifies_under_second_lease() {
+        // Re-exec child per action: a refused window (seccomp
+        // EACCES on W+X mprotect) triggers the proc-mem retry;
+        // at acquire #2 the guest changes the mapping. The retry
+        // must re-qualify and re-read — never store through the
+        // first lease's facts.
+        const CHILD: &str = "REVERIE_S5B_RV2_ACTION";
+        if let Ok(action) = std::env::var(CHILD) {
+            let _serial = PROMOTER_TEST_SERIAL.lock().unwrap();
+            let (p, page) = rx_page_with(0xd400_0001);
+            let site = p as u64;
+            install_window_refusing_filter();
+            let mut promoter = LazyPromoter::attested(1).unwrap();
+            promoter.set_store_fallback(StoreFallback::AllowProcMem);
+            let mut stop = SecondAcquireAction {
+                page: site,
+                len: page,
+                action,
+                acquires: 0,
+                resumes: 0,
+            };
+            let outcome = promoter.promote_one(site, &mut stop);
+            assert_eq!(outcome, PromoteOutcome::Refused);
+            assert_eq!(stop.acquires, 2);
+            assert_eq!(stop.resumes, 2);
+            std::process::exit(0);
+        }
+        for action in ["rw", "fixed", "munmap", "none"] {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "lazy_promote::tests::retry_requalifies_under_second_lease",
+                    "--nocapture",
+                ])
+                .env(CHILD, action)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "action {action}: {out:?}");
+        }
     }
 }
