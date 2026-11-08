@@ -18402,7 +18402,9 @@ fn refuse_unauthenticated_tls_access(
                 .ok_or("unauthenticated TLS access address overflows")?;
             let rest = &code[start..];
             // Module-base form: lea descriptor; call __tls_get_addr;
-            // then a [base + imm] operand inside a cell.
+            // then the [base + imm] access as the very next
+            // instruction (optionally after a test rax,rax and a
+            // short branch). Anything later has lost the base.
             if rest.len() >= 12
                 && rest[..3] == [0x48, 0x8d, 0x3d]
                 && rest[7] == 0xe8
@@ -18410,18 +18412,20 @@ fn refuse_unauthenticated_tls_access(
                 && fixed_rip_target(address + 7, &rest[7..], 1, 5).ok() == Some(plt_address)
                 && !in_accessor(address)
             {
-                for at in 12..rest.len().min(52) {
-                    let ins = &rest[at..];
+                for at in [12_usize, 15, 17] {
+                    let Some(ins) = rest.get(at..) else { break };
                     let imm = if ins.len() >= 7
                         && matches!(ins[0], 0x48 | 0x49 | 0x4c | 0x4d)
-                        && matches!(ins[1], 0x8b | 0x8d | 0x03 | 0x2b | 0x3b)
-                        && ins[2] >> 6 == 2
+                        && (matches!(ins[1], 0x8b | 0x8d | 0x03 | 0x2b | 0x3b)
+                            && ins[2] & 0xc7 == 0x80
+                            || ins[1] == 0x80 && ins[2] & 0xfe == 0xb8)
                     {
                         Some(u64::from(u32::from_le_bytes(ins[3..7].try_into().unwrap())))
                     } else if ins.len() >= 4
                         && matches!(ins[0], 0x48 | 0x49 | 0x4c | 0x4d)
-                        && matches!(ins[1], 0x8b | 0x8d | 0x03 | 0x2b | 0x3b)
-                        && ins[2] >> 6 == 1
+                        && (matches!(ins[1], 0x8b | 0x8d | 0x03 | 0x2b | 0x3b)
+                            && ins[2] & 0xc7 == 0x40
+                            || ins[1] == 0x80 && ins[2] & 0xfe == 0x78)
                     {
                         Some(u64::from(ins[3]))
                     } else if ins.len() >= 3
