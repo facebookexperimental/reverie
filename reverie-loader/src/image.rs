@@ -33,9 +33,28 @@ pub use private_runtime::TlsTemplate;
 /// instead of assuming this value holds on its host.
 pub const PAGE_SIZE: u64 = 4096;
 
-/// The most loadable segments an image may have. The loader and runtime
-/// have a handful; a bound keeps parsing allocation-free.
-pub const MAX_SEGMENTS: usize = 16;
+/// The most loadable segments an image may have. Measured images
+/// are far smaller: Reverie's own linker-script images declare 1-4
+/// PT_LOADs, and of 3,197 host ELFs measured for dh-q2xgh
+/// (`/usr/bin`, `/usr/lib64/*.so*`, `/usr/local/bin`,
+/// `/usr/libexec/*/*`) the maximum was 7 (system libLLVM 3-4;
+/// Rust toolchain libLLVM and rustc_driver, outside that set,
+/// 5). 64 is headroom
+/// for a future larger Tool image, not a measured need. This
+/// parser only ever sees fixed-address loader/runtime/Tool images
+/// (it refuses ET_DYN, PT_INTERP and PT_DYNAMIC), so host counts
+/// are context, not the comparison class. A bound keeps parsing
+/// allocation-free at a bounded cost: the fixed
+/// `[Option<Segment>; MAX_SEGMENTS]` array (~56 bytes per entry, so
+/// ~3.5 KiB per parsed image) and the quadratic pairwise-overlap check
+/// in `validate` (2,016 pairs at the cap). The count is never
+/// serialised — segment_count is a host `usize` and no wire format
+/// carries it — so raising the cap changes no layout on the wire.
+/// Scope: reverie-liteinst-artifact `private_static` geometry
+/// still caps the same RUNTIME_WINDOW Tool image at 16 PT_LOADs
+/// (follow-up dh-9uc6w), so the end-to-end liteinst cap does not
+/// rise with this constant yet. dh-q2xgh.
+pub const MAX_SEGMENTS: usize = 64;
 
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 const ELFCLASS64: u8 = 2;
@@ -234,7 +253,9 @@ impl<'a> Image<'a> {
         let mut image = Self {
             bytes,
             entry,
-            segments: Default::default(),
+            // [Option<Segment>; MAX_SEGMENTS] has no Default impl
+            // above 32 entries; from_fn keeps this allocation-free.
+            segments: core::array::from_fn(|_| None),
             segment_count: 0,
             has_interpreter: false,
             has_dynamic: false,
@@ -644,5 +665,105 @@ pub(crate) mod tests {
         let many = [text(16); MAX_SEGMENTS + 1];
         let too_many = build(BASE, &many, &[]);
         assert_eq!(Image::parse(&too_many), Err(ImageError::TooManySegments));
+    }
+
+    #[test]
+    fn segment_count_boundaries_hold_at_each_cap() {
+        // dh-q2xgh raised the cap from 16: the old cap and one
+        // past it must now parse, the new cap must parse, and
+        // one past the new cap must refuse by name. Against the
+        // old constant the 17-segment case is the failure this
+        // slice exists to remove.
+        for (count, accepted) in [(16usize, true), (17, true), (64, true), (65, false)] {
+            let phdrs = vec![text(16); count];
+            let bytes = build(BASE, &phdrs, &[]);
+            let parsed = Image::parse(&bytes);
+            if accepted {
+                assert_eq!(
+                    parsed.unwrap().segments().count(),
+                    count,
+                    "segment count {count} must parse"
+                );
+            } else {
+                assert_eq!(
+                    parsed,
+                    Err(ImageError::TooManySegments),
+                    "segment count {count} must refuse"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sixty_four_non_overlapping_segments_validate_and_audit_clean() {
+        // The boundary test above exercises parse only (its segments
+        // alias). This runs the new cap through validate's pairwise
+        // overlap loop and audit's executable-segment array
+        // (audit.rs [Option<&Segment>; MAX_SEGMENTS]) at exactly 64
+        // non-overlapping executable pages.
+        // Literal 64, not MAX_SEGMENTS: with the constant reverted
+        // to 16 this test must fail too, not shrink to fit.
+        let phdrs: Vec<Phdr> = (0..64u64)
+            .map(|i| {
+                (
+                    PT_LOAD,
+                    PF_R | PF_X,
+                    4096,
+                    BASE + i * PAGE_SIZE,
+                    16,
+                    PAGE_SIZE,
+                )
+            })
+            .collect();
+        let bytes = build(BASE, &phdrs, &[0xc3; 16]);
+        let validated = Image::parse(&bytes).unwrap().validate(&policy()).unwrap();
+        assert_eq!(validated.segments().count(), 64);
+        assert_eq!(crate::audit::stray_syscall(&validated, &[]), Ok(None));
+        // A planted syscall encoding in the shared first file page is
+        // found at the first segment's address.
+        let stray = build(BASE, &phdrs, &[0x0f, 0x05]);
+        let validated = Image::parse(&stray).unwrap().validate(&policy()).unwrap();
+        assert_eq!(
+            crate::audit::stray_syscall(&validated, &[])
+                .unwrap()
+                .unwrap()
+                .address,
+            BASE
+        );
+        // A stray mapped only by segment 63 (its own file page at
+        // offset 8192) proves the audit scans past segment 16: an
+        // audit loop truncated to the first 16 executable segments
+        // would miss it.
+        let mut last_only = phdrs.clone();
+        last_only[63].2 = 8192;
+        let mut body = vec![0xc3u8; 4096 + 16];
+        body[4096] = 0x0f;
+        body[4097] = 0x05;
+        let stray_last = build(BASE, &last_only, &body);
+        let validated = Image::parse(&stray_last)
+            .unwrap()
+            .validate(&policy())
+            .unwrap();
+        assert_eq!(
+            crate::audit::stray_syscall(&validated, &[])
+                .unwrap()
+                .unwrap()
+                .address,
+            BASE + 63 * PAGE_SIZE
+        );
+        // An overlap between segments 17 and 63 (both at or past
+        // index 16) proves validate's OUTER overlap loop reaches
+        // the cap: truncating that loop to the first 16 segments
+        // would miss this pair, while a 0/63 overlap would not.
+        let mut overlapping = phdrs.clone();
+        overlapping[63].3 = BASE + 17 * PAGE_SIZE;
+        let bytes = build(BASE, &overlapping, &[0xc3; 16]);
+        assert_eq!(
+            validate(&bytes),
+            Err(ImageError::Overlapping {
+                first: 17,
+                second: 63
+            })
+        );
     }
 }
