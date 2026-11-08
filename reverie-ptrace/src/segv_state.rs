@@ -167,7 +167,6 @@ impl SignalRun {
 
 /// What a trap's repair does, decided from what was known before the trap
 /// and what SIGSEGV's action reads at it.
-#[cfg(target_arch = "x86_64")]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct SegvRepair {
     /// Whether SIGSEGV is blocked again.
@@ -190,7 +189,6 @@ pub(crate) struct SegvRepair {
 /// action that now reads `SIG_DFL` was reset, so SIGSEGV was blocked; one
 /// that reads as before was not. The action is written back only if `now`
 /// is what the reset left of `before`.
-#[cfg(target_arch = "x86_64")]
 pub(crate) fn segv_repair(
     blocked: Option<bool>,
     before: Option<KernelSigaction>,
@@ -302,7 +300,6 @@ mod tests {
         assert_eq!(ignored.after_delivery(), ignored);
     }
 
-    #[cfg(target_arch = "x86_64")]
     #[test]
     fn a_delivered_signal_resolves_by_its_action() {
         let run = SignalRun::Delivered {
@@ -391,7 +388,6 @@ mod tests {
         );
     }
 
-    #[cfg(target_arch = "x86_64")]
     #[test]
     fn a_trap_repairs_what_was_known_to_be_reset() {
         let caught = action(HANDLER, SA_NODEFER, SIGSEGV_BIT);

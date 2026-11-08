@@ -13888,7 +13888,13 @@ impl<L: Tool + 'static> TracedTask<L> {
     /// left it, as before, and is logged; an action that may have been reset
     /// and was not written back is forgotten. The common case, SIGSEGV
     /// unblocked and not ignored, makes no request.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg_attr(
+        not(target_arch = "x86_64"),
+        allow(
+            dead_code,
+            reason = "only x86_64 currently generates rdtsc/cpuid SIGSEGV traps; the repair itself is arch-neutral"
+        )
+    )]
     async fn restore_segv_after_trap(&mut self, task: Stopped) -> Result<Stopped, TraceError> {
         if !self.keeps_segv_state() {
             return Ok(task);
