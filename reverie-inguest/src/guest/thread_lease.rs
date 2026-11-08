@@ -49,6 +49,12 @@ impl<S> ThreadStates<S> {
         }
     }
 
+    #[cfg(any(
+        test,
+        feature = "rcb-clock",
+        feature = "exec-native-injection",
+        feature = "exec-private-successor"
+    ))]
     pub(super) fn is_empty(&self) -> bool {
         self.slots.lock().is_empty()
     }
