@@ -196,12 +196,79 @@ fn require_owned_handshake_sigstop(task: &Stopped, pid: safeptrace::Pid) -> Resu
     Ok(())
 }
 
+/// A real SIGCONT sent to clear the handshake group stop flushes
+/// every queued stop signal at generation time. Refuse first if any
+/// stop signal is already queued, so the clear cannot claim or
+/// swallow somebody else's process control.
+#[allow(unsafe_code)]
+fn refuse_pending_stop_signal(task: &Stopped) -> Result<()> {
+    for flags in [None, Some(safeptrace::PeekSigInfoFlags::SHARED)] {
+        for info in task.peeksiginfo_all(flags)? {
+            if matches!(
+                info.si_signo,
+                libc::SIGSTOP | libc::SIGTSTP | libc::SIGTTIN | libc::SIGTTOU
+            ) {
+                // SAFETY: this is a queued Linux siginfo just returned
+                // by PTRACE_PEEKSIGINFO for the current stop.
+                let sender = unsafe { info.si_pid() };
+                return Err(format!(
+                    "exec supervisor encountered unowned SIGSTOP before exec: pending stop signal {} si_code={}, sender={sender}",
+                    info.si_signo, info.si_code
+                )
+                .into());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The SIGCONT used to clear a handshake group stop is this
+/// supervisor process's own `kill`: its delivery stop must name
+/// that exact sender and cause before it may be suppressed.
+#[allow(unsafe_code)]
+fn require_owned_sigcont(task: &Stopped) -> Result<()> {
+    let info = task.getsiginfo()?;
+    // SAFETY: this is the just-read Linux siginfo for the current stop.
+    let sender = unsafe { info.si_pid() };
+    if info.si_signo != libc::SIGCONT
+        || info.si_code != libc::SI_USER
+        || sender != std::process::id() as i32
+    {
+        return Err(format!(
+            "exec supervisor encountered unowned SIGCONT before exec: si_code={}, sender={sender}",
+            info.si_code
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// The first stop after sending the clearing SIGCONT is the ptrace
+/// trap notification for that generation, not a fresh group stop:
+/// its siginfo must be the child's own PTRACE_EVENT_STOP trap.
+#[allow(unsafe_code)]
+fn require_group_stop_clear_trap(task: &Stopped, pid: safeptrace::Pid) -> Result<()> {
+    let info = task.getsiginfo()?;
+    // SAFETY: this is the just-read Linux siginfo for the current stop.
+    let sender = unsafe { info.si_pid() };
+    let expected = libc::SIGTRAP | (libc::PTRACE_EVENT_STOP << 8);
+    if info.si_signo != libc::SIGTRAP || info.si_code != expected || sender != pid.as_raw() {
+        return Err(format!(
+            "exec supervisor encountered unexpected group-stop clear trap before exec: si_signo={}, si_code={}, sender={sender}",
+            info.si_signo, info.si_code
+        )
+        .into());
+    }
+    Ok(())
+}
+
 /// Wait for the child's handshake stop after seize. A group stop
-/// leaves the signal-delivery phase outstanding; a signal-delivery
-/// stop is accepted only if its siginfo proves it is the child's
-/// own handshake. Every other pre-exec stop fails closed rather
-/// than being silently forwarded or dropped. Bounded only by the
-/// caller's external deadline, like every synchronous exec-stop wait.
+/// has already consumed the handshake signal; no signal-delivery
+/// phase remains outstanding. A signal-delivery stop is accepted
+/// only if its siginfo proves it is the child's own handshake.
+/// Every other pre-exec stop fails closed rather than being
+/// silently forwarded or dropped. Bounded only by the caller's
+/// external deadline, like every synchronous exec-stop wait.
 fn wait_initial_stop(running: Running, pid: safeptrace::Pid) -> Result<(Stopped, bool)> {
     match trace::wait(running)? {
         Wait::Stopped(task, event) => match event {
@@ -230,11 +297,15 @@ fn wait_initial_stop(running: Running, pid: safeptrace::Pid) -> Result<(Stopped,
     }
 }
 
-/// Consume the seize stop and resume toward the initial exec. A group
-/// stop leaves the child's handshake signal still to be delivered;
-/// the returned flag says that one owned signal may still be
-/// suppressed before the first exec. Runs entirely on the original
-/// ptracer thread.
+/// Consume the seize stop and resume toward the initial exec. A
+/// handshake that completed as a group stop consumed its SIGSTOP,
+/// but the natural parent's group-stop report remains hidden while
+/// seized and would become a stale stopped status after detach.
+/// Send this supervisor's own real SIGCONT while still seized so
+/// the kernel clears that report at generation time; the returned
+/// flag says its trap/delivery stops must still be consumed before
+/// the first exec. A signal-delivery handshake stop is simply
+/// suppressed. Runs entirely on the original ptracer thread.
 fn consume_handshake(
     owner: &mut ChildOwner<'_>,
     running: Running,
@@ -244,11 +315,13 @@ fn consume_handshake(
     owner._thread = Some(owner.generation.ptracer_thread_guard()?);
     let (initial, group_stop) = wait_initial_stop(running, pid)?;
     before_initial_resume(pid);
-    // A group stop (Event::Stop) is not cleared by suppressing the
-    // signal: restart with SIGCONT so no job-control stop remains
-    // pending across the exec. A signal-delivery stop is suppressed.
     let running = if group_stop {
-        initial.resume(Some(Signal::SIGCONT))?
+        refuse_pending_stop_signal(&initial)?;
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid.as_raw()),
+            nix::sys::signal::Signal::SIGCONT,
+        )?;
+        initial.resume(None)?
     } else {
         initial.resume(None)?
     };
@@ -272,7 +345,7 @@ fn catch_initial_exec(
 fn wait_exec_detach(
     mut running: Running,
     pid: safeptrace::Pid,
-    mut handshake_signal_pending: bool,
+    mut group_stop_clear_pending: bool,
 ) -> Result<(Running, safeptrace::Pid)> {
     loop {
         match trace::wait(running)? {
@@ -285,30 +358,36 @@ fn wait_exec_detach(
                 }
                 // Drain only the exec syscall return, like ExecStop,
                 // so detach leaves the new image at its entry with no
-                // in-flight syscall or pending handshake stop. The
-                // captured context is discarded: this mode detaches
-                // without touching the new image.
+                // in-flight syscall. A group-stop handshake was
+                // already cleared by a real SIGCONT while seized, so
+                // no stale natural-parent stop remains for the
+                // detached wait. The captured context is discarded:
+                // this mode detaches without touching the new image.
                 let (task, _context, _boundary) = super::drain_and_capture(task, former)?;
-                // Detach with SIGCONT so any residual group-stop state
-                // from the handshake cannot park the detached guest.
                 let running = task.detach(Some(Signal::SIGCONT))?;
                 return Ok((running, former));
             }
-            Wait::Stopped(task, Event::Signal(Signal::SIGSTOP)) => {
-                // Only the one still-pending handshake signal may be
-                // suppressed here, and only if siginfo proves the
-                // child sent it to itself. A fresh SIGSTOP from any
-                // other sender is somebody else's process control and
-                // must fail this launch closed, not be swallowed.
-                if !handshake_signal_pending {
-                    return Err(
-                        "exec supervisor encountered unowned SIGSTOP before exec: no handshake signal was pending"
-                            .into(),
-                    );
-                }
-                require_owned_handshake_sigstop(&task, pid)?;
-                handshake_signal_pending = false;
+            Wait::Stopped(task, Event::Stop) if group_stop_clear_pending => {
+                require_group_stop_clear_trap(&task, pid)?;
                 running = task.resume(None)?;
+            }
+            Wait::Stopped(task, Event::Signal(Signal::SIGCONT)) if group_stop_clear_pending => {
+                require_owned_sigcont(&task)?;
+                group_stop_clear_pending = false;
+                running = task.resume(None)?;
+            }
+            Wait::Stopped(task, Event::Signal(Signal::SIGSTOP)) => {
+                // No handshake signal-delivery phase remains: a group
+                // stop consumed the child's SIGSTOP and a
+                // signal-delivery handshake was suppressed at the
+                // seize stop. Preserve the ownership proof so a
+                // SIGSTOP from any other sender is named unowned,
+                // then fail closed rather than swallow either kind.
+                require_owned_handshake_sigstop(&task, pid)?;
+                return Err(
+                    "exec supervisor encountered unowned SIGSTOP before exec: no handshake signal was pending"
+                        .into(),
+                );
             }
             Wait::Stopped(_task, Event::Signal(signal)) => {
                 return Err(format!(
@@ -361,6 +440,7 @@ fn launch_failure<'fd>(
 fn seize_child<'fd>(
     mut request: PreparedExec<'fd>,
     receipt: CleanupReceipt,
+    before_seize: &mut dyn FnMut(safeptrace::Pid),
 ) -> std::result::Result<
     (
         ChildOwner<'fd>,
@@ -411,6 +491,7 @@ fn seize_child<'fd>(
         }
     };
     let pid = pending.pid();
+    before_seize(pid);
     let running = match Running::seize_on_ptracer_thread(
         pid,
         Options::PTRACE_O_EXITKILL | Options::PTRACE_O_TRACEEXEC | Options::PTRACE_O_TRACESYSGOOD,
@@ -462,13 +543,14 @@ impl Supervisor {
         receipt: CleanupReceipt,
         mode: SupervisorMode,
     ) -> std::result::Result<DetachedSupervisor<'fd>, LaunchFailure<'fd>> {
-        Self::spawn_inner(request, receipt, mode, &mut |_| {})
+        Self::spawn_inner(request, receipt, mode, &mut |_| {}, &mut |_| {})
     }
 
     fn spawn_inner<'fd>(
         request: PreparedExec<'fd>,
         receipt: CleanupReceipt,
         mode: SupervisorMode,
+        before_seize: &mut dyn FnMut(safeptrace::Pid),
         before_initial_resume: &mut dyn FnMut(safeptrace::Pid),
     ) -> std::result::Result<DetachedSupervisor<'fd>, LaunchFailure<'fd>> {
         if mode == SupervisorMode::Disabled {
@@ -480,7 +562,8 @@ impl Supervisor {
                 parent_stdio: None,
             });
         }
-        let (mut owner, running, pid, started, receipt) = seize_child(request, receipt)?;
+        let (mut owner, running, pid, started, receipt) =
+            seize_child(request, receipt, before_seize)?;
         let result = catch_initial_exec(&mut owner, running, pid, started, before_initial_resume);
         match result {
             Ok((running, former_tid, spawn_to_after_detach)) => Ok(DetachedSupervisor {
@@ -506,24 +589,26 @@ impl Supervisor {
         request: PreparedExec<'fd>,
         receipt: CleanupReceipt,
     ) -> std::result::Result<WatchedSupervisor<'fd>, LaunchFailure<'fd>> {
-        Self::spawn_watched_inner(request, receipt, &mut |_| {})
+        Self::spawn_watched_inner(request, receipt, &mut |_| {}, &mut |_| {})
     }
 
     fn spawn_watched_inner<'fd>(
         request: PreparedExec<'fd>,
         receipt: CleanupReceipt,
+        before_seize: &mut dyn FnMut(safeptrace::Pid),
         before_initial_resume: &mut dyn FnMut(safeptrace::Pid),
     ) -> std::result::Result<WatchedSupervisor<'fd>, LaunchFailure<'fd>> {
-        let (mut owner, running, pid, started, receipt) = seize_child(request, receipt)?;
+        let (mut owner, running, pid, started, receipt) =
+            seize_child(request, receipt, before_seize)?;
         match consume_handshake(&mut owner, running, pid, before_initial_resume) {
-            Ok((running, handshake_signal_pending)) => Ok(WatchedSupervisor {
+            Ok((running, group_stop_clear_pending)) => Ok(WatchedSupervisor {
                 pid,
                 started,
                 owner,
                 running: Some(running),
                 receipt,
                 pre_first_exec: true,
-                handshake_signal_pending,
+                group_stop_clear_pending,
                 execs_seen: 0,
             }),
             Err(error) => Err(launch_failure(owner, receipt, error)),
@@ -566,15 +651,15 @@ enum NextExec {
 }
 
 /// Drive the seized guest until its next exec event or terminal
-/// exit. Before the first exec, only the one siginfo-proven owned
-/// handshake signal may be suppressed; afterwards guest signal
-/// deliveries are forwarded unchanged and group stops are resumed
-/// with `SIGCONT`.
+/// exit. Before the first exec, only this supervisor's own
+/// group-stop-clearing SIGCONT trap/delivery may be suppressed;
+/// afterwards guest signal deliveries are forwarded unchanged and
+/// group stops are resumed with `SIGCONT`.
 fn wait_watched(
     mut running: Running,
     pid: safeptrace::Pid,
     pre_first_exec: bool,
-    handshake_signal_pending: &mut bool,
+    group_stop_clear_pending: &mut bool,
 ) -> Result<NextExec> {
     loop {
         match trace::wait(running)? {
@@ -588,20 +673,27 @@ fn wait_watched(
                 }
                 return Ok(NextExec::Exec(task));
             }
-            Wait::Stopped(task, Event::Signal(Signal::SIGSTOP)) if pre_first_exec => {
-                // Same ownership proof as the detached path: only the
-                // child's own still-pending handshake signal may be
-                // suppressed here. Any other pre-exec SIGSTOP is
-                // somebody else's process control and fails closed.
-                if !*handshake_signal_pending {
-                    return Err(
-                        "exec supervisor encountered unowned SIGSTOP before exec: no handshake signal was pending"
-                            .into(),
-                    );
-                }
-                require_owned_handshake_sigstop(&task, pid)?;
-                *handshake_signal_pending = false;
+            Wait::Stopped(task, Event::Stop) if pre_first_exec && *group_stop_clear_pending => {
+                require_group_stop_clear_trap(&task, pid)?;
                 running = task.resume(None)?;
+            }
+            Wait::Stopped(task, Event::Signal(Signal::SIGCONT))
+                if pre_first_exec && *group_stop_clear_pending =>
+            {
+                require_owned_sigcont(&task)?;
+                *group_stop_clear_pending = false;
+                running = task.resume(None)?;
+            }
+            Wait::Stopped(task, Event::Signal(Signal::SIGSTOP)) if pre_first_exec => {
+                // Same ownership proof as the detached path: no
+                // handshake signal-delivery phase remains, so any
+                // pre-exec SIGSTOP fails closed rather than being
+                // swallowed as handshake residue.
+                require_owned_handshake_sigstop(&task, pid)?;
+                return Err(
+                    "exec supervisor encountered unowned SIGSTOP before exec: no handshake signal was pending"
+                        .into(),
+                );
             }
             Wait::Stopped(task, Event::Signal(signal)) => {
                 running = task.resume(Some(signal))?;
@@ -634,7 +726,7 @@ pub struct WatchedSupervisor<'fd> {
     running: Option<Running>,
     receipt: CleanupReceipt,
     pre_first_exec: bool,
-    handshake_signal_pending: bool,
+    group_stop_clear_pending: bool,
     execs_seen: u64,
 }
 
@@ -679,11 +771,11 @@ impl<'fd> WatchedSupervisor<'fd> {
             mut owner,
             receipt,
             pre_first_exec,
-            mut handshake_signal_pending,
+            mut group_stop_clear_pending,
             execs_seen,
             ..
         } = self;
-        let next = wait_watched(running, pid, pre_first_exec, &mut handshake_signal_pending);
+        let next = wait_watched(running, pid, pre_first_exec, &mut group_stop_clear_pending);
         match next {
             Ok(NextExec::Finished(status)) => {
                 owner.record_detached_terminal(status);
@@ -817,7 +909,7 @@ impl<'fd> SuccessorStop<'fd> {
                 running: Some(running),
                 receipt,
                 pre_first_exec: false,
-                handshake_signal_pending: false,
+                group_stop_clear_pending: false,
                 execs_seen,
             }),
             Err(error) => Err(launch_failure(owner, receipt, error)),
@@ -846,9 +938,10 @@ impl<'fd> SuccessorStop<'fd> {
             execs_seen: _,
         } = self;
         let former_tid = boundary.former_tid;
-        // Detach with SIGCONT, like the dormant path, so any residual
-        // group-stop state from the seize handshake cannot park the
-        // released guest.
+        // Detach with SIGCONT, like the dormant path. The handshake
+        // group stop was already cleared while seized; this signal
+        // only wakes the restored guest if it is job-control stopped
+        // at release.
         let result = hook(task, &context, &boundary)
             .and_then(|task| super::release_restored(task, &context, Some(Signal::SIGCONT)));
         match result {
@@ -986,6 +1079,7 @@ mod tests {
             request("/bin/true", &["true"]),
             CleanupReceipt::default(),
             SupervisorMode::DormantSeize,
+            &mut |_| {},
             &mut |pid| {
                 injected_pid = Some(pid);
                 nix::sys::signal::kill(
@@ -1004,6 +1098,65 @@ mod tests {
         );
         assert!(failure.cleanup().confirmed);
         assert!(!Path::new(&format!("/proc/{}", pid.as_raw())).exists());
+    }
+
+    #[allow(unsafe_code)]
+    fn pin_current_and_child(pid: safeptrace::Pid) {
+        let cpu = nix::sched::sched_getcpu().unwrap();
+        let mut set = nix::sched::CpuSet::new();
+        set.set(cpu).unwrap();
+        nix::sched::sched_setaffinity(nix::unistd::Pid::from_raw(0), &set).unwrap();
+        nix::sched::sched_setaffinity(nix::unistd::Pid::from_raw(pid.as_raw()), &set).unwrap();
+        // Keep the detached parent ahead of the woken child on that one
+        // CPU long enough for its first wait to observe kernel state
+        // before the child can process the detach SIGCONT.
+        assert_eq!(
+            unsafe { libc::setpriority(libc::PRIO_PROCESS, pid.as_raw().try_into().unwrap(), 19,) },
+            0
+        );
+    }
+
+    #[test]
+    fn supervisor_group_stop_handshake_detached_wait_reaps_running_guest() {
+        // Delaying seize until after the child's self-SIGSTOP forces
+        // the pre-seize group-stop handshake. The detached guest then
+        // sleeps long enough that a stale group-stop wait report, if
+        // one remained for the natural parent, would be collected
+        // before its exit rather than racing it.
+        let detached = Supervisor::spawn_inner(
+            request("/bin/sh", &["sh", "-c", "exec sleep 0.2"]),
+            CleanupReceipt::default(),
+            SupervisorMode::DormantSeize,
+            &mut |_| std::thread::sleep(Duration::from_millis(100)),
+            &mut pin_current_and_child,
+        )
+        .unwrap();
+        let outcome = detached.wait().unwrap();
+        assert_eq!(outcome.status, ExitStatus::Exited(0));
+        assert!(outcome.cleanup.confirmed);
+    }
+
+    #[test]
+    fn watched_group_stop_release_detached_wait_reaps_running_guest() {
+        let watched = Supervisor::spawn_watched_inner(
+            request("/bin/sh", &["sh", "-c", "exec sleep 0.2"]),
+            CleanupReceipt::default(),
+            &mut |_| std::thread::sleep(Duration::from_millis(100)),
+            &mut pin_current_and_child,
+        )
+        .unwrap();
+        let stop = match watched.wait_next().unwrap() {
+            WatchedStep::Exec(stop) => stop,
+            WatchedStep::Finished(outcome) => {
+                panic!("expected an exec stop, got terminal {outcome:?}")
+            }
+        };
+        let detached = stop
+            .release_detached(|task, _entry, _boundary| Ok(task))
+            .unwrap();
+        let outcome = detached.wait().unwrap();
+        assert_eq!(outcome.status, ExitStatus::Exited(0));
+        assert!(outcome.cleanup.confirmed);
     }
 
     #[test]
@@ -1855,7 +2008,7 @@ mod tests {
             // descriptors, genuine captured context, as in
             // prepare_and_cancel. Preparation only; the mismatched
             // release below refuses before any restore or entry.
-            let prepared = match unsafe { stop.prepare_mapping(preparation) } {
+            let mut prepared = match unsafe { stop.prepare_mapping(preparation) } {
                 Ok(prepared) => prepared,
                 Err(failure) => panic!(
                     "preparation refused: {} cleanup={:?}",
@@ -1863,18 +2016,25 @@ mod tests {
                     failure.cleanup()
                 ),
             };
+            // Name an exact initialized stop, then present a token for
+            // another pid naming that same stop. Only the release
+            // call site's owner-pid argument can refuse this; passing
+            // the token's own pid would wrongly proceed to restore.
+            let terminal = RUNTIME_WINDOW.start + 8192;
+            let reserved = 1_u64 << (libc::SIGSYS - 1);
+            prepared.set_initialized_stop_for_test(Some((terminal, reserved)));
             let wrong = VerifiedReady::for_test(
-                pid,
-                RUNTIME_WINDOW.start + 8192,
-                1_u64 << (libc::SIGSYS - 1),
+                safeptrace::Pid::from_raw(pid.as_raw() + 1),
+                terminal,
+                reserved,
             );
             let tokio = tokio::runtime::Builder::new_current_thread()
                 .enable_time()
                 .build()
                 .unwrap();
-            // SAFETY: the token names no recorded initialized stop
-            // for this mapping, so release must refuse at its
-            // recheck before any physical change.
+            // SAFETY: the token names the exact recorded stop but
+            // another child, so release must refuse at its recheck
+            // before any physical change.
             let failure = tokio.block_on(async {
                 match unsafe {
                     prepared

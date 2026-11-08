@@ -158,6 +158,31 @@ impl VerifiedReady {
 /// and the exact initialized stop the observer recorded for this
 /// mapping. Pure data comparison; it proves nothing beyond the
 /// token's own observer predicate.
+/// Apply one bootstrap-observer wait result: a stopped task is
+/// returned for retention, and an exited status is stored only if
+/// it names this generation before the caller reports the early
+/// exit. The generation is the retained owner's pid, never the
+/// waited status's own pid.
+fn apply_bootstrap_wait(
+    slot: &mut Option<ExitStatus>,
+    waited: Wait,
+    generation: safeptrace::Pid,
+) -> Result<(safeptrace::Stopped, Event)> {
+    match waited {
+        Wait::Stopped(task, event) => Ok((task, event)),
+        Wait::Exited(pid, status) => {
+            handover::store_same_generation_terminal(
+                slot,
+                pid,
+                generation,
+                status,
+                "mapped_entry_foreign_terminal",
+            )?;
+            Err("mapped_entry_early_exit".into())
+        }
+    }
+}
+
 pub(super) fn ready_token_matches(
     ready: &VerifiedReady,
     pid: safeptrace::Pid,
@@ -450,6 +475,14 @@ impl PreparedMapping<'_> {
         (self.entry.failed, self.entry.handover_started)
     }
 
+    /// Test-only initialized-stop injection, so release call-site
+    /// tests can name an exact recorded stop instead of relying on
+    /// its absence to produce a mismatch.
+    #[cfg(test)]
+    pub(crate) fn set_initialized_stop_for_test(&mut self, stop: Option<(u64, u64)>) {
+        self.entry.initialized_stop = stop;
+    }
+
     async fn bootstrap_observe(
         &mut self,
         coordinates: &BootstrapEntryCoordinates,
@@ -554,23 +587,17 @@ impl PreparedMapping<'_> {
             .await
             .map_err(|_| "mapped_entry_deadline")?;
             match waited {
-                Ok(Wait::Stopped(task, event)) => {
+                Ok(waited) => {
+                    self.entry.wait = None;
                     // Store BOTH capabilities before any generation/readback/
                     // classification failure. A NewChild event is retained too.
+                    let (task, event) = apply_bootstrap_wait(
+                        &mut self.entry.terminal,
+                        waited,
+                        self.owner.generation.pid(),
+                    )?;
                     self.task = Some(task);
                     self.entry.event = Some(event);
-                    self.entry.wait = None;
-                }
-                Ok(Wait::Exited(pid, status)) => {
-                    self.entry.wait = None;
-                    handover::store_same_generation_terminal(
-                        &mut self.entry.terminal,
-                        pid,
-                        self.owner.generation.pid(),
-                        status,
-                        "mapped_entry_foreign_terminal",
-                    )?;
-                    return Err("mapped_entry_early_exit".into());
                 }
                 Err(error) => return Err(error.into()), // original driver retained
             }
@@ -1022,6 +1049,39 @@ mod tests {
             ))
         ));
         assert!(!ready_token_matches(&ready, pid, None));
+    }
+
+    #[test]
+    fn bootstrap_wait_foreign_terminal_is_refused_at_the_call_site() {
+        let generation = safeptrace::Pid::from_raw(4242);
+        let foreign = safeptrace::Pid::from_raw(4243);
+        let mut slot = None;
+        let error = match apply_bootstrap_wait(
+            &mut slot,
+            Wait::Exited(foreign, ExitStatus::Exited(0)),
+            generation,
+        ) {
+            Ok(_) => panic!("foreign bootstrap terminal must refuse"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("mapped_entry_foreign_terminal"),
+            "unexpected foreign-terminal refusal: {error}"
+        );
+        assert_eq!(slot, None, "foreign status must not reach the retry slot");
+        let error = match apply_bootstrap_wait(
+            &mut slot,
+            Wait::Exited(generation, ExitStatus::Exited(7)),
+            generation,
+        ) {
+            Ok(_) => panic!("same-generation bootstrap exit must report early exit"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("mapped_entry_early_exit"),
+            "unexpected early-exit refusal: {error}"
+        );
+        assert_eq!(slot, Some(ExitStatus::Exited(7)));
     }
 
     fn put_i32(bytes: &mut [u8; 128], offset: usize, value: i32) {

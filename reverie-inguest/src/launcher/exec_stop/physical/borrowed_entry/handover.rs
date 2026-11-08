@@ -411,22 +411,14 @@ impl<'fd> PreparedMapping<'fd> {
             "mapped_handover_wait_deadline",
         )
         .await?;
-        match waited {
-            Wait::Stopped(task, event) => {
-                self.task = Some(task);
-                self.entry.event = Some(event); // retain NewChild before refusal
-                self.entry.wait = None;
-            }
-            Wait::Exited(pid, status) => {
-                self.entry.wait = None;
-                store_same_generation_terminal(
-                    &mut self.entry.terminal,
-                    pid,
-                    self.owner.generation.pid(),
-                    status,
-                    "mapped_handover_foreign_terminal",
-                )?;
-            }
+        self.entry.wait = None;
+        if let Some((task, event)) = apply_handover_wait(
+            &mut self.entry.terminal,
+            waited,
+            self.owner.generation.pid(),
+        )? {
+            self.task = Some(task);
+            self.entry.event = Some(event); // retain NewChild before refusal
         }
         self.entry_thread()?;
         Ok(())
@@ -478,6 +470,30 @@ pub(super) async fn wait_retained_driver(
             .map_err(|_| timeout_error)??,
         None => wait.await?,
     })
+}
+
+/// Apply one handover wait result: a stopped task is returned for
+/// retention, and an exited status is stored only if it names this
+/// generation. The generation is the caller's retained owner pid,
+/// never the waited status's own pid.
+pub(super) fn apply_handover_wait(
+    slot: &mut Option<ExitStatus>,
+    waited: Wait,
+    generation: safeptrace::Pid,
+) -> Result<Option<(safeptrace::Stopped, safeptrace::Event)>> {
+    match waited {
+        Wait::Stopped(task, event) => Ok(Some((task, event))),
+        Wait::Exited(pid, status) => {
+            store_same_generation_terminal(
+                slot,
+                pid,
+                generation,
+                status,
+                "mapped_handover_foreign_terminal",
+            )?;
+            Ok(None)
+        }
+    }
 }
 
 /// Store a terminal status only when it names this retained
@@ -565,6 +581,33 @@ mod tests {
             "mapped_handover_foreign_terminal",
         )
         .unwrap();
+        assert_eq!(slot, Some(ExitStatus::Exited(7)));
+    }
+    #[test]
+    fn handover_wait_foreign_terminal_is_refused_at_the_call_site() {
+        let generation = safeptrace::Pid::from_raw(4242);
+        let foreign = safeptrace::Pid::from_raw(4243);
+        let mut slot = None;
+        let error = apply_handover_wait(
+            &mut slot,
+            Wait::Exited(foreign, ExitStatus::Exited(0)),
+            generation,
+        )
+        .expect_err("foreign handover terminal must refuse");
+        assert!(
+            error
+                .to_string()
+                .contains("mapped_handover_foreign_terminal"),
+            "unexpected foreign-terminal refusal: {error}"
+        );
+        assert_eq!(slot, None, "foreign status must not reach the retry slot");
+        let stopped = apply_handover_wait(
+            &mut slot,
+            Wait::Exited(generation, ExitStatus::Exited(7)),
+            generation,
+        )
+        .unwrap();
+        assert!(stopped.is_none());
         assert_eq!(slot, Some(ExitStatus::Exited(7)));
     }
     // A real direct child held by its stdin pipe, with exactly one retained

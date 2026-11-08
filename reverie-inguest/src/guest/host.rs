@@ -776,8 +776,10 @@ where
 
     /// Admit the native exec/clone route for this host: the embedder
     /// opt-in, distinct from installing a driver. Until admitted, an
-    /// installed driver is never consulted for exec or clone and both
-    /// keep their typed refusals. Admission is single-shot and must
+    /// installed driver is never consulted for exec or clone; both
+    /// keep their typed refusals unless an exec watch is armed, in
+    /// which case exec forwards to the kernel and clone still keeps
+    /// its typed refusal. Admission is single-shot and must
     /// precede dispatch, under the same guards as driver installation.
     ///
     /// # Safety
@@ -2376,7 +2378,7 @@ impl<T: Tool, R: HostRuntime> InGuest<'_, T, R> {
     }
 
     /// The named refusal for a watched exec on a route that cannot
-    /// consult the installed native exec route, or `None` when the
+    /// consult the admitted native exec route, or `None` when the
     /// exec may proceed (unwatched handling is the caller's existing
     /// refusal; no driver, or the route was captured, forwards
     /// through the ordinary paths).
@@ -2386,7 +2388,7 @@ impl<T: Tool, R: HostRuntime> InGuest<'_, T, R> {
                 reverie::UnsupportedOperation::NativeExec,
                 Errno::EOPNOTSUPP,
                 "watched exec cannot forward from a dispatch route that did not capture \
-                 the installed native exec route",
+                 the admitted native exec route",
             ))
         } else {
             None
@@ -2406,7 +2408,7 @@ impl<T: Tool, R: HostRuntime> InGuest<'_, T, R> {
                 reverie::UnsupportedOperation::NativeExec,
                 Errno::EOPNOTSUPP,
                 "tail-injected exec has no native cut of its own and cannot bypass \
-                 the installed native exec route",
+                 the admitted native exec route",
             ));
         }
         None
@@ -4144,17 +4146,17 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
             }
         }
         if matches!(number, libc::SYS_execve | libc::SYS_execveat) {
-            // Installed native authority first: on a route that never
+            // Admitted native authority first: on a route that never
             // captured it (lifecycle callbacks run before capture), a
             // watched exec refuses by name here instead of forwarding
-            // past the installed route.
+            // past the admitted route.
             if let Some(refusal) = self.exec_native_priority_refusal() {
                 self.unsupported_refusal = Some(refusal);
                 return Err(Errno::EOPNOTSUPP);
             }
             if !self.runtime.exec_watch_armed() {
                 // A typed refusal, so the Tool can tell this from an exec
-                // that Linux failed: without an installed native exec
+                // that Linux failed: without an admitted native exec
                 // route or an armed exec watch the in-guest runtime has
                 // no way to replace the process image. With a watch
                 // armed (and no unreachable native route), execution
@@ -4372,10 +4374,10 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
         } else if matches!(number, libc::SYS_execve | libc::SYS_execveat)
             && let Some(refusal) = self.exec_tail_native_refusal()
         {
-            // A tail call has no native cut of its own; with a driver
-            // installed it refuses by name in every capture state
-            // rather than forwarding past (or re-spending) the
-            // installed route. The name rides on the event, whose
+            // A tail call has no native cut of its own; with the
+            // native route admitted it refuses by name in every
+            // capture state rather than forwarding past (or
+            // re-spending) the admitted route. The name rides on the event, whose
             // terminal result this refusal is; the parked Tool
             // continuation can never take it from the guest view.
             // Unwatched, the guard below refuses.

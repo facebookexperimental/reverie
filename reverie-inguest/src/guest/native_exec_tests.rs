@@ -1265,6 +1265,16 @@ fn run_watched_case(
     admitted: bool,
     subscribed: bool,
 ) -> WatchOutcome {
+    run_watched_case_admission(action, number, admitted, admitted, subscribed)
+}
+
+fn run_watched_case_admission(
+    action: WatchAction,
+    number: i64,
+    installed: bool,
+    admitted: bool,
+    subscribed: bool,
+) -> WatchOutcome {
     let _native = crate::guest::exec_private::native_exec_mock_callback();
     let (rpc, worker) = rpc();
     let returned: ReturnedCalls = Arc::new(Mutex::new(Vec::new()));
@@ -1287,15 +1297,19 @@ fn run_watched_case(
         false,
         ModelRuntime { watched: true },
     ));
-    if admitted {
+    if installed {
         unsafe {
             host.install_native_exec_driver(Arc::new(DenyDriver {
                 captures: captures.clone(),
             }))
         }
         .unwrap();
-        unsafe { host.admit_native_exec() }.unwrap();
-        assert!(host.native_exec_admitted());
+        if admitted {
+            unsafe { host.admit_native_exec() }.unwrap();
+            assert!(host.native_exec_admitted());
+        } else {
+            assert!(!host.native_exec_admitted());
+        }
     }
     let (event_number, event_args) = match action {
         WatchAction::ThreadStartInject | WatchAction::PostExecInject => (libc::SYS_getpid, [0; 6]),
@@ -1539,5 +1553,66 @@ fn watched_ordinary_inject_forwards_without_driver() {
             },
             0,
         );
+    }
+}
+
+#[test]
+fn watched_exec_forwards_with_installed_unadmitted_driver() {
+    // Adaptation 7 policy pin: an installed driver that was never
+    // admitted is not native authority. With the watch armed every
+    // exec route forwards to the kernel (NULL path -> untagged
+    // EFAULT) and the deny driver is never asked to capture.
+    for number in [libc::SYS_execve, libc::SYS_execveat] {
+        isolated(
+            move || {
+                let outcome = run_watched_case_admission(
+                    WatchAction::HandlerInject,
+                    number,
+                    true,
+                    false,
+                    true,
+                );
+                assert_eq!(outcome.returned, [(Errno::EFAULT, None)]);
+                assert_eq!(outcome.captures, 0);
+            },
+            0,
+        );
+        isolated(
+            move || {
+                let outcome =
+                    run_watched_case_admission(WatchAction::TailInject, number, true, false, true);
+                assert_eq!(outcome.event_result, -i64::from(libc::EFAULT));
+                assert_eq!(outcome.event_refusal, None);
+                assert_eq!(outcome.captures, 0);
+            },
+            0,
+        );
+        isolated(
+            move || {
+                let outcome =
+                    run_watched_case_admission(WatchAction::Plain, number, true, false, false);
+                assert_eq!(outcome.event_result, -i64::from(libc::EFAULT));
+                assert_eq!(outcome.event_refusal, None);
+                assert_eq!(outcome.captures, 0);
+            },
+            0,
+        );
+    }
+}
+
+#[test]
+fn watched_lifecycle_exec_forwards_with_installed_unadmitted_driver() {
+    for action in [WatchAction::ThreadStartInject, WatchAction::PostExecInject] {
+        for number in [libc::SYS_execve, libc::SYS_execveat] {
+            isolated(
+                move || {
+                    let outcome = run_watched_case_admission(action, number, true, false, true);
+                    assert_eq!(outcome.returned, [(Errno::EFAULT, None)]);
+                    assert_eq!(outcome.captures, 0);
+                    assert!(outcome.event_result > 0, "getpid completes the dispatch");
+                },
+                0,
+            );
+        }
     }
 }

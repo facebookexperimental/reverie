@@ -804,7 +804,8 @@ pub unsafe fn install_tool_successor_image<T: Tool + 'static>(
 
 /// Install an authenticated initial image with its concrete native exec driver
 /// before the first dispatch, without admitting the native exec/clone route:
-/// exec and thread creation keep their typed refusals. Ordinary
+/// exec keeps its typed refusal unless an exec watch is armed, and
+/// thread creation keeps its typed refusal. Ordinary
 /// InitialImage installation is unchanged.
 ///
 /// # Safety
