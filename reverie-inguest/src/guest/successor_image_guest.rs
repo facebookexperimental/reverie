@@ -708,6 +708,17 @@ mod tests {
                     ));
                     assert_eq!(pending.as_ref().unwrap().state, (99, 0x1234_5678_abcd_4321));
                     drop(pending);
+                    // The slot never completed, so it must still count as
+                    // occupied for ordinary dispatch. dispatch now reads
+                    // this mirror instead of the slot itself, so pin it
+                    // here: a variant that clears the mirror when the
+                    // phase flips to Failed (coord7 M7) would let an
+                    // ordinary dispatch through a Failed successor.
+                    assert!(
+                        host.prepared_exec_pending
+                            .load(core::sync::atomic::Ordering::Acquire),
+                        "failed post-exec must still refuse ordinary dispatch"
+                    );
                     assert_eq!(*memory, [0; 16]);
                     assert_eq!(native.successor_test_runtime_ready(), 0);
                     assert!(
@@ -756,6 +767,30 @@ mod tests {
                 127,
             );
         }
+    }
+
+    /// The `dispatch_instruction` twin of the test above: its own
+    /// entry check was previously exercised by nothing, so reverting
+    /// or deleting it passed the whole lib (coord7 mutants M3b/M4 on
+    /// 6631ca33). Without the check this reaches the Tool's
+    /// `init_thread_state`, which panics for a successor; the child
+    /// then exits 125, not 127.
+    #[test]
+    fn successor_pending_state_cannot_enter_dispatch_instruction() {
+        isolated(
+            || {
+                let (_native, owner, _entry) = successor_test_owner();
+                let (host, _worker) = host(0, 0, Arc::new(Mutex::new(Vec::new())));
+                unsafe { host.bind_successor_image_control(&owner) }.unwrap();
+                unsafe { host.restore_prepared_exec_state((99, 0x1234_5678_abcd_4321), &owner) }
+                    .unwrap();
+                let mut context = RegisterContext::default();
+                context.instruction_pointer = 0x1234;
+                unsafe { host.dispatch_instruction(InstructionEventKind::Rdtsc, &mut context) };
+                panic!("incomplete successor route returned");
+            },
+            127,
+        );
     }
 
     #[test]
