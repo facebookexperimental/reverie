@@ -3697,6 +3697,13 @@ fn checker_refuses_each_injected_tls_and_control_violation() {
             Vec::new(),
             "duplicate-gate-bounds",
         ),
+        (
+            "s-nsect-abs-entry-owner",
+            "zone_b_snsect.S",
+            ".section .gate,\"ax\",@progbits\n.globl fixed_gate_template\nfixed_gate_template:\n .fill 0x7c,1,0x90\n.globl fixed_native_entry\n.set fixed_native_entry, 0x7c\n syscall\n .fill 4,1,0x90\n jmp *%r12\n .fill 16,1,0x90\n.globl fixed_gate_template_end\nfixed_gate_template_end:\n.text\n.globl zone_b_mutant\nzone_b_mutant:\n mov %rdi,%r12\n jmp fixed_gate_template+0x82\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "duplicate-gate-bounds",
+        ),
     ];
     let mut missing = Vec::new();
     for (label, filename, contents, extra, expected) in cases {
@@ -3972,12 +3979,6 @@ fn production_set_refuses_gate_alias_call_and_deadcode_probes() {
             "duplicate-gate-bounds",
         ),
         (
-            "ps-n13z-no-weak-control",
-            "zone_b_ps_n13z.S",
-            ".data\nfixed_native_entry:\n .quad 0\n.section .gate,\"ax\",@progbits\n.globl reverie_inguest_fixed_gate_template\nreverie_inguest_fixed_gate_template:\n nop\n.globl reverie_inguest_fixed_gate_template_end\nreverie_inguest_fixed_gate_template_end:\n.text\n.globl zone_b_mutant\nzone_b_mutant:\n mov %rdi,%rax\n jmp fixed_signal_restorer+9\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
-            "unrecognized-outgoing-edge",
-        ),
-        (
             "ps-n4-local-owner-pair2",
             "zone_b_ps_n4.S",
             ".data\nfixed_native_entry:\n .quad 0\n.section .gate,\"ax\",@progbits\n.globl reverie_inguest_fixed_gate_template\nreverie_inguest_fixed_gate_template:\n nop\n.globl reverie_inguest_fixed_gate_template_end\nreverie_inguest_fixed_gate_template_end:\n.text\n.globl zone_b_mutant\nzone_b_mutant:\n mov %rdi,%rax\n jmp fixed_signal_restorer+9\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
@@ -3988,6 +3989,12 @@ fn production_set_refuses_gate_alias_call_and_deadcode_probes() {
             "zone_b_ps_r1b2_entry_addend_309.S",
             ".text\n.globl zone_b_mutant\nzone_b_mutant:\n lea fixed_native_entry+0x28d(%rip),%r12\n movabs $fixed_native_entry,%rcx\n jmp *%rcx\n ret\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
             "indirect-branch",
+        ),
+        (
+            "ps-n14-weak-entry-count",
+            "zone_b_ps_n14.S",
+            ".data\n.weak fixed_native_entry\n.globl fixed_native_entry\nfixed_native_entry:\n .quad 0\n.section .gate,\"ax\",@progbits\n.globl reverie_inguest_fixed_gate_template\nreverie_inguest_fixed_gate_template:\n nop\n.globl reverie_inguest_fixed_gate_template_end\nreverie_inguest_fixed_gate_template_end:\n.text\n.globl zone_b_mutant\nzone_b_mutant:\n ret\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
+            "duplicate-gate-bounds",
         ),
     ];
     let mut missing = Vec::new();
@@ -4047,12 +4054,14 @@ fn production_set_refuses_gate_alias_call_and_deadcode_probes() {
 
 #[test]
 fn duplicate_bound_symbol_in_owner_unit_refuses() {
-    // Genuine duplicate symbol entries for one bound name inside the
-    // owner unit cannot be produced by the assembler (one entry per
-    // name), so this pins the `duplicated` clause itself: objcopy adds
-    // a second global fixed_gate_template in .data to an otherwise
-    // clean owner fixture. Removing the duplicated clause (keeping
-    // the exactly-one-owner rule) makes this object pass.
+    // A second same-name GLOBAL definition at a different location
+    // cannot be written in one assembler source (it keeps one entry
+    // per name; a same-name `.file` entry is STT_FILE, not a second
+    // definition the bounds lookup reads), so this pins the
+    // `duplicated` clause itself: objcopy adds a second global
+    // fixed_gate_template in .data to an otherwise clean owner
+    // fixture. Removing the duplicated clause (keeping the
+    // exactly-one-owner rule) makes this object pass.
     let scratch = Scratch::new("dup-bound");
     let bytes = compile_source(
         &scratch.0,
