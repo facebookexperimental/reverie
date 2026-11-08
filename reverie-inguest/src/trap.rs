@@ -96,14 +96,13 @@ pub fn fixed_gate_region() -> Option<(u64, u64)> {
 /// the fixed signal-restorer entry, and the SIGSYS handler entry.
 /// Flipping any of these would break the runtime's own syscall
 /// path, including the promoter's store path itself.
-pub fn is_runtime_text(addr: u64) -> bool {
-    if let Some((lo, hi)) = fixed_gate_region()
-        && addr >= lo
-        && addr < hi
-    {
-        return true;
-    }
-    let ips = [
+/// The exact runtime instruction addresses [`is_runtime_text`]
+/// denies, before page-granular cover. Split out so tests can
+/// assert membership independent of link layout (a page-rule-only
+/// test passes by accident whenever the link happens to co-locate
+/// the restorer with a gate).
+pub(crate) fn runtime_text_ips() -> [u64; 8] {
+    [
         trusted_gate().syscall_ip,
         trusted_gate().return_ip,
         guest_syscall_gate().syscall_ip,
@@ -115,7 +114,17 @@ pub fn is_runtime_text(addr: u64) -> bool {
         // return IP: patching either breaks every signal return.
         crate::signal::signal_restorer(),
         crate::signal::signal_restorer_return_ip(),
-    ];
+    ]
+}
+
+pub fn is_runtime_text(addr: u64) -> bool {
+    if let Some((lo, hi)) = fixed_gate_region()
+        && addr >= lo
+        && addr < hi
+    {
+        return true;
+    }
+    let ips = runtime_text_ips();
     if ips.contains(&addr) {
         return true;
     }
@@ -709,43 +718,42 @@ fn promotion_island_denied(site: u64) -> bool {
 
 /// Register one island payload range `[lo, hi)` whose SVCs are the
 /// promoter's own, never promotion candidates. Ordinary context
-/// only (called by the promoter before the flip that makes the
-/// island reachable). Returns false when the fixed range table is
-/// full; the caller must then refuse the flip rather than let the
-/// island burn pending-table slots.
+/// only (called by the promoter after admission, before the flip
+/// that makes the island reachable). Returns false when the fixed
+/// range table is full; the caller must then refuse the flip rather
+/// than let the island burn pending-table slots.
+///
+/// Publication is safe against the handler's lock-free scan: the
+/// slot is claimed by CAS on its (nonzero) lo word, hi is stored
+/// next, and only then is the visible length published with
+/// `fetch_max`. The handler therefore never indexes past the
+/// claimed array and never sees a half-written range as live
+/// (lo == 0 marks an unclaimed slot; hi == 0 an empty range).
 #[cfg(target_arch = "aarch64")]
 pub fn register_pending_promotion_island(lo: u64, hi: u64) -> bool {
     use core::sync::atomic::Ordering;
-    if lo >= hi {
+    if lo >= hi || lo == 0 {
         return false;
     }
-    // Dedup exact ranges so fork re-registration is idempotent.
-    let len = PROMOTION_ISLAND_LEN.load(Ordering::Acquire);
-    for i in 0..len {
-        if PROMOTION_ISLANDS[i * 2].load(Ordering::Acquire) == lo
-            && PROMOTION_ISLANDS[i * 2 + 1].load(Ordering::Acquire) == hi
-        {
-            return true;
+    for idx in 0..PROMOTION_ISLAND_CAPACITY {
+        let seen_lo = PROMOTION_ISLANDS[idx * 2].load(Ordering::Acquire);
+        if seen_lo == lo && PROMOTION_ISLANDS[idx * 2 + 1].load(Ordering::Acquire) == hi {
+            return true; // exact range already registered
         }
+        if seen_lo != 0 {
+            continue;
+        }
+        if PROMOTION_ISLANDS[idx * 2]
+            .compare_exchange(0, lo, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            continue; // lost the claim; scan on (may now be our dup)
+        }
+        PROMOTION_ISLANDS[idx * 2 + 1].store(hi, Ordering::Release);
+        PROMOTION_ISLAND_LEN.fetch_max(idx + 1, Ordering::AcqRel);
+        return true;
     }
-    let idx = PROMOTION_ISLAND_LEN.fetch_add(1, Ordering::AcqRel);
-    if idx >= PROMOTION_ISLAND_CAPACITY {
-        PROMOTION_ISLAND_LEN.fetch_sub(1, Ordering::AcqRel);
-        return false;
-    }
-    PROMOTION_ISLANDS[idx * 2].store(lo, Ordering::Release);
-    PROMOTION_ISLANDS[idx * 2 + 1].store(hi, Ordering::Release);
-    true
-}
-
-/// Record the first observation of a candidate lazy-promotion site without
-/// allocating or waiting in signal context.
-///
-/// This is record-only plumbing for a future patch promoter. It does not
-/// inspect, patch, or otherwise alter guest code.
-#[cfg(target_arch = "aarch64")]
-pub fn record_pending_promotion_site(site: u64) -> PendingPromotionRecord {
-    PENDING_PROMOTIONS.try_record(site)
+    false
 }
 
 /// Remove one previously registered island range (exact match).
@@ -762,22 +770,40 @@ pub fn unregister_pending_promotion_island(lo: u64, hi: u64) -> bool {
         if PROMOTION_ISLANDS[i * 2].load(Ordering::Acquire) == lo
             && PROMOTION_ISLANDS[i * 2 + 1].load(Ordering::Acquire) == hi
         {
-            // Swap-remove with the last range. A handler racing
-            // this may briefly see either set; both are safe (a
-            // missed deny costs one pending slot, a stale deny
-            // only delays one promotion to a later drain).
+            // Empty this slot first (hi := lo makes the range
+            // empty), then swap the last range in and only then
+            // shrink the visible length. A racing handler sees,
+            // at worst, the moving range at both slots briefly —
+            // never a torn wide range and never an out-of-bounds
+            // index.
             let last = len - 1;
+            PROMOTION_ISLANDS[i * 2 + 1].store(lo, Ordering::Release);
             if i != last {
                 let llo = PROMOTION_ISLANDS[last * 2].load(Ordering::Acquire);
                 let lhi = PROMOTION_ISLANDS[last * 2 + 1].load(Ordering::Acquire);
                 PROMOTION_ISLANDS[i * 2].store(llo, Ordering::Release);
                 PROMOTION_ISLANDS[i * 2 + 1].store(lhi, Ordering::Release);
+                PROMOTION_ISLANDS[last * 2].store(0, Ordering::Release);
+                PROMOTION_ISLANDS[last * 2 + 1].store(0, Ordering::Release);
+            } else {
+                PROMOTION_ISLANDS[i * 2].store(0, Ordering::Release);
+                PROMOTION_ISLANDS[i * 2 + 1].store(0, Ordering::Release);
             }
             PROMOTION_ISLAND_LEN.store(last, Ordering::Release);
             return true;
         }
     }
     false
+}
+
+/// Record the first observation of a candidate lazy-promotion site without
+/// allocating or waiting in signal context.
+///
+/// This is record-only plumbing for a future patch promoter. It does not
+/// inspect, patch, or otherwise alter guest code.
+#[cfg(target_arch = "aarch64")]
+pub fn record_pending_promotion_site(site: u64) -> PendingPromotionRecord {
+    PENDING_PROMOTIONS.try_record(site)
 }
 
 /// Remove up to `out.len()` pending sites in first-observed order and
@@ -2756,5 +2782,22 @@ mod aarch64_gate_tests {
             );
             assert_eq!(libc::munmap(base, page), 0);
         }
+    }
+}
+
+#[cfg(test)]
+mod runtime_text_tests {
+    use super::*;
+
+    #[test]
+    fn restorer_and_gates_are_exact_denied_ips() {
+        // Layout-independent: exact membership, not page cover.
+        let ips = runtime_text_ips();
+        assert!(ips.contains(&crate::signal::signal_restorer()));
+        assert!(ips.contains(&crate::signal::signal_restorer_return_ip()));
+        assert!(ips.contains(&trusted_gate().syscall_ip));
+        assert!(ips.contains(&guest_syscall_gate().syscall_ip));
+        assert!(is_runtime_text(crate::signal::signal_restorer()));
+        assert!(!is_runtime_text(0x1000));
     }
 }
