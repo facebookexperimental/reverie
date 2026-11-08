@@ -27720,6 +27720,48 @@ fn detcore_no_scope_allocation_shape(bytes: &[u8]) -> bool {
             .map(|operand| operand.displacement),
     )
 }
+// Resolves one no-scope allocation operand target. The recipe's
+// null-reference panic operand names panic_null_reference_constructed,
+// which stable core merged into panic_null_pointer_dereference (the
+// same merge the validate templates handle by GOT discrimination):
+// when only the merged entry is bound it serves as this operand's
+// target, and when both are bound the GOT slot's actual callee
+// chooses. The recipe's own GOT check still verifies whichever
+// target is chosen, and with neither bound the operand refuses by
+// its recipe name.
+fn no_scope_allocation_operand_target(
+    targets: &BTreeMap<String, u64>,
+    got: &BTreeMap<u64, u64>,
+    address: u64,
+    bytes: &[u8],
+    operand: &DetcoreValidateOperand,
+) -> Result<u64> {
+    let unbound = || format!("unbound no-scope allocation operand {}", operand.key);
+    if operand.key != "fixed_panic_null_reference" {
+        return targets.get(operand.key).copied().ok_or_else(unbound);
+    }
+    match (
+        targets.get(operand.key),
+        targets.get("fixed_heap_panic_null"),
+    ) {
+        (Some(&primary), Some(&merged)) if primary != merged => {
+            if operand.got {
+                if let Ok(slot) =
+                    fixed_rip_target(address, bytes, operand.displacement, operand.next)
+                {
+                    if got.get(&slot) == Some(&merged) {
+                        return Ok(merged);
+                    }
+                }
+            }
+            Ok(primary)
+        }
+        (Some(&primary), _) => Ok(primary),
+        (None, Some(&merged)) => Ok(merged),
+        (None, None) => Err(unbound()),
+    }
+}
+
 fn fixed_detcore_no_scope_allocation_recipe(
     address: u64,
     bytes: &[u8],
@@ -27737,9 +27779,7 @@ fn fixed_detcore_no_scope_allocation_recipe(
     let mut fields = Vec::new();
     let mut resolved = Vec::new();
     for operand in DETCORE_NO_SCOPE_ALLOC.operands {
-        let expected = *targets
-            .get(operand.key)
-            .ok_or_else(|| format!("unbound no-scope allocation operand {}", operand.key))?;
+        let expected = no_scope_allocation_operand_target(targets, got, address, bytes, operand)?;
         require(expected != 0, "null no-scope allocation typed operand")?;
         let actual = fixed_rip_target(address, bytes, operand.displacement, operand.next)?;
         if operand.got {
@@ -59583,6 +59623,32 @@ mod tests {
                 },
             ]
         );
+        // Stable core merged panic_null_reference_constructed into
+        // panic_null_pointer_dereference: with only the merged entry
+        // bound, the same body qualifies with the same transfers.
+        let mut stable_targets = targets.clone();
+        stable_targets.remove("fixed_panic_null_reference");
+        stable_targets.insert("fixed_heap_panic_null".into(), 0xe8cce7);
+        assert_eq!(
+            check(&bytes, &stable_targets, &got, &readonly, &context).unwrap(),
+            edges,
+            "stable merged panic entry must bind the no-scope alloc operand"
+        );
+        // With neither panic entry bound, the operand refuses by name.
+        let mut unbound_targets = stable_targets.clone();
+        unbound_targets.remove("fixed_heap_panic_null");
+        let unbound_error = check(&bytes, &unbound_targets, &got, &readonly, &context)
+            .expect_err("unbound panic operand must refuse");
+        assert!(
+            unbound_error
+                .contains("unbound no-scope allocation operand fixed_panic_null_reference"),
+            "{unbound_error}"
+        );
+        // The merged entry bound to a different address than the
+        // GOT slot holds still refuses.
+        let mut wrong_got = got.clone();
+        *wrong_got.get_mut(&0xeea2e8).unwrap() ^= 1;
+        assert!(check(&bytes, &stable_targets, &wrong_got, &readonly, &context).is_err());
         let instructions: Vec<_> = [
             (0, 2),
             (2, 1),
