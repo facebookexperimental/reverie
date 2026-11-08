@@ -18685,12 +18685,16 @@ fn fs_absolute_displacement(bytes: &[u8]) -> Option<i64> {
     if opcode == 0x0f {
         opcode = *bytes.get(at)?;
         at += 1;
-        if !matches!(opcode, 0xb6 | 0xb7 | 0xbe | 0xbf) {
+        if matches!(
+            opcode,
+            0x05 | 0x06 | 0x08 | 0x09 | 0x0b | 0x30 | 0x31 | 0x32 | 0x37 | 0x77 | 0xa2
+        ) {
             return None;
         }
-    } else if !matches!(opcode, 0x80 | 0x88 | 0x89 | 0x8a | 0x8b | 0x39 | 0x3b) {
-        return None;
     }
+    // Opcode-agnostic: any instruction whose ModRM memory operand is
+    // absolute under an fs prefix names an fs:[disp32] access,
+    // whatever operation it performs (loads, stores, xchg, RMWs).
     let memory = parse_modrm(bytes, at, rex)?.memory?;
     (memory.base.is_none() && memory.index.is_none()).then_some(memory.displacement)
 }
@@ -18882,10 +18886,15 @@ fn refuse_tainted_tls_access(
                     }
                 }
             }
+            // A ret does not end the scope: cold blocks later in the
+            // same symbol are reached by branches, and a later source
+            // in the same scope must still arm the walk. Taint is
+            // carried past the ret (the address-order union already
+            // tolerates that over-approximation); the walk ends only
+            // at the end of the function scope.
             if decoded.ret {
-                break;
-            }
-            if decoded.call {
+                // Carried past, as described above.
+            } else if decoded.call {
                 for register in [0_u64, 1, 2, 6, 7, 8, 9, 10, 11] {
                     tainted[register as usize] = false;
                 }
@@ -47813,6 +47822,21 @@ mod tests {
             census(&retained_witness).is_err(),
             "retained-base access after a rax clobber must refuse"
         );
+        // The same retained-base access separated from its source by
+        // a ret byte (a cold block later in the same scope) refuses:
+        // the walk does not stop at the first ret in a function.
+        let mut ret_witness = base.clone();
+        let ret_at = 0x16c0_usize;
+        let mut ret_separated =
+            fixed_hex("488d3d00000000e800000000c34989c68b8077070000498b960000000059c3");
+        rip(&mut ret_separated, ret_at as u64, 3, 7, 0x3300);
+        rip(&mut ret_separated, ret_at as u64, 8, 12, 0x1810);
+        ret_separated[25..29].copy_from_slice(&(fixture_offsets[1] as u32).to_le_bytes());
+        ret_witness[ret_at..ret_at + ret_separated.len()].copy_from_slice(&ret_separated);
+        assert!(
+            census(&ret_witness).is_err(),
+            "ret-separated retained-base access to a cell must refuse"
+        );
         // An fs-segment access to a cell outside every accessor
         // refuses; at an unrelated offset it is accepted.
         let mut fs_witness = base.clone();
@@ -47874,6 +47898,7 @@ mod tests {
             ("dword load non-REX no SIB", "648b0500000000", 3),
             ("qword load REX no SIB", "64488b0500000000", 4),
             ("dword cmp non-REX SIB", "64803c250000000000", 4),
+            ("qword xchg non-REX SIB", "6487042500000000", 4),
         ] {
             let mut form_witness = base.clone();
             let form_at = 0x17a8_usize;
