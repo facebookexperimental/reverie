@@ -67883,7 +67883,9 @@ pub mod private_static {
                     96,
                     1,
                     120 * 8,
-                    1024 * 1024,
+                    // Mirror of reverie_loader::handoff::MAX_BYTES
+                    // (6_348_827); Hermit emits this word from that const.
+                    6_348_827,
                 ],
             "static layout revision/header/cap differs",
         )?;
@@ -68661,7 +68663,7 @@ pub mod private_static {
                 96,
                 1,
                 960,
-                1024 * 1024,
+                6_348_827,
                 3520,
                 64,
                 4096,
@@ -68861,7 +68863,8 @@ pub mod private_static {
                 (2, 95),
                 (3, 2),
                 (4, 936),
-                (5, 1024 * 1024 + 1),
+                (5, 1024 * 1024),
+                (5, 6_348_827 + 1),
                 (6, 3519),
                 (7, 8),
                 (8, 0),
