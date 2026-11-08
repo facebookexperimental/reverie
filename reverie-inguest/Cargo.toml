@@ -86,7 +86,7 @@ tracing = { version = "0.1.41", optional = true }
 reverie-loader = { version = "0.5.4", path = "../reverie-loader" }
 tokio = { version = "1.54.1", features = ["test-util"] }
 tracing-subscriber = "0.3.23"
-iced-x86 = { version = "1.21.0", default-features = false, features = ["std", "decoder"] }
+iced-x86 = { version = "1.21.0", default-features = false, features = ["std", "decoder", "instr_info"] }
 object = { version = "0.40.0", default-features = false, features = ["std", "read", "elf"] }
 
 [[bin]]
