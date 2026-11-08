@@ -30,18 +30,26 @@
 //! a guest group stop is continued at once: the supervisor sends
 //! its own real `SIGCONT` while still seized, consumes the notify
 //! trap, and forwards that SIGCONT delivery. The guest therefore
-//! observes a SIGCONT from the supervisor pid (including a
-//! handler, if installed), queued stop signals are flushed by
-//! that generation, and the stop lasts zero guest-visible time;
-//! this differs from native job control, where the guest would
-//! remain stopped until some other sender continues it. Only the
-//! initial pre-exec window keeps the stricter handshake ownership
-//! proof. After `release_detached`, the detached wait is
-//! terminal-only: a guest that then stops itself is reported as
-//! an unexpected post-detach stop and cancelled. The watched path
-//! follows one thread-group leader: an exec event whose former
-//! tid is not the watched leader fails closed; fork-following and
-//! thread supervision are not part of this module.
+//! ordinarily observes a SIGCONT from the supervisor pid
+//! (including a handler, if installed; if a foreign SIGCONT is
+//! already pending, standard-signal merging may preserve that
+//! sender instead), queued stop signals are flushed by that
+//! generation, and the stop lasts zero guest-visible time. A
+//! job-control continuer's SIGCONT can therefore become a second
+//! delivery (an extra handler run or EINTR), and a guest that
+//! keeps stopping itself spins through stop/continue cycles
+//! instead of remaining stopped. This differs from native job
+//! control, where the guest would remain stopped until some
+//! other sender continues it. Only the initial pre-exec window
+//! keeps the stricter handshake ownership proof. After
+//! `release_detached`, the detached wait is terminal-only: a
+//! guest that then stops itself is reported as an unexpected
+//! post-detach stop and cancelled. The watched path traces only
+//! one thread-group leader: other threads are untraced, so an
+//! exec from a non-leader thread is not observed and supervision
+//! silently ends when the kernel releases the leader; detecting
+//! that case, fork-following, and thread supervision are not
+//! part of this module.
 
 use std::time::Duration;
 use std::time::Instant;
@@ -714,7 +722,9 @@ enum NextExec {
 
 /// Drive the seized guest until its next exec event or terminal
 /// exit. Before the first exec, only this supervisor's own
-/// group-stop-clearing SIGCONT trap/delivery may be suppressed.
+/// group-stop-clearing SIGCONT trap/delivery may be suppressed;
+/// any other pre-exec SIGCONT notify trap is resumed and its
+/// delivery is forwarded.
 /// Afterwards guest signal deliveries are forwarded unchanged; a
 /// guest group stop is continued at once with this supervisor's
 /// real `SIGCONT`, whose delivery is forwarded. The stop lasts
@@ -777,6 +787,10 @@ fn wait_watched(
                     "exec supervisor encountered unexpected watched stop trap",
                 )?;
                 if signo == libc::SIGTRAP {
+                    // SIGCONT notify trap. No PTRACE_INTERRUPT or
+                    // PTRACE_LISTEN is issued by this module; a
+                    // future interrupt-based cancel must not reuse
+                    // this resume without distinguishing its trap.
                     running = task.resume(None)?;
                     continue;
                 }
@@ -1449,50 +1463,29 @@ mod tests {
     }
 
     #[test]
-    #[allow(unsafe_code)]
-    fn watched_blocked_sigcont_guest_entrypoint() {
-        if std::env::var_os("REVERIE_SUPERVISOR_BLOCKED_SIGCONT_GUEST").is_none() {
-            return;
-        }
-        // SAFETY: this process is the dedicated watched guest; block
-        // SIGCONT on this thread, stop it twice, then replace the
-        // image. No other test thread shares this process.
-        unsafe {
-            let mut set: libc::sigset_t = std::mem::zeroed();
-            assert_eq!(libc::sigemptyset(&mut set), 0);
-            assert_eq!(libc::sigaddset(&mut set, libc::SIGCONT), 0);
-            assert_eq!(
-                libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()),
-                0
-            );
-            assert_eq!(libc::raise(libc::SIGSTOP), 0);
-            assert_eq!(libc::raise(libc::SIGSTOP), 0);
-        }
-        let error =
-            std::os::unix::process::CommandExt::exec(&mut std::process::Command::new("/bin/true"));
-        panic!("blocked-SIGCONT guest exec failed: {error}");
-    }
-
-    #[test]
     fn watched_blocked_sigcont_two_stops_run_to_completion() {
-        let exe = std::env::current_exe().unwrap();
-        let args: Vec<OsString> = [
-            exe.as_os_str().to_owned(),
-            OsString::from(
-                "launcher::exec_stop::supervisor::tests::watched_blocked_sigcont_guest_entrypoint",
-            ),
-            OsString::from("--exact"),
-            OsString::from("--nocapture"),
-        ]
-        .to_vec();
-        let env = [(
-            OsString::from("REVERIE_SUPERVISOR_BLOCKED_SIGCONT_GUEST"),
-            OsString::from("1"),
-        )];
-        let request = PreparedExec::new(&exe, &args, &env, None, Vec::new()).unwrap();
-        let watched = Supervisor::spawn_watched(request, CleanupReceipt::default()).unwrap();
+        // A single-threaded perl guest blocks SIGCONT process-wide
+        // for its only thread, stops itself twice, then execs from
+        // the traced leader. Both execs must be observed; a libtest
+        // guest would block SIGCONT only on a non-leader thread and
+        // its final exec would escape through de_thread.
+        let perl = concat!(
+            "use POSIX qw(:signal_h sigprocmask); ",
+            "my $set = POSIX::SigSet->new(); ",
+            "$set->addset(SIGCONT); ",
+            "sigprocmask(SIG_BLOCK, $set) or die $!; ",
+            "kill STOP => $$; ",
+            "kill STOP => $$; ",
+            "exec '/bin/true' or die $!;"
+        );
+        let watched = Supervisor::spawn_watched(
+            request("/usr/bin/perl", &["perl", "-e", perl]),
+            CleanupReceipt::default(),
+        )
+        .unwrap();
         let outcome = rearm_until_finished(watched);
         assert_eq!(outcome.status, ExitStatus::Exited(0));
+        assert_eq!(outcome.execs_seen, 2);
         assert!(outcome.cleanup.confirmed);
     }
 
