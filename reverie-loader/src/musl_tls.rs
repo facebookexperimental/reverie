@@ -221,3 +221,239 @@ pub fn plan(
         dtv,
     })
 }
+
+/// Exact musl 1.2.5 `detach_state` values (`src/internal/pthread_impl.h`).
+/// A freshly built thread head is joinable unless its creator requested a
+/// detached thread, exactly as `__pthread_create` selects from the attribute.
+pub const DT_EXITED: u32 = 0;
+/// Transient exiting state; never written into a fresh head.
+pub const DT_EXITING: u32 = 1;
+/// Fresh joinable thread head state.
+pub const DT_JOINABLE: u32 = 2;
+/// Fresh detached thread head state.
+pub const DT_DETACHED: u32 = 3;
+
+/// Per-thread `tsd` array bytes: musl `PTHREAD_KEYS_MAX` (128) pointers.
+/// A fresh head must never carry a null `tsd`: musl `pthread_setspecific`
+/// writes through it, and a shared array would alias another thread's keys.
+pub const TSD_BYTES: usize = 128 * size_of::<usize>();
+
+/// Byte offset of `robust_list` inside the 200-byte pthread head, so the
+/// self-referential `robust_list.head` word is `tp + ROBUST_LIST_OFFSET`.
+pub const ROBUST_LIST_OFFSET: usize = 136;
+
+/// Process-wide head values a fresh thread copies from the leader, exactly as
+/// musl `__pthread_create` copies `canary`/`sysinfo` from the creating thread
+/// and points `locale` at `&__libc.global_locale`. Numeric inputs only.
+#[derive(Clone, Copy, Debug)]
+pub struct LeaderHead {
+    /// The leader's stack canary word.
+    pub canary: usize,
+    /// The leader's vDSO `sysinfo` word.
+    pub sysinfo: usize,
+    /// Numeric address of the retained libc global locale object.
+    pub locale: usize,
+}
+
+/// Slot-owned head inputs for one fresh thread, mirroring the fields musl
+/// `__pthread_create` fills from its stack mapping and attributes before the
+/// clone. `stack` must name the thread's lasting stack extent, never a
+/// transient birth stack that is unmapped while the thread may still run.
+/// `tsd` must name a zeroed per-slot extent of at least [`TSD_BYTES`].
+/// Numeric inputs only; supplying them proves no mapping or ownership.
+#[derive(Clone, Copy, Debug)]
+pub struct ThreadHead {
+    /// Base of the mapping the slot owns for this thread, if any.
+    pub map_base: usize,
+    /// Byte length of that mapping.
+    pub map_size: usize,
+    /// Lasting stack pointer recorded for the thread.
+    pub stack: usize,
+    /// Usable stack byte length below `stack`.
+    pub stack_size: usize,
+    /// Guard byte length below the usable stack.
+    pub guard_size: usize,
+    /// Per-slot zeroed `tsd` array address; never null for a live head.
+    pub tsd: usize,
+    /// Creator requested a detached thread.
+    pub detached: bool,
+}
+
+/// The complete 25-word image of one fresh pthread head over a zeroed extent,
+/// for the single-module [`Plan`] of one slot. This is the exact head fill of
+/// musl 1.2.5 `__copy_tls` plus `__pthread_create` before the clone:
+///
+/// - `self`, `prev` and `next` start self-linked, as `__init_tp` leaves the
+///   leader; list insertion under the thread-list lock is a later step.
+/// - `dtv` is the plan's DTV and `tid` stays zero: the creating clone writes
+///   it (`CLONE_PARENT_SETTID`), and `__init_tp` is never reused because its
+///   `set_tid_address` would replace the guest's clear-tid registration.
+/// - `robust_list.head` points at itself; `off`/`pending` stay zero.
+/// - Every other word stays zero, as musl relies on zeroed fresh mappings
+///   for `errno_val`, `cancel`, `result`, `cancelbuf`, `killlock` and the
+///   opaque flag byte at offset 66.
+///
+/// Pure numeric geometry: the caller zeroes the extent, runs the retained
+/// `__copy_tls`, verifies its placement, then writes these words.
+pub fn thread_head_words(plan: Plan, leader: LeaderHead, head: ThreadHead) -> [u64; 25] {
+    let tp = plan.pthread().start;
+    let mut words = [0_u64; 25];
+    words[0] = tp as u64;
+    words[1] = plan.dtv().start as u64;
+    words[2] = tp as u64;
+    words[3] = tp as u64;
+    words[4] = leader.sysinfo as u64;
+    words[5] = leader.canary as u64;
+    words[7] = u64::from(if head.detached {
+        DT_DETACHED
+    } else {
+        DT_JOINABLE
+    });
+    words[9] = head.map_base as u64;
+    words[10] = head.map_size as u64;
+    words[11] = head.stack as u64;
+    words[12] = head.stack_size as u64;
+    words[13] = head.guard_size as u64;
+    words[16] = head.tsd as u64;
+    words[17] = (tp + ROBUST_LIST_OFFSET) as u64;
+    words[21] = leader.locale as u64;
+    words
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BACKING: usize = 0x1000_0000;
+    const STRIDE: usize = 0x4000;
+    const IMAGE: usize = 0x2000_1000;
+    const LOCALE: usize = 0x3000_0040;
+
+    fn plan_at(backing_start: usize) -> Plan {
+        plan(
+            Extent {
+                start: 0x1000_0000,
+                bytes: 0x1001_0000,
+            },
+            Extent {
+                start: backing_start,
+                bytes: 0x1_0000,
+            },
+            Extent {
+                start: 0x2000_0000,
+                bytes: 0x1_0000,
+            },
+            Extent {
+                start: 0x2000_0000,
+                bytes: 0x1_0000,
+            },
+            Template {
+                image: IMAGE,
+                file_bytes: 16,
+                memory_bytes: 64,
+                alignment: 16,
+            },
+        )
+        .unwrap()
+    }
+
+    fn head(tsd: usize, detached: bool) -> ThreadHead {
+        ThreadHead {
+            map_base: 0x4000_0000,
+            map_size: 0x2_1000,
+            stack: 0x4002_0000,
+            stack_size: 0x1_f000,
+            guard_size: 0x1000,
+            tsd,
+            detached,
+        }
+    }
+
+    /// Erase values that point into the head's own extent so two heads can
+    /// be compared independently of where their slots sit.
+    fn relocated(plan: Plan, words: [u64; 25]) -> [u64; 25] {
+        let tp = plan.pthread().start as u64;
+        words.map(|w| {
+            if w == tp {
+                u64::MAX
+            } else if w == tp + ROBUST_LIST_OFFSET as u64 {
+                ROBUST_LIST_OFFSET as u64
+            } else if w == plan.dtv().start as u64 {
+                u64::MAX - 1
+            } else {
+                w
+            }
+        })
+    }
+
+    #[test]
+    fn second_tcb_head_equals_leader_head_after_relocation() {
+        let leader = LeaderHead {
+            canary: 0x1122_3344_5566_7700,
+            sysinfo: 0x7f00_0000,
+            locale: LOCALE,
+        };
+        // The leader's own head, as __init_tp leaves it on zeroed backing:
+        // self-linked, joinable, locale/sysinfo/canary set, robust list
+        // self-referential, no stack mapping recorded, no tsd array.
+        let leader_plan = plan_at(BACKING);
+        let leader_tp = leader_plan.pthread().start as u64;
+        let mut leader_words = [0_u64; 25];
+        leader_words[0] = leader_tp;
+        leader_words[1] = leader_plan.dtv().start as u64;
+        leader_words[2] = leader_tp;
+        leader_words[3] = leader_tp;
+        leader_words[4] = leader.sysinfo as u64;
+        leader_words[5] = leader.canary as u64;
+        leader_words[7] = u64::from(DT_JOINABLE);
+        leader_words[17] = leader_tp + ROBUST_LIST_OFFSET as u64;
+        leader_words[21] = LOCALE as u64;
+
+        let second_plan = plan_at(BACKING + STRIDE);
+        assert_eq!(second_plan.total_bytes(), leader_plan.total_bytes());
+        assert_eq!(
+            second_plan.pthread().start - leader_plan.pthread().start,
+            STRIDE
+        );
+        let second = thread_head_words(second_plan, leader, head(0x5000_0000, false));
+        let got = relocated(second_plan, second);
+        let want = relocated(leader_plan, leader_words);
+        for index in 0..25 {
+            // Slot-record words musl fills from the new mapping and its
+            // per-slot tsd; the leader keeps zeros there.
+            if matches!(index, 9..=13 | 16) {
+                continue;
+            }
+            assert_eq!(got[index], want[index], "word {index}");
+        }
+        // The slot-record words are exactly the supplied slot inputs.
+        assert_eq!(second[9], 0x4000_0000);
+        assert_eq!(second[10], 0x2_1000);
+        assert_eq!(second[11], 0x4002_0000);
+        assert_eq!(second[12], 0x1_f000);
+        assert_eq!(second[13], 0x1000);
+        assert_eq!(second[16], 0x5000_0000);
+        // The tid word stays zero for the creating clone to write.
+        assert_eq!(second[6], 0);
+    }
+
+    #[test]
+    fn detached_head_and_tsd_geometry() {
+        assert_eq!(TSD_BYTES, 1024);
+        let plan = plan_at(BACKING);
+        let words = thread_head_words(
+            plan,
+            LeaderHead {
+                canary: 0,
+                sysinfo: 0,
+                locale: LOCALE,
+            },
+            head(0x5000_0000, true),
+        );
+        assert_eq!(words[7], u64::from(DT_DETACHED));
+        // The DTV word is the plan's single-module DTV, whose entries the
+        // builder verifies as dtv[0] == 1 and dtv[1] == tls start.
+        assert_eq!(words[1], plan.dtv().start as u64);
+        assert_eq!(plan.dtv().bytes, DTV_BYTES);
+    }
+}
