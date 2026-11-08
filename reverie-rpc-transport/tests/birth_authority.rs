@@ -210,50 +210,70 @@ fn stale_after_failed_exec_and_unstaged_exec_refused() {
 fn close_resolver_orderings() {
     let authority = make_authority();
     let initial = NativeImageConnection::Initial;
-    assert!(authority.connection_closed(admitted(), &initial).is_err());
-    authority.record_initial_consumed(admitted()).unwrap();
-    authority
-        .stage_snapshot(admitted(), frame_tool_state(b"mailbox-only").unwrap())
-        .unwrap();
-    // Mailbox-only / idle EOF refuses.
-    assert!(authority.connection_closed(admitted(), &initial).is_err());
-    let captured = Arc::new(Mutex::new(None));
-    let expected = stage_and_stop(
-        &authority,
-        frame_tool_state(b"close-state").unwrap(),
-        &captured,
-    );
-    // The second stage replaces the slot; restage through stop flow above
-    // consumed the first entry, so rebuild a clean authority for ordering.
-    let _ = expected;
-    // Initial EOF after Issue is accepted; duplicate refuses.
+    // Initial EOF before any recorded fact is held pending, never
+    // accepted yet and never resolved by a timed wait. This is the
+    // close_cloexec_files-before-PTRACE_EVENT_EXEC ordering.
     authority.connection_closed(admitted(), &initial).unwrap();
+    assert_eq!(authority.pending_eof_count(), 1);
+    assert_eq!(authority.accepted_eof_count(), 0);
     assert!(authority.connection_closed(admitted(), &initial).is_err());
+
+    authority.record_initial_consumed(admitted()).unwrap();
+    assert_eq!(authority.pending_eof_count(), 1);
+    // A staged mailbox for this birth is itself a recorded fact.
+    authority
+        .stage_snapshot(admitted(), frame_tool_state(b"close-state").unwrap())
+        .unwrap();
+    assert_eq!(authority.pending_eof_count(), 0);
+    assert_eq!(authority.accepted_eof_count(), 1);
+
+    let captured = Arc::new(Mutex::new(None));
+    let stop = authority
+        .record_successor_stop(admitted(), &own_pidfd())
+        .unwrap();
+    let expected = authority
+        .at_successor_stop(stop, stamp_packet(&captured))
+        .unwrap();
     let ticket = captured.lock().unwrap().unwrap();
     let successor_image = NativeImageConnection::Successor {
         ticket: ticket.0.to_vec(),
     };
-    // Wrong incarnation / unknown ticket refuses.
-    assert!(
-        authority
-            .connection_closed(
-                admitted(),
-                &NativeImageConnection::Successor {
-                    ticket: vec![9; 32]
-                },
-            )
-            .is_err()
-    );
-    // Issued (not yet redeemed/completed) successor EOF refuses.
-    assert!(
-        authority
-            .connection_closed(admitted(), &successor_image)
-            .is_err()
-    );
+    // Issued successor EOF is held pending, not accepted.
+    authority
+        .connection_closed(admitted(), &successor_image)
+        .unwrap();
+    assert_eq!(authority.pending_eof_count(), 1);
+    assert_eq!(authority.accepted_eof_count(), 1);
+    // An unknown ticket likewise remains pending/unaccepted.
+    authority
+        .connection_closed(
+            admitted(),
+            &NativeImageConnection::Successor {
+                ticket: vec![9; 32],
+            },
+        )
+        .unwrap();
+    assert_eq!(authority.pending_eof_count(), 2);
+    // Redemption resolves only the exact successor image.
+    authority
+        .redeem(
+            own_pidfd(),
+            admitted(),
+            SuccessorRequest {
+                ticket: &ticket.0,
+                expected,
+            },
+        )
+        .unwrap();
+    assert_eq!(authority.pending_eof_count(), 1);
+    assert_eq!(authority.accepted_eof_count(), 2);
+
     // Watch-terminal fact accepts a fresh Initial EOF.
     let authority2 = make_authority();
     authority2.record_watch_terminal();
     authority2.connection_closed(admitted(), &initial).unwrap();
+    assert_eq!(authority2.accepted_eof_count(), 1);
+    assert_eq!(authority2.pending_eof_count(), 0);
 }
 
 struct Watch;

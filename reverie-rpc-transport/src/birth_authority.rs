@@ -329,6 +329,57 @@ struct Inner {
     stops: Vec<StopRecord>,
     watch_terminal: bool,
     closed: Vec<NativeImageConnection>,
+    pending_eof: Vec<NativeImageConnection>,
+}
+
+impl Inner {
+    fn close_accepted(&self, image: &NativeImageConnection) -> bool {
+        match image {
+            NativeImageConnection::Initial => {
+                self.watch_terminal
+                    || self.mailbox.is_some()
+                    || self.stops.iter().any(|stop| {
+                        stop.ticket.is_some_and(|ticket| {
+                            matches!(
+                                self.registry.stage(ticket),
+                                Some(
+                                    ExecStage::Issued | ExecStage::Redeemed | ExecStage::Completed
+                                )
+                            )
+                        })
+                    })
+            }
+            NativeImageConnection::Successor { ticket } => {
+                let Ok(ticket) = <[u8; 32]>::try_from(ticket.as_slice()) else {
+                    return false;
+                };
+                matches!(
+                    self.registry.stage(ExecTicket(ticket)),
+                    Some(
+                        ExecStage::Redeemed
+                            | ExecStage::Completed
+                            | ExecStage::Failed
+                            | ExecStage::Dead
+                    )
+                )
+            }
+        }
+    }
+
+    fn resolve_pending_eof(&mut self) {
+        let mut pending = std::mem::take(&mut self.pending_eof);
+        pending.retain(|image| {
+            if self.close_accepted(image) {
+                if !self.closed.contains(image) {
+                    self.closed.push(image.clone());
+                }
+                false
+            } else {
+                true
+            }
+        });
+        self.pending_eof = pending;
+    }
 }
 
 /// The one serialized authority for one watched birth.
@@ -368,6 +419,7 @@ impl BirthAuthority {
                 stops: Vec::new(),
                 watch_terminal: false,
                 closed: Vec::new(),
+                pending_eof: Vec::new(),
             }),
         })
     }
@@ -416,6 +468,7 @@ impl BirthAuthority {
             return Err(ExecControlError::Transition);
         }
         inner.mailbox = Some(framed_tool);
+        inner.resolve_pending_eof();
         Ok(())
     }
 
@@ -521,6 +574,9 @@ impl BirthAuthority {
             Ok(packet.expected)
         })();
         self.proof_state.lock().unwrap().expected_runtime = None;
+        if result.is_ok() {
+            inner.resolve_pending_eof();
+        }
         match result {
             Ok(expected) => Ok(expected),
             Err(error) => {
@@ -534,7 +590,10 @@ impl BirthAuthority {
 
     /// Host-only completion at verified Ready.
     pub fn complete(&self, ticket: ExecTicket) -> Result<(), ExecControlError> {
-        self.lock().registry.complete(self.key.process_id, ticket)
+        let mut inner = self.lock();
+        inner.registry.complete(self.key.process_id, ticket)?;
+        inner.resolve_pending_eof();
+        Ok(())
     }
 
     /// Recorded actual watch death/exit. Never call this on EOF.
@@ -542,6 +601,17 @@ impl BirthAuthority {
         let mut inner = self.lock();
         inner.watch_terminal = true;
         inner.registry.died();
+        inner.resolve_pending_eof();
+    }
+
+    /// EOFs accepted on a recorded fact so far.
+    pub fn accepted_eof_count(&self) -> usize {
+        self.lock().closed.len()
+    }
+
+    /// EOFs held pending a recorded fact (not yet accepted).
+    pub fn pending_eof_count(&self) -> usize {
+        self.lock().pending_eof.len()
     }
 
     /// Retained stage for host/test evidence.
@@ -592,7 +662,7 @@ impl SuccessorAdmission for BirthAuthority {
                 "successor before InitialImage in birth authority",
             ));
         }
-        inner
+        let state = inner
             .registry
             .redeem(
                 &peer,
@@ -602,7 +672,9 @@ impl SuccessorAdmission for BirthAuthority {
                 request.expected.config,
                 request.expected.state,
             )
-            .map_err(io::Error::other)
+            .map_err(io::Error::other)?;
+        inner.resolve_pending_eof();
+        Ok(state)
     }
 
     fn connection_closed(
@@ -611,43 +683,57 @@ impl SuccessorAdmission for BirthAuthority {
         image: &NativeImageConnection,
     ) -> io::Result<()> {
         self.check_admitted(admitted).map_err(io::Error::other)?;
+        if let NativeImageConnection::Successor { ticket } = image {
+            if <[u8; 32]>::try_from(ticket.as_slice()).is_err() {
+                return Err(io::Error::other("birth authority EOF ticket shape"));
+            }
+        }
         let mut inner = self.lock();
-        if inner.closed.contains(image) {
+        if inner.closed.contains(image) || inner.pending_eof.contains(image) {
             return Err(io::Error::other("birth authority duplicate EOF"));
         }
-        let accepted = match image {
-            NativeImageConnection::Initial => {
-                inner.watch_terminal
-                    || inner.stops.iter().any(|stop| {
-                        stop.ticket.is_some_and(|ticket| {
-                            matches!(
-                                inner.registry.stage(ticket),
-                                Some(
-                                    ExecStage::Issued | ExecStage::Redeemed | ExecStage::Completed
+        let accepted = inner.close_accepted(image)
+            || match image {
+                NativeImageConnection::Initial => {
+                    inner.watch_terminal
+                        || inner.stops.iter().any(|stop| {
+                            stop.ticket.is_some_and(|ticket| {
+                                matches!(
+                                    inner.registry.stage(ticket),
+                                    Some(
+                                        ExecStage::Issued
+                                            | ExecStage::Redeemed
+                                            | ExecStage::Completed
+                                    )
                                 )
-                            )
+                            })
                         })
-                    })
-            }
-            NativeImageConnection::Successor { ticket } => {
-                let Ok(ticket) = <[u8; 32]>::try_from(ticket.as_slice()) else {
-                    return Err(io::Error::other("birth authority EOF ticket shape"));
-                };
-                matches!(
-                    inner.registry.stage(ExecTicket(ticket)),
-                    Some(
-                        ExecStage::Redeemed
-                            | ExecStage::Completed
-                            | ExecStage::Failed
-                            | ExecStage::Dead
+                }
+                NativeImageConnection::Successor { ticket } => {
+                    let Ok(ticket) = <[u8; 32]>::try_from(ticket.as_slice()) else {
+                        return Err(io::Error::other("birth authority EOF ticket shape"));
+                    };
+                    matches!(
+                        inner.registry.stage(ExecTicket(ticket)),
+                        Some(
+                            ExecStage::Redeemed
+                                | ExecStage::Completed
+                                | ExecStage::Failed
+                                | ExecStage::Dead
+                        )
                     )
-                )
-            }
-        };
-        if !accepted {
-            return Err(io::Error::other("birth authority EOF refused"));
+                }
+            };
+        if accepted {
+            inner.closed.push(image.clone());
+        } else {
+            // Linux closes CLOEXEC descriptors in begin_new_exec()
+            // (fs/exec.c close_cloexec_files) before the exec stop is
+            // reported by ptrace_event(PTRACE_EVENT_EXEC), so an
+            // Initial EOF can legitimately arrive first. Hold it
+            // pending a recorded fact; no timed wait is used.
+            inner.pending_eof.push(image.clone());
         }
-        inner.closed.push(image.clone());
         Ok(())
     }
 }
