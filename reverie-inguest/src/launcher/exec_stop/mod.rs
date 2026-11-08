@@ -504,9 +504,10 @@ fn drain_and_capture(
 /// readiness checks a caller requires must already have run while the
 /// image was stopped. The detach signal is the caller's choice: the
 /// first-image launcher detaches silently, while the seize-based
-/// supervisor detaches with `SIGCONT` to wake a released guest that
-/// is job-control stopped at release. Its handshake group stop is
-/// cleared earlier, while still seized.
+/// supervisor detaches with `SIGCONT` as its restored guest's
+/// release signal. Group stops it encountered while seized were
+/// cleared before release; the detach signal is not their clearing
+/// mechanism.
 fn release_restored(
     task: Stopped,
     context: &EntryContext,

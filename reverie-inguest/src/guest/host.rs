@@ -2380,8 +2380,9 @@ impl<T: Tool, R: HostRuntime> InGuest<'_, T, R> {
     /// The named refusal for a watched exec on a route that cannot
     /// consult the admitted native exec route, or `None` when the
     /// exec may proceed (unwatched handling is the caller's existing
-    /// refusal; no driver, or the route was captured, forwards
-    /// through the ordinary paths).
+    /// refusal; no admitted route — whether no driver is installed
+    /// or it is installed but unadmitted — or a captured route
+    /// forwards through the ordinary paths).
     fn exec_native_priority_refusal(&self) -> Option<reverie::UnsupportedRefusal> {
         if self.runtime.exec_watch_armed() && self.exec_native_route_unreachable() {
             Some(reverie::UnsupportedRefusal::new(
