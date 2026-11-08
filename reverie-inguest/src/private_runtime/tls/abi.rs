@@ -11,8 +11,16 @@ use core::ptr;
 use core::sync::atomic::AtomicU8;
 use core::sync::atomic::Ordering;
 
+use core::ffi::c_uint;
+
+use super::layout::Extent;
+use super::layout::LeaderHead;
 use super::layout::PTHREAD_BYTES;
 use super::layout::Plan;
+use super::layout::ROBUST_LIST_OFFSET;
+use super::layout::TSD_BYTES;
+use super::layout::Template;
+use super::layout::ThreadHead;
 
 #[repr(C)]
 struct TlsModule {
@@ -91,6 +99,49 @@ const _: () = {
     assert!(offset_of!(Pthread, map_base) == 72 && offset_of!(Pthread, robust_list) == 136);
     assert!(offset_of!(Pthread, locale) == 168 && offset_of!(Pthread, killlock) == 176);
     assert!(offset_of!(Pthread, dlerror_buf) == 184 && offset_of!(Pthread, stdio_locks) == 192);
+    assert!(offset_of!(Pthread, robust_list) == ROBUST_LIST_OFFSET);
+};
+
+/// Exact musl 1.2.5 `struct _IO_FILE` (`src/internal/stdio_impl.h`), modeled
+/// only for the first-thread stdio lock transition: `next` walks the open
+/// file list and `lock` is the volatile file lock word.
+#[repr(C)]
+struct File {
+    flags: c_uint,
+    rpos: *mut u8,
+    rend: *mut u8,
+    close: *mut c_void,
+    wend: *mut u8,
+    wpos: *mut u8,
+    mustbezero_1: *mut u8,
+    wbase: *mut u8,
+    read: *mut c_void,
+    write: *mut c_void,
+    seek: *mut c_void,
+    buf: *mut u8,
+    buf_size: usize,
+    prev: *mut File,
+    next: *mut File,
+    fd: c_int,
+    pipe_pid: c_int,
+    lockcount: isize,
+    mode: c_int,
+    lock: c_int,
+    lbf: c_int,
+    cookie: *mut c_void,
+    off: i64,
+    getln_buf: *mut u8,
+    mustbezero_2: *mut c_void,
+    shend: *mut u8,
+    shlim: i64,
+    shcnt: i64,
+    prev_locked: *mut File,
+    next_locked: *mut File,
+    locale: *mut c_void,
+}
+const _: () = {
+    assert!(size_of::<File>() == 232 && align_of::<File>() == 8);
+    assert!(offset_of!(File, next) == 112 && offset_of!(File, lock) == 140);
 };
 
 unsafe extern "C" {
@@ -98,6 +149,20 @@ unsafe extern "C" {
     static mut __default_stacksize: u32;
     fn __copy_tls(backing: *mut u8) -> *mut c_void;
     fn __init_tp(pthread: *mut c_void) -> c_int;
+    // First-thread switch inputs from the same retained private libc. The
+    // final link audit must prove each resolves to the retained object, not
+    // a guest or host libc interposition.
+    fn __ofl_lock() -> *mut *mut File;
+    fn __ofl_unlock();
+    fn __membarrier_init();
+    fn __syscall(number: usize, ...) -> usize;
+    static mut __stdin_used: *mut File;
+    static mut __stdout_used: *mut File;
+    static mut __stderr_used: *mut File;
+    // Address only: the array extent is owned by the retained libc (the
+    // strong __pthread_tsd_main object when pthread keys are linked, else
+    // the one-word weak dummy in pthread_create).
+    static __pthread_tsd_main: u8;
     // Single link-required trusted leaf, not a caller-provided address. The
     // final artifact must prove this hidden symbol is the exact retained
     // no-TLS/no-allocation/no-unwind terminal gate. No default implementation.
@@ -301,5 +366,188 @@ pub unsafe extern "C" fn __init_tls(aux: *mut usize) {
 pub(super) fn require_tls_returned() {
     if STATE.load(Ordering::Acquire) != 3 {
         die(Failure::NotInstalled);
+    }
+}
+
+/// Build one additional thread's TCB in caller-owned slot backing, without
+/// admitting, publishing or switching to it. Nothing calls this yet.
+///
+/// This is the pre-clone half of musl `__pthread_create` at `len == 1`: plan
+/// this slot, zero the whole extent (a reused slot must never hand a newborn
+/// a dead thread's thread-local state), run the retained `__copy_tls`,
+/// verify placement exactly as the leader install does, then write the full
+/// pthread head from [`super::layout::thread_head_words`]. It never calls
+/// `__init_tp` (whose `set_tid_address` would replace the guest's clear-tid
+/// registration), never changes FS, and leaves `tid` zero for the creating
+/// clone to write.
+///
+/// # Safety
+/// The leader install has returned (`STATE == 3`) in the same exact retained
+/// private libc, whose single module set is frozen: `tls_cnt == 1` and the
+/// slot plan's total equals the recorded `tls_size`. `leader` is the live
+/// leader thread pointer, read only for its canary/sysinfo words. The slot
+/// backing and the `head.tsd` extent are exclusively owned, writable, and
+/// remain mapped for the new thread's whole lifetime; no other thread or
+/// signal accesses them during the build. `head.stack` names a lasting stack
+/// extent, never a transient birth stack. The returned thread pointer is
+/// inert: publishing, list insertion and FS switching are separate steps
+/// with their own contracts, and the final link audit must prove every
+/// extern here resolves to the retained objects.
+pub unsafe fn build_thread_tcb(
+    region: Extent,
+    backing: Extent,
+    mapped_load: Extent,
+    file_backed_load: Extent,
+    template: Template,
+    leader: *const c_void,
+    head: ThreadHead,
+) -> Result<*mut c_void, super::layout::Error> {
+    let plan = super::layout::plan(region, backing, mapped_load, file_backed_load, template)?;
+    if STATE.load(Ordering::Acquire) != 3 || leader.is_null() || head.tsd == 0 {
+        die(Failure::NotInstalled);
+    }
+    // SAFETY: exact resolved private object address, not guest libc interposition.
+    let libc = ptr::addr_of_mut!(__libc);
+    // The retained __copy_tls reads the frozen leader module globals, so a
+    // slot whose geometry disagrees with them can never be copied soundly.
+    if unsafe {
+        ptr::read(&raw const (*libc).tls_cnt) != 1
+            || ptr::read(&raw const (*libc).tls_size) != plan.total_bytes()
+    } {
+        die(Failure::CopyPlacement);
+    }
+    // SAFETY: caller-exclusive writable extents of at least these lengths.
+    // Zeroing precedes the copy, giving TLS BSS, the pthread head and the
+    // tsd array the all-zero fresh state musl takes from a new mapping.
+    unsafe {
+        ptr::write_bytes(backing.start as *mut u8, 0, plan.total_bytes());
+        ptr::write_bytes(head.tsd as *mut u8, 0, TSD_BYTES);
+    }
+    // SAFETY: exact retained musl function; zeroed ranges and frozen metadata.
+    let tp = unsafe { __copy_tls(backing.start as *mut u8) };
+    if tp as usize != plan.pthread().start {
+        die(Failure::CopyPlacement);
+    }
+    // SAFETY: the copy target and DTV entries are valid initialized words in
+    // owned RW memory, verified exactly as in the leader install.
+    let td = tp.cast::<Pthread>();
+    if unsafe {
+        ptr::read(&raw const (*td).dtv) as usize != plan.dtv().start
+            || ptr::read(plan.dtv().start as *const usize) != 1
+            || ptr::read((plan.dtv().start as *const usize).add(1)) != plan.tls().start
+    } {
+        die(Failure::CopyDtv);
+    }
+    // SAFETY: leader is the live leader head; only its canary/sysinfo words
+    // are read. The head words are written over the extent this call just
+    // zeroed and copied, so no live flag bitfield state can be clobbered.
+    let words = super::layout::thread_head_words(
+        plan,
+        LeaderHead {
+            canary: unsafe { ptr::read(&raw const (*leader.cast::<Pthread>()).canary) },
+            sysinfo: unsafe { ptr::read(&raw const (*leader.cast::<Pthread>()).sysinfo) },
+            locale: unsafe { ptr::addr_of_mut!((*libc).global_locale) as usize },
+        },
+        head,
+    );
+    for (index, word) in words.into_iter().enumerate() {
+        // SAFETY: tp is 8-aligned and PTHREAD_BYTES long by the plan.
+        unsafe { ptr::write((tp as *mut u64).add(index), word) };
+    }
+    Ok(tp)
+}
+
+// musl init_file_lock: a stdio file created single-threaded carries a
+// negative lock word meaning "locking elided"; the first thread arms it.
+unsafe fn init_file_lock(file: *mut File) {
+    if !file.is_null() && unsafe { ptr::read_volatile(&raw const (*file).lock) } < 0 {
+        // SAFETY: volatile lock word of a live retained-libc FILE.
+        unsafe { ptr::write_volatile(&raw mut (*file).lock, 0) };
+    }
+}
+
+/// The one-time musl transition into threaded mode: the
+/// `if (!libc.threaded)` block of `__pthread_create` (stdio file locks,
+/// unblocking the implementation signals, leader tsd arming, membarrier
+/// registration). Nothing calls this yet; it belongs parent-side, before
+/// the first physical clone creates a second Tool thread.
+///
+/// # Safety
+/// The leader install has returned and the process is still genuinely
+/// single-threaded on the leader's private FS. `leader` is the live leader
+/// thread pointer. The retained `__syscall` path must reach the kernel for
+/// `rt_sigprocmask` under the qualified private relay, and the final link
+/// audit must prove every extern resolves to the retained objects.
+pub unsafe fn first_thread_switch(leader: *mut c_void) {
+    if STATE.load(Ordering::Acquire) != 3 || leader.is_null() {
+        die(Failure::NotInstalled);
+    }
+    // SAFETY: exact resolved private object address, not guest libc interposition.
+    let libc = ptr::addr_of_mut!(__libc);
+    if unsafe { ptr::read(&raw const (*libc).threaded) } != 0 {
+        return;
+    }
+    // SAFETY: single-threaded retained libc; the ofl lock guards the list.
+    unsafe {
+        let ofl = __ofl_lock();
+        let mut file = ptr::read(ofl);
+        while !file.is_null() {
+            init_file_lock(file);
+            file = ptr::read(&raw const (*file).next);
+        }
+        __ofl_unlock();
+        init_file_lock(ptr::read_volatile(&raw const __stdin_used));
+        init_file_lock(ptr::read_volatile(&raw const __stdout_used));
+        init_file_lock(ptr::read_volatile(&raw const __stderr_used));
+        // SYS_rt_sigprocmask(SIG_UNBLOCK, SIGPT_SET, NULL, 8): SIGPT_SET on
+        // 64-bit is signals 33/34, the musl cancel/synccall pair.
+        let set: [u64; 1] = [3_u64 << 32];
+        let _ = __syscall(14_usize, 1_usize, set.as_ptr() as usize, 0_usize, 8_usize);
+        ptr::write(
+            &raw mut (*leader.cast::<Pthread>()).tsd,
+            ptr::addr_of!(__pthread_tsd_main) as *mut *mut c_void,
+        );
+        __membarrier_init();
+        ptr::write(&raw mut (*libc).threaded, 1);
+    }
+}
+
+/// The thread-count half of musl's threaded switch, taken under the
+/// thread-list lock immediately before a physical clone creates one more
+/// Tool thread: `if (!libc.threads_minus_1++) libc.need_locks = 1;`.
+/// Nothing calls this yet.
+///
+/// # Safety
+/// The caller holds the retained libc thread-list lock (or an equivalent
+/// exclusion over every `__libc` thread-count writer) after
+/// [`first_thread_switch`].
+pub unsafe fn note_thread_added_locked() {
+    // SAFETY: exact resolved private object, written under the caller lock.
+    let libc = ptr::addr_of_mut!(__libc);
+    unsafe {
+        let count = ptr::read(&raw const (*libc).threads_minus_1);
+        ptr::write(&raw mut (*libc).threads_minus_1, count + 1);
+        if count == 0 {
+            ptr::write_volatile(&raw mut (*libc).need_locks, 1);
+        }
+    }
+}
+
+/// Undo [`note_thread_added_locked`] when the clone it preceded fails,
+/// mirroring musl's clone-failure path (`need_locks` back to 0, unlike the
+/// thread-exit path which leaves it at -1). Nothing calls this yet.
+///
+/// # Safety
+/// Same locking contract as [`note_thread_added_locked`], and a matching
+/// add is still outstanding.
+pub unsafe fn note_thread_add_failed_locked() {
+    // SAFETY: exact resolved private object, written under the caller lock.
+    let libc = ptr::addr_of_mut!(__libc);
+    unsafe {
+        let count = ptr::read(&raw const (*libc).threads_minus_1) - 1;
+        ptr::write(&raw mut (*libc).threads_minus_1, count);
+        if count == 0 {
+            ptr::write_volatile(&raw mut (*libc).need_locks, 0);
+        }
     }
 }
