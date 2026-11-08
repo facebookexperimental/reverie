@@ -1149,8 +1149,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     // Bind the signal-mask gate and every changed native-source premise of it.
     (
         "reverie-inguest/src/guest/continuation.rs",
-        44673,
-        "7a2e070e0d4734a06e1f3b314f9de235003269a8a2538b87eb9f72c25a122f7c",
+        45939,
+        "3172b2feecca8cccd71b7947cee90fa830bae90fc8c3f1f32c948f0f8e438607",
     ),
     (
         "reverie-inguest/src/guest/instruction.rs",
@@ -1399,8 +1399,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-inguest/src/guest/alloc.rs",
-        37144,
-        "8179a15bf28fbaebae61cbc24ef212d0e0aeff959a4846ba96df3ed08bf8c6f0",
+        37723,
+        "e1304916625b1b166ce0d32b54965c6e3623d9a004b38e77b7ed26ba653e81dc",
     ),
     (
         "reverie-inguest/src/guest/tool_region_constructor.rs",
