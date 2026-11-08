@@ -40,4 +40,5 @@ pkey_buffer_syscall:
     pop r12
     ret
 .size pkey_buffer_syscall, .-pkey_buffer_syscall
-.section .note.GNU-stack,"",@progbits
+.pushsection .note.GNU-stack,"",@progbits
+.popsection
