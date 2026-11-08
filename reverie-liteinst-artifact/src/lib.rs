@@ -18358,18 +18358,356 @@ struct NoScopeCensus {
 }
 // Physical census only. The production caller separately requires actual
 // verified sources, actual compiler feature events and the whole101B recipe.
-/// Defense in depth for the four authenticated TLS cells: refuse,
-/// naming the site and the cell, any access to a cell that does not
-/// occur inside one of its authenticated accessors. Two access forms
-/// are scanned at every executable byte start: a module-base access
-/// (a lea of the image's authenticated module TLS descriptor plus a
-/// call to the authenticated __tls_get_addr import, followed within
-/// 40 bytes by a [base + imm] operand landing inside a cell), and an
-/// fs-segment access (absolute fs:[imm32], or an fs base load
-/// followed by a [base + imm32] lea or load landing inside a cell).
-/// Every legitimate read and write funnels through an accessor, so
-/// any other hit is a missed access site and refusal is correct.
-fn refuse_unauthenticated_tls_access(
+#[derive(Clone, Copy, Default)]
+struct MemoryOperand {
+    base: Option<u64>,
+    index: Option<u64>,
+    displacement: i64,
+}
+
+#[derive(Clone, Copy, Default)]
+struct DecodedInstruction {
+    length: usize,
+    memory: Option<MemoryOperand>,
+    register_write: Option<u64>,
+    copy: Option<(u64, u64)>,
+    exchange: Option<(u64, u64)>,
+    lea: bool,
+    call: bool,
+    ret: bool,
+}
+
+struct ParsedModRm {
+    raw_reg: u64,
+    reg: u64,
+    memory: Option<MemoryOperand>,
+    register: Option<u64>,
+    mode: u8,
+    end: usize,
+}
+
+// Parses one ModRM byte (plus SIB and displacement) at `at`, where a
+// REX prefix value `rex` (0 if absent) supplies the R/X/B extension
+// bits.
+fn parse_modrm(bytes: &[u8], at: usize, rex: u8) -> Option<ParsedModRm> {
+    let byte = *bytes.get(at)?;
+    let mode = byte >> 6;
+    let raw_reg = u64::from((byte >> 3) & 7);
+    let reg = raw_reg | (u64::from((rex >> 2) & 1) << 3);
+    let rm = u64::from(byte & 7);
+    if mode == 3 {
+        return Some(ParsedModRm {
+            raw_reg,
+            reg,
+            memory: None,
+            register: Some(rm | (u64::from(rex & 1) << 3)),
+            mode,
+            end: at + 1,
+        });
+    }
+    let mut pos = at + 1;
+    let (base, index, disp_len) = if rm == 4 {
+        let sib = *bytes.get(pos)?;
+        pos += 1;
+        let index_raw = u64::from((sib >> 3) & 7);
+        let index = (index_raw != 4 || (rex >> 1) & 1 == 1)
+            .then_some(index_raw | (u64::from((rex >> 1) & 1) << 3));
+        let base_raw = u64::from(sib & 7);
+        if base_raw == 5 && mode == 0 {
+            (None, index, 4)
+        } else {
+            (
+                Some(base_raw | (u64::from(rex & 1) << 3)),
+                index,
+                [0, 1, 4][usize::from(mode)],
+            )
+        }
+    } else if rm == 5 && mode == 0 {
+        (None, None, 4)
+    } else {
+        (
+            Some(rm | (u64::from(rex & 1) << 3)),
+            None,
+            [0, 1, 4][usize::from(mode)],
+        )
+    };
+    let displacement = match disp_len {
+        0 => 0_i64,
+        1 => i64::from(bytes.get(pos).map(|b| *b as i8)?),
+        _ => i64::from(i32::from_le_bytes(
+            bytes.get(pos..pos + 4)?.try_into().ok()?,
+        )),
+    };
+    Some(ParsedModRm {
+        raw_reg,
+        reg,
+        memory: Some(MemoryOperand {
+            base,
+            index,
+            displacement,
+        }),
+        register: None,
+        mode,
+        end: pos + disp_len,
+    })
+}
+
+fn decode_instruction(bytes: &[u8]) -> DecodedInstruction {
+    let mut decoded = DecodedInstruction {
+        length: 1,
+        ..Default::default()
+    };
+    let mut at = 0_usize;
+    let mut rex = 0_u8;
+    while let Some(&prefix) = bytes.get(at) {
+        match prefix {
+            0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 | 0x66 | 0x67 | 0xf0 | 0xf2 | 0xf3 => {
+                at += 1;
+            }
+            0x40..=0x4f => {
+                rex = prefix;
+                at += 1;
+                break;
+            }
+            _ => break,
+        }
+    }
+    let Some(&opcode) = bytes.get(at) else {
+        return decoded;
+    };
+    at += 1;
+    let rex_b = u64::from(rex & 1) << 3;
+    if opcode == 0x0f {
+        let Some(&second) = bytes.get(at) else {
+            return decoded;
+        };
+        at += 1;
+        if (0x80..=0x8f).contains(&second) {
+            decoded.length = (at + 4).min(bytes.len().max(1));
+            return decoded;
+        }
+        if matches!(
+            second,
+            0x05 | 0x06 | 0x08 | 0x09 | 0x0b | 0x30 | 0x31 | 0x32 | 0x37 | 0x77 | 0xa2
+        ) {
+            decoded.length = at;
+            return decoded;
+        }
+        // Nearly every other two-byte opcode carries a ModRM byte;
+        // its memory operand is real even when the destination is a
+        // vector register, so decode it generically and only assign
+        // a general-register write for the known GPR forms.
+        let Some(ParsedModRm {
+            reg,
+            memory,
+            register: rm,
+            mode,
+            end,
+            ..
+        }) = parse_modrm(bytes, at, rex)
+        else {
+            return decoded;
+        };
+        decoded.memory = memory;
+        decoded.register_write = if matches!(second, 0xb6 | 0xb7 | 0xbe | 0xbf | 0xaf) {
+            Some(reg)
+        } else if (0x90..=0x97).contains(&second) && mode == 3 {
+            rm
+        } else {
+            None
+        };
+        decoded.length = end + usize::from(second == 0xc2);
+        return decoded;
+    }
+    const MODRM_OPCODES: &[u8] = &[
+        0x00, 0x01, 0x02, 0x03, 0x08, 0x09, 0x0a, 0x0b, 0x10, 0x11, 0x12, 0x13, 0x18, 0x19, 0x1a,
+        0x1b, 0x20, 0x21, 0x22, 0x23, 0x28, 0x29, 0x2a, 0x2b, 0x30, 0x31, 0x32, 0x33, 0x38, 0x39,
+        0x3a, 0x3b, 0x63, 0x69, 0x6b, 0x80, 0x81, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8a,
+        0x8b, 0x8d, 0xc0, 0xc1, 0xc6, 0xc7, 0xd0, 0xd1, 0xd2, 0xd3, 0xf6, 0xf7, 0xfe, 0xff,
+    ];
+    if MODRM_OPCODES.contains(&opcode) {
+        let Some(ParsedModRm {
+            raw_reg,
+            reg,
+            memory,
+            register: rm,
+            mode,
+            end,
+        }) = parse_modrm(bytes, at, rex)
+        else {
+            return decoded;
+        };
+        decoded.memory = memory;
+        let immediate = match opcode {
+            0x80 | 0x83 | 0xc0 | 0xc1 | 0xc6 | 0x6b => 1,
+            0x81 | 0xc7 | 0x69 => 4,
+            0xf6 => usize::from(matches!(raw_reg, 0 | 1)),
+            0xf7 => {
+                if matches!(raw_reg, 0 | 1) {
+                    4
+                } else {
+                    0
+                }
+            }
+            _ => 0,
+        };
+        decoded.length = end + immediate;
+        if mode == 3 && opcode == 0x89 {
+            decoded.copy = Some((reg, rm.unwrap_or_default()));
+        } else if mode == 3 && opcode == 0x8b {
+            decoded.copy = Some((rm.unwrap_or_default(), reg));
+        } else if mode == 3 && matches!(opcode, 0x86 | 0x87) {
+            decoded.exchange = Some((reg, rm.unwrap_or_default()));
+        }
+        decoded.lea = opcode == 0x8d;
+        decoded.register_write = match opcode {
+            0x88 | 0x89 | 0xc6 | 0xc7 => {
+                if mode == 3 {
+                    rm
+                } else {
+                    None
+                }
+            }
+            0x8a | 0x8b | 0x8d | 0x63 | 0x69 | 0x6b => Some(reg),
+            0x01 | 0x09 | 0x11 | 0x19 | 0x21 | 0x29 | 0x31 | 0xc0 | 0xc1 | 0xd0 | 0xd1 | 0xd2
+            | 0xd3 | 0xfe => {
+                if mode == 3 {
+                    rm
+                } else {
+                    None
+                }
+            }
+            0x03 | 0x0b | 0x13 | 0x1b | 0x23 | 0x2b | 0x33 => Some(reg),
+            0xf6 | 0xf7 => {
+                if matches!(raw_reg, 0 | 1) || mode != 3 {
+                    None
+                } else {
+                    rm
+                }
+            }
+            0xff => match raw_reg {
+                0 | 1 => {
+                    if mode == 3 {
+                        rm
+                    } else {
+                        None
+                    }
+                }
+                2 | 4 => {
+                    decoded.call = raw_reg == 2;
+                    None
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        return decoded;
+    }
+    match opcode {
+        0x58..=0x5f => {
+            decoded.register_write = Some(u64::from(opcode - 0x58) | rex_b);
+            decoded.length = at;
+        }
+        0x91..=0x97 => {
+            decoded.exchange = Some((0, u64::from(opcode - 0x90) | rex_b));
+            decoded.length = at;
+        }
+        0xb0..=0xb7 => {
+            decoded.register_write = Some(u64::from(opcode - 0xb0) | rex_b);
+            decoded.length = at + 1;
+        }
+        0xb8..=0xbf => {
+            decoded.register_write = Some(u64::from(opcode - 0xb8) | rex_b);
+            decoded.length = at + if rex & 8 == 8 { 8 } else { 4 };
+        }
+        0xc2 => {
+            decoded.ret = true;
+            decoded.length = at + 2;
+        }
+        0xc3 => {
+            decoded.ret = true;
+            decoded.length = at;
+        }
+        0xe8 => {
+            decoded.call = true;
+            decoded.length = at + 4;
+        }
+        0x70..=0x7f | 0xeb => {
+            decoded.length = at + 1;
+        }
+        0xe9 => {
+            decoded.length = at + 4;
+        }
+        0x98 => {
+            decoded.register_write = Some(0);
+            decoded.length = at;
+        }
+        0x99 => {
+            decoded.register_write = Some(2);
+            decoded.length = at;
+        }
+        _ => {
+            decoded.length = at;
+        }
+    }
+    decoded
+}
+
+// The displacement of an absolute fs-segment memory operand
+// (fs:[disp32] in its SIB and non-SIB encodings, any operand size,
+// REX or not), decoded from the actual prefix/ModRM/SIB layout.
+fn fs_absolute_displacement(bytes: &[u8]) -> Option<i64> {
+    let mut at = 0_usize;
+    let mut segment_fs = false;
+    let mut rex = 0_u8;
+    while let Some(&prefix) = bytes.get(at) {
+        match prefix {
+            0x64 => {
+                segment_fs = true;
+                at += 1;
+            }
+            0x26 | 0x2e | 0x36 | 0x3e | 0x65 | 0x66 | 0x67 | 0xf0 | 0xf2 | 0xf3 => {
+                at += 1;
+            }
+            0x40..=0x4f => {
+                rex = prefix;
+                at += 1;
+                break;
+            }
+            _ => break,
+        }
+    }
+    if !segment_fs {
+        return None;
+    }
+    let mut opcode = *bytes.get(at)?;
+    at += 1;
+    if opcode == 0x0f {
+        opcode = *bytes.get(at)?;
+        at += 1;
+        if !matches!(opcode, 0xb6 | 0xb7 | 0xbe | 0xbf) {
+            return None;
+        }
+    } else if !matches!(opcode, 0x80 | 0x88 | 0x89 | 0x8a | 0x8b | 0x39 | 0x3b) {
+        return None;
+    }
+    let memory = parse_modrm(bytes, at, rex)?.memory?;
+    (memory.base.is_none() && memory.index.is_none()).then_some(memory.displacement)
+}
+
+// Function-scope register taint tracking for TLS base values. A
+// base enters a register from the authenticated __tls_get_addr call
+// for this module's descriptor, or from an fs:[0] base load. It then
+// propagates through register copies, lea reg,[base+0] and xchg;
+// any other write to a register clears it, an intervening call
+// clears the caller-saved registers (callee-saved registers keep
+// it), and instructions that write nothing clear nothing. Within a
+// function the scan runs in address order and never restores an
+// earlier state at a branch target, which is the union over joins.
+// Any memory operand whose base or index register is tainted and
+// whose displacement lands inside a cell is refused, wherever in
+// the function it occurs.
+fn refuse_tainted_tls_access(
     elf: &Elf<'_>,
     bytes: &[u8],
     getters: &[UnisolatedTlsGetter],
@@ -18377,6 +18715,217 @@ fn refuse_unauthenticated_tls_access(
 ) -> Result<()> {
     let module_slot = getters[0].module_slot;
     let plt_address = getters[0].plt_address;
+    let in_accessor = |address: u64| {
+        getters
+            .iter()
+            .any(|getter| (getter.getter.address..getter.getter.address + 22).contains(&address))
+    };
+    let cell_of = |imm: u64| {
+        cells
+            .iter()
+            .find(|(_, offset, size)| (*offset..offset + size).contains(&imm))
+    };
+    // Function ranges inside each executable segment, as offsets
+    // into that segment's file bytes.
+    let mut segments = Vec::new();
+    for segment in &elf.program_headers {
+        if segment.p_type != program_header::PT_LOAD || segment.p_flags & program_header::PF_X == 0
+        {
+            continue;
+        }
+        let at = loader_meta_usize(segment.p_offset)?;
+        let length = loader_meta_usize(segment.p_filesz)?;
+        let code = loader_meta_slice(bytes, at, length)?;
+        let mut functions: Vec<(usize, usize)> = elf
+            .syms
+            .iter()
+            .filter(|symbol| {
+                symbol.st_type() == sym::STT_FUNC
+                    && symbol.st_size > 0
+                    && symbol.st_value >= segment.p_vaddr
+                    && symbol.st_value + symbol.st_size <= segment.p_vaddr + segment.p_filesz
+            })
+            .map(|symbol| {
+                (
+                    (symbol.st_value - segment.p_vaddr) as usize,
+                    ((symbol.st_value + symbol.st_size - segment.p_vaddr) as usize),
+                )
+            })
+            .collect();
+        functions.sort_unstable();
+        functions.dedup();
+        segments.push((segment.p_vaddr, code, functions));
+    }
+    struct Source {
+        segment: usize,
+        anchor: usize,
+        after: usize,
+        register: u64,
+        scope: (usize, usize),
+    }
+    let mut sources = Vec::new();
+    for (segment_index, (vaddr, code, functions)) in segments.iter().enumerate() {
+        let scope_of = |anchor: usize| {
+            if let Some(&(start, end)) = functions
+                .iter()
+                .find(|&&(start, end)| (start..end).contains(&anchor))
+            {
+                (start, end)
+            } else {
+                let start = functions
+                    .iter()
+                    .filter(|&&(_, end)| end <= anchor)
+                    .map(|&(_, end)| end)
+                    .max()
+                    .unwrap_or(0);
+                let end = functions
+                    .iter()
+                    .filter(|&&(start, _)| start > anchor)
+                    .map(|&(start, _)| start)
+                    .min()
+                    .unwrap_or(code.len());
+                (start, end)
+            }
+        };
+        for start in 0..code.len() {
+            let rest = &code[start..];
+            let address = vaddr + start as u64;
+            if in_accessor(address) {
+                continue;
+            }
+            // __tls_get_addr result for this module's descriptor.
+            if rest.len() >= 12
+                && rest[..3] == [0x48, 0x8d, 0x3d]
+                && rest[7] == 0xe8
+                && fixed_rip_target(address, rest, 3, 7).ok() == Some(module_slot)
+                && fixed_rip_target(address + 7, &rest[7..], 1, 5).ok() == Some(plt_address)
+            {
+                sources.push(Source {
+                    segment: segment_index,
+                    anchor: start,
+                    after: start + 12,
+                    register: 0,
+                    scope: scope_of(start),
+                });
+                continue;
+            }
+            // fs:[0] base load, in REX and non-REX encodings.
+            if rest.first() == Some(&0x64) {
+                let rex_len = usize::from(rest.get(1).is_some_and(|b| (0x40..=0x4f).contains(b)));
+                let rex = if rex_len == 1 { rest[1] } else { 0 };
+                let opcode_at = 1 + rex_len;
+                if rest.get(opcode_at) == Some(&0x8b) {
+                    if let Some(ParsedModRm {
+                        reg,
+                        memory: Some(memory),
+                        end,
+                        ..
+                    }) = parse_modrm(rest, opcode_at + 1, rex)
+                    {
+                        if memory.base.is_none()
+                            && memory.index.is_none()
+                            && memory.displacement == 0
+                        {
+                            sources.push(Source {
+                                segment: segment_index,
+                                anchor: start,
+                                after: start + end,
+                                register: reg,
+                                scope: scope_of(start),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    sources.sort_by_key(|source| (source.segment, source.scope, source.anchor));
+    let mut group_start = 0_usize;
+    while group_start < sources.len() {
+        let mut group_end = group_start + 1;
+        while group_end < sources.len()
+            && sources[group_end].segment == sources[group_start].segment
+            && sources[group_end].scope == sources[group_start].scope
+        {
+            group_end += 1;
+        }
+        let group = &sources[group_start..group_end];
+        let (vaddr, code, _) = &segments[group[0].segment];
+        let scope_end = group[0].scope.1.min(code.len());
+        let mut tainted = [false; 16];
+        let mut next = 0_usize;
+        let mut pos = group[0].anchor;
+        while pos < scope_end {
+            while next < group.len() && group[next].anchor <= pos {
+                let source = &group[next];
+                tainted[source.register as usize] = true;
+                if pos < source.after {
+                    pos = source.after;
+                }
+                next += 1;
+            }
+            if pos >= scope_end {
+                break;
+            }
+            let decoded = decode_instruction(&code[pos..]);
+            let address = vaddr + pos as u64;
+            if let Some(memory) = decoded.memory {
+                let base_tainted = memory.base.is_some_and(|base| tainted[base as usize]);
+                let index_tainted = memory.index.is_some_and(|index| tainted[index as usize]);
+                if (base_tainted || index_tainted) && memory.displacement >= 0 {
+                    if let Some((cell, _, _)) = cell_of(memory.displacement as u64) {
+                        if !in_accessor(address) {
+                            return Err(format!(
+                                "TLS cell {cell} is accessed by a tainted-base operand at {address:#x} outside its authenticated accessor in no-scope image"
+                            ));
+                        }
+                    }
+                }
+            }
+            if decoded.ret {
+                break;
+            }
+            if decoded.call {
+                for register in [0_u64, 1, 2, 6, 7, 8, 9, 10, 11] {
+                    tainted[register as usize] = false;
+                }
+            } else if let Some((left, right)) = decoded.exchange {
+                tainted.swap(left as usize, right as usize);
+            } else if let Some((from, to)) = decoded.copy {
+                tainted[to as usize] = tainted[from as usize];
+            } else if decoded.lea {
+                let propagates = decoded.memory.is_some_and(|memory| {
+                    memory.displacement == 0
+                        && memory.index.is_none()
+                        && memory.base.is_some_and(|base| tainted[base as usize])
+                });
+                if let Some(written) = decoded.register_write {
+                    tainted[written as usize] = propagates;
+                }
+            } else if let Some(written) = decoded.register_write {
+                tainted[written as usize] = false;
+            }
+            pos += decoded.length.max(1);
+        }
+        group_start = group_end;
+    }
+    Ok(())
+}
+
+/// Defense in depth for the four authenticated TLS cells: refuse,
+/// naming the site and the cell, any access to a cell that does not
+/// occur inside one of its authenticated accessors. Absolute
+/// fs:[disp32] operands are decoded at every executable byte start,
+/// and base-relative accesses are caught by the function-scope
+/// register taint tracking in refuse_tainted_tls_access. Every
+/// legitimate read and write funnels through an accessor, so any
+/// other hit is a missed access site and refusal is correct.
+fn refuse_unauthenticated_tls_access(
+    elf: &Elf<'_>,
+    bytes: &[u8],
+    getters: &[UnisolatedTlsGetter],
+    cells: &[(&str, u64, u64)],
+) -> Result<()> {
     let in_accessor = |address: u64| {
         getters
             .iter()
@@ -18401,111 +18950,22 @@ fn refuse_unauthenticated_tls_access(
                 .checked_add(start as u64)
                 .ok_or("unauthenticated TLS access address overflows")?;
             let rest = &code[start..];
-            // Module-base form: lea descriptor; call __tls_get_addr;
-            // then the [base + imm] access as the very next
-            // instruction (optionally after a test rax,rax and a
-            // short branch). Anything later has lost the base.
-            if rest.len() >= 12
-                && rest[..3] == [0x48, 0x8d, 0x3d]
-                && rest[7] == 0xe8
-                && fixed_rip_target(address, rest, 3, 7).ok() == Some(module_slot)
-                && fixed_rip_target(address + 7, &rest[7..], 1, 5).ok() == Some(plt_address)
-                && !in_accessor(address)
-            {
-                for at in [12_usize, 15, 17] {
-                    let Some(ins) = rest.get(at..) else { break };
-                    let imm = if ins.len() >= 7
-                        && matches!(ins[0], 0x48 | 0x49 | 0x4c | 0x4d)
-                        && (matches!(ins[1], 0x8b | 0x8d | 0x03 | 0x2b | 0x3b)
-                            && ins[2] & 0xc7 == 0x80
-                            || ins[1] == 0x80 && ins[2] & 0xfe == 0xb8)
-                    {
-                        Some(u64::from(u32::from_le_bytes(ins[3..7].try_into().unwrap())))
-                    } else if ins.len() >= 4
-                        && matches!(ins[0], 0x48 | 0x49 | 0x4c | 0x4d)
-                        && (matches!(ins[1], 0x8b | 0x8d | 0x03 | 0x2b | 0x3b)
-                            && ins[2] & 0xc7 == 0x40
-                            || ins[1] == 0x80 && ins[2] & 0xfe == 0x78)
-                    {
-                        Some(u64::from(ins[3]))
-                    } else if ins.len() >= 3
-                        && matches!(ins[0], 0x48 | 0x49 | 0x4c | 0x4d)
-                        && matches!(ins[1], 0x8b | 0x8d)
-                        && ins[2] == 0x00
-                    {
-                        Some(0)
-                    } else {
-                        None
-                    };
-                    if let Some(imm) = imm {
-                        if let Some((cell, _, _)) = cell_of(imm) {
+            // Absolute fs-segment forms landing inside a cell,
+            // decoded from the actual prefix/ModRM/SIB layout.
+            if let Some(imm) = fs_absolute_displacement(rest) {
+                if imm >= 0 {
+                    if let Some((cell, _, _)) = cell_of(imm as u64) {
+                        if !in_accessor(address) {
                             return Err(format!(
-                                "TLS cell {cell} is accessed by a module-base operand at {address:#x} outside its authenticated accessor in no-scope image"
+                                "TLS cell {cell} is accessed by an fs-segment operand at {address:#x} outside its authenticated accessor in no-scope image"
                             ));
                         }
                     }
                 }
             }
-            // fs-segment forms landing inside a cell.
-            let fs_imm = if rest.len() >= 9
-                && rest[0] == 0x64
-                && (matches!(rest[1], 0x88..=0x8b) && rest[2] == 0x04 && rest[3] == 0x25
-                    || matches!(rest[1], 0x48 | 0x4c)
-                        && matches!(rest[2], 0x88..=0x8b)
-                        && rest[3] == 0x04
-                        && rest[4] == 0x25)
-            {
-                let imm_at = if rest[1] == 0x64 { 4 } else { 5 };
-                (rest.len() > imm_at + 4)
-                    .then(|| u32::from_le_bytes(rest[imm_at..imm_at + 4].try_into().unwrap()))
-            } else if rest.len() >= 10
-                && rest[0] == 0x64
-                && rest[1] == 0x80
-                && rest[2] == 0x3c
-                && rest[3] == 0x25
-            {
-                Some(u32::from_le_bytes(rest[4..8].try_into().unwrap()))
-            } else {
-                None
-            };
-            if let Some(imm) = fs_imm {
-                if let Some((cell, _, _)) = cell_of(u64::from(imm)) {
-                    if !in_accessor(address) {
-                        return Err(format!(
-                            "TLS cell {cell} is accessed by an fs-segment operand at {address:#x} outside its authenticated accessor in no-scope image"
-                        ));
-                    }
-                }
-            }
-            if rest.len() >= 9
-                && rest[0] == 0x64
-                && matches!(rest[1], 0x48 | 0x4c)
-                && rest[2] == 0x8b
-                && matches!(rest[3], 0x04 | 0x0c | 0x14 | 0x1c | 0x2c | 0x34 | 0x3c)
-                && rest[4..9] == [0x25, 0, 0, 0, 0]
-                && !in_accessor(address)
-            {
-                let base = ((rest[3] >> 3) & 7) | ((rest[1] & 1) << 3);
-                for at in 9..rest.len().min(41) {
-                    let ins = &rest[at..];
-                    if ins.len() < 7
-                        || !matches!(ins[0], 0x48 | 0x49 | 0x4c | 0x4d)
-                        || !matches!(ins[1], 0x8d | 0x8b)
-                        || ins[2] & 0xc7 != 0x80 | base
-                    {
-                        continue;
-                    }
-                    let imm = u32::from_le_bytes(ins[3..7].try_into().unwrap());
-                    if let Some((cell, _, _)) = cell_of(u64::from(imm)) {
-                        return Err(format!(
-                            "TLS cell {cell} is accessed by an fs-segment operand at {address:#x} outside its authenticated accessor in no-scope image"
-                        ));
-                    }
-                }
-            }
         }
     }
-    Ok(())
+    refuse_tainted_tls_access(elf, bytes, getters, cells)
 }
 
 fn no_installation_scope_census(
@@ -47303,6 +47763,56 @@ mod tests {
                 .len(),
             4
         );
+        // Register-copied, clobber-surviving and position-shifted
+        // module-base accesses refuse as well: the base value, not
+        // the rax register or one fixed offset, is what is tracked.
+        let mut shifted_witness = base.clone();
+        let shifted_at = 0x1640_usize;
+        let mut shifted = fixed_hex("488d3d00000000e800000000909090488b800000000059c3");
+        rip(&mut shifted, shifted_at as u64, 3, 7, 0x3300);
+        rip(&mut shifted, shifted_at as u64, 8, 12, 0x1810);
+        shifted[18..22].copy_from_slice(&(fixture_offsets[1] as u32).to_le_bytes());
+        shifted_witness[shifted_at..shifted_at + shifted.len()].copy_from_slice(&shifted);
+        assert!(
+            census(&shifted_witness).is_err(),
+            "nop-delayed module-base access to a cell must refuse"
+        );
+        let mut copy_witness = base.clone();
+        let copy_at = 0x1660_usize;
+        let mut copied = fixed_hex("488d3d00000000e8000000004889c34889d9488b880000000059c3");
+        rip(&mut copied, copy_at as u64, 3, 7, 0x3300);
+        rip(&mut copied, copy_at as u64, 8, 12, 0x1810);
+        copied[21..25].copy_from_slice(&(fixture_offsets[1] as u32).to_le_bytes());
+        copy_witness[copy_at..copy_at + copied.len()].copy_from_slice(&copied);
+        assert!(
+            census(&copy_witness).is_err(),
+            "register-copied module-base access to a cell must refuse"
+        );
+        let mut copy_unrelated = copy_witness.clone();
+        copy_unrelated[copy_at + 21..copy_at + 25].copy_from_slice(&0x777_u32.to_le_bytes());
+        assert_eq!(
+            census(&copy_unrelated)
+                .expect("unrelated register-copied offset census positive")
+                .other_tls_getters
+                .len(),
+            4
+        );
+        // The retained-base form from real codegen: the base is
+        // copied to a callee-saved register, rax is then overwritten
+        // by an unrelated load, and the cell is read through the
+        // retained register.
+        let mut retained_witness = base.clone();
+        let retained_at = 0x1690_usize;
+        let mut retained =
+            fixed_hex("488d3d00000000e8000000004989c68b8077070000498b960000000059c3");
+        rip(&mut retained, retained_at as u64, 3, 7, 0x3300);
+        rip(&mut retained, retained_at as u64, 8, 12, 0x1810);
+        retained[24..28].copy_from_slice(&(fixture_offsets[1] as u32).to_le_bytes());
+        retained_witness[retained_at..retained_at + retained.len()].copy_from_slice(&retained);
+        assert!(
+            census(&retained_witness).is_err(),
+            "retained-base access after a rax clobber must refuse"
+        );
         // An fs-segment access to a cell outside every accessor
         // refuses; at an unrelated offset it is accepted.
         let mut fs_witness = base.clone();
@@ -47323,6 +47833,59 @@ mod tests {
                 .len(),
             4
         );
+        // The non-REX byte-load fs form carries its displacement one
+        // byte earlier than the REX form; both must refuse.
+        let mut fs_byte_witness = base.clone();
+        let fs_byte_at = 0x17a8_usize;
+        let mut fs_byte = fixed_hex("648804250000000059c3");
+        fs_byte[4..8].copy_from_slice(&(fixture_offsets[1] as u32).to_le_bytes());
+        fs_byte_witness[fs_byte_at..fs_byte_at + fs_byte.len()].copy_from_slice(&fs_byte);
+        assert!(
+            census(&fs_byte_witness).is_err(),
+            "non-REX fs-segment access to a cell must refuse"
+        );
+        // An fs base copied to another register, or used after a
+        // delay, still names the same base value.
+        let mut fs_copy_witness = base.clone();
+        let fs_copy_at = 0x17c0_usize;
+        let mut fs_copied = fixed_hex("64488b0425000000004889c3488d830000000059c3");
+        fs_copied[15..19].copy_from_slice(&(fixture_offsets[1] as u32).to_le_bytes());
+        fs_copy_witness[fs_copy_at..fs_copy_at + fs_copied.len()].copy_from_slice(&fs_copied);
+        assert!(
+            census(&fs_copy_witness).is_err(),
+            "register-copied fs-base access to a cell must refuse"
+        );
+        let mut fs_shifted_witness = base.clone();
+        let fs_shifted_at = 0x17e0_usize;
+        let mut fs_shifted = fixed_hex("64488b0425000000009090488d800000000059c3");
+        fs_shifted[14..18].copy_from_slice(&(fixture_offsets[1] as u32).to_le_bytes());
+        fs_shifted_witness[fs_shifted_at..fs_shifted_at + fs_shifted.len()]
+            .copy_from_slice(&fs_shifted);
+        assert!(
+            census(&fs_shifted_witness).is_err(),
+            "nop-delayed fs-base access to a cell must refuse"
+        );
+        // Absolute fs forms across operand sizes, REX use and SIB
+        // use all decode their displacement from the same layout.
+        for (name, form, disp_at) in [
+            ("byte load non-REX SIB", "648a042500000000", 4_usize),
+            ("byte store REX SIB", "644988042500000000", 5),
+            ("word load REX SIB", "64480fb7042500000000", 6),
+            ("dword load non-REX no SIB", "648b0500000000", 3),
+            ("qword load REX no SIB", "64488b0500000000", 4),
+            ("dword cmp non-REX SIB", "64803c250000000000", 4),
+        ] {
+            let mut form_witness = base.clone();
+            let form_at = 0x17a8_usize;
+            let mut access = fixed_hex(form);
+            access[disp_at..disp_at + 4]
+                .copy_from_slice(&(fixture_offsets[1] as u32).to_le_bytes());
+            form_witness[form_at..form_at + access.len()].copy_from_slice(&access);
+            assert!(
+                census(&form_witness).is_err(),
+                "absolute fs form {name} access to a cell must refuse"
+            );
+        }
         assert_eq!(good.loader_writer_count, 2);
         assert!(good.other_getter_pointer_slots.is_empty());
         assert_eq!(good.mappings.len(), 1);
