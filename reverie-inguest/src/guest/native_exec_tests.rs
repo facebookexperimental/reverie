@@ -1016,9 +1016,9 @@ fn refused_first_empty_path_consumes_the_single_attempt() {
 fn admission_after_dispatch_is_refused() {
     // Pins the states-nonempty guard: once a dispatch created Tool
     // state, admission follows dispatch and must fail. The sibling
-    // try_lock WouldBlock guard needs a concurrently held state lock
-    // and stays explicitly deferred (identical guard to driver
-    // installation, same lock and errors).
+    // dispatch-active WouldBlock guard (install gate held, an active
+    // dispatch elsewhere) stays explicitly deferred (identical guard
+    // to driver installation, same gate and errors).
     isolated(
         || {
             let _native = crate::guest::exec_private::native_exec_mock_callback();
