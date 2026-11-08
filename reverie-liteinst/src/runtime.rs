@@ -281,7 +281,7 @@ struct SiteHookPolicy {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[cfg(any(test, feature = "liteinst"))]
+#[cfg(any(feature = "liteinst", all(test, feature = "exec-private-init")))]
 struct RuntimeMap {
     start: u64,
     end: u64,
@@ -308,17 +308,33 @@ struct SiteSlot {
     straddle_prefix: AtomicU8,
     /// Set, and never cleared, once this runtime first changes the site's
     /// protection to publish a patch there.
-    #[cfg(any(test, feature = "liteinst", feature = "native-exec-state"))]
+    #[cfg(any(
+        feature = "liteinst",
+        feature = "native-exec-state",
+        all(test, feature = "exec-private-init")
+    ))]
     publication_attempted: AtomicBool,
     /// The eight bytes at the site before, and after, the latest completed
     /// publication; valid only while `words_recorded` is set. Cleared when a
     /// new attempt starts, which happens only after the earlier patch was
     /// proved gone (see [`earlier_patch_survives`]).
-    #[cfg(any(test, feature = "liteinst", feature = "native-exec-state"))]
+    #[cfg(any(
+        feature = "liteinst",
+        feature = "native-exec-state",
+        all(test, feature = "exec-private-init")
+    ))]
     original_word: AtomicU64,
-    #[cfg(any(test, feature = "liteinst", feature = "native-exec-state"))]
+    #[cfg(any(
+        feature = "liteinst",
+        feature = "native-exec-state",
+        all(test, feature = "exec-private-init")
+    ))]
     published_word: AtomicU64,
-    #[cfg(any(test, feature = "liteinst", feature = "native-exec-state"))]
+    #[cfg(any(
+        feature = "liteinst",
+        feature = "native-exec-state",
+        all(test, feature = "exec-private-init")
+    ))]
     words_recorded: AtomicBool,
 }
 
@@ -336,24 +352,50 @@ impl SiteSlot {
             hook_count: AtomicU64::new(0),
             instruction_len: AtomicU8::new(0),
             straddle_prefix: AtomicU8::new(0),
-            #[cfg(any(test, feature = "liteinst", feature = "native-exec-state"))]
+            #[cfg(any(
+                feature = "liteinst",
+                feature = "native-exec-state",
+                all(test, feature = "exec-private-init")
+            ))]
             publication_attempted: AtomicBool::new(false),
-            #[cfg(any(test, feature = "liteinst", feature = "native-exec-state"))]
+            #[cfg(any(
+                feature = "liteinst",
+                feature = "native-exec-state",
+                all(test, feature = "exec-private-init")
+            ))]
             original_word: AtomicU64::new(0),
-            #[cfg(any(test, feature = "liteinst", feature = "native-exec-state"))]
+            #[cfg(any(
+                feature = "liteinst",
+                feature = "native-exec-state",
+                all(test, feature = "exec-private-init")
+            ))]
             published_word: AtomicU64::new(0),
-            #[cfg(any(test, feature = "liteinst", feature = "native-exec-state"))]
+            #[cfg(any(
+                feature = "liteinst",
+                feature = "native-exec-state",
+                all(test, feature = "exec-private-init")
+            ))]
             words_recorded: AtomicBool::new(false),
         }
     }
 
-    #[cfg(all(feature = "liteinst", any(test, feature = "native-exec-state")))]
+    // Callers: `native_exec_site_cut` (native-exec-state) and a unit test
+    // gated on exec-private-init, which native-exec-state implies.
+    #[cfg(all(
+        feature = "liteinst",
+        feature = "exec-private-init",
+        any(test, feature = "native-exec-state")
+    ))]
     fn has_installed_hook_or_adapter(&self) -> bool {
         !self.hook.load(Ordering::Acquire).is_null()
             || !self.adapter.load(Ordering::Acquire).is_null()
     }
 
-    #[cfg(all(not(feature = "liteinst"), any(test, feature = "native-exec-state")))]
+    #[cfg(all(
+        not(feature = "liteinst"),
+        feature = "exec-private-init",
+        any(test, feature = "native-exec-state")
+    ))]
     fn has_installed_hook_or_adapter(&self) -> bool {
         // Without site patching there are no hook/adapter slots to install.
         false
@@ -1230,14 +1272,14 @@ fn compatibility_event_channel() -> io::Result<Option<CompatibilityEventChannel>
     }))
 }
 
-#[cfg(any(test, feature = "liteinst"))]
+#[cfg(any(feature = "liteinst", all(test, feature = "exec-private-init")))]
 fn read_runtime_maps() -> io::Result<Vec<RuntimeMap>> {
     Ok(parse_runtime_maps(&std::fs::read_to_string(
         "/proc/self/maps",
     )?))
 }
 
-#[cfg(any(test, feature = "liteinst"))]
+#[cfg(any(feature = "liteinst", all(test, feature = "exec-private-init")))]
 fn parse_runtime_maps(maps: &str) -> Vec<RuntimeMap> {
     maps.lines()
         .filter_map(|line| {
