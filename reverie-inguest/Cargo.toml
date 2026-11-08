@@ -87,6 +87,7 @@ reverie-loader = { version = "0.5.4", path = "../reverie-loader" }
 tokio = { version = "1.54.1", features = ["test-util"] }
 tracing-subscriber = "0.3.23"
 iced-x86 = { version = "1.21.0", default-features = false, features = ["std", "decoder"] }
+object = { version = "0.40.0", default-features = false, features = ["std", "read", "elf"] }
 
 [[bin]]
 name = "reverie-inguest-probe"
