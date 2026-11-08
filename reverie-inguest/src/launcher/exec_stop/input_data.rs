@@ -1,6 +1,8 @@
 //! Host-side copied input data. This does not construct an execution-eligible
-//! handoff: complete source-qualified code/site/binding records and the actual
-//! admitted HLIINIT1 packet still have no combined producer here.
+//! handoff: complete source-qualified code/site/binding records and a
+//! combined producer that computes the expected configuration digest and
+//! stamps an HLISUC01 packet into an admitted handoff still do not exist
+//! here; [`build_init_packet`] only encodes caller-supplied values.
 
 use reverie_loader::artifact::RUNTIME_WINDOW;
 use reverie_loader::artifact::TOOL_REGION;
@@ -440,6 +442,88 @@ fn build_data(
         tls,
         maps,
         target,
+    })
+}
+
+/// Host-validated contents of one HLISUC01 successor-init packet
+/// (the schema in `reverie_loader::init_packet`).
+/// Validation is syntactic plus one digest equality; it is not
+/// admission, which stays with the coordinator-side one-use
+/// InitialImage redemption against the watched birth. The fields
+/// are private so only [`validate_init_packet`] can mint one.
+pub struct ValidatedInitPacket {
+    state_expected: bool,
+    redemption: Vec<u8>,
+}
+
+impl ValidatedInitPacket {
+    /// Whether this birth is a successor expecting a predecessor
+    /// state deposit. Absence means an explicitly typed first
+    /// image, never an inference from a missing deposit later.
+    pub fn state_expected(&self) -> bool {
+        self.state_expected
+    }
+
+    /// Exact bounded redemption bytes to present for InitialImage
+    /// redemption, verbatim from the packet.
+    pub fn redemption(&self) -> &[u8] {
+        &self.redemption
+    }
+}
+
+fn init_packet_error(error: reverie_loader::init_packet::Error) -> Box<dyn std::error::Error> {
+    use reverie_loader::init_packet::Error;
+    match error {
+        Error::Format => "init_packet_format".into(),
+        Error::Version => "init_packet_version".into(),
+        Error::Reserved => "init_packet_reserved".into(),
+        Error::Flags => "init_packet_flags".into(),
+        Error::Bounds => "init_packet_bounds".into(),
+    }
+}
+
+/// Build one exact HLISUC01 packet. The
+/// caller computes `expected_config_digest` with
+/// `reverie_rpc_transport::initial_image::config_digest` over the
+/// final, canonical configuration bytes; this helper never hashes
+/// and never supplies a digest of its own.
+pub fn build_init_packet(
+    state_expected: bool,
+    expected_config_digest: &[u8; 32],
+    redemption: &[u8],
+) -> Result<Vec<u8>> {
+    let flags = if state_expected {
+        reverie_loader::init_packet::FLAG_STATE_EXPECTED
+    } else {
+        0
+    };
+    let mut buffer = [0u8; reverie_loader::init_packet::MAX_PACKET_LEN];
+    let written = reverie_loader::init_packet::encode_into(
+        &mut buffer,
+        flags,
+        expected_config_digest,
+        redemption,
+    )
+    .map_err(init_packet_error)?;
+    Ok(buffer[..written].to_vec())
+}
+
+/// Host-validate one HLISUC01 packet against the independently
+/// expected configuration digest (same computation contract as
+/// [`build_init_packet`]). A packet whose embedded digest differs
+/// is refused as `init_packet_config_digest_mismatch` before any
+/// preparation step may consume it.
+pub fn validate_init_packet(
+    packet: &[u8],
+    expected_config_digest: &[u8; 32],
+) -> Result<ValidatedInitPacket> {
+    let decoded = reverie_loader::init_packet::decode(packet).map_err(init_packet_error)?;
+    if decoded.expected_config_digest() != *expected_config_digest {
+        return Err("init_packet_config_digest_mismatch".into());
+    }
+    Ok(ValidatedInitPacket {
+        state_expected: decoded.state_expected(),
+        redemption: decoded.redemption().to_vec(),
     })
 }
 

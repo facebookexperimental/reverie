@@ -379,3 +379,93 @@ fn genuine_captured_stop_uses_the_host_bridge_and_remains_unchanged_until_cancel
     assert!(other.cancel().unwrap().confirmed);
     assert!(stop.cancel().unwrap().confirmed);
 }
+
+#[test]
+fn init_packet_build_validate_round_trip() {
+    let digest = [0x11u8; 32];
+    let packet = build_init_packet(true, &digest, b"birth-nonce").unwrap();
+    // The packet bytes are exactly the loader codec's bytes.
+    let decoded = reverie_loader::init_packet::decode(&packet).unwrap();
+    assert!(decoded.state_expected());
+    let validated = validate_init_packet(&packet, &digest).unwrap();
+    assert!(validated.state_expected());
+    assert_eq!(validated.redemption(), b"birth-nonce");
+
+    let packet = build_init_packet(false, &digest, b"first-image").unwrap();
+    let validated = validate_init_packet(&packet, &digest).unwrap();
+    assert!(!validated.state_expected());
+}
+
+#[test]
+fn init_packet_digest_mismatch_is_named_refusal() {
+    let packet = build_init_packet(true, &[0x11u8; 32], b"nonce").unwrap();
+    let error = validate_init_packet(&packet, &[0x22u8; 32])
+        .err()
+        .unwrap()
+        .to_string();
+    assert_eq!(error, "init_packet_config_digest_mismatch");
+
+    // A mismatch in any single digest byte must still refuse:
+    // the comparison covers all 32 bytes, including byte 0 and
+    // byte 31, either of which a shortened compare could skip.
+    for i in 0..32 {
+        let mut one_byte_off = [0x11u8; 32];
+        one_byte_off[i] ^= 1;
+        let error = validate_init_packet(&packet, &one_byte_off)
+            .err()
+            .unwrap()
+            .to_string();
+        assert_eq!(error, "init_packet_config_digest_mismatch", "byte {i}");
+    }
+}
+
+#[test]
+fn init_packet_each_error_variant_is_a_named_refusal() {
+    let digest = [0x11u8; 32];
+    let valid = build_init_packet(true, &digest, b"nonce").unwrap();
+    let named = |packet: &[u8]| {
+        validate_init_packet(packet, &digest)
+            .err()
+            .unwrap()
+            .to_string()
+    };
+
+    let mut packet = valid.clone();
+    packet[7] ^= 1;
+    assert_eq!(named(&packet), "init_packet_format");
+
+    let mut packet = valid.clone();
+    packet[8..10].copy_from_slice(&0u16.to_le_bytes());
+    assert_eq!(named(&packet), "init_packet_version");
+
+    let mut packet = valid.clone();
+    packet[15] = 1;
+    assert_eq!(named(&packet), "init_packet_reserved");
+
+    let mut packet = valid.clone();
+    packet[10] |= 0b0000_0010;
+    assert_eq!(named(&packet), "init_packet_flags");
+
+    // Declared length 0 and 257, each in an exact-fit buffer so the
+    // refusal is the bound itself, not a length disagreement.
+    let mut packet = valid.clone();
+    packet[12..14].copy_from_slice(&0u16.to_le_bytes());
+    packet.truncate(reverie_loader::init_packet::HEADER_LEN);
+    assert_eq!(named(&packet), "init_packet_bounds");
+
+    let mut packet = valid;
+    packet.resize(reverie_loader::init_packet::HEADER_LEN + 257, 0xcd);
+    packet[12..14].copy_from_slice(&257u16.to_le_bytes());
+    assert_eq!(named(&packet), "init_packet_bounds");
+}
+
+#[test]
+fn init_packet_malformed_is_named_refusal() {
+    // The stage-1a probe placeholder is preparation-only data,
+    // never an admitted init packet.
+    let error = validate_init_packet(b"PREPARATION_ONLY_NOT_HLIINIT1", &[0u8; 32])
+        .err()
+        .unwrap()
+        .to_string();
+    assert_eq!(error, "init_packet_format");
+}

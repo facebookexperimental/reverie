@@ -24,6 +24,12 @@ pub use input_data::CopiedInitialData;
 pub use input_data::CopiedInputLocations;
 #[cfg(feature = "loader-private-runtime")]
 pub use input_data::CopiedInputRequest;
+#[cfg(feature = "loader-private-runtime")]
+pub use input_data::ValidatedInitPacket;
+#[cfg(feature = "loader-private-runtime")]
+pub use input_data::build_init_packet;
+#[cfg(feature = "loader-private-runtime")]
+pub use input_data::validate_init_packet;
 #[cfg(feature = "stage1a-probe")]
 pub mod inject;
 #[cfg(all(feature = "loader-private-runtime", not(feature = "stage1a-probe")))]
