@@ -441,11 +441,12 @@ fallback_xstate_clobber:
     ret
     .size fallback_xstate_clobber, .-fallback_xstate_clobber
 
-    .section .rodata
+    .pushsection .rodata
 seed_cw:
     .short 0x077f
 seed_mxcsr:
     .long 0x3f80
+    .popsection
     "#,
     expected_rsp = sym super::EXPECTED_RSP,
 );

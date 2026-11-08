@@ -7,6 +7,7 @@
  * experiment. The syscall crosses a cache line so production must use fallback.
  * No guest-stack read occurs after its rights/protection are changed.
  */
+.text
 .globl owned_frame_enter_guest
 .type owned_frame_enter_guest,@function
 owned_frame_enter_guest:
@@ -267,4 +268,5 @@ owned_frame_clobber_guest_fp:
 .Lclobber_done:
     ret
 .size owned_frame_clobber_guest_fp,.-owned_frame_clobber_guest_fp
-.section .note.GNU-stack,"",@progbits
+.pushsection .note.GNU-stack,"",@progbits
+.popsection

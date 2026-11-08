@@ -1,3 +1,4 @@
+use std::fs;
 use std::process::Command;
 use std::process::Output;
 use std::process::Stdio;
@@ -108,6 +109,120 @@ fn owned_frame_output(mut command: Command) -> Output {
         "owned-frame child exceeded five seconds/one MiB: {output:?}"
     );
     output
+}
+
+#[cfg(target_arch = "x86_64")]
+fn xstate_global_asm() -> String {
+    const SOURCE: &str = include_str!("../src/bin/rpc_tool_guest/syscall_fallback/xstate.rs");
+    let marker = "global_asm!(\n    r#\"";
+    let start = SOURCE
+        .find(marker)
+        .map(|offset| offset + marker.len())
+        .expect("xstate global_asm block must remain discoverable");
+    let end = SOURCE[start..]
+        .find("\"#,")
+        .map(|offset| start + offset)
+        .expect("xstate global_asm block must terminate");
+    SOURCE[start..end].replace("{expected_rsp}", "expected_rsp_probe")
+}
+
+#[cfg(target_arch = "x86_64")]
+fn assemble_section_probe(source: String) -> Vec<u8> {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("concat.s");
+    let output = directory.path().join("concat.o");
+    fs::write(&input, source).unwrap();
+    let result = Command::new("cc")
+        .args(["-x", "assembler", "-c"])
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "failed to assemble section probe:\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    fs::read(output).unwrap()
+}
+
+#[cfg(target_arch = "x86_64")]
+fn assert_symbol_section_is_executable(bytes: &[u8], name: &str, executable: bool) {
+    let elf = goblin::elf::Elf::parse(bytes).expect("assembled probe must parse as ELF");
+    let symbol = elf
+        .syms
+        .iter()
+        .find(|symbol| elf.strtab.get_at(symbol.st_name) == Some(name))
+        .unwrap_or_else(|| panic!("assembled probe is missing symbol {name}"));
+    let section = &elf.section_headers[symbol.st_shndx];
+    let section_name = elf
+        .shdr_strtab
+        .get_at(section.sh_name)
+        .unwrap_or("<invalid section name>");
+    assert_eq!(
+        section.sh_flags & u64::from(goblin::elf::section_header::SHF_EXECINSTR) != 0,
+        executable,
+        "symbol {name} landed in section {section_name} flags={:#x}",
+        section.sh_flags
+    );
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn fallback_assembly_blocks_restore_text_section() {
+    // Assembling the production chunks back-to-back deliberately removes
+    // the compiler's incidental section resets: neither chunk may rely
+    // on the assembler's ambient section when its code labels arrive.
+    let hostile = format!(
+        ".intel_syntax noprefix\n{}\n\
+         .globl __section_probe_after_xstate\n\
+         .type __section_probe_after_xstate,@function\n\
+         __section_probe_after_xstate:\n\
+         ret\n\
+         .size __section_probe_after_xstate, .-__section_probe_after_xstate\n\
+         .att_syntax\n{}\n\
+         .globl __section_probe_after_owned_frame\n\
+         .type __section_probe_after_owned_frame,@function\n\
+         __section_probe_after_owned_frame:\n\
+         ret\n\
+         .size __section_probe_after_owned_frame, .-__section_probe_after_owned_frame",
+        xstate_global_asm(),
+        include_str!("../src/bin/rpc_tool_guest/owned_frame.S")
+    );
+    let bytes = assemble_section_probe(hostile);
+    for name in [
+        "fallback_xstate_call",
+        "fallback_pkey_call",
+        "fallback_xstate_clobber",
+        "__section_probe_after_xstate",
+        "owned_frame_enter_guest",
+        "owned_frame_guest_syscall",
+        "owned_frame_guest_resume",
+        "owned_frame_clobber_guest_fp",
+        "__section_probe_after_owned_frame",
+    ] {
+        assert_symbol_section_is_executable(&bytes, name, true);
+    }
+    for name in ["seed_cw", "seed_mxcsr"] {
+        assert_symbol_section_is_executable(&bytes, name, false);
+    }
+
+    // The owned-frame chunk must also recover by itself if some other
+    // preceding assembly leaves .rodata selected.
+    let owned_hostile = format!(
+        ".section .rodata\n{}",
+        include_str!("../src/bin/rpc_tool_guest/owned_frame.S")
+    );
+    let bytes = assemble_section_probe(owned_hostile);
+    for name in [
+        "owned_frame_enter_guest",
+        "owned_frame_guest_syscall",
+        "owned_frame_guest_resume",
+        "owned_frame_clobber_guest_fp",
+    ] {
+        assert_symbol_section_is_executable(&bytes, name, true);
+    }
 }
 
 #[test]
