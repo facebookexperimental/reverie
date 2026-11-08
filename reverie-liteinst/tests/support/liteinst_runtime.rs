@@ -311,7 +311,11 @@ fn qualify_runtime() -> Result<QualifiedRuntime, String> {
             crate_types: vec!["cdylib".into()],
             target_source: artifact::real_file(&leaf.join("src/lib.rs"))?,
         };
-        let features = vec!["allocator-fixture".to_owned()];
+        let features = vec![
+            "allocator-fixture".to_owned(),
+            "default".to_owned(),
+            "liteinst".to_owned(),
+        ];
         let profile = serde_json::json!({
             "opt_level": "3", "debuginfo": 0, "debug_assertions": false,
             "overflow_checks": false, "test": false,

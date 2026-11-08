@@ -51,7 +51,7 @@ struct Config {
     rust_exports: PathBuf,
     c_workload: PathBuf,
     oracle_sha256: BTreeMap<String, String>,
-    /// The leaf has exactly allocator-fixture; no default feature exists.
+    /// The leaf has allocator-fixture over its default liteinst enablement.
     expected_features: Vec<String>,
     /// The standalone RV producer requires the ordinary release profile:
     /// the admitted pinned-standalone scalar cohort was qualified from
@@ -124,7 +124,11 @@ fn ci_config(generation: PathBuf) -> Result<Config> {
         rust_exports,
         c_workload,
         oracle_sha256: oracle_hashes(),
-        expected_features: vec!["allocator-fixture".to_owned()],
+        expected_features: vec![
+            "allocator-fixture".to_owned(),
+            "default".to_owned(),
+            "liteinst".to_owned(),
+        ],
         profile_name: "release".to_owned(),
         expected_cargo_profile: release_profile(),
         deadline_seconds: 540,
@@ -348,10 +352,10 @@ fn produce(
         config.max_command_stream_bytes,
     )?;
     check(
-        config.expected_features == ["allocator-fixture"]
+        config.expected_features == ["allocator-fixture", "default", "liteinst"]
             && config.profile_name == "release"
             && config.expected_cargo_profile == release_profile(),
-        "RV diagnostic leaf requires independent singleton fixture features and the ordinary release profile; a dev-profile body is outside this contract",
+        "RV diagnostic leaf requires independent fixture features and the ordinary release profile; a dev-profile body is outside this contract",
     )?;
     check(
         config.oracle_sha256 == oracle_hashes(),
