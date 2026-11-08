@@ -1616,6 +1616,7 @@ fn native_callback_entry_waits_out_tool_slot_contention() {
     let (host, _peer) = make_host();
     let (registered_tx, registered_rx) = std::sync::mpsc::channel();
     let (go_tx, go_rx) = std::sync::mpsc::channel();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
     let (entered_tx, entered_rx) = std::sync::mpsc::channel();
     std::thread::scope(|scope| {
         let host_ref = &host;
@@ -1629,6 +1630,9 @@ fn native_callback_entry_waits_out_tool_slot_contention() {
             };
             registered_tx.send(handle).unwrap();
             go_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            // Signal only after waking, so the holder's window below
+            // opens with this thread confirmed at the call.
+            started_tx.send(()).unwrap();
             let entered = unsafe { host.enter_native_callback(handle, identity) };
             entered_tx.send(entered.is_ok()).unwrap();
             drop(entered);
@@ -1636,12 +1640,118 @@ fn native_callback_entry_waits_out_tool_slot_contention() {
         let _handle = registered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         let held = host.tool.lock();
         go_tx.send(()).unwrap();
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(
             entered_rx.recv_timeout(Duration::from_millis(50)).is_err(),
             "native callback entry finished while another thread held the Tool slot"
         );
         drop(held);
         assert!(entered_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        child.join().unwrap();
+    });
+}
+
+#[test]
+fn native_thread_exit_waits_out_tool_slot_contention() {
+    let server = Server::new();
+    let (host, _peer) = make_host();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (go_tx, go_rx) = std::sync::mpsc::channel();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (exited_tx, exited_rx) = std::sync::mpsc::channel();
+    let server_path = server.path.clone();
+    std::thread::scope(|scope| {
+        let host_ref = &host;
+        let child = scope.spawn(move || {
+            let host = host_ref;
+            // The background owner is bound to its creating thread, so
+            // this thread admits its own rather than borrowing main's.
+            let background = unsafe {
+                super::super::native_rpc::NativeBackgroundRpc::from_admitted(
+                    server_path.clone(),
+                    host.rpc.shared_config(),
+                )
+                .unwrap()
+            };
+            let rpc = NativeRpc::new(server_path, host.rpc.shared_config()).unwrap();
+            let callback = Callback::new(1);
+            let identity = callback.identity();
+            let services = callback.services(None);
+            let handle = unsafe {
+                host.register_native_image_thread(identity, State::seeded())
+                    .unwrap()
+            };
+            // Prime the lifecycle (thread-start, post-exec, one syscall)
+            // the exit hook asserts, all before contention begins.
+            let lease = unsafe { host.enter_native_callback(handle, identity).unwrap() };
+            value(unsafe {
+                host.dispatch_native_syscall(lease, &services, &rpc, &mut event(1))
+                    .unwrap()
+            });
+            ready_tx.send(()).unwrap();
+            go_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            started_tx.send(()).unwrap();
+            let exited = unsafe {
+                host.dispatch_native_thread_exit(
+                    handle,
+                    identity,
+                    NativeExitRpc::Background(background.for_thread(identity.tid()).unwrap()),
+                    reverie::ExitStatus::Exited(0),
+                )
+            };
+            exited_tx.send(exited.is_ok()).unwrap();
+            fixture::close_test_primary(&rpc, &callback);
+        });
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let held = host.tool.lock();
+        go_tx.send(()).unwrap();
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            exited_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "native thread exit finished while another thread held the Tool slot"
+        );
+        drop(held);
+        assert!(exited_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        child.join().unwrap();
+    });
+}
+
+#[test]
+fn native_initializer_waits_out_tool_slot_contention() {
+    let server = Server::new();
+    let (host, _peer) = make_host();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (go_tx, go_rx) = std::sync::mpsc::channel();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (initialized_tx, initialized_rx) = std::sync::mpsc::channel();
+    let server_path = server.path.clone();
+    std::thread::scope(|scope| {
+        let host_ref = &host;
+        let child = scope.spawn(move || {
+            let host = host_ref;
+            let rpc = NativeRpc::new(server_path, host.rpc.shared_config()).unwrap();
+            let callback = Callback::new(1);
+            let services = callback.services(None);
+            ready_tx.send(()).unwrap();
+            go_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            started_tx.send(()).unwrap();
+            let initialized =
+                unsafe { host.initialize_native_image_thread(&services, &rpc, |_| Ok(())) };
+            initialized_tx.send(initialized.is_ok()).unwrap();
+            fixture::close_test_primary(&rpc, &callback);
+        });
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let held = host.tool.lock();
+        go_tx.send(()).unwrap();
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            initialized_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "native initializer finished while another thread held the Tool slot"
+        );
+        drop(held);
+        assert!(initialized_rx.recv_timeout(Duration::from_secs(5)).unwrap());
         child.join().unwrap();
     });
 }

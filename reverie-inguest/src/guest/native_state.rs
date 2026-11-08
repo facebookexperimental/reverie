@@ -898,13 +898,27 @@ mod tests {
         }
 
         // Same-thread re-entry is refused rather than spinning on itself.
-        {
-            let owner = NativeThreads::<u64>::new();
-            let identity = actual_identity(4);
-            let handle = owner.register(identity, 74).unwrap();
-            let _guard = owner.registry.lock();
+        // Detached threads with a bounded receive, so an implementation
+        // that spins on re-entry fails this assertion instead of hanging
+        // the test thread. The outer hold is taken once through the raw
+        // lock and once through the registry() entry helper itself.
+        for outer_via_registry in [false, true] {
+            let (result_tx, result_rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let owner = NativeThreads::<u64>::new();
+                let identity = actual_identity(4);
+                let handle = owner.register(identity, 74).unwrap();
+                let _guard = if outer_via_registry {
+                    owner.registry().unwrap()
+                } else {
+                    owner.registry.lock()
+                };
+                result_tx
+                    .send(owner.retire(handle, identity).unwrap_err().raw_os_error())
+                    .unwrap();
+            });
             assert_eq!(
-                owner.retire(handle, identity).unwrap_err().raw_os_error(),
+                result_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
                 Some(libc::EDEADLK)
             );
         }
@@ -935,6 +949,105 @@ mod tests {
                         .unwrap(),
                     73
                 );
+            });
+        }
+
+        // Register against its own held registry.
+        {
+            let owner = NativeThreads::<u64>::new();
+            let (started_tx, started_rx) = mpsc::channel();
+            let (result_tx, result_rx) = mpsc::channel();
+            let guard = owner.registry.lock();
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    started_tx.send(()).unwrap();
+                    result_tx
+                        .send(owner.register(actual_identity(5), 75).map(|_| ()))
+                        .unwrap();
+                });
+                started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert!(
+                    result_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+                    "register finished while another thread held the registry"
+                );
+                drop(guard);
+                result_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap();
+            });
+        }
+
+        // Parent check against its own held registry. The snapshot is
+        // built for the child thread's actual identity, handed over
+        // before the call so only the check itself waits.
+        {
+            let owner = NativeThreads::<u64>::new();
+            let parent = actual_identity(6);
+            let parent_handle = owner.register(parent, 76).unwrap();
+            let (child_tx, child_rx) = mpsc::channel();
+            let (snapshot_tx, snapshot_rx) = mpsc::channel();
+            let (started_tx, started_rx) = mpsc::channel();
+            let (result_tx, result_rx) = mpsc::channel();
+            let guard = owner.registry.lock();
+            let owner_ref = &owner;
+            std::thread::scope(|scope| {
+                scope.spawn(move || {
+                    let child = actual_identity(6);
+                    child_tx.send(child).unwrap();
+                    let snapshot = snapshot_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    started_tx.send(()).unwrap();
+                    result_tx
+                        .send(owner_ref.check_parent(&snapshot, child))
+                        .unwrap();
+                });
+                let child = child_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                snapshot_tx
+                    .send(NativeParentSnapshot {
+                        owner: owner.owner,
+                        parent_handle,
+                        parent,
+                        child,
+                        state: 76,
+                    })
+                    .unwrap();
+                started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert!(
+                    result_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+                    "check_parent finished while another thread held the registry"
+                );
+                drop(guard);
+                result_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap();
+            });
+        }
+
+        // Retired check against its own held registry.
+        {
+            let owner = NativeThreads::<u64>::new();
+            let identity = actual_identity(7);
+            let handle = owner.register(identity, 77).unwrap();
+            assert_eq!(owner.retire(handle, identity).unwrap(), 77);
+            let (started_tx, started_rx) = mpsc::channel();
+            let (result_tx, result_rx) = mpsc::channel();
+            let guard = owner.registry.lock();
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    started_tx.send(()).unwrap();
+                    result_tx.send(owner.ensure_retired()).unwrap();
+                });
+                started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert!(
+                    result_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+                    "ensure_retired finished while another thread held the registry"
+                );
+                drop(guard);
+                result_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap();
             });
         }
     }
