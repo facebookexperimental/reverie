@@ -27745,14 +27745,11 @@ fn no_scope_allocation_operand_target(
         targets.get("fixed_heap_panic_null"),
     ) {
         (Some(&primary), Some(&merged)) if primary != merged => {
-            if operand.got {
-                if let Ok(slot) =
-                    fixed_rip_target(address, bytes, operand.displacement, operand.next)
-                {
-                    if got.get(&slot) == Some(&merged) {
-                        return Ok(merged);
-                    }
-                }
+            let got_chooses_merged = operand.got
+                && fixed_rip_target(address, bytes, operand.displacement, operand.next)
+                    .is_ok_and(|slot| got.get(&slot) == Some(&merged));
+            if got_chooses_merged {
+                return Ok(merged);
             }
             Ok(primary)
         }
