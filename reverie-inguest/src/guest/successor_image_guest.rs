@@ -381,6 +381,8 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::guest::exec_private::lifecycle_test_owner;
+    use crate::guest::exec_private::mark_lifecycle_test_frontend_installed;
     use crate::guest::exec_private::mark_successor_test_frontend_installed;
     use crate::guest::exec_private::successor_test_owner;
 
@@ -489,6 +491,117 @@ mod tests {
             guest.thread_state_mut().0 += 1;
             Ok(77)
         }
+    }
+
+    #[derive(Default)]
+    struct ParityTool {
+        calls: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    #[reverie::tool]
+    impl Tool for ParityTool {
+        type GlobalState = EchoGlobal;
+        type ThreadState = (u64, u64);
+
+        fn init_thread_state(
+            &self,
+            _child: Pid,
+            _parent: Option<(Pid, &(u64, u64))>,
+        ) -> (u64, u64) {
+            self.calls.lock().unwrap().push("init");
+            (0, 0)
+        }
+
+        fn on_initial_image_attached(
+            &self,
+            _tid: Pid,
+            _state: &mut (u64, u64),
+        ) -> Result<(), Error> {
+            self.calls.lock().unwrap().push("attached");
+            Ok(())
+        }
+
+        async fn handle_thread_start<G: Guest<Self>>(&self, _guest: &mut G) -> Result<(), Error> {
+            self.calls.lock().unwrap().push("start");
+            Ok(())
+        }
+
+        async fn handle_post_exec<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
+            self.calls.lock().unwrap().push("post-exec");
+            assert_eq!(*guest.thread_state(), (99, 0x1234_5678_abcd_4321));
+            assert_eq!(*guest.config(), 901);
+            guest.thread_state_mut().0 += 1;
+            Ok(())
+        }
+    }
+
+    fn parity_host(
+        calls: Arc<Mutex<Vec<&'static str>>>,
+    ) -> (
+        Box<ToolHost<ParityTool, TestRuntime>>,
+        std::thread::JoinHandle<Vec<u64>>,
+    ) {
+        let (rpc, worker) = test_rpc();
+        (
+            Box::new(ToolHost::new(
+                ParityTool { calls },
+                rpc,
+                raw_pid(libc::SYS_getpid),
+                HashSet::from([Sysno::getpid]),
+                false,
+                TestRuntime,
+            )),
+            worker,
+        )
+    }
+
+    #[test]
+    fn mapped_and_native_successor_callback_sequences_match() {
+        isolated(
+            || {
+                let selected = (99, 0x1234_5678_abcd_4321);
+
+                let native_calls = Arc::new(Mutex::new(Vec::new()));
+                let (_native, owner, mut entry) = successor_test_owner();
+                let (native_host, native_worker) = parity_host(native_calls.clone());
+                unsafe { native_host.bind_successor_image_control(&owner) }.unwrap();
+                unsafe { native_host.restore_prepared_exec_state(selected, &owner) }.unwrap();
+                mark_successor_test_frontend_installed(&owner);
+                native_host
+                    .run_post_exec_before_loader(&mut entry, &owner)
+                    .unwrap();
+                assert_eq!(
+                    native_host
+                        .states
+                        .with_state(raw_pid(libc::SYS_gettid).as_raw(), |state| state.copied()),
+                    Some((100, selected.1))
+                );
+                drop(native_host);
+                assert!(native_worker.join().unwrap().is_empty());
+
+                let mapped_calls = Arc::new(Mutex::new(Vec::new()));
+                let (_native, owner) = lifecycle_test_owner();
+                let (mapped_host, mapped_worker) = parity_host(mapped_calls.clone());
+                unsafe { mapped_host.bind_initial_image_control(&owner) }.unwrap();
+                unsafe { mapped_host.restore_mapped_successor_state(selected, &owner) }.unwrap();
+                mark_lifecycle_test_frontend_installed(&owner);
+                mapped_host
+                    .initialize_mapped_successor_lifecycle(&owner)
+                    .unwrap();
+                assert_eq!(
+                    mapped_host
+                        .states
+                        .with_state(raw_pid(libc::SYS_gettid).as_raw(), |state| state.copied()),
+                    Some((100, selected.1))
+                );
+                drop(mapped_host);
+                assert!(mapped_worker.join().unwrap().is_empty());
+
+                assert_eq!(*native_calls.lock().unwrap(), ["post-exec"]);
+                assert_eq!(*mapped_calls.lock().unwrap(), *native_calls.lock().unwrap());
+            },
+            0,
+        );
     }
 
     struct TestRuntime;

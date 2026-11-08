@@ -1346,6 +1346,9 @@ pub struct InitialImageControl {
     // 0 not started, 1 permit live, 2 callbacks completed, 3 refused/abandoned.
     // Neither a returned error nor dropping a permit reopens initialization.
     lifecycle: AtomicUsize,
+    // 0 fresh-image lifecycle, 1 selected-state restore live, 2 restore
+    // completed, 3 refused/abandoned.
+    selected_restore: AtomicUsize,
 }
 impl InitialImageControl {
     fn new(control: usize) -> Self {
@@ -1355,6 +1358,7 @@ impl InitialImageControl {
             region: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
             installed_host: AtomicUsize::new(0),
             lifecycle: AtomicUsize::new(0),
+            selected_restore: AtomicUsize::new(0),
         }
     }
 
@@ -1417,6 +1421,46 @@ impl InitialImageControl {
         }
         self.check_initial_thread()?;
         Ok(permit)
+    }
+
+    #[cfg(any(feature = "coordinator-rpc", test))]
+    pub(super) fn begin_mapped_successor_restore(&self, host: usize) -> io::Result<()> {
+        if self
+            .selected_restore
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            self.lifecycle.store(3, Ordering::Release);
+            return Err(io::Error::other(
+                "InitialImage selected-state restoration attempted twice",
+            ));
+        }
+        if host == 0
+            || self.installed_host.load(Ordering::Acquire) != host
+            || self.installation.load(Ordering::Acquire) != 0
+            || self.lifecycle.load(Ordering::Acquire) != 0
+        {
+            self.mapped_successor_restore_failed();
+            return Err(io::Error::other(
+                "InitialImage selected-state restoration lacks its installed host",
+            ));
+        }
+        if let Err(error) = self.check_initial_thread() {
+            self.mapped_successor_restore_failed();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    #[cfg(any(feature = "coordinator-rpc", test))]
+    pub(super) fn mapped_successor_restore_completed(&self) {
+        self.selected_restore.store(2, Ordering::Release);
+    }
+
+    #[cfg(any(feature = "coordinator-rpc", test))]
+    pub(super) fn mapped_successor_restore_failed(&self) {
+        self.selected_restore.store(3, Ordering::Release);
+        self.lifecycle.store(3, Ordering::Release);
     }
 
     fn check_initial_thread(&self) -> io::Result<()> {
@@ -1526,6 +1570,7 @@ impl InitialImageControl {
             .map_err(|_| io::Error::other("private frontend installation did not complete once"))?;
         if self.installed_host.load(Ordering::Acquire) == 0
             || self.lifecycle.load(Ordering::Acquire) != 2
+            || !matches!(self.selected_restore.load(Ordering::Acquire), 0 | 2)
         {
             self.lifecycle.store(3, Ordering::Release);
             return Err(io::Error::other(

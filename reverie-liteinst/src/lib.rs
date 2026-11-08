@@ -135,14 +135,26 @@ pub use tool_host::install_tool_from_bootstrap_with_runtime;
 pub fn preflight_tool_allocator() -> std::io::Result<()> {
     patch_alloc::preflight_allocator()
 }
+#[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+pub use tool_host::InstalledMappedSuccessorImage;
+#[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+pub use tool_host::MappedSuccessorPreparation;
+#[cfg(feature = "loader-private-runtime")]
+pub use tool_host::MappedSuccessorVerifiedDigests;
+#[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+pub use tool_host::PreparedMappedSuccessorImage;
 #[cfg(feature = "exec-private-init")]
 pub use tool_host::ValidatedStraddlerStaleness;
+#[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+pub use tool_host::initialize_mapped_successor_lifecycle;
 #[cfg(feature = "exec-private-init")]
 pub use tool_host::install_tool_initial_image;
 #[cfg(feature = "exec-native-injection")]
 pub use tool_host::install_tool_initial_image_with_admitted_native_exec;
 #[cfg(feature = "exec-native-injection")]
 pub use tool_host::install_tool_initial_image_with_native_exec;
+#[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+pub use tool_host::install_tool_mapped_successor_image;
 pub use tool_host::install_tool_quiescent;
 #[cfg(feature = "exec-native-injection")]
 pub use tool_host::install_tool_successor_image;
@@ -154,6 +166,8 @@ pub use tool_host::prepare_tool_initial_image_validated;
 pub use tool_host::prepare_tool_mapped_initial_image;
 #[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
 pub use tool_host::prepare_tool_mapped_initial_image_validated;
+#[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+pub use tool_host::prepare_tool_mapped_successor_image_validated;
 #[cfg(feature = "exec-native-injection")]
 pub use tool_host::prepare_tool_successor_image;
 #[cfg(feature = "exec-native-injection")]

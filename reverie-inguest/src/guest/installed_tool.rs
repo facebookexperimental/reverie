@@ -60,6 +60,11 @@ trait ToolHandler: Send + Sync {
     unsafe fn bind_initial_image(&self, control: &InitialImageControl) -> io::Result<()>;
     #[cfg(feature = "exec-private-init")]
     fn initialize_initial_image_lifecycle(&self, control: &InitialImageControl) -> io::Result<()>;
+    #[cfg(feature = "exec-private-init")]
+    fn initialize_mapped_successor_lifecycle(
+        &self,
+        control: &InitialImageControl,
+    ) -> io::Result<()>;
 }
 
 impl<T: Tool + 'static, R: HostRuntime> ToolHandler for ToolHost<T, R> {
@@ -106,6 +111,14 @@ impl<T: Tool + 'static, R: HostRuntime> ToolHandler for ToolHost<T, R> {
     #[cfg(feature = "exec-private-init")]
     fn initialize_initial_image_lifecycle(&self, control: &InitialImageControl) -> io::Result<()> {
         ToolHost::initialize_initial_image_lifecycle(self, control)
+    }
+
+    #[cfg(feature = "exec-private-init")]
+    fn initialize_mapped_successor_lifecycle(
+        &self,
+        control: &InitialImageControl,
+    ) -> io::Result<()> {
+        ToolHost::initialize_mapped_successor_lifecycle(self, control)
     }
 }
 
@@ -190,6 +203,64 @@ pub unsafe fn publish_initial_tool<T: Tool + 'static, R: HostRuntime>(
     // SAFETY: publication has stored the stable host; the caller establishes
     // the same genuine live client/control/fatal lineage and native context.
     unsafe { handler.bind_initial_image(control) }
+}
+
+/// Publish and restore the selected mapped successor on the one
+/// stable owner. This binds the mapped frontend control, then
+/// attaches the exact decoded root state as pending; it calls
+/// no Tool startup or post-exec callback.
+///
+/// # Safety
+/// All `publish_initial_tool` premises apply. The selected Tool
+/// and state must have been decoded from the same admitted
+/// carrier's exact delivered config/state for this mapped
+/// image. The caller retains the actual fatal owner across
+/// publication, frontend installation, selected lifecycle, and
+/// finish. A digest or typed value alone is not admission proof.
+#[cfg(feature = "exec-private-init")]
+pub unsafe fn publish_mapped_successor_tool<T: Tool + 'static, R: HostRuntime>(
+    host: ToolHost<T, R>,
+    state: T::ThreadState,
+    control: &InitialImageControl,
+    _fatal: &InitialImageAbortGuard,
+) -> io::Result<()> {
+    let host = Box::new(host);
+    let stable_host = core::ptr::from_ref(&*host);
+    if let Err(unpublished) = HANDLER.set(host) {
+        drop(unpublished);
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            ToolAlreadyInstalled,
+        ));
+    }
+    // SAFETY: successful one-time Box publication retains this allocation.
+    let host = unsafe { &*stable_host };
+    unsafe {
+        host.bind_initial_image_control(control)?;
+        host.restore_mapped_successor_state(state, control)
+    }
+}
+
+/// Run the installed mapped successor's restored-root lifecycle:
+/// post-exec only, then publish that same state for dispatch.
+/// It calls neither `on_initial_image_attached`,
+/// `init_thread_state`, nor `handle_thread_start`.
+///
+/// # Safety
+/// All `initialize_initial_image_lifecycle` premises apply,
+/// and the selected state must already be attached as pending
+/// by `publish_mapped_successor_tool` for this same control and
+/// installed host. The caller retains the live fatal owner
+/// across the call; an error permanently refuses this image.
+#[cfg(feature = "exec-private-init")]
+pub unsafe fn initialize_mapped_successor_lifecycle(
+    control: &InitialImageControl,
+    _fatal: &InitialImageAbortGuard,
+) -> io::Result<()> {
+    let handler = HANDLER
+        .get()
+        .ok_or_else(|| io::Error::other("mapped successor Tool is not installed"))?;
+    handler.initialize_mapped_successor_lifecycle(control)
 }
 
 /// Run the installed InitialImage Tool's existing eager lifecycle.
@@ -688,6 +759,13 @@ mod tests {
                 _control: &super::super::exec_private::InitialImageControl,
             ) -> io::Result<()> {
                 unreachable!("counting handler runs no initial-image lifecycle");
+            }
+            #[cfg(feature = "exec-private-init")]
+            fn initialize_mapped_successor_lifecycle(
+                &self,
+                _control: &super::super::exec_private::InitialImageControl,
+            ) -> io::Result<()> {
+                unreachable!("counting handler runs no mapped successor lifecycle");
             }
         }
         assert!(HANDLER.get().is_none());

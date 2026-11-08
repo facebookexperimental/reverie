@@ -389,6 +389,13 @@ pub struct ToolHost<T: Tool, R: HostRuntime> {
     // Prepared only by the ordinary installer, before publication. Keeping it
     // outside `states` preserves the real first-event lifecycle callbacks.
     ordinary_root_state: SpinMutex<Option<T::ThreadState>>,
+    #[cfg(feature = "exec-private-init")]
+    mapped_successor_state: SpinMutex<Option<MappedSuccessorState<T>>>,
+    /// Whether `mapped_successor_state` currently holds a state, mirrored
+    /// under its lock so ordinary dispatch can refuse without contending
+    /// for the slot lock.
+    #[cfg(feature = "exec-private-init")]
+    mapped_successor_pending: core::sync::atomic::AtomicBool,
     runtime: R,
     #[cfg(feature = "exec-private-successor")]
     prepared_exec: SpinMutex<Option<PreparedExecState<T>>>,
@@ -406,6 +413,18 @@ pub struct ToolHost<T: Tool, R: HostRuntime> {
     // installer explicitly admitted it via `admit_native_exec`.
     #[cfg(feature = "exec-native-injection")]
     native_exec_admitted: bool,
+}
+
+#[cfg(feature = "exec-private-init")]
+enum MappedSuccessorPhase {
+    Pending,
+    Failed,
+    Complete,
+}
+#[cfg(feature = "exec-private-init")]
+struct MappedSuccessorState<T: Tool> {
+    state: T::ThreadState,
+    phase: MappedSuccessorPhase,
 }
 
 #[cfg(feature = "exec-private-successor")]
@@ -467,6 +486,15 @@ impl<T: Tool, R: HostRuntime> ToolHost<T, R> {
     /// dispatch currently holding the state lock, is refused without replacing
     /// anything. No production backend calls this inactive input seam.
     pub fn restore_current_thread_state(&self, state: T::ThreadState) -> io::Result<()> {
+        #[cfg(feature = "exec-private-init")]
+        if self
+            .mapped_successor_pending
+            .load(core::sync::atomic::Ordering::Acquire)
+        {
+            return Err(io::Error::other(
+                "mapped successor lifecycle state is not complete",
+            ));
+        }
         // Read the occupancy mirror, not the lock: momentary
         // contention (a writer updating the slot) must not read as a
         // pending successor and spuriously refuse a legitimate
@@ -679,6 +707,10 @@ where
             install_gate: SpinMutex::new(()),
             native_threads: None,
             ordinary_root_state: SpinMutex::new(None),
+            #[cfg(feature = "exec-private-init")]
+            mapped_successor_state: SpinMutex::new(None),
+            #[cfg(feature = "exec-private-init")]
+            mapped_successor_pending: core::sync::atomic::AtomicBool::new(false),
             runtime,
             #[cfg(feature = "exec-private-successor")]
             prepared_exec: SpinMutex::new(None),
@@ -987,6 +1019,157 @@ where
         control.bind_lifecycle_host(core::ptr::from_ref(self) as usize)
     }
 
+    /// Attach the exact decoded selected root state as pending for a
+    /// mapped successor. This neither creates thread state nor calls
+    /// `on_initial_image_attached`, `init_thread_state`,
+    /// `handle_thread_start`, or post-exec callbacks.
+    ///
+    /// # Safety
+    /// The same installer must have decoded and validated this state
+    /// from the admitted carrier's exact delivered bytes for this
+    /// authenticated mapped image. A matching digest alone does not
+    /// prove correct Tool-state restoration.
+    #[cfg(feature = "exec-private-init")]
+    pub unsafe fn restore_mapped_successor_state(
+        &self,
+        state: T::ThreadState,
+        control: &super::exec_private::InitialImageControl,
+    ) -> io::Result<()> {
+        control.begin_mapped_successor_restore(core::ptr::from_ref(self) as usize)?;
+        let result = (|| {
+            let _allocation_scope = super::alloc::enter_dispatch();
+            if self.root_pid != raw_pid(libc::SYS_gettid)
+                || self.root_pid != raw_pid(libc::SYS_getpid)
+            {
+                return Err(io::Error::other(
+                    "mapped successor host root identity differs",
+                ));
+            }
+            let Some(_install) = self.begin_install() else {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "mapped successor state dispatch is active",
+                ));
+            };
+            let mut pending = self.mapped_successor_state.lock();
+            if !self.states.is_empty() || pending.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "mapped successor thread state already exists",
+                ));
+            }
+            *pending = Some(MappedSuccessorState {
+                state,
+                phase: MappedSuccessorPhase::Pending,
+            });
+            self.mapped_successor_pending
+                .store(true, core::sync::atomic::Ordering::Release);
+            control.mapped_successor_restore_completed();
+            Ok(())
+        })();
+        if result.is_err() {
+            control.mapped_successor_restore_failed();
+        }
+        result
+    }
+
+    /// Run exactly the restored mapped successor's real post-exec
+    /// before loader entry, mirroring the native successor. There
+    /// is no `on_initial_image_attached`, `init_thread_state`,
+    /// thread-start, or syscall callback.
+    #[cfg(feature = "exec-private-init")]
+    pub(super) fn initialize_mapped_successor_lifecycle(
+        &self,
+        control: &super::exec_private::InitialImageControl,
+    ) -> io::Result<()> {
+        let permit = control.begin_lifecycle(core::ptr::from_ref(self) as usize)?;
+        let _scratch_scope = DispatchScratchScope::enter();
+        let tid = raw_pid(libc::SYS_gettid);
+        if tid != self.root_pid {
+            return Err(io::Error::other(
+                "mapped successor host root identity differs",
+            ));
+        }
+        let Some(_install) = self.begin_install() else {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "mapped successor Tool callback is active",
+            ));
+        };
+        let tool_arc = self
+            .tool_process()
+            .ok_or_else(|| io::Error::other("mapped successor Tool is absent"))?;
+        let tool: &ToolProcess<T> = &tool_arc;
+        let mut pending = self.mapped_successor_state.lock();
+        let restored = pending
+            .as_mut()
+            .ok_or_else(|| io::Error::other("mapped successor state is absent"))?;
+        if !self.states.is_empty() || !matches!(restored.phase, MappedSuccessorPhase::Pending) {
+            return Err(io::Error::other(
+                "mapped successor pending state binding differs",
+            ));
+        }
+        // Mark failed before invoking Tool code, including unwind.
+        restored.phase = MappedSuccessorPhase::Failed;
+        let tail = TailResult::default();
+        {
+            let mut guest = image_guest::ImageGuest::<T, R>::new(
+                tid,
+                &mut restored.state,
+                &self.rpc,
+                &self.runtime,
+                self.cpuid_interception,
+                &tail,
+                control,
+            );
+            #[cfg(feature = "exec-native-injection")]
+            if let Some(driver) = &self.native_exec_driver {
+                let mode = guest.signal_control_mode();
+                let actual = guest.signal_task_identity();
+                driver.bind_post_exec_state(guest.thread_state_mut(), mode, actual)?;
+            }
+            match drive_callback(tool.handle_post_exec(&mut guest), &tail) {
+                CallbackOutcome::Ready(Ok(())) => {}
+                CallbackOutcome::Ready(Err(error)) => {
+                    return Err(io::Error::from_raw_os_error(error.into_raw()));
+                }
+                CallbackOutcome::Exit { .. } | CallbackOutcome::Unsupported(_) => {
+                    return Err(io::Error::other(
+                        "mapped successor post-exec transition refused",
+                    ));
+                }
+            }
+            guest.check_refusal()?;
+        }
+        permit.complete()?;
+        restored.phase = MappedSuccessorPhase::Complete;
+        let completed = pending.take().expect("owned mapped successor state");
+        self.mapped_successor_pending
+            .store(false, core::sync::atomic::Ordering::Release);
+        drop(pending);
+        if self
+            .states
+            .try_publish(tid.as_raw(), completed.state)
+            .is_err()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "mapped successor thread state already exists",
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "exec-private-init")]
+    fn refuse_if_mapped_successor_pending(&self) {
+        if self
+            .mapped_successor_pending
+            .load(core::sync::atomic::Ordering::Acquire)
+        {
+            unsafe { super::exec_private::initialization_failed(core::ptr::null_mut()) }
+        }
+    }
+
     /// Run this installed InitialImage's real thread-start and post-exec
     /// callbacks before any guest instruction. This creates no syscall event
     /// or register snapshot. Unsupported lifecycle operations are retained
@@ -1146,6 +1329,8 @@ where
         if self.native_threads.is_some() {
             fatal(126);
         }
+        #[cfg(feature = "exec-private-init")]
+        self.refuse_if_mapped_successor_pending();
         #[cfg(feature = "exec-private-successor")]
         self.refuse_if_prepared_exec_pending();
 
@@ -1481,6 +1666,8 @@ where
         if self.native_threads.is_some() {
             fatal(126);
         }
+        #[cfg(feature = "exec-private-init")]
+        self.refuse_if_mapped_successor_pending();
         #[cfg(feature = "exec-private-successor")]
         self.refuse_if_prepared_exec_pending();
 

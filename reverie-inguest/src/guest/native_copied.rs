@@ -108,6 +108,10 @@ where
             install_gate: crate::sync::SpinMutex::new(()),
             native_threads: Some(NativeThreads::new()),
             ordinary_root_state: SpinMutex::new(None),
+            #[cfg(feature = "exec-private-init")]
+            mapped_successor_state: SpinMutex::new(None),
+            #[cfg(feature = "exec-private-init")]
+            mapped_successor_pending: core::sync::atomic::AtomicBool::new(false),
             runtime,
             #[cfg(feature = "exec-private-successor")]
             prepared_exec: SpinMutex::new(None),
