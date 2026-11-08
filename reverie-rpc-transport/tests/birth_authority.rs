@@ -294,6 +294,84 @@ fn close_resolver_orderings() {
 }
 
 #[test]
+fn exec_ordinal_mismatch_refuses_before_stamp() {
+    let authority = make_authority();
+    authority.record_initial_consumed(admitted()).unwrap();
+    authority
+        .stage_snapshot(admitted(), frame_tool_state(b"ordinal-one").unwrap())
+        .unwrap();
+    let _stop1 = authority
+        .record_successor_stop(admitted(), &own_pidfd())
+        .unwrap();
+    let stop2 = authority
+        .record_successor_stop(admitted(), &own_pidfd())
+        .unwrap();
+    let stamp_calls = std::sync::atomic::AtomicUsize::new(0);
+    let result = authority.at_successor_stop(stop2, |ticket, sealed| {
+        stamp_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(StampedPacket {
+            expected: ExpectedSuccessor {
+                config: config_digest_value(),
+                state: sealed,
+            },
+            redemption: ticket.0.to_vec(),
+        })
+    });
+    assert_eq!(result, Err(ExecControlError::Identity));
+    assert_eq!(stamp_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    let stop3 = authority
+        .record_successor_stop(admitted(), &own_pidfd())
+        .unwrap();
+    assert_eq!(
+        authority.at_successor_stop(stop3, stamp_packet(&Arc::new(Mutex::new(None)))),
+        Err(ExecControlError::Unavailable)
+    );
+}
+
+#[test]
+fn stage_after_watch_terminal_is_refused() {
+    let authority = make_authority();
+    authority.record_initial_consumed(admitted()).unwrap();
+    authority.record_watch_terminal().unwrap();
+    assert_eq!(
+        authority.stage_snapshot(admitted(), frame_tool_state(b"too-late").unwrap()),
+        Err(ExecControlError::Transition)
+    );
+}
+
+#[test]
+fn recorded_stop_resolves_pending_initial_eof() {
+    let authority = make_authority();
+    authority.record_initial_consumed(admitted()).unwrap();
+    let initial = NativeImageConnection::Initial;
+    authority.connection_closed(admitted(), &initial).unwrap();
+    assert_eq!(authority.pending_eof_count(), 1);
+    assert_eq!(authority.accepted_eof_count(), 0);
+    let stop = authority
+        .record_successor_stop(admitted(), &own_pidfd())
+        .unwrap();
+    assert_eq!(authority.pending_eof_count(), 0);
+    assert_eq!(authority.accepted_eof_count(), 1);
+    assert_eq!(
+        authority.at_successor_stop(stop, stamp_packet(&Arc::new(Mutex::new(None)))),
+        Err(ExecControlError::Unavailable)
+    );
+    authority.finish().unwrap();
+}
+
+#[test]
+fn terminal_first_then_initial_eof_accepted_at_once() {
+    let authority = make_authority();
+    authority.record_watch_terminal().unwrap();
+    let initial = NativeImageConnection::Initial;
+    authority.connection_closed(admitted(), &initial).unwrap();
+    assert_eq!(authority.accepted_eof_count(), 1);
+    assert_eq!(authority.pending_eof_count(), 0);
+    authority.finish().unwrap();
+}
+
+#[test]
 fn initial_eof_after_issue_accepted_at_once() {
     let authority = make_authority();
     authority.record_initial_consumed(admitted()).unwrap();

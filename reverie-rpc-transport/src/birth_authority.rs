@@ -745,6 +745,7 @@ impl SuccessorAdmission for BirthAuthority {
         } else {
             // Linux closes CLOEXEC descriptors in begin_new_exec()
             // (fs/exec.c close_cloexec_files/do_close_on_exec) before
+            // the exec stop is
             // reported by ptrace_event(PTRACE_EVENT_EXEC), so an
             // Initial EOF can legitimately arrive first. Hold it
             // pending a recorded fact; no timed wait is used.
