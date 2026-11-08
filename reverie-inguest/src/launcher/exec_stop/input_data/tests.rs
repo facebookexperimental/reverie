@@ -509,6 +509,27 @@ fn init_packet_birth_kind_mismatch_is_named_refusal() {
 }
 
 #[test]
+fn init_packet_successor_zero_state_digest_is_named_refusal() {
+    let zero_successor = InitPacketExpectation {
+        expected_state_digest: NO_STATE_DIGEST,
+        ..SUCCESSOR
+    };
+    let error = build_init_packet(zero_successor, b"nonce")
+        .err()
+        .unwrap()
+        .to_string();
+    assert_eq!(error, "init_packet_flags");
+
+    let mut packet = build_init_packet(SUCCESSOR, b"nonce").unwrap();
+    packet[48..80].fill(0);
+    let error = validate_init_packet(&packet, zero_successor)
+        .err()
+        .unwrap()
+        .to_string();
+    assert_eq!(error, "init_packet_flags");
+}
+
+#[test]
 fn init_packet_each_error_variant_is_a_named_refusal() {
     let valid = build_init_packet(SUCCESSOR, b"nonce").unwrap();
     let named = |packet: &[u8]| {
@@ -730,5 +751,26 @@ fn stamp_init_packet_refused_candidate_leaves_blob_unchanged() {
     .unwrap()
     .to_string();
     assert_eq!(error, "init_packet_config_digest_mismatch");
+    assert!(bytes.iter().all(|byte| *byte == 0xee));
+}
+
+#[test]
+fn stamp_init_packet_handoff_error_leaves_blob_unchanged() {
+    let packet = build_init_packet(SUCCESSOR, b"birth-nonce").unwrap();
+    let mut fixture = stamp_fixture(packet.len());
+    fixture.header.tables[3].count = packet.len() as u64 + 1;
+    let mut bytes = vec![0xeeu8; STAMP_BLOB_LEN];
+    let error = stamp_init_packet(
+        &packet,
+        SUCCESSOR,
+        &fixture.header,
+        fixture.tables(),
+        STAMP_ADDRESS,
+        &mut bytes,
+    )
+    .err()
+    .unwrap()
+    .to_string();
+    assert_eq!(error, "init_packet_stamp_handoff: Bounds");
     assert!(bytes.iter().all(|byte| *byte == 0xee));
 }

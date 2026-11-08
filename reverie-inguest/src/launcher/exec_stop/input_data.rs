@@ -466,8 +466,10 @@ impl InitPacketBirthKind {
 
 /// The host's independent expectations for one packet: which
 /// birth it was stamped for and the exact digests from the
-/// registration/frozen records. Grouped so the two digests
-/// cannot be swapped at a call site.
+/// registration/frozen records. Grouped under explicit field
+/// names so swapping the two digest values is visible by name
+/// at a call site; the fields remain plain `[u8; 32]` values,
+/// not distinct types.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InitPacketExpectation {
     /// Birth kind from the host's birth record.
@@ -475,7 +477,7 @@ pub struct InitPacketExpectation {
     /// Expected SHA-256 of the exact canonical configuration bytes.
     pub expected_config_digest: [u8; 32],
     /// Expected SHA-256 of the exact predecessor state bytes;
-    /// all zero for a first-image birth.
+    /// all zero exactly for a first-image birth.
     pub expected_state_digest: [u8; 32],
 }
 
@@ -505,7 +507,7 @@ impl ValidatedInitPacket {
     }
 
     /// Expected SHA-256 of the exact predecessor state bytes,
-    /// verbatim from the packet. All zero when no state deposit
+    /// verbatim from the packet. All zero iff no state deposit
     /// is expected.
     pub fn expected_state_digest(&self) -> [u8; 32] {
         self.expected_state_digest
@@ -599,7 +601,12 @@ fn stamp_handoff_error(error: reverie_loader::handoff::Error) -> Box<dyn std::er
 /// Re-parse a serialized blob and require its table 3 to be
 /// exactly the validated packet bytes. A blob carrying any
 /// other bytes there is refused as `init_packet_table3_mismatch`
-/// rather than sealed or consumed.
+/// rather than sealed or consumed. With the current
+/// `handoff::serialize`, whose table destination forces the
+/// table-3 count/stride and whose final `View::parse` refuses
+/// overlapping tables, this compare is a guard against future
+/// serializer changes rather than a mismatch reachable through
+/// [`stamp_init_packet`].
 fn verify_serialized_init_packet(
     bytes: &[u8],
     address: u64,
@@ -618,8 +625,9 @@ fn verify_serialized_init_packet(
 /// bytes, then re-parse the blob and byte-compare table 3
 /// against those bytes. The `packet` field of `tables` is not
 /// used; `header.tables[3]` must already declare the validated
-/// packet length. Validation happens before any byte is
-/// written, so a refused candidate leaves `bytes` unchanged.
+/// packet length. Serialization and verification run on a copy
+/// of `bytes`, which is copied back only after both succeed, so
+/// every refusal from this helper leaves `bytes` unchanged.
 /// This stamps data only: it does not seal, map, admit, or
 /// release the blob.
 pub fn stamp_init_packet(
@@ -642,8 +650,11 @@ pub fn stamp_init_packet(
         dev_null: tables.dev_null,
         tool_init: tables.tool_init,
     };
-    handoff::serialize(header, &stamped, address, bytes).map_err(stamp_handoff_error)?;
-    verify_serialized_init_packet(bytes, address, &validated)?;
+    let mut stamped_bytes = bytes.to_vec();
+    handoff::serialize(header, &stamped, address, &mut stamped_bytes)
+        .map_err(stamp_handoff_error)?;
+    verify_serialized_init_packet(&stamped_bytes, address, &validated)?;
+    bytes.copy_from_slice(&stamped_bytes);
     Ok(validated)
 }
 

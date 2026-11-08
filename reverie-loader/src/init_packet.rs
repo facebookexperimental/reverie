@@ -26,12 +26,13 @@
 //! expected configuration digest, the expected state digest,
 //! the bounded redemption bytes, and whether a predecessor
 //! state deposit is expected. It is data only: decoding grants
-//! no admission, mapping, or
-//! execution authority. Admission remains the coordinator-side
-//! watched-birth `InitialImageAdmission` consumption; the
-//! expected digest must additionally match the delivered
-//! configuration bytes under the transport's own check before
-//! any decode of that configuration.
+//! no admission, mapping, or execution authority. Admission
+//! remains the coordinator-side watched-birth
+//! `InitialImageAdmission` consumption. The expected digests
+//! must additionally match the delivered configuration and
+//! predecessor-state bytes before either is decoded; for state,
+//! a future successor entry must perform that hash comparison
+//! before `ExecState::decode`. That entry does not exist yet.
 //!
 //! Layout (all integers little-endian, matching [`crate::handoff`]):
 //!
@@ -133,8 +134,10 @@ impl<'a> InitPacket<'a> {
 
     /// Expected SHA-256 of the exact predecessor state bytes
     /// the coordinator will deliver, as carried. All zero iff
-    /// no state deposit is expected; hashing the delivered
-    /// state is the consumer's existing check.
+    /// no state deposit is expected. A future successor entry
+    /// must hash the delivered state and compare it with this
+    /// digest before `ExecState::decode`; that consumer check
+    /// is not implemented in this slice.
     pub fn expected_state_digest(&self) -> [u8; 32] {
         self.expected_state_digest
     }
@@ -143,6 +146,10 @@ impl<'a> InitPacket<'a> {
     pub fn redemption(&self) -> &'a [u8] {
         self.redemption
     }
+}
+
+fn state_digest_matches_flag(flags: u16, expected_state_digest: &[u8; 32]) -> bool {
+    (flags & FLAG_STATE_EXPECTED != 0) != (*expected_state_digest == [0u8; 32])
 }
 
 fn read_u16(packet: &[u8], offset: usize) -> Result<u16, Error> {
@@ -187,7 +194,7 @@ pub fn decode(packet: &[u8]) -> Result<InitPacket<'_>, Error> {
     expected_config_digest.copy_from_slice(&packet[16..48]);
     let mut expected_state_digest = [0u8; 32];
     expected_state_digest.copy_from_slice(&packet[48..80]);
-    if (flags & FLAG_STATE_EXPECTED == 0) != (expected_state_digest == [0u8; 32]) {
+    if !state_digest_matches_flag(flags, &expected_state_digest) {
         return Err(Error::Flags);
     }
     Ok(InitPacket {
@@ -208,9 +215,7 @@ pub fn encode_into(
     expected_state_digest: &[u8; 32],
     redemption: &[u8],
 ) -> Result<usize, Error> {
-    if flags & !KNOWN_FLAGS != 0
-        || (flags & FLAG_STATE_EXPECTED == 0) != (*expected_state_digest == [0u8; 32])
-    {
+    if flags & !KNOWN_FLAGS != 0 || !state_digest_matches_flag(flags, expected_state_digest) {
         return Err(Error::Flags);
     }
     let total = encoded_len(redemption.len()).ok_or(Error::Bounds)?;
@@ -425,10 +430,15 @@ mod tests {
             assert_eq!(decode(&packet[..len]), Err(Error::Flags), "byte {byte}");
         }
         let mut out = [0u8; MAX_PACKET_LEN];
-        assert_eq!(
-            encode_into(&mut out, 0, &DIGEST, &STATE_DIGEST, b"x"),
-            Err(Error::Flags)
-        );
+        for byte in 0..32 {
+            let mut one_byte_set = NO_STATE_DIGEST;
+            one_byte_set[byte] = 1;
+            assert_eq!(
+                encode_into(&mut out, 0, &DIGEST, &one_byte_set, b"x"),
+                Err(Error::Flags),
+                "digest byte {byte}"
+            );
+        }
     }
 
     #[test]
@@ -451,6 +461,12 @@ mod tests {
         // packet's flag set, leaving its digest all zero).
         let (mut packet, len) = encoded(0, b"x");
         packet[10..12].copy_from_slice(&FLAG_STATE_EXPECTED.to_le_bytes());
+        assert_eq!(decode(&packet[..len]), Err(Error::Flags));
+
+        // The same refusal applies when a valid successor
+        // packet's carried digest is zeroed in place.
+        let (mut packet, len) = encoded(FLAG_STATE_EXPECTED, b"x");
+        packet[48..80].fill(0);
         assert_eq!(decode(&packet[..len]), Err(Error::Flags));
     }
 
