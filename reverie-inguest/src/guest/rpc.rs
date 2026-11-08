@@ -202,6 +202,7 @@ pub struct CoordinatorRpc<G: GlobalTool> {
     config: Arc<G::Config>,
     path: Option<PathBuf>,
     fd: AtomicI32,
+    transport: reverie_rpc_transport::RpcTransport,
     on_reconnect: ReconnectHook,
     #[cfg(feature = "exec-private-successor")]
     native_failed: AtomicBool,
@@ -236,6 +237,7 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
             config,
             path: Some(path),
             fd: AtomicI32::new(-1),
+            transport: reverie_rpc_transport::RpcTransport::Socket,
             on_reconnect: |_, _| Err(io::Error::from_raw_os_error(libc::EPROTO)),
             #[cfg(feature = "exec-private-successor")]
             native_failed: AtomicBool::new(false),
@@ -252,6 +254,7 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
             config,
             path: None,
             fd: AtomicI32::new(-1),
+            transport: reverie_rpc_transport::RpcTransport::Socket,
             on_reconnect: |_, _| Err(io::Error::from_raw_os_error(libc::EPROTO)),
             #[cfg(feature = "exec-private-successor")]
             native_failed: AtomicBool::new(false),
@@ -310,6 +313,10 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
                 GuestRpcStream::Ordinary(previous) => {
                     let _ = previous.into_raw_fd();
                 }
+                // Unreachable: mapped reports fd -1, rejected by the `from`
+                // check above. Defensive forget mirrors Native below.
+                #[cfg(target_os = "linux")]
+                GuestRpcStream::Mapped(previous) => core::mem::forget(previous),
                 #[cfg(feature = "exec-private-init")]
                 GuestRpcStream::Native(previous) => core::mem::forget(previous),
             }
@@ -348,15 +355,27 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
                 "live coordinator client belongs to another thread",
             ));
         }
+        // Mapped streams retain no descriptor (as_raw_fd() == -1 by
+        // construction); every other GuestRpcStream kind has a real fd.
         let fd = client.as_raw_fd();
-        let valid = unsafe {
-            raw_syscall6(
-                libc::SYS_fcntl,
-                [fd as u64, libc::F_GETFD as u64, 0, 0, 0, 0],
-            )
+        let (transport, supplied) = if fd < 0 {
+            (reverie_rpc_transport::RpcTransport::Mapped, "mapped")
+        } else {
+            (reverie_rpc_transport::RpcTransport::Socket, "socket")
         };
-        if fd < 0 || valid < 0 {
-            return Err(io::Error::other("live coordinator descriptor is invalid"));
+        reverie_rpc_transport::RpcTransport::from_env()
+            .and_then(|selected| selected.require(supplied))
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        if transport == reverie_rpc_transport::RpcTransport::Socket {
+            let valid = unsafe {
+                raw_syscall6(
+                    libc::SYS_fcntl,
+                    [fd as u64, libc::F_GETFD as u64, 0, 0, 0, 0],
+                )
+            };
+            if valid < 0 {
+                return Err(io::Error::other("live coordinator descriptor is invalid"));
+            }
         }
         let config = Arc::new(client.config().clone());
         Ok(Self {
@@ -367,6 +386,42 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
             config,
             path: Some(path.as_ref().to_path_buf()),
             fd: AtomicI32::new(fd),
+            transport,
+            on_reconnect,
+            #[cfg(feature = "exec-private-successor")]
+            native_failed: AtomicBool::new(false),
+        })
+    }
+
+    /// Adopt a mapped (shared-memory) stream issued by the coordinator
+    /// (C1 PR1). Performs the ordinary config handshake over it.
+    /// Fork and successor flows over mapped refuse by name in PR1
+    /// (see `exchange`); fd delivery for children is PR2.
+    #[cfg(target_os = "linux")]
+    pub fn from_mapped_stream(
+        stream: reverie_rpc_transport::mapped::MappedStream,
+        on_reconnect: ReconnectHook,
+    ) -> io::Result<Self> {
+        reverie_rpc_transport::RpcTransport::from_env()
+            .and_then(|selected| selected.require("mapped"))
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        let pid = current_id(libc::SYS_getpid)?;
+        let tid = current_id(libc::SYS_gettid)?;
+        let client = BlockingRpcClient::<G, GuestRpcStream>::from_connected_stream(
+            GuestRpcStream::Mapped(stream),
+            tid,
+        )
+        .map_err(|error| io::Error::other(describe_rpc_error(&error)))?;
+        let config = Arc::new(client.config().clone());
+        Ok(Self {
+            connection: ConnectionOwner::Ordinary(OrdinaryConnections::new(
+                tid.as_raw(),
+                RpcConnection::new(pid, client),
+            )),
+            config,
+            path: None,
+            fd: AtomicI32::new(-1),
+            transport: reverie_rpc_transport::RpcTransport::Mapped,
             on_reconnect,
             #[cfg(feature = "exec-private-successor")]
             native_failed: AtomicBool::new(false),
@@ -377,6 +432,12 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
     /// `on_reconnect` runs when a forked child reconnects; see
     /// [`ReconnectHook`].
     pub fn connect(path: impl AsRef<Path>, on_reconnect: ReconnectHook) -> io::Result<Self> {
+        // Path connect is the socket transport by definition; a mapped
+        // selection here is a named mismatch, never a silent fallback.
+        let transport = reverie_rpc_transport::RpcTransport::Socket;
+        reverie_rpc_transport::RpcTransport::from_env()
+            .and_then(|selected| selected.require("socket"))
+            .map_err(|e| io::Error::other(e.to_string()))?;
         let path = path.as_ref().to_path_buf();
         let pid = current_id(libc::SYS_getpid)?;
         let tid = current_id(libc::SYS_gettid)?;
@@ -392,6 +453,7 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
             config,
             path: Some(path),
             fd: AtomicI32::new(fd),
+            transport,
             on_reconnect,
             #[cfg(feature = "exec-private-successor")]
             native_failed: AtomicBool::new(false),
@@ -419,6 +481,13 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
         let connections = self.connection.ordinary();
         if let Some(connection) = connections.get(tid) {
             return connection;
+        }
+        // A mapped run has no per-thread socket to open: refusing by name
+        // (124, as the fork path does) instead of silently falling back
+        // to a socket connect for later threads. Mapped fd delivery for
+        // children/threads is C1 PR2 scope.
+        if self.transport == reverie_rpc_transport::RpcTransport::Mapped {
+            rpc_fatal(124);
         }
         let pid = current_id(libc::SYS_getpid).unwrap_or_else(|_| rpc_fatal(122));
         let path = self.path.as_deref().unwrap_or_else(|| rpc_fatal(123));
@@ -489,6 +558,13 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
         // child, so `getpid`/`gettid` are issued only when a fork has actually
         // happened and the inherited connection may still belong to the parent.
         if FORKED_SINCE_LAST_RPC.swap(false, Ordering::AcqRel) {
+            // C1 PR1: a mapped endpoint must never be duplicated by fork
+            // (SPSC contract). Refuse by name (exit 124) instead of
+            // operating the inherited copy; PR2 delivers fresh pairs.
+            #[cfg(target_os = "linux")]
+            if self.transport == reverie_rpc_transport::RpcTransport::Mapped {
+                rpc_fatal(124);
+            }
             // Both installed private domains already refuse fork/thread. A
             // retained native stream can never reconnect as ordinary I/O.
             #[cfg(feature = "exec-private-init")]
@@ -574,6 +650,10 @@ fn close_inherited_stream(stream: GuestRpcStream) {
                 .unwrap_or_else(|_| rpc_fatal(reverie_rpc_transport::TOOL_RPC_FAILURE_EXIT_CODE));
             drop(blocked);
         }
+        // Not reached for mapped either: the fork branch refuses mapped
+        // (124) before reconnecting. Defensive.
+        #[cfg(target_os = "linux")]
+        GuestRpcStream::Mapped(stream) => drop(stream),
         // Not reached on the ordinary path: connect_ordinary builds only
         // Ordinary streams. Dropped as before, without the survivor check.
         #[cfg(feature = "exec-private-init")]
@@ -645,5 +725,229 @@ fn rpc_fatal(status: i32) -> ! {
     }
     loop {
         core::hint::spin_loop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+    use std::sync::Arc;
+
+    use super::CoordinatorRpc;
+    use super::GuestRpcStream;
+    use crate::guest::native_test_support::Remote;
+
+    /// F2: a mapped client adopted through `from_live_client` must
+    /// refuse by name (exit 124) when a second thread needs its own
+    /// connection, never silently connect a socket to `path`.
+    /// Fork-isolated: `rpc_fatal` exits the whole child process, and
+    /// the mapped pair is created and imported inside the child only
+    /// (neither endpoint is duplicated by the fork).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mapped_second_thread_connection_refuses_124() {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            let status =
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(child_body)).is_ok() {
+                    // thread_connection returned instead of refusing: this
+                    // exit code distinguishes that from the expected 124
+                    // and from a setup panic (125).
+                    0
+                } else {
+                    125
+                };
+            unsafe { libc::_exit(status) }
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status), "status {status:#x}");
+        assert_eq!(libc::WEXITSTATUS(status), 124);
+
+        fn child_body() {
+            use reverie_rpc_transport::mapped::MappedStream;
+            // SAFETY: single-threaded point in the forked child, before
+            // any other thread exists; the selection must name mapped
+            // for from_live_client to admit the mapped client at all.
+            unsafe { std::env::set_var("REVERIE_RPC_TRANSPORT", "mapped") };
+            // SAFETY: the setup descriptor goes to the sole importer
+            // below; no writes through the descriptor itself.
+            let (mut host, guest_fd) = unsafe { MappedStream::create(256 * 1024) }.unwrap();
+            let server = std::thread::spawn(move || {
+                let config = reverie_rpc_transport::codec::encode(&71_u64).unwrap();
+                host.write_all(&(config.len() as u32).to_be_bytes())
+                    .unwrap();
+                host.write_all(&config).unwrap();
+                // Keep the host end mapped until the child exits.
+                std::thread::park();
+            });
+            let _ = &server;
+            // SAFETY: sole importer of the setup descriptor.
+            let stream = unsafe { MappedStream::from_owned_fd(guest_fd) }.unwrap();
+            let tid = super::current_id(libc::SYS_gettid).unwrap();
+            let client =
+                reverie_rpc_transport::BlockingRpcClient::<Remote, _>::from_connected_stream(
+                    GuestRpcStream::Mapped(stream),
+                    tid,
+                )
+                .unwrap();
+            let rpc = Arc::new(
+                CoordinatorRpc::<Remote>::from_live_client(
+                    "unused-mapped-thread-test",
+                    client,
+                    |_, _| Ok(()),
+                )
+                .unwrap(),
+            );
+            assert_eq!(
+                rpc.transport,
+                reverie_rpc_transport::RpcTransport::Mapped,
+                "adopted client must be classified mapped (fd -1)"
+            );
+            // Root thread connection exists; a second thread has none
+            // and must hit the named mapped refusal before connecting.
+            let second = {
+                let rpc = Arc::clone(&rpc);
+                std::thread::spawn(move || {
+                    let _connection = rpc.thread_connection();
+                })
+            };
+            // rpc_fatal(124) in the second thread exit_groups the whole
+            // child; reaching join means no refusal happened.
+            let _ = second.join();
+        }
+    }
+
+    /// F2, `from_mapped_stream` constructor: same named 124 refusal for
+    /// a second thread (previously this only failed closed with the
+    /// ambiguous 123 from the missing path).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mapped_stream_second_thread_connection_refuses_124() {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            let status =
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(child_body)).is_ok() {
+                    0
+                } else {
+                    125
+                };
+            unsafe { libc::_exit(status) }
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status), "status {status:#x}");
+        assert_eq!(libc::WEXITSTATUS(status), 124);
+
+        fn child_body() {
+            use reverie_rpc_transport::mapped::MappedStream;
+            // SAFETY: single-threaded point in the forked child.
+            unsafe { std::env::set_var("REVERIE_RPC_TRANSPORT", "mapped") };
+            // SAFETY: the setup descriptor goes to the sole importer
+            // below; no writes through the descriptor itself.
+            let (mut host, guest_fd) = unsafe { MappedStream::create(256 * 1024) }.unwrap();
+            let server = std::thread::spawn(move || {
+                let config = reverie_rpc_transport::codec::encode(&71_u64).unwrap();
+                host.write_all(&(config.len() as u32).to_be_bytes())
+                    .unwrap();
+                host.write_all(&config).unwrap();
+                std::thread::park();
+            });
+            let _ = &server;
+            // SAFETY: sole importer of the setup descriptor.
+            let stream = unsafe { MappedStream::from_owned_fd(guest_fd) }.unwrap();
+            let rpc = Arc::new(
+                CoordinatorRpc::<Remote>::from_mapped_stream(stream, |_, _| Ok(())).unwrap(),
+            );
+            let second = {
+                let rpc = Arc::clone(&rpc);
+                std::thread::spawn(move || {
+                    let _connection = rpc.thread_connection();
+                })
+            };
+            let _ = second.join();
+        }
+    }
+
+    /// F2, fork control: a fork child's first connection lookup (its
+    /// TID has no entry; the root entry is the parent's) must meet the
+    /// same named 124 mapped refusal before any socket connect, not
+    /// lose it to the exchange-time guard. Double-forked so the env
+    /// selection and mapped endpoint exist only in the middle child:
+    /// the outer child adopts, grandchild's lookup must refuse 124
+    /// before touching the inherited stream (endpoints are never
+    /// operated across a fork; adopters only wait).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mapped_fork_child_connection_refuses_124() {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            let status = if std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                middle_child_body,
+            ))
+            .is_ok()
+            {
+                0
+            } else {
+                125
+            };
+            unsafe { libc::_exit(status) }
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status), "status {status:#x}");
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+
+        fn middle_child_body() {
+            use reverie_rpc_transport::mapped::MappedStream;
+            // SAFETY: single-threaded point in the forked child.
+            unsafe { std::env::set_var("REVERIE_RPC_TRANSPORT", "mapped") };
+            // SAFETY: the setup descriptor goes to the sole importer
+            // below; no writes through the descriptor itself.
+            let (mut host, guest_fd) = unsafe { MappedStream::create(256 * 1024) }.unwrap();
+            let server = std::thread::spawn(move || {
+                let config = reverie_rpc_transport::codec::encode(&71_u64).unwrap();
+                host.write_all(&(config.len() as u32).to_be_bytes())
+                    .unwrap();
+                host.write_all(&config).unwrap();
+                std::thread::park();
+            });
+            let _ = &server;
+            // SAFETY: sole importer of the setup descriptor.
+            let stream = unsafe { MappedStream::from_owned_fd(guest_fd) }.unwrap();
+            let tid = super::current_id(libc::SYS_gettid).unwrap();
+            let client =
+                reverie_rpc_transport::BlockingRpcClient::<Remote, _>::from_connected_stream(
+                    GuestRpcStream::Mapped(stream),
+                    tid,
+                )
+                .unwrap();
+            let rpc = Arc::new(
+                CoordinatorRpc::<Remote>::from_live_client(
+                    "unused-mapped-fork-test",
+                    client,
+                    |_, _| Ok(()),
+                )
+                .unwrap(),
+            );
+            assert_eq!(rpc.transport, reverie_rpc_transport::RpcTransport::Mapped);
+            let grandchild = unsafe { libc::fork() };
+            assert!(grandchild >= 0);
+            if grandchild == 0 {
+                // New TID, no entry: must refuse 124 before connecting.
+                let _connection = rpc.thread_connection();
+                unsafe { libc::_exit(0) }
+            }
+            let mut status = 0;
+            assert_eq!(
+                unsafe { libc::waitpid(grandchild, &mut status, 0) },
+                grandchild
+            );
+            assert!(libc::WIFEXITED(status), "status {status:#x}");
+            assert_eq!(libc::WEXITSTATUS(status), 124);
+        }
     }
 }

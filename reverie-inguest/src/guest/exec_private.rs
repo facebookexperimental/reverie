@@ -416,6 +416,36 @@ pub(super) fn native_exec_mock_callback() -> Box<NativeControl> {
     native
 }
 
+/// Transition an InitialImage lifecycle fixture control (phase 2,
+/// already published by `lifecycle_test_owner`) to the callback-ready
+/// state `native_exec_mock_callback` models on its successor control,
+/// so one stable control can serve both lifecycle and exec-callback
+/// facts in a single fixture process. The caller must have completed
+/// InitialImage lifecycle initialization on this control first.
+#[cfg(all(test, feature = "exec-native-injection"))]
+pub(super) fn native_exec_test_make_callback_ready(control: &mut NativeControl) {
+    // Component fixture only; Issue/installer authority remains modeled.
+    assert_eq!(control.phase, 2);
+    assert_eq!(control.runtime_ready, 0);
+    control.phase = 4;
+    control.runtime_ready = 1;
+    control.native_state = 3; // Modeled ready callback after kernel restoration.
+    control.guest_fs = control.tool_fs;
+    let mut head = 0_u64;
+    let mut length = 0_u64;
+    assert_eq!(
+        unsafe {
+            crate::trap::raw_syscall6(
+                libc::SYS_get_robust_list,
+                [0, (&raw mut head) as u64, (&raw mut length) as u64, 0, 0, 0],
+            )
+        },
+        0
+    );
+    control.kernel_robust_head = head;
+    control.kernel_robust_len = length;
+}
+
 #[cfg(all(test, feature = "exec-native-injection"))]
 pub(super) fn native_exec_test_enter_guest(control: &mut NativeControl) {
     // Component fixture only; protected installer/Issue authority is modeled.

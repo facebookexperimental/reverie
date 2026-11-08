@@ -58,9 +58,36 @@ pub fn move_ordinary_coordinator_stream(stream: UnixStream) -> io::Result<UnixSt
 pub enum GuestRpcStream {
     /// Existing ordinary socket semantics, including all EOF/error distinctions.
     Ordinary(UnixStream),
+    /// Shared-memory SPSC transport (C1). Carries no retained descriptor:
+    /// `as_raw_fd` reports -1 and fd placement/relocation do not apply.
+    #[cfg(target_os = "linux")]
+    Mapped(reverie_rpc_transport::mapped::MappedStream),
     /// Qualified physical native I/O; construction alone is not admission.
     #[cfg(feature = "exec-private-init")]
     Native(NativeGateStream),
+}
+
+impl GuestRpcStream {
+    /// Transport-selection kind string for
+    /// [`reverie_rpc_transport::RpcTransport::require`].
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Ordinary(_) => "socket",
+            #[cfg(target_os = "linux")]
+            Self::Mapped(_) => "mapped",
+            #[cfg(feature = "exec-private-init")]
+            Self::Native(_) => "socket",
+        }
+    }
+
+    /// Whether this stream is the mapped transport (no descriptor).
+    pub fn is_mapped(&self) -> bool {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Mapped(_) => true,
+            _ => false,
+        }
+    }
 }
 
 impl From<UnixStream> for GuestRpcStream {
@@ -152,6 +179,9 @@ impl AsRawFd for GuestRpcStream {
     fn as_raw_fd(&self) -> RawFd {
         match self {
             Self::Ordinary(stream) => stream.as_raw_fd(),
+            // Mapped streams retain no descriptor by construction.
+            #[cfg(target_os = "linux")]
+            Self::Mapped(_) => -1,
             #[cfg(feature = "exec-private-init")]
             Self::Native(stream) => stream.fd,
         }
@@ -182,6 +212,8 @@ impl Read for GuestRpcStream {
                 raw_result(result).map(|count| count as usize)
             }
             Self::Ordinary(stream) => stream.read(buffer),
+            #[cfg(target_os = "linux")]
+            Self::Mapped(stream) => stream.read(buffer),
             #[cfg(feature = "exec-private-init")]
             Self::Native(stream) => stream.read(buffer),
         }
@@ -213,6 +245,8 @@ impl Write for GuestRpcStream {
             // Outside a callback, libc must still reach guest interception:
             // a guest cannot use the installed accessor's protected socket.
             Self::Ordinary(stream) => stream.write(buffer),
+            #[cfg(target_os = "linux")]
+            Self::Mapped(stream) => stream.write(buffer),
             #[cfg(feature = "exec-private-init")]
             Self::Native(stream) => stream.write(buffer),
         }
@@ -221,6 +255,8 @@ impl Write for GuestRpcStream {
     fn flush(&mut self) -> io::Result<()> {
         match self {
             Self::Ordinary(stream) => stream.flush(),
+            #[cfg(target_os = "linux")]
+            Self::Mapped(stream) => stream.flush(),
             #[cfg(feature = "exec-private-init")]
             Self::Native(stream) => stream.flush(),
         }

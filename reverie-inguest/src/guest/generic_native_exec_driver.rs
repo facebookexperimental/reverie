@@ -430,6 +430,7 @@ mod tests {
         calls: CallLog,
     }
     thread_local! {
+        static ISSUE_ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         static PROVISION_OK: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
         static SHARED_CALLS: std::cell::RefCell<Vec<&'static str>> =
             const { std::cell::RefCell::new(Vec::new()) };
@@ -579,6 +580,37 @@ mod tests {
         assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
         assert!(libc::WIFEXITED(status), "status {status:#x}");
         assert_eq!(libc::WEXITSTATUS(status), 0);
+    }
+
+    #[test]
+    fn generic_driver_armed_leaf_witness() {
+        // Armed counterpart of the dispatch witness: with the test-only
+        // issue latch armed in the forked child, the attempt reaches
+        // this driver's leaf, which must refuse by its N2b name and
+        // never call issuer.issue. Fork-isolated like the witness:
+        // the latch is process-global, so arming must not leak.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            let status =
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(dispatch_armed_body))
+                    .is_ok()
+                {
+                    0
+                } else {
+                    125
+                };
+            unsafe { libc::_exit(status) }
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status), "status {status:#x}");
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+    }
+
+    fn dispatch_armed_body() {
+        ISSUE_ARMED.with(|armed| armed.set(true));
+        dispatch_body2();
     }
 
     fn dispatch_body2() {
@@ -731,6 +763,9 @@ mod tests {
             Rt,
         ));
         unsafe { host.install_native_exec_driver(Arc::new(driver)) }.unwrap();
+        // S1 splits installation from admission: until the embedder
+        // admits the route, dispatch never consults the driver.
+        unsafe { host.admit_native_exec() }.unwrap();
         let mut event = SyscallEvent {
             number: libc::SYS_execve,
             args: [0x1000, 0x2000, 0x3000, 0, 0, 0],
@@ -740,19 +775,48 @@ mod tests {
             dispatch: SyscallDispatch::Fallback,
             guest_pkru: None,
         };
+        if ISSUE_ARMED.with(|armed| armed.get()) {
+            crate::guest::native_exec::arm_test_issue();
+        }
         unsafe { host.dispatch(&mut event) };
         let results = returned.lock().unwrap();
         assert_eq!(results.len(), 1, "results: {results:?}");
         let (errno, refusal) = &results[0];
         assert_eq!(*errno, Errno::EOPNOTSUPP);
         let refusal = refusal.as_ref().expect("named leaf refusal");
-        if PROVISION_OK.with(|ok| ok.get()) {
-            // Delivery-positive: prepare/seal/deliver/mark succeeded,
-            // then the N2b leaf refusal (host cancels prepared ticket).
+        if ISSUE_ARMED.with(|armed| armed.get()) {
+            // Armed (test-only latch, forked child only): the host seam
+            // lets the attempt reach this driver's leaf, which must
+            // refuse by its N2b name and never call issuer.issue (the
+            // exact call sequence below asserts that). Delivery-positive
+            // only: prepare/seal/deliver/mark succeeded first.
+            assert!(
+                PROVISION_OK.with(|ok| ok.get()),
+                "armed case is delivery-positive by construction"
+            );
             assert!(
                 refusal
                     .diagnostic
                     .contains("generic native exec leaf is N2b"),
+                "{}",
+                refusal.diagnostic
+            );
+            let calls = SHARED_CALLS.with(|l| l.borrow().clone());
+            assert_eq!(
+                calls,
+                ["prepare", "seal", "deliver", "mark", "cancel"],
+                "calls: {calls:?}"
+            );
+        } else if PROVISION_OK.with(|ok| ok.get()) {
+            // Delivery-positive, unarmed: prepare/seal/deliver/mark
+            // succeeded, then the S1 host-enforced final-step refusal
+            // preempts this driver's N2b leaf (no successor execution
+            // in this stage regardless of driver behavior; removing
+            // that refusal is the seam that re-enables issue).
+            assert!(
+                refusal
+                    .diagnostic
+                    .contains("admitted native exec is refused at the final"),
                 "{}",
                 refusal.diagnostic
             );

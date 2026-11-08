@@ -99,6 +99,9 @@ mod image_guest;
 #[cfg(all(test, feature = "exec-native-injection"))]
 #[path = "native_exec_tests.rs"]
 mod native_exec_tests;
+#[cfg(all(test, feature = "exec-native-injection"))]
+#[path = "native_exec_witness_tests.rs"]
+mod native_exec_witness_tests;
 #[cfg(feature = "exec-private-successor")]
 #[path = "successor_image_guest.rs"]
 mod successor_image_guest;
@@ -367,6 +370,11 @@ pub struct ToolHost<T: Tool, R: HostRuntime> {
     prepared_exec_pending: core::sync::atomic::AtomicBool,
     #[cfg(feature = "exec-native-injection")]
     native_exec_driver: Option<std::sync::Arc<dyn super::native_exec::NativeExecDriver<T>>>,
+    // Embedder opt-in, separate from driver installation: the admitted
+    // native exec/clone route is consulted only when the authenticated
+    // installer explicitly admitted it via `admit_native_exec`.
+    #[cfg(feature = "exec-native-injection")]
+    native_exec_admitted: bool,
 }
 
 #[cfg(feature = "exec-private-successor")]
@@ -647,6 +655,8 @@ where
             prepared_exec_pending: core::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "exec-native-injection")]
             native_exec_driver: None,
+            #[cfg(feature = "exec-native-injection")]
+            native_exec_admitted: false,
         }
     }
 
@@ -731,6 +741,55 @@ where
         }
         self.native_exec_driver = Some(driver);
         Ok(())
+    }
+
+    /// Admit the native exec/clone route for this host: the embedder
+    /// opt-in, distinct from installing a driver. Until admitted, an
+    /// installed driver is never consulted for exec or clone and both
+    /// keep their typed refusals. Admission is single-shot and must
+    /// precede dispatch, under the same guards as driver installation.
+    ///
+    /// # Safety
+    /// Only the authenticated experimental installer that installed the
+    /// driver may call this, under every contract of
+    /// `install_native_exec_driver`. No guest Config, environment or
+    /// request is admission authority.
+    #[cfg(feature = "exec-native-injection")]
+    pub unsafe fn admit_native_exec(&mut self) -> io::Result<()> {
+        if self.native_exec_driver.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "native exec admission requires an installed driver",
+            ));
+        }
+        if self.native_exec_admitted {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "native exec route already admitted",
+            ));
+        }
+        // Field-level gate, mirroring install_native_exec_driver: holding
+        // the returned guard would borrow all of `self` and block the
+        // admission assignment below.
+        let _install = self.install_gate.lock();
+        if self.dispatch_active() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "Tool state dispatch is active",
+            ));
+        }
+        if !self.states.is_empty() {
+            return Err(io::Error::other("native exec admission follows dispatch"));
+        }
+        self.native_exec_admitted = true;
+        Ok(())
+    }
+
+    /// Whether the admitted native exec/clone route may be consulted:
+    /// feature compiled, driver installed, and embedder admitted.
+    #[cfg(feature = "exec-native-injection")]
+    fn native_exec_admitted(&self) -> bool {
+        self.native_exec_admitted && self.native_exec_driver.is_some()
     }
 
     /// Bind the actual stable installed successor host before its frontend.
@@ -1095,6 +1154,8 @@ where
             exec: None,
             #[cfg(feature = "exec-native-injection")]
             mapping_driver: self.native_exec_driver.as_deref(),
+            #[cfg(feature = "exec-native-injection")]
+            native_exec_admitted: self.native_exec_admitted(),
             unsupported_refusal: None,
             injected_syscalls: 0,
         };
@@ -1248,7 +1309,9 @@ where
         // drift between the in-guest backends; this host maps each terminal
         // outcome onto its own per-thread lifecycle (exit/fork-child) state.
         #[cfg(feature = "exec-native-injection")]
-        if let Some(driver) = self.native_exec_driver.as_ref() {
+        if self.native_exec_admitted()
+            && let Some(driver) = self.native_exec_driver.as_ref()
+        {
             let mut site = guest.native_exec_site();
             // Capture belongs immediately before this actual handler; it is
             // not a native authorization for thread-start/post-exec callbacks.
@@ -1398,6 +1461,8 @@ where
             exec: None,
             #[cfg(feature = "exec-native-injection")]
             mapping_driver: self.native_exec_driver.as_deref(),
+            #[cfg(feature = "exec-native-injection")]
+            native_exec_admitted: self.native_exec_admitted(),
             unsupported_refusal: None,
             injected_syscalls: 0,
         };
@@ -1555,6 +1620,8 @@ fn finish_fork_child<T: Tool + 'static, R: HostRuntime>(
         exec: None,
         #[cfg(feature = "exec-native-injection")]
         mapping_driver: None,
+        #[cfg(feature = "exec-native-injection")]
+        native_exec_admitted: false,
         unsupported_refusal: None,
         injected_syscalls: 0,
     };
@@ -2180,6 +2247,10 @@ pub struct InGuest<'a, T: Tool, R: HostRuntime> {
     exec: Option<super::native_exec::ExecInjection<'a, T>>,
     #[cfg(feature = "exec-native-injection")]
     mapping_driver: Option<&'a dyn super::native_exec::NativeExecDriver<T>>,
+    /// Whether the host admitted the native exec/clone route for this
+    /// dispatch (embedder opt-in; see `ToolHost::admit_native_exec`).
+    #[cfg(feature = "exec-native-injection")]
+    native_exec_admitted: bool,
     /// The typed refusal of the last injection, if the backend refused it
     /// ([`reverie::Guest::take_unsupported_refusal`]).
     unsupported_refusal: Option<reverie::UnsupportedRefusal>,
@@ -3847,6 +3918,26 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
             return Errno::from_ret(result as usize).map(|value| value as i64);
         }
 
+        #[cfg(feature = "exec-native-injection")]
+        if (matches!(number, libc::SYS_clone | libc::SYS_clone3)
+            || Some(number) == crate::arch::SYS_VFORK)
+            && self.native_exec_admitted
+        {
+            // Admitted route, final-step refusal: admission plumbing is
+            // consulted, but no thread is armed yet, so creation still
+            // refuses by typed name rather than running unmediated or
+            // crashing. Plain forks (including vfork and fork-shaped
+            // clone/clone3) never reach this arm: `is_plain_fork`
+            // forwards them above, in admitted and unadmitted mode alike.
+            self.unsupported_refusal = Some(reverie::UnsupportedRefusal::new(
+                reverie::UnsupportedOperation::ThreadCreation,
+                Errno::EOPNOTSUPP,
+                "the admitted native exec route does not arm thread creation: \
+                 clone and clone3 that are not plain forks are refused at the \
+                 final step",
+            ));
+            return Err(Errno::EOPNOTSUPP);
+        }
         // AUTONOMOUS-BOT-IMPLEMENTED
         if number == libc::SYS_clone
             || number == libc::SYS_clone3
@@ -5164,6 +5255,8 @@ mod tests {
             exec: None,
             #[cfg(feature = "exec-native-injection")]
             mapping_driver: None,
+            #[cfg(feature = "exec-native-injection")]
+            native_exec_admitted: false,
             unsupported_refusal: None,
             injected_syscalls: 0,
         };
@@ -5304,6 +5397,8 @@ mod tests {
             exec: None,
             #[cfg(feature = "exec-native-injection")]
             mapping_driver: None,
+            #[cfg(feature = "exec-native-injection")]
+            native_exec_admitted: false,
             unsupported_refusal: None,
             injected_syscalls: 0,
         };
@@ -5914,6 +6009,8 @@ mod tests {
                 exec: None,
                 #[cfg(feature = "exec-native-injection")]
                 mapping_driver: None,
+                #[cfg(feature = "exec-native-injection")]
+                native_exec_admitted: false,
                 unsupported_refusal: None,
                 injected_syscalls: 0,
             };

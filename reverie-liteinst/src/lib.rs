@@ -139,6 +139,8 @@ pub use tool_host::ValidatedStraddlerStaleness;
 #[cfg(feature = "exec-private-init")]
 pub use tool_host::install_tool_initial_image;
 #[cfg(feature = "exec-native-injection")]
+pub use tool_host::install_tool_initial_image_with_admitted_native_exec;
+#[cfg(feature = "exec-native-injection")]
 pub use tool_host::install_tool_initial_image_with_native_exec;
 pub use tool_host::install_tool_quiescent;
 #[cfg(feature = "exec-native-injection")]

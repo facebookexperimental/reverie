@@ -115,6 +115,8 @@ where
             prepared_exec_pending: core::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "exec-native-injection")]
             native_exec_driver: None,
+            #[cfg(feature = "exec-native-injection")]
+            native_exec_admitted: false,
         };
         Ok(CopiedNativeProcess {
             host,

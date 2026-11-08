@@ -780,7 +780,7 @@ pub unsafe fn install_tool_successor_image<T: Tool + 'static>(
                 state,
                 consumer: &mut *consumer,
             }),
-            Some(driver),
+            Some((driver, false)),
             true,
             straddler_staleness,
         )?;
@@ -793,7 +793,9 @@ pub unsafe fn install_tool_successor_image<T: Tool + 'static>(
 }
 
 /// Install an authenticated initial image with its concrete native exec driver
-/// before the first dispatch. Ordinary InitialImage installation is unchanged.
+/// before the first dispatch, without admitting the native exec/clone route:
+/// exec and thread creation keep their typed refusals. Ordinary
+/// InitialImage installation is unchanged.
 ///
 /// # Safety
 /// All InitialImage and NativeExecDriver contracts apply. `qualify` must inspect
@@ -807,6 +809,53 @@ pub unsafe fn install_tool_initial_image_with_native_exec<T: Tool + 'static>(
     prepared: PreparedInitialImage<T>,
     driver: std::sync::Arc<dyn reverie_inguest::guest::native_exec::NativeExecDriver<T>>,
     qualify: impl FnOnce(&<T::GlobalState as reverie::GlobalTool>::Config) -> io::Result<()>,
+) -> io::Result<InstalledInitialImage> {
+    // SAFETY: forwarded verbatim; all contracts of this entry apply.
+    unsafe {
+        install_tool_initial_image_with_native_exec_admission(
+            coordinator,
+            prepared,
+            driver,
+            qualify,
+            false,
+        )
+    }
+}
+
+/// As [`install_tool_initial_image_with_native_exec`], and additionally
+/// admit the native exec/clone route (the embedder opt-in): the host
+/// consults the driver for exec, and thread/vfork creation takes the
+/// admitted route's final-step typed refusal until thread arming exists.
+///
+/// # Safety
+/// All contracts of [`install_tool_initial_image_with_native_exec`] and
+/// of host native-exec admission apply.
+#[cfg(feature = "exec-native-injection")]
+pub unsafe fn install_tool_initial_image_with_admitted_native_exec<T: Tool + 'static>(
+    coordinator: impl AsRef<Path>,
+    prepared: PreparedInitialImage<T>,
+    driver: std::sync::Arc<dyn reverie_inguest::guest::native_exec::NativeExecDriver<T>>,
+    qualify: impl FnOnce(&<T::GlobalState as reverie::GlobalTool>::Config) -> io::Result<()>,
+) -> io::Result<InstalledInitialImage> {
+    // SAFETY: forwarded verbatim; all contracts of this entry apply.
+    unsafe {
+        install_tool_initial_image_with_native_exec_admission(
+            coordinator,
+            prepared,
+            driver,
+            qualify,
+            true,
+        )
+    }
+}
+
+#[cfg(feature = "exec-native-injection")]
+unsafe fn install_tool_initial_image_with_native_exec_admission<T: Tool + 'static>(
+    coordinator: impl AsRef<Path>,
+    prepared: PreparedInitialImage<T>,
+    driver: std::sync::Arc<dyn reverie_inguest::guest::native_exec::NativeExecDriver<T>>,
+    qualify: impl FnOnce(&<T::GlobalState as reverie::GlobalTool>::Config) -> io::Result<()>,
+    admit_native_exec: bool,
 ) -> io::Result<InstalledInitialImage> {
     let PreparedInitialImage {
         fatal,
@@ -822,7 +871,7 @@ pub unsafe fn install_tool_initial_image_with_native_exec<T: Tool + 'static>(
             false,
             runtime::PatchPublication::Quiescent,
             Some(ImageInstall::Initial(client, &control, &fatal)),
-            Some(driver),
+            Some((driver, admit_native_exec)),
             true,
             straddler_staleness,
         )?;
@@ -1075,9 +1124,10 @@ unsafe fn install_tool_inner<T>(
     remove_legacy_environment: bool,
     publication: runtime::PatchPublication,
     #[cfg(feature = "exec-private-init")] initial: Option<ImageInstall<'_, T>>,
-    #[cfg(feature = "exec-native-injection")] native_driver: Option<
+    #[cfg(feature = "exec-native-injection")] native_exec: Option<(
         std::sync::Arc<dyn reverie_inguest::guest::native_exec::NativeExecDriver<T>>,
-    >,
+        bool,
+    )>,
     #[cfg(feature = "exec-private-init")] skip_pmu: bool,
     #[cfg(feature = "exec-private-init")] straddler_staleness: Option<
         Option<crate::runtime::StalenessBudget>,
@@ -1312,11 +1362,19 @@ where
     #[cfg(feature = "exec-native-injection")]
     let host = {
         let mut host = host;
-        if let Some(driver) = native_driver {
+        if let Some((driver, admit_native_exec)) = native_exec {
             // SAFETY: only the explicitly authenticated native entry supplies
             // this concrete driver, before publication or any dispatch.
             unsafe {
                 install_try!(host.install_native_exec_driver(driver));
+            }
+            if admit_native_exec {
+                // SAFETY: same authenticated entry and pre-dispatch point
+                // as the driver installation above; admission is the
+                // embedder opt-in this entry was explicitly given.
+                unsafe {
+                    install_try!(host.admit_native_exec());
+                }
             }
         }
         host

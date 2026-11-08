@@ -575,6 +575,8 @@ mod tests {
             exec: None,
             #[cfg(feature = "exec-native-injection")]
             mapping_driver: None,
+            #[cfg(feature = "exec-native-injection")]
+            native_exec_admitted: false,
             unsupported_refusal: None,
             injected_syscalls: 0,
         };
