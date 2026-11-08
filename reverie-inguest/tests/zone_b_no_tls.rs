@@ -676,7 +676,19 @@ fn scan_range(
                 "FS-base instruction in zone-B code",
             );
         }
-        if instruction.mnemonic() == Mnemonic::Syscall
+        let direct_kernel_entry = match instruction.mnemonic() {
+            Mnemonic::Syscall => Some("syscall"),
+            Mnemonic::Sysenter => Some("sysenter"),
+            Mnemonic::Int
+                if instruction.op_count() > 0
+                    && instruction.op_kind(0) == OpKind::Immediate8
+                    && instruction.immediate8() == 0x80 =>
+            {
+                Some("int 0x80")
+            }
+            _ => None,
+        };
+        if let Some(entry) = direct_kernel_entry
             && section.name != ".gate"
             && !range.symbol.starts_with("fixed_")
         {
@@ -685,7 +697,7 @@ fn scan_range(
                 &range.symbol,
                 offset,
                 "direct-syscall-outside-gate",
-                "syscall instruction outside the fixed gate",
+                format!("{entry} instruction outside the fixed gate"),
             );
         }
         scan_branch(
@@ -1067,6 +1079,20 @@ fn checker_refuses_each_injected_tls_and_control_violation() {
             "extern void zone_b_fill(char *);\nint zone_b_mutant(void) { char buffer[64]; zone_b_fill(buffer); return buffer[0]; }\n",
             vec!["-fstack-protector-strong"],
             "stack-canary",
+        ),
+        (
+            "int80-entry",
+            "zone_b_int80.S",
+            ".text\n.globl zone_b_mutant\n.type zone_b_mutant,@function\nzone_b_mutant:\n int $0x80\n ret\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "direct-syscall-outside-gate",
+        ),
+        (
+            "sysenter-entry",
+            "zone_b_sysenter.S",
+            ".text\n.globl zone_b_mutant\n.type zone_b_mutant,@function\nzone_b_mutant:\n sysenter\n ret\n.size zone_b_mutant,.-zone_b_mutant\n.section .note.GNU-stack,\"\",@progbits\n",
+            Vec::new(),
+            "direct-syscall-outside-gate",
         ),
         (
             "indirect-branch",
