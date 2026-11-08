@@ -1942,7 +1942,6 @@ mod tests {
                     "{value} {output:?}"
                 );
             } else {
-                assert_child_ran(&output);
                 assert_eq!(
                     output.status.code(),
                     Some(GUEST_SIGNAL_RETURN_STATUS),
@@ -2040,6 +2039,7 @@ mod tests {
                     .env(CHILD, format!("{stack}:{foreign}"))
                     .output()
                     .unwrap();
+                assert_child_ran(&output);
                 assert_eq!(
                     output.status.code(),
                     Some(GUEST_SIGNAL_RETURN_STATUS),

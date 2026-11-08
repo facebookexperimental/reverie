@@ -374,6 +374,15 @@ fn classify(err: &PatchError, state: SiteState) -> (PromoteOutcome, bool) {
     if state != SiteState::Unpatched {
         return (PromoteOutcome::CustodyPending, true);
     }
+    debug_assert!(
+        !matches!(
+            err,
+            PatchError::StoreFailed { .. }
+                | PatchError::SyncFailed { .. }
+                | PatchError::RestoreFailed { .. }
+        ),
+        "post-store error with Unpatched state: patcher contract broken ({err:?})"
+    );
     match err {
         // Pre-store: the lease could not be cleanly released, so
         // executors may still be stopped — custody of the STOP,
@@ -1302,9 +1311,12 @@ mod tests {
             (PromoteOutcome::Refused, false)
         );
         // Post-store errors are classified by state alone: with a
-        // SyncPending state they are custody; the Unpatched
-        // pairing is unreachable (the patcher sets the pending
-        // state before storing) and refuses plainly.
+        // pending state (SyncPending OR RetainedStop — the state
+        // check is the only post-store discriminator left) they
+        // are custody. The Unpatched pairing is unreachable (the
+        // patcher sets the pending state before storing) and is
+        // rejected by classify's debug_assert, so it is not
+        // called here.
         assert_eq!(
             classify(
                 &PatchError::SyncFailed {
@@ -1316,15 +1328,30 @@ mod tests {
             ),
             (PromoteOutcome::CustodyPending, true)
         );
-        assert_eq!(
-            classify(
-                &PatchError::SyncFailed {
-                    source: Box::new(PatchError::CacheOpsUnavailable)
-                },
-                SiteState::Unpatched
-            ),
-            (PromoteOutcome::Refused, false)
-        );
+        // RetainedStop pins: a state check narrowed to
+        // SyncPending only would misclassify every one of these
+        // as a plain refusal and let completion resume onto an
+        // unsynced page.
+        for err in [
+            PatchError::SyncFailed {
+                source: Box::new(PatchError::CacheOpsUnavailable),
+            },
+            PatchError::RestoreFailed {
+                source: Box::new(PatchError::CacheOpsUnavailable),
+            },
+            PatchError::ResumeIncomplete,
+        ] {
+            assert_eq!(
+                classify(
+                    &err,
+                    SiteState::RetainedStop {
+                        pending: liteinst_aarch64_patch::site::PendingWord::Patch(0)
+                    }
+                ),
+                (PromoteOutcome::CustodyPending, true),
+                "{err:?} with RetainedStop must stay custody"
+            );
+        }
         // Pre-store resume shortfall: custody of the STOP, no site.
         assert_eq!(
             classify(&PatchError::ResumeIncomplete, SiteState::Unpatched),
@@ -1350,15 +1377,6 @@ mod tests {
                 }
             ),
             (PromoteOutcome::CustodyPending, true)
-        );
-        assert_eq!(
-            classify(
-                &PatchError::RestoreFailed {
-                    source: Box::new(PatchError::CacheOpsUnavailable)
-                },
-                SiteState::Unpatched
-            ),
-            (PromoteOutcome::Refused, false)
         );
         assert_eq!(
             classify(
@@ -1490,14 +1508,16 @@ mod tests {
 
     static PROMOTER_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// Serial guard that also rebalances the process-wide custody
-    /// counter to its entry baseline on drop (including panic
-    /// unwind). Production Drop deliberately LEAKS unsettled
-    /// custody (fail closed), so without this one panicking
-    /// custody test would poison GLOBAL_CUSTODY for every later
-    /// test in the process and bury the real failure under
-    /// cascades. Test-only cleanup: it runs at test end, after
-    /// the promoter under test has been dropped or forgotten.
+    /// Serial guard that also restores the process-wide custody
+    /// counter to its entry baseline on drop. Production Drop
+    /// deliberately LEAKS unsettled custody (fail closed), so
+    /// without this one panicking custody test would poison
+    /// GLOBAL_CUSTODY for every later test in the process and
+    /// bury the real failure under cascades. On unwind it only
+    /// restores (the original panic propagates); on clean exit
+    /// any imbalance is itself a test failure, in bounded time
+    /// (one store, never a decrement loop that an underflowed
+    /// counter would spin ~2^64 times under the serial lock).
     struct SerialCustodyGuard {
         _guard: std::sync::MutexGuard<'static, ()>,
         baseline: usize,
@@ -1505,8 +1525,10 @@ mod tests {
 
     impl Drop for SerialCustodyGuard {
         fn drop(&mut self) {
-            while GLOBAL_CUSTODY.load(std::sync::atomic::Ordering::SeqCst) > self.baseline {
-                custody_exit();
+            let now = GLOBAL_CUSTODY.load(std::sync::atomic::Ordering::SeqCst);
+            GLOBAL_CUSTODY.store(self.baseline, std::sync::atomic::Ordering::SeqCst);
+            if !std::thread::panicking() {
+                assert_eq!(now, self.baseline, "test leaked custody");
             }
         }
     }
@@ -2091,6 +2113,11 @@ mod tests {
             for (slot, len) in &slots[4..] {
                 unsafe { libc::munmap(*slot as *mut libc::c_void, *len) };
             }
+            // Snapshot before B: the stop is cumulative over the
+            // whole attempt (A's acquire + complete_sync's
+            // acquire/resume leave it at (2,1)), so B's refusal
+            // must be judged on equal DELTAS, not raw equality.
+            let (acq_b, res_b) = (stop.acquires, stop.resumes);
             let out_b = promoter.promote_one(pb as u64, &mut stop);
             if out_b == PromoteOutcome::Refused {
                 // Placement refusal for B only: prove B untouched
@@ -2101,7 +2128,11 @@ mod tests {
                 // slot in a test process) and rebuild.
                 assert_eq!(unsafe { (pb as *const u32).read_volatile() }, 0xd400_0001);
                 assert_eq!(perms_at(pb as u64), "r-xp");
-                assert_eq!(stop.acquires, stop.resumes);
+                assert_eq!(
+                    stop.acquires - acq_b,
+                    stop.resumes - res_b,
+                    "B refusal must release its own lease exactly once"
+                );
                 assert!(!promoter.unsettled_custody());
                 core::mem::forget(dummy_island);
                 core::mem::forget(promoter);
@@ -2543,6 +2574,102 @@ mod tests {
                 PromoteOutcome::CustodyPending
             );
             assert_eq!(stop2.acquires, 0);
+            drop(fresh);
+            // Second leg, the more dangerous case: a promoter
+            // holding a SyncPending SITE (mDropSites: a Drop that
+            // releases only site custody would reopen the gate
+            // while the site's page may be unsynced/RWX).
+            use liteinst_aarch64_patch::flip::FlipRequest;
+            use liteinst_aarch64_patch::site::{StrategyPreference, TrapRoute};
+            struct FailStore {
+                word: *mut u32,
+            }
+            // SAFETY (test): the word outlives the site below.
+            unsafe impl Send for FailStore {}
+            // SAFETY (test): models a store whose write always
+            // fails after begin; reads/writes name the same word.
+            unsafe impl liteinst_aarch64_patch::store::SiteStore for FailStore {
+                fn read_word(&self) -> u32 {
+                    unsafe { self.word.read_volatile() }
+                }
+                fn write_addr(&self) -> u64 {
+                    self.word as u64
+                }
+                fn begin_write(&mut self) -> Result<(), PatchError> {
+                    Ok(())
+                }
+                fn store_word(&mut self, _word: u32) -> Result<(), PatchError> {
+                    Err(PatchError::Os {
+                        op: "test store",
+                        errno: libc::EIO,
+                    })
+                }
+                fn finish_write(&mut self) -> Result<(), PatchError> {
+                    Ok(())
+                }
+            }
+            struct OpenStop;
+            // SAFETY (test): scripted stop; no executor exists.
+            unsafe impl StopControl for OpenStop {
+                fn acquire(&mut self) -> Result<(), PatchError> {
+                    Ok(())
+                }
+                fn resume(&mut self) -> Result<Vec<ResumeState>, PatchError> {
+                    Ok(vec![ResumeState::Released])
+                }
+            }
+            unsafe fn sync_ok(_rw: *mut u8, _rx: *mut u8, _len: usize) -> Result<(), PatchError> {
+                Ok(())
+            }
+            let baseline2 = GLOBAL_CUSTODY.load(std::sync::atomic::Ordering::SeqCst);
+            let mut word = 0xd400_0001u32;
+            let addr = 0x1000u64;
+            let mut promoter2 =
+                LazyPromoter::with_patcher(Patcher::test_with_sync(sync_ok), 7).unwrap();
+            let store = Box::new(FailStore {
+                word: std::ptr::from_mut(&mut word),
+            });
+            let mut site = unsafe {
+                liteinst_aarch64_patch::site::Site::from_rx(
+                    addr,
+                    word,
+                    facts(addr, Provenance::PrivateFile),
+                    store,
+                )
+            }
+            .unwrap();
+            // SAFETY (test): claims a route for this exact site;
+            // the fake stop never executes the word.
+            let route = unsafe { TrapRoute::arm(addr, 0x4c00, 1) };
+            let mut open_stop = OpenStop;
+            open_stop.acquire().unwrap();
+            let outcome = promoter2.patcher.flip_preacquired(
+                &mut site,
+                FlipRequest {
+                    island: None,
+                    strategy: StrategyPreference::TrapOnly,
+                    fallback: FallbackPermission::RefuseTrap,
+                    trap_route: Some(route),
+                    mapping_facts: Some(facts(addr, Provenance::PrivateFile)),
+                },
+                &mut open_stop,
+            );
+            assert!(matches!(outcome, Err(PatchError::StoreFailed { .. })));
+            assert!(matches!(site.state(), SiteState::SyncPending { .. }));
+            // Install custody exactly as try_promote's retain does.
+            custody_enter();
+            promoter2.sites.push(site);
+            assert!(promoter2.unsettled_custody());
+            assert_eq!(
+                GLOBAL_CUSTODY.load(std::sync::atomic::Ordering::SeqCst),
+                baseline2 + 1
+            );
+            drop(promoter2);
+            assert_eq!(
+                GLOBAL_CUSTODY.load(std::sync::atomic::Ordering::SeqCst),
+                baseline2 + 1,
+                "Drop must leak SyncPending site custody, not release it"
+            );
             std::process::exit(0);
         }
         let out = std::process::Command::new(std::env::current_exe().unwrap())
