@@ -50,10 +50,14 @@ pub const PAGE_SIZE: u64 = 4096;
 /// in `validate` (2,016 pairs at the cap). The count is never
 /// serialised — segment_count is a host `usize` and no wire format
 /// carries it — so raising the cap changes no layout on the wire.
-/// Scope: reverie-liteinst-artifact `private_static` geometry
-/// still caps the same RUNTIME_WINDOW Tool image at 16 PT_LOADs
-/// (follow-up dh-9uc6w), so the end-to-end liteinst cap does not
-/// rise with this constant yet. dh-q2xgh.
+/// Scope: reverie-liteinst-artifact `private_static` geometry and
+/// this module's `private_runtime_metadata` admit the same derived
+/// 67-header envelope for the RUNTIME_WINDOW Tool image (64 PT_LOADs
+/// plus PT_TLS, PT_GNU_STACK and optional PT_PHDR). That is not the
+/// mapped handoff path's end-to-end cap: `mapped_inputs` still refuses
+/// `tls(2)` (program_header_count) above 64 headers, and the handoff
+/// map table holds at most 64 rows, 6 of them fixed, so that path
+/// admits at most 58 PT_LOADs today (dh-hmqfw). dh-9uc6w.
 pub const MAX_SEGMENTS: usize = 64;
 
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];

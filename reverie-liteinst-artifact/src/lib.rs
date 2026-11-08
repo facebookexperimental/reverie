@@ -67180,8 +67180,24 @@ pub mod private_static {
                 && elf.is_64
                 && elf.little_endian
                 && elf.header.e_phentsize == 56
-                && elf.header.e_phnum > 0
-                && elf.header.e_phnum <= 64,
+                && elf.header.e_phnum > 0,
+            "static ELF type/architecture/program-header format differs",
+        )?;
+        // Lockstep with reverie_loader::image::MAX_SEGMENTS; literal only,
+        // because this source is include-by-source for Hermit consumers and
+        // must not gain a reverie-loader dependency. Count first so every
+        // over-cap PT_LOAD count refuses by this name, not by total PHDRs.
+        require(
+            elf.program_headers
+                .iter()
+                .filter(|p| p.p_type == program_header::PT_LOAD)
+                .count()
+                <= 64,
+            "static PT_LOAD count exceeds private_static 64-segment cap",
+        )?;
+        require(
+            // 64 PT_LOADs plus PT_TLS, PT_GNU_STACK and optional PT_PHDR.
+            elf.header.e_phnum <= 67,
             "static ELF type/architecture/program-header format differs",
         )?;
         require(
@@ -67210,17 +67226,16 @@ pub mod private_static {
             .filter(|p| p.p_type == program_header::PT_LOAD)
             .collect();
         require(
-            loads.len() <= 16
-                && loads.iter().all(|p| {
-                    p.p_align == 4096
-                        && p.p_offset % 4096 == 0
-                        && p.p_vaddr % 4096 == 0
-                        && p.p_vaddr >= LOW
-                        && p.p_vaddr
-                            .checked_add(p.p_memsz)
-                            .is_some_and(|end| end <= HIGH)
-                        && matches!(p.p_flags, 4..=6)
-                }),
+            loads.iter().all(|p| {
+                p.p_align == 4096
+                    && p.p_offset % 4096 == 0
+                    && p.p_vaddr % 4096 == 0
+                    && p.p_vaddr >= LOW
+                    && p.p_vaddr
+                        .checked_add(p.p_memsz)
+                        .is_some_and(|end| end <= HIGH)
+                    && matches!(p.p_flags, 4..=6)
+            }),
             "static load window/alignment/W^X differs",
         )?;
         let phbytes = u64::from(elf.header.e_phnum) * 56;
@@ -68174,6 +68189,95 @@ pub mod private_static {
                 changed[at..at + width].copy_from_slice(&value.to_le_bytes()[..width]);
                 let parsed = Elf::parse(&changed).unwrap();
                 assert!(geometry(&parsed, &changed).is_err(), "field {at}");
+            }
+        }
+        #[test]
+        fn private_static_geometry_segment_count_boundaries_hold() {
+            fn fixture(loads: usize, phdr: bool, note: bool) -> Vec<u8> {
+                let mut bytes = vec![0; 3 * 4096];
+                bytes[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+                bytes[16..18].copy_from_slice(&2u16.to_le_bytes());
+                bytes[18..20].copy_from_slice(&62u16.to_le_bytes());
+                bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
+                bytes[24..32].copy_from_slice(&(GATE + 512).to_le_bytes());
+                bytes[32..40].copy_from_slice(&64u64.to_le_bytes());
+                bytes[52..54].copy_from_slice(&64u16.to_le_bytes());
+                bytes[54..56].copy_from_slice(&56u16.to_le_bytes());
+                let phnum = loads + 2 + usize::from(phdr) + usize::from(note);
+                bytes[56..58].copy_from_slice(&u16::try_from(phnum).unwrap().to_le_bytes());
+                let mut phdrs = vec![
+                    (1u32, 4u32, 0u64, LOW, 4096u64, 4096u64, 4096u64),
+                    (1, 5, 4096, GATE, 4096, 4096, 4096),
+                    (1, 6, 8192, LOW + 8192, 4096, 4096, 4096),
+                ];
+                for index in 3..loads {
+                    phdrs.push((
+                        1,
+                        4,
+                        4096,
+                        LOW + 8192 + u64::try_from(index - 2).unwrap() * 4096,
+                        4096,
+                        4096,
+                        4096,
+                    ));
+                }
+                phdrs.push((7, 4, 8192, LOW + 8192, 16, 80, 16));
+                phdrs.push((0x6474e551, 6, 0, 0, 0, 0, 0));
+                if phdr {
+                    let phbytes = u64::try_from(phnum * 56).unwrap();
+                    phdrs.push((6, 4, 64, LOW + 64, phbytes, phbytes, 4096));
+                }
+                if note {
+                    phdrs.push((4, 0, 0, 0, 0, 0, 0));
+                }
+                for (index, (kind, flags, offset, address, file, memory, align)) in
+                    phdrs.into_iter().enumerate()
+                {
+                    let at = 64 + index * 56;
+                    bytes[at..at + 4].copy_from_slice(&kind.to_le_bytes());
+                    bytes[at + 4..at + 8].copy_from_slice(&flags.to_le_bytes());
+                    for (field, value) in [
+                        (8, offset),
+                        (16, address),
+                        (32, file),
+                        (40, memory),
+                        (48, align),
+                    ] {
+                        bytes[at + field..at + field + 8].copy_from_slice(&value.to_le_bytes());
+                    }
+                }
+                bytes
+            }
+            // Literal counts: 16 was the old cap, 64 is the loader cap.
+            // 67 total headers is 64 loads + TLS + GNU_STACK + PT_PHDR.
+            const NAMED: &str = "static PT_LOAD count exceeds private_static 64-segment cap";
+            const FORMAT: &str = "static ELF type/architecture/program-header format differs";
+            for (loads, phdr, note, refusal) in [
+                (16usize, false, false, None),
+                (17, false, false, None),
+                (64, false, false, None),
+                (64, true, false, None),
+                (65, false, false, Some(NAMED)),
+                (66, false, false, Some(NAMED)),
+                (65, true, false, Some(NAMED)),
+                (64, true, true, Some(FORMAT)),
+            ] {
+                let bytes = fixture(loads, phdr, note);
+                let parsed = Elf::parse(&bytes).unwrap();
+                let result = geometry(&parsed, &bytes);
+                if let Some(expected) = refusal {
+                    assert_eq!(
+                        result.unwrap_err(),
+                        expected,
+                        "{loads} PT_LOADs phdr={phdr} note={note}"
+                    );
+                } else {
+                    let observed = result.unwrap_or_else(|error| {
+                        panic!("{loads} PT_LOADs phdr={phdr} must pass geometry: {error}")
+                    });
+                    let phnum = loads + 2 + usize::from(phdr) + usize::from(note);
+                    assert_eq!(observed.0, (LOW + 64, u64::try_from(phnum * 56).unwrap()));
+                }
             }
         }
         #[test]
