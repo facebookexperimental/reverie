@@ -306,9 +306,26 @@ pub struct DispatchAllocationScope {
     _same_thread: PhantomData<*mut ()>,
 }
 
+/// The one outlined access site for the DISPATCH_DEPTH cell (see
+/// `tool_callback_active_cell`).
+#[inline(never)]
+pub(crate) fn dispatch_depth_cell() -> *mut core::cell::Cell<usize> {
+    DISPATCH_DEPTH.with(|depth| depth as *const core::cell::Cell<usize> as *mut _)
+}
+
+fn dispatch_depth_get() -> usize {
+    // SAFETY: this thread's own cell, used only on this thread.
+    unsafe { (*dispatch_depth_cell()).get() }
+}
+
+fn dispatch_depth_set(value: usize) {
+    // SAFETY: this thread's own cell, used only on this thread.
+    unsafe { (*dispatch_depth_cell()).set(value) }
+}
+
 impl Drop for DispatchAllocationScope {
     fn drop(&mut self) {
-        DISPATCH_DEPTH.set(DISPATCH_DEPTH.get() - 1);
+        dispatch_depth_set(dispatch_depth_get() - 1);
     }
 }
 
@@ -317,7 +334,7 @@ impl Drop for DispatchAllocationScope {
 /// is dropped. A Tool callback runs inside one, because it can interrupt the
 /// guest's own allocator.
 pub fn enter_dispatch() -> DispatchAllocationScope {
-    DISPATCH_DEPTH.set(DISPATCH_DEPTH.get() + 1);
+    dispatch_depth_set(dispatch_depth_get() + 1);
     DispatchAllocationScope {
         _same_thread: PhantomData,
     }
@@ -334,7 +351,7 @@ pub fn tool_heap_contains(pointer: *const u8) -> bool {
 #[cfg(feature = "allocator-fixture")]
 #[doc(hidden)]
 pub fn fixture_dispatch_depth() -> usize {
-    DISPATCH_DEPTH.get()
+    dispatch_depth_get()
 }
 
 /// Actual Legacy BSS bounds without allocation or region initialization.
@@ -439,7 +456,7 @@ pub fn fixture_fixed_tool_heap_state() -> Option<ToolHeapFixtureState> {
 }
 
 fn dispatch_active() -> bool {
-    DISPATCH_DEPTH.get() != 0
+    dispatch_depth_get() != 0
 }
 
 /// An allocator for a preload whose Rust allocations always belong to the Tool.

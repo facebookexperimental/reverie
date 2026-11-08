@@ -54,6 +54,41 @@ thread_local! {
     static MAPPED_CALLBACK: Cell<Option<MappedCallbackStamp>> = const { Cell::new(None) };
 }
 
+/// The one outlined access site for the OWNER cell (see
+/// `tool_callback_active_cell` in super::support).
+#[inline(never)]
+pub(crate) fn owner_cell() -> *mut core::cell::Cell<*mut Continuation> {
+    OWNER.with(|cell| cell as *const core::cell::Cell<*mut Continuation> as *mut _)
+}
+
+/// The one outlined access site for the PENDING cell. The address is
+/// type-erased so the retained-accessor table in super::support does
+/// not name the private Pending type.
+#[inline(never)]
+pub(crate) fn pending_cell() -> *mut core::ffi::c_void {
+    PENDING.with(|cell| cell as *const core::cell::Cell<Option<Pending>> as *mut core::ffi::c_void)
+}
+
+fn owner_get() -> *mut Continuation {
+    // SAFETY: this thread's own cell, used only on this thread.
+    unsafe { (*owner_cell()).get() }
+}
+
+fn owner_set(value: *mut Continuation) {
+    // SAFETY: this thread's own cell, used only on this thread.
+    unsafe { (*owner_cell()).set(value) }
+}
+
+fn pending_get() -> Option<Pending> {
+    // SAFETY: this thread's own cell, used only on this thread.
+    unsafe { (*pending_cell().cast::<core::cell::Cell<Option<Pending>>>()).get() }
+}
+
+fn pending_set(value: Option<Pending>) {
+    // SAFETY: this thread's own cell, used only on this thread.
+    unsafe { (*pending_cell().cast::<core::cell::Cell<Option<Pending>>>()).set(value) }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Pending {
     instruction: u64,
@@ -228,11 +263,11 @@ pub fn native_exec_resume_receipt(
     if !matches!(event.dispatch, super::event::SyscallDispatch::Fallback) {
         return None;
     }
-    let pointer = OWNER.get();
+    let pointer = owner_get();
     if pointer.is_null() {
         return None;
     }
-    let pending = PENDING.get()?;
+    let pending = pending_get()?;
     // Retained storage, exclusively owned by this thread; disjoint fields.
     let receipt = unsafe { (&raw const (*pointer).native_exec_resume).read() }?;
     let phase = unsafe { (&raw const (*pointer).phase).read() };
@@ -316,7 +351,7 @@ impl Drop for MappedCallbackScope {
 // full Continuation or its mutably borrowed RegisterContext crosses Tool code.
 #[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
 fn mapped_running_owner(pointer: *mut Continuation) -> Option<u64> {
-    if pointer.is_null() || PENDING.get().is_none() {
+    if pointer.is_null() || pending_get().is_none() {
         return None;
     }
     // SAFETY: OWNER is this thread's retained continuation; these disjoint
@@ -350,7 +385,7 @@ pub(super) unsafe fn enter_mapped_callback(
     if !super::exec_private::mapped_callback_origin() {
         return None;
     }
-    let pointer = OWNER.get();
+    let pointer = owner_get();
     let Some(generation) = mapped_running_owner(pointer) else {
         fatal()
     };
@@ -396,7 +431,7 @@ pub(super) fn mapped_callback_facts(
     region: &'static super::tool_region::ToolRegion,
 ) -> Option<MappedCallbackFacts> {
     let stamp = MAPPED_CALLBACK.get()?;
-    let pointer = OWNER.get();
+    let pointer = owner_get();
     let generation = mapped_running_owner(pointer)?;
     if !same_mapped_scope(stamp, pointer as usize, generation) {
         return None;
@@ -489,10 +524,10 @@ pub fn initialize_with_stack_backing(backing: StackBacking) -> io::Result<()> {
         .get_or_init(NativeIsa::configure_saved_state)
         .as_ref()
         .map_err(|error| io::Error::other(*error))?;
-    if PENDING.get().is_some() {
+    if pending_get().is_some() {
         return Err(io::Error::other("a syscall continuation is still active"));
     }
-    if OWNER.get().is_null() {
+    if owner_get().is_null() {
         let saved = SavedState::new()?;
         let stack = CallbackStack::new(backing)?;
         let owner = Box::new(Continuation {
@@ -513,11 +548,11 @@ pub fn initialize_with_stack_backing(backing: StackBacking) -> io::Result<()> {
             callbacks: 0,
             completions: 0,
         });
-        OWNER.set(Box::into_raw(owner));
+        owner_set(Box::into_raw(owner));
     } else {
         // The current thread exclusively owns the retained continuation. Only
         // inspect its backing; never reset a live COW-inherited stack/image.
-        let region = unsafe { &(*OWNER.get()).stack.region };
+        let region = unsafe { &(*owner_get()).stack.region };
         let same = match (region.as_ref(), backing) {
             (None, StackBacking::Legacy) => true,
             (Some(lease), StackBacking::ToolRegion(owner)) => lease.belongs_to(owner),
@@ -543,13 +578,11 @@ pub(crate) fn prepare(instruction: u64) -> Option<u64> {
 /// Reserve the existing single activation without overwriting a pending one.
 /// Kept separate from frame capture so its reentry contract remains testable.
 fn prepare_pending(request: Pending) -> Option<u64> {
-    PENDING.with(|pending| {
-        if !READY.get() || pending.get().is_some() {
-            return None;
-        }
-        pending.set(Some(request));
-        Some(NativeIsa::fallback_entry())
-    })
+    if !READY.get() || pending_get().is_some() {
+        return None;
+    }
+    pending_set(Some(request));
+    Some(NativeIsa::fallback_entry())
 }
 
 /// Capture a trapped `syscall`'s `SIGSYS` frame for ordinary-context dispatch.
@@ -616,7 +649,7 @@ fn prepare_signal_for(
     let Some(entry) = prepare_pending(request) else {
         return Ok(None);
     };
-    let pointer = OWNER.get();
+    let pointer = owner_get();
     if pointer.is_null() {
         return Err(FrameError);
     }
@@ -707,7 +740,7 @@ fn running_owner() -> Option<*mut Continuation> {
     if !super::runtime_mask::delivers_signals() {
         return None;
     }
-    let pointer = OWNER.get();
+    let pointer = owner_get();
     if pointer.is_null()
         || unsafe { core::ptr::addr_of!((*pointer).phase).read() } != Phase::Running
     {
@@ -731,7 +764,7 @@ pub fn rebind_fork_child() {
     if super::runtime_mask::delivers_signals() {
         super::runtime_mask::rebind_identity();
     }
-    let pointer = OWNER.get();
+    let pointer = owner_get();
     if !pointer.is_null() {
         unsafe {
             (*pointer).owner_tid = current_tid();
@@ -756,13 +789,13 @@ fn fatal() -> ! {
 }
 
 pub(crate) unsafe extern "C" fn dispatch(pointer: *mut Continuation) {
-    let Some(pending) = PENDING.get() else {
+    let Some(pending) = pending_get() else {
         fatal()
     };
     let Some(handlers) = HANDLERS.get() else {
         fatal()
     };
-    if pointer.is_null() || pointer != OWNER.get() {
+    if pointer.is_null() || pointer != owner_get() {
         fatal()
     }
     // No reference to the full owner is held across Tool dispatch: child fork
@@ -830,7 +863,7 @@ pub fn complete(frame: &mut SignalFrame<'_>) -> Result<bool, FrameError> {
     if NativeIsa::frame_pc(frame) != resume {
         return Ok(false);
     }
-    let pointer = OWNER.get();
+    let pointer = owner_get();
     if pointer.is_null() {
         return Err(FrameError);
     }
@@ -843,7 +876,7 @@ pub fn complete(frame: &mut SignalFrame<'_>) -> Result<bool, FrameError> {
     let generation = unsafe { core::ptr::addr_of!((*pointer).generation).read() };
     if phase != Phase::ReadyToReturn
         || owner_tid != current_tid()
-        || PENDING.get().is_none()
+        || pending_get().is_none()
         || !NativeIsa::validate_completion_frame(frame, generation, pointer as usize)
     {
         return Err(FrameError);
@@ -864,7 +897,7 @@ pub fn complete(frame: &mut SignalFrame<'_>) -> Result<bool, FrameError> {
     }
     owner.completions += 1;
     owner.phase = Phase::Idle;
-    PENDING.set(None);
+    pending_set(None);
     #[cfg(feature = "exec-private-init")]
     super::exec_private::guest_completed();
     Ok(true)
@@ -874,7 +907,7 @@ pub fn complete(frame: &mut SignalFrame<'_>) -> Result<bool, FrameError> {
 /// Selectors 0/1/2 are actual fallback entry, reached ordinary callback, and
 /// prepared genuine completion frame. They are not a kernel-stop census.
 pub fn owned_observation(selector: u32) -> u64 {
-    let pointer = OWNER.get();
+    let pointer = owner_get();
     if pointer.is_null() {
         return 0;
     }
@@ -890,7 +923,7 @@ pub fn owned_observation(selector: u32) -> u64 {
 
 /// Check a fixture's actual callback local address against owned stack bounds.
 pub fn on_owned_stack(address: usize) -> bool {
-    let pointer = OWNER.get();
+    let pointer = owner_get();
     if pointer.is_null() {
         return false;
     }
@@ -905,7 +938,7 @@ pub fn on_owned_stack(address: usize) -> bool {
 #[cfg(feature = "allocator-fixture")]
 #[doc(hidden)]
 pub fn fixture_stack_descriptor() -> Option<(usize, usize, u32)> {
-    let pointer = OWNER.get();
+    let pointer = owner_get();
     if pointer.is_null() {
         return None;
     }
@@ -916,7 +949,7 @@ pub fn fixture_stack_descriptor() -> Option<(usize, usize, u32)> {
 }
 
 pub(crate) unsafe extern "C" fn completion_generation() -> u64 {
-    let pointer = OWNER.get();
+    let pointer = owner_get();
     if pointer.is_null() || unsafe { (*pointer).phase != Phase::ReadyToReturn } {
         fatal()
     }
@@ -955,7 +988,7 @@ pub(crate) fn native_exec_test_binding_controls(event: &super::event::SyscallEve
         }
         assert!(native_exec_resume_receipt(&changed).is_none());
     }
-    let pointer = OWNER.get();
+    let pointer = owner_get();
     unsafe {
         let generation = (&raw const (*pointer).generation).read();
         (&raw mut (*pointer).generation).write(generation.checked_add(1).unwrap());
@@ -972,20 +1005,20 @@ pub(crate) fn native_exec_test_binding_controls(event: &super::event::SyscallEve
         assert!(native_exec_resume_receipt(event).is_none());
         (&raw mut (*pointer).owner_tid).write(tid);
     }
-    let pending = PENDING.get();
-    PENDING.set(None);
+    let pending = pending_get();
+    pending_set(None);
     assert!(native_exec_resume_receipt(event).is_none());
-    PENDING.set(Some(Pending {
+    pending_set(Some(Pending {
         instruction: event.instruction_pointer,
         kind: PendingKind::Instruction(InstructionEventKind::Cpuid),
     }));
     assert!(native_exec_resume_receipt(event).is_none());
-    PENDING.set(Some(Pending {
+    pending_set(Some(Pending {
         instruction: event.instruction_pointer ^ 1,
         kind: PendingKind::Syscall,
     }));
     assert!(native_exec_resume_receipt(event).is_none());
-    PENDING.set(pending);
+    pending_set(pending);
     assert_eq!(native_exec_resume_receipt(event), Some(receipt));
 }
 
@@ -1037,18 +1070,18 @@ mod tests {
             initialize_registered(&owner, HANDLERS_FOR_TESTS, StackBacking::Legacy)
         };
         initialize_owner().unwrap();
-        let first_stack = OWNER.get() as usize;
+        let first_stack = owner_get() as usize;
         assert_ne!(first_stack, 0);
         initialize_owner().unwrap();
-        assert_eq!(OWNER.get() as usize, first_stack);
+        assert_eq!(owner_get() as usize, first_stack);
         std::thread::scope(|scope| {
             scope
                 .spawn(|| {
-                    assert!(OWNER.get().is_null());
+                    assert!(owner_get().is_null());
                     initialize_owner().unwrap();
                     assert!(READY.get());
-                    assert_ne!(OWNER.get() as usize, 0);
-                    assert_ne!(OWNER.get() as usize, first_stack);
+                    assert_ne!(owner_get() as usize, 0);
+                    assert_ne!(owner_get() as usize, first_stack);
                 })
                 .join()
                 .unwrap();
@@ -1058,8 +1091,8 @@ mod tests {
             initialize_owner().unwrap_err().to_string(),
             "a syscall continuation is still active"
         );
-        assert_eq!(PENDING.get().unwrap().instruction, 0x1000);
-        PENDING.set(None);
+        assert_eq!(pending_get().unwrap().instruction, 0x1000);
+        pending_set(None);
         initialize_owner().unwrap();
 
         let other_owner = OnceLock::new();
@@ -1088,23 +1121,23 @@ mod tests {
         assert!(prepare(0x1000).is_some());
         assert!(prepare(0x2000).is_none());
         assert_eq!(
-            PENDING.get(),
+            pending_get(),
             Some(Pending {
                 instruction: 0x1000,
                 kind: PendingKind::Syscall,
             })
         );
         assert!(initialize().is_err());
-        PENDING.set(None);
+        pending_set(None);
         assert!(prepare(0x3000).is_some());
         assert_eq!(
-            PENDING.get(),
+            pending_get(),
             Some(Pending {
                 instruction: 0x3000,
                 kind: PendingKind::Syscall,
             })
         );
-        PENDING.set(None);
+        pending_set(None);
     }
 
     #[test]

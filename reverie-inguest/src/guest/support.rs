@@ -245,7 +245,8 @@ pub struct ToolCallbackGuard {
 impl ToolCallbackGuard {
     /// Marks the calling thread as running a Tool callback.
     pub fn enter() -> Self {
-        let previous = TOOL_CALLBACK_ACTIVE.with(|active| active.swap(true, Ordering::Relaxed));
+        // SAFETY: this thread's own cell, used only on this thread.
+        let previous = unsafe { (*tool_callback_active_cell()).swap(true, Ordering::Relaxed) };
         Self {
             previous,
             _same_thread: PhantomData,
@@ -255,7 +256,8 @@ impl ToolCallbackGuard {
 
 impl Drop for ToolCallbackGuard {
     fn drop(&mut self) {
-        TOOL_CALLBACK_ACTIVE.with(|active| active.store(self.previous, Ordering::Relaxed));
+        // SAFETY: this thread's own cell, used only on this thread.
+        unsafe { (*tool_callback_active_cell()).store(self.previous, Ordering::Relaxed) };
     }
 }
 
@@ -471,8 +473,19 @@ pub fn page_size() -> std::io::Result<u64> {
 /// Whether the calling thread is running a Tool callback. Syscalls and faulting
 /// instructions reached from inside one bypass the Tool (they are the Tool's
 /// own) and must not allocate or patch.
+/// The one outlined access site for the TOOL_CALLBACK_ACTIVE cell:
+/// every read and write of the cell goes through the pointer this
+/// returns, so the built image holds exactly one TLS access to the
+/// cell, in this function (the recognizer authenticates it).
+#[inline(never)]
+pub(crate) fn tool_callback_active_cell() -> *mut core::sync::atomic::AtomicBool {
+    TOOL_CALLBACK_ACTIVE.with(|active| active as *const core::sync::atomic::AtomicBool as *mut _)
+}
+
 pub fn tool_callback_active() -> bool {
-    TOOL_CALLBACK_ACTIVE.with(|active| active.load(Ordering::Relaxed))
+    // SAFETY: the cell is this thread's own AtomicBool; the pointer is
+    // used only on the calling thread.
+    unsafe { (*tool_callback_active_cell()).load(Ordering::Relaxed) }
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -834,3 +847,19 @@ mod tests {
         unsafe { libc::munmap(pages.cast(), page * 2) };
     }
 }
+
+/// Retention for the four authenticated TLS cell accessors: holding
+/// their addresses here keeps each outlined access site in the built
+/// image whatever code generation does with its callers.
+struct RetainedTlsCellAccessors([*const (); 4]);
+
+// SAFETY: the table holds only function addresses, never dereferenced.
+unsafe impl Sync for RetainedTlsCellAccessors {}
+
+#[used]
+static RETAINED_TLS_CELL_ACCESSORS: RetainedTlsCellAccessors = RetainedTlsCellAccessors([
+    tool_callback_active_cell as *const (),
+    super::alloc::dispatch_depth_cell as *const (),
+    super::continuation::owner_cell as *const (),
+    super::continuation::pending_cell as *const (),
+]);
