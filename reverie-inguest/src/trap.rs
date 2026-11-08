@@ -1619,6 +1619,17 @@ pub(crate) unsafe fn native_io_syscall(number: i64, args: [u64; 6]) -> i64 {
 mod tests {
     use super::*;
 
+    /// Proof that a re-exec child actually ran its one selected
+    /// test: a wrong `--exact` path makes libtest print
+    /// "running 0 tests" and exit 0, which a status-only parent
+    /// assert reads as success (the island-registry bug class).
+    fn assert_child_ran(output: &std::process::Output) {
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("running 1 test"),
+            "re-exec child ran no test (wrong --exact path?): {output:?}"
+        );
+    }
+
     #[test]
     fn runtime_text_covers_gates_and_handler() {
         assert!(is_runtime_text(trusted_gate().syscall_ip));
@@ -1673,6 +1684,7 @@ mod tests {
                 .env(CHILD, on_alt_stack)
                 .output()
                 .unwrap();
+            assert_child_ran(&output);
             assert_eq!(output.status.code(), Some(126), "{output:?}");
             assert!(output.stderr.is_empty(), "{output:?}");
         }
@@ -1739,6 +1751,7 @@ mod tests {
                 .env(CHILD, on_alt_stack)
                 .output()
                 .unwrap();
+            assert_child_ran(&output);
             assert_eq!(output.status.signal(), Some(libc::SIGABRT), "{output:?}");
             assert_eq!(
                 String::from_utf8_lossy(&output.stderr),
@@ -1795,6 +1808,7 @@ mod tests {
             .stderr(writer)
             .output()
             .unwrap();
+        assert_child_ran(&output);
         assert_eq!(output.status.signal(), Some(libc::SIGABRT), "{output:?}");
     }
 
@@ -1917,6 +1931,7 @@ mod tests {
                 .env(CHILD, value)
                 .output()
                 .unwrap();
+            assert_child_ran(&output);
             let stdout = String::from_utf8_lossy(&output.stdout);
             assert!(stdout.contains("forging\n"), "{value} {output:?}");
             if value == "unrestricted:main" {
@@ -1927,6 +1942,7 @@ mod tests {
                     "{value} {output:?}"
                 );
             } else {
+                assert_child_ran(&output);
                 assert_eq!(
                     output.status.code(),
                     Some(GUEST_SIGNAL_RETURN_STATUS),
@@ -2078,6 +2094,7 @@ mod tests {
             .env(CHILD, "1")
             .output()
             .unwrap();
+        assert_child_ran(&output);
         // The test harness reports the child's test as failed and exits 101.
         assert_eq!(output.status.code(), Some(101), "{output:?}");
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -2102,6 +2119,17 @@ mod tests {
 #[cfg(all(test, target_arch = "aarch64"))]
 mod aarch64_gate_tests {
     use super::*;
+
+    /// Proof that a re-exec child actually ran its one selected
+    /// test: a wrong `--exact` path makes libtest print
+    /// "running 0 tests" and exit 0, which a status-only parent
+    /// assert reads as success (the island-registry bug class).
+    fn assert_child_ran(output: &std::process::Output) {
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("running 1 test"),
+            "re-exec child ran no test (wrong --exact path?): {output:?}"
+        );
+    }
     use core::sync::atomic::AtomicU64;
 
     static ENTRIES: AtomicU64 = AtomicU64::new(0);
@@ -2259,12 +2287,13 @@ mod aarch64_gate_tests {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "trap::tests::island_registry_unregisters_middle_last_and_refuses_when_full",
+                "trap::aarch64_gate_tests::island_registry_unregisters_middle_last_and_refuses_when_full",
                 "--nocapture",
             ])
             .env(CHILD, "1")
             .output()
             .unwrap();
+        assert_child_ran(&output);
         assert!(output.status.success(), "{output:?}");
     }
 
@@ -2424,6 +2453,7 @@ mod aarch64_gate_tests {
             .env(CHILD, "1")
             .output()
             .unwrap();
+        assert_child_ran(&output);
         assert_eq!(output.status.code(), Some(0), "{output:?}");
     }
 
@@ -2701,6 +2731,7 @@ mod aarch64_gate_tests {
             )
             .output()
             .unwrap();
+        assert_child_ran(&output);
         assert_eq!(output.status.code(), Some(0), "{output:?}");
     }
 

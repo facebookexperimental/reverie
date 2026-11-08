@@ -33,6 +33,7 @@ unsafe impl StopControl for SingleThreadStop {
 }
 
 static SYNC_FAIL_ONCE: AtomicBool = AtomicBool::new(false);
+static HANDLER_ENTRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 unsafe fn sync_fail_once(rw: *mut u8, rx: *mut u8, len: usize) -> Result<(), PatchError> {
     if SYNC_FAIL_ONCE.swap(false, Ordering::SeqCst) {
         return Err(PatchError::Unsupported("injected sync failure"));
@@ -131,10 +132,16 @@ fn scenario_flip_exec() {
         PromoteOutcome::Refused
     );
     assert_eq!(promoter.retained_refusals(), [0x4000]);
-    // A generation bump is the caller's mapping-change signal;
-    // it must not disturb held custody bookkeeping.
+    // A generation bump is the caller's mapping-change signal:
+    // promotion must keep working at the new generation (a bump
+    // that desynced qualification from the flip would refuse).
     promoter.bump_generation();
-    assert_eq!(promoter.held_sites(), 1);
+    let (p2, _page2) = svc_page();
+    assert_eq!(
+        promoter.promote_one(p2 as u64, &mut stop),
+        PromoteOutcome::Flipped
+    );
+    assert_eq!(promoter.held_sites(), 2);
     let word = unsafe { (site as *const u32).read_volatile() };
     assert!(is_b(word), "word {word:#010x} is not B");
     assert_eq!(perms_at(site), "r-xp", "protection not restored exact");
@@ -202,8 +209,10 @@ fn scenario_drain_table_record() {
     };
     let out = promoter.drain_pending(&mut stop);
     assert_eq!(out, [(site, PromoteOutcome::Flipped)]);
-    // Promoted call re-traps at the ISLAND svc; the denylist must
-    // keep that out of the table: call twice, drain again, empty.
+    // No filter/handler is installed in this scenario, so the
+    // promoted call's island SVC executes natively and records
+    // nothing: this pins record+drain plumbing only (the
+    // denylist under a real trap is drain-table-real-trap).
     let a = unsafe { call_getpid_site(site) };
     let b = unsafe { call_getpid_site(site) };
     assert_eq!(a, b);
@@ -539,6 +548,7 @@ fn scenario_drain_table_real_trap() {
         _info: *mut libc::siginfo_t,
         ctx: *mut libc::c_void,
     ) {
+        HANDLER_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let ctx = unsafe { &mut *(ctx as *mut libc::ucontext_t) };
         if let Some(site) = ctx.uc_mcontext.pc.checked_sub(4) {
             reverie_inguest::trap::record_pending_promotion_site(site);
@@ -581,6 +591,7 @@ fn scenario_drain_table_real_trap() {
             if out != [(site, PromoteOutcome::Flipped)] {
                 return 23;
             }
+            let entries_before = HANDLER_ENTRIES.load(std::sync::atomic::Ordering::Relaxed);
             let baseline = reverie_inguest::trap::pending_promotion_stats().recorded_new;
             // Pid through the gate only: std::process::id() issues
             // its own libc SVC, which would trap and be recorded
@@ -595,6 +606,12 @@ fn scenario_drain_table_real_trap() {
             // The island SVCs trapped and were recorded as
             // candidates unless denylisted: recorded_new must not
             // move, and a second drain must be empty.
+            // Proof the traps really happened: exactly one handler
+            // entry per promoted call (a filter that admitted the
+            // island SVCs would also leave recorded_new flat).
+            if HANDLER_ENTRIES.load(std::sync::atomic::Ordering::Relaxed) - entries_before != 2 {
+                return 27;
+            }
             if reverie_inguest::trap::pending_promotion_stats().recorded_new != baseline {
                 return 25;
             }
@@ -619,7 +636,7 @@ fn scenario_drain_table_real_trap() {
     assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
     assert!(
         libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
-        "real-trap child status={status:#x} (9=panic, 20=handler, 21=filter build, 22=filter install, 23=drain flip, 24=call result, 25=island recorded, 26=second drain)"
+        "real-trap child status={status:#x} (9=panic, 20=handler, 21=filter build, 22=filter install, 23=drain flip, 24=call result, 25=island recorded, 26=second drain, 27=handler entries != 2)"
     );
     println!("PASS drain-table-real-trap");
 }

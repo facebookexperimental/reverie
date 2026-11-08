@@ -356,8 +356,16 @@ pub enum StoreFallback {
     AllowProcMem,
 }
 
-/// Classify a flip error by when it can occur, and whether the
-/// Site must be retained. Post-store errors retain the site.
+/// Classify a flip error by whether the Site must be retained.
+/// The STATE is the sole post-store discriminator: the patcher
+/// sets SyncPending/RetainedStop before issuing the store and
+/// before sync/restore can fail (finish_publication builds
+/// RestoreFailed only after setting that state), so every
+/// post-store error arrives with a non-Unpatched state and is
+/// custody. Store/Sync/Restore failures paired with Unpatched
+/// are therefore unreachable; they classify as plain refusals
+/// here rather than retaining a site no completion path could
+/// settle (which would wedge the global custody count).
 /// Pre-store custody (a resume shortfall on an Unpatched site:
 /// nothing was written, but executors may still be stopped)
 /// does NOT retain the site — it retains the STOP, which the
@@ -367,10 +375,6 @@ fn classify(err: &PatchError, state: SiteState) -> (PromoteOutcome, bool) {
         return (PromoteOutcome::CustodyPending, true);
     }
     match err {
-        PatchError::StoreFailed { .. } | PatchError::SyncFailed { .. } => {
-            (PromoteOutcome::CustodyPending, true)
-        }
-        PatchError::RestoreFailed { .. } => (PromoteOutcome::CustodyPending, true),
         // Pre-store: the lease could not be cleanly released, so
         // executors may still be stopped — custody of the STOP,
         // not of any site.
@@ -1128,17 +1132,19 @@ mod tests {
 
     #[cfg(target_arch = "aarch64")]
     fn rx_pages_near_island(word: u32) -> NearIslandPages {
-        // Deterministic B-range placement, by construction: map a
+        // B-range placement helper: map a
         // ten-page run directly below a dummy island (which holds
         // the highest gap) — eight PROT_NONE slot pages under two
         // RX site pages. The caller unmaps one GROUP of four
         // slots immediately before each promote_one; the
         // promoter's Island::reserve (two top-down first-fit
-        // mmaps, RW then RX) must then land in that freed group
-        // (four pages, so an intervening heap mmap stealing the
-        // topmost page cannot starve the RX alias), a few pages from
-        // the sites, no matter how much arena/stack mapping other
-        // threads have piled up further down. Without the reserved
+        // mmaps, RW then RX) then lands in that freed group in
+        // the common case (four pages, so an intervening heap
+        // mmap stealing the topmost page cannot starve the RX
+        // alias), a few pages from the sites. This is a strong
+        // bias, not a guarantee: some attempts still land far,
+        // which the custody test's bounded retry absorbs.
+        // Without the reserved
         // slots a fresh reserve routinely lands >128 MiB away on
         // hosts with large per-thread malloc arenas. No skip:
         // every candidate run either maps exactly or the scan
@@ -1295,6 +1301,21 @@ mod tests {
             classify(&PatchError::CacheOpsUnavailable, SiteState::Unpatched),
             (PromoteOutcome::Refused, false)
         );
+        // Post-store errors are classified by state alone: with a
+        // SyncPending state they are custody; the Unpatched
+        // pairing is unreachable (the patcher sets the pending
+        // state before storing) and refuses plainly.
+        assert_eq!(
+            classify(
+                &PatchError::SyncFailed {
+                    source: Box::new(PatchError::CacheOpsUnavailable)
+                },
+                SiteState::SyncPending {
+                    pending: liteinst_aarch64_patch::site::PendingWord::Patch(0)
+                }
+            ),
+            (PromoteOutcome::CustodyPending, true)
+        );
         assert_eq!(
             classify(
                 &PatchError::SyncFailed {
@@ -1302,7 +1323,7 @@ mod tests {
                 },
                 SiteState::Unpatched
             ),
-            (PromoteOutcome::CustodyPending, true)
+            (PromoteOutcome::Refused, false)
         );
         // Pre-store resume shortfall: custody of the STOP, no site.
         assert_eq!(
@@ -1324,9 +1345,20 @@ mod tests {
                 &PatchError::StoreFailed {
                     source: Box::new(PatchError::CacheOpsUnavailable)
                 },
-                SiteState::Unpatched
+                SiteState::SyncPending {
+                    pending: liteinst_aarch64_patch::site::PendingWord::Patch(0)
+                }
             ),
             (PromoteOutcome::CustodyPending, true)
+        );
+        assert_eq!(
+            classify(
+                &PatchError::RestoreFailed {
+                    source: Box::new(PatchError::CacheOpsUnavailable)
+                },
+                SiteState::Unpatched
+            ),
+            (PromoteOutcome::Refused, false)
         );
         assert_eq!(
             classify(
@@ -1399,10 +1431,8 @@ mod tests {
     fn drain_promotes_in_order_and_retains_refusals() {
         let _serial = promoter_test_serial();
         // Mapped SVC words, so admission runs real qualification.
-        // What refuses here, by architecture: acquire comes FIRST
-        // on both; on x86 the island reserve then refuses
-        // (Unsupported) under the lease, on aarch64 the
-        // RefusingStop's acquire itself refuses. The patcher's own unattested
+        // What refuses here: RefusingStop's acquire, on BOTH
+        // architectures, before any island work. The patcher's own unattested
         // refusal is covered in the patch crate and natively.
         let (p, page) = rx_page_with(0xd400_0001);
         let a = p as u64;
@@ -1460,10 +1490,46 @@ mod tests {
 
     static PROMOTER_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    fn promoter_test_serial() -> std::sync::MutexGuard<'static, ()> {
-        PROMOTER_TEST_SERIAL
+    /// Serial guard that also rebalances the process-wide custody
+    /// counter to its entry baseline on drop (including panic
+    /// unwind). Production Drop deliberately LEAKS unsettled
+    /// custody (fail closed), so without this one panicking
+    /// custody test would poison GLOBAL_CUSTODY for every later
+    /// test in the process and bury the real failure under
+    /// cascades. Test-only cleanup: it runs at test end, after
+    /// the promoter under test has been dropped or forgotten.
+    struct SerialCustodyGuard {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        baseline: usize,
+    }
+
+    impl Drop for SerialCustodyGuard {
+        fn drop(&mut self) {
+            while GLOBAL_CUSTODY.load(std::sync::atomic::Ordering::SeqCst) > self.baseline {
+                custody_exit();
+            }
+        }
+    }
+
+    fn promoter_test_serial() -> SerialCustodyGuard {
+        let guard = PROMOTER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        SerialCustodyGuard {
+            baseline: GLOBAL_CUSTODY.load(std::sync::atomic::Ordering::SeqCst),
+            _guard: guard,
+        }
+    }
+
+    /// Proof that a re-exec child actually ran its one selected
+    /// test: a wrong `--exact` path makes libtest print
+    /// "running 0 tests" and exit 0, which a status-only parent
+    /// assert reads as success (the island-registry bug class).
+    fn assert_child_ran(out: &std::process::Output) {
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("running 1 test"),
+            "re-exec child ran no test (wrong --exact path?): {out:?}"
+        );
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -1788,6 +1854,7 @@ mod tests {
             .env(CHILD, "1")
             .output()
             .unwrap();
+        assert_child_ran(&out);
         assert!(out.status.success(), "{out:?}");
         assert!(
             String::from_utf8_lossy(&out.stdout).contains("SECCOMP_OK"),
@@ -1942,6 +2009,7 @@ mod tests {
             .env(CHILD, "1")
             .output()
             .unwrap();
+        assert_child_ran(&out);
         assert!(out.status.success(), "{out:?}");
     }
     #[cfg(target_arch = "aarch64")]
@@ -1978,11 +2046,21 @@ mod tests {
             }
             let out_a = promoter.promote_one(pa as u64, &mut stop);
             if out_a == PromoteOutcome::Refused {
-                // Placement refusal only: nothing was stored and no
-                // custody exists, so dropping the promoter is safe.
-                // Leak the dummy island so the next attempt's mmap
-                // layout differs: rebuilding identical layout would
-                // deterministically reproduce the same far island.
+                // Placement refusal ONLY: prove nothing was stored
+                // (both words original, protections untouched, the
+                // lease fully released) before treating this as a
+                // retryable placement outcome. Any other refusal
+                // shape is a hard failure here, not a retry.
+                assert_eq!(unsafe { (pa as *const u32).read_volatile() }, 0xd400_0001);
+                assert_eq!(unsafe { (pb as *const u32).read_volatile() }, 0xd400_0001);
+                assert_eq!(perms_at(pa as u64), "r-xp");
+                assert_eq!(perms_at(pb as u64), "r-xp");
+                assert_eq!(stop.acquires, stop.resumes);
+                // Nothing was stored and no custody exists, so
+                // dropping the promoter is safe. Leak the dummy
+                // island so the next attempt's mmap layout differs:
+                // rebuilding identical layout would deterministically
+                // reproduce the same far island.
                 assert!(!promoter.unsettled_custody());
                 core::mem::forget(dummy_island);
                 drop(promoter);
@@ -2015,10 +2093,15 @@ mod tests {
             }
             let out_b = promoter.promote_one(pb as u64, &mut stop);
             if out_b == PromoteOutcome::Refused {
-                // Placement refusal for B: A is flipped and settled,
-                // B's word is untouched. Abandon this attempt (the
-                // promoter forget leaks A's island range slot, a
-                // lifetime slot in a test process) and rebuild.
+                // Placement refusal for B only: prove B untouched
+                // (word original, protections restored, every
+                // acquire resumed) before retrying. A is flipped
+                // and settled. Abandon this attempt (the promoter
+                // forget leaks A's island range slot, a lifetime
+                // slot in a test process) and rebuild.
+                assert_eq!(unsafe { (pb as *const u32).read_volatile() }, 0xd400_0001);
+                assert_eq!(perms_at(pb as u64), "r-xp");
+                assert_eq!(stop.acquires, stop.resumes);
                 assert!(!promoter.unsettled_custody());
                 core::mem::forget(dummy_island);
                 core::mem::forget(promoter);
@@ -2034,7 +2117,10 @@ mod tests {
             core::mem::forget(promoter);
             return;
         }
-        panic!("custody scenario never placed both islands in B range in 32 attempts");
+        panic!(
+            "custody scenario never completed in 32 attempts (placement or BTI refusal \
+             every time; under qemu export QEMU_CPU=cortex-a72)"
+        );
     }
     #[test]
     fn deferred_batch_survives_custody_block() {
@@ -2253,6 +2339,7 @@ mod tests {
             .env(CHILD, "1")
             .output()
             .unwrap();
+        assert_child_ran(&out);
         assert!(out.status.success(), "{out:?}");
     }
     #[test]
@@ -2403,6 +2490,73 @@ mod tests {
             baseline
         );
     }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn drop_leaks_unsettled_custody_fail_closed() {
+        // Re-exec child: the leaked global count is process-wide
+        // and permanent by design, so it must not poison this
+        // process. Dropping a promoter that holds custody must
+        // NOT balance GLOBAL_CUSTODY (mDropBalance: the old
+        // decrementing Drop reopens the cross-promoter gate while
+        // executors may still be stopped).
+        const CHILD: &str = "REVERIE_S5B_DROP_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            struct ShortfallStop {
+                acquires: usize,
+            }
+            // SAFETY (test): scripted stop; no executor exists.
+            unsafe impl StopControl for ShortfallStop {
+                fn acquire(&mut self) -> Result<(), PatchError> {
+                    self.acquires += 1;
+                    Ok(())
+                }
+                fn resume(&mut self) -> Result<Vec<ResumeState>, PatchError> {
+                    Ok(vec![ResumeState::Unknown])
+                }
+            }
+            let baseline = GLOBAL_CUSTODY.load(std::sync::atomic::Ordering::SeqCst);
+            let mut promoter = LazyPromoter::unattested(1);
+            let mut stop = ShortfallStop { acquires: 0 };
+            // Pre-store refusal + resume shortfall retains the stop.
+            assert_eq!(
+                promoter.promote_one(0x5000, &mut stop),
+                PromoteOutcome::CustodyPending
+            );
+            assert!(promoter.unsettled_custody());
+            assert_eq!(
+                GLOBAL_CUSTODY.load(std::sync::atomic::Ordering::SeqCst),
+                baseline + 1
+            );
+            drop(promoter);
+            // The count stays leaked after the drop...
+            assert_eq!(
+                GLOBAL_CUSTODY.load(std::sync::atomic::Ordering::SeqCst),
+                baseline + 1,
+                "Drop must leak unsettled custody, not balance it"
+            );
+            // ...so a fresh promoter is still blocked, without
+            // even acquiring its stop.
+            let mut fresh = LazyPromoter::unattested(1);
+            let mut stop2 = ShortfallStop { acquires: 0 };
+            assert_eq!(
+                fresh.promote_one(0x5000, &mut stop2),
+                PromoteOutcome::CustodyPending
+            );
+            assert_eq!(stop2.acquires, 0);
+            std::process::exit(0);
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "lazy_promote::tests::drop_leaks_unsettled_custody_fail_closed",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert_child_ran(&out);
+        assert!(out.status.success(), "{out:?}");
+    }
     #[cfg(target_arch = "aarch64")]
     #[repr(C)]
     #[derive(Clone, Copy)]
@@ -2471,22 +2625,6 @@ mod tests {
             bpf_jump(BPF_JMP_JEQ_K, 0x6, 0, 1),
             bpf_stmt(BPF_RET_K, SECCOMP_RET_ERRNO | libc::EACCES as u32),
             bpf_stmt(BPF_RET_K, SECCOMP_RET_ALLOW),
-        ]);
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    fn install_window_and_pwrite_refusing_filter() {
-        // pwrite64(68) -> EIO; mprotect W+X -> EACCES; else ALLOW.
-        install_seccomp_program(&[
-            bpf_stmt(BPF_LD_W_ABS, 0),
-            bpf_jump(BPF_JMP_JEQ_K, 68, 6, 0),
-            bpf_jump(BPF_JMP_JEQ_K, 226, 0, 4),
-            bpf_stmt(BPF_LD_W_ABS, 32),
-            bpf_stmt(BPF_ALU_AND_K, 0x6),
-            bpf_jump(BPF_JMP_JEQ_K, 0x6, 0, 1),
-            bpf_stmt(BPF_RET_K, SECCOMP_RET_ERRNO | libc::EACCES as u32),
-            bpf_stmt(BPF_RET_K, SECCOMP_RET_ALLOW),
-            bpf_stmt(BPF_RET_K, SECCOMP_RET_ERRNO | libc::EIO as u32),
         ]);
     }
 
@@ -2587,7 +2725,44 @@ mod tests {
                 .env(CHILD, action)
                 .output()
                 .unwrap();
+            assert_child_ran(&out);
             assert!(out.status.success(), "action {action}: {out:?}");
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    struct WindowPwriteFailGate {
+        armed: std::sync::atomic::AtomicBool,
+        pwrite_fired: std::sync::atomic::AtomicBool,
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    static WINDOW_PWRITE_FAIL_GATE: WindowPwriteFailGate = WindowPwriteFailGate {
+        armed: std::sync::atomic::AtomicBool::new(false),
+        pwrite_fired: std::sync::atomic::AtomicBool::new(false),
+    };
+
+    // SAFETY: forwards every syscall faithfully through the
+    // trusted gate except, while armed, the W+X window mprotect
+    // (EACCES) and every pwrite64 (EIO).
+    #[cfg(target_arch = "aarch64")]
+    unsafe impl liteinst_aarch64_patch::gate::GateSyscall for WindowPwriteFailGate {
+        unsafe fn syscall6(&self, nr: i64, args: [u64; 6]) -> i64 {
+            use std::sync::atomic::Ordering;
+            if self.armed.load(Ordering::SeqCst) {
+                if nr == libc::SYS_mprotect
+                    && args[2] & (libc::PROT_WRITE as u64) != 0
+                    && args[2] & (libc::PROT_EXEC as u64) != 0
+                {
+                    return -(libc::EACCES as i64);
+                }
+                if nr == libc::SYS_pwrite64 {
+                    self.pwrite_fired.store(true, Ordering::SeqCst);
+                    return -(libc::EIO as i64);
+                }
+            }
+            // SAFETY: same raw contract, forwarded.
+            unsafe { reverie_inguest::trap::raw_syscall6(nr, args) }
         }
     }
 
@@ -2631,8 +2806,10 @@ mod tests {
         // finish_write fails -> RestoreFailed custody. The
         // promoter must retain the site with the page still RWX,
         // resume nobody, block other work, and then complete to
-        // Flipped once the gate stops failing. (mRestoreFailed:
-        // classifying RestoreFailed as Refused resumes onto RWX.)
+        // Flipped once the gate stops failing. (The resume-on-
+        // restore-failure mutant in the patcher fails the
+        // resumes==0 assert below; classify's own RestoreFailed
+        // handling is by state, pinned in the classify test.)
         const CHILD: &str = "REVERIE_S5B_RESTORE_CHILD";
         if std::env::var_os(CHILD).is_some() {
             use std::sync::atomic::Ordering;
@@ -2689,6 +2866,7 @@ mod tests {
             .env(CHILD, "1")
             .output()
             .unwrap();
+        assert_child_ran(&out);
         assert!(out.status.success(), "{out:?}");
     }
 
@@ -2733,25 +2911,33 @@ mod tests {
             .env(CHILD, "1")
             .output()
             .unwrap();
+        assert_child_ran(&out);
         assert!(out.status.success(), "{out:?}");
     }
 
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn proc_mem_pwrite_failure_completes_to_unpatched() {
-        // Re-exec child: the filter refuses the W+X window AND
-        // every pwrite64. With explicit proc-mem permission, the
-        // first attempt gets WindowRefused, the retry's pwrite
-        // fails after begin (StoreFailed custody), and completion
+        // Re-exec child: the installed gate (not seccomp, so this
+        // also runs under qemu) refuses the W+X window AND every
+        // pwrite64. With explicit proc-mem permission, the first
+        // attempt gets WindowRefused, the retry's pwrite fails
+        // after begin (StoreFailed custody), and completion
         // settles back to Unpatched because the word never landed.
         const CHILD: &str = "REVERIE_S5B_PWRITE_CHILD";
         if std::env::var_os(CHILD).is_some() {
+            use std::sync::atomic::Ordering;
             let _serial = promoter_test_serial();
+            // SAFETY: first gate install in this fresh child.
+            unsafe { liteinst_aarch64_patch::gate::install_gate(&WINDOW_PWRITE_FAIL_GATE) }
+                .unwrap();
+            let patcher = Patcher::attested().unwrap();
             let (p, _page) = rx_page_with(0xd400_0001);
             let site = p as u64;
-            let mut promoter = LazyPromoter::attested(1).unwrap();
+            let mut promoter = LazyPromoter::unattested(1);
+            promoter.patcher = patcher;
             promoter.set_store_fallback(StoreFallback::AllowProcMem);
-            install_window_and_pwrite_refusing_filter();
+            WINDOW_PWRITE_FAIL_GATE.armed.store(true, Ordering::SeqCst);
             let mut stop = SingleThreadStop {
                 acquires: 0,
                 resumes: 0,
@@ -2763,6 +2949,14 @@ mod tests {
             );
             assert_eq!(promoter.held_sites(), 1);
             assert!(promoter.unsettled_custody());
+            assert!(
+                WINDOW_PWRITE_FAIL_GATE
+                    .pwrite_fired
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            );
+            // Exactly one resume so far (the refused window's lease
+            // release); the post-store StoreFailed must add none.
+            assert_eq!(stop.resumes, 1, "StoreFailed custody must not resume");
             // The failed pwrite left custody: other work is blocked
             // without acquiring (mPwrite reporting Flipped here
             // would let this second promotion proceed).
@@ -2789,6 +2983,7 @@ mod tests {
             .env(CHILD, "1")
             .output()
             .unwrap();
+        assert_child_ran(&out);
         assert!(out.status.success(), "{out:?}");
     }
 }
