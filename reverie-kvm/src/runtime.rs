@@ -615,8 +615,8 @@ pub(crate) struct ToolContext<'a, T: Tool> {
 /// [`LinuxProvider`] is the provider-neutral core (`execute`,
 /// `take_unsupported_refusal`), and [`LinuxEmuSignalControl`] and
 /// [`LinuxEmuMemoryMap`] are today's executor's own extensions (see
-/// `provider.rs`). The methods declared here are backend mechanics, on no
-/// provider trait: the vCPU clock and its preemption timer, CPUID
+/// `reverie-linuxemu/src/provider.rs`). The methods declared here are backend
+/// mechanics, on no provider trait: the vCPU clock and its preemption timer, CPUID
 /// interception, the run's failure subscription, the adapter's signal guard,
 /// the two injection admission checks, the traced-parent query behind
 /// `Guest::ppid`, the descriptor fact behind `Guest::descriptor_status`, the
