@@ -123,8 +123,8 @@
       "priority": 80,
       "hint": {
         "resources": {},
-        "est_duration_s": 120,
-        "rss_baseline_bytes": 1000000000,
+        "est_duration_s": 45,
+        "rss_baseline_bytes": 4000000000,
         "hard_mem_max_bytes": 16000000000,
         "classification": "cpu-bound",
         "preferred_inner_jobs": 16
