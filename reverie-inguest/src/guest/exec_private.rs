@@ -658,25 +658,29 @@ unsafe fn publish_native_control(control: *mut NativeControl) -> io::Result<()> 
         crate::trap::adopt_authenticated_initial_gate()?;
         verify_bootstrap_signal(control)?;
     }
-    publish_control_slot(control)?;
-    // Slot 0 of the per-thread Tool TLS registry is this leader, in every
-    // exec-private configuration. Registration cannot fail after the
-    // write-once control slot above unless the sealed native tid is not a
-    // positive kernel tid, which the caller treats as terminal either way.
-    let leader_tid = read(unsafe { &raw const (*control).native_tid });
-    i32::try_from(leader_tid)
-        .ok()
-        .and_then(|tid| tool_tls_registry::register_leader(tid).ok())
-        .ok_or_else(|| io::Error::other("private Tool leader slot registration failed"))
+    publish_control_slot(control)
 }
 
 // Same write-once physical pointer for both authenticated image origins.
 // Neither this helper nor the pointer value supplies coordinator admission.
+// This is also the one place slot 0 of the per-thread Tool TLS registry is
+// registered: the mapped musl image publishes through here directly, so
+// registering in a caller would leave its leader unregistered.
 fn publish_control_slot(control: *mut NativeControl) -> io::Result<()> {
+    // Validate the sealed leader tid before publishing anything: a tid that
+    // is not a positive kernel tid can never be the registry leader.
+    let leader_tid = i32::try_from(unsafe { (&raw const (*control).native_tid).read_volatile() })
+        .ok()
+        .filter(|tid| *tid > 0)
+        .ok_or_else(|| io::Error::other("private Tool leader slot registration failed"))?;
     reverie_inguest_private_exec_control
         .compare_exchange(0, control as usize, Ordering::Release, Ordering::Relaxed)
         .map_err(|_| io::Error::other("private Tool control published twice"))?;
-    Ok(())
+    // Registration cannot fail after the successful write-once publication
+    // above (slot 0 registers exactly once, here); both publication callers
+    // already treat an error at this point as terminal.
+    tool_tls_registry::register_leader(leader_tid)
+        .map_err(|_| io::Error::other("private Tool leader slot registration failed"))
 }
 
 /// Returned-error stage of the still-armed InitialImage refusal path.
@@ -4183,6 +4187,45 @@ mod tests {
                 unsafe { libc::_exit(93) };
             },
             127,
+        );
+    }
+
+    #[test]
+    fn control_slot_publication_registers_leader_slot() {
+        isolated(
+            || {
+                // publish_control_slot is the one physical publication both
+                // authenticated origins funnel through (the GNU path via
+                // publish_native_control, the mapped musl image directly),
+                // so slot-0 registration must happen there, not in a caller
+                // the mapped path bypasses.
+                let mut control: NativeControl = unsafe { core::mem::zeroed() };
+                let tid = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
+                assert!(tid > 0);
+                control.native_tid = tid as u64;
+                assert_eq!(tool_tls_registry::TOOL_TLS_REGISTRY.leader(), None);
+                publish_control_slot(&raw mut control).unwrap();
+                assert_eq!(tool_tls_registry::TOOL_TLS_REGISTRY.leader(), Some(tid));
+                assert_eq!(
+                    tool_tls_registry::TOOL_TLS_REGISTRY.lookup_ready(tid),
+                    Some(0)
+                );
+                // A second publication still refuses and changes nothing.
+                assert!(publish_control_slot(&raw mut control).is_err());
+                assert_eq!(tool_tls_registry::TOOL_TLS_REGISTRY.leader(), Some(tid));
+            },
+            0,
+        );
+        isolated(
+            || {
+                // A sealed tid that is not a positive kernel tid refuses
+                // the publication itself: no control, no leader slot.
+                let mut control: NativeControl = unsafe { core::mem::zeroed() };
+                assert!(publish_control_slot(&raw mut control).is_err());
+                assert!(!active());
+                assert_eq!(tool_tls_registry::TOOL_TLS_REGISTRY.leader(), None);
+            },
+            0,
         );
     }
 
