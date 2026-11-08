@@ -196,7 +196,7 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for SuccessorImageGuest<'a, T, R> {
         }
         let (number, args) = syscall.into_parts();
         let number = number.id() as i64;
-        let mut args = [
+        let args = [
             args.arg0 as u64,
             args.arg1 as u64,
             args.arg2 as u64,
@@ -204,66 +204,21 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for SuccessorImageGuest<'a, T, R> {
             args.arg4 as u64,
             args.arg5 as u64,
         ];
-        // Lifecycle may not create/replace/terminate an image, admit an extra
-        // filter/namespace, stage delivery, or activate keys/guest handlers.
-        if matches!(
-            number,
-            libc::SYS_clone
-                | libc::SYS_clone3
-                | libc::SYS_fork
-                | libc::SYS_vfork
-                | libc::SYS_execve
-                | libc::SYS_execveat
-                | libc::SYS_exit
-                | libc::SYS_exit_group
-                | libc::SYS_rt_sigreturn
-                | libc::SYS_rseq
-                | libc::SYS_seccomp
-                | libc::SYS_unshare
-                | libc::SYS_setns
-                | libc::SYS_mount
-                | libc::SYS_umount2
-                | libc::SYS_chroot
-                | libc::SYS_pivot_root
-                | libc::SYS_pkey_alloc
-                | libc::SYS_pkey_free
-                | libc::SYS_pkey_mprotect
-                | libc::SYS_kill
-                | libc::SYS_tkill
-                | libc::SYS_tgkill
-                | libc::SYS_rt_sigqueueinfo
-                | libc::SYS_rt_tgsigqueueinfo
-        ) || (number == libc::SYS_prctl && args[0] == libc::PR_SET_SECCOMP as u64)
-            || (number == libc::SYS_arch_prctl && args[0] == 0x1001)
-        {
-            return Err(self.refuse(1));
-        }
-        #[cfg(feature = "exec-native-injection")]
-        if let Some(driver) = self.mapping_driver
-            && driver.check_mapping(number, args).is_err()
-        {
-            return Err(self.refuse(1));
-        }
-        if let Some(error) = injected_syscall_guard(self.runtime, number, args) {
-            self.refuse(1);
-            return Err(error);
-        }
-        if let Some(result) = super::super::restorer::mapping_change_result(number, args) {
-            self.refuse(1);
-            return Errno::from_ret(result as usize).map(|value| value as i64);
-        }
-        if let Some(result) =
-            unsafe { super::super::protect::protect_forwarded_descriptor_change(number, args) }
-        {
-            self.refuse(1);
-            return Errno::from_ret(result as usize).map(|value| value as i64);
-        }
-        // No fabricated event or stale old-image PKRU enters this route.
-        let mask = match stripped_signal_mask(self.runtime, number, args) {
-            Ok(mask) => mask,
-            Err(error) => {
+        let (mut args, mask) = match guard_lifecycle_injection(self.runtime, number, args, || {
+            #[cfg(feature = "exec-native-injection")]
+            {
+                self.mapping_driver
+                    .is_none_or(|driver| driver.check_mapping(number, args).is_ok())
+            }
+            #[cfg(not(feature = "exec-native-injection"))]
+            {
+                true
+            }
+        }) {
+            GuardedLifecycleInjection::Physical { args, mask } => (args, mask),
+            GuardedLifecycleInjection::Refused(result) => {
                 self.refuse(1);
-                return Err(error);
+                return result;
             }
         };
         if let Some(mask) = mask.as_ref() {
@@ -498,6 +453,7 @@ mod tests {
         calls: Arc<Mutex<Vec<&'static str>>>,
         refuse_post_exec: bool,
         inject_in_post_exec: bool,
+        refusal_mode: usize,
     }
 
     #[reverie::tool]
@@ -536,10 +492,63 @@ mod tests {
                 return Err(Errno::EPERM);
             }
             if self.inject_in_post_exec {
+                let regs = guest.regs().await;
+                assert_eq!(regs.rsp, 0x1234_0000);
+                assert_eq!(regs.rip, 0x5678_0000);
+                assert_ne!(regs.fs_base, 0);
                 assert_eq!(
                     guest.inject(reverie::syscalls::Getpid::default()).await,
-                    Err(Errno::EOPNOTSUPP)
+                    Ok(raw_pid(libc::SYS_getpid).as_raw() as i64)
                 );
+                assert_eq!(guest.send_rpc(2).await, 12);
+            }
+            match self.refusal_mode {
+                1 => {
+                    assert_eq!(
+                        guest.inject(reverie::syscalls::Fork::default()).await,
+                        Err(Errno::EOPNOTSUPP)
+                    );
+                }
+                2 => {
+                    let regs = guest.regs().await;
+                    assert_eq!(
+                        guest
+                            .set_regs(regs)
+                            .await
+                            .unwrap_err()
+                            .into_errno()
+                            .unwrap(),
+                        Errno::EOPNOTSUPP
+                    );
+                }
+                3 => {
+                    assert_eq!(
+                        guest
+                            .set_timer(TimerSchedule::Rcbs(1))
+                            .unwrap_err()
+                            .into_errno()
+                            .unwrap(),
+                        Errno::EOPNOTSUPP
+                    );
+                }
+                4 => {
+                    assert_eq!(
+                        guest.read_clock().unwrap_err().into_errno().unwrap(),
+                        Errno::EOPNOTSUPP
+                    );
+                }
+                5 => {
+                    let _ = guest.stack().await;
+                }
+                6 => {
+                    guest
+                        .tail_inject(reverie::syscalls::Getpid::default())
+                        .await;
+                }
+                7 => {
+                    guest.daemonize().await;
+                }
+                _ => {}
             }
             guest.thread_state_mut().0 += 1;
             Ok(())
@@ -552,13 +561,54 @@ mod tests {
         Box<ToolHost<ParityTool, TestRuntime>>,
         std::thread::JoinHandle<Vec<u64>>,
     ) {
-        parity_host_with(calls, false, false)
+        parity_host_with(calls, false, true, 0)
+    }
+
+    fn mapped_test_regs() -> libc::user_regs_struct {
+        let mut fs_base = 0_u64;
+        let result =
+            unsafe { libc::syscall(libc::SYS_arch_prctl, 0x1003, (&raw mut fs_base) as u64) };
+        assert_eq!(result, 0);
+        let mut regs: libc::user_regs_struct = unsafe { core::mem::zeroed() };
+        regs.rsp = 0x1234_0000;
+        regs.rip = 0x5678_0000;
+        regs.fs_base = fs_base;
+        regs
+    }
+
+    fn mapped_test_entry(
+        owner: &crate::guest::exec_private::InitialImageControl,
+    ) -> crate::guest::exec_private::MappedSuccessorEntry {
+        let entry = unsafe {
+            crate::guest::exec_private::MappedSuccessorEntry::from_mapped_resume(
+                mapped_test_regs(),
+                None,
+            )
+        };
+        crate::guest::exec_private::set_mapped_successor_test_entry(owner, &entry);
+        entry
+    }
+
+    fn mapped_test_mismatched_entry(
+        mode: usize,
+    ) -> crate::guest::exec_private::MappedSuccessorEntry {
+        let mut regs = mapped_test_regs();
+        let mut pkru = None;
+        match mode {
+            0 => regs.rsp += 8,
+            1 => regs.rip += 8,
+            2 => regs.fs_base += 8,
+            3 => pkru = Some(2),
+            _ => unreachable!(),
+        }
+        unsafe { crate::guest::exec_private::MappedSuccessorEntry::from_mapped_resume(regs, pkru) }
     }
 
     fn parity_host_with(
         calls: Arc<Mutex<Vec<&'static str>>>,
         refuse_post_exec: bool,
         inject_in_post_exec: bool,
+        refusal_mode: usize,
     ) -> (
         Box<ToolHost<ParityTool, TestRuntime>>,
         std::thread::JoinHandle<Vec<u64>>,
@@ -570,6 +620,7 @@ mod tests {
                     calls,
                     refuse_post_exec,
                     inject_in_post_exec,
+                    refusal_mode,
                 },
                 rpc,
                 raw_pid(libc::SYS_getpid),
@@ -603,7 +654,7 @@ mod tests {
                     Some((100, selected.1))
                 );
                 drop(native_host);
-                assert!(native_worker.join().unwrap().is_empty());
+                assert_eq!(native_worker.join().unwrap(), [2]);
 
                 let mapped_calls = Arc::new(Mutex::new(Vec::new()));
                 let (_native, owner) = lifecycle_test_owner();
@@ -611,8 +662,9 @@ mod tests {
                 unsafe { mapped_host.bind_initial_image_control(&owner) }.unwrap();
                 unsafe { mapped_host.restore_mapped_successor_state(selected, &owner) }.unwrap();
                 mark_lifecycle_test_frontend_installed(&owner);
+                let mapped_entry = mapped_test_entry(&owner);
                 mapped_host
-                    .initialize_mapped_successor_lifecycle(&owner)
+                    .initialize_mapped_successor_lifecycle(&owner, &mapped_entry)
                     .unwrap();
                 assert_eq!(
                     mapped_host
@@ -621,7 +673,7 @@ mod tests {
                     Some((100, selected.1))
                 );
                 drop(mapped_host);
-                assert!(mapped_worker.join().unwrap().is_empty());
+                assert_eq!(mapped_worker.join().unwrap(), [2]);
 
                 assert_eq!(*native_calls.lock().unwrap(), ["post-exec"]);
                 assert_eq!(*mapped_calls.lock().unwrap(), *native_calls.lock().unwrap());
@@ -646,8 +698,9 @@ mod tests {
                     "InitialImage selected-state restoration attempted twice"
                 );
                 mark_lifecycle_test_frontend_installed(&owner);
+                let entry = mapped_test_entry(&owner);
                 let error = host
-                    .initialize_mapped_successor_lifecycle(&owner)
+                    .initialize_mapped_successor_lifecycle(&owner, &entry)
                     .unwrap_err();
                 assert_eq!(
                     error.to_string(),
@@ -668,13 +721,14 @@ mod tests {
             || {
                 let calls = Arc::new(Mutex::new(Vec::new()));
                 let (_native, owner) = lifecycle_test_owner();
-                let (host, worker) = parity_host_with(calls.clone(), true, false);
+                let (host, worker) = parity_host_with(calls.clone(), true, false, 0);
                 unsafe { host.bind_initial_image_control(&owner) }.unwrap();
                 unsafe { host.restore_mapped_successor_state((99, 0x1234_5678_abcd_4321), &owner) }
                     .unwrap();
                 mark_lifecycle_test_frontend_installed(&owner);
+                let entry = mapped_test_entry(&owner);
                 let error = host
-                    .initialize_mapped_successor_lifecycle(&owner)
+                    .initialize_mapped_successor_lifecycle(&owner, &entry)
                     .unwrap_err();
                 assert_eq!(error.raw_os_error(), Some(libc::EPERM));
                 assert!(host.states.is_empty());
@@ -683,7 +737,7 @@ mod tests {
                         .load(core::sync::atomic::Ordering::Acquire)
                 );
                 let error = host
-                    .initialize_mapped_successor_lifecycle(&owner)
+                    .initialize_mapped_successor_lifecycle(&owner, &entry)
                     .unwrap_err();
                 assert_eq!(
                     error.to_string(),
@@ -709,28 +763,28 @@ mod tests {
     }
 
     #[test]
-    fn mapped_successor_post_exec_inject_is_named_unsupported() {
+    fn mapped_successor_post_exec_injects_regs_and_rpc() {
         isolated(
             || {
                 let calls = Arc::new(Mutex::new(Vec::new()));
-                let (_native, owner) = lifecycle_test_owner();
-                let (host, worker) = parity_host_with(calls.clone(), false, true);
+                let (native, owner) = lifecycle_test_owner();
+                let (host, worker) = parity_host_with(calls.clone(), false, true, 0);
                 unsafe { host.bind_initial_image_control(&owner) }.unwrap();
-                unsafe { host.restore_mapped_successor_state((99, 0x1234_5678_abcd_4321), &owner) }
-                    .unwrap();
+                let selected = (99, 0x1234_5678_abcd_4321);
+                unsafe { host.restore_mapped_successor_state(selected, &owner) }.unwrap();
                 mark_lifecycle_test_frontend_installed(&owner);
-                let error = host
-                    .initialize_mapped_successor_lifecycle(&owner)
-                    .unwrap_err();
-                assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+                let entry = mapped_test_entry(&owner);
+                host.initialize_mapped_successor_lifecycle(&owner, &entry)
+                    .unwrap();
+                assert_eq!(native.successor_test_phase(), 2);
                 assert_eq!(
-                    error.to_string(),
-                    "InitialImage lifecycle syscall injection is unsupported"
+                    host.states
+                        .with_state(raw_pid(libc::SYS_gettid).as_raw(), |state| state.copied()),
+                    Some((100, selected.1))
                 );
-                assert!(host.states.is_empty());
                 assert_eq!(*calls.lock().unwrap(), ["post-exec"]);
                 drop(host);
-                assert!(worker.join().unwrap().is_empty());
+                assert_eq!(worker.join().unwrap(), [2]);
             },
             0,
         );
@@ -763,6 +817,122 @@ mod tests {
             },
             0,
         );
+    }
+
+    #[test]
+    fn mapped_successor_entry_mismatch_is_refused_before_post_exec() {
+        for mode in 0..4 {
+            isolated(
+                move || {
+                    let calls = Arc::new(Mutex::new(Vec::new()));
+                    let (_native, owner) = lifecycle_test_owner();
+                    let (host, worker) = parity_host(calls.clone());
+                    unsafe { host.bind_initial_image_control(&owner) }.unwrap();
+                    unsafe {
+                        host.restore_mapped_successor_state((99, 0x1234_5678_abcd_4321), &owner)
+                    }
+                    .unwrap();
+                    mark_lifecycle_test_frontend_installed(&owner);
+                    let _matching = mapped_test_entry(&owner);
+                    let mismatched = mapped_test_mismatched_entry(mode);
+                    let error = host
+                        .initialize_mapped_successor_lifecycle(&owner, &mismatched)
+                        .unwrap_err();
+                    assert_eq!(error.to_string(), "mapped successor resume entry differs");
+                    assert!(calls.lock().unwrap().is_empty());
+                    assert!(host.states.is_empty());
+                    drop(host);
+                    assert!(worker.join().unwrap().is_empty());
+                },
+                0,
+            );
+        }
+    }
+
+    #[test]
+    fn mapped_lifecycle_without_selected_restore_is_refused() {
+        isolated(
+            || {
+                let calls = Arc::new(Mutex::new(Vec::new()));
+                let (_native, owner) = lifecycle_test_owner();
+                let (host, worker) = parity_host(calls.clone());
+                unsafe { host.bind_initial_image_control(&owner) }.unwrap();
+                mark_lifecycle_test_frontend_installed(&owner);
+                let entry = mapped_test_entry(&owner);
+                let error = host
+                    .initialize_mapped_successor_lifecycle(&owner, &entry)
+                    .unwrap_err();
+                assert_eq!(
+                    error.to_string(),
+                    "InitialImage lifecycle lacks its installed host/frontend"
+                );
+                assert!(calls.lock().unwrap().is_empty());
+                assert!(host.states.is_empty());
+                drop(host);
+                assert!(worker.join().unwrap().is_empty());
+            },
+            0,
+        );
+    }
+
+    #[test]
+    fn mapped_successor_refusals_are_sticky_and_named() {
+        for (mode, name) in [
+            (1, "mapped successor lifecycle guarded injection refused"),
+            (
+                2,
+                "mapped successor lifecycle register mutation is unsupported",
+            ),
+            (
+                3,
+                "mapped successor lifecycle timer programming is unsupported",
+            ),
+            (4, "mapped successor lifecycle RCB clock is unsupported"),
+        ] {
+            isolated(
+                move || {
+                    let calls = Arc::new(Mutex::new(Vec::new()));
+                    let (_native, owner) = lifecycle_test_owner();
+                    let (host, worker) = parity_host_with(calls.clone(), false, false, mode);
+                    unsafe { host.bind_initial_image_control(&owner) }.unwrap();
+                    unsafe {
+                        host.restore_mapped_successor_state((99, 0x1234_5678_abcd_4321), &owner)
+                    }
+                    .unwrap();
+                    mark_lifecycle_test_frontend_installed(&owner);
+                    let entry = mapped_test_entry(&owner);
+                    let error = host
+                        .initialize_mapped_successor_lifecycle(&owner, &entry)
+                        .unwrap_err();
+                    assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+                    assert_eq!(error.to_string(), name);
+                    assert!(host.states.is_empty());
+                    assert_eq!(*calls.lock().unwrap(), ["post-exec"]);
+                    drop(host);
+                    assert!(worker.join().unwrap().is_empty());
+                },
+                0,
+            );
+        }
+        for mode in 5..8 {
+            isolated(
+                move || {
+                    let calls = Arc::new(Mutex::new(Vec::new()));
+                    let (_native, owner) = lifecycle_test_owner();
+                    let (host, _worker) = parity_host_with(calls.clone(), false, false, mode);
+                    unsafe { host.bind_initial_image_control(&owner) }.unwrap();
+                    unsafe {
+                        host.restore_mapped_successor_state((99, 0x1234_5678_abcd_4321), &owner)
+                    }
+                    .unwrap();
+                    mark_lifecycle_test_frontend_installed(&owner);
+                    let entry = mapped_test_entry(&owner);
+                    let _ = host.initialize_mapped_successor_lifecycle(&owner, &entry);
+                    panic!("terminal mapped successor operation returned");
+                },
+                127,
+            );
+        }
     }
 
     struct TestRuntime;

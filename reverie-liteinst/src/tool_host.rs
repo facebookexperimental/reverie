@@ -477,6 +477,7 @@ pub struct MappedSuccessorPreparation<T: Tool> {
 #[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
 pub struct PreparedMappedSuccessorImage<T: Tool> {
     initial: PreparedInitialImage<T>,
+    entry: reverie_inguest::guest::exec_private::MappedSuccessorEntry,
 }
 
 /// Installed mapped successor retaining fatal ownership through
@@ -484,6 +485,7 @@ pub struct PreparedMappedSuccessorImage<T: Tool> {
 #[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
 pub struct InstalledMappedSuccessorImage {
     initial: InstalledInitialImage,
+    entry: reverie_inguest::guest::exec_private::MappedSuccessorEntry,
 }
 
 #[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
@@ -644,6 +646,7 @@ pub unsafe fn prepare_tool_mapped_successor_image_validated<T: Tool>(
         state,
         verified,
     } = preparation;
+    let entry = mapped.successor_entry();
     let packet = mapped
         .successor_init_packet()
         .map_err(|error| io::Error::other(error.name()))?;
@@ -673,7 +676,7 @@ pub unsafe fn prepare_tool_mapped_successor_image_validated<T: Tool>(
         },
     )?;
     initial.selected = Some((tool, state));
-    Ok(PreparedMappedSuccessorImage { initial })
+    Ok(PreparedMappedSuccessorImage { initial, entry })
 }
 
 /// Install the selected mapped successor Tool/state using the
@@ -698,6 +701,7 @@ where
 {
     Ok(InstalledMappedSuccessorImage {
         initial: unsafe { install_prepared_initial_image(coordinator, prepared.initial)? },
+        entry: prepared.entry,
     })
 }
 
@@ -707,8 +711,9 @@ where
 /// same state. It calls neither `on_initial_image_attached`,
 /// `init_thread_state`, nor `handle_thread_start`. Only the
 /// callback order and published state are parity; the mapped
-/// lifecycle guest refuses injection and terminates on
-/// register access, unlike the native successor guest.
+/// lifecycle guest provides guarded injection and the verified
+/// mapped resume registers/PKRU under its selected-restore
+/// permit.
 #[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
 pub fn initialize_mapped_successor_lifecycle(
     image: &InstalledMappedSuccessorImage,
@@ -719,6 +724,7 @@ pub fn initialize_mapped_successor_lifecycle(
         installed_tool::initialize_mapped_successor_lifecycle(
             &image.initial.control,
             &image.initial.fatal,
+            &image.entry,
         )
     }
 }

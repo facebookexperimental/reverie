@@ -820,6 +820,18 @@ impl MappedToolPrelude {
         }
         Ok(self)
     }
+    /// Exact original resume registers/PKRU for the mapped
+    /// successor's guarded post-exec guest.
+    pub fn successor_entry(&self) -> super::MappedSuccessorEntry {
+        // SAFETY: this prelude retains the actual captured resume
+        // registers and PKRU for this same mapped image.
+        unsafe {
+            super::MappedSuccessorEntry::from_mapped_resume(
+                self.original_registers(),
+                Some(self.original_pkru()),
+            )
+        }
+    }
     /// Same control pointer for the genuine ordinary InitialImage bridge.
     pub fn control(&self) -> NonNull<NativeControl> {
         self.input.control

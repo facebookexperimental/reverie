@@ -828,7 +828,10 @@ unsafe extern "C" {
         guest_pkru: u64,
         use_pkru: u64,
     ) -> PhysicalResult;
-    #[cfg(feature = "exec-private-successor")]
+    #[cfg(any(
+        feature = "exec-private-successor",
+        all(feature = "exec-private-init", feature = "coordinator-rpc")
+    ))]
     fn reverie_inguest_private_lifecycle_call(
         number: i64,
         args: *const u64,
@@ -1265,6 +1268,20 @@ core::arch::global_asm!(r#"
     instruction_handler = sym super::instruction::instruction_sigsegv_handler,
 );
 
+#[cfg(all(test, feature = "exec-private-successor"))]
+pub(super) fn set_mapped_successor_test_entry(
+    owner: &InitialImageControl,
+    entry: &MappedSuccessorEntry,
+) {
+    let control = owner.control as *mut NativeControl;
+    unsafe {
+        (&raw mut (*control).guest_rsp).write_volatile(entry.regs.rsp);
+        (&raw mut (*control).guest_ld_entry).write_volatile(entry.regs.rip);
+        (&raw mut (*control).guest_fs).write_volatile(entry.regs.fs_base);
+        (&raw mut (*control).guest_pkru).write_volatile(entry.pkru.map(u64::from).unwrap_or(0));
+    }
+}
+
 #[cfg(test)]
 pub(super) fn lifecycle_test_owner() -> (Box<NativeControl>, InitialImageControl) {
     // Component fixture only: this does not install a signal frontend, redeem
@@ -1426,6 +1443,8 @@ impl InitialImageControl {
             owner: self,
             host,
             completed: false,
+            #[cfg(feature = "coordinator-rpc")]
+            selected: expected_selected_restore == 2,
             _same_thread: core::marker::PhantomData,
         };
         if self.installation.load(Ordering::Acquire) != 2
@@ -1473,6 +1492,25 @@ impl InitialImageControl {
     #[cfg(feature = "coordinator-rpc")]
     pub(super) fn mapped_successor_restore_completed(&self) {
         self.selected_restore.store(2, Ordering::Release);
+    }
+
+    #[cfg(feature = "coordinator-rpc")]
+    pub(super) fn verify_mapped_successor_entry(
+        &self,
+        entry: &MappedSuccessorEntry,
+    ) -> io::Result<()> {
+        let control = self.control as *const NativeControl;
+        if entry.regs.rsp != unsafe { (&raw const (*control).guest_rsp).read_volatile() }
+            || entry.regs.rip != unsafe { (&raw const (*control).guest_ld_entry).read_volatile() }
+            || entry.regs.fs_base != unsafe { (&raw const (*control).guest_fs).read_volatile() }
+            || entry.pkru.map(u64::from).unwrap_or(0)
+                != unsafe { (&raw const (*control).guest_pkru).read_volatile() }
+            || entry.regs.rsp == 0
+            || entry.regs.rip == 0
+        {
+            return Err(io::Error::other("mapped successor resume entry differs"));
+        }
+        Ok(())
     }
 
     #[cfg(feature = "coordinator-rpc")]
@@ -1628,11 +1666,68 @@ pub(super) struct InitialLifecyclePermit<'a> {
     owner: &'a InitialImageControl,
     host: usize,
     completed: bool,
+    #[cfg(feature = "coordinator-rpc")]
+    selected: bool,
     _same_thread: core::marker::PhantomData<*mut ()>,
 }
 
+// SAFETY: every shared mapped-injection operation revalidates the
+// actual initial thread, installed host, lifecycle phase, and
+// selected-restore state before touching the published control.
+#[cfg(feature = "coordinator-rpc")]
+unsafe impl Sync for InitialLifecyclePermit<'_> {}
+
 #[cfg(any(feature = "coordinator-rpc", test))]
 impl InitialLifecyclePermit<'_> {
+    #[cfg(feature = "coordinator-rpc")]
+    fn check_mapped_injection(&self) -> io::Result<()> {
+        if !self.selected
+            || self.completed
+            || self.owner.lifecycle.load(Ordering::Acquire) != 1
+            || self.owner.installation.load(Ordering::Acquire) != 2
+            || self.owner.installed_host.load(Ordering::Acquire) != self.host
+            || self.owner.selected_restore.load(Ordering::Acquire) != 2
+        {
+            return Err(io::Error::other(
+                "mapped successor injection permit differs",
+            ));
+        }
+        self.owner.check_initial_thread()
+    }
+
+    #[cfg(feature = "coordinator-rpc")]
+    pub(super) fn validate_mapped_injection(&self) -> io::Result<()> {
+        let result = self.check_mapped_injection();
+        if result.is_err() {
+            self.owner.lifecycle.store(3, Ordering::Release);
+        }
+        result
+    }
+
+    #[cfg(feature = "coordinator-rpc")]
+    pub(super) fn regs(&self, entry: &MappedSuccessorEntry) -> libc::user_regs_struct {
+        if self.check_mapped_injection().is_err()
+            || self.owner.verify_mapped_successor_entry(entry).is_err()
+        {
+            self.owner.terminate_lifecycle();
+        }
+        let mut regs = entry.regs;
+        regs.fs_base = unsafe {
+            (&raw const (*(self.owner.control as *const NativeControl)).guest_fs).read_volatile()
+        };
+        regs
+    }
+
+    #[cfg(feature = "coordinator-rpc")]
+    pub(super) fn pkru(&self, entry: &MappedSuccessorEntry) -> Option<u32> {
+        entry.pkru
+    }
+
+    #[cfg(feature = "coordinator-rpc")]
+    pub(super) fn terminate(&self) -> ! {
+        self.owner.terminate_lifecycle()
+    }
+
     pub(super) fn complete(mut self) -> io::Result<()> {
         if self.owner.installation.load(Ordering::Acquire) != 2
             || self.owner.installed_host.load(Ordering::Acquire) != self.host
@@ -1991,6 +2086,36 @@ pub struct ImageGuestEntry {
     regs: libc::user_regs_struct,
     pkru: Option<u32>,
 }
+/// Exact mapped-image resume registers and PKRU projected from
+/// the retained mapped prelude, with no SyscallEvent.
+#[cfg(feature = "exec-private-init")]
+#[derive(Clone, Copy)]
+pub struct MappedSuccessorEntry {
+    regs: libc::user_regs_struct,
+    pkru: Option<u32>,
+}
+#[cfg(feature = "exec-private-init")]
+impl MappedSuccessorEntry {
+    /// # Safety
+    /// Capture the actual registers and PKRU that this mapped
+    /// image's runner will use to resume its loader. Their
+    /// storage must be owned and immutable until lifecycle/finish;
+    /// no guest code may run or mutate them in between.
+    pub unsafe fn from_mapped_resume(regs: libc::user_regs_struct, pkru: Option<u32>) -> Self {
+        Self { regs, pkru }
+    }
+
+    /// Exact mapped loader-resume registers captured for this entry.
+    pub fn registers(&self) -> libc::user_regs_struct {
+        self.regs
+    }
+
+    /// Exact mapped loader-resume PKRU captured for this entry.
+    pub fn pkru(&self) -> Option<u32> {
+        self.pkru
+    }
+}
+
 #[cfg(feature = "exec-private-successor")]
 impl ImageGuestEntry {
     /// # Safety
@@ -2508,6 +2633,54 @@ pub unsafe fn physical_lifecycle_syscall(
         permit.owner.poison();
         return Err(error);
     }
+    Ok(crate::trap::NativeSyscallResult {
+        result: result.result,
+        pkru: pkru.map(|_| result.pkru as u32),
+    })
+}
+
+/// Execute only a guarded mapped lifecycle operation. The phase
+/// is bracketed 2 -> 6 -> leaf -> 2 for this one call, so Tool
+/// libc calls before and after it use the mapped relay's phase 2.
+/// This never exposes the ordinary callback leaf as a fallback.
+///
+/// # Safety
+/// The core host must apply all process/signal/mapping/descriptor
+/// guards first. Arguments/storage must survive the physical leaf;
+/// no thread creation, exec, tail/ending transition or callable
+/// guest signal delivery is admitted.
+#[cfg(all(feature = "exec-private-init", feature = "coordinator-rpc"))]
+pub(super) unsafe fn physical_mapped_lifecycle_syscall(
+    permit: &InitialLifecyclePermit<'_>,
+    number: i64,
+    args: [u64; 6],
+    pkru: Option<u32>,
+) -> io::Result<crate::trap::NativeSyscallResult> {
+    permit.validate_mapped_injection()?;
+    let control = permit.owner.control as *mut NativeControl;
+    // SAFETY: validate_mapped_injection has just required phase 2
+    // on this same initial thread and stable installed host.
+    unsafe { (&raw mut (*control).phase).write_volatile(6) };
+    let result = unsafe {
+        reverie_inguest_private_lifecycle_call(
+            number,
+            args.as_ptr(),
+            u64::from(pkru.unwrap_or(0)),
+            u64::from(pkru.is_some()),
+        )
+    };
+    // The leaf restored Tool FS and its expected phase (6). Restore
+    // phase 2 before any other Rust or libc work in this function.
+    unsafe { (&raw mut (*control).phase).write_volatile(2) };
+    unsafe {
+        if number == libc::SYS_set_tid_address && result.result > 0 {
+            (&raw mut (*control).kernel_clear_tid).write_volatile(args[0]);
+        } else if number == libc::SYS_set_robust_list && result.result == 0 {
+            (&raw mut (*control).kernel_robust_head).write_volatile(args[0]);
+            (&raw mut (*control).kernel_robust_len).write_volatile(args[1]);
+        }
+    }
+    permit.validate_mapped_injection()?;
     Ok(crate::trap::NativeSyscallResult {
         result: result.result,
         pkru: pkru.map(|_| result.pkru as u32),

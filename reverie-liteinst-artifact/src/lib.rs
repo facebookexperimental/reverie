@@ -1424,8 +1424,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-inguest/src/guest/installed_tool.rs",
-        35715,
-        "0119bc667ad13b526a923981f8040a356c159e681c67fae4e8030e2d90da58a9",
+        35986,
+        "cc560e970e06233c2edb8e54595ddae617ca857d0969d714151134e8c86c09da",
     ),
     (
         "reverie-inguest/src/guest/mod.rs",
@@ -1439,8 +1439,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-inguest/src/guest/host.rs",
-        272536,
-        "f5a07c8b8d676461499d6a8ee5e6163f7f57033f26c11d7fcec4425f4e362649",
+        276321,
+        "1558dc519963b376c7b0a9e69be6264817196cfe8ce7a945d1d5f531520b2a7c",
     ),
     (
         "reverie-inguest/src/guest/host_linux.rs",
@@ -1449,8 +1449,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-liteinst/src/tool_host.rs",
-        77555,
-        "273a207b2cabdcae378909a13484738ad8b96c951d9cfed08e9ec31474177a6e",
+        77827,
+        "8438f128924c1c4dcf19b72bcf98580458628c67f98b03383cde791b0f814966",
     ),
     (
         "reverie/Cargo.toml",
@@ -38572,6 +38572,21 @@ mod tests {
                 "reverie-inguest/src/guest/installed_tool.rs",
                 35633,
                 "9cdbb7f5f50751738041fffac5a5078e7ed765f24399699fa612b73e22ce7e00",
+            ),
+            (
+                "reverie-liteinst/src/tool_host.rs",
+                77555,
+                "273a207b2cabdcae378909a13484738ad8b96c951d9cfed08e9ec31474177a6e",
+            ),
+            (
+                "reverie-inguest/src/guest/host.rs",
+                272536,
+                "f5a07c8b8d676461499d6a8ee5e6163f7f57033f26c11d7fcec4425f4e362649",
+            ),
+            (
+                "reverie-inguest/src/guest/installed_tool.rs",
+                35715,
+                "0119bc667ad13b526a923981f8040a356c159e681c67fae4e8030e2d90da58a9",
             ),
             (
                 "Cargo.toml",

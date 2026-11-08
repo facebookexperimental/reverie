@@ -96,6 +96,9 @@ mod native_entry_tests;
 #[cfg(feature = "exec-private-init")]
 #[path = "image_guest.rs"]
 mod image_guest;
+#[cfg(feature = "exec-private-init")]
+#[path = "mapped_successor_image_guest.rs"]
+mod mapped_successor_image_guest;
 #[cfg(all(test, feature = "exec-native-injection"))]
 #[path = "native_exec_tests.rs"]
 mod native_exec_tests;
@@ -1078,13 +1081,14 @@ where
     /// `on_initial_image_attached`, `init_thread_state`,
     /// thread-start, or syscall callback. Only the callback order
     /// and published state are native parity: the mapped path
-    /// supplies `ImageGuest`, whose injection is unsupported and
-    /// whose register/stack access terminates, unlike the native
-    /// successor guest's entry registers and injection permit.
+    /// supplies its mapped-successor guest, with guarded injection
+    /// under the selected-restore permit and the verified mapped
+    /// resume registers/PKRU; stack access still terminates.
     #[cfg(feature = "exec-private-init")]
     pub(super) fn initialize_mapped_successor_lifecycle(
         &self,
         control: &super::exec_private::InitialImageControl,
+        entry: &super::exec_private::MappedSuccessorEntry,
     ) -> io::Result<()> {
         let permit = control.begin_mapped_successor_lifecycle(core::ptr::from_ref(self) as usize)?;
         let _scratch_scope = DispatchScratchScope::enter();
@@ -1100,6 +1104,7 @@ where
                 "mapped successor Tool callback is active",
             ));
         };
+        control.verify_mapped_successor_entry(entry)?;
         let tool_arc = self
             .tool_process()
             .ok_or_else(|| io::Error::other("mapped successor Tool is absent"))?;
@@ -1117,14 +1122,13 @@ where
         restored.phase = MappedSuccessorPhase::Failed;
         let tail = TailResult::default();
         {
-            let mut guest = image_guest::ImageGuest::<T, R>::new(
+            let mut guest = mapped_successor_image_guest::MappedSuccessorImageGuest::<T, R>::new(
                 tid,
                 &mut restored.state,
-                &self.rpc,
-                &self.runtime,
-                self.cpuid_interception,
+                self,
                 &tail,
-                control,
+                &permit,
+                entry,
             );
             #[cfg(feature = "exec-native-injection")]
             if let Some(driver) = &self.native_exec_driver {
@@ -3821,6 +3825,98 @@ fn stripped_signal_mask(
     } else {
         Err(Errno::new(-copied as i32))
     }
+}
+
+/// Outcome of the one shared lifecycle injection guard chain.
+/// `Refused` still requires the guest to record its sticky
+/// first refusal before returning the carried result.
+#[cfg(any(feature = "exec-private-successor", feature = "exec-private-init"))]
+pub(super) enum GuardedLifecycleInjection {
+    /// Run the route's physical lifecycle leaf with these exact
+    /// arguments; `mask`, when present, must outlive that call so
+    /// the caller can point `args[1]` at it.
+    Physical {
+        /// Guard-adjusted syscall arguments.
+        args: [u64; 6],
+        /// Stripped signal mask storage, when the call needs one.
+        mask: Option<u64>,
+    },
+    /// Do not run any physical call; return this precomputed
+    /// result after recording the caller's sticky refusal.
+    Refused(core::result::Result<i64, Errno>),
+}
+
+/// The one deny/mapping/signal/descriptor guard chain shared by
+/// native and mapped successor lifecycle injection.
+#[cfg(any(feature = "exec-private-successor", feature = "exec-private-init"))]
+pub(super) fn guard_lifecycle_injection(
+    runtime: &impl HostRuntime,
+    number: i64,
+    mut args: [u64; 6],
+    mapping_allowed: impl FnOnce() -> bool,
+) -> GuardedLifecycleInjection {
+    // Lifecycle may not create/replace/terminate an image, admit an extra
+    // filter/namespace, stage delivery, or activate keys/guest handlers.
+    if matches!(
+        number,
+        libc::SYS_clone
+            | libc::SYS_clone3
+            | libc::SYS_fork
+            | libc::SYS_vfork
+            | libc::SYS_execve
+            | libc::SYS_execveat
+            | libc::SYS_exit
+            | libc::SYS_exit_group
+            | libc::SYS_rt_sigreturn
+            | libc::SYS_rseq
+            | libc::SYS_seccomp
+            | libc::SYS_unshare
+            | libc::SYS_setns
+            | libc::SYS_mount
+            | libc::SYS_umount2
+            | libc::SYS_chroot
+            | libc::SYS_pivot_root
+            | libc::SYS_pkey_alloc
+            | libc::SYS_pkey_free
+            | libc::SYS_pkey_mprotect
+            | libc::SYS_kill
+            | libc::SYS_tkill
+            | libc::SYS_tgkill
+            | libc::SYS_rt_sigqueueinfo
+            | libc::SYS_rt_tgsigqueueinfo
+    ) || (number == libc::SYS_prctl && args[0] == libc::PR_SET_SECCOMP as u64)
+        || (number == libc::SYS_arch_prctl && args[0] == 0x1001)
+    {
+        return GuardedLifecycleInjection::Refused(Err(Errno::EOPNOTSUPP));
+    }
+    if !mapping_allowed() {
+        return GuardedLifecycleInjection::Refused(Err(Errno::EOPNOTSUPP));
+    }
+    if let Some(error) = injected_syscall_guard(runtime, number, args) {
+        return GuardedLifecycleInjection::Refused(Err(error));
+    }
+    if let Some(result) = super::restorer::mapping_change_result(number, args) {
+        return GuardedLifecycleInjection::Refused(
+            Errno::from_ret(result as usize).map(|value| value as i64),
+        );
+    }
+    if let Some(result) =
+        unsafe { super::protect::protect_forwarded_descriptor_change(number, args) }
+    {
+        return GuardedLifecycleInjection::Refused(
+            Errno::from_ret(result as usize).map(|value| value as i64),
+        );
+    }
+    let mask = match stripped_signal_mask(runtime, number, args) {
+        Ok(mask) => mask,
+        Err(error) => return GuardedLifecycleInjection::Refused(Err(error)),
+    };
+    if mask.is_some() {
+        // The caller points args[1] at the returned mask storage
+        // immediately before its physical call.
+        args[1] = 0;
+    }
+    GuardedLifecycleInjection::Physical { args, mask }
 }
 
 /// The guest memory a Tool callback reaches through [`Guest::memory`]: this

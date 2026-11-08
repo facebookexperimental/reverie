@@ -144,7 +144,7 @@ impl VerifiedReady {
         self.reserved_signals
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "loader-private-runtime", feature = "stage1a-probe"))]
     pub(crate) fn for_test(pid: safeptrace::Pid, terminal_ip: u64, reserved_signals: u64) -> Self {
         Self {
             pid,
@@ -470,7 +470,7 @@ impl PreparedMapping<'_> {
 
     /// Test-only view of the handover latches a refused release
     /// must leave unset: `(failed, handover_started)`.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "loader-private-runtime", feature = "stage1a-probe"))]
     pub(crate) fn handover_flags_for_test(&self) -> (bool, bool) {
         (self.entry.failed, self.entry.handover_started)
     }
@@ -478,7 +478,7 @@ impl PreparedMapping<'_> {
     /// Test-only initialized-stop injection, so release call-site
     /// tests can name an exact recorded stop instead of relying on
     /// its absence to produce a mismatch.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "loader-private-runtime", feature = "stage1a-probe"))]
     pub(crate) fn set_initialized_stop_for_test(&mut self, stop: Option<(u64, u64)>) {
         self.entry.initialized_stop = stop;
     }

@@ -64,6 +64,7 @@ trait ToolHandler: Send + Sync {
     fn initialize_mapped_successor_lifecycle(
         &self,
         control: &InitialImageControl,
+        entry: &super::exec_private::MappedSuccessorEntry,
     ) -> io::Result<()>;
 }
 
@@ -117,8 +118,9 @@ impl<T: Tool + 'static, R: HostRuntime> ToolHandler for ToolHost<T, R> {
     fn initialize_mapped_successor_lifecycle(
         &self,
         control: &InitialImageControl,
+        entry: &super::exec_private::MappedSuccessorEntry,
     ) -> io::Result<()> {
-        ToolHost::initialize_mapped_successor_lifecycle(self, control)
+        ToolHost::initialize_mapped_successor_lifecycle(self, control, entry)
     }
 }
 
@@ -246,9 +248,10 @@ pub unsafe fn publish_mapped_successor_tool<T: Tool + 'static, R: HostRuntime>(
 /// then publish that same state for dispatch. It calls neither
 /// `on_initial_image_attached`, `init_thread_state`, nor
 /// `handle_thread_start`. Only the callback order and
-/// published state are parity; the mapped `ImageGuest` refuses
-/// injection and terminates on register access, unlike the
-/// native successor guest's entry/injection capabilities.
+/// published state are parity; the mapped-successor guest
+/// additionally provides guarded injection and the verified
+/// mapped resume registers/PKRU under its selected-restore
+/// permit.
 ///
 /// # Safety
 /// All `initialize_initial_image_lifecycle` premises apply,
@@ -260,11 +263,12 @@ pub unsafe fn publish_mapped_successor_tool<T: Tool + 'static, R: HostRuntime>(
 pub unsafe fn initialize_mapped_successor_lifecycle(
     control: &InitialImageControl,
     _fatal: &InitialImageAbortGuard,
+    entry: &super::exec_private::MappedSuccessorEntry,
 ) -> io::Result<()> {
     let handler = HANDLER
         .get()
         .ok_or_else(|| io::Error::other("mapped successor Tool is not installed"))?;
-    handler.initialize_mapped_successor_lifecycle(control)
+    handler.initialize_mapped_successor_lifecycle(control, entry)
 }
 
 /// Run the installed InitialImage Tool's existing eager lifecycle.
@@ -768,6 +772,7 @@ mod tests {
             fn initialize_mapped_successor_lifecycle(
                 &self,
                 _control: &super::super::exec_private::InitialImageControl,
+                _entry: &super::super::exec_private::MappedSuccessorEntry,
             ) -> io::Result<()> {
                 unreachable!("counting handler runs no mapped successor lifecycle");
             }

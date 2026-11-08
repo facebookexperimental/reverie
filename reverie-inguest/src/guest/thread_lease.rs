@@ -53,7 +53,8 @@ impl<S> ThreadStates<S> {
         test,
         feature = "rcb-clock",
         feature = "exec-native-injection",
-        feature = "exec-private-successor"
+        feature = "exec-private-successor",
+        all(feature = "exec-private-init", feature = "coordinator-rpc")
     ))]
     pub(super) fn is_empty(&self) -> bool {
         self.slots.lock().is_empty()
