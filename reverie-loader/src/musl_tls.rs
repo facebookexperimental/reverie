@@ -386,6 +386,13 @@ mod tests {
         })
     }
 
+    // Witness level, stated plainly: this compares the pure model
+    // (thread_head_words) against a hand-written model array. The
+    // builder that applies these words (build_thread_tcb, plus
+    // first_thread_switch and note_thread_* in private_runtime::tls)
+    // has never executed — there is no musl runtime harness yet — so
+    // mutants inside it survive this test. Stage B's harness must
+    // compare a real second TCB against the live leader head.
     #[test]
     fn second_tcb_head_equals_leader_head_after_relocation() {
         let leader = LeaderHead {
@@ -393,9 +400,13 @@ mod tests {
             sysinfo: 0x7f00_0000,
             locale: LOCALE,
         };
-        // The leader's own head, as __init_tp leaves it on zeroed backing:
-        // self-linked, joinable, locale/sysinfo/canary set, robust list
-        // self-referential, no stack mapping recorded, no tsd array.
+        // The leader's own head as __init_tp leaves it on zeroed backing,
+        // except word 6: __init_tp writes the leader's tid there (via
+        // set_tid_address), while a newborn head leaves it zero for the
+        // creating clone/child to write, so both models use 0 and word 6
+        // is asserted separately below. Otherwise: self-linked, joinable,
+        // locale/sysinfo/canary set, robust list self-referential, no
+        // stack mapping recorded, no tsd array.
         let leader_plan = plan_at(BACKING);
         let leader_tp = leader_plan.pthread().start as u64;
         let mut leader_words = [0_u64; 25];

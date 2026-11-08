@@ -100,6 +100,17 @@ const _: () = {
     assert!(offset_of!(Pthread, locale) == 168 && offset_of!(Pthread, killlock) == 176);
     assert!(offset_of!(Pthread, dlerror_buf) == 184 && offset_of!(Pthread, stdio_locks) == 192);
     assert!(offset_of!(Pthread, robust_list) == ROBUST_LIST_OFFSET);
+    // thread_head_words writes whole words by index; bind every other
+    // index it touches to this modeled struct (word index = offset / 8):
+    // 2,3 prev/next; 4 sysinfo; 5 canary; 7 detach_state; 10 map_size;
+    // 11 stack; 12 stack_size; 13 guard_size; 16 tsd. (0, 1, 9, 17 and
+    // 21 are bound by the asserts above.)
+    assert!(offset_of!(Pthread, prev) == 16 && offset_of!(Pthread, next) == 24);
+    assert!(offset_of!(Pthread, sysinfo) == 32 && offset_of!(Pthread, canary) == 40);
+    assert!(offset_of!(Pthread, detach_state) == 56);
+    assert!(offset_of!(Pthread, map_size) == 80 && offset_of!(Pthread, stack) == 88);
+    assert!(offset_of!(Pthread, stack_size) == 96 && offset_of!(Pthread, guard_size) == 104);
+    assert!(offset_of!(Pthread, tsd) == 128);
 };
 
 /// Exact musl 1.2.5 `struct _IO_FILE` (`src/internal/stdio_impl.h`), modeled
@@ -154,8 +165,6 @@ unsafe extern "C" {
     // a guest or host libc interposition.
     fn __ofl_lock() -> *mut *mut File;
     fn __ofl_unlock();
-    fn __membarrier_init();
-    fn __syscall(number: usize, ...) -> usize;
     static mut __stdin_used: *mut File;
     static mut __stdout_used: *mut File;
     static mut __stderr_used: *mut File;
@@ -383,7 +392,9 @@ pub(super) fn require_tls_returned() {
 ///
 /// # Safety
 /// The leader install has returned (`STATE == 3`) in the same exact retained
-/// private libc, whose single module set is frozen: `tls_cnt == 1` and the
+/// private libc, and the full `__init_libc` has returned too — not merely
+/// `__init_tls` — so the leader canary `__init_ssp` installs is final. The
+/// single module set is frozen: `tls_cnt == 1` and the
 /// slot plan's total equals the recorded `tls_size`. `leader` is the live
 /// leader thread pointer, read only for its canary/sysinfo words. The slot
 /// backing and the `head.tsd` extent are exclusively owned, writable, and
@@ -466,18 +477,22 @@ unsafe fn init_file_lock(file: *mut File) {
     }
 }
 
-/// The one-time musl transition into threaded mode: the
-/// `if (!libc.threaded)` block of `__pthread_create` (stdio file locks,
-/// unblocking the implementation signals, leader tsd arming, membarrier
-/// registration). Nothing calls this yet; it belongs parent-side, before
-/// the first physical clone creates a second Tool thread.
+/// The retained-libc-only part of musl's one-time transition into
+/// threaded mode: the `if (!libc.threaded)` block of `__pthread_create`,
+/// limited to stdio file-lock arming, leader tsd arming and the
+/// `threaded` flag. Nothing calls this yet; it belongs parent-side,
+/// before the first physical clone creates a second Tool thread.
+/// Deliberately not here, carried to the Stage B plan: musl's
+/// SIGPT_SET `rt_sigprocmask` unblock (the thread's signal mask is
+/// shared with the guest and bypasses the NativeControl mask ledger;
+/// musl `__syscall` is a macro with no linkable symbol) and
+/// `__membarrier_init` (mm-wide kernel registration the guest shares).
 ///
 /// # Safety
 /// The leader install has returned and the process is still genuinely
 /// single-threaded on the leader's private FS. `leader` is the live leader
-/// thread pointer. The retained `__syscall` path must reach the kernel for
-/// `rt_sigprocmask` under the qualified private relay, and the final link
-/// audit must prove every extern resolves to the retained objects.
+/// thread pointer. The final link audit must prove every extern
+/// resolves to the retained objects.
 pub unsafe fn first_thread_switch(leader: *mut c_void) {
     if STATE.load(Ordering::Acquire) != 3 || leader.is_null() {
         die(Failure::NotInstalled);
@@ -499,15 +514,10 @@ pub unsafe fn first_thread_switch(leader: *mut c_void) {
         init_file_lock(ptr::read_volatile(&raw const __stdin_used));
         init_file_lock(ptr::read_volatile(&raw const __stdout_used));
         init_file_lock(ptr::read_volatile(&raw const __stderr_used));
-        // SYS_rt_sigprocmask(SIG_UNBLOCK, SIGPT_SET, NULL, 8): SIGPT_SET on
-        // 64-bit is signals 33/34, the musl cancel/synccall pair.
-        let set: [u64; 1] = [3_u64 << 32];
-        let _ = __syscall(14_usize, 1_usize, set.as_ptr() as usize, 0_usize, 8_usize);
         ptr::write(
             &raw mut (*leader.cast::<Pthread>()).tsd,
             ptr::addr_of!(__pthread_tsd_main) as *mut *mut c_void,
         );
-        __membarrier_init();
         ptr::write(&raw mut (*libc).threaded, 1);
     }
 }

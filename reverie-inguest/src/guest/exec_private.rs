@@ -15,7 +15,7 @@ use std::io;
 #[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
 pub mod mapped_initial;
 
-pub mod tool_tls_registry;
+pub(crate) mod tool_tls_registry;
 
 #[cfg(feature = "coordinator-rpc")]
 mod native_io;

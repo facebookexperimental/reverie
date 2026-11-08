@@ -26,14 +26,19 @@ pub const MAX_PRIVATE_TOOL_THREADS: usize = 64;
 
 const STATE_SHIFT: u32 = 32;
 const FREE: u64 = 0;
+// Stage B state/API surface: in Stage A only leader registration has a
+// production caller; the rest is exercised by this module's tests.
+#[allow(dead_code)]
 const BUILDING: u64 = 1;
 const READY: u64 = 2;
+#[allow(dead_code)]
 const RETIRING: u64 = 3;
 
 fn pack(state: u64, tid: i32) -> u64 {
     (state << STATE_SHIFT) | u64::from(tid as u32)
 }
 
+#[allow(dead_code)]
 fn unpack(word: u64) -> (u64, i32) {
     (word >> STATE_SHIFT, (word & 0xffff_ffff) as u32 as i32)
 }
@@ -59,6 +64,10 @@ impl Default for ToolTlsRegistry {
     }
 }
 
+// Stage B birth/exit API: only register_leader has a production caller in
+// Stage A; the remaining transitions are exercised by unit tests until
+// Stage B wires the HostRuntime hooks.
+#[allow(dead_code)]
 impl ToolTlsRegistry {
     /// An empty registry: every slot `Free` with tid 0.
     pub const fn new() -> Self {
@@ -142,14 +151,12 @@ impl ToolTlsRegistry {
     }
 
     /// Release a claim whose physical clone failed before any thread
-    /// existed. Only an unbound or bound `Building` slot can return to
-    /// `Free`; a slot that ever held a live thread cannot.
+    /// existed. Only an *unbound* `Building` slot (tid still 0) can
+    /// return to `Free`: a bound tid means the creating clone already
+    /// succeeded and a thread may be running on that slot's TCB, so a
+    /// bound slot can never be released or reused.
     pub fn release_claim(&self, index: usize) -> bool {
-        let Some(slot) = self.slots.get(index) else {
-            return false;
-        };
-        let (state, tid) = unpack(slot.load(Ordering::Acquire));
-        state == BUILDING && self.transition(index, pack(BUILDING, tid), pack(FREE, 0))
+        self.transition(index, pack(BUILDING, 0), pack(FREE, 0))
     }
 
     /// The slot holding `tid` as callback-ready, if any. A tid recycled by
@@ -175,17 +182,26 @@ impl ToolTlsRegistry {
 
 /// The one process registry. Slot 0 is registered by control publication;
 /// every exec successor image starts from a fresh process static.
-pub static TOOL_TLS_REGISTRY: ToolTlsRegistry = ToolTlsRegistry::new();
+/// Crate-private until Stage C defines the HostRuntime hooks: no other
+/// crate may fill slot 0 (or any slot) first.
+pub(crate) static TOOL_TLS_REGISTRY: ToolTlsRegistry = ToolTlsRegistry::new();
 
 /// Register the leader in the process registry. See
 /// [`ToolTlsRegistry::register_leader`].
-pub fn register_leader(tid: i32) -> Result<(), RegisterLeaderError> {
+pub(crate) fn register_leader(tid: i32) -> Result<(), RegisterLeaderError> {
     TOOL_TLS_REGISTRY.register_leader(tid)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thread_cap_is_pinned() {
+        // The cap decides where a guest clone starts receiving EAGAIN;
+        // it is a fixed ruling, not derived from any reservation size.
+        assert_eq!(MAX_PRIVATE_TOOL_THREADS, 64);
+    }
 
     #[test]
     fn leader_registers_once_in_slot_zero() {
@@ -243,8 +259,12 @@ mod tests {
         // because no thread ever occupied it.
         assert_eq!(registry.claim(), Some(slot));
         assert!(registry.bind_tid(slot, 55));
-        assert!(registry.release_claim(slot));
+        // A bound tid means the clone succeeded: the slot held a born
+        // thread and must never return to Free or be handed out again.
+        assert!(!registry.release_claim(slot));
         assert_eq!(registry.lookup_ready(55), None);
+        let next = registry.claim().unwrap();
+        assert_ne!(next, slot);
     }
 
     #[test]
