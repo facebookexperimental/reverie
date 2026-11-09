@@ -67416,13 +67416,22 @@ pub mod private_static {
         }
     }
 
+    /// Cargo's canonical git source string for the pinned
+    /// Reverie rev. Cargo strips the `.git` suffix when it
+    /// canonicalizes git URLs, so lockfiles and metadata name
+    /// `git+https://github.com/rrnewton/reverie?rev=...`, never
+    /// the `.git` spelling. Both CargoGitRev checks (root lock
+    /// and metadata source equality) build their expected
+    /// string here so they cannot drift.
+    fn cargo_git_source(pin: &str) -> String {
+        format!("git+https://github.com/rrnewton/reverie?rev={pin}#{pin}")
+    }
+
     /// The root lockfile names the exact pinned Reverie git
     /// source. A path-patched (source-less) Reverie package or
     /// any other rev does not satisfy this.
     fn cargo_git_rev_lock_accepts(lock_text: &str, pin: &str) -> bool {
-        lock_text.contains(&format!(
-            "source = \"git+https://github.com/rrnewton/reverie.git?rev={pin}#{pin}\""
-        ))
+        lock_text.contains(&format!("source = \"{}\"", cargo_git_source(pin)))
     }
 
     impl VerifiedStaticSource {
@@ -67582,10 +67591,15 @@ pub mod private_static {
                     .as_array()
                     .ok_or("static metadata lacks packages")?;
                 let mut roots = Vec::new();
-                let source = format!(
-                    "git+https://github.com/rrnewton/reverie.git?rev={0}#{0}",
-                    expected.reverie_pin
-                );
+                let source = match consumer.binding() {
+                    selected_initializers::WorkspaceBinding::CargoGitRev => {
+                        cargo_git_source(expected.reverie_pin)
+                    }
+                    selected_initializers::WorkspaceBinding::HermitGitlink { .. } => format!(
+                        "git+https://github.com/rrnewton/reverie.git?rev={0}#{0}",
+                        expected.reverie_pin
+                    ),
+                };
                 for name in ["reverie-inguest", "reverie-liteinst", "reverie-loader"] {
                     let rows: Vec<_> = packages.iter().filter(|p| p["name"] == name).collect();
                     require(
@@ -68692,10 +68706,13 @@ pub mod private_static {
                 Path::new("relative/target")
             ));
 
-            let pin = "0123456789abcdef0123456789abcdef01234567";
-            let exact = format!(
-                "[[package]]\nsource = \"git+https://github.com/rrnewton/reverie.git?rev={pin}#{pin}\"\n"
-            );
+            // Verbatim line from a real literoot Cargo.lock
+            // (reverie-core entry), so the control cannot
+            // self-mirror the implementation's format string.
+            let pin = "02973cdcfcadd21190fda864dfa9eb1b3e6ed1c1";
+            let exact = "[[package]]\nname = \"reverie-core\"\nversion = \"0.5.4\"\nsource = \"git+https://github.com/rrnewton/reverie?rev=02973cdcfcadd21190fda864dfa9eb1b3e6ed1c1#02973cdcfcadd21190fda864dfa9eb1b3e6ed1c1\"\n".to_owned();
+            let dot_git = exact.replace("rrnewton/reverie?", "rrnewton/reverie.git?");
+            assert!(!cargo_git_rev_lock_accepts(&dot_git, pin));
             assert!(cargo_git_rev_lock_accepts(&exact, pin));
             assert!(!cargo_git_rev_lock_accepts(
                 "[[package]]\nname = \"reverie-core\"\n",
