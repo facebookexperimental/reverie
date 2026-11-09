@@ -19576,10 +19576,10 @@ fn derive_detcore_direct_allocation_tls_evidence(
 ) -> Result<DirectAllocationTlsEvidence> {
     let sources = detcore_direct_tls_source_context(sources)?;
     // The complete existing Detcore operation closure still binds every actual
-    // operand/callee. This absence route additionally requires its exact e8
-    // whole allocation shape, not an arbitrary 241-byte function.
+    // operand/callee. This absence route additionally requires its exact
+    // e8/0x100 whole allocation shape, not an arbitrary 241-byte function.
     require(
-        cell.address == 0xe8
+        matches!(cell.address, 0xe8 | 0x100)
             && cell.size == 8
             && cell.binding == sym::STB_LOCAL
             && canonical_rust_symbol(&cell.name).as_deref() == Some(FIXED_TLS_CELL_ROLE)
@@ -19592,7 +19592,7 @@ fn derive_detcore_direct_allocation_tls_evidence(
                         template.operands.iter().map(|operand| operand.displacement),
                     )
             }),
-        "Detcore direct TLS proof lacks its exact e8 allocation recipe",
+        "Detcore direct TLS proof lacks its exact e8/0x100 allocation recipe",
     )?;
     authenticate_loader_metadata(elf, bytes)?;
     let census = direct_tls_getter_census(elf, bytes, cell, module, plt)?;
@@ -19646,7 +19646,7 @@ fn validate_direct_allocation_tls_evidence_in_image(
         FixedImageKind::Detcore => (
             2,
             DETCORE_DIRECT_TLS_CENSUS_POLICY,
-            tls.tls_cell.address == 0xe8
+            matches!(tls.tls_cell.address, 0xe8 | 0x100)
                 && tls.tls_cell.size == 8
                 && tls.tls_cell.binding == sym::STB_LOCAL
                 && canonical_rust_symbol(&tls.tls_cell.name).as_deref()
@@ -19749,7 +19749,7 @@ fn qualify_allocator_tls_boundary_in_source_context(
             allocation_bytes.len() == 241
                 && matches!(
                     cell.address,
-                    0x98 | 0xa0 | 0xd8 | 0xe0 | 0xe8 | 0x110 | 0x128
+                    0x98 | 0xa0 | 0xd8 | 0xe0 | 0xe8 | 0x100 | 0x110 | 0x128
                 ),
             format!(
                 "Detcore validate allocation/TLS shape differs: allocation length {}, cell offset {:#x}",
@@ -19808,7 +19808,7 @@ fn qualify_allocator_tls_boundary_in_source_context(
             });
         } else {
             require(
-                cell.address == 0xe8,
+                matches!(cell.address, 0xe8 | 0x100),
                 "Detcore missing getter has no exact direct-allocation cohort",
             )?;
         }
@@ -20059,7 +20059,7 @@ fn qualify_allocator_tls_boundary_in_source_context(
             sources,
         )?)
     } else if image_kind == FixedImageKind::Detcore
-        && cell.address == 0xe8
+        && matches!(cell.address, 0xe8 | 0x100)
         && allocation_bytes.len() == 241
         && !roles.contains_key("fixed_tls_fn_once")
     {
@@ -20777,7 +20777,7 @@ fn validate_existing_allocator_tls_boundary(
                 FixedImageKind::Detcore => {
                     matches!(
                         tls.tls_cell.address,
-                        0x98 | 0xa0 | 0xd8 | 0xe0 | 0xe8 | 0x110 | 0x128
+                        0x98 | 0xa0 | 0xd8 | 0xe0 | 0xe8 | 0x100 | 0x110 | 0x128
                     )
                 }
             }
@@ -20853,7 +20853,7 @@ fn validate_existing_allocator_tls_boundary(
         (None, None, None) => {
             let extent = match (image_kind, tls.tls_cell.address) {
                 (FixedImageKind::Standalone, 0x40 | 0x80) => Some(186),
-                (FixedImageKind::Detcore, 0x98 | 0xd8 | 0xe8 | 0x110 | 0x128) => Some(241),
+                (FixedImageKind::Detcore, 0x98 | 0xd8 | 0xe8 | 0x100 | 0x110 | 0x128) => Some(241),
                 _ => None,
             };
             if let Some(extent) = extent {
@@ -27662,6 +27662,77 @@ const DETCORE_VALIDATE_TEMPLATES: &[DetcoreValidateTemplate] = &[
         ],
         transfers: &[(71, 0), (176, 2), (216, 4)],
     },
+    // Actual stable-built Detcore image at Reverie 2465470e (stable
+    // 1.97.1): same 241-byte fixed_patch_alloc shape as the 0x128
+    // cohort, with INSTALLATION_DEPTH at TLS cell 0x100. Whole
+    // 241 bytes, SHA256 0be4c788adc82d1f0562d9d3b6123cc17a7ff871075414fab9af5d1b339aea8d.
+    DetcoreValidateTemplate {
+        role: "fixed_patch_alloc",
+        hex: "41574156415453504889d34989f6ff15d4818a004885c0747c4989c44c8b782041f6c7070f85a50000004d85ff0f84b1000000488d3dde248a00e851c47f004883b80001000000745d498b542410498b07498d76ff49f7de31c94889c74801d772354801f772304c21f74989f84929d072504901d8410f92c14981f801000002410f93c24508ca750ef04d0fb10775ca4889f9eb0231c94889c84883c4085b415c415e415fc3bf010000004c89f64889da4883c4085b415c415e415fff2566818a00488d3da7fd8200ff15c9278a00488d155afe8200bf080000004c89feff156c2f8a00488d3d45fe8200ff1557698a00",
+        operands: &[
+            DetcoreValidateOperand {
+                displacement: 16,
+                next: 20,
+                key: "fixed_arena_backing",
+                got: true,
+            },
+            DetcoreValidateOperand {
+                displacement: 54,
+                next: 58,
+                key: "fixed_publication_tls_descriptor",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 59,
+                next: 63,
+                key: "fixed_tls_get_addr_plt",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 190,
+                next: 194,
+                key: "fixed_tool_alloc",
+                got: true,
+            },
+            DetcoreValidateOperand {
+                displacement: 197,
+                next: 201,
+                key: "fixed_detcore_validate_fixed_patch_alloc_194_data",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 203,
+                next: 207,
+                key: "fixed_heap_panic_sub_overflow",
+                got: true,
+            },
+            DetcoreValidateOperand {
+                displacement: 210,
+                next: 214,
+                key: "fixed_detcore_validate_fixed_patch_alloc_207_data",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 224,
+                next: 228,
+                key: "fixed_heap_panic_misaligned",
+                got: true,
+            },
+            DetcoreValidateOperand {
+                displacement: 231,
+                next: 235,
+                key: "fixed_detcore_validate_fixed_patch_alloc_228_data",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 237,
+                next: 241,
+                key: "fixed_panic_null_reference",
+                got: true,
+            },
+        ],
+        transfers: &[(14, 0), (58, 2), (188, 3), (201, 5), (222, 7), (235, 9)],
+    },
 ];
 
 // Distinct from every historical TLS-bearing241B recipe. Measured in the true
@@ -27729,7 +27800,7 @@ fn detcore_no_scope_allocation_shape(bytes: &[u8]) -> bool {
 // chooses. The recipe's own GOT check still verifies whichever
 // target is chosen, and with neither bound the operand refuses by
 // its recipe name.
-fn no_scope_allocation_operand_target(
+fn detcore_panic_null_operand_target(
     targets: &BTreeMap<String, u64>,
     got: &BTreeMap<u64, u64>,
     address: u64,
@@ -27776,7 +27847,7 @@ fn fixed_detcore_no_scope_allocation_recipe(
     let mut fields = Vec::new();
     let mut resolved = Vec::new();
     for operand in DETCORE_NO_SCOPE_ALLOC.operands {
-        let expected = no_scope_allocation_operand_target(targets, got, address, bytes, operand)?;
+        let expected = detcore_panic_null_operand_target(targets, got, address, bytes, operand)?;
         require(expected != 0, "null no-scope allocation typed operand")?;
         let actual = fixed_rip_target(address, bytes, operand.displacement, operand.next)?;
         if operand.got {
@@ -28068,9 +28139,7 @@ fn fixed_detcore_validate_recipe_in_scope(
         )?;
     }
     for op in t.operands {
-        let expected = *targets
-            .get(op.key)
-            .ok_or_else(|| format!("unbound exact Detcore operand {}", op.key))?;
+        let expected = detcore_panic_null_operand_target(targets, got, address, bytes, op)?;
         require(expected != 0, "null Detcore typed operand")?;
         if op.key == "fixed_region_ready" || op.key == "fixed_region_value16" {
             let base = *targets
@@ -30377,8 +30446,10 @@ const FIXED_NAKED_COMPOSITIONS: &[FixedNakedComposition] = &[
 // appended naked identity alone proves publication is present: a
 // lone 108 fragment is routed to the naked composition check instead
 // of through the historical path. A complete tail build already also
-// carries 78 and 82, so including 108 changes no complete build.
-const FIXED_SOURCE_OWNED_TEMPLATE_END: usize = 111;
+// carries 78 and 82, so including 108 changes no complete build. The
+// stable 0x100 alloc template at 111 (dh-r5tic) follows the same
+// rule: it can only add refusals through this over-approximation.
+const FIXED_SOURCE_OWNED_TEMPLATE_END: usize = 112;
 
 fn fixed_naked_publication_present(
     witnesses: &BTreeMap<String, AuthenticatedDetcoreOperation>,
@@ -59896,6 +59967,85 @@ mod tests {
             AuthenticatedDetcoreOperationKind::ValidateTemplate(26)
         );
         assert_eq!(witness.scalar_storage, None);
+    }
+
+    // The stable-built Detcore image at Reverie 2465470e carries
+    // INSTALLATION_DEPTH at TLS cell 0x100 (size 8, local), with the
+    // same 241-byte fixed_patch_alloc shape as the 0x110/0x128 cohorts
+    // (sha256 0be4c788adc82d1f0562d9d3b6123cc17a7ff871075414fab9af5d1b339aea8d
+    // for the body extracted from that image, its encoded cell operand
+    // reading 0x100). Its existing-installation boundary must validate;
+    // the neighbouring IN_HANDLER cell at 0x108 is not the alloc cell
+    // and must refuse.
+    #[test]
+    fn detcore_allocator_tls_boundary_accepts_stable_cell_0x100() {
+        let boundary = |cell: u64| {
+            AllocatorTlsBoundary {
+            dependency: "existing_installation_depth_tls".into(),
+            provider_symbol: "__tls_get_addr".into(),
+            provider_version: "GLIBC_2.3".into(),
+            provider_library: "ld-linux-x86-64.so.2".into(),
+            plt_address: 0x363c40,
+            got_slot: 0x39ad18,
+            dynamic_symbol_index: 1,
+            tls_cell: SymbolEvidence {
+                name: "_RNvNCNKNvNtCsTest_16reverie_liteinst11patch_alloc18INSTALLATION_DEPTH0s_023___RUST_STD_INTERNAL_VAL".into(),
+                address: cell,
+                size: 8,
+                binding: sym::STB_LOCAL,
+                visibility: sym::STV_DEFAULT,
+            },
+            tls_module_slot: 0x39ae30,
+            tls_offset_slot: 0x39ae38,
+            callsites: vec![ConstructorTransfer {
+                instruction: 0x1000,
+                target: 0x363c40,
+                local_got_slot: None,
+            }],
+            local_key_object: None,
+            local_key_transfer: None,
+            local_key_resolution: None,
+            unisolated: true,
+            plt_sha256: "0".repeat(64),
+            function_sha256: BTreeMap::from([
+                ("fixed_patch_alloc".into(), "0".repeat(64)),
+                ("fixed_tls_fn_once".into(), "0".repeat(64)),
+            ]),
+            direct_allocation: None,
+            local_chain: BTreeMap::from([
+                (
+                    "fixed_patch_alloc".into(),
+                    SymbolEvidence {
+                        name: "fixed_patch_alloc".into(),
+                        address: 0x2000,
+                        size: 241,
+                        binding: sym::STB_LOCAL,
+                        visibility: sym::STV_DEFAULT,
+                    },
+                ),
+                (
+                    "fixed_tls_fn_once".into(),
+                    SymbolEvidence {
+                        name: "fixed_tls_fn_once".into(),
+                        address: 0x3000,
+                        size: 22,
+                        binding: sym::STB_LOCAL,
+                        visibility: sym::STV_DEFAULT,
+                    },
+                ),
+            ]),
+        }
+        };
+        assert!(
+            validate_existing_allocator_tls_boundary(&boundary(0x100), FixedImageKind::Detcore,)
+                .is_ok(),
+            "stable Detcore cell 0x100 must validate"
+        );
+        assert!(
+            validate_existing_allocator_tls_boundary(&boundary(0x108), FixedImageKind::Detcore,)
+                .is_err(),
+            "the neighbouring IN_HANDLER cell 0x108 must refuse"
+        );
     }
 
     // Literal extents and independently retained bindings from gate40 ELF d86724af.
