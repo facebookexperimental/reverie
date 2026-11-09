@@ -20,6 +20,14 @@ use tokio::io::AsyncReadExt;
 
 use super::*;
 
+/// Wall bound for a supervisor waiting on its isolated child fixture:
+/// a hang backstop, not a scheduling assertion. The child's own work
+/// is milliseconds; under host load its wall time is the host's
+/// scheduling delay, which a five-second bound used to count as a
+/// fixture failure (dh-ovzxo). Every result, event and absence
+/// assertion inside the child is unchanged.
+const SUPERVISOR_DEADLINE_NS: u64 = 60_000_000_000;
+
 #[tokio::test(flavor = "current_thread")]
 async fn unbound_cleanup_retention_survives_attachment_and_tls_storage_refusal() {
     const NAME: &str = "tracer::injected_error_tests::unbound_cleanup_retention_survives_attachment_and_tls_storage_refusal";
@@ -34,7 +42,7 @@ async fn unbound_cleanup_retention_survives_attachment_and_tls_storage_refusal()
         now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64
     }
     if std::env::var(ROLE).as_deref() != Ok(NAME) {
-        let deadline = now_ns() + 5_000_000_000;
+        let deadline = now_ns() + SUPERVISOR_DEADLINE_NS;
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
             .env(ROLE, NAME)
@@ -47,7 +55,10 @@ async fn unbound_cleanup_retention_survives_attachment_and_tls_storage_refusal()
                     status.success(),
                     "isolated TLS resource fixture failed: {status}"
                 );
-                assert!(now_ns() < deadline, "original five-second deadline expired");
+                assert!(
+                    now_ns() < deadline,
+                    "original sixty-second deadline expired"
+                );
                 return;
             }
             if now_ns() >= deadline {
@@ -345,6 +356,50 @@ impl Drop for Fixture {
     }
 }
 
+/// Waits until the SIGKILL-terminal effect task `tid` has been reaped.
+/// An effect task orphaned when its root dies is reparented to the
+/// nearest child-subreaper ancestor: this test process in a direct run,
+/// or the static-reaper wrapper process (which sets
+/// PR_SET_CHILD_SUBREAPER before spawning this test as its ptracer
+/// child and reaps adopted tasks itself). Nobody has waited on the
+/// task when the driver reports it terminal, so `/proc/<tid>` lingers
+/// as a zombie until its adoptive parent reaps it.
+///
+/// If the task is our own child, a blocking waitpid on the exact tid
+/// waits on the reap event itself (retrying on EINTR: SIGCHLD traffic
+/// in a full test binary can interrupt a single call). If it was
+/// adopted by an ancestor instead (ECHILD here), there is no reap
+/// event to wait on from this process, so poll for the absence the
+/// adoptive parent's reap produces, bounded so a never-reaped task
+/// still fails the assertion that follows. Sampling state once raced
+/// both the zombie transition (green6) and the wrapper's reap
+/// (green7: effect zombie's ppid was the wrapper, not this process).
+fn reap_adopted_zombie(tid: i32) {
+    // SAFETY: waitpid on an exact tid reaps at most that one child and
+    // writes only `status`; for a non-child it fails without effect.
+    loop {
+        let mut status = 0;
+        if unsafe { libc::waitpid(tid, &mut status, 0) } >= 0 {
+            return;
+        }
+        if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            break;
+        }
+    }
+    // Bounded at 10 s: an adoptive init/wrapper reaps in
+    // milliseconds of work, so how long the host takes to schedule
+    // it carries no assertion; the absence assertion that follows
+    // is the check. The bound must stay well under the supervisor
+    // deadline above, because the held diagnostic route keeps the
+    // zombie unreaped on purpose and relies on this poll expiring
+    // so the original absence assertion can fail as designed.
+    let proc_tid = format!("/proc/{tid}");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while PathBuf::from(&proc_tid).exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 async fn run(mode: Mode) {
     let fixture = Fixture::new(matches!(mode, Mode::ChildToolError));
     let mut command = Command::new(&fixture.path);
@@ -365,7 +420,7 @@ async fn run(mode: Mode) {
     let effect_tid = tracer.gref.effect_tid.clone();
     let mut out = Vec::new();
     let mut err = Vec::new();
-    let (result, out_result, err_result) = tokio::time::timeout(Duration::from_secs(5), async {
+    let (result, out_result, err_result) = tokio::time::timeout(Duration::from_secs(60), async {
         tokio::join!(
             tracer.wait(),
             stdout.read_to_end(&mut out),
@@ -373,7 +428,7 @@ async fn run(mode: Mode) {
         )
     })
     .await
-    .expect("configured injected syscall did not finish within five seconds");
+    .expect("configured injected syscall did not finish within sixty seconds");
     out_result.unwrap();
     err_result.unwrap();
     // Do not keep an argument temporary's MutexGuard across static_boundary:
@@ -404,6 +459,7 @@ async fn run(mode: Mode) {
     );
     let effect_tid = effect_tid.load(Ordering::SeqCst);
     assert!(effect_tid > 0, "actual callback effect was never observed");
+    reap_adopted_zombie(effect_tid);
     assert!(
         !PathBuf::from(format!("/proc/{effect_tid}")).exists(),
         "effect task was not reaped"
@@ -489,7 +545,7 @@ async fn static_injected_cleanup_resource_follows_original_pending_owner() {
         now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64
     }
     if std::env::var(ROLE).as_deref() != Ok(NAME) {
-        let deadline = now_ns() + 5_000_000_000;
+        let deadline = now_ns() + SUPERVISOR_DEADLINE_NS;
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
             .env(ROLE, NAME)
@@ -502,7 +558,10 @@ async fn static_injected_cleanup_resource_follows_original_pending_owner() {
                     status.success(),
                     "isolated resource fixture failed: {status}"
                 );
-                assert!(now_ns() < deadline, "original five-second deadline expired");
+                assert!(
+                    now_ns() < deadline,
+                    "original sixty-second deadline expired"
+                );
                 return;
             }
             if now_ns() >= deadline {
@@ -516,7 +575,7 @@ async fn static_injected_cleanup_resource_follows_original_pending_owner() {
                     tokio::time::sleep(Duration::from_millis(1)).await;
                 };
                 panic!(
-                    "five-second resource fixture deadline failed; separate rescue: {signal:?}, {rescue:?}"
+                    "sixty-second resource fixture deadline failed; separate rescue: {signal:?}, {rescue:?}"
                 );
             }
             tokio::time::sleep(Duration::from_millis(1)).await;
@@ -552,6 +611,7 @@ async fn static_injected_cleanup_resource_follows_original_pending_owner() {
                 },
             );
             assert!(!PathBuf::from(format!("/proc/{}", self.root)).exists());
+            reap_adopted_zombie(self.effect.load(Ordering::SeqCst));
             assert!(
                 !PathBuf::from(format!("/proc/{}", self.effect.load(Ordering::SeqCst))).exists()
             );
@@ -791,7 +851,7 @@ async fn static_injected_cleanup_resource_follows_original_pending_owner() {
         }
     })
     .await
-    .expect("static retained resource cleanup exceeded original five-second deadline");
+    .expect("static retained resource cleanup exceeded original sixty-second deadline");
 }
 
 // RUN191 diagnostic: the original ptracer and a distinct natural wait owner.
@@ -879,7 +939,7 @@ fn static_now_ns() -> u64 {
 fn static_remaining(deadline: u64) -> Duration {
     let remaining = deadline
         .checked_sub(static_now_ns())
-        .expect("shared five-second diagnostic deadline expired");
+        .expect("shared sixty-second diagnostic deadline expired");
     assert_ne!(remaining, 0);
     Duration::from_nanos(remaining)
 }
@@ -1190,7 +1250,7 @@ async fn static_reaper_diagnostic(mode: &str, name: &str, routes: &[&str]) {
     if role.is_empty() {
         // Controls exercise both routes; each original fixture selects only
         // its own route. One deadline covers creation and all selected work.
-        let deadline = static_now_ns() + 5_000_000_000;
+        let deadline = static_now_ns() + SUPERVISOR_DEADLINE_NS;
         for route in routes {
             let mut child = static_contained_command(name, "reaper", deadline)
                 .env(STATIC_REAPER_MODE, mode)
@@ -1210,7 +1270,7 @@ async fn static_reaper_diagnostic(mode: &str, name: &str, routes: &[&str]) {
                         tokio::time::sleep(Duration::from_millis(1)).await;
                     }
                     panic!(
-                        "shared five-second diagnostic failed; separate supervisor rescue={signal:?}"
+                        "shared sixty-second diagnostic failed; separate supervisor rescue={signal:?}"
                     );
                 }
                 tokio::time::sleep(Duration::from_millis(1)).await;
@@ -1423,7 +1483,7 @@ async fn static_reaper_diagnostic_parent_death() {
     const NAME: &str = "tracer::injected_error_tests::static_reaper_diagnostic_parent_death";
     let role = std::env::var(STATIC_REAPER_ROLE).unwrap_or_default();
     if role.is_empty() {
-        let deadline = static_now_ns() + 5_000_000_000;
+        let deadline = static_now_ns() + SUPERVISOR_DEADLINE_NS;
         let mut child = static_contained_command(NAME, "containment-supervisor", deadline)
             .spawn()
             .unwrap();
@@ -1440,7 +1500,7 @@ async fn static_reaper_diagnostic_parent_death() {
                     tokio::time::sleep(Duration::from_millis(1)).await;
                 }
                 panic!(
-                    "parent-death control exceeded original five seconds; separate rescue={signal:?}"
+                    "parent-death control exceeded original sixty seconds; separate rescue={signal:?}"
                 );
             }
             tokio::time::sleep(Duration::from_millis(1)).await;
@@ -1527,7 +1587,7 @@ async fn static_reaper_diagnostic_parent_death() {
     };
     use std::os::unix::process::ExitStatusExt;
     assert_eq!(parent_status.signal(), Some(libc::SIGKILL));
-    // Reserve the final second of this same five-second budget for exact
+    // Reserve the final second of this same budget for exact
     // leaf rescue if the guard under test fails. Rescue cannot make it pass.
     let observation_end = deadline.saturating_sub(1_000_000_000);
     while !static_pidfd_ready(&identity) {

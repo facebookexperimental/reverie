@@ -24,12 +24,17 @@ pub mod continuation;
 pub mod event;
 #[cfg(feature = "exec-private-init")]
 pub mod exec_private;
+#[cfg(feature = "exec-native-injection")]
+pub mod generic_native_exec_driver;
 #[cfg(feature = "coordinator-rpc")]
 pub mod host;
 pub mod installed_stack;
 #[cfg(feature = "coordinator-rpc")]
 pub mod installed_tool;
 pub mod instruction;
+pub mod isa;
+#[cfg(feature = "coordinator-rpc")]
+pub mod native_capture;
 #[cfg(feature = "exec-native-injection")]
 pub mod native_exec;
 #[cfg(feature = "exec-native-injection")]
@@ -39,11 +44,22 @@ pub mod native_exec_fds;
 #[cfg(feature = "exec-native-injection")]
 pub mod native_exec_mappings;
 #[cfg(feature = "coordinator-rpc")]
+mod native_linux;
+#[cfg(feature = "coordinator-rpc")]
+pub mod native_rpc;
+#[cfg(feature = "coordinator-rpc")]
+pub mod native_services;
+#[cfg(all(test, feature = "coordinator-rpc"))]
+pub(crate) mod native_test_support;
+#[cfg(feature = "coordinator-rpc")]
 pub mod patcher;
+#[cfg(feature = "coordinator-rpc")]
+pub(crate) mod pidfd_self;
 pub mod protect;
 pub mod restorer;
 #[cfg(feature = "coordinator-rpc")]
 pub mod rpc;
+pub mod runtime_mask;
 #[cfg(feature = "coordinator-rpc")]
 pub mod runtime_seam;
 pub mod sigalrm;

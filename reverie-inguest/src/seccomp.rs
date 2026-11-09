@@ -26,8 +26,15 @@
 use std::io;
 use std::ptr;
 
-/// `AUDIT_ARCH_X86_64` from `<linux/audit.h>`.
+/// `AUDIT_ARCH_X86_64` from `<linux/audit.h>`. The builders below compare
+/// against [`crate::arch::AUDIT_ARCH_NATIVE`]; this constant names the x86-64
+/// value explicitly for the filter-evaluator tests, which pin exact verdicts
+/// per architecture word. Compiled for tests on every architecture (the
+/// aarch64 verdict tests name it as a foreign word), not only on x86-64.
+#[cfg(any(test, target_arch = "x86_64"))]
 const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
+#[cfg(target_arch = "x86_64")]
+const _: () = assert!(AUDIT_ARCH_X86_64 == crate::arch::AUDIT_ARCH_NATIVE);
 
 // Offsets into `struct seccomp_data`.
 const SECCOMP_DATA_NR_OFFSET: u32 = 0;
@@ -77,17 +84,23 @@ pub struct SeccompFilter {
 impl SeccompFilter {
     /// Build the trap-everything-but-the-gate filter for `gate`.
     pub fn for_trusted_gate(gate: TrustedGate) -> io::Result<Self> {
+        Self::for_trusted_gate_abi(crate::arch::FILTER_ABI_NATIVE, gate)
+    }
+
+    /// [`Self::for_trusted_gate`] for an explicit filter ABI, so tests can
+    /// evaluate another architecture's verdicts on this host.
+    fn for_trusted_gate_abi(abi: crate::arch::FilterAbi, gate: TrustedGate) -> io::Result<Self> {
         gate.validate()?;
         let high = (gate.syscall_ip >> 32) as u32;
         let program = vec![
-            // Reject any non-x86-64 syscall ABI outright.
+            // Reject any non-native syscall ABI outright.
             stmt(BPF_LD_W_ABS, SECCOMP_DATA_ARCH_OFFSET),
-            jump(BPF_JMP_JEQ_K, AUDIT_ARCH_X86_64, 1, 0),
+            jump(BPF_JMP_JEQ_K, abi.audit_arch, 1, 0),
             stmt(BPF_RET_K, SECCOMP_RET_KILL_PROCESS),
             // Load the syscall number.
             stmt(BPF_LD_W_ABS, SECCOMP_DATA_NR_OFFSET),
             // rt_sigreturn must always be allowed to unwind the signal frame.
-            jump(BPF_JMP_JEQ_K, libc::SYS_rt_sigreturn as u32, 6, 0),
+            jump(BPF_JMP_JEQ_K, abi.rt_sigreturn, 6, 0),
             // Compare the calling instruction pointer against the trusted gate.
             stmt(BPF_LD_W_ABS, SECCOMP_DATA_IP_HIGH_OFFSET),
             jump(BPF_JMP_JEQ_K, high, 0, 3),
@@ -120,18 +133,34 @@ impl SeccompFilter {
         second: TrustedGate,
         signal_return: Option<u64>,
     ) -> io::Result<Self> {
+        Self::for_trusted_gates_with_signal_return_abi(
+            crate::arch::FILTER_ABI_NATIVE,
+            first,
+            second,
+            signal_return,
+        )
+    }
+
+    /// [`Self::for_trusted_gates_with_signal_return`] for an explicit filter
+    /// ABI, so tests can evaluate another architecture's verdicts here.
+    fn for_trusted_gates_with_signal_return_abi(
+        abi: crate::arch::FilterAbi,
+        first: TrustedGate,
+        second: TrustedGate,
+        signal_return: Option<u64>,
+    ) -> io::Result<Self> {
         first.validate()?;
         second.validate()?;
         let mut program = vec![
             stmt(BPF_LD_W_ABS, SECCOMP_DATA_ARCH_OFFSET),
-            jump(BPF_JMP_JEQ_K, AUDIT_ARCH_X86_64, 1, 0),
+            jump(BPF_JMP_JEQ_K, abi.audit_arch, 1, 0),
             stmt(BPF_RET_K, SECCOMP_RET_KILL_PROCESS),
             stmt(BPF_LD_W_ABS, SECCOMP_DATA_NR_OFFSET),
         ];
         if let Some(address) = signal_return {
             program.extend([
                 // rt_sigreturn: the six instructions below, else the gates.
-                jump(BPF_JMP_JEQ_K, libc::SYS_rt_sigreturn as u32, 0, 6),
+                jump(BPF_JMP_JEQ_K, abi.rt_sigreturn, 0, 6),
                 stmt(BPF_LD_W_ABS, SECCOMP_DATA_IP_HIGH_OFFSET),
                 jump(BPF_JMP_JEQ_K, (address >> 32) as u32, 0, 3),
                 stmt(BPF_LD_W_ABS, SECCOMP_DATA_IP_LOW_OFFSET),
@@ -140,7 +169,7 @@ impl SeccompFilter {
                 stmt(BPF_RET_K, SECCOMP_RET_TRAP),
             ]);
         } else {
-            program.push(jump(BPF_JMP_JEQ_K, libc::SYS_rt_sigreturn as u32, 11, 0));
+            program.push(jump(BPF_JMP_JEQ_K, abi.rt_sigreturn, 11, 0));
         }
         program.extend([
             stmt(BPF_LD_W_ABS, SECCOMP_DATA_IP_HIGH_OFFSET),
@@ -165,11 +194,14 @@ impl SeccompFilter {
     /// x32 entry and filter stacking even at trusted gates. The unchanged
     /// exact 23-instruction signal-return/two-gate suffix follows it. This is
     /// one installed filter with a new identity, never the ordinary 23 recipe.
-    #[cfg(feature = "exec-native-injection")]
+    // The fixed gates and restorer this recipe names are x86-64 sites, and the
+    // prefix denies fork/vfork numbers that only exist there; the aarch64
+    // recipe arrives with its fixed gates.
+    #[cfg(all(feature = "exec-native-injection", target_arch = "x86_64"))]
     pub fn for_native_exec_domain() -> io::Result<Self> {
         let mut prefix = vec![
             stmt(BPF_LD_W_ABS, SECCOMP_DATA_ARCH_OFFSET),
-            jump(BPF_JMP_JEQ_K, AUDIT_ARCH_X86_64, 1, 0),
+            jump(BPF_JMP_JEQ_K, crate::arch::AUDIT_ARCH_NATIVE, 1, 0),
             stmt(BPF_RET_K, SECCOMP_RET_KILL_PROCESS),
             stmt(BPF_LD_W_ABS, SECCOMP_DATA_NR_OFFSET),
             jump(0x45, 0x4000_0000, 0, 1),
@@ -226,7 +258,7 @@ impl SeccompFilter {
 
     /// Canonical little-endian bytes of the distinct native filter recipe.
     /// Content comparison is not authority to install or attest a filter.
-    #[cfg(feature = "exec-native-injection")]
+    #[cfg(all(feature = "exec-native-injection", target_arch = "x86_64"))]
     pub fn native_exec_recipe_bytes() -> io::Result<[u8; 69 * 8]> {
         let filter = Self::for_native_exec_domain()?;
         let mut bytes = [0; 69 * 8];
@@ -239,7 +271,7 @@ impl SeccompFilter {
         Ok(bytes)
     }
 
-    #[cfg(feature = "exec-native-injection")]
+    #[cfg(all(feature = "exec-native-injection", feature = "launcher"))]
     pub(crate) fn native_program(&mut self) -> libc::sock_fprog {
         // Only a prebuilt exact native recipe is passed by the child owner.
         libc::sock_fprog {
@@ -462,22 +494,57 @@ mod tests {
     }
 
     fn evaluate(filter: &SeccompFilter, arch: u32, number: i64, ip: u64) -> u32 {
+        evaluate_with_args(filter, arch, number, ip, [0; 6])
+    }
+
+    /// Classic-BPF interpreter for exactly the subset the builders emit:
+    /// `LD_W_ABS` over every `seccomp_data` word (nr, arch, both IP words,
+    /// and both words of each argument), `JEQ_K`, `JSET_K` (code 0x45, the
+    /// native recipe's x32-bit test), and `RET_K`. Anything else panics
+    /// rather than risk a silent mis-verdict.
+    fn evaluate_with_args(
+        filter: &SeccompFilter,
+        arch: u32,
+        number: i64,
+        ip: u64,
+        args: [u64; 6],
+    ) -> u32 {
+        const BPF_JMP_JSET_K: u16 = 0x45;
+        const SECCOMP_DATA_ARGS_OFFSET: u32 = 16;
+        fn load_word(offset: u32, arch: u32, number: i64, ip: u64, args: &[u64; 6]) -> u32 {
+            match offset {
+                SECCOMP_DATA_ARCH_OFFSET => arch,
+                SECCOMP_DATA_NR_OFFSET => number as u32,
+                SECCOMP_DATA_IP_LOW_OFFSET => ip as u32,
+                SECCOMP_DATA_IP_HIGH_OFFSET => (ip >> 32) as u32,
+                SECCOMP_DATA_ARGS_OFFSET..=60 if offset.is_multiple_of(4) => {
+                    let index = ((offset - SECCOMP_DATA_ARGS_OFFSET) / 8) as usize;
+                    if offset.is_multiple_of(8) {
+                        args[index] as u32
+                    } else {
+                        (args[index] >> 32) as u32
+                    }
+                }
+                offset => panic!("unexpected seccomp data offset {offset}"),
+            }
+        }
         let mut accumulator = 0;
         let mut pc = 0;
         loop {
             let instruction = &filter.program[pc];
             match instruction.code {
                 BPF_LD_W_ABS => {
-                    accumulator = match instruction.k {
-                        SECCOMP_DATA_ARCH_OFFSET => arch,
-                        SECCOMP_DATA_NR_OFFSET => number as u32,
-                        SECCOMP_DATA_IP_LOW_OFFSET => ip as u32,
-                        SECCOMP_DATA_IP_HIGH_OFFSET => (ip >> 32) as u32,
-                        offset => panic!("unexpected seccomp data offset {offset}"),
-                    };
+                    accumulator = load_word(instruction.k, arch, number, ip, &args);
                 }
                 BPF_JMP_JEQ_K => {
                     pc += usize::from(if accumulator == instruction.k {
+                        instruction.jt
+                    } else {
+                        instruction.jf
+                    });
+                }
+                BPF_JMP_JSET_K => {
+                    pc += usize::from(if accumulator & instruction.k != 0 {
                         instruction.jt
                     } else {
                         instruction.jf
@@ -488,6 +555,96 @@ mod tests {
             }
             pc += 1;
         }
+    }
+
+    /// The aarch64 verdicts of the same builders, evaluated on this host
+    /// against the arch word and syscall numbers the trap probe measured on
+    /// aarch64 hardware: the gate admits only its exact svc/return sites
+    /// (return = svc + 4 there), every other aarch64 entry traps, and any
+    /// other architecture word — x86-64 or compat32 — is killed outright.
+    #[test]
+    fn aarch64_filter_verdicts_match_the_measured_abi() {
+        const AUDIT_ARCH_AARCH64: u32 = 0xc000_00b7;
+        const AUDIT_ARCH_ARM: u32 = 0x4000_0028; // compat32: EM_ARM | __AUDIT_ARCH_LE
+        const AARCH64_RT_SIGRETURN: i64 = 139;
+        const AARCH64_GETPID: i64 = 172;
+        let abi = crate::arch::FILTER_ABI_AARCH64;
+        assert_eq!(abi.audit_arch, AUDIT_ARCH_AARCH64);
+        assert_eq!(abi.rt_sigreturn, AARCH64_RT_SIGRETURN as u32);
+
+        let gate = TrustedGate {
+            syscall_ip: 0x0000_aaaa_0000_1000,
+            return_ip: 0x0000_aaaa_0000_1004,
+        };
+        let single = SeccompFilter::for_trusted_gate_abi(abi, gate).unwrap();
+        for ip in [gate.syscall_ip, gate.return_ip] {
+            assert_eq!(
+                evaluate(&single, AUDIT_ARCH_AARCH64, AARCH64_GETPID, ip),
+                SECCOMP_RET_ALLOW
+            );
+        }
+        assert_eq!(
+            evaluate(
+                &single,
+                AUDIT_ARCH_AARCH64,
+                AARCH64_GETPID,
+                0x7fff_dead_beef
+            ),
+            SECCOMP_RET_TRAP
+        );
+        assert_eq!(
+            evaluate(
+                &single,
+                AUDIT_ARCH_AARCH64,
+                AARCH64_RT_SIGRETURN,
+                0x7fff_dead_beef
+            ),
+            SECCOMP_RET_ALLOW
+        );
+        for arch in [AUDIT_ARCH_X86_64, AUDIT_ARCH_ARM] {
+            assert_eq!(
+                evaluate(&single, arch, AARCH64_GETPID, gate.return_ip),
+                SECCOMP_RET_KILL_PROCESS
+            );
+        }
+
+        let second = TrustedGate {
+            syscall_ip: 0x0000_bbbb_0000_2000,
+            return_ip: 0x0000_bbbb_0000_2004,
+        };
+        let restorer_svc = 0x0000_cccc_0000_3000u64;
+        let two = SeccompFilter::for_trusted_gates_with_signal_return_abi(
+            abi,
+            gate,
+            second,
+            Some(restorer_svc + 4),
+        )
+        .unwrap();
+        // rt_sigreturn is admitted only at the reported return IP (svc + 4).
+        assert_eq!(
+            evaluate(
+                &two,
+                AUDIT_ARCH_AARCH64,
+                AARCH64_RT_SIGRETURN,
+                restorer_svc + 4
+            ),
+            SECCOMP_RET_ALLOW
+        );
+        for ip in [restorer_svc, gate.return_ip, second.return_ip] {
+            assert_eq!(
+                evaluate(&two, AUDIT_ARCH_AARCH64, AARCH64_RT_SIGRETURN, ip),
+                SECCOMP_RET_TRAP,
+                "{ip:#x}"
+            );
+        }
+        assert_eq!(
+            evaluate(&two, AUDIT_ARCH_AARCH64, AARCH64_GETPID, second.return_ip),
+            SECCOMP_RET_ALLOW
+        );
+        assert_eq!(
+            evaluate(&two, AUDIT_ARCH_X86_64, AARCH64_GETPID, second.return_ip),
+            SECCOMP_RET_KILL_PROCESS
+        );
     }
 
     /// With the runtime's restorer named, `rt_sigreturn` is admitted only at
@@ -505,13 +662,14 @@ mod tests {
             return_ip: 0x5678_0000_2002,
         };
         let restorer = 0x9abc_0000_3007;
+        let native_arch = crate::arch::FILTER_ABI_NATIVE.audit_arch;
         let filter =
             SeccompFilter::for_trusted_gates_with_signal_return(first, second, Some(restorer))
                 .unwrap();
         assert_eq!(filter.len(), 23);
         let sigreturn = libc::SYS_rt_sigreturn;
         assert_eq!(
-            evaluate(&filter, AUDIT_ARCH_X86_64, sigreturn, restorer),
+            evaluate(&filter, native_arch, sigreturn, restorer),
             SECCOMP_RET_ALLOW
         );
         for elsewhere in [
@@ -525,7 +683,7 @@ mod tests {
             0x7fff_dead_beef,
         ] {
             assert_eq!(
-                evaluate(&filter, AUDIT_ARCH_X86_64, sigreturn, elsewhere),
+                evaluate(&filter, native_arch, sigreturn, elsewhere),
                 SECCOMP_RET_TRAP,
                 "{elsewhere:#x}"
             );
@@ -539,8 +697,8 @@ mod tests {
                 0x7fff_dead_beef,
             ] {
                 assert_eq!(
-                    evaluate(&filter, AUDIT_ARCH_X86_64, number, address),
-                    evaluate(&plain, AUDIT_ARCH_X86_64, number, address),
+                    evaluate(&filter, native_arch, number, address),
+                    evaluate(&plain, native_arch, number, address),
                     "{number} at {address:#x}"
                 );
             }
@@ -551,7 +709,7 @@ mod tests {
         );
         // Without a restorer, rt_sigreturn is admitted anywhere, as before.
         assert_eq!(
-            evaluate(&plain, AUDIT_ARCH_X86_64, sigreturn, 0x7fff_dead_beef),
+            evaluate(&plain, native_arch, sigreturn, 0x7fff_dead_beef),
             SECCOMP_RET_ALLOW
         );
     }
@@ -566,12 +724,13 @@ mod tests {
             syscall_ip: 0x5678_0000_2000,
             return_ip: 0x5678_0000_2002,
         };
+        let native_arch = crate::arch::FILTER_ABI_NATIVE.audit_arch;
         let filter = SeccompFilter::for_trusted_gates(first, second).unwrap();
         assert_eq!(filter.len(), 17);
         for gate in [first, second] {
             for address in [gate.syscall_ip, gate.return_ip] {
                 assert_eq!(
-                    evaluate(&filter, AUDIT_ARCH_X86_64, libc::SYS_write, address),
+                    evaluate(&filter, native_arch, libc::SYS_write, address),
                     SECCOMP_RET_ALLOW
                 );
                 for forbidden in [
@@ -581,7 +740,7 @@ mod tests {
                     address as u32 as u64,
                 ] {
                     assert_eq!(
-                        evaluate(&filter, AUDIT_ARCH_X86_64, libc::SYS_write, forbidden),
+                        evaluate(&filter, native_arch, libc::SYS_write, forbidden),
                         SECCOMP_RET_TRAP,
                         "{forbidden:#x}"
                     );
@@ -593,7 +752,7 @@ mod tests {
             }
         }
         assert_eq!(
-            evaluate(&filter, AUDIT_ARCH_X86_64, libc::SYS_rt_sigreturn, 0),
+            evaluate(&filter, native_arch, libc::SYS_rt_sigreturn, 0),
             SECCOMP_RET_ALLOW
         );
         assert_eq!(
@@ -601,21 +760,11 @@ mod tests {
             SECCOMP_RET_KILL_PROCESS
         );
         assert_eq!(
-            evaluate(
-                &filter,
-                AUDIT_ARCH_X86_64,
-                libc::SYS_write,
-                0x1234_0000_2000
-            ),
+            evaluate(&filter, native_arch, libc::SYS_write, 0x1234_0000_2000),
             SECCOMP_RET_TRAP
         );
         assert_eq!(
-            evaluate(
-                &filter,
-                AUDIT_ARCH_X86_64,
-                libc::SYS_write,
-                0x5678_0000_1000
-            ),
+            evaluate(&filter, native_arch, libc::SYS_write, 0x5678_0000_1000),
             SECCOMP_RET_TRAP
         );
         let invalid = TrustedGate {
@@ -663,5 +812,131 @@ mod tests {
         assert!(ret_ks.contains(&SECCOMP_RET_TRAP));
         assert!(ret_ks.contains(&SECCOMP_RET_ALLOW));
         assert!(ret_ks.contains(&SECCOMP_RET_KILL_PROCESS));
+    }
+
+    /// The native-exec prefix verdicts that only the extended evaluator can
+    /// reach: the x32 syscall-bit deny (a `JSET` on the number), the denied
+    /// numbers, and the `prctl(PR_SET_SECCOMP)` deny keyed on argument 0 —
+    /// each refused even at a trusted gate — while ordinary calls at the
+    /// fixed gates and the restorer return site still pass the suffix.
+    /// Any aarch64 native recipe must pin its prefix the same way before it
+    /// exists; until then this guards the x86-64 recipe's JSET/arg words.
+    #[cfg(all(feature = "exec-native-injection", target_arch = "x86_64"))]
+    #[test]
+    fn native_exec_prefix_denies_x32_stacking_and_creation_even_at_gates() {
+        const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
+        let eperm = SECCOMP_RET_ERRNO | libc::EPERM as u32;
+        let filter = SeccompFilter::for_native_exec_domain().unwrap();
+        assert_eq!(filter.len(), 69);
+        let gate = crate::trap::FIXED_GATE_BASE + 0x82;
+        let guest_gate = crate::trap::FIXED_GATE_BASE + 0x202;
+        let restorer = crate::trap::FIXED_SIGNAL_RESTORER_RETURN_IP;
+        // Wrong arch is killed before any prefix or gate logic.
+        assert_eq!(
+            evaluate_with_args(&filter, 0x4000_0003, libc::SYS_gettid, gate, [0; 6]),
+            SECCOMP_RET_KILL_PROCESS
+        );
+        // The x32 bit on an otherwise ordinary number is denied by JSET,
+        // even from a gate; without the bit the same call passes.
+        let x32_write = libc::SYS_write | 0x4000_0000;
+        assert_eq!(
+            evaluate_with_args(&filter, AUDIT_ARCH_X86_64, x32_write, gate, [0; 6]),
+            eperm
+        );
+        assert_eq!(
+            evaluate_with_args(&filter, AUDIT_ARCH_X86_64, libc::SYS_write, gate, [0; 6]),
+            SECCOMP_RET_ALLOW
+        );
+        // Denied numbers are refused even at the gates.
+        for number in [
+            libc::SYS_clone,
+            libc::SYS_clone3,
+            libc::SYS_fork,
+            libc::SYS_vfork,
+            libc::SYS_unshare,
+            libc::SYS_mount,
+            libc::SYS_seccomp,
+        ] {
+            for ip in [gate, guest_gate] {
+                assert_eq!(
+                    evaluate_with_args(&filter, AUDIT_ARCH_X86_64, number, ip, [0; 6]),
+                    eperm,
+                    "{number} at {ip:#x}"
+                );
+            }
+        }
+        // prctl is denied only when arg0 is PR_SET_SECCOMP (low word at
+        // seccomp_data offset 16), including with garbage in the high word
+        // the filter never loads; other prctl ops reach the suffix.
+        let set_seccomp = [
+            libc::PR_SET_SECCOMP as u64 | (0xdead_beef << 32),
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
+        assert_eq!(
+            evaluate_with_args(
+                &filter,
+                AUDIT_ARCH_X86_64,
+                libc::SYS_prctl,
+                gate,
+                set_seccomp
+            ),
+            eperm
+        );
+        let get_seccomp = [21, 0, 0, 0, 0, 0]; // PR_GET_SECCOMP
+        assert_eq!(
+            evaluate_with_args(
+                &filter,
+                AUDIT_ARCH_X86_64,
+                libc::SYS_prctl,
+                gate,
+                get_seccomp
+            ),
+            SECCOMP_RET_ALLOW
+        );
+        // The gate suffix is unchanged behind the prefix.
+        assert_eq!(
+            evaluate_with_args(
+                &filter,
+                AUDIT_ARCH_X86_64,
+                libc::SYS_gettid,
+                guest_gate,
+                [0; 6]
+            ),
+            SECCOMP_RET_ALLOW
+        );
+        assert_eq!(
+            evaluate_with_args(
+                &filter,
+                AUDIT_ARCH_X86_64,
+                libc::SYS_gettid,
+                0x7fff_dead_beef,
+                [0; 6]
+            ),
+            SECCOMP_RET_TRAP
+        );
+        assert_eq!(
+            evaluate_with_args(
+                &filter,
+                AUDIT_ARCH_X86_64,
+                libc::SYS_rt_sigreturn,
+                restorer,
+                [0; 6]
+            ),
+            SECCOMP_RET_ALLOW
+        );
+        assert_eq!(
+            evaluate_with_args(
+                &filter,
+                AUDIT_ARCH_X86_64,
+                libc::SYS_rt_sigreturn,
+                gate,
+                [0; 6]
+            ),
+            SECCOMP_RET_TRAP
+        );
     }
 }

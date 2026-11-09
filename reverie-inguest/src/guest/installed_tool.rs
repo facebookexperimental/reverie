@@ -37,6 +37,7 @@ trait ToolHandler: Send + Sync {
         context: &mut RegisterContext,
     );
     fn rpc(&self) -> &dyn std::any::Any;
+    fn relocate_coordinator(&self, from: libc::c_int) -> io::Result<libc::c_int>;
     #[cfg(feature = "exec-private-successor")]
     fn run_successor_post_exec(
         &self,
@@ -68,6 +69,10 @@ impl<T: Tool + 'static, R: HostRuntime> ToolHandler for ToolHost<T, R> {
 
     fn rpc(&self) -> &dyn std::any::Any {
         ToolHost::rpc(self)
+    }
+
+    fn relocate_coordinator(&self, from: libc::c_int) -> io::Result<libc::c_int> {
+        ToolHost::rpc(self).relocate(from)
     }
 
     #[cfg(feature = "exec-private-successor")]
@@ -380,6 +385,8 @@ pub unsafe fn dispatch_saved_syscall(
     use super::clock::enter_rcb_handler;
     use super::clock::leave_rcb_handler;
     use super::event::SyscallDispatch;
+    use super::isa::Isa;
+    use super::isa::NativeIsa;
     use super::support::ToolCallbackGuard;
     use super::support::exit_now;
     use super::support::tool_callback_active;
@@ -398,16 +405,9 @@ pub unsafe fn dispatch_saved_syscall(
     let context_pointer = context as usize;
     let context = unsafe { &mut *context };
     let mut event = SyscallEvent {
-        number: number.unwrap_or(context.rax as i64),
-        args: [
-            context.rdi,
-            context.rsi,
-            context.rdx,
-            context.r10,
-            context.r8,
-            context.r9,
-        ],
-        instruction_pointer: context.instruction_pointer,
+        number: number.unwrap_or_else(|| NativeIsa::syscall_number(context)),
+        args: NativeIsa::syscall_args(context),
+        instruction_pointer: NativeIsa::instruction_pointer(context),
         result: UNSET_RESULT,
         context: context_pointer,
         dispatch,
@@ -434,9 +434,7 @@ pub unsafe fn dispatch_saved_syscall(
         // SAFETY: a genuine hook entry made while a Tool callback is active on
         // this thread: the callback's own syscall, which may run natively.
         unsafe { forward_nested_tool_syscall(&mut event, observe_nested_mapping) };
-        context.rax = event.result as u64;
-        context.rcx = context.instruction_pointer.saturating_add(2);
-        context.r11 = context.rflags;
+        NativeIsa::finish_syscall(context, event.result);
         if let Some(output) = guest_pkru {
             *output = event.guest_pkru;
         }
@@ -455,15 +453,23 @@ pub unsafe fn dispatch_saved_syscall(
     if event.result == UNSET_RESULT {
         event.result = -i64::from(libc::ENOSYS);
     }
-    context.rax = event.result as u64;
-    context.rcx = context.instruction_pointer.saturating_add(2);
-    context.r11 = context.rflags;
+    NativeIsa::finish_syscall(context, event.result);
     if let Some(output) = guest_pkru {
         *output = event.guest_pkru;
     }
     if leave_rcb_handler().is_err() {
         unsafe { exit_now(122) };
     }
+}
+
+/// Moves the installed Tool's coordinator connection off `from`
+/// (`CoordinatorRpc::relocate`) and returns its new number. Fails with EBADF
+/// when no Tool is installed or `from` is not its connection's number.
+pub(crate) fn relocate_coordinator(from: libc::c_int) -> io::Result<libc::c_int> {
+    HANDLER
+        .get()
+        .ok_or_else(|| io::Error::from_raw_os_error(libc::EBADF))?
+        .relocate_coordinator(from)
 }
 
 fn instruction_handler() -> &'static dyn ToolHandler {
@@ -493,6 +499,10 @@ fn instruction_handler() -> &'static dyn ToolHandler {
 pub fn blocking_global_rpc<G: reverie::GlobalTool + 'static>(
     request: G::Request,
 ) -> io::Result<G::Response> {
+    let request = match super::native_rpc::dispatch_global::<G>(request) {
+        super::native_rpc::NativeGlobalDispatch::Handled(result) => return result,
+        super::native_rpc::NativeGlobalDispatch::Absent(request) => request,
+    };
     if super::host::callback_ending_staged() {
         return Err(io::Error::from_raw_os_error(libc::ESRCH));
     }

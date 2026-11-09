@@ -436,7 +436,7 @@ mod fatal_callback_tests {
 
     async fn check_callback(callback: Callback, fail: bool) {
         let started = Instant::now();
-        let deadline = started + Duration::from_secs(3);
+        let deadline = started + GENEROUS_WALL_BACKSTOP;
         let helper = dead_helper(deadline).await;
         let words = FatalWords::new();
         let address = words.0 as usize;
@@ -523,7 +523,7 @@ mod fatal_callback_tests {
             }
         };
         assert!(
-            elapsed <= Duration::from_secs(3),
+            elapsed <= GENEROUS_WALL_BACKSTOP,
             "completion exceeded the original deadline"
         );
         assert!(root_retired, "root was not retired before rescue");

@@ -14,4 +14,4 @@ mod global_state;
 mod tool;
 
 // TODO-HUMAN-REVIEW(PR-159): Review crate-local reuse of the production ChromeTrace tool.
-pub(crate) use tool::ChromeTrace;
+pub use tool::ChromeTrace;

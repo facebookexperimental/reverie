@@ -12,11 +12,9 @@
 
 #[path = "backend.rs"]
 mod backend;
-#[path = "chaos.rs"]
-mod chaos;
-
-use chaos::*;
 use clap::Parser;
+use reverie_examples::tools::chaos::ChaosOpts;
+use reverie_examples::tools::chaos::ChaosTool;
 use reverie_util::CommonToolArguments;
 
 /// A tool to introduce inject "chaos" into a running process. A pathological

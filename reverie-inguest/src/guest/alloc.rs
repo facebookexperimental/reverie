@@ -13,9 +13,11 @@
 //! allocations are therefore isolated from libc until they are released or
 //! the process exits.
 //!
-//! Legacy storage is zero-initialized and page-aligned, so the loader places it in
-//! anonymous memory (`.bss`) rather than in a mapping of the file that holds
-//! it. A backend that reads an object's file mappings for code addresses
+//! Legacy storage is zero-initialized and aligned to the largest supported
+//! page size, so no heap page shares the file-backed final data page and the
+//! loader places it in anonymous memory (`.bss`) rather than in a mapping of
+//! the file that holds it. A backend that reads an object's file mappings for
+//! code addresses
 //! (LiteInst's entry census) therefore never finds the runtime's own state
 //! there, wherever the runtime is linked. Explicit fixed consumers instead use
 //! already-published ToolRegion storage, with no allocator-triggered setup.
@@ -37,8 +39,14 @@ pub(crate) const TOOL_HEAP_BYTES: usize = 32 * 1024 * 1024;
 /// it), so this can be 0 and the whole heap's initial value is zero.
 const FREE_LIST_END: usize = 0;
 
-#[repr(align(4096))]
+pub const MAX_PAGE_SIZE: usize = 65_536;
+
+// Align to the largest supported page size: on a 64 KiB-page host the last
+// file-backed data page can otherwise reach into the first heap page.
+#[repr(align(65536))]
 struct ToolHeapBytes([u8; TOOL_HEAP_BYTES]);
+
+const _: () = assert!(align_of::<ToolHeapBytes>() == MAX_PAGE_SIZE);
 
 #[repr(C)]
 struct ToolHeapBlock {
@@ -68,17 +76,6 @@ impl ToolHeapMetadata {
             next: UnsafeCell::new(0),
             free_head: UnsafeCell::new(FREE_LIST_END),
             locked: AtomicBool::new(false),
-        }
-    }
-
-    /// Initialize only authenticated fresh, unpublished anonymous storage.
-    pub(crate) unsafe fn initialize_at(address: *mut Self) {
-        // SAFETY: the fresh owner exclusively owns writable aligned storage.
-        // Individual scalar stores avoid constructing any arena/bitmap value.
-        unsafe {
-            ptr::addr_of_mut!((*address).next).write(UnsafeCell::new(0));
-            ptr::addr_of_mut!((*address).free_head).write(UnsafeCell::new(FREE_LIST_END));
-            ptr::addr_of_mut!((*address).locked).write(AtomicBool::new(false));
         }
     }
 }
@@ -309,9 +306,26 @@ pub struct DispatchAllocationScope {
     _same_thread: PhantomData<*mut ()>,
 }
 
+/// The one outlined access site for the DISPATCH_DEPTH cell (see
+/// `tool_callback_active_cell`).
+#[inline(never)]
+pub(crate) fn dispatch_depth_cell() -> *mut core::cell::Cell<usize> {
+    DISPATCH_DEPTH.with(|depth| depth as *const core::cell::Cell<usize> as *mut _)
+}
+
+fn dispatch_depth_get() -> usize {
+    // SAFETY: this thread's own cell, used only on this thread.
+    unsafe { (*dispatch_depth_cell()).get() }
+}
+
+fn dispatch_depth_set(value: usize) {
+    // SAFETY: this thread's own cell, used only on this thread.
+    unsafe { (*dispatch_depth_cell()).set(value) }
+}
+
 impl Drop for DispatchAllocationScope {
     fn drop(&mut self) {
-        DISPATCH_DEPTH.set(DISPATCH_DEPTH.get() - 1);
+        dispatch_depth_set(dispatch_depth_get() - 1);
     }
 }
 
@@ -320,7 +334,7 @@ impl Drop for DispatchAllocationScope {
 /// is dropped. A Tool callback runs inside one, because it can interrupt the
 /// guest's own allocator.
 pub fn enter_dispatch() -> DispatchAllocationScope {
-    DISPATCH_DEPTH.set(DISPATCH_DEPTH.get() + 1);
+    dispatch_depth_set(dispatch_depth_get() + 1);
     DispatchAllocationScope {
         _same_thread: PhantomData,
     }
@@ -337,7 +351,7 @@ pub fn tool_heap_contains(pointer: *const u8) -> bool {
 #[cfg(feature = "allocator-fixture")]
 #[doc(hidden)]
 pub fn fixture_dispatch_depth() -> usize {
-    DISPATCH_DEPTH.get()
+    dispatch_depth_get()
 }
 
 /// Actual Legacy BSS bounds without allocation or region initialization.
@@ -442,7 +456,7 @@ pub fn fixture_fixed_tool_heap_state() -> Option<ToolHeapFixtureState> {
 }
 
 fn dispatch_active() -> bool {
-    DISPATCH_DEPTH.get() != 0
+    dispatch_depth_get() != 0
 }
 
 /// An allocator for a preload whose Rust allocations always belong to the Tool.
@@ -474,7 +488,7 @@ fn refuse_foreign_allocation() -> ! {
     // filter refuses it, UD2 terminates instead of returning or spinning.
     unsafe {
         crate::trap::raw_syscall6(libc::SYS_exit_group, [127, 0, 0, 0, 0, 0]);
-        core::arch::asm!("ud2", options(noreturn, nostack));
+        crate::arch::trap_unreachable();
     }
 }
 
@@ -563,6 +577,7 @@ pub fn fixed_tool_heap_contains(pointer: *const u8) -> bool {
 /// x86-64 SysV clear-direction-flag contract used by all Rust Tool entries.
 #[doc(hidden)]
 #[inline(never)]
+#[cfg(target_arch = "x86_64")]
 pub unsafe fn fixed_zero_bytes(pointer: *mut u8, length: usize) {
     // SAFETY: the valid writable range and clear DF are caller requirements.
     // REP changes only the declared index/count registers, preserving flags.
@@ -577,6 +592,22 @@ pub unsafe fn fixed_zero_bytes(pointer: *mut u8, length: usize) {
     }
 }
 
+/// aarch64 counterpart: no DF contract exists there; volatile stores keep
+/// the clear free of interposable libc calls and compiler-intrinsic
+/// lowering to them.
+///
+/// # Safety
+/// `pointer` must cover `length` writable bytes.
+#[doc(hidden)]
+#[inline(never)]
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn fixed_zero_bytes(pointer: *mut u8, length: usize) {
+    for index in 0..length {
+        // SAFETY: the valid writable range is a caller requirement.
+        unsafe { pointer.add(index).write_volatile(0) };
+    }
+}
+
 /// Copy live disjoint Fixed allocations without an interposable libc call.
 ///
 /// # Safety
@@ -585,6 +616,7 @@ pub unsafe fn fixed_zero_bytes(pointer: *mut u8, length: usize) {
 /// clear-direction-flag contract used by all Rust Tool entries.
 #[doc(hidden)]
 #[inline(never)]
+#[cfg(target_arch = "x86_64")]
 pub unsafe fn fixed_copy_bytes(source: *const u8, destination: *mut u8, length: usize) {
     // SAFETY: the two valid disjoint ranges and clear DF are caller requirements.
     unsafe {
@@ -595,6 +627,24 @@ pub unsafe fn fixed_copy_bytes(source: *const u8, destination: *mut u8, length: 
             inout("rcx") length => _,
             options(nostack, preserves_flags),
         );
+    }
+}
+
+/// aarch64 counterpart: volatile copies, as in [`fixed_zero_bytes`].
+///
+/// # Safety
+/// `source` and `destination` must cover `length` readable and writable
+/// bytes, respectively, and must not overlap.
+#[doc(hidden)]
+#[inline(never)]
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn fixed_copy_bytes(source: *const u8, destination: *mut u8, length: usize) {
+    for index in 0..length {
+        // SAFETY: the two valid disjoint ranges are caller requirements.
+        unsafe {
+            let byte = source.add(index).read_volatile();
+            destination.add(index).write_volatile(byte);
+        }
     }
 }
 
@@ -760,8 +810,14 @@ mod tests {
     /// code addresses of the object.
     #[test]
     fn tool_heap_is_anonymous_memory() {
+        assert!(align_of::<ToolHeapBytes>() >= MAX_PAGE_SIZE);
         let start = TOOL_HEAP.base() as u64;
-        assert_eq!(start % 4096, 0, "the Tool heap is not page-aligned");
+        let page_size = crate::guest::support::page_size().unwrap();
+        assert_eq!(
+            start % page_size,
+            0,
+            "the Tool heap is not runtime-page-aligned"
+        );
         let last = start + TOOL_HEAP_BYTES as u64 - 1;
         let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
         for address in [start, last] {

@@ -10,85 +10,113 @@
 
 //! Tests surrounding exit logic.
 
-use std::sync::Mutex;
+#[path = "support/exit_command.rs"]
+mod command;
+#[path = "tool_fixtures/exit.rs"]
+mod exit_tool;
+#[path = "support/exit_rust_guest.rs"]
+mod rust_guest;
 
-use reverie::Error;
+use exit_tool::GlobalState;
+use exit_tool::InjectExitTool;
 use reverie::ExitStatus;
-use reverie::GlobalRPC;
-use reverie::GlobalTool;
-use reverie::Guest;
-use reverie::Pid;
 use reverie::Tool;
-use reverie::syscalls;
-use reverie::syscalls::Syscall;
-use reverie::syscalls::SyscallInfo;
-use reverie::syscalls::Sysno;
+use reverie::process::Output;
 
+/// The actual do-nothing Tool: it intercepts nothing and reports nothing.
 #[derive(Debug, Default)]
-struct GlobalState {
-    // FIXME: Can't use (Pid, ExitStatus) types here since they don't implement
-    // Serialize/Deserialize.
-    exited: Mutex<Vec<(i32, ExitStatus)>>,
-}
-
-#[reverie::global_tool]
-impl GlobalTool for GlobalState {
-    type Request = ExitStatus;
-    type Response = ();
-    type Config = ();
-
-    async fn receive_rpc(&self, from: Pid, exit_status: ExitStatus) -> Self::Response {
-        self.exited
-            .lock()
-            .unwrap()
-            .push((from.as_raw(), exit_status));
-    }
-}
-
-#[derive(Debug, Default, Clone)]
-struct InjectExitTool {}
-
-#[reverie::tool]
-impl Tool for InjectExitTool {
-    type GlobalState = GlobalState;
+struct NoopTool;
+impl Tool for NoopTool {
+    type GlobalState = ();
     type ThreadState = ();
+}
 
-    async fn on_exit_process<G: GlobalRPC<Self::GlobalState>>(
-        self,
-        _pid: Pid,
-        global_state: &G,
-        exit_status: ExitStatus,
-    ) -> Result<(), Error> {
-        global_state.send_rpc(exit_status).await;
-        Ok(())
-    }
+fn record_command(label: &str, output: &Output, state: &GlobalState) {
+    eprintln!(
+        "injected exit {label}: status={:?} stdout={:02x?} stderr={:02x?} exited={:?}",
+        output.status,
+        output.stdout,
+        output.stderr,
+        *state.exited.lock().unwrap(),
+    );
+}
 
-    async fn handle_syscall_event<T: Guest<Self>>(
-        &self,
-        guest: &mut T,
-        syscall: Syscall,
-    ) -> Result<i64, Error> {
-        if syscall.number() == Sysno::getpid {
-            guest
-                .tail_inject(syscalls::ExitGroup::new().with_status(42))
-                .await
-        } else {
-            guest.tail_inject(syscall).await
-        }
-    }
+fn assert_exit_oracle(output: &Output, state: &GlobalState) {
+    assert_eq!(output.status, ExitStatus::Exited(42));
+    let mut mg = state.exited.lock().unwrap();
+    assert_eq!(mg.pop().map(|x| x.1), Some(ExitStatus::Exited(42)));
+    assert!(mg.is_empty());
+}
+
+#[test]
+fn ptrace_inject_exit_command() {
+    let guest = command::GuestBinary::compile();
+    guest.assert_native();
+    guest.record_before_launch("ptrace");
+    let (output, state) =
+        reverie_test_support::test_cmd::<InjectExitTool>(guest.program(), &[]).unwrap();
+    record_command("ptrace", &output, &state);
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+    assert_exit_oracle(&output, &state);
+}
+
+#[test]
+fn ptrace_noop_rejects_injected_exit_oracle() {
+    let guest = command::GuestBinary::compile();
+    guest.assert_native();
+    guest.record_before_launch("noop");
+    // The actual Noop Tool injects no exit and reports no exit RPC, so its real
+    // run is paired with an empty exit GlobalState.
+    let (output, ()) = reverie_test_support::test_cmd::<NoopTool>(guest.program(), &[]).unwrap();
+    let state = GlobalState::default();
+    record_command("noop", &output, &state);
+    assert_eq!(output.status, ExitStatus::Exited(0));
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+    assert!(state.exited.lock().unwrap().is_empty());
+    assert!(std::panic::catch_unwind(|| assert_exit_oracle(&output, &state)).is_err());
 }
 
 #[test]
 fn smoke() {
     use reverie_ptrace::testing::test_fn;
 
-    let (output, state) = test_fn::<InjectExitTool, _>(|| unsafe {
-        let _ = libc::getpid();
-        libc::syscall(libc::SYS_exit_group, 0);
-    })
-    .unwrap();
+    let (output, state) = test_fn::<InjectExitTool, _>(rust_guest::smoke).unwrap();
     assert_eq!(output.status, ExitStatus::Exited(42));
     let mut mg = state.exited.lock().unwrap();
     assert_eq!(mg.pop().map(|x| x.1), Some(ExitStatus::Exited(42)));
     assert!(mg.is_empty());
+    drop(mg);
+
+    check_rust_command();
+}
+
+fn check_rust_command() {
+    let program = env!("CARGO_BIN_EXE_exit-rust-command-guest");
+    eprintln!("injected exit Rust command: image={program}");
+
+    let output = std::process::Command::new(program).output().unwrap();
+    eprintln!(
+        "injected exit rust/native: status={:?} stdout={:02x?} stderr={:02x?}",
+        output.status, output.stdout, output.stderr,
+    );
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, rust_guest::PRE_BODY_MARKER);
+    assert!(output.stderr.is_empty());
+
+    let (output, state) = reverie_test_support::test_cmd::<InjectExitTool>(program, &[]).unwrap();
+    record_command("rust/ptrace", &output, &state);
+    assert_eq!(output.stdout, rust_guest::PRE_BODY_MARKER);
+    assert!(output.stderr.is_empty());
+    assert_exit_oracle(&output, &state);
+
+    let (output, ()) = reverie_test_support::test_cmd::<NoopTool>(program, &[]).unwrap();
+    let state = GlobalState::default();
+    record_command("rust/noop", &output, &state);
+    assert_eq!(output.stdout, rust_guest::PRE_BODY_MARKER);
+    assert!(output.stderr.is_empty());
+    assert_eq!(output.status, ExitStatus::Exited(0));
+    assert!(state.exited.lock().unwrap().is_empty());
+    assert!(std::panic::catch_unwind(|| assert_exit_oracle(&output, &state)).is_err());
 }

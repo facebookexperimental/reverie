@@ -296,7 +296,7 @@ impl SuccessorAdmission for Admission {
 
 fn server(path: &SocketPath, global: Arc<Echo>, admission: Arc<Admission>) -> RpcServer<Echo> {
     let mut server = RpcServer::bind(&path.0, global, CONFIG.to_owned()).unwrap();
-    server.set_connection_admission(Arc::new(Watch));
+    server.set_connection_admission(Arc::new(Watch)).unwrap();
     server.retain_connection_issues();
     server
         .set_native_image_admission(admission.clone(), admission)
@@ -639,7 +639,7 @@ async fn both_watched_admission_and_issue_retention_are_required() {
             RpcServer::bind(&path.0, Arc::new(Echo::default()), CONFIG.to_owned()).unwrap();
         let admission = Arc::new(Admission::new(false));
         if watch {
-            server.set_connection_admission(Arc::new(Watch));
+            server.set_connection_admission(Arc::new(Watch)).unwrap();
         } else {
             server.retain_connection_issues();
         }
@@ -720,7 +720,7 @@ mod negative_controls {
         let mut server =
             RpcServer::bind_with_connection_readiness(&path.0, global, CONFIG.to_owned(), ready)
                 .unwrap();
-        server.set_connection_admission(Arc::new(Watch));
+        server.set_connection_admission(Arc::new(Watch)).unwrap();
         server.retain_connection_issues();
         server
             .set_native_image_admission(initial, successor)

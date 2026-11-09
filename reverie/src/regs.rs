@@ -130,7 +130,23 @@ impl<'a> std::fmt::Display for Display<'a> {
 #[cfg(target_arch = "aarch64")]
 impl<'a> std::fmt::Display for Display<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self.regs)
+        // x0..x30, four to a line when multiline, then sp, pc and pstate.
+        for (index, value) in self.regs.regs.iter().enumerate() {
+            if index > 0 {
+                f.write_str(if self.options.multiline && index % 4 == 0 {
+                    "\n"
+                } else {
+                    " "
+                })?;
+            }
+            write!(f, "x{index} {value:#x}")?;
+        }
+        f.write_str(if self.options.multiline { "\n" } else { " " })?;
+        write!(
+            f,
+            "sp {:#x} pc {:#x} pstate {:#x}",
+            self.regs.sp, self.regs.pc, self.regs.pstate
+        )
     }
 }
 
@@ -167,6 +183,46 @@ mod tests {
             " rip              0x0 eflags              0x0",
             " cs              0x0 ss              0x0 ds              0x0 es              0x0",
             " fs              0x0 gs              0x0",
+        ];
+
+        assert_eq!(result.lines().collect::<Vec<&str>>(), lines);
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn test_single_line_aarch64() {
+        let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
+        regs.regs[0] = 255;
+        regs.sp = 0x7ff0;
+        regs.pc = 0x1000;
+        let result = format!("{}", regs.display());
+        assert_eq!(
+            result,
+            "x0 0xff x1 0x0 x2 0x0 x3 0x0 x4 0x0 x5 0x0 x6 0x0 x7 0x0 x8 0x0 x9 0x0 x10 0x0 x11 0x0 x12 0x0 x13 0x0 x14 0x0 x15 0x0 x16 0x0 x17 0x0 x18 0x0 x19 0x0 x20 0x0 x21 0x0 x22 0x0 x23 0x0 x24 0x0 x25 0x0 x26 0x0 x27 0x0 x28 0x0 x29 0x0 x30 0x0 sp 0x7ff0 pc 0x1000 pstate 0x0"
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn test_multi_line_aarch64() {
+        let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
+        regs.regs[0] = 255;
+        regs.sp = 0x7ff0;
+        regs.pc = 0x1000;
+        let result = format!(
+            "{}",
+            regs.display_with_options(RegDisplayOptions { multiline: true })
+        );
+        let lines = vec![
+            "x0 0xff x1 0x0 x2 0x0 x3 0x0",
+            "x4 0x0 x5 0x0 x6 0x0 x7 0x0",
+            "x8 0x0 x9 0x0 x10 0x0 x11 0x0",
+            "x12 0x0 x13 0x0 x14 0x0 x15 0x0",
+            "x16 0x0 x17 0x0 x18 0x0 x19 0x0",
+            "x20 0x0 x21 0x0 x22 0x0 x23 0x0",
+            "x24 0x0 x25 0x0 x26 0x0 x27 0x0",
+            "x28 0x0 x29 0x0 x30 0x0",
+            "sp 0x7ff0 pc 0x1000 pstate 0x0",
         ];
 
         assert_eq!(result.lines().collect::<Vec<&str>>(), lines);

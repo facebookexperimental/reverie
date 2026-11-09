@@ -22,6 +22,7 @@ use std::io;
 
 use crate::trap::raw_syscall6;
 
+#[cfg(target_arch = "x86_64")]
 core::arch::global_asm!(
     r#"
     .text
@@ -40,12 +41,34 @@ reverie_inguest_signal_restorer_return_ip:
 "#
 );
 
+// `rt_sigreturn` is 139 on aarch64 and the reported return IP is the
+// instruction after the 4-byte `svc` (measured by the trap probe).
+#[cfg(target_arch = "aarch64")]
+core::arch::global_asm!(
+    r#"
+    .text
+    .p2align 4
+    .global reverie_inguest_signal_restorer
+    .hidden reverie_inguest_signal_restorer
+    .type reverie_inguest_signal_restorer,@function
+reverie_inguest_signal_restorer:
+    mov x8, #139
+    svc #0
+    .global reverie_inguest_signal_restorer_return_ip
+    .hidden reverie_inguest_signal_restorer_return_ip
+reverie_inguest_signal_restorer_return_ip:
+    brk #0
+    .size reverie_inguest_signal_restorer, .-reverie_inguest_signal_restorer
+"#
+);
+
 unsafe extern "C" {
     fn reverie_inguest_signal_restorer();
     fn reverie_inguest_signal_restorer_return_ip();
 }
 
-/// The runtime's private signal restorer: `rt_sigreturn` (15), then `ud2`.
+/// The runtime's private signal restorer: `rt_sigreturn`, then a trap
+/// instruction (`ud2` on x86-64, `brk` on aarch64) if it ever returns.
 ///
 /// Every runtime signal handler returns through it (`SA_RESTORER`), so a
 /// syscall filter can admit `rt_sigreturn` only at
@@ -152,11 +175,27 @@ pub unsafe fn install_runtime_handler(
     handler: unsafe extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void),
     extra_flags: i32,
 ) -> io::Result<()> {
+    unsafe { install_masked_runtime_handler(signal, handler, extra_flags, 0) }
+}
+
+/// [`install_runtime_handler`] with `mask` as the action's `sa_mask`: the
+/// signals the kernel blocks, besides `signal` itself, while the handler runs
+/// and before its first instruction.
+///
+/// # Safety
+///
+/// As [`install_runtime_handler`].
+pub unsafe fn install_masked_runtime_handler(
+    signal: i32,
+    handler: unsafe extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void),
+    extra_flags: i32,
+    mask: u64,
+) -> io::Result<()> {
     let action = KernelSigaction {
         handler: handler as *const () as u64,
         flags: (libc::SA_SIGINFO | SA_RESTORER | extra_flags) as u64,
         restorer: signal_restorer(),
-        mask: 0,
+        mask,
     };
     unsafe { raw_sigaction(signal, Some(&action), None) }.map_err(io::Error::from_raw_os_error)
 }
@@ -184,12 +223,15 @@ pub unsafe fn install_sigsys_handler(
     on_alt_stack: bool,
 ) -> io::Result<()> {
     // Through the private restorer, so a filter can admit `rt_sigreturn` only
-    // there ([`install_runtime_handler`]).
+    // there ([`install_runtime_handler`]). Under the in-guest signal-delivery
+    // gate its mask is the runtime mask, so no guest signal is delivered from
+    // the trap on (`guest::runtime_mask`); otherwise none.
     unsafe {
-        install_runtime_handler(
+        install_masked_runtime_handler(
             libc::SIGSYS,
             handler,
             if on_alt_stack { libc::SA_ONSTACK } else { 0 },
+            crate::guest::runtime_mask::runtime_action_mask(),
         )
     }
 }
@@ -299,8 +341,13 @@ mod tests {
             ..KernelSigaction::default()
         };
         unsafe { raw_sigaction(signal, Some(&default), None) }.unwrap();
-        // The restorer's syscall is `mov eax, 15` (5 bytes) then `syscall` (2).
+        // The restorer's syscall instruction follows its number load:
+        // x86-64 `mov eax, 15` (5 bytes) + `syscall` (2); aarch64
+        // `mov x8, #139` (4) + `svc` (4). The return IP is just past it.
+        #[cfg(target_arch = "x86_64")]
         assert_eq!(signal_restorer_return_ip(), signal_restorer() + 7);
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(signal_restorer_return_ip(), signal_restorer() + 8);
     }
 
     #[test]

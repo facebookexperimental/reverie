@@ -159,7 +159,7 @@ fn child_exit_signal_into_guest_forwards_complete_outcomes_without_guest_effects
                     Arc::new(AdapterTool::default()),
                     memory,
                     &[],
-                    unsafe { std::mem::zeroed() },
+                    &crate::runtime::ZEROED_USER_REGISTERS,
                     &mut state,
                     &mut executor,
                     &(),

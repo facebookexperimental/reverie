@@ -188,6 +188,7 @@ fn guest_stack_owner_cell(force_legacy: bool) {
         (),
         Arc::new(()),
         TracedTaskOptions {
+            reserved_input: None,
             command_bootstrap: false,
             events: &events,
             injected_syscall_trap: None,
@@ -202,8 +203,8 @@ fn guest_stack_owner_cell(force_legacy: bool) {
     );
     traced.ptracer_waits.bind_stopped(&original);
     let stack = futures::executor::block_on(traced.stack());
-    let flag = stack.token.flag.clone();
-    assert!(flag.load(Ordering::SeqCst));
+    let arena = stack.token.arena();
+    assert_eq!(arena.live(), 1);
     assert_eq!(
         stack.task.stopped().generation(),
         generation,
@@ -216,61 +217,88 @@ fn guest_stack_owner_cell(force_legacy: bool) {
             .terminal_cleanup()
             .same_generation(&original.terminal_cleanup())
     );
-    drop(stack);
-    assert!(
-        !flag.load(Ordering::SeqCst),
-        "uncommitted drop releases the original checkout"
-    );
-
-    let mut stack = futures::executor::block_on(traced.stack());
-    const PAYLOAD: [u8; 16] = *b"retained-stack!!";
-    let address = stack.push(PAYLOAD);
-    let guard = stack.commit().unwrap();
-    assert!(flag.load(Ordering::SeqCst));
-    let mut actual = [0u8; 16];
-    original.read_exact(address.cast(), &mut actual).unwrap();
-    assert_eq!(actual, PAYLOAD);
     let overlap = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         futures::executor::block_on(traced.stack())
     }));
     assert!(
         overlap.is_err(),
-        "a real simultaneous checkout must still be refused"
+        "an uncommitted builder can grow and excludes another checkout"
     );
-    assert!(flag.load(Ordering::SeqCst));
+    assert_eq!(
+        arena.live(),
+        1,
+        "failed checkout cannot release the builder"
+    );
+    drop(stack);
+    assert_eq!(arena.live(), 0, "uncommitted drop releases its frame");
+
+    let mut stack = futures::executor::block_on(traced.stack());
+    const PAYLOAD: [u8; 16] = *b"retained-stack!!";
+    let address = stack.push(PAYLOAD);
+    let guard = stack.commit().unwrap();
+    assert_eq!(arena.live(), 1);
+    let mut actual = [0u8; 16];
+    original.read_exact(address.cast(), &mut actual).unwrap();
+    assert_eq!(actual, PAYLOAD);
+    // A committed outer frame is fixed. A nested frame must use disjoint
+    // addresses and preserve both byte patterns through commit and Drop.
+    let mut inner = futures::executor::block_on(traced.stack());
+    const INNER: [u8; 128] = [0x5a; 128];
+    let inner_address = inner.push(INNER);
+    assert!(inner_address.as_raw() + INNER.len() <= address.as_raw());
+    let inner_guard = inner.commit().unwrap();
+    assert_eq!(arena.live(), 2);
+    let mut actual_inner = [0u8; 128];
+    original
+        .read_exact(inner_address.cast(), &mut actual_inner)
+        .unwrap();
+    original.read_exact(address.cast(), &mut actual).unwrap();
+    assert_eq!(actual_inner, INNER);
+    assert_eq!(actual, PAYLOAD);
+    // Out-of-order drop must not release the inner frame's reservation.
     drop(guard);
-    assert!(
-        !flag.load(Ordering::SeqCst),
-        "committed guard drop releases the same checkout"
-    );
+    assert_eq!(arena.live(), 1);
+    let mut lower = futures::executor::block_on(traced.stack());
+    let lower_address = lower.push([0xa5u8; 16]);
+    assert!(lower_address.as_raw() + 16 <= inner_address.as_raw());
+    let lower_guard = lower.commit().unwrap();
+    original
+        .read_exact(inner_address.cast(), &mut actual_inner)
+        .unwrap();
+    assert_eq!(actual_inner, INNER);
+    drop(lower_guard);
+    drop(inner_guard);
+    assert_eq!(arena.live(), 0);
 
     let mut stack = futures::executor::block_on(traced.stack());
     let foreign_stop = generation.assume_stopped();
-    let foreign_flag = Arc::new(AtomicBool::new(false));
-    let foreign_flag_check = foreign_flag.clone();
+    let foreign_arena = Arc::new(StackArena::default());
+    let foreign_arena_check = foreign_arena.clone();
     let (returned, refused) = std::thread::spawn(move || {
         let mut bytes = [0u8; 16];
         assert_eq!(stack.read(address.cast(), &mut bytes), Err(Errno::EPERM));
-        let refused = GuestStack::new_on_ptracer_thread(foreign_stop, foreign_flag);
+        let refused = GuestStack::new_on_ptracer_thread(foreign_stop, foreign_arena);
         assert!(matches!(refused, Err(TraceError::Errno(Errno::EPERM))));
-        (stack, foreign_flag_check)
+        (stack, foreign_arena_check)
     })
     .join()
     .unwrap();
     stack = returned;
-    assert!(
-        !refused.load(Ordering::SeqCst),
-        "constructor refusal must release its token"
+    assert_eq!(
+        refused.live(),
+        0,
+        "constructor refusal must reserve no frame"
     );
     assert_eq!(stack.task.stopped().generation(), generation);
-    assert!(
-        flag.load(Ordering::SeqCst),
-        "foreign refusal must not release the live owner's checkout"
+    assert_eq!(
+        arena.live(),
+        1,
+        "foreign refusal must not release the owner"
     );
     stack.read_exact(address.cast(), &mut actual).unwrap();
     assert_eq!(actual, PAYLOAD);
     drop(stack);
-    assert!(!flag.load(Ordering::SeqCst));
+    assert_eq!(arena.live(), 0);
     assert_eq!(original.generation(), generation);
     original.getregs().unwrap();
     let running = original.resume(None).unwrap();

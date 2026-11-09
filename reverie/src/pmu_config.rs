@@ -1,14 +1,112 @@
 //! Shared PMU configuration mechanics. One process configuration and override.
+use std::sync::Mutex;
 use std::sync::OnceLock;
 
 use thiserror::Error;
 
 use crate::Errno;
 use crate::perf::Event;
+#[cfg(target_arch = "x86_64")]
+pub use crate::pmu::RcbMetric;
+#[cfg(not(target_arch = "x86_64"))]
+pub use pmu_shim::RcbMetric;
+#[cfg(not(target_arch = "x86_64"))]
+mod pmu_shim {
+    /// Interim non-x86 stand-in for the x86 PMU metric vocabulary:
+    /// no host qualifies, so RCB stays unmeasured there.
+    #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+    pub enum RcbMetric {
+        /// Every retired conditional branch, user mode only.
+        ConditionalBranchesRetiredUserV1,
+    }
+    impl RcbMetric {
+        /// The stable identifier histories store.
+        pub const fn id(self) -> &'static str {
+            match self {
+                Self::ConditionalBranchesRetiredUserV1 => "rcb:cond-retired:user:v1",
+            }
+        }
+        /// The metric a stored identifier names.
+        pub fn from_id(id: &str) -> Option<Self> {
+            match id {
+                "rcb:cond-retired:user:v1" => Some(Self::ConditionalBranchesRetiredUserV1),
+                _ => None,
+            }
+        }
+    }
+    pub struct PmuProfile;
+    impl PmuProfile {
+        pub fn for_family_model(_family_id: u8, _model_id: u8) -> Option<Self> {
+            None
+        }
+        pub fn metric(&self) -> Option<RcbMetric> {
+            None
+        }
+        pub fn raw_rcb_event(&self) -> u64 {
+            0
+        }
+    }
+    pub fn vendor_has_family(_vendor: &str, _family_id: u8) -> bool {
+        false
+    }
+}
 // Used by both the preserved validation diagnostic and its ptrace probe.
+#[cfg(target_arch = "x86_64")]
+fn pmu_vendor_has_family(vendor: &str, family_id: u8) -> bool {
+    crate::pmu::vendor_has_family(vendor, family_id)
+}
+#[cfg(not(target_arch = "x86_64"))]
+fn pmu_vendor_has_family(vendor: &str, family_id: u8) -> bool {
+    pmu_shim::vendor_has_family(vendor, family_id)
+}
+#[cfg(target_arch = "x86_64")]
+fn pmu_profile_for_family_model(family_id: u8, model_id: u8) -> Option<crate::pmu::PmuProfile> {
+    crate::pmu::PmuProfile::for_family_model(family_id, model_id)
+}
+#[cfg(not(target_arch = "x86_64"))]
+fn pmu_profile_for_family_model(family_id: u8, model_id: u8) -> Option<pmu_shim::PmuProfile> {
+    pmu_shim::PmuProfile::for_family_model(family_id, model_id)
+}
+
 #[cfg(target_arch = "x86_64")]
 #[doc(hidden)]
 pub const RETIRED_LOCK_INSTRUCTIONS_EVENT: u64 = 0x510f25;
+/// A performance-counter count that either was measured over a window in
+/// which its counter ran throughout, or was not measured at all. Diagnostics
+/// use this instead of an integer so an unscheduled window prints as
+/// `unmeasured`, never as an invented count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MeasuredCount {
+    /// The counter ran for the whole window and yielded this delta.
+    Measured(i64),
+    /// The counter did not run for the whole window; there is no count.
+    Unmeasured,
+}
+
+impl core::fmt::Display for MeasuredCount {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            MeasuredCount::Measured(count) => write!(f, "{count}"),
+            MeasuredCount::Unmeasured => write!(f, "unmeasured"),
+        }
+    }
+}
+
+impl From<Option<i64>> for MeasuredCount {
+    fn from(count: Option<i64>) -> Self {
+        match count {
+            Some(count) => MeasuredCount::Measured(count),
+            None => MeasuredCount::Unmeasured,
+        }
+    }
+}
+
+impl From<i64> for MeasuredCount {
+    fn from(count: i64) -> Self {
+        MeasuredCount::Measured(count)
+    }
+}
+
 /// Why this host's performance counters failed validation. See
 /// `reverie_ptrace::pmu_validation`.
 #[derive(Error, Debug)]
@@ -94,22 +192,24 @@ pub enum PmuValidationError {
     #[cfg(target_arch = "x86_64")]
     #[error(
         "On AMD Zen CPUs, reverie timers will not work reliably unless you disable the \
-        hardware SpecLockMap optimization ({speclockmap_commits} of \
-        {locked_instructions} locked instructions were SpecLockMap commits). For \
+        hardware SpecLockMap optimization (the check counted \
+        {speclockmap_commits} SpecLockMap commits and {locked_instructions} \
+        locked instructions). For \
         instructions on how to do this, see https://github.com/rr-debugger/rr/wiki/Zen"
     )]
     AmdSpecLockMapShouldBeDisabled {
         /// How many SpecLockMap commits the check counted.
         speclockmap_commits: i64,
-        /// How many locked instructions the check counted.
-        locked_instructions: i64,
+        /// How many locked instructions the check counted, or
+        /// [`MeasuredCount::Unmeasured`] when that counter did not run
+        /// for the whole window in the attempt that counted the commits.
+        locked_instructions: MeasuredCount,
     },
 
-    /// The SpecLockMap check counted no SpecLockMap commits, but fewer locked
-    /// instructions than it executed, so its zero shows nothing. This happens
-    /// when the retired-lock event (AMD PMCx025) counts nothing, as under a
-    /// hypervisor that filters it, and could happen on a Zen part whose
-    /// PMCx025 does not count every locked instruction.
+    /// The retired-lock pipeline counted nothing at all, so the check's
+    /// zero commit count shows nothing. This happens when the
+    /// retired-lock event (AMD PMCx025) counts nothing, as under a
+    /// hypervisor that filters it.
     #[cfg(target_arch = "x86_64")]
     #[error(
         "The AMD Zen SpecLockMap check is inconclusive: it executed {executed} locked \
@@ -122,6 +222,72 @@ pub enum PmuValidationError {
         counted: i64,
         /// How many locked instructions the check executed.
         executed: usize,
+    },
+
+    /// A performance counter the SpecLockMap check depends on was not
+    /// scheduled for the whole measurement window (its perf
+    /// `time_running` never caught up with `time_enabled`, e.g. it was
+    /// multiplexed out under load), in every bounded attempt. Its
+    /// reading is not a measurement - in particular it is not a
+    /// counted zero - so the check refuses as inconclusive rather
+    /// than let a verdict consume it as a count.
+    #[cfg(target_arch = "x86_64")]
+    #[error(
+        "The AMD Zen SpecLockMap check is inconclusive: the {counter} performance \
+        counter was not scheduled for the whole measurement window in {attempts} \
+        attempts (time_running < time_enabled), so its reading is unmeasured and \
+        cannot decide. See https://github.com/rr-debugger/rr/wiki/Zen"
+    )]
+    SpecLockMapCounterUnmeasured {
+        /// Which counter(s) never ran for a whole window.
+        counter: String,
+        /// How many bounded measurement attempts were made.
+        attempts: usize,
+    },
+
+    /// The retired-branch counter counted more branches over a loop of
+    /// locked instructions than over a branch-matched loop without
+    /// them: locked instructions are inflating the branch count, which
+    /// is the harm SpecLockMap does to branch counting whether or not
+    /// its own commit counter moved.
+    #[cfg(target_arch = "x86_64")]
+    #[error(
+        "The retired-branch counter counted {branches_with_locks} branches over a loop of \
+        locked instructions against {branches} over the same loop without them: locked \
+        instructions inflate the branch count on this host, as SpecLockMap does when it \
+        is not disabled. See https://github.com/rr-debugger/rr/wiki/Zen"
+    )]
+    AmdSpecLockMapBranchOvercount {
+        /// Branches counted over the branches-only loop.
+        branches: i64,
+        /// Branches counted over the branch-matched locked loop.
+        branches_with_locks: i64,
+    },
+
+    /// The direct branch-counter test could not establish its own
+    /// exactness: the branches-only loop did not read the identical
+    /// count twice, read fewer branches than it executed, read beyond
+    /// the fixed loop overhead the test accepts, or the locked loop
+    /// read fewer branches than the branches-only loop.
+    /// The counter's output shows nothing on this host, so the check
+    /// refuses rather than pass.
+    #[cfg(target_arch = "x86_64")]
+    #[error(
+        "The AMD Zen branch-counter check is inconclusive: a loop of exactly the same \
+        conditional branches read {branches} then {branches_repeat}, and with a locked \
+        instruction per iteration {branches_with_locks}; an exact counter must read the \
+        identical count every time. See https://github.com/rr-debugger/rr/wiki/Zen"
+    )]
+    BranchCounterCheckInconclusive {
+        /// Branches counted over the first branches-only loop, or
+        /// unmeasured if that counter window did not run throughout.
+        branches: MeasuredCount,
+        /// Branches counted over the repeated branches-only loop, or
+        /// unmeasured if that counter window did not run throughout.
+        branches_repeat: MeasuredCount,
+        /// Branches counted over the branch-matched locked loop, or
+        /// unmeasured if that counter window did not run throughout.
+        branches_with_locks: MeasuredCount,
     },
 
     #[cfg(target_arch = "x86_64")]
@@ -137,7 +303,7 @@ pub enum PmuValidationError {
 pub const SINGLESTEP_TIMEOUT_RCBS: u64 = 5;
 
 /// The largest default skid margin of any processor in the PMU table
-/// (`crate::pmu::PmuProfile`, and 1000 on aarch64): that of the AMD Zen
+/// (`crate::pmu::PmuProfile`, and at most 2,700 on aarch64): that of the AMD Zen
 /// processors without a measured 1K entry. A unit test checks it against the
 /// whole table.
 pub const LARGEST_TABLE_SKID_MARGIN: u64 = 10_000;
@@ -162,10 +328,11 @@ pub const SKID_MARGIN_OVERRIDE_ENV: &str = "REVERIE_SKID_MARGIN_OVERRIDE";
 
 /// The overflow interrupt latency, in nanoseconds, that the second stage of a
 /// staged precise timer event leaves room for by default (see
-/// [`PmuConfig::stages`]). Measured on AMD family 1Ah, the latency was 43 ns
-/// at the median and 185 ns at the 99th percentile, and reached about 590 ns
-/// in a noisy hour (<https://github.com/rrnewton/hermit/issues/3810>). The
-/// tail grows with contention for the guest's core. For a loop retiring
+/// [`PmuConfig::stages`]), on every architecture but aarch64. Measured on AMD
+/// family 1Ah, the latency was 43 ns at the median and 185 ns at the 99th
+/// percentile, and reached about 590 ns in a noisy hour
+/// (<https://github.com/rrnewton/hermit/issues/3810>). The tail grows with
+/// contention for the guest's core. For a loop retiring
 /// about 2.9 RCBs per ns, the largest second-stage skid in 64 to 96
 /// notifications was 134 RCBs (about 45 ns) unloaded, 823 (about 280 ns)
 /// with the SMT sibling thrashing memory, and 1,631 (about 560 ns) with three
@@ -174,13 +341,56 @@ pub const SKID_MARGIN_OVERRIDE_ENV: &str = "REVERIE_SKID_MARGIN_OVERRIDE";
 /// times by 41 to 837 RCBs: notifications 0.7 to 0.95 µs late. 2,000 ns is
 /// about twice that. Only a guest retiring more than 1 RCB per ns
 /// (the skid margin over this budget) gets a margin above the skid margin.
+#[cfg(not(target_arch = "aarch64"))]
 pub const DEFAULT_SKID_LATENCY_BUDGET_NS: u64 = 2_000;
+
+/// On aarch64, the overflow interrupt latency that the second stage of a
+/// staged precise timer event leaves room for by default (see
+/// [`PmuConfig::stages`]). Measured on Neoverse V2 only, on bare metal and in
+/// a KVM guest that passes the core through, and untested on other cores such
+/// as Cortex-A78: the timer's own notifications came at most 379 RCBs past
+/// the overflow on a loop retiring about 2.1 RCBs per ns (about 180 ns; 358
+/// events, idle and with every CPU busy), and an overflow armed on a ptraced
+/// loop at about 3.3 RCBs per ns stopped at most 194 RCBs past it (about
+/// 60 ns). 400 ns is about twice the longer of the two latencies. The x86
+/// budget, sized for AMD's microsecond latency tail, put the second stage of
+/// that loop 4,200 to 4,800 RCBs short of its target, every one stepped an
+/// instruction at a time, as arm64 has no block step. The budget changes a
+/// margin only where the rate times the budget exceeds the skid margin.
+/// No latency budget covers a notification that comes microseconds late or
+/// not at all, as a virtual PMU's sometimes does (seen 2,180 to 8,101 RCBs
+/// past the target in an emulator under load); such an event is reported as
+/// an overshoot.
+#[cfg(target_arch = "aarch64")]
+pub const DEFAULT_SKID_LATENCY_BUDGET_NS: u64 = 400;
 
 /// When set to a parseable `u64`, this env var replaces
 /// [`DEFAULT_SKID_LATENCY_BUDGET_NS`] for the whole process. `0` stages no
 /// precise event, so that each is programmed at the skid margin. A value that
 /// does not parse as `u64` is ignored (default retained).
 pub const SKID_LATENCY_BUDGET_ENV: &str = "REVERIE_SKID_LATENCY_BUDGET_NS";
+
+/// When set to `0`, this env var turns halved notification stages off for the
+/// whole process (see [`PmuConfig::halves`]); `1` turns them on. Any other
+/// value is ignored (default retained).
+pub const HALVE_TIMER_STAGES_ENV: &str = "REVERIE_HALVE_TIMER_STAGES";
+
+/// A precise event's notification is programmed halfway while it is due
+/// more than its margin divided by this ahead (see [`PmuConfig::halves`]).
+/// The last, whole programming's period is then at most half its margin, so
+/// an overflow of it that the kernel absorbs notifies one period later, at
+/// most the whole margin from the programming, still short of the target.
+pub const HALVING_STOP_DIVISOR: u64 = 2;
+
+/// Whether precise event notifications are halved by default (see
+/// [`PmuConfig::halves`]): on aarch64 only. In an aarch64 KVM guest under
+/// load, about one notification in four thousand was absorbed, and 11 runs
+/// in 24 of a guest that blocks often overshot; halving cut that to 5 in 24
+/// (a repeat gave 10 and 4) for 2% to 15% more wall time. On x86 bare metal no
+/// notification was absorbed in 40,000 events, and the extra stops, whose
+/// cost was within the noise of a loaded host, would buy nothing measured.
+/// [`HALVE_TIMER_STAGES_ENV`] turns it on or off.
+pub const HALVE_STAGES_BY_DEFAULT: bool = cfg!(target_arch = "aarch64");
 
 /// Supervisor-only witness nonce. When the consuming harness (the hermit
 /// *supervisor*) sets this env var, its exact value is stamped into every
@@ -191,11 +401,10 @@ pub const SKID_LATENCY_BUDGET_ENV: &str = "REVERIE_SKID_LATENCY_BUDGET_NS";
 /// marker in its plain (unauthenticated) shape.
 pub const WITNESS_TOKEN_ENV: &str = "HERMIT_SKID_WITNESS_TOKEN";
 
-static PMU_CONFIG: OnceLock<PmuConfig> = OnceLock::new();
-
-/// The skid margin [`set_skid_margin_override`] recorded, applied to the PMU
-/// configuration when it is first built.
-static SKID_MARGIN_OVERRIDE: OnceLock<u64> = OnceLock::new();
+/// The process's PMU state: its configuration, the margin
+/// [`set_skid_margin_override`] recorded, and the clock key a qualified
+/// history producer or consumer pinned.
+static PMU_STATE: PmuState = PmuState::new();
 
 /// The process's PMU configuration, which must already exist: every caller
 /// runs after `reverie_ptrace::timer::TimerImpl::new` or `reverie_ptrace::validation` has built it through
@@ -209,10 +418,13 @@ pub fn get_pmu_config() -> &'static PmuConfig {
 /// configuration was set and this CPU has no profile.
 #[doc(hidden)]
 pub fn try_get_pmu_config() -> Option<&'static PmuConfig> {
-    match PMU_CONFIG.get() {
-        Some(config) => Some(config),
-        None => PmuConfig::try_new().map(|config| PMU_CONFIG.get_or_init(|| config)),
-    }
+    PMU_STATE.get_or_install(PmuConfig::try_new)
+}
+
+/// The process's PMU state (see [`PmuState`]).
+#[doc(hidden)]
+pub fn pmu_state() -> &'static PmuState {
+    &PMU_STATE
 }
 
 /// Processor-specific PMU event settings used by precise ptrace timers.
@@ -223,6 +435,8 @@ pub struct PmuConfig {
     skid_margin: u64,
     skid_margin_override: Option<u64>,
     skid_latency_budget_ns: u64,
+    halve_stages: bool,
+    metric: Option<RcbMetric>,
 }
 
 impl PmuConfig {
@@ -276,21 +490,24 @@ impl PmuConfig {
     /// Creates / initializes the PMU config.
     #[cfg(target_arch = "aarch64")]
     pub fn new() -> Result<Self, PmuValidationError> {
-        // TODO:
-        //  1. Compute the microarchitecture from
-        //     `/sys/devices/system/cpu/cpu*/regs/identification/midr_el1`
-        //  2. Look up the microarchitecture in a table to determine what features
-        //     we can enable.
+        // Every Armv8 PMU implements the architectural BR_RETIRED event, and
+        // Linux's generic branch event does not map to it on every PMU driver,
+        // so the raw event is used.
         // References:
         //  - https://github.com/rr-debugger/rr/blob/master/src/PerfCounters.cc#L156
         const BR_RETIRED: u64 = 0x21;
 
-        // For now, always assume that we can get retired branch events.
+        let midrs = host_midrs();
+        let skid_margin = aarch64_skid_margin(&midrs);
+        tracing::debug!("aarch64 skid margin {skid_margin} for CPU MIDRs {midrs:x?}");
         Ok(Self {
             rcb_event: BR_RETIRED,
-            skid_margin: 1000,
+            skid_margin,
             skid_margin_override: None,
             skid_latency_budget_ns: DEFAULT_SKID_LATENCY_BUDGET_NS,
+            halve_stages: HALVE_STAGES_BY_DEFAULT,
+            // What BR_RETIRED counts is not qualified for recorded histories.
+            metric: None,
         }
         .with_env_overrides()
         .with_recorded_skid_margin())
@@ -306,12 +523,23 @@ impl PmuConfig {
     #[cfg(target_arch = "x86_64")]
     #[doc(hidden)]
     pub fn try_from_family_model(family_id: u8, model_id: u8) -> Option<Self> {
-        crate::pmu::PmuProfile::for_family_model(family_id, model_id).map(|profile| Self {
+        pmu_profile_for_family_model(family_id, model_id).map(|profile| Self {
             rcb_event: profile.raw_rcb_event(),
             skid_margin: profile.default_skid_margin(),
             skid_margin_override: None,
             skid_latency_budget_ns: DEFAULT_SKID_LATENCY_BUDGET_NS,
+            halve_stages: HALVE_STAGES_BY_DEFAULT,
+            metric: profile.metric(),
         })
+    }
+
+    /// The key a pinned history clock compares: this configuration's event
+    /// and what it counts.
+    pub fn clock_key(&self) -> ClockKey {
+        ClockKey {
+            raw_event: self.rcb_event,
+            metric: self.metric,
+        }
     }
 
     /// Overrides the processor-specific skid margin while preserving the detected PMU event.
@@ -327,10 +555,35 @@ impl PmuConfig {
         self
     }
 
-    /// Applies the env overrides: [`SKID_MARGIN_OVERRIDE_ENV`] and
-    /// [`SKID_LATENCY_BUDGET_ENV`].
+    /// Turns halved notification stages on or off (see [`Self::halves`]).
+    pub fn with_halved_stages(mut self, halve: bool) -> Self {
+        self.halve_stages = halve;
+        self
+    }
+
+    /// Applies the env overrides: [`SKID_MARGIN_OVERRIDE_ENV`],
+    /// [`SKID_LATENCY_BUDGET_ENV`] and [`HALVE_TIMER_STAGES_ENV`].
     fn with_env_overrides(self) -> Self {
-        self.with_skid_margin_env().with_skid_latency_budget_env()
+        self.with_skid_margin_env()
+            .with_skid_latency_budget_env()
+            .with_halved_stages_env()
+    }
+
+    /// Applies the [`HALVE_TIMER_STAGES_ENV`] override, if the env var is `0`
+    /// or `1`.
+    fn with_halved_stages_env(self) -> Self {
+        match std::env::var(HALVE_TIMER_STAGES_ENV)
+            .as_deref()
+            .map(str::trim)
+        {
+            Ok("0") => self.with_halved_stages(false),
+            Ok("1") => self.with_halved_stages(true),
+            Ok(raw) => {
+                eprintln!("[reverie-ptrace] ignoring {HALVE_TIMER_STAGES_ENV}={raw:?}: not 0 or 1");
+                self
+            }
+            Err(_) => self,
+        }
     }
 
     /// Applies the margin [`set_skid_margin_override`] recorded, if any. It is
@@ -338,10 +591,7 @@ impl PmuConfig {
     /// [`SKID_MARGIN_OVERRIDE_ENV`], as an explicit override built from
     /// [`Self::new`] always did.
     fn with_recorded_skid_margin(self) -> Self {
-        match SKID_MARGIN_OVERRIDE.get() {
-            Some(&margin) => self.with_skid_margin_override(margin),
-            None => self,
-        }
+        PMU_STATE.with_recorded_margin(self)
     }
 
     /// Applies the [`SKID_LATENCY_BUDGET_ENV`] override, if the env var is
@@ -427,9 +677,12 @@ impl PmuConfig {
     ///
     /// Short of the target by more than the processor's skid margin plus the
     /// single steps of an artificial notification
-    /// ([`Self::max_single_step_count`]), the programming has not passed its
-    /// period, and no notification can be pending, taken or lost. Closer, one
-    /// of those holds as host interrupt timing decides. Using the largest
+    /// ([`Self::max_single_step_count`]), a whole programming has not passed
+    /// its period, and no notification can be pending, taken or lost. Closer,
+    /// one of those holds as host interrupt timing decides. A halved
+    /// programming (see [`Self::halves`]) can pass its period farther away,
+    /// but its notification, pending, taken or lost, only programs the rest
+    /// of the event, so the stop's outcome is the same either way. Using the largest
     /// margin of any processor in the PMU table,
     /// `LARGEST_TABLE_SKID_MARGIN`, instead of this processor's own gives a
     /// stop the same outcome on every supported processor, since each
@@ -495,6 +748,39 @@ impl PmuConfig {
             && ticks > self.first_stage_margin() + SINGLESTEP_TIMEOUT_RCBS
     }
 
+    /// Whether a precise event's notification, due `notification` RCBs from
+    /// its programming and `margin` RCBs short of its target, is programmed
+    /// halfway instead, at `notification / 2`. Its stop then programs the rest
+    /// the same way, until the notification is due at most half its margin
+    /// ahead ([`HALVING_STOP_DIVISOR`]).
+    ///
+    /// The kernel can absorb an overflow without notifying it. A sampling
+    /// counter that passed its period while its thread was switched in, but
+    /// whose overflow interrupt had not been handled when the thread was
+    /// switched out, is reprogrammed at the next switch-in for the following
+    /// period, and the overflow that period consumed raises no notification:
+    /// arm64's `armpmu_start` and x86's `x86_pmu_start` both ignore what the
+    /// period setter returns. The counter's next overflow comes one period
+    /// later. A late interrupt widens the window, as in a virtual machine,
+    /// where one PMU interrupt in a few thousand arrived a whole period late.
+    /// With the period halved, one absorbed overflow still notifies at the
+    /// whole distance, `margin` short of the target, instead of a period past
+    /// it. The last programming is whole, and its period is at most half the
+    /// margin, so one absorbed overflow of it notifies at most twice that
+    /// period from the programming: at least half the margin short of the
+    /// target, which leaves half the margin for the interrupt's skid. Each
+    /// halving adds one notification stop; the delivery point is unchanged,
+    /// as with staging (see [`Self::stages`]).
+    ///
+    /// No notification is halved under a skid margin override, as none is
+    /// staged, nor one whose half an artificial notification would replace.
+    pub fn halves(&self, notification: u64, margin: u64) -> bool {
+        self.halve_stages
+            && self.skid_margin_override.is_none()
+            && notification / 2 > SINGLESTEP_TIMEOUT_RCBS
+            && notification.saturating_mul(HALVING_STOP_DIVISOR) > margin.max(self.skid_margin())
+    }
+
     /// The margin of the second stage of a staged precise event (see
     /// [`Self::stages`]), whose first stage's notification came `rcbs` RCBs
     /// and `elapsed_ns` nanoseconds after its programming: the RCBs retired
@@ -540,9 +826,10 @@ impl PmuConfig {
     /// then return `true`. A non-overshoot (`rcb_actual <= rcb_target`) records
     /// nothing and returns `false`.
     ///
-    /// `TimerImpl::attempt_single_step`'s late-delivery guard is the sole runtime
-    /// caller, so a unit test that drives real `(actual, target)` pairs through
-    /// this method exercises exactly the behaviour the supervisor runs — a
+    /// `TimerImpl::record_late_delivery`, the late-delivery guard of
+    /// `TimerImpl::attempt_single_step`, is the sole runtime caller, so a
+    /// unit test that drives real `(actual, target)` pairs through this
+    /// method exercises exactly the behaviour the supervisor runs — a
     /// genuine overshoot causes exactly one witness record — without needing a
     /// live guest or PMU. The boolean return is what makes that behaviour
     /// (not merely the marker arithmetic) observable in a test.
@@ -558,6 +845,32 @@ impl PmuConfig {
         }
     }
 
+    /// Decision-and-record site for the notification of a precise event with
+    /// an instruction offset, before any step: iff the notification found the
+    /// guest at or past the target branch, emit the canonical
+    /// [`SKID_OVERSHOOT_MARKER`] line, increment the process-global witness
+    /// counter, and return `true`. The guest may have run any number of
+    /// instructions past the target branch before the notification stopped
+    /// it, and counting the offset from there would place the event where
+    /// host timing left the guest, so it is delivered at the observed
+    /// counter instead, as a late notification is. Without an offset an
+    /// event at its target is delivered where it was found, as before, and
+    /// only one past it is recorded ([`Self::record_overshoot_if_past_target`]).
+    pub fn record_offset_notification_at_or_past_target(
+        &self,
+        rcb_actual: u64,
+        rcb_target: u64,
+        instr_offset: u64,
+    ) -> bool {
+        if instr_offset > 0 && rcb_actual >= rcb_target {
+            self.emit_skid_overshoot_marker(rcb_actual, rcb_target);
+            crate::record_skid_overshoot();
+            true
+        } else {
+            false
+        }
+    }
+
     /// Single decision-and-record site for a precise event that another
     /// Tool-observable stop overtook: iff the guest had already reached the
     /// event's delivery point, emit the canonical [`SKID_OVERSHOOT_MARKER`]
@@ -565,22 +878,17 @@ impl PmuConfig {
     ///
     /// Unlike a late delivery, the event itself is lost here, so reaching the
     /// delivery point exactly already counts: the event was due before the
-    /// stop. With an instruction offset the delivery point lies `instr_offset`
-    /// instructions past the target branch, and those instructions may include
-    /// further branches (see `ClockCounter::single_step_with_clock`). The
-    /// counter alone cannot show instruction progress, but every branch past
-    /// the target is at least one instruction, so `rcb_actual - rcb_target >=
-    /// instr_offset` proves the guest got there. A stop with fewer branches
-    /// past the target is not recorded, even if the delivery point was in fact
-    /// reached. `TimerImpl::commit_missed`, for a stop that retires the event,
-    /// is the sole runtime caller.
-    pub fn record_missed_if_target_reached(
-        &self,
-        rcb_actual: u64,
-        rcb_target: u64,
-        instr_offset: u64,
-    ) -> bool {
-        let reached = target_reached(rcb_actual, rcb_target, instr_offset);
+    /// stop. With an instruction offset the delivery point lies some
+    /// instructions past the target branch, and the counter cannot show how
+    /// many instructions the guest ran past that branch before the stop, so
+    /// any stop at or past the target may have passed the delivery point and
+    /// is recorded too (see [`target_reached`]). The runtime callers are
+    /// reverie-ptrace's `TimerImpl::commit_missed`, for a stop that retires the
+    /// event, and reverie-kvm's preemption timer, for an exit at which a precise
+    /// request's target was reached: such an exit does not stop the guest at
+    /// the delivery point, so even an exact arrival there is late.
+    pub fn record_missed_if_target_reached(&self, rcb_actual: u64, rcb_target: u64) -> bool {
+        let reached = target_reached(rcb_actual, rcb_target);
         if reached {
             self.emit_skid_overshoot_marker(rcb_actual, rcb_target);
             crate::record_skid_overshoot();
@@ -630,7 +938,7 @@ impl PmuConfig {
 /// Returns the supplied configuration if a timer has already initialized the process-wide
 /// configuration. Callers should install overrides before spawning a `reverie_ptrace::Tracer`.
 pub fn set_pmu_config(config: PmuConfig) -> Result<(), PmuConfig> {
-    PMU_CONFIG.set(config)
+    PMU_STATE.set(config)
 }
 
 /// Records `skid_margin` as the margin of the PMU configuration this process
@@ -642,11 +950,7 @@ pub fn set_pmu_config(config: PmuConfig) -> Result<(), PmuConfig> {
 /// or the configuration was built or set, because it would then be lost.
 /// Record it before spawning a `reverie_ptrace::Tracer`.
 pub fn set_skid_margin_override(skid_margin: u64) -> Result<(), u64> {
-    record_skid_margin(
-        &SKID_MARGIN_OVERRIDE,
-        PMU_CONFIG.get().is_some(),
-        skid_margin,
-    )
+    PMU_STATE.set_skid_margin(skid_margin)
 }
 
 /// Whether this host's CPU has a PMU profile, the precondition for a ptrace
@@ -661,6 +965,81 @@ pub fn host_pmu_profile() -> Result<(), PmuValidationError> {
         .ok_or(PmuValidationError::CouldNotReadCpuInfo)?;
     PmuConfig::for_family_model(features.family_id(), features.model_id()).map(drop)
 }
+
+/// The `MIDR_EL1` of every CPU Linux lists (`cpuN`), `None` for one whose
+/// MIDR cannot be read: Linux removes an offline CPU's `regs/identification`
+/// and shows an empty `midr_el1` for one that never came up. A CPU that comes
+/// online later is not seen. A big.LITTLE host lists more than one part.
+#[cfg(target_arch = "aarch64")]
+fn host_midrs() -> Vec<Option<u64>> {
+    let Ok(cpus) = std::fs::read_dir("/sys/devices/system/cpu") else {
+        return Vec::new();
+    };
+    let is_cpu = |name: &str| {
+        name.strip_prefix("cpu")
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    };
+    cpus.filter_map(Result::ok)
+        .filter(|cpu| cpu.file_name().to_str().is_some_and(is_cpu))
+        .map(|cpu| {
+            let path = cpu.path().join("regs/identification/midr_el1");
+            parse_midr(&std::fs::read_to_string(path).ok()?)
+        })
+        .collect()
+}
+
+/// A `midr_el1` file's value, which Linux prints as `0x%016llx\n`
+/// (`CPUREGS_ATTR_RO`, arch/arm64/kernel/cpuinfo.c). An empty file, for a CPU
+/// that never came up, is `None`.
+#[cfg(target_arch = "aarch64")]
+fn parse_midr(text: &str) -> Option<u64> {
+    u64::from_str_radix(text.trim().strip_prefix("0x")?, 16).ok()
+}
+
+/// The BR_RETIRED skid margin for a host whose CPUs have these `MIDR_EL1`
+/// values: the largest of their margins, where a part without a measured
+/// margin, or a MIDR that could not be read, counts as
+/// [`AARCH64_UNKNOWN_SKID_MARGIN`], as does a host with no CPUs listed.
+#[cfg(target_arch = "aarch64")]
+fn aarch64_skid_margin(midrs: &[Option<u64>]) -> u64 {
+    const ARM: u64 = 0x41;
+    const NEOVERSE_V2: u64 = 0xd4f;
+    let part_margin = |midr: Option<u64>| match midr.map(|m| ((m >> 24) & 0xff, (m >> 4) & 0xfff)) {
+        Some((ARM, NEOVERSE_V2)) => NEOVERSE_V2_SKID_MARGIN,
+        _ => AARCH64_UNKNOWN_SKID_MARGIN,
+    };
+    midrs
+        .iter()
+        .map(|&midr| part_margin(midr))
+        .max()
+        .unwrap_or(AARCH64_UNKNOWN_SKID_MARGIN)
+}
+
+// The skid margins below were measured by arming an overflow signal on a
+// ptraced task and reading how far past the period it stopped, with periods of
+// 1e4 to 1e6 branches.
+
+/// Arm Neoverse V2: about twice the largest skid seen. On bare metal an
+/// overflow armed on a ptraced loop stopped at most 194 branches past its
+/// period (1,200 samples, idle and with every CPU busy), and the timer's own
+/// events overshot by at most 245 with a margin of 1 (2,001 events over four
+/// programs). In a KVM guest whose virtual PMU reports this core, the timer's
+/// own events skidded by at most 379 (358 events, idle and loaded). Every
+/// margin step costs single steps of about four instructions each, as arm64
+/// has no block step.
+#[cfg(target_arch = "aarch64")]
+const NEOVERSE_V2_SKID_MARGIN: u64 = 750;
+
+/// Any other core: more than twice the largest skid measured on any core,
+/// Cortex-A78C's 1,301.
+#[cfg(target_arch = "aarch64")]
+const AARCH64_UNKNOWN_SKID_MARGIN: u64 = 2_700;
+
+#[cfg(target_arch = "aarch64")]
+const _: () = assert!(
+    NEOVERSE_V2_SKID_MARGIN <= LARGEST_TABLE_SKID_MARGIN
+        && AARCH64_UNKNOWN_SKID_MARGIN <= LARGEST_TABLE_SKID_MARGIN
+);
 
 /// Every aarch64 CPU gets a configuration ([`PmuConfig::new`]).
 #[cfg(target_arch = "aarch64")]
@@ -682,12 +1061,780 @@ pub fn record_skid_margin(
     slot.set(skid_margin)
 }
 
-/// Whether a stop at `rcb_actual` has reached the delivery point of a precise
-/// event `instr_offset` instructions past `rcb_target`, as far as the counter
-/// can show. See [`PmuConfig::record_missed_if_target_reached`].
+/// Whether a stop at `rcb_actual` may have reached the delivery point of a
+/// precise event whose target branch is `rcb_target`. That holds at the
+/// target itself with or without an instruction offset: with one, the stop
+/// has run an unknown number of instructions past the target branch, each
+/// of which may be one of the offset's, so fewer further branches than
+/// offset instructions do not show that the delivery point is still ahead.
+/// See [`PmuConfig::record_missed_if_target_reached`].
 #[doc(hidden)]
-pub fn target_reached(rcb_actual: u64, rcb_target: u64, instr_offset: u64) -> bool {
-    rcb_actual
-        .checked_sub(rcb_target)
-        .is_some_and(|past| past >= instr_offset)
+pub fn target_reached(rcb_actual: u64, rcb_target: u64) -> bool {
+    rcb_actual >= rcb_target
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+mod aarch64_tests {
+    use super::*;
+
+    const NEOVERSE_V2: Option<u64> = Some(0x410f_d4f0);
+    // Cortex-A78C, which has no measured margin of its own.
+    const CORTEX_A78C: Option<u64> = Some(0x410f_d4b2);
+
+    #[test]
+    fn neoverse_v2_takes_its_measured_margin() {
+        assert_eq!(
+            aarch64_skid_margin(&[NEOVERSE_V2; 4]),
+            NEOVERSE_V2_SKID_MARGIN
+        );
+    }
+
+    #[test]
+    fn a_host_with_several_parts_takes_the_largest_margin() {
+        assert_eq!(
+            aarch64_skid_margin(&[NEOVERSE_V2, CORTEX_A78C, NEOVERSE_V2]),
+            AARCH64_UNKNOWN_SKID_MARGIN
+        );
+    }
+
+    #[test]
+    fn an_unread_cpu_or_no_cpus_take_the_unknown_margin() {
+        assert_eq!(
+            aarch64_skid_margin(&[NEOVERSE_V2, None]),
+            AARCH64_UNKNOWN_SKID_MARGIN
+        );
+        assert_eq!(aarch64_skid_margin(&[]), AARCH64_UNKNOWN_SKID_MARGIN);
+    }
+
+    #[test]
+    fn a_midr_parses_as_linux_prints_it() {
+        assert_eq!(parse_midr("0x00000000410fd4f0\n"), NEOVERSE_V2);
+        assert_eq!(parse_midr(""), None);
+        assert_eq!(parse_midr("410fd4f0\n"), None);
+    }
+
+    #[test]
+    fn the_second_stage_leaves_room_for_400_ns() {
+        assert_eq!(DEFAULT_SKID_LATENCY_BUDGET_NS, 400);
+        // Without any override, which would turn staging off, and with a
+        // skid margin below the budget's margin for the measured loop.
+        let config = PmuConfig {
+            skid_margin: 750,
+            skid_margin_override: None,
+            skid_latency_budget_ns: DEFAULT_SKID_LATENCY_BUDGET_NS,
+            ..PmuConfig::new().expect("every aarch64 CPU has a configuration")
+        };
+        assert!(config.stages(1_000_000));
+        // 2.1 RCBs per ns, a measured spin loop: 840 RCBs, rounded up.
+        assert_eq!(config.second_stage_margin(2_100_000, Some(1_000_000)), 840);
+        assert_eq!(config.second_stage_margin(2_100_001, Some(1_000_000)), 841);
+        // A slower loop takes the skid margin.
+        assert_eq!(config.second_stage_margin(1_000_000, Some(1_000_000)), 750);
+        // 50 RCBs per ns would need 20,000: no closer than the first stage.
+        assert_eq!(
+            config.second_stage_margin(50_000_000, Some(1_000_000)),
+            config.first_stage_margin()
+        );
+    }
+}
+
+/// The key a pinned history clock compares: a configuration's raw event and
+/// what it counts ([`PmuConfig::clock_key`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct ClockKey {
+    /// The raw perf event selector.
+    pub raw_event: u64,
+    /// What the event counts, if that is established.
+    pub metric: Option<RcbMetric>,
+}
+
+/// A host whose PMU profile's metric is established, so that the RCB
+/// coordinates it counts can be recorded and replayed as that metric.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QualifiedClock {
+    /// What the host's event counts.
+    pub metric: RcbMetric,
+    /// The host's raw event selector.
+    pub raw_event: u64,
+    /// The CPUID vendor string.
+    pub vendor: String,
+    /// The CPUID family.
+    pub family: u8,
+    /// The CPUID model.
+    pub model: u8,
+}
+
+impl QualifiedClock {
+    /// The key a qualified history clock pins.
+    pub fn key(&self) -> ClockKey {
+        ClockKey {
+            raw_event: self.raw_event,
+            metric: Some(self.metric),
+        }
+    }
+}
+
+/// Why a host's RCB coordinates are not qualified as a known metric.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UnqualifiedReason {
+    /// CPUID could not be read.
+    CpuInfoUnreadable,
+    /// The vendor and family are not a pair the profile table describes.
+    VendorFamilyNotInTable {
+        /// The CPUID vendor string.
+        vendor: String,
+        /// The CPUID family.
+        family: u8,
+    },
+    /// The model has no profile.
+    ModelNotInTable {
+        /// The CPUID family.
+        family: u8,
+        /// The CPUID model.
+        model: u8,
+    },
+    /// The model's profile exists, but what its event counts is not established.
+    MetricNotEstablished {
+        /// The CPUID family.
+        family: u8,
+        /// The CPUID model.
+        model: u8,
+    },
+    /// This architecture's branch event is not qualified.
+    UnqualifiedArchitecture,
+}
+
+impl std::fmt::Display for UnqualifiedReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CpuInfoUnreadable => write!(f, "cpuid-unreadable"),
+            Self::VendorFamilyNotInTable { vendor, family } => {
+                write!(f, "vendor-family-not-in-table:{vendor}:{family:#x}")
+            }
+            Self::ModelNotInTable { family, model } => {
+                write!(f, "model-not-in-table:{family:#x}:{model:#x}")
+            }
+            Self::MetricNotEstablished { family, model } => {
+                write!(f, "metric-not-established:{family:#x}:{model:#x}")
+            }
+            Self::UnqualifiedArchitecture => write!(f, "unqualified-architecture"),
+        }
+    }
+}
+
+/// Classifies a host from its CPUID vendor, family and model against the
+/// profile table. Pure: it builds, installs and records nothing.
+pub fn qualify_host(
+    vendor: &str,
+    family_id: u8,
+    model_id: u8,
+) -> Result<QualifiedClock, UnqualifiedReason> {
+    if !pmu_vendor_has_family(vendor, family_id) {
+        return Err(UnqualifiedReason::VendorFamilyNotInTable {
+            vendor: vendor.to_owned(),
+            family: family_id,
+        });
+    }
+    let profile = pmu_profile_for_family_model(family_id, model_id).ok_or(
+        UnqualifiedReason::ModelNotInTable {
+            family: family_id,
+            model: model_id,
+        },
+    )?;
+    let metric = profile
+        .metric()
+        .ok_or(UnqualifiedReason::MetricNotEstablished {
+            family: family_id,
+            model: model_id,
+        })?;
+    Ok(QualifiedClock {
+        metric,
+        raw_event: profile.raw_rcb_event(),
+        vendor: vendor.to_owned(),
+        family: family_id,
+        model: model_id,
+    })
+}
+
+/// [`qualify_host`] for this host. It only reads CPUID: it builds, installs
+/// and records no configuration, so it never prevents a later
+/// [`set_skid_margin_override`].
+#[cfg(target_arch = "x86_64")]
+pub fn resolve_host_clock() -> Result<QualifiedClock, UnqualifiedReason> {
+    let cpuid = raw_cpuid::CpuId::new();
+    let vendor = cpuid
+        .get_vendor_info()
+        .ok_or(UnqualifiedReason::CpuInfoUnreadable)?;
+    let features = cpuid
+        .get_feature_info()
+        .ok_or(UnqualifiedReason::CpuInfoUnreadable)?;
+    qualify_host(vendor.as_str(), features.family_id(), features.model_id())
+}
+
+/// No aarch64 branch event is qualified for recorded histories.
+#[cfg(target_arch = "aarch64")]
+pub fn resolve_host_clock() -> Result<QualifiedClock, UnqualifiedReason> {
+    Err(UnqualifiedReason::UnqualifiedArchitecture)
+}
+
+/// Why a qualified clock cannot be pinned, or a configuration installed, in a
+/// [`PmuState`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PinRefusal {
+    /// The installed configuration counts a different event or metric than
+    /// the qualified host clock.
+    InstalledDiffers {
+        /// The installed configuration's key.
+        installed: ClockKey,
+        /// The qualified key.
+        qualified: ClockKey,
+    },
+    /// Another key is already pinned.
+    PinnedDiffers {
+        /// The pinned key.
+        pinned: ClockKey,
+        /// The key asked for.
+        qualified: ClockKey,
+    },
+}
+
+impl std::fmt::Display for PinRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InstalledDiffers {
+                installed,
+                qualified,
+            } => write!(
+                f,
+                "the installed PMU configuration ({installed:?}) is not the host's qualified clock ({qualified:?})"
+            ),
+            Self::PinnedDiffers { pinned, qualified } => write!(
+                f,
+                "the PMU clock is already pinned to {pinned:?}, not {qualified:?}"
+            ),
+        }
+    }
+}
+
+/// A read-only qualification of a clock key against a [`PmuState`]. It
+/// authorizes nothing until [`PmuState::commit_pin`] rechecks and pins it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PinTicket {
+    key: ClockKey,
+}
+
+impl PinTicket {
+    /// The key this ticket would pin.
+    pub fn key(&self) -> ClockKey {
+        self.key
+    }
+}
+
+/// The PMU configuration, recorded margin and pinned history clock of a
+/// process, under one lock.
+///
+/// Every check-then-publish (installing the configuration lazily or
+/// explicitly, recording a margin, pinning a clock key) holds `pinned`'s lock,
+/// so they linearize: once a key is pinned no configuration with another key
+/// is installed, and a key is pinned only if the installed configuration, if
+/// any, has it. The installed configuration is published while the lock is
+/// held and never changes, so reading it takes no lock. Building a
+/// configuration and reading the recorded margin take no lock either, so a
+/// constructor run in a forked child never waits for it.
+pub struct PmuState {
+    pinned: Mutex<Option<ClockKey>>,
+    installed: OnceLock<PmuConfig>,
+    margin: OnceLock<u64>,
+}
+
+impl PmuState {
+    /// An empty state: no configuration, margin or pin.
+    pub const fn new() -> Self {
+        Self {
+            pinned: Mutex::new(None),
+            installed: OnceLock::new(),
+            margin: OnceLock::new(),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<ClockKey>> {
+        // Nothing under the lock panics, so a poisoned lock still holds a
+        // consistent key.
+        self.pinned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The installed configuration, without taking the lock.
+    pub fn installed(&self) -> Option<&PmuConfig> {
+        self.installed.get()
+    }
+
+    /// The pinned clock key, if any.
+    pub fn pinned(&self) -> Option<ClockKey> {
+        *self.lock()
+    }
+
+    /// `config` with the recorded margin applied, as the last override, without
+    /// taking the lock.
+    pub fn with_recorded_margin(&self, config: PmuConfig) -> PmuConfig {
+        match self.margin.get() {
+            Some(&margin) => config.with_skid_margin_override(margin),
+            None => config,
+        }
+    }
+
+    /// The installed configuration, or `build`'s, installed now. `build` runs
+    /// outside the lock. Under it, a configuration another thread installed
+    /// first wins, one whose key differs from the pinned key is not installed
+    /// (`None`), and the margin recorded by then is applied last, so a margin
+    /// [`Self::set_skid_margin`] accepted while `build` ran is not lost.
+    pub fn get_or_install(&self, build: impl FnOnce() -> Option<PmuConfig>) -> Option<&PmuConfig> {
+        if let Some(config) = self.installed.get() {
+            return Some(config);
+        }
+        let candidate = build();
+        let pinned = self.lock();
+        if let Some(config) = self.installed.get() {
+            return Some(config);
+        }
+        let candidate = candidate?;
+        if pinned.is_some_and(|key| key != candidate.clock_key()) {
+            return None;
+        }
+        let candidate = self.with_recorded_margin(candidate);
+        // Only this lock's holder installs, and nothing is installed yet.
+        let installed = self.installed.set(candidate);
+        debug_assert!(installed.is_ok());
+        drop(pinned);
+        self.installed.get()
+    }
+
+    /// Installs `config` as given, its own margin included. Returns it back if
+    /// a configuration is installed already or its key is not the pinned key.
+    pub fn set(&self, config: PmuConfig) -> Result<(), PmuConfig> {
+        let pinned = self.lock();
+        if self.installed.get().is_some() || pinned.is_some_and(|key| key != config.clock_key()) {
+            return Err(config);
+        }
+        let result = self.installed.set(config);
+        drop(pinned);
+        result
+    }
+
+    /// Records `skid_margin` for the configuration this state installs
+    /// lazily. Returns it back, recording nothing, once a configuration is
+    /// installed or a margin was recorded, as [`set_skid_margin_override`]
+    /// always did. A pinned key does not prevent it.
+    pub fn set_skid_margin(&self, skid_margin: u64) -> Result<(), u64> {
+        let _pinned = self.lock();
+        record_skid_margin(&self.margin, self.installed.get().is_some(), skid_margin)
+    }
+
+    /// Checks, without changing anything, that `qualified` can be pinned: the
+    /// installed configuration, if any, has its key, and no other key is
+    /// pinned.
+    pub fn qualify(&self, qualified: &QualifiedClock) -> Result<PinTicket, PinRefusal> {
+        let pinned = self.lock();
+        self.check(&pinned, qualified.key())
+    }
+
+    /// Pins `ticket`'s key after rechecking it under the lock. Pinning the
+    /// same key again succeeds.
+    pub fn commit_pin(&self, ticket: PinTicket) -> Result<(), PinRefusal> {
+        let mut pinned = self.lock();
+        self.check(&pinned, ticket.key)?;
+        *pinned = Some(ticket.key);
+        Ok(())
+    }
+
+    fn check(&self, pinned: &Option<ClockKey>, key: ClockKey) -> Result<PinTicket, PinRefusal> {
+        if let Some(installed) = self.installed.get()
+            && installed.clock_key() != key
+        {
+            return Err(PinRefusal::InstalledDiffers {
+                installed: installed.clock_key(),
+                qualified: key,
+            });
+        }
+        if let Some(pinned) = *pinned
+            && pinned != key
+        {
+            return Err(PinRefusal::PinnedDiffers {
+                pinned,
+                qualified: key,
+            });
+        }
+        Ok(PinTicket { key })
+    }
+}
+
+impl Default for PmuState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod clock_state_tests {
+    use super::*;
+
+    fn profile(family: u8, model: u8) -> PmuConfig {
+        PmuConfig::try_from_family_model(family, model).expect("a model in the profile table")
+    }
+
+    fn amd() -> QualifiedClock {
+        qualify_host("AuthenticAMD", 0x1A, 0x11).unwrap()
+    }
+
+    #[test]
+    fn qualified_hosts_share_one_metric_across_raw_events() {
+        let metric = RcbMetric::ConditionalBranchesRetiredUserV1;
+        for (vendor, family, model, raw_event) in [
+            ("GenuineIntel", 0x06, 0x8F, 0x5111c4),
+            ("GenuineIntel", 0x06, 0x55, 0x5101c4),
+            ("AuthenticAMD", 0x1A, 0x11, 0x5100d1),
+            ("AuthenticAMD", 0x19, 0xA0, 0x5100d1),
+        ] {
+            let clock = qualify_host(vendor, family, model).unwrap();
+            assert_eq!(clock.metric, metric, "{vendor} {family:#x} {model:#x}");
+            assert_eq!(
+                clock.raw_event, raw_event,
+                "{vendor} {family:#x} {model:#x}"
+            );
+        }
+        assert_eq!(metric.id(), "rcb:cond-retired:user:v1");
+        assert_eq!(RcbMetric::from_id(metric.id()), Some(metric));
+        assert_eq!(RcbMetric::from_id("rcb:cond-retired:user:v2"), None);
+    }
+
+    #[test]
+    fn unqualified_hosts_are_named() {
+        use UnqualifiedReason::*;
+        for (vendor, family, model, reason) in [
+            (
+                "GenuineIntel",
+                0x06,
+                0x9A,
+                MetricNotEstablished {
+                    family: 0x06,
+                    model: 0x9A,
+                },
+            ),
+            (
+                "GenuineIntel",
+                0x06,
+                0x86,
+                MetricNotEstablished {
+                    family: 0x06,
+                    model: 0x86,
+                },
+            ),
+            (
+                "GenuineIntel",
+                0x06,
+                0x01,
+                ModelNotInTable {
+                    family: 0x06,
+                    model: 0x01,
+                },
+            ),
+            (
+                "AuthenticAMD",
+                0x06,
+                0x55,
+                VendorFamilyNotInTable {
+                    vendor: "AuthenticAMD".into(),
+                    family: 0x06,
+                },
+            ),
+            (
+                "GenuineIntel",
+                0x19,
+                0x11,
+                VendorFamilyNotInTable {
+                    vendor: "GenuineIntel".into(),
+                    family: 0x19,
+                },
+            ),
+            (
+                "HygonGenuine",
+                0x18,
+                0x00,
+                VendorFamilyNotInTable {
+                    vendor: "HygonGenuine".into(),
+                    family: 0x18,
+                },
+            ),
+        ] {
+            assert_eq!(qualify_host(vendor, family, model), Err(reason));
+        }
+    }
+
+    #[test]
+    fn an_installed_profile_of_another_model_is_not_the_hosts_clock() {
+        let state = PmuState::new();
+        let spr = profile(0x06, 0x8F);
+        assert_ne!(spr.clock_key(), amd().key());
+        assert_eq!(state.set(spr.clone()), Ok(()));
+        assert_eq!(
+            state.qualify(&amd()),
+            Err(PinRefusal::InstalledDiffers {
+                installed: spr.clock_key(),
+                qualified: amd().key(),
+            })
+        );
+    }
+
+    #[test]
+    fn resolving_and_qualifying_install_nothing() {
+        let before = PMU_STATE.installed().is_some();
+        let _ = resolve_host_clock();
+        assert_eq!(PMU_STATE.installed().is_some(), before);
+        let state = PmuState::new();
+        let ticket = state.qualify(&amd()).unwrap();
+        assert!(state.installed().is_none());
+        assert_eq!(state.pinned(), None);
+        assert_eq!(state.set_skid_margin(500), Ok(()));
+        assert_eq!(state.commit_pin(ticket), Ok(()));
+        assert!(state.installed().is_none());
+    }
+
+    // S1: a configuration installed between qualification and commit wins,
+    // and the commit is refused.
+    #[test]
+    fn a_profile_installed_after_qualification_refuses_the_commit() {
+        let state = PmuState::new();
+        let ticket = state.qualify(&amd()).unwrap();
+        let other = profile(0x06, 0x55);
+        assert_eq!(state.set(other.clone()), Ok(()));
+        assert_eq!(
+            state.commit_pin(ticket),
+            Err(PinRefusal::InstalledDiffers {
+                installed: other.clock_key(),
+                qualified: amd().key(),
+            })
+        );
+        assert_eq!(state.pinned(), None);
+        assert_eq!(state.installed(), Some(&other));
+    }
+
+    // S2: once pinned, another key is not installed, explicitly or lazily.
+    #[test]
+    fn a_pin_refuses_another_key() {
+        let state = PmuState::new();
+        state.commit_pin(state.qualify(&amd()).unwrap()).unwrap();
+        let other = profile(0x06, 0x55);
+        assert_eq!(state.set(other.clone()), Err(other.clone()));
+        assert_eq!(state.get_or_install(|| Some(other)), None);
+        assert!(state.installed().is_none());
+        assert_eq!(
+            state.get_or_install(|| Some(profile(0x1A, 0x11))),
+            Some(&profile(0x1A, 0x11))
+        );
+    }
+
+    // S3: an installed configuration of another key cannot be qualified.
+    #[test]
+    fn an_already_installed_other_key_is_not_qualified() {
+        let state = PmuState::new();
+        state.set(profile(0x06, 0x55)).unwrap();
+        assert!(matches!(
+            state.qualify(&amd()),
+            Err(PinRefusal::InstalledDiffers { .. })
+        ));
+    }
+
+    // S4: a lazy install of another key after a pin installs nothing.
+    #[test]
+    fn a_lazy_install_of_another_key_after_a_pin_installs_nothing() {
+        let state = PmuState::new();
+        state.commit_pin(state.qualify(&amd()).unwrap()).unwrap();
+        assert_eq!(state.get_or_install(|| Some(profile(0x06, 0x8F))), None);
+        assert!(state.installed().is_none());
+        assert_eq!(state.pinned(), Some(amd().key()));
+    }
+
+    // S5: the same key can be pinned and used again.
+    #[test]
+    fn the_same_key_is_pinned_and_used_repeatedly() {
+        let state = PmuState::new();
+        let ticket = state.qualify(&amd()).unwrap();
+        assert_eq!(state.commit_pin(ticket), Ok(()));
+        assert_eq!(state.commit_pin(ticket), Ok(()));
+        let config = profile(0x1A, 0x11);
+        assert_eq!(state.get_or_install(|| Some(config.clone())), Some(&config));
+        assert_eq!(state.qualify(&amd()), Ok(ticket));
+        assert_eq!(state.set(config.clone()), Err(config));
+    }
+
+    // S6: a pin does not stop the first margin override, which the lazy
+    // install then applies.
+    #[test]
+    fn a_pin_leaves_the_margin_override_open() {
+        let state = PmuState::new();
+        state.commit_pin(state.qualify(&amd()).unwrap()).unwrap();
+        assert_eq!(state.set_skid_margin(500), Ok(()));
+        assert!(state.installed().is_none());
+        let installed = state.get_or_install(|| Some(profile(0x1A, 0x11))).unwrap();
+        assert_eq!(installed.skid_margin(), 500);
+        assert_eq!(installed.clock_key(), amd().key());
+    }
+
+    // M1: a margin is recorded once, before installation; a second, equal or
+    // not, is refused, as `set_skid_margin_override` always did.
+    #[test]
+    fn a_second_margin_is_refused_before_installation() {
+        let state = PmuState::new();
+        assert_eq!(state.set_skid_margin(500), Ok(()));
+        assert_eq!(state.set_skid_margin(500), Err(500));
+        assert_eq!(state.set_skid_margin(700), Err(700));
+        let installed = state.get_or_install(|| Some(profile(0x1A, 0x11))).unwrap();
+        assert_eq!(installed.skid_margin(), 500);
+        assert_eq!(state.set_skid_margin(800), Err(800));
+    }
+
+    // M2: a margin accepted while a lazy candidate is being built is applied
+    // when the candidate is installed.
+    #[test]
+    fn a_margin_accepted_during_a_lazy_build_is_installed() {
+        let state = PmuState::new();
+        let installed = state
+            .get_or_install(|| {
+                let candidate = state.with_recorded_margin(profile(0x1A, 0x11));
+                assert_eq!(candidate.skid_margin(), 2_000);
+                assert_eq!(state.set_skid_margin(500), Ok(()));
+                Some(candidate)
+            })
+            .unwrap();
+        assert_eq!(installed.skid_margin(), 500);
+        assert_eq!(state.set_skid_margin(600), Err(600));
+    }
+
+    // An explicit configuration keeps its own margin.
+    #[test]
+    fn an_explicit_configuration_keeps_its_margin() {
+        let state = PmuState::new();
+        assert_eq!(state.set_skid_margin(500), Ok(()));
+        state.set(profile(0x1A, 0x11)).unwrap();
+        assert_eq!(state.installed().unwrap().skid_margin(), 2_000);
+    }
+
+    // Racing an explicit install of another key against a commit, from two
+    // threads: whichever wins, no configuration of another key coexists with
+    // the pin.
+    #[test]
+    fn a_racing_install_and_commit_never_leave_a_pin_with_another_key() {
+        for _ in 0..200 {
+            let state = std::sync::Arc::new(PmuState::new());
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let ticket = state.qualify(&amd()).unwrap();
+            let setter = {
+                let (state, barrier) = (state.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    state.set(profile(0x06, 0x55)).is_ok()
+                })
+            };
+            barrier.wait();
+            let committed = state.commit_pin(ticket).is_ok();
+            let installed = setter.join().unwrap();
+            assert!(
+                committed != installed,
+                "committed {committed}, installed {installed}"
+            );
+            if committed {
+                assert!(state.installed().is_none());
+                assert_eq!(state.pinned(), Some(amd().key()));
+            } else {
+                assert_eq!(
+                    state.installed().map(PmuConfig::clock_key),
+                    Some(profile(0x06, 0x55).clock_key())
+                );
+                assert_eq!(state.pinned(), None);
+            }
+        }
+    }
+
+    // F2 and F3: while another thread holds the process's PMU state lock, a
+    // child of `fork` (which runs atfork handlers) and of a raw `clone`
+    // without CLONE_VM (which runs none) still builds a configuration and
+    // reads the recorded margin and installed configuration: none of them
+    // takes the lock, so neither child can wait on one it inherited held.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn constructors_complete_in_a_child_forked_while_the_lock_is_held() {
+        use std::sync::Arc;
+        use std::sync::Barrier;
+        use std::time::Duration;
+        use std::time::Instant;
+
+        let (held, release) = (Arc::new(Barrier::new(2)), Arc::new(Barrier::new(2)));
+        let holder = {
+            let (held, release) = (held.clone(), release.clone());
+            std::thread::spawn(move || {
+                let _guard = PMU_STATE.lock();
+                held.wait();
+                release.wait();
+            })
+        };
+        held.wait();
+        let mut statuses = Vec::new();
+        for raw_clone in [false, true] {
+            // SAFETY: the child calls only the lock-free constructors and
+            // reads, then `_exit`s.
+            let pid = unsafe {
+                if raw_clone {
+                    libc::syscall(
+                        libc::SYS_clone,
+                        libc::SIGCHLD as libc::c_ulong,
+                        0usize,
+                        0usize,
+                        0usize,
+                        0usize,
+                    ) as libc::pid_t
+                } else {
+                    libc::fork()
+                }
+            };
+            assert!(pid >= 0, "{}", std::io::Error::last_os_error());
+            if pid == 0 {
+                let _ = PmuConfig::try_new();
+                let _ = PMU_STATE.with_recorded_margin(profile(0x06, 0x55));
+                let _ = PMU_STATE.installed();
+                // SAFETY: ends the child without running the parent's exit path.
+                unsafe { libc::_exit(0) };
+            }
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let status = loop {
+                let mut status = 0;
+                // SAFETY: waits only for the child created above.
+                let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+                if waited == pid {
+                    break Some(status);
+                }
+                if Instant::now() >= deadline {
+                    // SAFETY: signals only the child created above, then reaps it.
+                    unsafe {
+                        libc::kill(pid, libc::SIGKILL);
+                        libc::waitpid(pid, &mut status, 0);
+                    }
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            statuses.push((raw_clone, status));
+        }
+        release.wait();
+        holder.join().unwrap();
+        for (raw_clone, status) in statuses {
+            let status = status.unwrap_or_else(|| {
+                panic!("the child (raw clone: {raw_clone}) did not finish in 20 s: it waited on the lock")
+            });
+            assert!(
+                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                "raw clone {raw_clone}: status {status:#x}"
+            );
+        }
+    }
 }

@@ -168,7 +168,7 @@ impl<'a> CStrPtr<'a> {
     /// Creates the `CStrPtr` from a raw pointer. Returns `None` if the given
     /// pointer is NULL.
     pub fn from_ptr(r: *const libc::c_char) -> Option<Self> {
-        Addr::from_ptr(r as *const u8).map(CStrPtr)
+        Addr::from_ptr(r.cast::<u8>()).map(CStrPtr)
     }
 }
 

@@ -11,8 +11,7 @@
 //! user address space).
 //!
 //! These are step U1 of the minimal provider seam
-//! (<https://github.com/rrnewton/hermit/issues/4485>, epic
-//! <https://github.com/rrnewton/hermit/issues/4492>). Their contracts are
+//! (<https://github.com/rrnewton/hermit/issues/4659>). Their contracts are
 //! stated in Linux terms only, so that any implementation of Linux user-memory
 //! semantics could serve them, including a foreign user-space kernel. The KVM
 //! backend's guest arena (`reverie_kvm::GuestMemory`) is today's only
@@ -240,7 +239,8 @@ pub enum MapError {
     Failed,
 }
 
-/// What [`AddressSpace::discard`] did.
+/// What [`AddressSpace::discard`], [`AddressSpace::guard_install`] or
+/// [`AddressSpace::guard_remove`] did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Discarded {
     /// Some page of the range was not mapped. Linux applies the advice to
@@ -296,4 +296,38 @@ pub trait AddressSpace {
     /// returns `Unsupported` before any page changes; which kinds, if any, is
     /// documented on the implementation.
     fn discard(&self, address: u64, length: u64) -> std::result::Result<Discarded, MapError>;
+
+    /// `MADV_GUARD_INSTALL` over `[address, address + length)`, with Linux's
+    /// semantics (`madvise_guard_install`, mm/madvise.c): every mapped page
+    /// of the range becomes a guard page. Its contents are discarded as
+    /// [`Self::discard`] discards them; while it stays a guard page, a copy
+    /// to or from it through [`GuestMemoryAccess`] fails with `EFAULT`,
+    /// whatever the mapping's protection. On Linux a direct guest load or
+    /// store to a guard page also faults (`SIGSEGV` with `SEGV_MAPERR`); this
+    /// contract does not promise that, and an implementation documents
+    /// whether it enforces it. The only implementation today,
+    /// reverie-kvm-core's `ProviderMemory`, does not: its vCPU page tables
+    /// leave direct accesses unenforced
+    /// (<https://github.com/rrnewton/hermit/issues/5177>), so such an access
+    /// completes where Linux would fault. The mapping itself is unchanged: its
+    /// protection, flags and extent stay as they were. A guard page stays one
+    /// through [`Self::discard`] and [`Self::protect`], and in a copy of the address
+    /// space made for `fork(2)`; [`Self::unmap`], a new mapping placed over
+    /// it, and [`Self::guard_remove`] end it. Installing a guard over a guard
+    /// page changes nothing. Unmapped pages are skipped and reported in the
+    /// result. An implementation that cannot provide this for some range
+    /// returns `Unsupported` before any page changes; which ranges, if any,
+    /// is documented on the implementation.
+    fn guard_install(&self, address: u64, length: u64) -> std::result::Result<Discarded, MapError>;
+
+    /// `MADV_GUARD_REMOVE` over `[address, address + length)`, with Linux's
+    /// semantics (`madvise_guard_remove`, mm/madvise.c): every guard page of
+    /// the range becomes an ordinary page of its mapping again, with the
+    /// access its protection gives. A private anonymous page then reads as
+    /// zeros; a shared page shows its object's contents. Pages that are not
+    /// guard pages are unchanged. Unmapped pages are skipped and reported in
+    /// the result. An implementation that cannot provide this for some range
+    /// returns `Unsupported` before any page changes; which ranges, if any,
+    /// is documented on the implementation.
+    fn guard_remove(&self, address: u64, length: u64) -> std::result::Result<Discarded, MapError>;
 }

@@ -2,24 +2,16 @@
 resolver = "2"
 members = [
     "experimental/nostd-print",
-    "experimental/reverie-host",
     "experimental/reverie-rpc-macros",
     "experimental/reverie-rpc",
-    "experimental/reverie-sabre-stats",
-    "experimental/reverie-sabre-macros",
-    "experimental/reverie-sabre-strace",
-    "experimental/reverie-sabre",
-    "experimental/riptrace",
     "experimental/riptrace/rpc",
-    "experimental/riptrace/tool",
     "reverie",
-    "reverie-dbt",
     "reverie-inguest",
-    "reverie-e9patch",
     "reverie-examples",
     "reverie-kvm",
     "reverie-kvm-core",
     "reverie-linux-provider",
+    "reverie-linuxemu",
     "reverie-liteinst",
     "reverie-liteinst-artifact",
     "reverie-liteinst-preload",
@@ -29,7 +21,10 @@ members = [
     "reverie-ptrace",
     "reverie-rpc-transport",
     "reverie-syscalls",
+    "reverie-test-support",
     "reverie-util",
     "safeptrace",
 ]
-exclude = ["public_autocargo/experimental"]
+exclude = [
+    "public_autocargo/experimental",
+]

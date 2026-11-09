@@ -373,16 +373,31 @@ fn resolve_claude_roots(host: &Path) -> Result<(String, String), String> {
 /// `.skill_reset_20260816/` and the owner is regrowing them step by step. This
 /// tolerance is DELIBERATE AND TEMPORARY — it is not a statement that a
 /// repository should have no agent policy. When the files come back, the
-/// symlink shape below is enforced again with no edit to this file.
+/// shape below is enforced again with no edit to this file.
+///
+/// `CLAUDE.md` is an optional alias: Claude Code reads `AGENTS.md` natively, so
+/// a host may carry `AGENTS.md` alone (Reverie's root has since 6f780b20). When
+/// the alias is present it must be a regular file that imports `AGENTS.md`.
 fn check_policy_files(host: &Path, root: &Path) -> Result<&'static str, String> {
     let agents = host.join("AGENTS.md");
     let claude = host.join("CLAUDE.md");
     match (exists(&agents), exists(&claude)) {
         (false, false) => Ok("absent (tolerated while skills are regrown)"),
+        (true, false) => {
+            require_real_file(&agents, root)?;
+            Ok("AGENTS.md without a CLAUDE.md alias")
+        }
         _ => {
             require_real_file(&agents, root)?;
-            require_internal_symlink(&claude, Path::new("AGENTS.md"), root)?;
-            Ok("AGENTS.md with CLAUDE.md symlink")
+            let meta = fs::symlink_metadata(&claude).map_err(|e| format!("inspect {}: {e}", claude.display()))?;
+            if meta.file_type().is_symlink() {
+                return Err(format!("{}: CLAUDE.md must not be a symlink; Claude Code reads AGENTS.md natively", claude.display()));
+            }
+            let text = fs::read_to_string(&claude).map_err(|e| format!("read {}: {e}", claude.display()))?;
+            if text.lines().next() != Some("@AGENTS.md") {
+                return Err(format!("{}: a regular CLAUDE.md must start with @AGENTS.md", claude.display()));
+            }
+            Ok("AGENTS.md with optional CLAUDE.md alias")
         }
     }
 }
@@ -638,9 +653,8 @@ fn filesystem_regression_tests() -> Result<(), String> {
         .map_err(|error| format!("cannot create filesystem fixture: {error}"))?;
     fs::write(root.join("AGENTS.md"), "fixture policy\n")
         .map_err(|error| format!("cannot write filesystem fixture: {error}"))?;
-    symlink("AGENTS.md", root.join("CLAUDE.md"))
-        .map_err(|error| format!("cannot create positive symlink fixture: {error}"))?;
-    require_internal_symlink(&root.join("CLAUDE.md"), Path::new("AGENTS.md"), &root)?;
+    fs::write(root.join("CLAUDE.md"), "@AGENTS.md\n")
+        .map_err(|error| format!("cannot write fixture: {error}"))?;
 
     symlink("missing", root.join("dangling"))
         .map_err(|error| format!("cannot create dangling symlink fixture: {error}"))?;
@@ -780,7 +794,7 @@ fn discovery_regression_tests() -> Result<(), String> {
     fs::create_dir_all(root.join(".llms")).map_err(|error| format!("cannot create: {error}"))?;
     fs::write(root.join("AGENTS.md"), "fixture policy\n")
         .map_err(|error| format!("cannot write fixture: {error}"))?;
-    link("AGENTS.md", &root.join("CLAUDE.md"))?;
+    fs::write(root.join("CLAUDE.md"), "@AGENTS.md\n").map_err(|error| format!("cannot write fixture: {error}"))?;
     link("../.claude/skills", &root.join(".llms/skills"))?;
     fs::write(a_canonical.join(README), "# canonical fixture\n")
         .map_err(|error| format!("cannot write fixture: {error}"))?;
@@ -948,6 +962,34 @@ fn discovery_regression_tests() -> Result<(), String> {
         "contains both required hosts but no skill packages anywhere",
         "zero skill packages",
     )?;
+
+    // CLAUDE.md is an optional alias of AGENTS.md: a host with AGENTS.md alone
+    // is accepted, an alias that is a symlink or does not import AGENTS.md is
+    // refused, and an alias without AGENTS.md is refused.
+    let claude = root.join("CLAUDE.md");
+    let agents = root.join("AGENTS.md");
+    fs::remove_file(&claude).map_err(|error| format!("cannot mutate fixture: {error}"))?;
+    inspect(&root).map_err(|error| {
+        format!("discovery regression refused AGENTS.md without a CLAUDE.md alias: {error}")
+    })?;
+    link("AGENTS.md", &claude)?;
+    expect_refusal_containing(&root, "has a symlinked CLAUDE.md", "must not be a symlink")?;
+    fs::remove_file(&claude).map_err(|error| format!("cannot mutate fixture: {error}"))?;
+    fs::write(&claude, "fixture alias without the import\n")
+        .map_err(|error| format!("cannot mutate fixture: {error}"))?;
+    expect_refusal_containing(&root, "has a CLAUDE.md that does not import AGENTS.md", "must start with @AGENTS.md")?;
+    fs::write(&claude, "@AGENTS.md\n").map_err(|error| format!("cannot mutate fixture: {error}"))?;
+    fs::remove_file(&agents).map_err(|error| format!("cannot mutate fixture: {error}"))?;
+    expect_refusal_containing(&root, "has a CLAUDE.md alias but no AGENTS.md", "AGENTS.md")?;
+    // Without the alias, AGENTS.md must still be a real file, not a symlink.
+    fs::remove_file(&claude).map_err(|error| format!("cannot mutate fixture: {error}"))?;
+    fs::write(root.join("policy.md"), "fixture policy\n").map_err(|error| format!("cannot mutate fixture: {error}"))?;
+    link("policy.md", &agents)?;
+    expect_refusal_containing(&root, "has a symlinked AGENTS.md and no CLAUDE.md alias", "AGENTS.md must be a regular file")?;
+    fs::remove_file(&agents).map_err(|error| format!("cannot restore fixture: {error}"))?;
+    fs::remove_file(root.join("policy.md")).map_err(|error| format!("cannot restore fixture: {error}"))?;
+    fs::write(&claude, "@AGENTS.md\n").map_err(|error| format!("cannot restore fixture: {error}"))?;
+    fs::write(&agents, "fixture policy\n").map_err(|error| format!("cannot restore fixture: {error}"))?;
 
     // And a tree with no client directories at all.
     let bare = fixture_root("bare")?;

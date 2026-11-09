@@ -315,7 +315,12 @@ async fn legacy_owner_exit_control(exact_reuse: bool) -> bool {
             });
             owner_exit.send(()).unwrap();
             owner.join().unwrap();
-            assert!(!event.legacy_wait_owner.get().unwrap().is_live().unwrap());
+            // The join returns when the exiting thread clears its TID
+            // (mm_release, from exit_mm), which do_exit does before
+            // exit_notify and release_task detach its PID. Until then the
+            // owner can still read as live, so wait for it to die.
+            let wait_owner = event.legacy_wait_owner.get().unwrap();
+            legacy_owner_until(|| !wait_owner.is_live().unwrap());
             legacy_owner_reap_root(root, &mut root_cleanup);
             assert!(matches!(
                 identity.current_tracer_pid(),

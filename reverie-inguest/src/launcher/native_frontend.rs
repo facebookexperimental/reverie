@@ -25,7 +25,7 @@ unsafe extern "C" {
 }
 
 core::arch::global_asm!(
-    ".text",
+    ".pushsection .text.reverie_native_launch_syscall,\"ax\",@progbits",
     ".p2align 4",
     ".globl reverie_native_launch_syscall",
     ".hidden reverie_native_launch_syscall",
@@ -48,6 +48,7 @@ core::arch::global_asm!(
     "pop r12",
     "ret",
     ".size reverie_native_launch_syscall,.-reverie_native_launch_syscall",
+    ".popsection",
     native_gate = const crate::trap::FIXED_NATIVE_ENTRY,
 );
 
@@ -74,7 +75,7 @@ pub unsafe extern "C" fn terminal_execve(
             0,
         );
         reverie_native_launch_syscall(libc::SYS_exit_group, 127, 0, 0, 0, 0, 0);
-        core::arch::asm!("ud2", options(noreturn));
+        crate::arch::trap_unreachable();
     }
 }
 
@@ -96,6 +97,11 @@ impl NativeFrontend {
     pub unsafe fn new(gate: Box<[u8; GATE_BYTES]>) -> io::Result<Self> {
         Ok(Self {
             gate,
+            // Widening break, by name: `for_native_exec_domain` is cfg'd
+            // to x86_64 (its fixed gates/restorer and fork/vfork deny list
+            // are x86 sites), so opening aarch64 compilation must cfg or
+            // port this frontend together with that recipe; it will fail
+            // to compile there, never silently substitute another filter.
             filter: SeccompFilter::for_native_exec_domain()?,
             prepared: AtomicBool::new(false),
             installed: AtomicBool::new(false),
@@ -201,7 +207,7 @@ impl NativeFrontend {
         {
             unsafe {
                 reverie_native_launch_syscall(libc::SYS_exit_group, 127, 0, 0, 0, 0, 0);
-                core::arch::asm!("ud2", options(noreturn));
+                crate::arch::trap_unreachable();
             }
         }
         Ok(())

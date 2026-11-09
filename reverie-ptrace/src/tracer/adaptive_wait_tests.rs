@@ -6,6 +6,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+// Its one test is x86_64-only.
+#[cfg(target_arch = "x86_64")]
 mod adaptive_wait_tests {
     use super::*;
 

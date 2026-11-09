@@ -7,6 +7,11 @@
  */
 
 #![cfg(target_arch = "x86_64")]
+#![allow(clippy::disallowed_methods, reason = "tests may make threads freely")]
+#![allow(
+    unexpected_cfgs,
+    reason = "`fbcode_build` is supplied by the internal Buck build"
+)]
 
 use std::collections::BTreeMap;
 use std::os::unix::fs::FileTypeExt;
@@ -74,14 +79,14 @@ use reverie_kvm::StraceTool;
 
 const MEMORY_SIZE: usize = 16 * 1024 * 1024;
 
-#[path = "support/alias_failure.rs"]
+#[path = "../../reverie-kvm-core/tests/support/alias_failure.rs"]
 mod alias_failure;
 
-#[path = "support/broker_test_client.rs"]
+#[path = "../../reverie-linuxemu/tests/support/broker_test_client.rs"]
 mod broker_test_client;
 use reverie_kvm::native_exit_broker;
 
-#[path = "support/broker_test_protocol.rs"]
+#[path = "../../reverie-linuxemu/tests/support/broker_test_protocol.rs"]
 mod broker_test_protocol;
 
 static ALIAS_FAILURE_CALLBACKS: AtomicU64 = AtomicU64::new(0);
@@ -793,22 +798,22 @@ int main(int argc, char **argv) {
     }
     CHECK(close(path) == 0 && close(regular) == 0);
     if (guest) {
-        // The backend deliberately exposes synthetic proc directories as empty.
-        fd = open("/proc", O_RDONLY | O_DIRECTORY);
-        CHECK(fd == 0);
-        CHECK(syscall(SYS_getdents64, fd, mapping, 128) == 0);
-        CHECK(syscall(SYS_getdents64, fd, (void *)-1, 0) == 0);
-        CHECK(close(fd) == 0);
+        // The backend refuses its own procfs, /proc itself included.
+        errno = 0;
+        CHECK(open("/proc", O_RDONLY | O_DIRECTORY) == -1 && errno == EACCES);
     }
     for (int i = 0; i < 8192; ++i) CHECK(mapping[i] == 0xa5);
     CHECK(munmap(mapping, 8192) == 0);
-    puts("copyout errors and synthetic proc policy PASS");
+    puts("copyout errors and procfs refusal PASS");
     return 0;
 }
 "#;
 
 #[path = "support/random_device_stream.rs"]
 mod random_device_stream;
+
+#[path = "support/getrandom_forward.rs"]
+mod getrandom_forward;
 
 #[path = "support/poll_descriptor_abi.rs"]
 mod poll_descriptor_abi;
@@ -980,6 +985,8 @@ fn file_script_exec_control(test: &str, case: &str) {
             assert_eq!(result.stdout, expected);
             assert!(result.stderr.is_empty());
         } else {
+            // No Tool renders the exe link here: the executor refuses it.
+            environment.push(("EXE_LINK_REFUSED".to_owned(), "1".to_owned()));
             let envp = environment
                 .into_iter()
                 .map(|(name, value)| format!("{name}={value}"))
@@ -1073,8 +1080,14 @@ int main(int argc, char **argv) {
         char link[4096];
         int length = snprintf(link, sizeof(link), "%s%s", path, !strcmp(mode, "unlink") || !strcmp(mode, "replace") ? " (deleted)" : "");
         if (length < 0 || length >= 4096) return 20;
-        memcpy(expected, link, length); memset(output, 0x5a, sizeof(output));
-        if (readlink("/proc/self/exe", (char *)output, sizeof(output)) != length || memcmp(output, expected, sizeof(output))) return 21;
+        if (getenv("EXE_LINK_REFUSED")) {
+            /* Under the KVM executor with no Tool: the exe link is a Tool's to render (Guest::link_path), so the executor refuses it, as any procfs link, and writes nothing. */
+            memset(output, 0x5a, sizeof(output)); memset(expected, 0x5a, sizeof(expected)); errno = 0;
+            if (readlink("/proc/self/exe", (char *)output, sizeof(output)) != -1 || errno != EACCES || memcmp(output, expected, sizeof(output))) return 21;
+        } else {
+            memcpy(expected, link, length); memset(output, 0x5a, sizeof(output));
+            if (readlink("/proc/self/exe", (char *)output, sizeof(output)) != length || memcmp(output, expected, sizeof(output))) return 21;
+        }
     }
     if (after) { puts("script final interpreter identity argv env name selfexec exact=PASS"); return 0; }
     if (prctl(PR_SET_NAME, "before-self") || setenv("SCRIPT_AFTER", "1", 1)) return 22;
@@ -1126,7 +1139,8 @@ fn file_script_exec_interpreter_identity() {
             .install_static_elf_file_with_context(
                 std::fs::File::open(input).unwrap(),
                 &[input.to_str().unwrap()],
-                &[&setting],
+                // No Tool renders the exe link here: the executor refuses it.
+                &[&setting, "EXE_LINK_REFUSED=1"],
                 &directory.0,
             )
             .unwrap();
@@ -1144,6 +1158,7 @@ fn file_script_exec_interpreter_identity() {
 
 const SCRIPT_IDENTITY_PROGRAM: &str = r###"
 #define _GNU_SOURCE
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1159,8 +1174,16 @@ int main(void) {
     memset(actual, 0x5a, sizeof(actual));
     memset(expected, 0x5a, sizeof(expected));
     memcpy(expected, path, strlen(path));
+    errno = 0;
     ssize_t count = readlink("/proc/self/exe", (char *)actual, sizeof(actual));
-    int link_equal = count == (ssize_t)strlen(path) && !memcmp(actual, expected, sizeof(actual));
+    int link_equal;
+    if (getenv("EXE_LINK_REFUSED")) {
+        /* Under the KVM executor with no Tool: the exe link is a Tool's to render (Guest::link_path), so the executor refuses it and writes nothing. */
+        memset(expected, 0x5a, sizeof(expected));
+        link_equal = count == -1 && errno == EACCES && !memcmp(actual, expected, sizeof(actual));
+    } else {
+        link_equal = count == (ssize_t)strlen(path) && !memcmp(actual, expected, sizeof(actual));
+    }
     int identity_equal = actual_stat.st_dev == expected_stat.st_dev && actual_stat.st_ino == expected_stat.st_ino;
     printf("interpreter_body=1 executable_inode_matches=%d link_full4096_matches=%d\n", identity_equal, link_equal);
     return identity_equal && link_equal ? 0 : 21;
@@ -1415,8 +1438,9 @@ int main(int argc, char **argv) {
         const char *link = getenv("BINDING_LINK");
         size_t length = strlen(link);
         if (length >= sizeof(expected)) return 12;
-        memcpy(expected, link, length);
-        if (readlink("/proc/self/exe", (char *)actual, sizeof(actual)) != (ssize_t)length || memcmp(actual, expected, sizeof(actual))) return 13;
+        /* The exe link is a Tool's to render; with no Tool the executor refuses it and writes nothing. */
+        memset(expected, 0x5a, sizeof(expected)); errno = 0;
+        if (readlink("/proc/self/exe", (char *)actual, sizeof(actual)) != -1 || errno != EACCES || memcmp(actual, expected, sizeof(actual))) return 13;
     } else if (result != -1 || error != ENOENT || memcmp(actual, expected, sizeof(actual))) {
         printf("unknown stat result=%d errno=%d full4096_unchanged=%d\n", result, error, !memcmp(actual, expected, sizeof(actual)));
         return 14;
@@ -1436,6 +1460,204 @@ int main(int argc, char **argv) {
     memset(expected_name, 0, 16); memcpy(expected_name, "binding-before", 14);
     if (known || error != ENOENT || prctl(PR_GET_NAME, name) || memcmp(name, expected_name, sizeof(name))) return 17;
     puts("unknown backing and failed selfexec exact=PASS");
+    return 0;
+}
+"###;
+
+/// A launcher installs a file as exec'd by a filename of its own, here a
+/// link to the file: the process's executable is the file from the first
+/// instruction, so it can exec `/proc/self/exe`, and its stack names the
+/// filename in `AT_EXECFN`. The task is named after the link, not its target,
+/// as natively (`symlink-alias-absolute`: an absolute link `alias` to `probe`
+/// gives `comm=alias`).
+#[test]
+fn initial_exec_file_with_execfn_self_execs() {
+    initial_exec_file_with_execfn_control(
+        "initial_exec_file_with_execfn_self_execs",
+        "file",
+        "launched-alias",
+        "launched-alias",
+    );
+}
+
+/// The same for a `#!` script that a launcher has already rewritten to its
+/// interpreter: the interpreter's file is the executable, the script's
+/// filename is `AT_EXECFN`, and the self-exec runs the interpreter again.
+/// The task is named after the script, not its interpreter
+/// (`script-shebang`: `./t.sh` gives `comm=t.sh`), here with a name of
+/// exactly 15 bytes, kept whole (`name-exactly-15`).
+#[test]
+fn initial_exec_file_with_execfn_script_self_execs() {
+    initial_exec_file_with_execfn_control(
+        "initial_exec_file_with_execfn_script_self_execs",
+        "script",
+        "launched-script",
+        "launched-script",
+    );
+}
+
+/// A link name of exactly 16 bytes loses its last byte (`name-exactly-16`:
+/// `abcdefghijklmnop` gives `comm=abcdefghijklmno`).
+#[test]
+fn initial_exec_file_with_execfn_names_16_byte_alias() {
+    initial_exec_file_with_execfn_control(
+        "initial_exec_file_with_execfn_names_16_byte_alias",
+        "file",
+        "launched-alias16",
+        "launched-alias1",
+    );
+}
+
+/// The control: the bytes entry, given the same image, filename and
+/// arguments, retains no file, so the following stat and the self-exec of
+/// `/proc/self/exe` both fail with ENOENT. It names the task as the file
+/// entry does.
+#[test]
+fn initial_exec_bytes_with_execfn_cannot_self_exec() {
+    initial_exec_file_with_execfn_control(
+        "initial_exec_bytes_with_execfn_cannot_self_exec",
+        "bytes",
+        "launched-alias",
+        "launched-alias",
+    );
+}
+
+/// Hermit's launch: the bytes entry for a `#!` script whose argv the
+/// launcher rewrote to the interpreter, named over 16 bytes. Linux names it
+/// after the script's first 15 bytes (`script-name-over-16`:
+/// `./script-name-over-16-bytes.sh` gives `comm=script-name-ove`).
+#[test]
+fn initial_exec_bytes_with_execfn_names_long_script() {
+    initial_exec_file_with_execfn_control(
+        "initial_exec_bytes_with_execfn_names_long_script",
+        "bytes-script",
+        "launched-script-over-16",
+        "launched-script",
+    );
+}
+
+/// `case` is `file` or `bytes` (the entry) for a link named `name`, or
+/// `script` or `bytes-script` for a `#!` script named `name`; `comm` is the
+/// name Linux gives the first image.
+fn initial_exec_file_with_execfn_control(test: &str, case: &str, name: &str, comm: &str) {
+    if !leader_self_exec_bounded(test) {
+        return;
+    }
+    let bytes = case.starts_with("bytes");
+    let script = case.ends_with("script");
+    let directory = TestDirectory::new();
+    let program = compile_c_program(
+        &directory.0,
+        "image-file",
+        INITIAL_EXEC_FILE_WITH_EXECFN_PROGRAM,
+    );
+    let execfn = directory.0.join(name);
+    if script {
+        std::fs::write(&execfn, format!("#!{}\n", program.display())).unwrap();
+    } else {
+        std::os::unix::fs::symlink(&program, &execfn).unwrap();
+    }
+    let program_text = program.to_str().unwrap();
+    let execfn_text = execfn.to_str().unwrap();
+    let argv = if script {
+        vec![program_text, execfn_text, "argument-preserved"]
+    } else {
+        vec![execfn_text, "argument-preserved"]
+    };
+    let environment = [format!("EXEC_IMAGE={program_text}")];
+    let envp = environment.iter().map(String::as_str).collect::<Vec<_>>();
+    let mut backend = KvmBackend::new(256 * 1024 * 1024).unwrap();
+    if bytes {
+        backend
+            .install_static_elf_with_exec_context(
+                &std::fs::read(&program).unwrap(),
+                execfn.as_os_str(),
+                &argv,
+                &envp,
+                &directory.0,
+            )
+            .unwrap();
+    } else {
+        backend
+            .install_static_elf_file_with_exec_context(
+                std::fs::File::open(&program).unwrap(),
+                execfn.as_os_str(),
+                &argv,
+                &envp,
+                &directory.0,
+            )
+            .unwrap();
+    }
+    let (code, stdout, stderr) = backend.run_static_elf_captured().unwrap();
+    let arguments = argv.join(" ");
+    // The first image is named after the last component of the filename it
+    // was exec'd by (https://github.com/rrnewton/reverie/issues/1106), never
+    // after the image file (`image-file`). The self-exec names it `exe`, as
+    // Linux does.
+    let expected = if bytes {
+        format!(
+            "before argv={arguments} execfn={execfn_text} comm={comm} exe=EACCES stat errno=2\n\
+             self-exec errno=2\n"
+        )
+    } else {
+        format!(
+            "before argv={arguments} execfn={execfn_text} comm={comm} exe=EACCES same_file=1\n\
+             after argv={arguments} execfn=/proc/self/exe comm=exe exe=EACCES same_file=1\n"
+        )
+    };
+    assert_eq!(
+        (code, String::from_utf8_lossy(&stdout).into_owned()),
+        (0, expected),
+        "stderr={}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert!(
+        stderr.is_empty(),
+        "stderr={}",
+        String::from_utf8_lossy(&stderr)
+    );
+}
+
+const INITIAL_EXEC_FILE_WITH_EXECFN_PROGRAM: &str = r###"
+#define _GNU_SOURCE
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/auxv.h>
+#include <sys/prctl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+extern char **environ;
+
+int main(int argc, char **argv) {
+    int after = getenv("EXEC_AFTER") != NULL;
+    printf("%s argv=", after ? "after" : "before");
+    for (int i = 0; i < argc; ++i) printf(i ? " %s" : "%s", argv[i]);
+    const char *execfn = (const char *)getauxval(AT_EXECFN);
+    char name[17] = {0};
+    if (prctl(PR_GET_NAME, name)) return 10;
+    /* The exe link is a Tool's to render; with no Tool the executor refuses it. */
+    char link[4096];
+    errno = 0;
+    ssize_t length = readlink("/proc/self/exe", link, sizeof(link) - 1);
+    if (length != -1) return 11;
+    printf(" execfn=%s comm=%s exe=%s", execfn ? execfn : "(none)", name, errno == EACCES ? "EACCES" : "other");
+    struct stat self, image;
+    if (stat(getenv("EXEC_IMAGE"), &image)) return 12;
+    if (stat("/proc/self/exe", &self)) {
+        int error = errno;
+        printf(" stat errno=%d\n", error);
+    } else {
+        printf(" same_file=%d\n", self.st_dev == image.st_dev && self.st_ino == image.st_ino);
+    }
+    if (after) return 0;
+    if (setenv("EXEC_AFTER", "1", 1)) return 13;
+    fflush(stdout);
+    execve("/proc/self/exe", argv, environ);
+    int error = errno;
+    printf("self-exec errno=%d\n", error);
     return 0;
 }
 "###;
@@ -1479,18 +1701,16 @@ int main(int argc, char **argv) {
             unsigned char expected[4096];
             if (actual == MAP_FAILED) return 11;
             memset(actual, 0x5a, 4096); memset(expected, 0x5a, sizeof(expected));
-            if (!access) {
-                if (operation) memcpy(expected, argv[0], strlen(argv[0]));
-                else if (syscall(SYS_newfstatat, AT_FDCWD, argv[0], expected, 0)) return 12;
-            }
+            /* readlink of the exe link: with no Tool the executor refuses it (EACCES) before it writes. */
+            if (!access && !operation && syscall(SYS_newfstatat, AT_FDCWD, argv[0], expected, 0)) return 12;
             int protection = access == 0 ? PROT_READ | PROT_WRITE : access == 1 ? PROT_READ : PROT_NONE;
             if (mprotect(actual, 4096, protection)) return 13;
             errno = 0;
             long result = operation ? syscall(SYS_readlink, "/proc/self/exe", actual, 4096) : syscall(SYS_newfstatat, AT_FDCWD, "/proc/self/exe", actual, 0);
             int error = errno;
             if (mprotect(actual, 4096, PROT_READ | PROT_WRITE)) return 14;
-            long expected_result = access ? -1 : operation ? (long)strlen(argv[0]) : 0;
-            int expected_error = access ? EFAULT : 0;
+            long expected_result = operation || access ? -1 : 0;
+            int expected_error = operation ? EACCES : access ? EFAULT : 0;
             int equal = memcmp(actual, expected, sizeof(expected)) == 0;
             if (result != expected_result || error != expected_error || !equal) {
                 printf("operation=%d access=%d result=%ld errno=%d full4096=%d expected_result=%ld expected_errno=%d\n", operation, access, result, error, equal, expected_result, expected_error);
@@ -1622,8 +1842,9 @@ int main(int argc, char **argv) {
         const char *path = getenv("SAVED_LINK");
         size_t length = strlen(path);
         if (length >= sizeof(expected)) return 34;
-        memcpy(expected, path, length);
-        if (readlink("/proc/self/exe", (char *)link, sizeof(link)) != (ssize_t)length || memcmp(link, expected, sizeof(link))) return 35;
+        /* The exe link is a Tool's to render; with no Tool the executor refuses it and writes nothing. */
+        memset(expected, 0x5a, sizeof(expected)); errno = 0;
+        if (readlink("/proc/self/exe", (char *)link, sizeof(link)) != -1 || errno != EACCES || memcmp(link, expected, sizeof(link))) return 35;
         if (prctl(PR_SET_NAME, "changed-after") || !name_is("changed-after")) return 36;
         if (!strcmp(stage, "thread")) {
             errno = 0;
@@ -1777,14 +1998,15 @@ fn self_exec_proc_aliases_use_loaded_image_after_unlink_or_replacement() {
                 mov $4096, %edx
                 mov $89, %eax
                 syscall
+                # The exe link is a Tool's to render (Guest::link_path); with no
+                # Tool the executor refuses it.
                 test %rax, %rax
-                js exit_with_errno
-                mov %eax, %edx
+                jns link_answered
                 mov $1, %edi
-                lea link_buffer(%rip), %rsi
+                lea refused_text(%rip), %rsi
+                mov $8, %edx
                 mov $1, %eax
                 syscall
-                call write_newline
 
                 mov $1, %edi
                 lea image_marker(%rip), %rsi
@@ -1823,6 +2045,11 @@ fn self_exec_proc_aliases_use_loaded_image_after_unlink_or_replacement() {
                 mov $231, %eax
                 syscall
 
+            link_answered:
+                mov $77, %edi
+                mov $231, %eax
+                syscall
+
             write_newline:
                 mov $1, %edi
                 lea newline(%rip), %rsi
@@ -1834,6 +2061,8 @@ fn self_exec_proc_aliases_use_loaded_image_after_unlink_or_replacement() {
                 .section .rodata
             self_path:
                 .asciz "{path}"
+            refused_text:
+                .ascii "refused\n"
             replacement_argv0:
                 .asciz "{argv0}"
             replacement_argv1:
@@ -1899,10 +2128,7 @@ fn self_exec_proc_aliases_use_loaded_image_after_unlink_or_replacement() {
         };
 
         let (code, stdout, stderr) = backend.run_static_elf_captured().unwrap();
-        let expected = format!(
-            "{} (deleted)\n{IMAGE_MARKER}{ARGV0}\n{ARGV1}\n{ENVP0}\n",
-            executable.display(),
-        );
+        let expected = format!("refused\n{IMAGE_MARKER}{ARGV0}\n{ARGV1}\n{ENVP0}\n");
         assert_eq!(code, 0, "path={path} execveat={execveat} {mutation}");
         assert_eq!(
             stdout,
@@ -1936,15 +2162,15 @@ fn exec_through_symlink_reports_the_opened_executable_and_preserves_argv0() {
             mov $4096, %edx
             mov $89, %eax
             syscall
+            # The exe link is a Tool's to render (Guest::link_path); with no
+            # Tool the executor refuses it.
             test %rax, %rax
-            js exit_with_errno
-
-            mov %eax, %edx
+            jns link_answered
             mov $1, %edi
-            lea link_buffer(%rip), %rsi
+            lea refused_text(%rip), %rsi
+            mov $8, %edx
             mov $1, %eax
             syscall
-            call write_newline
 
             mov $1, %edi
             mov 8(%rsp), %rsi
@@ -1971,9 +2197,16 @@ fn exec_through_symlink_reports_the_opened_executable_and_preserves_argv0() {
             mov $231, %eax
             syscall
 
+        link_answered:
+            mov $77, %edi
+            mov $231, %eax
+            syscall
+
             .section .rodata
         self_path:
             .asciz "/proc/self/exe"
+        refused_text:
+            .ascii "refused\n"
         newline:
             .ascii "\n"
 
@@ -1984,7 +2217,7 @@ fn exec_through_symlink_reports_the_opened_executable_and_preserves_argv0() {
         "#,
         argv0_len = ARGV0.len(),
     );
-    let target = compile_assembly_program(&root.0, "actual-target", &target_source);
+    compile_assembly_program(&root.0, "actual-target", &target_source);
     std::fs::create_dir(root.0.join("components")).unwrap();
     let alias = root.0.join("exec-alias");
     std::os::unix::fs::symlink("components/../actual-target", &alias).unwrap();
@@ -2031,7 +2264,7 @@ fn exec_through_symlink_reports_the_opened_executable_and_preserves_argv0() {
         .unwrap();
 
     let (code, stdout, stderr) = backend.run_static_elf_captured().unwrap();
-    let expected = format!("{}\n{ARGV0}\n", target.canonicalize().unwrap().display());
+    let expected = format!("refused\n{ARGV0}\n");
     assert_eq!(code, 0);
     assert_eq!(stdout, expected.as_bytes());
     assert!(stderr.is_empty());
@@ -2142,12 +2375,17 @@ fn repeated_self_exec_preserves_executable_identity_argv_and_envp() {
         mov $4096, %edx
         mov $89, %eax
         syscall
+        # The exe link is a Tool's to render (Guest::link_path); with no
+        # Tool the executor refuses it.
         test %rax, %rax
-        js exit_with_errno
-        mov %eax, %edx
-        lea link_buffer(%rip), %rsi
-        call write_buffer
-        jmp write_newline
+        jns link_answered
+        lea refused_text(%rip), %rsi
+        mov $8, %edx
+        jmp write_buffer
+
+    link_answered:
+        mov $77, %edi
+        jmp exit_with_code
 
     write_buffer:
         mov $1, %edi
@@ -2173,6 +2411,8 @@ fn repeated_self_exec_preserves_executable_identity_argv_and_envp() {
         .section .rodata
     self_path:
         .asciz "/proc/self/exe"
+    refused_text:
+        .ascii "refused\n"
     numeric_path:
         .asciz "/proc/37/exe"
     first_argv0:
@@ -2229,8 +2469,8 @@ fn repeated_self_exec_preserves_executable_identity_argv_and_envp() {
 
     let (code, stdout, stderr) = backend.run_static_elf_captured().unwrap();
     let expected = format!(
-        "{STAGE_ONE_MARKER}{executable}\n{executable}\n{FIRST_ARGV0}\n{FIRST_ARGV1}\n{FIRST_ENVP0}\n\
-         {STAGE_TWO_MARKER}{executable}\n{executable}\n{SECOND_ARGV0}\n{SECOND_ARGV1}\n\
+        "{STAGE_ONE_MARKER}refused\nrefused\n{FIRST_ARGV0}\n{FIRST_ARGV1}\n{FIRST_ENVP0}\n\
+         {STAGE_TWO_MARKER}refused\nrefused\n{SECOND_ARGV0}\n{SECOND_ARGV1}\n\
          {SECOND_ARGV2}\n{SECOND_ENVP0}\n"
     );
     assert_eq!(code, 0);
@@ -2271,19 +2511,23 @@ static int write_all(const char *bytes, size_t length) {
 }
 
 static int print_identity(const char *argv0) {
+  /* The exe link is a Tool's to render (Guest::link_path); with no Tool the
+     executor refuses it. */
   char link[4096];
+  errno = 0;
   ssize_t link_length = readlink("/proc/self/exe", link, sizeof(link));
-  if (link_length < 0 || write_all(link, (size_t)link_length) != 0 ||
-      write_all("\n", 1) != 0) return -1;
+  if (link_length != -1 || errno != EACCES || write_all("EACCES\n", 7) != 0) return -1;
 
-  int fd = open("/proc/self/stat", O_RDONLY);
-  char stat[4096];
-  ssize_t length = fd < 0 ? -1 : read(fd, stat, sizeof(stat) - 1);
+  /* The executor's comm, through its status Name line (its stat copy
+     followed Detcore, package K slice D4c-1). */
+  int fd = open("/proc/self/status", O_RDONLY);
+  char status[4096];
+  ssize_t length = fd < 0 ? -1 : read(fd, status, sizeof(status) - 1);
   if (fd >= 0) close(fd);
   if (length <= 0) return -1;
-  stat[length] = 0;
-  char *left = strchr(stat, '(');
-  char *right = strrchr(stat, ')');
+  status[length] = 0;
+  char *left = strncmp(status, "Name:\t", 6) == 0 ? status + 5 : NULL;
+  char *right = left == NULL ? NULL : strchr(left, '\n');
   if (left == NULL || right == NULL || right <= left ||
       write_all(left + 1, (size_t)(right - left - 1)) != 0 ||
       write_all("\n", 1) != 0 || write_all(argv0, strlen(argv0)) != 0 ||
@@ -2337,12 +2581,10 @@ int main(void) {{
         String::from_utf8_lossy(&stdout),
         String::from_utf8_lossy(&stderr)
     );
-    let target = target.canonicalize().unwrap();
-    let expected = format!(
-        "{target}\nalias-name\nnot-the-path\n{target}\nexe\nsecond-argv-zero\n",
-        target = target.display(),
+    assert_eq!(
+        stdout,
+        b"EACCES\nalias-name\nnot-the-path\nEACCES\nexe\nsecond-argv-zero\n"
     );
-    assert_eq!(stdout, expected.as_bytes());
     assert!(stderr.is_empty());
 }
 
@@ -2350,7 +2592,38 @@ fn leader_self_exec_bounded(test: &str) -> bool {
     leader_self_exec_bounded_with_output(test, false)
 }
 
+/// [`leader_self_exec_bounded`], with a per-case CPU/wall budget pair
+/// instead of the shared 30 s wall (owner rule 2026-11-01: the CPU cap
+/// is primary at about 1.5x the observed CPU, at most 60 s; the wall
+/// is the 8x backstop, at most 600 s). The CPU cap is enforced with
+/// prlimit's RLIMIT_CPU on the self-exec child; the wall stays a GNU
+/// timeout backstop. Only for cases whose measured cost needs it:
+/// every other case keeps the shared 30 s wall.
+fn leader_self_exec_bounded_capped(test: &str, cpu_seconds: u64, wall_seconds: u64) -> bool {
+    leader_self_exec_bounded_limited(test, false, wall_seconds, Some(cpu_seconds), |_| {})
+}
+
 fn leader_self_exec_bounded_with_output(test: &str, forward_output: bool) -> bool {
+    leader_self_exec_bounded_configured(test, forward_output, |_| {})
+}
+
+/// [`leader_self_exec_bounded_with_output`], with `configure` applied to the
+/// child's command before it starts.
+fn leader_self_exec_bounded_configured(
+    test: &str,
+    forward_output: bool,
+    configure: impl FnOnce(&mut std::process::Command),
+) -> bool {
+    leader_self_exec_bounded_limited(test, forward_output, 30, None, configure)
+}
+
+fn leader_self_exec_bounded_limited(
+    test: &str,
+    forward_output: bool,
+    wall_seconds: u64,
+    cpu_seconds: Option<u64>,
+    configure: impl FnOnce(&mut std::process::Command),
+) -> bool {
     if !kvm_available(test) {
         return false;
     }
@@ -2367,7 +2640,13 @@ fn leader_self_exec_bounded_with_output(test: &str, forward_output: bool) -> boo
     std::fs::set_permissions(&result_directory.0, std::fs::Permissions::from_mode(0o700)).unwrap();
     let execution_log = result_directory.0.join("libtest.log");
     let mut command = std::process::Command::new("timeout");
-    command.args(["--kill-after=2s", "30s"]);
+    command.args(["--kill-after=2s", &format!("{wall_seconds}s")]);
+    if let Some(cpu_seconds) = cpu_seconds {
+        command
+            .arg("prlimit")
+            .arg(format!("--cpu={cpu_seconds}"))
+            .arg("--");
+    }
     if broker_test_protocol::selected(test) {
         // Test runners can locate the helper at execution time on another host.
         command.arg(match std::env::var_os("REVERIE_KVM_TEST_BROKER_LAUNCHER") {
@@ -2375,19 +2654,35 @@ fn leader_self_exec_bounded_with_output(test: &str, forward_output: bool) -> boo
             None => env!("CARGO_BIN_EXE_reverie-kvm-broker-test-launcher").into(),
         });
     }
-    let output = command
+    command
         .arg(std::env::current_exe().unwrap())
         .args(["--exact", test, "--nocapture", "--logfile"])
         .arg(&execution_log)
-        .env("REVERIE_LEADER_EXEC_CHILD", test)
-        .output()
-        .unwrap();
+        .env("REVERIE_LEADER_EXEC_CHILD", test);
+    configure(&mut command);
+    let output = command.output().unwrap();
     if forward_output {
         std::io::Write::write_all(&mut std::io::stdout().lock(), &output.stdout).unwrap();
         std::io::Write::write_all(&mut std::io::stderr().lock(), &output.stderr).unwrap();
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
+    // Host-capability refusal: same named skip as the broker library helper.
+    if !output.status.success() && stderr.contains("ambient mount absent from bootstrap mountinfo")
+    {
+        let line = format!(
+            "\nREVERIE_SKIP: {test}: broker ambient mount absent from bootstrap mountinfo on this host\n"
+        );
+        let mut rest = line.as_bytes();
+        while !rest.is_empty() {
+            // SAFETY: writes only the line above to this process's stderr.
+            let written =
+                unsafe { libc::write(libc::STDERR_FILENO, rest.as_ptr().cast(), rest.len()) };
+            assert!(written > 0, "write named skip for {test}");
+            rest = &rest[written as usize..];
+        }
+        return false;
+    }
     assert!(
         output.status.success(),
         "{test}: status={:?} stdout={} stderr={}",
@@ -2663,6 +2958,135 @@ fn leader_self_exec_name_script() {
     leader_self_exec_name_control("leader_self_exec_name_script", "script");
 }
 
+/// An in-guest exec chain names each image as native Linux names it, by the
+/// filename it was exec'd by (reverie#1106). Every expected line is the
+/// native output of the same program, steps and file names (the reverie#1106
+/// probe, run outside any backend on Linux 7.1.3: cases `name-exactly-15`,
+/// `exec-execve-16`, `script-name-over-16`, `exec-proc-self-fd`,
+/// `exec-dev-fd`, `exec-empty-path-alias` and `exec-dirfd-relative-alias`),
+/// except the lines the comment below records as KVM differences.
+#[test]
+fn in_guest_exec_names_each_image_by_its_filename() {
+    if !leader_self_exec_bounded("in_guest_exec_names_each_image_by_its_filename") {
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let directory = TestDirectory::new();
+    let program = compile_c_program(&directory.0, "name-probe", EXEC_NAME_CHAIN_PROGRAM);
+    for alias in ["chosen-alias", "abcdefghijklmno", "abcdefghijklmnop"] {
+        std::os::unix::fs::symlink(&program, directory.0.join(alias)).unwrap();
+    }
+    let script = directory.0.join("script-name-over-16-bytes.sh");
+    std::fs::write(&script, format!("#!{}\n", program.display())).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let steps = "STEPS=execve:./abcdefghijklmno,execve:./abcdefghijklmnop,\
+                 execve:./script-name-over-16-bytes.sh,execve:chosen-alias,\
+                 procfd:./chosen-alias,devfd:./chosen-alias,empty:./chosen-alias,\
+                 dirrel:chosen-alias";
+    // A bare name: Linux resolves it against the working directory, the
+    // executor searches PATH, which names only that directory here, so both
+    // run the link; it is named after the link, not its resolved target.
+    let path = format!("PATH={}", directory.0.display());
+    let mut backend = KvmBackend::new(256 * 1024 * 1024).unwrap();
+    backend
+        .install_static_elf_file_with_context(
+            std::fs::File::open(&program).unwrap(),
+            &[program.to_str().unwrap()],
+            &[steps, &path],
+            &directory.0,
+        )
+        .unwrap();
+    let (code, stdout, stderr) = backend.run_static_elf_captured().unwrap();
+    // The last four lines record KVM differences in which execs the executor
+    // runs, not in naming. Natively they are `procfd ./chosen-alias comm=9`,
+    // `devfd ./chosen-alias comm=9` (named by bprm->filename `/proc/self/fd/9`
+    // or `/dev/fd/9`), `empty ./chosen-alias comm=name-probe` (AT_EMPTY_PATH
+    // names the task after the opened file's dentry) and
+    // `dirrel chosen-alias comm=chosen-alias`. On KVM the executor opens an
+    // exec path without following magic links, so a descriptor path fails
+    // with ELOOP (40), and it refuses `execveat` with a dirfd or flags with
+    // ENOTSUP (95).
+    let expected = "initial comm=name-probe\n\
+                    execve ./abcdefghijklmno comm=abcdefghijklmno\n\
+                    execve ./abcdefghijklmnop comm=abcdefghijklmno\n\
+                    execve ./script-name-over-16-bytes.sh comm=script-name-ove\n\
+                    execve chosen-alias comm=chosen-alias\n\
+                    procfd ./chosen-alias errno=40\n\
+                    devfd ./chosen-alias errno=40\n\
+                    empty ./chosen-alias errno=95\n\
+                    dirrel chosen-alias errno=95\n";
+    assert_eq!(
+        (code, String::from_utf8_lossy(&stdout).into_owned()),
+        (0, expected.to_owned()),
+        "stderr={}",
+        String::from_utf8_lossy(&stderr)
+    );
+}
+
+/// Prints the name `PR_GET_NAME` gives this image, then runs the next of the
+/// comma-separated `mode:target` steps in `STEPS`: `execve` of `target`,
+/// `procfd` or `devfd` (`target` opened onto descriptor 9 and exec'd as
+/// `/proc/self/fd/9` or `/dev/fd/9`), `empty` (`execveat(9, "",
+/// AT_EMPTY_PATH)`, glibc's `fexecve`) or `dirrel` (`execveat` of `target`
+/// relative to a descriptor for `.`). An exec that fails prints its errno and
+/// the next step runs.
+const EXEC_NAME_CHAIN_PROGRAM: &str = r###"
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+extern char **environ;
+
+int main(int argc, char **argv) {
+    (void)argc;
+    char name[17] = {0};
+    if (prctl(PR_GET_NAME, name)) return 10;
+    const char *label = getenv("LABEL");
+    printf("%s comm=%s\n", label ? label : "initial", name);
+    char steps[4096];
+    snprintf(steps, sizeof(steps), "%s", getenv("STEPS") ? getenv("STEPS") : "");
+    char *cursor = steps;
+    while (*cursor) {
+        char *comma = strchr(cursor, ',');
+        if (comma) *comma = 0;
+        char *mode = cursor, *target = strchr(cursor, ':');
+        cursor = comma ? comma + 1 : cursor + strlen(cursor);
+        if (!target) return 11;
+        *target++ = 0;
+        char value[512];
+        snprintf(value, sizeof(value), "%s %s", mode, target);
+        if (setenv("LABEL", value, 1) || setenv("STEPS", cursor, 1)) return 12;
+        fflush(stdout);
+        if (!strcmp(mode, "execve")) {
+            execve(target, argv, environ);
+        } else if (!strcmp(mode, "procfd") || !strcmp(mode, "devfd") || !strcmp(mode, "empty")) {
+            int fd = open(target, O_RDONLY);
+            if (fd < 0 || dup2(fd, 9) != 9) return 13;
+            if (fd != 9) close(fd);
+            if (!strcmp(mode, "empty")) {
+                syscall(SYS_execveat, 9, "", argv, environ, AT_EMPTY_PATH);
+            } else {
+                execve(mode[0] == 'p' ? "/proc/self/fd/9" : "/dev/fd/9", argv, environ);
+            }
+        } else if (!strcmp(mode, "dirrel")) {
+            int directory = open(".", O_RDONLY | O_DIRECTORY);
+            if (directory < 0) return 14;
+            syscall(SYS_execveat, directory, target, argv, environ, 0);
+        } else {
+            return 15;
+        }
+        printf("%s errno=%d\n", value, errno);
+    }
+    return 0;
+}
+"###;
+
 #[test]
 fn leader_self_exec_mutable_0_normal() {
     leader_self_exec_mutable_control("leader_self_exec_mutable_0_normal", "0", "normal");
@@ -2731,9 +3155,10 @@ int main(int argc, char **argv) {
         const char *expected = getenv("W12_LINK");
         size_t length = strlen(expected);
         if (length >= sizeof(expected_link)) return 52;
-        memcpy(expected_link, expected, length);
+        /* The exe link is a Tool's to render; with no Tool the executor refuses it and writes nothing. */
+        errno = 0;
         ssize_t count = readlink("/proc/self/exe", (char *)actual_link, sizeof(actual_link));
-        int link_equal = count == (ssize_t)length && !memcmp(actual_link, expected_link, sizeof(actual_link));
+        int link_equal = count == -1 && errno == EACCES && !memcmp(actual_link, expected_link, sizeof(actual_link));
         int argv_equal = argc == 2 && !strcmp(argv[0], "not-the-image") && !strcmp(argv[1], "after");
         int comm_equal = !memcmp(comm, expected_comm, sizeof(comm));
         printf("identity=%d link_full4096=%d argv=%d comm_full16=%d comm=", identity, link_equal, argv_equal, comm_equal);
@@ -2867,10 +3292,10 @@ int main(int argc, char **argv) {
         require(status_name_is(argv[3]), "initial status name");
         unsigned char actual[4096], expected[4096];
         memset(actual, 0x5a, sizeof(actual)); memset(expected, 0x5a, sizeof(expected));
-        size_t expected_length = strlen(argv[4]); memcpy(expected, argv[4], expected_length);
-        if (strcmp(argv[5], "normal")) { memcpy(expected+expected_length, " (deleted)", 10); expected_length += 10; }
+        /* The exe link is a Tool's to render (Guest::link_path); with no Tool the executor refuses it and writes nothing. */
+        errno = 0;
         ssize_t length = readlink("/proc/self/exe", (char *)actual, sizeof(actual));
-        require(length == (ssize_t)expected_length && !memcmp(actual, expected, sizeof(actual)), "retained executable identity full4096");
+        require(length == -1 && errno == EACCES && !memcmp(actual, expected, sizeof(actual)), "exe link refused without a Tool full4096");
         require(prctl(PR_SET_NAME, renamed, 0, 0, 0) == 0 && name_is(renamed), "mutable name after exec full64");
         require(status_name_is(renamed), "escaped status after exec");
         pthread_t worker; void *result = (void *)1;
@@ -3164,13 +3589,6 @@ int main(int argc, char **argv) {
     EXPECT_ERROR(open("missing-open-precedence", O_ACCMODE | O_TMPFILE, 0600), ENOENT);
     EXPECT_ERROR(open("missing-open-precedence", O_PATH | O_TMPFILE, 0600), ENOENT);
     EXPECT_ERROR(open("missing-open-precedence", O_RDONLY | O_DIRECTORY, 0600), ENOENT);
-    EXPECT_ERROR(open("/proc/self/fdinfo/999999", O_RDONLY | O_TMPFILE, 0600), EINVAL);
-    EXPECT_ERROR(open("/proc/self/fdinfo/999999", O_WRONLY | PRIVATE_TMPFILE, 0600), EINVAL);
-    EXPECT_ERROR(open("/proc/self/fdinfo/999999", O_WRONLY | O_TMPFILE | O_CREAT, 0600), EINVAL);
-    EXPECT_ERROR(open("/proc/self/fdinfo/999999", O_WRONLY | O_TMPFILE, 0600), ENOENT);
-    EXPECT_ERROR(open("/proc/self/fdinfo/999999", O_ACCMODE | O_TMPFILE, 0600), ENOENT);
-    EXPECT_ERROR(open("/proc/self/fdinfo/999999", O_PATH | O_TMPFILE, 0600), ENOENT);
-    EXPECT_ERROR(open("/proc/self/fdinfo/999999", O_RDONLY | O_DIRECTORY, 0600), ENOENT);
     EXPECT_ERROR(open("/proc/self/fd/999999", O_RDONLY | O_TMPFILE, 0600), EINVAL);
     EXPECT_ERROR(open("/proc/self/fd/999999", O_WRONLY | PRIVATE_TMPFILE, 0600), EINVAL);
     EXPECT_ERROR(open("/proc/self/fd/999999", O_WRONLY | O_TMPFILE | O_CREAT, 0600), EINVAL);
@@ -3189,9 +3607,6 @@ int main(int argc, char **argv) {
                         O_RDONLY | O_CREAT | O_DIRECTORY, 0600),
                  early_create_directory ? EINVAL : EBADF);
     EXPECT_ERROR(open("missing-open-precedence",
-                      O_RDONLY | O_CREAT | O_DIRECTORY, 0600),
-                 early_create_directory ? EINVAL : ENOENT);
-    EXPECT_ERROR(open("/proc/self/fdinfo/999999",
                       O_RDONLY | O_CREAT | O_DIRECTORY, 0600),
                  early_create_directory ? EINVAL : ENOENT);
     EXPECT_ERROR(open("/proc/self/fd/999999",
@@ -3219,19 +3634,6 @@ int main(int argc, char **argv) {
 
     char procfd[64];
     CHECK(snprintf(procfd, sizeof(procfd), "/proc/self/fd/%d", descriptor) > 0);
-    char unsupported_fdinfo[64];
-    CHECK(snprintf(unsupported_fdinfo, sizeof(unsupported_fdinfo),
-                   "/proc/self/fdinfo/%d", descriptor) > 0);
-    CHECK(stat(unsupported_fdinfo, &metadata) == 0);
-    CHECK(S_ISREG(metadata.st_mode));
-    EXPECT_ERROR(open(unsupported_fdinfo, O_RDONLY), ENOSYS);
-    EXPECT_ERROR(open(unsupported_fdinfo, O_RDONLY | O_DIRECTORY), ENOTDIR);
-    EXPECT_ERROR(open(unsupported_fdinfo, O_WRONLY | O_TMPFILE, 0600), ENOTDIR);
-    EXPECT_ERROR(open(unsupported_fdinfo, O_RDONLY | O_CREAT | O_DIRECTORY, 0600),
-                 expected_create_directory);
-    EXPECT_ERROR(open(unsupported_fdinfo,
-                      O_RDONLY | O_CREAT | O_EXCL | O_DIRECTORY, 0600),
-                 expected_create_directory_exclusive);
     EXPECT_ERROR(open(procfd, O_WRONLY), EACCES);
     EXPECT_ERROR(open(procfd, O_RDWR), EACCES);
     EXPECT_ERROR(open(procfd, O_RDONLY | O_TRUNC), EACCES);
@@ -3269,81 +3671,6 @@ int main(int argc, char **argv) {
     CHECK((fcntl(reopened, F_GETFL) & (O_NONBLOCK | O_APPEND | O_SYNC)) ==
           (O_NONBLOCK | O_APPEND | O_SYNC));
     CHECK(close(reopened) == 0);
-
-    int ordinary = open("fdinfo-target", O_CREAT | O_RDWR | O_TRUNC, 0600);
-    CHECK(ordinary >= 0);
-    char fdinfo[64];
-    CHECK(snprintf(fdinfo, sizeof(fdinfo), "/proc/self/fdinfo/%d", ordinary) > 0);
-    EXPECT_ERROR(open(fdinfo, O_RDONLY | O_TMPFILE, 0600), EINVAL);
-    EXPECT_ERROR(open(fdinfo, O_RDONLY | O_TMPFILE | O_NOFOLLOW, 0600), EINVAL);
-    EXPECT_ERROR(open(fdinfo, O_RDONLY | O_TMPFILE | O_TRUNC, 0600), EINVAL);
-    EXPECT_ERROR(open(fdinfo, O_RDONLY | O_TMPFILE | O_DIRECT, 0600), EINVAL);
-    EXPECT_ERROR(open(fdinfo, O_RDONLY | O_TMPFILE | O_EXCL, 0600), EINVAL);
-    EXPECT_ERROR(open(fdinfo, O_RDONLY | O_TMPFILE | O_NOFOLLOW | O_TRUNC | O_DIRECT | O_EXCL, 0600), EINVAL);
-    EXPECT_ERROR(open(fdinfo, O_WRONLY | PRIVATE_TMPFILE, 0600), EINVAL);
-    EXPECT_ERROR(open(fdinfo, O_WRONLY | O_TMPFILE | O_CREAT, 0600), EINVAL);
-    EXPECT_ERROR(open(fdinfo, O_RDWR | O_TMPFILE | O_CREAT, 0600), EINVAL);
-    EXPECT_ERROR(open(fdinfo, O_ACCMODE | O_TMPFILE | O_CREAT, 0600), EINVAL);
-    EXPECT_ERROR(open(fdinfo, O_WRONLY | O_TMPFILE, 0600), ENOTDIR);
-    EXPECT_ERROR(open(fdinfo, O_RDWR | O_TMPFILE, 0600), ENOTDIR);
-    EXPECT_ERROR(open(fdinfo, O_ACCMODE | O_TMPFILE, 0600), ENOTDIR);
-    EXPECT_ERROR(open(fdinfo, O_PATH | O_TMPFILE, 0600), ENOTDIR);
-    EXPECT_ERROR(open(fdinfo, O_PATH | O_TMPFILE | O_NOFOLLOW | O_TRUNC | O_DIRECT | O_EXCL, 0600), ENOTDIR);
-    EXPECT_ERROR(open(fdinfo, O_RDONLY | O_DIRECTORY), ENOTDIR);
-    EXPECT_ERROR(open(fdinfo, O_RDONLY | O_CREAT | O_DIRECTORY, 0600),
-                 expected_create_directory);
-    EXPECT_ERROR(open(fdinfo, O_RDONLY | O_CREAT | O_EXCL | O_DIRECTORY, 0600),
-                 expected_create_directory_exclusive);
-    EXPECT_ERROR(open(fdinfo, O_RDONLY | O_CREAT | O_DIRECTORY | O_NOFOLLOW, 0600),
-                 expected_create_directory);
-    EXPECT_ERROR(open(fdinfo,
-                      O_RDONLY | O_CREAT | O_EXCL | O_DIRECTORY | O_NOFOLLOW,
-                      0600),
-                 expected_create_directory_exclusive);
-    int readable_fdinfo = open(fdinfo, O_RDONLY | O_CLOEXEC);
-    CHECK(readable_fdinfo >= 0);
-    EXPECT_ERROR(syscall(SYS_pwrite64, readable_fdinfo, "x", 1, 0), ESPIPE);
-    EXPECT_ERROR(syscall(SYS_pwrite64, readable_fdinfo, "x", 0, 0), ESPIPE);
-    EXPECT_ERROR(syscall(SYS_pwrite64, readable_fdinfo, "x", 1, (off_t)-1), EINVAL);
-    EXPECT_ERROR(syscall(SYS_pwrite64, readable_fdinfo, "x", 0, (off_t)-1), EINVAL);
-    EXPECT_ERROR(syscall(SYS_pwrite64, readable_fdinfo,
-                         (const char *)(uintptr_t)-1, 1, 0),
-                 ESPIPE);
-    CHECK(close(readable_fdinfo) == 0);
-
-    if (expected_create_directory == ENOTDIR) {
-        static const char *const missing_fdinfo_paths[] = {
-            "/proc/self/fdinfo/999999",
-            "/proc/self/fdinfo/not-a-fd",
-            "/proc/self/fdinfo/03",
-        };
-        static const int create_directory_flags[] = {
-            O_RDONLY | O_CREAT | O_DIRECTORY,
-            O_RDONLY | O_CREAT | O_EXCL | O_DIRECTORY,
-            O_RDONLY | O_CREAT | O_DIRECTORY | O_NOFOLLOW,
-            O_RDONLY | O_CREAT | O_EXCL | O_DIRECTORY | O_NOFOLLOW,
-        };
-        for (size_t path_index = 0;
-             path_index < sizeof(missing_fdinfo_paths) / sizeof(missing_fdinfo_paths[0]);
-             ++path_index) {
-            for (size_t flag_index = 0;
-                 flag_index < sizeof(create_directory_flags) / sizeof(create_directory_flags[0]);
-                 ++flag_index) {
-                EXPECT_ERROR(open(missing_fdinfo_paths[path_index],
-                                  create_directory_flags[flag_index], 0600),
-                             ENOENT);
-            }
-        }
-        for (size_t flag_index = 0;
-             flag_index < sizeof(create_directory_flags) / sizeof(create_directory_flags[0]);
-             ++flag_index) {
-            EXPECT_ERROR(open("/proc/self/fdinfo/",
-                              create_directory_flags[flag_index], 0600),
-                         EISDIR);
-        }
-    }
-    CHECK(close(ordinary) == 0);
-    CHECK(unlink("fdinfo-target") == 0);
 
     EXPECT_ERROR(open("/proc/self/maps", O_RDONLY | O_DIRECTORY), ENOTDIR);
     EXPECT_ERROR(open("/proc/self/maps", O_PATH | O_DIRECTORY), ENOTDIR);
@@ -3431,20 +3758,29 @@ int main(int argc, char **argv) {
 }
 "#;
 
-#[test]
-fn proc_root_original_mutation_vectors_match_native() {
-    assert!(kvm_available(
-        "proc_root_original_mutation_vectors_match_native"
-    ));
+const LOAD_ADDRESS: u64 = 0x20_0000;
+const CODE_OFFSET: usize = 0x1000;
+const POST_EXEC_RANDOM: [u8; 16] = *b"kvm-post-exec-ok";
+static POST_EXEC_FAILURE_EXITED: AtomicBool = AtomicBool::new(false);
+const SIGNAL_EXIT_CHILD_TID: u64 = 0x0800_3000;
+const SIGNAL_EXIT_AFTER_CALLBACK: i32 = 0x5a5a_5a5a;
+static SIGNAL_EXIT_OBSERVED_TID: AtomicU64 = AtomicU64::new(u64::MAX);
+static SIGNAL_EXIT_MEMORY: Mutex<Option<reverie_kvm::GuestMemory>> = Mutex::new(None);
+static POST_EXEC_UNMASK_CALLBACKS: AtomicU64 = AtomicU64::new(0);
+static POST_EXEC_ENTRY_WRITES: AtomicU64 = AtomicU64::new(0);
+
+fn relative_mkdirat_case(case: usize) {
+    assert!(kvm_available("relative_mkdirat_case"));
     let directory = TestDirectory::new();
-    let executable = compile_c_program(
-        &directory.0,
-        "proc-root-mutations",
-        PROC_ROOT_MUTATION_PROGRAM,
-    );
-    let native = std::process::Command::new(&executable).output().unwrap();
+    let program = format!("#define CASE {case}\n{}", RELATIVE_MKDIRAT_PROGRAM);
+    let executable = compile_c_program(&directory.0, "relative-mkdirat", &program);
+    let native = std::process::Command::new(&executable)
+        .current_dir(&directory.0)
+        .output()
+        .unwrap();
     println!(
-        "native original vectors: {}",
+        "native case={case}: {:?} {}",
+        native.status.code(),
         String::from_utf8_lossy(&native.stdout)
     );
     assert_eq!(
@@ -3466,14 +3802,548 @@ fn proc_root_original_mutation_vectors_match_native() {
         .unwrap();
     let (code, stdout, stderr) = backend.run_static_elf_captured().unwrap();
     println!(
-        "guest original vectors: {}",
+        "guest case={case}: {code} {}",
         String::from_utf8_lossy(&stdout)
     );
     assert!(stderr.is_empty(), "{}", String::from_utf8_lossy(&stderr));
     assert_eq!(code, 0);
 }
 
-const PROC_ROOT_MUTATION_PROGRAM: &str = r#"
+#[test]
+fn relative_mkdirat_below_local_directory_with_trailing_slashes() {
+    relative_mkdirat_case(0);
+}
+#[test]
+fn relative_mkdirat_below_real_root_with_trailing_slashes() {
+    relative_mkdirat_case(1);
+}
+
+const RELATIVE_MKDIRAT_PROGRAM: &str = r#"
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+int main(void) {
+    char cwd[4096], relative[8192], target[8192];
+    if (!getcwd(cwd, sizeof(cwd)) || cwd[0] != '/' || strlen(cwd) < 20) return 80;
+    if (snprintf(target, sizeof(target), "%s/private-created", cwd) >= sizeof(target)) return 81;
+    struct stat initial;
+    errno = 0;
+    if (lstat(target, &initial) == 0 || errno != ENOENT) return 82;
+    int descriptor = open(CASE == 0 ? cwd : "/", O_RDONLY | O_DIRECTORY);
+    if (descriptor < 0) return 83;
+    if (CASE == 0) {
+        if (snprintf(relative, sizeof(relative), "private-created///") >= sizeof(relative)) return 88;
+    } else {
+        if (snprintf(relative, sizeof(relative), "%s/private-created///", cwd + 1) >= sizeof(relative)) return 89;
+    }
+    errno = 0;
+    int result = mkdirat(descriptor, relative, 0700);
+    int saved_errno = errno;
+    struct stat after;
+    errno = 0;
+    int exists = lstat(target, &after) == 0;
+    int lookup_errno = errno;
+    if (!exists && lookup_errno != ENOENT) return 90;
+    printf("case=%d result=%d errno=%d exists=%d directory=%d\n", CASE, result, saved_errno, exists, exists && S_ISDIR(after.st_mode));
+    close(descriptor);
+    int correct = result == 0 && exists && S_ISDIR(after.st_mode);
+    if (exists && rmdir(target)) return 91;
+    return correct ? 0 : 94;
+}
+"#;
+
+/// The tree [`TOOL_DIRECTORY_PROGRAM`] runs in: the directory to reserve,
+/// another directory, a link to the first, and links that dangle into it, by
+/// an absolute or a relative target or through a second link. Returns the
+/// directory to reserve.
+fn tool_directory_tree(root: &std::path::Path) -> PathBuf {
+    let reserved = root.join("reserved");
+    std::fs::create_dir(&reserved).unwrap();
+    std::fs::create_dir(root.join("elsewhere")).unwrap();
+    std::os::unix::fs::symlink(&reserved, root.join("link")).unwrap();
+    std::os::unix::fs::symlink(reserved.join("x"), root.join("dangling-absolute")).unwrap();
+    std::os::unix::fs::symlink("reserved/x", root.join("dangling-relative")).unwrap();
+    std::os::unix::fs::symlink("chain-second", root.join("chain-first")).unwrap();
+    std::os::unix::fs::symlink(reserved.join("y"), root.join("chain-second")).unwrap();
+    reserved
+}
+
+#[test]
+fn tool_directory_is_reached_only_by_its_exact_path() {
+    assert!(kvm_available(
+        "tool_directory_is_reached_only_by_its_exact_path"
+    ));
+    let directory = TestDirectory::new();
+    let reserved = tool_directory_tree(&directory.0);
+    let executable = compile_c_program(&directory.0, "tool-directory", TOOL_DIRECTORY_PROGRAM);
+    let image = std::fs::read(&executable).unwrap();
+    let exact = reserved.to_str().unwrap();
+    let mut unloaded = KvmBackend::new(64 * 1024 * 1024).unwrap();
+    assert!(matches!(
+        unloaded.reserve_tool_directory(&reserved),
+        Err(Error::StaticElfNotInstalled)
+    ));
+    // A reservation needs an absolute directory on a read-only file system,
+    // which the case below makes in a namespace of its own: a relative path,
+    // procfs and a writable directory are refused.
+    let mut refusing = KvmBackend::new(256 * 1024 * 1024).unwrap();
+    refusing
+        .install_static_elf_with_context(
+            &image,
+            &[executable.to_str().unwrap(), "control", exact],
+            &["PATH=/usr/bin:/bin"],
+            &directory.0,
+        )
+        .unwrap();
+    assert!(matches!(
+        refusing.reserve_tool_directory(std::path::Path::new("reserved")),
+        Err(Error::HostIo(ref error)) if error.raw_os_error() == Some(libc::EINVAL)
+    ));
+    assert!(matches!(
+        refusing.reserve_tool_directory(std::path::Path::new("/proc")),
+        Err(Error::HostIo(ref error)) if error.raw_os_error() == Some(libc::EINVAL)
+    ));
+    assert!(matches!(
+        refusing.reserve_tool_directory(&reserved),
+        Err(Error::HostIo(ref error))
+            if error.kind() == std::io::ErrorKind::InvalidInput
+                && error.to_string().contains("read-only file system")
+    ));
+    // The program without a reservation finds an ordinary writable
+    // directory, directly and with a Tool that injects every call; the
+    // reserved case is `tool_directory_on_a_read_only_mount_is_hidden`.
+    for (mode, tool_owned, expected) in [
+        ("control", false, "tool directory control PASS\n"),
+        ("control", true, "tool directory control PASS\n"),
+    ] {
+        let mut backend = KvmBackend::new(256 * 1024 * 1024).unwrap();
+        backend
+            .install_static_elf_with_context(
+                &image,
+                &[executable.to_str().unwrap(), mode, exact],
+                &["PATH=/usr/bin:/bin"],
+                &directory.0,
+            )
+            .unwrap();
+        let (code, stdout, stderr) = if tool_owned {
+            let (_, code, stdout, stderr) = futures::executor::block_on(
+                backend.run_static_elf_with_tool::<StraceTool>((), true),
+            )
+            .unwrap();
+            (code, stdout, stderr)
+        } else {
+            backend.run_static_elf_captured().unwrap()
+        };
+        assert_eq!(
+            (code, String::from_utf8_lossy(&stdout).into_owned()),
+            (0, expected.to_owned()),
+            "mode={mode} tool_owned={tool_owned} stderr={}",
+            String::from_utf8_lossy(&stderr)
+        );
+        assert!(stderr.is_empty(), "{}", String::from_utf8_lossy(&stderr));
+        assert_eq!(std::fs::read_dir(&reserved).unwrap().count(), 0);
+    }
+}
+
+/// Between fork and exec: a new user namespace that maps the caller to
+/// root, and a new mount namespace in which `target` is covered by an empty
+/// read-only tmpfs.
+struct ReadOnlyMountNamespace {
+    uid_map: Vec<u8>,
+    gid_map: Vec<u8>,
+    target: std::ffi::CString,
+}
+
+impl ReadOnlyMountNamespace {
+    fn new(target: &std::path::Path) -> Self {
+        use std::os::unix::ffi::OsStrExt;
+        // SAFETY: geteuid and getegid have no preconditions.
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        Self {
+            uid_map: format!("0 {uid} 1").into_bytes(),
+            gid_map: format!("0 {gid} 1").into_bytes(),
+            target: std::ffi::CString::new(target.as_os_str().as_bytes()).unwrap(),
+        }
+    }
+
+    fn write(path: &std::ffi::CStr, bytes: &[u8]) -> std::io::Result<()> {
+        // SAFETY: path is NUL-terminated and bytes is a live buffer of its
+        // length; the descriptor is closed before returning.
+        unsafe {
+            let fd = libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let written = libc::write(fd, bytes.as_ptr().cast(), bytes.len());
+            let error = std::io::Error::last_os_error();
+            libc::close(fd);
+            if written != bytes.len() as isize {
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    /// Only system calls, and no allocation: this runs in the forked child.
+    fn enter(&self) -> std::io::Result<()> {
+        // SAFETY: unshare and mount take no pointers but the NUL-terminated
+        // strings held by self.
+        unsafe {
+            if libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Self::write(c"/proc/self/setgroups", b"deny")?;
+            Self::write(c"/proc/self/uid_map", &self.uid_map)?;
+            Self::write(c"/proc/self/gid_map", &self.gid_map)?;
+            if libc::mount(
+                c"tmpfs".as_ptr(),
+                self.target.as_ptr(),
+                c"tmpfs".as_ptr(),
+                libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV,
+                std::ptr::null(),
+            ) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn tool_directory_on_a_read_only_mount_is_hidden() {
+    // A reserved directory is an empty read-only mount, so that nothing can
+    // be created there even past the executor. Every route to it but its
+    // exact path answers ENOENT, as for a name that does not exist, also for
+    // a creation, where the mount itself would answer EROFS; a creation
+    // through a final symbolic link into it is the kernel's, EROFS. The
+    // mount needs a mount namespace of its own, so the case runs in a child
+    // process.
+    const TEST: &str = "tool_directory_on_a_read_only_mount_is_hidden";
+    const ROOT: &str = "REVERIE_TOOL_DIRECTORY_READ_ONLY_ROOT";
+    let Some(root) = std::env::var_os(ROOT) else {
+        assert!(kvm_available(TEST));
+        let directory = TestDirectory::new();
+        let reserved = tool_directory_tree(&directory.0);
+        compile_c_program(&directory.0, "tool-directory", TOOL_DIRECTORY_PROGRAM);
+        let namespace = ReadOnlyMountNamespace::new(&reserved);
+        assert!(!leader_self_exec_bounded_configured(
+            TEST,
+            true,
+            |command| {
+                use std::os::unix::process::CommandExt;
+                command.env(ROOT, &directory.0);
+                // SAFETY: enter makes only system calls and allocates nothing.
+                unsafe { command.pre_exec(move || namespace.enter()) };
+            }
+        ));
+        assert_eq!(std::fs::read_dir(&reserved).unwrap().count(), 0);
+        return;
+    };
+    assert!(leader_self_exec_bounded(TEST));
+    let root = PathBuf::from(root);
+    let reserved = root.join("reserved");
+    let executable = root.join("tool-directory");
+    let image = std::fs::read(&executable).unwrap();
+    let exact = reserved.to_str().unwrap();
+    // Without a reservation the mount answers EROFS; with one, the
+    // executor answers ENOENT first for every route but the exact path.
+    for (mode, tool_owned, expected) in [
+        (
+            "read-only-control",
+            false,
+            "tool directory read-only control PASS\n",
+        ),
+        (
+            "read-only-control",
+            true,
+            "tool directory read-only control PASS\n",
+        ),
+        ("reserved", false, "tool directory PASS\n"),
+        ("reserved", true, "tool directory PASS\n"),
+    ] {
+        let mut backend = KvmBackend::new(256 * 1024 * 1024).unwrap();
+        backend
+            .install_static_elf_with_context(
+                &image,
+                &[executable.to_str().unwrap(), mode, exact],
+                &["PATH=/usr/bin:/bin"],
+                &root,
+            )
+            .unwrap();
+        if mode == "reserved" {
+            backend.reserve_tool_directory(&reserved).unwrap();
+        }
+        let (code, stdout, stderr) = if tool_owned {
+            let (_, code, stdout, stderr) = futures::executor::block_on(
+                backend.run_static_elf_with_tool::<StraceTool>((), true),
+            )
+            .unwrap();
+            (code, stdout, stderr)
+        } else {
+            backend.run_static_elf_captured().unwrap()
+        };
+        assert_eq!(
+            (code, String::from_utf8_lossy(&stdout).into_owned()),
+            (0, expected.to_owned()),
+            "mode={mode} tool_owned={tool_owned} stderr={}",
+            String::from_utf8_lossy(&stderr)
+        );
+        assert!(stderr.is_empty(), "{}", String::from_utf8_lossy(&stderr));
+        assert_eq!(std::fs::read_dir(&reserved).unwrap().count(), 0);
+    }
+}
+
+const TOOL_DIRECTORY_PROGRAM: &str = r#"
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/inotify.h>
+#include <sys/stat.h>
+#include <sys/statfs.h>
+#include <sys/syscall.h>
+#include <sys/time.h>
+#include <sys/xattr.h>
+#include <unistd.h>
+
+#define CHECK(expression) do { if (!(expression)) { printf("failure line=%d errno=%d\n", __LINE__, errno); return 93; } } while (0)
+#define REFUSED(call) do { errno = 0; long refused_result = (long)(call); CHECK(refused_result == -1 && errno == ENOENT); } while (0)
+
+/* Links whose final target is a missing name in the directory to reserve,
+ * by an absolute or a relative target or through a second link, and the
+ * name a creation through each makes where nothing refuses it. */
+static const char *const dangling[][2] = {
+    {"dangling-absolute", "reserved/x"},
+    {"dangling-relative", "reserved/x"},
+    {"chain-first", "reserved/y"},
+};
+#define DANGLING (sizeof(dangling) / sizeof(dangling[0]))
+
+/* Every route to the reserved directory but its exact path: each call that
+ * resolves to it, or creates, removes or executes a name below it, fails as
+ * for a name that does not exist (REFUSED: ENOENT). */
+static int refused_routes(const char *path, int directory, int is_link) {
+    char below[4096], buffer[256];
+    struct stat st;
+    struct statfs fs;
+    CHECK(snprintf(below, sizeof(below), "%s/new", path) < (int)sizeof(below));
+    REFUSED(statfs(path, &fs));
+    REFUSED(stat(path, &st));
+    REFUSED(open(path, O_RDONLY | O_DIRECTORY));
+    REFUSED(open(path, O_PATH | O_DIRECTORY));
+    REFUSED(openat(directory, path, O_RDONLY | O_DIRECTORY));
+    REFUSED(chdir(path));
+    REFUSED(getxattr(path, "user.reverie", buffer, sizeof(buffer)));
+    REFUSED(listxattr(path, buffer, sizeof(buffer)));
+    REFUSED(chmod(path, 0555));
+    REFUSED(utimes(path, NULL));
+    REFUSED(mkdir(below, 0700));
+    REFUSED(mkdirat(directory, below, 0700));
+    REFUSED(unlink(below));
+    REFUSED(open(below, O_CREAT | O_WRONLY, 0600));
+    REFUSED(open(path, O_CREAT | O_RDONLY, 0600));
+    /* Opens Linux refuses for a directory (EISDIR) are refused as missing. */
+    REFUSED(open(path, O_WRONLY));
+    REFUSED(open(path, O_RDWR));
+    REFUSED(open(path, O_RDONLY | O_TRUNC));
+    REFUSED(truncate(path, 0));
+    REFUSED(access(path, W_OK));
+    REFUSED(access(path, R_OK | X_OK));
+    if (!is_link) REFUSED(readlink(path, buffer, sizeof(buffer)));
+    int watcher = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    CHECK(watcher >= 0);
+    REFUSED(inotify_add_watch(watcher, path, IN_ALL_EVENTS));
+    CHECK(close(watcher) == 0);
+    char *arguments[] = {below, NULL};
+    errno = 0;
+    CHECK(execve(below, arguments, environ) == -1 && errno == ENOENT);
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    CHECK(argc == 3);
+    const char *exact = argv[2];
+    struct statfs fs;
+    if (strcmp(argv[1], "control") == 0) {
+        int fd = open("link", O_RDONLY | O_DIRECTORY);
+        CHECK(fd >= 0 && close(fd) == 0);
+        CHECK(statfs("reserved", &fs) == 0);
+        CHECK(mkdir("link/new", 0700) == 0 && rmdir("link/new") == 0);
+        /* A creation through a dangling link makes its target, as on Linux. */
+        for (unsigned index = 0; index < DANGLING; ++index) {
+            int created = open(dangling[index][0], O_CREAT | O_WRONLY, 0600);
+            CHECK(created >= 0 && close(created) == 0 && unlink(dangling[index][1]) == 0);
+        }
+        puts("tool directory control PASS");
+        return 0;
+    }
+    if (strcmp(argv[1], "read-only-control") == 0) {
+        /* Unreserved, an empty read-only mount answers EROFS. */
+        for (unsigned index = 0; index < DANGLING; ++index) {
+            errno = 0;
+            CHECK(open(dangling[index][0], O_CREAT | O_WRONLY, 0600) == -1 && errno == EROFS);
+        }
+        errno = 0;
+        CHECK(mkdir("link/new", 0700) == -1 && errno == EROFS);
+        errno = 0;
+        CHECK(open(exact, O_TMPFILE | O_WRONLY, 0600) == -1 && errno == EROFS);
+        /* Linux's answers through the link: a creating open with O_EXCL or
+         * O_NOFOLLOW finds the link itself, and a write open the directory. */
+        errno = 0;
+        CHECK(open("link", O_CREAT | O_EXCL | O_WRONLY, 0600) == -1 && errno == EEXIST);
+        errno = 0;
+        CHECK(open("link", O_CREAT | O_NOFOLLOW | O_WRONLY, 0600) == -1 && errno == ELOOP);
+        errno = 0;
+        CHECK(open("link", O_WRONLY) == -1 && errno == EISDIR);
+        puts("tool directory read-only control PASS");
+        return 0;
+    }
+    CHECK(strcmp(argv[1], "reserved") == 0);
+    /* Its exact path opens as a directory and stats. */
+    int fd = open(exact, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    CHECK(fd >= 0);
+    int path_fd = open(exact, O_PATH | O_DIRECTORY);
+    CHECK(path_fd >= 0);
+    struct stat by_path, by_descriptor;
+    CHECK(stat(exact, &by_path) == 0 && fstat(fd, &by_descriptor) == 0);
+    CHECK(S_ISDIR(by_descriptor.st_mode) && by_path.st_ino == by_descriptor.st_ino);
+    /* Its descriptor works as any other, but nothing is looked up from it
+     * that resolves to it or creates a name in it, and it is no working
+     * directory. */
+    char entries[512];
+    CHECK(syscall(SYS_getdents64, fd, entries, sizeof(entries)) > 0);
+    CHECK(fstatfs(fd, &fs) == 0);
+    REFUSED(fchdir(fd));
+    REFUSED(mkdirat(fd, "new", 0700));
+    REFUSED(openat(fd, ".", O_RDONLY | O_DIRECTORY));
+    REFUSED(openat(fd, "new", O_CREAT | O_RDWR, 0600));
+    /* Every other spelling of it is refused, and so is every other call by
+     * its exact path. */
+    int directory = open(".", O_RDONLY | O_DIRECTORY);
+    CHECK(directory >= 0);
+    CHECK(refused_routes("link", directory, 1) == 0);
+    CHECK(refused_routes("reserved", directory, 0) == 0);
+    CHECK(refused_routes("elsewhere/../reserved", directory, 0) == 0);
+    /* A creation through a final link that dangles into it is the kernel's
+     * to answer, by a path or from a directory descriptor: the read-only
+     * mount's EROFS, and nothing is created. An unnamed file in it is
+     * refused; through the link with O_NOFOLLOW, the link is no directory.
+     * An O_PATH open creates nothing, whatever its O_CREAT says. */
+    for (unsigned index = 0; index < DANGLING; ++index) {
+        errno = 0;
+        CHECK(open(dangling[index][0], O_CREAT | O_WRONLY, 0600) == -1 && errno == EROFS);
+        errno = 0;
+        CHECK(open(dangling[index][0], O_CREAT | O_RDWR | O_TRUNC, 0600) == -1 && errno == EROFS);
+        errno = 0;
+        CHECK(creat(dangling[index][0], 0600) == -1 && errno == EROFS);
+        errno = 0;
+        CHECK(openat(directory, dangling[index][0], O_CREAT | O_WRONLY, 0600) == -1 && errno == EROFS);
+    }
+    REFUSED(open(exact, O_TMPFILE | O_WRONLY, 0600));
+    REFUSED(open("link", O_TMPFILE | O_WRONLY, 0600));
+    errno = 0;
+    CHECK(open("link", O_TMPFILE | O_WRONLY | O_NOFOLLOW, 0600) == -1 && errno == ENOTDIR);
+    /* With O_EXCL or O_NOFOLLOW a creating open finds the link to it itself,
+     * as on Linux: EEXIST, ELOOP. The directory itself stays hidden. */
+    errno = 0;
+    CHECK(open("link", O_CREAT | O_EXCL | O_WRONLY, 0600) == -1 && errno == EEXIST);
+    errno = 0;
+    CHECK(open("link", O_CREAT | O_NOFOLLOW | O_WRONLY, 0600) == -1 && errno == ELOOP);
+    errno = 0;
+    CHECK(open("link", O_WRONLY | O_NOFOLLOW) == -1 && errno == ELOOP);
+    REFUSED(open("reserved", O_CREAT | O_EXCL | O_WRONLY, 0600));
+    REFUSED(open("reserved/", O_CREAT | O_EXCL | O_WRONLY, 0600));
+    REFUSED(open("reserved", O_CREAT | O_NOFOLLOW | O_WRONLY, 0600));
+    REFUSED(open("reserved/", O_CREAT | O_NOFOLLOW | O_WRONLY, 0600));
+    errno = 0;
+    CHECK(open("reserved/new", O_PATH | O_CREAT, 0600) == -1 && errno == ENOENT);
+    int admitted = open(exact, O_PATH | O_DIRECTORY | O_CREAT, 0600);
+    CHECK(admitted >= 0 && close(admitted) == 0);
+    REFUSED(open(exact, O_RDONLY));
+    REFUSED(open(exact, O_CREAT | O_RDONLY, 0600));
+    REFUSED(statfs(exact, &fs));
+    REFUSED(chdir(exact));
+    REFUSED(access(exact, R_OK));
+    /* The directory itself is neither removed, renamed nor replaced. */
+    REFUSED(rmdir("reserved"));
+    REFUSED(rmdir(exact));
+    REFUSED(rename("reserved", "elsewhere/moved"));
+    REFUSED(rename("elsewhere", "reserved"));
+    CHECK(stat("elsewhere", &by_path) == 0 && S_ISDIR(by_path.st_mode));
+    CHECK(close(directory) == 0 && close(path_fd) == 0 && close(fd) == 0);
+    puts("tool directory PASS");
+    return 0;
+}
+"#;
+
+#[test]
+fn inherited_proc_descriptor_mutation_vectors_match_native() {
+    // The guest cannot open procfs, but a procfs directory it inherits as
+    // its standard input is still a directory descriptor for the *at
+    // calls. Each mutation relative to it names a missing procfs path and
+    // must fail as natively, leaving everything else in place.
+    assert!(kvm_available(
+        "inherited_proc_descriptor_mutation_vectors_match_native"
+    ));
+    let directory = TestDirectory::new();
+    let executable = compile_c_program(
+        &directory.0,
+        "inherited-proc-mutations",
+        INHERITED_PROC_MUTATION_PROGRAM,
+    );
+    let proc_stdin = || std::fs::File::open("/proc").unwrap();
+    let native = std::process::Command::new(&executable)
+        .stdin(proc_stdin())
+        .output()
+        .unwrap();
+    assert_eq!(
+        native.status.code(),
+        Some(0),
+        "{} {}",
+        String::from_utf8_lossy(&native.stdout),
+        String::from_utf8_lossy(&native.stderr)
+    );
+    assert!(native.stderr.is_empty());
+    assert_eq!(String::from_utf8_lossy(&native.stdout).lines().count(), 13);
+    let image = std::fs::read(&executable).unwrap();
+    for tool_owned in [false, true] {
+        let mut backend =
+            KvmBackend::new_with_stdin(256 * 1024 * 1024, Some(proc_stdin())).unwrap();
+        backend
+            .install_static_elf_with_context(
+                &image,
+                &[executable.to_str().unwrap()],
+                &["PATH=/usr/bin:/bin"],
+                &directory.0,
+            )
+            .unwrap();
+        let (code, stdout, stderr) = if tool_owned {
+            let (_, code, stdout, stderr) = futures::executor::block_on(
+                backend.run_static_elf_with_tool::<StraceTool>((), true),
+            )
+            .unwrap();
+            (code, stdout, stderr)
+        } else {
+            backend.run_static_elf_captured().unwrap()
+        };
+        assert_eq!(
+            (code, String::from_utf8_lossy(&stdout).into_owned()),
+            (0, String::from_utf8_lossy(&native.stdout).into_owned()),
+            "tool_owned={tool_owned} stderr={}",
+            String::from_utf8_lossy(&stderr)
+        );
+        assert!(stderr.is_empty(), "{}", String::from_utf8_lossy(&stderr));
+    }
+}
+
+const INHERITED_PROC_MUTATION_PROGRAM: &str = r#"
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
@@ -3488,7 +4358,7 @@ int main(void) {
     if (!mkdtemp(directory) || chdir(directory)) return 80;
     int file = open("local-source", O_CREAT | O_EXCL | O_WRONLY, 0600);
     if (file < 0 || write(file, "payload", 7) != 7 || close(file) || mkdir("removable", 0700)) return 81;
-    int proc = open("/proc", O_RDONLY | O_DIRECTORY);
+    int proc = dup(STDIN_FILENO);
     if (proc < 0) return 82;
     char missing[4096], single_slash[4096], source[4096], removable[4096];
     if (snprintf(missing, sizeof(missing), "%s/escaped///", directory + 1) >= sizeof(missing)) return 83;
@@ -3533,488 +4403,6 @@ int main(void) {
     }
     if (close(proc) || unlink("local-source") || rmdir("removable") || chdir("/") || rmdir(directory)) return 89;
     return failures ? 94 : 0;
-}
-"#;
-
-fn proc_root_consumer_case(case: usize) {
-    assert!(kvm_available("proc_root_consumer_case"));
-    let directory = TestDirectory::new();
-    let program = format!("#define CASE {case}\n{}", PROC_ROOT_CONSUMER_PROGRAM);
-    let executable = compile_c_program(&directory.0, "proc-root-consumer", &program);
-    let native = std::process::Command::new(&executable)
-        .arg("native")
-        .current_dir(&directory.0)
-        .output()
-        .unwrap();
-    println!(
-        "native consumer={case}: {:?} {}",
-        native.status.code(),
-        String::from_utf8_lossy(&native.stdout)
-    );
-    assert_eq!(
-        native.status.code(),
-        Some(0),
-        "{}",
-        String::from_utf8_lossy(&native.stderr)
-    );
-    assert!(native.stderr.is_empty());
-    let image = std::fs::read(&executable).unwrap();
-    let mut backend = KvmBackend::new(256 * 1024 * 1024).unwrap();
-    backend
-        .install_static_elf_with_context(
-            &image,
-            &[executable.to_str().unwrap(), "guest"],
-            &["PATH=/usr/bin:/bin"],
-            &directory.0,
-        )
-        .unwrap();
-    let (code, stdout, stderr) = backend.run_static_elf_captured().unwrap();
-    println!(
-        "guest consumer={case}: {code} {}",
-        String::from_utf8_lossy(&stdout)
-    );
-    assert!(stderr.is_empty(), "{}", String::from_utf8_lossy(&stderr));
-    assert_eq!(code, 0);
-}
-
-#[test]
-fn proc_root_received_full_metadata() {
-    proc_root_consumer_case(0);
-}
-#[test]
-fn proc_root_received_empty_enumeration() {
-    proc_root_consumer_case(1);
-}
-#[test]
-fn proc_root_received_allowlisted_contents() {
-    proc_root_consumer_case(2);
-}
-#[test]
-fn proc_root_received_aliases_and_reuse() {
-    proc_root_consumer_case(3);
-}
-#[test]
-fn proc_root_received_fork_exec() {
-    proc_root_consumer_case(4);
-}
-#[test]
-fn proc_root_received_filesystem_stat_refusal() {
-    proc_root_consumer_case(5);
-}
-#[test]
-fn proc_root_cwd_restriction_and_ordinary_positive() {
-    proc_root_consumer_case(6);
-}
-#[test]
-fn proc_root_received_shared_thread_files() {
-    proc_root_consumer_case(7);
-}
-
-const PROC_ROOT_CONSUMER_PROGRAM: &str = r#"
-#define _GNU_SOURCE
-#include <errno.h>
-#include <fcntl.h>
-#include <pthread.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/socket.h>
-#include <sys/stat.h>
-#include <sys/statfs.h>
-#include <sys/syscall.h>
-#include <sys/wait.h>
-#include <unistd.h>
-
-#define CHECK(expression) do { if (!(expression)) { printf("failure line=%d errno=%d\n", __LINE__, errno); return 93; } } while (0)
-
-static int transfer(int descriptor, int cloexec) {
-    int sockets[2];
-    CHECK(socketpair(AF_UNIX, SOCK_DGRAM, 0, sockets) == 0);
-    char payload = 'x';
-    char control[CMSG_SPACE(sizeof(int))] = {0};
-    struct iovec vector = {.iov_base = &payload, .iov_len = 1};
-    struct msghdr message = {.msg_iov = &vector, .msg_iovlen = 1, .msg_control = control, .msg_controllen = sizeof(control)};
-    struct cmsghdr *header = CMSG_FIRSTHDR(&message);
-    header->cmsg_level = SOL_SOCKET;
-    header->cmsg_type = SCM_RIGHTS;
-    header->cmsg_len = CMSG_LEN(sizeof(int));
-    memcpy(CMSG_DATA(header), &descriptor, sizeof(int));
-    CHECK(sendmsg(sockets[0], &message, 0) == 1);
-    CHECK(close(descriptor) == 0);
-    memset(control, 0, sizeof(control));
-    message.msg_controllen = sizeof(control);
-    payload = 0;
-    CHECK(recvmsg(sockets[1], &message, cloexec ? MSG_CMSG_CLOEXEC : 0) == 1);
-    CHECK(payload == 'x' && !(message.msg_flags & MSG_CTRUNC));
-    header = CMSG_FIRSTHDR(&message);
-    CHECK(header && header->cmsg_level == SOL_SOCKET && header->cmsg_type == SCM_RIGHTS && header->cmsg_len == CMSG_LEN(sizeof(int)));
-    memcpy(&descriptor, CMSG_DATA(header), sizeof(int));
-    CHECK(close(sockets[0]) == 0 && close(sockets[1]) == 0);
-    CHECK(fcntl(descriptor, F_GETFD) == (cloexec ? FD_CLOEXEC : 0));
-    return descriptor;
-}
-
-static int metadata(int descriptor, int baseline, int guest) {
-    struct stat actual, expected;
-    memset(&actual, 0xa5, sizeof(actual));
-    memset(&expected, 0xa5, sizeof(expected));
-    CHECK(fstat(descriptor, &actual) == 0 && fstat(baseline, &expected) == 0);
-    CHECK(S_ISDIR(actual.st_mode));
-    if (guest) CHECK(memcmp(&actual, &expected, sizeof(actual)) == 0);
-    struct statx actualx, expectedx;
-    memset(&actualx, 0xa5, sizeof(actualx));
-    memset(&expectedx, 0xa5, sizeof(expectedx));
-    CHECK(statx(descriptor, "", AT_EMPTY_PATH, STATX_BASIC_STATS, &actualx) == 0);
-    CHECK(statx(baseline, "", AT_EMPTY_PATH, STATX_BASIC_STATS, &expectedx) == 0);
-    if (guest) CHECK(memcmp(&actualx, &expectedx, sizeof(actualx)) == 0);
-    struct stat empty;
-    memset(&empty, 0xa5, sizeof(empty));
-    CHECK(fstatat(descriptor, "", &empty, AT_EMPTY_PATH) == 0);
-    if (guest) CHECK(memcmp(&empty, &expected, sizeof(empty)) == 0);
-    char path[128], target[1024], wanted[1024];
-    CHECK(snprintf(path, sizeof(path), "/proc/self/fd/%d", descriptor) < sizeof(path));
-    memset(target, 0xa5, sizeof(target));
-    memset(wanted, 0xa5, sizeof(wanted));
-    memcpy(wanted, "/proc", 5);
-    CHECK(readlink(path, target, sizeof(target)) == 5);
-    CHECK(memcmp(target, wanted, sizeof(target)) == 0);
-    return 0;
-}
-
-static int enumeration(int descriptor, int guest) {
-    unsigned char output[16384], before[16384];
-    memset(output, 0xa5, sizeof(output));
-    memcpy(before, output, sizeof(output));
-    long result = syscall(SYS_getdents64, descriptor, output, sizeof(output));
-    if (guest) {
-        CHECK(result == 0);
-        CHECK(memcmp(output, before, sizeof(output)) == 0);
-    } else {
-        CHECK(result > 0);
-    }
-    return 0;
-}
-
-static int contents(int descriptor, int baseline, int guest) {
-    const char *paths[] = {"self/maps"};
-    for (unsigned index = 0; index < sizeof(paths) / sizeof(paths[0]); ++index) {
-        int actual = openat(descriptor, paths[index], O_RDONLY);
-        int expected = openat(baseline, paths[index], O_RDONLY);
-        CHECK(actual >= 0 && expected >= 0);
-        /* Read each file to EOF and compare the complete contents. */
-        enum { CONTENT_BYTES = 1 << 20 };
-        unsigned char *actual_bytes = malloc(CONTENT_BYTES), *expected_bytes = malloc(CONTENT_BYTES);
-        CHECK(actual_bytes != NULL && expected_bytes != NULL);
-        size_t actual_size = 0, expected_size = 0;
-        for (;;) {
-            CHECK(actual_size < CONTENT_BYTES);
-            ssize_t got = read(actual, actual_bytes + actual_size, CONTENT_BYTES - actual_size);
-            CHECK(got >= 0);
-            if (got == 0) break;
-            actual_size += (size_t)got;
-        }
-        for (;;) {
-            CHECK(expected_size < CONTENT_BYTES);
-            ssize_t got = read(expected, expected_bytes + expected_size, CONTENT_BYTES - expected_size);
-            CHECK(got >= 0);
-            if (got == 0) break;
-            expected_size += (size_t)got;
-        }
-        CHECK(actual_size > 0);
-        CHECK(actual_size == expected_size && memcmp(actual_bytes, expected_bytes, actual_size) == 0);
-        free(actual_bytes);
-        free(expected_bytes);
-        CHECK(close(actual) == 0 && close(expected) == 0);
-    }
-    if (guest) {
-        /* The mount tables are Detcore's to render; the backend keeps no copy. */
-        const char *unlisted[] = {"../etc/passwd", "self/environ", "thread-self/environ", "self/task", "self/fd", "1/environ", "mounts", "self/mountinfo"};
-        for (unsigned index = 0; index < sizeof(unlisted) / sizeof(unlisted[0]); ++index) {
-            errno = 0;
-            CHECK(openat(descriptor, unlisted[index], O_RDONLY) == -1 && errno == ENOENT);
-        }
-    }
-    return 0;
-}
-
-struct shared_context { int baseline; int guest; };
-
-static void *shared_worker(void *opaque) {
-    struct shared_context *context = opaque;
-    if (close(64)) return (void *)(uintptr_t)1;
-    int descriptor = open("/proc", O_RDONLY | O_DIRECTORY);
-    if (descriptor < 0 || dup2(descriptor, 65) != 65 || close(descriptor)) return (void *)(uintptr_t)2;
-    return (void *)(uintptr_t)metadata(65, context->baseline, context->guest);
-}
-
-static int filesystem_stats(int descriptor, int guest) {
-    char alias[128];
-    CHECK(snprintf(alias, sizeof(alias), "/proc/self/fd/%d", descriptor) < sizeof(alias));
-    for (int variant = 0; variant < 3; ++variant) {
-        unsigned char output[sizeof(struct statfs)], before[sizeof(struct statfs)];
-        memset(output, 0xa5, sizeof(output));
-        memcpy(before, output, sizeof(output));
-        errno = 0;
-        int result = variant == 0 ? fstatfs(descriptor, (struct statfs *)output) : statfs(variant == 1 ? alias : "/proc", (struct statfs *)output);
-        printf("statfs variant=%d result=%d errno=%d\n", variant, result, errno);
-        if (guest) {
-            CHECK(result == -1 && errno == EACCES);
-            CHECK(memcmp(output, before, sizeof(output)) == 0);
-        } else {
-            CHECK(result == 0);
-        }
-    }
-    struct statfs ordinary;
-    CHECK(statfs(".", &ordinary) == 0);
-    int ordinary_fd = open(".", O_RDONLY | O_DIRECTORY);
-    CHECK(ordinary_fd >= 0 && fstatfs(ordinary_fd, &ordinary) == 0);
-    errno = 0;
-    CHECK(syscall(SYS_fstatfs, ordinary_fd, (void *)1) == -1 && errno == EFAULT);
-    CHECK(close(ordinary_fd) == 0);
-    errno = 0;
-    CHECK(syscall(SYS_fstatfs, -1, (void *)1) == -1 && errno == EBADF);
-    return 0;
-}
-
-int main(int argc, char **argv) {
-    CHECK(argc >= 2);
-    int guest = strcmp(argv[1], "guest") == 0;
-    if (argc == 3) {
-        int baseline = open("/proc", O_RDONLY | O_DIRECTORY);
-        CHECK(baseline >= 0 && metadata(60, baseline, guest) == 0);
-        CHECK(contents(60, baseline, guest) == 0);
-        errno = 0;
-        CHECK(fcntl(61, F_GETFD) == -1 && errno == EBADF);
-        return 0;
-    }
-    int descriptor = open("/proc", O_RDONLY | O_DIRECTORY);
-    CHECK(descriptor >= 0);
-    descriptor = transfer(descriptor, 1);
-    CHECK(descriptor >= 0 && descriptor != 93);
-    descriptor = transfer(descriptor, 0);
-    CHECK(descriptor >= 0 && descriptor != 93);
-    int baseline = open("/proc", O_RDONLY | O_DIRECTORY);
-    CHECK(baseline >= 0);
-    if (CASE == 0) CHECK(metadata(descriptor, baseline, guest) == 0);
-    if (CASE == 1) CHECK(enumeration(descriptor, guest) == 0);
-    if (CASE == 2) CHECK(contents(descriptor, baseline, guest) == 0);
-    if (CASE == 3) {
-        int copies[3] = {dup(descriptor), fcntl(descriptor, F_DUPFD_CLOEXEC, 20), dup2(descriptor, 24)};
-        CHECK(close(descriptor) == 0);
-        for (unsigned index = 0; index < 3; ++index) {
-            CHECK(copies[index] >= 0 && metadata(copies[index], baseline, guest) == 0);
-            CHECK(contents(copies[index], baseline, guest) == 0);
-        }
-        const char *prefixes[] = {"/dev/fd/", "/proc/self/fd/", "/proc/thread-self/fd/"};
-        for (unsigned index = 0; index < 3; ++index) {
-            char path[128];
-            CHECK(snprintf(path, sizeof(path), "%s%d", prefixes[index], copies[0]) < sizeof(path));
-            int reopened = open(path, O_RDONLY | O_DIRECTORY);
-            CHECK(reopened >= 0 && metadata(reopened, baseline, guest) == 0);
-            CHECK(contents(reopened, baseline, guest) == 0);
-            CHECK(close(reopened) == 0);
-        }
-        char numeric_path[128];
-        CHECK(snprintf(numeric_path, sizeof(numeric_path), "/proc/%d/fd/%d", getpid(), copies[0]) < sizeof(numeric_path));
-        int numeric = open(numeric_path, O_RDONLY | O_DIRECTORY);
-        CHECK(numeric >= 0 && metadata(numeric, baseline, guest) == 0);
-        CHECK(contents(numeric, baseline, guest) == 0 && close(numeric) == 0);
-        int ordinary = open("/", O_RDONLY | O_DIRECTORY);
-        CHECK(ordinary >= 0 && dup2(ordinary, copies[0]) == copies[0]);
-        char path[128], target[1024];
-        CHECK(snprintf(path, sizeof(path), "/proc/self/fd/%d", copies[0]) < sizeof(path));
-        CHECK(readlink(path, target, sizeof(target)) == 1 && target[0] == '/');
-    }
-    if (CASE == 4) {
-        CHECK(dup2(descriptor, 60) == 60 && dup3(descriptor, 61, O_CLOEXEC) == 61);
-        pid_t child = fork();
-        CHECK(child >= 0);
-        if (child == 0) {
-            execl(argv[0], argv[0], argv[1], "after-exec", (char *)0);
-            _exit(94);
-        }
-        int status;
-        CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
-        CHECK(metadata(descriptor, baseline, guest) == 0);
-    }
-    if (CASE == 5) CHECK(filesystem_stats(descriptor, guest) == 0);
-    if (CASE == 6) {
-        char before[4096], after[4096];
-        CHECK(getcwd(before, sizeof(before)) != NULL);
-        int saved = open(".", O_RDONLY | O_DIRECTORY);
-        CHECK(saved >= 0);
-        errno = 0;
-        int result = fchdir(descriptor);
-        printf("fchdir result=%d errno=%d\n", result, errno);
-        if (guest) {
-            CHECK(result == -1 && errno == EACCES);
-            CHECK(getcwd(after, sizeof(after)) && strcmp(before, after) == 0);
-        } else {
-            CHECK(result == 0 && getcwd(after, sizeof(after)) && strcmp(after, "/proc") == 0);
-        }
-        CHECK(fchdir(saved) == 0);
-        CHECK(getcwd(after, sizeof(after)) && strcmp(before, after) == 0);
-        int path_fd = open(".", O_PATH | O_DIRECTORY);
-        CHECK(path_fd >= 0);
-        errno = 0;
-        result = fchdir(path_fd);
-        printf("O_PATH fchdir result=%d errno=%d\n", result, errno);
-        if (guest) CHECK(result == -1 && errno == EBADF);
-        else CHECK(result == 0);
-        CHECK(close(path_fd) == 0 && close(saved) == 0);
-    }
-    if (CASE == 7) {
-        CHECK(dup2(descriptor, 64) == 64);
-        struct shared_context context = {.baseline = baseline, .guest = guest};
-        pthread_t thread;
-        CHECK(pthread_create(&thread, NULL, shared_worker, &context) == 0);
-        void *result;
-        CHECK(pthread_join(thread, &result) == 0 && result == NULL);
-        errno = 0;
-        CHECK(fcntl(64, F_GETFD) == -1 && errno == EBADF);
-        CHECK(metadata(65, baseline, guest) == 0 && contents(65, baseline, guest) == 0);
-    }
-    return 0;
-}
-"#;
-const LOAD_ADDRESS: u64 = 0x20_0000;
-const CODE_OFFSET: usize = 0x1000;
-const POST_EXEC_RANDOM: [u8; 16] = *b"kvm-post-exec-ok";
-static POST_EXEC_FAILURE_EXITED: AtomicBool = AtomicBool::new(false);
-const SIGNAL_EXIT_CHILD_TID: u64 = 0x0800_3000;
-const SIGNAL_EXIT_AFTER_CALLBACK: i32 = 0x5a5a_5a5a;
-static SIGNAL_EXIT_OBSERVED_TID: AtomicU64 = AtomicU64::new(u64::MAX);
-static SIGNAL_EXIT_MEMORY: Mutex<Option<reverie_kvm::GuestMemory>> = Mutex::new(None);
-static POST_EXEC_UNMASK_CALLBACKS: AtomicU64 = AtomicU64::new(0);
-static POST_EXEC_ENTRY_WRITES: AtomicU64 = AtomicU64::new(0);
-
-fn proc_root_path_case(case: usize) {
-    assert!(kvm_available("proc_root_path_case"));
-    let directory = TestDirectory::new();
-    let program = format!("#define CASE {case}\n{}", PROC_ROOT_PATH_PROGRAM);
-    let executable = compile_c_program(&directory.0, "proc-root-path", &program);
-    let native = std::process::Command::new(&executable)
-        .current_dir(&directory.0)
-        .output()
-        .unwrap();
-    println!(
-        "native case={case}: {:?} {}",
-        native.status.code(),
-        String::from_utf8_lossy(&native.stdout)
-    );
-    assert_eq!(
-        native.status.code(),
-        Some(0),
-        "{}",
-        String::from_utf8_lossy(&native.stderr)
-    );
-    assert!(native.stderr.is_empty());
-    let image = std::fs::read(&executable).unwrap();
-    let mut backend = KvmBackend::new(256 * 1024 * 1024).unwrap();
-    backend
-        .install_static_elf_with_context(
-            &image,
-            &[executable.to_str().unwrap()],
-            &["PATH=/usr/bin:/bin"],
-            &directory.0,
-        )
-        .unwrap();
-    let (code, stdout, stderr) = backend.run_static_elf_captured().unwrap();
-    println!(
-        "guest case={case}: {code} {}",
-        String::from_utf8_lossy(&stdout)
-    );
-    assert!(stderr.is_empty(), "{}", String::from_utf8_lossy(&stderr));
-    assert_eq!(code, 0);
-}
-
-#[test]
-fn proc_root_local_trailing_positive() {
-    proc_root_path_case(0);
-}
-#[test]
-fn proc_root_received_trailing_no_creation() {
-    proc_root_path_case(1);
-}
-#[test]
-fn proc_root_received_plain_no_creation() {
-    proc_root_path_case(2);
-}
-#[test]
-fn proc_root_direct_trailing_no_creation() {
-    proc_root_path_case(3);
-}
-#[test]
-fn proc_root_real_root_trailing_positive() {
-    proc_root_path_case(4);
-}
-#[test]
-fn proc_root_direct_parent_exit_positive() {
-    proc_root_path_case(5);
-}
-
-const PROC_ROOT_PATH_PROGRAM: &str = r#"
-#define _GNU_SOURCE
-#include <errno.h>
-#include <fcntl.h>
-#include <stdio.h>
-#include <string.h>
-#include <sys/socket.h>
-#include <sys/stat.h>
-#include <unistd.h>
-
-int main(void) {
-    char cwd[4096], relative[8192], target[8192];
-    if (!getcwd(cwd, sizeof(cwd)) || cwd[0] != '/' || strlen(cwd) < 20) return 80;
-    if (snprintf(target, sizeof(target), "%s/private-created", cwd) >= sizeof(target)) return 81;
-    struct stat initial;
-    errno = 0;
-    if (lstat(target, &initial) == 0 || errno != ENOENT) return 82;
-    int descriptor = open(CASE == 0 ? cwd : (CASE == 4 ? "/" : "/proc"), O_RDONLY | O_DIRECTORY);
-    if (descriptor < 0) return 83;
-    if (CASE == 1 || CASE == 2) {
-        int sockets[2];
-        if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sockets)) return 84;
-        char payload = 'x';
-        char control[CMSG_SPACE(sizeof(int))] = {0};
-        struct iovec vector = {.iov_base = &payload, .iov_len = 1};
-        struct msghdr message = {.msg_iov = &vector, .msg_iovlen = 1, .msg_control = control, .msg_controllen = sizeof(control)};
-        struct cmsghdr *header = CMSG_FIRSTHDR(&message);
-        header->cmsg_level = SOL_SOCKET;
-        header->cmsg_type = SCM_RIGHTS;
-        header->cmsg_len = CMSG_LEN(sizeof(int));
-        memcpy(CMSG_DATA(header), &descriptor, sizeof(int));
-        if (sendmsg(sockets[0], &message, 0) != 1 || close(descriptor)) return 85;
-        memset(control, 0, sizeof(control));
-        message.msg_controllen = sizeof(control);
-        payload = 0;
-        if (recvmsg(sockets[1], &message, 0) != 1 || payload != 'x' || (message.msg_flags & MSG_CTRUNC)) return 86;
-        header = CMSG_FIRSTHDR(&message);
-        if (!header || header->cmsg_level != SOL_SOCKET || header->cmsg_type != SCM_RIGHTS || header->cmsg_len != CMSG_LEN(sizeof(int))) return 87;
-        memcpy(&descriptor, CMSG_DATA(header), sizeof(int));
-        close(sockets[0]);
-        close(sockets[1]);
-    }
-    if (CASE == 0) {
-        if (snprintf(relative, sizeof(relative), "private-created///") >= sizeof(relative)) return 88;
-    } else {
-        if (snprintf(relative, sizeof(relative), "%s%s/private-created%s", CASE == 5 ? "../" : "", cwd + 1, (CASE == 2 || CASE == 5) ? "" : "///") >= sizeof(relative)) return 89;
-    }
-    errno = 0;
-    int result = mkdirat(descriptor, relative, 0700);
-    int saved_errno = errno;
-    struct stat after;
-    errno = 0;
-    int exists = lstat(target, &after) == 0;
-    int lookup_errno = errno;
-    if (!exists && lookup_errno != ENOENT) return 90;
-    printf("case=%d result=%d errno=%d exists=%d directory=%d\n", CASE, result, saved_errno, exists, exists && S_ISDIR(after.st_mode));
-    close(descriptor);
-    int expected_creation = CASE == 0 || CASE == 4 || CASE == 5;
-    int correct = expected_creation ? (result == 0 && exists && S_ISDIR(after.st_mode)) : (result == -1 && !exists);
-    if (exists && rmdir(target)) return 91;
-    return correct ? 0 : 94;
 }
 "#;
 
@@ -4386,6 +4774,222 @@ impl Tool for PostExecTool {
         let address = unsafe { address.into_mut() };
         guest.memory().write_value(address, &POST_EXEC_RANDOM)
     }
+}
+
+/// The events an exec-commit test tool saw, in order: `commit <path>` from
+/// `handle_exec_commit`, with the exec's path read from the old image,
+/// `post-exec` from `handle_post_exec`, and `injected` if a hook's injection
+/// returned.
+#[derive(Default)]
+struct ExecCommitLog {
+    events: Mutex<Vec<String>>,
+}
+
+impl ExecCommitLog {
+    fn events(&self) -> Vec<String> {
+        self.events
+            .lock()
+            .expect("exec-commit log lock poisoned")
+            .clone()
+    }
+}
+
+#[reverie::global_tool]
+impl GlobalTool for ExecCommitLog {
+    type Request = String;
+    type Response = ();
+    type Config = ();
+
+    async fn receive_rpc(&self, _from: Pid, event: String) {
+        self.events
+            .lock()
+            .expect("exec-commit log lock poisoned")
+            .push(event);
+    }
+}
+
+/// Injects each `execve` and returns its result, so a failed exec returns to
+/// the guest. Its exec-commit hook reports the path it reads at the exec's
+/// path argument in the old image, then overwrites the path's first byte
+/// there: the exec read the path and the argument strings before the hook,
+/// so the new image still receives them as they were.
+#[derive(Clone, Copy, Debug, Default)]
+struct ExecCommitTool;
+
+#[reverie::tool]
+impl Tool for ExecCommitTool {
+    type GlobalState = ExecCommitLog;
+    type ThreadState = ();
+
+    fn subscriptions(_config: &()) -> Subscription {
+        let mut subscriptions = Subscription::none();
+        subscriptions.syscalls([Sysno::execve]);
+        subscriptions
+    }
+
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, reverie::Error> {
+        Ok(guest.inject(syscall).await?)
+    }
+
+    async fn handle_exec_commit<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
+        let path = guest.regs().await.rdi as usize;
+        let read = reverie::syscalls::Addr::<u8>::from_raw(path).ok_or(Errno::EFAULT)?;
+        let read = guest.memory().read_cstring(read)?;
+        guest
+            .send_rpc(format!("commit {}", read.to_string_lossy()))
+            .await;
+        let write = AddrMut::<u8>::from_raw(path).ok_or(Errno::EFAULT)?;
+        guest.memory().write_value(write, &b'X')
+    }
+
+    async fn handle_post_exec<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
+        guest.send_rpc("post-exec".to_owned()).await;
+        Ok(())
+    }
+}
+
+/// [`ExecCommitTool`], except that its exec-commit hook injects a syscall,
+/// which a hook may not do.
+#[derive(Clone, Copy, Debug, Default)]
+struct ExecCommitInjectingTool;
+
+#[reverie::tool]
+impl Tool for ExecCommitInjectingTool {
+    type GlobalState = ExecCommitLog;
+    type ThreadState = ();
+
+    fn subscriptions(_config: &()) -> Subscription {
+        let mut subscriptions = Subscription::none();
+        subscriptions.syscalls([Sysno::execve]);
+        subscriptions
+    }
+
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, reverie::Error> {
+        Ok(guest.inject(syscall).await?)
+    }
+
+    async fn handle_exec_commit<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
+        guest.inject(reverie::syscalls::Getpid::new()).await?;
+        guest.send_rpc("injected".to_owned()).await;
+        Ok(())
+    }
+}
+
+/// Fails one exec, then execs itself with argument `after`, which prints the
+/// argv[0] the new image received.
+const EXEC_COMMIT_PROGRAM: &str = r###"
+#include <errno.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+
+int main(int argc, char **argv) {
+    if (argc == 2 && strcmp(argv[1], "after") == 0) {
+        printf("after-exec argv0=%s\n", argv[0]);
+        return 0;
+    }
+    char *missing[] = {"missing", NULL};
+    execve("/nonexistent/exec-commit", missing, NULL);
+    printf("failed-exec errno=%d\n", errno);
+    fflush(stdout);
+    char *again[] = {argv[0], "after", NULL};
+    execve(argv[0], again, NULL);
+    return 99;
+}
+"###;
+
+/// What a run of [`EXEC_COMMIT_PROGRAM`] gives: the tool's log, the exit
+/// code, stdout and stderr.
+type ExecCommitRun = Result<(ExecCommitLog, i32, Vec<u8>, Vec<u8>), Error>;
+
+/// Installs [`EXEC_COMMIT_PROGRAM`] in a fresh directory and runs it under
+/// `T`, returning the run and the program's path.
+fn run_exec_commit_program<T>() -> (ExecCommitRun, String)
+where
+    T: Tool<GlobalState = ExecCommitLog> + 'static,
+    T::ThreadState: 'static,
+{
+    let directory = TestDirectory::new();
+    let program = compile_c_program(&directory.0, "exec-commit", EXEC_COMMIT_PROGRAM);
+    let path = program.to_str().unwrap().to_owned();
+    let mut backend = KvmBackend::new(256 * 1024 * 1024).unwrap();
+    backend
+        .install_static_elf_file_with_context(
+            std::fs::File::open(&program).unwrap(),
+            &[path.as_str()],
+            &[],
+            &directory.0,
+        )
+        .unwrap();
+    let result = futures::executor::block_on(backend.run_static_elf_with_tool::<T>((), true));
+    (result, path)
+}
+
+/// `Tool::handle_exec_commit` runs once for the guest's successful exec,
+/// never for its failed one and not for the initial image, between the
+/// initial image's `handle_post_exec` and the new image's. It sees the old
+/// image's memory, and it runs after the exec read its strings: the hook
+/// overwrites the path's first byte in the old image, yet the exec runs the
+/// program and the new image receives the path unchanged as argv[0].
+#[test]
+fn tool_exec_commit_runs_once_after_the_exec_read_its_strings() {
+    if !leader_self_exec_bounded("tool_exec_commit_runs_once_after_the_exec_read_its_strings") {
+        return;
+    }
+    let (result, path) = run_exec_commit_program::<ExecCommitTool>();
+    let (log, code, stdout, stderr) = result.unwrap();
+    assert_eq!(
+        code,
+        0,
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&stdout),
+        format!("failed-exec errno=2\nafter-exec argv0={path}\n")
+    );
+    assert_eq!(
+        log.events(),
+        vec![
+            "post-exec".to_owned(),
+            format!("commit {path}"),
+            "post-exec".to_owned(),
+        ]
+    );
+}
+
+/// An exec-commit hook that injects a syscall fails the run, by name, and the
+/// injection does not return to it.
+#[test]
+fn tool_exec_commit_may_not_inject() {
+    if !leader_self_exec_bounded("tool_exec_commit_may_not_inject") {
+        return;
+    }
+    let (result, _) = run_exec_commit_program::<ExecCommitInjectingTool>();
+    let error = match result {
+        Ok((log, code, stdout, _)) => panic!(
+            "the run succeeded: code={code} events={:?} stdout={}",
+            log.events(),
+            String::from_utf8_lossy(&stdout)
+        ),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains(&format!(
+            "exec-commit hook injected syscall {}",
+            libc::SYS_getpid
+        )),
+        "{error}"
+    );
 }
 
 #[derive(Default)]
@@ -5101,11 +5705,20 @@ fn unwrap_shared_guest_exception(error: Error) -> Error {
     }
 }
 
+/// How a dumpable guest that `signal` kills ends. The core flag is Linux's
+/// decision under this process's RLIMIT_CORE and the host's core_pattern
+/// (`reverie_linuxemu::core_dump`), not a constant: a limit of 1, for one,
+/// writes no core under any pattern.
+fn killed_by(signal: i32) -> ExitStatus {
+    let core = reverie_linuxemu::core_dump::guest_writes_core(signal, true);
+    ExitStatus::from_raw(signal | if core { 0x80 } else { 0 })
+}
+
 /// A user-mode #UD is the guest's own fault, not a backend error: Linux's
 /// `exc_invalid_op` raises SIGILL, whose default action terminates the process
-/// and dumps core.
+/// and dumps core when Linux would ([`killed_by`]).
 fn assert_invalid_opcode_signal(status: ExitStatus) {
-    assert_eq!(status, ExitStatus::from_raw(libc::SIGILL | 0x80));
+    assert_eq!(status, killed_by(libc::SIGILL));
 }
 
 fn assert_page_fault(error: Error) {
@@ -6137,9 +6750,18 @@ int main(int argc, char **argv) {
     );
     let executable = executable.to_str().unwrap();
     let image = std::fs::read(executable).unwrap();
+    // A nested frame that would begin exactly at the stack's lower end is off
+    // the stack, as on Linux, whose get_sigframe requires __on_sig_stack of
+    // the frame, which for a stack that grows down is (base, base + size],
+    // the base excluded
+    // (https://github.com/gregkh/linux/blob/v7.1.3/arch/x86/kernel/signal.c#L150-L158,
+    // https://github.com/gregkh/linux/blob/v7.1.3/include/linux/sched/signal.h#L574-L583):
+    // SIGSEGV, as for the frame 16 bytes lower. timer_events.rs compares
+    // that case with native Linux
+    // (a_frame_that_would_start_at_the_alternate_stacks_base_is_refused_as_on_linux).
     for (mode, expected) in [
         ("fresh", 0),
-        ("exact", 0),
+        ("exact", 128 + libc::SIGSEGV),
         ("underflow", 128 + libc::SIGSEGV),
         ("guard", 128 + libc::SIGSEGV),
     ] {
@@ -6267,8 +6889,12 @@ fn static_elf_rt_sigreturn_accepts_null_and_redirected_fpstate() {
     }
 }
 
+/// SIGUSR1 and SIGUSR2 are pending when one call unblocks both. Linux builds
+/// SIGUSR1's frame at that call's return and SIGUSR2's on top of it, so
+/// SIGUSR2's handler runs first and returns to SIGUSR1's, and both run before
+/// the guest's next instruction; the same binary exits 0 natively and on KVM.
 #[test]
-fn static_elf_chains_pending_after_sigreturn_before_user_code() {
+fn static_elf_stacks_pending_signals_before_user_code() {
     if !kvm_available("pending-signal boundary test") {
         return;
     }
@@ -6287,13 +6913,13 @@ static volatile sig_atomic_t between;
 static volatile sig_atomic_t failure;
 
 static void first_handler(int signal) {
-  if (signal != SIGUSR1 || phase != 0 || between != 0) failure = 10;
-  phase = 1;
+  if (signal != SIGUSR1 || phase != 1 || between != 0) failure = 10;
+  phase = 2;
 }
 
 static void second_handler(int signal) {
-  if (signal != SIGUSR2 || phase != 1 || between != 0) failure = 11;
-  phase = 2;
+  if (signal != SIGUSR2 || phase != 0 || between != 0) failure = 11;
+  phase = 1;
 }
 
 static int install(int signal, void (*handler)(int)) {
@@ -6320,6 +6946,11 @@ int main(void) {
 }
 "#,
     );
+    let native = std::process::Command::new(&executable)
+        .current_dir(&directory.0)
+        .status()
+        .unwrap();
+    assert_eq!(native.code(), Some(0), "native: {native}");
     let executable = executable.to_str().unwrap();
     let image = std::fs::read(executable).unwrap();
     let mut backend = KvmBackend::new(256 * 1024 * 1024).unwrap();
@@ -9450,7 +10081,6 @@ fn native_and_kvm_prctl_names_keep_worker_local_and_format_procfs_leader_bytes()
 #include <unistd.h>
 
 static const unsigned char leader_name[5] = {0xff, '\n', '\\', 'L', 0};
-static const unsigned char stat_name[6] = {'(', 0xff, '\n', '\\', 'L', ')'};
 static const unsigned char status_name[13] = {
     'N', 'a', 'm', 'e', ':', '\t', 0xff, '\\', 'n', '\\', '\\', 'L', '\n'
 };
@@ -9484,15 +10114,8 @@ static void *worker(void *unused) {
   if (write(1, observed, sizeof(observed)) != sizeof(observed))
     return (void *)(uintptr_t)4;
 
-  int count = read_proc("/proc/self/stat", buffer, sizeof(buffer));
+  int count = read_proc("/proc/self/status", buffer, sizeof(buffer));
   const unsigned char *found = count < 0 ? 0 : find_bytes(
-      buffer, (size_t)count, stat_name, sizeof(stat_name));
-  if (!found) return (void *)(uintptr_t)5;
-  if (write(1, found, sizeof(stat_name)) != sizeof(stat_name))
-    return (void *)(uintptr_t)6;
-
-  count = read_proc("/proc/self/status", buffer, sizeof(buffer));
-  found = count < 0 ? 0 : find_bytes(
       buffer, (size_t)count, status_name, sizeof(status_name));
   if (!found) return (void *)(uintptr_t)7;
   if (write(1, found, sizeof(status_name)) != sizeof(status_name))
@@ -9518,10 +10141,9 @@ int main(void) {
     );
     let mut expected = b"worker".to_vec();
     expected.resize(16, 0);
-    expected.extend_from_slice(&[b'(', 0xff, b'\n', b'\\', b'L', b')']);
     expected.extend_from_slice(b"Name:\t\xff\\n\\\\L\n");
     expected.extend_from_slice(&[0xff, b'\n', b'\\', b'L']);
-    expected.resize(51, 0);
+    expected.resize(45, 0);
 
     let native = std::process::Command::new(&executable)
         .current_dir(&directory.0)
@@ -10390,18 +11012,16 @@ static int read_record(int fd, char *buffer, size_t size) {
 }
 
 /* Runs in a grandchild adopted by the outside init. Its descriptors were opened
-   under its original parent; both must report the new parent when first read. */
-static char adopted_verdict(int stat_fd, int status_fd) {
+   under its original parent, by its pid and by self; both must report the new
+   parent when first read. */
+static char adopted_verdict(int pid_status_fd, int status_fd) {
   if (getppid() != 1) return 'p';
   char buffer[4096];
-  if (read_record(stat_fd, buffer, sizeof buffer) != 0) return 's';
-  char *end = strrchr(buffer, ')');
-  char state = 0;
-  int ppid = -1;
-  if (end == 0 || sscanf(end + 1, " %c %d", &state, &ppid) != 2 || ppid != 1)
-    return 'S';
-  if (read_record(status_fd, buffer, sizeof buffer) != 0) return 't';
+  if (read_record(pid_status_fd, buffer, sizeof buffer) != 0) return 's';
   char *line = strstr(buffer, "\nPPid:\t");
+  if (line == 0 || atoi(line + 7) != 1) return 'S';
+  if (read_record(status_fd, buffer, sizeof buffer) != 0) return 't';
+  line = strstr(buffer, "\nPPid:\t");
   if (line == 0 || atoi(line + 7) != 1) return 'T';
   return 'k';
 }
@@ -10443,15 +11063,17 @@ int main(int argc, char **argv) {
         /* Only the root may release this process; its failure reads as EOF.
            Dropping the hold end leaves the former parent as its last writer. */
         if (close(release[1]) != 0 || close(hold[1]) != 0) _exit(36);
-        int stat_fd = open("/proc/self/stat", O_RDONLY);
+        char pid_status[64];
+        snprintf(pid_status, sizeof pid_status, "/proc/%d/status", (int)getpid());
+        int pid_status_fd = open(pid_status, O_RDONLY);
         int status_fd = open("/proc/self/status", O_RDONLY);
-        if (stat_fd < 0 || status_fd < 0) _exit(27);
+        if (pid_status_fd < 0 || status_fd < 0) _exit(27);
         if (getppid() == 1) _exit(28);
         char byte = 'x';
         if (write(ready[1], &byte, 1) != 1) _exit(29);
         /* The parent exits after reading the byte; spin until adoption. */
         while (getppid() != 1) (void)getpid();
-        byte = adopted_verdict(stat_fd, status_fd);
+        byte = adopted_verdict(pid_status_fd, status_fd);
         if (write(verdict[1], &byte, 1) != 1) _exit(30);
         /* Outlive the former parent until the root has reaped it: its exit
            must not wait for this adopted process. */
@@ -11956,7 +12578,23 @@ fn repair_prctl_required_kvm_is_not_optional() {
         "msync_lifecycle::shared_coherence_and_mapping_lifetime_match_native",
         "shared_file_fork_settled_visibility_close_reuse_and_private_cow_match_native",
         "shared_file_fork_clear_tid_records_native_and_checks_kvm_last_owner",
+        "shared_file_vfork_and_posix_spawn_children_match_native",
+        "shared_file_vfork_child_view_changes_are_refused_by_name",
+        "shared_file_views_and_threads_coexist_as_natively",
+        "shared_file_views_with_threads_match_native",
+        "shared_file_view_over_a_waiting_futex_word_is_refused_by_name",
+        "seqpacket_socketpair_two_writers_match_native",
+        "vfork_children_share_private_memory_with_their_parent_like_native",
+        "a_vfork_child_cannot_leave_a_mapping_changed",
+        "a_vfork_child_and_a_parent_thread_storing_one_byte_are_refused_by_name",
+        "a_vfork_child_clears_its_clear_child_tid_word_in_its_parent_like_native",
+        "a_vfork_parent_thread_killed_by_its_leaders_exec_leaves_the_child_running_like_native",
+        "a_vfork_parent_whose_process_exits_during_the_window_exits_like_native",
+        "a_vfork_child_creating_a_thread_is_refused_by_name",
+        "a_parent_thread_replacing_a_page_the_vfork_child_changed_is_refused_by_name",
+        "a_fork_copies_every_page_its_parent_can_read_like_native",
         "shared_anonymous_fork_shares_one_object_across_fork_unmap_and_exec_like_native",
+        "guard_regions_fault_kernel_copies_like_native",
         "pdeathsig::unchanged_six_check_state_matches_native_controlled",
         "pdeathsig::direct_host_and_unopted_control_preserve_nonzero_refusal",
         "pdeathsig::creator_thread_death_and_clear_match_native_shared_pending",
@@ -12938,10 +13576,21 @@ static void caught(int signo) {
   else syscall(SYS_exit_group, 20);
 }
 
+static int install(int signo, int blocked) {
+  struct sigaction action = {0};
+  action.sa_handler = caught;
+  sigemptyset(&action.sa_mask);
+  if (blocked != 0) sigaddset(&action.sa_mask, blocked);
+  return sigaction(signo, &action, 0);
+}
+
 int main(void) {
   original_pid = getpid();
-  if (signal(SIGUSR1, caught) == SIG_ERR) return 21;
-  if (signal(SIGUSR2, caught) == SIG_ERR) return 22;
+  // SIGUSR1's handler blocks SIGUSR2, so SIGUSR2 is not delivered on top of
+  // SIGUSR1's frame at the unblocking call's return, as an unblocked one
+  // would be, but at that handler's rt_sigreturn.
+  if (install(SIGUSR1, SIGUSR2) != 0) return 21;
+  if (install(SIGUSR2, 0) != 0) return 22;
   sigset_t both;
   sigemptyset(&both);
   sigaddset(&both, SIGUSR1);
@@ -13088,6 +13737,9 @@ int main(void) {
 
 const TERMINAL_RECEIPT_CHILD_TID: u64 = 0x0800_3000;
 static TERMINAL_RECEIPT_MEMORY: Mutex<Option<reverie_kvm::GuestMemory>> = Mutex::new(None);
+/// Held by each test that installs `TERMINAL_RECEIPT_MEMORY`, so tests in one
+/// process take turns with it.
+static TERMINAL_RECEIPT_EXCLUSIVE: Mutex<()> = Mutex::new(());
 
 /// Reserves a permit for a worker's `SYS_exit`, as Detcore does for exit
 /// boundaries, and records the worker's CLONE_CHILD_CLEARTID word at the
@@ -13196,6 +13848,9 @@ fn worker_exit_clears_child_tid_before_terminal_receipt() {
     if !kvm_available("worker exit CHILD_CLEARTID terminal receipt ordering test") {
         return;
     }
+    let _exclusive = TERMINAL_RECEIPT_EXCLUSIVE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let directory = TestDirectory::new();
     let executable = compile_c_program(
@@ -13253,6 +13908,128 @@ int main(void) {
 
     let completion = futures::executor::block_on(
         backend.run_static_elf_with_tool_completion::<TerminalReceiptTool>((), true),
+    );
+    *TERMINAL_RECEIPT_MEMORY
+        .lock()
+        .expect("terminal-receipt memory lock poisoned") = None;
+    let completion = completion.unwrap();
+    let global = completion.global_state;
+    let (status, stdout, stderr) = completion.result.unwrap();
+    assert_eq!(status, reverie::ExitStatus::Exited(0));
+    assert!(stdout.is_empty());
+    assert!(stderr.is_empty());
+    assert!(global.permit.into_inner().unwrap().is_none());
+    assert_eq!(
+        global.receipts.into_inner().unwrap(),
+        vec![(
+            reverie::SignalBoundaryOutcome::Terminated {
+                group: false,
+                wait_status: 0,
+            },
+            0,
+        )],
+    );
+}
+
+/// Reserves a permit for the leader's own `SYS_exit` (the main thread's
+/// `pthread_exit`), as a Tool that observes exits through signal-boundary
+/// receipts does.
+#[derive(Default)]
+struct LeaderTerminalReceiptTool;
+
+#[reverie::tool]
+impl Tool for LeaderTerminalReceiptTool {
+    type GlobalState = TerminalReceiptGlobal;
+    type ThreadState = ();
+
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+    ) -> Result<i64, reverie::Error> {
+        if call.number() == Sysno::exit && guest.tid() == guest.pid() {
+            let task = guest
+                .signal_task_identity()
+                .expect("a running leader has a task identity");
+            guest.send_rpc(task).await;
+        }
+        guest.tail_inject(call).await
+    }
+}
+
+/// A process leader that exits by itself while another of its threads lives
+/// (the main thread's `pthread_exit`) has its CLONE_CHILD_CLEARTID word
+/// cleared before its terminal receipt is published, as a worker's is: Linux
+/// runs `mm_release` at every thread's `exit_mm`, before the exit is
+/// observable, and a Tool may wake the leader's joiner from that receipt. The
+/// other thread waits for the word to become zero and then ends the group.
+#[test]
+fn leader_exit_clears_child_tid_before_terminal_receipt() {
+    if !kvm_available("leader exit CHILD_CLEARTID terminal receipt ordering test") {
+        return;
+    }
+    let _exclusive = TERMINAL_RECEIPT_EXCLUSIVE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let directory = TestDirectory::new();
+    let executable = compile_c_program(
+        &directory.0,
+        "leader-exit-cleartid-receipt",
+        r#"
+#define _GNU_SOURCE
+#include <sched.h>
+#include <stdint.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+#define TID_WORD ((volatile int *)UINT64_C(0x08003000))
+static _Alignas(16) unsigned char worker_stack[1 << 20];
+
+static int worker_main(void *unused) {
+  (void)unused;
+  // Bounded, so that a word nobody clears ends the run instead of hanging it.
+  for (long spins = 0; *TID_WORD != 0; spins++) {
+    if (spins == 1000000) syscall(SYS_exit_group, 3);
+    syscall(SYS_sched_yield);
+  }
+  syscall(SYS_exit_group, 0);
+  return 44;
+}
+
+int main(void) {
+  void *mapped = mmap((void *)TID_WORD, 4096, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+  if (mapped != (void *)TID_WORD) return 20;
+  *TID_WORD = (int)syscall(SYS_gettid);
+  syscall(SYS_set_tid_address, (int *)TID_WORD);
+  int flags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND |
+              CLONE_THREAD | CLONE_SYSVSEM;
+  if (clone(worker_main, worker_stack + sizeof(worker_stack), flags, 0) < 0)
+    return 22;
+  syscall(SYS_exit, 0);
+  return 23;
+}
+"#,
+    );
+    let executable = executable.to_str().unwrap();
+    let image = std::fs::read(executable).unwrap();
+    let mut backend = KvmBackend::new(256 * 1024 * 1024).unwrap();
+    backend
+        .install_static_elf_with_context(
+            &image,
+            &[executable],
+            &["PATH=/usr/bin:/bin"],
+            &directory.0,
+        )
+        .unwrap();
+    *TERMINAL_RECEIPT_MEMORY
+        .lock()
+        .expect("terminal-receipt memory lock poisoned") = Some(backend.memory().unwrap().clone());
+
+    let completion = futures::executor::block_on(
+        backend.run_static_elf_with_tool_completion::<LeaderTerminalReceiptTool>((), true),
     );
     *TERMINAL_RECEIPT_MEMORY
         .lock()
@@ -13511,6 +14288,247 @@ int main(int argc, char **argv) {
     }
 }
 
+/// The callbacks `RestartClassTool` saw, in order: 0 for the interrupted
+/// `getpid`, 1 for the structured signal hook, 2 for `restart_syscall`.
+#[derive(Default)]
+struct RestartClassLog {
+    callbacks: Mutex<Vec<u8>>,
+}
+
+impl RestartClassLog {
+    fn callbacks(&self) -> Vec<u8> {
+        self.callbacks
+            .lock()
+            .expect("restart class log lock poisoned")
+            .clone()
+    }
+}
+
+#[reverie::global_tool]
+impl GlobalTool for RestartClassLog {
+    type Request = u8;
+    type Response = ();
+    /// `class * 100 + mode`; see `RestartClassTool`.
+    type Config = u32;
+
+    async fn receive_rpc(&self, _from: Pid, callback: u8) {
+        self.callbacks
+            .lock()
+            .expect("restart class log lock poisoned")
+            .push(callback);
+    }
+}
+
+/// The argument the guest passes its interrupted `getpid` in `rdi`, which a
+/// `restart_syscall` must still hold: Linux's restart rewrites only `rax` and
+/// the instruction pointer (`arch_do_signal_or_restart`).
+const RESTART_CLASS_MARKER: u64 = 0x5150;
+
+/// Returns the Linux-internal restart class `config / 100` from the first
+/// `getpid`, after deferring a SIGUSR1 to the calling thread unless the mode
+/// (`config % 100`) is 3. Mode 4 replaces that signal with the default-ignored
+/// SIGWINCH in the signal hook, and mode 5 suppresses it, so no handler runs
+/// in modes 3 to 5. The second `getpid` returns 77 and a `restart_syscall`
+/// returns 88.
+#[derive(Clone, Copy, Debug, Default)]
+struct RestartClassTool;
+
+#[reverie::tool]
+impl Tool for RestartClassTool {
+    type GlobalState = RestartClassLog;
+    type ThreadState = (u64, u64);
+
+    fn subscriptions(_config: &u32) -> Subscription {
+        let mut subscriptions = Subscription::none();
+        subscriptions.syscall(Sysno::getpid);
+        subscriptions.syscall(Sysno::restart_syscall);
+        subscriptions
+    }
+
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, reverie::Error> {
+        let (number, args) = syscall.into_parts();
+        if number == Sysno::restart_syscall {
+            guest.send_rpc(2).await;
+            assert_eq!(
+                args.arg0 as u64, RESTART_CLASS_MARKER,
+                "restart_syscall lost the interrupted call's argument registers"
+            );
+            let calls = guest.thread_state_mut();
+            calls.1 += 1;
+            assert_eq!(calls.1, 1, "restart_syscall ran more than once");
+            return Ok(88);
+        }
+        assert_eq!(number, Sysno::getpid);
+        let ordinal = {
+            let calls = guest.thread_state_mut();
+            calls.0 += 1;
+            calls.0
+        };
+        guest.send_rpc(0).await;
+        let class = (*guest.config() / 100) as i32;
+        let mode = *guest.config() % 100;
+        if ordinal == 1 {
+            if mode != 3 {
+                let mut info = [0; reverie::SIGNAL_INFO_SIZE];
+                info[0..4].copy_from_slice(&libc::SIGUSR1.to_ne_bytes());
+                info[8..12].copy_from_slice(&libc::SI_TKILL.to_ne_bytes());
+                let event = SignalEvent::new(
+                    libc::SIGUSR1,
+                    info,
+                    SignalTarget::Thread {
+                        pid: guest.pid(),
+                        tid: guest.tid(),
+                    },
+                )?;
+                guest.defer_signal_delivery(event).await?;
+            }
+            return Err(Errno::new(class).into());
+        }
+        assert_eq!(ordinal, 2, "a syscall restarted more than once");
+        Ok(77)
+    }
+
+    async fn handle_structured_signal_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        event: SignalEvent,
+    ) -> Result<Option<SignalEvent>, Errno> {
+        guest.send_rpc(1).await;
+        match *guest.config() % 100 {
+            4 => {
+                let mut info = event.siginfo();
+                info[0..4].copy_from_slice(&libc::SIGWINCH.to_ne_bytes());
+                Ok(Some(SignalEvent::new(
+                    libc::SIGWINCH,
+                    info,
+                    event.target(),
+                )?))
+            }
+            5 => Ok(None),
+            _ => Ok(Some(event)),
+        }
+    }
+}
+
+/// Each Linux-internal restart class a Tool returns, with a caught signal
+/// (without and with `SA_RESTART`) and with no handler (no signal, an ignored
+/// one, a suppressed one), gives the guest what Linux gives it:
+/// arch/x86/kernel/signal.c (v6.17) `handle_signal` when a handler runs and
+/// `arch_do_signal_or_restart` when none does. The guest prints nothing and
+/// exits 0 only when its `getpid` result and handler count match.
+#[test]
+fn tool_restart_classes_follow_linux_signal_restart_policy() {
+    if !kvm_available("tool restart classes test") {
+        return;
+    }
+
+    let directory = TestDirectory::new();
+    let executable = compile_c_program(
+        &directory.0,
+        "tool-restart-classes",
+        r#"
+#define _GNU_SOURCE
+#include <errno.h>
+#include <signal.h>
+#include <stdlib.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+static volatile sig_atomic_t usr1_calls;
+
+static void usr1_handler(int signo) {
+  if (signo == SIGUSR1) ++usr1_calls;
+}
+
+int main(int argc, char **argv) {
+  if (argc != 4) return 20;
+  int mode = atoi(argv[1]);
+  long expected = atol(argv[2]);
+  int expected_calls = atoi(argv[3]);
+  struct sigaction action = {0};
+  action.sa_handler = usr1_handler;
+  action.sa_flags = mode == 2 ? SA_RESTART : 0;
+  sigemptyset(&action.sa_mask);
+  if (sigaction(SIGUSR1, &action, 0) != 0) return 21;
+
+  errno = 0;
+  long result = syscall(SYS_getpid, 0x5150L);
+  int saved_errno = errno;
+  if (expected < 0) {
+    if (result != -1 || saved_errno != -expected) return 22;
+  } else if (result != expected) {
+    return 23;
+  }
+  if (usr1_calls != expected_calls) return 24;
+  return 0;
+}
+"#,
+    );
+    let executable = executable.to_str().unwrap();
+    let image = std::fs::read(executable).unwrap();
+    const EINTR: i64 = -(libc::EINTR as i64);
+    // (class, mode, guest result, handler calls, callbacks)
+    let cases: &[(u32, u32, i64, i32, &[u8])] = &[
+        // ERESTARTSYS: EINTR after a handler unless SA_RESTART, else restart.
+        (512, 1, EINTR, 1, &[0, 1]),
+        (512, 2, 77, 1, &[0, 1, 0]),
+        (512, 3, 77, 0, &[0, 0]),
+        (512, 4, 77, 0, &[0, 1, 0]),
+        (512, 5, 77, 0, &[0, 1, 0]),
+        // ERESTARTNOINTR: always restarted.
+        (513, 1, 77, 1, &[0, 1, 0]),
+        (513, 2, 77, 1, &[0, 1, 0]),
+        (513, 3, 77, 0, &[0, 0]),
+        (513, 4, 77, 0, &[0, 1, 0]),
+        (513, 5, 77, 0, &[0, 1, 0]),
+        // ERESTARTNOHAND: EINTR after any handler, restarted without one.
+        (514, 1, EINTR, 1, &[0, 1]),
+        (514, 2, EINTR, 1, &[0, 1]),
+        (514, 3, 77, 0, &[0, 0]),
+        (514, 4, 77, 0, &[0, 1, 0]),
+        (514, 5, 77, 0, &[0, 1, 0]),
+        // ERESTART_RESTARTBLOCK: EINTR after any handler, restart_syscall
+        // without one.
+        (516, 1, EINTR, 1, &[0, 1]),
+        (516, 2, EINTR, 1, &[0, 1]),
+        (516, 3, 88, 0, &[0, 2]),
+        (516, 4, 88, 0, &[0, 1, 2]),
+        (516, 5, 88, 0, &[0, 1, 2]),
+    ];
+    for &(class, mode, expected, calls, callbacks) in cases {
+        let arguments = [mode.to_string(), expected.to_string(), calls.to_string()];
+        let mut backend = KvmBackend::new(256 * 1024 * 1024).unwrap();
+        backend
+            .install_static_elf_with_context(
+                &image,
+                &[executable, &arguments[0], &arguments[1], &arguments[2]],
+                &["PATH=/usr/bin:/bin"],
+                &directory.0,
+            )
+            .unwrap();
+        let (log, code, stdout, stderr) = futures::executor::block_on(
+            backend.run_static_elf_with_tool::<RestartClassTool>(class * 100 + mode, true),
+        )
+        .unwrap_or_else(|error| panic!("restart class {class} mode {mode}: {error}"));
+        assert_eq!(
+            code,
+            0,
+            "restart class {class} mode {mode} failed; stdout={}; stderr={}",
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr),
+        );
+        assert_eq!(
+            log.callbacks(),
+            callbacks,
+            "restart class {class} mode {mode}"
+        );
+    }
+}
+
 #[test]
 fn static_elf_rt_sigreturn_requires_only_consumed_prefix() {
     if !kvm_available("static_elf_rt_sigreturn_requires_only_consumed_prefix") {
@@ -13588,7 +14606,7 @@ int main(int argc, char **argv) {
         assert_eq!(stdout, expected_stdout.as_bytes(), "case {argument}");
         assert!(stderr.is_empty(), "case {argument}: {stderr:?}");
         let expected_status = if argument == "311" {
-            ExitStatus::from_raw(libc::SIGSEGV | 0x80)
+            killed_by(libc::SIGSEGV)
         } else {
             ExitStatus::SUCCESS
         };
@@ -13951,7 +14969,7 @@ fn page_zero_nested_null_ignored() {
         &image,
         &[executable.to_str().unwrap(), "ignored-return"],
         &directory,
-        ExitStatus::from_raw(libc::SIGSEGV | 0x80),
+        killed_by(libc::SIGSEGV),
         b"handler\n",
     );
 }
@@ -13972,7 +14990,7 @@ fn page_zero_nested_null_blocked() {
         &image,
         &[executable.to_str().unwrap(), "blocked-return"],
         &directory,
-        ExitStatus::from_raw(libc::SIGSEGV | 0x80),
+        killed_by(libc::SIGSEGV),
         b"handler\n",
     );
 }
@@ -14633,7 +15651,7 @@ fn check_page_zero_fault_context(name: &str, operation: &str, disposition: &str,
             if disposition == "caught" {
                 ExitStatus::SUCCESS
             } else {
-                ExitStatus::from_raw(libc::SIGSEGV | 0x80)
+                killed_by(libc::SIGSEGV)
             },
             expected,
         );
@@ -15035,7 +16053,7 @@ fn typed_null_restorer_returning_status() {
     check_null_restorer_typed_status(
         "typed_null_restorer_returning_status",
         "null-return",
-        ExitStatus::from_raw(libc::SIGSEGV | 0x80),
+        killed_by(libc::SIGSEGV),
         b"handler\n",
     );
 }
@@ -17482,9 +18500,11 @@ fn pipe_fionread_native_and_kvm_complete_contract() {
                 )
                 .unwrap();
                 let calls = log.calls.load(Ordering::SeqCst);
+                // The excluded objects' FIONREAD probes: two each, none for
+                // /proc, whose open the backend refuses.
                 let expected_calls = match mode {
                     "supported" => 54,
-                    "excluded" => 24,
+                    "excluded" => 22,
                     "capture" => 12,
                     _ => unreachable!(),
                 };
@@ -18029,6 +19049,10 @@ impl Tool for ClockTimestampTool {
     }
 }
 
+#[cfg_attr(
+    fbcode_build,
+    ignore = "fbsource-disabled: sandcastle-env: needs /dev/kvm and exact PMU branch counts"
+)]
 #[test]
 fn timestamp_callbacks_observe_retired_branches_without_counting_rpc_work() {
     if !kvm_available("KVM timestamp callback clock test") {
@@ -19721,6 +20745,10 @@ int main(int argc, char **argv) {
     }
 }
 
+#[cfg_attr(
+    fbcode_build,
+    ignore = "fbsource-disabled: sandcastle-env: needs /dev/kvm and exact PMU branch counts"
+)]
 #[test]
 fn storage_fd_syscalls_consume_low_words_on_kvm() {
     if !kvm_available("KVM storage fd low-word argument test") {
@@ -19769,9 +20797,38 @@ int main(int argc, char **argv) {
   errno = 0;
   if (!failed_with(syscall(SYS_fallocate, HIGH_WORD | (uint32_t)fd,
                            0, 0, 0), EINVAL)) return 8;
+  // Linux's generic file advice refuses a negative offset only since commit
+  // 0fd66c343ce7, so the result and errno are printed for the emulated runs
+  // to match, and the high-word alias must observe what the plain fd does.
   errno = 0;
-  if (!failed_with(syscall(SYS_readahead, HIGH_WORD | (uint32_t)fd,
-                           (int64_t)-1, 1), EINVAL)) return 9;
+  long plain = syscall(SYS_readahead, (uint64_t)(uint32_t)fd, (int64_t)-1,
+                       (size_t)1);
+  int plain_errno = plain == 0 ? 0 : errno;
+  errno = 0;
+  long negative = syscall(SYS_readahead, HIGH_WORD | (uint32_t)fd,
+                          (int64_t)-1, (size_t)1);
+  int negative_errno = negative == 0 ? 0 : errno;
+  if ((negative != 0 && negative != -1) || (negative == -1 && negative_errno == 0) ||
+      negative != plain || negative_errno != plain_errno) {
+    fprintf(stderr,
+            "readahead offset -1: high-word result %ld errno %d, plain fd "
+            "result %ld errno %d\n",
+            negative, negative_errno, plain, plain_errno);
+    return 9;
+  }
+  // The access mode is checked before the offset on every version.
+  int write_only = open(argv[1], O_WRONLY);
+  if (write_only < 0) return 17;
+  errno = 0;
+  long refused = syscall(SYS_readahead, HIGH_WORD | (uint32_t)write_only,
+                         (int64_t)-1, (size_t)1);
+  int refused_errno = errno;
+  if (!(refused == -1 && refused_errno == EBADF)) {
+    fprintf(stderr, "write-only readahead offset -1: result %ld errno %d\n",
+            refused, refused_errno);
+    return 18;
+  }
+  if (close(write_only) != 0) return 19;
   errno = 0;
   if (!failed_with(syscall(SYS_sync_file_range,
                            HIGH_WORD | (uint32_t)fd, 0, 1,
@@ -19793,7 +20850,8 @@ int main(int argc, char **argv) {
   if (!failed_with(syscall(SYS_fallocate, invalid, 0, 0, 1), EBADF)) return 15;
 
   if (close(fd) != 0) return 16;
-  printf("storage-low-word-ok fallocate=%s\n", allocation_result);
+  printf("storage-low-word-ok fallocate=%s readahead-negative=%ld,%d\n",
+         allocation_result, negative, negative_errno);
   return 0;
 }
 "#,
@@ -19810,12 +20868,23 @@ int main(int argc, char **argv) {
         String::from_utf8_lossy(&native.stdout),
         String::from_utf8_lossy(&native.stderr)
     );
+    // A readable regular file's generic file advice gives 0 before Linux
+    // commit 0fd66c343ce7 and EINVAL after it; each emulated run must then
+    // print the same readahead result and errno as this native one.
+    let native_line = String::from_utf8_lossy(&native.stdout);
+    let readahead_negative = ["ok", "unsupported"].iter().find_map(|allocation| {
+        native_line
+            .strip_prefix(&format!(
+                "storage-low-word-ok fallocate={allocation} readahead-negative="
+            ))?
+            .strip_suffix('\n')
+    });
+    let einval = format!("-1,{}", libc::EINVAL);
     assert!(
-        native.stdout == b"storage-low-word-ok fallocate=ok\n"
-            || native.stdout == b"storage-low-word-ok fallocate=unsupported\n",
-        "unexpected native oracle: {:?}",
-        String::from_utf8_lossy(&native.stdout)
+        matches!(readahead_negative, Some(pair) if pair == "0,0" || pair == einval),
+        "unexpected native oracle: {native_line:?}"
     );
+    eprintln!("native readahead(fd, -1, 1): {native_line:?}");
     assert!(native.stderr.is_empty());
 
     let image = std::fs::read(&executable).unwrap();
@@ -19964,17 +21033,19 @@ fn getdents64_consumes_low_descriptor_words_on_kvm() {
         common.push('\n');
     }
     common.push_str("getdents64 canonical-count boundary=16777216,16777217 guards=unchanged\n");
-    // The controlled directories have one common native/KVM oracle. Synthetic
-    // proc deliberately differs; require its exact policy row separately.
+    // The controlled directories have one common native/KVM oracle. The
+    // backend refuses its own procfs, /proc included, where Linux lists it;
+    // require each side's exact policy rows separately. The guest makes none
+    // of the 100 calls on /proc, so it makes 774 legacy calls to Linux's 874.
     let native_expected = format!(
         "{common}getdents64 policy=native-proc-opath open=success\n\
          getdents64 policy=native-proc rows=100 records-and-errors checked\n\
          getdents64 checked calls=874\n"
     );
     let guest_expected = format!(
-        "{common}getdents64 policy=synthetic-proc-opath open=EINVAL\n\
-         getdents64 policy=synthetic-proc rows=100 zero-before-buffer unchanged\n\
-         getdents64 checked calls=874\n"
+        "{common}getdents64 policy=procfs-opath open=EACCES\n\
+         getdents64 policy=procfs open=EACCES\n\
+         getdents64 checked calls=774\n"
     );
     // Retain the exact legacy prefix. The additive raw-count rows contain the
     // complete native arena and continuation bytes, not a digest or filtered
@@ -20137,13 +21208,13 @@ fn getdents64_consumes_low_descriptor_words_on_kvm() {
         if let Some(calls) = tool_calls {
             assert_eq!(
                 calls,
-                874 + 754,
+                774 + 754,
                 "legacy plus raw-count getdents64 Tool callbacks"
             );
         }
         eprintln!(
             "getdents64 tool_owned={tool_owned} repetition={repetition} \
-             calls=874 raw_count_calls=754 total=1628 tool_calls={tool_calls:?} seconds={} stdout={}",
+             calls=774 raw_count_calls=754 total=1528 tool_calls={tool_calls:?} seconds={} stdout={}",
             start.elapsed().as_secs_f64(),
             String::from_utf8_lossy(&stdout)
         );
@@ -21671,9 +22742,7 @@ fn fstat_and_fstatfs_consume_low_descriptor_words_on_kvm() {
                     "stderr",
                     "file",
                     "directory",
-                    "proc-root",
                     "proc-maps",
-                    "fdinfo",
                 ][..],
             ),
             ("fstatfs", &["file", "directory"][..]),
@@ -21695,21 +22764,19 @@ fn fstat_and_fstatfs_consume_low_descriptor_words_on_kvm() {
             }
         }
         expected.push_str("proc-policy\n");
-        for (object, refusal) in [("proc-root", libc::EACCES), ("fdinfo", libc::ENOSYS)] {
-            for upper in upper_words {
-                for badptr in [0, 1] {
-                    let error = if guest {
-                        refusal
-                    } else if badptr == 1 {
-                        libc::EFAULT
-                    } else {
-                        0
-                    };
-                    let result = if error == 0 { 0 } else { -1 };
-                    expected.push_str(&format!(
-                        "fstatfs object={object} upper={upper:016x} badptr={badptr} result={result} errno={error}\n"
-                    ));
-                }
+        for upper in upper_words {
+            for badptr in [0, 1] {
+                let error = if guest {
+                    libc::EACCES
+                } else if badptr == 1 {
+                    libc::EFAULT
+                } else {
+                    0
+                };
+                let result = if error == 0 { 0 } else { -1 };
+                expected.push_str(&format!(
+                    "fstatfs object=proc-root upper={upper:016x} badptr={badptr} result={result} errno={error}\n"
+                ));
             }
         }
         expected
@@ -21722,17 +22789,21 @@ fn fstat_and_fstatfs_consume_low_descriptor_words_on_kvm() {
         include_str!("fixtures/fstat_fd_width.c"),
         &["-std=c11", "-Wall", "-Wextra", "-Werror"],
     );
+    // The fixture's /proc row uses a /proc it inherits as its standard input:
+    // the backend refuses a guest's own open of procfs.
+    let proc_stdin = || std::fs::File::open("/proc").unwrap();
     let native = std::process::Command::new("timeout")
         .args(["--kill-after=2s", "10s"])
         .arg(&executable)
         .arg("native")
         .arg(directory.0.join("native-fstat-fd-width"))
         .current_dir(&directory.0)
+        .stdin(proc_stdin())
         .output()
         .unwrap();
     assert_eq!(native.status.code(), Some(0), "native fixture: {native:?}");
     let native_stdout = std::str::from_utf8(&native.stdout).unwrap();
-    assert_eq!(native_stdout.lines().count(), 161);
+    assert_eq!(native_stdout.lines().count(), 137);
     assert_eq!(native_stdout, expected_transcript(false));
     assert!(native.stderr.is_empty());
     let (native_common, _) = native_stdout.split_once("proc-policy\n").unwrap();
@@ -21744,7 +22815,8 @@ fn fstat_and_fstatfs_consume_low_descriptor_words_on_kvm() {
         let guest_path = directory
             .0
             .join(format!("guest-fstat-fd-width-{tool_owned}-{repetition}"));
-        let mut backend = KvmBackend::new(256 * 1024 * 1024).unwrap();
+        let mut backend =
+            KvmBackend::new_with_stdin(256 * 1024 * 1024, Some(proc_stdin())).unwrap();
         backend
             .install_static_elf_with_context(
                 &image,
@@ -21856,11 +22928,15 @@ fn fchdir_consumes_low_descriptor_words_on_kvm() {
     );
     let native_directory = directory.0.join("native-fchdir");
     std::fs::create_dir(&native_directory).unwrap();
+    // The fixture's /proc row uses a /proc it inherits as its standard input:
+    // the backend refuses a guest's own open of procfs.
+    let proc_stdin = || std::fs::File::open("/proc").unwrap();
     let native = std::process::Command::new("timeout")
         .args(["--kill-after=2s", "10s"])
         .arg(&executable)
         .arg("native")
         .current_dir(&native_directory)
+        .stdin(proc_stdin())
         .output()
         .unwrap();
     assert_eq!(native.status.code(), Some(0), "native fixture: {native:?}");
@@ -21881,7 +22957,8 @@ fn fchdir_consumes_low_descriptor_words_on_kvm() {
             .0
             .join(format!("guest-fchdir-{tool_owned}-{repetition}"));
         std::fs::create_dir(&guest_directory).unwrap();
-        let mut backend = KvmBackend::new(256 * 1024 * 1024).unwrap();
+        let mut backend =
+            KvmBackend::new_with_stdin(256 * 1024 * 1024, Some(proc_stdin())).unwrap();
         backend
             .install_static_elf_with_context(
                 &image,
@@ -21928,6 +23005,9 @@ fn fchdir_consumes_low_descriptor_words_on_kvm() {
 
 #[path = "support/natural_retirement.rs"]
 mod natural_retirement;
+
+#[path = "support/tool_retired_group_exit.rs"]
+mod tool_retired_group_exit;
 
 #[path = "support/exit_descriptor_ordering.rs"]
 mod exit_descriptor_ordering;
@@ -22003,6 +23083,1202 @@ fn shared_file_fork_settled_visibility_close_reuse_and_private_cow_match_native(
     }
 }
 
+/// The three ways the shared-file vfork fixture runs on KVM: without a tool,
+/// and with the strace tool owning threads on the host and through the tool.
+const SHARED_FILE_VFORK_MODES: [(&str, Option<ThreadOwnership>); 3] = [
+    ("direct", None),
+    ("host", Some(ThreadOwnership::Host)),
+    ("tool", Some(ThreadOwnership::Tool)),
+];
+
+/// Whether `error`, or a KVM backend error among its sources, is a refusal
+/// by name (`reverie_kvm::Error::is_named_refusal`), as a consumer that walks
+/// the chain of a run's failure finds it.
+fn refused_by_name(error: &reverie_kvm::Error) -> bool {
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(current) = cause {
+        if current
+            .downcast_ref::<reverie_kvm::Error>()
+            .is_some_and(reverie_kvm::Error::is_named_refusal)
+        {
+            return true;
+        }
+        cause = current.source();
+    }
+    false
+}
+
+/// Runs the shared-file vfork fixture with `args` natively, in a directory
+/// of its own under `directory`, and returns its status and output.
+fn run_shared_file_vfork_natively(
+    directory: &std::path::Path,
+    program: &std::path::Path,
+    name: &str,
+    args: &[&str],
+) -> std::process::Output {
+    let native_directory = directory.join(name);
+    std::fs::create_dir(&native_directory).unwrap();
+    std::process::Command::new(program)
+        .args(args)
+        .current_dir(&native_directory)
+        .output()
+        .unwrap()
+}
+
+/// A KVM run of the shared-file vfork fixture: with a tool, the strace
+/// trace's syscall names; then the exit code, stdout and stderr.
+type SharedFileVforkRun = (Option<Vec<String>>, i32, Vec<u8>, Vec<u8>);
+
+/// Runs the shared-file vfork fixture with `args` on KVM in `mode`, in a
+/// directory of its own under `directory`.
+fn run_shared_file_vfork_on_kvm(
+    directory: &std::path::Path,
+    program: &std::path::Path,
+    mode: (&str, Option<ThreadOwnership>),
+    args: &[&str],
+) -> reverie_kvm::Result<SharedFileVforkRun> {
+    let (name, ownership) = mode;
+    let guest_directory = directory.join(format!("{name}-{}", args.join("-")));
+    std::fs::create_dir(&guest_directory).unwrap();
+    let image = std::fs::read(program).unwrap();
+    let mut argv = vec![program.to_str().unwrap()];
+    argv.extend_from_slice(args);
+    let mut backend = KvmBackend::new(256 * 1024 * 1024).unwrap();
+    backend
+        .install_static_elf_with_context(&image, &argv, &[], &guest_directory)
+        .unwrap();
+    match ownership {
+        Some(ownership) => {
+            backend.set_thread_ownership(ownership);
+            let (trace, code, stdout, stderr) = futures::executor::block_on(
+                backend.run_static_elf_with_tool::<StraceTool>((), true),
+            )?;
+            Ok((Some(trace.syscalls()), code, stdout, stderr))
+        }
+        None => {
+            let (code, stdout, stderr) = backend.run_static_elf_captured()?;
+            Ok((None, code, stdout, stderr))
+        }
+    }
+}
+
+/// Two threads of a child process send records of different sizes, with
+/// MSG_EOR, on one AF_UNIX SOCK_SEQPACKET socketpair at the same time, one of
+/// them also an SCM_RIGHTS message carrying a pipe's read end; the parent
+/// reads each record with a 4-byte recv(MSG_PEEK | MSG_TRUNC) and then a
+/// 16-byte recvmsg. Every record arrives whole and in its own writer's order,
+/// the peek returns its whole length, a longer record is cut to 16 bytes with
+/// MSG_TRUNC, and the passed descriptor reads what was written to the pipe:
+/// the same standard output as native Linux. Standard error holds the arrival
+/// order, which the two writers' timing decides.
+#[test]
+fn seqpacket_socketpair_two_writers_match_native() {
+    const TEST: &str = "seqpacket_socketpair_two_writers_match_native";
+    if !leader_self_exec_bounded(TEST) {
+        return;
+    }
+    let directory = TestDirectory::new();
+    let program = compile_c_program(
+        &directory.0,
+        "seqpacket-two-writers",
+        include_str!("fixtures/seqpacket_two_writers.c"),
+    );
+    let expected = "A0: whole 2, returned 2, bytes ok\n\
+                    A1: whole 17, returned 16, MSG_TRUNC, bytes ok\n\
+                    A2: whole 64, returned 16, MSG_TRUNC, bytes ok\n\
+                    A3: whole 200, returned 16, MSG_TRUNC, bytes ok\n\
+                    B0: whole 9, returned 9, bytes ok\n\
+                    B1: whole 40, returned 16, MSG_TRUNC, bytes ok\n\
+                    B2: whole 300, returned 16, MSG_TRUNC, bytes ok\n\
+                    B3: whole 2, returned 2, bytes ok, passed descriptor reads \
+                    \"through the passed pipe\" (24 bytes)\n\
+                    each writer's records arrived in its own order: yes\n\
+                    after the writers: recv returns 0; writer process exited 0\n";
+    let arrival = |stderr: &[u8]| {
+        let stderr = String::from_utf8_lossy(stderr);
+        let words: Vec<&str> = stderr.split_whitespace().collect();
+        words.len() == 10 && words[..2] == ["arrival", "order:"]
+    };
+    let native = run_shared_file_vfork_natively(&directory.0, &program, "native", &[]);
+    assert_eq!(native.status.code(), Some(0), "{native:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout),
+        expected,
+        "{native:?}"
+    );
+    assert!(arrival(&native.stderr), "{native:?}");
+    for mode in SHARED_FILE_VFORK_MODES {
+        let name = mode.0;
+        let (_, code, stdout, stderr) =
+            run_shared_file_vfork_on_kvm(&directory.0, &program, mode, &[])
+                .unwrap_or_else(|error| panic!("{TEST} mode={name}: {error}"));
+        assert_eq!(
+            code, 0,
+            "{TEST} mode={name}: stdout={stdout:?} stderr={stderr:?}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&stdout),
+            expected,
+            "{TEST} mode={name}"
+        );
+        assert!(arrival(&stderr), "{TEST} mode={name}: stderr={stderr:?}");
+        eprintln!("{TEST} completed {name}");
+    }
+}
+
+/// A process that holds MAP_SHARED views of an ordinary file can create
+/// children that share its address space until they exec or exit (vfork,
+/// and posix_spawn's clone or clone3 with CLONE_VM|CLONE_VFORK): a child that
+/// execs, one that exits, one whose execve fails, signals handled in the child
+/// and in the parent, a child killed by a signal, a nested vfork, and
+/// posix_spawn. Each store through the views reaches the other processes and
+/// the file, the THP-disable flag the exiting child clears is clear in the
+/// parent too (Linux keeps it per address space), and the parent's views
+/// still show the file's bytes afterwards, with the same output as native
+/// Linux.
+#[test]
+fn shared_file_vfork_and_posix_spawn_children_match_native() {
+    const TEST: &str = "shared_file_vfork_and_posix_spawn_children_match_native";
+    if !leader_self_exec_bounded(TEST) {
+        return;
+    }
+    let directory = TestDirectory::new();
+    let program = compile_c_program(
+        &directory.0,
+        "shared-file-vfork",
+        include_str!("fixtures/shared_file_vfork.c"),
+    );
+    // A signal a vfork child sends its parent is left out ("child-signal-
+    // only"): with or without shared views, reverie-kvm answers that kill
+    // with ENOSYS here, from the Direct driver, where the parent is suspended
+    // on the child's call stack, and with the strace tool.
+    let args: &[&str] = &["child-signal-only"];
+    let native = run_shared_file_vfork_natively(&directory.0, &program, "native", args);
+    assert_eq!(native.status.code(), Some(0), "{native:?}");
+    assert!(native.stderr.is_empty(), "{native:?}");
+    assert_eq!(
+        native.stdout,
+        b"shared-file vfork exec=ok exit=ok failed-exec=ok signals=child killed=ok nested=ok \
+          spawn=ok views=ok\n"
+    );
+    for mode in SHARED_FILE_VFORK_MODES {
+        let (trace, code, stdout, stderr) =
+            run_shared_file_vfork_on_kvm(&directory.0, &program, mode, args).unwrap();
+        let name = mode.0;
+        assert_eq!(code, 0, "mode={name}: stdout={stdout:?} stderr={stderr:?}");
+        assert_eq!(stderr, native.stderr, "mode={name}");
+        assert_eq!(stdout, native.stdout, "mode={name}");
+        if let Some(trace) = trace {
+            let count = |names: &[&str]| {
+                trace
+                    .iter()
+                    .filter(|name| names.contains(&name.as_str()))
+                    .count()
+            };
+            // Six vforks in the parent and the nested one in its child, and
+            // one posix_spawn clone. A successful execve does not return, so
+            // the tool records only the failed one; the helper images prove
+            // the others by the counter they bump.
+            assert_eq!(count(&["vfork"]), 7, "mode={name}: {trace:?}");
+            assert_eq!(count(&["clone", "clone3"]), 1, "mode={name}: {trace:?}");
+            assert_eq!(count(&["execve"]), 1, "mode={name}: {trace:?}");
+        }
+        eprintln!("shared-file-vfork completed {name}");
+    }
+}
+
+/// A thread created while the process holds shared-file views, and views
+/// mapped while a second thread is alive, behave on KVM as natively: the
+/// guest's output and exit status are Linux's. A publication closes
+/// admission for every vCPU of the address space; these used to be refused
+/// by name (https://github.com/rrnewton/reverie/issues/1108).
+#[test]
+fn shared_file_views_and_threads_coexist_as_natively() {
+    const TEST: &str = "shared_file_views_and_threads_coexist_as_natively";
+    if !leader_self_exec_bounded(TEST) {
+        return;
+    }
+    let directory = TestDirectory::new();
+    let program = compile_c_program(
+        &directory.0,
+        "shared-file-vfork",
+        include_str!("fixtures/shared_file_vfork.c"),
+    );
+    for (args, native_stdout) in [
+        (
+            vec!["map-then-thread"],
+            "shared-file vfork threads=map-then-thread ok\n",
+        ),
+        (
+            vec!["thread-then-map"],
+            "shared-file vfork threads=thread-then-map ok\n",
+        ),
+    ] {
+        let label = args.join("-");
+        let native = run_shared_file_vfork_natively(
+            &directory.0,
+            &program,
+            &format!("native-{label}"),
+            &args,
+        );
+        assert_eq!(native.status.code(), Some(0), "{label}: {native:?}");
+        assert_eq!(
+            native.stdout,
+            native_stdout.as_bytes(),
+            "{label}: {native:?}"
+        );
+        for mode in SHARED_FILE_VFORK_MODES {
+            let name = mode.0;
+            let (_, code, stdout, stderr) =
+                run_shared_file_vfork_on_kvm(&directory.0, &program, mode, &args)
+                    .unwrap_or_else(|error| panic!("{label} mode={name}: {error}"));
+            assert_eq!(
+                code, 0,
+                "{label} mode={name}: stdout={stdout:?} stderr={stderr:?}"
+            );
+            assert_eq!(stdout, native.stdout, "{label} mode={name}");
+            assert_eq!(stderr, native.stderr, "{label} mode={name}");
+            eprintln!("shared-file-vfork completed {label} {name}");
+        }
+    }
+}
+
+/// Shared file views in an address space with two worker threads alive
+/// (`fixtures/shared_file_threads.c`): a view mapped after the threads start,
+/// which every thread stores through and reads; the view unmapped and mapped
+/// again while they live; a worker's gettimeofday(2) into the view after the
+/// main thread made it read-only, which fails with EFAULT and stores nothing;
+/// and the main thread's pthread_exit while it holds the view, which, with
+/// workers alive, clears its TID word and wakes the worker joining it, in
+/// the first process and in a forked child, whose leader alone may skip that
+/// store as the last user of its address space. Each
+/// matches native Linux on KVM, without a tool and with the strace tool
+/// owning threads on the host or through the tool. A fork of the process
+/// while its workers live is refused by name: its snapshot would copy the
+/// views' address space while another vCPU runs in it. The fork waits for
+/// the workers to block first: a refusal's teardown while a worker enters a
+/// host futex wait can miss that worker
+/// (https://github.com/rrnewton/reverie/issues/1238).
+#[test]
+fn shared_file_views_with_threads_match_native() {
+    const TEST: &str = "shared_file_views_with_threads_match_native";
+    if !leader_self_exec_bounded(TEST) {
+        return;
+    }
+    let directory = TestDirectory::new();
+    let program = compile_c_program(
+        &directory.0,
+        "shared-file-threads",
+        include_str!("fixtures/shared_file_threads.c"),
+    );
+    let mapped = "mapped a shared view with 2 threads alive\n";
+    for (mode, expected) in [
+        (
+            "use",
+            format!(
+                "{mapped}round 0: the file holds every thread's store, and every thread read \
+                 them all\nunmapped the view and mapped it again with threads alive\nround 1: \
+                 the file holds every thread's store, and every thread read them all\nthreads \
+                 joined\n"
+            ),
+        ),
+        (
+            "mprotect",
+            format!(
+                "{mapped}a thread's gettimeofday into the read-only view failed with \
+                 EFAULT\nthreads joined\n"
+            ),
+        ),
+        (
+            "leader-exit",
+            format!("{mapped}a worker joined the main thread after it exited\n"),
+        ),
+        (
+            "fork-leader-exit",
+            "mapped a shared view, then forked\nthe child's worker joined the child's main \
+             thread after it exited\nthe child exited 0\n"
+                .to_owned(),
+        ),
+    ] {
+        let native = run_shared_file_vfork_natively(
+            &directory.0,
+            &program,
+            &format!("native-{mode}"),
+            &[mode],
+        );
+        assert_eq!(native.status.code(), Some(0), "{mode}: {native:?}");
+        assert_eq!(String::from_utf8_lossy(&native.stdout), expected, "{mode}");
+        for kvm_mode in SHARED_FILE_VFORK_MODES {
+            let name = kvm_mode.0;
+            let (_, code, stdout, stderr) =
+                run_shared_file_vfork_on_kvm(&directory.0, &program, kvm_mode, &[mode])
+                    .unwrap_or_else(|error| panic!("{mode} mode={name}: {error}"));
+            assert_eq!(
+                code, 0,
+                "{mode} mode={name}: stdout={stdout:?} stderr={stderr:?}"
+            );
+            assert_eq!(stdout, native.stdout, "{mode} mode={name}");
+            assert_eq!(stderr, native.stderr, "{mode} mode={name}");
+            eprintln!("shared-file-threads completed {mode} {name}");
+        }
+    }
+
+    let native = run_shared_file_vfork_natively(&directory.0, &program, "native-fork", &["fork"]);
+    assert_eq!(native.status.code(), Some(0), "fork: {native:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout),
+        format!("{mapped}the forked child read the view\nthreads joined\n"),
+        "fork"
+    );
+    for kvm_mode in SHARED_FILE_VFORK_MODES {
+        let name = kvm_mode.0;
+        let error = match run_shared_file_vfork_on_kvm(&directory.0, &program, kvm_mode, &["fork"])
+        {
+            Ok((_, code, stdout, stderr)) => panic!(
+                "fork mode={name}: expected the refusal, got code={code} stdout={stdout:?} \
+                 stderr={stderr:?}"
+            ),
+            // The program's doing (a fork beside a live thread), so a refusal
+            // by name rather than a failure of the backend.
+            Err(error) => {
+                assert!(refused_by_name(&error), "fork mode={name}: {error:?}");
+                error.to_string()
+            }
+        };
+        assert!(
+            error.contains(
+                "unsupported KVM shared-file operation shared-file fork snapshot: another thread \
+                 of the process is alive"
+            ),
+            "fork mode={name}: {error}"
+        );
+        eprintln!("shared-file-threads refused fork {name}");
+    }
+}
+
+/// A publication interrupts every vCPU that runs guest code
+/// (`fixtures/shared_file_threads.c`): in mode "spin" a worker spins in user
+/// code, making no system call, while the main thread maps a view, so the
+/// publication's close must kick that vCPU out of the guest by the reserved
+/// signal; in mode "publish-vs-clone" a publisher maps and unmaps a view 200
+/// times while the main thread creates and joins 200 short threads, so
+/// closes meet vCPUs that are starting, running and retiring. Each matches
+/// native Linux on KVM, without a tool and with the strace tool owning
+/// threads on the host or through the tool.
+#[test]
+fn shared_file_publications_kick_running_and_new_vcpus_as_natively() {
+    const TEST: &str = "shared_file_publications_kick_running_and_new_vcpus_as_natively";
+    if !leader_self_exec_bounded(TEST) {
+        return;
+    }
+    let directory = TestDirectory::new();
+    let program = compile_c_program(
+        &directory.0,
+        "shared-file-threads",
+        include_str!("fixtures/shared_file_threads.c"),
+    );
+    for (mode, expected) in [
+        (
+            "spin",
+            "mapped a shared view with 2 threads alive\na thread spinning in user code through \
+             the mapping went on\nthreads joined\n",
+        ),
+        (
+            "publish-vs-clone",
+            "200 threads came and went beside 200 mappings; the file counts 200\n",
+        ),
+    ] {
+        let native = run_shared_file_vfork_natively(
+            &directory.0,
+            &program,
+            &format!("native-{mode}"),
+            &[mode],
+        );
+        assert_eq!(native.status.code(), Some(0), "{mode}: {native:?}");
+        assert_eq!(String::from_utf8_lossy(&native.stdout), expected, "{mode}");
+        for kvm_mode in SHARED_FILE_VFORK_MODES {
+            let name = kvm_mode.0;
+            let (_, code, stdout, stderr) =
+                run_shared_file_vfork_on_kvm(&directory.0, &program, kvm_mode, &[mode])
+                    .unwrap_or_else(|error| panic!("{mode} mode={name}: {error}"));
+            assert_eq!(
+                code, 0,
+                "{mode} mode={name}: stdout={stdout:?} stderr={stderr:?}"
+            );
+            assert_eq!(stdout, native.stdout, "{mode} mode={name}");
+            assert_eq!(stderr, native.stderr, "{mode} mode={name}");
+            eprintln!("shared-file-threads completed {mode} {name}");
+        }
+    }
+}
+
+/// What a process that holds shared views may do once its other threads
+/// have exited (`fixtures/shared_file_threads.c`) does not depend on when
+/// their host threads finish tearing down: a thread stops counting as a user
+/// of the address space at its exit, in the guest's order. Mode "join-fork"
+/// forks five times, each time after joining the only other thread; mode
+/// "leader-exit-fork" forks from a child's last thread after its main thread
+/// exited; and in mode "leader-cleartid" a forked child's last thread exits
+/// with its clear_child_tid word in shared anonymous memory, which Linux
+/// leaves unwritten when no other task uses the address space, and in mode
+/// "worker-cleartid" that last thread is a worker; so does a child whose only
+/// shared memory is the marker's shared anonymous page
+/// ("anon-worker-cleartid"), and one that first vforked a child that exited
+/// at once ("vfork-worker-cleartid"). Each run matches native
+/// Linux on KVM, three times over, without a tool and with the strace tool
+/// owning threads on the host or through the tool. In mode "group-cleartid"
+/// the child's main thread, whose word is the marker, ends the group while a
+/// worker runs: Linux stores zero or not depending on when the worker drops
+/// its mm, and KVM stores zero every time, which is one of those outcomes,
+/// the one the exit's start decides.
+#[test]
+fn shared_file_threads_that_exited_stop_counting_in_the_guests_order() {
+    const TEST: &str = "shared_file_threads_that_exited_stop_counting_in_the_guests_order";
+    // Budget (dh-ynyvd, owner rule 2026-11-01): this case runs seven
+    // modes, each natively and under KVM, and is wall-dominated.
+    // Measured 2026-11-07 (single case, /usr/bin/time -v): quiet
+    // completion 20.2 s wall at 6.9 CPU-s; under taskset contention
+    // (2 CPUs, 6 spinners) it died at the old 30 s wall having used
+    // only about 4.5 CPU-s. A loaded completion extrapolates to about
+    // 10 CPU-s, so the CPU cap is 15 (1.5x) and the wall backstop is
+    // 120 (8x). The seven modes are distinct exit/clear_child_tid
+    // classes, so the workload is not shrunk to fit the old wall.
+    if !leader_self_exec_bounded_capped(TEST, 15, 120) {
+        return;
+    }
+    let directory = TestDirectory::new();
+    let program = compile_c_program(
+        &directory.0,
+        "shared-file-threads",
+        include_str!("fixtures/shared_file_threads.c"),
+    );
+    for (mode, expected) in [
+        (
+            "join-fork",
+            "forked five times, each after joining the only other thread\n",
+        ),
+        (
+            "leader-exit-fork",
+            "the child's last thread forked after its main thread exited\nthe child exited 0\n",
+        ),
+        (
+            "leader-cleartid",
+            "the child's last thread exited; its clear_child_tid word holds 0x5eedf00d\n",
+        ),
+        (
+            "worker-cleartid",
+            "the child's last thread, a worker, exited; its clear_child_tid word holds 0x5eedf00d\n",
+        ),
+        (
+            "group-cleartid",
+            "the child's group exit ended it; its clear_child_tid word holds 0\n",
+        ),
+        (
+            "anon-worker-cleartid",
+            "the child's last thread, a worker, exited; its clear_child_tid word holds 0x5eedf00d\n",
+        ),
+        (
+            "vfork-worker-cleartid",
+            "the child's last thread, a worker, exited; its clear_child_tid word holds 0x5eedf00d\n",
+        ),
+    ] {
+        let native = run_shared_file_vfork_natively(
+            &directory.0,
+            &program,
+            &format!("native-{mode}"),
+            &[mode],
+        );
+        assert_eq!(native.status.code(), Some(0), "{mode}: {native:?}");
+        let native_stdout = String::from_utf8_lossy(&native.stdout);
+        if mode == "group-cleartid" {
+            // Natively either outcome, by when the worker drops its mm.
+            assert!(
+                native_stdout == expected
+                    || native_stdout
+                        == "the child's group exit ended it; its clear_child_tid word holds 0x5eedf00d\n",
+                "{mode}: {native_stdout:?}"
+            );
+        } else {
+            assert_eq!(native_stdout, expected, "{mode}");
+        }
+        for round in 0..3 {
+            for kvm_mode in SHARED_FILE_VFORK_MODES {
+                let name = kvm_mode.0;
+                let run_directory = directory.0.join(format!("{mode}-{round}"));
+                std::fs::create_dir_all(&run_directory).unwrap();
+                let (_, code, stdout, stderr) =
+                    run_shared_file_vfork_on_kvm(&run_directory, &program, kvm_mode, &[mode])
+                        .unwrap_or_else(|error| {
+                            panic!("{mode} round {round} mode={name}: {error}")
+                        });
+                assert_eq!(
+                    code, 0,
+                    "{mode} round {round} mode={name}: stdout={stdout:?} stderr={stderr:?}"
+                );
+                assert_eq!(
+                    String::from_utf8_lossy(&stdout),
+                    expected,
+                    "{mode} round {round} mode={name}"
+                );
+                assert_eq!(stderr, native.stderr, "{mode} round {round} mode={name}");
+            }
+        }
+        eprintln!("shared-file-threads completed {mode} 3 rounds x 3 modes");
+    }
+}
+
+/// A view mapped with MAP_FIXED over the page of another thread's host
+/// FUTEX_WAIT (`fixtures/shared_file_threads.c`, mode "futex") is refused by
+/// name on KVM after the publication's bound: the wait holds a host pointer
+/// into the replaced page, which the publication cannot move, and waiting for
+/// it longer could wait for a wake that only the publishing thread would
+/// make. Linux replaces the page and the later wake still reaches the waiter.
+/// Without a tool only: each run waits out the ten-second bound.
+#[test]
+fn shared_file_view_over_a_waiting_futex_word_is_refused_by_name() {
+    const TEST: &str = "shared_file_view_over_a_waiting_futex_word_is_refused_by_name";
+    if !leader_self_exec_bounded(TEST) {
+        return;
+    }
+    let directory = TestDirectory::new();
+    let program = compile_c_program(
+        &directory.0,
+        "shared-file-threads",
+        include_str!("fixtures/shared_file_threads.c"),
+    );
+    let native = run_shared_file_vfork_natively(&directory.0, &program, "native-futex", &["futex"]);
+    assert_eq!(native.status.code(), Some(0), "futex: {native:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout),
+        "mapped a shared view with 2 threads alive\nmapped a view over a waiting thread's futex \
+         word\nthe waiter woke and read 1 through the view\nthreads joined\n",
+    );
+    let error = match run_shared_file_vfork_on_kvm(
+        &directory.0,
+        &program,
+        SHARED_FILE_VFORK_MODES[0],
+        &["futex"],
+    ) {
+        Ok((_, code, stdout, stderr)) => {
+            panic!("expected the refusal, got code={code} stdout={stdout:?} stderr={stderr:?}")
+        }
+        // The program's doing (a mapping over memory another of its threads
+        // waits on), so a refusal by name rather than a failure.
+        Err(error) => {
+            assert!(refused_by_name(&error), "{error:?}");
+            error.to_string()
+        }
+    };
+    assert!(
+        error.contains(
+            "unsupported KVM shared-file operation mapping publication: a host operation still \
+             uses memory in the replaced range"
+        ),
+        "{error}"
+    );
+}
+
+/// While a vfork child runs, another thread of its parent maps a shared view
+/// of a file with MAP_FIXED over a private page
+/// (`fixtures/shared_file_vfork.c`, mode "sibling-map"). On Linux the child
+/// shares the address space and reads the file's byte through the new view.
+/// On KVM the child runs on a copy, which the view would not reach, so the
+/// mapping is refused by name before it takes effect; the child never reads
+/// the page from before as if it were Linux's.
+#[test]
+fn shared_file_view_mapped_beside_a_vfork_child_is_refused_by_name() {
+    const TEST: &str = "shared_file_view_mapped_beside_a_vfork_child_is_refused_by_name";
+    if !leader_self_exec_bounded(TEST) {
+        return;
+    }
+    let directory = TestDirectory::new();
+    let program = compile_c_program(
+        &directory.0,
+        "shared-file-vfork",
+        include_str!("fixtures/shared_file_vfork.c"),
+    );
+    let native = run_shared_file_vfork_natively(
+        &directory.0,
+        &program,
+        "native-sibling-map",
+        &["sibling-map"],
+    );
+    assert_eq!(native.status.code(), Some(0), "{native:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout),
+        "shared-file vfork sibling-map child=B parent=B\n"
+    );
+    for mode in SHARED_FILE_VFORK_MODES {
+        let name = mode.0;
+        let error =
+            match run_shared_file_vfork_on_kvm(&directory.0, &program, mode, &["sibling-map"]) {
+                Ok((_, code, stdout, stderr)) => panic!(
+                    "mode={name}: expected the refusal, got code={code} stdout={:?} stderr={:?}",
+                    String::from_utf8_lossy(&stdout),
+                    String::from_utf8_lossy(&stderr)
+                ),
+                // The program's doing (a mapping beside a vfork child), so a
+                // refusal by name rather than a failure of the backend.
+                Err(error) => {
+                    assert!(refused_by_name(&error), "mode={name}: {error:?}");
+                    error.to_string()
+                }
+            };
+        assert!(
+            error.contains(
+                "unsupported KVM shared-file operation mapping publication: a vfork child of \
+                 this process runs on a copy of its address space"
+            ),
+            "mode={name}: {error}"
+        );
+        eprintln!("shared-file-vfork refused sibling-map {name}");
+    }
+}
+
+/// A vfork child that changes a shared view it inherited is refused by name
+/// on KVM before the change: Linux would apply an unmapping, a protection
+/// change, a private mapping over the view or a new shared view to the
+/// parent's address space too, and the child here runs on a copy of it.
+#[test]
+fn shared_file_vfork_child_view_changes_are_refused_by_name() {
+    const TEST: &str = "shared_file_vfork_child_view_changes_are_refused_by_name";
+    if !leader_self_exec_bounded(TEST) {
+        return;
+    }
+    let directory = TestDirectory::new();
+    let program = compile_c_program(
+        &directory.0,
+        "shared-file-vfork",
+        include_str!("fixtures/shared_file_vfork.c"),
+    );
+    let vfork_refusal = |operation: &str| {
+        format!(
+            "unsupported KVM shared-file operation {operation}: a vfork child shares its \
+             parent's address space until it execs or exits"
+        )
+    };
+    let cases = [
+        (
+            vec!["change", "munmap"],
+            "shared-file vfork change=munmap child=ok\n",
+            vfork_refusal("mapping change in a vfork child"),
+        ),
+        (
+            vec!["change", "fixed"],
+            "shared-file vfork change=fixed child=ok\n",
+            vfork_refusal("mapping change in a vfork child"),
+        ),
+        (
+            vec!["change", "map"],
+            "shared-file vfork change=map child=ok\n",
+            vfork_refusal("mapping change in a vfork child"),
+        ),
+        (
+            vec!["change", "mprotect"],
+            "shared-file vfork change=mprotect child=ok\n",
+            vfork_refusal("mprotect in a vfork child"),
+        ),
+    ];
+    for (args, native_stdout, refusal) in cases {
+        let label = args.join("-");
+        let native = run_shared_file_vfork_natively(
+            &directory.0,
+            &program,
+            &format!("native-{label}"),
+            &args,
+        );
+        assert_eq!(native.status.code(), Some(0), "{label}: {native:?}");
+        assert_eq!(
+            native.stdout,
+            native_stdout.as_bytes(),
+            "{label}: {native:?}"
+        );
+        for mode in SHARED_FILE_VFORK_MODES {
+            let name = mode.0;
+            let error = match run_shared_file_vfork_on_kvm(&directory.0, &program, mode, &args) {
+                Ok((_, code, stdout, stderr)) => panic!(
+                    "{label} mode={name}: expected the refusal, got code={code} \
+                     stdout={stdout:?} stderr={stderr:?}"
+                ),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                error.contains(&refusal),
+                "{label} mode={name}: expected {refusal:?} in {error:?}"
+            );
+            eprintln!("shared-file-vfork refused {label} {name}");
+        }
+    }
+}
+
+/// A vfork child shares its parent's whole address space until it execs or
+/// exits, and the parent's call returns only then. The child's stores to
+/// private memory and the file bytes it reads into a parent buffer are the
+/// parent's afterwards, whether the child execs, fails to exec and exits,
+/// exits, or dies by a signal; through vfork, clone and clone3 with
+/// CLONE_VM|CLONE_VFORK; while the process holds no shared view of a file and
+/// while it holds one. posix_spawn of a missing program reports ENOENT, which
+/// glibc's child writes into the parent's memory. A child that blocks in its
+/// window on a pipe another process writes keeps its parent inside vfork
+/// while that process runs; and a child's and another parent thread's stores
+/// to different bytes of one page both survive. The output is native Linux's
+/// in every mode.
+#[test]
+fn vfork_children_share_private_memory_with_their_parent_like_native() {
+    const TEST: &str = "vfork_children_share_private_memory_with_their_parent_like_native";
+    if !leader_self_exec_bounded(TEST) {
+        return;
+    }
+    let directory = TestDirectory::new();
+    let program = compile_c_program(
+        &directory.0,
+        "vfork-shares-memory",
+        include_str!("fixtures/vfork_shares_memory.c"),
+    );
+    let native = run_shared_file_vfork_natively(&directory.0, &program, "native", &[]);
+    assert_eq!(native.status.code(), Some(0), "{native:?}");
+    assert!(native.stderr.is_empty(), "{native:?}");
+    let stdout = String::from_utf8_lossy(&native.stdout);
+    for line in [
+        "vfork exit no-view: stored=93 read=file failed=0 exit 0\n",
+        "clone3 signal view: stored=102 read=file failed=0 signal 15\n",
+        "posix_spawn missing view: ENOENT\n",
+        "blocking: child read \"written by another process\" (27 bytes), child ok, writer ok\n",
+        "threads: child ok, page[0]=0x91 page[64]=0x55\n",
+    ] {
+        assert!(stdout.contains(line), "native lacks {line:?}: {stdout}");
+    }
+    for mode in SHARED_FILE_VFORK_MODES {
+        let (_, code, stdout, stderr) =
+            run_shared_file_vfork_on_kvm(&directory.0, &program, mode, &[]).unwrap();
+        let name = mode.0;
+        assert_eq!(code, 0, "mode={name}: stdout={stdout:?} stderr={stderr:?}");
+        assert_eq!(stderr, native.stderr, "mode={name}");
+        assert_eq!(
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&native.stdout),
+            "mode={name}"
+        );
+        eprintln!("vfork-shares-memory completed {name}");
+    }
+}
+
+/// A vfork child of a process that holds no shared view may change a mapping
+/// only for a while: on Linux the change is its parent's too, and the copy it
+/// runs on here carries back only its contents. A mapping it creates, stores
+/// into and removes, with its protection changed and restored in between,
+/// leaves its parent as on Linux. A change still in place when the child
+/// exits (mmap, munmap, mprotect or mremap, and a page unmapped and mapped
+/// again with the protection it had) is refused by name then, and a brk that
+/// moves the break is refused at the call.
+#[test]
+fn a_vfork_child_cannot_leave_a_mapping_changed() {
+    const TEST: &str = "a_vfork_child_cannot_leave_a_mapping_changed";
+    if !leader_self_exec_bounded(TEST) {
+        return;
+    }
+    let directory = TestDirectory::new();
+    let program = compile_c_program(
+        &directory.0,
+        "vfork-shares-memory",
+        include_str!("fixtures/vfork_shares_memory.c"),
+    );
+    for call in [
+        "scratch", "mmap", "munmap", "mprotect", "mremap", "remap", "brk",
+    ] {
+        let args = ["map-change", call];
+        let label = args.join("-");
+        let native = run_shared_file_vfork_natively(
+            &directory.0,
+            &program,
+            &format!("native-{label}"),
+            &args,
+        );
+        assert_eq!(native.status.code(), Some(0), "{label}: {native:?}");
+        assert_eq!(
+            native.stdout,
+            format!("vfork map-change={call} child=ok\n").into_bytes(),
+            "{label}: {native:?}"
+        );
+        let refusal = match call {
+            "scratch" => None,
+            "brk" => Some(
+                "unsupported KVM vfork child operation brk in a vfork child: a vfork child \
+                 shares its parent's address space until it execs or exits",
+            ),
+            _ => Some(
+                "unsupported KVM vfork child operation vfork write-back: the vfork child left \
+                 a mapping changed",
+            ),
+        };
+        for mode in SHARED_FILE_VFORK_MODES {
+            let name = mode.0;
+            let run = run_shared_file_vfork_on_kvm(&directory.0, &program, mode, &args);
+            match (refusal, run) {
+                (None, Ok((_, code, stdout, stderr))) => {
+                    assert_eq!(code, 0, "{label} mode={name}: stderr={stderr:?}");
+                    assert_eq!(stdout, native.stdout, "{label} mode={name}");
+                    assert_eq!(stderr, native.stderr, "{label} mode={name}");
+                }
+                (None, Err(error)) => panic!("{label} mode={name}: {error}"),
+                (Some(_), Ok((_, code, stdout, stderr))) => panic!(
+                    "{label} mode={name}: expected the refusal, got code={code} \
+                     stdout={stdout:?} stderr={stderr:?}"
+                ),
+                (Some(refusal), Err(error)) => {
+                    let error = error.to_string();
+                    assert!(
+                        error.contains(refusal),
+                        "{label} mode={name}: expected {refusal:?} in {error:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// A vfork child and another thread of its parent store to the same byte
+/// during the window, the thread after the child, ordered by pipes: Linux
+/// keeps the thread's value. The child runs on a copy here, whose changes go
+/// back when it exits, and a copy cannot order two stores to one byte, so
+/// that write-back is refused by name.
+#[test]
+fn a_vfork_child_and_a_parent_thread_storing_one_byte_are_refused_by_name() {
+    const TEST: &str = "a_vfork_child_and_a_parent_thread_storing_one_byte_are_refused_by_name";
+    if !leader_self_exec_bounded(TEST) {
+        return;
+    }
+    let directory = TestDirectory::new();
+    let program = compile_c_program(
+        &directory.0,
+        "vfork-shares-memory",
+        include_str!("fixtures/vfork_shares_memory.c"),
+    );
+    let args = ["conflict"];
+    let native = run_shared_file_vfork_natively(&directory.0, &program, "native-conflict", &args);
+    assert_eq!(native.status.code(), Some(0), "{native:?}");
+    assert_eq!(
+        native.stdout, b"conflict: child ok, page[0]=0x55 page[64]=0\n",
+        "{native:?}"
+    );
+    for mode in SHARED_FILE_VFORK_MODES {
+        let name = mode.0;
+        let error = match run_shared_file_vfork_on_kvm(&directory.0, &program, mode, &args) {
+            Ok((_, code, stdout, stderr)) => panic!(
+                "mode={name}: expected the refusal, got code={code} stdout={stdout:?} \
+                 stderr={stderr:?}"
+            ),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains(
+                "unsupported KVM vfork child operation vfork write-back: the vfork child and \
+                 another thread of its parent changed the same bytes during the window"
+            ),
+            "mode={name}: {error:?}"
+        );
+    }
+}
+
+/// Runs the vfork fixture with `args` natively and on KVM in every mode, and
+/// requires KVM's exit code, stdout and stderr to be native's, with `expected`
+/// native's stdout and `code` its exit code.
+fn assert_vfork_fixture_matches_native(test: &str, args: &[&str], expected: &str, code: i32) {
+    assert_vfork_fixture_matches_native_in(test, args, expected, code, &SHARED_FILE_VFORK_MODES);
+}
+
+/// [`assert_vfork_fixture_matches_native`] in `modes` only.
+fn assert_vfork_fixture_matches_native_in(
+    test: &str,
+    args: &[&str],
+    expected: &str,
+    code: i32,
+    modes: &[(&str, Option<ThreadOwnership>)],
+) {
+    let directory = TestDirectory::new();
+    let program = compile_c_program(
+        &directory.0,
+        "vfork-shares-memory",
+        include_str!("fixtures/vfork_shares_memory.c"),
+    );
+    let label = args.join("-");
+    let native =
+        run_shared_file_vfork_natively(&directory.0, &program, &format!("native-{label}"), args);
+    assert_eq!(
+        native.status.code(),
+        Some(code),
+        "{test} {label}: {native:?}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout),
+        expected,
+        "{test} {label}: {native:?}"
+    );
+    assert!(native.stderr.is_empty(), "{test} {label}: {native:?}");
+    for &mode in modes {
+        let name = mode.0;
+        let (_, kvm_code, stdout, stderr) =
+            run_shared_file_vfork_on_kvm(&directory.0, &program, mode, args)
+                .unwrap_or_else(|error| panic!("{test} {label} mode={name}: {error}"));
+        assert_eq!(
+            kvm_code, code,
+            "{test} {label} mode={name}: stdout={stdout:?} stderr={stderr:?}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&stdout),
+            expected,
+            "{test} {label} mode={name}"
+        );
+        assert_eq!(stderr, native.stderr, "{test} {label} mode={name}");
+        eprintln!("{test} {label} completed {name}");
+    }
+}
+
+/// Runs the vfork fixture with `args` natively, requiring `native_stdout`,
+/// and on KVM in every mode, requiring the run to be refused with `refusal`
+/// in its error.
+fn assert_vfork_fixture_refused(test: &str, args: &[&str], native_stdout: &str, refusal: &str) {
+    let directory = TestDirectory::new();
+    let program = compile_c_program(
+        &directory.0,
+        "vfork-shares-memory",
+        include_str!("fixtures/vfork_shares_memory.c"),
+    );
+    let label = args.join("-");
+    let native =
+        run_shared_file_vfork_natively(&directory.0, &program, &format!("native-{label}"), args);
+    assert_eq!(native.status.code(), Some(0), "{test} {label}: {native:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout),
+        native_stdout,
+        "{test} {label}: {native:?}"
+    );
+    for mode in SHARED_FILE_VFORK_MODES {
+        let name = mode.0;
+        let error = match run_shared_file_vfork_on_kvm(&directory.0, &program, mode, args) {
+            Ok((_, code, stdout, stderr)) => panic!(
+                "{test} {label} mode={name}: expected the refusal, got code={code} \
+                 stdout={stdout:?} stderr={stderr:?}"
+            ),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains(refusal),
+            "{test} {label} mode={name}: expected {refusal:?} in {error:?}"
+        );
+        eprintln!("{test} {label} refused {name}");
+    }
+}
+
+/// A vfork child registers a word of its parent holding 91 as its
+/// clear_child_tid (set_tid_address) and ends its window: by a successful
+/// exec, by a failed exec and an exit, by an exit, by death from SIGTERM, or
+/// by death from a fault (SIGSEGV).
+/// Linux's mm_release() clears the word before the parent's call returns,
+/// since the parent shares the mm, so the parent reads 0 in every case; a
+/// failed exec keeps the registration (the child still reads 91 after it),
+/// and the child's exit clears it. Another thread of the parent waiting on
+/// the word is woken, rather than left to its 5 s timeout.
+#[test]
+fn a_vfork_child_clears_its_clear_child_tid_word_in_its_parent_like_native() {
+    const TEST: &str = "a_vfork_child_clears_its_clear_child_tid_word_in_its_parent_like_native";
+    if !leader_self_exec_bounded(TEST) {
+        return;
+    }
+    for (ending, expected) in [
+        (
+            "exec",
+            "clear-tid exec: word=0 after-failed-exec=0 exit 0\n",
+        ),
+        (
+            "failed-exec",
+            "clear-tid failed-exec: word=0 after-failed-exec=91 exit 0\n",
+        ),
+        (
+            "exit",
+            "clear-tid exit: word=0 after-failed-exec=0 exit 0\n",
+        ),
+        (
+            "signal",
+            "clear-tid signal: word=0 after-failed-exec=0 signal 15\n",
+        ),
+        // A death by a fault, which the backend takes at the fault's
+        // boundary rather than at a system call's return.
+        (
+            "segv",
+            "clear-tid segv: word=0 after-failed-exec=0 signal 11\n",
+        ),
+        // Another thread of the parent waits on the word: the wake reaches
+        // the parent's word, not the copy's.
+        (
+            "exit-wake",
+            "clear-tid exit-wake: word=0 waiter woken exit 0\n",
+        ),
+    ] {
+        assert_vfork_fixture_matches_native(TEST, &["clear-tid", ending], expected, 0);
+    }
+}
+
+/// A second thread of a process vforks a child that blocks in its window,
+/// and the main thread execs meanwhile. Linux's vfork wait is killable: the
+/// exec kills the waiting thread, the child runs on as the process's child,
+/// and the new image releases and reaps it, whose store went to the old
+/// image. The waiting thread here retires as the exec cancels it, and keeps
+/// its child for the process, rather than holding the exec up.
+///
+/// Only threads the tool runs wait this way. A thread run without the tool
+/// (no tool at all, or host-owned threads) runs its children inline, on its
+/// own host thread, as it runs every fork child: such a thread cannot retire
+/// before its child ends, so the exec waits for the child, which here waits
+/// for the exec. That limit is the direct personality's, for fork children
+/// as well.
+#[test]
+fn a_vfork_parent_thread_killed_by_its_leaders_exec_leaves_the_child_running_like_native() {
+    const TEST: &str =
+        "a_vfork_parent_thread_killed_by_its_leaders_exec_leaves_the_child_running_like_native";
+    if !leader_self_exec_bounded(TEST) {
+        return;
+    }
+    assert_vfork_fixture_matches_native_in(
+        TEST,
+        &["leader-exec"],
+        "leader-exec: stored=7 after=7 child exit 7\n",
+        0,
+        &[("tool", Some(ThreadOwnership::Tool))],
+    );
+}
+
+/// The main thread vforks a child that blocks until a pipe only its parent's
+/// process can write reaches end of file, and another thread exits the process
+/// with status 3 during the window. Linux's vfork wait is killable, so the
+/// process exits 3 at once, and its end closes the pipe for the child. The
+/// waiting thread here ends its wait as the group exits. Without a tool the
+/// main thread runs its child inline, as the test above says, so that mode is
+/// left out.
+///
+/// The child is then the only user of the address space, so nothing of its
+/// copy goes back, and what would be refused while the parent lives is not:
+/// a byte the child and the exiting thread both changed to different values,
+/// or a page the child mapped after end of file and kept.
+#[test]
+fn a_vfork_parent_whose_process_exits_during_the_window_exits_like_native() {
+    const TEST: &str = "a_vfork_parent_whose_process_exits_during_the_window_exits_like_native";
+    if !leader_self_exec_bounded(TEST) {
+        return;
+    }
+    for args in [
+        &["parent-dies"][..],
+        &["parent-dies", "conflict"],
+        &["parent-dies", "map"],
+    ] {
+        assert_vfork_fixture_matches_native_in(TEST, args, "", 3, &SHARED_FILE_VFORK_MODES[1..]);
+    }
+}
+
+/// A vfork child that creates a thread is refused by name at the call: Linux
+/// completes the vfork when the creating task execs or exits, whatever
+/// threads of the child remain, and the child's copy cannot go back to its
+/// parent while another thread still changes it.
+#[test]
+fn a_vfork_child_creating_a_thread_is_refused_by_name() {
+    const TEST: &str = "a_vfork_child_creating_a_thread_is_refused_by_name";
+    if !leader_self_exec_bounded(TEST) {
+        return;
+    }
+    assert_vfork_fixture_refused(
+        TEST,
+        &["thread-in-child"],
+        "thread-in-child: exit 0\n",
+        "unsupported KVM vfork child operation thread creation in a vfork child: a vfork child \
+         shares its parent's address space until it execs or exits",
+    );
+}
+
+/// Another thread of a vfork child's parent replaces a page the child stored
+/// into, during the window: it maps a new anonymous page with MAP_FIXED over
+/// it, with the protection the page had, or it shrinks the page's mapping off
+/// it in place and grows the mapping back (mremap). On Linux the child's
+/// store went with the old page, and the parent reads zero. The copy cannot
+/// tell that store from one to the new page, so the write-back is refused by
+/// name rather than leave the child's byte in the new page.
+#[test]
+fn a_parent_thread_replacing_a_page_the_vfork_child_changed_is_refused_by_name() {
+    const TEST: &str =
+        "a_parent_thread_replacing_a_page_the_vfork_child_changed_is_refused_by_name";
+    if !leader_self_exec_bounded(TEST) {
+        return;
+    }
+    for (mode, native_stdout) in [
+        ("parent-remap", "parent-remap: child ok, page[100]=0\n"),
+        ("parent-regrow", "parent-regrow: child ok, page[1][100]=0\n"),
+    ] {
+        assert_vfork_fixture_refused(
+            TEST,
+            &[mode],
+            native_stdout,
+            "unsupported KVM vfork child operation vfork write-back: another thread of the \
+             parent removed or replaced the mapping of a page the vfork child changed during \
+             the window",
+        );
+    }
+}
+
+/// A fork's child reads every page of private memory as its parent did at
+/// the fork: a page written in full, one written with zeros, one never
+/// written, a heap buffer, a run that may be backed by huge pages, a buffer
+/// the kernel wrote for it with read(2), and pages that keep a backing of
+/// their own on KVM after a shared file view at their address went, by an
+/// unmap and by an exec. A MAP_SHARED file mapping inherited across the fork
+/// shows a byte the parent stores, one the child stores and one a third
+/// process writes to the file, on both sides, while the parent's later
+/// change to a private page stays its own. KVM's output must be native's in
+/// the host and tool modes. The parent and the child take turns through
+/// pipes, which a thread run without the tool cannot do: it runs its fork
+/// children inline, so that mode is left out.
+#[test]
+fn a_fork_copies_every_page_its_parent_can_read_like_native() {
+    const TEST: &str = "a_fork_copies_every_page_its_parent_can_read_like_native";
+    if !leader_self_exec_bounded(TEST) {
+        return;
+    }
+    let directory = TestDirectory::new();
+    let program = compile_c_program(
+        &directory.0,
+        "fork-copies-every-page",
+        include_str!("fixtures/fork_copies_every_page.c"),
+    );
+    let expected = "child: every page ok\n\
+                    child: shared PCO, private page kept\n\
+                    parent: child exit 0, shared PCO, file PCO\n\
+                    after exec: child: every page ok\n\
+                    after exec: parent: child exit 0\n";
+    let native = run_shared_file_vfork_natively(&directory.0, &program, "native", &[]);
+    assert_eq!(native.status.code(), Some(0), "{native:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout),
+        expected,
+        "{native:?}"
+    );
+    assert!(native.stderr.is_empty(), "{native:?}");
+    for mode in &SHARED_FILE_VFORK_MODES[1..] {
+        let name = mode.0;
+        let (_, code, stdout, stderr) =
+            run_shared_file_vfork_on_kvm(&directory.0, &program, *mode, &[])
+                .unwrap_or_else(|error| panic!("{TEST} mode={name}: {error}"));
+        assert_eq!(
+            code, 0,
+            "{TEST} mode={name}: stdout={stdout:?} stderr={stderr:?}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&stdout),
+            expected,
+            "{TEST} mode={name}"
+        );
+        assert_eq!(stderr, native.stderr, "{TEST} mode={name}");
+        eprintln!("{TEST} completed {name}");
+    }
+}
+
 #[test]
 fn shared_anonymous_fork_shares_one_object_across_fork_unmap_and_exec_like_native() {
     const TEST: &str =
@@ -22066,6 +24342,76 @@ fn shared_anonymous_fork_shares_one_object_across_fork_unmap_and_exec_like_nativ
         assert_eq!(stderr, native.stderr, "mode={name}");
         assert_eq!(stdout, native.stdout, "mode={name}");
         eprintln!("shared-anonymous-fork completed {name}: forks=3");
+    }
+}
+
+/// madvise(MADV_GUARD_INSTALL) and madvise(MADV_GUARD_REMOVE) answer as on
+/// native Linux 6.13+, observed through kernel copies: a guard page faults a
+/// copy (EFAULT) through MADV_DONTNEED, mprotect and a fork, until it is
+/// removed or unmapped or mapped over, and moves with mremap. The guest
+/// never touches a guard page itself: KVM keeps the guard in its page state,
+/// which every copy consults, while the vCPU's page tables enforce no
+/// protection (<https://github.com/rrnewton/hermit/issues/5177>). A host
+/// kernel without guard regions answers EINVAL, and the test is skipped.
+#[test]
+fn guard_regions_fault_kernel_copies_like_native() {
+    const TEST: &str = "guard_regions_fault_kernel_copies_like_native";
+    if !leader_self_exec_bounded(TEST) {
+        return;
+    }
+    let directory = TestDirectory::new();
+    let program = compile_c_program(
+        &directory.0,
+        "guard-regions",
+        include_str!("fixtures/guard_regions.c"),
+    );
+    let image = std::fs::read(&program).unwrap();
+    let native = std::process::Command::new(&program)
+        .current_dir(&directory.0)
+        .output()
+        .unwrap();
+    assert_eq!(native.status.code(), Some(0), "{native:?}");
+    assert!(native.stderr.is_empty(), "{native:?}");
+    if native.stdout == b"guard: unsupported\n" {
+        eprintln!("skipping {TEST}: the host kernel has no guard regions");
+        return;
+    }
+    assert!(
+        String::from_utf8_lossy(&native.stdout).contains("moved guard: Bad address\n"),
+        "{native:?}"
+    );
+    for (name, ownership) in [
+        ("direct", None),
+        ("host", Some(ThreadOwnership::Host)),
+        ("tool", Some(ThreadOwnership::Tool)),
+    ] {
+        let mut backend = KvmBackend::new(256 * 1024 * 1024).unwrap();
+        backend
+            .install_static_elf_with_context(
+                &image,
+                &[program.to_str().unwrap()],
+                &[],
+                &directory.0,
+            )
+            .unwrap();
+        let (code, stdout, stderr) = if let Some(ownership) = ownership {
+            backend.set_thread_ownership(ownership);
+            let (_trace, code, stdout, stderr) = futures::executor::block_on(
+                backend.run_static_elf_with_tool::<StraceTool>((), true),
+            )
+            .unwrap();
+            (code, stdout, stderr)
+        } else {
+            backend.run_static_elf_captured().unwrap()
+        };
+        assert_eq!(code, 0, "mode={name}: stdout={stdout:?} stderr={stderr:?}");
+        assert_eq!(stderr, native.stderr, "mode={name}");
+        assert_eq!(
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&native.stdout),
+            "mode={name}"
+        );
+        eprintln!("guard-regions completed {name}");
     }
 }
 

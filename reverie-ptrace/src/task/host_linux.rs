@@ -10,21 +10,23 @@
 //!
 //! Every syscall a Tool injects through
 //! [`Guest::inject`](reverie::Guest::inject) runs here, through
-//! [`LinuxProvider::execute`]. The provider owns no state: the host kernel
-//! holds it all, and the stopped tracee is the execution handle
-//! ([`LinuxProvider::Context`]). How the tracee runs the call stays in
-//! [`TracedTask::inner_inject`], unchanged. That covers resuming the tracee's
+//! [`LinuxProvider::execute`]. The stopped tracee is the execution handle
+//! ([`LinuxProvider::Context`]). An observed physical call additionally carries
+//! a borrowed, invocation-local input receipt; it is not part of the serialized
+//! syscall request. How the tracee runs the call stays in
+//! [`TracedTask::inner_inject_with_input`]. That covers resuming the tracee's
 //! own pending syscall when the request is that call, skipping the seccomp
 //! stop before running a different one, and the injected-trap frame. None of
-//! these is Linux semantics, so the provider passes only the request.
+//! these is Linux semantics, so the provider forwards the request and that
+//! optional call-local receipt without interpreting either's policy.
 //!
 //! [`Guest::inject_restartable`](reverie::Guest::inject_restartable) runs
 //! through it too. A call that a signal stopped before it ran comes back as
 //! [`ProviderOutcome::Interrupted`], and [`restartable`] decides from the
 //! outcome whether to run the call again.
 //!
-//! The provider is zero-sized and built at each call, so the call is
-//! dispatched statically. `execute`'s future is still boxed, because the
+//! The provider is built at each call and dispatched statically.
+//! `execute`'s future is still boxed, because the
 //! trait is an `async_trait`: dyn compatibility is what lets KVM call its
 //! provider as `dyn LinuxProvider`.
 
@@ -42,18 +44,25 @@ use reverie::syscalls::Sysno;
 use safeptrace::Error as TraceError;
 
 use super::TracedTask;
+use super::native_syscall::NativeCallContext;
 
 /// The host kernel, reached by running the call in the stopped tracee.
-pub(super) struct HostLinux<L>(PhantomData<fn() -> L>);
+pub(super) struct HostLinux<'a, L> {
+    input: Option<&'a NativeCallContext>,
+    tool: PhantomData<fn() -> L>,
+}
 
-impl<L> HostLinux<L> {
-    pub(super) fn new() -> Self {
-        Self(PhantomData)
+impl<'a, L> HostLinux<'a, L> {
+    pub(super) fn with_input(input: &'a NativeCallContext) -> Self {
+        Self {
+            input: Some(input),
+            tool: PhantomData,
+        }
     }
 }
 
 #[reverie::provider]
-impl<L: Tool + 'static> LinuxProvider for HostLinux<L> {
+impl<L: Tool + 'static> LinuxProvider for HostLinux<'_, L> {
     type Context = TracedTask<L>;
     /// The host kernel carries out fork, clone and exec itself, so there is
     /// never a plan for the backend.
@@ -82,7 +91,7 @@ impl<L: Tool + 'static> LinuxProvider for HostLinux<L> {
             return Err(Errno::EPROTO.into());
         }
         let (nr, args) = parts(request)?;
-        let result = cx.inner_inject(nr, args).await?;
+        let result = cx.inner_inject_with_input(nr, args, self.input).await?;
         Ok(classify(result, cx.last_injection_ran))
     }
 }

@@ -12,6 +12,7 @@ use futures::Future;
 use reverie::Error;
 use reverie::ExitStatus;
 use reverie::GlobalTool;
+use reverie::Pid;
 use reverie::Tool;
 use reverie::process::Command;
 use reverie::process::Output;
@@ -20,6 +21,12 @@ use reverie::process::Stdio;
 use crate::TracerBuilder;
 pub use crate::perf::do_branches;
 use crate::spawn_fn_with_config;
+
+/// The address of Reverie's SIGTRAP repair page, which pre-init maps in
+/// every guest image that leaves the address free (`cp::SCRATCH_BASE`).
+pub fn sigtrap_repair_page() -> usize {
+    crate::cp::SCRATCH_BASE
+}
 
 /// The number of late timer overflow signals this process has discarded at
 /// injected syscalls. Concurrent tests in one process share the count.
@@ -89,6 +96,13 @@ pub fn precise_timer_second_stages_armed() -> u64 {
     crate::timer::SECOND_STAGES_ARMED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The number of precise timer notifications this process has programmed
+/// halfway (see [`crate::PmuConfig::halves`]). Concurrent tests in one
+/// process share the count.
+pub fn precise_timer_halved_stages_armed() -> u64 {
+    crate::timer::HALVED_STAGES_ARMED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The steps this process's timers have taken toward precise event targets,
 /// and the lookups in their block bound caches, so far.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -97,6 +111,13 @@ pub struct PreciseTimerSteps {
     pub instruction: u64,
     /// Block steps (`PTRACE_SINGLEBLOCK`).
     pub block: u64,
+    /// Branch runs to a hardware breakpoint, on aarch64.
+    pub branch: u64,
+    /// Branch runs whose counter moved by more branches than decoded.
+    pub branch_mismatches: u64,
+    /// Branch runs that ran a load-exclusive sequence as one unit, on
+    /// aarch64.
+    pub exclusive: u64,
     /// Block bounds found in the cache, with their code unchanged.
     pub bound_hits: u64,
     /// Block bounds decoded afresh.
@@ -109,6 +130,9 @@ impl std::ops::Sub for PreciseTimerSteps {
         Self {
             instruction: self.instruction - earlier.instruction,
             block: self.block - earlier.block,
+            branch: self.branch - earlier.branch,
+            branch_mismatches: self.branch_mismatches - earlier.branch_mismatches,
+            exclusive: self.exclusive - earlier.exclusive,
             bound_hits: self.bound_hits - earlier.bound_hits,
             bound_misses: self.bound_misses - earlier.bound_misses,
         }
@@ -121,14 +145,18 @@ pub fn precise_timer_steps() -> PreciseTimerSteps {
     PreciseTimerSteps {
         instruction: crate::timer::INSTRUCTION_STEPS.load(Relaxed),
         block: crate::timer::BLOCK_STEPS.load(Relaxed),
+        branch: crate::timer::BRANCH_RUNS.load(Relaxed),
+        branch_mismatches: crate::timer::BRANCH_RUN_MISMATCHES.load(Relaxed),
+        exclusive: crate::timer::EXCLUSIVE_RUNS.load(Relaxed),
         bound_hits: crate::timer::BLOCK_BOUND_HITS.load(Relaxed),
         bound_misses: crate::timer::BLOCK_BOUND_MISSES.load(Relaxed),
     }
 }
 
-/// Makes this process's timers take block steps toward precise targets where
-/// the decoded bound allows (`enabled`, the default), or only single
-/// instruction steps, as `REVERIE_BLOCK_STEP=0` does. For a test that compares
+/// Makes this process's timers take block steps (x86_64) or branch runs
+/// (aarch64) toward precise targets where the decode allows (`enabled`, the
+/// default), or only single instruction steps, as `REVERIE_BLOCK_STEP=0`
+/// does. For a test that compares
 /// the two in one process; it affects every timer in the process.
 pub fn set_block_steps(enabled: bool) {
     crate::timer::BLOCK_STEPS_OFF_FOR_TESTS.store(!enabled, std::sync::atomic::Ordering::Relaxed);
@@ -432,6 +460,34 @@ pub fn rerun_at_skid_margin(
 /// count.
 pub fn unclaimed_sigtraps_suppressed() -> u64 {
     crate::task::UNCLAIMED_SIGTRAPS_SUPPRESSED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The SIGTRAP stops this process took as hardware watchpoint hits and
+/// nothing else, suppressing the signal. Concurrent tests in one process
+/// share the count.
+pub fn watch_traps_claimed() -> u64 {
+    crate::task::WATCH_TRAPS_CLAIMED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The precise timer's step stops, of a single step or a block step, at
+/// which this process found that a hardware watchpoint fired too: a stepped
+/// instruction made the access. Concurrent tests in one process share the
+/// count.
+pub fn watch_hits_in_timer_steps() -> u64 {
+    crate::task::WATCH_HITS_IN_TIMER_STEPS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The stops at which this process read thread `tid`'s debug status for
+/// hardware watchpoint hits: its SIGTRAP stops while it has a watch armed.
+/// A thread with none pays nothing, so the count is the cost of keeping
+/// its watches.
+pub fn watch_status_reads(tid: Pid) -> u64 {
+    crate::task::WATCH_STATUS_READS
+        .lock()
+        .unwrap()
+        .get(&tid)
+        .copied()
+        .unwrap_or(0)
 }
 
 /// For some tests, its nice to show what was printed.

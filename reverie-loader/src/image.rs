@@ -6,8 +6,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Validation of the images the loader maps: the loader itself and Hermit's
-//! runtime. Both are linked at fixed addresses (their windows are in
+//! Validation of the images the loader maps: the loader itself and the
+//! tool runtime. Both are linked at fixed addresses (their windows are in
 //! [`crate::artifact`]), so mapping them needs no relocation. The guest's
 //! own layout stays put only while those windows are reserved, which is the
 //! mapper's job, not this module's.
@@ -26,7 +26,11 @@ pub use private_runtime::PrivateRuntimeMetadata;
 pub use private_runtime::PrivateRuntimeMetadataError;
 pub use private_runtime::TlsTemplate;
 
-/// The page size the loader maps with.
+/// The page size the loader maps with. This public contract is
+/// x86-64 with 4 KiB pages only; a launcher must refuse other host
+/// page sizes by name (see
+/// [`crate::manifest::ToolManifest::validate_with_page_size`])
+/// instead of assuming this value holds on its host.
 pub const PAGE_SIZE: u64 = 4096;
 
 /// The most loadable segments an image may have. The loader and runtime

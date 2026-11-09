@@ -9,6 +9,13 @@
 //! Tests for process and thread state.
 
 #[cfg(all(not(sanitized), test))]
+#[path = "support/stack_rust_guest.rs"]
+mod stack_rust_guest;
+#[cfg(all(not(sanitized), test))]
+#[path = "tool_fixtures/stack.rs"]
+mod stack_tool;
+
+#[cfg(all(not(sanitized), test))]
 use reverie::Error;
 #[cfg(all(not(sanitized), test))]
 use reverie::Guest;
@@ -142,6 +149,12 @@ impl Tool for LocalState2 {
                 let v2 = guest.memory().read_value(ptr2).unwrap();
                 assert_eq!(v2, 4444);
 
+                // The nested frame must not disturb the still-live first
+                // frame: it lies strictly below it and leaves its value.
+                assert!(ptr2.as_raw() + 8 <= ptr1.as_raw());
+                let v1_again = guest.memory().read_value(ptr1).unwrap();
+                assert_eq!(v1_again, 3333);
+
                 guest.tail_inject(exit_success).await
             }
             _ => guest.tail_inject(syscall).await,
@@ -149,13 +162,16 @@ impl Tool for LocalState2 {
     }
 }
 
+/// Tool for the uncommitted-overlap negative: it holds a stack builder
+/// without committing, then asks for a second guest stack, which the
+/// allocator refuses with a panic (pending builders are exclusive).
 #[cfg(all(not(sanitized), test))]
 #[derive(Debug, Default, Clone)]
-struct LocalState3;
+struct LocalStateUncommitted;
 
 #[cfg(all(not(sanitized), test))]
 #[reverie::tool]
-impl Tool for LocalState3 {
+impl Tool for LocalStateUncommitted {
     type GlobalState = ();
     type ThreadState = ();
 
@@ -164,28 +180,17 @@ impl Tool for LocalState3 {
         guest: &mut T,
         syscall: Syscall,
     ) -> Result<i64, Error> {
-        let exit_success = ExitGroup::new().with_status(0);
         match syscall.number() {
             Sysno::exit_group => {
-                {
-                    let mut stack = guest.stack().await;
-                    let ptr1: AddrMut<u64> = stack.reserve();
-                    let _guard1 = stack.commit().unwrap();
-                    guest.memory().write_value(ptr1, &3333).unwrap();
-                    let v1 = guest.memory().read_value(ptr1).unwrap();
-                    assert_eq!(v1, 3333);
-                }
-
-                {
-                    let mut stack = guest.stack().await;
-                    let ptr2: AddrMut<u64> = stack.reserve();
-                    let _guard2 = stack.commit().unwrap();
-                    guest.memory().write_value(ptr2, &4444).unwrap();
-                    let v2 = guest.memory().read_value(ptr2).unwrap();
-                    assert_eq!(v2, 4444);
-                }
-
-                guest.tail_inject(exit_success).await
+                let mut stack = guest.stack().await;
+                let _ptr: AddrMut<u64> = stack.reserve();
+                // No commit: `stack` is a live uncommitted builder. A second
+                // checkout while it is alive must panic in the allocator. If
+                // it ever succeeds, exit 0 instead of panicking, so the
+                // should_panic test goes red.
+                let _second = guest.stack().await;
+                drop(_second);
+                guest.tail_inject(ExitGroup::new().with_status(0)).await
             }
             _ => guest.tail_inject(syscall).await,
         }
@@ -194,7 +199,10 @@ impl Tool for LocalState3 {
 
 #[cfg(all(not(sanitized), test))]
 mod tests {
+    use std::sync::atomic::Ordering;
+
     use reverie_ptrace::testing::check_fn;
+    use stack_tool::LocalState3;
 
     use super::*;
 
@@ -211,12 +219,30 @@ mod tests {
         });
     }
 
-    /// A test that allocates on the stack TWICE.
-    /// Currently failing because we attempt to grab a second stack while the guard is still alive.
+    /// The original two-allocs scenario: two nested stack commits with both
+    /// guards still alive. Nested scratch frames are now a supported,
+    /// bounded feature (commit ee4fb6e043: committed frames stay disjoint
+    /// below live ones), so this is a positive test: both values must be
+    /// written and read back by the Tool, and the guest must exit 0.
     #[test]
-    #[should_panic]
-    fn stack_two_allocs_bad() {
-        check_fn::<LocalState2, _>(|| {
+    fn stack_two_allocs_nested_good() {
+        use reverie_ptrace::testing::test_fn;
+        let (output, _) = test_fn::<LocalState2, _>(|| {
+            unsafe { libc::syscall(libc::SYS_exit_group, 0) };
+        })
+        .unwrap();
+        assert_eq!(output.status, reverie::ExitStatus::Exited(0));
+    }
+
+    /// The negative that must still panic: a second stack checkout while
+    /// the first builder is still uncommitted. Pending builders are
+    /// exclusive, so retrieving another guest stack panics.
+    #[test]
+    #[should_panic(
+        expected = "cannot retrieve guest Stack while an uncommitted stack builder is still alive"
+    )]
+    fn stack_two_allocs_uncommitted_bad() {
+        check_fn::<LocalStateUncommitted, _>(|| {
             unsafe { libc::syscall(libc::SYS_exit_group, 0) };
         });
     }
@@ -224,8 +250,45 @@ mod tests {
     /// In contrast, this is ok because the guard is dropped.
     #[test]
     fn stack_two_allocs_good() {
-        check_fn::<LocalState3, _>(|| {
-            unsafe { libc::syscall(libc::SYS_exit_group, 0) };
-        });
+        let state = check_fn::<LocalState3, _>(stack_rust_guest::guest);
+        let observed = state.observed.load(Ordering::SeqCst);
+        eprintln!("stack good function: observed={observed}");
+        assert!(observed);
+
+        rust_command_test();
+    }
+
+    fn assert_command_output(
+        label: &str,
+        output: &reverie::process::Output,
+        state: &stack_tool::StackObserved,
+    ) {
+        let observed = state.observed.load(Ordering::SeqCst);
+        eprintln!(
+            "stack good Rust command {label}: status={:?} stdout={:02x?} stderr={:02x?} observed={observed}",
+            output.status, output.stdout, output.stderr,
+        );
+        assert_eq!(output.status, reverie::ExitStatus::Exited(0));
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
+        assert!(observed);
+    }
+
+    fn rust_command_test() {
+        let program = env!("CARGO_BIN_EXE_stack-rust-command-guest");
+        eprintln!("stack good Rust command image={program}");
+
+        let native = std::process::Command::new(program).output().unwrap();
+        eprintln!(
+            "stack good Rust command native: status={:?} stdout={:02x?} stderr={:02x?}",
+            native.status, native.stdout, native.stderr,
+        );
+        assert_eq!(native.status.code(), Some(0));
+        assert!(native.stdout.is_empty());
+        assert!(native.stderr.is_empty());
+
+        let (output, state) =
+            reverie_test_support::test_cmd_with_config::<LocalState3>(program, &[], ()).unwrap();
+        assert_command_output("ptrace", &output, &state);
     }
 }

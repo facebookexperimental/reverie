@@ -6,6 +6,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+// Included into tracer.rs, whose crate-level allow covers `fbcode_build`.
 mod fatal_namespace_timer_tests {
     use super::*;
 
@@ -98,21 +99,11 @@ mod fatal_namespace_timer_tests {
                 "reverie-fatal-namespace-timer-{}",
                 std::process::id()
             ));
-            let status = std::process::Command::new("timeout")
-                .args([
-                    "--signal=TERM",
-                    "--kill-after=1s",
-                    "1s",
-                    "cc",
-                    "-std=c11",
-                    "-O1",
-                ])
-                .arg(source)
-                .arg("-o")
-                .arg(&output)
-                .status()
-                .unwrap();
-            assert!(status.success(), "bounded namespace payload compile failed");
+            let status = crate::compile_c_fixture(&source, &output);
+            assert!(
+                status.success(),
+                "bounded namespace payload compile failed: {status}"
+            );
             output
         });
         PAYLOAD.clone()
@@ -128,7 +119,7 @@ mod fatal_namespace_timer_tests {
         let original_deadline = std::env::var("REVERIE_NAMESPACE_TIMER_DEADLINE_NS")
             .ok()
             .map(|value| value.parse::<u64>().unwrap())
-            .unwrap_or_else(|| fatal_monotonic_ns() + 3_000_000_000);
+            .unwrap_or_else(|| fatal_monotonic_ns() + GENEROUS_WALL_BACKSTOP_NS);
         let deadline = started + fatal_remaining(original_deadline);
         let marker_log = Arc::new(StdMutex::new(Vec::new()));
         crate::timer::EXEC_SIGNAL_OBSERVATIONS
@@ -214,7 +205,7 @@ mod fatal_namespace_timer_tests {
                 );
             }
         };
-        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(started.elapsed() < GENEROUS_WALL_BACKSTOP);
         assert!(fatal_monotonic_ns() < original_deadline);
         assert!(retired && sentinel_untouched);
         if query_failure {
@@ -318,6 +309,10 @@ mod fatal_namespace_timer_tests {
         control(true, "query-failure").await;
     }
 
+    #[cfg_attr(
+        fbcode_build,
+        ignore = "fbsource-disabled: sandcastle-env: needs mount(2) in a fresh user and PID namespace"
+    )]
     #[tokio::test(flavor = "current_thread")]
     async fn descendant_guest_pid_equal_to_controller_pid_is_not_controller() {
         const NAME: &str = "tracer::tests::fatal_namespace_timer_tests::descendant_guest_pid_equal_to_controller_pid_is_not_controller";
@@ -327,7 +322,7 @@ mod fatal_namespace_timer_tests {
             control(true, "guest-active").await;
             return;
         }
-        let deadline = fatal_monotonic_ns() + 3_000_000_000;
+        let deadline = fatal_monotonic_ns() + GENEROUS_WALL_BACKSTOP_NS;
         let mut child = std::process::Command::new("unshare")
             .args([
                 "--user",

@@ -10,24 +10,26 @@
 fn explicit_ptracer_namespace_guard_requires_complete_original_self_field() {
     require_aligned_proc_pid_namespace().unwrap();
     let tid = super::Pid::from_raw(123);
+    // A kernel with PID namespaces, where only a missing NSpid line asks.
+    let pid_namespaces = || Ok(true);
     assert_eq!(
-        aligned_proc_pid_namespace(b"Name:\t\xff-name\nNSpid:\t123\n", tid),
+        aligned_proc_pid_namespace(b"Name:\t\xff-name\nNSpid:\t123\n", tid, pid_namespaces),
         Ok(())
     );
     assert_eq!(
-        aligned_proc_pid_namespace(b"NSpid:\t123 1\n", tid),
+        aligned_proc_pid_namespace(b"NSpid:\t123 1\n", tid, pid_namespaces),
         Err(Errno::EXDEV)
     );
     assert_eq!(
-        aligned_proc_pid_namespace(b"NSpid:\t456\n", tid),
+        aligned_proc_pid_namespace(b"NSpid:\t456\n", tid, pid_namespaces),
         Err(Errno::EXDEV)
     );
     assert_eq!(
-        aligned_proc_pid_namespace(b"NSpid:\t123", tid),
+        aligned_proc_pid_namespace(b"NSpid:\t123", tid, pid_namespaces),
         Err(Errno::EOPNOTSUPP)
     );
     assert_eq!(
-        aligned_proc_pid_namespace(b"NSpid:\t123 ", tid),
+        aligned_proc_pid_namespace(b"NSpid:\t123 ", tid, pid_namespaces),
         Err(Errno::EOPNOTSUPP)
     );
     let mut large = b"Name:\tlarge-groups\nGroups:\t".to_vec();
@@ -36,7 +38,10 @@ fn explicit_ptracer_namespace_guard_requires_complete_original_self_field() {
     }
     large.extend_from_slice(b"\nNSpid:\t123\n");
     assert!(large.len() < 1024 * 1024);
-    assert_eq!(aligned_proc_pid_namespace(&large, tid), Ok(()));
+    assert_eq!(
+        aligned_proc_pid_namespace(&large, tid, pid_namespaces),
+        Ok(())
+    );
 }
 
 #[test]
@@ -247,8 +252,12 @@ fn explicit_ptracer_mode_cannot_recapture_an_unbound_generic_token() {
 #[tokio::test(flavor = "current_thread")]
 #[cfg(all(feature = "memory", not(sanitized)))]
 async fn explicit_native_user_write_enforces_original_ptracer_owner() {
-    use reverie_memory::{Addr, AddrMut, MemoryAccess, RemoteIoVec};
     use std::io::IoSlice;
+
+    use reverie_memory::Addr;
+    use reverie_memory::AddrMut;
+    use reverie_memory::MemoryAccess;
+    use reverie_memory::RemoteIoVec;
 
     if run_legacy_test_outer("explicit_native_user_write_enforces_original_ptracer_owner") {
         return;
@@ -515,7 +524,7 @@ async fn explicit_legacy_cache_admits_real_native_sibling_without_another_owner(
             &format!("notifier::test::{NAME}"),
             &[(INNER, "1")],
             false,
-            Duration::from_secs(5),
+            EXACT_TEST_SUBPROCESS_TIMEOUT,
         )
         .unwrap();
         match classify_exact_reuse_output(Some(&output.output), MARKER, UNAVAILABLE).unwrap() {
@@ -653,7 +662,7 @@ async fn native_capture_before_legacy_open_refusal_keeps_native_wait_authority()
             &format!("notifier::test::{NAME}"),
             &[(INNER, "1")],
             false,
-            Duration::from_secs(5),
+            EXACT_TEST_SUBPROCESS_TIMEOUT,
         )
         .unwrap();
         match classify_exact_reuse_output(Some(&output.output), MARKER, UNAVAILABLE).unwrap() {
@@ -773,7 +782,7 @@ fn explicit_native_cache_admission_preserves_actual_local_sync_claim() {
             &format!("notifier::test::{NAME}"),
             &[(INNER, "1")],
             false,
-            Duration::from_secs(5),
+            EXACT_TEST_SUBPROCESS_TIMEOUT,
         )
         .unwrap();
         match classify_exact_reuse_output(Some(&output.output), MARKER, UNAVAILABLE).unwrap() {
@@ -991,7 +1000,7 @@ async fn explicit_child_capture_policy_follows_each_request_before_parent_commit
             &format!("notifier::test::{NAME}"),
             &[(INNER, "1")],
             false,
-            Duration::from_secs(5),
+            EXACT_TEST_SUBPROCESS_TIMEOUT,
         )
         .unwrap();
         match classify_exact_reuse_output(Some(&output.output), MARKER, UNAVAILABLE).unwrap() {
@@ -1193,7 +1202,7 @@ async fn explicit_native_reattach_preserves_current_owner_and_original_driver() 
             &format!("notifier::test::{NAME}"),
             &[(INNER, "1")],
             false,
-            Duration::from_secs(5),
+            EXACT_TEST_SUBPROCESS_TIMEOUT,
         )
         .unwrap();
         match classify_exact_reuse_output(Some(&output.output), MARKER, UNAVAILABLE).unwrap() {
@@ -1367,6 +1376,268 @@ async fn explicit_native_reattach_preserves_current_owner_and_original_driver() 
         }
     }
     emit_completion_marker(MARKER);
+}
+
+/// Seizes the guest member with a synchronous wait and returns its
+/// stopped capability. No notifier worker is started for the
+/// generation yet: registration happens when the caller creates a
+/// terminal cleanup handle, which the controls below do only after
+/// detaching, so the worker's first wait deterministically observes
+/// the detached state.
+#[cfg(not(sanitized))]
+fn seized_stopped_sync(tid: Pid) -> Stopped {
+    let running = Running::seize_on_ptracer_thread(tid.into(), legacy_thread_options()).unwrap();
+    running.interrupt().unwrap();
+    let (stopped, event) = running
+        .wait_sync_on_ptracer_thread()
+        .wait()
+        .unwrap()
+        .assume_stopped();
+    assert_eq!(event, crate::Event::Stop);
+    stopped
+}
+
+/// A permanent detach (no generation-bound wait created while detached)
+/// retires the generation promptly: the worker must not be retained by
+/// the detach -> reattach handoff exemption.
+#[test]
+#[cfg(not(sanitized))]
+fn permanent_detach_retires_native_generation() {
+    let (root, tid, release, mut root_cleanup) = legacy_owner_guest();
+    let stopped = seized_stopped_sync(tid);
+    let running = stopped.detach(None).unwrap();
+    let terminal = running.terminal_cleanup();
+    drop(running);
+    assert!(
+        terminal.wait(TRACEE_WAIT_TIMEOUT),
+        "permanently detached generation must retire"
+    );
+    legacy_owner_reap_root(root, &mut root_cleanup);
+    drop(release);
+}
+
+/// Owner-thread exit after a detach into a retained driver retires the
+/// generation: the driver's detached-wait note ends when the exiting
+/// thread drops it, so no live thread can reattach this generation.
+#[test]
+#[cfg(not(sanitized))]
+fn owner_exit_retires_native_generation() {
+    let (root, tid, release, mut root_cleanup) = legacy_owner_guest();
+    let (sent, received) = mpsc::channel();
+    let owner = thread::spawn(move || {
+        let stopped = seized_stopped_sync(tid);
+        let running = stopped.detach(None).unwrap();
+        let terminal = running.terminal_cleanup();
+        let driver = running.wait_sync_on_ptracer_thread().into_driver();
+        sent.send(terminal).unwrap();
+        // The retained driver (and its detached-wait note) drops with
+        // this thread's stack at exit.
+        drop(driver);
+    });
+    let terminal = received.recv_timeout(TRACEE_WAIT_TIMEOUT).unwrap();
+    owner.join().unwrap();
+    assert!(
+        terminal.wait(TRACEE_WAIT_TIMEOUT),
+        "generation whose owner thread exited must retire"
+    );
+    legacy_owner_reap_root(root, &mut root_cleanup);
+    drop(release);
+}
+
+/// An unreaped zombie retires even while a detached wait is held: Linux
+/// refuses ptrace attach once exit_state is set, so no reattach can
+/// consume it and retirement must not wait for the real parent's reap.
+#[test]
+#[cfg(not(sanitized))]
+fn unreaped_zombie_retires_native_generation() {
+    let (root, tid, release, mut root_cleanup) = legacy_owner_guest();
+    let stopped = seized_stopped_sync(tid);
+    let running = stopped.detach(None).unwrap();
+    let terminal = running.terminal_cleanup();
+    let driver = running.wait_sync_on_ptracer_thread().into_driver();
+    // Kill the whole guest group; the member is then a zombie (or gone)
+    // while the root remains unreaped by this test process.
+    assert_eq!(unsafe { libc::kill(root.as_raw(), libc::SIGKILL) }, 0);
+    assert!(
+        terminal.wait(TRACEE_WAIT_TIMEOUT),
+        "zombie generation must retire without waiting for reap"
+    );
+    drop(driver);
+    legacy_owner_reap_root(root, &mut root_cleanup);
+    drop(release);
+}
+
+/// A synchronous detached wait that already completed a successful
+/// reattach wait no longer protects the generation: its handoff note
+/// ends at the successful transfer, so a later permanent detach
+/// retires even while the completed driver object is still held.
+#[test]
+#[cfg(not(sanitized))]
+fn completed_sync_driver_does_not_retain_generation() {
+    let (root, tid, release, mut root_cleanup) = legacy_owner_guest();
+    let stopped = seized_stopped_sync(tid);
+    let running = stopped.detach(None).unwrap();
+    let mut driver = running.wait_sync_on_ptracer_thread().into_driver();
+    let reattached =
+        Running::seize_on_ptracer_thread(tid.into(), legacy_thread_options()).unwrap();
+    reattached.interrupt().unwrap();
+    let (stopped, event) = driver
+        .wait_on_ptracer_thread()
+        .unwrap()
+        .assume_stopped();
+    assert_eq!(event, crate::Event::Stop);
+    assert!(matches!(
+        driver.wait_on_ptracer_thread(),
+        Err(OwnedWaitError::Completed)
+    ));
+    let running = stopped.detach(None).unwrap();
+    // Register the worker only after the permanent detach, so its first
+    // wait deterministically observes the detached state.
+    let terminal = running.terminal_cleanup();
+    drop(running);
+    drop(reattached);
+    assert!(
+        terminal.wait(TRACEE_WAIT_TIMEOUT),
+        "completed-but-retained sync driver must not retain the generation"
+    );
+    drop(driver);
+    legacy_owner_reap_root(root, &mut root_cleanup);
+    drop(release);
+}
+
+/// The async counterpart: a completed owned wait releases its handoff
+/// note at the successful poll, not only at Drop.
+#[tokio::test(flavor = "current_thread")]
+#[cfg(not(sanitized))]
+async fn completed_async_driver_does_not_retain_generation() {
+    let (root, tid, release, mut root_cleanup) = legacy_owner_guest();
+    let stopped = seized_stopped_sync(tid);
+    let running = stopped.detach(None).unwrap();
+    let terminal = running.terminal_cleanup();
+    let mut driver = running.wait_owned_on_ptracer_thread().into_driver();
+    let reattached =
+        Running::seize_on_ptracer_thread(tid.into(), legacy_thread_options()).unwrap();
+    reattached.interrupt().unwrap();
+    let (stopped, event) = tokio::time::timeout(
+        TRACEE_WAIT_TIMEOUT,
+        futures::future::poll_fn(|cx| driver.poll_on_ptracer_thread(cx)),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .assume_stopped();
+    assert_eq!(event, crate::Event::Stop);
+    // The successful poll released the handoff note exactly once; the
+    // worker is blocked in its next waitid and cannot re-evaluate
+    // retirement until the guest next changes state (true at base as
+    // well), so assert the released note directly and then finish the
+    // guest through the traced exit path with the completed driver
+    // still held.
+    assert!(
+        !terminal.event.event().detach_handoff_pending(),
+        "successful async wait must release its detached-wait note"
+    );
+    stopped.setoptions(legacy_thread_options()).unwrap();
+    let exit = stopped.exit_event_on_ptracer_thread();
+    assert_eq!(
+        unsafe { libc::write(release.as_raw_fd(), b"x".as_ptr().cast(), 1) },
+        1
+    );
+    let running = stopped.resume(None).unwrap();
+    let stopped = tokio::time::timeout(TRACEE_WAIT_TIMEOUT, exit)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stopped.getevent().unwrap(), 23 << 8);
+    drop(running);
+    drop(reattached);
+    assert_eq!(
+        tokio::time::timeout(
+            TRACEE_WAIT_TIMEOUT,
+            stopped.resume(None).unwrap().wait_owned_on_ptracer_thread()
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .assume_exited(),
+        (tid.into(), crate::ExitStatus::Exited(23))
+    );
+    assert!(
+        terminal.wait(TRACEE_WAIT_TIMEOUT),
+        "completed-but-retained async driver must not retain the generation"
+    );
+    drop(driver);
+    legacy_owner_reap_root(root, &mut root_cleanup);
+    drop(release);
+}
+
+/// A Send driver that outlives its dead owner thread does not retain
+/// the generation: pending-handoff validity is bound to the recorded
+/// wait owner remaining live, not to the driver object existing.
+#[test]
+#[cfg(not(sanitized))]
+fn dead_owner_retained_driver_does_not_retain_generation() {
+    let (root, tid, release, mut root_cleanup) = legacy_owner_guest();
+    let (sent, received) = mpsc::channel();
+    let owner = thread::spawn(move || {
+        let stopped = seized_stopped_sync(tid);
+        let running = stopped.detach(None).unwrap();
+        let terminal = running.terminal_cleanup();
+        let driver = running.wait_sync_on_ptracer_thread().into_driver();
+        sent.send((terminal, driver)).unwrap();
+    });
+    let (terminal, driver) = received.recv_timeout(TRACEE_WAIT_TIMEOUT).unwrap();
+    owner.join().unwrap();
+    assert!(
+        terminal.wait(TRACEE_WAIT_TIMEOUT),
+        "dead owner's retained driver must not retain the generation"
+    );
+    drop(driver);
+    legacy_owner_reap_root(root, &mut root_cleanup);
+    drop(release);
+}
+
+/// The generic-attach conversion of the dead-owner control: the token
+/// carries no ptracer owner at driver creation, so the note must follow
+/// the explicit driver's authoritative affinity owner. That thread
+/// returns the Send driver to the main thread and exits; the generation
+/// retires while the driver is still held.
+#[test]
+#[cfg(not(sanitized))]
+fn dead_generic_owner_retained_driver_does_not_retain_generation() {
+    let (root, tid, release, mut root_cleanup) = legacy_owner_guest();
+    let (sent, received) = mpsc::channel();
+    let owner = thread::spawn(move || {
+        // Generic attach + generic synchronous wait: neither stamps a
+        // ptracer owner into the returned Stopped token, so the explicit
+        // driver created after detach starts from an ownerless token and
+        // must follow its affinity binding instead.
+        let running = Running::attach(tid.into()).unwrap();
+        let stopped = running.wait().unwrap().assume_stopped().0;
+        let running = stopped.detach(None).unwrap();
+        // Passive cleanup: registration (and therefore worker start) is
+        // deferred until the main thread asks, after the owner is gone.
+        let terminal = running.generation().terminal_cleanup();
+        let driver = running.wait_sync_on_ptracer_thread().into_driver();
+        sent.send((terminal, driver)).unwrap();
+    });
+    let (terminal, mut driver) = received.recv_timeout(TRACEE_WAIT_TIMEOUT).unwrap();
+    owner.join().unwrap();
+    // The explicit driver really is bound to the dead original owner,
+    // not an unbound generic wait that this thread could adopt.
+    assert!(matches!(
+        driver.wait_on_ptracer_thread(),
+        Err(OwnedWaitError::Errno(Errno::EPERM))
+    ));
+    terminal.ensure_registered().unwrap();
+    assert_eq!(terminal.has_thread_pidfd(), Ok(true));
+    assert!(
+        terminal.wait(TRACEE_WAIT_TIMEOUT),
+        "dead generic owner's retained driver must not retain the generation"
+    );
+    drop(driver);
+    legacy_owner_reap_root(root, &mut root_cleanup);
+    drop(release);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -3007,7 +3278,7 @@ fn run_explicit_wait_role_outer(name: &str, marker: &str, cell_prefix: &str) -> 
         &format!("notifier::test::{name}"),
         &[(INNER, name)],
         false,
-        Duration::from_secs(5),
+        EXACT_TEST_SUBPROCESS_TIMEOUT,
     )
     .expect("start bounded original wait-role control");
     assert!(!result.timed_out, "wait-role control timed out: {result:?}");
@@ -3050,10 +3321,7 @@ fn run_explicit_wait_role_outer(name: &str, marker: &str, cell_prefix: &str) -> 
 /// allocation fails immediately. No numeric equality is conditional, and no
 /// arbitrary allocator cursor, new capability, or fallback is introduced.
 #[cfg(not(sanitized))]
-fn spawn_namespace_owner_collision<F, T>(
-    owner_tid: super::Pid,
-    proof: F,
-) -> thread::JoinHandle<T>
+fn spawn_namespace_owner_collision<F, T>(owner_tid: super::Pid, proof: F) -> thread::JoinHandle<T>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
@@ -3079,7 +3347,8 @@ where
     assert!(Instant::now() < deadline, "owner-collision setup deadline");
     thread::spawn(move || {
         assert_eq!(
-            nix::unistd::gettid().as_raw(), requested,
+            nix::unistd::gettid().as_raw(),
+            requested,
             "proof thread must collide with the actual original owner TID"
         );
         proof()

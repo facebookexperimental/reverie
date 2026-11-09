@@ -118,7 +118,7 @@ fn raw(number: i64, args: [u64; 6]) -> i64 {
 fn raw_exit(code: i32) -> ! {
     raw(libc::SYS_exit_group, [code as u64, 0, 0, 0, 0, 0]);
     // SAFETY: exit_group must not return, and raw children never unwind.
-    unsafe { core::arch::asm!("ud2", options(noreturn)) }
+    crate::arch::trap_unreachable()
 }
 
 fn map(bytes: usize, shared: bool) -> Result<Span, SetupError> {

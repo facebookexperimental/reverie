@@ -5,7 +5,7 @@ space. If worker teardown fails, exec remains an error and must not execute
 the replacement image. The started owner still owes its consuming thread and
 process Tool hooks.
 
-[`Error::ExecWorkerTeardown`](../reverie-kvm/src/error.rs) preserves the original
+[`Error::ExecWorkerTeardown`](../reverie-kvm-core/src/error.rs) preserves the original
 worker error from this boundary. The common `finish_tool_process` in
 [`runtime.rs`](../reverie-kvm/src/runtime.rs) handles the static-ELF Tool loop's
 terminal outcomes, including subscribed and unsubscribed exec failures. It

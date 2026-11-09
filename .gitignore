@@ -7,3 +7,6 @@ target/
 *.orig
 **/__pycache__/
 **/.mypy_cache/
+
+# mdBook output (built in CI, deployed to GitHub Pages)
+guide/book/

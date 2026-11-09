@@ -266,6 +266,28 @@ impl AsyncFd {
         Ok(Self(async_fd))
     }
 
+    /// Registers a reader without discarding its descriptor on an I/O error.
+    ///
+    /// Registration happens before changing shared status flags. On a
+    /// registration error, the original descriptor and its flags are unchanged.
+    /// On success, only this endpoint's OFD is made nonblocking before exposure.
+    ///
+    /// Must be called inside an active I/O-enabled Tokio runtime. Tokio may
+    /// panic when its reactor is absent or disabled; this is not panic recovery.
+    pub fn try_readable(fd: Fd) -> Result<Self, (Fd, io::Error)> {
+        // Fd owns a stable, valid descriptor for the registration's lifetime.
+        // Keep the existing Tokio >= 1.52.4 floor; the pinned 1.53.3 deprecates
+        // this API in favor of unsafe register_with_interest with that same
+        // ownership contract. Both return the original inner fd on error.
+        #[allow(deprecated)]
+        let async_fd = TokioAsyncFd::try_with_interest(fd, Interest::READABLE)
+            .map_err(|error| error.into_parts())?;
+        if let Err(error) = async_fd.get_ref().set_nonblocking() {
+            return Err((async_fd.into_inner(), error.into()));
+        }
+        Ok(Self(async_fd))
+    }
+
     pub fn writable(fd: Fd) -> Result<Self, Errno> {
         fd.set_nonblocking()?;
         // tokio 1.53 deprecates `AsyncFd::with_interest` for lacking I/O safety
@@ -430,7 +452,7 @@ fn copy_cstr_to_slice<'a>(
 /// copying the path to a static buffer and replacing each `/` with a NUL
 /// terminator as needed (and then changing the `\0` back to `/` afterwards).
 pub fn create_dir_all(path: &CStr, mode: libc::mode_t) -> Result<(), Errno> {
-    let mut buf = ['\0' as libc::c_char; libc::PATH_MAX as usize];
+    let mut buf = [0 as libc::c_char; libc::PATH_MAX as usize];
     let path = copy_cstr_to_slice(path, &mut buf)?;
     create_dir_all_(path, mode)
 }
@@ -476,7 +498,7 @@ pub fn touch_path(
     file_mode: libc::mode_t,
     dir_mode: libc::mode_t,
 ) -> Result<(), Errno> {
-    let mut buf = ['\0' as libc::c_char; libc::PATH_MAX as usize];
+    let mut buf = [0 as libc::c_char; libc::PATH_MAX as usize];
     let path = copy_cstr_to_slice(path, &mut buf)?;
     touch_path_(path, file_mode, dir_mode)
 }

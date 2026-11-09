@@ -20,12 +20,17 @@
 //! inherits the mappings, occupied pages and live contents through COW.
 
 use core::cell::UnsafeCell;
+use core::ffi::c_void;
+use core::hint::black_box;
+use core::mem::ManuallyDrop;
 use core::mem::MaybeUninit;
 use core::sync::atomic::AtomicBool;
 use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::Ordering;
 use std::io;
 
+use super::isa::Isa;
+use super::isa::NativeIsa;
 use super::support::raw_zero_result;
 use crate::trap::raw_syscall6;
 
@@ -35,7 +40,10 @@ pub const BASE: usize = 0x6000_0000_0000;
 pub const BYTES: usize = 4 * 1024 * 1024 * 1024;
 /// End of the half-open fixed reservation.
 pub const END: usize = BASE + BYTES;
-const PAGE: usize = 4096;
+/// The page unit the version-one layout is expressed in. Hosts with
+/// a different runtime page size are refused by [`ToolRegion::reserve`].
+pub(crate) const LAYOUT_PAGE: usize = 4096;
+const PAGE: usize = LAYOUT_PAGE;
 const CONTROL_BYTES: usize = 1024 * 1024;
 const DATA_FIRST: usize = CONTROL_BYTES / PAGE;
 const DATA_END: usize = BYTES / PAGE - 1;
@@ -62,15 +70,41 @@ impl RegionPublication {
         }
     }
 
-    #[inline(never)]
+    #[inline(always)]
     fn get(&self) -> Option<&RegionResult> {
-        if !self.published.load(Ordering::Acquire) {
-            return None;
-        }
-        // SAFETY: the release publication precedes this acquire observation;
-        // there is no writer after publication. The cast uses MaybeUninit<T>'s
-        // documented layout equivalence, not guessed Rust enum offsets.
-        Some(unsafe { &*self.value.get().cast::<RegionResult>() })
+        let publication = black_box(core::ptr::from_ref(self).cast::<c_void>());
+        // SAFETY: publication is this live slot. The scalar getter returns
+        // null or its initialized immutable value, with this slot's lifetime.
+        let value = unsafe { Self::get_opaque(publication) };
+        // SAFETY: the getter observed release publication before returning a
+        // non-null value; no writer can change it while self remains borrowed.
+        unsafe { value.cast::<RegionResult>().as_ref() }
+    }
+
+    /// Observe only a live publication slot; never infer ownership from its
+    /// address. Opaque inputs/outputs constrain interprocedural specialization,
+    /// but emitted code still requires complete physical qualification.
+    ///
+    /// # Safety
+    /// publication must point to a live RegionPublication. The caller may use
+    /// the result only while that slot and its published owner remain live.
+    #[inline(never)]
+    unsafe extern "C" fn get_opaque(publication: *const c_void) -> *const c_void {
+        // SAFETY: the caller supplies an aligned, live publication slot.
+        let publication = unsafe { &*publication.cast::<Self>() };
+        let value = if publication.published.load(Ordering::Acquire) {
+            // MaybeUninit<T> has T's layout. Acquire publication authenticates
+            // initialization before any caller can dereference this pointer.
+            publication
+                .value
+                .get()
+                .cast::<RegionResult>()
+                .cast_const()
+                .cast::<c_void>()
+        } else {
+            core::ptr::null()
+        };
+        black_box(value)
     }
 
     /// # Safety
@@ -78,16 +112,50 @@ impl RegionPublication {
     /// observe that its byte is true. No second publication writer may run.
     /// The input must be the actual ordinary reserve result or authenticated
     /// fresh native owner. The slot and its owner must outlive all references.
-    #[inline(never)]
+    #[inline(always)]
     unsafe fn set_under_gate(&self, value: RegionResult) -> Result<(), RegionResult> {
-        if self.published.load(Ordering::Acquire) {
-            return Err(value);
+        let mut value = ManuallyDrop::new(value);
+        let publication = black_box(core::ptr::from_ref(self).cast::<c_void>());
+        let payload = black_box(core::ptr::from_mut(&mut *value).cast::<c_void>());
+        // SAFETY: the caller owns the initialization gate; payload is the
+        // actual initialized result and is exclusively borrowed for this call.
+        if unsafe { Self::set_opaque(publication, payload) } == 0 {
+            // The scalar setter moved the complete value into the slot. Its
+            // former stack storage must never be read or dropped again.
+            Ok(())
+        } else {
+            // Refusal does not read, move or modify payload; return ownership
+            // of the original result rather than reconstructing its variant.
+            Err(ManuallyDrop::into_inner(value))
+        }
+    }
+
+    /// Move an initialized result only on successful exclusive publication.
+    ///
+    /// # Safety
+    /// publication must be a live slot whose writes are exclusively owned by
+    /// the caller (INITIALIZING for the runtime slot). payload must point to an
+    /// initialized, exclusively owned RegionResult, disjoint from the slot.
+    /// Zero transfers ownership; any nonzero status leaves the payload intact.
+    #[inline(never)]
+    unsafe extern "C" fn set_opaque(publication: *const c_void, payload: *mut c_void) -> i32 {
+        // SAFETY: the caller supplies an aligned, live publication slot.
+        let publication = unsafe { &*publication.cast::<Self>() };
+        if publication.published.load(Ordering::Acquire) {
+            return black_box(libc::EAGAIN);
         }
         // SAFETY: exclusive gate ownership and unpublished state prevent any
-        // competing writer or reader of this storage. No existing value drops.
-        unsafe { self.value.get().cast::<RegionResult>().write(value) };
-        self.published.store(true, Ordering::Release);
-        Ok(())
+        // competing writer or reader. The initialized, disjoint payload moves
+        // once; the caller promises not to read or drop its former storage.
+        unsafe {
+            publication
+                .value
+                .get()
+                .cast::<RegionResult>()
+                .write(payload.cast::<RegionResult>().read());
+        }
+        publication.published.store(true, Ordering::Release);
+        black_box(0)
     }
 }
 
@@ -170,6 +238,22 @@ impl ToolRegion {
     /// An interrupted or concurrent initialization returns EAGAIN without
     /// waiting. Successfully published owners and retained errors are reused.
     pub fn reserve() -> io::Result<&'static Self> {
+        // The version-one layout below is expressed in 4096-byte pages
+        // (bitmap words, control offset, guard placement). On a host
+        // whose runtime page size differs it would misplace every
+        // guard and mprotect boundary, so refuse by name instead of
+        // reinterpreting the layout. A page-size-generic layout is
+        // its own change.
+        let runtime_page = NativeIsa::page_size()?;
+        if runtime_page != PAGE as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "tool region layout requires {PAGE}-byte pages; \
+                     this host uses {runtime_page}-byte pages"
+                ),
+            ));
+        }
         if REGION.get().is_none() {
             let _initializing = InitializationGuard::acquire()?;
             if REGION.get().is_none() {
@@ -188,8 +272,8 @@ impl ToolRegion {
     }
 
     fn reserve_inner() -> Result<Self, i32> {
-        // Linux x86-64 has 4096-byte base pages, including huge-page hosts.
-        // Do not reinterpret the fixed layout using a runtime-sized page.
+        // reserve() has refused every non-4096 runtime page size by
+        // name, so the fixed layout's page unit is exact here.
         let result = unsafe {
             raw_syscall6(
                 libc::SYS_mmap,
@@ -520,7 +604,7 @@ impl Drop for StackLease {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64"))]
 #[path = "tool_region_tests.rs"]
 mod tests;
 
@@ -801,15 +885,34 @@ mod mapped_image {
                 }
             }
             let rsp: usize;
+            #[cfg(target_arch = "x86_64")]
             unsafe {
                 core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nostack, preserves_flags))
             };
+            #[cfg(target_arch = "aarch64")]
+            unsafe {
+                core::arch::asm!("mov {}, sp", out(reg) rsp, options(nostack, preserves_flags))
+            };
+            // Thread-local base: FS base via arch_prctl on x86-64, the
+            // TPIDR_EL0 system register on aarch64.
             let mut fs = 0_usize;
+            #[cfg(target_arch = "x86_64")]
             let fs_result = unsafe {
                 raw_syscall6(
                     libc::SYS_arch_prctl,
                     [0x1003, (&raw mut fs) as u64, 0, 0, 0, 0],
                 )
+            };
+            #[cfg(target_arch = "aarch64")]
+            let fs_result = {
+                unsafe {
+                    core::arch::asm!(
+                        "mrs {}, tpidr_el0",
+                        out(reg) fs,
+                        options(nostack, preserves_flags)
+                    )
+                };
+                0
             };
             if fs_result != 0 {
                 return Err(libc::EINVAL);

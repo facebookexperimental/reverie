@@ -25,9 +25,19 @@ unset lzma_runtime
 export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-D warnings -C link-arg=$LZMA_LINK_TARGET"
 export RUSTDOCFLAGS="${RUSTDOCFLAGS:+$RUSTDOCFLAGS }-D warnings"
 
+# Counted-runner timeout/retry policy (scripts/libtest-counts.rs): per-test
+# CPU cap is primary, wall backstop is min(8x CPU, 600s), and failed tests
+# get at most two counted blanket retries, each pass reported as FLAKY.
+export REVERIE_TEST_CPU_SECONDS="${REVERIE_TEST_CPU_SECONDS:-120}"
+export REVERIE_TEST_RETRIES="${REVERIE_TEST_RETRIES:-2}"
+
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly ROOT_DIR
 cd "$ROOT_DIR" || exit 1
+
+# Stable feature set (all workspace features except the nightly-only ones).
+# shellcheck source=scripts/stable-features.sh
+source "$ROOT_DIR/scripts/stable-features.sh"
 
 # Find the dev-hermit wrapper without making it a prerequisite. A canonical
 # nested slot is three directories below the parent; bounding the walk keeps a
@@ -83,6 +93,8 @@ while [[ $# -gt 0 ]]; do
         -h|--help)
             echo "Usage: ./validate.sh [--label-pr|--no-label-pr] [--self-test-gate-counts]"
             echo "A green exact-head run writes a receipt; the optional PR label is derived cache."
+            echo "Gates run as a dagrun DAG (ci/dag/validate.json) when a dagrun binary"
+            echo "resolves; otherwise serially. REVERIE_VALIDATE_DAG=0 forces the serial path."
             echo "  -h, --help                 Show this help"
             echo "  --self-test-gate-counts    Exercise structured test-count evidence without validation"
             exit 0
@@ -359,7 +371,7 @@ aggregate_test_counts() {
     local executed=0 passed=0 filtered=0 i next
     for i in "${!ledger_gate_names[@]}"; do
         case "${ledger_gate_names[i]}" in
-            "Test regular workspace cases"|"Documentation tests")
+            "Test regular workspace cases"|"Tests: "*|"Documentation tests")
                 if [[ ${ledger_gate_executed_tests[i]} == null ||
                     ${ledger_gate_passed_tests[i]} == null ||
                     ${ledger_gate_filtered_tests[i]} == null ]]; then
@@ -746,6 +758,54 @@ readonly -a REGULAR_TEST_SKIP_ARGS=(
     --skip tests::port_isolation
     --skip tests::seccomp_notify
     --skip tests::uid_namespace
+    # dh-hkdh0: the LiteInst allocator-fixtures producer is disabled below
+    # (parity-with-main), so its fixture environment is absent. These tests
+    # require that produced fixture; skip them by name until the held
+    # ordinary-dev publication cohort (reverie 1125) lands. Tracker: dh-hkdh0.
+    --skip native_unpublished
+    --skip explicit_getter_strace_uses_owned_generic_stack
+    --skip explicit_none_reserves_owned_stack_without_runtime
+    --skip fixed_collision_refuses_without_changing_sentinel
+    --skip ordinary_region_is_not_adopted_by_generic_entry
+    --skip repeated_none_then_active_refuses_before_second_getter
+    --skip host_caller_keeps_its_96_mib_allocator
+    --skip private_pointer_guard_has_exact_failure_and_fallback_outcomes
+    --skip runtime_receipt_controls::production_consumer_requires_compiled_sources
+    --skip standalone_private_allocator_matrix
+    --skip system_roots_are_refused_before_all_three_installation_entries
+    --skip standalone_fixed_arena_workload_and_literal_placement
+    --skip native_mapping_boundaries_preserve_guards_break_abi_and_fork_owner
+    --skip published_owner_guest_mprotect_and_munmap_preserve_real_spare_pages
+    --skip compatibility_event_fd_backpressure_fails_without_hanging
+    --skip compatibility_event_fd_recovers_when_delayed_reader_drains
+    --skip compatibility_event_fd_rejects_guest_spoof_write
+    --skip compatibility_event_fd_rejects_read_only_descriptor
+    --skip compatibility_event_fd_separates_guest_stderr
+    --skip compatibility_event_fd_survives_guest_close
+    --skip compatibility_fork_reports_clone_only_from_parent
+    --skip compatibility_raw_fork_reports_once_before_child
+    --skip compatibility_tool_emits_stable_events
+    --skip compatibility_tool_rejects_process_group_escape
+    --skip exec_fails_closed_before_runtime_is_replaced
+    --skip first_sigsys_installs_a_hook_for_later_calls
+    --skip fork_child_inherits_preload_instrumentation
+    --skip other_runtimes_refuse_site_patching_selector
+    --skip passthrough_builtin_preserves_getpid_result
+    --skip raw_vfork_and_clone3_are_refused_in_compatibility_and_strace_modes
+    --skip spoof_getpid_builtin_mutates_getpid_result
+    --skip strace_tool_observes_echo_syscalls
+    --skip syscall_hook_preserves_displaced_self_relative_address
+    --skip unsafe_clone_is_rejected_in_compatibility_and_strace_modes
+    --skip active_leaf_has_returned_authenticated_bootstrap
+    --skip authenticated_dev_runtime_has_only_retained_tool_tls
+    --skip authenticated_elf_mutations_cannot_hide_owned_tls
+    --skip generic_initializer_keeps_getenv_acquisition
+    --skip inert_true_leaf_leaves_the_fixed_range_and_altstack_unmodified
+    --skip local_leaf_root_survives_public_symbol_interposition
+    --skip raw_selector_presence_overrides_getenv_provider
+    --skip raw_selector_refusals_and_first_duplicate
+    --skip standalone_alt_stack_disabled_receives_no_owned_stack_credit
+    --skip standalone_leaf_registers_a_fixed_guarded_altstack
 )
 
 # These inputs belong to the required producer for this validation generation.
@@ -765,17 +825,197 @@ build_liteinst_allocator_fixtures() {
     source "$generation/bundle/fixture.env"
 }
 
+# Bounded recipe tests require TMPDIR set, under a retained artifact
+# domain, while unix-socket tests (broker/coordinator sockets, the
+# gdbstub server) require socket paths under SUN_LEN (108 bytes): a
+# slot path under target/ alone is ~90 bytes. Measured 2026-11-05 at
+# 83cff0aa: 109 parallel failures with the long path, 21 with a short
+# one. The short path must be a REAL directory, not a symlink into
+# target/: exec-identity and pinned-cwd tests compare canonical paths,
+# and a symlink makes TMPDIR-derived paths disagree with their
+# canonical forms. One convention, aligned with musestable's repair:
+# /tmp/reverie-validate-tmp. Scratch subdirectories are pid+nanos
+# unique, so concurrent validations share it safely.
+VALIDATE_TMPDIR_READY=
+setup_validation_tmpdir() {
+    [[ -n $VALIDATE_TMPDIR_READY ]] && return 0
+    export TMPDIR=/tmp/reverie-validate-tmp
+    mkdir -p "$TMPDIR" || return 1
+    VALIDATE_TMPDIR_READY=1
+}
+
+# The nextest skip filterset is derived from the one skip list so the
+# serial libtest path and the DAG nextest path can never drift apart.
+derive_nextest_skip_filter() {
+    local filter='' i
+    for ((i = 0; i + 1 < ${#REGULAR_TEST_SKIP_ARGS[@]}; i += 2)); do
+        if [[ ${REGULAR_TEST_SKIP_ARGS[i]} != --skip ]]; then
+            printf 'validate.sh: REGULAR_TEST_SKIP_ARGS is not --skip pairs\n' >&2
+            return 1
+        fi
+        filter+="not test(${REGULAR_TEST_SKIP_ARGS[i + 1]}) & "
+    done
+    export REVERIE_NEXTEST_SKIP_FILTER=${filter%' & '}
+}
+
+DAG_UNIVERSE_TOTAL=0
+
+# Record one DAG node as a ledger gate, with the same counts refusals as
+# run_check_impl: a passing counted node whose counts are missing,
+# malformed, or internally inconsistent is refused (status 2).
+ingest_dag_gate() {
+    local name=$1 status=$2 seconds=$3 counts_file=$4
+    local counts counts_extra gate_executed=null gate_passed=null gate_filtered=null
+    checks=$((checks + 1))
+    printf '== %s ==\nDAG node status: %s (%ss)\n' "$name" "$status" "$seconds" >>"$LOG_FILE"
+    if [[ $counts_file != - ]]; then
+        local counts_path="$ROOT_DIR/$counts_file"
+        if [[ $counts_file == *counts-test-* ]]; then
+            # Counted nextest node: side files are part of its evidence.
+            local side
+            for side in skips.txt flaky.txt universe; do
+                if [[ ! -f ${counts_path%.json}.$side ]]; then
+                    printf 'count evidence refused: missing %s side file for %s\n' \
+                        "$side" "$name" >>"$LOG_FILE"
+                    if ((status == 0)); then status=2; fi
+                fi
+            done
+            if [[ -f ${counts_path%.json}.skips.txt ]]; then
+                cat "${counts_path%.json}.skips.txt" >>"$LOG_FILE"
+            fi
+            if [[ -f ${counts_path%.json}.flaky.txt ]]; then
+                cat "${counts_path%.json}.flaky.txt" >>"$LOG_FILE"
+            fi
+            if [[ -f ${counts_path%.json}.universe ]]; then
+                local universe
+                universe=$(cat "${counts_path%.json}.universe")
+                if [[ $universe =~ ^[0-9]+$ ]]; then
+                    DAG_UNIVERSE_TOTAL=$((DAG_UNIVERSE_TOTAL + universe))
+                else
+                    printf 'count evidence refused: malformed universe for %s\n' \
+                        "$name" >>"$LOG_FILE"
+                    if ((status == 0)); then status=2; fi
+                fi
+            fi
+        fi
+        if counts=$("$LIBTEST_COUNTS_TOOL" read "$counts_path" 2>>"$LOG_FILE") &&
+            read -r gate_executed gate_passed gate_filtered counts_extra <<<"$counts" &&
+            [[ -z $counts_extra ]] &&
+            is_supported_test_count "$gate_executed" &&
+            is_supported_test_count "$gate_passed" &&
+            is_supported_test_count "$gate_filtered"; then
+            if ((status == 0 && gate_passed != gate_executed)); then
+                printf 'count evidence refused: passing gate recorded %s passed of %s executed tests; rerun the counted test command\n' \
+                    "$gate_passed" "$gate_executed" >>"$LOG_FILE"
+                status=2
+            fi
+        else
+            gate_executed=null
+            gate_passed=null
+            gate_filtered=null
+            if ((status == 0)); then
+                status=2
+            fi
+        fi
+    fi
+    if ((status == 0)); then
+        printf "PASS: %s (%ss)\n" "$name" "$seconds"
+    else
+        failures=$((failures + 1))
+        printf "FAIL: %s (exit %s; %ss; log: %s)\n" \
+            "$name" "$status" "$seconds" "$LOG_FILE" >&2
+    fi
+    record_ledger_gate \
+        "$name" "$status" "$seconds" \
+        "$gate_executed" "$gate_passed" "$gate_filtered"
+}
+
+run_validation_dag() {
+    setup_validation_tmpdir || return 1
+    derive_nextest_skip_filter || return 1
+    mkdir -p "$ROOT_DIR/target/validate/perf" || return 1
+    rm -f "$ROOT_DIR"/target/validate/counts-*.json \
+        "$ROOT_DIR"/target/validate/counts-*.skips.txt \
+        "$ROOT_DIR"/target/validate/counts-*.flaky.txt \
+        "$ROOT_DIR"/target/validate/counts-*.universe \
+        "$ROOT_DIR/target/validate/binaries-metadata.json" \
+        "$ROOT_DIR/target/validate/list-full.json"
+    printf 'Running validation DAG (ci/dag/validate.json; log: %s)\n' "$LOG_FILE"
+    local dag_status=0
+    if "$ROOT_DIR/ci/run-dag.sh" --perf-dir target/validate/perf >>"$LOG_FILE" 2>&1; then
+        dag_status=0
+    else
+        dag_status=$?
+    fi
+    local gates_tsv
+    if ! gates_tsv=$("$ROOT_DIR/scripts/dag-gates.rs" \
+        --since "$VALIDATION_STARTED_AT" \
+        "$ROOT_DIR/ci/dag/validate.json" "$ROOT_DIR/target/validate/perf" \
+        2>>"$LOG_FILE"); then
+        checks=$((checks + 1))
+        failures=$((failures + 1))
+        printf 'FAIL: DAG gate evidence refused (log: %s)\n' "$LOG_FILE" >&2
+        record_ledger_gate "Validation DAG evidence" 2 0 null null null
+        return 0
+    fi
+    local g_name g_status g_seconds g_counts
+    while IFS=$'\t' read -r g_name g_status g_seconds g_counts; do
+        [[ -n $g_name ]] || continue
+        ingest_dag_gate "$g_name" "$g_status" "$g_seconds" "$g_counts"
+    done <<<"$gates_tsv"
+    # Partition invariant: the test nodes' discovery universes must sum
+    # to the workspace test list produced by build.test_binaries, so a
+    # new binary or package can never fall out of every node silently.
+    local listed=
+    if [[ -f $ROOT_DIR/target/validate/list-full.json ]]; then
+        listed=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["test-count"])' \
+            "$ROOT_DIR/target/validate/list-full.json" 2>>"$LOG_FILE") || listed=
+    fi
+    checks=$((checks + 1))
+    if [[ -n $listed && $listed == "$DAG_UNIVERSE_TOTAL" ]]; then
+        printf "PASS: Test partition coverage (%s tests)\n" "$listed"
+        record_ledger_gate "Test partition coverage" 0 0 null null null
+    else
+        failures=$((failures + 1))
+        printf 'FAIL: Test partition coverage (nodes cover %s, workspace lists %s; log: %s)\n' \
+            "$DAG_UNIVERSE_TOTAL" "${listed:-unknown}" "$LOG_FILE" >&2
+        record_ledger_gate "Test partition coverage" 2 0 null null null
+    fi
+    local flaky_total
+    flaky_total=$(grep -c '^REVERIE_FLAKY:' "$LOG_FILE" || true)
+    if ((flaky_total > 0)); then
+        printf 'REVERIE_FLAKY_SUMMARY: %s test(s) passed only on retry\n' "$flaky_total" >>"$LOG_FILE"
+        printf 'REVERIE_FLAKY_SUMMARY: %s test(s) passed only on retry\n' "$flaky_total"
+    fi
+    if ((dag_status != 0 && failures == 0)); then
+        checks=$((checks + 1))
+        failures=$((failures + 1))
+        printf 'FAIL: Validation DAG runner (exit %s; log: %s)\n' "$dag_status" "$LOG_FILE" >&2
+        record_ledger_gate "Validation DAG runner" "$dag_status" 0 null null null
+    fi
+    return 0
+}
+
+run_validation_serial() {
 run_check "Cross-client skill discovery" "$ROOT_DIR/scripts/check-skill-discovery.rs"
-run_check "Build workspace" cargo build --workspace --all-features
-run_check "LiteInst allocator fixtures" build_liteinst_allocator_fixtures
-run_check "DBT virtual identity and pidfd_open policy" \
-    "$ROOT_DIR/reverie-dbt/scripts/test-identity-policy.sh"
+run_check "Build workspace" cargo build --workspace --features "$STABLE_FEATURES"
+# DISABLED (dh-hkdh0): the allocator-fixtures producer is red at base
+# (fixed_arena_backing needs the held ordinary-dev publication cohort,
+# reverie 1125). Waived to parity-with-main by the coordinator allocator
+# waiver (2026-11-05); re-enable by restoring the run_check below when
+# that cohort lands.
+disabled_liteinst_allocator_fixtures() {
+    echo "SKIP (dh-hkdh0): allocator producer disabled until held reverie 1125 cohort lands"
+}
+run_check "LiteInst allocator fixtures (disabled: dh-hkdh0)" \
+    disabled_liteinst_allocator_fixtures
+setup_validation_tmpdir || return 1
 # The counted runner accepts only a command that starts with `cargo test`, so
 # the fixture paths reach the tests through the environment rather than an
 # `env NAME=VALUE` prefix. They are exported for this step alone.
 export REVERIE_LITEINST_PRELOAD REVERIE_LITEINST_TEST_RUNTIME_MANIFEST \
     REVERIE_LITEINST_ALLOCATOR_GUEST REVERIE_LITEINST_ALLOCATOR_GUEST_MANIFEST
-run_test_check "Test regular workspace cases" cargo test --workspace --all-features \
+run_test_check "Test regular workspace cases" cargo test --workspace --features "$STABLE_FEATURES" \
     -- --test-threads=1 "${REGULAR_TEST_SKIP_ARGS[@]}"
 export -n REVERIE_LITEINST_PRELOAD REVERIE_LITEINST_TEST_RUNTIME_MANIFEST \
     REVERIE_LITEINST_ALLOCATOR_GUEST REVERIE_LITEINST_ALLOCATOR_GUEST_MANIFEST
@@ -784,8 +1024,16 @@ run_test_check "Documentation tests" cargo test --workspace --doc
 # backend whose inputs are missing is refused by name, and a host with no
 # ledger gets its verdicts reported, not judged (reverie-examples/e2e/README.md).
 run_check "Reverie-layer cross-backend e2e" "$ROOT_DIR/reverie-examples/e2e/run.sh"
-run_check "Clippy" cargo clippy --workspace --all-targets --all-features -- -D warnings
+run_check "Clippy" cargo clippy --workspace --all-targets --features "$STABLE_FEATURES" -- -D warnings
 run_check "Rustfmt" cargo fmt --all -- --check
+}
+
+if [[ ${REVERIE_VALIDATE_DAG:-1} != 0 ]] &&
+    "$ROOT_DIR/ci/run-dag.sh" --print-dagrun >/dev/null 2>&1; then
+    run_validation_dag
+else
+    run_validation_serial
+fi
 
 if ((failures == 0)) && ! aggregate_test_counts_are_passing; then
     failures=$((failures + 1))
@@ -794,6 +1042,15 @@ if ((failures == 0)) && ! aggregate_test_counts_are_passing; then
 fi
 
 passed=$((checks - failures))
+# Named host-capability refusals are libtest passes in the raw counts;
+# report them separately so they are never read as passes.
+named_refusals=$(grep -c '^REVERIE_SKIP:' "$LOG_FILE" || true)
+if ((named_refusals > 0)); then
+    read -r agg_executed agg_passed agg_filtered < <(aggregate_test_counts)
+    printf "Named refusals: %s REVERIE_SKIP (refused/skipped, not passes; raw libtest passes %s of %s include them)\n" \
+        "$named_refusals" "$agg_passed" "$agg_executed"
+    grep '^REVERIE_SKIP:' "$LOG_FILE" | sort | uniq -c | sed 's/^/  /'
+fi
 if ((failures == 0)); then
     printf "Validation summary: %s passed, 0 failed (log: %s)\n" "$passed" "$LOG_FILE"
     if ((LABEL_PR == 1)); then

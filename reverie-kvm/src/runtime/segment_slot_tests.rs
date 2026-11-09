@@ -78,14 +78,14 @@ where
         signal_guard: SignalGuard::Ordinary,
     };
     // No instruction executes in this initialized VM control.
-    let registers = unsafe { std::mem::zeroed() };
+    let registers: libc::user_regs_struct = unsafe { std::mem::zeroed() };
     let mut guest = KvmGuest::new(
         pid,
         pid,
         tool.clone(),
         memory,
         &[],
-        registers,
+        &registers,
         &mut state,
         &mut adapter,
         global.as_ref(),
@@ -339,7 +339,7 @@ fn inject_through(
         GuestMemory::new(0, STACK_CAPACITY).unwrap(),
         &[],
         // This mock has no vCPU and never accesses registers.
-        unsafe { std::mem::zeroed() },
+        &crate::runtime::ZEROED_USER_REGISTERS,
         &mut state,
         provider,
         global.as_ref(),

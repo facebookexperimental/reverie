@@ -33,16 +33,42 @@ impl PreparedMapping<'_> {
     /// The caller must qualify initializer writes to guest stack/AT_RANDOM; this
     /// path preserves them, rather than restoring a historical stack snapshot.
     pub async unsafe fn handover_and_wait(&mut self, deadline: Instant) -> Result<ExitStatus> {
-        let result = self.handover_inner(deadline).await;
+        // SAFETY: this finite wrapper has the same complete caller contract.
+        unsafe {
+            self.handover_and_wait_with_live_deadline(deadline, Some(deadline))
+                .await
+        }
+    }
+
+    /// Restore and detach under a finite operation bound, then await this Guest.
+    /// `None` removes only the detached Guest execution deadline. Restoration,
+    /// native gate calls and detach still use `operation_deadline` unchanged.
+    /// Cancellation retains the same wait driver; it never acknowledges reap.
+    ///
+    /// # Safety
+    /// The complete contract of [`Self::handover_and_wait`] applies. The caller
+    /// keeps the original owner and services alive through unbounded execution
+    /// and performs original-owner retirement on error, panic or future drop.
+    pub async unsafe fn handover_and_wait_with_live_deadline(
+        &mut self,
+        operation_deadline: Instant,
+        live_deadline: Option<Instant>,
+    ) -> Result<ExitStatus> {
+        let result = self.handover_inner(operation_deadline, live_deadline).await;
         if result.is_err() {
             self.entry.failed = true;
         }
         result
     }
 
-    async fn handover_inner(&mut self, deadline: Instant) -> Result<ExitStatus> {
-        self.restore_guest_for_release(deadline).await?;
-        self.detach_restored_guest(deadline).await
+    async fn handover_inner(
+        &mut self,
+        operation_deadline: Instant,
+        live_deadline: Option<Instant>,
+    ) -> Result<ExitStatus> {
+        self.restore_guest_for_release(operation_deadline).await?;
+        self.detach_restored_guest(operation_deadline, live_deadline)
+            .await
     }
 
     // Shared real restoration only. The observational successor retains the
@@ -217,7 +243,11 @@ impl PreparedMapping<'_> {
         Ok(())
     }
 
-    async fn detach_restored_guest(&mut self, deadline: Instant) -> Result<ExitStatus> {
+    async fn detach_restored_guest(
+        &mut self,
+        deadline: Instant,
+        live_deadline: Option<Instant>,
+    ) -> Result<ExitStatus> {
         self.entry_thread()?;
         if Instant::now() >= deadline {
             return Err("mapped_handover_deadline_before_detach".into());
@@ -234,7 +264,7 @@ impl PreparedMapping<'_> {
                 return Err(error.into());
             }
         }
-        self.handover_wait_next(deadline).await?;
+        self.handover_wait_next_with_deadline(live_deadline).await?;
         match self.entry.terminal {
             Some(status) => {
                 self.owner.record_detached_terminal(status);
@@ -302,33 +332,53 @@ impl PreparedMapping<'_> {
     }
 
     pub(super) async fn handover_wait_next(&mut self, deadline: Instant) -> Result<()> {
-        let waited = tokio::time::timeout_at(
-            tokio::time::Instant::from_std(deadline),
-            poll_fn(|cx| match self.entry.wait.as_mut() {
-                Some(driver) => driver.poll_on_ptracer_thread(cx),
-                None => std::task::Poll::Ready(Err(safeptrace::OwnedWaitError::Completed)),
-            }),
+        self.handover_wait_next_with_deadline(Some(deadline)).await
+    }
+
+    async fn handover_wait_next_with_deadline(&mut self, deadline: Option<Instant>) -> Result<()> {
+        let waited = wait_retained_driver(
+            &mut self.entry.wait,
+            deadline,
+            "mapped_handover_wait_deadline",
         )
-        .await
-        .map_err(|_| "mapped_handover_wait_deadline")?;
+        .await?;
         match waited {
-            Ok(Wait::Stopped(task, event)) => {
+            Wait::Stopped(task, event) => {
                 self.task = Some(task);
                 self.entry.event = Some(event); // retain NewChild before refusal
                 self.entry.wait = None;
             }
-            Ok(Wait::Exited(pid, status)) => {
+            Wait::Exited(pid, status) => {
                 self.entry.terminal = Some(status);
                 self.entry.wait = None;
                 if pid != self.owner.generation.pid() {
                     return Err("mapped_handover_foreign_terminal".into());
                 }
             }
-            Err(error) => return Err(error.into()), // driver retained
         }
         self.entry_thread()?;
         Ok(())
     }
+}
+
+// Only borrows the original driver. No event/generation is recaptured and a
+// timeout, wait error or dropped future leaves that driver in its caller.
+// Once Ready, the caller stores the actual returned task/event synchronously.
+pub(super) async fn wait_retained_driver(
+    driver: &mut Option<PtracerWaitDriver>,
+    deadline: Option<Instant>,
+    timeout_error: &'static str,
+) -> Result<Wait> {
+    let wait = poll_fn(|cx| match driver.as_mut() {
+        Some(driver) => driver.poll_on_ptracer_thread(cx),
+        None => std::task::Poll::Ready(Err(safeptrace::OwnedWaitError::Completed)),
+    });
+    Ok(match deadline {
+        Some(deadline) => tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), wait)
+            .await
+            .map_err(|_| timeout_error)??,
+        None => wait.await?,
+    })
 }
 
 fn restoration_facts(control: &[u8; 384], original_mask: u64, reserved: u64) -> bool {
@@ -370,5 +420,163 @@ mod tests {
             assert!(!restoration_facts(&changed, mask, reserved), "field {i}");
         }
         assert!(!restoration_facts(&c, mask, 0));
+    }
+    // A real direct child held by its stdin pipe, with exactly one retained
+    // safeptrace driver. std::process never waits after that driver is created.
+    // These controls exercise the shared poll mechanism, not recovery/restart
+    // of a failed PreparedMapping: its public finite API still latches failure.
+    struct HeldChild {
+        stdin: Option<std::process::ChildStdin>,
+        cleanup: safeptrace::PtracerTerminalCleanup,
+        retired: bool,
+    }
+
+    impl HeldChild {
+        fn spawn() -> (Self, Option<PtracerWaitDriver>) {
+            use std::process::Command;
+            use std::process::Stdio;
+            let mut child = Command::new("/bin/cat")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn held wait fixture");
+            let running = match safeptrace::Running::new_on_ptracer_thread(
+                safeptrace::Pid::from_raw(child.id() as i32),
+            ) {
+                Ok(running) => running,
+                Err(error) => {
+                    // No original driver exists yet; the spawning owner still
+                    // owns this setup-failure cleanup.
+                    drop(child.stdin.take());
+                    let signal = child.kill();
+                    let deadline = Instant::now() + std::time::Duration::from_secs(2);
+                    loop {
+                        match child.try_wait() {
+                            Ok(Some(_)) => break,
+                            Ok(None) if Instant::now() < deadline => {
+                                std::thread::sleep(std::time::Duration::from_millis(1));
+                            }
+                            result => panic!(
+                                "capture held fixture: {error}; setup cleanup: {signal:?}, {result:?}"
+                            ),
+                        }
+                    }
+                    panic!("capture held fixture: {error}");
+                }
+            };
+            let held = Self {
+                stdin: child.stdin.take(),
+                cleanup: running.terminal_cleanup_on_ptracer_thread(),
+                retired: false,
+            };
+            let driver = Some(running.wait_owned_on_ptracer_thread().into_driver());
+            drop(child);
+            (held, driver)
+        }
+
+        fn confirm_reap(&mut self) {
+            assert!(
+                self.cleanup
+                    .wait(std::time::Duration::from_secs(2))
+                    .unwrap(),
+                "original cleanup did not confirm retirement"
+            );
+            self.retired = true;
+        }
+    }
+
+    impl Drop for HeldChild {
+        fn drop(&mut self) {
+            if !self.retired {
+                // Descriptor-directed cancellation and original-owner progress;
+                // no numeric recapture or second std::process wait/reaper.
+                let signal = self.cleanup.shared().request_sigkill();
+                let reaped = self.cleanup.wait(std::time::Duration::from_secs(2));
+                if std::thread::panicking() {
+                    if reaped != Ok(true) {
+                        eprintln!(
+                            "held fixture cleanup failed: signal={signal:?}, reap={reaped:?}"
+                        );
+                    }
+                } else {
+                    assert!(signal.is_ok() || signal == Err(syscalls::Errno::ESRCH));
+                    assert_eq!(reaped, Ok(true), "fixture cleanup did not retire");
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn finite_wait_expires_but_live_wait_retains_same_driver_past_that_deadline() {
+        use std::time::Duration;
+        let (mut held, mut driver) = HeldChild::spawn();
+        let generation = driver.as_ref().unwrap().generation().unwrap();
+        let deadline = Instant::now() + Duration::from_millis(20);
+        let error =
+            wait_retained_driver(&mut driver, Some(deadline), "mapped_handover_wait_deadline")
+                .await
+                .unwrap_err();
+        assert_eq!(error.to_string(), "mapped_handover_wait_deadline");
+        assert_eq!(
+            driver.as_ref().unwrap().generation(),
+            Some(generation.clone())
+        );
+        assert!(Instant::now() >= deadline);
+        {
+            let live = wait_retained_driver(&mut driver, None, "unused_live_deadline");
+            tokio::pin!(live);
+            tokio::select! {
+                result = &mut live => panic!("held live child returned early: {result:?}"),
+                _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+            }
+        } // Cancel only the borrowed future, keeping its exact original driver.
+        assert_eq!(
+            driver.as_ref().unwrap().generation(),
+            Some(generation.clone())
+        );
+        drop(held.stdin.take());
+        let event = tokio::time::timeout(
+            Duration::from_secs(2),
+            wait_retained_driver(&mut driver, None, "unused_live_deadline"),
+        )
+        .await
+        .expect("outer fixture bound")
+        .unwrap();
+        let (pid, status) = event.assume_exited();
+        assert_eq!(pid, generation.pid());
+        assert_eq!(status, ExitStatus::SUCCESS);
+        held.confirm_reap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_live_wait_keeps_original_kill_reap_and_terminal_status() {
+        use std::time::Duration;
+        let (mut held, mut driver) = HeldChild::spawn();
+        let generation = driver.as_ref().unwrap().generation().unwrap();
+        {
+            let live = wait_retained_driver(&mut driver, None, "unused_live_deadline");
+            tokio::pin!(live);
+            tokio::select! {
+                result = &mut live => panic!("held live child returned early: {result:?}"),
+                _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+            }
+        }
+        assert_eq!(
+            driver.as_ref().unwrap().generation(),
+            Some(generation.clone())
+        );
+        held.cleanup.shared().request_sigkill().unwrap();
+        let event = tokio::time::timeout(
+            Duration::from_secs(2),
+            wait_retained_driver(&mut driver, None, "unused_live_deadline"),
+        )
+        .await
+        .expect("outer fixture bound")
+        .unwrap();
+        let (pid, status) = event.assume_exited();
+        assert_eq!(pid, generation.pid());
+        assert_eq!(status, ExitStatus::Signaled(Signal::SIGKILL, false));
+        held.confirm_reap();
     }
 }

@@ -43,6 +43,10 @@ impl From<FileStat> for HostioStat {
         HostioStat {
             st_dev: stat.st_dev as u32,
             st_ino: stat.st_ino as u32,
+            #[allow(
+                clippy::unnecessary_cast,
+                reason = "st_nlink is u64 on x86_64 and u32 on aarch64"
+            )]
             st_nlink: stat.st_nlink as u32,
             st_mode: stat.st_mode,
             st_uid: stat.st_uid,

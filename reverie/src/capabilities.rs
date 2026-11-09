@@ -36,6 +36,80 @@
 //! `capabilities()` on backends that do not implement that trait. Those return
 //! the matching constant. The tests below pin every constant field by field.
 //!
+//! # What every backend does
+//!
+//! A fact that holds on every backend is part of the backend contract, not a
+//! field here. Three that used to be fields:
+//!
+//! - **Registers a `syscall` instruction clobbers.** On x86-64, when a guest
+//!   resumes at the instruction after its `syscall`, `%rcx` holds that
+//!   instruction's address and `%r11` the guest's RFLAGS, as after a native
+//!   Linux return, however the backend serviced the call. `rt_sigreturn` is not
+//!   such a resumption (it restores both registers from the signal frame), nor
+//!   is a successful `execve`, whose new image starts afresh.
+//!   - reverie-ptrace leaves the kernel's values, and restores the guest's own
+//!     after an injected call. With e9patch preprocessing, the frame a
+//!     rewritten site restores is given the native values (the site's address
+//!     plus two, and the guest's RFLAGS) before the call is dispatched.
+//!   - reverie-dbt's client sets them after each call it skips or completes,
+//!     except the private call its signal continuation makes, whose registers
+//!     are the interrupted context's.
+//!   - reverie-kvm returns with SYSRETQ from the staged return address and
+//!     RFLAGS.
+//!   - The in-guest backends (LiteInst) set them from the context captured at
+//!     the guest's `syscall`: its address plus two, and the RFLAGS saved there.
+//!   - SaBRe's rewriter loads them before its handler runs: the trampoline of
+//!     each rewritten `syscall` sets `%r11` from RFLAGS and `%rcx` to the site's
+//!     next address (SaBRe's rewriter.c, now in hermit-3rdparty-patching).
+//!
+//!   Two known exceptions remain:
+//!   - On reverie-kvm, a signal handler whose frame is set up at a syscall's
+//!     return starts with the handler's address in `%rcx` and the handler's
+//!     RFLAGS in `%r11`, where Linux leaves the interrupted call's values.
+//!   - On reverie-dbt, the child of a `vfork` starts with a DynamoRIO address
+//!     in `%rcx` (the same value in four runs of one probe). DynamoRIO delivers
+//!     no post-syscall event to it, so the client's correction does not reach
+//!     it. The child of a shared-memory clone takes the same path and has not
+//!     been measured.
+//!
+//! - **`madvise`.** A tool may forward any advice to the backend. A backend
+//!   that does not implement an advice whose effect, or whose possible
+//!   failure, a program can observe (what a fork copies, what a core dump
+//!   holds, a punched hole) answers it with ENOSYS and the typed refusal
+//!   [`UnsupportedOperation::MemoryAdvice`](crate::UnsupportedOperation::MemoryAdvice),
+//!   which names the advice. Every backend implements `MADV_DONTNEED` over
+//!   anonymous memory: private pages then read as zeros, and shared contents
+//!   survive.
+//!   - reverie-ptrace, e9patch preprocessing, reverie-dbt, the in-guest
+//!     backends (LiteInst) and SaBRe let the host kernel perform the call.
+//!   - reverie-kvm implements `MADV_DONTNEED` over anonymous memory; refuses
+//!     it over a private file mapping, and refuses the fork, core-dump,
+//!     locked-page, hole-punching, population, collapse, memory-failure and
+//!     guard-region advice; answers an advice Linux does not know with EINVAL;
+//!     and answers the rest (the access-pattern hints, `MADV_FREE`,
+//!     `MADV_COLD`, `MADV_PAGEOUT`, the KSM and huge-page advice) as hints it
+//!     does not act on, with Linux's result for the range. Linux may refuse
+//!     some of those for a mapping of the wrong kind, which reverie-kvm does
+//!     not model.
+//!
+//! - **When a `vfork` child registers.** When the tool injects a `clone`,
+//!   `clone3` or `vfork` with `CLONE_VFORK`, a failed call's child never
+//!   registers with the tool, and a successful call's child may register
+//!   before or after the parent's call returns to the tool. A missing child at
+//!   the parent's return is therefore not a failed call. A successful call's
+//!   child can also be torn down before it starts (killed before its first
+//!   stop), and then never registers: the tool learns of that only through
+//!   the child's own teardown, so a tool that waits for the child waits for
+//!   its registration, the call's failure, or that teardown.
+//!   - reverie-ptrace: the kernel keeps the parent inside the call until the
+//!     child execs or exits, so the child has registered before the parent's
+//!     call returns.
+//!   - reverie-kvm, likewise, keeps the parent inside the call until the
+//!     child execs or exits (and the child's changes to its copy of the
+//!     parent's private memory went back), and starts the child while the
+//!     call is pending, so the child has registered before the parent's call
+//!     returns.
+//!
 //! # Adding a field
 //!
 //! The struct is `#[non_exhaustive]`, so code outside this crate cannot build
@@ -67,13 +141,6 @@ pub struct BackendCapabilities {
     /// handed across the exec explicitly.
     pub rediscovers_descriptors_after_exec: bool,
 
-    /// Scheduler turns for I/O on a tool-managed internal pipe (a pipe that is
-    /// physically nonblocking while the guest sees it as blocking) include a
-    /// descriptor-discovery turn whose count depends on host timing. The tool
-    /// marks those turns so their count is not treated as guest-visible
-    /// progress.
-    pub internal_pipe_turns_are_host_timed: bool,
-
     /// A zero-timeout poll by a task that owns a loopback connection must
     /// yield its turn to another runnable task first; without that yield a
     /// poller can starve the loopback peer it is waiting for.
@@ -83,11 +150,6 @@ pub struct BackendCapabilities {
     /// absolute futex deadline may have been computed from the host clock
     /// rather than from the tool's logical clock.
     pub guest_clock_reads_bypass_backend: bool,
-
-    /// The backend already returns deterministic values in every register that
-    /// a `syscall` instruction clobbers, so the tool must not write the whole
-    /// register set back after a syscall.
-    pub virtualizes_syscall_clobbers: bool,
 
     /// A pending tool request from a thread that the tool has logically killed
     /// is not resolved by the kernel's exit-group teardown, so the tool must
@@ -107,12 +169,6 @@ pub struct BackendCapabilities {
     /// descriptors still open.
     pub process_exits_complete_asynchronously: bool,
 
-    /// A signal interrupts a blocking syscall that the backend runs outside the
-    /// tool's scheduler, and the interrupted thread's continuation request
-    /// arrives only afterwards. The tool must wait for that continuation
-    /// instead of treating the thread as parked inside its own scheduler.
-    pub signal_interrupts_external_syscalls: bool,
-
     /// The backend reports every process child through the tool's
     /// child-registration callbacks, so the tool's own record of children is
     /// complete. When this is false the tool must not conclude ECHILD from an
@@ -124,6 +180,27 @@ pub struct BackendCapabilities {
     /// the owner-word update to the kernel.
     pub runs_exit_robust_list: bool,
 
+    /// No Linux task exits for a guest thread, so Linux's exit-time walk of a
+    /// thread's robust-futex list (`exit_robust_list`, run by
+    /// `futex_exit_release` and `futex_exec_release`) never runs for one:
+    /// nothing marks an owner word `FUTEX_OWNER_DIED` or wakes its waiter. A
+    /// tool that models robust-futex owner death must make that transition
+    /// itself, with the guest compare-and-exchange
+    /// ([`MemoryAccess::compare_exchange_u32`](crate::syscalls::MemoryAccess::compare_exchange_u32)),
+    /// which such a backend implements. Such a backend also carries an exec
+    /// out itself, so it calls
+    /// [`Tool::handle_exec_commit`](crate::Tool::handle_exec_commit) at each
+    /// exec's point of no return, where the tool makes the walk Linux's
+    /// `futex_exec_release` makes. Never true together with
+    /// `runs_exit_robust_list`: a backend whose kernel walks the list must
+    /// leave the word to that walk, or the word would be marked twice.
+    /// - reverie-ptrace (and e9patch preprocessing, which runs on it),
+    ///   reverie-dbt, the in-guest backends (LiteInst) and SaBRe run every
+    ///   guest thread as a host task, whose exit runs Linux's walk;
+    /// - reverie-kvm runs guest threads on its own vCPUs: their exits are the
+    ///   backend's, and no Linux task exits with them.
+    pub kernel_never_walks_robust_lists: bool,
+
     /// The backend cannot execute a process-directed signal syscall with the
     /// tool's process identifier, so the tool must translate an unambiguous
     /// process target to a specific thread.
@@ -133,21 +210,6 @@ pub struct BackendCapabilities {
     /// parked when another task signals the writer, preserving Linux's signal
     /// mask, disposition and syscall-restart behavior.
     pub supports_parked_write_signal_interruption: bool,
-
-    /// The backend starts a `CLONE_VFORK` child only after the parent's clone
-    /// call has returned to the tool, so the child registers after the parent
-    /// asks to continue. The tool must keep waiting for the late child rather
-    /// than treat its absence as a failed clone.
-    pub defers_vfork_child_registration: bool,
-
-    /// The backend implements guest-visible `madvise` semantics, so the tool
-    /// may forward an `madvise` call to it.
-    pub supports_madvise: bool,
-
-    /// The backend implements `MADV_DONTNEED` (private anonymous pages then
-    /// read as zeros; shared contents survive), so the tool may forward that
-    /// advice even when it may not forward the others (`supports_madvise`).
-    pub supports_madv_dontneed: bool,
 
     /// The backend reports, through
     /// [`GlobalTool::on_backend_process_exited`](crate::GlobalTool::on_backend_process_exited),
@@ -314,7 +376,85 @@ pub struct BackendCapabilities {
     /// still fail closed when the kernel's state disagrees with what the
     /// reports predict.
     pub reports_sigreturns: bool,
+
+    /// How many hardware watchpoints a guest thread can hold at once
+    /// ([`Guest::set_watchpoints`](crate::Guest::set_watchpoints), see
+    /// [`WatchSpec`](crate::WatchSpec)); 0 when the backend sets none.
+    /// Whether a hit can change a timer event is a per-thread fact,
+    /// [`Guest::watch_hits_keep_timer_events`](crate::Guest::watch_hits_keep_timer_events).
+    pub hardware_watchpoints: u8,
+
+    /// [`Guest::backtrace`](crate::Guest::backtrace) unwinds the current
+    /// guest thread's stack and returns its frames. It may still return
+    /// `None` at a particular stop, for example where the thread's registers
+    /// are unavailable. False where it never returns a backtrace, so that a
+    /// tool asked to report a stack at every event of some kind can refuse
+    /// the request before the guest starts, rather than report no stack each
+    /// time.
+    /// - reverie-ptrace (and e9patch preprocessing, which runs on it) unwinds
+    ///   remotely with libunwind;
+    /// - reverie-dbt walks the guest's frame-pointer chain in process;
+    /// - reverie-sabre returns one frame, the site of the trapped syscall;
+    /// - reverie-kvm and reverie-liteinst's in-guest runtime never return one.
+    pub provides_guest_backtraces: bool,
+
+    /// The backend's process signal control (see
+    /// [`provides_process_signal_control`](Self::provides_process_signal_control))
+    /// lets a tool name the new parent of each child of an exiting process:
+    /// after [`ProcessSignalControl::enable_orphan_placement`](crate::ProcessSignalControl::enable_orphan_placement),
+    /// a process's exit leaves its children waiting for
+    /// [`ProcessSignalControl::place_orphans`](crate::ProcessSignalControl::place_orphans),
+    /// which moves each one to a live process of the run (a child subreaper,
+    /// as Linux's `find_new_reaper` chooses one) or to the PID namespace's
+    /// init. A tool that models `PR_SET_CHILD_SUBREAPER` on a backend that
+    /// emulates child waits itself (`emulates_child_waits`) needs this, so
+    /// that the backend's waits, `SIGCHLD` and `getppid` follow the parent the
+    /// tool chose.
+    pub places_orphans: bool,
+
+    /// The parent-death signals the backend's process signal control
+    /// publishes for a tool that decided them
+    /// ([`ProcessSignalControl::publish_parent_death_signal`](crate::ProcessSignalControl::publish_parent_death_signal)),
+    /// as a kernel signal set (bit `n - 1` for signal `n`), each with Linux's
+    /// siginfo to an exact process lifetime; it rejects any other. 0: it
+    /// publishes none. A tool that holds `PR_SET_PDEATHSIG` values itself can
+    /// then send these on a backend whose guest threads no host signal
+    /// reaches, and leave any other to the backend's own `PR_SET_PDEATHSIG`.
+    pub publishable_parent_death_signals: u64,
+
+    /// How the backend counts the RCB clock whose coordinates a tool records
+    /// and replays, or `None` where that counter is not a qualified contract.
+    /// Absent from an older serialized value, which reads as `None`.
+    #[serde(default)]
+    pub rcb_clock_contract: Option<RcbClockContract>,
 }
+
+/// A qualified way of counting the RCB clock.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RcbClockContract {
+    /// A perf counter on the guest thread's own host task, counting its user
+    /// mode only (kernel, hypervisor and guest-mode execution excluded), read
+    /// as the raw count with no offsets: the ptrace backend's timer and clock.
+    PerfCounterOnTargetThreadUserOnly,
+}
+
+/// Bit `signal - 1` of a kernel signal set.
+const fn signal_bit(signal: libc::c_int) -> u64 {
+    1 << (signal - 1)
+}
+
+/// The parent-death signals reverie-kvm's process signal control publishes
+/// (`BackendCapabilities::publishable_parent_death_signals`): every standard
+/// signal (1 to 31), `SIGKILL` included, but `SIGCHLD`, which its signal
+/// queues carry only for a child's exit, and the stop signals (`SIGSTOP`,
+/// `SIGTSTP`, `SIGTTIN`, `SIGTTOU`), as it has no stopped state.
+const KVM_PUBLISHABLE_PARENT_DEATH_SIGNALS: u64 = (signal_bit(32) - 1)
+    & !(signal_bit(libc::SIGCHLD)
+        | signal_bit(libc::SIGSTOP)
+        | signal_bit(libc::SIGTSTP)
+        | signal_bit(libc::SIGTTIN)
+        | signal_bit(libc::SIGTTOU));
 
 impl BackendCapabilities {
     /// `reverie-ptrace`: every guest thread is a host task stopped and resumed
@@ -322,21 +462,16 @@ impl BackendCapabilities {
     pub const PTRACE: Self = Self {
         tool_shares_guest_descriptor_table: false,
         rediscovers_descriptors_after_exec: false,
-        internal_pipe_turns_are_host_timed: false,
         loopback_pollers_yield_to_peers: false,
         guest_clock_reads_bypass_backend: false,
-        virtualizes_syscall_clobbers: false,
         needs_killed_thread_rpc_cancellation: false,
         reports_physical_process_exits: false,
         process_exits_complete_asynchronously: false,
-        signal_interrupts_external_syscalls: false,
         tracks_process_children: true,
         runs_exit_robust_list: true,
+        kernel_never_walks_robust_lists: false,
         requires_thread_directed_process_signals: false,
         supports_parked_write_signal_interruption: true,
-        defers_vfork_child_registration: false,
-        supports_madvise: true,
-        supports_madv_dontneed: true,
         reports_child_exit_publication: true,
         reports_kernel_child_exit_signals: true,
         provides_process_signal_control: false,
@@ -352,6 +487,13 @@ impl BackendCapabilities {
         promotes_open_files_before_native_lifecycle: false,
         // The report reads an x86-64 signal frame.
         reports_sigreturns: cfg!(target_arch = "x86_64"),
+        // DR0-DR3 on x86-64; arm64 watchpoints are not implemented yet.
+        hardware_watchpoints: if cfg!(target_arch = "x86_64") { 4 } else { 0 },
+        provides_guest_backtraces: true,
+        // The kernel re-parents orphans and sends parent-death signals itself.
+        places_orphans: false,
+        publishable_parent_death_signals: 0,
+        rcb_clock_contract: Some(RcbClockContract::PerfCounterOnTargetThreadUserOnly),
     };
 
     /// `reverie-e9patch`: the guest is rewritten ahead of time and then run
@@ -361,6 +503,8 @@ impl BackendCapabilities {
     /// execution), so it does not report sigreturns.
     pub const E9PATCH: Self = Self {
         reports_sigreturns: false,
+        // Not qualified for recorded RCB coordinates.
+        rcb_clock_contract: None,
         ..Self::PTRACE
     };
 
@@ -384,6 +528,10 @@ impl BackendCapabilities {
         runs_guest_code_between_injections: true,
         promotes_open_files_before_native_lifecycle: true,
         reports_sigreturns: false,
+        hardware_watchpoints: 0,
+        provides_guest_backtraces: false,
+        // Not qualified for recorded RCB coordinates.
+        rcb_clock_contract: None,
         ..Self::PTRACE
     };
 
@@ -392,13 +540,10 @@ impl BackendCapabilities {
     pub const SABRE: Self = Self {
         tool_shares_guest_descriptor_table: true,
         rediscovers_descriptors_after_exec: true,
-        internal_pipe_turns_are_host_timed: true,
         loopback_pollers_yield_to_peers: true,
         guest_clock_reads_bypass_backend: true,
-        virtualizes_syscall_clobbers: true,
         needs_killed_thread_rpc_cancellation: true,
         reports_physical_process_exits: true,
-        signal_interrupts_external_syscalls: true,
         runs_exit_robust_list: false,
         supports_parked_write_signal_interruption: false,
         reports_child_exit_publication: false,
@@ -410,6 +555,9 @@ impl BackendCapabilities {
         delivers_preemption_timer_events: false,
         runs_guest_code_between_injections: true,
         reports_sigreturns: false,
+        hardware_watchpoints: 0,
+        // Not qualified for recorded RCB coordinates.
+        rcb_clock_contract: None,
         ..Self::PTRACE
     };
 
@@ -435,6 +583,9 @@ impl BackendCapabilities {
         delivers_preemption_timer_events: false,
         promotes_open_files_before_native_lifecycle: true,
         reports_sigreturns: false,
+        hardware_watchpoints: 0,
+        // Not qualified for recorded RCB coordinates.
+        rcb_clock_contract: None,
         ..Self::PTRACE
     };
 
@@ -443,8 +594,9 @@ impl BackendCapabilities {
     pub const KVM: Self = Self {
         needs_killed_thread_rpc_cancellation: true,
         runs_exit_robust_list: false,
-        defers_vfork_child_registration: true,
-        supports_madvise: false,
+        // Guest threads run on the backend's vCPUs: no Linux task exits with
+        // one, so no kernel walk marks its robust-futex owner words.
+        kernel_never_walks_robust_lists: true,
         provides_process_signal_control: true,
         emulates_child_waits: true,
         reports_child_exit_publication: false,
@@ -455,8 +607,13 @@ impl BackendCapabilities {
         kernel_signal_targets_are_predictable: false,
         host_task_reads_reach_guest_threads: false,
         host_timed_signals_are_physical: false,
-        delivers_preemption_timer_events: false,
         reports_sigreturns: false,
+        hardware_watchpoints: 0,
+        provides_guest_backtraces: false,
+        places_orphans: true,
+        publishable_parent_death_signals: KVM_PUBLISHABLE_PARENT_DEATH_SIGNALS,
+        // Not qualified for recorded RCB coordinates.
+        rcb_clock_contract: None,
         ..Self::PTRACE
     };
 }
@@ -477,21 +634,16 @@ mod tests {
         serde_json::json!({
             "tool_shares_guest_descriptor_table": false,
             "rediscovers_descriptors_after_exec": false,
-            "internal_pipe_turns_are_host_timed": false,
             "loopback_pollers_yield_to_peers": false,
             "guest_clock_reads_bypass_backend": false,
-            "virtualizes_syscall_clobbers": false,
             "needs_killed_thread_rpc_cancellation": false,
             "reports_physical_process_exits": false,
             "process_exits_complete_asynchronously": false,
-            "signal_interrupts_external_syscalls": false,
             "tracks_process_children": true,
             "runs_exit_robust_list": true,
+            "kernel_never_walks_robust_lists": false,
             "requires_thread_directed_process_signals": false,
             "supports_parked_write_signal_interruption": true,
-            "defers_vfork_child_registration": false,
-            "supports_madvise": true,
-            "supports_madv_dontneed": true,
             "reports_child_exit_publication": true,
             "reports_kernel_child_exit_signals": true,
             "provides_process_signal_control": false,
@@ -506,20 +658,24 @@ mod tests {
             "runs_guest_code_between_injections": false,
             "promotes_open_files_before_native_lifecycle": false,
             "reports_sigreturns": cfg!(target_arch = "x86_64"),
+            "hardware_watchpoints": if cfg!(target_arch = "x86_64") { 4 } else { 0 },
+            "provides_guest_backtraces": true,
+            "places_orphans": false,
+            "publishable_parent_death_signals": 0,
+            "rcb_clock_contract": "PerfCounterOnTargetThreadUserOnly",
         })
     }
 
     /// The ptrace table with `changes` applied; every key in `changes` must
     /// already exist and must actually change, so a table cannot list a no-op.
-    /// Off x86-64 ptrace does not report sigreturns either, so there a
-    /// `reports_sigreturns: false` change is the no-op it would be, and is
-    /// dropped.
+    /// Off x86-64 ptrace neither reports sigreturns nor sets watchpoints, so
+    /// there a `reports_sigreturns: false` or `hardware_watchpoints: 0`
+    /// change is the no-op it would be, and is dropped.
     fn ptrace_with(mut changes: serde_json::Value) -> serde_json::Value {
         if !cfg!(target_arch = "x86_64") {
-            changes
-                .as_object_mut()
-                .unwrap()
-                .remove("reports_sigreturns");
+            let changes = changes.as_object_mut().unwrap();
+            changes.remove("reports_sigreturns");
+            changes.remove("hardware_watchpoints");
         }
         let mut table = ptrace_table();
         for (key, value) in changes.as_object().unwrap() {
@@ -543,6 +699,7 @@ mod tests {
             table(BackendCapabilities::E9PATCH),
             ptrace_with(serde_json::json!({
                 "reports_sigreturns": false,
+                "rcb_clock_contract": null,
             }))
         );
     }
@@ -568,6 +725,9 @@ mod tests {
                 "runs_guest_code_between_injections": true,
                 "promotes_open_files_before_native_lifecycle": true,
                 "reports_sigreturns": false,
+                "hardware_watchpoints": 0,
+                "provides_guest_backtraces": false,
+                "rcb_clock_contract": null,
             }))
         );
     }
@@ -579,13 +739,10 @@ mod tests {
             ptrace_with(serde_json::json!({
                 "tool_shares_guest_descriptor_table": true,
                 "rediscovers_descriptors_after_exec": true,
-                "internal_pipe_turns_are_host_timed": true,
                 "loopback_pollers_yield_to_peers": true,
                 "guest_clock_reads_bypass_backend": true,
-                "virtualizes_syscall_clobbers": true,
                 "needs_killed_thread_rpc_cancellation": true,
                 "reports_physical_process_exits": true,
-                "signal_interrupts_external_syscalls": true,
                 "runs_exit_robust_list": false,
                 "supports_parked_write_signal_interruption": false,
                 "reports_child_exit_publication": false,
@@ -597,6 +754,8 @@ mod tests {
                 "delivers_preemption_timer_events": false,
                 "runs_guest_code_between_injections": true,
                 "reports_sigreturns": false,
+                "hardware_watchpoints": 0,
+                "rcb_clock_contract": null,
             }))
         );
     }
@@ -623,6 +782,8 @@ mod tests {
                 "delivers_preemption_timer_events": false,
                 "promotes_open_files_before_native_lifecycle": true,
                 "reports_sigreturns": false,
+                "hardware_watchpoints": 0,
+                "rcb_clock_contract": null,
             }))
         );
     }
@@ -634,8 +795,7 @@ mod tests {
             ptrace_with(serde_json::json!({
                 "needs_killed_thread_rpc_cancellation": true,
                 "runs_exit_robust_list": false,
-                "defers_vfork_child_registration": true,
-                "supports_madvise": false,
+                "kernel_never_walks_robust_lists": true,
                 "provides_process_signal_control": true,
                 "emulates_child_waits": true,
                 "reports_child_exit_publication": false,
@@ -645,9 +805,52 @@ mod tests {
                 "kernel_signal_targets_are_predictable": false,
                 "host_task_reads_reach_guest_threads": false,
                 "host_timed_signals_are_physical": false,
-                "delivers_preemption_timer_events": false,
                 "reports_sigreturns": false,
+                "hardware_watchpoints": 0,
+                "provides_guest_backtraces": false,
+                "places_orphans": true,
+                // Signals 1 to 31 but SIGCHLD (17) and SIGSTOP, SIGTSTP,
+                // SIGTTIN and SIGTTOU (19 to 22).
+                "publishable_parent_death_signals": 0x7fc2_ffff_u64,
+                "rcb_clock_contract": null,
             }))
+        );
+    }
+
+    /// A kernel either walks a dying thread's robust list or never does: no
+    /// constant claims both, so a tool never marks a word that Linux's own
+    /// walk marks again.
+    #[test]
+    fn no_backend_both_runs_and_never_runs_the_kernel_robust_list_walk() {
+        for (name, caps) in [
+            ("PTRACE", BackendCapabilities::PTRACE),
+            ("E9PATCH", BackendCapabilities::E9PATCH),
+            ("LITEINST_IN_GUEST", BackendCapabilities::LITEINST_IN_GUEST),
+            ("SABRE", BackendCapabilities::SABRE),
+            ("DBT", BackendCapabilities::DBT),
+            ("KVM", BackendCapabilities::KVM),
+        ] {
+            assert!(
+                !(caps.runs_exit_robust_list && caps.kernel_never_walks_robust_lists),
+                "{name}"
+            );
+        }
+    }
+
+    /// A value serialized before `rcb_clock_contract` existed reads as no
+    /// qualified RCB clock, never as ptrace's.
+    #[test]
+    fn an_older_serialized_value_has_no_rcb_clock_contract() {
+        let mut older = table(BackendCapabilities::PTRACE);
+        older.as_object_mut().unwrap().remove("rcb_clock_contract");
+        let caps: BackendCapabilities = serde_json::from_value(older).unwrap();
+        assert_eq!(caps.rcb_clock_contract, None);
+        assert_eq!(
+            BackendCapabilities {
+                rcb_clock_contract: BackendCapabilities::PTRACE.rcb_clock_contract,
+                ..caps
+            },
+            BackendCapabilities::PTRACE
         );
     }
 

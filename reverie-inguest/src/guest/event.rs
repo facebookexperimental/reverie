@@ -71,6 +71,18 @@ impl SyscallEvent {
     }
 }
 
+/// Which faulting instructions the Tool subscribes to. Plain data
+/// shared by every architecture; whether a subscription can be
+/// admitted is the native Isa implementation's answer.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct InstructionSubscriptions {
+    /// CPUID, trapped by CPUID faulting where the architecture has it.
+    pub cpuid: bool,
+    /// RDTSC and RDTSCP, trapped by the native TSC faulting control
+    /// where the architecture has it.
+    pub rdtsc: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// The instruction an instruction event is for.
 pub enum InstructionEventKind {

@@ -21,7 +21,6 @@ mod example_tools;
 // TODO-HUMAN-REVIEW(PR-139): Review crate-local strace source reuse.
 pub(crate) use example_tools::config;
 pub(crate) use example_tools::filter;
-pub(crate) use example_tools::global_state;
 
 #[derive(Debug, Default, clap::Args)]
 struct ChaosCliOptions {

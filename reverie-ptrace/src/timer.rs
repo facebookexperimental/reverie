@@ -53,12 +53,13 @@
 //! late notification let the guest pass it.
 //!
 //! Proper use of timers requires that all delivered signals of type
-//! `Timer::signal_type()` be passed through `Timer::handle_signal`, and that
-//! `Timer::observe_event()` be called whenever a Tool-observable reverie event
-//! occurs. A caller that observes a stop before it knows whether the Tool
-//! observes it must pass a stop that the Tool does not observe to
-//! `Timer::disregard_stop()`, and finish what of the active event this
-//! returns with `Timer::continue_stepping()`. Additionally,
+//! `Timer::signal_type()` be passed through `Timer::accept_signal` and
+//! `Timer::deliver_accepted`, and that `Timer::observe_stop()` be called
+//! whenever a Tool-observable reverie event occurs. A caller that observes a
+//! stop before it knows whether the Tool observes it must pass a stop that
+//! the Tool does not observe to `Timer::disregard_stop()`, and finish what of
+//! the active event this returns with `Timer::continue_stepping()`.
+//! Additionally,
 //! `Timer::finalize_requests()` must be called
 //!  - after the end of the tool callback in which the user could have
 //!    requested a timer event, i.e. those with `&mut guest` access.
@@ -74,26 +75,28 @@ use std::sync::OnceLock;
 
 use reverie::Errno;
 use reverie::Pid;
+#[cfg(target_arch = "x86_64")]
 use reverie::RegDisplay;
+#[cfg(target_arch = "x86_64")]
 use reverie::RegDisplayOptions;
 use reverie::Signal;
+use reverie::SkidOvershootDetail;
+use reverie::SkidOvershootKind;
 use reverie::Tid;
 pub use reverie::pmu_config::*;
-#[cfg(target_arch = "x86_64")]
 use reverie::syscalls::Addr;
 #[cfg(target_arch = "x86_64")]
 use reverie::syscalls::AddrMut;
-#[cfg(target_arch = "x86_64")]
 use reverie::syscalls::MemoryAccess;
 use safeptrace::Error as TraceError;
 use safeptrace::Event as TraceEvent;
-#[cfg(target_arch = "x86_64")]
 use safeptrace::Regs;
 use safeptrace::Running;
 use safeptrace::Stopped;
 use safeptrace::Wait;
 use thiserror::Error;
 use tracing::debug;
+#[cfg(target_arch = "x86_64")]
 use tracing::trace;
 use tracing::warn;
 
@@ -136,6 +139,37 @@ const OVERTAKEN_WITH_NOTIFICATION_QUEUED_KEPT: usize = 1024;
 pub(crate) static SECOND_STAGES_ARMED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Precise event notifications programmed halfway (see
+/// [`PmuConfig::halves`]), for tests and measurement.
+pub(crate) static HALVED_STAGES_ARMED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+thread_local! {
+    /// Turns halving on or off on this thread whatever the configuration
+    /// says, so that a test does not depend on the architecture's default.
+    static HALVED_STAGES_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// Makes [`TimerImpl::switch_out`] wait on this thread as where the
+    /// counter's page needs it, whatever this host's page publishes.
+    static SWITCH_OUT_FORCED_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The waits [`TimerImpl::switch_out`] made on this thread.
+    static SWITCH_OUTS_FOR_TEST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether a notification due `notification` RCBs ahead, `margin` short of
+/// its target, is programmed halfway ([`PmuConfig::halves`]).
+fn halves(notification: u64, margin: u64) -> bool {
+    let config = get_pmu_config();
+    #[cfg(test)]
+    if let Some(halve) = HALVED_STAGES_FOR_TEST.get() {
+        return config
+            .clone()
+            .with_halved_stages(halve)
+            .halves(notification, margin);
+    }
+    config.halves(notification, margin)
+}
+
 /// How far one step toward a precise event's target runs the guest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StepUnit {
@@ -146,6 +180,138 @@ pub(crate) enum StepUnit {
     /// target (see [`TimerImpl::step_unit`]).
     #[cfg(target_arch = "x86_64")]
     Block,
+    /// Up to, not including, the first of `stops[..count]` that the guest
+    /// reaches, each marked by a hardware breakpoint, retiring `branches[i]`
+    /// branches on the way to `stops[i]`: none from before a stop point, the
+    /// one branch it starts at otherwise (see [`crate::branch_step`] and
+    /// [`TimerImpl::branch_run`]), the same at either end. A load-exclusive
+    /// sequence run as one unit ([`crate::branch_step::exclusive_sequence`])
+    /// may retire different counts at its two ends.
+    #[cfg(target_arch = "aarch64")]
+    ToBranch {
+        stops: [u64; 2],
+        count: usize,
+        branches: [u64; 2],
+    },
+    /// One instruction (`PTRACE_SINGLESTEP`) that reaches the target, if it
+    /// retires no branch. Unlike [`StepUnit::Instruction`], never run as a
+    /// syscall: the sequence may end at the step's stop, and at an aarch64
+    /// syscall-exit stop x7 holds the stop's direction rather than the
+    /// guest's value, which a Tool reading registers there would see, and
+    /// which an injection there would save and restore. Only this step can
+    /// end a sequence at a syscall: a `syscall` or `svc` retires no counted
+    /// branch (measured on Neoverse V2, where the counter is `BR_RETIRED`:
+    /// no change across 501 `rt_sigreturn` syscall steps), so an earlier
+    /// one never reaches an RCB target. The cost: should this last
+    /// instruction be an aarch64 `rt_sigreturn` that unblocks a queued
+    /// synchronous-class signal, its `SI_USER` report stays queued, as it
+    /// did before syscall steps existed.
+    LastInstruction,
+    /// One `syscall` instruction that can queue the thread a SIGTRAP with a
+    /// code the guest chooses ([`queues_the_thread_a_sigtrap`]), run with
+    /// `PTRACE_SYSCALL` to its entry stop and then to its exit stop
+    /// ([`StepUnit::SyscallExit`]) rather than single-stepped. Single-stepped,
+    /// such a SIGTRAP would be delivered at the step's own stop, in place of
+    /// the step's report, which Linux drops while a SIGTRAP is queued
+    /// (`legacy_queue`), and could not be told from it. At the exit stop the
+    /// thread's queue is read before anything is delivered
+    /// ([`TimerImpl::attempt_single_step`]). Chosen by the timer on x86_64,
+    /// which reads the registers for every step; on aarch64 the caller's step
+    /// function runs such an `svc` this way from the registers its shield
+    /// reads.
+    #[cfg(target_arch = "x86_64")]
+    Syscall,
+    /// From the entry stop of a syscall that a step resumed with
+    /// `PTRACE_SYSCALL` to its exit stop (see [`TimerImpl::attempt_single_step`]).
+    /// The caller's step function chooses `PTRACE_SYSCALL` for a step over a
+    /// guest `rt_sigreturn` that no seccomp stop reports, and for a
+    /// [`StepUnit::Syscall`].
+    SyscallExit,
+    /// From the stop of a signal the kernel took ahead of the step's report,
+    /// back to that report: the signal is resumed while blocked, so the
+    /// kernel queues it again behind the report and runs no instruction
+    /// ([`dequeued_ahead_of_step_report`]).
+    Requeue(Signal),
+}
+
+/// What a stop handed to a step's observer is to the step that reached it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StepStop {
+    /// The step's last stop.
+    Final,
+    /// A stop the step goes on from: the entry stop of a syscall it runs
+    /// (`StepUnit::SyscallExit`), or the stop of a signal it requeues
+    /// (`StepUnit::Requeue`). Whatever the step function changed for the
+    /// step stays in place until its last stop.
+    Passing,
+}
+
+/// The next step and, on x86, its registers at the same owned stop.
+/// Consumed synchronously by the step callback before resuming the task.
+pub(crate) struct StepRequest {
+    pub(crate) unit: StepUnit,
+    /// The registers at the stop the step starts from, for the step's shield;
+    /// `None` for a step that goes on from a step's own stop
+    /// (`StepUnit::SyscallExit`, `StepUnit::Requeue`), which has no shield.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) regs: Option<Regs>,
+}
+
+/// Whether a branch run's counter, `moved` branches on from where it
+/// started, agrees with its decode ([`StepUnit::ToBranch`]'s `stops[..count]`
+/// and `branches`), as [`TimerImpl::check_branch_run`] requires:
+/// - at the run's own breakpoint (`at_breakpoint`, which reads the stop's pc),
+///   exactly the count of the end it stopped at. Where the two ends differ in
+///   count, the pc picks the end, and a pc that cannot be read or is at
+///   neither end fails closed. Otherwise every end has the first end's count,
+///   and the pc is not read;
+/// - at any other stop, no more than the most at any end.
+///
+/// Kept apart from the check, which only aarch64 builds, so that its
+/// arithmetic is tested on every architecture.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+fn branch_run_consistent(
+    stops: [u64; 2],
+    count: usize,
+    branches: [u64; 2],
+    moved: u64,
+    at_breakpoint: Option<impl FnOnce() -> Option<u64>>,
+) -> bool {
+    match at_breakpoint {
+        Some(pc) => {
+            let expected = if count == 2 && branches[0] != branches[1] {
+                pc().and_then(|pc| stops[..count].iter().position(|&stop| stop == pc))
+                    .map(|end| branches[end])
+            } else {
+                Some(branches[0])
+            };
+            expected == Some(moved)
+        }
+        None => moved <= branches[..count].iter().copied().max().unwrap_or(0),
+    }
+}
+
+/// Whether a branch run's SIGTRAP stop ends the stepping as a stop that is
+/// not its breakpoint's report, handed on after the counter check
+/// ([`TimerImpl::check_branch_run`]), rather than going on to the rules every
+/// step's SIGTRAP stop follows. `at_report` says whether the stop is the
+/// run's report (`is_branch_run_report`, which reads the stop); it is not
+/// called for a SIGTRAP that was queued before the run (`sigtrap_queued`).
+///
+/// Such a SIGTRAP is the guest's, whatever its siginfo says. The
+/// breakpoint's trap is forced while it is pending, and Linux drops the trap,
+/// so the stop shows the guest's siginfo at the breakpoint's pc. A thread may
+/// queue itself one with any code, a breakpoint's or a single step's
+/// included. Taken for an interruption, it would reach a guest that blocks
+/// it, and the run's report would be lost. The queued-SIGTRAP rule refuses
+/// one that no process sent by name (`HandleFailure::GuestSigtrap`), as at a
+/// single step.
+///
+/// Kept apart from the match, which only aarch64 builds, so that the
+/// decision is tested on every architecture.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+fn branch_run_stop_ends_stepping(sigtrap_queued: bool, at_report: impl FnOnce() -> bool) -> bool {
+    !sigtrap_queued && !at_report()
 }
 
 /// Steps of each unit taken toward precise event targets, and lookups in the
@@ -153,19 +319,43 @@ pub(crate) enum StepUnit {
 pub(crate) static INSTRUCTION_STEPS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub(crate) static BLOCK_STEPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static BRANCH_RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Branch runs whose counter moved by more branches than their decode
+/// allows, for tests (see [`TimerImpl::check_branch_run`]).
+pub(crate) static BRANCH_RUN_MISMATCHES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Notifications of a timer's own that arrived during its single steps and
+/// were consumed there (see [`TimerImpl::own_notification_during_steps`]),
+/// for tests.
+pub(crate) static OWN_NOTIFICATIONS_DURING_STEPS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Branch runs that ran a load-exclusive sequence as one unit, for tests.
+pub(crate) static EXCLUSIVE_RUNS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 pub(crate) static BLOCK_BOUND_HITS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub(crate) static BLOCK_BOUND_MISSES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 /// When set to `0`, every step toward a precise event's target is a single
-/// instruction step, as before block steps existed. Any other value, or none,
+/// instruction step, as before block steps (x86_64) and branch runs
+/// (aarch64) existed. Any other value, or none,
 /// leaves block steps on. For measurement and as an escape hatch.
+///
+/// On aarch64, a thread's first branch run registers two of its hardware
+/// breakpoint slots, disabled between runs, and they stay registered until
+/// the thread execs or exits: ptrace has no request that unregisters one.
+/// A guest thread that arms breakpoints of its own through
+/// `perf_event_open` after that finds two fewer free slots than natively,
+/// and can get `ENOSPC` where a native run would not. Breakpoints it armed
+/// before are left alone: with fewer than two free slots the thread takes
+/// no branch runs. Setting this to `0` avoids the reservation entirely.
 pub const BLOCK_STEP_ENV: &str = "REVERIE_BLOCK_STEP";
 
 /// When set (to anything), every hit in the block bound cache re-reads the
 /// guest's code and decodes it again, and panics if the result differs from
 /// the cached one. A debug mode: a wrong entry would be a determinism bug.
+#[cfg(target_arch = "x86_64")]
 pub const BLOCK_STEP_VERIFY_CACHE_ENV: &str = "REVERIE_BLOCK_STEP_VERIFY_CACHE";
 
 /// Timers single step every step toward a precise target while this is set,
@@ -299,6 +489,18 @@ struct FirstStage {
     programmed_ns: u64,
     /// The clock of the request.
     programmed_clock: u64,
+}
+
+/// A precise event's notification programmed halfway to where it is due
+/// (see [`PmuConfig::halves`]), whose stop programs the rest.
+#[derive(Debug, Clone, Copy)]
+struct HalvedStage {
+    /// How far short of the target the notification is due.
+    margin: u64,
+    /// For a staged event's first stage (see [`PmuConfig::stages`]), this
+    /// programming, which measures the second stage's margin if its
+    /// notification comes within the first stage margin of the target.
+    first_stage: Option<FirstStage>,
 }
 
 /// `CLOCK_MONOTONIC` in nanoseconds, the clock of `timer`'s sample records,
@@ -450,6 +652,16 @@ pub enum HandleFailure {
     /// this timer. The task is returned unchanged.
     #[error("Pending signal was not for this timer")]
     ImproperSignal(Stopped),
+
+    /// A SIGTRAP of the guest's own was queued for the thread before a step,
+    /// with a code that Reverie's own traps use, so the step's report could
+    /// not be queued and the guest's SIGTRAP could not be told from it: the
+    /// step stopped at it, or at a synchronous-class signal the kernel took
+    /// ahead of it ([`dequeued_ahead_of_step_report`]), or the step that
+    /// reaches the target would queue one ([`queues_the_thread_a_sigtrap`]).
+    /// The caller ends the run with `QueuedSigtrapAtStep` and the site.
+    #[error("A SIGTRAP of the guest's own is queued at a timer step ({1})")]
+    GuestSigtrap(Stopped, &'static str),
 }
 
 #[cfg(test)]
@@ -526,6 +738,16 @@ impl Timer {
         if let Some(timer) = self.inner_mut_noinit() {
             timer.finish_initial_exec();
         }
+    }
+
+    /// Whether a stop the Tool does not observe ([`Timer::disregard_stop`])
+    /// always leaves this thread's timer events as they were: true when the
+    /// thread's precise timer maps its overflow records, or when it has no
+    /// timer at all. Without the records such a stop within the keep margin
+    /// of a precise event's target cancels the event.
+    pub(crate) fn keeps_events_across_disregarded_stops(&self) -> bool {
+        self.inner_noinit()
+            .is_none_or(|timer| timer.timer.has_sample_records())
     }
 
     /// Read the thread-local deterministic clock. Represents total elapsed RCBs
@@ -608,6 +830,8 @@ impl Timer {
     /// Hands on the active event whose live notification
     /// [`Timer::take_overflow_signal`] took, to be finished with
     /// [`Timer::continue_stepping`] before the guest is resumed.
+    // Only the x86_64 injected-syscall trap hands a taken notification on.
+    #[cfg(target_arch = "x86_64")]
     pub(crate) fn take_notification(&mut self) -> Option<Unfinished> {
         self.inner_mut_noinit()
             .and_then(|timer| timer.take_notification())
@@ -622,6 +846,8 @@ impl Timer {
     /// overshoot, as a stop that cancels it is. An event already delivered,
     /// or already decided by a stop, is not recorded again, whatever the
     /// guest's clock.
+    // Only the x86_64 injected-syscall trap retires an event this way.
+    #[cfg(target_arch = "x86_64")]
     pub(crate) fn retire(&mut self) -> Result<(), Errno> {
         match self.inner_mut_noinit() {
             Some(timer) => timer.retire(),
@@ -707,13 +933,24 @@ impl Timer {
     /// unless the thread exits before anything decides the event (see
     /// [`Timer::settle_at_exit`]); one that cancels the event instead records
     /// it at once, as does [`Timer::retire`].
-    pub fn observe_event(&mut self, event: &TraceEvent) {
+    ///
+    /// The stop is `task`'s, by `event`, and the clock it may read must be
+    /// current first: the counter's page is current only once the thread is
+    /// switched out (see `PerfCounter::ctr_value_fast`), and a plain signal,
+    /// seccomp or group stop is decoded with no ptrace request that would
+    /// wait for that. A request is made only where the page needs it, and
+    /// only when the event reads the clock: while a precise event is
+    /// scheduled.
+    pub fn observe_stop(&mut self, task: &Stopped, event: &TraceEvent) {
         if let Some(t) = self.inner_mut_noinit() {
+            if t.reads_clock_at(event) {
+                t.switch_out(task);
+            }
             t.observe_event(event);
         }
     }
 
-    /// Undoes what the latest [`Timer::observe_event`] did to the active
+    /// Undoes what the latest [`Timer::observe_stop`] did to the active
     /// event, for a stop that turns out to be one the Tool does not observe,
     /// such as a trap that Reverie consumes without a Tool callback. Such a
     /// stop neither cancels the event nor ends its single steps.
@@ -761,12 +998,19 @@ impl Timer {
     ///
     /// Past the period the notification may already be pending, may have
     /// been taken as single steps began, or may have been lost, and which of
-    /// these holds at the stop is decided by host timing. The period is the
-    /// target less this processor's skid margin, so it too depends on the
-    /// host. The keep margin is the same on every supported processor and
-    /// places the decision at or before every processor's period, so the
-    /// guest's clock alone gives the stop its outcome. A kept event's
+    /// these holds at the stop is decided by host timing. A whole
+    /// programming's period is the target less this processor's skid margin,
+    /// so it too depends on the host. The keep margin is the same on every
+    /// supported processor and places the decision at or before every
+    /// processor's whole period, so the guest's clock alone gives the stop
+    /// its outcome. A halved programming (see [`PmuConfig::halves`]) passes
+    /// its period far earlier, but its notification only re-arms the rest of
+    /// the event, and a stop that finds it pending or lost re-arms the same
+    /// rest, so host timing still decides nothing there. A kept event's
     /// programming is checked as [`Timer::disregard_stop`] describes.
+    // Only the x86_64 injected-syscall trap's rt_sigreturn disregards a stop
+    // this way.
+    #[cfg(target_arch = "x86_64")]
     pub(crate) fn disregard_stop_before_period(&mut self) -> Result<(), Errno> {
         match self.inner_mut_noinit() {
             Some(timer) => {
@@ -822,6 +1066,10 @@ impl Timer {
     /// [`Timer::disregard_stop_before_period`] does: a request whose
     /// notification stays blocked would also leave an event whose single
     /// steps the stop ended with nothing to drive it.
+    // ptrace reports rt_sigreturn only on x86_64 (see
+    // `BackendCapabilities::reports_sigreturns`); reports on aarch64 would
+    // need this too.
+    #[cfg(target_arch = "x86_64")]
     pub(crate) fn disregard_sigreturn_stop(
         &mut self,
         notified_after_return: bool,
@@ -954,31 +1202,16 @@ impl Timer {
         }
     }
 
-    /// When a signal is received, this method drives the timer event to
-    /// completion via single stepping, after checking that the signal was meant
-    /// for this specific timer. This *must* be called when a timer signal is
-    /// received for correctness.
-    ///
-    /// Preconditions: task is in signal-delivery-stop.
-    /// Postconditions: if a signal meant for this timer was the cause of the
-    /// stop, the tracee will be at the precise instruction the timer event
-    /// should fire at, unless signal delivery was already past the target. In
-    /// that case the overshoot is recorded and the event fires at the observed
-    /// counter.
-    /// Drives a timer signal using caller-owned stopped-state transitions.
-    ///
-    /// The caller uses this hook to keep its exact-generation root-stop lease
-    /// synchronized across the precise timer's internal single steps, and to
-    /// observe each step's wait, for example to retain a decoded new child.
-    pub(crate) async fn handle_signal(
-        &mut self,
-        task: Stopped,
-        step: &mut (dyn FnMut(Stopped, StepUnit) -> Result<Running, TraceError> + Send),
-        observe: &mut (dyn FnMut(&Wait) -> Result<(), TraceError> + Send),
-        waits: &std::sync::Arc<PtracerWaitOwner>,
-    ) -> Result<Stopped, HandleFailure> {
+    /// Checks that the signal
+    /// stop `task` is this timer's notification and that its event is to be
+    /// delivered, and returns the task to deliver it from
+    /// ([`Timer::deliver_accepted`]). The stop's siginfo is read here, so
+    /// the caller may move the thread off the signal stop between the two
+    /// (with requests that retire no guest branch) before the event is
+    /// delivered.
+    pub(crate) fn accept_signal(&mut self, task: Stopped) -> Result<Stopped, HandleFailure> {
         match self.inner_mut_noinit() {
-            Some(t) => t.handle_signal(task, step, observe, waits).await,
+            Some(t) => t.accept_signal(task),
             None => {
                 warn!("Stray SIGSTKFLT indicates a bug!");
                 Err(HandleFailure::ImproperSignal(task))
@@ -986,15 +1219,40 @@ impl Timer {
         }
     }
 
+    /// Drives the event of a signal [`Timer::accept_signal`] accepted, with
+    /// caller-owned stopped-state transitions: the caller keeps its
+    /// exact-generation root-stop lease synchronized across the precise
+    /// timer's internal single steps (`step`) and observes each step's wait
+    /// (`observe`), for example to retain a decoded new child.
+    ///
+    /// Postconditions: the tracee is at the precise instruction the timer
+    /// event should fire at, unless signal delivery was already past the
+    /// target. In that case the overshoot is recorded and the event fires at
+    /// the observed counter.
+    pub(crate) async fn deliver_accepted(
+        &mut self,
+        task: Stopped,
+        step: &mut (dyn FnMut(Stopped, StepRequest) -> Result<Running, TraceError> + Send),
+        observe: &mut (dyn FnMut(&Wait, StepStop) -> Result<(), TraceError> + Send),
+        waits: &std::sync::Arc<PtracerWaitOwner>,
+    ) -> Result<Stopped, HandleFailure> {
+        match self.inner_mut_noinit() {
+            Some(t) => t.deliver(task, step, observe, waits).await,
+            // Only an initialized timer accepts a signal.
+            None => Err(HandleFailure::ImproperSignal(task)),
+        }
+    }
+
     /// Finishes what of the active event a disregarded stop left unfinished,
-    /// as [`Timer::handle_signal`] would have finished it. The task is in the
-    /// disregarded stop, and the result is as for [`Timer::handle_signal`].
+    /// as [`Timer::deliver_accepted`] would have finished it. The task is in
+    /// the disregarded stop, and the result is as for
+    /// [`Timer::deliver_accepted`].
     pub(crate) async fn continue_stepping(
         &mut self,
         task: Stopped,
         unfinished: Unfinished,
-        step: &mut (dyn FnMut(Stopped, StepUnit) -> Result<Running, TraceError> + Send),
-        observe: &mut (dyn FnMut(&Wait) -> Result<(), TraceError> + Send),
+        step: &mut (dyn FnMut(Stopped, StepRequest) -> Result<Running, TraceError> + Send),
+        observe: &mut (dyn FnMut(&Wait, StepStop) -> Result<(), TraceError> + Send),
         waits: &std::sync::Arc<PtracerWaitOwner>,
     ) -> Result<Stopped, HandleFailure> {
         match self.inner_mut_noinit() {
@@ -1056,7 +1314,7 @@ pub(crate) struct HostTimedTimerEvents {
     pub preempted_overflow: u64,
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64"))]
 impl HostTimedTimerEvents {
     /// The number of host-timed outcomes of every kind.
     pub fn total(&self) -> u64 {
@@ -1066,7 +1324,7 @@ impl HostTimedTimerEvents {
 
 /// Takes, and resets to zero, the host-timed timer outcomes counted on this
 /// thread.
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64"))]
 pub(crate) fn take_host_timed_timer_events() -> HostTimedTimerEvents {
     HOST_TIMED_TIMER_EVENTS.with(|events| events.take())
 }
@@ -1119,18 +1377,52 @@ struct TimerImpl {
     /// programmed. Consuming notifications does not clear it.
     programming_overflowed: bool,
 
+    /// Overflows of the current programming that the kernel has recorded and
+    /// whose notification no stop has yet taken. The kernel writes an
+    /// overflow's record before it queues the notification, so a notification
+    /// of this counter's own is one of these; one beyond them is not the
+    /// kernel's (see [`TimerImpl::own_notification_during_steps`]). Collecting
+    /// records adds to it, each notification of the timer's own that a stop
+    /// takes uses one up, and it starts again from zero at every programming
+    /// and once an event's steps reach their target, so that what one
+    /// programming recorded cannot account for a signal after it.
+    unnotified_overflows: u64,
+
+    /// The clock at which the programming of the active event's latest
+    /// successful request (or second stage) overflows `timer`, or `None` if
+    /// it programmed no overflow, as for an artificial notification or a
+    /// held initial-command request. The request sets it once
+    /// `prepare_notification` succeeds, from the clock it reads with the
+    /// thread stopped; a request that fails leaves the active event, and
+    /// this, as they were. Unlike `overflow_period`, it outlives the
+    /// programming, so that a skid overshoot of its event, found once
+    /// stepping has disabled `timer`, can say where the overflow was due
+    /// (see [`reverie::SkidOvershootDetail`]).
+    overflow_point: Option<u64>,
+
     /// How many RCBs short of the active precise event's target its latest
-    /// programming put the notification: the first stage margin while a
+    /// programming put the notification, or, for a halved programming, its
+    /// last one (see [`PmuConfig::halves`]): the first stage margin while a
     /// staged event's first stage is programmed, and at most that (see
     /// [`PmuConfig::stages`]).
     event_margin: u64,
 
     /// The programming of the active precise event's first stage, if it is
-    /// staged and that programming's notification has not been delivered.
+    /// staged, programmed whole, and that programming's notification has not
+    /// been delivered. A halved first stage is in `halved`.
     first_stage: Option<FirstStage>,
+
+    /// The active precise event's notification, if it is programmed halfway
+    /// and has not been delivered.
+    halved: Option<HalvedStage>,
     /// Decoded block bounds by code address (see [`BlockBounds`]).
     #[cfg(target_arch = "x86_64")]
     block_bounds: BlockBounds,
+    /// Whether this thread's steps toward precise targets are single steps
+    /// only: a branch run's counter check failed, or its hardware breakpoints
+    /// could not be used (see [`TimerImpl::branch_run`]).
+    #[cfg(target_arch = "aarch64")]
+    branch_runs_off: bool,
 
     initial_command: InitialCommand,
 
@@ -1225,6 +1517,7 @@ enum Interruption {
 
 /// A precise event that a reported `rt_sigreturn` found undelivered (see
 /// [`Timer::disregard_sigreturn_stop`]).
+#[cfg(target_arch = "x86_64")]
 #[derive(Debug, Copy, Clone)]
 struct UndeliveredEvent {
     clock_target: u64,
@@ -1265,6 +1558,39 @@ struct MissedTarget {
     /// overflow records, where a queued notification cannot be told from a
     /// lost one.
     notification_queued: bool,
+    /// What the overflow records showed when the stop found the delivery
+    /// point reached.
+    evidence: OverflowEvidence,
+}
+
+/// What [`TimerImpl::overflow_evidence`] found of the latest programming at
+/// a skid overshoot: the fields of [`reverie::SkidOvershootDetail`] that the
+/// overflow records give.
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+struct OverflowEvidence {
+    overflow_point: Option<u64>,
+    overflow_recorded: Option<bool>,
+    sample_age_ns: Option<u64>,
+}
+
+impl OverflowEvidence {
+    fn detail(
+        self,
+        tid: Tid,
+        kind: SkidOvershootKind,
+        rcb_actual: u64,
+        rcb_target: u64,
+    ) -> SkidOvershootDetail {
+        SkidOvershootDetail {
+            tid,
+            kind,
+            rcb_target,
+            rcb_actual,
+            overflow_point: self.overflow_point,
+            overflow_recorded: self.overflow_recorded,
+            sample_age_ns: self.sample_age_ns,
+        }
+    }
 }
 
 /// An overflow notification of this thread's timer, taken at an injected
@@ -1322,10 +1648,17 @@ impl ActiveEvent {
         match self {
             ActiveEvent::Precise {
                 clock_target,
-                offset: _,
+                offset,
             } => {
                 if clock_target.saturating_sub(curr_clock) > max_single_step_count {
-                    Some(TimerEventRequest::Precise(*clock_target - curr_clock))
+                    // The same event, its instruction offset included:
+                    // without the offset it would be delivered at the target
+                    // branch.
+                    let rcbs = *clock_target - curr_clock;
+                    Some(match *offset {
+                        0 => TimerEventRequest::Precise(rcbs),
+                        offset => TimerEventRequest::PreciseInstruction(rcbs, offset),
+                    })
                 } else {
                     None
                 }
@@ -1409,6 +1742,26 @@ impl ClockCounter {
         }
     }
 
+    /// Brings the counter to `rcbs`, the clock now, after the guest ran one
+    /// instruction outside the steps: gdb's step over a breakpoint that a
+    /// step ran into. The interrupted step counted the breakpoint's `int3`
+    /// as an instruction, which then stands for the instruction it
+    /// replaced. So only a conditional branch the replaced instruction
+    /// retired short of the target is counted, as a step counts it
+    /// (`single_step_with_clock`); at the target the counter holds its
+    /// count and counts instructions, the `int3` among them. A clock that
+    /// has not moved changes nothing, as for every stop where the guest ran
+    /// nothing outside the steps. Where the breakpoint was removed instead
+    /// of stepped over (by gdb, or by Reverie in a process gdb does not
+    /// follow), the replaced instruction has not run yet and is counted
+    /// twice, so an instruction offset past the target, which no in-tree
+    /// Tool requests, lands one instruction early.
+    fn catch_up(&mut self, rcbs: u64) {
+        if self.rcbs < self.target_rcb && rcbs > self.rcbs {
+            self.single_step_with_clock(rcbs);
+        }
+    }
+
     /// If a counter behind a given (rcb, instr) pair.
     ///
     /// Note: this is not always comparable. [None] will be returned in this case
@@ -1425,6 +1778,46 @@ impl ClockCounter {
 
     fn rcbs(&self) -> u64 {
         self.rcbs
+    }
+}
+
+/// Where the guest stands in the controller's PID namespaces.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GuestPidNamespace {
+    /// The guest shares the controller's PID namespace.
+    Same,
+    /// The guest is in a descendant of the controller's PID namespace.
+    Descendant,
+    /// The kernel has no PID namespaces, so both are in its only one.
+    Single,
+}
+
+/// Whether a marker `SI_TKILL` whose sender reads as `sender` came from the
+/// controller `controller`. Linux reports a sender from an ancestor PID
+/// namespace as 0, so with the guest in a descendant namespace only 0 matches.
+fn sent_by_controller(
+    sender: libc::pid_t,
+    controller: libc::pid_t,
+    guest: GuestPidNamespace,
+) -> bool {
+    match guest {
+        GuestPidNamespace::Descendant => sender == 0,
+        GuestPidNamespace::Same | GuestPidNamespace::Single => sender == controller,
+    }
+}
+
+/// The PID namespace that `ns_dir`, a `/proc/<task>/ns` directory, names, or
+/// `None` on a kernel without PID namespaces: there the directory lists `mnt`,
+/// as it always does, but no `pid` (`ns_entries`, fs/proc/namespaces.c). Any
+/// other failure, such as a procfs in which this task has no PID, keeps the
+/// error of the `pid` lookup.
+fn pid_namespace_of(ns_dir: &std::path::Path) -> nix::Result<Option<nix::sys::stat::FileStat>> {
+    match nix::sys::stat::stat(&ns_dir.join("pid")) {
+        Ok(namespace) => Ok(Some(namespace)),
+        Err(nix::errno::Errno::ENOENT) => nix::sys::stat::stat(&ns_dir.join("mnt"))
+            .map(|_| None)
+            .map_err(|_| nix::errno::Errno::ENOENT),
+        Err(error) => Err(error),
     }
 }
 
@@ -1538,10 +1931,15 @@ impl TimerImpl {
             overflow_period: None,
             overflow_recorded: false,
             programming_overflowed: false,
+            unnotified_overflows: 0,
+            overflow_point: None,
             event_margin: get_pmu_config().skid_margin(),
             first_stage: None,
+            halved: None,
             #[cfg(target_arch = "x86_64")]
             block_bounds: BlockBounds::default(),
+            #[cfg(target_arch = "aarch64")]
+            branch_runs_off: false,
             initial_command: if initial_command {
                 InitialCommand::WaitingForExec
             } else {
@@ -1568,7 +1966,7 @@ impl TimerImpl {
 
     pub fn request_event(&mut self, evt: TimerEventRequest) -> Result<(), Errno> {
         let config = get_pmu_config();
-        let (delivery, margin) = match evt {
+        let (delivery, margin, staged) = match evt {
             TimerEventRequest::Precise(ticks) | TimerEventRequest::PreciseInstruction(ticks, _) => {
                 let staged =
                     self.initial_command == InitialCommand::Ordinary && config.stages(ticks);
@@ -1579,9 +1977,10 @@ impl TimerImpl {
                     } else {
                         config.skid_margin()
                     },
+                    staged,
                 )
             }
-            TimerEventRequest::Imprecise(ticks) => (ticks, 0),
+            TimerEventRequest::Imprecise(ticks) => (ticks, 0, false),
         };
         let notification = delivery.saturating_sub(margin);
         if delivery == 0 {
@@ -1594,31 +1993,31 @@ impl TimerImpl {
         self.recheck_kept_programming();
         self.armed_programming = None;
         self.first_stage = None;
+        self.halved = None;
         if self.initial_command != InitialCommand::Ordinary {
             self.event_margin = margin;
+            self.overflow_point = None;
             self.event = Self::event_at(evt, self.read_clock() + delivery);
             self.held_initial_event = Some(self.event);
             self.set_status(EventStatus::Scheduled);
             debug_assert!(!self.send_artificial_signal);
             return Ok(());
         }
-        self.prepare_notification(notification)?;
+        if matches!(evt, TimerEventRequest::Imprecise(_)) {
+            self.prepare_notification(notification)?;
+        } else {
+            self.program_notification(notification, margin, staged)?;
+        }
         self.event_margin = margin;
-        self.event = Self::event_at(evt, self.read_clock() + delivery);
+        // The thread is stopped, so the clock is the programming's.
+        let clock = self.read_clock();
+        self.overflow_point = self.overflow_period.map(|period| clock + period);
+        self.event = Self::event_at(evt, clock + delivery);
         self.set_status(EventStatus::Scheduled);
         if kept_programming_checks() {
-            // The thread is stopped, so the clock is the request's.
-            self.armed_programming = self.overflow_period.map(|period| ArmedProgramming {
-                overflow_point: self.read_clock() + period,
+            self.armed_programming = self.overflow_point.map(|overflow_point| ArmedProgramming {
+                overflow_point,
                 programmings: self.timer.programmings(),
-            });
-        }
-        if margin > config.skid_margin() && self.overflow_period.is_some() {
-            // The guest has not run since the programming, so the time from
-            // here to its overflow is at least the time it ran.
-            self.first_stage = Some(FirstStage {
-                programmed_ns: monotonic_ns(),
-                programmed_clock: self.read_clock(),
             });
         }
         Ok(())
@@ -1660,23 +2059,166 @@ impl TimerImpl {
         if remaining <= margin.saturating_add(SINGLESTEP_TIMEOUT_RCBS) {
             return Ok(false);
         }
+        self.rearm(clock, remaining, margin, false)?;
+        SECOND_STAGES_ARMED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(true)
+    }
+
+    /// Programs the active precise event, stopped at `clock` with `remaining`
+    /// RCBs to its target, again: its notification `margin` short of the
+    /// target (see [`Self::program_notification`]). Only the programming
+    /// changes: the event, its target and offset, is the one requested.
+    fn rearm(
+        &mut self,
+        clock: u64,
+        remaining: u64,
+        margin: u64,
+        first_stage: bool,
+    ) -> Result<(), Errno> {
         #[cfg(test)]
         {
             self.preempted_overflow_counted = false;
         }
         self.recheck_kept_programming();
         self.armed_programming = None;
-        self.prepare_notification(remaining - margin)?;
+        self.program_notification(remaining - margin, margin, first_stage)?;
+        self.overflow_point = self.overflow_period.map(|period| clock + period);
         self.event_margin = margin;
         self.set_status(EventStatus::Scheduled);
         if kept_programming_checks() {
-            self.armed_programming = self.overflow_period.map(|period| ArmedProgramming {
-                overflow_point: clock + period,
+            self.armed_programming = self.overflow_point.map(|overflow_point| ArmedProgramming {
+                overflow_point,
                 programmings: self.timer.programmings(),
             });
         }
-        SECOND_STAGES_ARMED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Programs the active precise event's notification `notification` RCBs
+    /// ahead, `margin` short of its target, or halfway there (see
+    /// [`PmuConfig::halves`]), whose stop programs the rest
+    /// ([`Self::rearm_halved`]). A staged event's `first_stage` is recorded
+    /// for the measurement of its second stage (see
+    /// [`Self::rearm_second_stage`]).
+    fn program_notification(
+        &mut self,
+        notification: u64,
+        margin: u64,
+        first_stage: bool,
+    ) -> Result<(), Errno> {
+        let halve = halves(notification, margin);
+        self.prepare_notification(if halve {
+            notification / 2
+        } else {
+            notification
+        })?;
+        // The guest has not run since the programming, so the time from here
+        // to its overflow is at least the time it ran.
+        let programmed = (first_stage && self.overflow_period.is_some()).then(|| FirstStage {
+            programmed_ns: monotonic_ns(),
+            programmed_clock: self.read_clock(),
+        });
+        if halve {
+            self.halved = Some(HalvedStage {
+                margin,
+                first_stage: programmed,
+            });
+            self.first_stage = None;
+            HALVED_STAGES_ARMED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            self.halved = None;
+            self.first_stage = programmed;
+        }
+        Ok(())
+    }
+
+    /// Re-arms the active precise event, found at `clock` by the notification
+    /// of its `halved` programming, or by a stop that found that notification
+    /// lost, at the rest of its distance: halved again while
+    /// [`PmuConfig::halves`] says so, then whole. Returns whether it re-armed
+    /// the event. Within the margin plus an artificial notification's steps
+    /// of the target, as after an absorbed overflow (see
+    /// [`PmuConfig::halves`]), the event is delivered from there as a whole
+    /// programming's notification is, after a staged event's first stage
+    /// arms its second stage.
+    fn rearm_halved(&mut self, halved: HalvedStage, clock: u64) -> Result<bool, Errno> {
+        let ActiveEvent::Precise { clock_target, .. } = self.event else {
+            return Ok(false);
+        };
+        let remaining = clock_target.saturating_sub(clock);
+        debug!(
+            margin = halved.margin,
+            remaining, "Halved notification of a precise timer event"
+        );
+        if remaining <= halved.margin.saturating_add(SINGLESTEP_TIMEOUT_RCBS) {
+            return match halved.first_stage {
+                Some(first_stage) => {
+                    self.rearm_second_stage(first_stage, clock, self.timer.last_sample_time())
+                }
+                None => Ok(false),
+            };
+        }
+        self.rearm(
+            clock,
+            remaining,
+            halved.margin,
+            halved.first_stage.is_some(),
+        )?;
         Ok(true)
+    }
+
+    /// At a notification that finds the guest's clock `ctr` more than the
+    /// programming's steps short of the active event's target (a spurious
+    /// wakeup), requests the same event again, from `ctr`, and returns the
+    /// request's result; otherwise returns `None`.
+    fn reschedule_spurious_wakeup(&mut self, ctr: u64) -> Option<Result<(), Errno>> {
+        let request = self
+            .event
+            .reschedule_if_spurious_wakeup(ctr, self.max_single_step_count())?;
+        debug!("Spurious wakeup - rescheduling new timer event");
+        Some(self.request_event(request))
+    }
+
+    /// What a notification found at `ctr`, before any step toward the target,
+    /// does first (see [`Self::deliver`]): a halved programming's re-arms the
+    /// rest of the event, as a first stage does, with no Tool callback, since
+    /// it comes before the target by design and is no spurious wakeup;
+    /// otherwise one too far from the target reschedules the event; otherwise
+    /// a staged event's first stage arms its second (`first_stage`). Returns
+    /// whether the event was re-armed, so that the guest resumes toward the
+    /// same target with no Tool callback.
+    fn rearm_short_of_target(&mut self, ctr: u64, first_stage: Option<FirstStage>) -> bool {
+        if let Some(halved) = self.halved.take() {
+            match self.rearm_halved(halved, ctr) {
+                Ok(true) => return true,
+                Ok(false) => {}
+                Err(errno) => warn!(
+                    "Attempted to re-arm a halved precise timer notification, but failed with - {:?}. A panic will likely follow",
+                    errno
+                ),
+            }
+        } else if let Some(rescheduled) = self.reschedule_spurious_wakeup(ctr) {
+            if let Err(errno) = rescheduled {
+                warn!(
+                    "Attempted to reschedule a timer signal after an early wakeup, but failed with - {:?}. A panic will likely follow",
+                    errno
+                );
+            } else {
+                return true;
+            };
+        } else if let Some(first_stage) = first_stage {
+            // As after a spurious wakeup, the guest resumes with no Tool
+            // callback, toward the same target.
+            match self.rearm_second_stage(first_stage, ctr, self.timer.last_sample_time()) {
+                Ok(true) => return true,
+                Ok(false) => {}
+                Err(errno) => warn!(
+                    "Attempted to re-arm a staged precise timer event at its second stage, but failed with - {:?}; single stepping from the first stage",
+                    errno
+                ),
+            }
+        }
+        false
     }
 
     /// The most single steps the active precise event's latest programming
@@ -1710,6 +2252,7 @@ impl TimerImpl {
         // overflows is still to be handled.
         self.collect_overflow_records();
         self.programming_overflowed = false;
+        self.unnotified_overflows = 0;
         self.send_artificial_signal = if notification <= SINGLESTEP_TIMEOUT_RCBS {
             // If there's an existing event making use of the timer counter,
             // we need to "overwrite" it the same way setting an actual RCB
@@ -1728,6 +2271,32 @@ impl TimerImpl {
         Ok(())
     }
 
+    /// What the overflow records show of the latest programming, for a skid
+    /// overshoot detected now: where it overflows, whether the kernel has
+    /// handled an overflow of it, and how long ago it handled the newest, by
+    /// that sample's time. A sample is this programming's only if the kernel
+    /// recorded an overflow since the programming: `prepare_notification`
+    /// releases earlier records when it programs. A programming without an
+    /// overflow point has no overflow to record.
+    fn overflow_evidence(&mut self) -> OverflowEvidence {
+        let overflow_recorded = self
+            .collect_overflow_records()
+            .then_some(self.programming_overflowed)
+            .filter(|_| self.overflow_point.is_some());
+        let now = monotonic_ns();
+        let sample_age_ns = self
+            .programming_overflowed
+            .then(|| self.timer.last_sample_time())
+            .flatten()
+            .filter(|_| now != u64::MAX)
+            .and_then(|time| now.checked_sub(time));
+        OverflowEvidence {
+            overflow_point: self.overflow_point,
+            overflow_recorded,
+            sample_age_ns,
+        }
+    }
+
     /// Whether the current programming of `timer` has passed its period.
     fn current_overflow(&self) -> Result<bool, Errno> {
         match self.overflow_period {
@@ -1744,6 +2313,7 @@ impl TimerImpl {
                 if samples > 0 {
                     self.overflow_recorded = true;
                     self.programming_overflowed = true;
+                    self.unnotified_overflows = self.unnotified_overflows.saturating_add(samples);
                 }
                 true
             }
@@ -1782,6 +2352,13 @@ impl TimerImpl {
     fn mark_overflows_consumed(&mut self) {
         self.collect_overflow_records();
         self.overflow_recorded = false;
+    }
+
+    /// Records that a stop took a notification of this counter's own, which
+    /// accounts for one recorded overflow (`unnotified_overflows`).
+    fn note_overflow_notification(&mut self) {
+        self.collect_overflow_records();
+        self.unnotified_overflows = self.unnotified_overflows.saturating_sub(1);
     }
 
     /// Whether the kernel has recorded an overflow whose notification has not
@@ -1855,6 +2432,41 @@ impl TimerImpl {
         }
     }
 
+    /// Makes sure the stopped `task` is switched out before the clock is read,
+    /// where reading the clock needs that (see
+    /// `PerfCounter::fast_read_needs_switch_out`): a ptrace request waits for
+    /// it. Only its waiting matters; a thread that died surfaces at the next
+    /// request.
+    fn switch_out(&self, task: &Stopped) {
+        #[cfg(test)]
+        let forced = SWITCH_OUT_FORCED_FOR_TEST.get();
+        #[cfg(not(test))]
+        let forced = false;
+        if forced || self.clock.fast_read_needs_switch_out() {
+            #[cfg(test)]
+            SWITCH_OUTS_FOR_TEST.set(SWITCH_OUTS_FOR_TEST.get() + 1);
+            let _ = task.getsiginfo();
+        }
+    }
+
+    /// The clock at the stop of `task`, read once the thread is switched out
+    /// ([`TimerImpl::switch_out`]). A read that may come before any ptrace
+    /// request at its stop goes through this.
+    #[cfg(any(test, target_arch = "aarch64"))]
+    fn read_clock_at(&self, task: &Stopped) -> u64 {
+        self.switch_out(task);
+        self.read_clock()
+    }
+
+    /// Whether [`TimerImpl::observe_event`] reads the clock at a stop by
+    /// `event`: a scheduled precise event that the stop may find reached.
+    fn reads_clock_at(&self, event: &TraceEvent) -> bool {
+        matches!(self.event, ActiveEvent::Precise { .. })
+            && self.timer_status == EventStatus::Scheduled
+            && self.initial_command == InitialCommand::Ordinary
+            && !matches!(event, TraceEvent::Signal(signal) if *signal == MARKER_SIGNAL)
+    }
+
     pub fn observe_event(&mut self, event: &TraceEvent) {
         // The first stop after a request decides the event: a stop by this
         // timer's signal delivers it, and any other stop cancels it. When that
@@ -1862,19 +2474,16 @@ impl TimerImpl {
         // the overflow interrupt was late and the event was due first. That is
         // recorded once the stop is known to cancel the event, since a stop
         // that `disregard_stop` hands back to the event does not. Stops with
-        // the timer's signal number are left to `handle_signal`, which records
+        // the timer's signal number are left to `accept_signal`, which records
         // a late delivery itself. Held initial-command requests have no
         // physical notification to be late.
         let missed = match self.event {
             ActiveEvent::Precise {
                 clock_target,
                 offset,
-            } if self.timer_status == EventStatus::Scheduled
-                && self.initial_command == InitialCommand::Ordinary
-                && !matches!(event, TraceEvent::Signal(signal) if *signal == MARKER_SIGNAL) =>
-            {
+            } if self.reads_clock_at(event) => {
                 let clock = self.read_clock();
-                target_reached(clock, clock_target, offset).then(|| MissedTarget {
+                target_reached(clock, clock_target).then(|| MissedTarget {
                     clock,
                     clock_target,
                     offset,
@@ -1882,6 +2491,7 @@ impl TimerImpl {
                     // Refined against the thread's pending signals by
                     // `expire_overflow_records`, which follows.
                     notification_queued: self.own_notification_queued(),
+                    evidence: self.overflow_evidence(),
                 })
             }
             _ => None,
@@ -1889,7 +2499,7 @@ impl TimerImpl {
         // This stop is the request's one allowed stop, unless it is
         // disregarded, which takes this count back. If the counter has
         // already passed the programmed overflow, either this is the timer's
-        // own signal stop, and `handle_signal` takes the count back, or
+        // own signal stop, and `accept_signal` takes the count back, or
         // another stop came first although the overflow was due.
         #[cfg(test)]
         let preempted = self.timer_status == EventStatus::Scheduled
@@ -1935,26 +2545,32 @@ impl TimerImpl {
     /// Ends the latest observed stop, which decided the event.
     fn settle_stop(&mut self) {
         if let Some(observed) = self.observed.take() {
-            Self::commit_missed(observed.missed);
+            self.commit_missed(observed.missed);
         }
     }
 
     /// Records a precise event that a stop retired past its delivery point as
-    /// a skid overshoot.
-    fn commit_missed(missed: Option<MissedTarget>) {
+    /// a skid overshoot, with its detail.
+    fn commit_missed(&self, missed: Option<MissedTarget>) {
         let Some(missed) = missed else {
             return;
         };
-        if get_pmu_config().record_missed_if_target_reached(
-            missed.clock,
-            missed.clock_target,
-            missed.offset,
-        ) {
+        if get_pmu_config().record_missed_if_target_reached(missed.clock, missed.clock_target) {
+            let detail = missed.evidence.detail(
+                self.guest_tid,
+                SkidOvershootKind::Missed {
+                    by: missed.stop,
+                    notification_queued: missed.notification_queued,
+                },
+                missed.clock,
+                missed.clock_target,
+            );
             warn!(
                 "Precise timer target {} + {} instructions reached before its interrupt \
-                 was handled; {} at counter {} cancels the event",
-                missed.clock_target, missed.offset, missed.stop, missed.clock
+                 was handled; the event ends undelivered: {detail}",
+                missed.clock_target, missed.offset
             );
+            reverie::record_skid_overshoot_detail(detail);
             if missed.notification_queued {
                 OVERTAKEN_WITH_NOTIFICATION_QUEUED
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1981,7 +2597,12 @@ impl TimerImpl {
     fn settle_at_exit(&mut self) {
         self.recheck_kept_programming();
         self.settle_stop();
-        let missed = self.disregarded_missed.take().or_else(|| {
+        // A disregarded stop did not end the event: the exit does.
+        let disregarded = self.disregarded_missed.take().map(|missed| MissedTarget {
+            stop: format!("the thread's exit after a disregarded {}", missed.stop),
+            ..missed
+        });
+        let missed = disregarded.or_else(|| {
             let ActiveEvent::Precise {
                 clock_target,
                 offset,
@@ -2005,7 +2626,7 @@ impl TimerImpl {
                     return None;
                 }
             };
-            target_reached(clock, clock_target, offset).then(|| MissedTarget {
+            target_reached(clock, clock_target).then(|| MissedTarget {
                 clock,
                 clock_target,
                 offset,
@@ -2013,9 +2634,10 @@ impl TimerImpl {
                 // The exited thread's pending signals cannot be read, and no
                 // stop overtook the event.
                 notification_queued: false,
+                evidence: self.overflow_evidence(),
             })
         });
-        Self::commit_missed(missed);
+        self.commit_missed(missed);
     }
 
     fn disregard_stop(&mut self) -> Result<Option<Unfinished>, Errno> {
@@ -2067,10 +2689,22 @@ impl TimerImpl {
             }
         }
         // Nothing else will take up an event whose notification was lost,
-        // even to cancel it.
-        Ok(self
-            .notification_lost()?
-            .then_some(Unfinished::Notification))
+        // even to cancel it. A halved programming's lost notification only
+        // re-arms the rest of the event, here as at its stop, so that host
+        // timing, which decides whether it was lost, decides nothing.
+        if !self.notification_lost()? {
+            return Ok(None);
+        }
+        // Only a live event is re-armed: a cancelled one stays cancelled.
+        if self.timer_status == EventStatus::Scheduled
+            && let Some(halved) = self.halved.take()
+        {
+            let clock = self.read_clock();
+            if self.rearm_halved(halved, clock)? {
+                return Ok(None);
+            }
+        }
+        Ok(Some(Unfinished::Notification))
     }
 
     /// Hands the event back from a disregarded stop, which did not decide
@@ -2094,10 +2728,11 @@ impl TimerImpl {
     /// [`TimerImpl::retire`], which records only a Scheduled event, does not
     /// record it again either way.
     fn cancel_at_disregarded_stop(&mut self, missed: Option<MissedTarget>) {
-        Self::commit_missed(missed);
+        self.commit_missed(missed);
         self.timer_status = EventStatus::Cancelled;
     }
 
+    #[cfg(target_arch = "x86_64")]
     fn disregard_stop_before_period(&mut self) -> Result<(), Errno> {
         // Read before the stop is disregarded, which leaves the programming
         // as it is, like every step of the decision.
@@ -2111,6 +2746,7 @@ impl TimerImpl {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
     fn disregard_sigreturn_stop(&mut self, notified_after_return: bool) -> Result<(), Errno> {
         // Both read before the stop is disregarded, which consumes what the
         // stop observed.
@@ -2135,6 +2771,7 @@ impl TimerImpl {
     /// single steps toward it under way, or with their cleanup failed. An
     /// Armed event the stop did not interrupt was delivered. `None` too for
     /// an imprecise event, and for a held initial-command request.
+    #[cfg(target_arch = "x86_64")]
     fn undelivered_precise_event(&self) -> Option<UndeliveredEvent> {
         if self.initial_command != InitialCommand::Ordinary {
             return None;
@@ -2173,9 +2810,10 @@ impl TimerImpl {
     /// notification would have delivered it after the return too, at a
     /// clock that host timing decided. An Armed event's steps do not pass
     /// its target, and one whose cleanup failed may have, unrecorded, so
-    /// neither is requested past it. Nor is an event at its clock target
-    /// whose instruction offset is still ahead: a request needs at least one
-    /// conditional branch, and no in-tree Tool asks for instruction offsets.
+    /// neither is requested past it. A Scheduled event with an instruction
+    /// offset counts as past its delivery point at its clock target already
+    /// (see [`target_reached`]), so it is requested one branch later too.
+    #[cfg(target_arch = "x86_64")]
     fn request_again(&mut self, undelivered: UndeliveredEvent) -> Result<(), Errno> {
         let UndeliveredEvent {
             clock_target,
@@ -2191,7 +2829,7 @@ impl TimerImpl {
                 TimerEventRequest::PreciseInstruction(ticks, offset)
             });
         }
-        if scheduled && target_reached(clock, clock_target, offset) {
+        if scheduled && target_reached(clock, clock_target) {
             return self.request_event(TimerEventRequest::Precise(1));
         }
         Ok(())
@@ -2314,6 +2952,7 @@ impl TimerImpl {
         }
         self.collect_overflow_records();
         if self.live_notification()? {
+            self.note_overflow_notification();
             self.mark_overflows_consumed();
             self.notification_taken = true;
             return Ok(Some(OwnNotification::Live));
@@ -2323,10 +2962,19 @@ impl TimerImpl {
             .then_some(OwnNotification::Late))
     }
 
+    #[cfg_attr(
+        not(target_arch = "x86_64"),
+        allow(
+            dead_code,
+            reason = "only the x86_64 injected-syscall trap hands a taken notification on; \
+                      the unit tests read it on every architecture"
+        )
+    )]
     fn take_notification(&mut self) -> Option<Unfinished> {
         std::mem::take(&mut self.notification_taken).then_some(Unfinished::Notification)
     }
 
+    #[cfg(target_arch = "x86_64")]
     fn retire(&mut self) -> Result<(), Errno> {
         self.recheck_kept_programming();
         // Only an event that no stop has decided is recorded here, as at the
@@ -2347,8 +2995,8 @@ impl TimerImpl {
             } = self.event
         {
             let clock = self.read_clock();
-            if target_reached(clock, clock_target, offset) {
-                Self::commit_missed(Some(MissedTarget {
+            if target_reached(clock, clock_target) {
+                let missed = MissedTarget {
                     clock,
                     clock_target,
                     offset,
@@ -2367,7 +3015,9 @@ impl TimerImpl {
                     // untested witness code in
                     // https://github.com/rrnewton/reverie/issues/748.
                     notification_queued: self.own_notification_queued(),
-                }));
+                    evidence: self.overflow_evidence(),
+                };
+                self.commit_missed(Some(missed));
             }
         }
         self.set_status(EventStatus::Cancelled);
@@ -2381,15 +3031,18 @@ impl TimerImpl {
         &mut self,
         task: Stopped,
         unfinished: Unfinished,
-        step: &mut (dyn FnMut(Stopped, StepUnit) -> Result<Running, TraceError> + Send),
-        observe: &mut (dyn FnMut(&Wait) -> Result<(), TraceError> + Send),
+        step: &mut (dyn FnMut(Stopped, StepRequest) -> Result<Running, TraceError> + Send),
+        observe: &mut (dyn FnMut(&Wait, StepStop) -> Result<(), TraceError> + Send),
         waits: &std::sync::Arc<PtracerWaitOwner>,
     ) -> Result<Stopped, HandleFailure> {
         match unfinished {
-            Unfinished::Steps(steps) => {
+            Unfinished::Steps(mut steps) => {
                 // Steps are only interrupted, and so only continued, once the
                 // event has been decided on.
                 debug_assert_eq!(self.timer_status, EventStatus::Armed);
+                // The guest can have run since the stop: gdb steps over its
+                // breakpoint before it lets the guest go on.
+                steps.steps.catch_up(self.read_clock());
                 self.attempt_single_step(
                     task,
                     steps.steps,
@@ -2450,7 +3103,7 @@ impl TimerImpl {
         if sender != 0 && sender != controller {
             return Ok(false);
         }
-        // This runs while handle_signal owns the tracee's actual stop, before
+        // This runs while accept_signal owns the tracee's actual stop, before
         // any resumption. A task visible to this ptracer is in the same PID
         // namespace or a descendant. Linux translates an ancestor's tgkill
         // sender to zero; a positive numerical match alone is insufficient
@@ -2463,7 +3116,13 @@ impl TimerImpl {
                 .map(|path| path.to_string_lossy().into_owned())
                 .unwrap_or(guest_path)
         });
-        let ours = nix::sys::stat::stat("/proc/thread-self/ns/pid")?;
+        let Some(ours) = pid_namespace_of(std::path::Path::new("/proc/thread-self/ns"))? else {
+            return Ok(sent_by_controller(
+                sender,
+                controller,
+                GuestPidNamespace::Single,
+            ));
+        };
         let theirs = nix::sys::stat::stat(guest_path.as_str());
         #[cfg(test)]
         CONTROLLER_QUERY_LOG.with(|slot| {
@@ -2476,14 +3135,20 @@ impl TimerImpl {
             }
         });
         let theirs = theirs?;
-        let same_namespace = (ours.st_dev, ours.st_ino) == (theirs.st_dev, theirs.st_ino);
-        // Namespace lookup failure propagates through the held-stop error
-        // path; it neither accepts an unknown sender nor makes construction
-        // newly fallible. This discriminates accidental guest markers under
-        // the existing reserved-signal convention, not hostile forgery:
-        // another ancestor also maps to zero and self rt_tgsigqueueinfo can
-        // supply SI_TKILL with a forged sender in either namespace.
-        Ok(sender == if same_namespace { controller } else { 0 })
+        let guest = if (ours.st_dev, ours.st_ino) == (theirs.st_dev, theirs.st_ino) {
+            GuestPidNamespace::Same
+        } else {
+            GuestPidNamespace::Descendant
+        };
+        // Namespace lookup failure propagates through the held-stop error path;
+        // it neither accepts an unknown sender nor makes construction newly
+        // fallible. Only positive evidence of a kernel without PID namespaces
+        // (`pid_namespace_of`) skips the comparison above. This discriminates
+        // accidental guest markers under the existing reserved-signal
+        // convention, not hostile forgery: another ancestor also maps to zero
+        // and self rt_tgsigqueueinfo can supply SI_TKILL with a forged sender
+        // in either namespace.
+        Ok(sent_by_controller(sender, controller, guest))
     }
 
     fn generated_signal(&self, signal: &libc::siginfo_t, controller: bool) -> bool {
@@ -2526,6 +3191,7 @@ impl TimerImpl {
             self.timer.disable()?;
             self.overflow_period = None;
         }
+        self.note_overflow_notification();
         self.mark_overflows_consumed();
         Ok(true)
     }
@@ -2544,7 +3210,7 @@ impl TimerImpl {
             debug!("Sending artificial timer signal");
 
             // Give the guest a kick via an "artificial signal".  This gives us something
-            // to handle in `handle_signal` and thus drives single-stepping.
+            // to handle in `accept_signal` and thus drives single-stepping.
             Errno::result(unsafe {
                 libc::syscall(
                     libc::SYS_tgkill,
@@ -2558,16 +3224,12 @@ impl TimerImpl {
         }
     }
 
-    async fn handle_signal(
-        &mut self,
-        task: Stopped,
-        step: &mut (dyn FnMut(Stopped, StepUnit) -> Result<Running, TraceError> + Send),
-        observe: &mut (dyn FnMut(&Wait) -> Result<(), TraceError> + Send),
-        waits: &std::sync::Arc<PtracerWaitOwner>,
-    ) -> Result<Stopped, HandleFailure> {
+    /// See [`Timer::accept_signal`].
+    fn accept_signal(&mut self, task: Stopped) -> Result<Stopped, HandleFailure> {
         self.recheck_kept_programming();
-        // From libc 0.2.190 `siginfo_t` is not `Send`, so it must not be
-        // alive at the `.await` below; this block owns it.
+        // From libc 0.2.190 `siginfo_t` is not `Send`; this block owns it, so
+        // that it is gone before the caller awaits the delivery's steps
+        // (`deliver_accepted`).
         let controller = {
             let signal = task.getsiginfo()?;
             #[cfg(test)]
@@ -2597,6 +3259,7 @@ impl TimerImpl {
                 return Err(HandleFailure::ImproperSignal(task));
             }
             if self.owns_overflow_signal(&signal) {
+                self.note_overflow_notification();
                 // Otherwise a later injected syscall could mistake a guest signal
                 // for this notification.
                 self.mark_overflows_consumed();
@@ -2631,7 +3294,7 @@ impl TimerImpl {
         };
 
         // At this point, we've decided that a timer event is to be delivered.
-        self.deliver(task, step, observe, waits).await
+        Ok(task)
     }
 
     /// Delivers the active event, whose notification the guest has taken or
@@ -2640,8 +3303,8 @@ impl TimerImpl {
     async fn deliver(
         &mut self,
         task: Stopped,
-        step: &mut (dyn FnMut(Stopped, StepUnit) -> Result<Running, TraceError> + Send),
-        observe: &mut (dyn FnMut(&Wait) -> Result<(), TraceError> + Send),
+        step: &mut (dyn FnMut(Stopped, StepRequest) -> Result<Running, TraceError> + Send),
+        observe: &mut (dyn FnMut(&Wait, StepStop) -> Result<(), TraceError> + Send),
         waits: &std::sync::Arc<PtracerWaitOwner>,
     ) -> Result<Stopped, HandleFailure> {
         // Ensure any new timer signals don't mess with us while single-stepping
@@ -2650,31 +3313,8 @@ impl TimerImpl {
         // Last check to see if this an unexpected wakeup (a signal before the minimum expected)
         let ctr = self.read_clock();
         let first_stage = self.first_stage.take();
-
-        if let Some(additional_timer_request) = self
-            .event
-            .reschedule_if_spurious_wakeup(ctr, self.max_single_step_count())
-        {
-            debug!("Spurious wakeup - rescheduling new timer event");
-            if let Err(errno) = self.request_event(additional_timer_request) {
-                warn!(
-                    "Attempted to reschedule a timer signal after an early wakeup, but failed with - {:?}. A panic will likely follow",
-                    errno
-                );
-            } else {
-                return Err(HandleFailure::Cancelled(task));
-            };
-        } else if let Some(first_stage) = first_stage {
-            // As after a spurious wakeup, the guest resumes with no Tool
-            // callback, toward the same target.
-            match self.rearm_second_stage(first_stage, ctr, self.timer.last_sample_time()) {
-                Ok(true) => return Err(HandleFailure::Cancelled(task)),
-                Ok(false) => {}
-                Err(errno) => warn!(
-                    "Attempted to re-arm a staged precise timer event at its second stage, but failed with - {:?}; single stepping from the first stage",
-                    errno
-                ),
-            }
+        if self.rearm_short_of_target(ctr, first_stage) {
+            return Err(HandleFailure::Cancelled(task));
         }
 
         // Before we drive the event to completion, clear `send_artificial_signal` flag so that:
@@ -2693,6 +3333,24 @@ impl TimerImpl {
                 #[cfg(test)]
                 if ctr == clock_target && offset == 0 {
                     count_host_timed(|events| events.unstepped_at_target += 1);
+                }
+                // Nor does one place an offset event that the notification
+                // finds at or past its target count: the guest has run an
+                // unknown number of instructions past the target branch.
+                if get_pmu_config().record_offset_notification_at_or_past_target(
+                    ctr,
+                    clock_target,
+                    offset,
+                ) {
+                    warn!(
+                        "Precise timer interrupt arrived at or after target {} with {} \
+                         instructions still to step (counter {}); delivering the timer event \
+                         at the observed counter",
+                        clock_target, offset, ctr
+                    );
+                    #[cfg(test)]
+                    count_host_timed(|events| events.overshoot += 1);
+                    return Ok(task);
                 }
                 let current = ClockCounter::new(ctr, 0, clock_target);
                 self.attempt_single_step(task, current, offset, step, observe, waits)
@@ -2717,8 +3375,8 @@ impl TimerImpl {
         task: Stopped,
         mut current: ClockCounter,
         target_instr: u64,
-        step: &mut (dyn FnMut(Stopped, StepUnit) -> Result<Running, TraceError> + Send),
-        observe: &mut (dyn FnMut(&Wait) -> Result<(), TraceError> + Send),
+        step: &mut (dyn FnMut(Stopped, StepRequest) -> Result<Running, TraceError> + Send),
+        observe: &mut (dyn FnMut(&Wait, StepStop) -> Result<(), TraceError> + Send),
         waits: &std::sync::Arc<PtracerWaitOwner>,
     ) -> Result<Stopped, HandleFailure> {
         let target_rcb = current.target_rcb;
@@ -2730,15 +3388,7 @@ impl TimerImpl {
         // deliver the timer event at the observed counter. The Tool can then
         // account for the late event and either end the timeslice or re-arm
         // the next timer through its normal callback.
-        if get_pmu_config().record_overshoot_if_past_target(current.rcbs(), target_rcb) {
-            warn!(
-                "Precise timer interrupt arrived after target: actual {} > target {}; \
-                 delivering timer event at the observed counter",
-                current.rcbs(),
-                target_rcb
-            );
-            #[cfg(test)]
-            count_host_timed(|events| events.overshoot += 1);
+        if self.record_late_delivery(current.rcbs(), target_rcb) {
             return Ok(task);
         }
         let max_single_step_count = self.max_single_step_count();
@@ -2755,6 +3405,24 @@ impl TimerImpl {
             "Timer will single-step from ctr {} to {}",
             current, target_rcb
         );
+        // Whether a SIGTRAP is in the thread's own queue before the next
+        // step. Linux keeps at most one standard signal of a number in a
+        // queue (`legacy_queue`), so a step taken with one queued gets no
+        // report of its own, and any SIGTRAP it stops at, or finds queued
+        // behind a signal the kernel took first, is the guest's
+        // (`dequeued_ahead_of_step_report`). It is read here, and again only
+        // after a step that ran a syscall to its exit stop, never per step:
+        // - the stop at a step's report dequeues the queue's one SIGTRAP;
+        // - only a syscall can queue a SIGTRAP with a code the guest chooses,
+        //   and a step over one that can (`queues_the_thread_a_sigtrap`) runs
+        //   it to its exit stop (`StepUnit::Syscall`), before anything it
+        //   queued is delivered, so the read there sees it; a step run as a
+        //   syscall otherwise only runs a guest `rt_sigreturn`, which queues
+        //   nothing but may unblock one already queued, which the read also
+        //   sees;
+        // - as for the shield's pending-state reads, no other guest thread
+        //   queues one during a sequence.
+        let mut sigtrap_queued = sigtrap_in_own_queue(&task)?;
         let mut task = task;
         // The registers before each step. A step's cleanup reads them back
         // afterwards, so they carry over to the next step.
@@ -2766,8 +3434,12 @@ impl TimerImpl {
         #[cfg(target_arch = "x86_64")]
         let mut guest_trap_flag = regs.eflags & TRAP_FLAG != 0;
         // Steps of each unit this approach takes, for the log.
-        #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
         let (mut instruction_steps, mut block_steps) = (0u64, 0u64);
+        // The hardware breakpoints branch runs use, once a run needs them,
+        // given back on every return (`crate::branch_step::Borrowed`).
+        #[cfg(target_arch = "aarch64")]
+        let mut breakpoints =
+            crate::branch_step::Borrowed::<BranchBreakpoints>::new(task.generation());
         loop {
             if !current
                 .is_behind(target_rcb, target_instr)
@@ -2778,7 +3450,11 @@ impl TimerImpl {
             #[cfg(target_arch = "x86_64")]
             trace!(
                 "[instruction]\n{}\n{}",
-                crate::decoder::decode_instruction(&task)?,
+                // A log line must not fail the step: the code can be
+                // unreadable to `process_vm_readv`, as in an execute-only
+                // page.
+                crate::decoder::decode_instruction(&task)
+                    .unwrap_or_else(|err| format!("(unreadable: {err})")),
                 regs.display_with_options(RegDisplayOptions { multiline: true })
             );
             #[cfg(target_arch = "x86_64")]
@@ -2798,10 +3474,48 @@ impl TimerImpl {
                 current.rcbs(),
                 target_rcb,
             );
-            #[cfg(not(target_arch = "x86_64"))]
+            #[cfg(target_arch = "aarch64")]
+            let unit = self.branch_run(&task, breakpoints.regs(), current.rcbs(), target_rcb)?;
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
             let unit = StepUnit::Instruction;
+            // An instruction that retires no branch reaches the target here.
+            let unit = if unit == StepUnit::Instruction
+                && current.rcbs() == target_rcb
+                && current.instr + 1 >= target_instr
+            {
+                StepUnit::LastInstruction
+            } else {
+                unit
+            };
+            // A `syscall` that can queue the thread a SIGTRAP of the guest's
+            // choosing runs to its exit stop, where the queue is read. The
+            // step that reaches the target cannot (`StepUnit::LastInstruction`)
+            // and would leave such a SIGTRAP to be taken for its report, so
+            // the run ends there instead.
+            #[cfg(target_arch = "x86_64")]
+            let unit = match unit {
+                StepUnit::Instruction | StepUnit::LastInstruction
+                    if matches!(start.instruction, FlagsInstruction::Syscall { .. })
+                        && queues_the_thread_a_sigtrap(regs.rax, regs.rsi, regs.rdx) =>
+                {
+                    if unit == StepUnit::LastInstruction {
+                        return Err(HandleFailure::GuestSigtrap(task, LAST_STEP_QUEUES_SIGTRAP));
+                    }
+                    StepUnit::Syscall
+                }
+                unit => unit,
+            };
             match unit {
-                StepUnit::Instruction => {
+                // The loop chooses neither of the last two.
+                StepUnit::Instruction
+                | StepUnit::LastInstruction
+                | StepUnit::SyscallExit
+                | StepUnit::Requeue(_) => {
+                    instruction_steps += 1;
+                    &INSTRUCTION_STEPS
+                }
+                #[cfg(target_arch = "x86_64")]
+                StepUnit::Syscall => {
                     instruction_steps += 1;
                     &INSTRUCTION_STEPS
                 }
@@ -2810,20 +3524,240 @@ impl TimerImpl {
                     block_steps += 1;
                     &BLOCK_STEPS
                 }
+                #[cfg(target_arch = "aarch64")]
+                StepUnit::ToBranch { .. } => {
+                    block_steps += 1;
+                    &BRANCH_RUNS
+                }
             }
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let wait = step(task, unit)?.next_state_with_owner(waits).await?;
-            observe(&wait)?;
+            // Every resuming request, the step's and those of its syscall
+            // exit and requeues below, leaves the borrowed breakpoints with
+            // the thread's next stop, as `Borrowed` requires.
+            #[cfg(target_arch = "aarch64")]
+            fn note_stop(
+                breakpoints: &mut crate::branch_step::Borrowed<BranchBreakpoints>,
+                wait: &Wait,
+            ) {
+                match wait {
+                    // A single-stepped execve: Linux flushed the old program's
+                    // breakpoints, and writing the saved ones would register
+                    // them in the new program.
+                    Wait::Stopped(_, TraceEvent::Exec(_)) => breakpoints.forget(),
+                    Wait::Stopped(new_task, _) => breakpoints.stopped(new_task.generation()),
+                    // The thread is gone, and its breakpoints with it.
+                    _ => breakpoints.forget(),
+                }
+            }
+            // A failed step made no resuming request that took effect, so the
+            // thread is still at its stop, where an early return gives the
+            // breakpoints back.
+            let running = step(
+                task,
+                StepRequest {
+                    unit,
+                    #[cfg(target_arch = "x86_64")]
+                    regs: Some(regs),
+                },
+            )?;
+            #[cfg(target_arch = "aarch64")]
+            breakpoints.resumed();
+            let mut wait = running.next_state_with_owner(waits).await?;
+            #[cfg(target_arch = "aarch64")]
+            note_stop(&mut breakpoints, &wait);
+            // A step run as a syscall (`StepUnit::Syscall`, or one the caller
+            // chose, `StepUnit::SyscallExit`) stops at the syscall's entry
+            // first; it ends at its exit stop. A branch run is resumed with
+            // `PTRACE_CONT` and makes no syscall stop.
+            let mut ran_syscall = false;
+            if let Wait::Stopped(_, event) = &wait
+                && is_syscall_stop(event)
+            {
+                observe(&wait, StepStop::Passing)?;
+                let Wait::Stopped(entered, _) = wait else {
+                    unreachable!("matched a stop");
+                };
+                let running = step(
+                    entered,
+                    StepRequest {
+                        unit: StepUnit::SyscallExit,
+                        #[cfg(target_arch = "x86_64")]
+                        regs: None,
+                    },
+                )?;
+                #[cfg(target_arch = "aarch64")]
+                breakpoints.resumed();
+                wait = running.next_state_with_owner(waits).await?;
+                #[cfg(target_arch = "aarch64")]
+                note_stop(&mut breakpoints, &wait);
+                ran_syscall = true;
+            }
+            // Signals the kernel took ahead of the step's report go back
+            // behind it, so that the step ends at its own report and leaves
+            // nothing queued for a later step to find. Signals this blocked
+            // to requeue them are unblocked again at the report; those the
+            // guest blocked stay blocked. Nothing runs in between, so they
+            // are then delivered in their original order once the guest
+            // runs, each at a stop of its own.
+            // The code the step's report carries besides `TRAP_TRACE`: x86
+            // reports a stepped `syscall` with `TRAP_BRKPT`
+            // (`is_step_report`). aarch64 reports a stepped `svc` with
+            // `SI_USER`, which the kernel never takes first.
+            #[cfg(target_arch = "x86_64")]
+            let other_report_code = matches!(start.instruction, FlagsInstruction::Syscall { .. })
+                .then_some(libc::TRAP_BRKPT);
+            #[cfg(not(target_arch = "x86_64"))]
+            let other_report_code = None;
+            let (mut requeued, mut returned) = (0u64, 0u64);
+            while let Wait::Stopped(stopped, TraceEvent::Signal(sig)) = &wait
+                && dequeued_ahead_of_step_report(stopped, *sig, other_report_code, returned)?
+            {
+                if sigtrap_queued {
+                    // A SIGTRAP was queued before the step, so the step's
+                    // report could not be queued too: the queued one is the
+                    // guest's.
+                    let Wait::Stopped(stopped, _) = wait else {
+                        unreachable!("matched a stop");
+                    };
+                    return Err(HandleFailure::GuestSigtrap(stopped, "precise timer"));
+                }
+                let sig = *sig;
+                observe(&wait, StepStop::Passing)?;
+                let Wait::Stopped(stopped, _) = wait else {
+                    unreachable!("matched a stop");
+                };
+                let bit = signal_bit(sig);
+                let mask = stopped.getsigmask()?;
+                if mask & bit == 0 {
+                    stopped.setsigmask(mask | bit)?;
+                    requeued |= bit;
+                }
+                returned |= bit;
+                debug!(
+                    "Requeueing {} that a timer step stopped at, behind the step's report",
+                    sig
+                );
+                let running = step(
+                    stopped,
+                    StepRequest {
+                        unit: StepUnit::Requeue(sig),
+                        #[cfg(target_arch = "x86_64")]
+                        regs: None,
+                    },
+                )?;
+                #[cfg(target_arch = "aarch64")]
+                breakpoints.resumed();
+                wait = running.next_state_with_owner(waits).await?;
+                #[cfg(target_arch = "aarch64")]
+                note_stop(&mut breakpoints, &wait);
+            }
+            if requeued != 0
+                && let Wait::Stopped(stopped, _) = &wait
+            {
+                let mask = stopped.getsigmask()?;
+                stopped.setsigmask(mask & !requeued)?;
+            }
+            observe(&wait, StepStop::Final)?;
+            // A notification of this timer's own that reaches the thread
+            // during its steps is consumed, and the stepping goes on from
+            // where the stop found it (`own_notification_during_steps`).
+            // Handed on, it would reach the run loop as the event's
+            // notification after the stop had already decided the event,
+            // which then fires nowhere.
+            if let Wait::Stopped(stopped, TraceEvent::Signal(signal)) = &wait
+                && *signal == MARKER_SIGNAL
+                && self.own_notification_during_steps(stopped)?
+            {
+                let Wait::Stopped(stopped, _) = wait else {
+                    unreachable!("matched a stop");
+                };
+                #[cfg(target_arch = "x86_64")]
+                let mut stopped = stopped;
+                #[cfg(target_arch = "x86_64")]
+                {
+                    (guest_trap_flag, regs) =
+                        remove_stepping_trap_flag(&mut stopped, &start, guest_trap_flag)?;
+                }
+                // A branch run, which lets the guest run, may have come part
+                // of its way; its counter is checked as at any other stop.
+                #[cfg(target_arch = "aarch64")]
+                self.check_branch_run(&stopped, unit, current.rcbs(), target_rcb, None);
+                #[cfg(target_arch = "aarch64")]
+                let clock = self.read_clock_at(&stopped);
+                #[cfg(not(target_arch = "aarch64"))]
+                let clock = self.read_clock();
+                current.catch_up(clock);
+                task = stopped;
+                continue;
+            }
+            // A stop during a branch run that is not its breakpoint's ends
+            // the stepping like any other stop, with the breakpoints gone.
+            // Any stop of a branch run checks its counter first, so a run
+            // that escaped its breakpoints is reported, not passed on as if
+            // stepping had kept short of the target. A SIGTRAP stop while one
+            // was queued before the run is the guest's, which the match below
+            // takes as at a single step's (`branch_run_stop_ends_stepping`).
+            #[cfg(target_arch = "aarch64")]
+            let wait = match (unit, wait) {
+                (
+                    StepUnit::ToBranch { stops, count, .. },
+                    Wait::Stopped(new_task, TraceEvent::Signal(Signal::SIGTRAP)),
+                ) if branch_run_stop_ends_stepping(sigtrap_queued, || {
+                    is_branch_run_report(&new_task, &stops[..count])
+                }) =>
+                {
+                    self.check_branch_run(&new_task, unit, current.rcbs(), target_rcb, None);
+                    restore_breakpoints(breakpoints.regs(), &new_task);
+                    return Err(HandleFailure::Event(Wait::Stopped(
+                        new_task,
+                        TraceEvent::Signal(Signal::SIGTRAP),
+                    )));
+                }
+                (_, Wait::Stopped(new_task, event))
+                    if !matches!(event, TraceEvent::Signal(Signal::SIGTRAP)) =>
+                {
+                    // The check reads the clock, at a stop that may not have
+                    // made a ptrace request yet (`read_clock_at`).
+                    self.check_branch_run(&new_task, unit, current.rcbs(), target_rcb, None);
+                    // Nothing to restore after an exec (forgotten above).
+                    restore_breakpoints(breakpoints.regs(), &new_task);
+                    Wait::Stopped(new_task, event)
+                }
+                (_, wait) => wait,
+            };
             task = match wait {
+                // A SIGTRAP stop while one was queued before the step is that
+                // SIGTRAP, the guest's: the step got no report. One a process
+                // sent is passed on below, and the run loop delivers it
+                // (`handle_sigtrap`); one with a trap's code would be taken
+                // for a trap of Reverie's there, so the run ends instead.
+                Wait::Stopped(new_task, TraceEvent::Signal(Signal::SIGTRAP))
+                    if sigtrap_queued && !crate::task::is_sigtrap_sent_by_a_process(&new_task) =>
+                {
+                    return Err(HandleFailure::GuestSigtrap(new_task, "precise timer"));
+                }
+                // A syscall run to its exit stop completes its step; the
+                // stop sends no signal.
+                Wait::Stopped(new_task, event) if ran_syscall && is_syscall_stop(&event) => {
+                    new_task
+                }
                 // a successful single step results in SIGTRAP stop
                 #[cfg(target_arch = "x86_64")]
                 Wait::Stopped(new_task, TraceEvent::Signal(Signal::SIGTRAP))
-                    if matches!(is_step_report(&new_task, &start), Ok(true)) =>
+                    if !sigtrap_queued && matches!(is_step_report(&new_task, &start), Ok(true)) =>
                 {
                     new_task
                 }
                 #[cfg(not(target_arch = "x86_64"))]
-                Wait::Stopped(new_task, TraceEvent::Signal(Signal::SIGTRAP)) => new_task,
+                Wait::Stopped(new_task, TraceEvent::Signal(Signal::SIGTRAP)) if !sigtrap_queued => {
+                    // The clock is read below, and nothing at a single step's
+                    // stop has made a ptrace request yet (x86 reads the
+                    // registers here). A branch run's stop has.
+                    if matches!(unit, StepUnit::Instruction | StepUnit::LastInstruction) {
+                        self.switch_out(&new_task);
+                    }
+                    new_task
+                }
                 // Any other stop ends the stepping, and so does a SIGTRAP that
                 // the step did not report, such as an `int3`'s, or one whose
                 // siginfo cannot be read. The step's instruction may still
@@ -2840,10 +3774,15 @@ impl TimerImpl {
                 // moved rip or the clock. A SIGTRAP from elsewhere that
                 // arrives before the step leaves both, and one that arrives
                 // during it replaces the step's report, so a step whose
-                // instruction moves neither is then not counted, and the event
-                // lands one instruction late. A `rep` string instruction does
-                // that on every iteration but its last, as does a jump to
-                // itself.
+                // instruction moves neither is then not counted. A `rep`
+                // string instruction does that on every iteration but its
+                // last, as does a jump to itself. Short of the target branch
+                // the clock alone counts, so that costs nothing; past it, while
+                // instructions are counted, such an instruction could make the
+                // event land one instruction late, so the overshoot is recorded
+                // instead (`uncounted_step_may_miscount`). Any other instruction
+                // moves rip when it runs, so one that did not move it did not
+                // run, and the next step runs it.
                 #[cfg(target_arch = "x86_64")]
                 Wait::Stopped(mut new_task, event) => {
                     self.interrupted = Some(
@@ -2853,6 +3792,17 @@ impl TimerImpl {
                                 block_step_reached_target(unit, clock, target_rcb);
                                 if regs.rip != start.rip || clock != start.clock {
                                     current.single_step_with_clock(clock);
+                                } else if uncounted_step_may_miscount(&current, target_instr)
+                                    && instruction_may_run_in_place(&new_task, start.rip)
+                                {
+                                    warn!(
+                                        "A stop interrupted a single step {} instructions past \
+                                         the precise timer target {} that moved neither rip nor \
+                                         the counter; the step may have run",
+                                        current.instr, target_rcb
+                                    );
+                                    get_pmu_config().emit_skid_overshoot_marker(clock, target_rcb);
+                                    reverie::record_skid_overshoot();
                                 }
                                 Interruption::At(InterruptedSteps {
                                     steps: current,
@@ -2879,24 +3829,271 @@ impl TimerImpl {
                 }
                 wait => return Err(HandleFailure::Event(wait)),
             };
+            // The step's report stop dequeued the thread's one SIGTRAP; a
+            // syscall's exit stop dequeued nothing, and the syscall may have
+            // queued one, delivered at the next resume.
+            sigtrap_queued = ran_syscall && sigtrap_in_own_queue(&task)?;
             #[cfg(target_arch = "x86_64")]
             {
                 (guest_trap_flag, regs) =
                     remove_stepping_trap_flag(&mut task, &start, guest_trap_flag)?;
             }
+            #[cfg(target_arch = "aarch64")]
+            self.check_branch_run(&task, unit, current.rcbs(), target_rcb, Some(&task));
             let clock = self.read_clock();
             if block_step_reached_target(unit, clock, target_rcb) {
                 // Delivered at the observed counter, as a late notification
                 // is; the marker makes the run fail closed.
+                #[cfg(target_arch = "aarch64")]
+                restore_breakpoints(breakpoints.regs(), &task);
                 return Ok(task);
             }
             current.single_step_with_clock(clock);
         }
+        #[cfg(target_arch = "aarch64")]
+        restore_breakpoints(breakpoints.regs(), &task);
         debug!(
-            "Timer reached its target {} with {} block steps and {} single steps",
+            "Timer reached its target {} with {} block steps or branch runs and {} single steps",
             current, block_steps, instruction_steps
         );
+        // A notification still outstanding was merged into one already taken,
+        // as standard signals coalesce; none can come for this event now.
+        self.unnotified_overflows = 0;
         Ok(task)
+    }
+
+    /// Checks the counter after a branch run from counter `from` stopped, at
+    /// `task`'s stop: at its breakpoint (`at_breakpoint`, the stopped thread)
+    /// it must have moved by exactly the branches decoded for the end it
+    /// stopped at, at any other stop by no more than the most at any end.
+    /// Anything else ends branch runs for this thread; a counter at or past
+    /// `target_rcb` is also reported as an overshoot
+    /// ([`block_step_reached_target`]). The stop's pc is read only for a unit
+    /// whose two ends differ in count. The clock is read only once the thread
+    /// is switched out ([`TimerImpl::read_clock_at`]): a stop other than the
+    /// run's own breakpoint has made no ptrace request before this.
+    #[cfg(target_arch = "aarch64")]
+    fn check_branch_run(
+        &mut self,
+        task: &Stopped,
+        unit: StepUnit,
+        from: u64,
+        target_rcb: u64,
+        at_breakpoint: Option<&Stopped>,
+    ) {
+        let StepUnit::ToBranch {
+            stops,
+            count,
+            branches,
+        } = unit
+        else {
+            return;
+        };
+        let clock = self.read_clock_at(task);
+        let moved = clock.wrapping_sub(from);
+        let at = at_breakpoint.map(|task| move || task.getregs().ok().map(|regs| regs.pc));
+        if branch_run_consistent(stops, count, branches, moved, at) {
+            return;
+        }
+        warn!(
+            "A branch run from counter {from} retired {moved} branches, decoded {:?}; single \
+             stepping from now on",
+            &branches[..count]
+        );
+        BRANCH_RUN_MISMATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.branch_runs_off = true;
+        if at_breakpoint.is_none() {
+            // The breakpoint stop's own path reports this after restoring.
+            block_step_reached_target(unit, clock, target_rcb);
+        }
+    }
+
+    /// The unit of the next step on aarch64, `clock` RCBs into a precise
+    /// event whose target is `target_rcb`, with the hardware breakpoints it
+    /// needs armed and any others of this stepping disarmed.
+    ///
+    /// A branch run lets the guest run until a hardware breakpoint stops it,
+    /// before the instruction there executes (see [`decode_branch_run`] and
+    /// [`crate::branch_step`]):
+    /// - through the first stop point when that is a branch whose
+    ///   successors are known (its encoding's, or the register's for BR, BLR
+    ///   and RET from the branch itself), retiring that one branch, and only
+    ///   when the counter stays short of the target after it;
+    /// - otherwise up to the first stop point, retiring no branch, whenever
+    ///   the counter is short of the target.
+    ///
+    /// A load-exclusive at pc runs with the code up to its store-exclusive
+    /// as one unit, when that sequence decodes and cannot reach the target
+    /// ([`crate::branch_step::exclusive_sequence`]). Single stepped, its store
+    /// would fail on every attempt, since every stop between the load and the
+    /// store clears the exclusive monitor, and a retry loop would spin until
+    /// the target, where the same code run without a stop takes one attempt.
+    ///
+    /// The last stretch to the target, and its instruction offset, are then
+    /// single stepped exactly as before, to the same delivery point.
+    /// Everything else is single stepped: a stop point that is not such a
+    /// branch, reached at pc; code that does not decode; a thread with fewer
+    /// than two free breakpoint registers (they belong to someone else, and
+    /// are never written); and a thread whose branch runs are off. A
+    /// load-exclusive sequence single stepped for want of breakpoint
+    /// registers is reported, once per process
+    /// ([`report_stepped_exclusive_sequence`]).
+    #[cfg(target_arch = "aarch64")]
+    fn branch_run(
+        &mut self,
+        task: &Stopped,
+        breakpoints: &mut Option<BranchBreakpoints>,
+        clock: u64,
+        target_rcb: u64,
+    ) -> Result<StepUnit, TraceError> {
+        let run = if !block_steps_enabled() || self.branch_runs_off || clock >= target_rcb {
+            if self.branch_runs_off && clock < target_rcb {
+                report_stepped_exclusive_sequence(
+                    task,
+                    None,
+                    "branch runs are off for this thread",
+                );
+            }
+            None
+        } else {
+            decode_branch_run(task, &task.getregs()?, clock, target_rcb)
+        };
+        let Some(BranchRunPlan {
+            stops,
+            count,
+            branches,
+            exclusive,
+        }) = run
+        else {
+            // A breakpoint elsewhere stays armed: a single step's trap is
+            // taken before the next instruction's breakpoint could match.
+            // Registers are read only then, so forced single steps take the
+            // path they took before branch runs.
+            if let Some(armed) = breakpoints.as_mut() {
+                armed.disarm_at(task, task.getregs()?.pc)?;
+            }
+            return Ok(StepUnit::Instruction);
+        };
+        if breakpoints.is_none() {
+            match BranchBreakpoints::new(task) {
+                Ok(Some(reserved)) => *breakpoints = Some(reserved),
+                Ok(None) => {
+                    debug!("Fewer than two free hardware breakpoints: single stepping");
+                    self.branch_runs_off = true;
+                    if exclusive {
+                        report_stepped_exclusive_sequence(
+                            task,
+                            Some(stops[0]),
+                            "the thread has fewer than two free hardware breakpoint registers",
+                        );
+                    }
+                    return Ok(StepUnit::Instruction);
+                }
+                Err(TraceError::Errno(error)) => {
+                    warn!("Hardware breakpoints unusable ({error}): single stepping");
+                    self.branch_runs_off = true;
+                    if exclusive {
+                        report_stepped_exclusive_sequence(
+                            task,
+                            Some(stops[0]),
+                            "the thread's hardware breakpoints are unusable",
+                        );
+                    }
+                    return Ok(StepUnit::Instruction);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        let armed = breakpoints.as_mut().expect("reserved above");
+        if let Err(error) = armed.arm(task, &stops[..count]) {
+            warn!("Could not arm hardware breakpoints ({error:?}): single stepping");
+            self.branch_runs_off = true;
+            armed.recover(task)?;
+            return Ok(StepUnit::Instruction);
+        }
+        if exclusive {
+            EXCLUSIVE_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(StepUnit::ToBranch {
+            stops,
+            count,
+            branches,
+        })
+    }
+
+    /// Whether the signal stop `task`, which a step toward the active event
+    /// reached, is a notification of this timer's own; if so, it is consumed.
+    /// The event is being delivered, and the steps disabled the counter
+    /// before they began ([`TimerImpl::disable_timer_before_stepping`]), so
+    /// such a notification was raised before that and announces the event
+    /// the steps deliver. On an NVIDIA Grace host a staged event's last
+    /// programming can overflow a second time before the steps disable it;
+    /// that notification is delivered as a step resumes the thread, before
+    /// the step's instruction runs, or part of the way through a branch run,
+    /// which lets the guest run.
+    ///
+    /// A guest can produce the same siginfo: it may queue itself the timer's
+    /// signal with `POLL_IN` and the counter's descriptor number, or have an
+    /// `F_SETSIG` descriptor of its own with that number. So an overflow's
+    /// notification is taken as the timer's only while the kernel has
+    /// recorded an overflow of the current programming that no stop has yet
+    /// taken a notification for (`unnotified_overflows`), counted after the
+    /// records written so far are collected. Otherwise, or where no records
+    /// are mapped, the stop is handed on as any other stop is. The
+    /// controller's artificial kick is taken as the run loop takes it
+    /// ([`TimerImpl::controller_artificial_signal`]). The siginfo cannot tell
+    /// a forged signal from a genuine notification while one is outstanding,
+    /// and such a signal then uses that notification's count.
+    fn own_notification_during_steps(&mut self, task: &Stopped) -> Result<bool, TraceError> {
+        let signal = task.getsiginfo()?;
+        let controller = self.controller_artificial_signal(&signal)?;
+        if !self.generated_signal(&signal, controller) {
+            return Ok(false);
+        }
+        if !controller {
+            self.collect_overflow_records();
+            debug!(
+                unnotified_overflows = self.unnotified_overflows,
+                "A notification of this timer's counter arrived during its steps"
+            );
+            if self.unnotified_overflows == 0 {
+                return Ok(false);
+            }
+            self.note_overflow_notification();
+            self.mark_overflows_consumed();
+        } else {
+            self.artificial_signal_sent = false;
+        }
+        debug!(
+            si_code = signal.si_code,
+            "A notification of this timer arrived during its steps; consuming it"
+        );
+        OWN_NOTIFICATIONS_DURING_STEPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(true)
+    }
+
+    /// Records a precise event whose notification found the thread at
+    /// `rcb_actual`, past its target `rcb_target`, as a skid overshoot, with
+    /// its detail, and returns `true`. A notification at or short of the
+    /// target records nothing and returns `false`.
+    fn record_late_delivery(&mut self, rcb_actual: u64, rcb_target: u64) -> bool {
+        if !get_pmu_config().record_overshoot_if_past_target(rcb_actual, rcb_target) {
+            return false;
+        }
+        let detail = self.overflow_evidence().detail(
+            self.guest_tid,
+            SkidOvershootKind::DeliveredLate,
+            rcb_actual,
+            rcb_target,
+        );
+        warn!(
+            "Precise timer interrupt arrived after target: {detail}; delivering timer event \
+             at the observed counter"
+        );
+        reverie::record_skid_overshoot_detail(detail);
+        #[cfg(test)]
+        count_host_timed(|events| events.overshoot += 1);
+        true
     }
 
     /// The unit of the next step from `start`, `clock` RCBs into a precise
@@ -2960,17 +4157,99 @@ impl TimerImpl {
     }
 }
 
+/// Whether an interrupted single step that moved neither rip nor the clock,
+/// and so is not counted, may make the event land one instruction late, if
+/// its instruction can run in place ([`instruction_may_run_in_place`]): it
+/// may once the steps are counting instructions past the target branch.
+/// Short of the target branch only the clock counts.
+#[cfg(target_arch = "x86_64")]
+fn uncounted_step_may_miscount(current: &ClockCounter, target_instr: u64) -> bool {
+    target_instr > 0 && current.rcbs() >= current.target_rcb
+}
+
+/// [`runs_in_place`] for the guest instruction at `ip`. Code that cannot be
+/// read counts as able to.
+#[cfg(target_arch = "x86_64")]
+fn instruction_may_run_in_place(task: &Stopped, ip: u64) -> bool {
+    /// The longest x86 instruction, in bytes.
+    const LONGEST: usize = 15;
+    let mut code = CodeReader {
+        task,
+        word_addr: None,
+        word: [0; 8],
+    };
+    let mut bytes = [0u8; LONGEST];
+    let mut len = 0;
+    while len < LONGEST {
+        match code.byte(ip.wrapping_add(len as u64)) {
+            Some(byte) => bytes[len] = byte,
+            None => break,
+        }
+        len += 1;
+    }
+    runs_in_place(ip, &bytes[..len])
+}
+
+/// Whether the 64-bit instruction at the start of `code`, whose first byte
+/// is at `ip`, can run without moving rip: a `rep` or `repne` string
+/// instruction, which repeats in place until its count runs out, a direct
+/// branch to itself, or an indirect branch or a return, whose target is not
+/// decoded (a return's comes from the stack, which can hold its own address).
+/// Bytes that do not decode count as able to.
+#[cfg(target_arch = "x86_64")]
+fn runs_in_place(ip: u64, code: &[u8]) -> bool {
+    use iced_x86::Decoder;
+    use iced_x86::DecoderOptions;
+    use iced_x86::FlowControl;
+    use iced_x86::Instruction;
+
+    let mut decoder = Decoder::with_ip(64, code, ip, DecoderOptions::NONE);
+    let mut instruction = Instruction::default();
+    if !decoder.can_decode() {
+        return true;
+    }
+    decoder.decode_out(&mut instruction);
+    if instruction.is_invalid() {
+        return true;
+    }
+    match instruction.flow_control() {
+        FlowControl::UnconditionalBranch | FlowControl::ConditionalBranch | FlowControl::Call => {
+            instruction.near_branch_target() == ip
+        }
+        FlowControl::IndirectBranch | FlowControl::IndirectCall | FlowControl::Return => true,
+        _ => {
+            instruction.is_string_instruction()
+                && (instruction.has_rep_prefix() || instruction.has_repne_prefix())
+        }
+    }
+}
+
+/// Whether `unit` is a block step or a branch run, which may retire branches
+/// as far as their decode allows. A single instruction, however the step
+/// runs it (`Instruction`, `LastInstruction`, and on x86 `Syscall`), and the
+/// halves of a step that go on from its own stops (`SyscallExit`, `Requeue`)
+/// are not.
+fn block_step(unit: StepUnit) -> bool {
+    match unit {
+        #[cfg(target_arch = "x86_64")]
+        StepUnit::Block => true,
+        #[cfg(target_arch = "aarch64")]
+        StepUnit::ToBranch { .. } => true,
+        _ => false,
+    }
+}
+
 /// Whether a block step left the counter at `clock`, at or past the precise
 /// target `target_rcb`, which the decoded bound rules out. If it did, the
 /// delivery point may be passed, so this is recorded as a skid overshoot,
 /// with its marker, and the run fails closed as for a late notification.
 fn block_step_reached_target(unit: StepUnit, clock: u64, target_rcb: u64) -> bool {
-    if unit == StepUnit::Instruction || clock < target_rcb {
+    if !block_step(unit) || clock < target_rcb {
         return false;
     }
     warn!(
-        "A block step reached the precise timer target {} (clock {}), which its decoded bound \
-         rules out; delivering the timer event at the observed counter",
+        "A block step or branch run reached the precise timer target {} (clock {}), which its \
+         decode rules out; delivering the timer event at the observed counter",
         target_rcb, clock
     );
     get_pmu_config().emit_skid_overshoot_marker(clock, target_rcb);
@@ -3103,9 +4382,303 @@ fn decode_block_bound(ip: u64, code: &[u8]) -> BlockBound {
     }
 }
 
+/// `si_code` of a hardware breakpoint's SIGTRAP
+/// (include/uapi/asm-generic/siginfo.h).
+#[cfg(target_arch = "aarch64")]
+const TRAP_HWBKPT: i32 = 4;
+
+/// The branch run from the registers `regs`, `clock` RCBs into a precise
+/// event whose target is `target_rcb` (see [`TimerImpl::branch_run`]): the
+/// addresses whose breakpoints end it, how many of them, and the branches it
+/// retires.
+///
+/// A load-exclusive at pc is planned first: the sequence up to its
+/// store-exclusive runs as one unit ([`crate::branch_step::exclusive_sequence`])
+/// if even its longest path leaves the counter short of the target, and is
+/// single stepped otherwise. The unit's ends lie outside the sequence, so no
+/// breakpoint stops it between its load and its store, and each end has the
+/// one count of the one straight-line path that reaches it. A store that
+/// fails in the unit, because the host interrupted the guest between its load
+/// and its store, fails as it would without the timer: the unit stops at the
+/// instruction after the store, and the retry branch is planned from there
+/// like any other, so retries are counted, not run past a breakpoint.
+///
+/// The run from pc meets the first stop point at or after pc, `at`. If that
+/// is a branch whose successors are known, and one more branch leaves the
+/// counter short of the target, the run retires it and ends, for each
+/// successor, at the last address of the straight-line path from it that is
+/// outside `[pc, at]` (a breakpoint inside would stop the run before the
+/// branch): the successor's own first stop point, or, for a path that runs
+/// back into `[pc, at]` (a loop of one block), the instruction just before
+/// pc. Otherwise the run ends at `at`, retiring nothing. A register branch's
+/// successor is known only from `at == pc`, where the register is current.
+///
+/// A run's breakpoint stop is a forced SIGTRAP, which, like a single step's,
+/// resets a blocked or ignored SIGTRAP. The step shield that prepares each
+/// unit decodes only the instruction at pc, and that is enough for a run
+/// too: every instruction that raises SIGTRAP itself (BRK, SVC and the other
+/// exception-generating instructions) is a stop point, so a run neither
+/// starts at nor executes one. A load-exclusive unit starts at its
+/// load-exclusive, which raises no SIGTRAP, and executes only instructions
+/// that are not stop points and conditional branches, so this holds for it
+/// too ([`crate::branch_step::exclusive_sequence`] refuses anything else). The shield leaves SIGTRAP unblocked for the
+/// whole run rather than one instruction; the guest makes no syscall and
+/// takes no trap of its own before the run ends, so it cannot tell.
+///
+/// A guest `rt_sigreturn` is an `svc` (x8 = 139), so it is a stop point as
+/// well, and a run never executes one. That is the only instruction that can
+/// change the guest's signal mask without a stop where no seccomp stop
+/// reports it. So a shield that decides from the instruction at pc whether a
+/// unit can change the mask may treat a run as it treats a single step. A
+/// change that lets a run execute an `svc` must turn such a shortcut off for
+/// runs (`branch_step::tests::an_rt_sigreturn_ends_a_run_before_it`).
+#[cfg(target_arch = "aarch64")]
+fn decode_branch_run(
+    task: &Stopped,
+    regs: &Regs,
+    clock: u64,
+    target_rcb: u64,
+) -> Option<BranchRunPlan> {
+    use crate::branch_step::STOP_WINDOW;
+    use crate::branch_step::Stop;
+    use crate::branch_step::exclusive_sequence;
+    use crate::branch_step::first_stop;
+
+    let mut code = [0u8; 4 * STOP_WINDOW];
+    let pc = regs.pc;
+    let len = read_code(task, pc, &mut code);
+    if let Some(sequence) = exclusive_sequence(pc, &code[..len]) {
+        // One unit or nothing: a sequence that could reach the target is
+        // single stepped as before, so that the event lands where single
+        // steps land it. Its store may then fail, as it does there.
+        return (clock + sequence.most() < target_rcb).then_some(BranchRunPlan {
+            stops: sequence.stops,
+            count: sequence.count,
+            branches: sequence.branches,
+            exclusive: true,
+        });
+    }
+    let (at, stop) = first_stop(pc, &code[..len])?;
+    let mut stop_after = |from: u64| {
+        let len = read_code(task, from, &mut code);
+        first_stop(from, &code[..len])
+    };
+    let through = (clock + 1 < target_rcb)
+        .then(|| match stop {
+            Stop::Register { .. } if at != pc => None,
+            stop => stop.successors(at, &regs.regs),
+        })
+        .flatten()
+        .and_then(|(successors, count)| {
+            let mut ends = [0u64; 2];
+            for (end, &successor) in ends.iter_mut().zip(&successors[..count]) {
+                let (next, _) = stop_after(successor)?;
+                *end = if !(pc..=at).contains(&next) {
+                    next
+                } else if successor < pc {
+                    pc - 4
+                } else {
+                    return None;
+                };
+            }
+            Some(if count == 1 || ends[0] == ends[1] {
+                ([ends[0], ends[0]], 1, 1)
+            } else {
+                (ends, 2, 1)
+            })
+        });
+    through
+        .or_else(|| (at != pc).then_some(([at, at], 1, 0)))
+        .map(|(stops, count, branches)| BranchRunPlan {
+            stops,
+            count,
+            branches: [branches, branches],
+            exclusive: false,
+        })
+}
+
+/// A branch run as [`decode_branch_run`] plans it: its breakpoints'
+/// addresses `stops[..count]`, the branches it retires on the way to each,
+/// and whether it runs a load-exclusive sequence as one unit.
+#[cfg(target_arch = "aarch64")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BranchRunPlan {
+    stops: [u64; 2],
+    count: usize,
+    branches: [u64; 2],
+    exclusive: bool,
+}
+
+/// Reports, once per process, that a load-exclusive sequence at the stopped
+/// thread's pc is single stepped although branch runs are on, for `reason`:
+/// its store-exclusive then fails on every attempt, and its retry loop, if
+/// it has one, retires branches until the timer's target, where a run
+/// without stops takes one attempt. A `decoded` sequence was found by
+/// [`decode_branch_run`]; otherwise the code at pc is read, and only a
+/// sequence that would run as a unit is reported. That costs every stepped
+/// instruction one register read and one 4-byte code read while branch runs
+/// are off and nothing is reported yet; the window is read and decoded only
+/// at a load-exclusive (`crate::branch_step::probe_exclusive_sequence`). `REVERIE_BLOCK_STEP=0`,
+/// which turns branch runs off on purpose, is not reported.
+#[cfg(target_arch = "aarch64")]
+fn report_stepped_exclusive_sequence(task: &Stopped, decoded: Option<u64>, reason: &str) {
+    static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if REPORTED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let Ok(regs) = task.getregs() else {
+        return;
+    };
+    if decoded.is_none()
+        && !crate::branch_step::probe_exclusive_sequence(regs.pc, |addr, buf| {
+            read_code(task, addr, buf)
+        })
+    {
+        return;
+    }
+    if REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    warn!(
+        "Single stepping the load-exclusive sequence at {:#x} toward a precise timer target \
+         because {reason}: a stop between its load and store clears the exclusive monitor, so \
+         its store fails on every attempt and a retry loop runs until the target, unlike the \
+         same code run without stops.",
+        regs.pc
+    );
+}
+
+/// Whether the SIGTRAP stop of a branch run is its breakpoint's: a hardware
+/// breakpoint trap at one of the run's stop points.
+#[cfg(target_arch = "aarch64")]
+fn is_branch_run_report(task: &Stopped, stops: &[u64]) -> bool {
+    matches!(task.getsiginfo(), Ok(info) if info.si_code == TRAP_HWBKPT)
+        && matches!(task.getregs(), Ok(regs) if stops.contains(&regs.pc))
+}
+
+/// Two hardware breakpoint registers of a thread that branch runs use, for
+/// one approach to a precise target.
+///
+/// They are two that were not enabled when the approach began. The others
+/// belong to someone else (a debugger of the guest, or the guest's own
+/// breakpoints) and are written back unchanged, as Linux writes registers
+/// from the first. Every return from the approach leaves the two as they
+/// were found: its ordinary returns through [`restore_breakpoints`], and
+/// every other return, an error's `?` included, through
+/// [`crate::branch_step::Borrowed`], at the last stop the approach saw.
+#[cfg(target_arch = "aarch64")]
+#[derive(Debug)]
+struct BranchBreakpoints {
+    /// The registers as the approach found them.
+    saved: safeptrace::HwBreakpoints,
+    /// The registers as last written.
+    current: safeptrace::HwBreakpoints,
+    /// The two registers used.
+    slots: [usize; 2],
+}
+
+#[cfg(target_arch = "aarch64")]
+impl BranchBreakpoints {
+    /// The thread's first two free breakpoint registers, if it has two and
+    /// Linux can reserve both.
+    ///
+    /// Linux registers a ptrace breakpoint for each register written, and
+    /// stops at the first that fails, so the two are first written as they
+    /// are (disabled): that reserves both hardware slots, or fails with
+    /// ENOSPC when others (the guest's own `perf_event_open` breakpoints)
+    /// hold them, before anything is enabled. A later write then only
+    /// changes registered breakpoints.
+    ///
+    /// The two stay registered, disabled, until the thread execs or exits:
+    /// ptrace has no request that unregisters one. From its first branch run
+    /// on, the thread's own `perf_event_open` breakpoints therefore find two
+    /// fewer free slots (of six on Neoverse V2), and may get ENOSPC where a
+    /// run with `REVERIE_BLOCK_STEP=0` would not.
+    fn new(task: &Stopped) -> Result<Option<Self>, TraceError> {
+        let saved = task.hw_breakpoints()?;
+        let enabled = saved.regs[..saved.slots()].iter().map(|reg| reg.enabled());
+        let Some(slots) = crate::branch_step::free_slots(enabled) else {
+            return Ok(None);
+        };
+        match task.set_hw_breakpoints(&saved, slots[1] + 1) {
+            Ok(()) => Ok(Some(Self {
+                saved,
+                current: saved,
+                slots,
+            })),
+            Err(TraceError::Errno(Errno::ENOSPC)) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Disarms a used register whose breakpoint is at `pc`, where a single
+    /// step is about to start.
+    fn disarm_at(&mut self, task: &Stopped, pc: u64) -> Result<(), TraceError> {
+        let mut next = self.current;
+        for &slot in &self.slots {
+            if next.regs[slot].enabled() && next.regs[slot].addr == pc {
+                next.regs[slot] = self.saved.regs[slot];
+            }
+        }
+        self.write(task, next)
+    }
+
+    /// After a failed write, which Linux may have applied in part: reads
+    /// the registers back, then disarms both used registers.
+    fn recover(&mut self, task: &Stopped) -> Result<(), TraceError> {
+        self.current = task.hw_breakpoints()?;
+        self.arm(task, &[])
+    }
+
+    /// Writes `next` if it differs from the registers as last written.
+    fn write(&mut self, task: &Stopped, next: safeptrace::HwBreakpoints) -> Result<(), TraceError> {
+        if next != self.current {
+            task.set_hw_breakpoints(&next, self.slots[1] + 1)?;
+            self.current = next;
+        }
+        Ok(())
+    }
+
+    /// Arms breakpoints at `stops` (at most two) and disarms the other used
+    /// register, writing only if that changes a register: a breakpoint
+    /// stays armed while its address stays a stop point.
+    fn arm(&mut self, task: &Stopped, stops: &[u64]) -> Result<(), TraceError> {
+        let mut next = self.current;
+        for (index, &slot) in self.slots.iter().enumerate() {
+            next.regs[slot] = match stops.get(index) {
+                Some(&at) => safeptrace::HwBreakpoint::at(at),
+                None => self.saved.regs[slot],
+            };
+        }
+        self.write(task, next)
+    }
+}
+
+/// Leaves the breakpoint registers branch runs used as the approach found
+/// them. A thread that cannot be written to has left its stop (it is dying),
+/// and its registers go with it.
+#[cfg(target_arch = "aarch64")]
+fn restore_breakpoints(breakpoints: &mut Option<BranchBreakpoints>, task: &Stopped) {
+    if let Some(mut armed) = breakpoints.take()
+        && let Err(error) = armed.arm(task, &[]).or_else(|_| armed.recover(task))
+    {
+        warn!("Could not restore hardware breakpoints after branch runs: {error:?}");
+    }
+}
+
+/// An early return from an approach gives its breakpoints back at the
+/// generation's stop, which the guard knows the thread to be in.
+#[cfg(target_arch = "aarch64")]
+impl crate::branch_step::GiveBack for BranchBreakpoints {
+    type Stop = safeptrace::TraceeGeneration;
+
+    fn give_back(self, stop: &Self::Stop) {
+        restore_breakpoints(&mut Some(self), &stop.assume_stopped());
+    }
+}
+
 /// Reads up to `buf.len()` bytes of guest code at `addr`, and returns how
 /// many it read: fewer where the code is unmapped or unreadable.
-#[cfg(target_arch = "x86_64")]
 fn read_code(task: &Stopped, addr: u64, buf: &mut [u8]) -> usize {
     match Addr::<u8>::from_raw(addr as usize) {
         Some(addr) => task.read(addr, buf).unwrap_or(0),
@@ -3596,6 +5169,140 @@ fn memory_error(task: &Stopped, err: Errno) -> TraceError {
     TraceError::Errno(err)
 }
 
+/// The synchronous-class signals other than SIGTRAP (`SYNCHRONOUS_MASK` in
+/// kernel/signal.c).
+const SYNCHRONOUS_SIGNALS: [Signal; 5] = [
+    Signal::SIGSEGV,
+    Signal::SIGBUS,
+    Signal::SIGILL,
+    Signal::SIGFPE,
+    Signal::SIGSYS,
+];
+
+/// The bit for `sig` in a kernel signal mask.
+fn signal_bit(sig: Signal) -> u64 {
+    1u64 << (sig as i32 - 1)
+}
+
+/// Whether a step's stop at `sig` is a synchronous-class signal that the
+/// kernel took ahead of the step's own report, which is still queued.
+///
+/// `dequeue_synchronous_signal` takes the first queued synchronous-class
+/// signal with a positive `si_code` before any other, and it does so
+/// without consulting the mask whenever any unblocked synchronous-class
+/// signal is pending; the step's SIGTRAP is one. So a step taken while the
+/// guest has such a signal pending and blocked, as a crash handler does
+/// after queueing its signal to itself again, completes its instruction and
+/// then stops at that signal, as does a step whose instruction makes one
+/// deliverable. The report stays queued behind it. Handed on, the stop would
+/// leave that report for a later step to meet as a pending SIGTRAP, blocked
+/// once a handler's mask blocks it, which no step can keep.
+///
+/// The report is recognized in the thread's own queue by its siginfo, as
+/// the step loop recognizes it at its stop (`is_step_report`): an
+/// instruction step reports with `TRAP_TRACE` and `si_addr` at the next
+/// instruction, where the thread now stands, on both x86 and aarch64, and
+/// a stepped x86 `syscall` with `TRAP_BRKPT` there (`other_report_code`). A
+/// SIGTRAP that the stepped instruction raised itself (`int3` with
+/// `SI_KERNEL`, `icebp` or `brk` with `TRAP_BRKPT`) or that was sent is not
+/// one, and such a stop is handed on as before: requeueing would put the
+/// guest's trap ahead of its signal, and the step could take it for its
+/// report. A SIGTRAP the guest queued itself with those very fields
+/// (`rt_tgsigqueueinfo` allows any positive code for the caller) cannot be
+/// told from the report by its siginfo; it is told by when it was queued.
+/// The caller knows whether a SIGTRAP was in the thread's own queue before
+/// the step: it reads the queue before the steps and at the exit stop of
+/// every step that ran a syscall, and a `syscall` that can queue one
+/// (`queues_the_thread_a_sigtrap`) is always run to its exit stop
+/// (`StepUnit::Syscall`). With a SIGTRAP queued, the report cannot be
+/// queued too (a queue holds one SIGTRAP, `legacy_queue`), nor does the
+/// instruction run: the pending signals are taken on the way out of the stop
+/// the step resumes, before it. The caller then ends the run
+/// (`HandleFailure::GuestSigtrap`) instead of requeueing, which would hand
+/// the guest's SIGTRAP to the step as its report and put the other signal
+/// behind it. Each
+/// signal is requeued once per step (`returned`): a second stop at it means
+/// the kernel did not take the report next, and it is handed on.
+/// The report must be deliverable, so that resuming takes it next and runs
+/// no instruction.
+fn dequeued_ahead_of_step_report(
+    task: &Stopped,
+    sig: Signal,
+    other_report_code: Option<i32>,
+    returned: u64,
+) -> Result<bool, TraceError> {
+    if !SYNCHRONOUS_SIGNALS.contains(&sig) || returned & signal_bit(sig) != 0 {
+        return Ok(false);
+    }
+    // A group stop has no siginfo.
+    let Ok(info) = task.getsiginfo() else {
+        return Ok(false);
+    };
+    // While a temporary mask's restore is pending, after a mask-swapping
+    // syscall that the step ran, `PTRACE_GETSIGMASK` reports the mask to be
+    // restored, but the kernel decides with the temporary one, which only
+    // procfs shows (`SigBlk`). Such a stop is handed on.
+    let mask = task.getsigmask()?;
+    if info.si_code <= 0
+        || mask & signal_bit(Signal::SIGTRAP) != 0
+        || crate::task::blocked_signal_mask(task.pid())
+            .map_err(|error| crate::task::dead_or(task, error))?
+            != mask
+    {
+        return Ok(false);
+    }
+    let next = crate::regs::RegAccess::ip(&task.getregs()?);
+    task.peeksiginfo_any(None, |info| {
+        // SAFETY: si_addr reads the fault-address member that a TRAP_TRACE
+        // report fills in.
+        info.si_signo == libc::SIGTRAP
+            && (info.si_code == libc::TRAP_TRACE || Some(info.si_code) == other_report_code)
+            && unsafe { info.si_addr() } as u64 == next
+    })
+}
+
+/// Whether a SIGTRAP is queued for the stopped `task` in its own queue
+/// (`PTRACE_PEEKSIGINFO`), the one a step's report goes to.
+///
+/// A SIGTRAP in the thread group's queue does not stop the report: Linux
+/// queues the report in the thread's own queue and delivers that first.
+fn sigtrap_in_own_queue(task: &Stopped) -> Result<bool, TraceError> {
+    task.peeksiginfo_any(None, |info| info.si_signo == libc::SIGTRAP)
+}
+
+/// The site `HandleFailure::GuestSigtrap` names for a step that would reach
+/// the target over a syscall that can queue the thread a SIGTRAP.
+pub(crate) const LAST_STEP_QUEUES_SIGTRAP: &str =
+    "precise timer's last step, over a call that can queue the thread a SIGTRAP";
+
+/// Whether the syscall `nr`, with its second and third arguments `arg1` and
+/// `arg2`, can queue the calling thread a SIGTRAP with a code the caller
+/// chooses: `rt_tgsigqueueinfo` naming SIGTRAP (third argument), which Linux
+/// lets a thread send itself with any code, and `pidfd_send_signal` naming
+/// SIGTRAP (second argument), which can target the thread's own queue
+/// (`PIDFD_SIGNAL_THREAD`). Other ways to queue the thread a SIGTRAP give it
+/// a code a process cannot choose and that no step report has (`tgkill`,
+/// `tkill`: `SI_TKILL`; POSIX timers: `SI_TIMER`), or queue it for the
+/// thread group (`rt_sigqueueinfo`, `kill`), whose queue a step's report does
+/// not share. A queueing call whose target is another thread, or whose code
+/// turns out to be a sender's, is caught too; that costs it two stops.
+///
+/// Linux declares both calls' signal argument `int` (`pidfd_send_signal`,
+/// kernel/signal.c:4065, and `rt_tgsigqueueinfo`, kernel/signal.c:4247, at
+/// v6.16), so only the low 32 bits of its register name the signal: a
+/// register holding `0x1_0000_0005` sends SIGTRAP.
+pub(crate) fn queues_the_thread_a_sigtrap(nr: u64, arg1: u64, arg2: u64) -> bool {
+    let names_sigtrap = |arg: u64| arg as u32 as i32 == libc::SIGTRAP;
+    (nr == libc::SYS_rt_tgsigqueueinfo as u64 && names_sigtrap(arg2))
+        || (nr == libc::SYS_pidfd_send_signal as u64 && names_sigtrap(arg1))
+}
+
+/// Whether `event` is a syscall stop (`PTRACE_SYSCALL`). Reverie's launch
+/// sets `PTRACE_O_TRACESYSGOOD`, so such a stop is never read as a trap.
+fn is_syscall_stop(event: &TraceEvent) -> bool {
+    matches!(event, TraceEvent::Syscall)
+}
+
 /// Reads the guest byte at `addr`.
 #[cfg(target_arch = "x86_64")]
 fn read_byte(task: &Stopped, addr: u64) -> Result<u8, Errno> {
@@ -3666,7 +5373,1159 @@ mod tests {
     use super::ClockCounter;
     #[cfg(target_arch = "x86_64")]
     use super::PmuConfig;
+    use super::branch_run_consistent;
+    use super::branch_run_stop_ends_stepping;
+    #[cfg(target_arch = "x86_64")]
+    use super::runs_in_place;
+    #[cfg(target_arch = "x86_64")]
+    use super::uncounted_step_may_miscount;
 
+    /// A load-exclusive unit whose two ends differ in count, as
+    /// [`crate::branch_step::exclusive_sequence`] decodes a compare-and-swap:
+    /// 2 branches to the address after its store-exclusive, 1 to its exit.
+    const UNIT_STOPS: [u64; 2] = [0x1010, 0x2000];
+    const UNIT_BRANCHES: [u64; 2] = [2, 1];
+
+    /// At the run's breakpoint, a unit whose ends differ in count is checked
+    /// against the end the stop's pc is at: each end's own count agrees, and
+    /// the other end's count is a mismatch, which ends branch runs
+    /// (`check_branch_run`).
+    #[test]
+    fn a_branch_run_at_its_breakpoint_is_checked_against_that_ends_count() {
+        for (end, &pc) in UNIT_STOPS.iter().enumerate() {
+            let other = UNIT_BRANCHES[1 - end];
+            assert!(
+                branch_run_consistent(
+                    UNIT_STOPS,
+                    2,
+                    UNIT_BRANCHES,
+                    UNIT_BRANCHES[end],
+                    Some(|| Some(pc))
+                ),
+                "end {end}: its own count"
+            );
+            assert!(
+                !branch_run_consistent(UNIT_STOPS, 2, UNIT_BRANCHES, other, Some(|| Some(pc))),
+                "end {end}: the other end's count {other} is a mismatch"
+            );
+        }
+    }
+
+    /// At the run's breakpoint, a unit whose ends differ in count fails
+    /// closed where the end cannot be known: a pc that cannot be read, or one
+    /// at neither end, agrees with no count, either end's included.
+    #[test]
+    fn a_branch_run_at_its_breakpoint_with_an_unknown_end_fails_closed() {
+        for moved in [0, 1, 2, 3] {
+            assert!(
+                !branch_run_consistent(UNIT_STOPS, 2, UNIT_BRANCHES, moved, Some(|| None)),
+                "unreadable pc, moved {moved}"
+            );
+            assert!(
+                !branch_run_consistent(UNIT_STOPS, 2, UNIT_BRANCHES, moved, Some(|| Some(0x1004))),
+                "pc at neither end, moved {moved}"
+            );
+        }
+    }
+
+    /// At a stop other than the run's breakpoint (an interrupting signal),
+    /// the counter may have moved by any count up to the most at any end;
+    /// more fails closed. A unit whose ends have one count is checked at its
+    /// breakpoint against that count exactly, without reading the pc.
+    #[test]
+    fn a_branch_run_elsewhere_may_not_pass_its_most_branches() {
+        let none = None::<fn() -> Option<u64>>;
+        for moved in [0, 1, 2] {
+            assert!(
+                branch_run_consistent(UNIT_STOPS, 2, UNIT_BRANCHES, moved, none),
+                "{moved}"
+            );
+        }
+        assert!(!branch_run_consistent(
+            UNIT_STOPS,
+            2,
+            UNIT_BRANCHES,
+            3,
+            none
+        ));
+        assert!(!branch_run_consistent([0x1010, 0], 1, [1, 0], 2, none));
+        let unread = || -> Option<u64> { panic!("the pc is read only where the ends differ") };
+        assert!(branch_run_consistent(
+            [0x1010, 0x2000],
+            2,
+            [1, 1],
+            1,
+            Some(unread)
+        ));
+        assert!(!branch_run_consistent(
+            [0x1010, 0],
+            1,
+            [1, 0],
+            0,
+            Some(unread)
+        ));
+        assert!(!branch_run_consistent(
+            [0x1010, 0],
+            1,
+            [1, 0],
+            2,
+            Some(unread)
+        ));
+    }
+
+    /// A SIGTRAP queued before a branch run goes on to the queued-SIGTRAP
+    /// rule, whatever its siginfo, without the report check reading the stop.
+    /// So a guest's self-queued `TRAP_BRKPT` or `TRAP_TRACE` SIGTRAP at the
+    /// breakpoint's pc, which the report check would not take for the
+    /// breakpoint's (its code is not `TRAP_HWBKPT`), is not handed on as an
+    /// interruption. With none queued, a stop that is not the report ends the
+    /// stepping, and the report does not.
+    #[test]
+    fn a_sigtrap_queued_before_a_branch_run_goes_to_the_queued_rule() {
+        let unread = || -> bool { panic!("a queued SIGTRAP's stop is not checked for the report") };
+        assert!(!branch_run_stop_ends_stepping(true, unread));
+        assert!(branch_run_stop_ends_stepping(false, || false));
+        assert!(!branch_run_stop_ends_stepping(false, || true));
+    }
+
+    /// How a guest SIGTRAP gets queued for the tests below, and what else
+    /// is queued with it.
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum QueuedTrap {
+        /// Queued by the guest before the steps; the steps start at that
+        /// call's exit stop, with nothing delivered.
+        Before,
+        /// Queued by an untraced `rt_tgsigqueueinfo` that the first step
+        /// runs (x86_64 only: the steps start at a stop just before the
+        /// `syscall`).
+        Stepped,
+        /// As `Stepped`, with bits above 31 set in the signal register,
+        /// which Linux ignores (`queues_the_thread_a_sigtrap`).
+        SteppedPadded,
+    }
+
+    /// `FPE_INTDIV` (include/uapi/asm-generic/siginfo.h), a positive code.
+    const FPE_INTDIV: i32 = 1;
+    /// `SI_QUEUE` (include/uapi/asm-generic/siginfo.h), `sigqueue`'s code.
+    const SI_QUEUE: i32 = -1;
+
+    /// Runs a precise timer's steps on a traced child that queues itself a
+    /// SIGTRAP with `code` and `si_addr` at the instruction after the queueing
+    /// call, as `how` says, after queueing itself a blocked SIGFPE first when
+    /// `fpe_first` is set. The steps aim `rcbs` branches past the clock at
+    /// the first step, at instruction offset `instr`. Returns the steps'
+    /// result, the si_addr the SIGTRAP carries, and the guard that kills the
+    /// child; `None` where perf counters are missing.
+    fn steps_with_a_guest_sigtrap(
+        how: QueuedTrap,
+        code: i32,
+        fpe_first: bool,
+        rcbs: u64,
+        instr: u64,
+    ) -> Option<(Result<super::Stopped, super::HandleFailure>, u64, impl Drop)> {
+        use nix::unistd::ForkResult;
+        use reverie::Pid;
+        use reverie::Tid;
+        use reverie::syscalls::AddrMut;
+        use reverie::syscalls::MemoryAccess;
+
+        use super::Running;
+        use super::StepStop;
+        use super::StepUnit;
+        use super::Stopped;
+        use super::TraceError;
+        use super::TraceEvent;
+        use super::Wait;
+        use crate::regs::RegAccess;
+
+        if !crate::perf::is_perf_supported() || super::try_get_pmu_config().is_none() {
+            eprintln!("skipping: perf counters are not supported here");
+            return None;
+        }
+        struct Reap(i32);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                // SAFETY: kill and waitpid take plain values and a local status.
+                unsafe {
+                    libc::kill(self.0, libc::SIGKILL);
+                    let mut status = 0;
+                    while libc::waitpid(self.0, &mut status, libc::__WALL) < 0
+                        && *libc::__errno_location() == libc::EINTR
+                    {}
+                }
+            }
+        }
+        // The SIGTRAP's siginfo, at the same address in the forked child.
+        // SAFETY: an all-zero siginfo is valid.
+        let trap: &'static mut libc::siginfo_t = Box::leak(Box::new(unsafe { std::mem::zeroed() }));
+        let trap = std::ptr::from_mut(trap) as usize;
+        // SAFETY: the child makes only raw calls before it spins.
+        let raw = match unsafe { nix::unistd::fork() }.expect("fork the tracee") {
+            ForkResult::Child => unsafe {
+                if libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0) != 0 {
+                    libc::_exit(1);
+                }
+                libc::raise(libc::SIGSTOP);
+                let (pid, tid) = (libc::getpid(), libc::syscall(libc::SYS_gettid));
+                if fpe_first {
+                    let mut set: libc::sigset_t = std::mem::zeroed();
+                    libc::sigemptyset(&mut set);
+                    libc::sigaddset(&mut set, libc::SIGFPE);
+                    libc::sigprocmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+                    let mut fpe: libc::siginfo_t = std::mem::zeroed();
+                    fpe.si_signo = libc::SIGFPE;
+                    fpe.si_code = FPE_INTDIV;
+                    libc::syscall(
+                        libc::SYS_rt_tgsigqueueinfo,
+                        pid,
+                        tid,
+                        libc::SIGFPE,
+                        &raw const fpe,
+                    );
+                }
+                let info = trap as *mut libc::siginfo_t;
+                (*info).si_signo = libc::SIGTRAP;
+                (*info).si_code = code;
+                match how {
+                    // The tracer fills in si_addr at the call's entry stop.
+                    QueuedTrap::Before => {
+                        libc::syscall(libc::SYS_rt_tgsigqueueinfo, pid, tid, libc::SIGTRAP, info);
+                    }
+                    // si_addr is the instruction after the `syscall`; the
+                    // `int3` stops the child just before it.
+                    #[cfg(target_arch = "x86_64")]
+                    QueuedTrap::Stepped | QueuedTrap::SteppedPadded => core::arch::asm!(
+                        "lea {next}, [rip + 2f]",
+                        "mov qword ptr [{info} + 16], {next}",
+                        "int3",
+                        "syscall",
+                        "2:",
+                        next = out(reg) _,
+                        info = in(reg) info,
+                        inlateout("rax") libc::SYS_rt_tgsigqueueinfo => _,
+                        in("rdi") pid,
+                        in("rsi") tid,
+                        in("rdx") if how == QueuedTrap::SteppedPadded {
+                            1u64 << 32 | libc::SIGTRAP as u64
+                        } else {
+                            libc::SIGTRAP as u64
+                        },
+                        in("r10") info,
+                        lateout("rcx") _,
+                        lateout("r11") _,
+                    ),
+                    #[cfg(not(target_arch = "x86_64"))]
+                    QueuedTrap::Stepped | QueuedTrap::SteppedPadded => libc::_exit(2),
+                }
+                let mut count = 0u64;
+                loop {
+                    count = std::hint::black_box(count.wrapping_add(1));
+                    if std::hint::black_box(count) == 0 {
+                        libc::_exit(0);
+                    }
+                }
+            },
+            ForkResult::Parent { child } => child.as_raw(),
+        };
+        let reap = Reap(raw);
+        let pid = Pid::from_raw(raw);
+        let (mut task, event) = Running::new_on_ptracer_thread(pid)
+            .expect("capture the tracee")
+            .wait()
+            .expect("wait")
+            .assume_stopped();
+        assert_eq!(event, TraceEvent::Signal(reverie::Signal::SIGSTOP));
+        task.setoptions(nix::sys::ptrace::Options::PTRACE_O_TRACESYSGOOD)
+            .expect("set options");
+        let si_addr = AddrMut::<u64>::from_raw(trap + 16).expect("an address");
+        let task = match how {
+            QueuedTrap::Before => {
+                // Syscall stops alternate between entry and exit, from an
+                // entry.
+                let mut entry = true;
+                loop {
+                    let (stopped, event) = task
+                        .syscall(None)
+                        .expect("resume")
+                        .wait()
+                        .expect("wait")
+                        .assume_stopped();
+                    task = stopped;
+                    assert_eq!(event, TraceEvent::Syscall, "only syscall stops come first");
+                    let regs = task.getregs().expect("read the registers");
+                    let queues_trap = entry
+                        && regs.orig_syscall() == libc::SYS_rt_tgsigqueueinfo as u64
+                        && regs.args().2 == libc::SIGTRAP as u64;
+                    entry = !entry;
+                    if queues_trap {
+                        // The report's pc: the instruction after the call's.
+                        task.write_value(si_addr, &regs.ip())
+                            .expect("fill in si_addr");
+                        break;
+                    }
+                }
+                // At the call's exit stop the SIGTRAP is queued, and the
+                // kernel has taken nothing.
+                let (task, event) = task
+                    .syscall(None)
+                    .expect("resume")
+                    .wait()
+                    .expect("wait")
+                    .assume_stopped();
+                assert_eq!(event, TraceEvent::Syscall);
+                task
+            }
+            QueuedTrap::Stepped | QueuedTrap::SteppedPadded => {
+                let (mut task, mut event) = task
+                    .resume(None)
+                    .expect("resume")
+                    .wait()
+                    .expect("wait")
+                    .assume_stopped();
+                if event == TraceEvent::Signal(reverie::Signal::SIGFPE) {
+                    // The kernel takes the queued SIGFPE ahead of the int3's
+                    // trap (`dequeue_synchronous_signal`); resumed while
+                    // blocked, it is queued again.
+                    (task, event) = task
+                        .resume(Some(reverie::Signal::SIGFPE))
+                        .expect("resume")
+                        .wait()
+                        .expect("wait")
+                        .assume_stopped();
+                }
+                assert_eq!(
+                    event,
+                    TraceEvent::Signal(reverie::Signal::SIGTRAP),
+                    "the int3"
+                );
+                task
+            }
+        };
+        let queued = sigtrap_queued_for_test(&task);
+        assert_eq!(queued, how == QueuedTrap::Before, "queued before the steps");
+        let trap_addr: u64 = task.read_value(si_addr).expect("read si_addr");
+
+        let mut timer = super::Timer::new(pid, Tid::from_raw(raw));
+        let inner = timer.inner_mut_noinit().expect("a timer");
+        let from = inner.read_clock();
+        let mut step =
+            |task: Stopped, request: super::StepRequest| -> Result<Running, TraceError> {
+                match request.unit {
+                    StepUnit::Requeue(sig) => task.step(Some(sig)),
+                    StepUnit::SyscallExit => task.syscall(None),
+                    #[cfg(target_arch = "x86_64")]
+                    StepUnit::Syscall => task.syscall(None),
+                    #[cfg(target_arch = "x86_64")]
+                    StepUnit::Block => task.block_step(),
+                    _ => task.step(None),
+                }
+            };
+        let mut observe = |_: &Wait, _: StepStop| Ok(());
+        let waits = std::sync::Arc::new(super::PtracerWaitOwner::default());
+        waits.bind_stopped(&task);
+        let result = futures::executor::block_on(inner.attempt_single_step(
+            task,
+            super::ClockCounter::new(from, 0, from + rcbs),
+            instr,
+            &mut step,
+            &mut observe,
+            &waits,
+        ));
+        Some((result, trap_addr, reap))
+    }
+
+    /// Whether a SIGTRAP is in `task`'s own queue.
+    fn sigtrap_queued_for_test(task: &super::Stopped) -> bool {
+        task.peeksiginfo_any(None, |info| info.si_signo == libc::SIGTRAP)
+            .expect("read the queue")
+    }
+
+    /// Checks that the steps ended with `HandleFailure::GuestSigtrap` at a
+    /// stop for `signal`, and, where that is SIGFPE, that the guest's SIGTRAP
+    /// is still queued; where it is SIGTRAP, that the stop is the guest's
+    /// (its code and si_addr).
+    fn ended_at_the_guests_sigtrap(
+        result: Result<super::Stopped, super::HandleFailure>,
+        signal: i32,
+        trap_addr: u64,
+    ) {
+        let Err(super::HandleFailure::GuestSigtrap(stopped, site)) = result else {
+            panic!("the guest's SIGTRAP was taken for a step's report: {result:?}");
+        };
+        assert_eq!(site, "precise timer");
+        let info = stopped.getsiginfo().expect("read the siginfo");
+        assert_eq!(info.si_signo, signal, "the stop the sequence ended at");
+        if signal == libc::SIGTRAP {
+            assert_eq!(info.si_code, libc::TRAP_TRACE);
+            // SAFETY: si_addr reads the member the guest filled in.
+            assert_eq!(unsafe { info.si_addr() } as u64, trap_addr);
+        } else {
+            assert!(
+                sigtrap_queued_for_test(&stopped),
+                "the guest's SIGTRAP stays queued"
+            );
+        }
+    }
+
+    /// A SIGTRAP the guest queued for itself before a timer step, shaped like
+    /// the step's report (`TRAP_TRACE` at the pc the thread stands at), is not
+    /// taken for the report when the kernel takes a blocked synchronous-class
+    /// signal queued before it first. The step's report cannot be queued
+    /// behind a queued SIGTRAP (`legacy_queue`), so requeueing the signal
+    /// would hand the guest's SIGTRAP to the step as its report and put the
+    /// signal behind it. The sequence ends instead
+    /// (`HandleFailure::GuestSigtrap`), with both signals still queued.
+    #[test]
+    fn a_sigtrap_queued_before_a_step_is_not_taken_for_its_report() {
+        let Some((result, addr, _reap)) =
+            steps_with_a_guest_sigtrap(QueuedTrap::Before, libc::TRAP_TRACE, true, 2, 0)
+        else {
+            return;
+        };
+        ended_at_the_guests_sigtrap(result, libc::SIGFPE, addr);
+    }
+
+    /// As `a_sigtrap_queued_before_a_step_is_not_taken_for_its_report`, with
+    /// nothing queued ahead of the guest's SIGTRAP: the step stops at it, before
+    /// its instruction runs, and it is not taken for the step's report.
+    #[test]
+    fn a_sigtrap_queued_before_a_step_is_not_taken_for_its_report_at_its_stop() {
+        let Some((result, addr, _reap)) =
+            steps_with_a_guest_sigtrap(QueuedTrap::Before, libc::TRAP_TRACE, false, 2, 0)
+        else {
+            return;
+        };
+        ended_at_the_guests_sigtrap(result, libc::SIGTRAP, addr);
+    }
+
+    /// A step over an untraced `rt_tgsigqueueinfo` that queues the thread a
+    /// SIGTRAP shaped like the step's report runs to the syscall's exit stop
+    /// (`StepUnit::Syscall`), where the queue is read, so the SIGTRAP, which
+    /// the next resume delivers, is not taken for a report when the kernel
+    /// takes a blocked SIGFPE queued before it first (the requeue form).
+    /// Single-stepped, the call's SIGTRAP would take the place of the step's
+    /// report, which Linux then drops, and be handed to the step behind the
+    /// requeued SIGFPE.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn a_sigtrap_a_stepped_call_queues_is_not_taken_for_a_report_behind_a_signal() {
+        let Some((result, addr, _reap)) =
+            steps_with_a_guest_sigtrap(QueuedTrap::Stepped, libc::TRAP_TRACE, true, 2, 0)
+        else {
+            return;
+        };
+        ended_at_the_guests_sigtrap(result, libc::SIGFPE, addr);
+    }
+
+    /// As `a_sigtrap_a_stepped_call_queues_is_not_taken_for_a_report_behind_a_signal`,
+    /// with bits above 31 set in the call's signal register. Linux reads the
+    /// signal as an `int`, so the call queues SIGTRAP all the same, and the
+    /// step over it must run to the syscall's exit stop as well.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn a_sigtrap_a_stepped_call_queues_with_a_padded_signal_is_not_taken_for_a_report() {
+        let Some((result, addr, _reap)) =
+            steps_with_a_guest_sigtrap(QueuedTrap::SteppedPadded, libc::TRAP_TRACE, true, 2, 0)
+        else {
+            return;
+        };
+        ended_at_the_guests_sigtrap(result, libc::SIGFPE, addr);
+    }
+
+    /// As `a_sigtrap_a_stepped_call_queues_is_not_taken_for_a_report_behind_a_signal`,
+    /// with nothing queued ahead of the call's SIGTRAP: the next step stops at
+    /// it, and it is not taken for that step's report.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn a_sigtrap_a_stepped_call_queues_is_not_taken_for_a_report_at_its_stop() {
+        let Some((result, addr, _reap)) =
+            steps_with_a_guest_sigtrap(QueuedTrap::Stepped, libc::TRAP_TRACE, false, 2, 0)
+        else {
+            return;
+        };
+        ended_at_the_guests_sigtrap(result, libc::SIGTRAP, addr);
+    }
+
+    /// A SIGTRAP a stepped call queues with a sender's code (`SI_QUEUE`) is
+    /// the guest's too, but the run loop tells it from Reverie's traps
+    /// (`handle_sigtrap`): the steps hand its stop on, unchanged, for the run
+    /// loop to deliver.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn a_sent_sigtrap_a_stepped_call_queues_is_handed_on() {
+        let Some((result, _, _reap)) =
+            steps_with_a_guest_sigtrap(QueuedTrap::Stepped, SI_QUEUE, false, 2, 0)
+        else {
+            return;
+        };
+        let Err(super::HandleFailure::Event(super::Wait::Stopped(stopped, event))) = result else {
+            panic!("the guest's SIGTRAP was not handed on: {result:?}");
+        };
+        assert_eq!(event, super::TraceEvent::Signal(reverie::Signal::SIGTRAP));
+        assert_eq!(
+            stopped.getsiginfo().expect("read the siginfo").si_code,
+            SI_QUEUE
+        );
+    }
+
+    /// The step that reaches an instruction-precise target cannot run a
+    /// syscall to its exit stop (`StepUnit::LastInstruction`), so where that
+    /// step is over a call that can queue the thread a SIGTRAP, the run ends
+    /// before the call runs, rather than let its SIGTRAP be taken for the
+    /// step's report.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn a_last_step_over_a_call_that_can_queue_a_sigtrap_is_refused() {
+        let Some((result, _, _reap)) =
+            steps_with_a_guest_sigtrap(QueuedTrap::Stepped, libc::TRAP_TRACE, false, 0, 1)
+        else {
+            return;
+        };
+        let Err(super::HandleFailure::GuestSigtrap(stopped, site)) = result else {
+            panic!("the last step ran the call: {result:?}");
+        };
+        assert_eq!(site, super::LAST_STEP_QUEUES_SIGTRAP);
+        assert!(!sigtrap_queued_for_test(&stopped), "the call did not run");
+    }
+
+    /// A block step or branch run whose counter reaches its precise target,
+    /// which its decode rules out, is recorded as a skid overshoot; one short
+    /// of the target is not, and no single-instruction unit ever is
+    /// (`block_step_reached_target`). The past-target case is a run from RCB
+    /// 10 toward target 12, decoded to retire at most one branch, that stopped
+    /// at 13.
+    #[test]
+    fn a_block_step_or_branch_run_at_or_past_its_target_is_an_overshoot() {
+        use super::StepUnit;
+        use super::block_step;
+        use super::block_step_reached_target;
+        use super::try_get_pmu_config;
+        #[cfg(target_arch = "x86_64")]
+        let unit = StepUnit::Block;
+        #[cfg(target_arch = "aarch64")]
+        let unit = StepUnit::ToBranch {
+            stops: [0x1010, 0],
+            count: 1,
+            branches: [1, 0],
+        };
+        assert!(block_step(unit), "{unit:?}");
+        for single in [
+            StepUnit::Instruction,
+            StepUnit::LastInstruction,
+            StepUnit::SyscallExit,
+            StepUnit::Requeue(reverie::Signal::SIGFPE),
+        ] {
+            assert!(!block_step(single), "{single:?}");
+            assert!(
+                !block_step_reached_target(single, 13, 12),
+                "{single:?} past its target"
+            );
+        }
+        assert!(
+            !block_step_reached_target(unit, 11, 12),
+            "short of the target"
+        );
+        // Recording an overshoot emits the marker, which reads the PMU
+        // configuration.
+        if try_get_pmu_config().is_none() {
+            eprintln!("skipping the at- and past-target cases: no PMU configuration");
+            return;
+        }
+        assert!(block_step_reached_target(unit, 12, 12), "at the target");
+        assert!(block_step_reached_target(unit, 13, 12), "past the target");
+    }
+
+    /// The calls that can queue the calling thread a SIGTRAP with a code it
+    /// chooses, from the registers at their `syscall` or `svc`.
+    #[test]
+    fn calls_that_can_queue_the_thread_a_sigtrap() {
+        use super::queues_the_thread_a_sigtrap as queues;
+        let (tgsigqueueinfo, pidfd) = (
+            libc::SYS_rt_tgsigqueueinfo as u64,
+            libc::SYS_pidfd_send_signal as u64,
+        );
+        let sigtrap = libc::SIGTRAP as u64;
+        assert!(queues(tgsigqueueinfo, 7, sigtrap));
+        assert!(!queues(tgsigqueueinfo, 7, libc::SIGFPE as u64));
+        assert!(queues(pidfd, sigtrap, 0));
+        assert!(!queues(pidfd, libc::SIGUSR1 as u64, sigtrap));
+        // The kernel reads the signal as an `int`: bits above 31 are ignored.
+        let padded = 1 << 32 | sigtrap;
+        assert!(queues(tgsigqueueinfo, 7, padded));
+        assert!(queues(pidfd, padded, 0));
+        assert!(!queues(tgsigqueueinfo, 7, 1 << 32 | libc::SIGFPE as u64));
+        assert!(!queues(pidfd, 1 << 32 | libc::SIGUSR1 as u64, 0));
+        for nr in [
+            libc::SYS_rt_sigqueueinfo,
+            libc::SYS_tgkill,
+            libc::SYS_tkill,
+            libc::SYS_kill,
+        ] {
+            assert!(!queues(nr as u64, sigtrap, sigtrap), "{nr}");
+        }
+    }
+
+    /// The controller's marker reads as its own PID in a shared PID
+    /// namespace, as 0 from a descendant one, and as its own PID on a kernel
+    /// without PID namespaces, which has only one.
+    #[test]
+    fn controller_sender_by_namespace() {
+        use super::GuestPidNamespace::*;
+        use super::sent_by_controller;
+        assert!(sent_by_controller(77, 77, Same));
+        assert!(!sent_by_controller(0, 77, Same));
+        assert!(sent_by_controller(0, 77, Descendant));
+        assert!(!sent_by_controller(77, 77, Descendant));
+        assert!(sent_by_controller(77, 77, Single));
+        assert!(!sent_by_controller(0, 77, Single));
+    }
+
+    /// Only an `ns` directory that lists `mnt` but not `pid` means a kernel
+    /// without PID namespaces; a directory that lists neither keeps the
+    /// `pid` lookup's ENOENT.
+    #[test]
+    fn pid_namespace_needs_positive_evidence_of_its_absence() {
+        use super::pid_namespace_of;
+        let dir = std::env::temp_dir().join(format!("reverie-ns-{}", std::process::id()));
+        // A panicked run with the same PID may have left `mnt` behind.
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(
+            pid_namespace_of(&dir).err(),
+            Some(nix::errno::Errno::ENOENT)
+        );
+        std::fs::write(dir.join("mnt"), b"").unwrap();
+        assert!(matches!(pid_namespace_of(&dir), Ok(None)));
+        std::fs::remove_dir_all(&dir).unwrap();
+        let listed = std::fs::symlink_metadata("/proc/thread-self/ns/pid").is_ok();
+        let this_task = pid_namespace_of(std::path::Path::new("/proc/thread-self/ns")).unwrap();
+        assert_eq!(this_task.is_some(), listed);
+    }
+
+    /// A stopped child of this test's thread with a timer on it, killed and
+    /// reaped when the guard drops; `None` where perf counters are missing.
+    fn timer_on_a_stopped_child() -> Option<(super::Timer, super::Stopped, impl Drop)> {
+        use nix::unistd::ForkResult;
+        use reverie::Pid;
+        use reverie::Tid;
+
+        if !crate::perf::is_perf_supported() || super::try_get_pmu_config().is_none() {
+            eprintln!("skipping: perf counters are not supported here");
+            return None;
+        }
+        struct Reap(i32);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                // SAFETY: kill and waitpid take plain values and a local status.
+                unsafe {
+                    libc::kill(self.0, libc::SIGKILL);
+                    let mut status = 0;
+                    while libc::waitpid(self.0, &mut status, libc::__WALL) < 0
+                        && *libc::__errno_location() == libc::EINTR
+                    {}
+                }
+            }
+        }
+        // SAFETY: the child calls only `traceme_and_stop` and `_exit`.
+        let raw = match unsafe { nix::unistd::fork() }.expect("fork the tracee") {
+            ForkResult::Child => {
+                safeptrace::traceme_and_stop().expect("TRACEME");
+                // SAFETY: _exit takes a plain value.
+                unsafe { libc::_exit(0) }
+            }
+            ForkResult::Parent { child } => child.as_raw(),
+        };
+        let reap = Reap(raw);
+        let (task, event) = super::Running::new(Pid::from_raw(raw))
+            .wait()
+            .expect("wait")
+            .assume_stopped();
+        assert_eq!(event, super::TraceEvent::Signal(reverie::Signal::SIGSTOP));
+        let timer = super::Timer::new(Pid::from_raw(raw), Tid::from_raw(raw));
+        Some((timer, task, reap))
+    }
+
+    /// A clock read at a stop that may not have made a ptrace request yet
+    /// (`TimerImpl::read_clock_at`, which the branch-run check uses) first
+    /// waits for the stopped thread to be switched out, where the counter's
+    /// page needs that (forced here, since this host's page may publish a
+    /// live counter's index), and only there.
+    #[test]
+    fn a_clock_read_at_a_stop_waits_for_the_switch_out_first() {
+        use super::SWITCH_OUT_FORCED_FOR_TEST;
+        use super::SWITCH_OUTS_FOR_TEST;
+
+        let Some((timer, task, _reap)) = timer_on_a_stopped_child() else {
+            return;
+        };
+        let inner = timer.inner();
+        let waits = || SWITCH_OUTS_FOR_TEST.get();
+
+        SWITCH_OUT_FORCED_FOR_TEST.set(true);
+        let before = waits();
+        let at_stop = inner.read_clock_at(&task);
+        SWITCH_OUT_FORCED_FOR_TEST.set(false);
+        assert_eq!(waits(), before + 1, "the read waited for the switch-out");
+        assert_eq!(
+            at_stop,
+            inner.read_clock(),
+            "a stopped thread's clock holds"
+        );
+
+        let before = waits();
+        inner.read_clock_at(&task);
+        let needs = inner.clock.fast_read_needs_switch_out();
+        assert_eq!(
+            waits(),
+            before + u64::from(needs),
+            "waits only where needed"
+        );
+    }
+
+    /// The branch-run check reads the clock only after the switch-out wait,
+    /// at a stop other than the run's breakpoint as at the breakpoint. A run
+    /// that retired the branches it decoded leaves branch runs on.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn a_branch_run_check_reads_the_clock_after_the_switch_out() {
+        use super::SWITCH_OUT_FORCED_FOR_TEST;
+        use super::SWITCH_OUTS_FOR_TEST;
+        use super::StepUnit;
+
+        let Some((mut timer, task, _reap)) = timer_on_a_stopped_child() else {
+            return;
+        };
+        let inner = timer.inner_mut_noinit().expect("a timer");
+        let from = inner.read_clock();
+        let unit = StepUnit::ToBranch {
+            stops: [0, 0],
+            count: 1,
+            branches: [0, 0],
+        };
+        SWITCH_OUT_FORCED_FOR_TEST.set(true);
+        for at_breakpoint in [None, Some(&task)] {
+            let before = SWITCH_OUTS_FOR_TEST.get();
+            inner.check_branch_run(&task, unit, from, from + 1_000, at_breakpoint);
+            assert_eq!(
+                SWITCH_OUTS_FOR_TEST.get(),
+                before + 1,
+                "{}",
+                at_breakpoint.is_some()
+            );
+        }
+        SWITCH_OUT_FORCED_FOR_TEST.set(false);
+        assert!(!inner.branch_runs_off);
+    }
+
+    /// A branch run whose counter disagrees with its decode at its own
+    /// breakpoint (no branch retired where the unit decoded 5) ends branch
+    /// runs for the thread and is counted (`check_branch_run`), as any
+    /// inconsistency `branch_run_consistent` finds.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn a_branch_run_mismatch_ends_branch_runs() {
+        use super::BRANCH_RUN_MISMATCHES;
+        use super::StepUnit;
+
+        let Some((mut timer, task, _reap)) = timer_on_a_stopped_child() else {
+            return;
+        };
+        let inner = timer.inner_mut_noinit().expect("a timer");
+        let from = inner.read_clock();
+        let unit = StepUnit::ToBranch {
+            stops: [0, 0],
+            count: 1,
+            branches: [5, 5],
+        };
+        let before = BRANCH_RUN_MISMATCHES.load(std::sync::atomic::Ordering::Relaxed);
+        inner.check_branch_run(&task, unit, from, from + 1_000, Some(&task));
+        assert!(inner.branch_runs_off);
+        assert!(BRANCH_RUN_MISMATCHES.load(std::sync::atomic::Ordering::Relaxed) > before);
+    }
+
+    /// A step that fails after a branch run armed its breakpoints, before
+    /// any resuming request took effect, gives them back
+    /// (`crate::branch_step::Borrowed`): the thread's registers are enabled
+    /// exactly as the approach found them, and those enabled then are
+    /// unchanged.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn a_failed_step_after_arming_gives_the_breakpoints_back() {
+        use super::ClockCounter;
+        use super::HandleFailure;
+        use super::StepUnit;
+        use super::TraceError;
+
+        let Some((mut timer, task, _reap)) = timer_on_a_stopped_child() else {
+            return;
+        };
+        let generation = task.generation();
+        let found = task.hw_breakpoints().expect("read the breakpoints");
+        let inner = timer.inner_mut_noinit().expect("a timer");
+        let from = inner.read_clock();
+        let mut armed = None;
+        let mut step = |task: super::Stopped,
+                        request: super::StepRequest|
+         -> Result<super::Running, TraceError> {
+            if matches!(request.unit, StepUnit::ToBranch { .. }) {
+                armed = Some(task.hw_breakpoints().expect("read the armed breakpoints"));
+            }
+            Err(TraceError::Errno(super::Errno::EIO))
+        };
+        let mut observe = |_: &super::Wait, _: super::StepStop| Ok(());
+        let waits = std::sync::Arc::new(super::PtracerWaitOwner::default());
+        let result = futures::executor::block_on(inner.attempt_single_step(
+            task,
+            ClockCounter::new(from, 0, from + 50),
+            0,
+            &mut step,
+            &mut observe,
+            &waits,
+        ));
+        assert_eq!(
+            result,
+            Err(HandleFailure::TraceError(TraceError::Errno(
+                super::Errno::EIO
+            )))
+        );
+        // Which registers are enabled. A register that has held a ptrace
+        // breakpoint keeps its other control bits once disabled: a write
+        // that disables it only marks the registered breakpoint disabled
+        // (`ptrace_hbp_fill_attr_ctrl`, arch/arm64/kernel/ptrace.c:326-334 at
+        // v6.16), and a read encodes the control bits the breakpoint kept
+        // (`ptrace_hbp_get_ctrl`, :384-396), so a given-back register reads
+        // as disabled, not as zero.
+        let enabled = |regs: &safeptrace::HwBreakpoints| -> Vec<bool> {
+            regs.regs[..regs.slots()]
+                .iter()
+                .map(|reg| reg.enabled())
+                .collect()
+        };
+        let armed = armed.expect("the first step was a branch run");
+        assert_ne!(
+            enabled(&armed),
+            enabled(&found),
+            "the branch run armed a breakpoint"
+        );
+        let now = generation
+            .assume_stopped()
+            .hw_breakpoints()
+            .expect("read the breakpoints");
+        assert_eq!(
+            enabled(&now),
+            enabled(&found),
+            "the failed step left a breakpoint armed"
+        );
+        for slot in 0..found.slots() {
+            if found.regs[slot].enabled() {
+                assert_eq!(now.regs[slot], found.regs[slot], "slot {slot}");
+            }
+        }
+    }
+
+    /// What a traced child queues itself before the steps toward an event
+    /// start (see `steps_over_a_queued_signal`).
+    #[derive(Debug, Clone, Copy)]
+    enum Queued {
+        /// The timer's signal with `POLL_IN` and the counter's descriptor, as
+        /// a counter overflow raises it.
+        PerfShaped,
+        /// The same with another descriptor number, as another counter's.
+        OtherDescriptor,
+        /// The timer's signal by `rt_tgsigqueueinfo` with `SI_QUEUE`, as
+        /// `sigqueue` sends it.
+        Sigqueued,
+        /// The timer's signal by `tgkill`, as `raise` sends it.
+        Raised,
+    }
+
+    /// How the steps over a queued signal ended.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Steps {
+        /// They reached the target.
+        Reached,
+        /// They handed on the stop of a signal, with this number and code.
+        HandedOn(i32, i32),
+    }
+
+    /// A traced child queues itself the timer's signal as `queued` says, and
+    /// the steps toward a target two branches out start at that call's exit
+    /// stop, so the first step's resume delivers the signal, before any
+    /// instruction runs. `prepare` sets up the timer first. If
+    /// `end_an_event_first`, steps toward a target already reached run
+    /// first, as an event's last steps end. Returns how the steps ended and
+    /// the recorded overflows left outstanding (`unnotified_overflows`).
+    /// Each test reads its own timer, not the process-wide count that
+    /// concurrent tests share.
+    fn steps_over_a_queued_signal(
+        queued: Queued,
+        end_an_event_first: bool,
+        prepare: impl FnOnce(&mut super::TimerImpl),
+    ) -> Option<(Steps, u64)> {
+        use nix::unistd::ForkResult;
+        use reverie::Pid;
+        use reverie::Tid;
+        use reverie::syscalls::AddrMut;
+        use reverie::syscalls::MemoryAccess;
+
+        use super::ClockCounter;
+        use super::HandleFailure;
+        use super::MARKER_SIGNAL;
+        use super::Running;
+        use super::StepUnit;
+        use super::Stopped;
+        use super::TraceError;
+        use super::TraceEvent;
+        use super::Wait;
+        use crate::regs::RegAccess;
+
+        if !crate::perf::is_perf_supported() || super::try_get_pmu_config().is_none() {
+            eprintln!("skipping: perf counters are not supported here");
+            return None;
+        }
+        struct Reap(i32);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                // SAFETY: kill and waitpid take plain values and a local status.
+                unsafe {
+                    libc::kill(self.0, libc::SIGKILL);
+                    let mut status = 0;
+                    while libc::waitpid(self.0, &mut status, libc::__WALL) < 0
+                        && *libc::__errno_location() == libc::EINTR
+                    {}
+                }
+            }
+        }
+        let signo = MARKER_SIGNAL as i32;
+        let call = match queued {
+            Queued::Raised => libc::SYS_tgkill,
+            _ => libc::SYS_rt_tgsigqueueinfo,
+        };
+        // The siginfo the child queues, at the same address in the forked
+        // child; the tracer fills in a descriptor (si_fd, 24 bytes in) at the
+        // call's entry stop.
+        // SAFETY: an all-zero siginfo is valid.
+        let info: &'static mut libc::siginfo_t = Box::leak(Box::new(unsafe { std::mem::zeroed() }));
+        info.si_signo = signo;
+        info.si_code = match queued {
+            Queued::PerfShaped | Queued::OtherDescriptor => i32::from(libc::POLLIN),
+            _ => libc::SI_QUEUE,
+        };
+        let info = std::ptr::from_mut(info) as usize;
+        // SAFETY: the child makes only raw calls before it spins.
+        let raw = match unsafe { nix::unistd::fork() }.expect("fork the tracee") {
+            ForkResult::Child => unsafe {
+                if libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0) != 0 {
+                    libc::_exit(1);
+                }
+                libc::raise(libc::SIGSTOP);
+                if call == libc::SYS_tgkill {
+                    libc::syscall(call, libc::getpid(), libc::syscall(libc::SYS_gettid), signo);
+                } else {
+                    libc::syscall(
+                        call,
+                        libc::getpid(),
+                        libc::syscall(libc::SYS_gettid),
+                        signo,
+                        info as *const libc::siginfo_t,
+                    );
+                }
+                let mut count = 0u64;
+                loop {
+                    count = std::hint::black_box(count.wrapping_add(1));
+                    if std::hint::black_box(count) == 0 {
+                        libc::_exit(0);
+                    }
+                }
+            },
+            ForkResult::Parent { child } => child.as_raw(),
+        };
+        let _reap = Reap(raw);
+        let pid = Pid::from_raw(raw);
+        let (mut task, event) = Running::new_on_ptracer_thread(pid)
+            .expect("capture the tracee")
+            .wait()
+            .expect("wait")
+            .assume_stopped();
+        assert_eq!(event, TraceEvent::Signal(reverie::Signal::SIGSTOP));
+        task.setoptions(nix::sys::ptrace::Options::PTRACE_O_TRACESYSGOOD)
+            .expect("set options");
+        let mut timer = super::Timer::new(pid, Tid::from_raw(raw));
+        let fd = timer.inner().timer.raw_fd();
+        // Syscall stops alternate between entry and exit, from an entry.
+        let mut entry = true;
+        loop {
+            let (stopped, event) = task
+                .syscall(None)
+                .expect("resume")
+                .wait()
+                .expect("wait")
+                .assume_stopped();
+            task = stopped;
+            assert_eq!(event, TraceEvent::Syscall, "only syscall stops come first");
+            let regs = task.getregs().expect("read the registers");
+            let queues =
+                entry && regs.orig_syscall() == call as u64 && regs.args().2 == signo as u64;
+            entry = !entry;
+            if queues {
+                let si_fd = AddrMut::<i32>::from_raw(info + 24).expect("an address");
+                let number = match queued {
+                    Queued::OtherDescriptor => fd + 100,
+                    _ => fd,
+                };
+                task.write_value(si_fd, &number).expect("fill in si_fd");
+                break;
+            }
+        }
+        let (mut task, event) = task
+            .syscall(None)
+            .expect("resume")
+            .wait()
+            .expect("wait")
+            .assume_stopped();
+        assert_eq!(event, TraceEvent::Syscall, "the call's exit stop");
+
+        let inner = timer.inner_mut_noinit().expect("a timer");
+        prepare(inner);
+        let mut step =
+            |task: Stopped, request: super::StepRequest| -> Result<Running, TraceError> {
+                match request.unit {
+                    #[cfg(target_arch = "x86_64")]
+                    StepUnit::Block => task.block_step(),
+                    #[cfg(target_arch = "aarch64")]
+                    StepUnit::ToBranch { .. } => task.resume(None),
+                    _ => task.step(None),
+                }
+            };
+        let mut observe = |_: &Wait, _: super::StepStop| Ok(());
+        let waits = std::sync::Arc::new(super::PtracerWaitOwner::default());
+        waits.bind_stopped(&task);
+        if end_an_event_first {
+            let clock = inner.read_clock();
+            task = futures::executor::block_on(inner.attempt_single_step(
+                task,
+                ClockCounter::new(clock, 0, clock),
+                0,
+                &mut step,
+                &mut observe,
+                &waits,
+            ))
+            .expect("steps toward a target already reached");
+        }
+        let from = inner.read_clock();
+        let result = futures::executor::block_on(inner.attempt_single_step(
+            task,
+            ClockCounter::new(from, 0, from + 2),
+            0,
+            &mut step,
+            &mut observe,
+            &waits,
+        ));
+        let steps = match result {
+            Ok(_) => {
+                assert!(
+                    inner.read_clock() >= from + 2,
+                    "the steps reached the target"
+                );
+                Steps::Reached
+            }
+            Err(HandleFailure::Event(Wait::Stopped(stopped, TraceEvent::Signal(_)))) => {
+                let info = stopped.getsiginfo().expect("the stop's siginfo");
+                Steps::HandedOn(info.si_signo, info.si_code)
+            }
+            Err(error) => panic!("the steps failed: {error:?}"),
+        };
+        Some((steps, inner.unnotified_overflows))
+    }
+
+    /// A signal that only looks like the timer's notification, which the
+    /// steps toward an event meet, is handed on, as every stop the steps do
+    /// not own is: the timer's signal with `POLL_IN` and the counter's
+    /// descriptor that the guest queued itself, with no overflow recorded
+    /// (the counter never ran past a period); the same with another
+    /// descriptor number; and the timer's signal by `sigqueue` or `raise`.
+    #[test]
+    fn a_signal_shaped_like_the_timers_during_its_steps_is_handed_on() {
+        let poll_in = i32::from(libc::POLLIN);
+        let signo = super::MARKER_SIGNAL as i32;
+        for (queued, code) in [
+            (Queued::PerfShaped, poll_in),
+            (Queued::OtherDescriptor, poll_in),
+            (Queued::Sigqueued, libc::SI_QUEUE),
+            (Queued::Raised, libc::SI_TKILL),
+        ] {
+            let Some(outcome) = steps_over_a_queued_signal(queued, false, |_| {}) else {
+                return;
+            };
+            assert_eq!(outcome, (Steps::HandedOn(signo, code), 0), "{queued:?}");
+        }
+    }
+
+    /// A notification of the counter's own that reaches the thread during
+    /// the steps toward its event, while the kernel has recorded an overflow
+    /// of the current programming that no stop took a notification for, is
+    /// consumed, and the steps go on to the target. Handed on, it reached the
+    /// run loop after the stop had decided the event, which then fired
+    /// nowhere. The recorded overflow is set up as collecting its record
+    /// leaves it (`unnotified_overflows`); the child queues the notification
+    /// itself, which the siginfo cannot tell from the kernel's.
+    #[test]
+    fn a_notification_of_a_recorded_overflow_during_the_steps_is_consumed() {
+        let Some(outcome) = steps_over_a_queued_signal(Queued::PerfShaped, false, |timer| {
+            timer.unnotified_overflows = 1;
+        }) else {
+            return;
+        };
+        // Handed on, it would have ended the steps; consumed, it used up
+        // the overflow.
+        assert_eq!(outcome, (Steps::Reached, 0));
+    }
+
+    /// What an earlier programming recorded does not account for a
+    /// notification during the steps: a programming made after the overflow
+    /// was recorded starts the count again, and the notification is handed
+    /// on.
+    #[test]
+    fn an_earlier_programmings_overflow_does_not_account_for_a_notification() {
+        let Some(outcome) = steps_over_a_queued_signal(Queued::PerfShaped, false, |timer| {
+            timer.unnotified_overflows = 1;
+            timer
+                .prepare_notification(1 << 40)
+                .expect("program the counter");
+            timer.timer.disable().expect("disable the counter");
+            timer.overflow_period = None;
+        }) else {
+            return;
+        };
+        assert_eq!(
+            outcome,
+            (
+                Steps::HandedOn(super::MARKER_SIGNAL as i32, i32::from(libc::POLLIN)),
+                0
+            )
+        );
+    }
+
+    /// Two overflows recorded and one notification taken, as when standard
+    /// signals coalesce, leave one counted; it ends with the event's steps,
+    /// so a later signal shaped like the notification is handed on.
+    #[test]
+    fn a_coalesced_notifications_count_ends_with_its_event() {
+        let Some(outcome) = steps_over_a_queued_signal(Queued::PerfShaped, true, |timer| {
+            timer.unnotified_overflows = 2;
+            timer.note_overflow_notification();
+            assert_eq!(timer.unnotified_overflows, 1);
+        }) else {
+            return;
+        };
+        assert_eq!(
+            outcome,
+            (
+                Steps::HandedOn(super::MARKER_SIGNAL as i32, i32::from(libc::POLLIN)),
+                0
+            )
+        );
+    }
     #[test]
     fn terminal_close_attempts_both_counters_after_cancellation_error() {
         use super::*;
@@ -3698,10 +6557,15 @@ mod tests {
                 overflow_period: None,
                 overflow_recorded: false,
                 programming_overflowed: false,
+                unnotified_overflows: 0,
+                overflow_point: None,
                 event_margin: get_pmu_config().skid_margin(),
                 first_stage: None,
+                halved: None,
                 #[cfg(target_arch = "x86_64")]
                 block_bounds: BlockBounds::default(),
+                #[cfg(target_arch = "aarch64")]
+                branch_runs_off: false,
                 initial_command: InitialCommand::Ordinary,
                 held_initial_event: Some(event),
                 interrupted: None,
@@ -3848,6 +6712,22 @@ mod tests {
         (signo == super::MARKER_SIGNAL as i32).then_some(info)
     }
 
+    /// Turns halved notifications on or off on this thread until dropped
+    /// (see `HALVED_STAGES_FOR_TEST`).
+    struct HalvingForTest(Option<bool>);
+
+    impl HalvingForTest {
+        fn set(halve: bool) -> Self {
+            Self(super::HALVED_STAGES_FOR_TEST.replace(Some(halve)))
+        }
+    }
+
+    impl Drop for HalvingForTest {
+        fn drop(&mut self) {
+            super::HALVED_STAGES_FOR_TEST.set(self.0);
+        }
+    }
+
     /// Blocks the timer's signal on the calling thread, so that the test can
     /// take its notifications.
     fn block_timer_signal() {
@@ -3860,6 +6740,56 @@ mod tests {
                 0
             );
         }
+    }
+
+    // A notification that finds the clock more than the programming's steps
+    // short of a precise target (a spurious wakeup) requests the same event
+    // again: the same target and the same instruction offset. Requested
+    // without its offset, the event was delivered at the target branch.
+    #[test]
+    fn a_spurious_wakeup_requests_the_same_event_with_its_instruction_offset() {
+        use reverie::Pid;
+
+        use super::ActiveEvent;
+        use super::TimerEventRequest;
+        use super::TimerImpl;
+
+        const TICKS: u64 = 1_000_000;
+        block_timer_signal();
+        let pid = Pid::from_raw(unsafe { libc::getpid() });
+        let tid = Pid::from_raw(unsafe { libc::syscall(libc::SYS_gettid) } as i32);
+        let mut timer = TimerImpl::new(pid, tid, false).expect("control requires a working PMU");
+        // The clock stands still, as a stopped guest's does, so that every
+        // read in a call is the same.
+        timer.clock.disable().unwrap();
+        for offset in [11, 0] {
+            timer
+                .request_event(TimerEventRequest::PreciseInstruction(TICKS, offset))
+                .unwrap();
+            timer.timer.disable().unwrap();
+            let requested = timer.event;
+            let ActiveEvent::Precise { clock_target, .. } = requested else {
+                panic!("a precise event: {requested:?}");
+            };
+            // The notification finds the clock where the request did, the
+            // whole request short of the target.
+            let clock = timer.read_clock();
+            assert_eq!(clock_target - clock, TICKS);
+            assert_eq!(timer.reschedule_spurious_wakeup(clock), Some(Ok(())));
+            timer.timer.disable().unwrap();
+            assert_eq!(timer.event, requested, "offset {offset}");
+            // Within the programming's steps of the target it is no
+            // spurious wakeup.
+            assert_eq!(timer.reschedule_spurious_wakeup(clock_target - 1), None);
+        }
+        let event = ActiveEvent::Precise {
+            clock_target: 30_233,
+            offset: 11,
+        };
+        assert!(matches!(
+            event.reschedule_if_spurious_wakeup(7_000, 200),
+            Some(TimerEventRequest::PreciseInstruction(23_233, 11))
+        ));
     }
 
     // A staged precise event's first stage is programmed the first stage
@@ -3881,6 +6811,8 @@ mod tests {
         use super::TimerImpl;
         use super::get_pmu_config;
 
+        // It checks whole programmings.
+        let _halving = HalvingForTest::set(false);
         const TICKS: u64 = 1_000_000;
         let config = get_pmu_config();
         if !config.stages(TICKS) {
@@ -3911,6 +6843,7 @@ mod tests {
             panic!("a precise event: {requested:?}");
         };
         assert_eq!(timer.overflow_period, Some(TICKS - first));
+        assert_eq!(timer.overflow_point, Some(clock_target - first));
         assert_eq!(timer.event_margin, first);
         assert_eq!(
             timer.max_single_step_count(),
@@ -3924,6 +6857,7 @@ mod tests {
         assert_eq!(timer.rearm_second_stage(stage, clock, None), Ok(false));
         assert_eq!(timer.event, requested);
         assert_eq!(timer.overflow_period, Some(TICKS - first));
+        assert_eq!(timer.overflow_point, Some(clock_target - first));
         assert_eq!(timer.event_margin, first);
 
         // The notification finds the guest 200 RCBs past the overflow, which
@@ -3945,6 +6879,7 @@ mod tests {
         assert_eq!(timer.event, requested);
         assert_eq!(timer.timer_status, EventStatus::Scheduled);
         assert_eq!(timer.overflow_period, Some(remaining - margin));
+        assert_eq!(timer.overflow_point, Some(clock_target - margin));
         assert_eq!(timer.event_margin, margin);
         assert_eq!(
             timer.max_single_step_count(),
@@ -3963,9 +6898,75 @@ mod tests {
             );
             assert_eq!(timer.event, requested);
             assert_eq!(timer.overflow_period, Some(remaining - skid));
+            assert_eq!(timer.overflow_point, Some(clock_target - skid));
             assert_eq!(timer.event_margin, skid);
         }
         timer.timer.disable().unwrap();
+    }
+
+    // A second stage re-programs the active event, and its overflow point
+    // moves with it, so that a second stage's overshoot reports the
+    // overflow it missed. Unlike
+    // `a_staged_event_is_rearmed_short_of_the_same_target`, this runs where
+    // events are not staged too: the re-arm itself does not ask.
+    #[test]
+    fn a_second_stage_moves_the_overflow_point() {
+        use reverie::Pid;
+
+        use super::ActiveEvent;
+        use super::EventStatus;
+        use super::FirstStage;
+        use super::TimerEventRequest;
+        use super::TimerImpl;
+        use super::get_pmu_config;
+
+        const TICKS: u64 = 1_000_000;
+        block_timer_signal();
+        // Whole programmings, as on x86 by default: a halved one's point is
+        // pinned by a_halved_notification_rearms_before_any_step_keeping_the_offset.
+        let _halving = HalvingForTest::set(false);
+        let pid = Pid::from_raw(unsafe { libc::getpid() });
+        let tid = Pid::from_raw(unsafe { libc::syscall(libc::SYS_gettid) } as i32);
+        let mut timer = TimerImpl::new(pid, tid, false).expect("control requires a working PMU");
+        // The clock stands still, as a stopped guest's does.
+        timer.clock.disable().unwrap();
+        timer
+            .request_event(TimerEventRequest::Precise(TICKS))
+            .unwrap();
+        timer.timer.disable().unwrap();
+        let ActiveEvent::Precise { clock_target, .. } = timer.event else {
+            panic!("a precise event: {:?}", timer.event);
+        };
+        let period = timer
+            .overflow_period
+            .expect("the request programs an overflow");
+        assert_eq!(timer.overflow_point, Some(clock_target - TICKS + period));
+
+        // Without a time from the programming, the second stage is the skid
+        // margin short of the target.
+        let stage = FirstStage {
+            programmed_ns: 0,
+            programmed_clock: clock_target - TICKS,
+        };
+        let skid = get_pmu_config().skid_margin();
+        let clock = clock_target - TICKS / 2;
+        // Where events are not staged, both programmings are the skid margin
+        // short of the target, so forget the first stage's point to see the
+        // second stage set its own.
+        timer.overflow_point = None;
+        assert_eq!(timer.rearm_second_stage(stage, clock, None), Ok(true));
+        // The second stage's programming is whole, or halved where halving
+        // applies: either way its overflow is one period from `clock`.
+        let notification = clock_target - clock - skid;
+        let period = if super::halves(notification, skid) {
+            notification / 2
+        } else {
+            notification
+        };
+        assert_eq!(timer.overflow_period, Some(period));
+        assert_eq!(timer.overflow_point, Some(clock + period));
+        timer.timer.disable().unwrap();
+        timer.set_status(EventStatus::Cancelled);
     }
 
     // The first stage's overflow records its time, after the programming,
@@ -4276,6 +7277,102 @@ mod tests {
         }
     }
 
+    // A disregarded stop that finds a halved programming's notification lost
+    // re-arms the rest of the event in place, as the notification's own stop
+    // would, rather than handing the event on to be delivered from far
+    // short of its target; a whole programming's is handed on as before.
+    #[test]
+    fn a_lost_halved_notification_rearms_the_rest_at_a_disregarded_stop() {
+        use reverie::Pid;
+
+        use super::ActiveEvent;
+        use super::EventStatus;
+        use super::TimerEventRequest;
+        use super::TimerImpl;
+        use super::Unfinished;
+        use crate::perf::PerfCounter;
+
+        block_timer_signal();
+        let guest = BranchThread::spawn();
+        let pid = Pid::from_raw(unsafe { libc::getpid() });
+        let mut timer =
+            TimerImpl::new(pid, guest.tid, false).expect("control requires a working PMU");
+        let margin = super::get_pmu_config()
+            .first_stage_margin()
+            .max(super::get_pmu_config().skid_margin());
+        let ticks = 100 * margin;
+        for halve in [true, false] {
+            let _halving = HalvingForTest::set(halve);
+            if halve && !super::halves(ticks - margin, margin) {
+                eprintln!("skipping: no notification is halved under a skid margin override");
+                return;
+            }
+            timer
+                .request_event(TimerEventRequest::Precise(ticks))
+                .unwrap();
+            let ActiveEvent::Precise { clock_target, .. } = timer.event else {
+                panic!("a precise event")
+            };
+            assert_eq!(timer.halved.is_some(), halve);
+            let period = timer.overflow_period.expect("a programmed notification");
+            // Raising the hardware period makes the counter pass its period
+            // without an overflow, as the kernel's absorption does.
+            timer
+                .timer
+                .set_period(PerfCounter::DISABLE_SAMPLE_PERIOD)
+                .unwrap();
+            guest.run(period);
+            // A halved programming passes its period far short of the target.
+            assert!(!halve || timer.read_clock() + 10 * margin < clock_target);
+            assert_eq!(timer.notification_lost(), Ok(true));
+            timer.tick_observed();
+            let unfinished = timer.disregard_stop().unwrap();
+            if halve {
+                assert!(unfinished.is_none(), "re-armed, not handed on");
+                assert_eq!(timer.timer_status, EventStatus::Scheduled);
+                let remaining = clock_target - timer.read_clock();
+                let whole = remaining - timer.event_margin;
+                let expected = if timer.halved.is_some() {
+                    whole / 2
+                } else {
+                    whole
+                };
+                assert_eq!(timer.overflow_period, Some(expected));
+                assert_eq!(timer.notification_lost(), Ok(false));
+            } else {
+                assert!(matches!(unfinished, Some(Unfinished::Notification)));
+            }
+            let ActiveEvent::Precise {
+                clock_target: after,
+                ..
+            } = timer.event
+            else {
+                panic!("a precise event")
+            };
+            assert_eq!(after, clock_target, "the target is unchanged");
+            timer.disable_timer_before_stepping();
+        }
+
+        // A cancelled event stays cancelled, halved programming or not.
+        let _halving = HalvingForTest::set(true);
+        timer
+            .request_event(TimerEventRequest::Precise(ticks))
+            .unwrap();
+        let period = timer.overflow_period.expect("a programmed notification");
+        assert!(timer.halved.is_some());
+        timer.set_status(EventStatus::Cancelled);
+        timer
+            .timer
+            .set_period(PerfCounter::DISABLE_SAMPLE_PERIOD)
+            .unwrap();
+        guest.run(period);
+        timer.tick_observed();
+        let _ = timer.disregard_stop().unwrap();
+        assert_eq!(timer.timer_status, EventStatus::Cancelled);
+        timer.disable_timer_before_stepping();
+        assert!(take_timer_signal_now().is_none());
+    }
+
     #[test]
     fn a_notification_is_lost_when_its_programming_passes_its_period_unrecorded() {
         use reverie::Pid;
@@ -4391,6 +7488,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn a_stop_that_nothing_continues_keeps_the_event_only_before_the_period() {
         use reverie::Pid;
@@ -4403,6 +7501,8 @@ mod tests {
         use super::TimerImpl;
         use crate::perf::do_branches;
 
+        // It checks whole programmings.
+        let _halving = HalvingForTest::set(false);
         let mut blocked: libc::sigset_t = unsafe { core::mem::zeroed() };
         unsafe {
             libc::sigemptyset(&mut blocked);
@@ -4428,6 +7528,7 @@ mod tests {
             offset: 0,
             stop: "test".into(),
             notification_queued: false,
+            evidence: super::OverflowEvidence::default(),
         };
 
         // Before the period the stop leaves the event and its programming as
@@ -4652,19 +7753,25 @@ mod tests {
             assert_eq!(timer.disregard_sigreturn_stop(true), Ok(()));
             assert_eq!(timer.timer_status, EventStatus::Cancelled);
             assert!(!timer.send_artificial_signal);
-            // Nor is one the guest's clock has reached, here with an
-            // instruction offset still ahead, so that the stop records no
-            // skid overshoot in the process-wide count.
-            timer.set_status(EventStatus::Scheduled);
-            timer.prepare_notification(far).unwrap();
+            // Nor is an Armed event whose interrupted steps have reached its
+            // clock target and count its instruction offset: the return the
+            // steps reached ends it there. (A Scheduled event at its target
+            // with an offset ahead counts as reached and is requested again,
+            // which records a skid overshoot in the process-wide count; see
+            // `target_reached`.)
+            let clock = timer.read_clock();
+            timer.set_status(EventStatus::Armed);
             timer.event = super::ActiveEvent::Precise {
-                clock_target: timer.read_clock(),
+                clock_target: clock,
                 offset: 1,
             };
+            timer.interrupted = Some(Interruption::At(InterruptedSteps {
+                steps: ClockCounter::new(clock, 0, clock),
+                target_instr: 1,
+            }));
             timer.tick_observed();
             assert_eq!(timer.disregard_sigreturn_stop(true), Ok(()));
             assert_eq!(timer.timer_status, EventStatus::Cancelled);
-            assert_eq!(timer.overflow_period, None);
             assert!(!timer.send_artificial_signal);
         }
         timer.event = super::ActiveEvent::Imprecise { clock_min: 0 };
@@ -4678,6 +7785,7 @@ mod tests {
     /// A thread of this process that retires the conditional branches it is
     /// asked for, and otherwise waits blocked in a `read`, where its counters
     /// hold still, as a stopped guest thread's do.
+    #[cfg(target_arch = "x86_64")]
     struct BranchThread {
         tid: reverie::Tid,
         requests: libc::c_int,
@@ -4685,6 +7793,7 @@ mod tests {
         thread: Option<std::thread::JoinHandle<()>>,
     }
 
+    #[cfg(target_arch = "x86_64")]
     impl BranchThread {
         /// Starts the thread, which inherits the caller's signal mask.
         fn spawn() -> Self {
@@ -4761,6 +7870,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
     impl Drop for BranchThread {
         fn drop(&mut self) {
             let stop = 0u64.to_ne_bytes();
@@ -4773,6 +7883,259 @@ mod tests {
                 libc::close(self.done);
             }
         }
+    }
+
+    // The notification of a halved programming re-arms the rest of the event
+    // before any step (`TimerImpl::rearm_short_of_target`, which `deliver`
+    // calls first): the same target and instruction offset, and the new
+    // programming's overflow point recorded for a later overshoot record.
+    #[test]
+    fn a_halved_notification_rearms_before_any_step_keeping_the_offset() {
+        use reverie::Pid;
+
+        use super::ActiveEvent;
+        use super::HALVED_STAGES_ARMED;
+        use super::Timer;
+        use super::TimerEventRequest;
+        use super::TimerImpl;
+
+        block_timer_signal();
+        let _halving = HalvingForTest::set(true);
+        let guest = BranchThread::spawn();
+        let pid = Pid::from_raw(unsafe { libc::getpid() });
+        let mut timer = Timer {
+            inner: Some(
+                TimerImpl::new(pid, guest.tid, false).expect("control requires a working PMU"),
+            ),
+        };
+        let config = super::get_pmu_config();
+        let staged = config.stages(80 * config.first_stage_margin());
+        let margin = if staged {
+            config.first_stage_margin()
+        } else {
+            config.skid_margin()
+        };
+        let ticks = 80 * margin;
+        if !super::halves(ticks - margin, margin) {
+            eprintln!("skipping: no notification is halved under a skid margin override");
+            return;
+        }
+        let timer = timer.inner.as_mut().unwrap();
+        let halved_before = HALVED_STAGES_ARMED.load(std::sync::atomic::Ordering::Relaxed);
+        let requested = timer.read_clock();
+        timer
+            .request_event(TimerEventRequest::PreciseInstruction(ticks, 3))
+            .unwrap();
+        let ActiveEvent::Precise {
+            clock_target,
+            offset,
+        } = timer.event
+        else {
+            panic!("a precise event")
+        };
+        assert_eq!((clock_target, offset), (requested + ticks, 3));
+        assert!(timer.halved.is_some(), "the first programming is halved");
+        assert!(HALVED_STAGES_ARMED.load(std::sync::atomic::Ordering::Relaxed) > halved_before);
+
+        // Its notification, on time, re-arms the rest, with no step.
+        let clock = requested + (ticks - margin) / 2;
+        let first_stage = timer.first_stage.take();
+        assert!(timer.rearm_short_of_target(clock, first_stage));
+        assert_eq!(
+            timer.event,
+            ActiveEvent::Precise {
+                clock_target,
+                offset: 3
+            },
+            "the same target and instruction offset"
+        );
+        let period = timer.overflow_period.expect("re-armed");
+        assert_eq!(timer.overflow_point, Some(clock + period));
+        assert_eq!(timer.event_margin, margin);
+    }
+
+    // A halved notification is no spurious wakeup even within the margin of
+    // the target, as after an absorbed overflow: a staged event arms its
+    // second stage there, with no step (`TimerImpl::rearm_short_of_target`,
+    // which `deliver` calls first). The spurious-wakeup path would find
+    // nothing to reschedule that close, and no whole first stage to measure,
+    // and so single step the whole first stage margin. Farther out that path
+    // requests the same event, its instruction offset included, so this is
+    // where the two differ.
+    #[test]
+    fn a_halved_notification_at_the_margin_arms_the_second_stage() {
+        use reverie::Pid;
+
+        use super::ActiveEvent;
+        use super::FirstStage;
+        use super::HalvedStage;
+        use super::SINGLESTEP_TIMEOUT_RCBS;
+        use super::Timer;
+        use super::TimerEventRequest;
+        use super::TimerImpl;
+
+        block_timer_signal();
+        let _halving = HalvingForTest::set(true);
+        let guest = BranchThread::spawn();
+        let pid = Pid::from_raw(unsafe { libc::getpid() });
+        let mut timer = Timer {
+            inner: Some(
+                TimerImpl::new(pid, guest.tid, false).expect("control requires a working PMU"),
+            ),
+        };
+        let config = super::get_pmu_config();
+        let timer = timer.inner.as_mut().unwrap();
+        // Again, as a staged event's halved first stage, whether or not this
+        // processor stages events (the re-arm does not ask): its notification
+        // comes where the whole first stage was due, `first` short of the
+        // target, as after an absorbed overflow. With no sample since the
+        // programming, the second stage is the skid margin short.
+        let skid = config.skid_margin();
+        let first = 4 * skid + SINGLESTEP_TIMEOUT_RCBS;
+        let ticks = 80 * first;
+        let requested = timer.read_clock();
+        timer
+            .request_event(TimerEventRequest::PreciseInstruction(ticks, 3))
+            .unwrap();
+        timer.halved = Some(HalvedStage {
+            margin: first,
+            first_stage: Some(FirstStage {
+                programmed_ns: super::monotonic_ns(),
+                programmed_clock: requested,
+            }),
+        });
+        timer.first_stage = None;
+        timer.event_margin = first;
+        assert!(
+            timer.rearm_short_of_target(requested + ticks - first, None),
+            "the second stage is armed, with no step"
+        );
+        assert_eq!(timer.event_margin, skid, "the second stage margin");
+        assert_eq!(
+            timer.event,
+            ActiveEvent::Precise {
+                clock_target: requested + ticks,
+                offset: 3
+            }
+        );
+    }
+
+    // A notification far from its target is programmed halfway, and its stop
+    // programs the rest the same way until it is due at most half its margin
+    // ahead (`HALVING_STOP_DIVISOR`). If the kernel absorbs a halved overflow,
+    // the counter's next overflow, a period later, still comes no later than
+    // the whole notification would have, so no overshoot follows. One that it
+    // absorbs of the last, whole programming comes short of the target too.
+    #[test]
+    fn a_halved_notification_rearms_the_rest_and_survives_one_absorbed_overflow() {
+        use reverie::Pid;
+        use reverie::pmu_config::HALVING_STOP_DIVISOR;
+
+        use super::ActiveEvent;
+        use super::SINGLESTEP_TIMEOUT_RCBS;
+        use super::Timer;
+        use super::TimerEventRequest;
+        use super::TimerImpl;
+
+        block_timer_signal();
+        let _halving = HalvingForTest::set(true);
+        let guest = BranchThread::spawn();
+        let pid = Pid::from_raw(unsafe { libc::getpid() });
+        let mut timer = Timer {
+            inner: Some(
+                TimerImpl::new(pid, guest.tid, false).expect("control requires a working PMU"),
+            ),
+        };
+        let config = super::get_pmu_config();
+        // Where this PMU stages events, the event is staged and its first
+        // stage halved; elsewhere its only programming is.
+        let staged = config.stages(80 * config.first_stage_margin());
+        let margin = if staged {
+            config.first_stage_margin()
+        } else {
+            config.skid_margin()
+        };
+        let ticks = 80 * margin;
+        if !super::halves(ticks - margin, margin) {
+            eprintln!("skipping: no notification is halved under a skid margin override");
+            return;
+        }
+        let timer = timer.inner.as_mut().unwrap();
+        let requested = timer.read_clock();
+        timer
+            .request_event(TimerEventRequest::Precise(ticks))
+            .unwrap();
+        let ActiveEvent::Precise { clock_target, .. } = timer.event else {
+            panic!("a precise event")
+        };
+        assert_eq!(clock_target, requested + ticks);
+        let mut period = (ticks - margin) / 2;
+        assert_eq!(timer.overflow_period, Some(period));
+        let mut clock = requested;
+        let mut rearms = 0;
+        // Each halved notification, delivered on time, re-arms the rest.
+        while let Some(halved) = timer.halved.take() {
+            assert_eq!(halved.margin, margin);
+            assert_eq!(halved.first_stage.is_some(), staged);
+            assert!(timer.first_stage.is_none());
+            clock += period;
+            assert!(timer.rearm_halved(halved, clock).unwrap());
+            rearms += 1;
+            let whole = clock_target - clock - margin;
+            period = if timer.halved.is_some() {
+                whole / 2
+            } else {
+                whole
+            };
+            assert_eq!(timer.overflow_period, Some(period));
+            assert_eq!(timer.event_margin, margin);
+        }
+        assert!(rearms >= 2, "{rearms} re-arms");
+        assert!(
+            period * HALVING_STOP_DIVISOR <= margin,
+            "the last programming is whole, at most half its margin ahead"
+        );
+        // An overflow of it that the kernel absorbs notifies a period later,
+        // still at least half the margin short of the target.
+        assert!(
+            clock + 2 * period + margin / 2 <= clock_target,
+            "an absorbed overflow of the last programming comes short of the target"
+        );
+        // A whole first stage is measured for its second stage.
+        assert_eq!(timer.first_stage.is_some(), staged);
+
+        // Again, but the kernel absorbs the first halved overflow: the
+        // counter's next overflow comes a period later, which is where the
+        // whole notification was due, `margin` short of the target, and so
+        // no later than the target. It is not re-armed halfway again: an
+        // unstaged event is delivered from there, by single steps, and is no
+        // spurious wakeup; a staged one arms its second stage.
+        let requested = timer.read_clock();
+        timer
+            .request_event(TimerEventRequest::Precise(ticks))
+            .unwrap();
+        let halved = timer.halved.take().expect("halved again");
+        let late = requested + 2 * ((ticks - margin) / 2);
+        assert!(requested + ticks - late <= margin + 1);
+        let rearmed = timer.rearm_halved(halved, late).unwrap();
+        assert!(timer.halved.is_none() || staged);
+        if staged {
+            assert!(!rearmed || timer.event_margin < margin);
+        } else {
+            assert!(!rearmed);
+            assert!(
+                timer
+                    .event
+                    .reschedule_if_spurious_wakeup(late, timer.max_single_step_count())
+                    .is_none()
+            );
+            assert!(requested + ticks - late <= timer.max_single_step_count());
+            assert!(timer.max_single_step_count() <= margin + SINGLESTEP_TIMEOUT_RCBS);
+        }
+        let ActiveEvent::Precise { clock_target, .. } = timer.event else {
+            panic!("a precise event")
+        };
+        assert_eq!(clock_target, requested + ticks, "the target is unchanged");
     }
 
     // A disregarded stop that keeps a scheduled precise event leaves the
@@ -4821,10 +8184,17 @@ mod tests {
         guest.run(1_000);
         const TARGET: u64 = 1_000_000;
         let config = super::get_pmu_config();
-        let period = if config.stages(TARGET) {
-            TARGET - config.first_stage_margin()
+        let margin = if config.stages(TARGET) {
+            config.first_stage_margin()
         } else {
-            TARGET - config.skid_margin()
+            config.skid_margin()
+        };
+        // A notification this far ahead is programmed halfway (see
+        // `PmuConfig::halves`).
+        let period = if super::halves(TARGET - margin, margin) {
+            (TARGET - margin) / 2
+        } else {
+            TARGET - margin
         };
         fn inner(timer: &mut Timer) -> &mut TimerImpl {
             timer.inner.as_mut().unwrap()
@@ -5121,6 +8491,180 @@ mod tests {
         }
     }
 
+    // Both sites that detect a skid overshoot record its detail: where the
+    // event's programming overflowed and what the overflow records showed
+    // when the overshoot was found. A late notification is found once its
+    // signal is consumed and stepping has disabled the counter, which ends
+    // the programming but must not lose where its overflow was due. A stop
+    // past the delivery point retires the event, here with its
+    // notification queued. A programming that never overflowed reports no
+    // recorded overflow and no sample age. The witness count and details
+    // are process global, and other tests in this binary read the count, so
+    // the overshoots happen in a fresh exact-test process.
+    #[test]
+    fn both_detection_sites_record_a_skid_overshoot_detail() {
+        const CHILD: &str = "REVERIE_PTRACE_SKID_DETAIL_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            record_skid_overshoot_details_at_both_sites();
+            return;
+        }
+        let (_, module) = module_path!()
+            .split_once("::")
+            .expect("the module path names the crate");
+        let output =
+            std::process::Command::new(std::env::current_exe().expect("locate test binary"))
+                .args([
+                    "--exact",
+                    &format!("{module}::both_detection_sites_record_a_skid_overshoot_detail"),
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .expect("run the skid-detail child test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "skid-detail child test failed:\nstdout:\n{stdout}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// The overshoots of [`both_detection_sites_record_a_skid_overshoot_detail`],
+    /// in the exact-test child process that owns the witness count.
+    fn record_skid_overshoot_details_at_both_sites() {
+        use reverie::Pid;
+        use reverie::SkidOvershootKind;
+
+        use super::ActiveEvent;
+        use super::EventStatus;
+        use super::TimerEventRequest;
+        use super::TimerImpl;
+        use crate::perf::do_branches;
+
+        block_timer_signal();
+        let pid = Pid::from_raw(unsafe { libc::getpid() });
+        let tid = Pid::from_raw(unsafe { libc::syscall(libc::SYS_gettid) } as i32);
+        let mut timer = TimerImpl::new(pid, tid, false).expect("control requires a working PMU");
+        assert_eq!(timer.timer.take_sample_records(), Some(0));
+        let _ = reverie::take_skid_overshoot_count();
+        let _ = reverie::take_skid_overshoot_details();
+        const PERIOD: u64 = 10_000;
+        // Far enough ahead that the request programs an overflow, at least
+        // `PERIOD` branches in, whatever margin it uses.
+        let config = super::get_pmu_config();
+        let ticks = config.first_stage_margin().max(config.skid_margin()) + PERIOD;
+        // The clock counts this thread only while it runs the guest's
+        // branches, so that it reads the same however often it is read (see
+        // `a_stop_that_nothing_continues_keeps_the_event_only_before_the_period`).
+        timer.clock.disable().unwrap();
+        // Requests an event `ticks` branches ahead and runs well past it,
+        // and so past the overflow the request programmed, which the kernel
+        // records and notifies. Returns where the overflow was due and the
+        // event's target.
+        let overflow = |timer: &mut TimerImpl| {
+            let requested = timer.read_clock();
+            timer
+                .request_event(TimerEventRequest::Precise(ticks))
+                .unwrap();
+            let period = timer
+                .overflow_period
+                .expect("the request programs an overflow");
+            assert_eq!(timer.overflow_point, Some(requested + period));
+            assert_eq!(
+                timer.event,
+                ActiveEvent::Precise {
+                    clock_target: requested + ticks,
+                    offset: 0,
+                }
+            );
+            timer.clock.enable().unwrap();
+            do_branches(ticks + 2 * PERIOD);
+            timer.clock.disable().unwrap();
+            timer.timer.disable().unwrap();
+            (requested + period, requested + ticks)
+        };
+        let sample_times = timer.timer.records_sample_time();
+        let check = |detail: &reverie::SkidOvershootDetail, point: u64, target: u64| {
+            assert_eq!(detail.tid, tid);
+            assert_eq!(detail.rcb_target, target);
+            assert_eq!(detail.overflow_point, Some(point));
+            assert!(detail.past_target() >= 2 * PERIOD, "{detail}");
+            assert_eq!(detail.overflow_recorded, Some(true));
+            assert_eq!(detail.sample_age_ns.is_some(), sample_times);
+            // An age is from the sample to now, within this test's run.
+            assert!(
+                detail.sample_age_ns.unwrap_or(0) < 60_000_000_000,
+                "{detail}"
+            );
+        };
+        // A late notification: consumed as `accept_signal` does, then the
+        // counter disabled for stepping as `deliver` does.
+        let (point, target) = overflow(&mut timer);
+        let notification = take_timer_signal().expect("the counter overflowed");
+        assert!(timer.owns_overflow_signal(&notification));
+        timer.mark_overflows_consumed();
+        timer.disable_timer_before_stepping();
+        assert_eq!(timer.overflow_period, None);
+        let actual = timer.read_clock();
+        assert!(!timer.record_late_delivery(target, target));
+        assert!(timer.record_late_delivery(actual, target));
+        assert_eq!(reverie::take_skid_overshoot_count(), 1);
+        let details = reverie::take_skid_overshoot_details();
+        assert_eq!(details.len(), 1, "{details:?}");
+        assert_eq!(details[0].kind, SkidOvershootKind::DeliveredLate);
+        assert_eq!(details[0].rcb_actual, actual);
+        check(&details[0], point, target);
+
+        // A stop past the delivery point, with the notification still
+        // queued, retires the event once it is settled.
+        let (point, target) = overflow(&mut timer);
+        let actual = timer.read_clock();
+        timer.observe_event(&super::TraceEvent::Signal(super::Signal::SIGUSR1));
+        let notification = take_timer_signal().expect("the counter overflowed");
+        timer.expire_overflow_records(&[notification]);
+        timer.settle_stop();
+        assert_eq!(reverie::take_skid_overshoot_count(), 1);
+        let details = reverie::take_skid_overshoot_details();
+        assert_eq!(details.len(), 1, "{details:?}");
+        assert_eq!(
+            details[0].kind,
+            SkidOvershootKind::Missed {
+                by: "Signal(SIGUSR1) stop".to_owned(),
+                notification_queued: true,
+            }
+        );
+        assert_eq!(details[0].rcb_actual, actual);
+        check(&details[0], point, target);
+
+        // A programming whose counter stopped before its period, so that
+        // the kernel recorded no overflow of it: the detail says so, and
+        // the previous programming's sample gives it no age.
+        let requested = timer.read_clock();
+        timer
+            .request_event(TimerEventRequest::Precise(ticks))
+            .unwrap();
+        timer.timer.disable().unwrap();
+        let point = timer
+            .overflow_point
+            .expect("the request programs an overflow");
+        timer.clock.enable().unwrap();
+        do_branches(ticks + 2 * PERIOD);
+        timer.clock.disable().unwrap();
+        let actual = timer.read_clock();
+        assert!(timer.record_late_delivery(actual, requested + ticks));
+        assert_eq!(reverie::take_skid_overshoot_count(), 1);
+        let details = reverie::take_skid_overshoot_details();
+        assert_eq!(details.len(), 1, "{details:?}");
+        assert_eq!(details[0].overflow_point, Some(point));
+        assert_eq!(details[0].overflow_recorded, Some(false));
+        assert_eq!(details[0].sample_age_ns, None);
+
+        timer.set_status(EventStatus::Cancelled);
+        timer.event = ActiveEvent::Imprecise { clock_min: 0 };
+        assert!(take_timer_signal_now().is_none());
+    }
+
     /// Overwrite `si_fd`, at the offset `get_si_fd` reads.
     fn set_si_fd(signal: &mut libc::siginfo_t, fd: libc::c_int) {
         // Three `int`s, then the pointer-aligned union whose SIGPOLL member
@@ -5271,7 +8815,7 @@ mod tests {
         let emerald = PmuConfig::from_family_model(0x06, 0xCF);
         let sapphire = PmuConfig::from_family_model(0x06, 0x8F);
         assert_eq!(emerald, sapphire);
-        assert_eq!(emerald.raw_rcb_event(), 0x5101c4);
+        assert_eq!(emerald.raw_rcb_event(), 0x5111c4);
         assert_eq!(emerald.skid_margin(), 125);
     }
 
@@ -5282,8 +8826,41 @@ mod tests {
     fn ice_lake_models_have_a_profile() {
         for model in [0x6A, 0x6C, 0x7D, 0x7E] {
             let config = PmuConfig::from_family_model(0x06, model);
-            assert_eq!(config.raw_rcb_event(), 0x5101c4, "model {model:#x}");
+            assert_eq!(config.raw_rcb_event(), 0x5111c4, "model {model:#x}");
             assert_eq!(config.skid_margin(), 100, "model {model:#x}");
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn tiger_lake_counts_every_conditional_branch() {
+        let config = PmuConfig::from_family_model(0x06, 0x8D);
+        assert_eq!(config.raw_rcb_event(), 0x5111c4);
+        assert_eq!(config.skid_margin(), 100);
+    }
+
+    // Umask 01 already counts every conditional branch on these cores
+    // (perfmon skylake_core.json, skylakex_core.json, cascadelakex_core.json).
+    // Alder Lake (hybrid) and model 0x86 keep their entries; that is the scope
+    // of https://github.com/rrnewton/reverie/issues/965, not a claim that
+    // their counting is right.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn models_outside_the_umask_11_correction_keep_their_event() {
+        for (model, margin) in [
+            (0x4E, 100),
+            (0x55, 100),
+            (0x5E, 100),
+            (0x8E, 100),
+            (0x9E, 100),
+            (0xA5, 100),
+            (0xA6, 100),
+            (0x9A, 125),
+            (0x86, 100),
+        ] {
+            let config = PmuConfig::from_family_model(0x06, model);
+            assert_eq!(config.raw_rcb_event(), 0x5101c4, "model {model:#x}");
+            assert_eq!(config.skid_margin(), margin, "model {model:#x}");
         }
     }
 
@@ -5532,29 +9109,83 @@ mod tests {
         // --- An event overtaken by another stop is lost, so reaching the
         // delivery point exactly already counts. It stays in this test so the
         // witness counter keeps a single direct writer. ---
-        assert!(!config.record_missed_if_target_reached(32_999, 33_000, 0));
+        // With or without an instruction offset: the stop may have run any
+        // number of the offset's instructions past the target branch.
+        assert!(!config.record_missed_if_target_reached(32_999, 33_000));
         assert_eq!(reverie::take_skid_overshoot_count(), 0);
-        assert!(config.record_missed_if_target_reached(33_000, 33_000, 0));
+        assert!(config.record_missed_if_target_reached(33_000, 33_000));
         assert_eq!(reverie::take_skid_overshoot_count(), 1);
-        assert!(config.record_missed_if_target_reached(33_001, 33_000, 0));
+        assert!(config.record_missed_if_target_reached(33_001, 33_000));
         assert_eq!(reverie::take_skid_overshoot_count(), 1);
-        // With an instruction offset, the branches past the target must
-        // cover the offset: each is at least one instruction, while one
-        // branch past the target may be far short of the delivery point.
-        assert!(!config.record_missed_if_target_reached(32_999, 33_000, 7));
-        assert!(!config.record_missed_if_target_reached(33_000, 33_000, 7));
-        assert!(!config.record_missed_if_target_reached(33_001, 33_000, 7));
-        assert!(!config.record_missed_if_target_reached(33_006, 33_000, 7));
+        assert!(config.record_missed_if_target_reached(u64::MAX, 0));
+        assert_eq!(reverie::take_skid_overshoot_count(), 1);
+
+        // --- The notification of an offset event before any step: one at
+        // the target itself cannot be placed either. Without an offset,
+        // `record_overshoot_if_past_target` alone decides, as before. ---
+        assert!(!config.record_offset_notification_at_or_past_target(32_999, 33_000, 7));
+        assert!(!config.record_offset_notification_at_or_past_target(33_000, 33_000, 0));
+        assert!(!config.record_offset_notification_at_or_past_target(33_001, 33_000, 0));
         assert_eq!(reverie::take_skid_overshoot_count(), 0);
-        assert!(config.record_missed_if_target_reached(33_007, 33_000, 7));
+        assert!(config.record_offset_notification_at_or_past_target(33_000, 33_000, 7));
         assert_eq!(reverie::take_skid_overshoot_count(), 1);
-        assert!(config.record_missed_if_target_reached(66_000, 33_000, 7));
+        assert!(config.record_offset_notification_at_or_past_target(33_001, 33_000, 1));
         assert_eq!(reverie::take_skid_overshoot_count(), 1);
-        // The comparison cannot wrap at the top of the range.
-        assert!(!config.record_missed_if_target_reached(33_001, 33_000, u64::MAX));
-        assert_eq!(reverie::take_skid_overshoot_count(), 0);
-        assert!(config.record_missed_if_target_reached(u64::MAX, 0, u64::MAX));
-        assert_eq!(reverie::take_skid_overshoot_count(), 1);
+    }
+
+    /// An uncounted interrupted step matters only while the steps count
+    /// instructions past the target branch.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn an_uncounted_step_may_miscount_only_past_the_target() {
+        // Short of the target branch the clock counts, with or without an offset.
+        assert!(!uncounted_step_may_miscount(
+            &ClockCounter::new(9, 0, 10),
+            3
+        ));
+        // At the target branch with instructions still to count.
+        assert!(uncounted_step_may_miscount(
+            &ClockCounter::new(10, 0, 10),
+            3
+        ));
+        assert!(uncounted_step_may_miscount(
+            &ClockCounter::new(10, 2, 10),
+            3
+        ));
+        // Without an offset no instruction is counted.
+        assert!(!uncounted_step_may_miscount(
+            &ClockCounter::new(10, 0, 10),
+            0
+        ));
+    }
+
+    /// Only an instruction that can repeat without moving rip, or a branch or
+    /// return whose target is not decoded, leaves an unmoved interrupted step
+    /// ambiguous.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn only_repeats_and_branches_to_themselves_run_in_place() {
+        const IP: u64 = 0x40_1000;
+        let cases: [(&[u8], bool); 15] = [
+            (&[0xf3, 0xa4], true),        // rep movsb
+            (&[0xf2, 0xae], true),        // repne scasb
+            (&[0xa4], false),             // movsb
+            (&[0xf3, 0xc3], true),        // rep ret: a return, not a string instruction
+            (&[0xc3], true),              // ret: target taken from the stack
+            (&[0xc2, 0x08, 0x00], true),  // ret 8: likewise
+            (&[0xeb, 0xfe], true),        // jmp to itself
+            (&[0x75, 0xfe], true),        // jne to itself
+            (&[0xe2, 0xfe], true),        // loop to itself
+            (&[0xeb, 0x00], false),       // jmp to the next instruction
+            (&[0xff, 0xe0], true),        // jmp rax: target not decoded
+            (&[0x90], false),             // nop
+            (&[0x48, 0x89, 0x07], false), // mov [rdi], rax
+            (&[], true),                  // nothing readable
+            (&[0x0f], true),              // a truncated instruction
+        ];
+        for (code, in_place) in cases {
+            assert_eq!(runs_in_place(IP, code), in_place, "{code:02x?}");
+        }
     }
 
     #[test_case(ClockCounter::new(0, 0, 10), 0, 1, Some(true))]
@@ -5590,6 +9221,24 @@ mod tests {
         expected: (u64, u64),
     ) {
         counter.single_step_with_clock(new_clock);
+        assert_eq!((counter.rcbs, counter.instr), expected);
+    }
+
+    // Short of the target, a moved clock is counted as a step counts it,
+    // and an unmoved one changes nothing. At the target the counter counts
+    // instructions, so a clock past it changes nothing either: the `int3`
+    // the interrupted step counted stands for the replaced instruction.
+    #[test_case(ClockCounter::new(10, 1, 11), 10, (10, 1); "unmoved short of the target")]
+    #[test_case(ClockCounter::new(10, 1, 11), 11, (11, 0); "a branch to the target")]
+    #[test_case(ClockCounter::new(9, 1, 11), 10, (10, 0); "a branch short of the target")]
+    #[test_case(ClockCounter::new(11, 2, 11), 11, (11, 2); "unmoved at the target")]
+    #[test_case(ClockCounter::new(11, 2, 11), 13, (11, 2); "past the target")]
+    fn test_catch_up_counter_with_clock(
+        mut counter: ClockCounter,
+        new_clock: u64,
+        expected: (u64, u64),
+    ) {
+        counter.catch_up(new_clock);
         assert_eq!((counter.rcbs, counter.instr), expected);
     }
 

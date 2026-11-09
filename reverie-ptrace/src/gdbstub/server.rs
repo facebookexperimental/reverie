@@ -22,11 +22,14 @@ use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
 use super::error::Error;
+use super::features::ClientFeatures;
 use super::inferior::StoppedInferior;
+use super::interrupt::Interrupt;
 use super::packet::Packet;
 use super::packet::PacketParseError;
 use super::packet::checksum_delimiter;
 use super::session::Session;
+use super::signals::PassedSignals;
 
 /// GdbServer controller
 pub struct GdbServer {
@@ -37,6 +40,15 @@ pub struct GdbServer {
     /// FIXME: the tracees are serialized already, tell gdbserver not to
     /// serialize by its own.
     pub sequentialized_guest: bool,
+    /// The signals gdb asked to have passed without a stop, which the session
+    /// records and the traced threads read.
+    pub passed_signals: PassedSignals,
+    /// gdb's interrupt, which the packet relay raises and a traced thread
+    /// takes.
+    pub interrupt: Interrupt,
+    /// The optional stop events gdb asked for, which the session records and
+    /// the traced threads read.
+    pub client_features: ClientFeatures,
 }
 
 impl GdbServer {
@@ -47,7 +59,18 @@ impl GdbServer {
         let (inferior_attached_tx, inferior_attached_rx) = mpsc::channel(1);
         let (server_tx, server_rx) = oneshot::channel();
 
-        let server = GdbServerImpl::from_addr(addr, server_rx, inferior_attached_rx).await?;
+        let passed_signals = PassedSignals::default();
+        let interrupt = Interrupt::default();
+        let client_features = ClientFeatures::default();
+        let server = GdbServerImpl::from_addr(
+            addr,
+            server_rx,
+            inferior_attached_rx,
+            passed_signals.clone(),
+            interrupt.clone(),
+            client_features.clone(),
+        )
+        .await?;
         tokio::task::spawn(async move {
             if let Err(err) = server.run().await {
                 tracing::error!("Failed to run gdbserver: {:?}", err);
@@ -57,6 +80,9 @@ impl GdbServer {
             server_tx: Some(server_tx),
             inferior_attached_tx: Some(inferior_attached_tx),
             sequentialized_guest: false,
+            passed_signals,
+            interrupt,
+            client_features,
         })
     }
 
@@ -67,7 +93,18 @@ impl GdbServer {
         let (inferior_attached_tx, inferior_attached_rx) = mpsc::channel(1);
         let (server_tx, server_rx) = oneshot::channel();
 
-        let server = GdbServerImpl::from_path(path, server_rx, inferior_attached_rx).await?;
+        let passed_signals = PassedSignals::default();
+        let interrupt = Interrupt::default();
+        let client_features = ClientFeatures::default();
+        let server = GdbServerImpl::from_path(
+            path,
+            server_rx,
+            inferior_attached_rx,
+            passed_signals.clone(),
+            interrupt.clone(),
+            client_features.clone(),
+        )
+        .await?;
         tokio::task::spawn(async move {
             if let Err(err) = server.run().await {
                 tracing::error!("Failed to run gdbserver: {:?}", err);
@@ -77,11 +114,15 @@ impl GdbServer {
             server_tx: Some(server_tx),
             inferior_attached_tx: Some(inferior_attached_tx),
             sequentialized_guest: false,
+            passed_signals,
+            interrupt,
+            client_features,
         })
     }
 
     pub fn sequentialized_guest(&mut self) -> &mut Self {
         self.sequentialized_guest = true;
+        self.interrupt.set_sequentialized();
         self
     }
 
@@ -118,6 +159,13 @@ struct GdbServerImpl {
     pkt_tx: Option<mpsc::Sender<Packet>>,
     server_rx: Option<oneshot::Receiver<()>>,
     session: Option<Session>,
+    /// Raised when gdb sends the interrupt byte. The relay raises it itself,
+    /// rather than queue the byte for the session: while the guest runs, the
+    /// session waits for a stop and reads no packets.
+    interrupt: Interrupt,
+    /// How many commands the relay has passed to the session, which numbers
+    /// them the same way: an interrupt byte applies to the resume it follows.
+    commands: u64,
 }
 
 /// Binds to the given address and waits for an incoming connection.
@@ -175,6 +223,9 @@ impl GdbServerImpl {
         addr: SocketAddr,
         server_rx: oneshot::Receiver<()>,
         inferior_attached_rx: mpsc::Receiver<StoppedInferior>,
+        passed_signals: PassedSignals,
+        interrupt: Interrupt,
+        client_features: ClientFeatures,
     ) -> Result<Self, Error> {
         let stream = wait_for_tcp_connection(addr)
             .await
@@ -183,7 +234,10 @@ impl GdbServerImpl {
 
         let (tx, rx) = mpsc::channel(1);
         // create a gdb session.
-        let session = Session::new(Box::new(writer), rx, inferior_attached_rx);
+        let mut session = Session::new(Box::new(writer), rx, inferior_attached_rx);
+        session.passed_signals = passed_signals;
+        session.interrupt = interrupt.clone();
+        session.client_features = client_features;
 
         Ok(GdbServerImpl {
             reader: Box::new(reader),
@@ -191,6 +245,8 @@ impl GdbServerImpl {
             pkt_tx: Some(tx),
             server_rx: Some(server_rx),
             session: Some(session),
+            interrupt,
+            commands: 0,
         })
     }
 
@@ -199,6 +255,9 @@ impl GdbServerImpl {
         path: &Path,
         server_rx: oneshot::Receiver<()>,
         inferior_attached_rx: mpsc::Receiver<StoppedInferior>,
+        passed_signals: PassedSignals,
+        interrupt: Interrupt,
+        client_features: ClientFeatures,
     ) -> Result<Self, Error> {
         let stream = wait_for_unix_connection(path)
             .await
@@ -208,7 +267,10 @@ impl GdbServerImpl {
         let (tx, rx) = mpsc::channel(1);
 
         // Create a gdb session.
-        let session = Session::new(Box::new(writer), rx, inferior_attached_rx);
+        let mut session = Session::new(Box::new(writer), rx, inferior_attached_rx);
+        session.passed_signals = passed_signals;
+        session.interrupt = interrupt.clone();
+        session.client_features = client_features;
 
         Ok(GdbServerImpl {
             reader: Box::new(reader),
@@ -216,6 +278,8 @@ impl GdbServerImpl {
             pkt_tx: Some(tx),
             server_rx: Some(server_rx),
             session: Some(session),
+            interrupt,
+            commands: 0,
         })
     }
 
@@ -298,14 +362,28 @@ impl GdbServerImpl {
             .map_err(|_| Error::GdbServerSendPacketError)
     }
 
+    /// Passes `packet` to the session, counting it if it is a command.
+    async fn send_command_or_packet(&mut self, packet: Packet) -> Result<(), Error> {
+        if matches!(packet, Packet::Command(_)) {
+            self.commands += 1;
+        }
+        self.send_packet(packet).await
+    }
+
     async fn relay_gdb_packets(&mut self) -> Result<(), Error> {
         while let Ok(pkt) = self.recv_packet().await {
             match pkt {
+                // Not a packet: it is neither acknowledged nor answered, except
+                // by the stop it causes.
+                PacketWithAck::JustPacket(Packet::Interrupt)
+                | PacketWithAck::WithAck(Packet::Interrupt) => {
+                    self.interrupt.request(self.commands);
+                }
                 PacketWithAck::JustPacket(pkt) => {
                     self.send_packet(Packet::Ack).await?;
-                    self.send_packet(pkt).await?;
+                    self.send_command_or_packet(pkt).await?;
                 }
-                PacketWithAck::WithAck(pkt) => self.send_packet(pkt).await?,
+                PacketWithAck::WithAck(pkt) => self.send_command_or_packet(pkt).await?,
             }
         }
 
@@ -389,6 +467,7 @@ impl GdbServerImpl {
 
 #[cfg(test)]
 mod tests {
+    use futures::FutureExt;
     use tokio::io::AsyncWriteExt;
     use tokio::sync::mpsc;
     use tokio::sync::oneshot;
@@ -401,6 +480,7 @@ mod tests {
     async fn vfile_test_connection() -> (tokio::io::DuplexStream, GdbServerImpl) {
         use reverie::Pid;
 
+        use crate::gdbstub::ThreadView;
         use crate::gdbstub::commands::ExpediatedRegs;
         use crate::gdbstub::commands::StopEvent;
         use crate::gdbstub::commands::StopReason;
@@ -424,6 +504,8 @@ mod tests {
                 ),
                 request_tx,
                 resume_tx,
+                view: ThreadView::default(),
+                replied: None,
             })
             .await
             .expect("initial inert stop must fit the channel");
@@ -436,8 +518,595 @@ mod tests {
             pkt_tx: Some(pkt_tx),
             server_rx: Some(start_rx),
             session: Some(Session::new(Box::new(writer), pkt_rx, stop_rx)),
+            interrupt: Interrupt::default(),
+            commands: 0,
         };
         (client, server)
+    }
+
+    /// A session whose first stop is thread 1 at a breakpoint, with the
+    /// tracee's ends of that thread's channels: the stop channel, where the
+    /// test reports its next stop, and the resume channel, where gdb's resume
+    /// arrives.
+    async fn exit_test_connection() -> (
+        tokio::io::DuplexStream,
+        GdbServerImpl,
+        mpsc::Sender<StoppedInferior>,
+        mpsc::Receiver<crate::gdbstub::ResumeInferior>,
+        mpsc::Sender<crate::gdbstub::GdbRequest>,
+    ) {
+        use reverie::Pid;
+
+        use crate::gdbstub::ThreadView;
+        use crate::gdbstub::commands::ExpediatedRegs;
+        use crate::gdbstub::commands::StopEvent;
+        use crate::gdbstub::commands::StopReason;
+
+        let (client, transport) = tokio::io::duplex(1024);
+        let (reader, writer) = tokio::io::split(transport);
+        let (pkt_tx, pkt_rx) = mpsc::channel(1);
+        let (stop_tx, stop_rx) = mpsc::channel(1);
+        let (request_tx, _request_rx) = mpsc::channel(1);
+        let (resume_tx, resume_rx) = mpsc::channel(1);
+        let (start_tx, start_rx) = oneshot::channel();
+        // SAFETY: user_regs_struct contains only integer register values.
+        let regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
+        stop_tx
+            .send(StoppedInferior {
+                reason: StopReason::stopped(
+                    Pid::from_raw(1),
+                    Pid::from_raw(1),
+                    StopEvent::SwBreak,
+                    ExpediatedRegs::from(regs),
+                ),
+                request_tx: request_tx.clone(),
+                resume_tx,
+                view: ThreadView::default(),
+                replied: None,
+            })
+            .await
+            .expect("initial stop must fit the channel");
+        start_tx
+            .send(())
+            .expect("session start receiver must exist");
+        let server = GdbServerImpl {
+            reader: Box::new(reader),
+            rx_buf: BytesMut::with_capacity(PACKET_BUFFER_CAPACITY),
+            pkt_tx: Some(pkt_tx),
+            server_rx: Some(start_rx),
+            session: Some(Session::new(Box::new(writer), pkt_rx, stop_rx)),
+            interrupt: Interrupt::default(),
+            commands: 0,
+        };
+        (client, server, stop_tx, resume_rx, request_tx)
+    }
+
+    /// A process exit's reporter is told only once gdb's reply is written:
+    /// the run, and with it the connection, may end as soon as it returns.
+    #[tokio::test]
+    async fn a_process_exit_is_acknowledged_after_its_reply_is_written() {
+        use futures::FutureExt;
+        use reverie::ExitStatus;
+        use reverie::Pid;
+        use reverie::Signal;
+
+        use crate::gdbstub::ThreadView;
+        use crate::gdbstub::commands::StopReason;
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let (mut client, server, stop_tx, mut resume_rx, request_tx) =
+                exit_test_connection().await;
+            let tracee = async {
+                resume_rx.recv().await.expect("gdb resumes the thread");
+                let (replied, written) = oneshot::channel();
+                let (resume_tx, _resume_rx) = mpsc::channel(1);
+                stop_tx
+                    .send(StoppedInferior {
+                        reason: StopReason::exit(
+                            Pid::from_raw(1),
+                            ExitStatus::Signaled(Signal::SIGUSR1, false),
+                        ),
+                        request_tx,
+                        resume_tx,
+                        view: ThreadView::default(),
+                        replied: Some(replied),
+                    })
+                    .await
+                    .unwrap();
+                written.await.expect("the session acknowledges the reply");
+            };
+            let exchange = async {
+                client
+                    .write_all(vfile_test_frame("vCont;c:p1.1").as_bytes())
+                    .await
+                    .unwrap();
+                tracee.await;
+                // Acknowledged, so the whole reply is already readable.
+                let expected = format!("+{}", vfile_test_frame("X1e;process:01"));
+                let mut reply = vec![0; expected.len()];
+                client
+                    .read_exact(&mut reply)
+                    .now_or_never()
+                    .expect("the reply is written before the acknowledgement")
+                    .unwrap();
+                assert_eq!(String::from_utf8_lossy(&reply), expected);
+                client.shutdown().await.unwrap();
+            };
+            let (server_result, ()) = tokio::join!(server.run(), exchange);
+            server_result.expect("server must finish after client shutdown");
+        })
+        .await
+        .expect("the exchange must finish within the hang backstop");
+    }
+
+    /// Reads one reply frame (`+$...#xx`) from `client`, as text.
+    async fn read_reply(client: &mut tokio::io::DuplexStream) -> String {
+        let mut reply = Vec::new();
+        let mut byte = [0; 1];
+        while !reply.ends_with(b"#") {
+            client.read_exact(&mut byte).await.unwrap();
+            reply.push(byte[0]);
+        }
+        let mut checksum = [0; 2];
+        client.read_exact(&mut checksum).await.unwrap();
+        reply.extend_from_slice(&checksum);
+        String::from_utf8_lossy(&reply).into_owned()
+    }
+
+    /// A thread stepped with a fatal signal (gdb steps over a breakpoint with
+    /// the signal it continues with) exits with its whole group. The process's
+    /// exit comes from the leader, which an earlier resume left running, and
+    /// gdb is told of it as the step's result.
+    #[tokio::test]
+    async fn a_group_exit_ends_a_step_of_another_thread() {
+        use reverie::ExitStatus;
+        use reverie::Pid;
+        use reverie::Signal;
+        use safeptrace::ChildOp;
+
+        use crate::gdbstub::ThreadView;
+        use crate::gdbstub::commands::ExpediatedRegs;
+        use crate::gdbstub::commands::ResumeAction;
+        use crate::gdbstub::commands::StopEvent;
+        use crate::gdbstub::commands::StopReason;
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let (mut client, server, leader_stop_tx, mut leader_resume_rx, request_tx) =
+                exit_test_connection().await;
+            // SAFETY: user_regs_struct contains only integer register values.
+            let regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
+            let (worker_stop_tx, worker_stop_rx) = mpsc::channel(1);
+            let (worker_resume_tx, mut worker_resume_rx) = mpsc::channel(1);
+            let (worker_request_tx, _worker_request_rx) = mpsc::channel(1);
+            let (resume_tx, _resume_rx) = mpsc::channel(1);
+            let stopped = |reason, replied| StoppedInferior {
+                reason,
+                request_tx: request_tx.clone(),
+                resume_tx: resume_tx.clone(),
+                view: ThreadView::default(),
+                replied,
+            };
+            let exchange = async {
+                // The leader creates the worker.
+                client
+                    .write_all(vfile_test_frame("vCont;c:p1.-1").as_bytes())
+                    .await
+                    .unwrap();
+                leader_resume_rx.recv().await.unwrap();
+                leader_stop_tx
+                    .send(stopped(
+                        StopReason::new_task(
+                            Pid::from_raw(1),
+                            Pid::from_raw(1),
+                            Pid::from_raw(2),
+                            ExpediatedRegs::from(regs),
+                            ChildOp::Clone,
+                            Some(worker_request_tx),
+                            Some(worker_resume_tx),
+                            Some(worker_stop_rx),
+                            ThreadView::default(),
+                        ),
+                        None,
+                    ))
+                    .await
+                    .unwrap();
+                assert!(read_reply(&mut client).await.contains("create:p01.02"));
+                // Both continue; the worker hits a breakpoint while the
+                // leader, resumed again, has not stopped.
+                client
+                    .write_all(vfile_test_frame("vCont;c:p1.-1").as_bytes())
+                    .await
+                    .unwrap();
+                leader_resume_rx.recv().await.unwrap();
+                worker_resume_rx.recv().await.unwrap();
+                worker_stop_tx
+                    .send(stopped(
+                        StopReason::stopped(
+                            Pid::from_raw(2),
+                            Pid::from_raw(1),
+                            StopEvent::SwBreak,
+                            ExpediatedRegs::from(regs),
+                        ),
+                        None,
+                    ))
+                    .await
+                    .unwrap();
+                assert!(read_reply(&mut client).await.contains("thread:p01.02"));
+                // gdb steps the worker over its breakpoint with SIGUSR1, which
+                // ends the group: the worker exits, then the leader.
+                client
+                    .write_all(vfile_test_frame("vCont;S1e:p1.2").as_bytes())
+                    .await
+                    .unwrap();
+                let step = worker_resume_rx.recv().await.unwrap();
+                assert!(matches!(step.action, ResumeAction::Step(Some(_))));
+                worker_stop_tx
+                    .send(stopped(
+                        StopReason::thread_exited(
+                            Pid::from_raw(2),
+                            Pid::from_raw(1),
+                            ExitStatus::Exited(0),
+                        ),
+                        None,
+                    ))
+                    .await
+                    .unwrap();
+                drop(worker_stop_tx);
+                let (replied, written) = oneshot::channel();
+                leader_stop_tx
+                    .send(stopped(
+                        StopReason::exit(
+                            Pid::from_raw(1),
+                            ExitStatus::Signaled(Signal::SIGUSR1, false),
+                        ),
+                        Some(replied),
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    read_reply(&mut client).await,
+                    format!("+{}", vfile_test_frame("X1e;process:01"))
+                );
+                written.await.expect("the session acknowledges the exit");
+                client.shutdown().await.unwrap();
+            };
+            let (server_result, ()) = tokio::join!(server.run(), exchange);
+            server_result.expect("server must finish after client shutdown");
+        })
+        .await
+        .expect("the exchange must finish within the hang backstop");
+    }
+
+    /// A session whose first stop is thread 1 at a breakpoint, wired to one
+    /// interrupt as `GdbServer` wires it, with the tracee's ends of the
+    /// thread's channels and the thread's view, which the test sets as the
+    /// thread would.
+    async fn interrupt_test_connection() -> (
+        tokio::io::DuplexStream,
+        GdbServerImpl,
+        mpsc::Sender<StoppedInferior>,
+        mpsc::Receiver<crate::gdbstub::ResumeInferior>,
+        crate::gdbstub::ThreadView,
+        Interrupt,
+    ) {
+        use reverie::Pid;
+
+        use crate::gdbstub::ThreadView;
+        use crate::gdbstub::commands::ExpediatedRegs;
+        use crate::gdbstub::commands::StopEvent;
+        use crate::gdbstub::commands::StopReason;
+
+        let (client, transport) = tokio::io::duplex(1024);
+        let (reader, writer) = tokio::io::split(transport);
+        let (pkt_tx, pkt_rx) = mpsc::channel(1);
+        let (stop_tx, stop_rx) = mpsc::channel(1);
+        let (request_tx, _request_rx) = mpsc::channel(1);
+        let (resume_tx, resume_rx) = mpsc::channel(1);
+        let (start_tx, start_rx) = oneshot::channel();
+        let view = ThreadView::default();
+        // SAFETY: user_regs_struct contains only integer register values.
+        let regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
+        stop_tx
+            .send(StoppedInferior {
+                reason: StopReason::stopped(
+                    Pid::from_raw(1),
+                    Pid::from_raw(1),
+                    StopEvent::SwBreak,
+                    ExpediatedRegs::from(regs),
+                ),
+                request_tx,
+                resume_tx,
+                view: view.clone(),
+                replied: None,
+            })
+            .await
+            .expect("initial stop must fit the channel");
+        start_tx
+            .send(())
+            .expect("session start receiver must exist");
+        // As for a Tool that runs one thread at a time, where a waiting
+        // thread may stop where it waits. Under another Tool the session
+        // would send the thread, a pid that is not a tracee here, SIGSTOP.
+        let interrupt = Interrupt::default();
+        interrupt.set_sequentialized();
+        let mut session = Session::new(Box::new(writer), pkt_rx, stop_rx);
+        session.interrupt = interrupt.clone();
+        let server = GdbServerImpl {
+            reader: Box::new(reader),
+            rx_buf: BytesMut::with_capacity(PACKET_BUFFER_CAPACITY),
+            pkt_tx: Some(pkt_tx),
+            server_rx: Some(start_rx),
+            session: Some(session),
+            interrupt: interrupt.clone(),
+            commands: 0,
+        };
+        (client, server, stop_tx, resume_rx, view, interrupt)
+    }
+
+    /// Thread 1's stop with `event`, as a traced thread reports it.
+    fn thread_stop(
+        event: crate::gdbstub::commands::StopEvent,
+        view: &crate::gdbstub::ThreadView,
+    ) -> StoppedInferior {
+        use reverie::Pid;
+
+        use crate::gdbstub::commands::ExpediatedRegs;
+        use crate::gdbstub::commands::StopReason;
+
+        // SAFETY: user_regs_struct contains only integer register values.
+        let regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
+        let (request_tx, _request_rx) = mpsc::channel(1);
+        let (resume_tx, _resume_rx) = mpsc::channel(1);
+        StoppedInferior {
+            reason: StopReason::stopped(
+                Pid::from_raw(1),
+                Pid::from_raw(1),
+                event,
+                ExpediatedRegs::from(regs),
+            ),
+            request_tx,
+            resume_tx,
+            view: view.clone(),
+            replied: None,
+        }
+    }
+
+    /// gdb's interrupt byte, sent while the guest runs, reaches the traced
+    /// threads although the session reads no packet while it waits for a
+    /// stop, and the stop of the thread that takes it is reported to gdb as
+    /// SIGINT (`T02`). A thread that runs takes it at its next stop: none
+    /// may take it where it waits inside a Tool callback.
+    #[tokio::test]
+    async fn an_interrupt_is_answered_by_the_sigint_stop_of_a_running_thread() {
+        use reverie::Signal;
+
+        use crate::gdbstub::commands::StopEvent;
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let (mut client, server, stop_tx, mut resume_rx, view, interrupt) =
+                interrupt_test_connection().await;
+            let exchange = async {
+                client
+                    .write_all(vfile_test_frame("vCont;c:p1.1").as_bytes())
+                    .await
+                    .unwrap();
+                resume_rx.recv().await.expect("gdb resumes the thread");
+                assert!(
+                    !interrupt.take(reverie::Pid::from_raw(1)),
+                    "nothing to take before gdb interrupts"
+                );
+                client.write_all(b"\x03").await.unwrap();
+                interrupt.requested().await;
+                assert!(
+                    interrupt.requested_in_place().now_or_never().is_none(),
+                    "the running thread takes it at its next stop"
+                );
+                assert!(interrupt.take(reverie::Pid::from_raw(1)));
+                stop_tx
+                    .send(thread_stop(StopEvent::Signal(Signal::SIGINT.into()), &view))
+                    .await
+                    .unwrap();
+                let reply = read_reply(&mut client).await;
+                assert!(reply.starts_with("+$T02"), "{reply:?}");
+                assert!(reply.contains("thread:p01.01;"), "{reply:?}");
+                client.shutdown().await.unwrap();
+            };
+            let (server_result, ()) = tokio::join!(server.run(), exchange);
+            server_result.expect("server must finish after client shutdown");
+        })
+        .await
+        .expect("the exchange must finish within the hang backstop");
+    }
+
+    /// When no thread runs, as when every thread waits inside a Tool
+    /// callback for a turn that does not come, a thread may take gdb's
+    /// interrupt where it waits.
+    #[tokio::test]
+    async fn an_interrupt_with_no_thread_running_may_be_taken_where_a_thread_waits() {
+        use crate::gdbstub::ThreadState;
+        use crate::gdbstub::commands::StopEvent;
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let (mut client, server, stop_tx, mut resume_rx, view, interrupt) =
+                interrupt_test_connection().await;
+            let exchange = async {
+                client
+                    .write_all(vfile_test_frame("vCont;c:p1.1").as_bytes())
+                    .await
+                    .unwrap();
+                resume_rx.recv().await.expect("gdb resumes the thread");
+                // The thread waits inside a Tool callback.
+                let _parked = view.enter(ThreadState::Parked(Box::default()));
+                client.write_all(b"\x03").await.unwrap();
+                interrupt.requested_in_place().await;
+                stop_tx
+                    .send(thread_stop(StopEvent::SwBreak, &view))
+                    .await
+                    .unwrap();
+                assert!(read_reply(&mut client).await.starts_with("+$T05"));
+                client.shutdown().await.unwrap();
+            };
+            let (server_result, ()) = tokio::join!(server.run(), exchange);
+            server_result.expect("server must finish after client shutdown");
+        })
+        .await
+        .expect("the waiting thread must be let take the interrupt");
+    }
+
+    /// A thread that runs but does not reach a stop, such as one that spins
+    /// without a system call under a Tool with no timer, leaves gdb's
+    /// interrupt to a thread that waits where it is, after
+    /// `INTERRUPT_IN_PLACE_AFTER` and not before.
+    #[tokio::test(start_paused = true)]
+    async fn an_interrupt_no_running_thread_takes_falls_to_a_waiting_thread() {
+        use crate::gdbstub::commands::StopEvent;
+
+        // Time is paused: the bound is on the virtual clock, ten times the
+        // fallback.
+        let backstop = super::super::session::INTERRUPT_IN_PLACE_AFTER * 10;
+        let (mut client, server, stop_tx, mut resume_rx, view, interrupt) =
+            interrupt_test_connection().await;
+        let exchange = async {
+            client
+                .write_all(vfile_test_frame("vCont;c:p1.1").as_bytes())
+                .await
+                .unwrap();
+            resume_rx.recv().await.expect("gdb resumes the thread");
+            client.write_all(b"\x03").await.unwrap();
+            interrupt.requested().await;
+            let start = tokio::time::Instant::now();
+            interrupt.requested_in_place().await;
+            let waited = start.elapsed();
+            assert!(
+                waited >= super::super::session::INTERRUPT_IN_PLACE_AFTER,
+                "a running thread had {waited:?} to reach a stop"
+            );
+            stop_tx
+                .send(thread_stop(StopEvent::SwBreak, &view))
+                .await
+                .unwrap();
+            assert!(read_reply(&mut client).await.starts_with("+$T05"));
+            client.shutdown().await.unwrap();
+        };
+        let (server_result, ()) =
+            tokio::time::timeout(backstop, async { tokio::join!(server.run(), exchange) })
+                .await
+                .expect("the waiting thread must be let take the interrupt");
+        server_result.expect("server must finish after client shutdown");
+    }
+
+    /// A thread that took gdb's interrupt holds it until gdb resumes the
+    /// thread, which comes after the session has resumed the guest. The next
+    /// interrupt during that resume is decided afresh: a waiting thread may
+    /// take it where it waits again.
+    #[tokio::test]
+    async fn a_second_interrupt_is_decided_after_the_first_is_released() {
+        use reverie::Signal;
+
+        use crate::gdbstub::ThreadState;
+        use crate::gdbstub::commands::StopEvent;
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let (mut client, server, stop_tx, mut resume_rx, view, interrupt) =
+                interrupt_test_connection().await;
+            let exchange = async {
+                // The thread waits inside a Tool callback throughout.
+                let _parked = view.enter(ThreadState::Parked(Box::default()));
+                for _ in 0..2 {
+                    client
+                        .write_all(vfile_test_frame("vCont;c:p1.1").as_bytes())
+                        .await
+                        .unwrap();
+                    resume_rx.recv().await.expect("gdb resumes the thread");
+                    // The thread goes on from its stop for the last interrupt.
+                    interrupt.release();
+                    client.write_all(b"\x03").await.unwrap();
+                    interrupt.requested_in_place().await;
+                    assert!(interrupt.take(reverie::Pid::from_raw(1)));
+                    stop_tx
+                        .send(thread_stop(StopEvent::Signal(Signal::SIGINT.into()), &view))
+                        .await
+                        .unwrap();
+                    assert!(read_reply(&mut client).await.starts_with("+$T02"));
+                }
+                client.shutdown().await.unwrap();
+            };
+            let (server_result, ()) = tokio::join!(server.run(), exchange);
+            server_result.expect("server must finish after client shutdown");
+        })
+        .await
+        .expect("the second interrupt must be let taken where the thread waits");
+    }
+
+    /// The interrupt byte is ignored while gdb holds the guest stopped, and a
+    /// request no thread took is answered by whatever stop gdb gets first: it
+    /// stops neither that resume's guest nor the next.
+    #[tokio::test]
+    async fn an_interrupt_lasts_only_while_gdb_waits_for_its_stop() {
+        use crate::gdbstub::commands::StopEvent;
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let (mut client, server, stop_tx, mut resume_rx, view, interrupt) =
+                interrupt_test_connection().await;
+            let exchange = async {
+                // While the guest is stopped.
+                client.write_all(b"\x03").await.unwrap();
+                assert_eq!(
+                    request_reply(&mut client, "qC").await,
+                    format!("+{}", vfile_test_frame("QCp01.01"))
+                );
+                client
+                    .write_all(vfile_test_frame("vCont;c:p1.1").as_bytes())
+                    .await
+                    .unwrap();
+                resume_rx.recv().await.expect("gdb resumes the thread");
+                assert!(
+                    !interrupt.take(reverie::Pid::from_raw(1)),
+                    "the stopped guest's byte was ignored"
+                );
+
+                // A breakpoint stop reaches gdb before a thread takes it.
+                client.write_all(b"\x03").await.unwrap();
+                interrupt.requested().await;
+                stop_tx
+                    .send(thread_stop(StopEvent::SwBreak, &view))
+                    .await
+                    .unwrap();
+                assert!(read_reply(&mut client).await.starts_with("+$T05"));
+                assert!(
+                    !interrupt.take(reverie::Pid::from_raw(1)),
+                    "the breakpoint stop answered it"
+                );
+                client
+                    .write_all(vfile_test_frame("vCont;c:p1.1").as_bytes())
+                    .await
+                    .unwrap();
+                resume_rx.recv().await.expect("gdb resumes the thread");
+                assert!(
+                    !interrupt.take(reverie::Pid::from_raw(1)),
+                    "nor does it stop the next resume"
+                );
+                stop_tx
+                    .send(thread_stop(StopEvent::SwBreak, &view))
+                    .await
+                    .unwrap();
+                assert!(read_reply(&mut client).await.starts_with("+$T05"));
+                client.shutdown().await.unwrap();
+            };
+            let (server_result, ()) = tokio::join!(server.run(), exchange);
+            server_result.expect("server must finish after client shutdown");
+        })
+        .await
+        .expect("the exchange must finish within the hang backstop");
+    }
+
+    /// Sends `request` and reads its reply frame.
+    async fn request_reply(client: &mut tokio::io::DuplexStream, request: &str) -> String {
+        client
+            .write_all(vfile_test_frame(request).as_bytes())
+            .await
+            .unwrap();
+        read_reply(client).await
     }
 
     fn vfile_test_frame(body: &str) -> String {
@@ -528,6 +1197,8 @@ mod tests {
             pkt_tx: None,
             server_rx: None,
             session: None,
+            interrupt: Interrupt::default(),
+            commands: 0,
         }
     }
 
@@ -831,6 +1502,8 @@ mod tests {
             // real `Session` needs an inferior. Keeping this `None` is what lets
             // the boundary under test be exercised on its own.
             session: None,
+            interrupt: Interrupt::default(),
+            commands: 0,
         };
 
         // The peer departs without ever speaking, which is the reproduction:

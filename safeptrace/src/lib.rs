@@ -229,11 +229,23 @@ impl TraceeToken {
         Ok(token)
     }
 
+    #[cfg(feature = "notifier")]
     fn capture_child(&self, pid: Pid) -> Result<Running, Errno> {
-        #[cfg(feature = "notifier")]
-        if self.policy == notifier::WaitPolicy::PtracerThread {
-            return Running::new_on_ptracer_thread(pid);
-        }
+        // Adopting the child's Event can run `Waker` callbacks. Those go
+        // through `WakerSlot`, which records them; recording them here too
+        // is deliberately cautious.
+        notifier::note_waker_callbacks();
+        let child = if self.policy == notifier::WaitPolicy::PtracerThread {
+            Running::new_on_ptracer_thread(pid)
+        } else {
+            Running::from_current_or_new(pid)
+        };
+        notifier::note_waker_callbacks();
+        child
+    }
+
+    #[cfg(not(feature = "notifier"))]
+    fn capture_child(&self, pid: Pid) -> Result<Running, Errno> {
         Running::from_current_or_new(pid)
     }
 
@@ -552,15 +564,26 @@ impl Event {
     }
 }
 
-/// `ptrace(request, pid, 0, sig)` for a resuming request, with the signal as a
-/// raw number so that one `nix` cannot name can be delivered.
+/// `NT_ARM_HW_BREAK` (include/uapi/linux/elf.h): a thread's hardware
+/// breakpoint registers.
+#[cfg(target_arch = "aarch64")]
+const NT_ARM_HW_BREAK: i32 = 0x402;
+
+/// The libc `ptrace` request word is `c_uint` on glibc and `c_int` on musl.
+#[cfg(target_env = "musl")]
+type PtraceRequest = libc::c_int;
+#[cfg(not(target_env = "musl"))]
+type PtraceRequest = libc::c_uint;
+
 /// `PTRACE_SINGLEBLOCK` (arch/x86/include/uapi/asm/ptrace-abi.h), which the
 /// libc crate does not define. Linux accepts it on every x86-64 processor
 /// (`arch_has_block_step`).
 #[cfg(target_arch = "x86_64")]
-const PTRACE_SINGLEBLOCK: libc::c_uint = 33;
+const PTRACE_SINGLEBLOCK: PtraceRequest = 33;
 
-fn ptrace_resume_raw(request: libc::c_uint, pid: Pid, sig: i32) -> Result<(), Errno> {
+/// `ptrace(request, pid, 0, sig)` for a resuming request, with the signal as a
+/// raw number so that one `nix` cannot name can be delivered.
+fn ptrace_resume_raw(request: PtraceRequest, pid: Pid, sig: i32) -> Result<(), Errno> {
     Errno::result(unsafe {
         libc::ptrace(
             request,
@@ -1049,6 +1072,22 @@ impl std::hash::Hash for ExitStopMark {
     fn hash<H: std::hash::Hasher>(&self, _: &mut H) {}
 }
 
+/// Native Linux PTRACE_GET_RSEQ_CONFIGURATION reply, without Tool interpretation.
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RseqConfiguration {
+    /// Registered userspace address, or zero.
+    pub address: u64,
+    /// Registered region size.
+    pub length: u32,
+    /// Registered instruction signature.
+    pub signature: u32,
+    /// Kernel-reported flags.
+    pub flags: u32,
+    /// Reserved ABI padding, retained for exact native request size.
+    pub padding: u32,
+}
+
 impl Stopped {
     /// Helper for converting from the Errno type.
     ///
@@ -1080,6 +1119,12 @@ impl Stopped {
     /// of the exit stop, so the queued stops ahead of it are still dead.
     fn map_err(&self, err: Errno) -> Error {
         if err == Errno::ESRCH {
+            // The tracee has left the stop this capability names.
+            #[cfg(feature = "notifier")]
+            {
+                self.1.event().invalidate_regs();
+                self.1.event().stop_may_have_ended();
+            }
             self.retire_statuses_before_exit_stop();
             Error::Died(Zombie::from_token(self.0, self.1.clone()))
         } else {
@@ -1226,7 +1271,14 @@ impl Stopped {
     /// ptrace request moved the tracee out of its stop.
     fn into_running(self) -> Running {
         #[cfg(feature = "notifier")]
-        self.1.event().invalidate_numeric_auth();
+        {
+            // The resume that ends this stop may run arbitrary guest
+            // code, a syscall, or a signal handler: none of the cached
+            // registers survive it (see `Event::regs_cache`).
+            self.1.event().invalidate_regs();
+            self.1.event().invalidate_numeric_auth();
+            self.1.event().expect_stop();
+        }
         self.retire_statuses_before_exit_stop();
         Running::from_token(self.0, self.1)
     }
@@ -1292,9 +1344,16 @@ impl Stopped {
     }
 
     fn setregset<T>(&self, which: i32, regs: &T) -> Result<(), Error> {
+        self.setregset_prefix(which, regs, core::mem::size_of::<T>())
+    }
+
+    /// Like `setregset`, writing only the first `len` bytes of `regs`, for a
+    /// regset whose kernel side takes a prefix, such as `NT_ARM_HW_BREAK`.
+    fn setregset_prefix<T>(&self, which: i32, regs: &T, len: usize) -> Result<(), Error> {
+        assert!(len <= core::mem::size_of::<T>());
         let iov = libc::iovec {
             iov_base: regs as *const _ as *mut _,
-            iov_len: core::mem::size_of::<T>(),
+            iov_len: len,
         };
 
         self.1
@@ -1314,14 +1373,172 @@ impl Stopped {
         Ok(())
     }
 
+    /// Read the kernel's actual rseq registration under this stopped generation.
+    /// A failed request remains an error, never an invented unregistered state.
+    pub fn rseq_configuration(&self) -> Result<RseqConfiguration, Errno> {
+        let mut config = RseqConfiguration::default();
+        let size = core::mem::size_of::<RseqConfiguration>();
+        let returned = self.1.on_held_tid(|| unsafe {
+            syscalls::syscall!(
+                Sysno::ptrace,
+                0x420f_u32,
+                self.0.as_raw(),
+                size,
+                &mut config as *mut _
+            )
+        })?;
+        if returned != size {
+            return Err(Errno::EPROTO);
+        }
+        Ok(config)
+    }
+
+    /// Reads the word at byte `offset` of the tracee's `struct user`
+    /// (`PTRACE_PEEKUSER`), such as one of its debug registers on x86-64
+    /// (`offset_of!(libc::user, u_debugreg)` plus eight times its number).
+    pub fn peekuser(&self, offset: usize) -> Result<u64, Error> {
+        // `struct user` includes the general-purpose register area: a
+        // read there must observe the latest `setregs`.
+        self.flush_regs()?;
+        let mut word: u64 = 0;
+        // The raw request stores the word at `data`; only glibc's wrapper
+        // returns it.
+        self.1
+            .on_held_tid(|| unsafe {
+                syscalls::syscall!(
+                    Sysno::ptrace,
+                    libc::PTRACE_PEEKUSER,
+                    self.0.as_raw(),
+                    offset,
+                    &mut word as *mut u64
+                )
+            })
+            .map_err(|err| self.map_err(err))?;
+        Ok(word)
+    }
+
+    /// Writes `word` at byte `offset` of the tracee's `struct user`
+    /// (`PTRACE_POKEUSER`). See [`Stopped::peekuser`].
+    pub fn pokeuser(&self, offset: usize, word: u64) -> Result<(), Error> {
+        // Order this write after any dirty `setregs`, as the calls were
+        // made; the invalidation below then drops the cache it may
+        // have changed.
+        self.flush_regs()?;
+        self.1
+            .on_held_tid(|| unsafe {
+                syscalls::syscall!(
+                    Sysno::ptrace,
+                    libc::PTRACE_POKEUSER,
+                    self.0.as_raw(),
+                    offset,
+                    word
+                )
+            })
+            .map_err(|err| self.map_err(err))?;
+        // `struct user` includes the general-purpose register area, so a
+        // write may have changed the registers outside `setregs`.
+        #[cfg(feature = "notifier")]
+        self.1.event().invalidate_regs();
+        Ok(())
+    }
+
     /// Gets the current state of the general purpose registers.
+    ///
+    /// With the `notifier` feature, repeated calls at one stop of a
+    /// generation with a bound identity serve the registers its first
+    /// call read (or its latest [`Stopped::setregs`] wrote) instead of
+    /// reading them from the kernel again; see the generation's
+    /// register cache. A stop ends at every successful resume, which
+    /// clears the cache. The cache assumes what this API already
+    /// assumes (see `Stopped::map_err`): every ptrace request for the
+    /// tracee comes through this API from its one tracer thread. A
+    /// register write made outside it (a raw `PTRACE_SETREGS` on the
+    /// same tracee) is not observed until the next resume.
     pub fn getregs(&self) -> Result<Regs, Error> {
+        #[cfg(feature = "notifier")]
+        if self.1.event().regs_cacheable() {
+            if let Some(regs) = self.1.event().cached_regs() {
+                // A cache hit skips only the kernel read itself. It
+                // still runs under the TID hold, so a tracee whose stop
+                // has ended reports `Died` and a foreign ptracer thread
+                // is refused exactly as for the kernel request.
+                return self
+                    .1
+                    .on_held_tid(|| Ok(regs))
+                    .map_err(|err| self.map_err(err));
+            }
+            let regs = self.getregset(libc::NT_PRSTATUS)?;
+            #[cfg(test)]
+            self.1.event().note_regs_kernel_read();
+            self.1.event().store_regs(regs);
+            return Ok(regs);
+        }
         self.getregset(libc::NT_PRSTATUS)
     }
 
+    /// [`Stopped::flush_regs`] as a retaining resume's refusal: the
+    /// flush's `Died` becomes the plain `ESRCH` the retaining contract
+    /// returns (its stop-ended bookkeeping already ran in `map_err`).
+    fn flush_regs_retaining(&self) -> Result<(), Errno> {
+        self.flush_regs().map_err(|error| match error {
+            Error::Errno(errno) => errno,
+            Error::Died(_) => Errno::ESRCH,
+        })
+    }
+
+    /// Writes this generation's dirty cached registers to the kernel
+    /// in one `NT_PRSTATUS` set, if any are dirty. Runs before every
+    /// resume and before requests that observe kernel registers
+    /// (`peekuser`, `pokeuser`, `getsyscallinfo`), so the kernel never
+    /// acts on registers older than the latest [`Stopped::setregs`].
+    pub(crate) fn flush_regs(&self) -> Result<(), Error> {
+        #[cfg(feature = "notifier")]
+        if self.1.event().regs_cacheable()
+            && let Some(regs) = self.1.event().dirty_regs()
+        {
+            self.setregset(libc::NT_PRSTATUS, &regs)?;
+            #[cfg(test)]
+            self.1.event().note_regs_kernel_write();
+            self.1.event().mark_regs_clean();
+        }
+        Ok(())
+    }
+
     /// Sets the general purpose registers.
+    ///
+    /// With the `notifier` feature on a generation with a bound
+    /// identity, the value replaces the generation's cached registers
+    /// as dirty (see [`Stopped::getregs`]) and reaches the kernel in
+    /// one write before the next resume, so a run of writes at one
+    /// stop costs a single `NT_PRSTATUS` set. The TID-hold refusals
+    /// are unchanged: a foreign ptracer thread is refused before
+    /// anything is recorded. As a consequence an `ESRCH` the kernel
+    /// write would have reported at once can instead surface at the
+    /// flush, as that resume's `Died`. Without the cache the write
+    /// goes to the kernel immediately.
     pub fn setregs(&self, regs: &Regs) -> Result<(), Error> {
-        self.setregset(libc::NT_PRSTATUS, regs)
+        #[cfg(feature = "notifier")]
+        if self.1.event().regs_cacheable() {
+            let regs = *regs;
+            return self
+                .1
+                .on_held_tid(|| {
+                    // Writing the values the kernel already holds (a
+                    // clean cache) changes nothing; e.g. setting a
+                    // return value the in-place exit stop already left
+                    // in the result register. Only the kernel write is
+                    // skipped — the TID-hold refusals above still ran.
+                    if !self.1.event().regs_already_current(&regs) {
+                        self.1.event().store_regs_dirty(regs);
+                    }
+                    Ok(())
+                })
+                .map_err(|err| self.map_err(err));
+        }
+        self.setregset(libc::NT_PRSTATUS, regs)?;
+        #[cfg(all(test, feature = "notifier"))]
+        self.1.event().note_regs_kernel_write();
+        Ok(())
     }
 
     /// Gets the floating point registers.
@@ -1394,6 +1611,7 @@ impl Stopped {
 
     /// Resumes the process and transitions it back to a running state.
     pub fn resume<T: Into<Option<Signal>>>(self, sig: T) -> Result<Running, Error> {
+        self.flush_regs()?;
         self.1
             .on_held_tid(|| ptrace::cont(self.0.into(), sig).map_err(nix_errno))
             .map_err(|err| self.map_err(err))?;
@@ -1413,6 +1631,9 @@ impl Stopped {
         self,
         sig: T,
     ) -> Result<Running, (Self, Errno)> {
+        if let Err(errno) = self.flush_regs_retaining() {
+            return Err((self, errno));
+        }
         let result = self
             .1
             .on_held_tid(|| ptrace::cont(self.0.into(), sig).map_err(nix_errno));
@@ -1428,6 +1649,9 @@ impl Stopped {
         self,
         sig: T,
     ) -> Result<Running, (Self, Errno)> {
+        if let Err(errno) = self.flush_regs_retaining() {
+            return Err((self, errno));
+        }
         let result = self
             .1
             .on_held_tid(|| ptrace::syscall(self.0.into(), sig).map_err(nix_errno));
@@ -1440,6 +1664,9 @@ impl Stopped {
     /// absent signal. Invalid numbers are refused by the original kernel
     /// request, with the same generation-bound capability returned on error.
     pub fn syscall_raw_retaining(self, sig: i32) -> Result<Running, (Self, Errno)> {
+        if let Err(errno) = self.flush_regs_retaining() {
+            return Err((self, errno));
+        }
         let result = self
             .1
             .on_held_tid(|| ptrace_resume_raw(libc::PTRACE_SYSCALL, self.0, sig));
@@ -1480,6 +1707,11 @@ impl Stopped {
                 if error == Errno::ESRCH {
                     // The retained value keeps its ownership role, but the
                     // tracee has left the exit stop this capability names.
+                    #[cfg(feature = "notifier")]
+                    {
+                        self.1.event().invalidate_regs();
+                        self.1.event().stop_may_have_ended();
+                    }
                     self.retire_statuses_before_exit_stop();
                 }
                 Err((self, error))
@@ -1491,6 +1723,7 @@ impl Stopped {
     /// `nix`'s `Signal` cannot name (a realtime signal; see
     /// [`Event::RawSignal`]). `0` delivers nothing.
     pub fn resume_raw(self, sig: i32) -> Result<Running, Error> {
+        self.flush_regs()?;
         self.1
             .on_held_tid(|| ptrace_resume_raw(libc::PTRACE_CONT, self.0, sig))
             .map_err(|err| self.map_err(err))?;
@@ -1500,6 +1733,7 @@ impl Stopped {
     /// Like [`Stopped::syscall`], delivering the raw signal `sig` (see
     /// [`Stopped::resume_raw`]).
     pub fn syscall_raw(self, sig: i32) -> Result<Running, Error> {
+        self.flush_regs()?;
         self.1
             .on_held_tid(|| ptrace_resume_raw(libc::PTRACE_SYSCALL, self.0, sig))
             .map_err(|err| self.map_err(err))?;
@@ -1509,6 +1743,7 @@ impl Stopped {
     /// Like [`Stopped::step`], delivering the raw signal `sig` (see
     /// [`Stopped::resume_raw`]).
     pub fn step_raw(self, sig: i32) -> Result<Running, Error> {
+        self.flush_regs()?;
         self.1
             .on_held_tid(|| ptrace_resume_raw(libc::PTRACE_SINGLESTEP, self.0, sig))
             .map_err(|err| self.map_err(err))?;
@@ -1528,6 +1763,7 @@ impl Stopped {
     /// a single instruction instead, which is earlier still.
     #[cfg(target_arch = "x86_64")]
     pub fn block_step(self) -> Result<Running, Error> {
+        self.flush_regs()?;
         self.1
             .on_held_tid(|| ptrace_resume_raw(PTRACE_SINGLEBLOCK, self.0, 0))
             .map_err(|err| self.map_err(err))?;
@@ -1537,6 +1773,7 @@ impl Stopped {
     /// Advances the execution of the process by a single step optionally
     /// delivering a signal specified by `sig`.
     pub fn step<T: Into<Option<Signal>>>(self, sig: T) -> Result<Running, Error> {
+        self.flush_regs()?;
         self.1
             .on_held_tid(|| ptrace::step(self.0.into(), sig).map_err(nix_errno))
             .map_err(|err| self.map_err(err))?;
@@ -1546,6 +1783,7 @@ impl Stopped {
     /// Like `step`, but arranges for the tracee to be stopped at the next
     /// entry to or exit from a system call.
     pub fn syscall<T: Into<Option<Signal>>>(self, sig: T) -> Result<Running, Error> {
+        self.flush_regs()?;
         self.1
             .on_held_tid(|| ptrace::syscall(self.0.into(), sig).map_err(nix_errno))
             .map_err(|err| self.map_err(err))?;
@@ -1566,7 +1804,44 @@ impl Stopped {
     #[cfg(target_arch = "aarch64")]
     pub fn set_syscall(&self, nr: i32) -> Result<(), Error> {
         const NT_ARM_SYSTEM_CALL: i32 = 0x404;
-        self.setregset(NT_ARM_SYSTEM_CALL, &nr)
+        // Flush first: the invalidation below would otherwise drop a
+        // dirty `setregs` recorded at this stop without ever writing it.
+        self.flush_regs()?;
+        self.setregset(NT_ARM_SYSTEM_CALL, &nr)?;
+        // The kernel's syscall number lives outside `NT_PRSTATUS` here,
+        // but the register view derived from `x8` and the number the
+        // resume runs must not be read as one cached whole.
+        #[cfg(feature = "notifier")]
+        self.1.event().invalidate_regs();
+        Ok(())
+    }
+
+    /// Reads this thread's ptrace hardware breakpoints (`NT_ARM_HW_BREAK`).
+    /// Breakpoints the thread holds through `perf_event_open` do not appear
+    /// here, though they take hardware slots.
+    #[cfg(target_arch = "aarch64")]
+    pub fn hw_breakpoints(&self) -> Result<HwBreakpoints, Error> {
+        self.getregset(NT_ARM_HW_BREAK)
+    }
+
+    /// Writes the first `count` breakpoint registers of `breakpoints` to
+    /// this thread (`NT_ARM_HW_BREAK`), leaving the others as they are.
+    /// Linux registers each written register as a ptrace breakpoint, in
+    /// order, and stops at the first that fails, so a failed write may have
+    /// applied in part. Writing one the hardware lacks, or more than the
+    /// slots that other breakpoints of the thread leave free, fails
+    /// (`ENOSPC` or `EINVAL`). A registered breakpoint keeps its hardware
+    /// slot, enabled or not, until the thread execs or exits.
+    #[cfg(target_arch = "aarch64")]
+    pub fn set_hw_breakpoints(
+        &self,
+        breakpoints: &HwBreakpoints,
+        count: usize,
+    ) -> Result<(), Error> {
+        let count = count.min(breakpoints.regs.len());
+        let len = core::mem::offset_of!(HwBreakpoints, regs)
+            + count * core::mem::size_of::<HwBreakpoint>();
+        self.setregset_prefix(NT_ARM_HW_BREAK, breakpoints, len)
     }
 
     /// Gets info about the signal that caused the process to be stopped.
@@ -1679,6 +1954,9 @@ impl Stopped {
             #[cfg(target_arch = "x86_64")]
             Transition::BlockStep => (PTRACE_SINGLEBLOCK, 0),
         };
+        // Before the probe, so no system call is added between the
+        // probe's final check and the resume request below.
+        self.flush_regs()?;
         self.1
             .on_held_tid(|| {
                 // A probe that cannot observe refuses with its own error: no
@@ -1801,7 +2079,7 @@ impl Stopped {
             .on_held_tid(|| {
                 Errno::result(unsafe {
                     libc::ptrace(
-                        libc::PTRACE_GETSIGMASK,
+                        libc::PTRACE_GETSIGMASK as _,
                         self.0.as_raw(),
                         core::mem::size_of::<u64>(),
                         &mut mask as *mut u64,
@@ -1821,7 +2099,7 @@ impl Stopped {
             .on_held_tid(|| {
                 Errno::result(unsafe {
                     libc::ptrace(
-                        libc::PTRACE_SETSIGMASK,
+                        libc::PTRACE_SETSIGMASK as _,
                         self.0.as_raw(),
                         core::mem::size_of::<u64>(),
                         &mask as *const u64,
@@ -1965,6 +2243,9 @@ impl Stopped {
         self,
         sig: T,
     ) -> Result<Running, (Self, Errno)> {
+        if let Err(errno) = self.flush_regs_retaining() {
+            return Err((self, errno));
+        }
         let result = self
             .1
             .on_held_tid(|| ptrace::detach(self.0.into(), sig).map_err(nix_errno));
@@ -1973,6 +2254,7 @@ impl Stopped {
 
     /// Detaches from and then resumes the stopped tracee.
     pub fn detach<T: Into<Option<Signal>>>(self, sig: T) -> Result<Running, Error> {
+        self.flush_regs()?;
         self.1
             .on_held_tid(|| ptrace::detach(self.0.into(), sig).map_err(nix_errno))
             .map_err(|err| self.map_err(err))?;
@@ -2253,7 +2535,10 @@ impl Running {
                 )
             })
             .map(drop)
-        })
+        })?;
+        #[cfg(feature = "notifier")]
+        self.1.event().expect_stop();
+        Ok(())
     }
 
     /// Returns the pid of the running process.
@@ -2839,6 +3124,13 @@ mod test {
         let mut compat = original;
         compat[PRSTATUS_CS..PRSTATUS_CS + 8].copy_from_slice(&0x23u64.to_ne_bytes());
         set_native_prstatus(tid, &compat)?;
+        // The raw write above bypasses `Stopped::setregs`, so the
+        // generation's register cache still holds the native registers
+        // read before it. Drop them explicitly, as any writer outside
+        // the `Stopped` API must: the refusal below has to observe the
+        // kernel's current compat reply, not the cached native one.
+        #[cfg(feature = "notifier")]
+        tracee.1.event().invalidate_regs();
         let (reply, length) = raw_prstatus(tid)?;
         assert_eq!(length, 68, "actual short kernel PRSTATUS, never a mock");
         assert_eq!(u16::from_ne_bytes(reply[52..54].try_into().unwrap()), 0x23);
@@ -3584,6 +3876,44 @@ mod test {
             stopped.resume(Some(Signal::SIGUSR1))?.wait()?,
             Wait::Exited(pid, ExitStatus::Exited(0))
         );
+        Ok(())
+    }
+
+    /// A tracee's debug registers, read and written in its `struct user`:
+    /// an address and a slot's controls read back as written, and DR6 reads
+    /// back in the hardware's polarity, its hit bits as written.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn debug_registers_round_trip_through_peekuser_and_pokeuser()
+    -> Result<(), Box<dyn std::error::Error + 'static>> {
+        static WATCHED: u64 = 0;
+        let debugreg = |n: usize| core::mem::offset_of!(libc::user, u_debugreg) + 8 * n;
+        let (parent_pid, tracee) = trace(
+            || {
+                let _ = unsafe { libc::syscall(libc::SYS_exit_group, 0) };
+                unreachable!()
+            },
+            Options::PTRACE_O_EXITKILL,
+        )?;
+        let addr = &WATCHED as *const u64 as u64;
+        tracee.pokeuser(debugreg(0), addr)?;
+        assert_eq!(tracee.peekuser(debugreg(0))?, addr);
+        // Slot 0 enabled, watching writes of 8 bytes.
+        tracee.pokeuser(debugreg(7), 0x0009_0001)?;
+        assert_eq!(tracee.peekuser(debugreg(7))?, 0x0009_0001);
+        let dr6 = tracee.peekuser(debugreg(6))?;
+        assert_eq!(dr6 & 0xf, 0, "{dr6:#x}");
+        tracee.pokeuser(debugreg(6), dr6 | 0b0100)?;
+        assert_eq!(tracee.peekuser(debugreg(6))?, dr6 | 0b0100);
+        tracee.pokeuser(debugreg(6), dr6)?;
+        tracee.pokeuser(debugreg(7), 0)?;
+        // There is no DR4.
+        assert_eq!(
+            tracee.pokeuser(debugreg(4), 0),
+            Err(Error::Errno(Errno::EIO))
+        );
+        tracee.resume(None)?;
+        while wait_group(parent_pid)?.is_some() {}
         Ok(())
     }
 

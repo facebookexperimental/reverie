@@ -237,6 +237,7 @@ fn ordinary_post_exec_owner_cell(force_legacy: bool, unrelated_signal: bool) {
         (),
         Arc::new(()),
         TracedTaskOptions {
+            reserved_input: None,
             command_bootstrap: false,
             events: &events,
             injected_syscall_trap: None,

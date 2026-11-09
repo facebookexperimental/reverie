@@ -455,15 +455,18 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
     async fn daemonize(&mut self);
 
     /// Inject a system call into the guest and wait for the return value. This
-    /// function dirties the register file while its executing, but restores at
-    /// the end.
+    /// function temporarily changes the computational and control-register
+    /// frame to execute the injection, then restores that frame on return.
     ///
     /// Preconditions: the guest is in a stopped state and Reverie is currently
     /// running a handler on that guest thread's behalf.
     ///
-    /// Postconditions: the register file is the same as before the call to this
-    /// function. However, any side effects, including to guest memory, persist
-    /// after the injected call.
+    /// Postconditions: general-purpose registers (including the return-value
+    /// register), instruction and stack pointers, and flags are restored to
+    /// their values before this call. Architectural segment/TLS state changed
+    /// by the syscall, such as FS/GS bases, is retained, as are other syscall
+    /// side effects, including changes to guest memory. The syscall's result is
+    /// returned separately from the restored register frame.
     ///
     /// # Caveats
     ///
@@ -475,12 +478,171 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
     ///    handle successful calls to `execve`, use [`Tool::handle_post_exec`].
     ///    Failed calls to `execve` will still return, however. Thus, it is safe to
     ///    use [`Result::unwrap_err`] on the result of the `inject`.
+    ///  - An injection by a thread whose thread group has exited (another thread
+    ///    called `exit_group`, for example) never returns: the thread is dead.
+    ///    On the ptrace backend the kernel kills it; on the KVM backend the call
+    ///    is cancelled before it runs, for a call made after the group's exit
+    ///    is published.
     ///
     /// A signal can stop the injected syscall before it runs. The call then
     /// returns `Err(ERESTARTSYS)` rather than a value read from the register
     /// file, and the syscall has had no effect; [`Guest::inject_with_retry`]
     /// injects it again.
     async fn inject<S: SyscallInfo>(&mut self, syscall: S) -> Result<i64, Errno>;
+
+    /// The exact explicitly bound caller operation, if this is a forwarding
+    /// operation wrapper. Backends and nested Tool callbacks default to None.
+    fn native_operation(&self) -> Option<crate::native_syscall::NativeOperation> {
+        None
+    }
+
+    /// Whether this backend transports explicit native-operation ownership.
+    /// False by default; constructing NativeOperationGuest then fails before
+    /// issuing anything. Backends returning true implement every method below.
+    fn supports_native_operations(&self) -> bool {
+        false
+    }
+
+    /// Bind this exact physical request while the caller still owns its live
+    /// execution grant, before releasing coverage for a background operation.
+    /// The result retains the same operation owner/completion proof. Later
+    /// operand or ABI changes fail native ownership before issue, not as errno.
+    /// Helpers must use their own view rather than inherit this constraint.
+    fn bind_native_request<S: SyscallInfo>(
+        &self,
+        _operation: &crate::native_syscall::NativeOperation,
+        _syscall: S,
+    ) -> Result<crate::native_syscall::NativeOperation, Error> {
+        Err(Error::Tool(anyhow::anyhow!(
+            "native-request-binding-unsupported"
+        )))
+    }
+
+    /// Issue with an explicit operation owner. Call only after checking support.
+    async fn inject_with_native_operation<S: SyscallInfo>(
+        &mut self,
+        _syscall: S,
+        _operation: crate::native_syscall::NativeOperation,
+    ) -> Result<i64, Errno> {
+        panic!("native-operation injection is unsupported by this backend")
+    }
+
+    /// Restartable injection with the same explicit caller operation.
+    async fn inject_restartable_with_native_operation<S: SyscallInfo>(
+        &mut self,
+        _syscall: S,
+        _operation: crate::native_syscall::NativeOperation,
+    ) -> Result<i64, Errno> {
+        panic!("native-operation restart is unsupported by this backend")
+    }
+
+    /// Transfer the explicit operation to this exact nonreturning injection.
+    async fn tail_inject_with_native_operation<S: SyscallInfo>(
+        &mut self,
+        _syscall: S,
+        _operation: crate::native_syscall::NativeOperation,
+    ) -> Never {
+        panic!("native-operation tail is unsupported by this backend")
+    }
+
+    /// Observed injection with both independent call-local capabilities.
+    async fn inject_observed_with_native_operation<S: SyscallInfo>(
+        &mut self,
+        _syscall: S,
+        _receipt: crate::reserved_input::PhysicalInjectionReceipt,
+        _operation: crate::native_syscall::NativeOperation,
+    ) -> Result<Result<i64, Errno>, crate::reserved_input::InputInjectionError> {
+        Err(crate::reserved_input::InputUnavailable::new("native-operation-unsupported").into())
+    }
+
+    /// Staged injection with an explicit caller operation; scope remains borrowed.
+    async fn inject_staged_with_native_operation<S: SyscallInfo>(
+        &mut self,
+        _syscall: S,
+        _scope: &crate::reserved_input::InputOperationScope,
+        _image: crate::reserved_input::ReservedInputImage,
+        _receipt: crate::reserved_input::PhysicalInjectionReceipt,
+        _operation: crate::native_syscall::NativeOperation,
+    ) -> Result<Result<i64, Errno>, crate::reserved_input::InputInjectionError> {
+        Err(crate::reserved_input::InputUnavailable::new("native-operation-unsupported").into())
+    }
+
+    /// Run-local private-input facade, when this backend installed one.
+    /// This observation alone grants neither execution nor stopped memory access.
+    fn reserved_input_control(&self) -> Option<crate::reserved_input::ReservedInputControl> {
+        None
+    }
+
+    /// Current native task incarnation in the installed input registry.
+    fn reserved_input_task(&self) -> Option<crate::reserved_input::InputTaskId> {
+        None
+    }
+
+    /// Complete actual native descriptor snapshot, retaining every OFD pin.
+    /// Pins must be dropped before logical readmission or an await.
+    fn reserved_input_descriptors(
+        &self,
+    ) -> Result<
+        crate::reserved_input::InputDescriptorSnapshot,
+        crate::reserved_input::InputUnavailable,
+    > {
+        Err(crate::reserved_input::InputUnavailable::new(
+            "input-native-descriptors-unsupported",
+        ))
+    }
+
+    /// Actual inherited exit signal of the caller's owned native process.
+    /// This is a native observation, not the requested creation argument.
+    fn reserved_input_process_exit_signal(
+        &self,
+    ) -> Result<i32, crate::reserved_input::InputUnavailable> {
+        Err(crate::reserved_input::InputUnavailable::new(
+            "input-native-exit-signal-unsupported",
+        ))
+    }
+
+    /// Inspect an actual native descriptor while retaining its open description.
+    /// The returned pin must be dropped before logical readmission or an await.
+    fn reserved_input_descriptor(
+        &self,
+        _fd: i32,
+    ) -> Result<crate::reserved_input::PinnedInputDescriptor, crate::reserved_input::InputUnavailable>
+    {
+        Err(crate::reserved_input::InputUnavailable::new(
+            "input-native-descriptor-unsupported",
+        ))
+    }
+
+    /// Inject one physical call with an explicit, backend-owned receipt.
+    /// Helper and preparation injections cannot consume this receipt.
+    async fn inject_observed<S: SyscallInfo>(
+        &mut self,
+        _syscall: S,
+        _receipt: crate::reserved_input::PhysicalInjectionReceipt,
+    ) -> Result<Result<i64, Errno>, crate::reserved_input::InputInjectionError> {
+        Err(
+            crate::reserved_input::InputUnavailable::new("input-observed-injection-unsupported")
+                .into(),
+        )
+    }
+
+    /// Prepare an injection before filling the authenticated private input page.
+    /// On Ok, the exact full image was read back and the native return settled;
+    /// the inner result is the unchanged native value or errno. Unavailable is
+    /// permitted only after proved no-effect/normalization and entry settlement.
+    /// The operation scope is borrowed so a settled fallback uses the same grant.
+    async fn inject_staged_input<S: SyscallInfo>(
+        &mut self,
+        _syscall: S,
+        _scope: &crate::reserved_input::InputOperationScope,
+        _image: crate::reserved_input::ReservedInputImage,
+        _receipt: crate::reserved_input::PhysicalInjectionReceipt,
+    ) -> Result<Result<i64, Errno>, crate::reserved_input::InputInjectionError> {
+        Err(
+            crate::reserved_input::InputUnavailable::new("input-staged-injection-unsupported")
+                .into(),
+        )
+    }
 
     /// Inject with the closed interception purpose described by [InjectionPurpose].
     ///
@@ -576,6 +738,16 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
     /// adopts the final process status, including a peer's later group exit.
     /// Unlike explicit cancellation, retirement does not discard their work.
     /// Restricted signal callbacks do not gain arbitrary syscall injection.
+    ///
+    /// A retirement before any group exit of the thread's process is
+    /// published is taken as the start of that thread's death with its
+    /// group (a peer's exit_group, a fatal signal, an exec): a backend that
+    /// decides whether a dying thread is its address space's last user (KVM,
+    /// for CLONE_CHILD_CLEARTID) counts the retired thread as live for the
+    /// group's decision if another thread was live when it retired. A Tool
+    /// that retires a thread for any other reason, and then lets a lone
+    /// thread call exit_group, gets a store where Linux, with mm_users at 1,
+    /// would skip it.
     async fn retire_current_thread(&mut self) -> Never {
         self.tail_inject(reverie_syscalls::Exit::default()).await
     }
@@ -1050,6 +1222,66 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
         None
     }
 
+    /// Arms this thread's hardware watchpoints with `specs`, replacing the
+    /// ones it had: an empty slice disarms them. Every access a watch catches
+    /// is reported to [`GlobalTool::on_watchpoint_hit`] as a
+    /// [`WatchHit`](crate::WatchHit) whose `slot` is the watch's index in
+    /// `specs`. Only the thread's own instructions are watched: an access the
+    /// kernel makes for one of its syscalls (a `read` into the watched
+    /// bytes) is not reported, as Linux excludes the kernel from a
+    /// debugger's watchpoints.
+    ///
+    /// The watches are this thread's own. A thread or process it starts has
+    /// none, and a successful `execve` disarms them, as Linux does. The
+    /// backend refuses, changing nothing, more watches than
+    /// [`BackendCapabilities::hardware_watchpoints`](crate::BackendCapabilities::hardware_watchpoints),
+    /// a length or alignment the hardware cannot watch, and, with any watch,
+    /// a thread that blocks or ignores SIGTRAP: Linux reports a hit by
+    /// forcing a SIGTRAP on the thread, which unblocks it and resets its
+    /// action to the default (`force_sig_info_to_task`). A thread can still
+    /// block or ignore SIGTRAP after its watches are armed; what its next hit
+    /// then changes, and what the backend puts back, is
+    /// [`WatchHit::sigtrap`](crate::WatchHit::sigtrap). A backend puts back
+    /// only what it knows, so a Tool that must not change the guest checks
+    /// each hit.
+    ///
+    /// A thread that glibc's `pthread_create` starts runs with every signal
+    /// blocked until its start code restores its mask with an
+    /// `rt_sigprocmask`, before the program's start routine: arming it in
+    /// [`Tool::handle_thread_start`](crate::Tool::handle_thread_start) is
+    /// refused ([`WatchError::SigtrapBlocked`](crate::WatchError::SigtrapBlocked)),
+    /// and the first stop at which it can be armed is the end of that
+    /// syscall. The thread's accesses before then, in glibc's start code,
+    /// are not watched.
+    ///
+    /// A hit stops the thread briefly and makes no Tool callback other than
+    /// `on_watchpoint_hit`: it does not count as an event the Tool observes.
+    /// Whether it can still change when a timer event
+    /// ([`Guest::set_timer_precise`]) is delivered is
+    /// [`Guest::watch_hits_keep_timer_events`].
+    ///
+    /// The default refuses ([`WatchError::Unsupported`](crate::WatchError::Unsupported)).
+    fn set_watchpoints(&mut self, _specs: &[crate::WatchSpec]) -> Result<(), crate::WatchError> {
+        Err(crate::WatchError::Unsupported)
+    }
+
+    /// Whether a watch hit on this thread ([`Guest::set_watchpoints`]) leaves
+    /// every timer event of the thread as it would have been without the
+    /// hit: delivered at the same clock and instruction, or not at all. A
+    /// backend that cannot tell whether a hit's stop came before the timer's
+    /// notification answers `false`, and so does the default.
+    ///
+    /// On reverie-ptrace this holds when the thread's precise timer maps its
+    /// overflow records, or when the thread has no timer at all. Without the
+    /// records (a `PREEMPT_RT` kernel, or a host whose perf locked-memory
+    /// budget ran out), a hit's stop within the keep margin of a precise
+    /// event's target cancels the event, as Reverie's other traps without a
+    /// Tool callback do. A Tool that must not let a hit move a timer event
+    /// checks this on every thread it arms.
+    fn watch_hits_keep_timer_events(&self) -> bool {
+        false
+    }
+
     /// Returns true if all of the following conditions are true:
     ///  1. [`Tool::subscriptions`] returns an interest in intercepting CPUID.
     ///  2. We're able to trap and intercept the CPUID instruction. We may not
@@ -1091,6 +1323,31 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
     /// every operation they accept always return `None`, which is the default.
     fn take_unsupported_refusal(&mut self) -> Option<crate::UnsupportedRefusal> {
         None
+    }
+
+    /// How many syscalls this guest has handed to the backend through
+    /// [`Guest::inject`] and its variants so far, counting each attempt,
+    /// refused or retried ones included; `None` when the backend does not
+    /// count them, which is the default.
+    ///
+    /// Only the difference between two readings in one callback means
+    /// anything: a tool reads it before and after handling an event to learn
+    /// whether the backend executed anything for it. Counting has no effect on
+    /// the guest. Raw calls the tool makes for itself
+    /// ([`Guest::tool_syscall`]) are not injections and are not counted.
+    fn injected_syscalls(&self) -> Option<u64> {
+        None
+    }
+
+    /// How the kernel that physically executes this guest's syscalls spells
+    /// the pidfd self sentinels ([`crate::pidfd_self`]): a stable fact of the
+    /// backend's execution, qualified once by the backend at its own raw
+    /// native leaf, or declared by a backend that executes these calls itself.
+    /// A tool that forwards a call naming a sentinel spells it this way below
+    /// any record of the call. The default, for a backend that states nothing,
+    /// is [`crate::PidfdSelfSpelling::Unknown`].
+    fn pidfd_self_spelling(&self) -> crate::PidfdSelfSpelling {
+        crate::PidfdSelfSpelling::Unknown
     }
 
     /// Returns half-open guest address ranges, `(start, end)`, that together
@@ -1144,6 +1401,181 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
     /// are) override this with the rule their own syscall emulation applies.
     fn user_address_limit(&self) -> Result<crate::UserAddressLimit, crate::Error> {
         crate::user_address::host_user_address_limit()
+    }
+
+    /// Returns the state of this thread's open descriptor `fd` that no
+    /// syscall reads without changing it: an eventfd's counter, a Unix domain
+    /// socket's queued `SCM_RIGHTS` descriptors, and the locks held through
+    /// the descriptor's open file description. Linux shows the same state in
+    /// `/proc/<pid>/fdinfo/<fd>`; see [`crate::DescriptorStatus`].
+    ///
+    /// `Err(FactError::Errno(EBADF))` means that `fd` is not open in this
+    /// thread's descriptor table. Other errnos come from the backend's own
+    /// read of the state. `Err(FactError::NotProvided)` means the backend
+    /// does not report this fact, for any descriptor or for this one; it is
+    /// the default, for a backend that states nothing.
+    ///
+    /// The answer describes the moment of the call, while this thread is
+    /// stopped in the callback. Any task that shares the descriptor's open
+    /// file description, or the socket's peer, can change it afterwards.
+    ///
+    /// A backend whose guest threads are host tasks the tool may read
+    /// ([`crate::BackendCapabilities::host_task_reads_reach_guest_threads`])
+    /// reads the thread's own `fdinfo`. A backend that runs the guest's
+    /// syscalls itself answers from the descriptor table it keeps, with the
+    /// differences from Linux that its documentation names. Any other backend
+    /// does not report it, because a host read there would describe another
+    /// task.
+    fn descriptor_status(&self, _fd: i32) -> Result<crate::DescriptorStatus, crate::FactError> {
+        Err(crate::FactError::NotProvided)
+    }
+
+    /// Returns the signal sets of thread `tid`, a live guest thread of this
+    /// tool instance in any of its processes: what is pending for the thread
+    /// and for its process, its mask, and its process's ignored and caught
+    /// signals. Linux shows the same sets to any reader in the thread's
+    /// `/proc/<pid>/task/<tid>/status` (`SigPnd`, `ShdPnd`, `SigBlk`, `SigIgn`
+    /// and `SigCgt`); see [`crate::SignalSets`]. `tid` is numbered as
+    /// [`Guest::tid`] numbers this thread.
+    ///
+    /// `Err(FactError::Errno(ESRCH))` means that `tid` names no live thread
+    /// the backend runs for this tool instance: a thread that has exited,
+    /// reaped or not, a host task that is not one of its guest threads, or a
+    /// number no task has, zero and below included. ESRCH is the errno Linux
+    /// gives a thread-directed call such as `tgkill(2)` for a thread it
+    /// cannot find. Other errnos come from the backend's own read of the
+    /// state. `Err(FactError::NotProvided)` means the backend does not report
+    /// this fact, for any thread or for this one; it is the default, for a
+    /// backend that states nothing.
+    ///
+    /// The answer describes the moment of the call. This thread is stopped in
+    /// the callback, but other guest threads may run unless the tool keeps
+    /// them from it, and any thread can change another's sets by signalling
+    /// it. A tool that needs a stable answer for another thread asks while
+    /// that thread, and every thread that could signal it, cannot run; the
+    /// backend's read is a snapshot taken under the locks the target's own
+    /// signal syscalls take.
+    ///
+    /// A backend whose guest threads are host tasks the tool may read
+    /// ([`crate::BackendCapabilities::host_task_reads_reach_guest_threads`])
+    /// reads the kernel's sets of a thread it traces, every bit as Linux
+    /// shows it, including any signal the backend reserves for its own use.
+    /// It reads them through a handle on that task taken while it traced it,
+    /// so it reads no other task's state, not even that of a task that took
+    /// over the number of one it traced. A backend that runs the guest's
+    /// syscalls and delivers its signals itself answers from the signal
+    /// state it keeps, with the differences from Linux that its documentation
+    /// names. Any other backend does not report it, because a host read
+    /// there would describe another task.
+    ///
+    /// Like [`Guest::descriptor_status`], the call is synchronous: the
+    /// backend reads state it reaches without running the guest or injecting
+    /// anything, while this thread stays stopped.
+    fn signal_sets(&self, _tid: Pid) -> Result<crate::SignalSets, crate::FactError> {
+        Err(crate::FactError::NotProvided)
+    }
+
+    /// Returns what Linux's `readlink(2)` gives for the path link `link` of
+    /// thread `tid`, a live guest thread of this tool instance in any of its
+    /// processes: the name of the file one of its descriptors refers to, of
+    /// the file its process executes, or of its working directory, as its
+    /// `/proc/<pid>/task/<tid>/fd/<fd>`, `exe` and `cwd` show them to a reader
+    /// Linux lets read them; see [`crate::PathLink`] and [`crate::LinkPath`].
+    /// `tid` is numbered as [`Guest::tid`] numbers this thread.
+    ///
+    /// `Err(FactError::Errno(ESRCH))` means that `tid` names no live thread
+    /// the backend runs for this tool instance, exactly as for
+    /// [`Guest::signal_sets`]: a thread that has exited, reaped or not, a host
+    /// task that is not one of its guest threads, or a number no task has,
+    /// zero and below included. `Err(FactError::Errno(EBADF))` means that the
+    /// descriptor of a [`crate::PathLink::Descriptor`] is not open in the
+    /// thread's descriptor table, a negative number included (Linux's
+    /// `readlink` answers `ENOENT` there, as for any name `/proc` does not
+    /// have). Other errnos come from the backend's own read: for example
+    /// `ENAMETOOLONG`, Linux's answer for a name that does not fit in
+    /// `PATH_MAX` bytes. `Err(FactError::NotProvided)` means the backend does
+    /// not report this fact, for any link or for this one; it is the default,
+    /// for a backend that states nothing.
+    ///
+    /// The answer describes the moment of the call. This thread is stopped in
+    /// the callback, but other guest threads may run unless the tool keeps
+    /// them from it: a thread that shares the target's descriptor table can
+    /// close or replace the descriptor, and any file can be renamed or
+    /// unlinked. Linux renders a path from the root of the task that reads
+    /// the link, which here is the backend's reader: the guest's root unless
+    /// a guest thread changed its own.
+    ///
+    /// A backend whose guest threads are host tasks the tool may read
+    /// ([`crate::BackendCapabilities::host_task_reads_reach_guest_threads`])
+    /// reads the kernel's link of a thread it traces, through a handle on
+    /// that task taken while it traced it, so it reads no other task's link,
+    /// not even that of a task that took over the number of one it traced. A
+    /// backend that runs the guest's syscalls itself answers from the state
+    /// it keeps, with the differences from Linux that its documentation
+    /// names. Any other backend does not report it, because a host read there
+    /// would describe another task.
+    ///
+    /// Like [`Guest::descriptor_status`], the call is synchronous: the
+    /// backend reads state it reaches without running the guest or injecting
+    /// anything, while this thread stays stopped.
+    fn link_path(
+        &self,
+        _tid: Pid,
+        _link: crate::PathLink,
+    ) -> Result<crate::LinkPath, crate::FactError> {
+        Err(crate::FactError::NotProvided)
+    }
+
+    /// Returns the mappings of the address space of thread `tid`, a live
+    /// guest thread of this tool instance in any of its processes, as its
+    /// `/proc/<pid>/task/<tid>/maps` lists them to a reader Linux lets read
+    /// it, and whether the list is all of them; see [`crate::MemoryMap`]. The
+    /// threads of a process share its address space, so they have the same
+    /// list. `tid` is numbered as [`Guest::tid`] numbers this thread.
+    ///
+    /// `Err(FactError::Errno(ESRCH))` means that `tid` names no live thread
+    /// the backend runs for this tool instance, exactly as for
+    /// [`Guest::signal_sets`]: a thread that has exited, reaped or not, a host
+    /// task that is not one of its guest threads, or a number no task has,
+    /// zero and below included. Other errnos come from the backend's own
+    /// read. `Err(FactError::NotProvided)` means the backend does not report
+    /// this fact, for any thread or for this one; it is the default, for a
+    /// backend that states nothing.
+    ///
+    /// Every listed mapping is exact for the backend's own address space, as
+    /// Linux prints it, whether or not the list is complete: a backend that
+    /// cannot establish a mapping's fields leaves the mapping out. That
+    /// address space can differ from the one a native process would have
+    /// after the same calls (a backend may map a whole stack at once, for
+    /// example); the backend's documentation names how. A list with
+    /// [`complete`](crate::MemoryMap::complete) false omits mappings that
+    /// exist, which the backend's documentation names. A tool must not infer
+    /// from a missing entry that no mapping is there, such as that an address
+    /// is unmapped or free, and a tool that renders such a list as a `maps`
+    /// file must name the omissions as a difference of the backend.
+    ///
+    /// The answer describes the moment of the call. This thread is stopped in
+    /// the callback, but other guest threads may run unless the tool keeps
+    /// them from it, and any thread of the process can map, unmap or protect
+    /// memory. Linux renders a file's name from the root of the task that
+    /// reads the map, which here is the backend's reader: the guest's root
+    /// unless a guest thread changed its own.
+    ///
+    /// A backend whose guest threads are host tasks the tool may read
+    /// ([`crate::BackendCapabilities::host_task_reads_reach_guest_threads`])
+    /// reads the kernel's map of a thread it traces, through a handle on that
+    /// task taken while it traced it, so it reads no other task's map, not
+    /// even that of a task that took over the number of one it traced. A
+    /// backend that runs the guest's syscalls itself answers from the address
+    /// space it keeps, and each mapping it lists is exact for that address
+    /// space. Any other backend does not report it, because a host read there
+    /// would describe another task.
+    ///
+    /// Like [`Guest::descriptor_status`], the call is synchronous: the
+    /// backend reads state it reaches without running the guest or injecting
+    /// anything, while this thread stays stopped.
+    fn memory_map(&self, _tid: Pid) -> Result<crate::MemoryMap, crate::FactError> {
+        Err(crate::FactError::NotProvided)
     }
 }
 
@@ -1297,6 +1729,122 @@ where
         self.inner.inject(syscall).await
     }
 
+    fn native_operation(&self) -> Option<crate::native_syscall::NativeOperation> {
+        self.inner.native_operation()
+    }
+
+    fn supports_native_operations(&self) -> bool {
+        self.inner.supports_native_operations()
+    }
+    fn bind_native_request<S: SyscallInfo>(
+        &self,
+        operation: &crate::native_syscall::NativeOperation,
+        syscall: S,
+    ) -> Result<crate::native_syscall::NativeOperation, Error> {
+        self.inner.bind_native_request(operation, syscall)
+    }
+    async fn inject_with_native_operation<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        operation: crate::native_syscall::NativeOperation,
+    ) -> Result<i64, Errno> {
+        self.inner
+            .inject_with_native_operation(syscall, operation)
+            .await
+    }
+    async fn inject_restartable_with_native_operation<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        operation: crate::native_syscall::NativeOperation,
+    ) -> Result<i64, Errno> {
+        self.inner
+            .inject_restartable_with_native_operation(syscall, operation)
+            .await
+    }
+    async fn tail_inject_with_native_operation<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        operation: crate::native_syscall::NativeOperation,
+    ) -> Never {
+        self.inner
+            .tail_inject_with_native_operation(syscall, operation)
+            .await
+    }
+    async fn inject_observed_with_native_operation<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        receipt: crate::reserved_input::PhysicalInjectionReceipt,
+        operation: crate::native_syscall::NativeOperation,
+    ) -> Result<Result<i64, Errno>, crate::reserved_input::InputInjectionError> {
+        self.inner
+            .inject_observed_with_native_operation(syscall, receipt, operation)
+            .await
+    }
+    async fn inject_staged_with_native_operation<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        scope: &crate::reserved_input::InputOperationScope,
+        image: crate::reserved_input::ReservedInputImage,
+        receipt: crate::reserved_input::PhysicalInjectionReceipt,
+        operation: crate::native_syscall::NativeOperation,
+    ) -> Result<Result<i64, Errno>, crate::reserved_input::InputInjectionError> {
+        self.inner
+            .inject_staged_with_native_operation(syscall, scope, image, receipt, operation)
+            .await
+    }
+
+    fn reserved_input_control(&self) -> Option<crate::reserved_input::ReservedInputControl> {
+        self.inner.reserved_input_control()
+    }
+
+    fn reserved_input_task(&self) -> Option<crate::reserved_input::InputTaskId> {
+        self.inner.reserved_input_task()
+    }
+
+    /// Complete actual native descriptor snapshot, retaining every OFD pin.
+    fn reserved_input_descriptors(
+        &self,
+    ) -> Result<
+        crate::reserved_input::InputDescriptorSnapshot,
+        crate::reserved_input::InputUnavailable,
+    > {
+        self.inner.reserved_input_descriptors()
+    }
+
+    fn reserved_input_process_exit_signal(
+        &self,
+    ) -> Result<i32, crate::reserved_input::InputUnavailable> {
+        self.inner.reserved_input_process_exit_signal()
+    }
+
+    fn reserved_input_descriptor(
+        &self,
+        fd: i32,
+    ) -> Result<crate::reserved_input::PinnedInputDescriptor, crate::reserved_input::InputUnavailable>
+    {
+        self.inner.reserved_input_descriptor(fd)
+    }
+
+    async fn inject_observed<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        receipt: crate::reserved_input::PhysicalInjectionReceipt,
+    ) -> Result<Result<i64, Errno>, crate::reserved_input::InputInjectionError> {
+        self.inner.inject_observed(syscall, receipt).await
+    }
+
+    async fn inject_staged_input<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        scope: &crate::reserved_input::InputOperationScope,
+        image: crate::reserved_input::ReservedInputImage,
+        receipt: crate::reserved_input::PhysicalInjectionReceipt,
+    ) -> Result<Result<i64, Errno>, crate::reserved_input::InputInjectionError> {
+        self.inner
+            .inject_staged_input(syscall, scope, image, receipt)
+            .await
+    }
+
     async fn inject_with_purpose<S: SyscallInfo>(
         &mut self,
         syscall: S,
@@ -1432,6 +1980,14 @@ where
         self.inner.backtrace()
     }
 
+    fn set_watchpoints(&mut self, specs: &[crate::WatchSpec]) -> Result<(), crate::WatchError> {
+        self.inner.set_watchpoints(specs)
+    }
+
+    fn watch_hits_keep_timer_events(&self) -> bool {
+        self.inner.watch_hits_keep_timer_events()
+    }
+
     fn has_cpuid_interception(&self) -> bool {
         self.inner.has_cpuid_interception()
     }
@@ -1444,11 +2000,554 @@ where
         self.inner.take_unsupported_refusal()
     }
 
+    fn injected_syscalls(&self) -> Option<u64> {
+        self.inner.injected_syscalls()
+    }
+
+    fn pidfd_self_spelling(&self) -> crate::PidfdSelfSpelling {
+        self.inner.pidfd_self_spelling()
+    }
+
     fn storable_memory_ranges(&self) -> Result<Vec<(u64, u64)>, crate::Error> {
         self.inner.storable_memory_ranges()
     }
 
     fn user_address_limit(&self) -> Result<crate::UserAddressLimit, crate::Error> {
         self.inner.user_address_limit()
+    }
+
+    fn descriptor_status(&self, fd: i32) -> Result<crate::DescriptorStatus, crate::FactError> {
+        self.inner.descriptor_status(fd)
+    }
+
+    fn signal_sets(&self, tid: Pid) -> Result<crate::SignalSets, crate::FactError> {
+        self.inner.signal_sets(tid)
+    }
+
+    fn link_path(
+        &self,
+        tid: Pid,
+        link: crate::PathLink,
+    ) -> Result<crate::LinkPath, crate::FactError> {
+        self.inner.link_path(tid, link)
+    }
+
+    fn memory_map(&self, tid: Pid) -> Result<crate::MemoryMap, crate::FactError> {
+        self.inner.memory_map(tid)
+    }
+}
+
+/// A forwarding Guest carrying one explicit caller-owned native operation.
+/// Nested Tool callbacks receive the backend Guest, not this wrapper. Dropping
+/// the wrapper does not settle its operation or any copyout/readmission lease.
+pub struct NativeOperationGuest<'a, G: ?Sized, U> {
+    inner: &'a mut G,
+    operation: Option<crate::native_syscall::NativeOperation>,
+    _phantom: core::marker::PhantomData<U>,
+}
+impl<'a, G: Guest<U> + ?Sized, U: Tool> NativeOperationGuest<'a, G, U> {
+    /// Bind an operation before releasing logical ownership. Unsupported
+    /// backends fail here, before any native call; no guest errno is invented.
+    pub fn new(
+        guest: &'a mut G,
+        operation: crate::native_syscall::NativeOperation,
+    ) -> Result<Self, Error> {
+        Self::optional(guest, Some(operation))
+    }
+
+    /// Forward unchanged when no operation is supplied; this arm does not
+    /// require support or introduce native observations on other backends.
+    pub fn optional(
+        guest: &'a mut G,
+        operation: Option<crate::native_syscall::NativeOperation>,
+    ) -> Result<Self, Error> {
+        if operation.is_some() && !guest.supports_native_operations() {
+            return Err(Error::Tool(anyhow::anyhow!("native-operation-unsupported")));
+        }
+        Ok(Self {
+            inner: guest,
+            operation,
+            _phantom: core::marker::PhantomData,
+        })
+    }
+}
+
+#[async_trait]
+impl<'a, G, U> GlobalRPC<U::GlobalState> for NativeOperationGuest<'a, G, U>
+where
+    G: Guest<U> + ?Sized,
+    U: Tool,
+{
+    async fn send_rpc(
+        &self,
+        message: <U::GlobalState as GlobalTool>::Request,
+    ) -> <U::GlobalState as GlobalTool>::Response {
+        self.inner.send_rpc(message).await
+    }
+
+    fn try_send_rpc_sync(
+        &self,
+        message: <U::GlobalState as GlobalTool>::Request,
+    ) -> Result<<U::GlobalState as GlobalTool>::Response, <U::GlobalState as GlobalTool>::Request>
+    {
+        self.inner.try_send_rpc_sync(message)
+    }
+
+    fn config(&self) -> &<U::GlobalState as GlobalTool>::Config {
+        self.inner.config()
+    }
+}
+
+#[async_trait]
+impl<'a, G, U> Guest<U> for NativeOperationGuest<'a, G, U>
+where
+    G: Guest<U> + ?Sized,
+    U: Tool,
+{
+    type Memory = G::Memory;
+    type Stack = G::Stack;
+
+    fn tid(&self) -> Pid {
+        self.inner.tid()
+    }
+
+    fn pid(&self) -> Pid {
+        self.inner.pid()
+    }
+
+    fn controller_capture_fact(&self) -> Option<ControllerCaptureFact> {
+        self.inner.controller_capture_fact()
+    }
+
+    fn ppid(&self) -> Option<Pid> {
+        self.inner.ppid()
+    }
+
+    fn is_command_bootstrap(&self) -> bool {
+        self.inner.is_command_bootstrap()
+    }
+
+    fn is_backend_runtime_bootstrap(&self) -> bool {
+        self.inner.is_backend_runtime_bootstrap()
+    }
+
+    fn is_runtime_owned_fd(&self, fd: i32) -> bool {
+        self.inner.is_runtime_owned_fd(fd)
+    }
+
+    fn runtime_private_memory_regions(&self) -> Option<RuntimePrivateMemory> {
+        self.inner.runtime_private_memory_regions()
+    }
+
+    fn runtime_private_memory_is_current(&self, snapshot: &RuntimePrivateMemorySnapshot) -> bool {
+        self.inner.runtime_private_memory_is_current(snapshot)
+    }
+
+    fn try_mapping_capture(
+        &self,
+        prepared: crate::PreparedMappingCapture<<U::GlobalState as GlobalTool>::Request>,
+    ) -> Result<<U::GlobalState as GlobalTool>::Response, crate::MappingCaptureError> {
+        self.inner.try_mapping_capture(prepared)
+    }
+
+    fn is_main_thread(&self) -> bool {
+        self.inner.is_main_thread()
+    }
+
+    fn is_root_process(&self) -> bool {
+        self.inner.is_root_process()
+    }
+
+    fn is_root_thread(&self) -> bool {
+        self.inner.is_root_thread()
+    }
+
+    fn memory(&self) -> Self::Memory {
+        self.inner.memory()
+    }
+
+    unsafe fn tool_syscall(&self, number: Sysno, args: [usize; 6]) -> Result<usize, Errno> {
+        // SAFETY: forwarding preserves the caller's syscall and safety obligations.
+        unsafe { self.inner.tool_syscall(number, args) }
+    }
+
+    fn thread_state_mut(&mut self) -> &mut U::ThreadState {
+        self.inner.thread_state_mut()
+    }
+
+    fn thread_state(&self) -> &U::ThreadState {
+        self.inner.thread_state()
+    }
+
+    async fn regs(&mut self) -> libc::user_regs_struct {
+        self.inner.regs().await
+    }
+
+    async fn set_regs(&mut self, regs: libc::user_regs_struct) -> Result<(), Error> {
+        self.inner.set_regs(regs).await
+    }
+
+    async fn stack(&mut self) -> Self::Stack {
+        self.inner.stack().await
+    }
+
+    async fn daemonize(&mut self) {
+        self.inner.daemonize().await
+    }
+
+    async fn inject<S: SyscallInfo>(&mut self, syscall: S) -> Result<i64, Errno> {
+        match self.operation.clone() {
+            Some(operation) => {
+                self.inner
+                    .inject_with_native_operation(syscall, operation)
+                    .await
+            }
+            None => self.inner.inject(syscall).await,
+        }
+    }
+
+    fn native_operation(&self) -> Option<crate::native_syscall::NativeOperation> {
+        self.operation
+            .clone()
+            .or_else(|| self.inner.native_operation())
+    }
+
+    fn supports_native_operations(&self) -> bool {
+        self.inner.supports_native_operations()
+    }
+    fn bind_native_request<S: SyscallInfo>(
+        &self,
+        operation: &crate::native_syscall::NativeOperation,
+        syscall: S,
+    ) -> Result<crate::native_syscall::NativeOperation, Error> {
+        self.inner.bind_native_request(operation, syscall)
+    }
+    async fn inject_with_native_operation<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        operation: crate::native_syscall::NativeOperation,
+    ) -> Result<i64, Errno> {
+        self.inner
+            .inject_with_native_operation(syscall, operation)
+            .await
+    }
+    async fn inject_restartable_with_native_operation<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        operation: crate::native_syscall::NativeOperation,
+    ) -> Result<i64, Errno> {
+        self.inner
+            .inject_restartable_with_native_operation(syscall, operation)
+            .await
+    }
+    async fn tail_inject_with_native_operation<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        operation: crate::native_syscall::NativeOperation,
+    ) -> Never {
+        self.inner
+            .tail_inject_with_native_operation(syscall, operation)
+            .await
+    }
+    async fn inject_observed_with_native_operation<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        receipt: crate::reserved_input::PhysicalInjectionReceipt,
+        operation: crate::native_syscall::NativeOperation,
+    ) -> Result<Result<i64, Errno>, crate::reserved_input::InputInjectionError> {
+        self.inner
+            .inject_observed_with_native_operation(syscall, receipt, operation)
+            .await
+    }
+    async fn inject_staged_with_native_operation<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        scope: &crate::reserved_input::InputOperationScope,
+        image: crate::reserved_input::ReservedInputImage,
+        receipt: crate::reserved_input::PhysicalInjectionReceipt,
+        operation: crate::native_syscall::NativeOperation,
+    ) -> Result<Result<i64, Errno>, crate::reserved_input::InputInjectionError> {
+        self.inner
+            .inject_staged_with_native_operation(syscall, scope, image, receipt, operation)
+            .await
+    }
+
+    fn reserved_input_control(&self) -> Option<crate::reserved_input::ReservedInputControl> {
+        self.inner.reserved_input_control()
+    }
+
+    fn reserved_input_task(&self) -> Option<crate::reserved_input::InputTaskId> {
+        self.inner.reserved_input_task()
+    }
+
+    /// Complete actual native descriptor snapshot, retaining every OFD pin.
+    fn reserved_input_descriptors(
+        &self,
+    ) -> Result<
+        crate::reserved_input::InputDescriptorSnapshot,
+        crate::reserved_input::InputUnavailable,
+    > {
+        self.inner.reserved_input_descriptors()
+    }
+
+    fn reserved_input_process_exit_signal(
+        &self,
+    ) -> Result<i32, crate::reserved_input::InputUnavailable> {
+        self.inner.reserved_input_process_exit_signal()
+    }
+
+    fn reserved_input_descriptor(
+        &self,
+        fd: i32,
+    ) -> Result<crate::reserved_input::PinnedInputDescriptor, crate::reserved_input::InputUnavailable>
+    {
+        self.inner.reserved_input_descriptor(fd)
+    }
+
+    async fn inject_observed<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        receipt: crate::reserved_input::PhysicalInjectionReceipt,
+    ) -> Result<Result<i64, Errno>, crate::reserved_input::InputInjectionError> {
+        match self.operation.clone() {
+            Some(operation) => {
+                self.inner
+                    .inject_observed_with_native_operation(syscall, receipt, operation)
+                    .await
+            }
+            None => self.inner.inject_observed(syscall, receipt).await,
+        }
+    }
+
+    async fn inject_staged_input<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        scope: &crate::reserved_input::InputOperationScope,
+        image: crate::reserved_input::ReservedInputImage,
+        receipt: crate::reserved_input::PhysicalInjectionReceipt,
+    ) -> Result<Result<i64, Errno>, crate::reserved_input::InputInjectionError> {
+        match self.operation.clone() {
+            Some(operation) => {
+                self.inner
+                    .inject_staged_with_native_operation(syscall, scope, image, receipt, operation)
+                    .await
+            }
+            None => {
+                self.inner
+                    .inject_staged_input(syscall, scope, image, receipt)
+                    .await
+            }
+        }
+    }
+
+    async fn inject_with_purpose<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        purpose: InjectionPurpose,
+    ) -> Result<i64, Error> {
+        if self.operation.is_none() {
+            return self.inner.inject_with_purpose(syscall, purpose).await;
+        }
+        match purpose {
+            InjectionPurpose::Application | InjectionPurpose::Pselect6WrapperValidation => {
+                self.inject(syscall).await.map_err(Error::from)
+            }
+        }
+    }
+
+    async fn inject_restartable<S: SyscallInfo>(&mut self, syscall: S) -> Result<i64, Errno> {
+        match self.operation.clone() {
+            Some(operation) => {
+                self.inner
+                    .inject_restartable_with_native_operation(syscall, operation)
+                    .await
+            }
+            None => self.inner.inject_restartable(syscall).await,
+        }
+    }
+
+    async fn tail_inject<S: SyscallInfo>(&mut self, syscall: S) -> Never {
+        match self.operation.clone() {
+            Some(operation) => {
+                self.inner
+                    .tail_inject_with_native_operation(syscall, operation)
+                    .await
+            }
+            None => self.inner.tail_inject(syscall).await,
+        }
+    }
+
+    async fn cancel_current_thread(&mut self) -> Never {
+        self.inner.cancel_current_thread().await
+    }
+
+    async fn retire_current_thread(&mut self) -> Never {
+        self.inner.retire_current_thread().await
+    }
+
+    async fn defer_signal_delivery(&mut self, event: SignalEvent) -> Result<(), Error> {
+        self.inner.defer_signal_delivery(event).await
+    }
+
+    async fn queue_child_exit_signal(
+        &mut self,
+        event: SignalEvent,
+    ) -> crate::ChildExitSignalOutcome {
+        self.inner.queue_child_exit_signal(event).await
+    }
+
+    async fn queue_process_alarm_signal(
+        &mut self,
+        event: SignalEvent,
+    ) -> crate::ProcessAlarmSignalOutcome {
+        self.inner.queue_process_alarm_signal(event).await
+    }
+
+    fn signal_info(&self) -> Option<[u8; crate::SIGNAL_INFO_SIZE]> {
+        self.inner.signal_info()
+    }
+    fn set_signal_info(&mut self, info: [u8; crate::SIGNAL_INFO_SIZE]) -> Result<(), Errno> {
+        self.inner.set_signal_info(info)
+    }
+    async fn deliver_signal(
+        &mut self,
+        delivery: crate::SignalDelivery,
+    ) -> crate::SignalDeliveryOutcome {
+        self.inner.deliver_signal(delivery).await
+    }
+    fn signal_report_path(&self) -> Option<crate::SignalReportPath> {
+        self.inner.signal_report_path()
+    }
+    fn signal_task_identity(&self) -> Option<crate::SignalTaskIdentity> {
+        self.inner.signal_task_identity()
+    }
+    fn signal_control_mode(&self) -> crate::BackendSignalControlMode {
+        self.inner.signal_control_mode()
+    }
+    fn parked_signal_site(&self) -> Option<crate::CallbackSignalSite> {
+        self.inner.parked_signal_site()
+    }
+    fn polled_read_signal_site(
+        &self,
+        call: crate::syscalls::Read,
+    ) -> Option<crate::CallbackSignalSite> {
+        self.inner.polled_read_signal_site(call)
+    }
+    fn captured_write_signal_site(
+        &self,
+        call: crate::syscalls::Write,
+    ) -> Option<crate::CallbackSignalSite> {
+        self.inner.captured_write_signal_site(call)
+    }
+    fn parent_death_syscall_preflight(
+        &self,
+        call: crate::syscalls::Syscall,
+    ) -> Result<crate::ParentDeathSyscallAdmission, crate::Error> {
+        self.inner.parent_death_syscall_preflight(call)
+    }
+    fn signal_observation_lease(&self) -> Option<crate::ParkedObservationLease> {
+        self.inner.signal_observation_lease()
+    }
+    async fn observe_parked_signal(
+        &mut self,
+        site: crate::CallbackSignalSite,
+        lease: crate::ParkedObservationLease,
+    ) -> Result<crate::ParkedSignalObservation, crate::SignalObservationFailure> {
+        self.inner.observe_parked_signal(site, lease).await
+    }
+    async fn terminate_from_parked_signal(
+        &mut self,
+        selection: crate::PreparedSignalToken,
+    ) -> Result<Never, crate::SignalObservationFailure> {
+        self.inner.terminate_from_parked_signal(selection).await
+    }
+    fn parked_signal_failure_context(&self) -> Option<crate::ParkedSignalFailureContext> {
+        self.inner.parked_signal_failure_context()
+    }
+    async fn cancel_parked_signal(
+        &mut self,
+        context: crate::ParkedSignalFailureContext,
+    ) -> Result<Never, crate::SignalObservationFailure> {
+        self.inner.cancel_parked_signal(context).await
+    }
+
+    async fn set_blocked_signals(&mut self, mask: u64) -> Result<u64, MaskChangeRefused> {
+        self.inner.set_blocked_signals(mask).await
+    }
+
+    fn resume_signal_mask(&self) -> Option<u64> {
+        self.inner.resume_signal_mask()
+    }
+
+    fn set_timer(&mut self, sched: TimerSchedule) -> Result<(), Error> {
+        self.inner.set_timer(sched)
+    }
+
+    fn set_timer_precise(&mut self, sched: TimerSchedule) -> Result<(), Error> {
+        self.inner.set_timer_precise(sched)
+    }
+
+    fn read_clock(&mut self) -> Result<u64, Error> {
+        self.inner.read_clock()
+    }
+
+    fn backtrace(&mut self) -> Option<Backtrace> {
+        self.inner.backtrace()
+    }
+
+    fn set_watchpoints(&mut self, specs: &[crate::WatchSpec]) -> Result<(), crate::WatchError> {
+        self.inner.set_watchpoints(specs)
+    }
+
+    fn watch_hits_keep_timer_events(&self) -> bool {
+        self.inner.watch_hits_keep_timer_events()
+    }
+
+    fn has_cpuid_interception(&self) -> bool {
+        self.inner.has_cpuid_interception()
+    }
+
+    fn detlog_memory_regions(&self) -> Option<Vec<DetlogMemoryRegion>> {
+        self.inner.detlog_memory_regions()
+    }
+
+    fn take_unsupported_refusal(&mut self) -> Option<crate::UnsupportedRefusal> {
+        self.inner.take_unsupported_refusal()
+    }
+
+    fn injected_syscalls(&self) -> Option<u64> {
+        self.inner.injected_syscalls()
+    }
+
+    fn pidfd_self_spelling(&self) -> crate::PidfdSelfSpelling {
+        self.inner.pidfd_self_spelling()
+    }
+
+    fn storable_memory_ranges(&self) -> Result<Vec<(u64, u64)>, crate::Error> {
+        self.inner.storable_memory_ranges()
+    }
+
+    fn user_address_limit(&self) -> Result<crate::UserAddressLimit, crate::Error> {
+        self.inner.user_address_limit()
+    }
+
+    fn descriptor_status(&self, fd: i32) -> Result<crate::DescriptorStatus, crate::FactError> {
+        self.inner.descriptor_status(fd)
+    }
+
+    fn signal_sets(&self, tid: Pid) -> Result<crate::SignalSets, crate::FactError> {
+        self.inner.signal_sets(tid)
+    }
+
+    fn link_path(
+        &self,
+        tid: Pid,
+        link: crate::PathLink,
+    ) -> Result<crate::LinkPath, crate::FactError> {
+        self.inner.link_path(tid, link)
+    }
+
+    fn memory_map(&self, tid: Pid) -> Result<crate::MemoryMap, crate::FactError> {
+        self.inner.memory_map(tid)
     }
 }

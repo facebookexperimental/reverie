@@ -5,6 +5,11 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#![allow(
+    unexpected_cfgs,
+    reason = "`fbcode_build` is supplied by the internal Buck build"
+)]
+
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
@@ -323,6 +328,10 @@ async fn run(config: Config, launcher_branches: u64) {
     );
 }
 
+#[cfg_attr(
+    fbcode_build,
+    ignore = "fbsource-disabled: sandcastle-env: needs exact PMU branch counts"
+)]
 #[tokio::test(flavor = "current_thread")]
 async fn initial_command_clock_counts_first_branch_and_guest_loop() {
     for injected_exec in [false, true] {
@@ -337,6 +346,10 @@ async fn initial_command_clock_counts_first_branch_and_guest_loop() {
     }
 }
 
+#[cfg_attr(
+    fbcode_build,
+    ignore = "fbsource-disabled: sandcastle-env: needs exact PMU branch counts"
+)]
 #[tokio::test(flavor = "current_thread")]
 async fn initial_exec_retires_thread_start_and_intercepted_exec_timers() {
     for injected_exec in [false, true] {
@@ -354,6 +367,10 @@ async fn initial_exec_retires_thread_start_and_intercepted_exec_timers() {
     }
 }
 
+#[cfg_attr(
+    fbcode_build,
+    ignore = "fbsource-disabled: sandcastle-env: needs exact PMU branch counts"
+)]
 #[tokio::test(flavor = "current_thread")]
 async fn initial_post_exec_injection_and_new_timer_remain_live() {
     for injected_exec in [false, true] {
@@ -370,6 +387,10 @@ async fn initial_post_exec_injection_and_new_timer_remain_live() {
     }
 }
 
+#[cfg_attr(
+    fbcode_build,
+    ignore = "fbsource-disabled: sandcastle-env: needs exact PMU branch counts"
+)]
 #[tokio::test(flavor = "current_thread")]
 async fn initial_command_clock_excludes_added_post_stop_launcher_branches() {
     for injected_exec in [false, true] {

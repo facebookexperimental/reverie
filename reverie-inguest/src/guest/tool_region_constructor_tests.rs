@@ -439,7 +439,7 @@ extern "C" fn inspect_colliding_occupant(_: i32) {
         libc::SYS_exit,
         [if correct { 0 } else { 103 }, 0, 0, 0, 0, 0],
     );
-    unsafe { core::arch::asm!("ud2", options(noreturn)) }
+    crate::arch::trap_unreachable()
 }
 
 #[test]

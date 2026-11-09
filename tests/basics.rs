@@ -8,6 +8,17 @@
 
 //! Basic tests that don't fall into some other category.
 
+#[path = "support/basics_commands.rs"]
+mod commands;
+// Without the `nightly` feature, `print_body` has no caller in this target
+// (its only use is the feature-gated half of `run_guest_func_print_test`);
+// the command guest and conformance crates include the same file separately.
+#[cfg_attr(not(feature = "nightly"), allow(dead_code))]
+#[path = "support/basics_rust_guest.rs"]
+mod rust_guest;
+#[path = "tool_fixtures/basics.rs"]
+mod tools;
+
 #[allow(unused_imports)]
 use std::ffi::CString;
 #[allow(unused_imports)]
@@ -27,108 +38,34 @@ use nix::sys::wait::WaitStatus;
 use nix::unistd;
 #[allow(unused_imports)]
 use nix::unistd::ForkResult;
-use reverie::Error;
 use reverie::ExitStatus;
-use reverie::GlobalTool;
-use reverie::Guest;
-use reverie::Pid;
-use reverie::Tool;
-use reverie::syscalls::Syscall;
-use reverie::syscalls::SyscallInfo;
-use reverie::syscalls::Sysno;
 #[allow(unused_imports)]
 use reverie_ptrace::testing::check_fn;
 #[allow(unused_imports)]
-use reverie_ptrace::testing::test_cmd;
-#[allow(unused_imports)]
 use reverie_ptrace::testing::test_fn;
-use serde::Deserialize;
-use serde::Serialize;
-
-#[derive(Debug, Default)]
-struct NoopTool;
-impl Tool for NoopTool {
-    type GlobalState = ();
-    type ThreadState = ();
-}
+#[allow(unused_imports)]
+use reverie_test_support::test_cmd;
+use tools::CounterLocal;
+use tools::NoopTool;
 
 #[test]
 fn noop_tool_test() {
-    let (output, _) = test_cmd::<NoopTool>("/bin/pwd", &[]).unwrap();
-    // pwd should succeed & print some characters:
-    assert_eq!(output.status, ExitStatus::Exited(0));
-    assert!(!output.stdout.is_empty());
-    assert!(output.stderr.is_empty());
-}
-
-#[derive(Debug, Default)]
-struct CounterGlobal {
-    num_syscalls: AtomicU64,
-}
-
-#[derive(Debug, Default, Clone)]
-struct CounterLocal {}
-
-/// The message sent to the global state method.
-/// This contains the syscall number.
-#[derive(PartialEq, Debug, Eq, Clone, Copy, Serialize, Deserialize)]
-pub struct IncrMsg(Sysno);
-
-#[reverie::global_tool]
-impl GlobalTool for CounterGlobal {
-    type Request = IncrMsg;
-    type Response = ();
-    type Config = ();
-
-    async fn receive_rpc(&self, _from: Pid, _: IncrMsg) -> Self::Response {
-        AtomicU64::fetch_add(&self.num_syscalls, 1, Ordering::SeqCst);
-    }
-}
-
-#[reverie::tool]
-impl Tool for CounterLocal {
-    type GlobalState = CounterGlobal;
-    type ThreadState = ();
-
-    async fn handle_syscall_event<T: Guest<Self>>(
-        &self,
-        guest: &mut T,
-        syscall: Syscall,
-    ) -> Result<i64, Error> {
-        let sysno = syscall.number();
-        let _ = guest.send_rpc(IncrMsg(sysno)).await;
-        guest.tail_inject(syscall).await
-    }
+    commands::noop_tool_test(test_cmd::<NoopTool>);
 }
 
 #[test]
 fn counter_tool_test() {
-    let (output, state) = test_cmd::<CounterLocal>("ls", &[]).unwrap();
-    assert_eq!(output.status, ExitStatus::Exited(0));
-    // ls should print some characters and perform some syscalls:
-    assert!(!output.stdout.is_empty());
-    assert!(AtomicU64::load(&state.num_syscalls, Ordering::SeqCst) > 30);
+    commands::counter_tool_test(test_cmd::<CounterLocal>);
 }
 
 #[test]
 fn error_exit_test() {
-    let (output, state) = test_cmd::<CounterLocal>("/bin/bash", &["-c", "exit 42"]).unwrap();
-    assert_eq!(output.status, ExitStatus::Exited(42));
-    assert_eq!(output.stdout.len(), 0);
-    assert!(AtomicU64::load(&state.num_syscalls, Ordering::SeqCst) > 0);
+    commands::error_exit_test(test_cmd::<CounterLocal>);
 }
 
 #[allow(dead_code)]
 fn fn_test() {
-    let (output, state) = test_fn::<CounterLocal, _>(|| {
-        let pid = nix::unistd::getpid();
-        println!("Hello world1!  Pid = {:?}", pid);
-        unsafe {
-            libc::syscall(libc::SYS_write, 1, "Hello world2!\n", 14);
-        }
-        let _gid = nix::unistd::getgid();
-    })
-    .unwrap();
+    let (output, state) = test_fn::<CounterLocal, _>(rust_guest::run_fn_body).unwrap();
 
     println!(
         " >>> Command complete, stdout len {}, stderr len {}",
@@ -144,49 +81,197 @@ fn fn_test() {
 #[test]
 fn run_fn_test() {
     fn_test();
+    rust_command_test();
+}
+
+#[cfg(not(sanitized))]
+fn assert_rust_marker(stdout: &[u8]) {
+    const MARKER: &[u8] = b"basics-rust-body-complete\n";
+    assert_eq!(
+        stdout
+            .windows(MARKER.len())
+            .filter(|part| *part == MARKER)
+            .count(),
+        1,
+    );
+}
+
+#[cfg(not(sanitized))]
+fn assert_rust_counter(output: &reverie::process::Output, state: &tools::CounterGlobal) {
+    // The original fn_test predicates, applied to the actual returned state.
+    assert_eq!(output.status, ExitStatus::Exited(0));
+    assert_eq!(output.stderr.len(), 0);
+    assert!(AtomicU64::load(&state.num_syscalls, Ordering::SeqCst) > 1);
+}
+
+#[cfg(not(sanitized))]
+fn record_rust_command(
+    label: &str,
+    output: &reverie::process::Output,
+    state: &tools::CounterGlobal,
+) {
+    eprintln!(
+        "basics Rust command {label}: status={:?} syscalls={} stdout={:02x?} stderr={:02x?}",
+        output.status,
+        state.num_syscalls.load(Ordering::SeqCst),
+        output.stdout,
+        output.stderr,
+    );
+    // The command and controller have completed before this snapshot or output.
+    let (count, sequence) = {
+        let sequence = state.syscall_sequence.lock().unwrap();
+        (state.num_syscalls.load(Ordering::SeqCst), sequence.clone())
+    };
+    let entries: Vec<_> = sequence
+        .iter()
+        .enumerate()
+        .map(|(ordinal, (sender, sysno))| (ordinal, sender, *sysno as usize, sysno))
+        .collect();
+    eprintln!("basics Rust syscall sequence {label}: count={count} entries={entries:?}");
+    assert_eq!(count, u64::try_from(sequence.len()).unwrap());
+    assert_eq!(output.status, ExitStatus::Exited(0));
+    assert_eq!(output.stderr.len(), 0);
+    assert_rust_marker(&output.stdout);
+}
+
+#[cfg(not(sanitized))]
+fn rust_command_test() {
+    let program = env!("CARGO_BIN_EXE_basics-rust-command-guest");
+    eprintln!("basics Rust command image={program}");
+    let output = std::process::Command::new(program).output().unwrap();
+    eprintln!(
+        "basics Rust command native: status={:?} stdout={:02x?} stderr={:02x?}",
+        output.status, output.stdout, output.stderr,
+    );
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stderr.len(), 0);
+    assert_rust_marker(&output.stdout);
+
+    let (output, state) = test_cmd::<CounterLocal>(program, &[]).unwrap();
+    record_rust_command("ptrace", &output, &state);
+    assert_rust_counter(&output, &state);
+
+    // The actual Noop Tool has no counter, so its real successful run is
+    // paired with an empty counter state. record_rust_command first requires
+    // that run's success and marker, so the rejection below can only come from
+    // the count predicate: it cannot pass a Tool that intercepts no syscall.
+    let (output, ()) = test_cmd::<NoopTool>(program, &[]).unwrap();
+    let noop = tools::CounterGlobal::default();
+    record_rust_command("noop", &output, &noop);
+    assert_eq!(noop.num_syscalls.load(Ordering::SeqCst), 0);
+    assert!(std::panic::catch_unwind(|| assert_rust_counter(&output, &noop)).is_err());
 }
 
 #[cfg(not(sanitized))]
 #[test]
 fn run_guest_command_test() {
-    let (output, _state) = test_cmd::<CounterLocal>("/bin/echo", &["-n", "abcd"]).unwrap();
-    assert_eq!(output.status, ExitStatus::Exited(0));
-    assert_eq!(output.stdout.as_slice(), b"abcd");
+    commands::run_guest_command_test(test_cmd::<CounterLocal>);
 }
 
 #[cfg(not(sanitized))]
 #[test]
 fn run_guest_command_test_closure() {
-    let msg = "abcd";
-    let (output, _state) = test_cmd::<CounterLocal>("/bin/echo", &["-n", msg]).unwrap();
-    assert_eq!(output.status, ExitStatus::Exited(0));
-    assert_eq!(output.stdout.as_slice(), msg.as_bytes());
+    commands::run_guest_command_test_closure(test_cmd::<CounterLocal>);
 }
 
 #[cfg(not(sanitized))]
 #[test]
 fn run_guest_func_write_test() {
     let msg = "abcd";
-    let (output, _state) = test_fn::<CounterLocal, _>(move || {
-        std::io::stdout().write_all(msg.as_bytes()).unwrap();
-        std::io::stdout().flush().unwrap();
-    })
-    .unwrap();
+    let (output, _state) = test_fn::<CounterLocal, _>(move || rust_guest::write_body(msg)).unwrap();
     assert_eq!(output.status, ExitStatus::Exited(0));
     assert_eq!(output.stdout.as_slice(), msg.as_bytes());
+    rust_output_command_test("write");
 }
 
 #[cfg(not(sanitized))]
 #[test]
 fn run_guest_func_print_test() {
-    let msg = "abcd";
-    let (output, _state) = test_fn::<CounterLocal, _>(move || {
-        println!("{}", msg);
-    })
-    .unwrap();
+    // The function guest prints with `println!`, which libtest's capture
+    // intercepts before it reaches the output pipes unless reverie-ptrace's
+    // `nightly` feature clears that capture across the fork. On stable the
+    // command-guest half below still covers the same body and oracle; the
+    // function half runs in the nightly CI lane.
+    #[cfg(feature = "nightly")]
+    {
+        let msg = "abcd";
+        let (output, _state) =
+            test_fn::<CounterLocal, _>(move || rust_guest::print_body(msg)).unwrap();
 
-    assert_eq!(output.status, ExitStatus::Exited(0));
-    assert_eq!(output.stdout.as_slice(), b"abcd\n");
+        assert_eq!(output.status, ExitStatus::Exited(0));
+        assert_eq!(output.stdout.as_slice(), b"abcd\n");
+    }
+    rust_output_command_test("print");
+}
+
+#[cfg(not(sanitized))]
+fn rust_output_matches(mode: &str, exited_zero: bool, stdout: &[u8], stderr: &[u8]) -> bool {
+    let expected: &[u8] = match mode {
+        "write" => b"abcd",
+        "print" => b"abcd\n",
+        _ => panic!("unknown Rust output mode: {mode}"),
+    };
+    exited_zero && stdout == expected && stderr.is_empty()
+}
+
+/// The shared write/print bodies as ordinary commands, natively and under
+/// ptrace. The opposite selector's real output must pass its own oracle and be
+/// rejected by this mode's, so the byte oracle cannot accept either output.
+#[cfg(not(sanitized))]
+fn rust_output_command_test(mode: &str) {
+    let opposite = match mode {
+        "write" => "print",
+        "print" => "write",
+        _ => panic!("unknown Rust output mode: {mode}"),
+    };
+    let program = env!("CARGO_BIN_EXE_basics-rust-command-guest");
+    eprintln!("basics Rust output mode={mode} image={program}");
+
+    let output = std::process::Command::new(program)
+        .arg(mode)
+        .output()
+        .unwrap();
+    eprintln!(
+        "basics Rust output mode={mode} role=native selector={mode}: status={:?} stdout={:02x?} stderr={:02x?}",
+        output.status, output.stdout, output.stderr,
+    );
+    assert!(rust_output_matches(
+        mode,
+        output.status.code() == Some(0),
+        &output.stdout,
+        &output.stderr,
+    ));
+
+    let (output, _state) = test_cmd::<CounterLocal>(program, &[mode]).unwrap();
+    eprintln!(
+        "basics Rust output mode={mode} role=ptrace selector={mode}: status={:?} stdout={:02x?} stderr={:02x?}",
+        output.status, output.stdout, output.stderr,
+    );
+    assert!(rust_output_matches(
+        mode,
+        output.status == ExitStatus::Exited(0),
+        &output.stdout,
+        &output.stderr,
+    ));
+
+    let (output, _state) = test_cmd::<CounterLocal>(program, &[opposite]).unwrap();
+    eprintln!(
+        "basics Rust output mode={mode} role=opposite-ptrace selector={opposite}: status={:?} stdout={:02x?} stderr={:02x?}",
+        output.status, output.stdout, output.stderr,
+    );
+    assert!(rust_output_matches(
+        opposite,
+        output.status == ExitStatus::Exited(0),
+        &output.stdout,
+        &output.stderr,
+    ));
+    assert!(!rust_output_matches(
+        mode,
+        output.status == ExitStatus::Exited(0),
+        &output.stdout,
+        &output.stderr,
+    ));
+    eprintln!("basics Rust output mode={mode} opposite={opposite} rejected=true");
 }
 
 #[cfg(not(sanitized))]
@@ -228,25 +313,62 @@ fn rust_execve_noexist_test() {
     });
 }
 
+/// Runs `body` natively in a forked child (no tracer) and returns the
+/// kernel-reported status. The child inherits this process's limits
+/// (including RLIMIT_CORE) unchanged, so its core-dump bit is the native
+/// oracle for the same body under the same inherited limits: with a pipe
+/// core_pattern and RLIMIT_CORE == 1 the kernel skips the core helper and
+/// the bit is false, which a hard-coded `true` cannot express in every
+/// environment. A control that cannot run, or whose body does not die by
+/// a signal, panics: the control failing IS the test failing.
+#[cfg(not(sanitized))]
+fn native_signal_status(body: &dyn Fn()) -> ExitStatus {
+    use nix::sys::wait::WaitStatus;
+    use nix::unistd::ForkResult;
+    match unsafe { nix::unistd::fork() } {
+        Ok(ForkResult::Child) => {
+            body();
+            // The body must die by signal; reaching here is a control failure.
+            unsafe { libc::_exit(86) }
+        }
+        Ok(ForkResult::Parent { child }) => loop {
+            match nix::sys::wait::waitpid(child, None) {
+                Ok(WaitStatus::Signaled(_, signal, core_dumped)) => {
+                    assert_eq!(
+                        signal,
+                        nix::sys::signal::Signal::SIGSEGV,
+                        "native segfault control died by the wrong signal"
+                    );
+                    return ExitStatus::Signaled(signal, core_dumped);
+                }
+                Ok(other) => {
+                    panic!("native segfault control did not die by signal: {other:?}")
+                }
+                Err(nix::errno::Errno::EINTR) => continue,
+                Err(e) => panic!("native segfault control waitpid failed: {e}"),
+            }
+        },
+        Err(e) => panic!("native segfault control fork failed: {e}"),
+    }
+}
+
 #[cfg(not(sanitized))]
 #[test]
 fn i_should_segfault() {
-    use nix::sys::signal::Signal::SIGSEGV;
     use reverie_ptrace::testing::test_fn;
-    let (output, _) = test_fn::<NoopTool, _>(|| {
+    let body = || {
         unsafe {
             let invalid_ptr = std::ptr::dangling_mut::<u64>();
             invalid_ptr.write_volatile(0xdeadbeefu64);
         };
-    })
-    .unwrap();
-    assert_eq!(output.status, ExitStatus::Signaled(SIGSEGV, true),);
+    };
+    let (output, _) = test_fn::<NoopTool, _>(body).unwrap();
+    assert_eq!(output.status, native_signal_status(&body));
 }
 
 #[cfg(not(sanitized))]
 #[test]
 fn i_should_segfault_2() {
-    use nix::sys::signal::Signal::SIGSEGV;
     use reverie_ptrace::testing::test_fn;
 
     pub fn do_segfault() {
@@ -258,7 +380,7 @@ fn i_should_segfault_2() {
     }
 
     let (output, _) = test_fn::<NoopTool, _>(do_segfault).unwrap();
-    assert_eq!(output.status, ExitStatus::Signaled(SIGSEGV, true),);
+    assert_eq!(output.status, native_signal_status(&do_segfault));
 }
 
 #[cfg(not(sanitized))]

@@ -301,6 +301,7 @@ impl PtraceBackendStatsSource {
 
     /// Counts one validated rewritten-site syscall-trap `SIGTRAP` stop; see
     /// [`PtraceBackendStatsSnapshot::injected_trap_stops`].
+    #[cfg(target_arch = "x86_64")]
     pub(crate) fn record_injected_trap(&self) {
         self.collector
             .injected_trap_stops
@@ -408,7 +409,7 @@ impl PtraceBackendStatsSource {
     }
 
     /// Returns every recorded signal-delivery stop in arrival order.
-    #[cfg(test)]
+    #[cfg(all(test, target_arch = "x86_64"))]
     pub(crate) fn signal_trace(&self) -> Vec<(reverie::Pid, String)> {
         self.collector
             .signal_trace
@@ -418,7 +419,7 @@ impl PtraceBackendStatsSource {
     }
 
     /// Returns every recorded run-loop wait in arrival order.
-    #[cfg(test)]
+    #[cfg(all(test, target_arch = "x86_64"))]
     pub(crate) fn stop_trace(&self) -> Vec<(reverie::Pid, String)> {
         self.collector
             .stop_trace

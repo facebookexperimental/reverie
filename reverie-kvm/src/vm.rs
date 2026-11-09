@@ -6,6 +6,11 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#![allow(
+    unexpected_cfgs,
+    reason = "`fbcode_build` is supplied by the internal Buck build"
+)]
+
 use std::fs::File;
 use std::future::Future;
 use std::os::fd::AsRawFd;
@@ -41,6 +46,7 @@ use reverie::Pid;
 use reverie::SignalProcessId;
 use reverie::ThreadOwnership;
 use reverie::Tool;
+pub use reverie_kvm_core::bootstrap::VMCALL_SYSCALL_TRANSPORT;
 
 use crate::Error;
 use crate::GuestMemory;
@@ -70,11 +76,13 @@ use crate::bootstrap::stage_process_syscall_return;
 use crate::bootstrap::syscall_hypercall_address;
 use crate::bootstrap::thread_tool_stack_top;
 use crate::bootstrap::try_set_syscall_return_park;
+use crate::clock::StepMode;
 use crate::elf::LoadedStaticElf;
 use crate::elf::TaskLifecycleTable;
-use crate::elf::initial_thread_name;
 use crate::elf::load_static_elf;
 use crate::elf::load_static_elf_file;
+use crate::elf::load_static_elf_file_with_execfn;
+use crate::elf::load_static_elf_image_of;
 use crate::elf::load_static_elf_with_execfn;
 use crate::error::ErrorExt;
 use crate::executor::AbandonedRuns;
@@ -109,15 +117,11 @@ use crate::signal::Ucontext;
 use crate::signal::XsaveImage;
 use crate::stats::KvmBackendStats;
 use crate::stats::KvmExitCollector;
+use crate::step_filter::StepClass;
 use crate::syscall::FRAME_SIZE;
 use crate::syscall::RETURN_FLAGS_WORD;
 use crate::syscall::RETURN_RIP_WORD;
 use crate::syscall::SAVED_RBX_WORD;
-
-/// KVM currently permits userspace exits for this standardized hypercall.
-/// The prototype uses it as a transport opcode and places the syscall frame
-/// address in the first hypercall argument.
-pub const VMCALL_SYSCALL_TRANSPORT: u64 = 12;
 
 const SYSCALL_FRAME_STRIDE: u64 = 4096;
 const PAGE_SIZE: u64 = 4096;
@@ -145,15 +149,23 @@ pub(crate) struct InstructionBoundary<I> {
 
 pub(crate) type TimestampBoundary = InstructionBoundary<crate::timestamp::TimestampInstruction>;
 pub(crate) type CpuidBoundary = InstructionBoundary<crate::cpuid_instruction::Instruction>;
+/// The user registers at which a due timer request is delivered, with that
+/// request: those of a vCPU stopped in user mode (see
+/// [`KvmBackend::timer_instruction_boundary`]), or those the return of a
+/// syscall resumes the guest with (see
+/// [`KvmBackend::syscall_return_timer_boundary`]).
+pub(crate) type TimerBoundary = InstructionBoundary<crate::preemption_timer::TimerDue>;
 
 pub(crate) enum ToolInstructionBoundary {
     Timestamp(TimestampBoundary),
     Cpuid(CpuidBoundary),
+    Timer(TimerBoundary),
 }
 
 pub(crate) enum ToolInstructionResult {
     Timestamp(reverie::RdtscResult),
     Cpuid(reverie::CpuIdResult),
+    Timer,
 }
 
 impl ToolInstructionBoundary {
@@ -161,23 +173,43 @@ impl ToolInstructionBoundary {
         match self {
             Self::Timestamp(boundary) => boundary.user_registers(),
             Self::Cpuid(boundary) => boundary.user_registers(),
+            Self::Timer(boundary) => boundary.user_registers(),
         }
     }
 }
 
 impl<I> InstructionBoundary<I> {
     pub(crate) fn user_registers(&self) -> libc::user_regs_struct {
-        let mut registers = crate::runtime::kvm_registers(self.registers, u64::MAX);
-        registers.cs = self.code_segment.into();
-        registers.ss = self.stack_segment.into();
-        registers.ds = self.special_registers.ds.selector.into();
-        registers.es = self.special_registers.es.selector.into();
-        registers.fs = self.special_registers.fs.selector.into();
-        registers.gs = self.special_registers.gs.selector.into();
-        registers.fs_base = self.special_registers.fs.base;
-        registers.gs_base = self.special_registers.gs.base;
-        registers
+        user_registers_with_segments(
+            self.registers,
+            u64::MAX,
+            &self.special_registers,
+            self.code_segment,
+            self.stack_segment,
+        )
     }
+}
+
+/// The user registers a Tool callback sees: `registers` with `orig_rax`, the
+/// code and stack segment selectors, and the data segment selectors and the
+/// FS and GS bases of `special`.
+pub(crate) fn user_registers_with_segments(
+    registers: kvm_regs,
+    orig_rax: u64,
+    special: &kvm_bindings::kvm_sregs,
+    code_segment: u16,
+    stack_segment: u16,
+) -> libc::user_regs_struct {
+    let mut user = crate::runtime::kvm_registers(registers, orig_rax);
+    user.cs = code_segment.into();
+    user.ss = stack_segment.into();
+    user.ds = special.ds.selector.into();
+    user.es = special.es.selector.into();
+    user.fs = special.fs.selector.into();
+    user.gs = special.gs.selector.into();
+    user.fs_base = special.fs.base;
+    user.gs_base = special.gs.base;
+    user
 }
 
 /// The signal Linux raises for a CPU exception taken in user mode.
@@ -234,7 +266,9 @@ pub(crate) struct UserTrap {
     stack_segment: u16,
     vector: u8,
     error_code: u64,
-    /// The `sigcontext.cr2` value: CR2 for a page fault, otherwise zero.
+    /// CR2 for a page fault, otherwise zero. A page fault records it in the
+    /// thread's trap fields, which every later frame saves as
+    /// `sigcontext.cr2` (see [`UserTrap::prepare_delivery`]).
     address: u64,
     halted_registers: kvm_regs,
     special_registers: kvm_bindings::kvm_sregs,
@@ -353,7 +387,71 @@ impl UserTrap {
         }
         Ok(())
     }
+
+    /// What Linux's trap handler does in the thread before its signal is
+    /// selected: it records the exception in the thread's trap fields, which
+    /// this frame and every later one saves (a page fault's address only for a
+    /// page fault), and forces the signal past a block or an ignore
+    /// (`ElfExecutor::prepare_captured_trap`).
+    pub(crate) fn prepare_delivery(&self, executor: &mut ElfExecutor) {
+        executor.record_user_trap(
+            self.vector.into(),
+            self.error_code,
+            (self.vector == 14).then_some(self.address),
+        );
+        executor.prepare_captured_trap(self.event.signal());
+    }
 }
+
+/// How the guest enters the handler a signal frame is built for (see
+/// [`KvmBackend::deliver_selected_signal_at_boundary`]).
+#[derive(Clone, Copy)]
+pub(crate) enum HandlerEntry<'a> {
+    /// Through the syscall frame at this address, which the ring-zero
+    /// trampoline returns to user mode with: a syscall's return or
+    /// rt_sigreturn's.
+    SyscallFrame(u64),
+    /// By setting the vCPU's registers: the vCPU stands at a user instruction
+    /// boundary. That is an unstarted clone, a timer event's boundary, and a
+    /// fault's boundary once the fault's own frame has resumed the vCPU in
+    /// user mode at its handler.
+    UserBoundary,
+    /// Through the fault's exception: the fault's own frame, which saves the
+    /// FPU state and selectors captured with it.
+    Fault(&'a UserTrap),
+}
+
+impl HandlerEntry<'_> {
+    /// How the handler of a frame built on top of one entered this way is
+    /// entered: through the same syscall frame, or with the vCPU's registers
+    /// at the user boundary where the fault's frame left the vCPU.
+    fn stacked(self) -> Self {
+        match self {
+            Self::Fault(_) => Self::UserBoundary,
+            entry => entry,
+        }
+    }
+}
+
+/// The bound on the signals one return to user mode delivers. Linux selects
+/// again after every frame (`exit_to_user_mode_loop`) until no eligible signal
+/// is left, with no bound. Each selection takes one pending entry: LinuxEmu
+/// queues standard signals only, in two domains of at most 31 entries, so a
+/// return without a new send stays below this bound, and each frame for a
+/// signal without SA_NODEFER also blocks its number for the rest of the
+/// return. Only a sender that keeps queueing signals, another thread or a
+/// Tool's signal hook, can reach the bound, for example by signalling an
+/// SA_NODEFER handler again and again: Linux would keep building frames at
+/// that return, while here what is left stays pending for the next boundary.
+/// Real-time signals, which can queue many entries each, would need this
+/// bound revisited.
+///
+/// With no Tool, a return takes at most this many signals from the pending
+/// sets, to build their frames or to discard them; a fault's own signal is
+/// not among them. Under a Tool, a return builds at most this many frames,
+/// the first included, and each frame's selection may take the signals the
+/// hook suppresses before it, which `SIGNAL_SELECTIONS_PER_BOUNDARY` bounds.
+pub(crate) const SIGNAL_SELECTIONS_PER_RETURN: usize = 64;
 
 extern "C" fn interrupt_guest_worker(_signal: libc::c_int) {
     #[cfg(test)]
@@ -391,9 +489,12 @@ fn install_worker_interrupt_handler() -> Result<()> {
     }
 }
 
-fn set_guest_interrupt_signal_mask(how: libc::c_int) -> Result<bool> {
+/// Blocks or unblocks the worker interrupt signal on this thread and returns
+/// whether it was blocked before. An actual change is noted for the
+/// preemption timer, whose vCPU signal mask follows this thread's mask.
+pub(crate) fn set_guest_interrupt_signal_mask(how: libc::c_int) -> Result<bool> {
     // SAFETY: set and previous are initialized before libc reads or writes them.
-    unsafe {
+    let was_blocked = unsafe {
         let mut set = std::mem::zeroed::<libc::sigset_t>();
         let mut previous = std::mem::zeroed::<libc::sigset_t>();
         libc::sigemptyset(&mut set);
@@ -402,8 +503,12 @@ fn set_guest_interrupt_signal_mask(how: libc::c_int) -> Result<bool> {
         if error != 0 {
             return Err(std::io::Error::from_raw_os_error(error).into());
         }
-        Ok(libc::sigismember(&previous, worker_interrupt_signal()) == 1)
+        libc::sigismember(&previous, worker_interrupt_signal()) == 1
+    };
+    if was_blocked != (how == libc::SIG_BLOCK) {
+        crate::preemption_timer::note_thread_mask_change();
     }
+    Ok(was_blocked)
 }
 type GuestWorkerResult = Result<(ExitStatus, Vec<u8>, Vec<u8>)>;
 
@@ -440,6 +545,18 @@ impl Drop for WorkerCompletionNotice {
         self.returning.store(true, Ordering::Release);
         self.group.notify_worker_completion();
     }
+}
+
+/// What one entry toward a process action's park did
+/// (`KvmBackend::try_park_process_action`).
+#[derive(Debug)]
+enum ParkAttempt {
+    /// The vCPU exited: at its park (`Ok`), or elsewhere (`Err`).
+    Parked(Result<()>),
+    /// Admission was closed, so no entry was made.
+    AdmissionClosed,
+    /// A signal interrupted the entry before the vCPU reached its park.
+    Interrupted,
 }
 
 /// How an inline (Direct) fork child's completion resolved for its caller.
@@ -512,8 +629,37 @@ pub(crate) struct GuestThreadGroup {
     // AUTONOMOUS-BOT-IMPLEMENTED: Propagate worker exit_group to the root vCPU.
     // TODO-HUMAN-REVIEW(PR-177): Review KVM thread-group exit ordering.
     exit_status: Mutex<Option<ExitStatus>>,
-    root: Mutex<Option<libc::pthread_t>>,
-    workers: Mutex<Vec<libc::pthread_t>>,
+    // Whether another thread of the group had not retired (in the guest's
+    // order) when its group exit was first published: what every thread that
+    // dies in that exit decides its clear_child_tid store by
+    // (`KvmBackend::clear_registered_worker_tid_before_exit`). Set with the
+    // exit status by the first publisher that knows it, and read and cleared
+    // only under `exit_status`'s lock, so it describes the published exit
+    // and no other: an exec's rearm clears both.
+    group_exit_others_live: Mutex<Option<bool>>,
+    // Whether the Tool retired a thread of the group
+    // (`Guest::retire_current_thread`) while another thread was live, before
+    // any group exit was published (`KvmBackend::note_tool_retirement`).
+    // Before a group exit is published, a Tool retirement is the start of
+    // that thread's death with its group, as `Guest::retire_current_thread`
+    // documents (a sibling's exit_group, a fatal signal, an exec the Tool
+    // has already ordered), at whose commit that thread was live; its host
+    // side may retire before the exit's first publication, so the
+    // publication counts it as live through this, not through whether it
+    // has retired yet. Read and set only under `exit_status`'s lock; an
+    // exec's rearm clears it.
+    retired_by_tool_beside_live: Mutex<bool>,
+    // The process's certificate that every user of its guest mm is one of
+    // its own threads, each counted by the entry gate: a non-CLONE_VM
+    // process snapshot (`KvmBackend::prepare_forked_process`), or a process
+    // that has exec'd, whose new mm only its own threads use. Its
+    // CLONE_THREAD workers share it with it, as they share the mm. A vfork
+    // child also uses the mm while its window is open; the decision checks
+    // that separately (`GuestMemory::vfork_window_open`). A vfork child
+    // itself and the initial root have it only once they exec.
+    independent_mm: AtomicBool,
+    root: Mutex<Option<GuestThreadTarget>>,
+    workers: Mutex<Vec<GuestThreadTarget>>,
     // AUTONOMOUS-BOT-IMPLEMENTED: Join cancelled KVM workers before root teardown returns.
     // TODO-HUMAN-REVIEW(PR-178): Review KVM worker join ordering.
     worker_handles: Mutex<Vec<GuestWorkerHandle>>,
@@ -738,27 +884,97 @@ impl GuestThreadGroup {
             .expect("KVM exit-group lock poisoned")
     }
 
-    fn request_exit_group(&self, status: ExitStatus) {
-        let status = *self
+    /// Whether another thread of the group was live when its group exit was
+    /// first published; None before a group exit, or for one published
+    /// without the answer (unit tests that publish on the group directly).
+    fn group_exit_others_live(&self) -> Option<bool> {
+        let published = self
             .exit_status
             .lock()
+            .expect("KVM exit-group lock poisoned");
+        published.and(
+            *self
+                .group_exit_others_live
+                .lock()
+                .expect("KVM exit-group lock poisoned"),
+        )
+    }
+
+    #[cfg(test)]
+    fn retired_by_tool_beside_live(&self) -> bool {
+        let _published = self
+            .exit_status
+            .lock()
+            .expect("KVM exit-group lock poisoned");
+        *self
+            .retired_by_tool_beside_live
+            .lock()
             .expect("KVM exit-group lock poisoned")
-            .get_or_insert(status);
+    }
+
+    /// Records that the Tool is retiring a thread of the group while
+    /// `others_live` says another thread is live, unless a group exit has
+    /// been published, whose recorded answer the retiring thread then takes.
+    /// Called before the thread retires from the entry gate and under
+    /// `exit_status`'s lock, so the exit's first publication either precedes
+    /// it or reads it; and no publisher has retired while no exit is
+    /// published (a publisher publishes before it retires), so a publishing
+    /// thread is among those `others_live` counts.
+    fn note_tool_retirement(&self, others_live: impl FnOnce() -> bool) {
+        let published = self
+            .exit_status
+            .lock()
+            .expect("KVM exit-group lock poisoned");
+        if published.is_none() && others_live() {
+            *self
+                .retired_by_tool_beside_live
+                .lock()
+                .expect("KVM exit-group lock poisoned") = true;
+        }
+    }
+
+    /// A group exit published without the live-thread answer, as only unit
+    /// tests publish on the group directly.
+    #[cfg(test)]
+    fn request_exit_group(&self, status: ExitStatus) {
+        self.request_exit_group_from(status, None);
+    }
+
+    /// As [`Self::request_exit_group`]; `others_live` is whether the
+    /// publishing thread saw another live thread of the group. The first
+    /// publication's answer is kept for every thread that dies in the exit;
+    /// a thread the Tool retired beside a live one before it counts as live
+    /// (`retired_by_tool_beside_live`).
+    fn request_exit_group_from(&self, status: ExitStatus, others_live: Option<bool>) {
+        let status = {
+            let mut published = self
+                .exit_status
+                .lock()
+                .expect("KVM exit-group lock poisoned");
+            if published.is_none() {
+                let retired_beside_live = *self
+                    .retired_by_tool_beside_live
+                    .lock()
+                    .expect("KVM exit-group lock poisoned");
+                *self
+                    .group_exit_others_live
+                    .lock()
+                    .expect("KVM exit-group lock poisoned") =
+                    others_live.map(|live| live || retired_beside_live);
+            }
+            *published.get_or_insert(status)
+        };
         self.cancelled.store(true, Ordering::Release);
         self.terminal_reads.request_exit_group(status);
 
         if let Some(root) = *self.root.lock().expect("KVM guest root lock poisoned") {
-            // SAFETY: root is registered for the lifetime of its run loop.
-            unsafe {
-                libc::pthread_kill(root, worker_interrupt_signal());
-            }
+            // Root is registered for the lifetime of its run loop.
+            let _ = root.interrupt();
         }
         let workers = self.workers.lock().expect("KVM guest worker lock poisoned");
-        for &worker in workers.iter() {
-            // SAFETY: the registry lock keeps each pthread ID live for this call.
-            unsafe {
-                libc::pthread_kill(worker, worker_interrupt_signal());
-            }
+        for worker in workers.iter() {
+            // The registry lock keeps each thread registered for this call.
+            let _ = worker.interrupt();
         }
         drop(workers);
         self.notify_cancellation();
@@ -934,11 +1150,9 @@ impl GuestThreadGroup {
             .workers
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for &worker in workers.iter() {
-            // SAFETY: the registry lock keeps each pthread ID live for this call.
-            unsafe {
-                libc::pthread_kill(worker, worker_interrupt_signal());
-            }
+        for worker in workers.iter() {
+            // The registry lock keeps each thread registered for this call.
+            let _ = worker.interrupt();
         }
         drop(workers);
         self.notify_cancellation();
@@ -955,10 +1169,21 @@ impl GuestThreadGroup {
         // Exec reaches this boundary only after every old worker has joined.
         // The read registry must reject rearm with any old helper still owned.
         self.terminal_reads.rearm_after_exec();
-        *self
-            .exit_status
-            .lock()
-            .expect("KVM exit-group lock poisoned") = None;
+        {
+            let mut published = self
+                .exit_status
+                .lock()
+                .expect("KVM exit-group lock poisoned");
+            *published = None;
+            *self
+                .group_exit_others_live
+                .lock()
+                .expect("KVM exit-group lock poisoned") = None;
+            *self
+                .retired_by_tool_beside_live
+                .lock()
+                .expect("KVM exit-group lock poisoned") = false;
+        }
         *self
             .failure_state
             .lock()
@@ -996,9 +1221,37 @@ impl GuestThreadGroup {
     }
 }
 
+/// A registered guest thread's host thread: its pthread identity, which the
+/// registry compares, and the kernel's process and thread IDs, to which the
+/// worker interrupt is sent (`tgkill(2)`). glibc's `pthread_kill` sends to
+/// the thread ID cached in the thread's descriptor, which the initial thread
+/// of a process created by a raw `clone(2)` holds from its parent, so a kick
+/// of that thread would fail with ESRCH (see `crate::entry::HostThread`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GuestThreadTarget {
+    pthread: libc::pthread_t,
+    host: crate::entry::HostThread,
+}
+
+impl GuestThreadTarget {
+    /// The calling thread.
+    fn current() -> Self {
+        Self {
+            // SAFETY: pthread_self identifies this live calling thread.
+            pthread: unsafe { libc::pthread_self() },
+            host: crate::entry::HostThread::current(),
+        }
+    }
+
+    /// Sends the worker interrupt to this thread.
+    fn interrupt(self) -> std::io::Result<()> {
+        self.host.signal(worker_interrupt_signal())
+    }
+}
+
 pub(crate) struct GuestThreadRegistration {
     group: Arc<GuestThreadGroup>,
-    pthread: libc::pthread_t,
+    target: GuestThreadTarget,
     root: bool,
     restore_blocked_signal: bool,
 }
@@ -1006,25 +1259,24 @@ pub(crate) struct GuestThreadRegistration {
 impl GuestThreadRegistration {
     fn register(group: Arc<GuestThreadGroup>, root: bool) -> Result<Self> {
         let restore_blocked_signal = set_guest_interrupt_signal_mask(libc::SIG_UNBLOCK)?;
-        // SAFETY: pthread_self identifies this live calling thread.
-        let pthread = unsafe { libc::pthread_self() };
+        let target = GuestThreadTarget::current();
         if root {
             let previous = group
                 .root
                 .lock()
                 .expect("KVM guest root lock poisoned")
-                .replace(pthread);
+                .replace(target);
             assert!(previous.is_none(), "KVM guest root already registered");
         } else {
             group
                 .workers
                 .lock()
                 .expect("KVM guest worker lock poisoned")
-                .push(pthread);
+                .push(target);
         }
         Ok(Self {
             group,
-            pthread,
+            target,
             root,
             restore_blocked_signal,
         })
@@ -1037,7 +1289,7 @@ impl GuestThreadRegistration {
         panics: Arc<crate::failure::tool_panics::ToolPanics>,
     ) -> Result<GuestInterruptSuspension<'_>> {
         // Only the private synchronous Direct driver supplies this owner.
-        if unsafe { libc::pthread_equal(libc::pthread_self(), self.pthread) } == 0 {
+        if unsafe { libc::pthread_equal(libc::pthread_self(), self.target.pthread) } == 0 {
             return Err(interrupt_ownership_error(
                 "Direct fork moved off its registered pthread",
             ));
@@ -1054,7 +1306,7 @@ impl GuestThreadRegistration {
         };
         let withdrawn = if self.root {
             match self.group.root.lock() {
-                Ok(mut root) if *root == Some(self.pthread) => {
+                Ok(mut root) if *root == Some(self.target) => {
                     *root = None;
                     suspended.detached = true;
                     Ok(())
@@ -1066,10 +1318,8 @@ impl GuestThreadRegistration {
             }
         } else {
             match self.group.workers.lock() {
-                Ok(mut workers)
-                    if workers.iter().filter(|&&id| id == self.pthread).count() == 1 =>
-                {
-                    workers.retain(|id| *id != self.pthread);
+                Ok(mut workers) if workers.iter().filter(|&&id| id == self.target).count() == 1 => {
+                    workers.retain(|id| *id != self.target);
                     suspended.detached = true;
                     Ok(())
                 }
@@ -1079,7 +1329,7 @@ impl GuestThreadRegistration {
                 Err(_) => Err(interrupt_ownership_error("Direct worker registry poisoned")),
             }
         };
-        // Senders hold these same locks through pthread_kill. No old-parent
+        // Senders hold these same locks through each send. No old-parent
         // send remains in flight, and no registry lock crosses the child await.
         if let Err(error) = withdrawn.and_then(|()| deliver_guest_interrupt_at_neutral_boundary()) {
             return suspended.finish(Err(error));
@@ -1137,7 +1387,7 @@ struct GuestInterruptSuspension<'a> {
 impl GuestInterruptSuspension<'_> {
     fn restore(&mut self) -> Result<()> {
         let registration = self.registration;
-        if unsafe { libc::pthread_equal(libc::pthread_self(), registration.pthread) } == 0 {
+        if unsafe { libc::pthread_equal(libc::pthread_self(), registration.target.pthread) } == 0 {
             return Err(interrupt_ownership_error(
                 "Direct restoration moved off its registered pthread",
             ));
@@ -1165,7 +1415,7 @@ impl GuestInterruptSuspension<'_> {
                     }
                 };
                 if root.is_none() {
-                    *root = Some(registration.pthread);
+                    *root = Some(registration.target);
                 } else {
                     errors.push(interrupt_ownership_error(
                         "Direct root was replaced while suspended",
@@ -1181,8 +1431,8 @@ impl GuestInterruptSuspension<'_> {
                         poisoned.into_inner()
                     }
                 };
-                if !workers.contains(&registration.pthread) {
-                    workers.push(registration.pthread);
+                if !workers.contains(&registration.target) {
+                    workers.push(registration.target);
                 } else {
                     errors.push(interrupt_ownership_error(
                         "Direct worker was replaced while suspended",
@@ -1234,7 +1484,7 @@ impl Drop for GuestThreadRegistration {
                 .root
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if *root == Some(self.pthread) {
+            if *root == Some(self.target) {
                 *root = None;
             }
         } else {
@@ -1242,7 +1492,7 @@ impl Drop for GuestThreadRegistration {
                 .workers
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .retain(|worker| *worker != self.pthread);
+                .retain(|worker| *worker != self.target);
         }
         if self.restore_blocked_signal {
             let _ = set_guest_interrupt_signal_mask(libc::SIG_BLOCK);
@@ -1274,12 +1524,7 @@ fn validate_root_pid(pid: i32) -> Result<i32> {
     }
 }
 
-/// The PID-namespace init process seen by the deterministic container. The
-/// ptrace backend runs the guest inside a real PID namespace whose `init` is
-/// PID 1, so the conventional root guest (PID 3, see detcore `ROOT_DETPID`) has
-/// `getppid() == 1`. KVM synthesizes the guest identity rather than using a real
-/// namespace, so it must reproduce the same parent value for parity.
-pub(crate) const CONTAINER_INIT_PID: i32 = 1;
+pub(crate) use crate::elf::CONTAINER_INIT_PID;
 
 /// Deterministic parent PID for the container's root guest, matching the ptrace
 /// backend. A guest that is itself the namespace init (PID 1) has no parent and
@@ -1310,11 +1555,30 @@ fn normalize_completed_syscall_boundary_registers(
 }
 
 fn normalize_completed_syscall_boundary_registers_with_read(
-    mut read: impl FnMut(u64, &mut [u8]) -> Result<()>,
+    read: impl FnMut(u64, &mut [u8]) -> Result<()>,
     mut registers: kvm_regs,
     hypercall_instruction: [u8; 3],
     hypercall_address: u64,
 ) -> Result<kvm_regs> {
+    normalize_completed_syscall_boundary_registers_in_place(
+        read,
+        &mut registers,
+        hypercall_instruction,
+        hypercall_address,
+    )?;
+    Ok(registers)
+}
+
+/// [`normalize_completed_syscall_boundary_registers_with_read`] on
+/// `registers` where they are, with the same checks and reads in the same
+/// order. `registers` changes only after every check has passed, so an error
+/// leaves it as it was.
+fn normalize_completed_syscall_boundary_registers_in_place(
+    mut read: impl FnMut(u64, &mut [u8]) -> Result<()>,
+    registers: &mut kvm_regs,
+    hypercall_instruction: [u8; 3],
+    hypercall_address: u64,
+) -> Result<()> {
     let return_address = hypercall_address
         .checked_add(hypercall_instruction.len() as u64)
         .ok_or_else(|| Error::UnexpectedVcpuExit("hypercall RIP overflow".to_owned()))?;
@@ -1338,7 +1602,7 @@ fn normalize_completed_syscall_boundary_registers_with_read(
     // any process action can consume the exit. Both admitted RIP forms model
     // that same completed-hypercall state.
     registers.rax = 0;
-    Ok(registers)
+    Ok(())
 }
 
 /// What a syscall exit's first guest-memory copy read: the whole transport
@@ -1370,6 +1634,19 @@ pub(crate) struct SyscallExitRead {
 }
 
 impl SyscallExitRead {
+    /// An exit read with every field zero and no hypercall bytes, to be
+    /// overwritten by [`KvmBackend::read_syscall_exit_into`] before anything
+    /// reads it.
+    pub(crate) fn empty() -> Self {
+        Self {
+            frame_address: 0,
+            frame: [0; FRAME_SIZE],
+            hypercall_address: 0,
+            hypercall: None,
+            generation: crate::entry::MappingGeneration::INITIAL,
+        }
+    }
+
     /// The registers the guest held at its `syscall` instruction that the
     /// trampoline overwrites before its hypercall, as it saved them in the
     /// frame first (`bootstrap::syscall_trampoline`): the return RIP, which
@@ -1552,20 +1829,51 @@ impl CompletedSyscallBoundary {
         backend: &KvmBackend,
         frame_address: u64,
         action_return_registers: Option<kvm_regs>,
-        mut read: impl FnMut(u64, &mut [u8]) -> Result<()>,
+        read: impl FnMut(u64, &mut [u8]) -> Result<()>,
     ) -> Result<Self> {
-        let mut frame = [0; FRAME_SIZE];
-        read(frame_address, &mut frame)?;
-        let (registers, special_registers) =
-            backend.completed_syscall_boundary_registers_with_read(&mut read)?;
-        Ok(Self {
-            frame_address,
-            frame,
-            registers,
-            special_registers,
-            action_return_registers,
+        let mut boundary = Self::empty();
+        boundary.capture_with_read_into(backend, frame_address, read)?;
+        boundary.action_return_registers = action_return_registers;
+        Ok(boundary)
+    }
+
+    /// The capture [`Self::capture_with_read`] makes, with no action-return
+    /// registers, written over `self` where it is instead of into a new
+    /// value that is then moved: the frame read, the general registers, the
+    /// hypercall read and check, and the special registers, in that order,
+    /// then the plain fields. Every field is overwritten on success, so
+    /// nothing of an earlier capture survives. On an error `self` holds
+    /// partial values; every caller discards it with the error and never
+    /// reads it.
+    fn capture_with_read_into(
+        &mut self,
+        backend: &KvmBackend,
+        frame_address: u64,
+        mut read: impl FnMut(u64, &mut [u8]) -> Result<()>,
+    ) -> Result<()> {
+        read(frame_address, &mut self.frame)?;
+        backend.completed_syscall_boundary_registers_with_read_into(
+            &mut read,
+            &mut self.registers,
+            &mut self.special_registers,
+        )?;
+        self.frame_address = frame_address;
+        self.action_return_registers = None;
+        self.stage_action_outcome = false;
+        Ok(())
+    }
+
+    /// A boundary with every field zero, to be overwritten by a capture
+    /// before anything reads it.
+    fn empty() -> Self {
+        Self {
+            frame_address: 0,
+            frame: [0; FRAME_SIZE],
+            registers: kvm_regs::default(),
+            special_registers: kvm_bindings::kvm_sregs::default(),
+            action_return_registers: None,
             stage_action_outcome: false,
-        })
+        }
     }
 
     pub(crate) async fn capture_admitted(
@@ -1592,13 +1900,21 @@ impl CompletedSyscallBoundary {
     /// mapping (the same entry gate), covers exactly the frame and hypercall
     /// this capture reads, and the gate still admits at the generation the
     /// read saw; otherwise this is `capture_admitted`, unchanged.
-    pub(crate) async fn capture_admitted_reusing(
+    ///
+    /// The boundary is captured into `slot`, where it stays, and is lent
+    /// back: a syscall callback's boundary is otherwise moved (about 670
+    /// bytes, by `memcpy`) out of the capture and again into the callback's
+    /// executor, on every syscall a Tool handles. The reads, their order and
+    /// every check are those of a capture by value; only where the result is
+    /// stored differs. A syscall callback's boundary has no action-return
+    /// registers (`capture_admitted` with `None`).
+    pub(crate) async fn capture_admitted_reusing<'slot>(
         backend: &mut KvmBackend,
         frame_address: u64,
-        action_return_registers: Option<kvm_regs>,
         stop: Pin<&mut (dyn Future<Output = ()> + Send + '_)>,
         exit: Option<(&SyscallExitRead, &GuestMemory)>,
-    ) -> Result<Option<Self>> {
+        slot: &'slot mut CompletedBoundarySlot,
+    ) -> Result<Option<&'slot Self>> {
         let hypercall_address = syscall_hypercall_address(
             backend.hypercall_instruction,
             backend.syscall_trampoline_address,
@@ -1611,25 +1927,32 @@ impl CompletedSyscallBoundary {
                 && Arc::ptr_eq(memory.entry_gate_ref(), backend.memory.entry_gate_ref())
         });
         let reused = reuse.map(|(exit, _)| {
-            (exit.generation, move |backend: &KvmBackend| {
-                Self::capture_with_read(
-                    backend,
-                    frame_address,
-                    action_return_registers,
-                    |address, bytes| exit.read(address, bytes),
-                )
-            })
+            (
+                exit.generation,
+                move |backend: &KvmBackend, boundary: &mut Self| {
+                    boundary.capture_with_read_into(backend, frame_address, |address, bytes| {
+                        exit.read(address, bytes)
+                    })
+                },
+            )
         });
-        backend
-            .prepare_action_read_or_reuse(stop, reused, |backend, access| {
-                Self::capture_with_read(
-                    backend,
-                    frame_address,
-                    action_return_registers,
-                    |address, bytes| access.read_raw(address, bytes),
-                )
-            })
-            .await
+        let captured = backend
+            .prepare_action_read_or_reuse(
+                stop,
+                reused,
+                &mut slot.boundary,
+                |backend, access, boundary| {
+                    boundary.capture_with_read_into(backend, frame_address, |address, bytes| {
+                        access.read_raw(address, bytes)
+                    })
+                },
+            )
+            .await?;
+        let slot: &'slot CompletedBoundarySlot = slot;
+        Ok(match captured {
+            Some(()) => Some(&slot.boundary),
+            None => None,
+        })
     }
 
     pub(crate) async fn capture_for_action_admitted(
@@ -1687,8 +2010,13 @@ impl CompletedSyscallBoundary {
         Ok(())
     }
 
+    /// [`Self::for_test`] as a constant, which a test may borrow for as long
+    /// as it likes.
     #[cfg(test)]
-    pub(crate) fn for_test() -> Self {
+    pub(crate) const FOR_TEST: Self = Self::for_test();
+
+    #[cfg(test)]
+    pub(crate) const fn for_test() -> Self {
         Self {
             frame_address: 0x1000,
             frame: [0; FRAME_SIZE],
@@ -1699,6 +2027,45 @@ impl CompletedSyscallBoundary {
             action_return_registers: None,
             stage_action_outcome: false,
         }
+    }
+}
+
+/// Where [`CompletedSyscallBoundary::capture_admitted_reusing`] captures a
+/// boundary, kept for a thread's run so that each syscall callback's capture
+/// overwrites it in place. Its contents are reachable only through a
+/// successful capture, which overwrites every field first, so no earlier
+/// capture's state can be read through it.
+pub(crate) struct CompletedBoundarySlot {
+    boundary: CompletedSyscallBoundary,
+}
+
+impl CompletedBoundarySlot {
+    pub(crate) fn new() -> Self {
+        Self {
+            boundary: CompletedSyscallBoundary::empty(),
+        }
+    }
+}
+
+/// The error an exec past its point of no return ends the run with. The old
+/// image is gone, so no errno can answer the guest. A host resource of this
+/// process's own that ran out (memory, a descriptor, the host's file table),
+/// whether a host call, a fallible allocation or a KVM ioctl reported it, is
+/// this backend's to refuse: the named refusal [`Error::HostResources`], which
+/// carries the resource and names it, the error and the limit. Any other error
+/// is returned as it is.
+pub(crate) fn exec_after_point_of_no_return_error(error: Error) -> Error {
+    match error.host_resource_exhaustion() {
+        Some(exhaustion) => Error::HostResources {
+            resource: exhaustion.resource,
+            diagnostic: format!(
+                "KVM exec: {} after the old image was discarded: replacing the image failed \
+                 ({error}) under {}; the old image cannot be restored, so the run ends here",
+                exhaustion.resource.ran_out(),
+                exhaustion.limit,
+            ),
+        },
+        None => error,
     }
 }
 
@@ -1771,12 +2138,6 @@ pub struct KvmBackend {
     completed_tool_panics: Mutex<Vec<CompletedToolPanic>>,
     thread_slot: Option<usize>,
     is_guest_thread: bool,
-    // Conservative certificate for a non-CLONE_VM process snapshot. The
-    // ordinary shared-file domain separately excludes additional same-mm
-    // participants. Initial roots and legacy vfork snapshots have no certificate;
-    // a later CLONE_VM process preparation revokes it instead of guessing when
-    // the other process has stopped using the guest mm.
-    independent_process_mm: bool,
     // Who owns this backend's guest threads. The single value drives BOTH the
     // CLONE_THREAD worker dispatch path (`run_process_action_with_tool`) and
     // `futex`/CLEARTID ownership (`is_backend_owned_syscall`), so the two can
@@ -1822,6 +2183,33 @@ pub struct KvmBackend {
     /// as an issue in the dev-hermit parent repository, at
     /// ai_docs/evidence/kvm-kernel-trait-design-20261016/pending-issue-reverie-kvm-segment-slot.md.
     pending_segment: Option<(SegmentBase, u64)>,
+    /// The user instruction the syscall trampoline, stopped at its VMCALL
+    /// within a precise timer event's stepping window, returns to (see
+    /// `prepare_timer_steps`), until the breakpoint there takes the guest
+    /// back or the guest is found in user mode.
+    trampoline_return: Option<u64>,
+    /// Whether a single step's fault frame still holds the step's trap flag.
+    stepped_fault: crate::preemption_timer::SteppedFault,
+    /// In a vfork child's backend, what lets its parent, kept inside its
+    /// `CLONE_VFORK` call (`run_process_action_with_tool`), go on: sent when
+    /// the child's window ends, after its changes to private memory went
+    /// back to the parent (`release_vfork_parent`), or dropped with this
+    /// backend, so every end of the child releases the parent once.
+    vfork_release: Option<futures::channel::oneshot::Sender<()>>,
+}
+
+/// RFLAGS' trap flag.
+const TRAP_FLAG: u64 = 1 << 8;
+
+/// The refusal, by name, of what a guest does at `rip` while a precise timer
+/// event single-steps it: it sets its own trap flag, which the steps take
+/// over, or runs an instruction the steps cannot run (see
+/// [`crate::step_filter::StepClass::Refused`]).
+fn refused_while_stepping(what: &str, rip: u64) -> Error {
+    Error::GuestClock(format!(
+        "preemption timer: the guest {what} at {rip:#x} while a precise timer event \
+         single-steps it, which this backend does not support"
+    ))
 }
 
 struct CompletedToolPanic {
@@ -1938,7 +2326,8 @@ impl KvmBackend {
         &mut self,
     ) -> Result<Option<crate::entry::owner::CallbackScope>> {
         self.check_entry_owner()?;
-        let Some(owner) = self.entry_driver_owner() else {
+        // Borrowed, not cloned: the borrow ends before the origin is stored.
+        let Some(owner) = self.entry_driver.as_ref() else {
             return Ok(None);
         };
         let callback = owner.begin_callback(None)?;
@@ -2010,6 +2399,15 @@ impl KvmBackend {
         self.is_guest_thread && self.thread_group.cancelled.load(Ordering::Acquire)
     }
 
+    /// Makes this backend a worker of its thread group and cancels the group's
+    /// workers without a group exit status, as another thread's exec or a
+    /// peer's failure does. For unit tests of the cancellation checks.
+    #[cfg(test)]
+    pub(crate) fn cancel_as_worker_for_test(&mut self) {
+        self.is_guest_thread = true;
+        self.thread_group.cancel_workers();
+    }
+
     /// Creates a VM with one vCPU and a memory slot starting at GPA zero.
     pub fn new(memory_size: usize) -> Result<Self> {
         let stdin = duplicate_stdin()?;
@@ -2051,7 +2449,9 @@ impl KvmBackend {
         // reads this table: every guest CPUID faults to the Tool, whose answer
         // is the guest's (Detcore's machine description under Hermit, the
         // host's by Reverie's default).
-        let cpuid = vcpu_cpuid(kvm.get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)?)?;
+        let supported = kvm.get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)?;
+        let supported_xsave = crate::host_xss::XsaveSubleaf::of_table(&supported);
+        let cpuid = vcpu_cpuid(supported)?;
         // TODO-HUMAN-REVIEW(PR-129): Review host-selected private hypercall transport.
         let hypercall_instruction = supported_hypercall_instruction(&cpuid)?;
         let cap = kvm_enable_cap {
@@ -2076,6 +2476,11 @@ impl KvmBackend {
 
         let vcpu = vm.create_vcpu(0)?;
         vcpu.set_cpuid2(&cpuid)?;
+        // Once, before the first KVM_RUN: with the host's IA32_XSS, KVM no
+        // longer writes the MSR around every guest entry. If the write fails,
+        // the vCPU falls back to 0; an error here means 0 could not be
+        // confirmed, and it stops the backend before any guest entry.
+        crate::host_xss::match_host_xss(&vcpu, supported_xsave, &cpuid)?;
         let wanted = kvm_bindings::KVM_SYNC_X86_REGS | kvm_bindings::KVM_SYNC_X86_SREGS;
         // A negative result is a failed probe, not a mask.
         let offered = vm.check_extension_int(Cap::SyncRegs);
@@ -2123,7 +2528,6 @@ impl KvmBackend {
             completed_tool_panics: Mutex::new(Vec::new()),
             thread_slot: None,
             is_guest_thread: false,
-            independent_process_mm: false,
             // Effective ownership before any tool run resolves it. The direct
             // (non-tool) personality never dispatches threads through a Tool loop,
             // so Host is the correct effective value there; when a tool runs,
@@ -2143,7 +2547,46 @@ impl KvmBackend {
             exit_collector: None,
             abandoned_runs: Arc::default(),
             pending_segment: None,
+            trampoline_return: None,
+            stepped_fault: Default::default(),
+            vfork_release: None,
         })
+    }
+
+    /// Ends this vfork child's window for its parent: lets the parent, kept
+    /// inside its `CLONE_VFORK` call, go on. Called after the child's
+    /// window's end released its address space (`release_vfork_mm`), at its
+    /// successful exec and at its last exit; dropping the backend does the
+    /// same for every other end. Without a waiting parent it does nothing.
+    pub(crate) fn release_vfork_parent(&mut self) {
+        if let Some(release) = self.vfork_release.take() {
+            #[cfg(test)]
+            crate::memory::vfork_window_steps::note("release");
+            let _ = release.send(());
+        }
+    }
+
+    /// The end of this vfork child's window, short of the parent's release:
+    /// what Linux's `mm_release()` does there, which the Linux provider
+    /// decides and makes (`ElfExecutor::release_vfork_mm`: the
+    /// clear_child_tid store, this backend's write-back of the child's
+    /// changes to private memory, and the wake), and nothing outside a
+    /// window. Returns whether a window ended.
+    pub(crate) fn release_vfork_mm(&self, executor: &mut ElfExecutor) -> Result<bool> {
+        executor.release_vfork_mm(&self.memory, |child| {
+            child.return_vfork_changes(BOOT_RESERVED_END)
+        })
+    }
+
+    /// Ends this vfork child's window, if one is open (`release_vfork_mm`),
+    /// and then lets its parent go on (`release_vfork_parent`), as Linux
+    /// completes a vfork after mm_release()'s effects. A refused write-back
+    /// returns before the release, so that the caller can publish the
+    /// failure first. Returns whether a window ended.
+    pub(crate) fn end_vfork_window(&mut self, executor: &mut ElfExecutor) -> Result<bool> {
+        let ended = self.release_vfork_mm(executor)?;
+        self.release_vfork_parent();
+        Ok(ended)
     }
 
     /// Enables or disables completed-process-tree KVM exit statistics.
@@ -2301,8 +2744,7 @@ impl KvmBackend {
         regs.rip = entry_point;
         regs.rflags = 2;
         self.vcpu.set_regs(&regs)?;
-        self.vcpu.new_guest();
-        Ok(())
+        self.vcpu.new_guest()
     }
 
     /// Returns the Tool scratch-page top for this backend. Process leaders use
@@ -2315,7 +2757,7 @@ impl KvmBackend {
 
     /// Ends a public run that returned; see `RunAdmission::finish`.
     pub(crate) fn finish_run(&self, admission: RunAdmission) {
-        admission.finish(&self.thread_group);
+        admission.finish(&*self.thread_group);
     }
 
     /// Releases a guest thread's transport and Tool scratch-page slot.
@@ -2359,7 +2801,7 @@ impl KvmBackend {
     /// vCPU to enter it in long mode.
     ///
     /// `argv` must be non-empty; `argv[0]` becomes the program name reported to
-    /// the guest (initial stack and `AT_EXECFN`/`readlink("/proc/self/exe")`).
+    /// the guest (initial stack and `AT_EXECFN`).
     /// The guest observes a standard System V initial stack: `argc`, the `argv`
     /// pointer array, a NULL terminator, the `envp` pointer array, a NULL
     /// terminator, and the auxiliary vector.
@@ -2377,7 +2819,7 @@ impl KvmBackend {
     ///
     /// This entry does not establish a backing file from `argv[0]`. Executable
     /// following-stat and retained self-exec require a known backing file and
-    /// return ENOENT without one. The legacy nominal executable readlink remains.
+    /// return ENOENT without one, and `Guest::link_path` provides no image.
     pub fn install_static_elf_with_context(
         &mut self,
         image: &[u8],
@@ -2396,7 +2838,9 @@ impl KvmBackend {
     /// initial stack and names it in `AT_EXECFN`. When a launcher has
     /// already rewritten a `#!` script's `argv` to its interpreter, `execfn`
     /// is still the script's filename, as `execve` gave it to the kernel, so
-    /// the guest's stack matches a traced guest's.
+    /// the guest's stack matches a traced guest's. Like that entry, this one
+    /// establishes no backing file; to retain one, use
+    /// [`Self::install_static_elf_file_with_exec_context`].
     pub fn install_static_elf_with_exec_context(
         &mut self,
         image: &[u8],
@@ -2443,18 +2887,19 @@ impl KvmBackend {
         // A new image starts a new task lifetime: nothing staged for an
         // earlier one survives (on the base it died with that executor).
         self.clear_pending_segment();
-        self.vcpu.new_elf_guest();
-        Ok(())
+        self.vcpu.new_elf_guest()
     }
 
     /// Loads image bytes from the supplied open file, retaining the final executable.
     ///
     /// Positional reads start at zero without changing the file's shared offset.
-    /// `argv[0]` remains independent of the file identity. The retained object's
-    /// path supplies the initial executable name; later exec uses its invoked name.
-    /// For scripts, each interpreter is read from its retained open file, and the
-    /// final interpreter's file and bytes become the executable identity. The
-    /// original script still supplies the invoked name and script argument.
+    /// `argv[0]` remains independent of the file identity. The retained
+    /// object's path supplies the initial executable name, as the filename a
+    /// native exec of it under any `argv[0]` is named by; a later exec uses
+    /// its own filename. For scripts, each interpreter is read from its
+    /// retained open file, and the final interpreter's file and bytes become
+    /// the executable identity. The original script still supplies the
+    /// invoked name and script argument.
     /// This does not add initial execution authorization or snapshot concurrent
     /// host file writes. The caller must provide a stable, readable executable.
     pub fn install_static_elf_file_with_context(
@@ -2467,6 +2912,41 @@ impl KvmBackend {
         AbandonedRuns::admit(&self.abandoned_runs)?;
         self.vcpu.check_initial_elf_install()?;
         let loaded = load_static_elf_file(&mut self.memory, file, argv, envp, cwd)?;
+        self.install_loaded_static_elf(loaded)
+    }
+
+    /// As [`Self::install_static_elf_file_with_context`], for an image exec'd
+    /// by the filename `execfn`, which Linux copies to the top of the initial
+    /// stack and names in `AT_EXECFN`, as
+    /// [`Self::install_static_elf_with_exec_context`] takes it. Unlike that
+    /// entry, this one retains `file` as the process's executable, so that an
+    /// exec or a following stat of `/proc/self/exe` reaches it from the first
+    /// instruction. A launcher that has already rewritten a `#!` script's
+    /// `argv` to its interpreter passes the interpreter's file and the
+    /// script's filename as `execfn`, so that the guest's stack and its
+    /// executable both match what `execve` of the script gives a native
+    /// process. The new task is named by `execfn`, as Linux names it: by the
+    /// filename's bytes after its last `/`, cut to 15 bytes (`kbasename` in
+    /// `begin_new_exec`), so a script is named after itself rather than its
+    /// interpreter, and a symlink after itself rather than its target.
+    pub fn install_static_elf_file_with_exec_context(
+        &mut self,
+        file: File,
+        execfn: &std::ffi::OsStr,
+        argv: &[&str],
+        envp: &[&str],
+        cwd: &Path,
+    ) -> Result<()> {
+        AbandonedRuns::admit(&self.abandoned_runs)?;
+        self.vcpu.check_initial_elf_install()?;
+        let loaded = load_static_elf_file_with_execfn(
+            &mut self.memory,
+            file,
+            Some(std::os::unix::ffi::OsStrExt::as_bytes(execfn)),
+            argv,
+            envp,
+            cwd,
+        )?;
         self.install_loaded_static_elf(loaded)
     }
 
@@ -2512,6 +2992,103 @@ impl KvmBackend {
         Ok(())
     }
 
+    /// Reserve the host directory at the absolute path `path` for the Tool.
+    ///
+    /// This is the reservation's whole contract; the README and
+    /// `reverie_linuxemu::elf::ToolDirectory` refer to it.
+    ///
+    /// - **A read-only file system.** The directory must be on a file system
+    ///   that is itself read-only (its superblock: the `ro` super option of
+    ///   its mount in `/proc/self/mountinfo`), not only on a read-only mount
+    ///   of a writable one, such as a read-only bind, and empty. On a local
+    ///   file system whose superblock is its only writer, such as a fresh
+    ///   read-only tmpfs, nothing can then be created in it by any route the
+    ///   executor does not see, another mount of the same file system and a
+    ///   race between a check and the call it checks included. Where
+    ///   something else writes behind a read-only superblock, names can
+    ///   still appear in the directory, and no check here detects it: a
+    ///   writable NFS, CIFS or 9p mount of the same export, a FUSE daemon, a
+    ///   lower layer of an overlayfs changed elsewhere, or a loop image whose
+    ///   backing file is writable.
+    /// - **The exact path.** The executor reaches the directory for a guest
+    ///   path call only where the call names exactly `path`, byte for byte,
+    ///   as an `O_DIRECTORY` open that creates nothing or as `newfstatat`
+    ///   (also `stat` and `lstat`), and only while `path` still resolves to
+    ///   the directory recorded now: the same filesystem type, device and
+    ///   inode. Keep the path and the mounts under it stable for the run:
+    ///   once an ancestor is renamed or another mount covers the path, the
+    ///   exact path is refused too, and the recorded directory stays refused
+    ///   under any name.
+    /// - **Every other route fails with `ENOENT`,** as a lookup of a name
+    ///   that does not exist fails: the guest is to see no directory there.
+    ///   That is every other path call that resolves to the directory
+    ///   (through a symbolic link, relative to the working directory or to a
+    ///   descriptor, by a `..`, or as `statx`), an open the kernel refuses
+    ///   for a directory (a write mode or `O_TRUNC`, `O_DIRECT`), a working
+    ///   directory in it (`chdir`, `fchdir`), removing, renaming or replacing
+    ///   it, and every call that would create, remove, rename or link a name
+    ///   in it: `open`, `openat` and `creat` with `O_CREAT`, `O_TMPFILE`,
+    ///   `mkdir`, `mknod`, `symlink`, `link`, `rename`, `unlink` and `rmdir`.
+    ///   procfs objects keep their own refusal, `EACCES`, also as the parent
+    ///   directory a call that changes a name checks first.
+    /// - **A final symbolic link,** spelled without a trailing slash, is
+    ///   answered as Linux answers it: a named `O_CREAT` open with `O_EXCL`
+    ///   or `O_NOFOLLOW` finds the link itself (`EEXIST`, `ELOOP`), an
+    ///   `O_TMPFILE` open with `O_NOFOLLOW` finds no directory there
+    ///   (`ENOTDIR`), and a creation through a final link into the directory
+    ///   is not refused: the kernel follows the link and answers for the
+    ///   read-only file system, `EROFS`, and creates nothing.
+    /// - **A trailing slash.** A creating open spelled with a trailing slash
+    ///   that reaches the directory, as `reserved/` or through a link as
+    ///   `l/`, answers `ENOENT`, where Linux answers `EISDIR` for any such
+    ///   spelling before it looks anything up.
+    /// - **Two more `EROFS` answers.** A creating open (`O_CREAT`,
+    ///   `O_TMPFILE`), `mkdir`, `mknod`, `symlink`, `link`, `rename` and
+    ///   `unlink` check the directory whose name they change and then act by
+    ///   path: if another process redirects a symbolic link in that path to
+    ///   the directory in between, the call fails as the read-only file
+    ///   system answers, `EROFS` (or `EXDEV` for a `rename` across mounts),
+    ///   not `ENOENT`. And with `fs.protected_symlinks=1`, a
+    ///   creation below another user's link `L` in a sticky world-writable
+    ///   directory (`L/new`) answers `EROFS`: that rule refuses the
+    ///   executor's own lookup of `L`, a refused lookup decides nothing, and
+    ///   the kernel's lookup follows `L` as an intermediate component.
+    ///   Neither creates anything.
+    /// - **Descriptors** opened there work as any other descriptor: the
+    ///   calls that name one are not refused, but a lookup from one that
+    ///   resolves to the directory or creates a name in it is.
+    /// - **Not covered:** AF_UNIX socket paths in `bind`, `connect` and
+    ///   `sendto` go to the host unchecked (a `bind` below the directory
+    ///   answers `EROFS`), and the interpreter an executable names in
+    ///   `PT_INTERP` is opened without the check; see
+    ///   <https://github.com/rrnewton/reverie/issues/1171>. Objects below
+    ///   the directory are not protected either, because the executor does
+    ///   not look below it: the directory must be empty.
+    /// - **Enforcement** is the built-in LinuxEmu executor's, which runs the
+    ///   installed image. A guest whose calls go to a caller-supplied
+    ///   [`crate::SyscallExecutor`] or to another provider gets no such
+    ///   protection: that executor must enforce the reservation itself.
+    ///
+    /// A Tool that keeps the exact path from the guest therefore keeps the
+    /// directory to itself, and a descriptor it opens there can stand for a
+    /// directory the Tool serves itself. The directory's identity is
+    /// recorded now, in this process's mount namespace, where the guest's
+    /// file operations run. Fork, clone and exec keep the reservation. Fails
+    /// with [`Error::StaticElfNotInstalled`] without an installed image, and
+    /// with [`Error::HostIo`] where the path is relative, names no directory,
+    /// names a procfs one (which the executor refuses whatever names it), or
+    /// names a directory whose file system is not read-only (a read-only bind
+    /// of a writable one included).
+    pub fn reserve_tool_directory(&mut self, path: &Path) -> Result<()> {
+        AbandonedRuns::admit(&self.abandoned_runs)?;
+        let loaded = self
+            .static_elf
+            .as_mut()
+            .ok_or(Error::StaticElfNotInstalled)?;
+        loaded.tool_directory = Some(crate::elf::ToolDirectory::open(path).map_err(Error::HostIo)?);
+        Ok(())
+    }
+
     /// Whether the installed image reports host metadata timestamps.
     fn host_metadata_timestamps_enabled(&self) -> bool {
         self.static_elf
@@ -2550,28 +3127,47 @@ impl KvmBackend {
         Ok((registers, self.vcpu.get_sregs()?))
     }
 
-    fn completed_syscall_boundary_registers_with_read(
+    /// [`Self::completed_syscall_boundary_registers`], reading the hypercall
+    /// instruction through `read` and storing both register sets where the
+    /// caller keeps them: the general registers, the normalization's checks
+    /// and read, then the special registers, in that order, as a returned
+    /// pair was built. On an error the destinations hold partial values and
+    /// the caller discards them with the error.
+    fn completed_syscall_boundary_registers_with_read_into(
         &self,
         read: impl FnMut(u64, &mut [u8]) -> Result<()>,
-    ) -> Result<(kvm_regs, kvm_bindings::kvm_sregs)> {
+        registers: &mut kvm_regs,
+        special_registers: &mut kvm_bindings::kvm_sregs,
+    ) -> Result<()> {
         let hypercall_address = syscall_hypercall_address(
             self.hypercall_instruction,
             self.syscall_trampoline_address,
             self.syscall_frame_address,
         );
-        let registers = normalize_completed_syscall_boundary_registers_with_read(
+        self.vcpu.get_regs_into(registers)?;
+        normalize_completed_syscall_boundary_registers_in_place(
             read,
-            self.vcpu.get_regs()?,
+            registers,
             self.hypercall_instruction,
             hypercall_address,
         )?;
-        Ok((registers, self.vcpu.get_sregs()?))
+        self.vcpu.get_sregs_into(special_registers)?;
+        Ok(())
     }
 
-    fn snapshot_process(&self) -> Result<KvmProcessSnapshot> {
+    /// The child's copy of the process. A child that shares the address space
+    /// on Linux (`share_address_space`, a vfork) runs on a copy here, which
+    /// shares the stack window's record with the parent's memory
+    /// (`GuestMemory::snapshot_sharing_address_space`) until the child's exec
+    /// gives it a record of its own.
+    fn snapshot_process(&self, share_address_space: bool) -> Result<KvmProcessSnapshot> {
         #[cfg(test)]
         tests::entry_action_tests::observe("snapshot");
-        let mut memory = self.memory.snapshot()?;
+        let mut memory = if share_address_space {
+            self.memory.snapshot_sharing_address_space()?
+        } else {
+            self.memory.snapshot()?
+        };
         #[cfg(test)]
         tests::entry_action_tests::observe_fork_memory(&memory.entry_gate());
         // Snapshot preparation is still part of the issuing operation. The
@@ -2660,8 +3256,46 @@ impl KvmBackend {
         // this reset onward, any exceptional loader or KVM failure is fatal to
         // the backend and is never reported back to the old guest image. This
         // is the same point-of-no-return behavior as the prior zero_raw reset.
+        // The reload loads the image the preflight read, but it opens the
+        // program interpreter and the working directory again by path. If
+        // either changed since the preflight, the reload can fail where the
+        // preflight did not, or load an interpreter the preflight did not
+        // check. A host resource of this process's own that ran out (memory,
+        // a descriptor, the host's file table) ends the run with the named
+        // refusal; any other failure ends it as a backend fault.
+        self.replace_process_image(executor, executable, execfn, image, argv, envp)
+            .map_err(exec_after_point_of_no_return_error)?;
+        // The new image's mm is used only by this process's threads (Linux's
+        // exec_mmap gives the process a new mm, and the other threads have
+        // exited): the process holds the certificate from here on, a vfork
+        // child and the initial root included.
+        self.thread_group
+            .independent_mm
+            .store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// [`Self::exec_process`] from its point of no return: discards the old
+    /// image and loads the new one.
+    fn replace_process_image(
+        &mut self,
+        executor: &mut ElfExecutor,
+        executable: (&Path, Option<Arc<File>>),
+        execfn: Option<&[u8]>,
+        image: &[u8],
+        argv: &[String],
+        envp: &[String],
+    ) -> Result<()> {
         let user_length = usize::try_from(self.memory.guest_end() - BOOT_RESERVED_END)
             .expect("guest memory length must fit usize");
+        // A vfork child's window ends at its exec, at Linux's
+        // exec_mm_release(): its changes to private memory go back to the
+        // parent before the new image replaces them, with what the provider
+        // makes of mm_release() around them; then the parent, kept inside its
+        // call, may go on. A refused write-back returns before the release;
+        // the run fails, and the parent's wait sees that failure before it
+        // returns.
+        self.end_vfork_window(executor)?;
         // Replace file-backed HVA pages before discarding the new private
         // image. Clearing the outgoing file mapping would corrupt its file.
         self.memory.retire_shared_files_for_exec()?;
@@ -2669,26 +3303,24 @@ impl KvmBackend {
 
         let argv = argv.iter().map(String::as_str).collect::<Vec<_>>();
         let envp = envp.iter().map(String::as_str).collect::<Vec<_>>();
-        let mut loaded = load_static_elf_with_execfn(
+        let (executable_path, executable_file) = executable;
+        // The image is a mapping of the file the exec opened, as the
+        // process's memory map lists it (`elf::load_static_elf_image_of`).
+        let mut loaded = load_static_elf_image_of(
             &mut self.memory,
             image,
+            executable_file.clone(),
             execfn,
             &argv,
             &envp,
             executor.cwd(),
         )?;
-        let (executable_path, executable_file) = executable;
         loaded.executable_path = executable_file
             .as_ref()
             .and_then(|file| std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).ok())
             .unwrap_or_else(|| executable_path.to_owned());
         loaded.executable_file = executable_file;
-        let thread_name = initial_thread_name(executable_path);
-        loaded.thread_name = thread_name;
-        *loaded
-            .thread_group_leader_name
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = thread_name;
+        // The loader named the new image by `execfn` (`elf::initial_thread_name`).
         loaded.stdin = self.clone_reserved_stdin()?;
         configure_long_mode(
             &mut self.memory,
@@ -2698,7 +3330,7 @@ impl KvmBackend {
             self.hypercall_instruction,
         )?;
         self.memory.enable_user_access();
-        executor.replace_after_exec(loaded);
+        executor.replace_after_exec(loaded)?;
         // An exec discards a base staged for the old image, as
         // replace_after_exec discards the executor's.
         self.clear_pending_segment();
@@ -2733,6 +3365,19 @@ impl KvmBackend {
         self.pending_segment = None;
     }
 
+    /// [`Self::read_syscall_exit_into`] into new storage, returned with the
+    /// request (for tests).
+    #[cfg(test)]
+    pub(crate) fn read_syscall_exit(
+        &self,
+        memory: &GuestMemory,
+        frame_address: u64,
+    ) -> Result<(SyscallRequest, SyscallExitRead)> {
+        let mut exit = SyscallExitRead::empty();
+        let request = self.read_syscall_exit_into(memory, frame_address, &mut exit)?;
+        Ok((request, exit))
+    }
+
     /// Reads a syscall exit's transport frame and decodes its request, as
     /// [`SyscallRequest::read_from`] does, and in the same admission also
     /// reads the trampoline's hypercall instruction, which the exit's
@@ -2740,34 +3385,35 @@ impl KvmBackend {
     /// [`SyscallExitRead`]). The frame read and its errors are exactly
     /// `read_from`'s; the extra read is only an attempt, and its failure
     /// changes nothing but leaves the boundary to copy again.
-    pub(crate) fn read_syscall_exit(
+    ///
+    /// The exit read is stored in `exit`, where the caller keeps it, rather
+    /// than returned: the same single admitted copy, with the frame copied
+    /// straight into place. Every field
+    /// of `exit` is overwritten on success; on an error it holds partial
+    /// values and the caller discards it with the error.
+    pub(crate) fn read_syscall_exit_into(
         &self,
         memory: &GuestMemory,
         frame_address: u64,
-    ) -> Result<(SyscallRequest, SyscallExitRead)> {
+        exit: &mut SyscallExitRead,
+    ) -> Result<SyscallRequest> {
         let hypercall_address = syscall_hypercall_address(
             self.hypercall_instruction,
             self.syscall_trampoline_address,
             self.syscall_frame_address,
         );
-        let mut frame = [0; FRAME_SIZE];
         let mut hypercall = [0; 3];
         let (generation, read) = memory.read_raw_and_try_read(
             frame_address,
-            &mut frame,
+            &mut exit.frame,
             hypercall_address,
             &mut hypercall,
         )?;
-        Ok((
-            SyscallRequest::from_frame(&frame),
-            SyscallExitRead {
-                frame_address,
-                frame,
-                hypercall_address,
-                hypercall: read.then_some(hypercall),
-                generation,
-            },
-        ))
+        exit.frame_address = frame_address;
+        exit.hypercall_address = hypercall_address;
+        exit.hypercall = read.then_some(hypercall);
+        exit.generation = generation;
+        Ok(SyscallRequest::from_frame(&exit.frame))
     }
 
     /// Capture one complete parent read state only after admission. The owned
@@ -2780,8 +3426,12 @@ impl KvmBackend {
     ) -> Result<Option<T>> {
         self.prepare_action_read_or_reuse(
             stop,
-            None::<(crate::entry::MappingGeneration, fn(&Self) -> Result<T>)>,
-            capture,
+            None::<(
+                crate::entry::MappingGeneration,
+                fn(&Self, &mut ()) -> Result<T>,
+            )>,
+            &mut (),
+            |backend, access, ()| capture(backend, access),
         )
         .await
     }
@@ -2795,14 +3445,19 @@ impl KvmBackend {
     /// cancellation, the copy failures checked around an admitted copy) runs
     /// in the same order as for a fresh copy. Otherwise the attempt copies,
     /// exactly as `prepare_action_read`.
-    async fn prepare_action_read_or_reuse<T, R>(
+    ///
+    /// Both `reused` and `capture` are lent `destination`, which lets a
+    /// capture write its value where the caller keeps it rather than return
+    /// it; `prepare_action_read` lends nothing.
+    async fn prepare_action_read_or_reuse<T, D, R>(
         &mut self,
         mut stop: Pin<&mut (dyn Future<Output = ()> + Send + '_)>,
         mut reused: Option<(crate::entry::MappingGeneration, R)>,
-        capture: impl Fn(&Self, &crate::memory::RawMemoryRead<'_>) -> Result<T>,
+        destination: &mut D,
+        capture: impl Fn(&Self, &crate::memory::RawMemoryRead<'_>, &mut D) -> Result<T>,
     ) -> Result<Option<T>>
     where
-        R: FnOnce(&Self) -> Result<T>,
+        R: FnOnce(&Self, &mut D) -> Result<T>,
     {
         let gate = self.memory.entry_gate();
         // The first attempt subscribes to nothing: it nearly always reads at
@@ -2833,11 +3488,14 @@ impl KvmBackend {
                 // The failures an admitted copy checks before and after it
                 // runs; the bytes themselves were copied under admission.
                 self.memory.check_copy_failures()?;
-                let value = reused(self);
+                let value = reused(self, destination);
                 self.memory.check_copy_failures()?;
                 return value.map(Some);
             }
-            if let Some(value) = self.memory.try_read_with(|access| capture(self, access))? {
+            if let Some(value) = self
+                .memory
+                .try_read_with(|access| capture(self, access, destination))?
+            {
                 return Ok(Some(value));
             }
             let Some((changed, cancelled)) = subscriptions else {
@@ -2946,11 +3604,20 @@ impl KvmBackend {
                     }
                     Ok(None) => {}
                 }
-            } else if let Some(actual) = self.try_park_process_action(phase)? {
-                // This is an owned result, not a borrowed VcpuExit. Retain it
-                // across an unpark wait and never execute this entry twice.
-                parked = Some(actual);
-                continue;
+            } else {
+                match self.try_park_process_action(phase)? {
+                    // This is an owned result, not a borrowed VcpuExit. Retain
+                    // it across an unpark wait and never execute this entry
+                    // twice.
+                    ParkAttempt::Parked(actual) => {
+                        parked = Some(actual);
+                        continue;
+                    }
+                    // Enter again at once, as the run loop does, after the
+                    // checks above: a closing gate refuses the next entry.
+                    ParkAttempt::Interrupted => continue,
+                    ParkAttempt::AdmissionClosed => {}
+                }
             }
             match futures::future::select(
                 futures::future::select(changed, cancelled),
@@ -2968,12 +3635,23 @@ impl KvmBackend {
         }
     }
 
-    fn try_park_process_action(&mut self, phase: &'static str) -> Result<Option<Result<()>>> {
-        let Some(exit) = self.vcpu.run()? else {
-            return Ok(None);
+    fn try_park_process_action(&mut self, phase: &'static str) -> Result<ParkAttempt> {
+        let exit = match self.vcpu.run() {
+            Ok(Some(exit)) => exit,
+            Ok(None) => return Ok(ParkAttempt::AdmissionClosed),
+            // A signal ended KVM_RUN before the vCPU reached its park: the
+            // reserved signal of another thread's close of admission, which
+            // kicks every running vCPU, or another. The entry left the guest
+            // where a later one resumes it.
+            Err(Error::Kvm(error)) if error.errno() == libc::EINTR => {
+                #[cfg(test)]
+                tests::entry_action_tests::observe("park_interrupted");
+                return Ok(ParkAttempt::Interrupted);
+            }
+            Err(error) => return Err(error),
         };
         Self::record_exit(self.exit_collector.as_deref(), &exit);
-        Ok(Some(match exit {
+        Ok(ParkAttempt::Parked(match exit {
             VcpuExit::Hlt => {
                 #[cfg(test)]
                 tests::entry_action_tests::observe("park_hlt");
@@ -3030,13 +3708,17 @@ impl KvmBackend {
         fault: Option<&UserTrap>,
         stop: Pin<&mut (dyn Future<Output = ()> + Send + '_)>,
     ) -> Result<Option<ForkedProcess>> {
+        // A process clone that shares the address space on Linux is the
+        // provider's vfork-style child (it admits CLONE_VM only with
+        // CLONE_VFORK), whose parent waits for its exec or exit. Like a
+        // fork's, its copy of shared-file views gets an arena and entry gate
+        // of its own (`GuestMemory::snapshot_sharing_address_space`), so the
+        // child adds no participant to this gate; the copy refuses changes to
+        // the views until the child execs, and this memory refuses another
+        // thread's changes to its views while the child's window is open. A
+        // thread created by the child is refused before any process action
+        // exists.
         let shared_file_snapshot = self.memory.contains_shared_file();
-        if shared_file_snapshot && share_address_space {
-            return Err(Error::SharedFileCapability {
-                operation: "CLONE_VM/thread creation",
-                reason: "ordinary shared-file views require one vCPU per address space",
-            });
-        }
         // Preserve the existing private-fork preparation order. For real file
         // views, duplication may fail after unmapping a child destination;
         // finish that owned snapshot/VM preparation before publishing a child
@@ -3056,12 +3738,34 @@ impl KvmBackend {
         {
             return Ok(None);
         }
-        let child_snapshot = self.snapshot_process()?;
+        // The write-back of a vfork-style child's copy
+        // (`GuestMemory::return_vfork_changes`) is exact only because the
+        // parent's memory gets no TID store after the copy: a
+        // CLONE_PARENT_SETTID store below would be undone by the copy's stale
+        // page. The provider answers every TID flag on a CLONE_VM|CLONE_VFORK
+        // clone with ENOTSUP (`validate_process_clone_flags`); lifting that
+        // must store the TID into the copy as well.
+        debug_assert!(
+            !share_address_space || (parent_tid.is_none() && child_tid.is_none()),
+            "a vfork-style child with a TID store would make its write-back inexact"
+        );
+        let child_snapshot = self.snapshot_process(share_address_space)?;
+        if share_address_space && executor.has_live_sibling_thread() {
+            // Another thread of the parent may change the parent's memory
+            // during the window: only the child's own changes may go back.
+            child_snapshot.memory.keep_vfork_baseline()?;
+        }
         if !shared_file_snapshot {
             write_tid_best_effort(&mut self.memory, parent_tid, child_pid);
         }
 
         let mut child = Self::from_process_snapshot(child_snapshot)?;
+        if !share_address_space {
+            // The Linux provider makes the forked child's mappings as
+            // `dup_mmap` does: the stack window's inherited mappings kept
+            // apart, and none locked.
+            ElfExecutor::inherit_mappings_in_forked_child(&child.memory)?;
+        }
         if let Some(child_executor) = prepared_executor.as_mut() {
             child_executor.set_clear_child_tid(clear_child_tid);
         }
@@ -3105,7 +3809,8 @@ impl KvmBackend {
         let mut child_executor = match prepared_executor {
             Some(child) => child,
             None => {
-                let mut child_executor = executor.fork_child(child_pid, clear_sighand, false)?;
+                let mut child_executor =
+                    executor.fork_child(child_pid, clear_sighand, share_address_space)?;
                 #[cfg(test)]
                 tests::entry_action_tests::observe("fork_executor");
                 child_executor.set_clear_child_tid(clear_child_tid);
@@ -3119,10 +3824,14 @@ impl KvmBackend {
         // guest mm. The legacy vfork path also creates a backend snapshot, so
         // distinct host mappings alone cannot confer this certificate. Never
         // recover a revoked parent certificate from a guessed join condition.
-        child.independent_process_mm = !share_address_space;
-        if share_address_space {
-            self.independent_process_mm = false;
-        }
+        // A CLONE_VM (vfork) child shares this mm until its window ends; the
+        // last-user decision refuses the certificate while the window is open
+        // (`GuestMemory::vfork_window_open`), and it holds again once the
+        // child has exec'd or exited, as Linux's mm_users falls back then.
+        child
+            .thread_group
+            .independent_mm
+            .store(!share_address_space, Ordering::Release);
         if shared_file_snapshot {
             // Child TID may itself lie in a shared file, so neither TID store
             // precedes fallible VM setup or descriptor/lifecycle preparation.
@@ -3156,13 +3865,16 @@ impl KvmBackend {
         stdout: Vec<u8>,
         stderr: Vec<u8>,
     ) -> Result<ForkedProcessCompletion> {
-        // A process clone has a private snapshot, so no surviving task can
-        // observe this clear; preserve the child-side ABI.
-        write_tid_best_effort(
-            &mut child.backend.memory,
-            child.executor.take_clear_child_tid(),
-            0,
-        );
+        // A vfork child that did not exec ends its window here, with Linux's
+        // mm_release(): its changes to private memory, and what the provider
+        // makes of its clear_child_tid word, reach the parent before the
+        // parent's call returns.
+        if !child.backend.end_vfork_window(&mut child.executor)? {
+            // A process clone has a private snapshot, so no surviving task
+            // can observe this clear; preserve the child-side ABI.
+            let clear_child_tid = child.executor.take_clear_child_tid();
+            write_tid_best_effort(&mut child.backend.memory, clear_child_tid, 0);
+        }
         child.backend.check_entry_owner()?;
         let family = child.executor.claim_process_family_exit()?;
         let snapshot = match family {
@@ -3465,7 +4177,7 @@ impl KvmBackend {
                 let returning = completion_notice.returning.clone();
                 #[cfg(test)]
                 tests::entry_action_tests::observe("host_spawn");
-                let handle = std::thread::Builder::new()
+                let handle = crate::supervisor_thread::builder()
                     .name(format!("reverie-kvm-guest-{child_tid}"))
                     .spawn(move || {
                         let _completion_notice = completion_notice;
@@ -3937,10 +4649,16 @@ impl KvmBackend {
                     crate::executor::ChildProcessPanicOwner::new(failure.run.clone())
                 });
                 let child_panic_owner = panic_owner.clone();
+                let mut child = child;
+                let vfork_released = share_address_space.then(|| {
+                    let (release, released) = futures::channel::oneshot::channel();
+                    child.backend.vfork_release = Some(release);
+                    released
+                });
                 let (start_sender, start_receiver) = std::sync::mpsc::channel();
                 let start_gate = ChildStartGate::new(start_sender);
                 let handle = ChildThread::spawn_owned(
-                    std::thread::Builder::new()
+                    crate::supervisor_thread::builder()
                         .name(format!("reverie-kvm-process-{raw_child_pid}")),
                     (
                         child,
@@ -4113,6 +4831,7 @@ impl KvmBackend {
                         raw_child_pid,
                         start_gate.clone(),
                     ));
+                let vfork_start = vfork_released.is_some().then(|| start_gate.clone());
                 executor.register_child_process_with_panic_owner(
                     raw_child_pid,
                     start_gate,
@@ -4131,6 +4850,70 @@ impl KvmBackend {
                         i64::from(raw_child_pid),
                         None,
                     )?;
+                }
+                if let (Some(released), Some(start)) = (vfork_released, vfork_start) {
+                    // Linux keeps a CLONE_VFORK caller inside its call until
+                    // the child execs or exits (`wait_for_vfork_done()`), as
+                    // reverie-ptrace's kernel does. So the child starts now,
+                    // while this call is pending, and registers before the
+                    // call returns; the gate's later start by the callback's
+                    // driver is a no-op. The child ends the wait once its
+                    // changes to private memory went back to this parent
+                    // (`release_vfork_parent`), or as its backend goes away
+                    // (a child that cannot start drops it at once). A run
+                    // failure ends the wait too.
+                    //
+                    // The wait is killable on Linux (`TASK_KILLABLE`): another
+                    // thread's exec or group exit, or a peer's failure, kills
+                    // a caller still waiting, and the child runs on. So the
+                    // wait also ends when this thread's group cancels it or
+                    // begins to exit, and the caller retires without a result.
+                    // The child stays registered with this executor, which
+                    // hands it to the process as this thread finishes
+                    // (`transfer_child_processes_to_owner`), as Linux reparents
+                    // a dead thread's children to a live thread of its group.
+                    // Its changes no longer reach a parent that execs (the
+                    // copy's exec count, `return_vfork_changes`).
+                    let _ = start.start();
+                    let mut released = released;
+                    loop {
+                        // Subscribe before rechecking, so a cancellation
+                        // published after the check still wakes this wait.
+                        let cancellation = self.entry_cancellation();
+                        if self.guest_thread_group_exit_status().is_some()
+                            || self.guest_thread_is_cancelled()
+                        {
+                            return Ok(ProcessActionOutcome::cancelled());
+                        }
+                        match futures::future::select(
+                            futures::future::select(&mut released, cancellation),
+                            stop.as_mut(),
+                        )
+                        .await
+                        {
+                            // A child whose write-back was refused publishes
+                            // the run's failure before its release or the
+                            // drop of its sender, so a release that comes
+                            // with that failure returns no result.
+                            futures::future::Either::Left((
+                                futures::future::Either::Left(_),
+                                _,
+                            )) => {
+                                if stop.as_mut().now_or_never().is_some() {
+                                    return Ok(ProcessActionOutcome::cancelled());
+                                }
+                                break;
+                            }
+                            // A wake only asks for another check.
+                            futures::future::Either::Left((
+                                futures::future::Either::Right(_),
+                                _,
+                            )) => continue,
+                            futures::future::Either::Right(_) => {
+                                return Ok(ProcessActionOutcome::cancelled());
+                            }
+                        }
+                    }
                 }
                 Ok(ProcessActionOutcome::returned(i64::from(raw_child_pid)))
             }
@@ -4272,7 +5055,8 @@ impl KvmBackend {
                 #[cfg(test)]
                 tests::entry_action_tests::observe("tool_spawn");
                 let handle = crate::failure::spawn_owned(
-                    std::thread::Builder::new().name(format!("reverie-kvm-guest-{child_tid}")),
+                    crate::supervisor_thread::builder()
+                        .name(format!("reverie-kvm-guest-{child_tid}")),
                     (
                         child,
                         child_executor,
@@ -4606,6 +5390,219 @@ impl KvmBackend {
             .map(ToolInstructionBoundary::Timestamp))
     }
 
+    /// The thread's due timer request, taken for `Tool::handle_timer_event`
+    /// at the user instruction boundary where the vCPU is stopped, or None.
+    /// Read before each entry; with no request due it reads nothing and
+    /// issues no syscall.
+    ///
+    /// Only a vCPU stopped in user mode (a CPL 3 code segment) stands at a
+    /// user instruction boundary: an exit that interrupts the guest there
+    /// (a kick) stops it between two instructions, and the callback sees the
+    /// live registers. A syscall's exit, `rt_sigreturn`'s included, delivers a
+    /// request it finds due at the syscall's return instead (see
+    /// [`Self::syscall_return_timer_boundary`]), and an exit whose Tool
+    /// callback ran cancelled the request it found outstanding before that
+    /// callback. So a request found due anywhere else was found by a kick
+    /// that stopped the guest in ring 0, in the syscall trampoline or in an
+    /// exception stub. It is armed again at its target (a late precise one as
+    /// an imprecise one, see [`crate::preemption_timer::TimerState::defer_due`]),
+    /// so the next entry has the timer overflow at the earliest count past
+    /// the clock, and the exit that follows decides it then.
+    pub(crate) fn timer_instruction_boundary(&mut self) -> Result<Option<ToolInstructionBoundary>> {
+        let Some(due) = self.vcpu.timer_due() else {
+            return Ok(None);
+        };
+        let special = self.vcpu.get_sregs()?;
+        if special.cs.dpl != 3 {
+            self.vcpu.defer_due_timer();
+            return Ok(None);
+        }
+        let registers = self.vcpu.get_regs()?;
+        self.vcpu.take_due_timer();
+        Ok(Some(ToolInstructionBoundary::Timer(InstructionBoundary {
+            registers,
+            instruction: due,
+            special_registers: special,
+            code_segment: special.cs.selector,
+            stack_segment: special.ss.selector,
+        })))
+    }
+
+    /// The thread's due timer request, taken for `Tool::handle_timer_event`
+    /// at the return of the syscall whose exit found it due, or None. With no
+    /// request due it issues no syscall. The syscall made no Tool callback,
+    /// which would have cancelled the request, and it has completed: the
+    /// callback sees `returned`, the user registers the guest resumes with
+    /// (see `process_syscall_return_registers`), in user mode. The vCPU itself
+    /// waits in the ring-0 trampoline, which returns the guest to them on the
+    /// next entry. Delivering here, rather than at a later kick in user mode,
+    /// keeps a guest that makes syscalls faster than a kick lands from
+    /// postponing the event to its last one.
+    pub(crate) fn syscall_return_timer_boundary(
+        &mut self,
+        returned: kvm_regs,
+    ) -> Result<Option<ToolInstructionBoundary>> {
+        let Some(due) = self.vcpu.timer_due() else {
+            return Ok(None);
+        };
+        let special = self.vcpu.get_sregs()?;
+        self.vcpu.take_due_timer();
+        Ok(Some(ToolInstructionBoundary::Timer(InstructionBoundary {
+            registers: returned,
+            instruction: due,
+            special_registers: special,
+            code_segment: crate::signal::USER_CODE_SELECTOR,
+            stack_segment: crate::signal::USER_DATA_SELECTOR,
+        })))
+    }
+
+    /// Sets up the next entry for an armed precise timer request within its
+    /// stepping window (see `preemption_timer.rs`); outside it, the entry
+    /// runs unstepped and nothing is read. Each entry either single-steps one
+    /// user instruction, runs unstepped to a user instruction where a
+    /// breakpoint takes the guest back, or runs unstepped to an exit that
+    /// comes before any user instruction can retire a branch:
+    /// - In user mode the instruction at RIP decides (see
+    ///   [`crate::step_filter::classify`]); an instruction the steps cannot
+    ///   run is refused by name.
+    /// - In the syscall trampoline at its VMCALL, the entry runs to the user
+    ///   instruction the trampoline returns to, which the syscall frame
+    ///   names: the return of a syscall that made no Tool callback has no
+    ///   exit of its own. A host interrupt that stops the trampoline on its
+    ///   way back keeps that run.
+    /// - Anywhere else in ring 0 (the trampoline before its VMCALL, an
+    ///   exception stub before its HLT) it runs unstepped: that exit comes
+    ///   first.
+    pub(crate) fn prepare_timer_steps(&mut self) -> Result<()> {
+        if !self.vcpu.timer_stepping() {
+            self.trampoline_return = None;
+            return Ok(());
+        }
+        if let Some(collector) = self.exit_collector.as_deref() {
+            collector.record_timer_window_entry();
+        }
+        let special = self.vcpu.get_sregs()?;
+        let registers = self.vcpu.get_regs()?;
+        let mode = if special.cs.dpl == 3 {
+            self.trampoline_return = None;
+            // Outside a single step, RFLAGS shows the guest's own trap flag,
+            // which a POPF whose run a host interrupt ended, or an
+            // `rt_sigreturn`, may have loaded: it is refused at every
+            // user-mode entry in the window, whatever runs next.
+            if self.vcpu.last_step_mode().0 != StepMode::Step && registers.rflags & TRAP_FLAG != 0 {
+                return Err(refused_while_stepping(
+                    "sets its own trap flag",
+                    registers.rip,
+                ));
+            }
+            let mut code = crate::step_filter::InstructionBytes::default();
+            let fetched = crate::timestamp::fetch_user_code(
+                &self.memory,
+                special.cr3,
+                registers.rip,
+                &mut code.0[..crate::step_filter::MAX_INSTRUCTION_BYTES],
+            );
+            match crate::step_filter::classify(&code.0[..fetched], registers.rip) {
+                StepClass::Step => StepMode::Step,
+                StepClass::RunOver { length } => StepMode::RunTo(registers.rip + length),
+                StepClass::Unstepped => StepMode::Off,
+                StepClass::Refused(what) => {
+                    return Err(refused_while_stepping(what, registers.rip));
+                }
+            }
+        } else {
+            let hypercall = syscall_hypercall_address(
+                self.hypercall_instruction,
+                self.syscall_trampoline_address,
+                self.syscall_frame_address,
+            );
+            if [
+                hypercall,
+                hypercall + self.hypercall_instruction.len() as u64,
+            ]
+            .contains(&registers.rip)
+            {
+                self.trampoline_return = Some(crate::bootstrap::breakpoint_staged_return(
+                    &self.memory,
+                    self.syscall_frame_address,
+                )?);
+            }
+            self.trampoline_return
+                .map_or(StepMode::Off, StepMode::RunTo)
+        };
+        self.vcpu.step_next_entry(mode);
+        Ok(())
+    }
+
+    /// Finishes the `Debug` exit of an entry that `prepare_timer_steps` set
+    /// up: a single step's (DR6.BS), or a breakpoint's at the address the
+    /// entry ran to (DR6.B0). The guest's own trap flag, which a run to a
+    /// breakpoint leaves in RFLAGS (loaded by POPF or `rt_sigreturn`), is
+    /// refused by name, found there or trapping first. Any other is refused.
+    pub(crate) fn finish_timer_step(
+        &mut self,
+        debug: kvm_bindings::kvm_debug_exit_arch,
+    ) -> Result<()> {
+        const SINGLE_STEP: u64 = 1 << 14;
+        const BREAKPOINT_0: u64 = 1;
+        match self.vcpu.last_step_mode().0 {
+            StepMode::Step if debug.dr6 & SINGLE_STEP != 0 => Ok(()),
+            StepMode::RunTo(address) if debug.dr6 & BREAKPOINT_0 != 0 && debug.pc == address => {
+                if self.trampoline_return == Some(address) {
+                    self.trampoline_return = None;
+                }
+                if self.vcpu.get_regs()?.rflags & TRAP_FLAG != 0 {
+                    return Err(refused_while_stepping("sets its own trap flag", address));
+                }
+                Ok(())
+            }
+            StepMode::RunTo(_) if debug.dr6 & SINGLE_STEP != 0 => {
+                Err(refused_while_stepping("sets its own trap flag", debug.pc))
+            }
+            _ => Err(Error::UnexpectedVcpuExit(format!(
+                "debug exit outside a timer step: {debug:?}"
+            ))),
+        }
+    }
+
+    /// Notes an entry that a host signal interrupted: a stepped entry that
+    /// stopped in ring 0 had its instruction fault, and the frame its
+    /// exception stub halts with keeps the step's trap flag until then (see
+    /// [`crate::preemption_timer::SteppedFault`]).
+    pub(crate) fn note_interrupted_entry(&mut self) -> Result<()> {
+        if self.vcpu.last_step_mode().1 {
+            let in_ring_0 = self.vcpu.get_sregs()?.cs.dpl == 0;
+            self.stepped_fault.interrupted(in_ring_0);
+        }
+        Ok(())
+    }
+
+    /// Clears the trap flag a single step left in the frame of the exception
+    /// that ended it, before anything reads or resumes that frame: the CPU
+    /// pushed RFLAGS with the step's TF, which is not the guest's. The
+    /// exception (a page fault, a general protection fault, ...) is the
+    /// guest's own and reaches the Tool as before, which cancels the timer
+    /// request. Does nothing for a frame no step pushed.
+    pub(crate) fn scrub_stepped_exception_frame(&mut self) -> Result<()> {
+        if !self
+            .stepped_fault
+            .take_at_halt(self.vcpu.last_step_mode().1)
+        {
+            return Ok(());
+        }
+        let halted = self.vcpu.get_regs()?;
+        let Some(vector) = exception_from_halt(halted.rip) else {
+            return Ok(());
+        };
+        // An optional error code, then RIP, CS, RFLAGS, RSP and SS.
+        let first = u64::from(exception_pushes_error_code(vector));
+        let address = halted.rsp + (first + 2) * std::mem::size_of::<u64>() as u64;
+        let mut flags = [0; std::mem::size_of::<u64>()];
+        self.memory.read_raw(address, &mut flags)?;
+        let flags = u64::from_le_bytes(flags) & !TRAP_FLAG;
+        self.memory.write_raw(address, &flags.to_le_bytes())
+    }
+
     fn cpuid_instruction_exception(&self) -> Result<Option<CpuidBoundary>> {
         if !self.cpuid_interception.enabled() {
             return Ok(None);
@@ -4769,6 +5766,9 @@ impl KvmBackend {
                 .ok_or_else(|| Error::UnexpectedVcpuExit("CPUID RIP overflow".to_owned()))?;
                 self.resume_instruction_registers(boundary, registers)
             }
+            // The guest resumes where the timer event found it: nothing of
+            // its register file was replaced, and the next entry runs it on.
+            (ToolInstructionBoundary::Timer(_), ToolInstructionResult::Timer) => Ok(()),
             _ => Err(Error::UnexpectedVcpuExit(
                 "instruction callback result kind changed".to_owned(),
             )),
@@ -4943,7 +5943,7 @@ impl KvmBackend {
         executor: &mut ElfExecutor,
         syscall_frame_address: u64,
         result: i64,
-    ) -> Result<bool> {
+    ) -> Result<Option<kvm_regs>> {
         let interrupted = process_syscall_return_registers(
             &self.memory,
             self.vcpu.get_regs()?,
@@ -4954,32 +5954,64 @@ impl KvmBackend {
         self.deliver_pending_signal_from_registers(executor, syscall_frame_address, interrupted)
     }
 
+    /// Delivers every eligible pending signal at the return through the
+    /// syscall frame at `syscall_frame_address`, with `interrupted` as the
+    /// interrupted context, and returns the registers the last frame's
+    /// handler starts with. When none is delivered, a temporary-mask call's
+    /// saved mask is put back (`restore_saved_sigmask`).
     pub(crate) fn deliver_pending_signal_from_registers(
         &mut self,
         executor: &mut ElfExecutor,
         syscall_frame_address: u64,
         interrupted: kvm_bindings::kvm_regs,
-    ) -> Result<bool> {
-        let delivered = loop {
+    ) -> Result<Option<kvm_regs>> {
+        let delivered = self.deliver_pending_signals(
+            executor,
+            interrupted,
+            HandlerEntry::SyscallFrame(syscall_frame_address),
+        )?;
+        if delivered.is_none() {
+            executor.restore_saved_signal_mask();
+        }
+        Ok(delivered)
+    }
+
+    /// Linux's `exit_to_user_mode_loop` for a backend run with no Tool: while
+    /// a signal the mask leaves unblocked is pending, selects one, discards it
+    /// if it is ignored, and otherwise builds its frame (see
+    /// [`Self::deliver_selected_signal_at_boundary`]). Each frame goes on top
+    /// of the last: its interrupted context is the previous frame's handler
+    /// at its first instruction, and its selection sees the mask that
+    /// delivery left. Returns the registers the last frame's handler starts
+    /// with, or `None` when no frame was built. A signal whose default action
+    /// ends the thread or its group ends the loop with that exit pending.
+    pub(crate) fn deliver_pending_signals(
+        &mut self,
+        executor: &mut ElfExecutor,
+        mut interrupted: kvm_regs,
+        mut entry: HandlerEntry<'_>,
+    ) -> Result<Option<kvm_regs>> {
+        let mut delivered = None;
+        for _ in 0..SIGNAL_SELECTIONS_PER_RETURN {
+            if executor.has_pending_exit() {
+                break;
+            }
             let Some(pending) = executor
                 .take_pending_signal_for_delivery()
                 .map_err(|errno| Error::Reverie(errno.into()))?
             else {
-                break false;
+                break;
             };
-
             if executor.signal_disposition(pending.event.signal()) == SignalDisposition::Ignore {
                 continue;
             }
-            break self.deliver_selected_signal_from_registers(
-                executor,
-                syscall_frame_address,
-                interrupted,
-                pending,
-            )?;
-        };
-        if !delivered {
-            executor.restore_saved_signal_mask();
+            if let Some(handler) =
+                self.deliver_selected_signal_at_boundary(executor, interrupted, pending, entry)?
+            {
+                delivered = Some(handler);
+                interrupted = handler;
+                entry = entry.stacked();
+            }
         }
         Ok(delivered)
     }
@@ -4990,30 +6022,29 @@ impl KvmBackend {
         syscall_frame_address: u64,
         interrupted: kvm_bindings::kvm_regs,
         pending: crate::executor::PendingSignal,
-    ) -> Result<bool> {
+    ) -> Result<Option<kvm_regs>> {
         self.deliver_selected_signal_at_boundary(
             executor,
-            syscall_frame_address,
             interrupted,
             pending,
-            None,
-            false,
+            HandlerEntry::SyscallFrame(syscall_frame_address),
         )
     }
 
+    /// Builds the frame of a fault's own signal, which resumes the vCPU in
+    /// user mode at its handler; a frame built on top of it then enters its
+    /// handler at that user boundary ([`HandlerEntry::UserBoundary`]).
     pub(crate) fn deliver_user_trap(
         &mut self,
         executor: &mut ElfExecutor,
         fault: &UserTrap,
         pending: crate::executor::PendingSignal,
-    ) -> Result<bool> {
+    ) -> Result<Option<kvm_regs>> {
         self.deliver_selected_signal_at_boundary(
             executor,
-            self.syscall_frame_address,
             fault.registers,
             pending,
-            Some(fault),
-            false,
+            HandlerEntry::Fault(fault),
         )
     }
 
@@ -5025,37 +6056,116 @@ impl KvmBackend {
         executor: &mut ElfExecutor,
         interrupted: kvm_regs,
         pending: crate::executor::PendingSignal,
-    ) -> Result<bool> {
+    ) -> Result<Option<kvm_regs>> {
+        self.check_unstarted_clone()?;
+        self.deliver_selected_signal_at_boundary(
+            executor,
+            interrupted,
+            pending,
+            HandlerEntry::UserBoundary,
+        )
+    }
+
+    /// Fails unless this vCPU is an unstarted clone's, with a complete user
+    /// continuation (see [`Self::deliver_selected_signal_before_thread_entry`]).
+    fn check_unstarted_clone(&self) -> Result<()> {
         if !self.is_guest_thread || self.vcpu.get_sregs()?.cs.dpl != 3 {
             return Err(Error::UnexpectedVcpuExit(
                 "thread-entry signal requires an unstarted clone user continuation".to_owned(),
             ));
         }
+        Ok(())
+    }
+
+    /// Whether a signal can be delivered where a timer event's callback found
+    /// the vCPU, at a user instruction boundary (see
+    /// [`Self::timer_instruction_boundary`]): still in user mode, with no
+    /// event that KVM has yet to inject. A host interrupt can end an entry
+    /// while the CPU delivers an exception to its stub; the guest then stands
+    /// at the faulting instruction, and the next entry delivers the exception.
+    /// Moving the guest to a handler there would deliver that exception at the
+    /// handler instead, so the selection waits for the first user boundary
+    /// with no event left to inject, which that exception's own boundary
+    /// leaves (see `KvmBackend::deliver_signal_at_timer_boundary`).
+    pub(crate) fn timer_boundary_takes_signal(&self) -> Result<bool> {
+        if self.vcpu.get_sregs()?.cs.dpl != 3 {
+            return Ok(false);
+        }
+        let events = self.vcpu.get_vcpu_events()?;
+        Ok(events.exception.injected == 0
+            && events.exception.pending == 0
+            && events.interrupt.injected == 0
+            && events.nmi.injected == 0
+            && events.nmi.pending == 0)
+    }
+
+    /// The complete user registers of a vCPU that stands at a user
+    /// instruction boundary, as a Tool callback there sees them: `registers`
+    /// with `orig_rax`, and the segment selectors and the FS and GS bases the
+    /// vCPU holds (an unstarted clone, or a timer event's boundary).
+    pub(crate) fn user_boundary_registers(
+        &self,
+        registers: kvm_regs,
+        orig_rax: u64,
+    ) -> Result<libc::user_regs_struct> {
+        let special = self.vcpu.get_sregs()?;
+        Ok(user_registers_with_segments(
+            registers,
+            orig_rax,
+            &special,
+            special.cs.selector,
+            special.ss.selector,
+        ))
+    }
+
+    /// Delivers `pending` at the user instruction boundary where a timer
+    /// event's callback found the vCPU (see
+    /// [`Self::timer_boundary_takes_signal`]), with `interrupted`, the live
+    /// user registers, as the interrupted context. This is no syscall's
+    /// return, so nothing restarts, as on Linux's return to user mode from
+    /// the interrupt that preempts a thread, which enters with `orig_ax` -1.
+    /// Like an unstarted clone's, the vCPU's continuation is changed directly.
+    pub(crate) fn deliver_selected_signal_at_timer_boundary(
+        &mut self,
+        executor: &mut ElfExecutor,
+        interrupted: kvm_regs,
+        pending: crate::executor::PendingSignal,
+    ) -> Result<Option<kvm_regs>> {
         self.deliver_selected_signal_at_boundary(
             executor,
-            self.syscall_frame_address,
             interrupted,
             pending,
-            None,
-            true,
+            HandlerEntry::UserBoundary,
         )
     }
 
-    fn deliver_selected_signal_at_boundary(
+    /// Builds `pending`'s signal frame for `interrupted` and resumes the guest
+    /// at its handler as `entry` says, as Linux's `handle_signal` does.
+    /// Returns the registers the handler starts with, or `None` when the
+    /// signal is ignored or ends the thread group (its default action, or the
+    /// SIGSEGV Linux forces when it cannot build the frame), with that exit
+    /// pending.
+    ///
+    /// Every delivery point builds its frames here, one for each signal it
+    /// selects at the same return. A frame built on top of another has that
+    /// frame's handler at its first instruction as `interrupted`: rip the
+    /// handler, rsp its frame, its three arguments, rax 0 and the FPU state the
+    /// previous delivery installed. Nothing restarts there: Linux's next
+    /// `handle_signal` finds `regs->ax` 0, which `x64_setup_rt_frame` set, so
+    /// `syscall_get_error` reports no error.
+    pub(crate) fn deliver_selected_signal_at_boundary(
         &mut self,
         executor: &mut ElfExecutor,
-        syscall_frame_address: u64,
         interrupted: kvm_regs,
         pending: crate::executor::PendingSignal,
-        fault: Option<&UserTrap>,
-        thread_entry: bool,
-    ) -> Result<bool> {
+        entry: HandlerEntry<'_>,
+    ) -> Result<Option<kvm_regs>> {
         let signal = pending.event.signal();
         match executor.signal_disposition(signal) {
-            SignalDisposition::Ignore => return Ok(false),
+            SignalDisposition::Ignore => return Ok(None),
             SignalDisposition::Terminate => {
                 executor.force_signal_exit(signal);
-                return Ok(false);
+                return Ok(None);
             }
             SignalDisposition::Stop => {
                 return Err(Error::UnexpectedVcpuExit(format!(
@@ -5069,29 +6179,29 @@ impl KvmBackend {
         if action.flags & SA_RESTORER == 0 || action.handler == 0 || action.handler >= (1_u64 << 47)
         {
             executor.force_signal_exit(libc::SIGSEGV);
-            return Ok(false);
+            return Ok(None);
         }
-        let altstack = executor.signal_altstack(interrupted.rsp);
-        let (stack_top, lower_bound, reserve_red_zone, autodisarm) =
+        let altstack = executor.signal_altstack();
+        let (stack_top, lower_bound, reserve_red_zone) =
             match executor.signal_stack_top(action, interrupted.rsp) {
                 Ok(stack) => stack,
                 Err(_) => {
                     executor.force_signal_exit(libc::SIGSEGV);
-                    return Ok(false);
+                    return Ok(None);
                 }
             };
         let layout = match SignalFrameLayout::below(stack_top, reserve_red_zone) {
             Ok(layout) => layout,
             Err(_) => {
                 executor.force_signal_exit(libc::SIGSEGV);
-                return Ok(false);
+                return Ok(None);
             }
         };
         if lower_bound.is_some_and(|lower_bound| !layout.fits_above(lower_bound)) {
             executor.force_signal_exit(libc::SIGSEGV);
-            return Ok(false);
+            return Ok(None);
         }
-        let xsave = if let Some(fault) = fault {
+        let xsave = if let HandlerEntry::Fault(fault) = entry {
             XsaveImage::from_kvm(&fault.xsave)
         } else {
             XsaveImage::from_kvm(&self.vcpu.get_xsave()?)
@@ -5099,12 +6209,15 @@ impl KvmBackend {
         // A temporary-mask call's saved mask, else the current one.
         let saved_mask = executor.frame_signal_mask();
         let mut mcontext = Sigcontext::from_kvm(interrupted, layout.xsave_address, saved_mask);
-        if let Some(fault) = fault {
+        // The thread's last trap, which every frame saves, not only the
+        // fault's own (see `SignalTrapFields`).
+        let trap = executor.signal_trap_fields();
+        mcontext.trapno = trap.trapno;
+        mcontext.err = trap.error_code;
+        mcontext.cr2 = trap.cr2;
+        if let HandlerEntry::Fault(fault) = entry {
             mcontext.cs = fault.code_segment;
             mcontext.ss = fault.stack_segment;
-            mcontext.err = fault.error_code;
-            mcontext.trapno = fault.vector.into();
-            mcontext.cr2 = fault.address;
         }
         let frame = RtSigframe {
             pretcode: action.restorer,
@@ -5129,7 +6242,7 @@ impl KvmBackend {
                 .is_err()
         {
             executor.force_signal_exit(libc::SIGSEGV);
-            return Ok(false);
+            return Ok(None);
         }
 
         let mut handler = interrupted;
@@ -5140,73 +6253,157 @@ impl KvmBackend {
         handler.rip = action.handler;
         handler.rsp = layout.frame_address;
         handler.rflags &= !((1 << 8) | (1 << 10) | (1 << 16));
-        if let Some(fault) = fault {
-            fault.resume_user(self, handler)?;
-        } else if thread_entry {
-            self.vcpu.set_regs(&handler)?;
-        } else {
-            stage_process_syscall_return(
+        match entry {
+            HandlerEntry::Fault(fault) => fault.resume_user(self, handler)?,
+            HandlerEntry::UserBoundary => self.vcpu.set_regs(&handler)?,
+            HandlerEntry::SyscallFrame(syscall_frame_address) => stage_process_syscall_return(
                 &mut self.memory,
                 &self.vcpu,
                 syscall_frame_address,
                 handler,
-            )?;
+            )?,
         }
-        executor.enter_signal_handler(pending, action, autodisarm);
-        Ok(true)
+        // The frame holds the interrupted FPU state. As Linux's handle_signal
+        // does with fpu__clear_user_states, the handler then starts in the
+        // initial state; rt_sigreturn restores the frame's. A frame built on
+        // top of this one saves that initial state.
+        // SAFETY: the fixed KVM CPUID policy limits the vCPU's XSAVE state to
+        // the x87, SSE and YMM components, which kvm_xsave holds.
+        unsafe { self.vcpu.set_xsave(&XsaveImage::initialized_kvm())? };
+        // The mask the handler runs under, which the next selection at this
+        // return sees, and the disarm of an SS_AUTODISARM stack after every
+        // delivery, which a frame on top sees.
+        executor.enter_signal_handler(pending, action);
+        Ok(Some(handler))
     }
 
+    /// A process killed by a signal drops its clear_child_tid registration
+    /// unwritten, unless the end of a vfork window holds it; the Linux
+    /// provider decides (`ElfExecutor::drop_clear_child_tid_at_fatal_signal`).
     pub(crate) fn discard_process_clear_tid_at_signal_return(&self, executor: &mut ElfExecutor) {
         if !self.is_guest_thread {
-            let _ = executor.take_clear_child_tid();
+            executor.drop_clear_child_tid_at_fatal_signal(&self.memory);
         }
     }
 
-    /// Clears a CLONE_THREAD worker's CLONE_CHILD_CLEARTID word before the
-    /// worker's non-group terminal signal-boundary receipt is published.
+    /// Clears a thread's CLONE_CHILD_CLEARTID word before its non-group
+    /// terminal signal-boundary receipt is published: a CLONE_THREAD worker's,
+    /// and a process leader's that exits by itself (`pthread_exit` of the main
+    /// thread) while other threads of its process may live.
     ///
     /// Linux clears and wakes this word in `mm_release`, called from `exit_mm`,
-    /// before `exit_notify` makes the task's death observable. A receipt is
-    /// how a Tool observes that death; Detcore, for example, retires the task
-    /// and wakes a `pthread_join` waiter from it. If the clear waited for
-    /// `finish_tool_process`, the woken joiner would read the stale TID and
-    /// retry `FUTEX_WAIT` a host-timing-dependent number of times.
+    /// before `exit_notify` makes the task's death observable, for a leader as
+    /// for any other thread. A receipt is how a Tool observes that death, and
+    /// a Tool that schedules the guest's threads may let a `pthread_join`
+    /// waiter run from it. If the clear waited for `finish_tool_process`, the
+    /// woken joiner would read the stale TID and retry `FUTEX_WAIT` a
+    /// host-timing-dependent number of times, or wait for a wake that comes
+    /// only when the whole process finishes.
     ///
     /// The clear consumes the registered address, so the later call in
-    /// `finish_tool_process` does nothing. A process leader keeps its existing
-    /// discard-or-clear policy at the signal-return and finish sites.
-    pub(crate) fn clear_worker_tid_before_terminal_receipt(&mut self, executor: &mut ElfExecutor) {
-        if self.is_guest_thread {
-            self.clear_registered_worker_tid_before_exit(executor);
-        }
+    /// `finish_tool_process` does nothing. Only a thread's own exit has a
+    /// non-group receipt: a process killed by a signal keeps its discard
+    /// policy at the signal-return site.
+    pub(crate) fn clear_thread_tid_before_terminal_receipt(&mut self, executor: &mut ElfExecutor) {
+        self.clear_registered_worker_tid_before_exit(executor, false);
     }
 
-    pub(crate) fn clear_registered_worker_tid_before_exit(&mut self, executor: &mut ElfExecutor) {
+    /// `group` is whether the thread dies in its group's exit (exit_group, a
+    /// fatal signal, a peer's exit_group, or its Tool's retirement of it);
+    /// otherwise it exits by itself (or its run failed).
+    pub(crate) fn clear_registered_worker_tid_before_exit(
+        &mut self,
+        executor: &mut ElfExecutor,
+        group: bool,
+    ) {
         #[cfg(test)]
         clear_tid_diagnostic::begin();
+        // The thread has made its last guest-visible change. Before anything
+        // makes its exit observable (the store and wake below, a terminal
+        // receipt, a Tool's deregistration), it stops counting as a user of
+        // the address space, so a sibling that sees the exit sees that too:
+        // the last-user decision below and a later fork's do not depend on
+        // when this host thread finishes tearing down. Whether it was the
+        // last user is answered under the same hold of the gate's lock that
+        // retires it, so of two threads exiting at once exactly one finds
+        // the other still live, as of two tasks only the second to reach
+        // exit_mm can find mm_users at 1.
+        #[cfg(test)]
+        clear_tid_last_user_hold::before_retirement(
+            self.is_guest_thread,
+            || self.thread_group.retired_by_tool_beside_live(),
+            || self.vcpu.is_sole_participant(),
+        );
+        let last_at_retirement = self.vcpu.retire_participant_from_guest();
+        #[cfg(test)]
+        clear_tid_last_user_hold::after_retirement(
+            group,
+            || self.vcpu.is_sole_participant(),
+            || self.thread_group.exit_status().is_some(),
+        );
         self.release_thread_slot();
+        if executor.vfork_window_holds_clear_child_tid(&self.memory) {
+            // A vfork child's word lies in memory its parent shares: the end
+            // of its window releases it (`release_vfork_mm`).
+            #[cfg(test)]
+            clear_tid_diagnostic::stopped("vfork child's window end clears it");
+            return;
+        }
         let Some(address) = executor.take_clear_child_tid() else {
             #[cfg(test)]
             clear_tid_diagnostic::stopped("no registered address");
             return;
         };
         debug_assert!(self.thread_slot.is_none());
-        if self.independent_process_mm
-            && !self.is_guest_thread
-            && self.memory.contains_shared_file()
-            && self.memory.entry_gate().single_member_domain_active()
+        // Whether this thread is the address space's last user. A thread that
+        // dies in its group's exit takes the answer recorded when that exit
+        // was first published (`publish_group_exit`): Linux runs every dying
+        // thread's mm_release in an order the program does not control, and
+        // with another thread live at the commit, every thread storing is
+        // one order Linux allows (each reaches mm_release before any drops
+        // its mm), where the answer at each thread's own retirement would
+        // depend on when the others' host threads tear down. A thread that
+        // exits by itself keeps the answer it got at its retirement, even if
+        // a group exit is published after it: that exit's answer counted it
+        // as already gone. A thread its Tool retired dies in its group's
+        // death too (`KvmBackend::note_tool_retirement`): after the exit is
+        // published it takes its answer, which counts it; before, its
+        // retirement found the publisher, which publishes before it retires,
+        // still live.
+        let sole = match group
+            .then(|| self.thread_group.group_exit_others_live())
+            .flatten()
+        {
+            Some(others_live) => !others_live,
+            None => last_at_retirement,
+        };
+        if self.thread_group.independent_mm.load(Ordering::Acquire)
+            && !self.memory.vfork_window_open()
+            && self.memory.contains_retained_shared()
+            && sole
         {
             // Linux mm_release discards clear_child_tid in either case, but
-            // stores/wakes only for mm_users > 1. File pages shared with a
-            // different process do not share the guest mm. This certificate
-            // plus the exclusive file domain proves the virtual last-user
-            // case; it is not a general model of host mm_users, which temporary
-            // /proc readers can also increment. No virtual observer owns such
-            // a reference here. Consume the registration without accessing its
+            // stores/wakes only for mm_users > 1, for any thread, a process
+            // leader or a worker; an exiting thread drops its mm reference in
+            // exit_mm right after its mm_release, before anything makes its
+            // exit observable. File pages and fork-shared anonymous memory
+            // shared with a different process do not share the guest mm; only
+            // when the address space holds such a page can another process
+            // see the word, so only then is the store skipped (without one,
+            // storing into the dying mm and skipping look alike). The
+            // process's certificate, which its workers share, with no vfork
+            // window open over the mm and every other thread of the address
+            // space
+            // retired (each thread's vCPU registers when the thread is
+            // created and stops counting at the thread's retirement above, in
+            // the guest's order), proves the virtual last-user case; it is
+            // not a general model of host mm_users, which temporary /proc
+            // readers can also increment. No virtual observer owns such a
+            // reference here. Consume the registration without accessing its
             // address; existing gate failures remain pending and unchanged.
             // https://github.com/gregkh/linux/blob/v7.1.3/kernel/fork.c#L1463
             #[cfg(test)]
-            clear_tid_diagnostic::stopped("single-owner shared-file process mm");
+            clear_tid_diagnostic::stopped("single-owner shared-memory process mm");
             return;
         }
         // Errors below are dropped on purpose. A bad guest address is Linux's
@@ -5450,19 +6647,16 @@ impl KvmBackend {
         self.set_cpuid_interception(false)?;
         let registration = self.register_guest_thread()?;
         if self.is_guest_thread {
-            let entry_registers = self.vcpu.get_regs()?;
-            while let Some(pending) = executor
-                .take_pending_signal_for_delivery()
-                .map_err(|errno| Error::Reverie(errno.into()))?
-            {
-                if self.deliver_selected_signal_before_thread_entry(
+            // Every eligible signal gets its frame before the new thread's
+            // first instruction, each on top of the last.
+            if executor.has_eligible_pending_signal() {
+                self.check_unstarted_clone()?;
+                let entry_registers = self.vcpu.get_regs()?;
+                self.deliver_pending_signals(
                     executor,
                     entry_registers,
-                    pending,
-                )? || executor.has_pending_exit()
-                {
-                    break;
-                }
+                    HandlerEntry::UserBoundary,
+                )?;
             }
             if let Some(exit) = executor.take_exit() {
                 return self.finish_static_elf_thread(executor, exit).await;
@@ -5543,7 +6737,7 @@ impl KvmBackend {
                                 frame_address,
                                 restored,
                             )?;
-                            if !delivered {
+                            if delivered.is_none() {
                                 stage_process_signal_return(
                                     &mut self.memory,
                                     &self.vcpu,
@@ -5555,7 +6749,8 @@ impl KvmBackend {
                         if executor.has_pending_exit() {
                             self.publish_pending_group_exit(executor);
                             self.discard_process_clear_tid_at_signal_return(executor);
-                            self.clear_registered_worker_tid_before_exit(executor);
+                            let group = executor.pending_group_exit_status().is_some();
+                            self.clear_registered_worker_tid_before_exit(executor, group);
                         }
                         (None, None, None)
                     } else {
@@ -5602,12 +6797,24 @@ impl KvmBackend {
                     let Some(fault) = self.capture_user_trap(executor)? else {
                         return Err(self.static_elf_halt_error()?);
                     };
-                    executor.prepare_captured_trap(fault.event.signal());
-                    self.deliver_user_trap(executor, &fault, fault.pending())?;
+                    fault.prepare_delivery(executor);
+                    // The fault's synchronous signal first, as Linux's
+                    // get_signal selects it, then every other eligible
+                    // signal on top of its frame.
+                    if let Some(handler) =
+                        self.deliver_user_trap(executor, &fault, fault.pending())?
+                    {
+                        self.deliver_pending_signals(
+                            executor,
+                            handler,
+                            HandlerEntry::UserBoundary,
+                        )?;
+                    }
                     if executor.has_pending_exit() {
                         self.publish_pending_group_exit(executor);
                         self.discard_process_clear_tid_at_signal_return(executor);
-                        self.clear_registered_worker_tid_before_exit(executor);
+                        let group = executor.pending_group_exit_status().is_some();
+                        self.clear_registered_worker_tid_before_exit(executor, group);
                     }
                     (None, None, None)
                 }
@@ -5693,7 +6900,7 @@ impl KvmBackend {
         if exit.group {
             self.request_guest_thread_group_exit(exit.status);
         }
-        self.clear_registered_worker_tid_before_exit(executor);
+        self.clear_registered_worker_tid_before_exit(executor, exit.group);
         executor.finish_terminal_cleanup().await?;
         self.release_stdin_on_exit();
         // Best-effort writes and Errno adapters can conceal a captured cause.
@@ -5850,8 +7057,62 @@ impl KvmBackend {
         self.thread_group.exit_status()
     }
 
+    /// Whether this thread must select no more signals: its thread group has
+    /// begun to exit, as this backend published it or as LinuxEmu committed
+    /// it, or the group cancelled this worker (a group exit, the root's exec,
+    /// or a peer's failure). Linux's get_signal takes a group exit, or
+    /// another thread's exec, before every dequeue (SIGNAL_GROUP_EXIT and
+    /// group_exec_task, at the top of its loop). A group exit that LinuxEmu
+    /// has committed and this backend has yet to publish (the exiting thread
+    /// publishes it only after its own bookkeeping) is published here, see
+    /// [`Self::publish_committed_group_exit`].
+    pub(crate) fn guest_thread_takes_no_signal(&self, executor: &ElfExecutor) -> bool {
+        if self.guest_thread_group_exit_status().is_some() || self.guest_thread_is_cancelled() {
+            return true;
+        }
+        match executor.committed_group_exit_status() {
+            Some(status) => {
+                self.publish_committed_group_exit(status);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Publishes a group exit that LinuxEmu has committed, which this thread
+    /// found before the exiting thread published it. The run loop checks the
+    /// published exit at the top of each iteration, before any entry into the
+    /// guest, so a thread that found the commit ends there and runs no
+    /// further guest instruction, as Linux's get_signal takes a group exit at
+    /// the next return to user mode. The status is the committed winner,
+    /// which the exiting thread then publishes again.
+    pub(crate) fn publish_committed_group_exit(&self, status: ExitStatus) {
+        self.publish_group_exit(status);
+    }
+
     pub(crate) fn request_guest_thread_group_exit(&self, status: ExitStatus) {
-        self.thread_group.request_exit_group(status);
+        #[cfg(test)]
+        group_exit_publication_gap::hold(self.is_guest_thread, || {
+            self.thread_group.exit_status().is_some()
+        });
+        self.publish_group_exit(status);
+    }
+
+    /// Publishes the group's exit with whether another of its threads is
+    /// live now. The first publication follows the exit's commit in the
+    /// guest's order and precedes every thread's death in it: each dying
+    /// thread learns of the exit from a publication, and retires only after
+    /// that. So the answer the first publication records is the one at the
+    /// commit, and no dying thread's host teardown can change it.
+    fn publish_group_exit(&self, status: ExitStatus) {
+        #[cfg(test)]
+        clear_tid_last_user_hold::before_group_answer(
+            || self.vcpu.is_sole_participant(),
+            || self.thread_group.retired_by_tool_beside_live(),
+        );
+        let others_live = !self.vcpu.is_sole_participant();
+        self.thread_group
+            .request_exit_group_from(status, Some(others_live));
     }
 
     /// Linux makes a fatal signal's group exit visible to every sibling
@@ -5863,6 +7124,31 @@ impl KvmBackend {
         if let Some(status) = executor.pending_group_exit_status() {
             self.request_guest_thread_group_exit(status);
         }
+    }
+
+    /// The Tool is retiring this thread (`Guest::retire_current_thread`)
+    /// with no group exit published, before the thread retires from the
+    /// entry gate. Before a group exit is published, a Tool retirement is
+    /// the start of this thread's death with its group
+    /// (`Guest::retire_current_thread` documents the contract): a Tool may
+    /// retire a sibling of an exit_group as soon as it has ordered that exit,
+    /// before the issuing thread's exit_group reaches this backend, so this
+    /// retirement can come before that exit's first publication, which then
+    /// would find this thread gone and record that no other thread was live.
+    /// A Tool that retires a thread for another reason and then lets a lone
+    /// thread call exit_group gets a store where Linux would skip it (see
+    /// that contract). So whether another thread
+    /// is live now is recorded here, under the lock that orders it with the
+    /// publication (`GuestThreadGroup::note_tool_retirement`): the issuer has
+    /// not published, so has not retired, and counts. That exit's answer,
+    /// and this thread's own (it dies in the group's death and takes that
+    /// answer once published; before, its retirement finds the publisher
+    /// still live), is then the one at the death's commit, not the one at
+    /// whichever comes first on the host.
+    /// https://github.com/rrnewton/reverie/issues/1108
+    pub(crate) fn note_tool_retirement(&self) {
+        self.thread_group
+            .note_tool_retirement(|| !self.vcpu.is_sole_participant());
     }
 
     // TODO-HUMAN-REVIEW(PR-172): Review signal-driven KVM worker cancellation.
@@ -5878,6 +7164,8 @@ impl KvmBackend {
         mut stop: Pin<&mut (dyn Future<Output = ()> + Send + '_)>,
     ) -> Result<()> {
         self.thread_group.cancel_workers();
+        #[cfg(test)]
+        exec_cancellation_observation::cancelled();
         let watch = self.entry_driver_watch();
         watch.check()?;
         // Preserve the existing worker-Exec rejection in exec_process; a
@@ -5993,7 +7281,7 @@ impl KvmBackend {
             crate::runtime::finish_unstarted_tool_cleanups_with_panics(executor, &self.tool_panics),
         );
         executor.retire_failed_thread();
-        self.clear_registered_worker_tid_before_exit(executor);
+        self.clear_registered_worker_tid_before_exit(executor, false);
         executor.release_files_on_exit();
         self.release_stdin_on_exit();
         executor.transfer_child_processes_to_owner();
@@ -6043,7 +7331,7 @@ impl KvmBackend {
             crate::runtime::finish_unstarted_tool_cleanups_with_panics(executor, &self.tool_panics),
         );
         executor.retire_failed_thread();
-        self.clear_registered_worker_tid_before_exit(executor);
+        self.clear_registered_worker_tid_before_exit(executor, false);
         executor.release_files_on_exit();
         self.release_stdin_on_exit();
         let error = futures::executor::block_on(self.route_entry_outcome::<()>(Err(
@@ -6144,10 +7432,11 @@ impl KvmBackend {
 
     /// Runs until the guest halts, invoking `handler` for each syscall vmcall.
     ///
-    /// Actual KVM_RUN interruption remains an error on this raw interface.
-    /// A private close against a running vCPU can also cause EINTR; this loop
-    /// does not distinguish that kick from a foreign interrupt. A production
-    /// closer must not use this driver without defining that distinction.
+    /// Actual KVM_RUN interruption remains an error on this raw interface. It
+    /// runs one vCPU, and no other thread of its address space, so no close
+    /// of the entry gate by a publication kicks it; a caller that closes the
+    /// gate against it from another thread must not use this driver, which
+    /// does not tell such a kick from a foreign interrupt.
     pub fn run<F>(&mut self, handler: F) -> Result<()>
     where
         F: FnMut(Syscall, &GuestMemory) -> i64,
@@ -6377,10 +7666,13 @@ pub(crate) fn clear_tid_and_wake(memory: &mut GuestMemory, address: Option<u64>)
 /// - leaf 0xd, whose extended state is limited to `signal::FIXED_XFEATURES`,
 ///   the x87, SSE and YMM components the backend's signal frames carry; KVM
 ///   sizes the guest's XSAVE state from this leaf, so with more it would save
-///   state (AVX-512, PKRU) that no frame can hold.
+///   state (AVX-512, PKRU) that no frame can hold. Its subleaf 1 keeps the
+///   host's IA32_XSS components, which `host_xss` relies on: KVM accepts a
+///   vCPU IA32_XSS value only within them.
 ///
 /// KVM still computes the fields that describe the vCPU itself (OSXSAVE from
-/// the guest's CR4, the XSAVE sizes from its XCR0) when the guest reads them.
+/// the guest's CR4, the XSAVE sizes from its XCR0 and IA32_XSS) when the guest
+/// reads them.
 pub(crate) fn vcpu_cpuid(supported: CpuId) -> Result<CpuId> {
     let fixed = crate::signal::FIXED_XFEATURES;
     let entries = supported
@@ -6431,10 +7723,11 @@ fn supported_hypercall_instruction(cpuid: &CpuId) -> Result<[u8; 3]> {
 
 #[cfg(test)]
 #[path = "vm/worker_panic_tests.rs"]
+#[allow(clippy::disallowed_methods, reason = "tests may make threads freely")]
 mod worker_panic_tests;
 
 #[cfg(test)]
-pub(crate) use tests::minimal_test_elf;
+pub(crate) use crate::elf::minimal_test_elf;
 
 #[cfg(test)]
 mod user_trap_signal_tests {
@@ -6487,12 +7780,21 @@ mod user_trap_signal_tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods, reason = "tests may make threads freely")]
 mod tests {
     /// The stack window's first page in a 16 MiB test memory: the user address
     /// of physical 0x80_0000, which these tests use as scratch memory.
     const STACK_SCRATCH: u64 = crate::memory::USER_ADDRESS_END - crate::elf::STACK_LIMIT;
 
     use super::*;
+
+    /// The raw wait status of a dumpable guest that SIGSEGV kills: the core
+    /// flag is Linux's decision under this process's RLIMIT_CORE and the
+    /// host's core_pattern (`reverie_linuxemu::core_dump`).
+    fn sigsegv_wait_status() -> i32 {
+        let core = reverie_linuxemu::core_dump::guest_writes_core(libc::SIGSEGV, true);
+        libc::SIGSEGV | if core { 0x80 } else { 0 }
+    }
 
     include!("cpuid_runtime_tests.rs");
     include!("vm/entry_public_tests.rs");
@@ -6866,6 +8168,54 @@ mod tests {
             assert_eq!(next.now_or_never(), Some(Ok(())));
             assert_eq!(group.exit_status(), Some(ExitStatus::Exited(31)));
             assert!(group.subscribe_cancellation().now_or_never().is_none());
+        }
+
+        /// A group exit's last-user answer belongs to that exit: the first
+        /// publication sets it, a later one keeps it, and an exec's rearm
+        /// clears it with the exit status, so a later exit of the new image
+        /// does not read a stale answer.
+        #[test]
+        fn a_group_exits_last_user_answer_is_cleared_with_it_at_exec() {
+            let group = GuestThreadGroup::default();
+            assert_eq!(group.group_exit_others_live(), None);
+            group.request_exit_group_from(ExitStatus::Exited(1), Some(false));
+            group.request_exit_group_from(ExitStatus::Exited(2), Some(true));
+            assert_eq!(group.exit_status(), Some(ExitStatus::Exited(1)));
+            assert_eq!(group.group_exit_others_live(), Some(false));
+            group.rearm_after_exec();
+            assert_eq!(group.exit_status(), None);
+            assert_eq!(group.group_exit_others_live(), None);
+            group.request_exit_group_from(ExitStatus::Exited(3), Some(true));
+            assert_eq!(group.group_exit_others_live(), Some(true));
+        }
+
+        /// A thread the Tool retires beside a live one before a group exit is
+        /// published counts as live in that exit's answer, even when the
+        /// publisher finds it already retired. One retired with no other live
+        /// thread, or after the publication, changes nothing, and an exec's
+        /// rearm forgets it.
+        #[test]
+        fn a_thread_the_tool_retired_before_the_publication_counts_as_live() {
+            let group = GuestThreadGroup::default();
+            group.note_tool_retirement(|| false);
+            assert!(!group.retired_by_tool_beside_live());
+            group.request_exit_group_from(ExitStatus::Exited(1), Some(false));
+            assert_eq!(group.group_exit_others_live(), Some(false));
+            group.note_tool_retirement(|| panic!("asked after the publication"));
+            assert!(!group.retired_by_tool_beside_live());
+            assert_eq!(group.group_exit_others_live(), Some(false));
+
+            group.rearm_after_exec();
+            group.note_tool_retirement(|| true);
+            assert!(group.retired_by_tool_beside_live());
+            assert_eq!(group.group_exit_others_live(), None);
+            group.request_exit_group_from(ExitStatus::Exited(2), Some(false));
+            assert_eq!(group.group_exit_others_live(), Some(true));
+
+            group.rearm_after_exec();
+            assert_eq!(group.group_exit_others_live(), None);
+            group.request_exit_group_from(ExitStatus::Exited(3), Some(false));
+            assert_eq!(group.group_exit_others_live(), Some(false));
         }
 
         #[test]
@@ -8748,7 +10098,7 @@ mod tests {
     }
 
     #[test]
-    fn independent_process_mm_certificate_excludes_vfork_and_stays_revoked() {
+    fn independent_mm_certificate_is_shared_by_workers_and_held_off_by_an_open_vfork_window() {
         let mut parent =
             KvmBackend::new(16 * 1024 * 1024).expect("independent mm control requires KVM");
         parent
@@ -8763,14 +10113,23 @@ mod tests {
             registers,
         )
         .unwrap();
-        assert!(!parent.independent_process_mm);
+        let independent =
+            |backend: &KvmBackend| backend.thread_group.independent_mm.load(Ordering::Acquire);
+        assert!(!independent(&parent));
         let mut child = parent
             .prepare_forked_process(
                 &executor, 2, None, None, None, None, false, false, false, None,
             )
             .unwrap();
-        assert!(child.backend.independent_process_mm);
-        assert!(!parent.independent_process_mm);
+        assert!(independent(&child.backend));
+        assert!(!independent(&parent));
+        // A CLONE_THREAD worker of the child shares its process's thread
+        // group, and with it the certificate.
+        let mut worker =
+            KvmBackend::new(16 * 1024 * 1024).expect("independent mm control requires KVM");
+        worker.thread_group = child.backend.thread_group.clone();
+        worker.is_guest_thread = true;
+        assert!(independent(&worker));
 
         let vfork_child = child
             .backend
@@ -8787,10 +10146,16 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert!(!vfork_child.backend.independent_process_mm);
-        assert!(!child.backend.independent_process_mm);
+        // The vfork child has no certificate of its own until it execs. The
+        // process keeps its certificate, but the vfork child's open window
+        // over its memory holds the last-user skip off for every thread of
+        // it, the worker included, until the window ends.
+        assert!(!independent(&vfork_child.backend));
+        assert!(independent(&child.backend) && independent(&worker));
+        assert!(child.backend.memory.vfork_window_open());
         drop(vfork_child);
-        assert!(!child.backend.independent_process_mm);
+        assert!(!child.backend.memory.vfork_window_open());
+        assert!(independent(&child.backend) && independent(&worker));
 
         let independent_child = child
             .backend
@@ -8807,8 +10172,217 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert!(independent_child.backend.independent_process_mm);
-        assert!(!child.backend.independent_process_mm);
+        assert!(independent(&independent_child.backend));
+        assert!(independent(&child.backend));
+    }
+
+    /// The stack window's pages as extents of equal declared mapping, `(user
+    /// start, user end, declared)`; `None` while the window's record is not
+    /// certain. Every page of these windows is declared.
+    fn window_extents(
+        memory: &crate::memory::GuestMemory,
+    ) -> Option<Vec<(u64, u64, crate::memory::DeclaredMapping)>> {
+        let mut extents: Vec<(u64, u64, crate::memory::DeclaredMapping)> = Vec::new();
+        for page in memory.user_stack_window_pages()? {
+            let declared = page.declared.unwrap();
+            match extents.last_mut() {
+                Some((_, end, last)) if *end == page.user_address && *last == declared => {
+                    *end += PAGE_SIZE;
+                }
+                _ => extents.push((page.user_address, page.user_address + PAGE_SIZE, declared)),
+            }
+        }
+        Some(extents)
+    }
+
+    /// A parent backend at its first syscall boundary, with its executor.
+    fn stack_window_parent() -> (KvmBackend, ElfExecutor) {
+        let mut parent =
+            KvmBackend::new(64 * 1024 * 1024).expect("stack window record control requires KVM");
+        parent
+            .install_static_elf(&minimal_test_elf(&[0xf4]), "/bin/stack-window")
+            .unwrap();
+        let executor = ElfExecutor::new(parent.static_elf.take().unwrap(), false);
+        let registers = parent.vcpu.get_regs().unwrap();
+        stage_process_syscall_return(
+            &mut parent.memory,
+            &parent.vcpu,
+            parent.syscall_frame_address,
+            registers,
+        )
+        .unwrap();
+        (parent, executor)
+    }
+
+    /// Makes the page at user address `page` of `memory` read-only.
+    fn protect_read_only(memory: &crate::memory::GuestMemory, page: u64) {
+        let physical = memory.user_range_to_guest(page, PAGE_SIZE).unwrap();
+        memory
+            .protect_user_range(physical, PAGE_SIZE, libc::PROT_READ as u8)
+            .unwrap();
+    }
+
+    /// A child that shares its parent's address space on Linux (vfork, and
+    /// a process clone with CLONE_VM|CLONE_VFORK) runs on a copy of the
+    /// parent's memory here, and shares the stack window's record with it:
+    /// a change to the window either makes, child or parent, leaves the
+    /// other's pages unknown, while the one that made it holds it. A forked
+    /// child's record is its own.
+    #[test]
+    fn a_vfork_child_shares_the_stack_windows_record_with_its_parent() {
+        for share_address_space in [true, false] {
+            for child_changes in [true, false] {
+                let label = format!("vfork: {share_address_space}, child changes: {child_changes}");
+                let (mut parent, executor) = stack_window_parent();
+                let window = window_extents(&parent.memory);
+                let &[(start, end, mapping)] = window.as_deref().unwrap() else {
+                    panic!("{label}: {window:?}");
+                };
+                let child = parent
+                    .prepare_forked_process(
+                        &executor,
+                        2,
+                        None,
+                        None,
+                        None,
+                        None,
+                        false,
+                        share_address_space,
+                        false,
+                        None,
+                    )
+                    .unwrap();
+                assert_eq!(window_extents(&child.backend.memory), window, "{label}");
+                let (changing, other) = if child_changes {
+                    (&child.backend.memory, &parent.memory)
+                } else {
+                    (&parent.memory, &child.backend.memory)
+                };
+                // A page of the window well below the initial stack, read-only.
+                let page = start + 16 * PAGE_SIZE;
+                protect_read_only(changing, page);
+                let read_only = crate::memory::DeclaredMapping {
+                    prot: libc::PROT_READ as u8,
+                    ..mapping
+                };
+                assert_eq!(
+                    window_extents(changing),
+                    Some(vec![
+                        (start, page, mapping),
+                        (page, page + PAGE_SIZE, read_only),
+                        (page + PAGE_SIZE, end, mapping),
+                    ]),
+                    "{label}"
+                );
+                let expected = if share_address_space { None } else { window };
+                assert_eq!(window_extents(other), expected, "{label}");
+            }
+        }
+    }
+
+    /// A vfork child's window ends in Linux's order
+    /// (`KvmBackend::end_vfork_window`): mm_release()'s store of zero to the
+    /// child's clear_child_tid word, in the child's copy; the write-back that
+    /// carries the copy's changes, the store among them, to the parent; the
+    /// wake of the parent's word, which then holds the store; and only then
+    /// the parent's release from its call, as Linux completes the vfork after
+    /// mm_release(). A wake before the write-back would let a waiter read the
+    /// old word, and a release before the wake would let the parent run
+    /// before it.
+    #[test]
+    fn a_vfork_window_ends_in_linux_order() {
+        use crate::memory::vfork_window_steps;
+        let (mut parent, executor) = stack_window_parent();
+        let window = window_extents(&parent.memory).unwrap();
+        // A word in the stack window, below the initial stack.
+        let word = window[0].0 + 16 * PAGE_SIZE + 8;
+        parent
+            .memory
+            .user()
+            .write(word, &91_i32.to_ne_bytes())
+            .unwrap();
+        let mut child = parent
+            .prepare_forked_process(
+                &executor, 2, None, None, None, None, false, true, false, None,
+            )
+            .unwrap();
+        let (release, mut released) = futures::channel::oneshot::channel();
+        child.backend.vfork_release = Some(release);
+        child.executor.set_clear_child_tid(Some(word));
+        vfork_window_steps::record();
+        assert!(child.backend.end_vfork_window(&mut child.executor).unwrap());
+        assert_eq!(
+            vfork_window_steps::take(),
+            ["clear", "write-back", "wake", "release"]
+        );
+        let mut bytes = [0; 4];
+        parent.memory.user().read(word, &mut bytes).unwrap();
+        assert_eq!(i32::from_ne_bytes(bytes), 0);
+        assert_eq!(released.try_recv(), Ok(Some(())));
+    }
+
+    /// The Linux provider keeps apart the stack window's mappings a forked
+    /// child inherits (`ElfExecutor::keep_inherited_stack_mappings_apart`):
+    /// a parent's split gives the child three parts with lineages that
+    /// differ from their neighbours', which stay apart once the child sets
+    /// the page back, while the parent keeps its own lineage and a vfork
+    /// child, which shares the address space, keeps the parent's.
+    #[test]
+    fn a_forked_child_keeps_the_stack_mappings_it_inherited_apart() {
+        for share_address_space in [false, true] {
+            let label = format!("vfork: {share_address_space}");
+            let (mut parent, executor) = stack_window_parent();
+            let window = window_extents(&parent.memory);
+            let &[(start, _, mapping)] = window.as_deref().unwrap() else {
+                panic!("{label}: {window:?}");
+            };
+            let page = start + 16 * PAGE_SIZE;
+            protect_read_only(&parent.memory, page);
+            let child = parent
+                .prepare_forked_process(
+                    &executor,
+                    2,
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    share_address_space,
+                    false,
+                    None,
+                )
+                .unwrap();
+            let lineages = |memory: &crate::memory::GuestMemory| {
+                window_extents(memory)
+                    .unwrap()
+                    .iter()
+                    .map(|extent| extent.2.lineage)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(lineages(&parent.memory), [0, 0, 0], "{label}");
+            if share_address_space {
+                assert_eq!(lineages(&child.backend.memory), [0, 0, 0], "{label}");
+                continue;
+            }
+            let inherited = lineages(&child.backend.memory);
+            assert!(
+                inherited.windows(2).all(|pair| pair[0] != pair[1]),
+                "{label}: {inherited:?}"
+            );
+            let physical = child
+                .backend
+                .memory
+                .user_range_to_guest(page, PAGE_SIZE)
+                .unwrap();
+            child
+                .backend
+                .memory
+                .protect_user_range(physical, PAGE_SIZE, mapping.prot)
+                .unwrap();
+            let set_back = window_extents(&child.backend.memory).unwrap();
+            assert_eq!(set_back.len(), 3, "{label}: {set_back:?}");
+            assert!(set_back.iter().all(|extent| extent.2.prot == mapping.prot));
+        }
     }
 
     // This control requires KVM construction and snapshot/register ioctls. It
@@ -9159,13 +10733,13 @@ mod tests {
             .unwrap();
         let mut after_wrapper = [0; 4096];
         memory.read(STACK_SCRATCH, &mut after_wrapper).unwrap();
-        assert_eq!(status.into_raw(), libc::SIGSEGV | 0x80);
+        assert_eq!(status.into_raw(), sigsegv_wait_status());
         assert!(stdout.is_empty());
         assert!(stderr.is_empty());
         if with_tool {
             assert_eq!(
                 *log.observations.lock().unwrap(),
-                vec![(libc::SIGSEGV | 0x80, vec![0x5a; 4096])]
+                vec![(sigsegv_wait_status(), vec![0x5a; 4096])]
             );
         } else {
             assert!(log.observations.lock().unwrap().is_empty());
@@ -9183,7 +10757,7 @@ mod tests {
         assert_eq!(executor.execute(&request, &parent.memory), 2);
         let mut wait_status = [0; 4];
         parent.memory.read(STACK_SCRATCH, &mut wait_status).unwrap();
-        assert_eq!(i32::from_ne_bytes(wait_status), libc::SIGSEGV | 0x80);
+        assert_eq!(i32::from_ne_bytes(wait_status), sigsegv_wait_status());
     }
 
     #[test]
@@ -9206,6 +10780,10 @@ mod tests {
         check_fatal_page_zero_registration(true, true);
     }
 
+    #[cfg_attr(
+        fbcode_build,
+        ignore = "fbsource-disabled: sandcastle-env: needs /dev/kvm and exact PMU branch counts"
+    )]
     #[test]
     fn page_fault_action_restores_complete_stopped_context() {
         for thread in [false, true] {
@@ -9628,13 +11206,13 @@ mod tests {
             .unwrap();
         let mut after_wrapper = [0; 4096];
         memory.read(STACK_SCRATCH, &mut after_wrapper).unwrap();
-        assert_eq!(status.into_raw(), libc::SIGSEGV | 0x80);
+        assert_eq!(status.into_raw(), sigsegv_wait_status());
         assert!(stdout.is_empty());
         assert!(stderr.is_empty());
         if with_tool {
             assert_eq!(
                 *log.observations.lock().unwrap(),
-                vec![(libc::SIGSEGV | 0x80, vec![0x5a; 4096])]
+                vec![(sigsegv_wait_status(), vec![0x5a; 4096])]
             );
         } else {
             assert!(log.observations.lock().unwrap().is_empty());
@@ -9652,7 +11230,7 @@ mod tests {
         assert_eq!(executor.execute(&request, &parent.memory), 2);
         let mut wait_status = [0; 4];
         parent.memory.read(STACK_SCRATCH, &mut wait_status).unwrap();
-        assert_eq!(i32::from_ne_bytes(wait_status), libc::SIGSEGV | 0x80);
+        assert_eq!(i32::from_ne_bytes(wait_status), sigsegv_wait_status());
     }
 
     #[test]
@@ -9997,7 +11575,7 @@ mod tests {
         let expected_status = if cancel_before_start {
             0
         } else {
-            libc::SIGSEGV | 0x80
+            sigsegv_wait_status()
         };
         assert_eq!(observations, vec![(expected_status, 0, expected.clone())]);
         expected[offset as usize..offset as usize + 4].fill(0x6b);
@@ -10568,44 +12146,6 @@ mod tests {
         }
     }
 
-    pub(crate) fn minimal_test_elf(code: &[u8]) -> Vec<u8> {
-        const LOAD_ADDRESS: u64 = 0x20_0000;
-        const CODE_OFFSET: usize = 0x1000;
-        let mut image = vec![0; CODE_OFFSET + code.len()];
-        let put_u16 = |image: &mut [u8], offset: usize, value: u16| {
-            image[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
-        };
-        let put_u32 = |image: &mut [u8], offset: usize, value: u32| {
-            image[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-        };
-        let put_u64 = |image: &mut [u8], offset: usize, value: u64| {
-            image[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
-        };
-
-        image[..4].copy_from_slice(b"\x7fELF");
-        image[4] = 2;
-        image[5] = 1;
-        image[6] = 1;
-        put_u16(&mut image, 16, 2);
-        put_u16(&mut image, 18, 62);
-        put_u32(&mut image, 20, 1);
-        put_u64(&mut image, 24, LOAD_ADDRESS);
-        put_u64(&mut image, 32, 64);
-        put_u16(&mut image, 52, 64);
-        put_u16(&mut image, 54, 56);
-        put_u16(&mut image, 56, 1);
-        put_u32(&mut image, 64, 1);
-        put_u32(&mut image, 68, 5);
-        put_u64(&mut image, 72, CODE_OFFSET as u64);
-        put_u64(&mut image, 80, LOAD_ADDRESS);
-        put_u64(&mut image, 88, LOAD_ADDRESS);
-        put_u64(&mut image, 96, code.len() as u64);
-        put_u64(&mut image, 104, 0x2000);
-        put_u64(&mut image, 112, 0x1000);
-        image[CODE_OFFSET..].copy_from_slice(code);
-        image
-    }
-
     #[test]
     fn timestamp_boundary_respects_hardware_instruction_fetch_fault_priority() {
         const BOUNDARY: u64 = 0x40_0000;
@@ -10850,7 +12390,8 @@ mod tests {
         match mode {
             "fork" => {
                 let child =
-                    KvmBackend::from_process_snapshot(parent.snapshot_process().unwrap()).unwrap();
+                    KvmBackend::from_process_snapshot(parent.snapshot_process(false).unwrap())
+                        .unwrap();
                 let mut after = [0_u8; PAGE_SIZE as usize];
                 parent.memory.read_raw(0, &mut after).unwrap();
                 assert_eq!(after, before);
@@ -12466,7 +14007,7 @@ mod tests {
                 // https://github.com/torvalds/linux/blob/v7.1/io_uring/futex.c
                 if registered_worker {
                     executor.set_clear_child_tid(Some(WORD));
-                    backend.clear_registered_worker_tid_before_exit(&mut executor);
+                    backend.clear_registered_worker_tid_before_exit(&mut executor, false);
                     assert_eq!(executor.take_clear_child_tid(), None);
                 } else {
                     clear_tid_and_wake(&mut backend.memory, Some(WORD));
@@ -12540,7 +14081,7 @@ mod tests {
             backend.memory.write_raw(address, &[0xa5; 4]).unwrap();
             if registered_worker {
                 executor.set_clear_child_tid(Some(address));
-                backend.clear_registered_worker_tid_before_exit(&mut executor);
+                backend.clear_registered_worker_tid_before_exit(&mut executor, false);
                 assert_eq!(executor.take_clear_child_tid(), None);
             } else {
                 clear_tid_and_wake(&mut backend.memory, Some(address));
@@ -12618,13 +14159,18 @@ mod tests {
     include!("vm/kept_rpc_failure_tests.rs");
     include!("vm/empty_signal_boundary_tests.rs");
     include!("vm/instruction_callback_panic_tests.rs");
+    include!("vm/timer_signal_deferral_tests.rs");
+    include!("vm/lazy_arming_tests.rs");
+    include!("vm/exec_host_resources_tests.rs");
 }
 
 #[cfg(test)]
 #[path = "terminal_vm_tests.rs"]
+#[allow(clippy::disallowed_methods, reason = "tests may make threads freely")]
 mod terminal_tests;
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods, reason = "tests may make threads freely")]
 mod terminal_direct_error_tests {
     use std::os::fd::FromRawFd;
     use std::sync::mpsc;
@@ -12737,6 +14283,7 @@ mod entry_owner_tests;
 
 #[cfg(test)]
 #[path = "vm/exec_wait_tests.rs"]
+#[allow(clippy::disallowed_methods, reason = "tests may make threads freely")]
 mod exec_wait_tests;
 
 /// Milliseconds a dying task sleeps after its clear_child_tid wake (tests).
@@ -12744,6 +14291,278 @@ mod exec_wait_tests;
 static DELAY_AFTER_CLEAR_TID_WAKE_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Test holds around a dying thread's last-user decision, process-wide while
+/// armed. `Peers`: right after its retirement, a dying thread waits, bounded,
+/// until every other thread of the address space has retired, as when the
+/// others' host threads happen to tear down first. `OrdinaryThenGroup`: a
+/// thread exiting by itself waits after its retirement until its group's
+/// exit has been published, and the first publisher of a group exit waits
+/// before it reads who is live until every other thread has retired, as
+/// when an exit_group lands just after another thread's own exit.
+#[cfg(test)]
+pub(crate) mod clear_tid_last_user_hold {
+    use std::sync::atomic::AtomicU8;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    use std::time::Instant;
+
+    static MODE: AtomicU8 = AtomicU8::new(0);
+
+    #[derive(Clone, Copy)]
+    #[repr(u8)]
+    pub(crate) enum Hold {
+        Peers = 1,
+        OrdinaryThenGroup = 2,
+        /// A group exit's publisher, with another thread live, publishes only
+        /// once the Tool has retired a thread beside a live one; a worker
+        /// whose retirement the Tool asked for beside a live thread retires
+        /// from the entry gate only once every other thread has (the
+        /// publisher included).
+        ToolRetiredThenPublisher = 3,
+    }
+
+    /// Disarms the hold when dropped, a panicking test's included.
+    pub(crate) struct Armed(());
+
+    impl Drop for Armed {
+        fn drop(&mut self) {
+            MODE.store(0, Ordering::SeqCst);
+        }
+    }
+
+    pub(crate) fn arm(hold: Hold) -> Armed {
+        MODE.store(hold as u8, Ordering::SeqCst);
+        Armed(())
+    }
+
+    fn wait_until(done: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    pub(super) fn after_retirement(
+        group: bool,
+        sole: impl Fn() -> bool,
+        published: impl Fn() -> bool,
+    ) {
+        match MODE.load(Ordering::SeqCst) {
+            1 => wait_until(sole),
+            2 if !group => wait_until(published),
+            _ => {}
+        }
+    }
+
+    pub(super) fn before_group_answer(sole: impl Fn() -> bool, noted: impl Fn() -> bool) {
+        match MODE.load(Ordering::SeqCst) {
+            2 => wait_until(sole),
+            3 if !sole() => wait_until(noted),
+            _ => {}
+        }
+    }
+
+    pub(super) fn before_retirement(
+        worker: bool,
+        noted: impl Fn() -> bool,
+        sole: impl Fn() -> bool,
+    ) {
+        if MODE.load(Ordering::SeqCst) == 3 && worker && noted() {
+            wait_until(sole);
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "vm/group_exit_order_tests.rs"]
 mod group_exit_order_tests;
+
+#[cfg(test)]
+#[path = "vm/clear_tid_last_user_tests.rs"]
+mod clear_tid_last_user_tests;
+
+/// A test hold in the gap between a worker's committed group exit and its
+/// publication (`KvmBackend::request_guest_thread_group_exit`), process-wide,
+/// for the tests of what another thread does in that gap. Once armed, the
+/// first worker to publish a group exit waits there, before publishing it,
+/// until another thread has published it or a deadline passes.
+#[cfg(test)]
+pub(crate) mod group_exit_publication_gap {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    use std::time::Instant;
+
+    static ARMED: AtomicBool = AtomicBool::new(false);
+    static HELD: AtomicBool = AtomicBool::new(false);
+    static RELEASED_BY_PUBLICATION: AtomicBool = AtomicBool::new(false);
+
+    /// How long a held worker waits for another thread's publication.
+    pub(crate) const DEADLINE: Duration = Duration::from_secs(3);
+
+    /// Arms the hold for the next worker that publishes a group exit.
+    pub(crate) fn arm() {
+        HELD.store(false, Ordering::SeqCst);
+        RELEASED_BY_PUBLICATION.store(false, Ordering::SeqCst);
+        ARMED.store(true, Ordering::SeqCst);
+    }
+
+    /// Holds the first worker to publish a group exit after [`arm`] until
+    /// another thread has published one (`published`) or [`DEADLINE`]
+    /// passes; every other caller passes through.
+    pub(crate) fn hold(is_worker: bool, published: impl Fn() -> bool) {
+        if !is_worker || !ARMED.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        HELD.store(true, Ordering::SeqCst);
+        let deadline = Instant::now() + DEADLINE;
+        while !published() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        RELEASED_BY_PUBLICATION.store(published(), Ordering::SeqCst);
+    }
+
+    /// Waits until a worker is held in the gap, for at most `limit`.
+    pub(crate) fn wait_held(limit: Duration) -> bool {
+        let deadline = Instant::now() + limit;
+        while !HELD.load(Ordering::SeqCst) {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        true
+    }
+
+    /// Whether the held worker found the exit published by another thread
+    /// before its deadline.
+    pub(crate) fn released_by_publication() -> bool {
+        RELEASED_BY_PUBLICATION.load(Ordering::SeqCst)
+    }
+
+    /// Whether a worker is held in the gap now, or was.
+    pub(crate) fn is_held() -> bool {
+        HELD.load(Ordering::SeqCst)
+    }
+}
+
+/// A test record of what the guarded signal selections found
+/// (`KvmBackend::filter_next_pending_signal_with_tool` and the parked
+/// observation's dequeue), process-wide, and a hold of a thread whose
+/// captured fault has reached its admission.
+#[cfg(test)]
+pub(crate) mod guarded_selection_observation {
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    use std::time::Instant;
+
+    /// Where a guarded selection found a committed group exit.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum Site {
+        /// A boundary's dequeue, and whether a signal was then eligible.
+        Dequeue { eligible: bool },
+        /// A captured fault's admission.
+        FaultAdmission,
+        /// A parked syscall's signal observation.
+        ParkedObservation,
+    }
+
+    static FOUND: Mutex<Vec<Site>> = Mutex::new(Vec::new());
+    static FAULT_ADMISSIONS: Mutex<Vec<bool>> = Mutex::new(Vec::new());
+    static FAULT_HOLD_ARMED: AtomicBool = AtomicBool::new(false);
+    static FAULT_REACHED: AtomicBool = AtomicBool::new(false);
+
+    pub(crate) fn found_group_exit(site: Site) {
+        FOUND.lock().unwrap().push(site);
+    }
+
+    /// Every committed group exit a guarded selection found, in order.
+    pub(crate) fn found() -> Vec<Site> {
+        FOUND.lock().unwrap().clone()
+    }
+
+    pub(crate) fn fault_admitted(found_group_exit: bool) {
+        FAULT_ADMISSIONS.lock().unwrap().push(found_group_exit);
+    }
+
+    /// Every captured fault's admission, in order: whether it found a
+    /// committed group exit.
+    pub(crate) fn fault_admissions() -> Vec<bool> {
+        FAULT_ADMISSIONS.lock().unwrap().clone()
+    }
+
+    /// Arms the hold for the next captured fault to reach its admission.
+    pub(crate) fn arm_fault_hold() {
+        FAULT_REACHED.store(false, Ordering::SeqCst);
+        FAULT_HOLD_ARMED.store(true, Ordering::SeqCst);
+    }
+
+    /// Holds the first captured fault to reach its admission after
+    /// [`arm_fault_hold`] until `release` holds or the publication gap's
+    /// deadline passes; every other fault passes through.
+    pub(crate) fn hold_fault(release: impl Fn() -> bool) {
+        if !FAULT_HOLD_ARMED.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        FAULT_REACHED.store(true, Ordering::SeqCst);
+        let deadline = Instant::now() + super::group_exit_publication_gap::DEADLINE;
+        while !release() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Waits until a captured fault is held at its admission, for at most
+    /// `limit`.
+    pub(crate) fn wait_fault_reached(limit: Duration) -> bool {
+        let deadline = Instant::now() + limit;
+        while !FAULT_REACHED.load(Ordering::SeqCst) {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        true
+    }
+}
+
+/// A test observation of an exec's cancellation of its sibling workers
+/// (`KvmBackend::cancel_guest_threads_for_exec`), process-wide.
+#[cfg(test)]
+pub(crate) mod exec_cancellation_observation {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    use std::time::Instant;
+
+    static CANCELLED: AtomicBool = AtomicBool::new(false);
+
+    pub(crate) fn cancelled() {
+        CANCELLED.store(true, Ordering::SeqCst);
+    }
+
+    /// Waits until an exec has cancelled its workers, for at most `limit`.
+    pub(crate) fn wait_cancelled(limit: Duration) -> bool {
+        let deadline = Instant::now() + limit;
+        while !CANCELLED.load(Ordering::SeqCst) {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        true
+    }
+}
+
+#[cfg(test)]
+#[path = "vm/group_exit_injection_loop_tests.rs"]
+mod group_exit_injection_loop_tests;
+
+#[cfg(test)]
+#[path = "vm/group_exit_gap_tests.rs"]
+mod group_exit_gap_tests;
+
+#[cfg(test)]
+#[path = "vm/initial_fpu_state_tests.rs"]
+mod initial_fpu_state_tests;

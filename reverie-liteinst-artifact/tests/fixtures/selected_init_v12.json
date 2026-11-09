@@ -1,0 +1,331 @@
+{
+  "authority": "TEST_DATA_ONLY_NOT_FACTORY_INPUT",
+  "original_elf_sha256": "1c763c09b79983d20638e341854ad19dbeabf761de1e619d5c761f0f634e7db1",
+  "roles": [
+    {
+      "name": "__init_tls",
+      "address": 105556899030048,
+      "input_hex": "41574156534883ec40b102b001f00fb00d000000000f856c0100000f1047180f2904240f1047280f294424100f2805000000000f294424200f2805000000000f29442430660f6f0424660f6f4c2410660f744c2430660f74442420660fdbc1660fd7c03dffff00000f852d010000488b050000000048837810000f852501000048837828000f851a01000048837818000f850f01000048837820000f85040100000f280500000000488b3d00000000488b0d00000000488b1500000000488b3500000000488b1d000000004c8b3d000000004c8b350000000048c70500000000000000004c8d05000000000f11050000000048890d000000004889150000000048890d000000004c89401048c74028010000004889502048897018488b05000000008b10488b0d000000004839d176124881f900008000ba00008000480f42d18910ff15000000004939c775624c3b7008752a49833e01752449395e08751e4889c7ff150000000085c0784dc60500000000034883c4405b415e415fc3bf06000000e800000000a8fbb807000000bf010000000f44f8e800000000bf02000000e800000000bf03000000e800000000bf04000000e800000000bf05000000e800000000",
+      "linked_hex": "41574156534883ec40b102b001f00fb00dd70d37040f856c0100000f1047180f2904240f1047280f294424100f2805ed0d37040f294424200f2805f10d37040f29442430660f6f0424660f6f4c2410660f744c2430660f74442420660fdbc1660fd7c03dffff00000f852d010000488b052be22f0048837810000f852501000048837828000f851a01000048837818000f850f01000048837820000f85040100000f2805980d3704488b3db10d3704488b0dea0d3704488b15eb0d3704488b35ec0d3704488b1da50d37044c8b3dae0d37044c8b35b70d370448c7050c0d3704000000004c8d05050d37040f1105060d370448890d0f0d3704488915100d370448890d110d37044c89401048c74028010000004889502048897018488b0586e12f008b10488b0d8d0d37044839d176124881f900008000ba00008000480f42d18910ff1568e12f004939c775624c3b7008752a49833e01752449395e08751e4889c7ff1550e12f0085c0784dc605790c3704034883c4405b415e415fc3bf06000000e86916eeffa8fbb807000000bf010000000f44f8e85516eeffbf02000000e84b16eeffbf03000000e84116eeffbf04000000e83716eeffbf05000000e82d16eeff",
+      "relocations": [
+        {
+          "offset": 17,
+          "kind": 2,
+          "input_addend": -4,
+          "mapped_input_target": 105556969746956,
+          "final_addend": -4,
+          "final_symbol_value": 105556969746956,
+          "input_target_name": "_RNvNtNtNtCs2wfjSAhXBvH_15reverie_inguest15private_runtime3tls3abi5STATE.llvm.16675895538620437867"
+        },
+        {
+          "offset": 47,
+          "kind": 2,
+          "input_addend": -4,
+          "mapped_input_target": 105556969747008,
+          "final_addend": -4,
+          "final_symbol_value": 105556969747008,
+          "input_target_name": "_RNvNtNtNtCs2wfjSAhXBvH_15reverie_inguest15private_runtime3tls3abi7CONTEXT.llvm.16675895538620437867"
+        },
+        {
+          "offset": 59,
+          "kind": 2,
+          "input_addend": 12,
+          "mapped_input_target": 105556969747008,
+          "final_addend": 12,
+          "final_symbol_value": 105556969747008,
+          "input_target_name": "_RNvNtNtNtCs2wfjSAhXBvH_15reverie_inguest15private_runtime3tls3abi7CONTEXT.llvm.16675895538620437867"
+        },
+        {
+          "offset": 113,
+          "kind": 9,
+          "input_addend": -4,
+          "mapped_input_target": 105556969751872,
+          "final_addend": -4,
+          "final_symbol_value": 105556969751872,
+          "input_target_name": "__libc"
+        },
+        {
+          "offset": 164,
+          "kind": 2,
+          "input_addend": 28,
+          "mapped_input_target": 105556969747008,
+          "final_addend": 28,
+          "final_symbol_value": 105556969747008,
+          "input_target_name": "_RNvNtNtNtCs2wfjSAhXBvH_15reverie_inguest15private_runtime3tls3abi7CONTEXT.llvm.16675895538620437867"
+        },
+        {
+          "offset": 171,
+          "kind": 2,
+          "input_addend": 60,
+          "mapped_input_target": 105556969747008,
+          "final_addend": 60,
+          "final_symbol_value": 105556969747008,
+          "input_target_name": "_RNvNtNtNtCs2wfjSAhXBvH_15reverie_inguest15private_runtime3tls3abi7CONTEXT.llvm.16675895538620437867"
+        },
+        {
+          "offset": 178,
+          "kind": 2,
+          "input_addend": 124,
+          "mapped_input_target": 105556969747008,
+          "final_addend": 124,
+          "final_symbol_value": 105556969747008,
+          "input_target_name": "_RNvNtNtNtCs2wfjSAhXBvH_15reverie_inguest15private_runtime3tls3abi7CONTEXT.llvm.16675895538620437867"
+        },
+        {
+          "offset": 185,
+          "kind": 2,
+          "input_addend": 132,
+          "mapped_input_target": 105556969747008,
+          "final_addend": 132,
+          "final_symbol_value": 105556969747008,
+          "input_target_name": "_RNvNtNtNtCs2wfjSAhXBvH_15reverie_inguest15private_runtime3tls3abi7CONTEXT.llvm.16675895538620437867"
+        },
+        {
+          "offset": 192,
+          "kind": 2,
+          "input_addend": 140,
+          "mapped_input_target": 105556969747008,
+          "final_addend": 140,
+          "final_symbol_value": 105556969747008,
+          "input_target_name": "_RNvNtNtNtCs2wfjSAhXBvH_15reverie_inguest15private_runtime3tls3abi7CONTEXT.llvm.16675895538620437867"
+        },
+        {
+          "offset": 199,
+          "kind": 2,
+          "input_addend": 76,
+          "mapped_input_target": 105556969747008,
+          "final_addend": 76,
+          "final_symbol_value": 105556969747008,
+          "input_target_name": "_RNvNtNtNtCs2wfjSAhXBvH_15reverie_inguest15private_runtime3tls3abi7CONTEXT.llvm.16675895538620437867"
+        },
+        {
+          "offset": 206,
+          "kind": 2,
+          "input_addend": 92,
+          "mapped_input_target": 105556969747008,
+          "final_addend": 92,
+          "final_symbol_value": 105556969747008,
+          "input_target_name": "_RNvNtNtNtCs2wfjSAhXBvH_15reverie_inguest15private_runtime3tls3abi7CONTEXT.llvm.16675895538620437867"
+        },
+        {
+          "offset": 213,
+          "kind": 2,
+          "input_addend": 108,
+          "mapped_input_target": 105556969747008,
+          "final_addend": 108,
+          "final_symbol_value": 105556969747008,
+          "input_target_name": "_RNvNtNtNtCs2wfjSAhXBvH_15reverie_inguest15private_runtime3tls3abi7CONTEXT.llvm.16675895538620437867"
+        },
+        {
+          "offset": 220,
+          "kind": 2,
+          "input_addend": -8,
+          "mapped_input_target": 105556969746960,
+          "final_addend": 67133960,
+          "final_symbol_value": 105556902612992,
+          "input_target_name": ""
+        },
+        {
+          "offset": 231,
+          "kind": 2,
+          "input_addend": -4,
+          "mapped_input_target": 105556969746960,
+          "final_addend": 67133964,
+          "final_symbol_value": 105556902612992,
+          "input_target_name": ""
+        },
+        {
+          "offset": 238,
+          "kind": 2,
+          "input_addend": 4,
+          "mapped_input_target": 105556969746960,
+          "final_addend": 67133972,
+          "final_symbol_value": 105556902612992,
+          "input_target_name": ""
+        },
+        {
+          "offset": 245,
+          "kind": 2,
+          "input_addend": 20,
+          "mapped_input_target": 105556969746960,
+          "final_addend": 67133988,
+          "final_symbol_value": 105556902612992,
+          "input_target_name": ""
+        },
+        {
+          "offset": 252,
+          "kind": 2,
+          "input_addend": 28,
+          "mapped_input_target": 105556969746960,
+          "final_addend": 67133996,
+          "final_symbol_value": 105556902612992,
+          "input_target_name": ""
+        },
+        {
+          "offset": 259,
+          "kind": 2,
+          "input_addend": 36,
+          "mapped_input_target": 105556969746960,
+          "final_addend": 67134004,
+          "final_symbol_value": 105556902612992,
+          "input_target_name": ""
+        },
+        {
+          "offset": 286,
+          "kind": 9,
+          "input_addend": -4,
+          "mapped_input_target": 105556902190184,
+          "final_addend": -4,
+          "final_symbol_value": 105556902190184,
+          "input_target_name": "__default_stacksize"
+        },
+        {
+          "offset": 295,
+          "kind": 2,
+          "input_addend": 148,
+          "mapped_input_target": 105556969747008,
+          "final_addend": 148,
+          "final_symbol_value": 105556969747008,
+          "input_target_name": "_RNvNtNtNtCs2wfjSAhXBvH_15reverie_inguest15private_runtime3tls3abi7CONTEXT.llvm.16675895538620437867"
+        },
+        {
+          "offset": 324,
+          "kind": 9,
+          "input_addend": -4,
+          "mapped_input_target": 105556899028293,
+          "final_addend": -4,
+          "final_symbol_value": 105556899028293,
+          "input_target_name": "__copy_tls"
+        },
+        {
+          "offset": 356,
+          "kind": 9,
+          "input_addend": -4,
+          "mapped_input_target": 105556899030499,
+          "final_addend": -4,
+          "final_symbol_value": 105556899030499,
+          "input_target_name": "__init_tp"
+        },
+        {
+          "offset": 366,
+          "kind": 2,
+          "input_addend": -5,
+          "mapped_input_target": 105556969746956,
+          "final_addend": -5,
+          "final_symbol_value": 105556969746956,
+          "input_target_name": "_RNvNtNtNtCs2wfjSAhXBvH_15reverie_inguest15private_runtime3tls3abi5STATE.llvm.16675895538620437867"
+        },
+        {
+          "offset": 387,
+          "kind": 4,
+          "input_addend": -4,
+          "mapped_input_target": 105556897856528,
+          "final_addend": -4,
+          "final_symbol_value": 105556897856528,
+          "input_target_name": "_RNvNtNtNtCs2wfjSAhXBvH_15reverie_inguest15private_runtime3tls3abi3die.llvm.16675895538620437867"
+        },
+        {
+          "offset": 407,
+          "kind": 4,
+          "input_addend": -4,
+          "mapped_input_target": 105556897856528,
+          "final_addend": -4,
+          "final_symbol_value": 105556897856528,
+          "input_target_name": "_RNvNtNtNtCs2wfjSAhXBvH_15reverie_inguest15private_runtime3tls3abi3die.llvm.16675895538620437867"
+        },
+        {
+          "offset": 417,
+          "kind": 4,
+          "input_addend": -4,
+          "mapped_input_target": 105556897856528,
+          "final_addend": -4,
+          "final_symbol_value": 105556897856528,
+          "input_target_name": "_RNvNtNtNtCs2wfjSAhXBvH_15reverie_inguest15private_runtime3tls3abi3die.llvm.16675895538620437867"
+        },
+        {
+          "offset": 427,
+          "kind": 4,
+          "input_addend": -4,
+          "mapped_input_target": 105556897856528,
+          "final_addend": -4,
+          "final_symbol_value": 105556897856528,
+          "input_target_name": "_RNvNtNtNtCs2wfjSAhXBvH_15reverie_inguest15private_runtime3tls3abi3die.llvm.16675895538620437867"
+        },
+        {
+          "offset": 437,
+          "kind": 4,
+          "input_addend": -4,
+          "mapped_input_target": 105556897856528,
+          "final_addend": -4,
+          "final_symbol_value": 105556897856528,
+          "input_target_name": "_RNvNtNtNtCs2wfjSAhXBvH_15reverie_inguest15private_runtime3tls3abi3die.llvm.16675895538620437867"
+        },
+        {
+          "offset": 447,
+          "kind": 4,
+          "input_addend": -4,
+          "mapped_input_target": 105556897856528,
+          "final_addend": -4,
+          "final_symbol_value": 105556897856528,
+          "input_target_name": "_RNvNtNtNtCs2wfjSAhXBvH_15reverie_inguest15private_runtime3tls3abi3die.llvm.16675895538620437867"
+        }
+      ],
+      "ro_slots": {
+        "105556902168256": 105556969751872,
+        "105556902168264": 105556902190184,
+        "105556902168272": 105556899028293,
+        "105556902168280": 105556899030499
+      },
+      "origin": {
+        "archive": "/home/newton/work/dev-hermit/worktrees/slots/liteinst-lane-20260927-scorecard/ignored/lc/coverage-work-20261012/t2-cold-constructor-budget-20261016/hermit-budget-candidate-dbbb/target/x86_64-unknown-linux-musl/loader-musl-feasibility/libdetcore_liteinst.a",
+        "header_offset": 62250882,
+        "member": "reverie_inguest-7584237dbf11f40b.reverie_inguest.1d5a7416414991fb-cgu.03.rcgu.o",
+        "ordinal": 133
+      }
+    },
+    {
+      "name": "__init_ssp",
+      "address": 105556899029978,
+      "input_hex": "534885ff742d488b1d000000004889feba080000004889dfe800000000c6430100488b1364488b042500000000488950285bc3488b1d000000004869c36d4ec641488903ebd7",
+      "linked_hex": "534885ff742d488b1dd1f42f004889feba080000004889dfe844c187ffc6430100488b1364488b042500000000488950285bc3488b1da4f42f004869c36d4ec641488903ebd7",
+      "relocations": [
+        {
+          "offset": 9,
+          "kind": 9,
+          "input_addend": -4,
+          "mapped_input_target": 105556969751992,
+          "final_addend": -4,
+          "final_symbol_value": 105556969751992,
+          "input_target_name": "__stack_chk_guard"
+        },
+        {
+          "offset": 25,
+          "kind": 4,
+          "input_addend": -4,
+          "mapped_input_target": 105556891149627,
+          "final_addend": -4,
+          "final_symbol_value": 105556891149627,
+          "input_target_name": "memcpy"
+        },
+        {
+          "offset": 54,
+          "kind": 9,
+          "input_addend": -4,
+          "mapped_input_target": 105556969751992,
+          "final_addend": -4,
+          "final_symbol_value": 105556969751992,
+          "input_target_name": "__stack_chk_guard"
+        }
+      ],
+      "ro_slots": {
+        "105556902172856": 105556969751992
+      },
+      "origin": {
+        "archive": "/home/newton/work/dev-hermit/worktrees/slots/liteinst-lane-20260927-scorecard/ignored/lc/coverage-work-20261012/t2-a5-ptrace-boundary-reverie-20261016/ignored/dh-io2z-resumed-20261018/buck-reland-20261018/loader-musl-inputs/nightly-20260712/private-toolchain/lib/rustlib/x86_64-unknown-linux-musl/lib/self-contained/libc.a",
+        "header_offset": 712450,
+        "member": "__stack_chk_fail.lo",
+        "ordinal": 137
+      }
+    }
+  ]
+}

@@ -68,14 +68,27 @@ pub enum Error {
     #[error("inherited stdin read retired after terminal cancellation")]
     TerminalReadCancelled,
 
-    /// The consumer cannot yet release its scheduler turn safely around this
-    /// external zero-count read. This is a terminal backend refusal, never a
-    /// successful read or a Linux syscall errno.
-    #[error(
-        "unsupported KVM zero-count read on guest fd {fd}: potentially blocking external endpoint requires consumer scheduling support"
-    )]
+    /// The executor cannot show that this zero-count read of a host endpoint
+    /// returns without waiting in the host, so it does not make it. This is a
+    /// terminal backend refusal, never a successful read or a Linux syscall
+    /// errno.
+    #[error("unsupported KVM zero-count read on guest fd {fd}: the endpoint may wait in the host")]
     PotentiallyBlockingZeroRead {
         /// The guest's low-word descriptor, including inherited stdin aliases.
+        fd: i32,
+    },
+
+    /// A read of an inotify instance whose host description is blocking,
+    /// which would wait in the host for an event, where the Tool can neither
+    /// see nor order the wait. Every instance this executor creates is
+    /// nonblocking on the host, so such an instance came from outside the
+    /// guest (received, or inherited). This is a terminal backend refusal,
+    /// never a Linux syscall errno.
+    #[error(
+        "unsupported KVM read of inotify guest fd {fd}: its host description is blocking, so the read would wait in the host"
+    )]
+    BlockingInotifyRead {
+        /// The guest's low-word descriptor.
         fd: i32,
     },
 
@@ -273,6 +286,16 @@ pub enum Error {
     #[error("Reverie post-exec hook failed: {0}")]
     PostExec(reverie::syscalls::Errno),
 
+    /// A Tool's exec-commit hook (`Tool::handle_exec_commit`) failed.
+    #[error("Reverie exec-commit hook failed: {0}")]
+    ExecCommit(reverie::syscalls::Errno),
+
+    /// A Tool's exec-commit hook injected a syscall (this number), which it may
+    /// not do: the exec can no longer fail, and the call would run between its
+    /// last fallible step and the image's replacement.
+    #[error("Reverie exec-commit hook injected syscall {0}, which it may not do")]
+    ExecCommitInjection(u64),
+
     /// A shared Reverie tool callback failed.
     #[error("Reverie tool failed: {0}")]
     Reverie(#[source] reverie::Error),
@@ -284,6 +307,32 @@ pub enum Error {
     /// The guest-memory mapping could not be created.
     #[error("failed to allocate guest memory: {0}")]
     MemoryMapping(#[source] std::io::Error),
+
+    /// A fallible allocation of host memory for the backend's own use failed:
+    /// `bytes` bytes for `what`, such as a copy of an image an exec loads.
+    #[error("allocating {bytes} bytes of host memory for {what} failed")]
+    HostAllocation {
+        /// What the memory was for.
+        what: &'static str,
+        /// The size of the request.
+        bytes: usize,
+    },
+
+    /// A host resource of this process's own (memory or address space,
+    /// descriptors, the host's file table) ran out while the backend carried
+    /// out an operation past the point where it could still answer the
+    /// guest: an exec that had already discarded the old image. The guest
+    /// asked for nothing Linux would have refused, and it sees no errno; the
+    /// run ends with this named refusal. The diagnostic names the resource,
+    /// the step that failed and the limit
+    /// ([`crate::host_limits::HostResourceExhaustion`]).
+    #[error("{diagnostic}")]
+    HostResources {
+        /// The host resource that ran out.
+        resource: crate::host_limits::HostResource,
+        /// What ran out, in which step, under which limit.
+        diagnostic: String,
+    },
 
     /// A writable syscall alias could not be physically retired. This is a
     /// terminal backend failure, never a guest errno. A process-lifetime ledger
@@ -304,6 +353,20 @@ pub enum Error {
         retention_id: usize,
     },
 
+    /// A vfork child runs on a copy of the address space it shares with its
+    /// parent on Linux, and its changes to private memory go back to the
+    /// parent when it execs or exits
+    /// ([`crate::GuestMemory::return_vfork_changes`]). An operation that the
+    /// copy cannot carry back is refused before its effect. This is terminal,
+    /// not a Linux syscall errno.
+    #[error("unsupported KVM vfork child operation {operation}: {reason}")]
+    VforkChildCapability {
+        /// Operation refused before its effect.
+        operation: &'static str,
+        /// Why the copy cannot carry it back.
+        reason: &'static str,
+    },
+
     /// An ordinary shared-file history requires an unsupported backend capability.
     /// This is terminal, not a Linux syscall errno or fabricated guest SIGBUS.
     #[error("unsupported KVM shared-file operation {operation}: {reason}")]
@@ -311,6 +374,19 @@ pub enum Error {
         /// Operation refused before its unsupported memory effect.
         operation: &'static str,
         /// Exact capability boundary, independent of host timing retries.
+        reason: &'static str,
+    },
+
+    /// A shared-file operation Linux would perform that this backend does not
+    /// implement, refused by name before any effect. It is terminal like
+    /// [`Self::SharedFileCapability`], which also reports the backend's
+    /// internal guards; this one never does, so a run that ends with it ends
+    /// with a named refusal ([`Self::is_named_refusal`]).
+    #[error("unsupported KVM shared-file operation {operation}: {reason}")]
+    UnsupportedSharedFile {
+        /// Operation refused before its effect.
+        operation: &'static str,
+        /// What the backend does not implement.
         reason: &'static str,
     },
 
@@ -445,6 +521,24 @@ pub enum Error {
     #[error("KVM guest threads cannot replace the process image")]
     GuestThreadExecUnsupported,
 
+    /// A Tool's timer-event callback (`Tool::handle_timer_event`) injected a
+    /// syscall that the callback cannot perform on this backend: a process
+    /// action (fork, vfork, clone, clone3 or exec), a tail injection other
+    /// than an exit, a signal that needs a syscall return frame, or an
+    /// `rt_sigprocmask` that would make a pending signal deliverable, which
+    /// needs one too. It was refused before it had any effect, and the run
+    /// fails, so that the Tool cannot take the refusal for an ordinary
+    /// failure of the syscall. The refusal stays the callback's outcome: an
+    /// injection the callback makes afterwards never runs, and a later exit
+    /// or retirement does not replace it.
+    #[error(
+        "KVM timer-event callback injected syscall {syscall}, which a timer event cannot perform: it can inject syscalls that return, and exits, but no process action, and no signal or signal-mask change that needs a syscall return frame"
+    )]
+    TimerCallbackInjectionUnsupported {
+        /// The refused syscall's number.
+        syscall: u64,
+    },
+
     /// Exec cancelled its siblings, but one of their consuming hooks failed.
     /// The Tool owner must finish consuming its own state before returning this
     /// error; no old or replacement guest continuation remains available.
@@ -496,5 +590,48 @@ impl Error {
             Self::ExecWorkerTeardown(error) => error.primary(),
             _ => self,
         }
+    }
+
+    /// Whether this error's [`Self::primary`] cause is the named refusal
+    /// [`Self::HostResources`]: a host resource of this process's own ran out
+    /// past the point where the backend could answer the guest.
+    pub fn is_host_resources_refusal(&self) -> bool {
+        matches!(self.primary(), Self::HostResources { .. })
+    }
+
+    /// The host resource this error reports running out of, when it is a
+    /// host call or allocation of this process's own that the host refused:
+    /// [`Self::MemoryMapping`] or [`Self::HostIo`] carrying ENOMEM, an
+    /// allocation's `OutOfMemory`, EMFILE or ENFILE; a KVM ioctl
+    /// ([`Self::Kvm`]) failing with one of those errnos, as `KVM_GET_SREGS`
+    /// can when the kernel cannot allocate; or a failed
+    /// [`Self::HostAllocation`]. `None` for any other error, such as a
+    /// malformed image or an ordinary ioctl fault.
+    pub fn host_resource_exhaustion(&self) -> Option<crate::host_limits::HostResourceExhaustion> {
+        use crate::host_limits::HostResource;
+        use crate::host_limits::HostResourceExhaustion;
+        match self {
+            Self::MemoryMapping(error) | Self::HostIo(error) => HostResourceExhaustion::of(error),
+            Self::Kvm(error) => HostResourceExhaustion::of_errno(error.errno()),
+            Self::HostAllocation { .. } => Some(HostResourceExhaustion::new(HostResource::Memory)),
+            _ => None,
+        }
+    }
+
+    /// Whether this failure's original cause ([`Self::primary`]) is a refusal
+    /// by name: the executor declined an operation it cannot perform
+    /// faithfully, rather than failing at one. A consumer reports a run that
+    /// ends this way as a refusal under its fail-closed policy, not as a
+    /// failure of its own. The refusals are [`Self::PotentiallyBlockingZeroRead`],
+    /// [`Self::BlockingInotifyRead`] and [`Self::UnsupportedSharedFile`];
+    /// every other variant is a failure, [`Self::SharedFileCapability`]
+    /// among them, since it also reports the backend's internal guards.
+    pub fn is_named_refusal(&self) -> bool {
+        matches!(
+            self.primary(),
+            Self::PotentiallyBlockingZeroRead { .. }
+                | Self::BlockingInotifyRead { .. }
+                | Self::UnsupportedSharedFile { .. }
+        )
     }
 }

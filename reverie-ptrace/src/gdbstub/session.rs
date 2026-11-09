@@ -10,11 +10,13 @@ use std::collections::BTreeMap;
 use std::os::fd::BorrowedFd;
 use std::os::fd::IntoRawFd;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use bytes::BytesMut;
-use futures::future::Future;
+use futures::future::FutureExt;
 use futures::stream::FuturesUnordered;
+use futures::stream::Stream;
 use futures::stream::StreamExt;
 use nix::fcntl;
 use nix::fcntl::OFlag;
@@ -27,29 +29,43 @@ use reverie::Pid;
 use safeptrace::ChildOp;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::MappedMutexGuard;
 use tokio::sync::Mutex;
-use tokio::sync::MutexGuard;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
 use super::Breakpoint;
 use super::BreakpointType;
+use super::ClientFeatures;
 use super::Error;
 use super::GdbRequest;
 use super::Inferior;
 use super::InferiorThreadId;
+use super::Interrupt;
 use super::Packet;
 use super::ResumeInferior;
 use super::StoppedInferior;
+use super::ThreadState;
+use super::ThreadView;
 use super::commands;
 use super::commands::*;
 use super::regs::CoreRegs;
 #[cfg(target_arch = "x86_64")]
 use super::regs::REGISTER_INFOS;
 use super::response::*;
+use super::signals::PassedSignals;
 
 type BoxWriter = Box<dyn AsyncWrite + Unpin + Send + Sync + 'static>;
+
+/// How often the session looks again for a thread that can take gdb's
+/// interrupt where it waits (`Session::next_stop`).
+const INTERRUPT_CHECK: Duration = Duration::from_millis(10);
+
+/// How long gdb's interrupt waits for a thread's next stop before, under a
+/// Tool that runs one thread at a time, a thread waiting inside a Tool
+/// callback may take it where it waits, whether or not another thread still
+/// runs, or, under any other Tool, every thread is sent SIGSTOP to make it
+/// stop (`Session::next_stop`).
+pub(super) const INTERRUPT_IN_PLACE_AFTER: Duration = Duration::from_secs(1);
 
 /// Target triple reported to LLDB via `qHostInfo`/`qProcessInfo`.
 #[cfg(target_arch = "x86_64")]
@@ -88,6 +104,30 @@ pub struct Session {
     /// Current thread
     pub current: Option<InferiorThreadId>,
 
+    /// The thread whose stop gdb was last told about. It answers requests on
+    /// its own channel until gdb resumes it, even before it reaches the gdb stop.
+    pub stopped: Option<InferiorThreadId>,
+
+    /// The signals gdb asked to have passed without a stop (`QPassSignals`),
+    /// shared with the traced threads, which deliver them unreported.
+    pub passed_signals: PassedSignals,
+
+    /// The optional stop events gdb asked for in its `qSupported`, shared
+    /// with the traced threads, which report only those.
+    pub client_features: ClientFeatures,
+
+    /// gdb's interrupt, armed while gdb waits for a stop and shared with the
+    /// packet relay, which raises it, and the traced threads, which take it.
+    pub interrupt: Interrupt,
+
+    /// Reporters to tell once the reply now being written reaches gdb
+    /// (`StoppedInferior::replied`).
+    replied: Vec<oneshot::Sender<()>>,
+
+    /// How many commands gdb has sent, which numbers the one now handled, as
+    /// the packet relay numbers them (`Interrupt::arm`).
+    commands: u64,
+
     /// Channel to report stop event.
     // NB: even though we could use a single `gdb_stop_rx` to receive all
     // stop events (mpsc), we use a `stop_rx` channel for each `inferior`
@@ -107,6 +147,10 @@ struct VcontResumeResult {
     new_inferior: Option<Inferior>,
     /// ptids must be removed, due to some tasks are exited.
     ptid_to_remove: Vec<ThreadId>,
+    /// The thread that reported the stop, which then waits in a gdb stop.
+    reporter: Option<InferiorThreadId>,
+    /// Tells the reporter once the reply is written (`StoppedInferior::replied`).
+    replied: Option<oneshot::Sender<()>>,
     /// Switch to a new task
     //
     // NB: This is possible when supporting multi-threaded programs. See
@@ -130,6 +174,80 @@ struct VcontResumeResult {
     // we switch current to thread `switch_to`, to simulate gdb's (client)
     // (mis)behavior.
     switch_to: Option<InferiorThreadId>,
+}
+
+/// The stops resumed threads report, until one that gdb is told about.
+#[derive(Default)]
+struct StopCollector {
+    reason: Option<StopReason>,
+    replied: Option<oneshot::Sender<()>>,
+    new_inferior: Option<Inferior>,
+    ptid_to_remove: Vec<ThreadId>,
+    reporter: Option<InferiorThreadId>,
+    switch_to: Option<InferiorThreadId>,
+}
+
+impl StopCollector {
+    /// Takes what thread `id` reported, returning whether gdb is to be told.
+    /// A thread exit is not reported, nor is a thread whose stop channel has
+    /// closed: it has gone, its exit with it.
+    fn take(
+        &mut self,
+        id: InferiorThreadId,
+        stop: Result<(StopReason, Option<oneshot::Sender<()>>), Error>,
+    ) -> Result<bool, Error> {
+        let (mut stop_reason, replied) = match stop {
+            Ok(stop) => stop,
+            Err(Error::GdbServerStopEventRecvError) => {
+                self.ptid_to_remove.push(id.into());
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
+        match &mut stop_reason {
+            StopReason::ThreadExited(pid, tgid, _exit_status) => {
+                self.ptid_to_remove
+                    .push(ThreadId::pid_tid(tgid.as_raw(), pid.as_raw()));
+                // The thread exit event `w XX; ptid is not reported
+                return Ok(false);
+            }
+            StopReason::Exited(pid, _exit_staus) => {
+                self.ptid_to_remove.push(ThreadId::pid(pid.as_raw()));
+            }
+            StopReason::NewTask(new_task) => {
+                self.reporter = Some(InferiorThreadId::new(new_task.pid, new_task.tgid));
+                let id = match new_task.op {
+                    ChildOp::Fork | ChildOp::Vfork => {
+                        InferiorThreadId::new(new_task.child, new_task.child)
+                    }
+                    ChildOp::Clone => InferiorThreadId::new(new_task.child, new_task.tgid),
+                };
+                self.new_inferior = Some(Inferior {
+                    id,
+                    view: new_task.view.clone(),
+                    resume_tx: new_task.resume_tx.take(),
+                    request_tx: new_task.request_tx.take(),
+                    stop_rx: new_task.stop_rx.take(),
+                    resume_pending: false,
+                });
+            }
+            StopReason::Stopped(stopped) => {
+                self.reporter = Some(InferiorThreadId::new(stopped.pid, stopped.tgid));
+                self.switch_to = self.reporter;
+            }
+        }
+        self.reason = Some(stop_reason);
+        self.replied = replied;
+        Ok(true)
+    }
+}
+
+/// Where the session reads a thread's registers.
+enum RegistersSource {
+    /// The thread answers requests on this channel.
+    Ask(mpsc::Sender<GdbRequest>),
+    /// The thread is held in a tool callback with these registers.
+    Parked(Box<CoreRegs>),
 }
 
 enum HandleVcontResume {
@@ -157,41 +275,74 @@ impl Session {
             bufsiz: 0x8000,
             inferiors: Arc::new(Mutex::new(BTreeMap::new())),
             current: None,
+            stopped: None,
+            replied: Vec::new(),
+            commands: 0,
+            passed_signals: PassedSignals::default(),
+            client_features: ClientFeatures::default(),
+            interrupt: Interrupt::default(),
             gdb_stop_rx: Some(gdb_stop_rx),
         }
     }
 
-    /// Get current inferior. GDB can select current inferior by `Hg<thread-id>`.
-    async fn with_inferior<'a, F, Fut>(&'a self, threadid: ThreadId, f: F) -> Fut::Output
-    where
-        F: FnOnce(MappedMutexGuard<'a, Inferior>) -> Fut + 'a,
-        Fut: Future + 'a,
-    {
-        let tid = threadid.gettid().unwrap_or_else(|| {
-            threadid
-                .getpid()
-                .expect("GDB thread identifier must contain a pid or tid")
-        });
-        let inferiors = self.inferiors.lock().await;
-        let inferior = MutexGuard::map(inferiors, |inferiors| {
-            inferiors
-                .get_mut(&tid)
-                .expect("selected GDB inferior must exist in the session map")
-        });
-        f(inferior).await
+    fn current_id(&self) -> Result<InferiorThreadId, Error> {
+        self.current.ok_or(Error::SessionNotStarted)
     }
 
-    /// Get current inferior. GDB can select current inferior by `Hg<thread-id>`.
-    async fn with_current_inferior<'a, F, Fut>(&'a self, f: F) -> Fut::Output
-    where
-        F: FnOnce(MappedMutexGuard<'a, Inferior>) -> Fut + 'a,
-        Fut: Future + 'a,
-    {
-        let threadid: ThreadId = self
-            .current
-            .expect("GDB current inferior must be set before handling requests")
-            .into();
-        self.with_inferior(threadid, f).await
+    /// Whether `inferior` answers requests on its own channel now.
+    fn answers(&self, inferior: &Inferior) -> bool {
+        self.stopped == Some(inferior.id) || matches!(inferior.view.state(), ThreadState::InGdbStop)
+    }
+
+    /// The requests channel of a thread that can act on the current thread's
+    /// address space: the current thread when it answers, else a thread of the
+    /// same process that does. Every thread of a process shares its memory and
+    /// breakpoints, so any of them serves memory and breakpoint requests.
+    async fn process_request_tx(&self) -> Result<mpsc::Sender<GdbRequest>, Error> {
+        let current = self.current_id()?;
+        let inferiors = self.inferiors.lock().await;
+        let target = inferiors
+            .get(&current.tid)
+            .ok_or(Error::UnknownThread(current.tid))?;
+        let same_process = |inferior: &&Inferior| inferior.getpid() == target.getpid();
+        let answering = if self.answers(target) {
+            Some(target)
+        } else {
+            self.stopped
+                .and_then(|stopped| inferiors.get(&stopped.tid))
+                .filter(same_process)
+                .or_else(|| {
+                    inferiors
+                        .values()
+                        .find(|inferior| same_process(inferior) && self.answers(inferior))
+                })
+        };
+        answering
+            .ok_or(Error::ThreadRunning(current.tid))?
+            .request_tx
+            .clone()
+            .ok_or(Error::SessionNotStarted)
+    }
+
+    /// Where the current thread's registers come from: the thread itself when it
+    /// answers requests, else what it published when a tool callback held it.
+    async fn registers_source(&self) -> Result<RegistersSource, Error> {
+        let current = self.current_id()?;
+        let inferiors = self.inferiors.lock().await;
+        let target = inferiors
+            .get(&current.tid)
+            .ok_or(Error::UnknownThread(current.tid))?;
+        if self.answers(target) {
+            return target
+                .request_tx
+                .clone()
+                .map(RegistersSource::Ask)
+                .ok_or(Error::SessionNotStarted);
+        }
+        match target.view.state() {
+            ThreadState::Parked(regs) => Ok(RegistersSource::Parked(regs)),
+            ThreadState::Running | ThreadState::InGdbStop => Err(Error::ThreadRunning(current.tid)),
+        }
     }
 
     /// create a new response writer
@@ -204,7 +355,7 @@ impl Session {
         let mut inferiors = self.inferiors.lock().await;
         let resume = ResumeInferior {
             action: if kill {
-                ResumeAction::Continue(Some(Signal::SIGKILL))
+                ResumeAction::Continue(Some(Signal::SIGKILL.into()))
             } else {
                 ResumeAction::Continue(None)
             },
@@ -219,20 +370,106 @@ impl Session {
         Ok(())
     }
 
+    /// The next stop in `waiting`, the stops of the threads of `views`.
+    /// Meanwhile, if gdb interrupts the guest, a running thread takes the
+    /// interrupt at its next stop. If none has after `INTERRUPT_CHECK`, and no
+    /// thread runs (each waits inside a Tool callback, such as threads that
+    /// all sleep or block, or waits for gdb), one that waits inside a callback
+    /// may take it where it waits; after `INTERRUPT_IN_PLACE_AFTER`, one may
+    /// whatever the others do. Under a Tool that lets threads run at once,
+    /// which none waits for, every thread is then sent SIGSTOP: a thread that
+    /// spins or blocks in the kernel makes no stop of its own.
+    async fn next_stop<S: Stream + Unpin>(
+        &self,
+        waiting: &mut S,
+        views: &BTreeMap<Pid, (Pid, ThreadView)>,
+    ) -> Option<S::Item> {
+        self.interrupt.wait_for(views.keys().copied());
+        let allow_in_place = async {
+            // A request taken while gdb held the guest stopped, by a thread
+            // whose stop gdb has yet to resume, is not one to decide; the
+            // next request after that thread's resume is.
+            loop {
+                self.interrupt.requested().await;
+                let mut waited = Duration::ZERO;
+                loop {
+                    // A thread that runs reaches its next stop meanwhile, as
+                    // does one that waits only briefly in the Tool.
+                    tokio::time::sleep(INTERRUPT_CHECK).await;
+                    waited += INTERRUPT_CHECK;
+                    if !self.interrupt.is_requested() {
+                        break;
+                    }
+                    let none_runs = views
+                        .values()
+                        .all(|(_, view)| !matches!(view.state(), ThreadState::Running));
+                    let fallback = waited >= INTERRUPT_IN_PLACE_AFTER;
+                    if self.interrupt.sequentialized() && (none_runs || fallback) {
+                        tracing::debug!(
+                            none_runs,
+                            ?waited,
+                            "gdb's interrupt may be taken where a thread waits"
+                        );
+                        self.interrupt.allow_in_place();
+                        break;
+                    }
+                    if !self.interrupt.sequentialized() && fallback {
+                        tracing::debug!(
+                            ?waited,
+                            "stopping the guest's threads for gdb's interrupt"
+                        );
+                        for (tid, (pid, _)) in views {
+                            self.interrupt.kick(*tid);
+                            // SAFETY: a plain syscall with integer arguments.
+                            let _ = unsafe {
+                                libc::syscall(
+                                    libc::SYS_tgkill,
+                                    pid.as_raw(),
+                                    tid.as_raw(),
+                                    libc::SIGSTOP,
+                                )
+                            };
+                        }
+                        break;
+                    }
+                }
+                self.interrupt.settled().await;
+            }
+        };
+        tokio::pin!(allow_in_place);
+        tokio::select! {
+            biased;
+            stop = waiting.next() => stop,
+            _ = &mut allow_in_place => unreachable!("deciding never ends"),
+        }
+    }
+
     /// handle vCont resume
     async fn vcont_resume(
         &self,
         threadid: ThreadId,
         resume: ResumeInferior,
     ) -> Result<HandleVcontResume, Error> {
-        let mut inferiors_to_resume: Vec<&mut Inferior> = Vec::new();
+        // An interrupt may come while gdb waits for the stop that answers
+        // this resume. Whatever stop gdb gets answers it.
+        self.interrupt.arm(self.commands);
+        let resumed = self.vcont_resume_until_stop(threadid, resume).await;
+        self.interrupt.disarm();
+        resumed
+    }
+
+    async fn vcont_resume_until_stop(
+        &self,
+        threadid: ThreadId,
+        resume: ResumeInferior,
+    ) -> Result<HandleVcontResume, Error> {
         let mut inferiors = self.inferiors.lock().await;
 
-        match threadid.tid {
+        let to_resume: Vec<Pid> = match threadid.tid {
             // vCont a specific ptid, such as $vCont;c:p2.2#..
             IdKind::Id(tid) => {
-                let inferior = inferiors.get_mut(&tid).ok_or(Error::UnknownThread(tid))?;
-                inferiors_to_resume.push(inferior);
+                inferiors.get(&tid).ok_or(Error::UnknownThread(tid))?;
+                vec![tid]
             }
             // Invalid vCont
             IdKind::Any => {
@@ -240,80 +477,81 @@ impl Session {
             }
             // vCont all threads, such as $vCont;c:p2.-1#10
             IdKind::All => match threadid.pid {
-                IdKind::Id(pid) => {
-                    for inferior in inferiors.values_mut() {
-                        if inferior.getpid() == pid {
-                            inferiors_to_resume.push(inferior);
-                        }
-                    }
-                }
+                IdKind::Id(pid) => inferiors
+                    .values()
+                    .filter(|inferior| inferior.getpid() == pid)
+                    .map(Inferior::gettid)
+                    .collect(),
                 _ => return Err(Error::ThreadIdNotSpecified),
             },
-        }
+        };
 
-        if inferiors_to_resume.is_empty() {
+        if to_resume.is_empty() {
             return Ok(HandleVcontResume::NotHandled);
         }
+        let processes: Vec<Pid> = to_resume
+            .iter()
+            .filter_map(|tid| inferiors.get(tid).map(Inferior::getpid))
+            .collect();
 
-        let mut new_inferior: Option<Inferior> = None;
-        let mut ptid_to_remove: Vec<ThreadId> = Vec::new();
-        let mut switch_to: Option<InferiorThreadId> = None;
-        let mut inferiors_to_wait = FuturesUnordered::new();
-
-        for inferior in inferiors_to_resume {
-            inferior.notify_resume(resume).await?;
-            inferiors_to_wait.push(inferior.wait_for_stop());
-        }
-
-        let mut reason: Option<StopReason> = None;
-        while let Some(stop_reason) = inferiors_to_wait.next().await {
-            let mut stop_reason = stop_reason?;
-            match &mut stop_reason {
-                StopReason::ThreadExited(pid, tgid, _exit_status) => {
-                    ptid_to_remove.push(ThreadId::pid_tid(tgid.as_raw(), pid.as_raw()));
-                    // The thread exit event `w XX; ptid is not reported
-                    continue;
-                }
-                StopReason::Exited(pid, _exit_staus) => {
-                    ptid_to_remove.push(ThreadId::pid(pid.as_raw()));
-                }
-                StopReason::NewTask(new_task) => {
-                    new_inferior = Some(match new_task.op {
-                        ChildOp::Fork => Inferior {
-                            id: InferiorThreadId::new(new_task.child, new_task.child),
-                            resume_tx: new_task.resume_tx.take(),
-                            request_tx: new_task.request_tx.take(),
-                            stop_rx: new_task.stop_rx.take(),
-                            resume_pending: false,
-                        },
-                        ChildOp::Vfork => Inferior {
-                            id: InferiorThreadId::new(new_task.child, new_task.child),
-                            resume_tx: new_task.resume_tx.take(),
-                            request_tx: new_task.request_tx.take(),
-                            stop_rx: new_task.stop_rx.take(),
-                            resume_pending: false,
-                        },
-                        ChildOp::Clone => Inferior {
-                            id: InferiorThreadId::new(new_task.child, new_task.tgid),
-                            resume_tx: new_task.resume_tx.take(),
-                            request_tx: new_task.request_tx.take(),
-                            stop_rx: new_task.stop_rx.take(),
-                            resume_pending: false,
-                        },
-                    });
-                }
-
-                StopReason::Stopped(stopped) => {
-                    switch_to = Some(InferiorThreadId::new(stopped.pid, stopped.tgid));
+        let mut stops = StopCollector::default();
+        {
+            // The threads waited for, where each is, to tell whether one runs
+            // when gdb interrupts the guest.
+            let mut views = BTreeMap::new();
+            let mut inferiors_to_wait = FuturesUnordered::new();
+            for inferior in inferiors.values_mut() {
+                if to_resume.contains(&inferior.gettid()) {
+                    inferior.notify_resume(resume).await?;
+                    let id = inferior.id;
+                    views.insert(id.tid, (id.pid, inferior.view.clone()));
+                    inferiors_to_wait.push(inferior.wait_for_stop().map(move |stop| (id, stop)));
                 }
             }
-            reason = Some(stop_reason);
-            break;
+            while let Some((id, stop)) = self.next_stop(&mut inferiors_to_wait, &views).await {
+                if stops.take(id, stop)? {
+                    break;
+                }
+                // Gone, or exited: it will not run again.
+                views.remove(&id.tid);
+            }
         }
-        Ok(HandleVcontResume::Handled(VcontResumeResult {
-            reason: reason.expect("GDB resume loop must produce a stop reason"),
+        if stops.reason.is_none() {
+            // Every thread this resumed exited without reporting a stop: a
+            // fatal signal it was resumed or stepped with ends the whole
+            // group. The process's exit then comes from a thread of it that an
+            // earlier resume left running, from gdb's view stopped, such as a
+            // leader that reports its exit last.
+            let mut views = BTreeMap::new();
+            let mut inferiors_to_wait = FuturesUnordered::new();
+            for inferior in inferiors.values_mut() {
+                if inferior.resume_pending && processes.contains(&inferior.getpid()) {
+                    let id = inferior.id;
+                    views.insert(id.tid, (id.pid, inferior.view.clone()));
+                    inferiors_to_wait.push(inferior.wait_for_stop().map(move |stop| (id, stop)));
+                }
+            }
+            while let Some((id, stop)) = self.next_stop(&mut inferiors_to_wait, &views).await {
+                if stops.take(id, stop)? {
+                    break;
+                }
+                views.remove(&id.tid);
+            }
+        }
+        let StopCollector {
+            reason,
+            replied,
             new_inferior,
             ptid_to_remove,
+            reporter,
+            switch_to,
+        } = stops;
+        Ok(HandleVcontResume::Handled(VcontResumeResult {
+            reason: reason.ok_or(Error::GdbServerStopEventRecvError)?,
+            new_inferior,
+            ptid_to_remove,
+            reporter,
+            replied,
             switch_to,
         }))
     }
@@ -328,8 +566,10 @@ impl Session {
                 self.no_ack_mode = true;
                 writer.put_str("OK");
             }
-            Base::qSupported(_) => {
-                writer.put_str("PacketSize=8000;vContSupported+;multiprocess+;exec-events+;fork-events+;vfork-events+;QThreadEvents+;QStartNoAckMode+;swbreak+;qXfer:features:read+;qXfer:auxv:read+;");
+            Base::qSupported(supported) => {
+                self.client_features
+                    .set_from_qsupported(&supported.features);
+                writer.put_str("PacketSize=8000;vContSupported+;multiprocess+;exec-events+;fork-events+;vfork-events+;QThreadEvents+;QStartNoAckMode+;QPassSignals+;swbreak+;qXfer:features:read+;qXfer:auxv:read+;qXfer:threads:read+;");
             }
             // LLDB extensions. See
             // https://github.com/llvm/llvm-project/blob/main/lldb/docs/resources/lldbgdbremote.md
@@ -377,6 +617,13 @@ impl Session {
                         }
                     }
                 }
+                qXfer::ThreadsRead { offset, len } => {
+                    let xml = self.threads_xml().await;
+                    let start = offset.min(xml.len());
+                    let end = offset.saturating_add(len).min(xml.len());
+                    writer.put_str(if end < xml.len() { "m" } else { "l" });
+                    writer.put_binary_encoded(&xml.as_bytes()[start..end]);
+                }
             },
             Base::qfThreadInfo(_) => {
                 writer.put_str("m");
@@ -397,6 +644,10 @@ impl Session {
             }
             Base::qAttached(_pid) => {
                 writer.put_str("0");
+            }
+            Base::QPassSignals(passed) => {
+                self.passed_signals.set(&passed.signals);
+                writer.put_str("OK");
             }
             Base::QThreadEvents(_thread_events) => {
                 // NB: This should toggle reporting thread event, such as
@@ -469,6 +720,7 @@ impl Session {
             Base::D(pid) => {
                 let pid = pid.pid;
                 let threadid = pid.map_or_else(ThreadId::all, |pid| ThreadId::pid(pid.as_raw()));
+                self.stopped = None;
                 self.detach_or_kill(threadid, false)
                     .await
                     .map(|_| ResponseOk)
@@ -504,6 +756,7 @@ impl Session {
             // receiving further (gdb) stop events.
             Base::vKill(pid) => {
                 let threadid = ThreadId::pid(pid.pid.as_raw());
+                self.stopped = None;
                 self.detach_or_kill(threadid, true)
                     .await
                     .map(|_| ResponseOk)
@@ -537,8 +790,12 @@ impl Session {
                                 reason,
                                 new_inferior,
                                 ptid_to_remove,
+                                reporter,
+                                replied,
                                 switch_to,
                             }) => {
+                                self.stopped = reporter;
+                                self.replied.extend(replied);
                                 let mut inferiors = self.inferiors.lock().await;
                                 for ptid in ptid_to_remove {
                                     if let Some(tid) = ptid.gettid() {
@@ -743,7 +1000,9 @@ impl Session {
             StopReason::Stopped(stopped) => {
                 let id = InferiorThreadId::new(stopped.pid, stopped.tgid);
                 self.current = Some(id);
+                self.stopped = Some(id);
                 let mut inferior = Inferior::new(id);
+                inferior.view = stop_reason.view;
                 inferior.request_tx = Some(stop_reason.request_tx);
                 inferior.resume_tx = Some(stop_reason.resume_tx);
                 inferior.stop_rx = Some(gdb_stop_rx);
@@ -770,84 +1029,72 @@ impl Session {
                 // handle interrupt
                 Packet::Interrupt => {}
                 Packet::Command(cmd) => {
+                    self.commands += 1;
                     tx_buf.clear();
                     let resp = self.handle_command(cmd, tx_buf.clone()).await?;
                     self.stream_tx
                         .write_all(&resp)
                         .await
                         .map_err(|_| Error::GdbServerSendPacketError)?;
+                    if !self.replied.is_empty() {
+                        self.stream_tx
+                            .flush()
+                            .await
+                            .map_err(|_| Error::GdbServerSendPacketError)?;
+                        for replied in self.replied.drain(..) {
+                            let _ = replied.send(());
+                        }
+                    }
                 }
             }
         }
         Ok(())
     }
 
+    /// Send `request`, made with a reply channel, to `request_tx` and await the reply.
+    async fn ask<T>(
+        request_tx: mpsc::Sender<GdbRequest>,
+        request: impl FnOnce(oneshot::Sender<Result<T, safeptrace::Error>>) -> GdbRequest,
+    ) -> Result<T, Error> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        request_tx
+            .send(request(reply_tx))
+            .await
+            .map_err(|_| Error::GdbRequestSendError)?;
+        Ok(reply_rx.await.map_err(|_| Error::GdbRequestRecvError)??)
+    }
+
     /// Set a breakpoint. must have an active inferior.
     async fn set_breakpoint(&self, bkpt: Breakpoint) -> Result<(), Error> {
-        self.with_current_inferior(move |inferior| async move {
-            let request_tx = inferior
-                .request_tx
-                .as_ref()
-                .ok_or(Error::SessionNotStarted)?;
-            let (reply_tx, reply_rx) = oneshot::channel();
-            let request = GdbRequest::SetBreakpoint(
-                Breakpoint {
-                    ty: BreakpointType::Software,
-                    addr: bkpt.addr,
-                    bytecode: None,
-                },
-                reply_tx,
-            );
-            request_tx
-                .send(request)
-                .await
-                .map_err(|_| Error::GdbRequestSendError)?;
-            reply_rx.await.map_err(|_| Error::GdbRequestRecvError)??;
-            Ok(())
+        let request_tx = self.process_request_tx().await?;
+        let bkpt = Breakpoint {
+            ty: BreakpointType::Software,
+            addr: bkpt.addr,
+            bytecode: None,
+        };
+        Self::ask(request_tx, |reply_tx| {
+            GdbRequest::SetBreakpoint(bkpt, reply_tx)
         })
         .await
     }
 
     async fn remove_breakpoint(&self, bkpt: Breakpoint) -> Result<(), Error> {
-        self.with_current_inferior(move |inferior| async move {
-            let request_tx = inferior
-                .request_tx
-                .as_ref()
-                .ok_or(Error::SessionNotStarted)?;
-            let (reply_tx, reply_rx) = oneshot::channel();
-            let request = GdbRequest::RemoveBreakpoint(
-                Breakpoint {
-                    ty: BreakpointType::Software,
-                    addr: bkpt.addr,
-                    bytecode: None,
-                },
-                reply_tx,
-            );
-            request_tx
-                .send(request)
-                .await
-                .map_err(|_| Error::GdbRequestSendError)?;
-            reply_rx.await.map_err(|_| Error::GdbRequestRecvError)??;
-
-            Ok(())
+        let request_tx = self.process_request_tx().await?;
+        let bkpt = Breakpoint {
+            ty: BreakpointType::Software,
+            addr: bkpt.addr,
+            bytecode: None,
+        };
+        Self::ask(request_tx, |reply_tx| {
+            GdbRequest::RemoveBreakpoint(bkpt, reply_tx)
         })
         .await
     }
 
     async fn read_inferior_memory(&self, addr: u64, size: usize) -> Result<Vec<u8>, Error> {
-        self.with_current_inferior(move |inferior| async move {
-            let request_tx = inferior
-                .request_tx
-                .as_ref()
-                .ok_or(Error::SessionNotStarted)?;
-            let (reply_tx, reply_rx) = oneshot::channel();
-            let request = GdbRequest::ReadInferiorMemory(addr, size, reply_tx);
-            request_tx
-                .send(request)
-                .await
-                .map_err(|_| Error::GdbRequestSendError)?;
-            let reply = reply_rx.await.map_err(|_| Error::GdbRequestRecvError)??;
-            Ok(reply)
+        let request_tx = self.process_request_tx().await?;
+        Self::ask(request_tx, |reply_tx| {
+            GdbRequest::ReadInferiorMemory(addr, size, reply_tx)
         })
         .await
     }
@@ -858,20 +1105,9 @@ impl Session {
         size: usize,
         data: Vec<u8>,
     ) -> Result<(), Error> {
-        let data = data.clone();
-        self.with_current_inferior(move |inferior| async move {
-            let request_tx = inferior
-                .request_tx
-                .as_ref()
-                .ok_or(Error::SessionNotStarted)?;
-            let (reply_tx, reply_rx) = oneshot::channel();
-            let request = GdbRequest::WriteInferiorMemory(addr, size, data, reply_tx);
-            request_tx
-                .send(request)
-                .await
-                .map_err(|_| Error::GdbRequestSendError)?;
-            reply_rx.await.map_err(|_| Error::GdbRequestRecvError)??;
-            Ok(())
+        let request_tx = self.process_request_tx().await?;
+        Self::ask(request_tx, |reply_tx| {
+            GdbRequest::WriteInferiorMemory(addr, size, data, reply_tx)
         })
         .await
     }
@@ -941,6 +1177,22 @@ impl Session {
         writer.put_binary_encoded(json.as_bytes());
     }
 
+    /// The `qXfer:threads:read` object: every thread, named as the guest named it,
+    /// so that gdb can tell a program's many threads apart.
+    async fn threads_xml(&self) -> String {
+        let mut xml = String::from("<?xml version=\"1.0\"?>\n<threads>\n");
+        for inferior in self.inferiors.lock().await.values() {
+            let (pid, tid) = (inferior.getpid().as_raw(), inferior.gettid().as_raw());
+            xml.push_str(&format!("<thread id=\"p{pid:x}.{tid:x}\""));
+            if let Some(name) = thread_name(pid, tid) {
+                xml.push_str(&format!(" name=\"{}\"", xml_escape(&name)));
+            }
+            xml.push_str("/>\n");
+        }
+        xml.push_str("</threads>\n");
+        xml
+    }
+
     /// Select the current thread from an optional LLDB `;thread:<id>;` suffix.
     /// A missing suffix leaves the current thread unchanged.
     async fn select_thread(&mut self, thread: Option<ThreadId>) {
@@ -961,43 +1213,255 @@ impl Session {
     }
 
     async fn read_registers(&self) -> Result<CoreRegs, Error> {
-        self.with_current_inferior(move |inferior| async move {
-            let request_tx = inferior
-                .request_tx
-                .as_ref()
-                .ok_or(Error::SessionNotStarted)?;
-            let (reply_tx, reply_rx) = oneshot::channel();
-            let request = GdbRequest::ReadRegisters(reply_tx);
-            request_tx
-                .send(request)
-                .await
-                .map_err(|_| Error::GdbRequestSendError)?;
-            let reply = reply_rx.await.map_err(|_| Error::GdbRequestRecvError)??;
-            Ok(reply)
-        })
-        .await
+        match self.registers_source().await? {
+            RegistersSource::Ask(request_tx) => {
+                Self::ask(request_tx, GdbRequest::ReadRegisters).await
+            }
+            RegistersSource::Parked(regs) => Ok(*regs),
+        }
     }
 
     async fn write_registers(&self, regs: Vec<u8>) -> Result<(), Error> {
-        self.with_current_inferior(move |inferior| async move {
-            let regs = regs.as_slice();
-            let request_tx = inferior
-                .request_tx
-                .as_ref()
-                .ok_or(Error::SessionNotStarted)?;
-            let (reply_tx, reply_rx) = oneshot::channel();
-            let core_regs: CoreRegs =
-                bincode::serde::decode_from_slice(regs, bincode::config::legacy())
-                    .map(|(v, _)| v)
-                    .map_err(|_| CommandParseError::MalformedRegisters)?;
-            let request = GdbRequest::WriteRegisters(core_regs, reply_tx);
-            request_tx
-                .send(request)
+        let core_regs: CoreRegs =
+            bincode::serde::decode_from_slice(regs.as_slice(), bincode::config::legacy())
+                .map(|(v, _)| v)
+                .map_err(|_| CommandParseError::MalformedRegisters)?;
+        match self.registers_source().await? {
+            RegistersSource::Ask(request_tx) => {
+                Self::ask(request_tx, |reply_tx| {
+                    GdbRequest::WriteRegisters(core_regs, reply_tx)
+                })
                 .await
-                .map_err(|_| Error::GdbRequestSendError)?;
-            reply_rx.await.map_err(|_| Error::GdbRequestRecvError)??;
-            Ok(())
+            }
+            // The tool resumes the thread from registers it may have kept, so
+            // changing them under it would be lost or, worse, half applied.
+            RegistersSource::Parked(_) => Err(Error::ThreadParked(self.current_id()?.tid)),
+        }
+    }
+}
+
+/// The name of thread `tid` of process `pid`, as `/proc` reports it.
+fn thread_name(pid: i32, tid: i32) -> Option<String> {
+    let comm = std::fs::read_to_string(format!("/proc/{pid}/task/{tid}/comm")).ok()?;
+    Some(comm.trim_end_matches('\n').to_owned())
+}
+
+fn xml_escape(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            '&' => "&amp;".to_owned(),
+            '<' => "&lt;".to_owned(),
+            '>' => "&gt;".to_owned(),
+            '"' => "&quot;".to_owned(),
+            '\'' => "&apos;".to_owned(),
+            c => c.to_string(),
         })
+        .collect()
+}
+
+// The tests tell threads apart by `CoreRegs::rip`.
+#[cfg(all(test, target_arch = "x86_64"))]
+mod tests {
+    use reverie::Pid;
+
+    use super::*;
+
+    fn session() -> Session {
+        let (_pkt_tx, pkt_rx) = mpsc::channel(1);
+        let (_stop_tx, stop_rx) = mpsc::channel(1);
+        Session::new(Box::new(tokio::io::sink()), pkt_rx, stop_rx)
+    }
+
+    /// Registers that tell threads apart by their instruction pointer.
+    fn regs(rip: u64) -> CoreRegs {
+        CoreRegs {
+            rip,
+            ..Default::default()
+        }
+    }
+
+    /// Adds thread `tid` of process `pid` in `state`, returning its requests
+    /// receiver and the guard that keeps the state.
+    async fn add_thread(
+        session: &Session,
+        pid: i32,
+        tid: i32,
+        state: ThreadState,
+    ) -> (mpsc::Receiver<GdbRequest>, crate::gdbstub::ThreadStateGuard) {
+        let mut inferior = Inferior::new(InferiorThreadId::new(
+            Pid::from_raw(tid),
+            Pid::from_raw(pid),
+        ));
+        let (request_tx, request_rx) = mpsc::channel(1);
+        inferior.request_tx = Some(request_tx);
+        let guard = inferior.view.enter(state);
+        session
+            .inferiors
+            .lock()
+            .await
+            .insert(Pid::from_raw(tid), inferior);
+        (request_rx, guard)
+    }
+
+    fn select(session: &mut Session, pid: i32, tid: i32) {
+        session.current = Some(InferiorThreadId::new(
+            Pid::from_raw(tid),
+            Pid::from_raw(pid),
+        ));
+    }
+
+    /// Answers one memory read on `requests` with `bytes`.
+    fn answer_memory_read(
+        mut requests: mpsc::Receiver<GdbRequest>,
+        bytes: Vec<u8>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            match requests.recv().await {
+                Some(GdbRequest::ReadInferiorMemory(_, _, reply_tx)) => {
+                    let _ = reply_tx.send(Ok(bytes));
+                }
+                other => panic!("expected a memory read, got {other:?}"),
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn threads_object_lists_every_thread() {
+        let session = session();
+        let (_main_rx, _main) = add_thread(&session, 3, 3, ThreadState::InGdbStop).await;
+        let (_worker_rx, _worker) = add_thread(&session, 3, 0x1f, ThreadState::Running).await;
+
+        let xml = session.threads_xml().await;
+        assert!(xml.contains(r#"<thread id="p3.3""#), "{xml}");
+        assert!(
+            xml.contains(r#"<thread id="p3.1f""#),
+            "thread ids are hex, as in packets: {xml}"
+        );
+    }
+
+    #[test]
+    fn thread_names_come_from_proc() {
+        let pid = std::process::id() as i32;
+        let name = thread_name(pid, pid).expect("this process names its main thread");
+        assert!(!name.is_empty() && !name.ends_with('\n'), "{name:?}");
+        assert_eq!(thread_name(pid, i32::MAX), None, "no such thread");
+    }
+
+    #[test]
+    fn thread_names_are_escaped_for_xml() {
+        assert_eq!(xml_escape(r#"a<b>&"c'"#), "a&lt;b&gt;&amp;&quot;c&apos;");
+    }
+
+    #[tokio::test]
+    async fn parked_thread_registers_come_from_its_snapshot() {
+        let mut session = session();
+        let (_stopped_rx, _stopped) = add_thread(&session, 3, 3, ThreadState::InGdbStop).await;
+        let (mut parked_rx, _parked) =
+            add_thread(&session, 3, 5, ThreadState::Parked(Box::new(regs(0x5555)))).await;
+        select(&mut session, 3, 5);
+
+        let read = session
+            .read_registers()
+            .await
+            .expect("parked registers are readable");
+        assert_eq!(read.rip, 0x5555, "the snapshot the parked thread published");
+        assert!(
+            parked_rx.try_recv().is_err(),
+            "a parked thread cannot answer, so it is not asked"
+        );
+    }
+
+    #[tokio::test]
+    async fn stopped_thread_answers_before_it_reaches_the_gdb_stop() {
+        let mut session = session();
+        // The thread has reported its stop but still looks parked: it has not
+        // entered its gdb stop yet, where it reads the request.
+        let (mut stopped_rx, _stopped) =
+            add_thread(&session, 3, 3, ThreadState::Parked(Box::new(regs(0x1)))).await;
+        session.stopped = Some(InferiorThreadId::new(Pid::from_raw(3), Pid::from_raw(3)));
+        select(&mut session, 3, 3);
+        let answer = tokio::spawn(async move {
+            match stopped_rx.recv().await {
+                Some(GdbRequest::ReadRegisters(reply_tx)) => {
+                    let _ = reply_tx.send(Ok(regs(0x3333)));
+                }
+                other => panic!("expected a register read, got {other:?}"),
+            }
+        });
+
+        let read = session
+            .read_registers()
+            .await
+            .expect("the stopped thread answers");
+        assert_eq!(read.rip, 0x3333, "live registers, not the stale snapshot");
+        answer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn parked_thread_memory_is_read_through_a_stopped_thread() {
+        let mut session = session();
+        let (stopped_rx, _stopped) = add_thread(&session, 3, 3, ThreadState::InGdbStop).await;
+        let (_parked_rx, _parked) =
+            add_thread(&session, 3, 5, ThreadState::Parked(Box::new(regs(0x5555)))).await;
+        select(&mut session, 3, 5);
+        let answer = answer_memory_read(stopped_rx, vec![1, 2, 3]);
+
+        let bytes = session
+            .read_inferior_memory(0x1000, 3)
+            .await
+            .expect("memory is shared");
+        assert_eq!(bytes, vec![1, 2, 3]);
+        answer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn running_thread_fails_instead_of_waiting() {
+        let mut session = session();
+        let (_stopped_rx, _stopped) = add_thread(&session, 3, 3, ThreadState::InGdbStop).await;
+        let (_running_rx, _running) = add_thread(&session, 3, 7, ThreadState::Running).await;
+        select(&mut session, 3, 7);
+
+        let read =
+            tokio::time::timeout(std::time::Duration::from_secs(10), session.read_registers())
+                .await
+                .expect("a thread that cannot answer must not block the session");
+        assert!(
+            matches!(read, Err(Error::ThreadRunning(tid)) if tid == Pid::from_raw(7)),
+            "{read:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn parked_registers_are_read_only() {
+        let mut session = session();
+        let (_stopped_rx, _stopped) = add_thread(&session, 3, 3, ThreadState::InGdbStop).await;
+        let (_parked_rx, _parked) =
+            add_thread(&session, 3, 5, ThreadState::Parked(Box::new(regs(0x5555)))).await;
+        select(&mut session, 3, 5);
+        let encoded =
+            bincode::serde::encode_to_vec(regs(0x6666), bincode::config::legacy()).unwrap();
+
+        let written = session.write_registers(encoded).await;
+        assert!(
+            matches!(written, Err(Error::ThreadParked(tid)) if tid == Pid::from_raw(5)),
+            "{written:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn another_process_memory_is_not_read_through_this_one() {
+        let mut session = session();
+        let (_stopped_rx, _stopped) = add_thread(&session, 3, 3, ThreadState::InGdbStop).await;
+        // A forked child has its own address space.
+        let (_child_rx, _child) = add_thread(&session, 9, 9, ThreadState::Running).await;
+        select(&mut session, 9, 9);
+
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            session.read_inferior_memory(0x1000, 3),
+        )
         .await
+        .expect("must not block");
+        assert!(matches!(read, Err(Error::ThreadRunning(_))), "{read:?}");
     }
 }

@@ -5,7 +5,7 @@ target. It measures the instrumentation overhead of Reverie's exact shared
 [`counter2`](../../reverie-examples/counter2_tool.rs) Tool over calibrated
 multi-second fixed-work guests.
 
-The runner supports `ptrace`, `kvm`, `liteinst`, `dbt`, `sabre`, and `e9patch`.
+The core runner supports `ptrace`, `kvm`, and `liteinst`.
 It reports each backend against the matching native executable rather than
 comparing raw times from unlike static and dynamic binaries.
 
@@ -52,31 +52,37 @@ is constrained to 3-10 seconds.
 
 ## Build
 
-Optional backend sources are pinned submodules. Build selected adapters and
-their native dependencies through the proxy:
+Build selected first-party adapters and their native dependencies:
 
 ```bash
-with-proxy benchmarks/counter2-shootout/prepare.sh
+benchmarks/counter2-shootout/prepare.sh
 ```
 
 Pass a comma-separated subset to build less, for example:
 
 ```bash
-with-proxy benchmarks/counter2-shootout/prepare.sh ptrace,kvm,liteinst
+benchmarks/counter2-shootout/prepare.sh ptrace,kvm,liteinst
 ```
 
-The full build needs a working C/C++ toolchain, CMake, and the upstream e9patch
-build dependencies. The KVM variant is a freestanding `-nostdlib` ELF, so it
+The build needs a working C/C++ toolchain. The KVM variant is a freestanding `-nostdlib` ELF, so it
 does not require static glibc; KVM measurements do require usable `/dev/kvm`.
 
 ## Run
 
 The default is five measured repetitions, one warmup, five seconds of native
-work, and all six backends:
+work, and all three first-party backends:
 
 ```bash
 benchmarks/counter2-shootout/run.py
 ```
+
+The external repositories own the former DynamoRIO and SaBRe/e9patch physical
+preparation. The core driver exposes explicit physical command and environment
+callbacks while retaining its comparison, calibration, sampling, and reporting.
+The patching repository's frontend and hash-bound driver adapter are staged as
+source; their final dependency pins, builds, and benchmark execution remain
+unqualified. DynamoRIO benchmark orchestration remains open. Historical
+all-backend results and the original `known-green.json` data are retained.
 
 Compare a pair on only its known-green intersection:
 
