@@ -66991,9 +66991,7 @@ pub mod private_static {
     const LOW: u64 = 0x6000_e100_0000;
     const HIGH: u64 = 0x6000_ff00_0000;
     const GATE: u64 = LOW + 4096;
-    const ENTRY: &str = selected_initializers::MappedConsumer::Detcore
-        .source()
-        .first_entry();
+    #[cfg(test)]
     const LAYOUT: &str = selected_initializers::MappedConsumer::Detcore
         .source()
         .layout();
@@ -67395,7 +67393,10 @@ pub mod private_static {
         guard: Guard,
         cargo: FileIdentity,
         target_dir: PathBuf,
-        features: &'static [&'static str],
+        // The one consumer this transaction selected. The link, joins,
+        // final-artifact checks, diagnostics and terminal observation
+        // all read it here; none of them selects again.
+        consumer: selected_initializers::MappedConsumer,
         metadata_sha256: String,
         archive_owner: Arc<ArchiveSourceOwner>,
     }
@@ -67453,6 +67454,11 @@ pub mod private_static {
             &self.metadata_sha256
         }
 
+        /// The mapped consumer selected when this transaction resolved.
+        pub fn mapped_consumer(&self) -> selected_initializers::MappedConsumer {
+            self.consumer
+        }
+
         fn require_archive_owner(&self, archive: &StaticArchive) -> Result<()> {
             require_same_archive_source(
                 &self.archive_owner,
@@ -67482,7 +67488,7 @@ pub mod private_static {
         /// source is bound; every other identity check reads
         /// the same descriptor, never per-site literals.
         pub fn with_resolved_for<T>(
-            consumer: selected_initializers::MappedConsumer,
+            selected: selected_initializers::MappedConsumer,
             expected: &SourceExpectation<'_>,
             runner: &mut Runner,
             body: impl FnOnce(&Self, &mut Runner) -> Result<T>,
@@ -67516,7 +67522,7 @@ pub mod private_static {
             }
             // Package identity comes from the selected closed
             // consumer descriptor, not per-site literals.
-            let consumer = consumer.source();
+            let consumer = selected.source();
             require(
                 expected.target_dir.is_absolute()
                     && fs::canonicalize(expected.target_dir).map_err(|e| e.to_string())?
@@ -67715,7 +67721,7 @@ pub mod private_static {
                 guard,
                 cargo,
                 target_dir: expected.target_dir.to_owned(),
-                features: consumer.features(),
+                consumer: selected,
                 archive_owner: Arc::new(ArchiveSourceOwner { _reserved: 0 }),
             };
             let result = body(&context, runner);
@@ -67747,7 +67753,7 @@ pub mod private_static {
                         "--profile".into(),
                         "liteinst-runtime".into(),
                         "--features".into(),
-                        self.features.join(","),
+                        self.consumer.source().features().join(","),
                         "--crate-type".into(),
                         "staticlib".into(),
                         "--message-format=json-render-diagnostics".into(),
@@ -67767,7 +67773,7 @@ pub mod private_static {
                     ArchiveSelectionExpectation {
                         target_dir: &self.target_dir,
                         metadata_sha256: &self.metadata_sha256,
-                        expected_features: self.features,
+                        expected_features: self.consumer.source().features(),
                         archive_owner: &self.archive_owner,
                     },
                 )
@@ -68031,8 +68037,12 @@ pub mod private_static {
     }
     // Only the target-produced #[used] layout has SHF_GNU_RETAIN. This is an
     // exact role-specific contract, not a mask applied to arbitrary objects.
-    fn layout_object<'a>(elf: &Elf<'_>, bytes: &'a [u8]) -> Result<(sym::Sym, &'a [u8])> {
-        object_with_section_flags(elf, bytes, LAYOUT, 96, 4, 0x200002)
+    fn layout_object<'a>(
+        elf: &Elf<'_>,
+        bytes: &'a [u8],
+        layout: &str,
+    ) -> Result<(sym::Sym, &'a [u8])> {
+        object_with_section_flags(elf, bytes, layout, 96, 4, 0x200002)
     }
     fn object_with_section_flags<'a>(
         elf: &Elf<'_>,
@@ -68351,7 +68361,7 @@ pub mod private_static {
                     (
                         "entry",
                         &self.workspace,
-                        "detcore-liteinst/src/exec_initial/mapped_entry.rs",
+                        self.consumer.source().entry_source_relative(),
                     ),
                     (
                         "exec_private",
@@ -68416,7 +68426,10 @@ pub mod private_static {
                 files.push(geometry.clone());
                 sources.insert("tls_layout", geometry);
                 super::private_machine_diagnostic::startup_census::inspect(
-                    tls_variant,
+                    super::private_machine_diagnostic::startup_census::CensusSelectors {
+                        tls_variant,
+                        entry: self.consumer.source().first_entry()?,
+                    },
                     &archive.file,
                     artifact,
                     link_map,
@@ -68451,9 +68464,11 @@ pub mod private_static {
             objdump: &FileIdentity,
             runner: &mut Runner,
         ) -> Result<super::private_machine_diagnostic::EntryTransferDiagnostic> {
-            let result = super::private_machine_diagnostic::inspect_entry_transfers_with_memcpy(
-                inputs, artifact, objdump, runner,
-            );
+            let result = self.consumer.source().first_entry().and_then(|entry| {
+                super::private_machine_diagnostic::inspect_entry_transfers_with_memcpy(
+                    entry, inputs, artifact, objdump, runner,
+                )
+            });
             close_result(result, self.guard.close(runner))
         }
         /// Inspect current bytes and close source/archive/file identities even
@@ -68563,14 +68578,16 @@ pub mod private_static {
                     Some(observation) => geometry_impl(&elf, &bytes, Some(observation))?,
                     None => geometry(&elf, &bytes)?,
                 };
-                let entry = strong_function(&elf, &bytes, ENTRY)?;
+                let consumer = self.consumer.source();
+                let entry_name = consumer.first_entry()?;
+                let entry = strong_function(&elf, &bytes, entry_name)?;
                 require(
                     elf.entry == entry.st_value,
                     "static ELF entry differs from genuine mapped entry",
                 )?;
                 let mut strong_symbols = BTreeMap::new();
                 for name in [
-                    ENTRY,
+                    entry_name,
                     "__init_tls",
                     "malloc",
                     "__libc_malloc",
@@ -68654,7 +68671,7 @@ pub mod private_static {
                 )?;
                 // Equality + the ABI interval is observation, not qualification
                 // of both pages' remaining bytes against reviewed instructions.
-                let (_, descriptor) = layout_object(&elf, &bytes)?;
+                let (_, descriptor) = layout_object(&elf, &bytes, consumer.layout())?;
                 let layout = layout_words(descriptor)?;
                 Ok(StaticImageInspection {
                     artifact: artifact.clone(),
@@ -69034,10 +69051,10 @@ pub mod private_static {
             let (_, payload) =
                 object(&elf, &bytes, "reverie_inguest_fixed_gate_template", 4096, 4).unwrap();
             assert_eq!(payload, &[0x5a; 4096]);
-            assert!(layout_object(&elf, &bytes).is_err());
+            assert!(layout_object(&elf, &bytes, LAYOUT).is_err());
             let bytes = reference_object_fixture(LAYOUT, 96, 0x200002);
             let elf = Elf::parse(&bytes).unwrap();
-            let (_, payload) = layout_object(&elf, &bytes).unwrap();
+            let (_, payload) = layout_object(&elf, &bytes, LAYOUT).unwrap();
             assert_eq!(payload, &[0x5a; 96]);
             // The ordinary object path remains strict even for the same name.
             assert!(object(&elf, &bytes, LAYOUT, 96, 4).is_err());
@@ -69063,7 +69080,7 @@ pub mod private_static {
                 );
                 let bytes = reference_object_fixture(LAYOUT, 96, 0x200002 | extra);
                 assert!(
-                    layout_object(&Elf::parse(&bytes).unwrap(), &bytes).is_err(),
+                    layout_object(&Elf::parse(&bytes).unwrap(), &bytes, LAYOUT).is_err(),
                     "layout flags {extra:#x}"
                 );
             }
@@ -69080,7 +69097,7 @@ pub mod private_static {
                 .is_err()
             );
             let bytes = reference_object_fixture(LAYOUT, 96, 2);
-            assert!(layout_object(&Elf::parse(&bytes).unwrap(), &bytes).is_err());
+            assert!(layout_object(&Elf::parse(&bytes).unwrap(), &bytes, LAYOUT).is_err());
         }
         #[test]
         fn private_static_retained_layout_keeps_type_size_load_and_coordinate_checks() {
@@ -69100,7 +69117,7 @@ pub mod private_static {
                 let mut bytes = original.clone();
                 bytes[at..at + width].copy_from_slice(&value.to_le_bytes()[..width]);
                 assert!(
-                    layout_object(&Elf::parse(&bytes).unwrap(), &bytes).is_err(),
+                    layout_object(&Elf::parse(&bytes).unwrap(), &bytes, LAYOUT).is_err(),
                     "field {at}"
                 );
             }
@@ -69531,6 +69548,8 @@ pub mod private_machine_diagnostic {
             Role {
                 name: "entry",
                 source: Some("entry"),
+                // Recorded V9 selector only; `inspect` selects the
+                // entry its source transaction's consumer names.
                 symbol: "detcore_liteinst_mapped_entry",
                 asynchronous: false,
             },
@@ -69832,10 +69851,17 @@ pub mod private_machine_diagnostic {
             Ok(bytes)
         }
 
+        /// What the source transaction selects for the census: the TLS
+        /// source variant and the first entry of its mapped consumer.
+        pub(in super::super) struct CensusSelectors {
+            pub(in super::super) tls_variant: super::super::private_static::tls_sources::Variant,
+            pub(in super::super) entry: &'static str,
+        }
+
         // Only the source factory calls this. All output is diagnostic data, including
         // a successfully collected body. No variant can satisfy an executable API.
         pub(in super::super) fn inspect(
-            tls_variant: super::super::private_static::tls_sources::Variant,
+            selectors: CensusSelectors,
             archive: &FileIdentity,
             artifact: &FileIdentity,
             link_map: &FileIdentity,
@@ -69843,6 +69869,7 @@ pub mod private_machine_diagnostic {
             sources: BTreeMap<&'static str, FileIdentity>,
             runner: &mut Runner,
         ) -> Result<PrivateStartupCensus> {
+            let CensusSelectors { tls_variant, entry } = selectors;
             let mut files = vec![
                 archive.clone(),
                 artifact.clone(),
@@ -69886,12 +69913,12 @@ pub mod private_machine_diagnostic {
                 for role in ROLES.iter().chain(project) {
                     let selected_selector = selector(cohort, role);
                     let source = selected_selector.map_or(role.source, |(_, source)| source);
-                    let expected_symbol = selected_selector.map(|(symbol, _)| {
-                        if role.name == "tls_geometry" {
-                            tls_variant.geometry_symbol()
-                        } else {
-                            symbol
-                        }
+                    let expected_symbol = selected_selector.map(|(symbol, _)| match role.name {
+                        "tls_geometry" => tls_variant.geometry_symbol(),
+                        // The source transaction's consumer, not the
+                        // recorded Detcore selector below.
+                        "entry" => entry,
+                        _ => symbol,
                     });
                     let matches = elf
                         .syms
@@ -70605,10 +70632,6 @@ pub mod private_machine_diagnostic {
         }
     }
 
-    const ENTRY: &str = crate::private_static::selected_initializers::MappedConsumer::Detcore
-        .source()
-        .first_entry();
-
     /// Immutable observations only. Even a complete root transfer census leaves
     /// every callee's semantics and pre-TLS closure explicitly unproved.
     #[derive(Debug, Serialize)]
@@ -70801,22 +70824,29 @@ pub mod private_machine_diagnostic {
     /// No returned value can be converted to an existing admission capability.
     /// An unsupported transfer is retained as diagnostic refusal; NOT_PROVEN
     /// remains unconditional even when all root transfers have known addresses.
+    ///
+    /// Outside a source transaction the caller names the closed mapped
+    /// consumer whose first entry roots the census; this is that call's
+    /// one selection.
     pub fn inspect_entry_transfers(
+        consumer: private_static::selected_initializers::MappedConsumer,
         artifact: &FileIdentity,
         objdump: &FileIdentity,
         runner: &mut Runner,
     ) -> Result<EntryTransferDiagnostic> {
-        inspect_entry_transfers_impl(artifact, objdump, runner, None, None)
+        let entry = consumer.source().first_entry()?;
+        inspect_entry_transfers_impl(entry, artifact, objdump, runner, None, None)
     }
 
     pub(super) fn inspect_entry_transfers_with_memcpy(
+        entry: &str,
         inputs: &NativeMemcpyInputs<'_>,
         artifact: &FileIdentity,
         objdump: &FileIdentity,
         runner: &mut Runner,
     ) -> Result<EntryTransferDiagnostic> {
         with_native_memcpy(inputs, artifact, |role| {
-            inspect_entry_transfers_impl(artifact, objdump, runner, Some(role), None)
+            inspect_entry_transfers_impl(entry, artifact, objdump, runner, Some(role), None)
         })
     }
 
@@ -70826,7 +70856,14 @@ pub mod private_machine_diagnostic {
         objdump: &FileIdentity,
         runner: &mut Runner,
     ) -> Result<EntryTransferDiagnostic> {
-        inspect_entry_transfers_impl(artifact, objdump, runner, None, Some(role))
+        inspect_entry_transfers_impl(
+            role.mapped_entry(),
+            artifact,
+            objdump,
+            runner,
+            None,
+            Some(role),
+        )
     }
 
     pub(crate) fn inspect_entry_transfers_with_ordinary_and_memcpy(
@@ -70837,11 +70874,19 @@ pub mod private_machine_diagnostic {
         runner: &mut Runner,
     ) -> Result<EntryTransferDiagnostic> {
         with_native_memcpy(inputs, artifact, |native| {
-            inspect_entry_transfers_impl(artifact, objdump, runner, Some(native), Some(ordinary))
+            inspect_entry_transfers_impl(
+                ordinary.mapped_entry(),
+                artifact,
+                objdump,
+                runner,
+                Some(native),
+                Some(ordinary),
+            )
         })
     }
 
     fn inspect_entry_transfers_impl(
+        entry: &str,
         artifact: &FileIdentity,
         objdump: &FileIdentity,
         runner: &mut Runner,
@@ -70863,7 +70908,7 @@ pub mod private_machine_diagnostic {
             let roots: Vec<_> = elf
                 .syms
                 .iter()
-                .filter(|s| elf.strtab.get_at(s.st_name) == Some(ENTRY))
+                .filter(|s| elf.strtab.get_at(s.st_name) == Some(entry))
                 .collect();
             require(roots.len() == 1, "mapped root absent/ambiguous")?;
             let root = roots[0];
@@ -70963,7 +71008,7 @@ pub mod private_machine_diagnostic {
                 artifact: artifact.clone(),
                 objdump_tool: objdump.clone(),
                 disassembly,
-                root: symbol_evidence(ENTRY, &root),
+                root: symbol_evidence(entry, &root),
                 complete_root_bytes: usize::try_from(root.st_size)
                     .map_err(|_| "root byte count exceeds usize")?,
                 complete_root_instructions: instructions.len(),

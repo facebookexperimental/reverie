@@ -746,6 +746,10 @@ pub struct OrdinaryGateObservations {
     page_member_ordinal: usize,
     page_member_header: u64,
     scope: &'static str,
+    // First entry of the consumer the creating source transaction
+    // selected; the entry-transfer diagnostic roots its census here.
+    #[serde(skip)]
+    mapped_entry: &'static str,
 }
 fn same_identity(actual: &FileIdentity, expected: &FileIdentity, error: &str) -> Result<()> {
     require(
@@ -765,6 +769,10 @@ impl OrdinaryGateObservations {
     /// contract; this observation never authorizes that call or any syscall.
     pub fn addresses(&self) -> (u64, u64, u64) {
         (self.entry, self.entry + 32, self.entry + 34)
+    }
+
+    pub(crate) fn mapped_entry(&self) -> &'static str {
+        self.mapped_entry
     }
 
     /// Reuse the actual complete root-byte/decoder/caller/RO-GOT diagnostic.
@@ -1239,6 +1247,7 @@ impl VerifiedStaticSource {
                 page_member_ordinal: g.ordinal,
                 page_member_header: g.header,
                 scope: "ORDINARY44_SOURCE_MEMBER_MAP_RX_IDENTITY_ONLY_NOT_SYSCALL_OR_READY",
+                mapped_entry: self.consumer.source().first_entry()?,
             };
             role.verify_final(&elf, &data)?;
             body(&role, runner)
@@ -1476,6 +1485,7 @@ mod tests {
             page_member_ordinal: 0,
             page_member_header: 0,
             scope: "STRUCTURAL_TEST_ONLY",
+            mapped_entry: MappedConsumer::Detcore.source().first_entry().unwrap(),
         };
         (b, role)
     }

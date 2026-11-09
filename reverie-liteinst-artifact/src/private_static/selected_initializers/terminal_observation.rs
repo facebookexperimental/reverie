@@ -143,7 +143,8 @@ fn wrappers(
 fn aliases(
     elf: &Elf<'_>,
     input: bool,
-    selection: super::SelectedRole<'_>,
+    role: InitializerRole,
+    owner_name: &str,
     section: usize,
     address: u64,
     bytes: usize,
@@ -161,22 +162,13 @@ fn aliases(
                 && s.st_type() != sym::STT_SECTION
         })
         .collect::<Vec<_>>();
-    let super::SelectedRole {
-        role,
-        consumer,
-        actual_name: owner_name,
-    } = selection;
-    let generation = match role {
-        InitializerRole::MappedRoot(generation)
-        | InitializerRole::MappedTerminal(generation)
-        | InitializerRole::MappedObserver(generation) => generation,
-        _ => GenerationKind::First,
+    // Only an observer carries a label: its generation's, through
+    // the one generation lookup (an absent generation refuses).
+    let observed_label = match role {
+        InitializerRole::MappedObserver(mapped) => Some(mapped.symbols()?.observed_label),
+        _ => None,
     };
-    let observed_label = consumer
-        .generation(generation)
-        .map(|symbols| symbols.observed_label)
-        .unwrap_or("");
-    let is_observer = matches!(role, InitializerRole::MappedObserver(_));
+    let is_observer = observed_label.is_some();
     require(
         found.len() == if is_observer { 2 } else { 1 },
         "terminal alias set differs",
@@ -192,15 +184,12 @@ fn aliases(
                 "terminal owner alias differs",
             )?;
         } else {
-            require(
-                is_observer && name == observed_label,
-                "extra terminal alias",
-            )?;
+            require(observed_label == Some(name), "extra terminal alias")?;
             observer_label(s, address, input)?;
         }
     }
     // Another section/alias must not impersonate the owner or the trap label.
-    for name in std::iter::once(owner_name).chain(is_observer.then_some(observed_label)) {
+    for name in std::iter::once(owner_name).chain(observed_label) {
         require(
             elf.syms
                 .iter()
@@ -228,7 +217,6 @@ pub(super) fn exact_terminal_output(elf: &Elf<'_>, actual_name: &str) -> Result<
 
 fn joined_role(
     role: InitializerRole,
-    consumer: &MappedConsumerSource,
     objects: &[ObjectInput<'_>],
     map: &str,
     runtime: &Path,
@@ -237,22 +225,18 @@ fn joined_role(
 ) -> Result<RelocatedDefinition> {
     let (selected, actual_name) = select_role_named(
         &role,
-        consumer,
         objects,
         map,
         runtime,
-        role.terminal_path(consumer).is_some(),
+        role.terminal_path()?.is_some(),
     )?;
-    let selection = super::SelectedRole {
-        role,
-        consumer,
-        actual_name: &actual_name,
-    };
-    let proof = join_selected_initializer_named(selection, map, selected, objects, elf, bytes)?;
+    let proof =
+        join_selected_initializer_named(role, &actual_name, map, selected, objects, elf, bytes)?;
     aliases(
         &selected.elf,
         true,
-        selection,
+        role,
+        &actual_name,
         proof.section_index,
         0,
         proof.bytes,
@@ -261,7 +245,8 @@ fn joined_role(
     aliases(
         elf,
         false,
-        selection,
+        role,
+        &actual_name,
         final_symbol.st_shndx,
         proof.address,
         proof.bytes,
@@ -344,7 +329,7 @@ impl VerifiedStaticSource {
         callback: impl FnOnce(&super::MappedTerminalObservation, &mut Runner) -> Result<T>,
     ) -> Result<T> {
         self.with_mapped_terminal_observation_for(
-            (MappedConsumer::Detcore, GenerationKind::First),
+            GenerationKind::First,
             archive,
             definitions,
             objdump,
@@ -355,24 +340,26 @@ impl VerifiedStaticSource {
 
     /// Generation-scoped form: qualifies one present
     /// generation's root/terminal/observer bodies under the
-    /// selected closed consumer. A generation the consumer
-    /// does not carry refuses before any join.
+    /// consumer this source transaction selected. There is no
+    /// consumer parameter; a generation that consumer does not
+    /// carry refuses by name before any join.
     pub fn with_mapped_terminal_observation_for<T>(
         &self,
-        target: (MappedConsumer, GenerationKind),
+        generation: GenerationKind,
         archive: &StaticArchive,
         definitions: &SelectedInitializerDefinitions,
         objdump: &FileIdentity,
         runner: &mut Runner,
         callback: impl FnOnce(&super::MappedTerminalObservation, &mut Runner) -> Result<T>,
     ) -> Result<T> {
-        let (consumer, generation) = (target.0.source(), target.1);
-        if consumer.generation(generation).is_none() {
-            return close_result(
-                Err("terminal generation absent for selected consumer".into()),
-                self.guard.close(runner),
-            );
+        let mapped = MappedRole {
+            consumer: self.consumer,
+            generation,
+        };
+        if let Err(error) = mapped.symbols() {
+            return close_result(Err(error), self.guard.close(runner));
         }
+        let consumer = self.consumer.source();
         let admission = self.require_archive_owner(archive).and_then(|_| {
             require(
                 Arc::ptr_eq(&self.archive_owner, &definitions.source_owner.0)
@@ -457,25 +444,15 @@ impl VerifiedStaticSource {
                 let map =
                     fs::read_to_string(&definitions.core.map.path).map_err(|e| e.to_string())?;
                 let roles = [
-                    InitializerRole::MappedRoot(generation),
-                    InitializerRole::MappedTerminal(generation),
+                    InitializerRole::MappedRoot(mapped),
+                    InitializerRole::MappedTerminal(mapped),
                     InitializerRole::InitializationFailed,
                     InitializerRole::InitialTerminal,
-                    InitializerRole::MappedObserver(generation),
+                    InitializerRole::MappedObserver(mapped),
                 ];
                 let joined = roles
                     .into_iter()
-                    .map(|role| {
-                        joined_role(
-                            role,
-                            consumer,
-                            &objects,
-                            &map,
-                            &archive.file.path,
-                            &elf,
-                            &data,
-                        )
-                    })
+                    .map(|role| joined_role(role, &objects, &map, &archive.file.path, &elf, &data))
                     .collect::<Result<Vec<_>>>()?;
                 let [root, mapped, failed, terminal, observed] = joined.as_slice() else {
                     return Err("terminal internal role count".into());
@@ -486,9 +463,10 @@ impl VerifiedStaticSource {
                 // not be the header entry. The first-image text is
                 // the Detcore-only producer's, unchanged.
                 match generation {
-                    GenerationKind::First => {
-                        require(elf.entry == root.address, "terminal root is not actual e_entry")?
-                    }
+                    GenerationKind::First => require(
+                        elf.entry == root.address,
+                        "terminal root is not actual e_entry",
+                    )?,
                     GenerationKind::Successor => require(
                         elf.entry != root.address,
                         "terminal successor root is actual e_entry",
