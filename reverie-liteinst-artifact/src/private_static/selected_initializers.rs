@@ -828,8 +828,44 @@ impl MappedConsumerSource {
         self.accepted_entry_sources
     }
     /// Consumer entry source path, workspace-relative.
-    pub fn entry_source_relative(&self) -> &'static str {
+    pub const fn entry_source_relative(&self) -> &'static str {
         self.entry_source_relative
+    }
+    /// Workspace binding kind for the source transaction.
+    pub const fn binding(&self) -> WorkspaceBinding {
+        self.binding
+    }
+    /// Cargo package that produces the mapped image archive.
+    pub const fn package_name(&self) -> &'static str {
+        self.package_name
+    }
+    /// Exact package version in the constructed package id.
+    pub const fn package_version(&self) -> &'static str {
+        self.package_version
+    }
+    /// Lib target name in the leaf package metadata.
+    pub const fn lib_target(&self) -> &'static str {
+        self.lib_target
+    }
+    /// Leaf manifest path, workspace-relative.
+    pub const fn manifest_relative(&self) -> &'static str {
+        self.manifest_relative
+    }
+    /// Leaf lib.rs path, workspace-relative.
+    pub const fn lib_rs_relative(&self) -> &'static str {
+        self.lib_rs_relative
+    }
+    /// Workspace root manifest path, workspace-relative.
+    pub const fn root_manifest_relative(&self) -> &'static str {
+        self.root_manifest_relative
+    }
+    /// Workspace root lockfile path, workspace-relative.
+    pub const fn root_lock_relative(&self) -> &'static str {
+        self.root_lock_relative
+    }
+    /// Exact Cargo feature set for the archive build.
+    pub const fn features(&self) -> &'static [&'static str] {
+        self.features
     }
 }
 
