@@ -3706,7 +3706,8 @@ unsafe fn process_syscall(event: &mut SyscallEvent) {
     }
 
     let compatibility_fork = TOOL_MODE.load(Ordering::Relaxed) == TOOL_COMPAT
-        && matches!(event.number, libc::SYS_clone | libc::SYS_fork);
+        && (event.number == libc::SYS_clone
+            || Some(event.number) == reverie_inguest::arch::SYS_FORK);
     if compatibility_fork {
         unsafe {
             trace_event(event, None);
@@ -3766,7 +3767,11 @@ unsafe fn process_syscall(event: &mut SyscallEvent) {
 /// `clone_args` is never read. The shared preload dispatcher refuses both for
 /// the same reason. See <https://github.com/rrnewton/reverie/issues/758>.
 ///
-/// Both are refused with `ENOTSUP` in both modes. This matches the preload
+/// Both are refused with `ENOTSUP` in both modes, on both architectures: on
+/// aarch64 there is no vfork syscall number, and a vfork arrives as
+/// `clone(CLONE_VM | CLONE_VFORK | SIGCHLD, child_stack)` (musl passes a null
+/// child stack, glibc passes the current SP), refused by the flag-keyed first
+/// arm below regardless of the stack argument. This matches the preload
 /// dispatcher and Tool mode's nested and injected syscall guards. `ENOSYS` was
 /// the alternative. Seccomp sandboxes conventionally deny with `ENOSYS` so that
 /// libc falls back to an older syscall (the containers-common 5.8 seccomp
@@ -3786,6 +3791,16 @@ unsafe fn process_syscall(event: &mut SyscallEvent) {
 /// (`reverie_inguest::guest::host`).
 fn refused_process_creation(number: i64, args: [u64; 6], tool_mode: u8) -> Option<i32> {
     match number {
+        // aarch64 has no vfork number: a vfork arrives as
+        // clone(CLONE_VM | CLONE_VFORK | SIGCHLD, ..) with a null (musl) or
+        // SP (glibc) child stack. Refuse on the flag alone, never the stack
+        // argument, before the generic clone arm can mode-split the errno.
+        libc::SYS_clone
+            if reverie_inguest::arch::SYS_VFORK.is_none()
+                && args[0] & libc::CLONE_VFORK as u64 != 0 =>
+        {
+            Some(libc::ENOTSUP)
+        }
         libc::SYS_clone if !clone_is_fork_like(args[0], args[1]) => {
             Some(if tool_mode == TOOL_COMPAT {
                 libc::EPERM
@@ -3793,7 +3808,8 @@ fn refused_process_creation(number: i64, args: [u64; 6], tool_mode: u8) -> Optio
                 libc::ENOTSUP
             })
         }
-        libc::SYS_clone3 | libc::SYS_vfork => Some(libc::ENOTSUP),
+        libc::SYS_clone3 => Some(libc::ENOTSUP),
+        _ if Some(number) == reverie_inguest::arch::SYS_VFORK => Some(libc::ENOTSUP),
         _ => None,
     }
 }
@@ -3885,6 +3901,10 @@ unsafe fn write_compatibility_event(output_fd: libc::c_int, bytes: &[u8]) {
             events: libc::POLLOUT,
             revents: 0,
         };
+        // aarch64 has no poll syscall; ppoll takes a *timespec, not
+        // milliseconds, so the aarch64 arm builds one (the kernel writes the
+        // remaining time back into it). x86-64 keeps poll unchanged.
+        #[cfg(target_arch = "x86_64")]
         let _ = unsafe {
             raw_syscall6(
                 libc::SYS_poll,
@@ -3892,6 +3912,24 @@ unsafe fn write_compatibility_event(output_fd: libc::c_int, bytes: &[u8]) {
                     (&raw mut descriptor) as u64,
                     1,
                     BACKPRESSURE_POLL_MILLISECONDS,
+                    0,
+                    0,
+                    0,
+                ],
+            )
+        };
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = unsafe {
+            let mut timeout = libc::timespec {
+                tv_sec: (BACKPRESSURE_POLL_MILLISECONDS / 1000) as libc::time_t,
+                tv_nsec: ((BACKPRESSURE_POLL_MILLISECONDS % 1000) * 1_000_000) as libc::c_long,
+            };
+            raw_syscall6(
+                libc::SYS_ppoll,
+                [
+                    (&raw mut descriptor) as u64,
+                    1,
+                    (&raw mut timeout) as u64,
                     0,
                     0,
                     0,
@@ -5054,15 +5092,25 @@ mod tests {
         let bookkeeping = (libc::CLONE_CHILD_CLEARTID
             | libc::CLONE_CHILD_SETTID
             | libc::CLONE_PARENT_SETTID) as u64;
+        // 0x4111: the vfork-shaped clone flags glibc and musl issue on
+        // aarch64 for vfork (CLONE_VM | CLONE_VFORK | SIGCHLD).
+        let vfork_flags = (libc::CLONE_VM | libc::CLONE_VFORK) as u64 | libc::SIGCHLD as u64;
         for mode in [super::TOOL_STRACE, super::TOOL_COMPAT] {
             let clone_errno = if mode == super::TOOL_COMPAT {
                 libc::EPERM
             } else {
                 libc::ENOTSUP
             };
+            // On aarch64 (no vfork number) the flag-keyed arm refuses
+            // vfork-shaped clones with ENOTSUP in both modes and both stack
+            // shapes; on x86-64 the same clones keep today's split errno.
+            let vfork_clone_errno = if reverie_inguest::arch::SYS_VFORK.is_none() {
+                libc::ENOTSUP
+            } else {
+                clone_errno
+            };
             for (number, args, expected) in [
                 // Refused by number, whatever the clone_args pointer and size.
-                (libc::SYS_vfork, [0; 6], Some(libc::ENOTSUP)),
                 (libc::SYS_clone3, [0; 6], Some(libc::ENOTSUP)),
                 (libc::SYS_clone3, [u64::MAX; 6], Some(libc::ENOTSUP)),
                 (
@@ -5075,7 +5123,18 @@ mod tests {
                     [libc::SIGCHLD as u64, 1, 0, 0, 0, 0],
                     Some(clone_errno),
                 ),
-                (libc::SYS_fork, [0; 6], None),
+                // musl vfork shape: clone(0x4111, 0).
+                (
+                    libc::SYS_clone,
+                    [vfork_flags, 0, 0, 0, 0, 0],
+                    Some(vfork_clone_errno),
+                ),
+                // glibc vfork shape: clone(0x4111, SP).
+                (
+                    libc::SYS_clone,
+                    [vfork_flags, 0x0000_7fff_e000, 0, 0, 0, 0],
+                    Some(vfork_clone_errno),
+                ),
                 (
                     libc::SYS_clone,
                     [libc::SIGCHLD as u64 | bookkeeping, 0, 0, 0, 0, 0],
@@ -5087,6 +5146,22 @@ mod tests {
                     refused_process_creation(number, args, mode),
                     expected,
                     "mode {mode} syscall {number} args {args:?}"
+                );
+            }
+            // By-number rows, present only where the arch table has them:
+            // x86-64 SYS_vfork refuses by number, SYS_fork is admitted.
+            if let Some(vfork_nr) = reverie_inguest::arch::SYS_VFORK {
+                assert_eq!(
+                    refused_process_creation(vfork_nr, [0; 6], mode),
+                    Some(libc::ENOTSUP),
+                    "mode {mode} vfork by number"
+                );
+            }
+            if let Some(fork_nr) = reverie_inguest::arch::SYS_FORK {
+                assert_eq!(
+                    refused_process_creation(fork_nr, [0; 6], mode),
+                    None,
+                    "mode {mode} fork by number"
                 );
             }
         }
