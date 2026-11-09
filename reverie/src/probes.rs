@@ -283,6 +283,7 @@ const TRIAL_REFUSED: i32 = 43;
 /// Exit code a trial child uses for "the trial itself could not be
 /// performed" (for example a failed state query before any arming
 /// attempt): unproved, never a proved-negative capability.
+#[cfg(any(target_arch = "x86_64", test))]
 const TRIAL_INCONCLUSIVE: i32 = 44;
 
 /// What a throwaway-child trial concluded.
@@ -869,6 +870,7 @@ pub fn probe_sud() -> Knowledge<bool> {
 /// proved-negative capability; only a refused SET is a denial. Restore
 /// is best-effort: the throwaway child exits either way, and arming was
 /// already proved by the successful SET.
+#[cfg(any(target_arch = "x86_64", test))]
 fn arm_sequence(get: impl Fn() -> i64, set: impl Fn(i64) -> i64) -> i32 {
     let previous = get();
     if previous < 0 {

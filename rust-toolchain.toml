@@ -10,3 +10,4 @@ channel = "1.97.1" # @oss-only
 # Date/version pinning installs a fresh toolchain; rustup only adds clippy
 # and rustfmt for it when they are requested here.
 components = ["clippy", "rustfmt"] # @oss-only
+targets = ["aarch64-unknown-linux-gnu"] # @oss-only

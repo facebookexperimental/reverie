@@ -121,6 +121,32 @@ fn validation_dag_builds_once_and_counts_every_test_node() {
     );
 }
 
+#[test]
+fn validation_dag_checks_the_reverie_ptrace_library_for_aarch64() {
+    let dag: serde_json::Value =
+        serde_json::from_str(VALIDATE_DAG).expect("validate DAG must be valid JSON");
+    let steps = dag["steps"]
+        .as_array()
+        .expect("validate DAG must declare its steps");
+    let matches: Vec<_> = steps
+        .iter()
+        .filter(|step| step["group"] == "build" && step["job"] == "ptrace_aarch64")
+        .collect();
+    assert_eq!(matches.len(), 1, "expected one AArch64 ptrace check node");
+    let step = matches[0];
+    assert_eq!(
+        step["cmd"],
+        "cargo check --locked -p reverie-ptrace --lib --target aarch64-unknown-linux-gnu"
+    );
+    assert_eq!(step["deps"], serde_json::json!([]));
+    assert_eq!(
+        step["env"],
+        serde_json::json!({"PKG_CONFIG_ALLOW_CROSS": "1"})
+    );
+    assert_eq!(step["labels"], serde_json::json!(["full"]));
+    assert_eq!(step["hint"]["resources"]["cargo-build"], 1);
+}
+
 const WORKFLOW: &str = include_str!("../../.github/workflows/ci.yml");
 const CORE_MANIFEST: &str = include_str!("../../reverie-liteinst/Cargo.toml");
 const ALLOCATOR_TESTS: &str = include_str!("../../reverie-liteinst/tests/allocator_contract.rs");

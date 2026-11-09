@@ -20,6 +20,7 @@ use crate::timer::has_precise_ip;
 const IN_TXCP: u64 = 1 << 33;
 const NUM_BRANCHES: u64 = 500;
 
+#[cfg(target_arch = "x86_64")]
 use reverie::pmu_config::MeasuredCount;
 pub use reverie::pmu_config::PmuValidationError;
 fn init_perf_event_attr(

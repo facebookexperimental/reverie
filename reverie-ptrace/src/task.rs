@@ -12002,6 +12002,7 @@ impl<L: Tool + 'static> TracedTask<L> {
     ///
     /// Side effects:
     /// - mutates contexts
+    #[cfg(target_arch = "x86_64")]
     async fn untraced_syscall(
         &mut self,
         task: Stopped,

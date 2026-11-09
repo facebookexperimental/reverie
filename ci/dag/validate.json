@@ -108,6 +108,35 @@
       "jobs_env": "CARGO_BUILD_JOBS"
     },
     {
+      "group": "build",
+      "job": "ptrace_aarch64",
+      "desc": "AArch64 check: reverie-ptrace",
+      "description": "Compile only the reverie-ptrace library for aarch64-unknown-linux-gnu. Host validation exercises the package for the host architecture, so this separate package-scoped check catches target_arch conditional-compilation errors in library code. It intentionally does not compile test targets.",
+      "labels": [
+        "full"
+      ],
+      "cmd": "cargo check --locked -p reverie-ptrace --lib --target aarch64-unknown-linux-gnu",
+      "deps": [],
+      "env": {
+        "PKG_CONFIG_ALLOW_CROSS": "1"
+      },
+      "timeout": 600,
+      "cpu_timeout": 300,
+      "priority": 80,
+      "hint": {
+        "resources": {
+          "cargo-build": 1
+        },
+        "est_duration_s": 60,
+        "rss_baseline_bytes": 8000000000,
+        "hard_mem_max_bytes": 16000000000,
+        "classification": "cpu-bound",
+        "preferred_inner_jobs": 8
+      },
+      "jobs_flag": "",
+      "jobs_env": "CARGO_BUILD_JOBS"
+    },
+    {
       "group": "fixtures",
       "job": "liteinst",
       "desc": "LiteInst allocator fixtures",
