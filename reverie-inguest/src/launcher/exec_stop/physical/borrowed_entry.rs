@@ -43,10 +43,14 @@ pub struct BootstrapEntryCoordinates {
 }
 
 /// First-image and successor entry coordinates for one mapped
-/// private image, as one pair. Generation choice is made only
-/// through the typed stop accessors on `BridgeInitialStop` /
-/// `BridgeIssuedStop`; there is no boolean selector to flip and
-/// no packet inspection anywhere in the choice.
+/// private image, as one pair. Choosing a member of this pair goes
+/// only through the typed stop accessors on `BridgeInitialStop` /
+/// `BridgeIssuedStop` (the constructor is test-only and, like the
+/// member getters, private to the exec-stop module); there is no
+/// boolean selector to flip and no packet inspection in that choice. The claim
+/// covers values taken from this pair only: `RuntimeEntrySpec` has
+/// public fields, so a caller can still build a runtime entry from
+/// any coordinates without going through it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EntryCoordinates {
     first: BootstrapEntryCoordinates,
@@ -54,13 +58,20 @@ pub struct EntryCoordinates {
 }
 
 impl EntryCoordinates {
-    /// Build the pair from a producer-qualified ELF's
-    /// per-generation symbol addresses: `(entry, observed_int3)`
-    /// for the first image and for the successor. This is the
-    /// only constructor; harness call sites pass symbol-read
-    /// results from the qualified ELF evidence, never raw
-    /// address literals of their own.
-    pub fn from_qualified_symbols(first: (u64, u64), successor: (u64, u64)) -> Self {
+    /// Build the pair from `(entry, observed_int3)` for the first
+    /// image and for the successor. Data only, like
+    /// [`BootstrapEntryCoordinates`]: nothing here proves the numbers
+    /// were read from a producer-qualified ELF. The producer exposes
+    /// them as `MappedTerminalObservation::entry_coordinates`; carrying
+    /// that value here is the slice-4 host harness's job, and until it
+    /// does, musearch gate 2 (coordinate provenance) is outstanding.
+    /// Until then the constructor is test-only and private to the
+    /// exec-stop module: no production caller can build a pair.
+    #[cfg(test)]
+    pub(in crate::launcher::exec_stop) fn from_unqualified_addresses(
+        first: (u64, u64),
+        successor: (u64, u64),
+    ) -> Self {
         Self {
             first: BootstrapEntryCoordinates {
                 entry: first.0,
@@ -74,12 +85,12 @@ impl EntryCoordinates {
     }
 
     /// First-image entry coordinates.
-    pub fn first(&self) -> BootstrapEntryCoordinates {
+    pub(in crate::launcher::exec_stop) fn first(&self) -> BootstrapEntryCoordinates {
         self.first
     }
 
     /// Successor entry coordinates.
-    pub fn successor(&self) -> BootstrapEntryCoordinates {
+    pub(in crate::launcher::exec_stop) fn successor(&self) -> BootstrapEntryCoordinates {
         self.successor
     }
 }
@@ -918,7 +929,7 @@ fn sigsys_identity(info: &[u8; 128], rip: u64, number: u64) -> bool {
         && i32_at(info, 24) >= 0
         && i32_at(info, 24) as u64 == number
 }
-fn terminal(info: &[u8; 128], rip: u64, int3: u64) -> bool {
+pub(in crate::launcher::exec_stop) fn terminal(info: &[u8; 128], rip: u64, int3: u64) -> bool {
     i32_at(info, 0) == libc::SIGTRAP
         && i32_at(info, 4) == 0
         && i32_at(info, 8) == 128

@@ -1094,7 +1094,7 @@ mod tests {
         let initial = expect_initial(bridge.wait_next().unwrap());
         // Typed generation choice: each stop type yields only
         // its own pair member, with identical packet bytes.
-        let pair = EntryCoordinates::from_qualified_symbols((0x1111, 0x2222), (0x3333, 0x4444));
+        let pair = EntryCoordinates::from_unqualified_addresses((0x1111, 0x2222), (0x3333, 0x4444));
         assert_eq!(initial.entry_coordinates(&pair), pair.first());
         assert_ne!(initial.entry_coordinates(&pair), pair.successor());
         // Staging refuses until the single consumption path runs.
@@ -1182,6 +1182,59 @@ mod tests {
             ["initial-rearm", "stamp", "successor-rearm"]
         );
         assert_eq!(authority.stage(ticket), Some(ExecStage::Completed));
+    }
+
+    /// Design test 6, accessor half: at each bridge stop, the
+    /// coordinate its typed accessor yields is the one the
+    /// supervisor's terminal-trap predicate accepts for that
+    /// generation's INT3, and the other generation's coordinate
+    /// refuses. The siginfo and RIP are constructed here, so the
+    /// predicate holds by construction; the test observes no real
+    /// trap stop.
+    /// The observe-path half (a real stop observed and refused before
+    /// resume) belongs to dh-tc7os.
+    #[test]
+    fn wrong_generation_entry_coordinate_refuses_at_terminal_trap() {
+        use super::super::physical::terminal_trap_matches;
+        // SIGTRAP, errno 0, SI_KERNEL: the INT3 stop the check accepts.
+        let trap_after = |int3: u64| {
+            let mut info = [0u8; 128];
+            info[..4].copy_from_slice(&libc::SIGTRAP.to_ne_bytes());
+            info[8..12].copy_from_slice(&128i32.to_ne_bytes());
+            (info, int3 + 1)
+        };
+        let pair = EntryCoordinates::from_unqualified_addresses((0x1111, 0x2222), (0x3333, 0x4444));
+        let bridge = spawn_bridge(host_config());
+        let authority = bridge.authority();
+        let admitted = bridge.admitted();
+        let initial = expect_initial(bridge.wait_next().unwrap());
+        let (info, rip) = trap_after(pair.first().terminal_int3);
+        let chosen = initial.entry_coordinates(&pair);
+        assert!(terminal_trap_matches(&info, rip, chosen.terminal_int3));
+        assert!(!terminal_trap_matches(
+            &info,
+            rip,
+            pair.successor().terminal_int3
+        ));
+        initial.record_mapped_initial_consumed().unwrap();
+        let bridge = initial
+            .rearm_and_resume(|task, _entry, _boundary| Ok(task))
+            .unwrap();
+        authority
+            .stage_snapshot(admitted, frame_tool_state(b"generation-state").unwrap())
+            .unwrap();
+        let issued = expect_successor(bridge.wait_next().unwrap())
+            .issue(|ticket, _sealed| Ok(ticket.0.to_vec()))
+            .unwrap();
+        let (info, rip) = trap_after(pair.successor().terminal_int3);
+        let chosen = issued.entry_coordinates(&pair);
+        assert!(terminal_trap_matches(&info, rip, chosen.terminal_int3));
+        assert!(!terminal_trap_matches(
+            &info,
+            rip,
+            pair.first().terminal_int3
+        ));
+        issued.cancel().unwrap();
     }
 
     fn bridge_complete(authority: &BirthAuthority, ticket: ExecTicket) {

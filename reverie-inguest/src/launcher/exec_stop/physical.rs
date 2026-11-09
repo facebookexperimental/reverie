@@ -44,6 +44,8 @@ pub use borrowed_entry::ReleaseFailure;
 pub use borrowed_entry::ReleasedPreparedMapping;
 pub use borrowed_entry::RuntimeEntrySpec;
 pub use borrowed_entry::VerifiedReady;
+#[cfg(test)]
+pub(super) use borrowed_entry::terminal as terminal_trap_matches;
 
 /// Numeric preparation inputs, NOT image/source/entry qualification authority.
 /// The only consuming operation is unsafe and retains all physical obligations.

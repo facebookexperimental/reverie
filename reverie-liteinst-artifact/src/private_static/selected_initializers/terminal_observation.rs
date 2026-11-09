@@ -36,6 +36,27 @@ pub struct MappedTerminalObservation {
     // These are persistent open obligations, not successful qualification.
     remaining: Vec<String>,
     scope: &'static str,
+    // Not serialized, so the exported evidence keeps its fields.
+    #[serde(skip)]
+    generation: GenerationKind,
+    #[serde(skip)]
+    entry: u64,
+}
+
+impl MappedTerminalObservation {
+    /// The generation this observation qualified.
+    pub fn generation(&self) -> GenerationKind {
+        self.generation
+    }
+
+    /// `(entry, observed INT3)` for that generation, read from the
+    /// final ELF in this same source transaction: the joined root's
+    /// address and its observer label's address. This is the producer
+    /// half of the supervisor's per-generation entry coordinates. It is
+    /// data only and grants no entry or Ready authority.
+    pub fn entry_coordinates(&self) -> (u64, u64) {
+        (self.entry, self.observer_int3)
+    }
 }
 
 fn body<'a>(elf: &Elf<'_>, bytes: &'a [u8], role: &RelocatedDefinition) -> Result<&'a [u8]> {
@@ -658,6 +679,8 @@ impl VerifiedStaticSource {
                         "PRE_FS_CLOSURE_AND_ENTRY_ADMISSION_NOT_PROVEN".into(),
                     ],
                     scope: "FINITE_TERMINAL_OBSERVER_STATIC_OBSERVATIONS_ONLY",
+                    generation,
+                    entry: root.address,
                 };
                 let result = callback(&observation, runner);
                 close_result(result, observation.disassembly.verify())
