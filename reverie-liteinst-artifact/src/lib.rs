@@ -1449,8 +1449,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-liteinst/src/tool_host.rs",
-        79634,
-        "7ba6aa50c8f4da098795b0d1f182b9aeb8f8e82efdb4b55a240e1b9a51121ae5",
+        85210,
+        "ae03d580e6e5a6b4c313afa4673f36cc3172db690e9639fac2d216064cfa751b",
     ),
     (
         "reverie/Cargo.toml",
@@ -1536,13 +1536,13 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-rpc-transport/src/lib.rs",
-        5018,
-        "7ac7f50a9b43af71abf678026762052267ac9c003d99a49f39257455dd41c725",
+        5043,
+        "5bfc05680ef93b8ae846a4cafa96c16c4b6e3db0582064289644b20496ac800c",
     ),
     (
         "reverie-rpc-transport/src/server.rs",
-        124661,
-        "dced4ec2c6a35adf3835b8cc632d32d88bca89ffbc29d6c5073d3ec3e67815e5",
+        129298,
+        "8aca80d978e602a386f46c0331b31653b7adb7bbe0a83b097670168686754f34",
     ),
     (
         "reverie-rpc-transport/src/blocking_client.rs",
@@ -38716,6 +38716,36 @@ mod tests {
                 "reverie-liteinst/src/tool_host.rs",
                 77827,
                 "8438f128924c1c4dcf19b72bcf98580458628c67f98b03383cde791b0f814966",
+            ),
+            (
+                "reverie-liteinst/src/tool_host.rs",
+                79634,
+                "7ba6aa50c8f4da098795b0d1f182b9aeb8f8e82efdb4b55a240e1b9a51121ae5",
+            ),
+            (
+                "reverie-rpc-transport/src/lib.rs",
+                5018,
+                "7ac7f50a9b43af71abf678026762052267ac9c003d99a49f39257455dd41c725",
+            ),
+            (
+                "reverie-rpc-transport/src/server.rs",
+                124661,
+                "dced4ec2c6a35adf3835b8cc632d32d88bca89ffbc29d6c5073d3ec3e67815e5",
+            ),
+            (
+                "reverie-liteinst/src/tool_host.rs",
+                80408,
+                "c8ea1218b4510231065591886f36d42c86035a7f9e1fd58e401e920aee535db5",
+            ),
+            (
+                "reverie-liteinst/Cargo.toml",
+                6589,
+                "c39c8a6d516187302f1e4de686c13eee2d5a4b89519af0578f7e251792113db2",
+            ),
+            (
+                "reverie-rpc-transport/src/server.rs",
+                129280,
+                "36277ed3bd85e2ee454e0a6ffebd469c9389a0a1322551dc0a3970dad1a8945d",
             ),
         ] {
             let entries: Vec<_> = CONTENT_REVERIE_CATALOG
