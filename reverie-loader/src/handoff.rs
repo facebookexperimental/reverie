@@ -224,6 +224,24 @@ fn has_zero(bytes: &[u8]) -> Result<bool, Error> {
     }
     Ok(false)
 }
+/// Numeric mapped-entry slice preconditions only: a non-null,
+/// eight-byte-aligned address whose `bytes` extent covers at
+/// least the fixed header, stays within the complete-blob cap,
+/// and ends at or below `isize::MAX`. No address is
+/// dereferenced or authenticated by this check; it is the pure
+/// bounds gate a mapped musl entry runs before forming its
+/// input slice.
+#[inline]
+pub fn valid_mapped_input_range(address: usize, bytes: usize) -> bool {
+    address != 0
+        && address.is_multiple_of(8)
+        && bytes >= HEADER_BYTES
+        && bytes <= MAX_BYTES
+        && bytes <= isize::MAX as usize
+        && address
+            .checked_add(bytes)
+            .is_some_and(|end| end <= isize::MAX as usize)
+}
 /// A bounded immutable scalar table. Values are copied, never referenced as a
 /// compiler-dependent record. A lifetime cannot outlive the retained byte slice.
 #[derive(Clone, Copy)]
@@ -1408,6 +1426,34 @@ mod tests {
         assert_eq!(view.env(1), Err(Error::Bounds));
         put(&mut b, 1800 / 8, 0x100000 + HEADER_BYTES as u64 - 1);
         assert_eq!(View::parse(&b, 0x100000).err(), Some(Error::Bounds));
+    }
+
+    #[test]
+    fn valid_mapped_input_range_accepts_literal_header_and_cap() {
+        // Literal boundaries, not only the constants, so a
+        // HEADER_BYTES/MAX_BYTES drift is caught here.
+        assert_eq!(HEADER_BYTES, 960);
+        assert_eq!(MAX_BYTES, 6_348_827);
+        let address = 0x6000_1000_0000;
+        assert!(valid_mapped_input_range(address, 960));
+        assert!(valid_mapped_input_range(address, 6_348_827));
+    }
+
+    #[test]
+    fn valid_mapped_input_range_refuses_null_alignment_short_excess_and_wrap() {
+        let address = 0x6000_1000_0000;
+        for (pointer, bytes) in [
+            (0, 960),
+            (address + 1, 960),
+            (address, 0),
+            (address, 959),
+            (address, 6_348_828),
+            (usize::MAX - 7, 960),
+            ((isize::MAX as usize) & !7, 960),
+            (address, usize::MAX),
+        ] {
+            assert!(!valid_mapped_input_range(pointer, bytes));
+        }
     }
 
     #[test]
