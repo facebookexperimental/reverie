@@ -818,9 +818,9 @@ mod tests {
     use std::os::fd::OwnedFd;
     use std::path::Path;
     use std::path::PathBuf;
-    use std::sync::atomic::Ordering;
     use std::sync::Arc;
     use std::sync::Mutex;
+    use std::sync::atomic::Ordering;
 
     use reverie_rpc_transport::birth_authority::frame_tool_state;
     use reverie_rpc_transport::birth_authority::verify_and_split_runtime;
