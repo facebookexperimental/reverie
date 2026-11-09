@@ -118,7 +118,6 @@ impl std::fmt::Display for BridgeError<'_> {
 
 impl std::error::Error for BridgeError<'_> {}
 
-#[derive(Clone)]
 struct BridgeCore {
     authority: Arc<BirthAuthority>,
     admitted: Admitted,
@@ -227,8 +226,14 @@ impl BridgeVerdict {
     /// Consume a detached supervisor's confirmed terminal
     /// outcome: record the watch terminal fact, then finish,
     /// each exactly once, and return the outcome on success.
-    /// A verdict error is a launch failure even though the
-    /// guest already exited.
+    /// Pass only the value the real wait returned; a hand-built
+    /// outcome is outside the bridge contract. Ok means the
+    /// verdict passed, not that the launch succeeded: the
+    /// harness must confirm every issued ticket reached
+    /// `Completed` (see `BirthBridge::complete`) before calling
+    /// the launch successful; that completion gate belongs to
+    /// the slice-4 harness. A verdict error is a launch failure
+    /// even though the guest already exited.
     pub fn record_detached_outcome(
         self,
         outcome: super::supervisor::SupervisorOutcome,
@@ -239,12 +244,27 @@ impl BridgeVerdict {
 
     /// Consume a released prepared outcome's confirmed terminal
     /// status the same way, returning the status on success.
+    /// Pass only the status the real wait returned. As with
+    /// `record_detached_outcome`, Ok means the verdict passed,
+    /// not that the launch succeeded.
     pub fn record_released_status(
         self,
         status: safeptrace::ExitStatus,
     ) -> Result<safeptrace::ExitStatus, ExecControlError> {
         self.core.verdict_terminal()?;
         Ok(status)
+    }
+
+    /// The detached/released wait itself failed (or the raw
+    /// stop was cancelled after `into_successor_stop`): take
+    /// the verdict for the retained cleanup state exactly once
+    /// and return the verdict error if any. The launch failed
+    /// either way; this returns nothing success-shaped, and a
+    /// later retry that confirms retirement cannot record the
+    /// terminal after the fact (the verdict is exactly-once and
+    /// already taken).
+    pub fn record_failed_launch(self, cleanup: &CleanupState) -> Option<ExecControlError> {
+        self.core.verdict_for_cleanup(cleanup.confirmed).err()
     }
 }
 
@@ -267,7 +287,11 @@ pub enum BridgeStep<'fd> {
     /// authority; issue it before any release.
     SuccessorExec(Box<BridgeRecordedStop<'fd>>),
     /// Terminal outcome; the verdict has already been taken and
-    /// passed, or this step would be a `Verdict` error.
+    /// passed, or this step would be a `Verdict` error. This
+    /// outcome does not by itself mean the launch succeeded:
+    /// the harness must confirm every issued ticket reached
+    /// `Completed` (via `BirthBridge::complete` at its verified
+    /// Ready point) before treating the launch as successful.
     Finished(WatchedOutcome),
 }
 
@@ -396,6 +420,9 @@ impl<'fd> BirthBridge<'fd> {
     /// the authority's exactly-once transition check remains
     /// the fail-closed backstop either way.
     pub fn record_mapped_initial_consumed(&self) -> Result<(), ExecControlError> {
+        if !self.initial_seen {
+            return Err(ExecControlError::Transition);
+        }
         self.core.record_mapped_initial_consumed()
     }
 
@@ -613,11 +640,6 @@ impl<'fd> BridgeRecordedStop<'fd> {
         &mut self.stop
     }
 
-    /// The authority for stamp-time host work.
-    pub fn authority(&self) -> Arc<BirthAuthority> {
-        self.core.authority.clone()
-    }
-
     /// Take the mailbox snapshot, seal it, run the caller's
     /// stamp hook (which writes the init packet and returns the
     /// exact redemption bytes), mark delivered, and issue. All
@@ -628,7 +650,10 @@ impl<'fd> BridgeRecordedStop<'fd> {
     /// The stamp hook runs while `at_successor_stop` holds the
     /// `BirthAuthority` lock across prepare/seal/stamp/issue:
     /// it must not call any `BirthAuthority` method (that
-    /// self-deadlocks), and it should be pure packet-byte work.
+    /// self-deadlocks), must not block on the RPC server or the
+    /// guest, and must be bounded pure packet-byte work. A
+    /// panic in the hook leaves the ticket `Prepared` with no
+    /// verdict taken; the caller must still cancel the stop.
     pub fn issue<F>(self, stamp: F) -> Result<BridgeIssuedStop<'fd>, BridgeError<'fd>>
     where
         F: FnOnce(ExecTicket, [u8; 32]) -> Result<Vec<u8>, ExecControlError>,
@@ -792,6 +817,8 @@ mod tests {
     use std::os::fd::FromRawFd;
     use std::os::fd::OwnedFd;
     use std::path::Path;
+    use std::path::PathBuf;
+    use std::sync::atomic::Ordering;
     use std::sync::Arc;
     use std::sync::Mutex;
 
@@ -840,12 +867,31 @@ mod tests {
     }
 
     fn spawn_bridge(config: BridgeConfig) -> BirthBridge<'static> {
-        BirthBridge::spawn_watched(
-            request("/bin/sh", &["sh", "-c", "exec /bin/true"]),
-            CleanupReceipt::default(),
-            Some(config),
-        )
-        .unwrap()
+        spawn_bridge_req(config, request("/bin/sh", &["sh", "-c", "exec /bin/true"]))
+    }
+
+    fn spawn_bridge_req(config: BridgeConfig, req: PreparedExec<'static>) -> BirthBridge<'static> {
+        BirthBridge::spawn_watched(req, CleanupReceipt::default(), Some(config)).unwrap()
+    }
+
+    /// Fixture whose successor writes a marker file if it is
+    /// ever released to run: initial sh exec, then exec to an
+    /// inner sh that writes the marker.
+    fn marker_request() -> (PreparedExec<'static>, PathBuf) {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "rv-bridge-marker-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("released");
+        let command = format!("exec /bin/sh -c 'echo released > {}'", marker.display());
+        let req = request(
+            "/bin/sh",
+            &["sh", "-c", Box::leak(command.into_boxed_str())],
+        );
+        (req, marker)
     }
 
     fn expect_initial(step: BridgeStep<'static>) -> BridgeInitialStop<'static> {
@@ -951,6 +997,10 @@ mod tests {
             Err(ExecControlError::Transition)
         ));
         bridge.cancel().unwrap();
+        assert!(matches!(
+            authority.stage_snapshot(admitted, frame_tool_state(b"after-cancel").unwrap()),
+            Err(ExecControlError::Transition)
+        ));
 
         // HostConsumed: an Initial RPC attempt with any guessed
         // redemption refuses (the stored redemption is a
@@ -968,12 +1018,17 @@ mod tests {
             InitialImageAdmission::redeem(&*authority, pidfd, admitted, b"initial-only", [3u8; 32])
                 .is_err()
         );
-        bridge.record_mapped_initial_consumed().unwrap();
+        let initial = expect_initial(bridge.wait_next().unwrap());
+        initial.record_mapped_initial_consumed().unwrap();
         assert!(matches!(
-            bridge.record_mapped_initial_consumed(),
+            initial.record_mapped_initial_consumed(),
             Err(ExecControlError::Transition)
         ));
-        bridge.cancel().unwrap();
+        initial.cancel().unwrap();
+        assert!(matches!(
+            authority.stage_snapshot(admitted, frame_tool_state(b"after-cancel").unwrap()),
+            Err(ExecControlError::Transition)
+        ));
     }
 
     #[test]
@@ -1075,7 +1130,10 @@ mod tests {
 
     #[test]
     fn stop_without_stage_is_unavailable_and_cancels() {
-        let bridge = spawn_bridge(host_config());
+        let (req, marker) = marker_request();
+        let bridge = spawn_bridge_req(host_config(), req);
+        let authority = bridge.authority();
+        let admitted = bridge.admitted();
         let pid = bridge.pid();
         let initial = expect_initial(bridge.wait_next().unwrap());
         initial.record_mapped_initial_consumed().unwrap();
@@ -1097,11 +1155,22 @@ mod tests {
         );
         assert!(failure.cleanup().confirmed);
         assert!(!Path::new(&format!("/proc/{}", pid.as_raw())).exists());
+        assert!(
+            !marker.exists(),
+            "successor ran after a failed issue: marker written"
+        );
+        std::fs::remove_dir_all(marker.parent().unwrap()).unwrap();
+        // The verdict ran on this error path: staging is closed.
+        assert!(matches!(
+            authority.stage_snapshot(admitted, frame_tool_state(b"after-failure").unwrap()),
+            Err(ExecControlError::Transition)
+        ));
     }
 
     #[test]
     fn stamp_failure_cancels_ticket_and_never_releases() {
-        let bridge = spawn_bridge(host_config());
+        let (req, marker) = marker_request();
+        let bridge = spawn_bridge_req(host_config(), req);
         let authority = bridge.authority();
         let admitted = bridge.admitted();
         let pid = bridge.pid();
@@ -1133,6 +1202,15 @@ mod tests {
         };
         assert!(failure.cleanup().confirmed);
         assert!(!Path::new(&format!("/proc/{}", pid.as_raw())).exists());
+        assert!(
+            !marker.exists(),
+            "successor ran after a failed stamp: marker written"
+        );
+        std::fs::remove_dir_all(marker.parent().unwrap()).unwrap();
+        assert!(matches!(
+            authority.stage_snapshot(admitted, frame_tool_state(b"after-failure").unwrap()),
+            Err(ExecControlError::Transition)
+        ));
     }
 
     #[test]
@@ -1204,6 +1282,125 @@ mod tests {
         assert_eq!(authority.stage(ticket), Some(ExecStage::Dead));
         assert!(matches!(
             authority.stage_snapshot(admitted, frame_tool_state(b"too-late").unwrap()),
+            Err(ExecControlError::Transition)
+        ));
+    }
+
+    #[test]
+    fn sigkill_before_successor_stop_accepts_pending_initial_eof_at_terminal() {
+        let bridge = spawn_bridge_req(
+            host_config(),
+            request("/bin/sh", &["sh", "-c", "kill -KILL $$"]),
+        );
+        let authority = bridge.authority();
+        let admitted = bridge.admitted();
+        let initial = expect_initial(bridge.wait_next().unwrap());
+        let bridge = initial
+            .rearm_and_resume(|task, _entry, _boundary| Ok(task))
+            .unwrap();
+        // Pending Initial EOF with no mailbox and no recorded stop.
+        authority
+            .connection_closed(admitted, &NativeImageConnection::Initial)
+            .unwrap();
+        assert_eq!(authority.pending_eof_count(), 1);
+        match bridge.wait_next().unwrap() {
+            BridgeStep::Finished(outcome) => {
+                assert!(
+                    matches!(
+                        outcome.status,
+                        safeptrace::ExitStatus::Signaled(safeptrace::Signal::SIGKILL, _)
+                    ),
+                    "unexpected status: {:?}",
+                    outcome.status
+                );
+            }
+            BridgeStep::InitialExec(_) | BridgeStep::SuccessorExec(_) => {
+                panic!("expected finished outcome")
+            }
+        }
+        assert_eq!(authority.accepted_eof_count(), 1);
+        assert_eq!(authority.refused_eof_count(), 0);
+        assert_eq!(authority.pending_eof_count(), 0);
+    }
+
+    #[test]
+    fn issued_stop_cancel_records_terminal_and_kills_ticket() {
+        let bridge = spawn_bridge(host_config());
+        let authority = bridge.authority();
+        let admitted = bridge.admitted();
+        let initial = expect_initial(bridge.wait_next().unwrap());
+        initial.record_mapped_initial_consumed().unwrap();
+        let bridge = initial
+            .rearm_and_resume(|task, _entry, _boundary| Ok(task))
+            .unwrap();
+        authority
+            .stage_snapshot(admitted, frame_tool_state(b"cancel-state").unwrap())
+            .unwrap();
+        let recorded = expect_successor(bridge.wait_next().unwrap());
+        let issued = recorded
+            .issue(|ticket, _sealed| Ok(ticket.0.to_vec()))
+            .unwrap();
+        let ticket = issued.ticket();
+        issued.cancel().unwrap();
+        assert_eq!(authority.stage(ticket), Some(ExecStage::Dead));
+        assert!(matches!(
+            authority.stage_snapshot(admitted, frame_tool_state(b"after-cancel").unwrap()),
+            Err(ExecControlError::Transition)
+        ));
+    }
+
+    #[test]
+    fn release_detached_then_record_outcome_runs_verdict() {
+        let bridge = spawn_bridge_req(host_config(), request("/bin/true", &["true"]));
+        let authority = bridge.authority();
+        let admitted = bridge.admitted();
+        let initial = expect_initial(bridge.wait_next().unwrap());
+        initial.record_mapped_initial_consumed().unwrap();
+        authority
+            .stage_snapshot(admitted, frame_tool_state(b"detached-state").unwrap())
+            .unwrap();
+        let (detached, verdict) = initial
+            .release_detached(|task, _entry, _boundary| Ok(task))
+            .unwrap();
+        // Before the verdict, staging is still open.
+        authority
+            .stage_snapshot(admitted, frame_tool_state(b"detached-state-2").unwrap())
+            .unwrap();
+        let outcome = detached.wait().unwrap();
+        assert_eq!(outcome.status, safeptrace::ExitStatus::Exited(0));
+        let outcome = verdict.record_detached_outcome(outcome).unwrap();
+        assert_eq!(outcome.status, safeptrace::ExitStatus::Exited(0));
+        assert!(matches!(
+            authority.stage_snapshot(admitted, frame_tool_state(b"after-verdict").unwrap()),
+            Err(ExecControlError::Transition)
+        ));
+    }
+
+    #[test]
+    fn into_successor_stop_cancel_then_failed_launch_verdict() {
+        let bridge = spawn_bridge(host_config());
+        let authority = bridge.authority();
+        let admitted = bridge.admitted();
+        let initial = expect_initial(bridge.wait_next().unwrap());
+        initial.record_mapped_initial_consumed().unwrap();
+        let bridge = initial
+            .rearm_and_resume(|task, _entry, _boundary| Ok(task))
+            .unwrap();
+        authority
+            .stage_snapshot(admitted, frame_tool_state(b"into-parts-state").unwrap())
+            .unwrap();
+        let recorded = expect_successor(bridge.wait_next().unwrap());
+        let issued = recorded
+            .issue(|ticket, _sealed| Ok(ticket.0.to_vec()))
+            .unwrap();
+        let ticket = issued.ticket();
+        let (stop, verdict) = issued.into_successor_stop();
+        let cleanup = stop.cancel().unwrap();
+        assert!(cleanup.confirmed);
+        assert_eq!(verdict.record_failed_launch(&cleanup), None);
+        assert_eq!(authority.stage(ticket), Some(ExecStage::Dead));
+        assert!(matches!(
+            authority.stage_snapshot(admitted, frame_tool_state(b"after-failed").unwrap()),
             Err(ExecControlError::Transition)
         ));
     }
