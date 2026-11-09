@@ -859,6 +859,12 @@ pub fn register_words(r: &Regs) -> [u64; 27] {
     ]
 }
 
+/// The forked-child test guard lives at the crate root under the
+/// same test-feature gate as its callers; re-export it so
+/// exec-stop tests keep their call.
+#[cfg(test)]
+pub(crate) use crate::forked_child_test_guard;
+
 #[cfg(all(test, feature = "loader-private-runtime"))]
 // Test-only raw FD queries and the explicit isolated rlimit control. Each raw
 // operation documents SAFETY; production unsafe remains in the child boundary.

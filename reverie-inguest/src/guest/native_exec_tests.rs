@@ -427,6 +427,13 @@ fn rpc() -> (CoordinatorRpc<ModelGlobal>, std::thread::JoinHandle<()>) {
     (rpc, worker)
 }
 fn isolated(body: impl FnOnce() + std::panic::UnwindSafe, expected: i32) {
+    // Serialize these forks with the exec-stop stdio and
+    // before-seize supervisor tests in one libtest process. The
+    // guard is a mitigation for forking from a multithreaded
+    // libtest process, scoped to these filtered runs; the RPC
+    // socketpair is created inside the child, so inherited
+    // descriptors are not the cause here.
+    let _guard = crate::forked_child_test_guard();
     let pid = unsafe { libc::fork() };
     assert!(pid >= 0);
     if pid == 0 {

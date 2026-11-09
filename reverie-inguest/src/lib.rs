@@ -320,6 +320,25 @@ pub unsafe extern "C" fn reverie_inguest_initialize() {
 #[unsafe(link_section = ".init_array")]
 static REVERIE_INGUEST_INIT: unsafe extern "C" fn() = reverie_inguest_initialize;
 
+/// Serializes the long-window forked-child holders (the five
+/// `before_seize`-sleep supervisor tests and every
+/// `native_exec_tests::isolated` fork) with the prepared-stdio
+/// tests in one libtest process. Such a child inherits every open
+/// parent pipe writer, so a concurrent stdio test can otherwise
+/// miss POLLHUP until that child execs or exits. Gated to the
+/// test subsets that fork (`exec-stop` or
+/// `exec-native-injection`) so it is not dead code in other
+/// test builds.
+#[cfg(all(test, any(feature = "exec-stop", feature = "exec-native-injection")))]
+static FORKED_CHILD_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(all(test, any(feature = "exec-stop", feature = "exec-native-injection")))]
+pub(crate) fn forked_child_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    FORKED_CHILD_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -46,6 +46,7 @@ fn complete_bytes(fd: OwnedFd) -> Vec<u8> {
 
 #[test]
 fn prepared_stdio_keeps_streams_distinct_at_the_original_exec_stop() {
+    let _guard = forked_child_test_guard();
     let mut stop = ExecStop::spawn(
         request("/bin/true", &["stdio-stop"]),
         CleanupReceipt::default(),
@@ -92,6 +93,7 @@ fn prepared_stdio_keeps_streams_distinct_at_the_original_exec_stop() {
 
 #[test]
 fn prepared_stdio_returns_real_input_output_and_status() {
+    let _guard = forked_child_test_guard();
     let mut stop = ExecStop::spawn(
         request(
             "/bin/sh",
@@ -125,6 +127,7 @@ fn prepared_stdio_returns_real_input_output_and_status() {
 
 #[test]
 fn prepared_stdio_eof_does_not_wait_for_the_retained_request() {
+    let _guard = forked_child_test_guard();
     let mut stop = ExecStop::spawn(
         request("/bin/true", &["stdio-retained-request"]),
         CleanupReceipt::default(),
@@ -143,6 +146,7 @@ fn prepared_stdio_eof_does_not_wait_for_the_retained_request() {
 
 #[test]
 fn prepared_stdio_failed_exec_preserves_parent_endpoints_without_writers() {
+    let _guard = forked_child_test_guard();
     let mut failure = match ExecStop::spawn(
         request("/__reverie_missing_stdio_exec__", &["stdio-missing"]),
         CleanupReceipt::default(),
