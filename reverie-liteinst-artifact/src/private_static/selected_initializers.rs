@@ -2907,10 +2907,25 @@ mod tests {
             assert_eq!(found.member_name, "literoot_preload-first.o");
             // The other closed consumer never selects this fixture.
             assert!(select_role(&role, &DETCORE, &objects, &map, runtime).is_err());
+            // The same symbol from the wrong archive member owner
+            // refuses: the member-prefix check is load-bearing.
+            let wrong_member = [role_selection_object(
+                &bytes,
+                runtime,
+                "detcore_liteinst-first.o",
+            )];
+            let wrong_map = role_selection_row(runtime, "detcore_liteinst-first.o");
+            assert!(
+                select_role(&role, literoot, &wrong_member, &wrong_map, runtime)
+                    .err()
+                    .unwrap()
+                    .contains("wrong physical source owner")
+            );
         }
         // Missing generation refuses instead of falling back to first.
         let role = InitializerRole::MappedRoot(GenerationKind::Successor);
-        let bytes = role_selection_image("detcore_liteinst_mapped_entry");
+        let mut bytes = role_selection_image("detcore_liteinst_mapped_entry");
+        bytes[189] = sym::STV_PROTECTED;
         let map = role_selection_row(runtime, "detcore_liteinst-first.o");
         let objects = [role_selection_object(
             &bytes,
