@@ -822,6 +822,16 @@ impl MappedToolPrelude {
     }
     /// Exact original resume registers/PKRU for the mapped
     /// successor's guarded post-exec guest.
+    /// Single sealed coordinator endpoint for the mapped
+    /// successor's fresh connect. Data only; connecting and
+    /// admission remain the successor initializer's work.
+    pub fn coordinator_path(
+        &self,
+    ) -> Result<std::path::PathBuf, mapped_scalar::CoordinatorPathError> {
+        mapped_scalar::coordinator_path(&self.input.scalar)
+    }
+    /// Exact original resume registers/PKRU for the mapped
+    /// successor's guarded post-exec guest.
     pub fn successor_entry(&self) -> super::MappedSuccessorEntry {
         // SAFETY: this prelude retains the actual captured resume
         // registers and PKRU for this same mapped image.

@@ -778,6 +778,31 @@ impl<'a> View<'a> {
     pub fn bytes(self) -> &'a [u8] {
         self.bytes
     }
+    /// Bounded original environment entry count, excluding the
+    /// terminating zero word. Values are unproved copied data.
+    pub fn env_count(self) -> Result<usize, Error> {
+        self.table(4)?.len().checked_sub(1).ok_or(Error::Bounds)
+    }
+    /// One exact original environment entry without its final NUL.
+    /// The pointer is resolved only against this retained blob;
+    /// no represented address is dereferenced.
+    pub fn env(self, index: usize) -> Result<&'a [u8], Error> {
+        if index >= self.env_count()? {
+            return Err(Error::Bounds);
+        }
+        let pointer = self.table(4)?.field(index, 0)?;
+        let relative = pointer.checked_sub(self.address).ok_or(Error::Bounds)?;
+        let relative = usize::try_from(relative).map_err(|_| Error::Bounds)?;
+        if relative < HEADER_BYTES {
+            return Err(Error::Bounds);
+        }
+        let suffix = self.bytes.get(relative..).ok_or(Error::Bounds)?;
+        let end = suffix
+            .iter()
+            .position(|byte| *byte == 0)
+            .ok_or(Error::Bounds)?;
+        suffix.get(..end).ok_or(Error::Bounds)
+    }
     /// Claimed mapped address, not address authority.
     pub fn address(self) -> u64 {
         self.address
@@ -1363,6 +1388,24 @@ mod tests {
         assert_eq!(View::parse(&b, 0x100000).err(), Some(Error::Bounds));
         put(&mut b, 1800 / 8, 0x100000 + 2048);
         assert_eq!(View::parse(&b, 0x100000).err(), Some(Error::Bounds));
+        put(&mut b, 1800 / 8, 0x100000 + HEADER_BYTES as u64 - 1);
+        assert_eq!(View::parse(&b, 0x100000).err(), Some(Error::Bounds));
+    }
+
+    #[test]
+    fn view_env_returns_exact_entry_without_nul() {
+        let mut b = fixture();
+        put(&mut b, 93, 1800);
+        put(&mut b, 94, 2);
+        put(&mut b, 96, 1816);
+        b[2040..2047].copy_from_slice(b"KEY=val");
+        b[2047] = 0;
+        put(&mut b, 1800 / 8, 0x100000 + 2040);
+        put(&mut b, 1808 / 8, 0);
+        let view = View::parse(&b, 0x100000).unwrap();
+        assert_eq!(view.env_count(), Ok(1));
+        assert_eq!(view.env(0), Ok(b"KEY=val".as_slice()));
+        assert_eq!(view.env(1), Err(Error::Bounds));
         put(&mut b, 1800 / 8, 0x100000 + HEADER_BYTES as u64 - 1);
         assert_eq!(View::parse(&b, 0x100000).err(), Some(Error::Bounds));
     }

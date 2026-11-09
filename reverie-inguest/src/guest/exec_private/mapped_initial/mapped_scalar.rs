@@ -1,6 +1,8 @@
 //! Native register bridge for the shared no_std mapped-input predicate.
 //! Re-exports are numeric data only, never physical origin or readiness.
 
+use std::path::PathBuf;
+
 use reverie_loader::handoff::Error;
 use reverie_loader::handoff::Registers;
 pub use reverie_loader::mapped_inputs::ConsumerLayout;
@@ -47,6 +49,78 @@ pub trait SuccessorPacketSource<'a> {
     > {
         successor_init_packet(self.successor_inputs())
     }
+}
+
+/// Sealed table-4 env name carrying the coordinator endpoint to
+/// the mapped successor initializer. The endpoint is only a
+/// rendezvous; admission authority comes from the watched birth
+/// and ticket checked after connecting.
+pub const COORDINATOR_PATH_ENV: &[u8] = b"REVERIE_LITEINST_COORDINATOR";
+
+/// Refusal to decode the sealed coordinator endpoint carriage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoordinatorPathError {
+    /// The retained scalar view or env entry is malformed.
+    Format(Error),
+    /// No coordinator env entry is present.
+    Absent,
+    /// More than one coordinator env entry is present.
+    Duplicate,
+    /// The coordinator env entry has no value.
+    Empty,
+}
+
+impl CoordinatorPathError {
+    /// Stable refusal name for host/guest diagnostics.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Format(_) => "mapped_coordinator_path_format",
+            Self::Absent => "mapped_coordinator_path_absent",
+            Self::Duplicate => "mapped_coordinator_path_duplicate",
+            Self::Empty => "mapped_coordinator_path_empty",
+        }
+    }
+}
+
+/// Decode the single coordinator endpoint from the sealed
+/// HLSCAL01 table-4 env entries. This is data only: no connect,
+/// admission, publication, or Ready transition happens here.
+pub fn coordinator_path(
+    inputs: &ProductionMappedInputs<'_>,
+) -> Result<PathBuf, CoordinatorPathError> {
+    let view = inputs.view();
+    let mut found = None;
+    for index in 0..view.env_count().map_err(CoordinatorPathError::Format)? {
+        let entry = view.env(index).map_err(CoordinatorPathError::Format)?;
+        let Some(equals) = entry.iter().position(|byte| *byte == b'=') else {
+            if entry == COORDINATOR_PATH_ENV {
+                return Err(CoordinatorPathError::Empty);
+            }
+            continue;
+        };
+        let (name, value) = entry.split_at(equals);
+        if name != COORDINATOR_PATH_ENV {
+            continue;
+        }
+        if found.is_some() {
+            return Err(CoordinatorPathError::Duplicate);
+        }
+        let value = value.get(1..).ok_or(CoordinatorPathError::Empty)?;
+        if value.is_empty() {
+            return Err(CoordinatorPathError::Empty);
+        }
+        #[cfg(unix)]
+        {
+            use std::ffi::OsString;
+            use std::os::unix::ffi::OsStringExt;
+            found = Some(PathBuf::from(OsString::from_vec(value.to_vec())));
+        }
+        #[cfg(not(unix))]
+        {
+            return Err(CoordinatorPathError::Format(Error::Value));
+        }
+    }
+    found.ok_or(CoordinatorPathError::Absent)
 }
 
 impl<'a> SuccessorPacketSource<'a> for ProductionMappedInputs<'a> {
@@ -123,6 +197,9 @@ mod tests {
         fixture_with_packet(&[0; 8])
     }
     fn fixture_with_packet(packet: &[u8]) -> (Vec<u8>, ConsumerLayout) {
+        fixture_with_packet_env(packet, &[])
+    }
+    fn fixture_with_packet_env(packet: &[u8], env_entries: &[&[u8]]) -> (Vec<u8>, ConsumerLayout) {
         let mut b = vec![0; 4096];
         let addr = b.as_ptr() as u64;
         let hand = (addr & !4095) - 4096;
@@ -179,7 +256,7 @@ mod tests {
             (1, 16),
             (4, 32),
             (packet.len() as u64, 1),
-            (1, 8),
+            (env_entries.len() as u64 + 1, 8),
             (10, 8),
             (8, 1),
             (10, 1),
@@ -261,6 +338,14 @@ mod tests {
         {
             put(&mut b, 108 + i, w);
         }
+        let env = at(&b, 4);
+        for (i, entry) in env_entries.iter().enumerate() {
+            let string_offset = 3700 + i * 128;
+            b[string_offset..string_offset + entry.len()].copy_from_slice(entry);
+            b[string_offset + entry.len()] = 0;
+            put(&mut b, env + i, addr + string_offset as u64);
+        }
+        put(&mut b, env + env_entries.len(), 0);
         let aux = at(&b, 5);
         for (i, w) in [3, runtime + 64, 4, 56, 5, 1, 6, 4096, 0, 0]
             .into_iter()
@@ -420,6 +505,51 @@ mod tests {
             reverie_loader::init_packet::SuccessorInitPacketError::StateNotExpected
         );
         assert_eq!(error.name(), "init_packet_state_not_expected");
+    }
+
+    #[test]
+    fn scalar_coordinator_path_reads_single_sealed_env_entry() {
+        let entry = b"REVERIE_LITEINST_COORDINATOR=/run/rv-coord.sock";
+        let (bytes, expected) = fixture_with_packet_env(&[0; 8], &[b"OTHER=1", entry]);
+        let input = ProductionMappedInputs::decode(&bytes, expected).unwrap();
+        assert_eq!(
+            coordinator_path(&input).unwrap(),
+            std::path::PathBuf::from("/run/rv-coord.sock")
+        );
+    }
+
+    #[test]
+    fn scalar_coordinator_path_refuses_absent_duplicate_and_empty() {
+        for (entries, expected) in [
+            (&[][..], CoordinatorPathError::Absent),
+            (
+                &[
+                    b"REVERIE_LITEINST_COORDINATOR=/a" as &[u8],
+                    b"REVERIE_LITEINST_COORDINATOR=/b",
+                ][..],
+                CoordinatorPathError::Duplicate,
+            ),
+            (
+                &[b"REVERIE_LITEINST_COORDINATOR=" as &[u8]][..],
+                CoordinatorPathError::Empty,
+            ),
+            (
+                &[b"REVERIE_LITEINST_COORDINATOR" as &[u8]][..],
+                CoordinatorPathError::Empty,
+            ),
+            (
+                &[b"REVERIE_LITEINST_COORDINATORX=/a" as &[u8]][..],
+                CoordinatorPathError::Absent,
+            ),
+        ] {
+            let (bytes, layout) = fixture_with_packet_env(&[0; 8], entries);
+            let input = ProductionMappedInputs::decode(&bytes, layout).unwrap();
+            assert_eq!(coordinator_path(&input).unwrap_err(), expected);
+        }
+        assert_eq!(
+            CoordinatorPathError::Duplicate.name(),
+            "mapped_coordinator_path_duplicate"
+        );
     }
 
     #[test]
