@@ -1463,18 +1463,18 @@ async fn image_handshake(
     // never `R`.
     if !request.starts_with(&crate::initial_image::REQUEST_MAGIC)
         && !request.starts_with(&crate::successor::REQUEST_MAGIC)
-        && birth_authority.is_some()
     {
-        let authority = birth_authority.unwrap();
-        let mut payload = request;
-        loop {
-            let response =
-                crate::birth_authority::handle_stage_request(&payload, authority, admitted)?;
-            write_message(stream, &response).await?;
-            match read_message(stream, crate::birth_authority::MAX_STAGE_FRAME_LEN).await {
-                Ok(next) => payload = next,
-                Err(RpcError::Closed) => return Ok(ImageHandshake::StageServed),
-                Err(error) => return Err(error),
+        if let Some(authority) = birth_authority {
+            let mut payload = request;
+            loop {
+                let response =
+                    crate::birth_authority::handle_stage_request(&payload, authority, admitted)?;
+                write_message(stream, &response).await?;
+                match read_message(stream, crate::birth_authority::MAX_STAGE_FRAME_LEN).await {
+                    Ok(next) => payload = next,
+                    Err(RpcError::Closed) => return Ok(ImageHandshake::StageServed),
+                    Err(error) => return Err(error),
+                }
             }
         }
     }
