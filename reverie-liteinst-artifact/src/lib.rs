@@ -1224,8 +1224,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-liteinst-artifact/src/private_static/tls_sources.rs",
-        19927,
-        "d7bc03dd3fa432f406977a02d5fe58628cc656aca26d2bb921d22e69094348b6",
+        31145,
+        "32c2926c904342ede1c0cd0cb53734ffcf41baaef388f9ea139295c711173e67",
     ),
     (
         "Cargo.toml",
@@ -1254,8 +1254,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers.rs",
-        240984,
-        "386d565e8ef2d80ae52a9069f7a7cda61df761601907f6594cedd47301c1b6e5",
+        241046,
+        "04bc1f83df130609b7e2db500adb3c7fd3a80a712021990782a3a6e9684acac7",
     ),
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers/package_roles.rs",
@@ -38757,6 +38757,16 @@ mod tests {
                 129280,
                 "36277ed3bd85e2ee454e0a6ffebd469c9389a0a1322551dc0a3970dad1a8945d",
             ),
+            (
+                "reverie-liteinst-artifact/src/private_static/tls_sources.rs",
+                19927,
+                "d7bc03dd3fa432f406977a02d5fe58628cc656aca26d2bb921d22e69094348b6",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers.rs",
+                240984,
+                "386d565e8ef2d80ae52a9069f7a7cda61df761601907f6594cedd47301c1b6e5",
+            ),
         ] {
             let entries: Vec<_> = CONTENT_REVERIE_CATALOG
                 .iter()
@@ -66079,6 +66089,13 @@ pub mod private_static {
     pub mod selected_initializers;
 
     pub(super) mod tls_sources;
+
+    /// Test seam only: the real runtime TLS source check over one checkout
+    /// root, refusing unless it is exactly one complete reviewed tuple.
+    #[doc(hidden)]
+    pub fn tls_sources_self_check(root: &Path) -> Result<()> {
+        tls_sources::self_check(root)
+    }
 
     const TARGET: &str = "x86_64-unknown-linux-musl";
     const LOW: u64 = 0x6000_e100_0000;

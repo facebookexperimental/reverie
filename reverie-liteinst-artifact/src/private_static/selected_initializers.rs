@@ -1796,6 +1796,7 @@ fn join_from_files(
     let bytes = fs::read(&artifact.path).map_err(|e| e.to_string())?;
     let elf = Elf::parse(&bytes).map_err(|e| e.to_string())?;
     static_image_metadata(&elf, &bytes)?;
+    super::tls_sources::require_per_thread_abi_absent(&elf)?;
     for object in &objects {
         checked_object_symbol_authority(&object.elf, object.bytes)?;
     }
