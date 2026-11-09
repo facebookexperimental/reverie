@@ -6,11 +6,14 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[cfg(all(not(sanitized), test))]
 use reverie::Tool;
 
+#[cfg(all(not(sanitized), test))]
 #[derive(Debug, Default, Clone)]
 struct LocalState;
 
+#[cfg(all(not(sanitized), test))]
 #[reverie::tool]
 impl Tool for LocalState {
     type GlobalState = ();
