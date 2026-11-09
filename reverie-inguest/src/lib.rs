@@ -68,7 +68,6 @@ compile_error!("reverie-inguest requires Linux x86-64 or aarch64");
     any(
         feature = "exec-private-init",
         feature = "loader-private-runtime",
-        feature = "native-exec-state",
         feature = "exec-private-successor",
         feature = "exec-native-injection"
     )

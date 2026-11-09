@@ -27,6 +27,21 @@ use crate::rpc::CoordinatorRpc;
 use crate::runtime;
 use crate::runtime::SyscallEvent;
 
+/// Named aarch64 refusal for the serving entry points below (L0 of the
+/// aarch64 LiteInst port): the serving tails are not compiled on aarch64,
+/// and each public installer refuses here before touching any
+/// process-global state. One signature exists per installer on both
+/// architectures (the refusal is a cfg arm inside the single fn item), so
+/// signature drift between serving and refusing shapes is impossible by
+/// construction. L1 flips surfaces to real trap serving one by one.
+#[cfg(not(target_arch = "x86_64"))]
+pub(crate) fn aarch64_unsupported(surface: &'static str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!("{surface}: in-guest LiteInst runtime is not supported on aarch64"),
+    )
+}
+
 // Patched trampolines save HookContext; the shared entry reads RegisterContext.
 // The shared fallback continuation already owns RegisterContext.
 #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
@@ -60,6 +75,7 @@ const _: () = {
 };
 
 /// LiteInst's services for the in-guest Tool host.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 pub(crate) struct LiteinstRuntime {
     stats: crate::stats::GuestStatsHooks,
     /// Armed external exec watch (see `HostRuntime::exec_watch_armed`).
@@ -73,6 +89,7 @@ pub(crate) struct LiteinstRuntime {
 
 impl LiteinstRuntime {
     /// The services of an ordinary installation.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     pub(crate) fn new(stats: crate::stats::GuestStatsHooks) -> Self {
         Self {
             stats,
@@ -156,6 +173,12 @@ pub unsafe fn install_tool<T>(coordinator: impl AsRef<Path>) -> io::Result<()>
 where
     T: Tool + 'static,
 {
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = &coordinator;
+        Err(aarch64_unsupported("install_tool"))
+    }
+    #[cfg(target_arch = "x86_64")]
     unsafe {
         reverie_inguest::guest::tool_install::install_tool_with::<T, _>(
             coordinator.as_ref(),
@@ -183,6 +206,12 @@ pub unsafe fn install_tool_quiescent<T>(coordinator: impl AsRef<Path>) -> io::Re
 where
     T: Tool + 'static,
 {
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = &coordinator;
+        Err(aarch64_unsupported("install_tool_quiescent"))
+    }
+    #[cfg(target_arch = "x86_64")]
     unsafe {
         reverie_inguest::guest::tool_install::install_tool_with::<T, _>(
             coordinator.as_ref(),
@@ -208,6 +237,12 @@ pub unsafe fn install_tool_from_bootstrap<T>(coordinator: impl AsRef<Path>) -> i
 where
     T: Tool + 'static,
 {
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = &coordinator;
+        Err(aarch64_unsupported("install_tool_from_bootstrap"))
+    }
+    #[cfg(target_arch = "x86_64")]
     unsafe {
         reverie_inguest::guest::tool_install::install_tool_with::<T, _>(
             coordinator.as_ref(),
@@ -238,8 +273,17 @@ where
     T: Tool + 'static,
     R: HostRuntime,
 {
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = &coordinator;
+        let _ = &project;
+        Err(aarch64_unsupported(
+            "install_tool_from_bootstrap_with_runtime",
+        ))
+    }
     // SAFETY: the caller retains the original installation and service
     // projection obligations. No private image owner is created here.
+    #[cfg(target_arch = "x86_64")]
     unsafe {
         reverie_inguest::guest::tool_install::install_tool_with_runtime::<T, _, R, _>(
             coordinator.as_ref(),

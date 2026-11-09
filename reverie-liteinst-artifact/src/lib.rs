@@ -1344,8 +1344,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-inguest/src/lib.rs",
-        12593,
-        "8a0e8c1aa9ad1b704141aadf1e322e1ff125059d3529fa37ed296910c6510b30",
+        12554,
+        "4654517265bc7cadceba08ed7501bc12dfdd4690370a5d3a2d4cb518a63883f5",
     ),
     (
         "reverie-syscalls/Cargo.toml",
@@ -1379,8 +1379,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-liteinst/src/lib.rs",
-        27188,
-        "914df22cc643e6ed968596483198833a0a0d304d0d7d0ed62ff541c74563c1b4",
+        35314,
+        "a1f8f2f5d9c2626b7e80b0e6ccfdfc6eb740d7c2092ce5583dcc66b7db245bb3",
     ),
     (
         "reverie-liteinst-preload/Cargo.toml",
@@ -1389,8 +1389,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-liteinst-preload/src/lib.rs",
-        842,
-        "40587a60db06dc95538745208d23e7ec55a069c79ac86bfef87377df5a59fbe6",
+        1301,
+        "5d8059e7b6924429422672eda8f96c11e1163d684232a5d856f7ab4deaefea28",
     ),
     (
         "reverie-liteinst/src/patch_alloc.rs",
@@ -1449,8 +1449,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-liteinst/src/tool_host.rs",
-        77992,
-        "eb9b9481dc8ef1c7b311d6c1fe0c75efa33924d293b189e86eb98c562e44e878",
+        79634,
+        "7ba6aa50c8f4da098795b0d1f182b9aeb8f8e82efdb4b55a240e1b9a51121ae5",
     ),
     (
         "reverie/Cargo.toml",
@@ -38657,6 +38657,26 @@ mod tests {
                 "reverie-liteinst/src/patch_alloc.rs",
                 26462,
                 "799b94da011fa6d9313a296a74592fd060c12dd8543176ff4d56e7f82abb02bc",
+            ),
+            (
+                "reverie-inguest/src/lib.rs",
+                12593,
+                "8a0e8c1aa9ad1b704141aadf1e322e1ff125059d3529fa37ed296910c6510b30",
+            ),
+            (
+                "reverie-liteinst/src/lib.rs",
+                27188,
+                "914df22cc643e6ed968596483198833a0a0d304d0d7d0ed62ff541c74563c1b4",
+            ),
+            (
+                "reverie-liteinst-preload/src/lib.rs",
+                842,
+                "40587a60db06dc95538745208d23e7ec55a069c79ac86bfef87377df5a59fbe6",
+            ),
+            (
+                "reverie-liteinst/src/tool_host.rs",
+                77992,
+                "eb9b9481dc8ef1c7b311d6c1fe0c75efa33924d293b189e86eb98c562e44e878",
             ),
             (
                 "reverie-liteinst/src/tool_host.rs",

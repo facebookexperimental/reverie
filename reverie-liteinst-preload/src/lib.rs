@@ -1,6 +1,16 @@
 //! Standalone preload ownership. The shared core stays allocator neutral.
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+// Named refusal (option A of the aarch64 LiteInst port review): no preload
+// artifact exists on aarch64 until inguest has an aarch64 native bootstrap,
+// so aarch64 consumers run through the literoot bootstrap root instead.
+// This is a compile-time refusal, not a silent cfg-out: no artifact exists
+// to load.
+#[cfg(not(target_arch = "x86_64"))]
+compile_error!(
+    "reverie-liteinst-preload is not supported on aarch64 (no aarch64 native bootstrap)"
+);
+
 #[cfg(target_env = "gnu")]
 mod glibc_compat;
 
