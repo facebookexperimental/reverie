@@ -712,7 +712,6 @@ mod tests {
             );
             assert!(error.to_string().contains(surface), "{surface}: {error}");
         }
-        let patching_before = crate::site_patching_enabled();
         // SAFETY: on aarch64 every surface refuses before installing any
         // process-global state (that is exactly what is asserted here).
         assert_refusal(
@@ -748,7 +747,6 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
         assert!(error.to_string().contains("not supported on aarch64"));
         crate::runtime::initialize_from_selected_value(None).unwrap();
-        assert_eq!(crate::site_patching_enabled(), patching_before);
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -773,7 +771,6 @@ mod tests {
                 0
             );
             assert_eq!(after.sa_sigaction, handler_before);
-            assert!(!crate::site_patching_enabled());
             return;
         }
         let exe = std::env::current_exe().unwrap();

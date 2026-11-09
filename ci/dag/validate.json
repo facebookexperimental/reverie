@@ -140,7 +140,7 @@
       "group": "build",
       "job": "liteinst_aarch64_l0",
       "desc": "LiteInst aarch64 L0 gates",
-      "description": "Runs scripts/check-liteinst-aarch64-l0.py (G2-G6): exact liteinst alias and lazy_promote reference checks; gnu check and musl build for every L0 feature set; named exec-private compile refusals; aarch64 clippy; and pinned qemu-aarch64 lib runs. Verified host tooling is devbig030 (declared gnu/musl std targets, rust-lld, /opt/fb-qemu-user/bin/qemu-aarch64). The script fails rather than skips when any prerequisite is missing. G7 native preload/lazy_promote evidence is intentionally metal-only and is not in this DAG step.",
+      "description": "Runs scripts/check-liteinst-aarch64-l0.py (G2-G6): exact liteinst alias and lazy_promote reference checks; gnu check and musl build for every L0 feature set; named exec-private compile refusals; aarch64 clippy; and pinned qemu-aarch64 lib runs. Verified host tooling is devbig030 (declared gnu/musl std targets, rust-lld, /opt/fb-qemu-user/bin/qemu-aarch64). The script fails rather than skips when any prerequisite is missing. Its qemu leg runs the aarch64 lib tests serialized (--test-threads 1, required under qemu-user) and is intentionally not counted by libtest-counts; a counted test.* node can come later. G7 native preload/lazy_promote evidence is intentionally metal-only and is not in this DAG step.",
       "labels": [
         "full"
       ],
@@ -154,9 +154,9 @@
         "resources": {
           "cargo-build": 1
         },
-        "est_duration_s": 600,
-        "rss_baseline_bytes": 16000000000,
-        "hard_mem_max_bytes": 32000000000,
+        "est_duration_s": 150,
+        "rss_baseline_bytes": 2000000000,
+        "hard_mem_max_bytes": 8000000000,
         "classification": "cpu-bound",
         "preferred_inner_jobs": 8
       },

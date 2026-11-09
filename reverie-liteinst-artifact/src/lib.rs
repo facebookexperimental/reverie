@@ -1379,8 +1379,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-liteinst/src/lib.rs",
-        35314,
-        "a1f8f2f5d9c2626b7e80b0e6ccfdfc6eb740d7c2092ce5583dcc66b7db245bb3",
+        35129,
+        "1270edf2571480add4843055dd5417b9886291c4f75d8399645f94cfc76e12ec",
     ),
     (
         "reverie-liteinst-preload/Cargo.toml",
@@ -38657,6 +38657,11 @@ mod tests {
                 "reverie-liteinst/src/patch_alloc.rs",
                 26462,
                 "799b94da011fa6d9313a296a74592fd060c12dd8543176ff4d56e7f82abb02bc",
+            ),
+            (
+                "reverie-liteinst/src/lib.rs",
+                35314,
+                "a1f8f2f5d9c2626b7e80b0e6ccfdfc6eb740d7c2092ce5583dcc66b7db245bb3",
             ),
             (
                 "reverie-inguest/src/lib.rs",
