@@ -433,6 +433,18 @@ pub struct MappedSuccessorVerifiedDigests {
     pub ticket: [u8; 32],
 }
 
+#[cfg(feature = "loader-private-runtime")]
+impl From<&reverie_rpc_transport::successor::VerifiedSuccessorState>
+    for MappedSuccessorVerifiedDigests
+{
+    fn from(verified: &reverie_rpc_transport::successor::VerifiedSuccessorState) -> Self {
+        Self {
+            state: verified.expected().state,
+            ticket: verified.ticket_digest(),
+        }
+    }
+}
+
 #[cfg(all(feature = "loader-private-runtime", any(test, target_env = "musl")))]
 fn mapped_successor_binding_digests<C: serde::Serialize>(
     config: &C,
