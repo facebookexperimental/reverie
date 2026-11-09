@@ -424,13 +424,31 @@ impl InstalledInitialImage {
 /// Verified digests supplied by whichever already-admitted
 /// carrier delivered the selected state. This seam does not
 /// construct or name that carrier's scalar-5 client.
+///
+/// The fields are private: outside this module the only
+/// constructor is the `From<&VerifiedSuccessorState>`
+/// conversion below, so both digests always come from the
+/// transport-verified successor state, never from the packet.
 #[cfg(feature = "loader-private-runtime")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MappedSuccessorVerifiedDigests {
     /// SHA-256 of the exact delivered opaque state bytes.
-    pub state: [u8; 32],
+    state: [u8; 32],
     /// SHA-256 of the exact one-use ticket/redemption bytes.
-    pub ticket: [u8; 32],
+    ticket: [u8; 32],
+}
+
+#[cfg(feature = "loader-private-runtime")]
+impl MappedSuccessorVerifiedDigests {
+    /// SHA-256 of the exact delivered opaque state bytes.
+    pub fn state(&self) -> [u8; 32] {
+        self.state
+    }
+
+    /// SHA-256 of the exact one-use ticket/redemption bytes.
+    pub fn ticket(&self) -> [u8; 32] {
+        self.ticket
+    }
 }
 
 #[cfg(feature = "loader-private-runtime")]
@@ -1890,6 +1908,51 @@ mod mapped_successor_binding_tests {
             error.to_string(),
             "mapped successor packet ticket digest mismatch"
         );
+
+        // A zeroed verified ticket never binds, even against the
+        // genuine packet ticket digest.
+        let error = check_mapped_successor_binding(
+            client_config_digest,
+            packet_config,
+            packet_state,
+            packet_ticket,
+            &MappedSuccessorVerifiedDigests {
+                ticket: [0; 32],
+                ..verified
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "mapped successor packet ticket digest mismatch"
+        );
+    }
+
+    #[test]
+    fn mapped_digests_from_verified_state_are_faithful() {
+        use reverie_rpc_transport::initial_image::config_digest;
+        use reverie_rpc_transport::successor::ExpectedSuccessor;
+        use reverie_rpc_transport::successor::SuccessorRequest;
+        use reverie_rpc_transport::successor::VerifiedSuccessorState;
+
+        let bytes = b"selected-state-bytes".to_vec();
+        let expected = ExpectedSuccessor {
+            config: config_digest(b"config-bytes"),
+            state: config_digest(&bytes),
+        };
+        let verified = VerifiedSuccessorState::from_checked_frame_for_test(
+            SuccessorRequest {
+                ticket: b"birth-nonce",
+                expected,
+            },
+            bytes,
+        )
+        .unwrap();
+        let digests = MappedSuccessorVerifiedDigests::from(&verified);
+        assert_eq!(digests.state(), verified.expected().state);
+        assert_eq!(digests.ticket(), verified.ticket_digest());
+        assert_eq!(digests.ticket(), config_digest(b"birth-nonce"));
+        assert_ne!(digests.ticket(), [0; 32]);
     }
 
     #[test]

@@ -35,6 +35,9 @@ path = "tests/fixtures/mapped_rpc_fork_fixture.rs"
 
 [features]
 test-guest-log = []
+# Test-only constructors for downstream binding tests. Never enable in a
+# production build: it permits fabricating checked-frame values.
+test-support = []
 
 [[bin]]
 name = "guest_log_lifecycle_fixture"

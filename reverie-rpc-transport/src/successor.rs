@@ -147,6 +147,18 @@ impl VerifiedSuccessorState {
             bytes,
         })
     }
+
+    /// Test-only checked-frame constructor running the same state check as
+    /// the production path. Downstream binding tests use it to obtain a
+    /// genuine `VerifiedSuccessorState` without a live exchange.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn from_checked_frame_for_test(
+        request: SuccessorRequest<'_>,
+        bytes: Vec<u8>,
+    ) -> Result<Self, RpcError> {
+        Self::from_checked_frame(request, bytes)
+    }
 }
 
 /// Encode only the explicit bounded successor request.
