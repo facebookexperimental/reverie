@@ -1,7 +1,7 @@
 [package]
 name = "reverie-kvm"
 description = "KVM-based execution backend for the Reverie instrumentation framework."
-version = "0.5.4"
+version = "0.5.5"
 authors = ["Meta Platforms"]
 edition = "2024"
 repository = "https://github.com/facebookexperimental/reverie"
@@ -28,17 +28,17 @@ kvm-bindings = "0.14.1"
 kvm-ioctls = "0.25.0"
 libc = "0.2.186"
 perf-event-open-sys = "5.0"
-reverie = { version = "0.5.4", path = "../reverie", package = "reverie-core" }
-reverie-kvm-core = { version = "0.5.4", path = "../reverie-kvm-core" }
-reverie-linuxemu = { version = "0.5.4", path = "../reverie-linuxemu" }
+reverie = { version = "0.5.5", path = "../reverie", package = "reverie-core" }
+reverie-kvm-core = { version = "0.5.5", path = "../reverie-kvm-core" }
+reverie-linuxemu = { version = "0.5.5", path = "../reverie-linuxemu" }
 thiserror = "2.0.18"
 
 [dev-dependencies]
 io-uring = "0.7.11"
-reverie-kvm-core = { version = "0.5.4", path = "../reverie-kvm-core", features = ["test-support"] }
-reverie-linuxemu = { version = "0.5.4", path = "../reverie-linuxemu", features = ["test-support"] }
+reverie-kvm-core = { version = "0.5.5", path = "../reverie-kvm-core", features = ["test-support"] }
+reverie-linuxemu = { version = "0.5.5", path = "../reverie-linuxemu", features = ["test-support"] }
 # The reference backend of the timer tests' ptrace comparison (tests/timer_events.rs).
-reverie-ptrace = { version = "0.5.4", path = "../reverie-ptrace" }
+reverie-ptrace = { version = "0.5.5", path = "../reverie-ptrace" }
 serde = { version = "1.0.219", features = ["derive"] }
 tokio = { version = "1.54.1", features = ["rt-multi-thread"] }
 

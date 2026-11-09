@@ -13,7 +13,7 @@
 
 [package]
 name = "reverie-examples"
-version = "0.5.4"
+version = "0.5.5"
 authors = ["Meta Platforms"]
 edition = "2024"
 repository = "https://github.com/facebookexperimental/reverie"
@@ -113,11 +113,11 @@ anyhow = "1.0.103"
 clap = { version = "4.6.2", features = ["derive", "env", "string", "unicode", "wrap_help"] }
 libc = "0.2.186"
 nix = { version = "0.30.1", features = ["ptrace", "signal"] }
-reverie = { version = "0.5.4", path = "../reverie", package = "reverie-core" }
-reverie-kvm = { version = "0.5.4", path = "../reverie-kvm", optional = true }
-reverie-liteinst = { version = "0.5.4", path = "../reverie-liteinst", default-features = false, features = ["liteinst"], optional = true }
-reverie-ptrace = { version = "0.5.4", path = "../reverie-ptrace", optional = true }
-reverie-util = { version = "0.5.4", path = "../reverie-util" }
+reverie = { version = "0.5.5", path = "../reverie", package = "reverie-core" }
+reverie-kvm = { version = "0.5.5", path = "../reverie-kvm", optional = true }
+reverie-liteinst = { version = "0.5.5", path = "../reverie-liteinst", default-features = false, features = ["liteinst"], optional = true }
+reverie-ptrace = { version = "0.5.5", path = "../reverie-ptrace", optional = true }
+reverie-util = { version = "0.5.5", path = "../reverie-util" }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 syscalls = { version = "0.6.18", optional = true }
@@ -127,7 +127,7 @@ tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 [dev-dependencies]
 # Shared coordinator framing for the retained-configuration Strace library test.
 # Keep the internal strace test dependency synchronized before the next export.
-reverie-rpc-transport = { version = "0.5.4", path = "../reverie-rpc-transport" }
+reverie-rpc-transport = { version = "0.5.5", path = "../reverie-rpc-transport" }
 tempfile = "3.27.0"
 
 # Shared guests use cfg(sanitized); keep the internal target synchronized.
