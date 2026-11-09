@@ -4,7 +4,42 @@ Versions 0.5.1 and 0.5.3 describe selected development snapshots; 0.5.0
 describes the registry release. Backend-specific entries retain the limits
 of those execution paths.
 
-## 0.5.3 (Unreleased)
+## 0.5.5
+
+Release cut for the 2026-11-09 fbsource import, taken at Reverie
+`78d41ebd`, the commit Hermit pinned; Reverie main continued past it. It
+summarizes the commits from the 0.5.4 alignment to that cut, about 700 of
+them.
+
+- Split Reverie into its first-party core: ptrace, KVM, LiteInst and the
+  in-guest runtime stay here; DBT, SaBRe, e9patch and their tools live in the
+  satellite repositories listed in `docs/BACKEND_SOURCES.md`.
+- KVM: a preemption timer with precise and imprecise timer events, signal
+  delivery at timer boundaries and at every return to user mode, vfork
+  children that share file views with their parent, and named, bounded
+  refusals when an exec runs out of host resources.
+- LinuxEmu: Linux-faithful answers for signalfd, pidfd, inotify, mincore,
+  protection keys and descriptor limits, with tests pinned against the native
+  host.
+- In-guest runtime: aarch64 trap dispatch, signal frames and SIGSYS handling,
+  and groundwork for per-thread Tool TLS.
+- gdb stub: guest signals are reported as stops, and signal numbers are
+  translated between gdb and Linux.
+- safeptrace: register writes stay in a cache until they are needed;
+  `set_syscall` writes dirty registers back first.
+- Dependencies: tokio 1.54.1.
+- Align every first-party package and internal requirement at 0.5.5. The
+  LiteInst artifact identity checks now require 0.5.5 and still reject 0.5.4,
+  0.5.1 and older identities.
+
+## 0.5.4
+
+- Package-version alignment for the native import
+  ([a131082c](https://github.com/rrnewton/reverie/commit/a131082c93759d2666984a639e6d02813cd16e23)).
+  Changes made between the 0.5.3 snapshot and this alignment have no entries
+  of their own.
+
+## 0.5.3 (Development snapshot)
 
 - Give KVM syscall callbacks the guest's saved instruction pointer, flags and
   argument registers instead of the trampoline's overwritten state. `RAX`
