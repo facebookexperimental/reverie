@@ -140,7 +140,11 @@ def require_prerequisites() -> None:
         libdir = Path(result.stdout.strip())
         if result.returncode != 0 or not libdir.is_dir():
             raise GateFailure(f"missing Rust std target {target}: {result.stderr.strip()}")
-    if shutil.which("rust-lld") is None:
+    sysroot = subprocess.run(
+        ["rustc", "--print", "sysroot"], stdout=subprocess.PIPE, text=True, check=False
+    ).stdout.strip()
+    bundled_lld = list(Path(sysroot).glob("lib/rustlib/*/bin/rust-lld"))
+    if shutil.which("rust-lld") is None and not bundled_lld:
         raise GateFailure("missing rust-lld (required; refusing to skip)")
     if not QEMU.is_file() or not os.access(QEMU, os.X_OK):
         raise GateFailure(f"missing qemu-aarch64 runner {QEMU} (refusing to skip)")
