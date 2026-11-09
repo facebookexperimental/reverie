@@ -196,6 +196,12 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for MappedSuccessorImageGuest<'a, T, 
             args.arg4 as u64,
             args.arg5 as u64,
         ];
+        // The mapped runner resumes with the prelude's retained
+        // original FS, not a live control.guest_fs change. Refuse
+        // SET_FS instead of claiming it carries to that resume.
+        if number == libc::SYS_arch_prctl && args[0] == 0x1002 {
+            return Err(self.refuse(1));
+        }
         let (mut args, mask) = match guard_lifecycle_injection(self.runtime, number, args, || {
             #[cfg(feature = "exec-native-injection")]
             {

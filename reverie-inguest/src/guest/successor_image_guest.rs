@@ -548,6 +548,56 @@ mod tests {
                 7 => {
                     guest.daemonize().await;
                 }
+                8 => {
+                    let before = guest.regs().await;
+                    let moved = before.fs_base + 0x1000;
+                    let call = reverie::syscalls::Syscall::from_raw(
+                        reverie::syscalls::Sysno::arch_prctl,
+                        reverie::syscalls::SyscallArgs::new(0x1002, moved as usize, 0, 0, 0, 0),
+                    );
+                    assert_eq!(guest.inject(call).await, Ok(0));
+                    let after = guest.regs().await;
+                    assert_eq!(after.fs_base, moved);
+                }
+                12 => {
+                    let owner = unsafe {
+                        &*(PERMIT_INVALIDATION_OWNER.load(core::sync::atomic::Ordering::SeqCst)
+                            as *const crate::guest::exec_private::InitialImageControl)
+                    };
+                    owner.mapped_successor_restore_failed();
+                    let fd = PERMIT_INVALIDATION_FD.load(core::sync::atomic::Ordering::SeqCst);
+                    let call = reverie::syscalls::Syscall::from_raw(
+                        reverie::syscalls::Sysno::close,
+                        reverie::syscalls::SyscallArgs::new(fd, 0, 0, 0, 0, 0),
+                    );
+                    assert_eq!(guest.inject(call).await, Err(Errno::EOPNOTSUPP));
+                    assert!(
+                        unsafe { libc::fcntl(fd as i32, libc::F_GETFD) } >= 0,
+                        "injected close ran after the permit was invalidated"
+                    );
+                }
+                13 => {
+                    let call = reverie::syscalls::Syscall::from_raw(
+                        reverie::syscalls::Sysno::close,
+                        reverie::syscalls::SyscallArgs::new(100_000, 0, 0, 0, 0, 0),
+                    );
+                    assert_eq!(guest.inject(call).await, Err(Errno::EBADF));
+                    assert_eq!(
+                        guest.inject(reverie::syscalls::Getpid::default()).await,
+                        Ok(raw_pid(libc::SYS_getpid).as_raw() as i64)
+                    );
+                }
+                14 => {
+                    let before = guest.regs().await;
+                    let moved = before.fs_base + 0x1000;
+                    let call = reverie::syscalls::Syscall::from_raw(
+                        reverie::syscalls::Sysno::arch_prctl,
+                        reverie::syscalls::SyscallArgs::new(0x1002, moved as usize, 0, 0, 0, 0),
+                    );
+                    assert_eq!(guest.inject(call).await, Err(Errno::EOPNOTSUPP));
+                    let after = guest.regs().await;
+                    assert_eq!(after.fs_base, before.fs_base);
+                }
                 _ => {}
             }
             guest.thread_state_mut().0 += 1;
@@ -933,6 +983,120 @@ mod tests {
                 127,
             );
         }
+    }
+
+    static PERMIT_INVALIDATION_OWNER: core::sync::atomic::AtomicUsize =
+        core::sync::atomic::AtomicUsize::new(0);
+    static PERMIT_INVALIDATION_FD: core::sync::atomic::AtomicUsize =
+        core::sync::atomic::AtomicUsize::new(0);
+
+    #[test]
+    fn mapped_permit_invalidated_after_begin_blocks_injection() {
+        isolated(
+            || {
+                let calls = Arc::new(Mutex::new(Vec::new()));
+                let (_native, owner) = lifecycle_test_owner();
+                let (host, worker) = parity_host_with(calls.clone(), false, false, 12);
+                unsafe { host.bind_initial_image_control(&owner) }.unwrap();
+                unsafe { host.restore_mapped_successor_state((99, 0x1234_5678_abcd_4321), &owner) }
+                    .unwrap();
+                mark_lifecycle_test_frontend_installed(&owner);
+                let entry = mapped_test_entry(&owner);
+                let fd = unsafe { libc::eventfd(0, 0) };
+                assert!(fd >= 0);
+                PERMIT_INVALIDATION_FD.store(fd as usize, core::sync::atomic::Ordering::SeqCst);
+                PERMIT_INVALIDATION_OWNER.store(
+                    core::ptr::from_ref(&owner) as usize,
+                    core::sync::atomic::Ordering::SeqCst,
+                );
+                let error = host
+                    .initialize_mapped_successor_lifecycle(&owner, &entry)
+                    .unwrap_err();
+                assert_eq!(
+                    error.to_string(),
+                    "mapped successor lifecycle guarded injection refused"
+                );
+                assert!(unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0);
+                assert!(host.states.is_empty());
+                assert_eq!(*calls.lock().unwrap(), ["post-exec"]);
+                drop(host);
+                assert!(worker.join().unwrap().is_empty());
+            },
+            0,
+        );
+    }
+
+    #[test]
+    fn mapped_failed_syscall_restores_phase_and_errno() {
+        isolated(
+            || {
+                let calls = Arc::new(Mutex::new(Vec::new()));
+                let (native, owner) = lifecycle_test_owner();
+                let (host, worker) = parity_host_with(calls.clone(), false, false, 13);
+                unsafe { host.bind_initial_image_control(&owner) }.unwrap();
+                unsafe { host.restore_mapped_successor_state((99, 0x1234_5678_abcd_4321), &owner) }
+                    .unwrap();
+                mark_lifecycle_test_frontend_installed(&owner);
+                let entry = mapped_test_entry(&owner);
+                host.initialize_mapped_successor_lifecycle(&owner, &entry)
+                    .unwrap();
+                assert_eq!(native.successor_test_phase(), 2);
+                assert_eq!(*calls.lock().unwrap(), ["post-exec"]);
+                drop(host);
+                assert!(worker.join().unwrap().is_empty());
+            },
+            0,
+        );
+    }
+
+    #[test]
+    fn native_regs_after_guest_fs_injection() {
+        isolated(
+            || {
+                let calls = Arc::new(Mutex::new(Vec::new()));
+                let (_native, owner, mut entry) = successor_test_owner();
+                let (host, worker) = parity_host_with(calls.clone(), false, false, 8);
+                unsafe { host.bind_successor_image_control(&owner) }.unwrap();
+                unsafe { host.restore_prepared_exec_state((99, 0x1234_5678_abcd_4321), &owner) }
+                    .unwrap();
+                mark_successor_test_frontend_installed(&owner);
+                host.run_post_exec_before_loader(&mut entry, &owner)
+                    .unwrap();
+                assert_eq!(*calls.lock().unwrap(), ["post-exec"]);
+                drop(host);
+                assert!(worker.join().unwrap().is_empty());
+            },
+            0,
+        );
+    }
+
+    #[test]
+    fn mapped_arch_set_fs_is_refused_and_regs_keep_original_fs() {
+        isolated(
+            || {
+                let calls = Arc::new(Mutex::new(Vec::new()));
+                let (_native, owner) = lifecycle_test_owner();
+                let (host, worker) = parity_host_with(calls.clone(), false, false, 14);
+                unsafe { host.bind_initial_image_control(&owner) }.unwrap();
+                unsafe { host.restore_mapped_successor_state((99, 0x1234_5678_abcd_4321), &owner) }
+                    .unwrap();
+                mark_lifecycle_test_frontend_installed(&owner);
+                let entry = mapped_test_entry(&owner);
+                let error = host
+                    .initialize_mapped_successor_lifecycle(&owner, &entry)
+                    .unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+                assert_eq!(
+                    error.to_string(),
+                    "mapped successor lifecycle guarded injection refused"
+                );
+                assert!(host.states.is_empty());
+                assert_eq!(*calls.lock().unwrap(), ["post-exec"]);
+                drop(host);
+                assert!(worker.join().unwrap().is_empty());
+            },
+            0,
+        );
     }
 
     struct TestRuntime;

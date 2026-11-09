@@ -3410,6 +3410,29 @@ mod tests {
         assert!(libc::WIFEXITED(status), "child wait status {status}");
         assert_eq!(libc::WEXITSTATUS(status), expected);
     }
+    #[cfg(feature = "coordinator-rpc")]
+    fn mapped_permit_test_owner() -> (
+        Box<NativeControl>,
+        InitialImageControl,
+        MappedSuccessorEntry,
+    ) {
+        let (mut native, owner) = lifecycle_test_owner();
+        owner.bind_lifecycle_host(1).unwrap();
+        owner.begin_mapped_successor_restore(1).unwrap();
+        owner.mapped_successor_restore_completed();
+        mark_lifecycle_test_frontend_installed(&owner);
+        let mut regs: libc::user_regs_struct = unsafe { core::mem::zeroed() };
+        regs.rsp = 0x1234_0000;
+        regs.rip = 0x5678_0000;
+        regs.fs_base = native.tool_fs;
+        native.guest_rsp = regs.rsp;
+        native.guest_ld_entry = regs.rip;
+        native.guest_fs = regs.fs_base;
+        native.guest_pkru = 0;
+        let entry = unsafe { MappedSuccessorEntry::from_mapped_resume(regs, None) };
+        (native, owner, entry)
+    }
+
     // These component controls install the actual fixed gate and reserve real
     // seqpacket FDs. They establish reporter mechanics, not native admission.
     fn refusal_socket() -> (i32, i32) {
@@ -4597,6 +4620,90 @@ mod tests {
             },
             0,
         );
+    }
+
+    #[cfg(feature = "coordinator-rpc")]
+    #[test]
+    fn mapped_injection_permit_revalidates_every_issuance_field() {
+        for mutation in 0..6 {
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0);
+            if pid == 0 {
+                let status = if std::panic::catch_unwind(|| {
+                    let (_native, owner, entry) = mapped_permit_test_owner();
+                    let mut permit = owner.begin_mapped_successor_lifecycle(1).unwrap();
+                    permit.validate_mapped_injection().unwrap();
+                    assert_eq!(permit.regs(&entry).rsp, 0x1234_0000);
+                    match mutation {
+                        0 => permit.selected = false,
+                        1 => permit.completed = true,
+                        2 => owner.lifecycle.store(2, Ordering::Release),
+                        3 => owner.installation.store(1, Ordering::Release),
+                        4 => owner.installed_host.store(2, Ordering::Release),
+                        5 => owner.selected_restore.store(1, Ordering::Release),
+                        _ => unreachable!(),
+                    }
+                    let error = permit.validate_mapped_injection().unwrap_err();
+                    assert_eq!(
+                        error.to_string(),
+                        "mapped successor injection permit differs",
+                        "permit mutation {mutation}"
+                    );
+                    assert_eq!(owner.lifecycle.load(Ordering::Acquire), 3);
+                })
+                .is_ok()
+                {
+                    0
+                } else {
+                    125
+                };
+                unsafe { libc::_exit(status) };
+            }
+            let mut status = 0;
+            assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+            assert!(libc::WIFEXITED(status));
+            assert_eq!(libc::WEXITSTATUS(status), 0, "permit mutation {mutation}");
+        }
+    }
+
+    #[cfg(feature = "coordinator-rpc")]
+    #[test]
+    fn mapped_regs_reverify_entry_after_control_mutation() {
+        for mutation in 0..4 {
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0);
+            if pid == 0 {
+                let status = if std::panic::catch_unwind(|| {
+                    let (mut native, owner, entry) = mapped_permit_test_owner();
+                    let permit = owner.begin_mapped_successor_lifecycle(1).unwrap();
+                    assert_eq!(permit.regs(&entry).rsp, 0x1234_0000);
+                    match mutation {
+                        0 => native.guest_rsp += 8,
+                        1 => native.guest_ld_entry += 8,
+                        2 => native.guest_fs += 8,
+                        3 => native.guest_pkru = 2,
+                        _ => unreachable!(),
+                    }
+                    let _ = permit.regs(&entry);
+                    panic!("mapped regs returned after entry mutation {mutation}");
+                })
+                .is_ok()
+                {
+                    0
+                } else {
+                    125
+                };
+                unsafe { libc::_exit(status) };
+            }
+            let mut status = 0;
+            assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+            assert!(libc::WIFEXITED(status));
+            assert_eq!(
+                libc::WEXITSTATUS(status),
+                127,
+                "entry mutation {mutation} must terminate at regs"
+            );
+        }
     }
 
     #[test]
