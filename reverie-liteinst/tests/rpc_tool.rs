@@ -17,13 +17,15 @@ fn fallback_uses_owned_frames_after_guest_stack_revocation() {
     for on_alt_stack in [true, false] {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("coordinator.sock");
-        let mut coordinator = Command::new(binary)
-            .arg("coordinator")
-            .arg(&socket)
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+        let mut coordinator = KillOnDropChild::new(
+            Command::new(binary)
+                .arg("coordinator")
+                .arg(&socket)
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
         let deadline = Instant::now() + Duration::from_secs(5);
         while !socket.exists() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
@@ -36,8 +38,7 @@ fn fallback_uses_owned_frames_after_guest_stack_revocation() {
             .env_remove(STRADDLER_STALENESS_TICKS_ENV);
         reverie_liteinst::set_guest_alt_stack(&mut command, on_alt_stack);
         let output = ready.then(|| owned_frame_output(command));
-        let _ = coordinator.kill();
-        let _ = coordinator.wait();
+        let _ = coordinator.kill_and_wait();
         let output = output.expect("coordinator socket was not created");
         assert!(output.stderr.is_empty(), "{output:?}");
         if output.status.code() == Some(77) {
@@ -231,13 +232,15 @@ fn ordinary_tool_memory_and_scratch_work_with_protected_guest_state() {
     for on_alt_stack in [true, false] {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("coordinator.sock");
-        let mut coordinator = Command::new(binary)
-            .arg("coordinator")
-            .arg(&socket)
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+        let mut coordinator = KillOnDropChild::new(
+            Command::new(binary)
+                .arg("coordinator")
+                .arg(&socket)
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
         let deadline = Instant::now() + Duration::from_secs(5);
         while !socket.exists() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
@@ -247,8 +250,7 @@ fn ordinary_tool_memory_and_scratch_work_with_protected_guest_state() {
         command.arg("memory-access").arg(&socket);
         reverie_liteinst::set_guest_alt_stack(&mut command, on_alt_stack);
         let output = ready.then(|| output_with_timeout(command, Duration::from_secs(20)));
-        let _ = coordinator.kill();
-        let _ = coordinator.wait();
+        let _ = coordinator.kill_and_wait();
         let output = output.expect("coordinator socket was not created");
         assert!(output.stderr.is_empty(), "{output:?}");
         if output.status.code() == Some(77) {
@@ -271,13 +273,15 @@ fn unpatchable_syscall_dispatches_tool_after_signal_return() {
     let binary = env!("CARGO_BIN_EXE_reverie-liteinst-rpc-tool-guest");
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("coordinator.sock");
-    let mut coordinator = Command::new(binary)
-        .arg("coordinator")
-        .arg(&socket)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut coordinator = KillOnDropChild::new(
+        Command::new(binary)
+            .arg("coordinator")
+            .arg(&socket)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
     let deadline = Instant::now() + Duration::from_secs(5);
     while !socket.exists() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(10));
@@ -286,8 +290,7 @@ fn unpatchable_syscall_dispatches_tool_after_signal_return() {
     let mut command = Command::new(binary);
     command.arg("syscall-fallback").arg(&socket);
     let output = ready.then(|| output_with_timeout(command, Duration::from_secs(20)));
-    let _ = coordinator.kill();
-    let _ = coordinator.wait();
+    let _ = coordinator.kill_and_wait();
     let output = output.expect("coordinator socket was not created");
     assert!(output.status.success(), "{output:?}");
     assert_eq!(
@@ -302,13 +305,15 @@ fn unpatchable_syscall_preserves_xstate_with_native_controls() {
     let binary = env!("CARGO_BIN_EXE_reverie-liteinst-rpc-tool-guest");
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("coordinator.sock");
-    let mut coordinator = Command::new(binary)
-        .arg("coordinator")
-        .arg(&socket)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut coordinator = KillOnDropChild::new(
+        Command::new(binary)
+            .arg("coordinator")
+            .arg(&socket)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
     let deadline = Instant::now() + Duration::from_secs(5);
     while !socket.exists() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(10));
@@ -317,8 +322,7 @@ fn unpatchable_syscall_preserves_xstate_with_native_controls() {
     let mut command = Command::new(binary);
     command.arg("syscall-fallback-xstate").arg(&socket);
     let output = ready.then(|| output_with_timeout(command, Duration::from_secs(20)));
-    let _ = coordinator.kill();
-    let _ = coordinator.wait();
+    let _ = coordinator.kill_and_wait();
     let output = output.expect("coordinator socket was not created");
     assert!(output.status.success(), "{output:?}");
     assert!(output.stderr.is_empty(), "{output:?}");
@@ -346,13 +350,15 @@ fn protection_keys_with_signal_stack(on_alt_stack: bool) {
     let binary = env!("CARGO_BIN_EXE_reverie-liteinst-rpc-tool-guest");
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("coordinator.sock");
-    let mut coordinator = Command::new(binary)
-        .arg("coordinator")
-        .arg(&socket)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut coordinator = KillOnDropChild::new(
+        Command::new(binary)
+            .arg("coordinator")
+            .arg(&socket)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
     let deadline = Instant::now() + Duration::from_secs(5);
     while !socket.exists() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(10));
@@ -362,8 +368,7 @@ fn protection_keys_with_signal_stack(on_alt_stack: bool) {
     command.arg("syscall-fallback-pkey").arg(&socket);
     reverie_liteinst::set_guest_alt_stack(&mut command, on_alt_stack);
     let output = ready.then(|| output_with_timeout(command, Duration::from_secs(20)));
-    let _ = coordinator.kill();
-    let _ = coordinator.wait();
+    let _ = coordinator.kill_and_wait();
     let output = output.expect("coordinator socket was not created");
     if output.status.code() == Some(77) {
         assert_eq!(output.stdout, b"fallback pkeys: OSPKE unavailable\n");
@@ -395,13 +400,15 @@ fn fork_child_accounts_for_fallback_and_installed_dispatch() {
     let binary = env!("CARGO_BIN_EXE_reverie-liteinst-rpc-tool-guest");
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("coordinator.sock");
-    let mut coordinator = Command::new(binary)
-        .arg("coordinator")
-        .arg(&socket)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut coordinator = KillOnDropChild::new(
+        Command::new(binary)
+            .arg("coordinator")
+            .arg(&socket)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
     let deadline = Instant::now() + Duration::from_secs(5);
     while !socket.exists() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(10));
@@ -414,8 +421,7 @@ fn fork_child_accounts_for_fallback_and_installed_dispatch() {
             output_with_timeout(command, Duration::from_secs(20))
         })
     });
-    let _ = coordinator.kill();
-    let _ = coordinator.wait();
+    let _ = coordinator.kill_and_wait();
     let [installed, fallback] = outputs.expect("coordinator socket was not created");
     assert!(installed.status.success(), "{installed:?}");
     assert_eq!(installed.stdout, b"installed fork child: hooks=1 traps=0 fallback=0 syscall=0\ninstalled fork parent: hooks=2 traps=1 fallback=0 syscall=0\n");
@@ -439,13 +445,15 @@ fn an_anonymous_syscall_site_stays_on_the_fallback_path() {
     let binary = env!("CARGO_BIN_EXE_reverie-liteinst-rpc-tool-guest");
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("coordinator.sock");
-    let mut coordinator = Command::new(binary)
-        .arg("coordinator")
-        .arg(&socket)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut coordinator = KillOnDropChild::new(
+        Command::new(binary)
+            .arg("coordinator")
+            .arg(&socket)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
     let deadline = Instant::now() + Duration::from_secs(5);
     while !socket.exists() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(10));
@@ -454,8 +462,7 @@ fn an_anonymous_syscall_site_stays_on_the_fallback_path() {
     let mut command = Command::new(binary);
     command.arg("syscall-anonymous-site").arg(&socket);
     let output = ready.then(|| output_with_timeout(command, Duration::from_secs(20)));
-    let _ = coordinator.kill();
-    let _ = coordinator.wait();
+    let _ = coordinator.kill_and_wait();
     let output = output.expect("coordinator socket was not created");
     assert!(output.status.success(), "{output:?}");
     assert_eq!(
@@ -744,17 +751,27 @@ fn timeout_capture_preserves_prefixes_and_reaps_child_and_coordinator_on_unwind(
 #[test]
 fn installed_hook_reentry_bypasses_tool_with_shared_coordinator_rpc() {
     let binary = env!("CARGO_BIN_EXE_reverie-liteinst-rpc-tool-guest");
-    let directory = std::path::Path::new("/tmp").join(format!("li-rpc-{}", std::process::id()));
-    std::fs::create_dir_all(&directory).unwrap();
-    let socket = directory.join("coordinator.sock");
-
-    let mut coordinator = Command::new(binary)
-        .arg("coordinator")
-        .arg(&socket)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
+    // The socket path must stay short (sun_path), so the directory
+    // lives directly in /tmp, but it is still a TempDir guard: a
+    // panic or a killed test run must not leave the directory (or,
+    // via KillOnDropChild below, the coordinator) behind in /tmp.
+    let directory = tempfile::Builder::new()
+        .prefix("li-rpc-")
+        .tempdir_in("/tmp")
         .unwrap();
+    let directory_path = directory.path().to_path_buf();
+    let socket = directory.path().join("coordinator.sock");
+
+    let mut coordinator = KillOnDropChild::new(
+        Command::new(binary)
+            .arg("coordinator")
+            .arg(&socket)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let coordinator_pid = coordinator.child().id();
     let deadline = Instant::now() + Duration::from_secs(5);
     while !socket.exists() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(10));
@@ -1349,9 +1366,25 @@ fn installed_hook_reentry_bypasses_tool_with_shared_coordinator_rpc() {
         .arg(&socket)
         .output()
         .unwrap();
-    let _ = coordinator.kill();
-    let _ = coordinator.wait();
-    let _ = std::fs::remove_dir_all(&directory);
+    drop(coordinator);
+    drop(directory);
+    // Neither the coordinator nor its socket directory may outlive
+    // this test (dh-obm7): the pid must already be reaped and the
+    // /tmp/li-rpc-* directory must be gone.
+    let mut status = 0;
+    assert_eq!(
+        unsafe { libc::waitpid(coordinator_pid as libc::pid_t, &mut status, libc::WNOHANG) },
+        -1
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ECHILD)
+    );
+    assert!(
+        !directory_path.exists(),
+        "coordinator socket directory leaked: {}",
+        directory_path.display()
+    );
 
     assert!(
         guest.status.success(),
