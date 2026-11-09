@@ -211,12 +211,15 @@ impl BridgeCore {
 }
 
 /// The exactly-once terminal verdict duty after a detached
-/// release. It is consumed only by handing it a confirmed
-/// terminal wait outcome; a wait failure retains its owner for
-/// retry outside this handle and is never convertible into a
-/// finish success. Dropping the handle is only a `must_use`
-/// warning, not drop-proof exactly-once: the consuming outcome
-/// methods are the enforceable part.
+/// release. Its three consuming methods are
+/// `record_detached_outcome`, `record_released_status` (both
+/// only on a confirmed terminal wait), and
+/// `record_failed_launch` (the wait failed or was abandoned).
+/// A wait failure retains its owner for retry outside this
+/// handle and is never convertible into a finish success.
+/// Dropping the handle is only a `must_use` warning, not
+/// drop-proof exactly-once: the consuming outcome methods are
+/// the enforceable part.
 #[must_use = "record the terminal verdict exactly once after the detached wait"]
 pub struct BridgeVerdict {
     core: BridgeCore,
@@ -263,6 +266,7 @@ impl BridgeVerdict {
     /// later retry that confirms retirement cannot record the
     /// terminal after the fact (the verdict is exactly-once and
     /// already taken).
+    #[must_use = "the verdict error is the launch failure; handle it"]
     pub fn record_failed_launch(self, cleanup: &CleanupState) -> Option<ExecControlError> {
         self.core.verdict_for_cleanup(cleanup.confirmed).err()
     }
@@ -651,9 +655,13 @@ impl<'fd> BridgeRecordedStop<'fd> {
     /// `BirthAuthority` lock across prepare/seal/stamp/issue:
     /// it must not call any `BirthAuthority` method (that
     /// self-deadlocks), must not block on the RPC server or the
-    /// guest, and must be bounded pure packet-byte work. A
-    /// panic in the hook leaves the ticket `Prepared` with no
-    /// verdict taken; the caller must still cancel the stop.
+    /// guest, and must be bounded pure packet-byte work. This
+    /// method has already consumed the stop when the hook runs,
+    /// so a hook panic unwinds through the stop's drop (the
+    /// child owner sends SIGKILL and waits at most 2 s); no
+    /// verdict is taken, the ticket stays `Prepared`, and the
+    /// registry proof's expected runtime stays set. There is
+    /// no stop left for the caller to cancel after a panic.
     pub fn issue<F>(self, stamp: F) -> Result<BridgeIssuedStop<'fd>, BridgeError<'fd>>
     where
         F: FnOnce(ExecTicket, [u8; 32]) -> Result<Vec<u8>, ExecControlError>,
@@ -935,27 +943,55 @@ mod tests {
         assert!(!receipt.snapshot().child_created);
         assert!(!failure.cleanup().child_created);
 
-        // Invalid configs also create no child.
-        for config in [
-            BridgeConfig {
-                registry_nonce: [0u8; 32],
-                ..host_config()
-            },
-            BridgeConfig {
-                initial: InitialMode::RpcRedeemed {
-                    initial_redemption: Vec::new(),
+        // Invalid configs also create no child, each refused by
+        // its own name.
+        for (config, expected) in [
+            (
+                BridgeConfig {
+                    registry_nonce: [0u8; 32],
+                    ..host_config()
                 },
-                ..host_config()
-            },
+                "registry nonce must be nonzero",
+            ),
+            (
+                BridgeConfig {
+                    initial: InitialMode::RpcRedeemed {
+                        initial_redemption: Vec::new(),
+                    },
+                    ..host_config()
+                },
+                "initial redemption length is invalid",
+            ),
+            (
+                BridgeConfig {
+                    initial: InitialMode::RpcRedeemed {
+                        initial_redemption: vec![
+                            0xEE;
+                            reverie_rpc_transport::initial_image::MAX_REDEMPTION_LEN
+                                + 1
+                        ],
+                    },
+                    ..host_config()
+                },
+                "initial redemption length is invalid",
+            ),
         ] {
             let receipt = CleanupReceipt::default();
+            let failure = match BirthBridge::spawn_watched(
+                request("/bin/true", &["true"]),
+                receipt.clone(),
+                Some(config),
+            ) {
+                Ok(_) => panic!("invalid bridge config must refuse"),
+                Err(error) => error,
+            };
+            let BridgeError::Launch(failure) = failure else {
+                panic!("expected launch refusal");
+            };
             assert!(
-                BirthBridge::spawn_watched(
-                    request("/bin/true", &["true"]),
-                    receipt.clone(),
-                    Some(config),
-                )
-                .is_err()
+                failure.error.to_string().contains(expected),
+                "unexpected refusal: {}",
+                failure.error
             );
             assert!(!receipt.snapshot().child_created);
         }
@@ -1193,10 +1229,7 @@ mod tests {
             Err(error) => error,
         };
         let ticket = captured.lock().unwrap().unwrap();
-        assert!(matches!(
-            authority.stage(ticket),
-            Some(ExecStage::Cancelled) | Some(ExecStage::Failed)
-        ));
+        assert_eq!(authority.stage(ticket), Some(ExecStage::Cancelled));
         let BridgeError::Launch(failure) = failure else {
             panic!("expected launch failure");
         };
@@ -1403,5 +1436,86 @@ mod tests {
             authority.stage_snapshot(admitted, frame_tool_state(b"after-failed").unwrap()),
             Err(ExecControlError::Transition)
         ));
+    }
+
+    #[test]
+    fn release_detached_then_released_status_runs_verdict() {
+        // Same detached flow as the outcome variant, consumed
+        // through record_released_status: its verdict call is
+        // pinned, not just the shared helper behind it.
+        let bridge = spawn_bridge_req(host_config(), request("/bin/true", &["true"]));
+        let authority = bridge.authority();
+        let admitted = bridge.admitted();
+        let initial = expect_initial(bridge.wait_next().unwrap());
+        initial.record_mapped_initial_consumed().unwrap();
+        authority
+            .stage_snapshot(admitted, frame_tool_state(b"status-state").unwrap())
+            .unwrap();
+        let (detached, verdict) = initial
+            .release_detached(|task, _entry, _boundary| Ok(task))
+            .unwrap();
+        authority
+            .stage_snapshot(admitted, frame_tool_state(b"status-state-2").unwrap())
+            .unwrap();
+        let outcome = detached.wait().unwrap();
+        let status = verdict.record_released_status(outcome.status).unwrap();
+        assert_eq!(status, safeptrace::ExitStatus::Exited(0));
+        assert!(matches!(
+            authority.stage_snapshot(admitted, frame_tool_state(b"after-verdict").unwrap()),
+            Err(ExecControlError::Transition)
+        ));
+    }
+
+    #[test]
+    fn failed_launch_unconfirmed_cleanup_refuses_pending_eof() {
+        // Unconfirmed cleanup arm: the verdict finishes without
+        // recording a terminal fact, so a pending Initial EOF is
+        // visibly refused and returned as the verdict error. The
+        // pending EOF is recorded while no stop has been
+        // recorded and no mailbox is staged, so nothing accepts
+        // it early.
+        let bridge = spawn_bridge(host_config());
+        let authority = bridge.authority();
+        let admitted = bridge.admitted();
+        let initial = expect_initial(bridge.wait_next().unwrap());
+        let (stop, verdict) = initial.into_successor_stop();
+        stop.cancel().unwrap();
+        authority
+            .connection_closed(admitted, &NativeImageConnection::Initial)
+            .unwrap();
+        assert_eq!(authority.pending_eof_count(), 1);
+        let unconfirmed = CleanupState {
+            confirmed: false,
+            ..Default::default()
+        };
+        assert_eq!(
+            verdict.record_failed_launch(&unconfirmed),
+            Some(ExecControlError::Transition)
+        );
+        assert_eq!(authority.refused_eof_count(), 1);
+        assert_eq!(authority.pending_eof_count(), 0);
+    }
+
+    #[test]
+    fn record_consumed_requires_initial_exec_seen() {
+        // Before the initial exec is seen, the bridge-level
+        // record refuses; after the initial stop is rearmed it
+        // succeeds and staging opens.
+        let bridge = spawn_bridge(host_config());
+        assert!(matches!(
+            bridge.record_mapped_initial_consumed(),
+            Err(ExecControlError::Transition)
+        ));
+        let authority = bridge.authority();
+        let admitted = bridge.admitted();
+        let initial = expect_initial(bridge.wait_next().unwrap());
+        let bridge = initial
+            .rearm_and_resume(|task, _entry, _boundary| Ok(task))
+            .unwrap();
+        bridge.record_mapped_initial_consumed().unwrap();
+        authority
+            .stage_snapshot(admitted, frame_tool_state(b"after-rearm").unwrap())
+            .unwrap();
+        bridge.cancel().unwrap();
     }
 }
