@@ -67430,12 +67430,13 @@ pub mod private_static {
         }
     }
 
-    /// Cargo's canonical git source string for the pinned
-    /// Reverie rev. Cargo strips the `.git` suffix when it
-    /// canonicalizes git URLs, so lockfiles and metadata name
-    /// `git+https://github.com/rrnewton/reverie?rev=...`, never
-    /// the `.git` spelling. Both CargoGitRev checks (root lock
-    /// and metadata source equality) build their expected
+    /// The git source string CargoGitRev expects for the pinned
+    /// Reverie rev. Cargo keeps the URL spelling the manifest uses:
+    /// literoot's manifests and locks say
+    /// `git+https://github.com/rrnewton/reverie?rev=...` while Hermit's
+    /// Cargo.lock says `...reverie.git?rev=...`. This is literoot's
+    /// spelling; any other spelling refuses. Both CargoGitRev checks
+    /// (root lock and metadata source equality) build their expected
     /// string here so they cannot drift.
     fn cargo_git_source(pin: &str) -> String {
         format!("git+https://github.com/rrnewton/reverie?rev={pin}#{pin}")
@@ -67462,9 +67463,142 @@ pub mod private_static {
         Ok(format!("path+file://{}#{fragment}", directory.display()))
     }
 
-    /// The root lockfile names the exact pinned Reverie git
-    /// source. A path-patched (source-less) Reverie package or
-    /// any other rev does not satisfy this.
+    /// Binds the resolved Reverie crates to the pin and returns the
+    /// manifest path of each bound package. For both kinds each bound
+    /// package must appear once with the exact pinned git source; this
+    /// equality, not the lock text, is what binds the compiled Reverie
+    /// crates. The Hermit kind keeps exactly these pre-generalization
+    /// checks; its gitlink root and ls-tree pin guard the checkout.
+    ///
+    /// CargoGitRev has no gitlink root that would guard another tree,
+    /// so it also requires:
+    /// - the leaf to be the only source-less package. A `[patch]` or
+    ///   path override to a local tree yields a source-less package
+    ///   whether or not that tree is also declared a workspace member;
+    ///   literoot's real resolve has exactly one (literoot-preload).
+    /// - every Reverie-internal dependency edge to resolve to the
+    ///   pinned source. An edge is internal when its declaring package
+    ///   (a pinned Reverie package or the leaf) names the pinned source
+    ///   for it in `dependencies[].source`: with the `#<rev>` fragment
+    ///   inside the checkout, without it in the leaf's own manifest.
+    ///   `resolve.nodes` gives the package it actually resolved to. A
+    ///   `[patch]` to a fork, another URL spelling, a registry or a local
+    ///   path changes that resolved package's source and refuses here.
+    /// - no crate that the pinned source carries to appear a second time
+    ///   at another source (for example a direct leaf dependency on
+    ///   reverie-syscalls at another rev, coord7 lens A2 case V5).
+    /// - every `reverie-*` package to be at the pinned source, including
+    ///   one the leaf declares directly at a fork or a stale rev that no
+    ///   pinned crate reaches (coord7 round-2 cases E3 and E5).
+    ///
+    /// Accepted residual (coord7 design ruling on 1982bdb7): a crate the
+    /// resolve carries only at a non-pinned source, declared there by the
+    /// leaf, outside the `reverie-*` name rule, is not recognized as
+    /// Reverie code. None exists at literoot 74c241de, whose leaf declares
+    /// only pinned Reverie crates plus libc and serde from crates.io.
+    fn bound_reverie_manifests<'m>(
+        metadata: &'m Value,
+        binding: selected_initializers::WorkspaceBinding,
+        pin: &str,
+        leaf_id: &str,
+    ) -> Result<Vec<(&'static str, &'m str)>> {
+        let packages = metadata["packages"]
+            .as_array()
+            .ok_or("static metadata lacks packages")?;
+        let source = match binding {
+            selected_initializers::WorkspaceBinding::CargoGitRev => cargo_git_source(pin),
+            selected_initializers::WorkspaceBinding::HermitGitlink { .. } => {
+                format!("git+https://github.com/rrnewton/reverie.git?rev={pin}#{pin}")
+            }
+        };
+        let mut bound = Vec::new();
+        for name in ["reverie-inguest", "reverie-liteinst", "reverie-loader"] {
+            let rows: Vec<_> = packages.iter().filter(|p| p["name"] == name).collect();
+            require(
+                rows.len() == 1 && rows[0]["source"].as_str() == Some(source.as_str()),
+                "static metadata R source/uniqueness mismatch",
+            )?;
+            let manifest = rows[0]["manifest_path"]
+                .as_str()
+                .ok_or("static R manifest absent")?;
+            bound.push((name, manifest));
+        }
+        if binding == selected_initializers::WorkspaceBinding::CargoGitRev {
+            require(
+                packages
+                    .iter()
+                    .filter(|p| p["source"].is_null())
+                    .map(|p| p["id"].as_str())
+                    .eq([Some(leaf_id)]),
+                "static CargoGitRev resolve has a source-less package other than the leaf (local patch refused)",
+            )?;
+            let nodes = metadata["resolve"]["nodes"]
+                .as_array()
+                .ok_or("static metadata lacks resolve nodes")?;
+            for parent in packages.iter().filter(|p| {
+                p["source"].as_str() == Some(source.as_str()) || p["id"].as_str() == Some(leaf_id)
+            }) {
+                let internal: Vec<_> = parent["dependencies"]
+                    .as_array()
+                    .ok_or("static metadata package lacks dependencies")?
+                    .iter()
+                    .filter(|d| {
+                        // Cargo prints the `#<rev>` fragment only for
+                        // dependencies declared inside the git checkout;
+                        // the leaf's own declarations read `?rev=<rev>`.
+                        d["source"].as_str().is_some_and(|declared| {
+                            declared == source || Some(declared) == source.split('#').next()
+                        })
+                    })
+                    .map(|d| &d["name"])
+                    .collect();
+                let node = nodes
+                    .iter()
+                    .find(|n| n["id"] == parent["id"])
+                    .ok_or("static metadata package lacks resolve node")?;
+                for edge in node["deps"]
+                    .as_array()
+                    .ok_or("static resolve node lacks deps")?
+                {
+                    let resolved = packages
+                        .iter()
+                        .find(|p| p["id"] == edge["pkg"])
+                        .ok_or("static resolve edge names no package")?;
+                    require(
+                        !internal.contains(&&resolved["name"])
+                            || resolved["source"].as_str() == Some(source.as_str()),
+                        "static CargoGitRev Reverie dependency resolves outside the pinned source",
+                    )?;
+                }
+            }
+            let pinned: Vec<_> = packages
+                .iter()
+                .filter(|p| p["source"].as_str() == Some(source.as_str()))
+                .map(|p| &p["name"])
+                .collect();
+            require(
+                packages.iter().all(|p| {
+                    p["source"].as_str() == Some(source.as_str()) || !pinned.contains(&&p["name"])
+                }),
+                "static CargoGitRev resolve carries a second copy of a pinned Reverie crate",
+            )?;
+            require(
+                packages.iter().all(|p| {
+                    p["source"].as_str() == Some(source.as_str())
+                        || !p["name"]
+                            .as_str()
+                            .is_some_and(|n| n.starts_with("reverie-"))
+                }),
+                "static CargoGitRev resolve has a reverie-* package outside the pinned source",
+            )?;
+        }
+        Ok(bound)
+    }
+
+    /// The root lockfile names the exact pinned Reverie git source at
+    /// least once. This is an early refusal only (one matching line
+    /// satisfies it); `bound_reverie_manifests` is what binds the
+    /// compiled Reverie crates.
     fn cargo_git_rev_lock_accepts(lock_text: &str, pin: &str) -> bool {
         lock_text.contains(&format!("source = \"{}\"", cargo_git_source(pin)))
     }
@@ -67637,26 +67771,14 @@ pub mod private_static {
                     .as_array()
                     .ok_or("static metadata lacks packages")?;
                 let mut roots = Vec::new();
-                let source = match consumer.binding() {
-                    selected_initializers::WorkspaceBinding::CargoGitRev => {
-                        cargo_git_source(expected.reverie_pin)
-                    }
-                    selected_initializers::WorkspaceBinding::HermitGitlink { .. } => format!(
-                        "git+https://github.com/rrnewton/reverie.git?rev={0}#{0}",
-                        expected.reverie_pin
-                    ),
-                };
-                for name in ["reverie-inguest", "reverie-liteinst", "reverie-loader"] {
-                    let rows: Vec<_> = packages.iter().filter(|p| p["name"] == name).collect();
-                    require(
-                        rows.len() == 1 && rows[0]["source"].as_str() == Some(source.as_str()),
-                        "static metadata R source/uniqueness mismatch",
-                    )?;
-                    let p = real_file(Path::new(
-                        rows[0]["manifest_path"]
-                            .as_str()
-                            .ok_or("static R manifest absent")?,
-                    ))?;
+                let id = leaf_package_id(expected.workspace, consumer)?;
+                for (name, manifest) in bound_reverie_manifests(
+                    &metadata,
+                    consumer.binding(),
+                    expected.reverie_pin,
+                    &id,
+                )? {
+                    let p = real_file(Path::new(manifest))?;
                     let root = p
                         .parent()
                         .and_then(Path::parent)
@@ -67681,7 +67803,6 @@ pub mod private_static {
                     .collect();
                 require(rows.len() == 1, "static metadata leaf ambiguous")?;
                 let leaf = rows[0];
-                let id = leaf_package_id(expected.workspace, consumer)?;
                 require(
                     leaf["id"] == id
                         && leaf["source"].is_null()
@@ -68782,6 +68903,411 @@ pub mod private_static {
             assert!(!cargo_git_rev_lock_accepts(&wrong, pin));
             let patched = "[[package]]\nname = \"reverie-core\"\nversion = \"0.5.4\"\n";
             assert!(!cargo_git_rev_lock_accepts(patched, pin));
+        }
+
+        #[test]
+        fn reverie_resolve_binding_refuses_other_revs_and_local_patches() {
+            let pin = "02973cdcfcadd21190fda864dfa9eb1b3e6ed1c1";
+            let other = "ffffffffffffffffffffffffffffffffffffffff";
+            let hermit = selected_initializers::WorkspaceBinding::HermitGitlink {
+                reverie_gitlink_relative: "reverie",
+            };
+            let cargo = selected_initializers::WorkspaceBinding::CargoGitRev;
+            let canonical =
+                |rev: &str| format!("git+https://github.com/rrnewton/reverie?rev={rev}#{rev}");
+            let dot_git =
+                |rev: &str| format!("git+https://github.com/rrnewton/reverie.git?rev={rev}#{rev}");
+            let leaf = "path+file:///ws/preload#literoot-preload@0.0.1";
+            let crates_io = "registry+https://github.com/rust-lang/crates.io-index";
+            // Field shapes copied from `cargo metadata --offline
+            // --format-version=1 --features mapped-successor
+            // --filter-platform x86_64-unknown-linux-musl` (cargo 1.97.1)
+            // over literoot 74c241de preload/: a git package's id swaps
+            // the source's `#<sha>` for `#<name>@<version>`; a registry
+            // id is `<registry>#<name>@<version>`; a local path package
+            // has a null source and a `path+file` id; checkout manifests
+            // sit under one `<checkout>/<rev7>/` root; a dependency
+            // declared inside the checkout carries `?rev=<rev>#<rev>` in
+            // `dependencies[].source`, while the leaf's own Reverie
+            // dependencies read `?rev=<rev>` (no fragment);
+            // `resolve.nodes[].deps[].pkg` names the package each edge
+            // resolved to.
+            let id_of = |name: &str, source: Option<&str>| match source {
+                Some(source) => format!("{}#{name}@0.5.4", source.split('#').next().unwrap()),
+                None => format!("path+file:///home/u/reverie/{name}#0.5.4"),
+            };
+            let checkout = "/home/u/.cargo/git/checkouts/reverie-2fc770f7a9c80803/02973cd";
+            // (package, its declared Reverie-internal dependencies).
+            // reverie-rpc-transport is declared only by the leaf;
+            // safeptrace is internal but not named `reverie-*`.
+            let graph: [(&str, &[&str]); 8] = [
+                (
+                    "literoot-preload",
+                    &["reverie-core", "reverie-liteinst", "reverie-rpc-transport"],
+                ),
+                ("reverie-core", &[]),
+                (
+                    "reverie-inguest",
+                    &[
+                        "reverie-core",
+                        "reverie-loader",
+                        "reverie-syscalls",
+                        "safeptrace",
+                    ],
+                ),
+                ("reverie-liteinst", &["reverie-inguest", "reverie-loader"]),
+                ("reverie-loader", &[]),
+                ("reverie-syscalls", &[]),
+                ("reverie-rpc-transport", &[]),
+                ("safeptrace", &[]),
+            ];
+            // `swaps` replaces where a named crate resolves (its source);
+            // `None` is a local path package.
+            let metadata = |spelling: &dyn Fn(&str) -> String, swaps: &[(&str, Option<String>)]| {
+                let pinned = spelling(pin);
+                let source_of = |name: &str| -> Option<String> {
+                    if name == "literoot-preload" {
+                        return None;
+                    }
+                    swaps
+                        .iter()
+                        .find(|(swapped, _)| *swapped == name)
+                        .map_or(Some(pinned.clone()), |(_, source)| source.clone())
+                };
+                let id_for = |name: &str| match name {
+                    "literoot-preload" => leaf.to_owned(),
+                    _ => id_of(name, source_of(name).as_deref()),
+                };
+                let mut packages = vec![serde_json::json!({
+                    "name": "libc",
+                    "id": format!("{crates_io}#libc@0.2.186"),
+                    "source": crates_io,
+                    "dependencies": [],
+                })];
+                let mut nodes = vec![serde_json::json!({
+                    "id": format!("{crates_io}#libc@0.2.186"),
+                    "deps": [],
+                })];
+                for (name, internal) in graph {
+                    let declared = match name {
+                        "literoot-preload" => pinned.split('#').next().unwrap(),
+                        _ => pinned.as_str(),
+                    };
+                    let mut dependencies: Vec<_> = internal
+                        .iter()
+                        .map(|dep| serde_json::json!({"name": dep, "source": declared}))
+                        .collect();
+                    dependencies.push(serde_json::json!({"name": "libc", "source": crates_io}));
+                    let mut deps: Vec<_> = internal
+                        .iter()
+                        .map(|dep| serde_json::json!({"name": dep.replace('-', "_"), "pkg": id_for(dep)}))
+                        .collect();
+                    deps.push(serde_json::json!({"name": "libc", "pkg": format!("{crates_io}#libc@0.2.186")}));
+                    let manifest = match source_of(name) {
+                        _ if name == "literoot-preload" => "/ws/preload/Cargo.toml".to_owned(),
+                        Some(_) => format!("{checkout}/{name}/Cargo.toml"),
+                        None => format!("/home/u/reverie/{name}/Cargo.toml"),
+                    };
+                    packages.push(serde_json::json!({
+                        "name": name,
+                        "id": id_for(name),
+                        "source": source_of(name),
+                        "manifest_path": manifest,
+                        "dependencies": dependencies,
+                    }));
+                    nodes.push(serde_json::json!({"id": id_for(name), "deps": deps}));
+                }
+                serde_json::json!({
+                    "packages": packages,
+                    "workspace_members": [leaf],
+                    "resolve": {"nodes": nodes},
+                })
+            };
+            let exact = metadata(&canonical, &[]);
+            let bound = bound_reverie_manifests(&exact, cargo, pin, leaf).unwrap();
+            assert_eq!(
+                bound,
+                ["reverie-inguest", "reverie-liteinst", "reverie-loader"]
+                    .map(|name| (name, format!("{checkout}/{name}/Cargo.toml")))
+                    .iter()
+                    .map(|(name, manifest)| (*name, manifest.as_str()))
+                    .collect::<Vec<_>>()
+            );
+            // Each kind binds its own spelling of the exact rev. The
+            // bound-package equality is checked first, so this refusal
+            // text comes from it and not from the CargoGitRev checks.
+            let mismatch = "static metadata R source/uniqueness mismatch";
+            assert_eq!(
+                bound_reverie_manifests(&exact, hermit, pin, leaf)
+                    .err()
+                    .unwrap(),
+                mismatch
+            );
+            let hermit_exact = metadata(&dot_git, &[]);
+            assert_eq!(
+                bound_reverie_manifests(&hermit_exact, hermit, pin, leaf)
+                    .unwrap()
+                    .len(),
+                3
+            );
+            assert_eq!(
+                bound_reverie_manifests(&hermit_exact, cargo, pin, leaf)
+                    .err()
+                    .unwrap(),
+                mismatch
+            );
+            for binding in [hermit, cargo] {
+                for metadata in [&exact, &hermit_exact] {
+                    assert_eq!(
+                        bound_reverie_manifests(metadata, binding, other, leaf)
+                            .err()
+                            .unwrap(),
+                        mismatch
+                    );
+                }
+            }
+            let mut duplicate = exact.clone();
+            let again = duplicate["packages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["name"] == "reverie-inguest")
+                .unwrap()
+                .clone();
+            duplicate["packages"].as_array_mut().unwrap().push(again);
+            assert_eq!(
+                bound_reverie_manifests(&duplicate, cargo, pin, leaf)
+                    .err()
+                    .unwrap(),
+                mismatch
+            );
+            // A local path patch refuses whether or not the patched tree
+            // is also declared a workspace member (cargo then lists it in
+            // workspace_members; coord7 lens A2 measured that resolve).
+            let local = metadata(&canonical, &[("reverie-syscalls", None)]);
+            let only_leaf = "static CargoGitRev resolve has a source-less package other than the leaf (local patch refused)";
+            assert_eq!(
+                bound_reverie_manifests(&local, cargo, pin, leaf)
+                    .err()
+                    .unwrap(),
+                only_leaf
+            );
+            let mut member_declared = local.clone();
+            member_declared["workspace_members"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!(id_of("reverie-syscalls", None)));
+            assert_eq!(
+                bound_reverie_manifests(&member_declared, cargo, pin, leaf)
+                    .err()
+                    .unwrap(),
+                only_leaf
+            );
+            // The leaf itself must be that one source-less package.
+            assert_eq!(
+                bound_reverie_manifests(&exact, cargo, pin, "path+file:///ws/other#x@0.0.1")
+                    .err()
+                    .unwrap(),
+                only_leaf
+            );
+            // Patches cargo accepts for an unbound internal crate (a
+            // fork, another spelling of the repository, a registry, a
+            // stale rev). reverie-syscalls and safeptrace are reached from
+            // a pinned crate (`#<rev>` declarations); reverie-rpc-transport
+            // only from the leaf (`?rev=<rev>` declaration), which swapped
+            // to a fork is coord7's round-2 case E1. The edge rule runs
+            // before the `reverie-*` rule, so this text pins the edge rule
+            // even for the `reverie-*` names.
+            let outside =
+                "static CargoGitRev Reverie dependency resolves outside the pinned source";
+            for crate_name in ["reverie-syscalls", "safeptrace", "reverie-rpc-transport"] {
+                for swapped in [
+                    format!("git+https://github.com/fork/reverie?rev={other}#{other}"),
+                    format!("git+ssh://git@github.com/rrnewton/reverie?rev={pin}#{pin}"),
+                    format!("git+https://github.com/RRNewton/reverie?rev={pin}#{pin}"),
+                    dot_git(pin),
+                    canonical(other),
+                    crates_io.to_owned(),
+                ] {
+                    let patched = metadata(&canonical, &[(crate_name, Some(swapped.clone()))]);
+                    assert_eq!(
+                        bound_reverie_manifests(&patched, cargo, pin, leaf)
+                            .err()
+                            .unwrap(),
+                        outside,
+                        "{crate_name} -> {swapped}"
+                    );
+                }
+            }
+            // Verbatim entries from the captured `cargo metadata` of
+            // literoot 74c241de preload/ (cargo 1.97.1, pin 02973cdc): the
+            // leaf's declaration of reverie-rpc-transport (no fragment),
+            // reverie-inguest's declaration of reverie-syscalls (with
+            // fragment) and both resolve edges.
+            const LEAF_DECLARES: &str = r#"{"name": "reverie-rpc-transport", "source": "git+https://github.com/rrnewton/reverie?rev=02973cdcfcadd21190fda864dfa9eb1b3e6ed1c1", "req": "*", "kind": null, "rename": null, "optional": true, "uses_default_features": true, "features": [], "target": null, "registry": null}"#;
+            const CHECKOUT_DECLARES: &str = r#"{"name": "reverie-syscalls", "source": "git+https://github.com/rrnewton/reverie?rev=02973cdcfcadd21190fda864dfa9eb1b3e6ed1c1#02973cdcfcadd21190fda864dfa9eb1b3e6ed1c1", "req": "^0.5.4", "kind": null, "rename": null, "optional": false, "uses_default_features": true, "features": [], "target": null, "registry": null}"#;
+            const LEAF_EDGE: &str = r#"{"name": "reverie_rpc_transport", "pkg": "git+https://github.com/rrnewton/reverie?rev=02973cdcfcadd21190fda864dfa9eb1b3e6ed1c1#reverie-rpc-transport@0.5.4", "dep_kinds": [{"kind": null, "target": null}]}"#;
+            const CHECKOUT_EDGE: &str = r#"{"name": "reverie_syscalls", "pkg": "git+https://github.com/rrnewton/reverie?rev=02973cdcfcadd21190fda864dfa9eb1b3e6ed1c1#reverie-syscalls@0.5.4", "dep_kinds": [{"kind": null, "target": null}]}"#;
+            let real = |text: &str| serde_json::from_str::<Value>(text).unwrap();
+            // Swap in the verbatim objects; each edge keeps the package
+            // the fixture resolved it to, so swaps still apply.
+            let with_real = |mut metadata: Value| {
+                let parent_id = |name: &str| id_of(name, Some(&canonical(pin)));
+                for (parent, dep, declares, edge) in [
+                    (
+                        leaf.to_owned(),
+                        "reverie-rpc-transport",
+                        LEAF_DECLARES,
+                        LEAF_EDGE,
+                    ),
+                    (
+                        parent_id("reverie-inguest"),
+                        "reverie-syscalls",
+                        CHECKOUT_DECLARES,
+                        CHECKOUT_EDGE,
+                    ),
+                ] {
+                    for package in metadata["packages"].as_array_mut().unwrap() {
+                        if package["id"] == parent.as_str() {
+                            for declared in package["dependencies"].as_array_mut().unwrap() {
+                                if declared["name"] == dep {
+                                    *declared = real(declares);
+                                }
+                            }
+                        }
+                    }
+                    for node in metadata["resolve"]["nodes"].as_array_mut().unwrap() {
+                        if node["id"] == parent.as_str() {
+                            for resolved in node["deps"].as_array_mut().unwrap() {
+                                if resolved["name"] == real(edge)["name"] {
+                                    let pkg = resolved["pkg"].clone();
+                                    *resolved = real(edge);
+                                    resolved["pkg"] = pkg;
+                                }
+                            }
+                        }
+                    }
+                }
+                metadata
+            };
+            // The fixture already produces cargo's shapes: its source
+            // strings and edge targets equal the verbatim ones.
+            let leaf_row = exact["packages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["id"] == leaf)
+                .unwrap();
+            let fixture_declared = leaf_row["dependencies"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|d| d["name"] == "reverie-rpc-transport")
+                .unwrap();
+            assert_eq!(fixture_declared["source"], real(LEAF_DECLARES)["source"]);
+            let leaf_node = exact["resolve"]["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|n| n["id"] == leaf)
+                .unwrap();
+            assert!(
+                leaf_node["deps"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|e| e["name"] == real(LEAF_EDGE)["name"]
+                        && e["pkg"] == real(LEAF_EDGE)["pkg"])
+            );
+            let real_exact = with_real(exact.clone());
+            assert_eq!(
+                bound_reverie_manifests(&real_exact, cargo, pin, leaf)
+                    .unwrap()
+                    .len(),
+                3
+            );
+            for crate_name in ["reverie-rpc-transport", "reverie-syscalls"] {
+                let fork = format!("git+https://github.com/fork/reverie?rev={other}#{other}");
+                let patched = with_real(metadata(&canonical, &[(crate_name, Some(fork))]));
+                assert_eq!(
+                    bound_reverie_manifests(&patched, cargo, pin, leaf)
+                        .err()
+                        .unwrap(),
+                    outside,
+                    "verbatim declarations, {crate_name} -> fork"
+                );
+            }
+            // The leaf declares `name` directly, at `resolved` (a git
+            // source with its `#<rev>`), optionally under a rename; its
+            // declaration reads `?rev=<rev>` as cargo prints it.
+            let leaf_declares = |name: &str, rename: Option<&str>, resolved: &str| {
+                let mut metadata = exact.clone();
+                let id = id_of(name, Some(resolved));
+                let declared = resolved.split('#').next().unwrap();
+                metadata["packages"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(serde_json::json!({
+                        "name": name,
+                        "id": id,
+                        "source": resolved,
+                        "manifest_path": format!("/home/u/.cargo/git/checkouts/other/fffffff/{name}/Cargo.toml"),
+                        "dependencies": [],
+                    }));
+                for package in metadata["packages"].as_array_mut().unwrap() {
+                    if package["id"] == leaf {
+                        package["dependencies"]
+                            .as_array_mut()
+                            .unwrap()
+                            .push(serde_json::json!({
+                                "name": name, "rename": rename, "source": declared,
+                            }));
+                    }
+                }
+                let extern_name = rename.map_or(name.replace('-', "_"), str::to_owned);
+                for node in metadata["resolve"]["nodes"].as_array_mut().unwrap() {
+                    if node["id"] == leaf {
+                        node["deps"]
+                            .as_array_mut()
+                            .unwrap()
+                            .push(serde_json::json!({"name": extern_name, "pkg": id}));
+                    }
+                }
+                metadata["resolve"]["nodes"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(serde_json::json!({"id": id, "deps": []}));
+                metadata
+            };
+            // A second copy of a pinned crate at another rev, declared by
+            // the leaf under a rename (lens A2 case V5).
+            let second_copy = leaf_declares("reverie-syscalls", Some("rsys2"), &canonical(other));
+            assert_eq!(
+                bound_reverie_manifests(&second_copy, cargo, pin, leaf)
+                    .err()
+                    .unwrap(),
+                "static CargoGitRev resolve carries a second copy of a pinned Reverie crate"
+            );
+            // A `reverie-*` crate no pinned crate reaches, declared by the
+            // leaf at a stale rev (E5) or at a fork (E3).
+            let not_pinned =
+                "static CargoGitRev resolve has a reverie-* package outside the pinned source";
+            for resolved in [
+                canonical(other),
+                format!("git+https://github.com/fork/reverie?rev={other}#{other}"),
+            ] {
+                let direct = leaf_declares("reverie-extra", None, &resolved);
+                assert_eq!(
+                    bound_reverie_manifests(&direct, cargo, pin, leaf)
+                        .err()
+                        .unwrap(),
+                    not_pinned,
+                    "{resolved}"
+                );
+            }
+            let mut no_resolve = exact.clone();
+            no_resolve["resolve"] = Value::Null;
+            assert!(bound_reverie_manifests(&no_resolve, cargo, pin, leaf).is_err());
         }
 
         struct CacheFixture {
