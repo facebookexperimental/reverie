@@ -60,9 +60,7 @@ path = "src/bin/lifecycle_guest.rs"
 
 [dependencies]
 bincode = { version = "2", features = ["serde"] }
-iced-x86 = { version = "1.21.0", default-features = false, features = ["std", "decoder"], optional = true }
 libc = "0.2.186"
-liteinst = { version = "0.2.0", optional = true }
 liteinst-aarch64 = { version = "0.2.0", git = "https://github.com/rrnewton/liteinst2", rev = "4a6092fe5207866b35eb50c152cabcdc0bda0371" }
 liteinst-aarch64-patch = { version = "0.1.0", git = "https://github.com/rrnewton/liteinst2", rev = "4a6092fe5207866b35eb50c152cabcdc0bda0371" }
 reverie = { version = "0.5.4", path = "../reverie", package = "reverie-core" }
@@ -72,6 +70,13 @@ serde = { version = "1.0.219", features = ["derive"] }
 tokio = { version = "1.54.1", features = ["macros", "net", "rt", "time"] }
 tempfile = "3.27.0"
 tracing = "0.1.41"
+
+# The crates.io liteinst trampoline builder and its x86 decoder are x86-64
+# only upstream; the `liteinst` feature's site patching exists only there.
+# On other targets the feature compiles the trap-only runtime.
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+iced-x86 = { version = "1.21.0", default-features = false, features = ["std", "decoder"], optional = true }
+liteinst = { version = "0.2.0", optional = true }
 
 [dev-dependencies]
 # Cross-crate tests inspect the actual shared collector without exposing fields.

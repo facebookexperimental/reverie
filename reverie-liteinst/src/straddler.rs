@@ -1,19 +1,19 @@
 //! Policy for concurrently publishing patch words across a cache line.
 
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 use std::ffi::OsStr;
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 use std::io;
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 use std::sync::OnceLock;
 
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 use liteinst::cache_line::CacheLineSize;
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 use liteinst::patcher::PatchStrategy;
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 use liteinst::patcher::StalenessBudget;
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 use liteinst::patcher::classify_word_patch;
 
 /// Opt-in calibrated WordPatch++ delay, in timestamp-counter ticks.
@@ -26,19 +26,19 @@ use liteinst::patcher::classify_word_patch;
 /// WordPatch++ publication contract.
 pub const STRADDLER_STALENESS_TICKS_ENV: &str = "REVERIE_LITEINST_STRADDLER_STALENESS_TICKS";
 
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 static CALIBRATED_STALENESS: OnceLock<Option<StalenessBudget>> = OnceLock::new();
 
 /// The only budget refusal eligible for an unpublished syscall adapter is
 /// `UncalibratedSplit`. An uninitialized runtime is never that admission.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 pub(crate) enum BudgetRefusal {
     Uninitialized,
     UncalibratedSplit,
 }
 
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 impl From<BudgetRefusal> for io::Error {
     fn from(refusal: BudgetRefusal) -> Self {
         match refusal {
@@ -60,7 +60,7 @@ impl From<BudgetRefusal> for io::Error {
 ///
 /// `None` disables guarded cross-line publication. A configured value must be
 /// a nonzero decimal count of timestamp-counter ticks.
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 pub fn straddler_staleness_from_env_value(
     value: Option<&OsStr>,
 ) -> io::Result<Option<StalenessBudget>> {
@@ -87,7 +87,7 @@ pub fn straddler_staleness_from_env_value(
     })
 }
 
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 pub(crate) fn initialize_from_environment() -> io::Result<()> {
     let staleness = straddler_staleness_from_env_value(
         std::env::var_os(STRADDLER_STALENESS_TICKS_ENV).as_deref(),
@@ -95,14 +95,14 @@ pub(crate) fn initialize_from_environment() -> io::Result<()> {
     initialize(staleness)
 }
 
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 pub(crate) fn initialize(staleness: Option<StalenessBudget>) -> io::Result<()> {
     CALIBRATED_STALENESS
         .set(staleness)
         .map_err(|_| io::Error::other("LiteInst straddler policy initialized twice"))
 }
 
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 pub(crate) fn budget_for_patch(
     address: usize,
     cache_line: CacheLineSize,
@@ -114,7 +114,7 @@ pub(crate) fn budget_for_patch(
     budget_for_patch_with(address, cache_line, calibrated)
 }
 
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 fn budget_for_patch_with(
     address: usize,
     cache_line: CacheLineSize,
@@ -126,14 +126,14 @@ fn budget_for_patch_with(
     }
 }
 
-#[cfg(all(test, feature = "liteinst"))]
+#[cfg(all(test, all(feature = "liteinst", target_arch = "x86_64")))]
 mod tests {
-    #[cfg(feature = "liteinst")]
+    #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
     use std::ffi::OsStr;
 
-    #[cfg(feature = "liteinst")]
+    #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
     use liteinst::cache_line::CacheLineSize;
-    #[cfg(feature = "liteinst")]
+    #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
     use liteinst::patcher::StalenessBudget;
 
     use super::BudgetRefusal;

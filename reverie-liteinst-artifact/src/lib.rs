@@ -1374,13 +1374,13 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-liteinst/Cargo.toml",
-        6419,
-        "f715014a652758f724583232e19fcfaa2146d574457c4272a6173c04ac28d8cd",
+        6685,
+        "5c4b7bb530ce9d06e6f81336704256466a76bb27419fddd5f5977c4b299fd9aa",
     ),
     (
         "reverie-liteinst/src/lib.rs",
-        26805,
-        "058da9150afc5097c8ef24039e53bf6b4e89c1fb835faa44ab3cca1d53a1896d",
+        27188,
+        "914df22cc643e6ed968596483198833a0a0d304d0d7d0ed62ff541c74563c1b4",
     ),
     (
         "reverie-liteinst-preload/Cargo.toml",
@@ -1394,8 +1394,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-liteinst/src/patch_alloc.rs",
-        26462,
-        "799b94da011fa6d9313a296a74592fd060c12dd8543176ff4d56e7f82abb02bc",
+        26591,
+        "62646a8519771eabf5a43c6dcb351d49d0ba6b8c8bde2e5d6defeda7fd79bbd0",
     ),
     (
         "reverie-inguest/src/guest/alloc.rs",
@@ -1449,8 +1449,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-liteinst/src/tool_host.rs",
-        77827,
-        "8438f128924c1c4dcf19b72bcf98580458628c67f98b03383cde791b0f814966",
+        77992,
+        "eb9b9481dc8ef1c7b311d6c1fe0c75efa33924d293b189e86eb98c562e44e878",
     ),
     (
         "reverie/Cargo.toml",
@@ -3997,8 +3997,8 @@ const NO_INSTALLATION_SCOPE_POLICY: &str =
     "detcore_native_off_alloc101_reviewed_source_current_build_rx_loader_census_v1";
 const NO_INSTALLATION_SCOPE_SOURCE: (&str, u64, &str) = (
     "reverie-liteinst/src/patch_alloc.rs",
-    26462,
-    "799b94da011fa6d9313a296a74592fd060c12dd8543176ff4d56e7f82abb02bc",
+    26591,
+    "62646a8519771eabf5a43c6dcb351d49d0ba6b8c8bde2e5d6defeda7fd79bbd0",
 );
 /// The five authenticated TLS cell accessors of a no-scope image, as
 /// (accessor, cell) canonical-name pairs. Every read and write of
@@ -38642,6 +38642,26 @@ mod tests {
                 "reverie-inguest/src/guest/host_linux.rs",
                 24921,
                 "3236278ee1985a08a47c01658e20bf9c3e6569ce2ca3c3551cd59a41804e00f5",
+            ),
+            (
+                "reverie-liteinst/Cargo.toml",
+                6419,
+                "f715014a652758f724583232e19fcfaa2146d574457c4272a6173c04ac28d8cd",
+            ),
+            (
+                "reverie-liteinst/src/lib.rs",
+                26805,
+                "058da9150afc5097c8ef24039e53bf6b4e89c1fb835faa44ab3cca1d53a1896d",
+            ),
+            (
+                "reverie-liteinst/src/patch_alloc.rs",
+                26462,
+                "799b94da011fa6d9313a296a74592fd060c12dd8543176ff4d56e7f82abb02bc",
+            ),
+            (
+                "reverie-liteinst/src/tool_host.rs",
+                77827,
+                "8438f128924c1c4dcf19b72bcf98580458628c67f98b03383cde791b0f814966",
             ),
         ] {
             let entries: Vec<_> = CONTENT_REVERIE_CATALOG

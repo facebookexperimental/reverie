@@ -5,13 +5,13 @@
 use std::io;
 use std::path::Path;
 
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 use liteinst::trampoline::HookContext;
 #[cfg(feature = "exec-private-init")]
 use reverie::GlobalRPC;
 use reverie::Pid;
 use reverie::Tool;
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 use reverie_inguest::guest::context::RegisterContext;
 use reverie_inguest::guest::host::HostRuntime;
 #[cfg(feature = "exec-private-init")]
@@ -29,7 +29,7 @@ use crate::runtime::SyscallEvent;
 
 // Patched trampolines save HookContext; the shared entry reads RegisterContext.
 // The shared fallback continuation already owns RegisterContext.
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 const _: () = {
     use core::mem::align_of;
     use core::mem::offset_of;
@@ -301,12 +301,18 @@ enum ImageInstall<'a, T: Tool> {
 /// Parse the straddler selector from the runner's environ block
 /// directly: no getenv interposition and no allocation unless the
 /// parse constructs its error.
-#[cfg(all(feature = "exec-private-init", not(feature = "liteinst")))]
+#[cfg(all(
+    feature = "exec-private-init",
+    not(all(feature = "liteinst", target_arch = "x86_64"))
+))]
 fn validated_straddler_staleness() -> io::Result<Option<crate::runtime::StalenessBudget>> {
     Ok(Some(()))
 }
 
-#[cfg(all(feature = "exec-private-init", feature = "liteinst"))]
+#[cfg(all(
+    feature = "exec-private-init",
+    all(feature = "liteinst", target_arch = "x86_64")
+))]
 fn validated_straddler_staleness() -> io::Result<Option<crate::runtime::StalenessBudget>> {
     use std::os::unix::ffi::OsStrExt;
     let value = reverie_inguest::guest::support::environment_value(
