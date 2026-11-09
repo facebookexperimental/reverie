@@ -4071,6 +4071,16 @@ const DIRECT_TLS_CENSUS_POLICY: &str =
 // Separate from the standalone v1 contract: one observed native Detcore cohort.
 const DETCORE_DIRECT_TLS_CENSUS_POLICY: &str =
     "detcore_e8_alloc241_named_getter_pt_load22_raw_loader_pointers_v2";
+// Semantic getter-less Detcore cohort at any accepted direct-allocation offset.
+const DETCORE_DIRECT_TLS_CENSUS_POLICY_V3: &str =
+    "detcore_semantic_alloc241_named_getter_pt_load22_raw_loader_pointers_v3";
+
+fn detcore_direct_tls_offset_accepted(address: u64) -> bool {
+    matches!(
+        address,
+        0x98 | 0xa0 | 0xd8 | 0xe0 | 0xe8 | 0x100 | 0x110 | 0x128
+    )
+}
 
 /// Mandatory same-ELF Fixed selection, never a name/descriptor-only admission.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -19565,6 +19575,10 @@ fn detcore_direct_tls_source_context(
     Ok(sources)
 }
 
+// This evidence proves only that no getter function, and no loader pointer
+// to a getter, exists. It does not bind the installer's inlined enter/Drop
+// INSTALLATION_DEPTH accesses; those depth-counter writes are not getters
+// and remain outside this boundary, as they were before dh-aum5m.
 fn derive_detcore_direct_allocation_tls_evidence(
     elf: &Elf<'_>,
     bytes: &[u8],
@@ -19575,11 +19589,34 @@ fn derive_detcore_direct_allocation_tls_evidence(
     sources: Option<&VerifiedCompiledSources>,
 ) -> Result<DirectAllocationTlsEvidence> {
     let sources = detcore_direct_tls_source_context(sources)?;
+    authenticate_loader_metadata(elf, bytes)?;
+    let census = direct_tls_getter_census(elf, bytes, cell, module, plt)?;
+    mint_detcore_direct_allocation_tls_evidence(
+        bytes,
+        cell,
+        allocation_bytes,
+        census,
+        sha256(&serde_json::to_vec(sources.record()).map_err(|e| e.to_string())?),
+        sources.record().reverie_pin.clone(),
+        (elf.syms.len(), elf.dynsyms.len()),
+    )
+}
+
+fn mint_detcore_direct_allocation_tls_evidence(
+    bytes: &[u8],
+    cell: &SymbolEvidence,
+    allocation_bytes: &[u8],
+    census: DirectTlsGetterCensus,
+    compiled_sources_sha256: String,
+    reverie_pin: String,
+    symbol_counts: (usize, usize),
+) -> Result<DirectAllocationTlsEvidence> {
     // The complete existing Detcore operation closure still binds every actual
-    // operand/callee. This absence route additionally requires its exact
-    // e8/0x100 whole allocation shape, not an arbitrary 241-byte function.
+    // operand/callee. This absence route additionally requires an accepted
+    // direct-allocation offset and whole allocation shape, not an arbitrary
+    // 241-byte function.
     require(
-        matches!(cell.address, 0xe8 | 0x100)
+        detcore_direct_tls_offset_accepted(cell.address)
             && cell.size == 8
             && cell.binding == sym::STB_LOCAL
             && canonical_rust_symbol(&cell.name).as_deref() == Some(FIXED_TLS_CELL_ROLE)
@@ -19592,10 +19629,8 @@ fn derive_detcore_direct_allocation_tls_evidence(
                         template.operands.iter().map(|operand| operand.displacement),
                     )
             }),
-        "Detcore direct TLS proof lacks its exact e8/0x100 allocation recipe",
+        "Detcore direct TLS proof lacks its accepted-offset allocation recipe",
     )?;
-    authenticate_loader_metadata(elf, bytes)?;
-    let census = direct_tls_getter_census(elf, bytes, cell, module, plt)?;
     require(
         census.named_getters.is_empty()
             && census.recipe_getters.is_empty()
@@ -19603,17 +19638,15 @@ fn derive_detcore_direct_allocation_tls_evidence(
         "Detcore direct allocation TLS proof found a getter or raw loader pointer edge",
     )?;
     Ok(DirectAllocationTlsEvidence {
-        version: 2,
-        policy: DETCORE_DIRECT_TLS_CENSUS_POLICY.into(),
+        version: 3,
+        policy: DETCORE_DIRECT_TLS_CENSUS_POLICY_V3.into(),
         elf_sha256: sha256(bytes),
-        compiled_sources_sha256: sha256(
-            &serde_json::to_vec(sources.record()).map_err(|e| e.to_string())?,
-        ),
-        reverie_pin: sources.record().reverie_pin.clone(),
+        compiled_sources_sha256,
+        reverie_pin,
         allocation_sha256: sha256(allocation_bytes),
         mappings: census.mappings,
-        static_symbol_count: elf.syms.len(),
-        dynamic_symbol_count: elf.dynsyms.len(),
+        static_symbol_count: symbol_counts.0,
+        dynamic_symbol_count: symbol_counts.1,
         raw_names_sha256: census.raw_names_sha256,
         loader_writer_count: census.loader_writer_count,
         loader_writers_sha256: census.loader_writers_sha256,
@@ -19635,25 +19668,26 @@ fn validate_direct_allocation_tls_evidence_in_image(
     proof: &DirectAllocationTlsEvidence,
     image_kind: FixedImageKind,
 ) -> Result<()> {
-    let (version, policy, cell_matches, extent, call_offset) = match image_kind {
+    let (version_policy_matches, cell_matches, extent, call_offset) = match image_kind {
         FixedImageKind::Standalone => (
-            1,
-            DIRECT_TLS_CENSUS_POLICY,
+            proof.version == 1 && proof.policy == DIRECT_TLS_CENSUS_POLICY,
             matches!(tls.tls_cell.address, 0x40 | 0x80),
             186,
             0x2c,
         ),
-        FixedImageKind::Detcore => (
-            2,
-            DETCORE_DIRECT_TLS_CENSUS_POLICY,
-            matches!(tls.tls_cell.address, 0xe8 | 0x100)
-                && tls.tls_cell.size == 8
+        FixedImageKind::Detcore => {
+            let cell_identity = tls.tls_cell.size == 8
                 && tls.tls_cell.binding == sym::STB_LOCAL
                 && canonical_rust_symbol(&tls.tls_cell.name).as_deref()
-                    == Some(FIXED_TLS_CELL_ROLE),
-            241,
-            58,
-        ),
+                    == Some(FIXED_TLS_CELL_ROLE);
+            let retained_v2 = proof.version == 2
+                && proof.policy == DETCORE_DIRECT_TLS_CENSUS_POLICY
+                && matches!(tls.tls_cell.address, 0xe8 | 0x100);
+            let semantic_v3 = proof.version == 3
+                && proof.policy == DETCORE_DIRECT_TLS_CENSUS_POLICY_V3
+                && detcore_direct_tls_offset_accepted(tls.tls_cell.address);
+            (retained_v2 || semantic_v3, cell_identity, 241, 58)
+        }
     };
     let hash =
         |s: &str, length: usize| s.len() == length && s.bytes().all(|b| b.is_ascii_hexdigit());
@@ -19662,8 +19696,7 @@ fn validate_direct_allocation_tls_evidence_in_image(
         .get("fixed_patch_alloc")
         .ok_or("direct TLS allocation role absent")?;
     require(
-        proof.version == version
-            && proof.policy == policy
+        version_policy_matches
             && [
                 proof.elf_sha256.as_str(),
                 proof.compiled_sources_sha256.as_str(),
@@ -19746,11 +19779,7 @@ fn qualify_allocator_tls_boundary_in_source_context(
         == FixedImageKind::Detcore
     {
         require(
-            allocation_bytes.len() == 241
-                && matches!(
-                    cell.address,
-                    0x98 | 0xa0 | 0xd8 | 0xe0 | 0xe8 | 0x100 | 0x110 | 0x128
-                ),
+            allocation_bytes.len() == 241 && detcore_direct_tls_offset_accepted(cell.address),
             format!(
                 "Detcore validate allocation/TLS shape differs: allocation length {}, cell offset {:#x}",
                 allocation_bytes.len(),
@@ -19808,7 +19837,7 @@ fn qualify_allocator_tls_boundary_in_source_context(
             });
         } else {
             require(
-                matches!(cell.address, 0xe8 | 0x100),
+                detcore_direct_tls_offset_accepted(cell.address),
                 "Detcore missing getter has no exact direct-allocation cohort",
             )?;
         }
@@ -20059,7 +20088,7 @@ fn qualify_allocator_tls_boundary_in_source_context(
             sources,
         )?)
     } else if image_kind == FixedImageKind::Detcore
-        && matches!(cell.address, 0xe8 | 0x100)
+        && detcore_direct_tls_offset_accepted(cell.address)
         && allocation_bytes.len() == 241
         && !roles.contains_key("fixed_tls_fn_once")
     {
@@ -20774,12 +20803,7 @@ fn validate_existing_allocator_tls_boundary(
                         0x30 | 0x40 | 0x48 | 0x70 | 0x80 | 0x88
                     )
                 }
-                FixedImageKind::Detcore => {
-                    matches!(
-                        tls.tls_cell.address,
-                        0x98 | 0xa0 | 0xd8 | 0xe0 | 0xe8 | 0x100 | 0x110 | 0x128
-                    )
-                }
+                FixedImageKind::Detcore => detcore_direct_tls_offset_accepted(tls.tls_cell.address),
             }
             && tls.tls_cell.size == 8
             && tls.tls_offset_slot
@@ -20853,7 +20877,12 @@ fn validate_existing_allocator_tls_boundary(
         (None, None, None) => {
             let extent = match (image_kind, tls.tls_cell.address) {
                 (FixedImageKind::Standalone, 0x40 | 0x80) => Some(186),
-                (FixedImageKind::Detcore, 0x98 | 0xd8 | 0xe8 | 0x100 | 0x110 | 0x128) => Some(241),
+                // Hand-made records use the same accepted set qualify can mint.
+                (FixedImageKind::Detcore, address)
+                    if detcore_direct_tls_offset_accepted(address) =>
+                {
+                    Some(241)
+                }
                 _ => None,
             };
             if let Some(extent) = extent {
@@ -49047,6 +49076,125 @@ mod tests {
             put(&mut dynamic, 0x4418 + offset, width, value);
         }
         assert!(detcore_census(&dynamic).is_err());
+        // The same physical census at the getter-less 0x110 cohort: absent is
+        // empty, while a planted recipe getter or loader pointer is found.
+        let mut detcore110 = base.clone();
+        put(&mut detcore110, 0x4020, 8, 0x110);
+        let mut cell110 = cell.clone();
+        cell110.address = 0x110;
+        let census110 = |bytes: &[u8]| {
+            direct_tls_getter_census(&Elf::parse(bytes).unwrap(), bytes, &cell110, 0x3300, 0x1800)
+        };
+        let absent110 = census110(&detcore110).unwrap();
+        assert!(
+            absent110.named_getters.is_empty()
+                && absent110.recipe_getters.is_empty()
+                && absent110.getter_pointer_slots.is_empty()
+        );
+        let mut thunk110 = thunk.clone();
+        thunk110[16..20].copy_from_slice(&0x110u32.to_le_bytes());
+        let mut hidden110 = detcore110.clone();
+        hidden110[0x1500..0x1516].copy_from_slice(&thunk110);
+        assert_eq!(census110(&hidden110).unwrap().recipe_getters, [0x1500]);
+        let mut pointer110 = hidden110.clone();
+        for (offset, value) in [
+            (0, 0x3400),
+            (8, u64::from(reloc::R_X86_64_RELATIVE)),
+            (16, 0x1500),
+        ] {
+            put(&mut pointer110, 0x4800 + offset, 8, value);
+        }
+        assert_eq!(
+            census110(&pointer110).unwrap().getter_pointer_slots,
+            [0x3400]
+        );
+        // A novel v0 backref spelling remains an exact-spelling refusal in
+        // this slice; it must not be silently treated as the known getter.
+        let mut novel110 = hidden110.clone();
+        for (offset, width, value) in [
+            (0, 4, getter_name_offset as u64),
+            (4, 1, u64::from(sym::STT_FUNC)),
+            (6, 2, 1),
+            (8, 8, 0x1500),
+            (16, 8, 22),
+        ] {
+            put(&mut novel110, 0x4030 + offset, width, value);
+        }
+        let name_at = 0x4200 + getter_name_offset;
+        let backref = novel110[name_at..name_at + getter_name.len()]
+            .windows(3)
+            .position(|window| window == b"B1n" || window == b"B1o")
+            .expect("known getter backref");
+        novel110[name_at + backref + 2] = b'x';
+        assert!(
+            census110(&novel110).is_err(),
+            "novel-spelling named getter must refuse"
+        );
+        // Derive's source-independent mint gate must mint v3 at 0x110 from
+        // the empty census, and must refuse outside-offset or
+        // planted-getter images. This is the gate the qualify/mint sites share.
+        let alloc_template = DETCORE_VALIDATE_TEMPLATES
+            .iter()
+            .find(|template| {
+                template.role == "fixed_patch_alloc" && fixed_hex(template.hex).len() == 241
+            })
+            .unwrap();
+        let alloc_bytes = fixed_hex(alloc_template.hex);
+        let minted = mint_detcore_direct_allocation_tls_evidence(
+            &detcore110,
+            &cell110,
+            &alloc_bytes,
+            absent110,
+            "0".repeat(64),
+            "2".repeat(40),
+            (0, 0),
+        )
+        .unwrap();
+        assert_eq!(minted.version, 3);
+        assert_eq!(minted.policy, DETCORE_DIRECT_TLS_CENSUS_POLICY_V3);
+        assert!(
+            minted.named_getters.is_empty()
+                && minted.recipe_getters.is_empty()
+                && minted.getter_pointer_slots.is_empty()
+        );
+        let mut detcore118 = detcore110.clone();
+        put(&mut detcore118, 0x4020, 8, 0x118);
+        let mut cell118 = cell110.clone();
+        cell118.address = 0x118;
+        let census118 = direct_tls_getter_census(
+            &Elf::parse(&detcore118).unwrap(),
+            &detcore118,
+            &cell118,
+            0x3300,
+            0x1800,
+        )
+        .unwrap();
+        assert!(
+            mint_detcore_direct_allocation_tls_evidence(
+                &detcore118,
+                &cell118,
+                &alloc_bytes,
+                census118,
+                "0".repeat(64),
+                "2".repeat(40),
+                (0, 0),
+            )
+            .is_err(),
+            "derive must refuse an offset outside the accepted set"
+        );
+        assert!(
+            mint_detcore_direct_allocation_tls_evidence(
+                &hidden110,
+                &cell110,
+                &alloc_bytes,
+                census110(&hidden110).unwrap(),
+                "0".repeat(64),
+                "2".repeat(40),
+                (0, 0),
+            )
+            .is_err(),
+            "derive must refuse a planted recipe getter"
+        );
         // Actual mapping bytes participate in the record join even when a
         // change does not create a getter. An old census cannot be replayed.
         let mut changed = base.clone();
@@ -49218,6 +49366,61 @@ mod tests {
             .is_err(),
             "v2 cannot enter the standalone v1 validator"
         );
+        // V3 is the semantic getter-less cohort: the same retained sample at
+        // 0x110 validates only under the new version/policy pair. Retained
+        // v2 at 0x110 and v3 outside the accepted set still refuse.
+        let mut v3 = value.clone();
+        v3["tls_boundary"]["tls_cell"]["address"] = serde_json::json!(0x110);
+        v3["tls_boundary"]["direct_allocation"]["version"] = serde_json::json!(3);
+        v3["tls_boundary"]["direct_allocation"]["policy"] = serde_json::json!(
+            "detcore_semantic_alloc241_named_getter_pt_load22_raw_loader_pointers_v3"
+        );
+        let decoded_v3: AllocatorBackingEvidence = serde_json::from_value(v3.clone()).unwrap();
+        check(&decoded_v3).unwrap();
+        let mut outside = decoded_v3.clone();
+        outside.tls_boundary.existing_mut().tls_cell.address = 0x118;
+        assert!(
+            validate_direct_allocation_tls_evidence_in_image(
+                outside.tls_boundary.existing().unwrap(),
+                outside
+                    .tls_boundary
+                    .existing()
+                    .unwrap()
+                    .direct_allocation
+                    .as_ref()
+                    .unwrap(),
+                FixedImageKind::Detcore,
+            )
+            .is_err(),
+            "Detcore v3 direct validator must refuse offset outside the accepted set"
+        );
+        assert_eq!(serde_json::to_value(&decoded_v3).unwrap(), v3);
+        for (version, policy, address) in [
+            (2, DETCORE_DIRECT_TLS_CENSUS_POLICY, 0x110),
+            (
+                3,
+                "detcore_semantic_alloc241_named_getter_pt_load22_raw_loader_pointers_v3",
+                0x118,
+            ),
+            (3, DETCORE_DIRECT_TLS_CENSUS_POLICY, 0x110),
+        ] {
+            let mut bad = v3.clone();
+            bad["tls_boundary"]["tls_cell"]["address"] = serde_json::json!(address);
+            bad["tls_boundary"]["direct_allocation"]["version"] = serde_json::json!(version);
+            bad["tls_boundary"]["direct_allocation"]["policy"] = serde_json::json!(policy);
+            assert!(
+                check(&serde_json::from_value(bad).unwrap()).is_err(),
+                "Detcore direct version/policy/address {version}/{policy}/{address:#x}"
+            );
+        }
+        for field in ["named_getters", "recipe_getters", "getter_pointer_slots"] {
+            let mut bad = v3.clone();
+            bad["tls_boundary"]["direct_allocation"][field] = serde_json::json!([0x1500]);
+            assert!(
+                check(&serde_json::from_value(bad).unwrap()).is_err(),
+                "Detcore v3 direct {field}"
+            );
+        }
         // Wrong image/version, omitted/stale/forged joins, and any getter or
         // pointer edge remain refusals. No empty role map is accepted alone.
         for (field, replacement) in [
