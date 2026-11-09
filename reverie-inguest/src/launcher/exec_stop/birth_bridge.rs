@@ -327,10 +327,7 @@ impl<'fd> BirthBridge<'fd> {
             InitialMode::HostConsumed => match never_issued_redemption() {
                 Ok(bytes) => bytes,
                 Err(error) => {
-                    let owner = match watched.cancel() {
-                        Ok(_) => None,
-                        Err(owner) => Some(owner),
-                    };
+                    let owner = watched.cancel().err();
                     return Err(BridgeError::Launch(LaunchFailure {
                         error: error.to_string().into(),
                         receipt: retained_receipt,
@@ -349,10 +346,7 @@ impl<'fd> BirthBridge<'fd> {
         ) {
             Ok(authority) => Arc::new(authority),
             Err(error) => {
-                let owner = match watched.cancel() {
-                    Ok(_) => None,
-                    Err(owner) => Some(owner),
-                };
+                let owner = watched.cancel().err();
                 return Err(BridgeError::Launch(LaunchFailure {
                     error: error.to_string().into(),
                     receipt: retained_receipt,
