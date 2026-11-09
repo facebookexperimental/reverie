@@ -624,6 +624,11 @@ impl<'fd> BridgeRecordedStop<'fd> {
     /// of this happens while the successor is still stopped.
     /// On any error the stop is cancelled — never released
     /// half-stamped — and the verdict is taken.
+    ///
+    /// The stamp hook runs while `at_successor_stop` holds the
+    /// `BirthAuthority` lock across prepare/seal/stamp/issue:
+    /// it must not call any `BirthAuthority` method (that
+    /// self-deadlocks), and it should be pure packet-byte work.
     pub fn issue<F>(self, stamp: F) -> Result<BridgeIssuedStop<'fd>, BridgeError<'fd>>
     where
         F: FnOnce(ExecTicket, [u8; 32]) -> Result<Vec<u8>, ExecControlError>,
@@ -1158,5 +1163,48 @@ mod tests {
             "unexpected failure: {}",
             failure.error
         );
+    }
+
+    #[test]
+    fn finished_verdict_records_watch_terminal() {
+        // The terminal verdict is record_watch_terminal + finish,
+        // not finish alone: after a Finished outcome the registry
+        // is died (live tickets are Dead) and staged snapshots
+        // refuse fail-closed. finish() alone sets neither.
+        let bridge = spawn_bridge(host_config());
+        let authority = bridge.authority();
+        let admitted = bridge.admitted();
+        let initial = expect_initial(bridge.wait_next().unwrap());
+        initial.record_mapped_initial_consumed().unwrap();
+        let bridge = initial
+            .rearm_and_resume(|task, _entry, _boundary| Ok(task))
+            .unwrap();
+        authority
+            .stage_snapshot(admitted, frame_tool_state(b"terminal-state").unwrap())
+            .unwrap();
+        let recorded = expect_successor(bridge.wait_next().unwrap());
+        let issued = recorded
+            .issue(|ticket, _sealed| Ok(ticket.0.to_vec()))
+            .unwrap();
+        let ticket = issued.ticket();
+        assert_eq!(authority.stage(ticket), Some(ExecStage::Issued));
+        // Deliberately no redeem/complete: the ticket stays live
+        // across the terminal outcome.
+        let bridge = issued
+            .rearm_and_resume(|task, _entry, _boundary| Ok(task))
+            .unwrap();
+        match bridge.wait_next().unwrap() {
+            BridgeStep::Finished(outcome) => {
+                assert_eq!(outcome.status, safeptrace::ExitStatus::Exited(0));
+            }
+            BridgeStep::InitialExec(_) | BridgeStep::SuccessorExec(_) => {
+                panic!("expected finished outcome")
+            }
+        }
+        assert_eq!(authority.stage(ticket), Some(ExecStage::Dead));
+        assert!(matches!(
+            authority.stage_snapshot(admitted, frame_tool_state(b"too-late").unwrap()),
+            Err(ExecControlError::Transition)
+        ));
     }
 }
