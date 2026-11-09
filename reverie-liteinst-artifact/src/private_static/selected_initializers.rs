@@ -965,8 +965,11 @@ const LITEROOT: MappedConsumerSource = MappedConsumerSource {
     lib_target: "literoot_preload",
     manifest_relative: "preload/Cargo.toml",
     lib_rs_relative: "preload/src/lib.rs",
-    root_manifest_relative: "Cargo.toml",
-    root_lock_relative: "Cargo.lock",
+    // `preload/` is a standalone Cargo workspace (its Cargo.toml has
+    // an empty `[workspace]` table and it carries its own lock); the
+    // repository-root workspace does not contain literoot-preload.
+    root_manifest_relative: "preload/Cargo.toml",
+    root_lock_relative: "preload/Cargo.lock",
     features: &["mapped-successor"],
 };
 
@@ -2929,16 +2932,16 @@ mod tests {
                 reverie_gitlink_relative: "reverie"
             }
         ));
-        // Constructed metadata expectations used by the leaf
-        // check, built from descriptor fields only.
-        let root = Path::new("/ws");
+        // The production leaf id the metadata check compares
+        // against, not a re-derivation of its format.
         assert_eq!(
-            format!(
-                "path+file://{}#{}",
-                root.join(detcore.package_name).display(),
-                detcore.package_version
-            ),
+            super::super::leaf_package_id(Path::new("/ws"), detcore).unwrap(),
             "path+file:///ws/detcore-liteinst#0.5.6"
+        );
+        // The pre-0.5.5 Detcore leaf id is not what production builds.
+        assert_ne!(
+            super::super::leaf_package_id(Path::new("/ws"), detcore).unwrap(),
+            "path+file:///ws/detcore-liteinst#0.5.4"
         );
         assert_eq!(
             entry_undefined_args(detcore).unwrap(),
@@ -3009,6 +3012,30 @@ mod tests {
         assert_ne!(
             literoot.accepted_entry_sources(),
             DETCORE.accepted_entry_sources()
+        );
+    }
+
+    #[test]
+    fn literoot_descriptor_names_the_standalone_preload_workspace() {
+        // literoot 74c241de: preload/Cargo.toml declares package
+        // literoot-preload 0.0.1, lib literoot_preload, feature
+        // mapped-successor and an empty `[workspace]`; the lock is
+        // preload/Cargo.lock.
+        let literoot = MappedConsumer::Literoot.source();
+        assert_eq!(literoot.binding(), WorkspaceBinding::CargoGitRev);
+        assert_eq!(literoot.package_name(), "literoot-preload");
+        assert_eq!(literoot.package_version(), "0.0.1");
+        assert_eq!(literoot.lib_target(), "literoot_preload");
+        assert_eq!(literoot.manifest_relative(), "preload/Cargo.toml");
+        assert_eq!(literoot.lib_rs_relative(), "preload/src/lib.rs");
+        assert_eq!(literoot.root_manifest_relative(), "preload/Cargo.toml");
+        assert_eq!(literoot.root_lock_relative(), "preload/Cargo.lock");
+        assert_eq!(literoot.features(), ["mapped-successor"]);
+        // cargo metadata 1.97.1 names a leaf whose directory differs
+        // from its package name with `#<name>@<version>`.
+        assert_eq!(
+            super::super::leaf_package_id(Path::new("/ws"), literoot).unwrap(),
+            "path+file:///ws/preload#literoot-preload@0.0.1"
         );
     }
 

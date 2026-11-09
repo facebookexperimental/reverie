@@ -67441,6 +67441,27 @@ pub mod private_static {
         format!("git+https://github.com/rrnewton/reverie?rev={pin}#{pin}")
     }
 
+    /// The package id cargo (1.97.1, measured) reports for the path
+    /// leaf: the manifest directory URL, then `#<version>` when the
+    /// directory name is the package name, else `#<name>@<version>`
+    /// (`path+file:///ws/detcore-liteinst#0.5.5`,
+    /// `path+file:///ws/preload#literoot-preload@0.0.1`). The leaf
+    /// identity check compares metadata against exactly this.
+    fn leaf_package_id(
+        workspace: &Path,
+        consumer: &selected_initializers::MappedConsumerSource,
+    ) -> Result<String> {
+        let manifest = workspace.join(consumer.manifest_relative());
+        let directory = manifest.parent().ok_or("static leaf manifest parent")?;
+        let (name, version) = (consumer.package_name(), consumer.package_version());
+        let fragment = if directory.file_name().and_then(|n| n.to_str()) == Some(name) {
+            version.to_owned()
+        } else {
+            format!("{name}@{version}")
+        };
+        Ok(format!("path+file://{}#{fragment}", directory.display()))
+    }
+
     /// The root lockfile names the exact pinned Reverie git
     /// source. A path-patched (source-less) Reverie package or
     /// any other rev does not satisfy this.
@@ -67563,12 +67584,18 @@ pub mod private_static {
                         "static H gitlink mismatch",
                     )?;
                 }
-                for relative in [
+                let relatives = [
                     consumer.root_manifest_relative(),
                     consumer.root_lock_relative(),
                     consumer.manifest_relative(),
                     consumer.lib_rs_relative(),
-                ] {
+                ];
+                for (index, &relative) in relatives.iter().enumerate() {
+                    // A leaf that is its own workspace root (literoot's
+                    // preload) names one manifest twice; guard it once.
+                    if relatives[..index].contains(&relative) {
+                        continue;
+                    }
                     guard.files.push(compiled_blob_file(
                         expected.workspace,
                         expected.workspace_head,
@@ -67654,14 +67681,7 @@ pub mod private_static {
                     .collect();
                 require(rows.len() == 1, "static metadata leaf ambiguous")?;
                 let leaf = rows[0];
-                let id = format!(
-                    "path+file://{}#{}",
-                    manifest
-                        .parent()
-                        .ok_or("static leaf manifest parent")?
-                        .display(),
-                    consumer.package_version()
-                );
+                let id = leaf_package_id(expected.workspace, consumer)?;
                 require(
                     leaf["id"] == id
                         && leaf["source"].is_null()
@@ -68745,9 +68765,10 @@ pub mod private_static {
                 "static producer requires canonical explicit target"
             );
 
-            // Verbatim line from a real literoot Cargo.lock
-            // (reverie-core entry), so the control cannot
-            // self-mirror the implementation's format string.
+            // Verbatim reverie-core entry from literoot 74c241de
+            // preload/Cargo.lock lines 811-814 (the preload workspace's
+            // own lock), so the control cannot self-mirror the
+            // implementation's format string.
             let pin = "02973cdcfcadd21190fda864dfa9eb1b3e6ed1c1";
             let exact = "[[package]]\nname = \"reverie-core\"\nversion = \"0.5.4\"\nsource = \"git+https://github.com/rrnewton/reverie?rev=02973cdcfcadd21190fda864dfa9eb1b3e6ed1c1#02973cdcfcadd21190fda864dfa9eb1b3e6ed1c1\"\n".to_owned();
             let dot_git = exact.replace("rrnewton/reverie?", "rrnewton/reverie.git?");
