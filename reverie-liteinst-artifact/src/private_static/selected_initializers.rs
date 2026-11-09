@@ -898,6 +898,12 @@ pub enum MappedConsumer {
     Detcore,
     /// Literoot mapped successor (its first image is not written yet).
     Literoot,
+    /// Test-only consumer carrying both generations under fixture
+    /// names, so two-generation selection, retention and observer
+    /// distinctness stay exercised while no production consumer
+    /// has both. It names no real crate and exists only in tests.
+    #[cfg(test)]
+    TwoGenerationFixture,
 }
 
 const DETCORE: MappedConsumerSource = MappedConsumerSource {
@@ -973,12 +979,47 @@ const LITEROOT: MappedConsumerSource = MappedConsumerSource {
     features: &["mapped-successor"],
 };
 
+#[cfg(test)]
+const TWO_GENERATION_FIXTURE: MappedConsumerSource = MappedConsumerSource {
+    layout: "fixture_mapped_layout",
+    member_prefix: "fixture_preload-",
+    first: Some(MappedGenerationSymbols {
+        entry: "fixture_mapped_first_entry",
+        observed_label: "fixture_mapped_first_entry_observed_int3",
+        terminal_exact: None,
+        observer_exact: None,
+        terminal_path: "_RNvNtCs_15fixture_preload12mapped_first8terminal",
+        observer_path: "_RNvNtCs_15fixture_preload12mapped_first26observe_initializer_return",
+    }),
+    successor: Some(MappedGenerationSymbols {
+        entry: "fixture_mapped_successor_entry",
+        observed_label: "fixture_mapped_successor_entry_observed_int3",
+        terminal_exact: None,
+        observer_exact: None,
+        terminal_path: "_RNvNtCs_15fixture_preload16mapped_successor8terminal",
+        observer_path: "_RNvNtCs_15fixture_preload16mapped_successor26observe_initializer_return",
+    }),
+    entry_source_relative: "fixture/src/mapped_entry.rs",
+    accepted_entry_sources: &[],
+    binding: WorkspaceBinding::CargoGitRev,
+    package_name: "fixture-preload",
+    package_version: "0.0.0",
+    lib_target: "fixture_preload",
+    manifest_relative: "fixture/Cargo.toml",
+    lib_rs_relative: "fixture/src/lib.rs",
+    root_manifest_relative: "fixture/Cargo.toml",
+    root_lock_relative: "fixture/Cargo.lock",
+    features: &[],
+};
+
 impl MappedConsumer {
     /// The reviewed descriptor constant for this consumer.
     pub const fn source(self) -> &'static MappedConsumerSource {
         match self {
             Self::Detcore => &DETCORE,
             Self::Literoot => &LITEROOT,
+            #[cfg(test)]
+            Self::TwoGenerationFixture => &TWO_GENERATION_FIXTURE,
         }
     }
 }
@@ -2366,6 +2407,9 @@ impl VerifiedStaticSource {
                         .is_some_and(|p| fs::canonicalize(p).ok().as_deref() == Some(p)),
                 "initializer link output must have canonical sole-target parent",
             )?;
+            // A consumer without a first generation refuses before
+            // the output directory exists, not after.
+            self.consumer.source().first_entry()?;
             fs::create_dir(output).map_err(|e| e.to_string())?;
             let elf_path = output.join("initializer-definitions.not-qualified.elf");
             let map_path = output.join("initializer-definitions.map");
@@ -2864,6 +2908,14 @@ mod tests {
         consumer: MappedConsumer::Literoot,
         generation: GenerationKind::Successor,
     };
+    const FIXTURE_FIRST: MappedRole = MappedRole {
+        consumer: MappedConsumer::TwoGenerationFixture,
+        generation: GenerationKind::First,
+    };
+    const FIXTURE_SUCCESSOR: MappedRole = MappedRole {
+        consumer: MappedConsumer::TwoGenerationFixture,
+        generation: GenerationKind::Successor,
+    };
 
     #[test]
     fn detcore_descriptor_matches_todays_literals() {
@@ -3016,6 +3068,148 @@ mod tests {
     }
 
     #[test]
+    fn two_generation_descriptor_retains_both_entries_and_selects_each_generation() {
+        // No production consumer carries both generations yet
+        // (literoot's first image belongs to dh-tc7os), so these
+        // assertions run on the test-only fixture descriptor.
+        let fixture = MappedConsumer::TwoGenerationFixture.source();
+        assert_eq!(
+            entry_undefined_args(fixture).unwrap(),
+            [
+                "--undefined=fixture_mapped_first_entry",
+                "--undefined=fixture_mapped_successor_entry",
+            ]
+        );
+        // The ELF header entry names the first image only.
+        assert_eq!(
+            elf_entry_arg(fixture).unwrap(),
+            "--entry=fixture_mapped_first_entry"
+        );
+        let runtime = Path::new("/runtime.a");
+        let member = "fixture_preload-mapped.o";
+        let map = role_selection_row(runtime, member);
+        for (role, other, name) in [
+            (
+                FIXTURE_FIRST,
+                FIXTURE_SUCCESSOR,
+                "fixture_mapped_first_entry",
+            ),
+            (
+                FIXTURE_SUCCESSOR,
+                FIXTURE_FIRST,
+                "fixture_mapped_successor_entry",
+            ),
+        ] {
+            let root = InitializerRole::MappedRoot(role);
+            assert_eq!(root.symbol().unwrap(), name);
+            let mut bytes = role_selection_image(name);
+            bytes[189] = sym::STV_PROTECTED;
+            let objects = [role_selection_object(&bytes, runtime, member)];
+            // Both generations select from the one archive member.
+            let found = select_role(&root, &objects, &map, runtime).unwrap();
+            assert_eq!(found.member_name, member);
+            // Neither generation's entry stands in for the other's.
+            assert!(
+                select_role(&InitializerRole::MappedRoot(other), &objects, &map, runtime)
+                    .err()
+                    .unwrap()
+                    .contains("selected strong definition absent/duplicate")
+            );
+            // Wrong consumer, fixture to production: no production
+            // role selects a fixture entry.
+            for (production, refusal) in [
+                (DETCORE_FIRST, "selected strong definition absent/duplicate"),
+                (DETCORE_SUCCESSOR, GENERATION_ABSENT),
+                (LITEROOT_FIRST, GENERATION_ABSENT),
+                (
+                    LITEROOT_SUCCESSOR,
+                    "selected strong definition absent/duplicate",
+                ),
+            ] {
+                assert!(
+                    select_role(
+                        &InitializerRole::MappedRoot(production),
+                        &objects,
+                        &map,
+                        runtime
+                    )
+                    .err()
+                    .unwrap()
+                    .contains(refusal),
+                    "{production:?}"
+                );
+            }
+            // Wrong member: the fixture entry from another
+            // consumer's member prefix refuses.
+            let wrong_member = [role_selection_object(
+                &bytes,
+                runtime,
+                "literoot_preload-mapped.o",
+            )];
+            let wrong_map = role_selection_row(runtime, "literoot_preload-mapped.o");
+            assert!(
+                select_role(&root, &wrong_member, &wrong_map, runtime)
+                    .err()
+                    .unwrap()
+                    .contains("wrong physical source owner")
+            );
+        }
+        // Wrong consumer, production to fixture: Detcore's first
+        // entry and literoot's successor entry, each from its own
+        // member, are not fixture entries.
+        for (name, member) in [
+            ("detcore_liteinst_mapped_entry", "detcore_liteinst-mapped.o"),
+            (
+                "literoot_mapped_successor_entry",
+                "literoot_preload-mapped.o",
+            ),
+        ] {
+            let mut bytes = role_selection_image(name);
+            bytes[189] = sym::STV_PROTECTED;
+            let objects = [role_selection_object(&bytes, runtime, member)];
+            let map = role_selection_row(runtime, member);
+            for role in [FIXTURE_FIRST, FIXTURE_SUCCESSOR] {
+                assert!(
+                    select_role(&InitializerRole::MappedRoot(role), &objects, &map, runtime)
+                        .err()
+                        .unwrap()
+                        .contains("selected strong definition absent/duplicate"),
+                    "{name} as {role:?}"
+                );
+            }
+        }
+        // Each generation's terminal and observer discovery matches
+        // its own body only, never the other generation's.
+        for (role, other, module) in [
+            (FIXTURE_FIRST, FIXTURE_SUCCESSOR, "12mapped_first"),
+            (FIXTURE_SUCCESSOR, FIXTURE_FIRST, "16mapped_successor"),
+        ] {
+            for (kind, leaf) in [
+                (
+                    InitializerRole::MappedTerminal as fn(MappedRole) -> InitializerRole,
+                    "8terminal",
+                ),
+                (
+                    InitializerRole::MappedObserver,
+                    "26observe_initializer_return",
+                ),
+            ] {
+                let name = format!("_RNvNtCs2AUgrzUFSDC_15fixture_preload{module}{leaf}");
+                assert!(kind(role).terminal_name(&name), "{name}");
+                assert!(!kind(other).terminal_name(&name), "{name}");
+                let bytes = terminal_selection_image(&name, kind(role));
+                let map = role_selection_row(runtime, member);
+                let objects = [role_selection_object(&bytes, runtime, member)];
+                let (object, actual) =
+                    select_role_named(&kind(role), &objects, &map, runtime, true).unwrap();
+                assert_eq!(actual, name);
+                assert_eq!(object.member_name, member);
+                assert!(select_role_named(&kind(other), &objects, &map, runtime, true).is_err());
+            }
+        }
+    }
+
+    #[test]
     fn literoot_descriptor_names_the_standalone_preload_workspace() {
         // literoot 74c241de: preload/Cargo.toml declares package
         // literoot-preload 0.0.1, lib literoot_preload, feature
@@ -3122,22 +3316,55 @@ mod tests {
         }
     }
 
+    /// Whether two present generations share an observer body or
+    /// an observed label. `aliases` lets one observer body carry
+    /// exactly one label, so two generations need two bodies.
+    fn generations_share_an_observer(source: &MappedConsumerSource) -> bool {
+        match (source.first, source.successor) {
+            (Some(first), Some(successor)) => {
+                first.observer_path == successor.observer_path
+                    || first.observed_label == successor.observed_label
+            }
+            _ => false,
+        }
+    }
+
     #[test]
     fn no_consumer_shares_an_observer_body_between_generations() {
-        // `aliases` lets one observer body carry exactly one label,
-        // so two present generations need two observer bodies.
-        for consumer in [MappedConsumer::Detcore, MappedConsumer::Literoot] {
+        let consumers = [
+            MappedConsumer::Detcore,
+            MappedConsumer::Literoot,
+            MappedConsumer::TwoGenerationFixture,
+        ];
+        for consumer in consumers {
+            assert!(
+                !generations_share_an_observer(consumer.source()),
+                "{consumer:?}"
+            );
+        }
+        // Not vacuous: one checked consumer carries both generations,
+        assert!(consumers.iter().any(|consumer| {
             let source = consumer.source();
-            if let (Some(first), Some(successor)) = (
-                source.generation(GenerationKind::First),
-                source.generation(GenerationKind::Successor),
-            ) {
-                assert_ne!(first.observer_path, successor.observer_path, "{consumer:?}");
-                assert_ne!(
-                    first.observed_label, successor.observed_label,
-                    "{consumer:?}"
-                );
-            }
+            source.first.is_some() && source.successor.is_some()
+        }));
+        // and the check reports both collision shapes (a shared body
+        // is what ab9c6674's guessed literoot first generation had).
+        let first = TWO_GENERATION_FIXTURE.first.unwrap();
+        let successor = TWO_GENERATION_FIXTURE.successor.unwrap();
+        for collided in [
+            MappedGenerationSymbols {
+                observer_path: first.observer_path,
+                ..successor
+            },
+            MappedGenerationSymbols {
+                observed_label: first.observed_label,
+                ..successor
+            },
+        ] {
+            assert!(generations_share_an_observer(&MappedConsumerSource {
+                successor: Some(collided),
+                ..TWO_GENERATION_FIXTURE
+            }));
         }
     }
 
