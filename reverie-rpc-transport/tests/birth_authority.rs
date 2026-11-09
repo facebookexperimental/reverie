@@ -27,6 +27,8 @@ use reverie::Tid;
 use reverie_rpc_transport::Admitted;
 use reverie_rpc_transport::BlockingRpcClient;
 use reverie_rpc_transport::ConnectionAdmission;
+use reverie_rpc_transport::ConnectionFailure;
+use reverie_rpc_transport::RpcError;
 use reverie_rpc_transport::RpcServer;
 use reverie_rpc_transport::birth_authority::BirthAuthority;
 use reverie_rpc_transport::birth_authority::StageClient;
@@ -661,9 +663,19 @@ async fn stage_routing_through_authority_server() {
         other => panic!("client failed: {other:?}; issues={:?}", issues.snapshot()),
     }
     // Exactly the two malformed-magic connections and the
-    // trailing-byte connection are recorded failures; stage and
-    // native handshakes complete cleanly.
-    assert_eq!(issues.snapshot().len(), 3, "issues={:?}", issues.snapshot());
+    // trailing-byte connection are recorded failures, each with
+    // its own decoder's refusal text; stage and native
+    // handshakes complete cleanly.
+    let snapshot = issues.snapshot();
+    assert_eq!(snapshot.len(), 3, "issues={snapshot:?}");
+    let texts = format!("{snapshot:?}");
+    for expected in [
+        "InitialImage magic or version mismatch",
+        "successor request length is invalid",
+        "stage request decode refused",
+    ] {
+        assert!(texts.contains(expected), "missing {expected} in {texts}");
+    }
     serve.abort();
 }
 
@@ -674,7 +686,7 @@ async fn stage_refused_without_birth_authority() {
     let mut server =
         RpcServer::bind(&path.0, Arc::new(Echo::default()), CONFIG.to_owned()).unwrap();
     server.set_connection_admission(Arc::new(Watch)).unwrap();
-    server.retain_connection_issues();
+    let issues = server.retain_connection_issues();
     // Same hooks, but installed without stage routing.
     server
         .set_native_image_admission(authority.clone(), authority.clone())
@@ -702,6 +714,18 @@ async fn stage_refused_without_birth_authority() {
             "stage frame must refuse without the authority route"
         );
         drop(stage);
+        // Pin the non-authority 4096 first-frame bound: a header
+        // claiming 4097 bytes (no payload ever sent) must refuse
+        // at read with FrameTooLarge, not be awaited as a
+        // plausible stage payload.
+        {
+            use std::io::Write;
+            let mut raw = UnixStream::connect(&client_path).unwrap();
+            raw.write_all(&4097_u32.to_be_bytes()).unwrap();
+            raw.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+            drop(raw);
+        }
         drop(initial);
         // Nothing was staged: issue at a recorded stop is Unavailable.
         let captured = Arc::new(Mutex::new(None));
@@ -716,6 +740,25 @@ async fn stage_refused_without_birth_authority() {
     match tokio::time::timeout(WAIT, client).await {
         Ok(Ok(())) => {}
         other => panic!("client failed: {other:?}"),
+    }
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let found = issues.snapshot().iter().any(|issue| {
+            matches!(
+                &issue.failure,
+                ConnectionFailure::Transport(error)
+                    if matches!(error.as_ref(), RpcError::FrameTooLarge { len: 4097, max: 4096 })
+            )
+        });
+        if found {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no FrameTooLarge 4097/4096 issue recorded: {:?}",
+            issues.snapshot()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
     serve.abort();
 }
@@ -750,4 +793,123 @@ async fn wrong_birth_stage_refuses_identity() {
         other => panic!("client failed: {other:?}"),
     }
     serve.abort();
+}
+
+#[test]
+fn wrong_birth_stage_and_invalidate_do_not_mutate_mailbox() {
+    let authority = make_authority();
+    authority.record_initial_consumed(admitted()).unwrap();
+    authority
+        .stage_snapshot(admitted(), frame_tool_state(b"snapshot-a").unwrap())
+        .unwrap();
+    let wrong = Admitted {
+        process_id: pid() + 1,
+    };
+    assert!(matches!(
+        authority.stage_snapshot(wrong, frame_tool_state(b"snapshot-b").unwrap()),
+        Err(ExecControlError::Identity)
+    ));
+    assert!(matches!(
+        authority.invalidate_mailbox(wrong),
+        Err(ExecControlError::Identity)
+    ));
+    // The staged snapshot survives both wrong-birth attempts
+    // byte-for-byte through issue and redeem.
+    let captured = Arc::new(Mutex::new(None));
+    let expected = stage_and_stop_resume(&authority, &captured);
+    let ticket = captured.lock().unwrap().unwrap();
+    let state = authority
+        .redeem(
+            own_pidfd(),
+            admitted(),
+            SuccessorRequest {
+                ticket: &ticket.0,
+                expected,
+            },
+        )
+        .unwrap();
+    let (_runtime, tool) =
+        verify_and_split_runtime(&state, config_digest_value(), config_digest(&ticket.0)).unwrap();
+    assert_eq!(&tool[4..], b"snapshot-a");
+    authority.complete(ticket).unwrap();
+}
+
+fn stage_and_stop_resume(
+    authority: &BirthAuthority,
+    captured: &Arc<Mutex<Option<ExecTicket>>>,
+) -> ExpectedSuccessor {
+    let stop = authority
+        .record_successor_stop(admitted(), &own_pidfd())
+        .unwrap();
+    authority
+        .at_successor_stop(stop, stamp_packet(captured))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn reconfiguration_clears_stage_routing() {
+    let path = SocketPath::new();
+    let authority = make_authority();
+    let mut server = authority_server(&path, &authority);
+    // Reconfiguring with plain native admission must switch
+    // stage routing off (no stale birth_authority retained).
+    server
+        .set_native_image_admission(authority.clone(), authority.clone())
+        .unwrap();
+    let serve = tokio::spawn(async move { server.serve().await });
+
+    let client_path = path.0.clone();
+    let client = tokio::task::spawn_blocking(move || {
+        let tid = Tid::from_raw(pid());
+        let initial = BlockingRpcClient::<Echo>::connect_initial_image(
+            &client_path,
+            tid,
+            b"initial-only",
+            config_digest_value(),
+        )
+        .unwrap()
+        .into_client();
+        assert_eq!(initial.try_send_rpc(1).unwrap(), 2);
+        let mut stage = StageClient::new(UnixStream::connect(&client_path).unwrap());
+        assert!(
+            stage
+                .stage_snapshot(frame_tool_state(b"stale-route").unwrap())
+                .is_err(),
+            "stage must refuse after routing was reconfigured off"
+        );
+    });
+    match tokio::time::timeout(WAIT, client).await {
+        Ok(Ok(())) => {}
+        other => panic!("client failed: {other:?}"),
+    }
+    serve.abort();
+}
+
+#[tokio::test]
+async fn serve_one_stage_connection_completes_cleanly() {
+    let path = SocketPath::new();
+    let authority = make_authority();
+    authority.record_initial_consumed(admitted()).unwrap();
+    let server = authority_server(&path, &authority);
+    let serve = tokio::spawn(async move { server.serve_one().await });
+
+    let client_path = path.0.clone();
+    let client = tokio::task::spawn_blocking(move || {
+        let mut stage = StageClient::new(UnixStream::connect(&client_path).unwrap());
+        stage
+            .stage_snapshot(frame_tool_state(b"serve-one-state").unwrap())
+            .unwrap();
+        drop(stage);
+    });
+    match tokio::time::timeout(WAIT, client).await {
+        Ok(Ok(())) => {}
+        other => panic!("client failed: {other:?}"),
+    }
+    match tokio::time::timeout(WAIT, serve).await {
+        Ok(Ok(Ok(()))) => {}
+        other => panic!("serve_one failed: {other:?}"),
+    }
+    // The serve_one stage path really staged: issue succeeds.
+    let captured = Arc::new(Mutex::new(None));
+    stage_and_stop_resume(&authority, &captured);
 }
