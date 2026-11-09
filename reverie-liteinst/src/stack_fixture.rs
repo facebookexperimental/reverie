@@ -129,9 +129,21 @@ pub(crate) fn record_fallback(number: usize, guest_ip: usize) {
     let rsp: usize;
     // SAFETY: read the hardware stack pointer at this actual dispatch entry.
     // No caller-supplied address, descriptor or async-local pointer replaces it.
+    // The register is spelled per-architecture: rsp on x86-64, sp on aarch64
+    // (the x86 spelling is invalid aarch64 assembly whenever this function is
+    // actually codegen'd there).
+    #[cfg(target_arch = "x86_64")]
     unsafe {
         core::arch::asm!(
             "mov {}, rsp",
+            out(reg) rsp,
+            options(nostack, nomem, preserves_flags),
+        );
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!(
+            "mov {}, sp",
             out(reg) rsp,
             options(nostack, nomem, preserves_flags),
         );
