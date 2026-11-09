@@ -1443,7 +1443,7 @@ mod tests {
         // Same detached flow as the outcome variant, consumed
         // through record_released_status: its verdict call is
         // pinned, not just the shared helper behind it.
-        let bridge = spawn_bridge_req(host_config(), request("/bin/true", &["true"]));
+        let bridge = spawn_bridge_req(host_config(), request("/bin/sh", &["sh", "-c", "exit 3"]));
         let authority = bridge.authority();
         let admitted = bridge.admitted();
         let initial = expect_initial(bridge.wait_next().unwrap());
@@ -1458,8 +1458,9 @@ mod tests {
             .stage_snapshot(admitted, frame_tool_state(b"status-state-2").unwrap())
             .unwrap();
         let outcome = detached.wait().unwrap();
+        assert_eq!(outcome.status, safeptrace::ExitStatus::Exited(3));
         let status = verdict.record_released_status(outcome.status).unwrap();
-        assert_eq!(status, safeptrace::ExitStatus::Exited(0));
+        assert_eq!(status, safeptrace::ExitStatus::Exited(3));
         assert!(matches!(
             authority.stage_snapshot(admitted, frame_tool_state(b"after-verdict").unwrap()),
             Err(ExecControlError::Transition)
