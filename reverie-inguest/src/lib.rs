@@ -57,6 +57,26 @@
 )))]
 compile_error!("reverie-inguest requires Linux x86-64 or aarch64");
 
+// Named aarch64 refusal for the exec-private feature family: guest
+// exec_private is x86-64 only. This boundary is the one stated exception to
+// the aarch64 LiteInst port's F(1) confinement (arch cfgs live in
+// reverie-liteinst backend modules): the refusal must live here because
+// reverie-inguest compiles before every consumer, so a consumer-side
+// message would never print.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(
+        feature = "exec-private-init",
+        feature = "loader-private-runtime",
+        feature = "native-exec-state",
+        feature = "exec-private-successor",
+        feature = "exec-native-injection"
+    )
+))]
+compile_error!(
+    "reverie-inguest exec-private features are not supported on aarch64 (exec_private is x86-64 only)"
+);
+
 pub mod arch;
 pub mod bootstrap;
 pub mod bootstrap_recipe;
