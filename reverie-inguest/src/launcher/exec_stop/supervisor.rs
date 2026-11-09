@@ -969,6 +969,16 @@ impl<'fd> SuccessorStop<'fd> {
         self.owner.cancellation_handle()
     }
 
+    /// Duplicate this held birth's original kernel pidfd for
+    /// coordinator admission, exactly as
+    /// [`super::InitialExecStop::duplicate_birth_pidfd`] does for a
+    /// first image. This conveys descriptor identity only, never
+    /// wait ownership or permission to resume.
+    #[cfg(feature = "loader-private-runtime")]
+    pub fn duplicate_birth_pidfd(&self) -> Result<std::os::fd::OwnedFd> {
+        self.owner.duplicate_birth_pidfd(&self.task)
+    }
+
     /// Take the original child's parent pipe endpoints once, before
     /// releasing guest execution.
     pub fn take_parent_stdio(&mut self) -> Option<reverie::process::ParentStdio> {

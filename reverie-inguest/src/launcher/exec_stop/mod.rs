@@ -36,6 +36,9 @@ pub use input_data::build_init_packet;
 pub use input_data::stamp_init_packet;
 #[cfg(feature = "loader-private-runtime")]
 pub use input_data::validate_init_packet;
+/// Watched-supervisor to birth-authority bridge (E2-3c slice 3).
+#[cfg(all(feature = "loader-private-runtime", feature = "coordinator-rpc"))]
+pub mod birth_bridge;
 #[cfg(feature = "stage1a-probe")]
 pub mod inject;
 #[cfg(all(feature = "loader-private-runtime", not(feature = "stage1a-probe")))]
@@ -48,6 +51,24 @@ mod mapping_plan;
 pub mod physical;
 mod supervisor;
 mod trace;
+#[cfg(all(feature = "loader-private-runtime", feature = "coordinator-rpc"))]
+pub use birth_bridge::BirthBridge;
+#[cfg(all(feature = "loader-private-runtime", feature = "coordinator-rpc"))]
+pub use birth_bridge::BridgeConfig;
+#[cfg(all(feature = "loader-private-runtime", feature = "coordinator-rpc"))]
+pub use birth_bridge::BridgeError;
+#[cfg(all(feature = "loader-private-runtime", feature = "coordinator-rpc"))]
+pub use birth_bridge::BridgeInitialStop;
+#[cfg(all(feature = "loader-private-runtime", feature = "coordinator-rpc"))]
+pub use birth_bridge::BridgeIssuedStop;
+#[cfg(all(feature = "loader-private-runtime", feature = "coordinator-rpc"))]
+pub use birth_bridge::BridgeRecordedStop;
+#[cfg(all(feature = "loader-private-runtime", feature = "coordinator-rpc"))]
+pub use birth_bridge::BridgeStep;
+#[cfg(all(feature = "loader-private-runtime", feature = "coordinator-rpc"))]
+pub use birth_bridge::BridgeVerdict;
+#[cfg(all(feature = "loader-private-runtime", feature = "coordinator-rpc"))]
+pub use birth_bridge::InitialMode;
 
 pub use supervisor::DetachedSupervisor;
 pub use supervisor::DetachedWaitFailure;
