@@ -820,8 +820,6 @@ impl MappedToolPrelude {
         }
         Ok(self)
     }
-    /// Exact original resume registers/PKRU for the mapped
-    /// successor's guarded post-exec guest.
     /// Single sealed coordinator endpoint for the mapped
     /// successor's fresh connect. Data only; connecting and
     /// admission remain the successor initializer's work.
