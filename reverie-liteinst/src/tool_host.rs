@@ -425,10 +425,10 @@ impl InstalledInitialImage {
 /// carrier delivered the selected state. This seam does not
 /// construct or name that carrier's scalar-5 client.
 ///
-/// The fields are private: outside this module the only
-/// constructor is the `From<&VerifiedSuccessorState>`
-/// conversion below, so both digests always come from the
-/// transport-verified successor state, never from the packet.
+/// The fields are private: outside this module, the digests
+/// can only be copied from a `VerifiedSuccessorState` via
+/// the `From` conversion below; code inside this module can
+/// still build them by struct literal.
 #[cfg(feature = "loader-private-runtime")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MappedSuccessorVerifiedDigests {
@@ -1928,29 +1928,73 @@ mod mapped_successor_binding_tests {
         );
     }
 
+    #[derive(Default)]
+    struct FidelityGlobal;
+
+    #[reverie::global_tool]
+    impl reverie::GlobalTool for FidelityGlobal {
+        type Request = ();
+        type Response = ();
+        type Config = u64;
+
+        async fn receive_rpc(&self, _from: reverie::Pid, _message: ()) {
+            panic!("fidelity fixture performs no RPC");
+        }
+    }
+
     #[test]
     fn mapped_digests_from_verified_state_are_faithful() {
+        use reverie_rpc_transport::BlockingRpcClient;
         use reverie_rpc_transport::initial_image::config_digest;
         use reverie_rpc_transport::successor::ExpectedSuccessor;
         use reverie_rpc_transport::successor::SuccessorRequest;
-        use reverie_rpc_transport::successor::VerifiedSuccessorState;
+        use std::io::Read;
+        use std::io::Write;
+        use std::os::unix::net::UnixStream;
 
-        let bytes = b"selected-state-bytes".to_vec();
+        let config = reverie_rpc_transport::codec::encode(&73_u64).unwrap();
+        let state_bytes: &[u8] = b"selected-state-bytes";
         let expected = ExpectedSuccessor {
-            config: config_digest(b"config-bytes"),
-            state: config_digest(&bytes),
+            config: config_digest(&config),
+            state: config_digest(state_bytes),
         };
-        let verified = VerifiedSuccessorState::from_checked_frame_for_test(
-            SuccessorRequest {
-                ticket: b"birth-nonce",
-                expected,
-            },
-            bytes,
-        )
-        .unwrap();
-        let digests = MappedSuccessorVerifiedDigests::from(&verified);
-        assert_eq!(digests.state(), verified.expected().state);
-        assert_eq!(digests.ticket(), verified.ticket_digest());
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        peer.set_write_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        let peer_config = config.clone();
+        let peer_thread = std::thread::spawn(move || {
+            let mut header = [0_u8; 4];
+            peer.read_exact(&mut header).unwrap();
+            let mut request = vec![0_u8; u32::from_be_bytes(header) as usize];
+            peer.read_exact(&mut request).unwrap();
+            let mut ack = Vec::from(*b"RVSUCCAK");
+            ack.extend_from_slice(&1_u16.to_be_bytes());
+            ack.extend_from_slice(&expected.config);
+            ack.extend_from_slice(&expected.state);
+            ack.extend_from_slice(&config_digest(b"birth-nonce"));
+            for payload in [&ack, &peer_config, &state_bytes.to_vec()] {
+                peer.write_all(&(payload.len() as u32).to_be_bytes())
+                    .unwrap();
+                peer.write_all(payload).unwrap();
+            }
+            peer.flush().unwrap();
+        });
+        let client =
+            BlockingRpcClient::<FidelityGlobal, UnixStream>::successor_from_connected_stream(
+                stream,
+                reverie::Tid::from_raw(17),
+                SuccessorRequest {
+                    ticket: b"birth-nonce",
+                    expected,
+                },
+            )
+            .unwrap();
+        peer_thread.join().unwrap();
+        let digests = MappedSuccessorVerifiedDigests::from(client.state());
+        assert_eq!(digests.state(), client.state().expected().state);
+        assert_eq!(digests.ticket(), client.state().ticket_digest());
         assert_eq!(digests.ticket(), config_digest(b"birth-nonce"));
         assert_ne!(digests.ticket(), [0; 32]);
     }
@@ -1978,6 +2022,47 @@ mod mapped_successor_binding_tests {
         assert_eq!(
             error.to_string(),
             "mapped successor packet config digest mismatch"
+        );
+        assert!(!published.get());
+
+        let error = publish_after_mapped_successor_binding(
+            client_config_digest,
+            packet_config,
+            packet_state,
+            packet_ticket,
+            &MappedSuccessorVerifiedDigests {
+                state: [0x44; 32],
+                ..verified
+            },
+            || {
+                published.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "mapped successor packet state digest mismatch"
+        );
+        assert!(!published.get());
+
+        let (_, wrong_ticket_digest) =
+            mapped_successor_binding_digests(&config, b"wrong-nonce").unwrap();
+        let error = publish_after_mapped_successor_binding(
+            client_config_digest,
+            packet_config,
+            packet_state,
+            wrong_ticket_digest,
+            &verified,
+            || {
+                published.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "mapped successor packet ticket digest mismatch"
         );
         assert!(!published.get());
 
