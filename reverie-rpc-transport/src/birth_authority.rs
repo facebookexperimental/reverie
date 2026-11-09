@@ -4,7 +4,7 @@
  * This source code is licensed under the BSD-style license found in LICENSE.
  */
 
-//! One-agent-day D1/D3 spike: one serialized per-birth authority.
+//! One serialized per-birth authority for the successor-v1 carrier.
 //!
 //! This module combines, under one mutex, the one-use InitialImage
 //! fact, the predecessor's one-slot snapshot mailbox, and the
@@ -14,12 +14,14 @@
 //! seal, mark, issue, complete, watch death, and close resolution
 //! are host-side methods on the authority.
 //!
-//! Scalar-5 claim scope for this spike: this implements the
-//! transport authority consumed through the existing RpcServer
-//! native-image hooks and a synchronous stage service whose birth
-//! key is supplied by the server from its admitted connection. The
-//! launcher supervisor that reports the kernel stop and the mapped
-//! selected-construction seam remain their existing owners.
+//! Claim scope: this implements the transport authority consumed
+//! through the RpcServer native-image hooks (see
+//! `RpcServer::set_birth_authority`) and the stage service whose
+//! birth key is supplied by the server from its admitted
+//! connection. The launcher supervisor that reports the kernel
+//! stop and the mapped selected-construction seam remain their
+//! existing owners; until a host records the initial image as
+//! consumed, staging refuses fail-closed.
 
 use std::io;
 use std::io::Read;
@@ -58,7 +60,11 @@ pub const EXEC_BOUNDARY_RUNTIME_LEN: usize = 128;
 const RUNTIME_MAGIC: &[u8; 8] = b"RVEXBD01";
 const RUNTIME_VERSION: u16 = 1;
 const RUNTIME_FLAG_KERNEL_STOP: u32 = 1;
-const MAX_STAGE_FRAME_LEN: usize = MAX_STATE_BYTES + 4096;
+/// Largest accepted stage frame: one framed snapshot plus its
+/// request envelope. The birth-authority server route reads its
+/// first frame at this bound; other servers keep the native
+/// control bound.
+pub const MAX_STAGE_FRAME_LEN: usize = MAX_STATE_BYTES + 4096;
 
 /// Frame `ExecState` bytes as `[u32 LE len][bytes]`, enforcing the
 /// combined budget at capture/stage time with `E2BIG`.
@@ -823,6 +829,37 @@ impl<S: Read + Write> StageClient<S> {
     }
 }
 
+/// Handle one already-read stage payload and return the encoded
+/// response payload. The decode is exact and bounded: a malformed
+/// or trailing-byte payload is an `Err` before any mailbox
+/// mutation, never a clean close. Authority refusals are encoded
+/// as [`StageResponse::Refused`] inside the `Ok` payload.
+/// `admitted` is server-derived from the accepted connection;
+/// frames carry no birth key.
+pub fn handle_stage_request(
+    payload: &[u8],
+    authority: &BirthAuthority,
+    admitted: Admitted,
+) -> io::Result<Vec<u8>> {
+    let request: StageRequest =
+        crate::codec::decode_exact_bounded::<StageRequest, MAX_STAGE_FRAME_LEN>(payload).map_err(
+            |_| io::Error::new(io::ErrorKind::InvalidData, "stage request decode refused"),
+        )?;
+    let response = match request {
+        StageRequest::StageSnapshot { framed_tool } => {
+            match authority.stage_snapshot(admitted, framed_tool) {
+                Ok(()) => StageResponse::Unit,
+                Err(error) => StageResponse::Refused(error),
+            }
+        }
+        StageRequest::Invalidate => match authority.invalidate_mailbox(admitted) {
+            Ok(()) => StageResponse::Unit,
+            Err(error) => StageResponse::Refused(error),
+        },
+    };
+    codec_encode(&response).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "stage encode"))
+}
+
 /// Serve stage requests until EOF. `admitted` is supplied only by
 /// the server that admitted this connection; frames carry no key.
 pub fn serve_stage_snapshot(
@@ -836,24 +873,7 @@ pub fn serve_stage_snapshot(
             Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(error) => return Err(error),
         };
-        let request: StageRequest = match codec_decode(&payload) {
-            Ok(request) => request,
-            Err(_) => return Ok(()),
-        };
-        let response = match request {
-            StageRequest::StageSnapshot { framed_tool } => {
-                match authority.stage_snapshot(admitted, framed_tool) {
-                    Ok(()) => StageResponse::Unit,
-                    Err(error) => StageResponse::Refused(error),
-                }
-            }
-            StageRequest::Invalidate => match authority.invalidate_mailbox(admitted) {
-                Ok(()) => StageResponse::Unit,
-                Err(error) => StageResponse::Refused(error),
-            },
-        };
-        let payload = codec_encode(&response)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "stage encode"))?;
+        let payload = handle_stage_request(&payload, authority, admitted)?;
         write_stage_frame(&mut stream, &payload)?;
     }
 }
@@ -965,5 +985,73 @@ mod tests {
         .unwrap();
         assert_eq!(decoded, b"exec-state-bytes");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    fn test_authority() -> (BirthAuthority, Admitted) {
+        let admitted = Admitted { process_id: 4242 };
+        (
+            BirthAuthority::new(admitted, [3u8; 32], b"initial-only".to_vec(), [7u8; 32]).unwrap(),
+            admitted,
+        )
+    }
+
+    #[test]
+    fn stage_payloads_cannot_collide_with_native_magics() {
+        for request in [
+            StageRequest::StageSnapshot {
+                framed_tool: vec![0x52; 64],
+            },
+            StageRequest::Invalidate,
+        ] {
+            let payload = codec_encode(&request).unwrap();
+            assert!(payload[0] <= 1, "variant index byte, got {:#x}", payload[0]);
+            assert!(!payload.starts_with(&crate::initial_image::REQUEST_MAGIC));
+            assert!(!payload.starts_with(&crate::successor::REQUEST_MAGIC));
+        }
+    }
+
+    #[test]
+    fn handle_stage_request_is_exact_and_refuses_before_initial() {
+        let (authority, admitted) = test_authority();
+        let framed = frame_tool_state(b"unit-state").unwrap();
+        let payload = codec_encode(&StageRequest::StageSnapshot {
+            framed_tool: framed.clone(),
+        })
+        .unwrap();
+
+        // Before the initial image is consumed, staging refuses
+        // fail-closed inside an encoded Refused response.
+        let response = handle_stage_request(&payload, &authority, admitted).unwrap();
+        assert!(matches!(
+            codec_decode::<StageResponse>(&response).unwrap(),
+            StageResponse::Refused(ExecControlError::Transition)
+        ));
+
+        // Trailing bytes and garbage are errors, never clean closes.
+        let mut trailing = payload.clone();
+        trailing.push(0xAB);
+        assert!(handle_stage_request(&trailing, &authority, admitted).is_err());
+        assert!(handle_stage_request(b"not-a-stage-frame", &authority, admitted).is_err());
+
+        // Wrong birth refuses by identity before any mutation.
+        let wrong = Admitted { process_id: 4243 };
+        let response = handle_stage_request(&payload, &authority, wrong).unwrap();
+        assert!(matches!(
+            codec_decode::<StageResponse>(&response).unwrap(),
+            StageResponse::Refused(ExecControlError::Identity)
+        ));
+
+        authority.record_initial_consumed(admitted).unwrap();
+        let response = handle_stage_request(&payload, &authority, admitted).unwrap();
+        assert!(matches!(
+            codec_decode::<StageResponse>(&response).unwrap(),
+            StageResponse::Unit
+        ));
+        let invalidate = codec_encode(&StageRequest::Invalidate).unwrap();
+        let response = handle_stage_request(&invalidate, &authority, admitted).unwrap();
+        assert!(matches!(
+            codec_decode::<StageResponse>(&response).unwrap(),
+            StageResponse::Unit
+        ));
     }
 }

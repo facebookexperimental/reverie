@@ -211,6 +211,7 @@ pub struct RpcServer<G: GlobalTool> {
     identify_connections: bool,
     initial_image: Option<InitialImageSetup>,
     native_successor: Option<Arc<dyn SuccessorAdmission>>,
+    birth_authority: Option<Arc<crate::birth_authority::BirthAuthority>>,
     mapping_capture: Option<reverie::MappingCaptureRun>,
     tool_activation: Option<ActivationRun>,
 }
@@ -705,6 +706,7 @@ where
             identify_connections: false,
             initial_image: None,
             native_successor: None,
+            birth_authority: None,
             mapping_capture: None,
             tool_activation: None,
         })
@@ -749,6 +751,7 @@ where
             identify_connections: false,
             initial_image: None,
             native_successor: None,
+            birth_authority: None,
             mapping_capture: None,
             tool_activation: None,
         })
@@ -872,6 +875,7 @@ where
             identify_connections: false,
             initial_image: None,
             native_successor: None,
+            birth_authority: None,
             mapping_capture: None,
             tool_activation: None,
         })
@@ -971,6 +975,7 @@ where
             config_bytes: Arc::new(encode(&self.config)?),
         });
         self.native_successor = None;
+        self.birth_authority = None;
         Ok(())
     }
 
@@ -988,6 +993,33 @@ where
     ) -> Result<(), RpcError> {
         self.set_initial_image_admission(initial)?;
         self.native_successor = Some(successor);
+        Ok(())
+    }
+
+    /// Install the one serialized per-birth authority as this
+    /// server's InitialImage and successor admission, and enable
+    /// stage first-frame routing for its birth.
+    ///
+    /// This makes the server a **one-birth server for the launch
+    /// lifetime**: the authority is keyed to a single watched
+    /// process, and connections admitted for any other birth are
+    /// refused by name by the authority's identity checks. The
+    /// caller constructs the authority from the same watched
+    /// `Admitted`, this server's config digest, and the exact
+    /// initial redemption bytes it issued for the first image;
+    /// on the mapped first-image route (no InitialImage RPC) the
+    /// host instead calls `BirthAuthority::record_initial_consumed`
+    /// exactly once after verified first-image admission (owned
+    /// by the exec-stop supervisor bridge). Until one of those
+    /// happens, staging refuses fail-closed. Replaces any
+    /// previously installed image admission. No guest-reachable
+    /// exec-control surface is wired by this call.
+    pub fn set_birth_authority(
+        &mut self,
+        authority: Arc<crate::birth_authority::BirthAuthority>,
+    ) -> Result<(), RpcError> {
+        self.set_native_image_admission(authority.clone(), authority.clone())?;
+        self.birth_authority = Some(authority);
         Ok(())
     }
 
@@ -1124,6 +1156,7 @@ where
                 let identify_connections = self.identify_connections;
                 let initial_image = self.initial_image.clone();
                 let native_successor = self.native_successor.clone();
+                let birth_authority = self.birth_authority.clone();
                 let request_cancellation = cancellation.clone();
                 let mapping_capture = self.mapping_capture.clone();
                 let activation_run = self.tool_activation.clone();
@@ -1137,30 +1170,42 @@ where
                             let admitted = admit_connection(admission.as_ref(), &stream)?;
                             let identity = identify_connection(identify_connections, &stream)?;
                             let cancellation = request_cancellation.map(|cancel| (connection, cancel));
+                            let mut stage_served = false;
                             let config_bytes = match initial_image {
-                                Some(hook) => Some(connection_io(
+                                Some(hook) => match connection_io(
                                     image_handshake(&mut stream, admitted, &hook,
-                                        native_successor.as_deref()),
-                                    admitted, cancellation.as_ref()).await?),
+                                        native_successor.as_deref(),
+                                        birth_authority.as_deref()),
+                                    admitted, cancellation.as_ref()).await? {
+                                    ImageHandshake::Frames(frames) => Some(frames),
+                                    ImageHandshake::StageServed => {
+                                        stage_served = true;
+                                        None
+                                    }
+                                },
                                 None => None,
                             };
-                            serve_connection_owned(
-                                global,
-                                config,
-                                stream,
-                                ConnectionSetup {
-                                    readiness,
-                                    connection_readiness,
-                                    admitted,
-                                    identity,
-                                    handshake: config_bytes,
-                                    native_close: native_successor,
-                                    cancellation,
-                                    mapping_capture,
-                                    tool_activation,
-                                },
-                            )
-                            .await
+                            if stage_served {
+                                Ok(())
+                            } else {
+                                serve_connection_owned(
+                                    global,
+                                    config,
+                                    stream,
+                                    ConnectionSetup {
+                                        readiness,
+                                        connection_readiness,
+                                        admitted,
+                                        identity,
+                                        handshake: config_bytes,
+                                        native_close: native_successor,
+                                        cancellation,
+                                        mapping_capture,
+                                        tool_activation,
+                                    },
+                                )
+                                .await
+                            }
                         }.await;
                         if result.is_err() {
                             if let Some(run) = &activation_run {
@@ -1243,35 +1288,46 @@ where
             let admitted = admit_connection(self.admission.as_ref(), &stream)?;
             let identity = identify_connection(self.identify_connections, &stream)?;
             let config = self.config.clone();
+            let mut stage_served = false;
             let config_bytes = match &self.initial_image {
-                Some(hook) => Some(
-                    image_handshake(
-                        &mut stream,
-                        admitted,
-                        hook,
-                        self.native_successor.as_deref(),
-                    )
-                    .await?,
-                ),
+                Some(hook) => match image_handshake(
+                    &mut stream,
+                    admitted,
+                    hook,
+                    self.native_successor.as_deref(),
+                    self.birth_authority.as_deref(),
+                )
+                .await?
+                {
+                    ImageHandshake::Frames(frames) => Some(frames),
+                    ImageHandshake::StageServed => {
+                        stage_served = true;
+                        None
+                    }
+                },
                 None => None,
             };
-            serve_connection_inner(
-                self.global.clone(),
-                config,
-                stream,
-                ConnectionSetup {
-                    readiness: self.readiness.clone(),
-                    connection_readiness: self.connection_readiness.clone(),
-                    admitted,
-                    identity,
-                    handshake: config_bytes,
-                    native_close: self.native_successor.clone(),
-                    cancellation: None,
-                    mapping_capture,
-                    tool_activation,
-                },
-            )
-            .await
+            if stage_served {
+                Ok(())
+            } else {
+                serve_connection_inner(
+                    self.global.clone(),
+                    config,
+                    stream,
+                    ConnectionSetup {
+                        readiness: self.readiness.clone(),
+                        connection_readiness: self.connection_readiness.clone(),
+                        admitted,
+                        identity,
+                        handshake: config_bytes,
+                        native_close: self.native_successor.clone(),
+                        cancellation: None,
+                        mapping_capture,
+                        tool_activation,
+                    },
+                )
+                .await
+            }
         }
         .await;
         if result.is_err() {
@@ -1351,14 +1407,23 @@ where
 
 /// Admission has already installed the normal process watch. A second pidfd
 /// comes from this exact socket; the watcher continues owning its first one.
+/// Outcome of the native-image first-frame exchange: either the
+/// connection proceeds as an RPC connection with these frames, or
+/// it was a stage connection that has been fully served.
+enum ImageHandshake {
+    Frames(HandshakeFrames),
+    StageServed,
+}
+
 async fn image_handshake(
     stream: &mut UnixStream,
     admitted: Option<Admitted>,
     initial: &InitialImageSetup,
     successor: Option<&dyn SuccessorAdmission>,
-) -> Result<HandshakeFrames, RpcError> {
+    birth_authority: Option<&crate::birth_authority::BirthAuthority>,
+) -> Result<ImageHandshake, RpcError> {
     let Some(successor) = successor else {
-        return Ok(HandshakeFrames {
+        return Ok(ImageHandshake::Frames(HandshakeFrames {
             config: initial_image_handshake(
                 stream,
                 admitted,
@@ -1369,18 +1434,50 @@ async fn image_handshake(
             successor_state: None,
             strict_sender: false,
             native_image: None,
-        });
+        }));
     };
     let admitted = admitted.ok_or_else(|| {
         crate::successor::invalid("native image connection has no watched process admission")
     })?;
     let peer = peer_pidfd(stream)?;
-    let request = read_message(stream, crate::successor::MAX_CONTROL_LEN)
+    // Only the birth-authority route reads its first frame at the
+    // stage bound; every other server keeps the native control
+    // bound and behavior unchanged.
+    let first_bound = if birth_authority.is_some() {
+        crate::birth_authority::MAX_STAGE_FRAME_LEN
+    } else {
+        crate::successor::MAX_CONTROL_LEN
+    };
+    let request = read_message(stream, first_bound)
         .await
         .map_err(|error| match error {
             RpcError::Closed => crate::successor::invalid("native image redemption is missing"),
             other => other,
         })?;
+    // Classification is by exact native magic first. A malformed
+    // frame bearing either magic stays in its native decoder and
+    // refuses there; it is never rerouted to staging. Only a
+    // payload with neither magic may be a stage frame, and stage
+    // payloads cannot collide with either magic: their bincode
+    // enum encoding starts with the variant index byte (0 or 1),
+    // never `R`.
+    if !request.starts_with(&crate::initial_image::REQUEST_MAGIC)
+        && !request.starts_with(&crate::successor::REQUEST_MAGIC)
+        && birth_authority.is_some()
+    {
+        let authority = birth_authority.unwrap();
+        let mut payload = request;
+        loop {
+            let response =
+                crate::birth_authority::handle_stage_request(&payload, authority, admitted)?;
+            write_message(stream, &response).await?;
+            match read_message(stream, crate::birth_authority::MAX_STAGE_FRAME_LEN).await {
+                Ok(next) => payload = next,
+                Err(RpcError::Closed) => return Ok(ImageHandshake::StageServed),
+                Err(error) => return Err(error),
+            }
+        }
+    }
     let digest = crate::initial_image::config_digest(&initial.config_bytes);
     let (successor_state, native_image) =
         if request.starts_with(&crate::initial_image::REQUEST_MAGIC) {
@@ -1409,12 +1506,12 @@ async fn image_handshake(
                 },
             )
         };
-    Ok(HandshakeFrames {
+    Ok(ImageHandshake::Frames(HandshakeFrames {
         config: initial.config_bytes.clone(),
         successor_state,
         strict_sender: true,
         native_image: Some(native_image),
-    })
+    }))
 }
 
 async fn initial_image_handshake(

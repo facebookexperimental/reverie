@@ -32,7 +32,6 @@ use reverie_rpc_transport::birth_authority::BirthAuthority;
 use reverie_rpc_transport::birth_authority::StageClient;
 use reverie_rpc_transport::birth_authority::StampedPacket;
 use reverie_rpc_transport::birth_authority::frame_tool_state;
-use reverie_rpc_transport::birth_authority::serve_stage_snapshot;
 use reverie_rpc_transport::birth_authority::verify_and_split_runtime;
 use reverie_rpc_transport::codec::encode;
 use reverie_rpc_transport::exec_ticket::ExecControlError;
@@ -429,9 +428,7 @@ async fn scalar_stream_initial_stage_stop_successor_end_to_end() {
     let mut server = RpcServer::bind(&path.0, global.clone(), CONFIG.to_owned()).unwrap();
     server.set_connection_admission(Arc::new(Watch)).unwrap();
     let issues = server.retain_connection_issues();
-    server
-        .set_native_image_admission(authority.clone(), authority.clone())
-        .unwrap();
+    server.set_birth_authority(authority.clone()).unwrap();
     let serve = tokio::spawn(async move { server.serve().await });
 
     let client_authority = authority.clone();
@@ -449,19 +446,14 @@ async fn scalar_stream_initial_stage_stop_successor_end_to_end() {
         assert_eq!(initial.config(), CONFIG);
         assert_eq!(initial.try_send_rpc(1).unwrap(), 2);
 
-        // Stage-only RPC over a separate admitted sync stream. The
+        // Stage-only RPC over a fresh accepted connection to the
+        // same coordinator endpoint, routed by first frame. The
         // client object exposes no seal/mark/issue operation.
-        let (guest_stream, host_stream) = UnixStream::pair().unwrap();
-        let stage_authority = client_authority.clone();
-        let stage_server = std::thread::spawn(move || {
-            serve_stage_snapshot(host_stream, &stage_authority, admitted())
-        });
-        let mut stage = StageClient::new(guest_stream);
+        let mut stage = StageClient::new(UnixStream::connect(&client_path).unwrap());
         stage
             .stage_snapshot(frame_tool_state(b"scalar-stream-state").unwrap())
             .unwrap();
         drop(stage);
-        stage_server.join().unwrap().unwrap();
 
         // Host-side stop sequence (same test process stands in for the
         // watched birth; the pidfd and Admitted are real).
@@ -517,5 +509,245 @@ async fn scalar_stream_initial_stage_stop_successor_end_to_end() {
         "issues={:?}",
         issues.snapshot()
     );
+    serve.abort();
+}
+
+fn raw_write_frame(stream: &mut UnixStream, payload: &[u8]) {
+    use std::io::Write;
+    stream
+        .write_all(&(payload.len() as u32).to_be_bytes())
+        .unwrap();
+    stream.write_all(payload).unwrap();
+    stream.flush().unwrap();
+}
+
+/// The server must close this connection without any response frame.
+fn assert_raw_refused(path: &PathBuf, payload: &[u8]) {
+    use std::io::Read;
+    let mut stream = UnixStream::connect(path).unwrap();
+    stream.set_read_timeout(Some(WAIT)).unwrap();
+    raw_write_frame(&mut stream, payload);
+    let mut header = [0_u8; 4];
+    assert!(
+        stream.read_exact(&mut header).is_err(),
+        "refused frame unexpectedly got a response"
+    );
+}
+
+/// Capture the exact payload bytes `StageClient` sends for one
+/// stage attempt, by acting as its peer and then closing.
+fn capture_stage_payload(framed: Vec<u8>) -> Vec<u8> {
+    use std::io::Read;
+    let (guest, mut peer) = UnixStream::pair().unwrap();
+    let client = std::thread::spawn(move || {
+        let mut stage = StageClient::new(guest);
+        let _ = stage.stage_snapshot(framed);
+    });
+    let mut header = [0_u8; 4];
+    peer.read_exact(&mut header).unwrap();
+    let mut payload = vec![0_u8; u32::from_be_bytes(header) as usize];
+    peer.read_exact(&mut payload).unwrap();
+    drop(peer);
+    let _ = client.join();
+    payload
+}
+
+fn authority_server(path: &SocketPath, authority: &Arc<BirthAuthority>) -> RpcServer<Echo> {
+    let mut server =
+        RpcServer::bind(&path.0, Arc::new(Echo::default()), CONFIG.to_owned()).unwrap();
+    server.set_connection_admission(Arc::new(Watch)).unwrap();
+    server.retain_connection_issues();
+    server.set_birth_authority(authority.clone()).unwrap();
+    server
+}
+
+#[tokio::test]
+async fn stage_routing_through_authority_server() {
+    let path = SocketPath::new();
+    let authority = make_authority();
+    let mut server = authority_server(&path, &authority);
+    let issues = server.retain_connection_issues();
+    let serve = tokio::spawn(async move { server.serve().await });
+
+    let client_authority = authority.clone();
+    let client_path = path.0.clone();
+    let client = tokio::task::spawn_blocking(move || {
+        let tid = Tid::from_raw(pid());
+        // Stage before the initial image is consumed refuses
+        // fail-closed with the exact Transition error.
+        let mut stage = StageClient::new(UnixStream::connect(&client_path).unwrap());
+        assert!(matches!(
+            stage.stage_snapshot(frame_tool_state(b"early-state").unwrap()),
+            Err(ExecControlError::Transition)
+        ));
+        drop(stage);
+
+        // The valid Initial handshake is preserved on this route.
+        let initial = BlockingRpcClient::<Echo>::connect_initial_image(
+            &client_path,
+            tid,
+            b"initial-only",
+            config_digest_value(),
+        )
+        .unwrap()
+        .into_client();
+        assert_eq!(initial.config(), CONFIG);
+        assert_eq!(initial.try_send_rpc(1).unwrap(), 2);
+
+        // A stage frame larger than the native 4096 control bound
+        // is accepted on the authority route.
+        let big_state = vec![0x5A_u8; 6000];
+        let mut stage = StageClient::new(UnixStream::connect(&client_path).unwrap());
+        stage
+            .stage_snapshot(frame_tool_state(&big_state).unwrap())
+            .unwrap();
+        drop(stage);
+
+        // Malformed frames bearing either native magic refuse in
+        // their native decoders and never reach staging.
+        assert_raw_refused(&client_path, b"RVINITRQgarbage");
+        assert_raw_refused(&client_path, b"RVSUCCRQgarbage");
+        // A trailing byte after an otherwise valid stage payload
+        // refuses by exact decode, also without a response.
+        let mut trailing = capture_stage_payload(frame_tool_state(b"small-state").unwrap());
+        trailing.push(0xAB);
+        assert_raw_refused(&client_path, &trailing);
+
+        // The mailbox still holds exactly the big snapshot: issue
+        // and redeem it through the valid Successor handshake.
+        let captured = Arc::new(Mutex::new(None));
+        let stop = client_authority
+            .record_successor_stop(admitted(), &own_pidfd())
+            .unwrap();
+        let expected = client_authority
+            .at_successor_stop(stop, stamp_packet(&captured))
+            .unwrap();
+        let ticket = captured.lock().unwrap().unwrap();
+        let successor = BlockingRpcClient::<Echo>::connect_successor(
+            &client_path,
+            tid,
+            SuccessorRequest {
+                ticket: &ticket.0,
+                expected,
+            },
+        )
+        .unwrap();
+        let (_runtime, tool) = verify_and_split_runtime(
+            successor.state().bytes(),
+            config_digest_value(),
+            successor.state().ticket_digest(),
+        )
+        .unwrap();
+        assert_eq!(&tool[4..], &big_state[..]);
+        let (client, _verified) = successor.into_parts();
+        assert_eq!(client.try_send_rpc(4).unwrap(), 5);
+        client_authority.complete(ticket).unwrap();
+        drop(client);
+        drop(initial);
+        for _ in 0..200 {
+            if client_authority.accepted_eof_count() >= 2
+                && client_authority.pending_eof_count() == 0
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(client_authority.pending_eof_count(), 0);
+        assert_eq!(client_authority.accepted_eof_count(), 2);
+        client_authority.finish().unwrap();
+    });
+    match tokio::time::timeout(WAIT, client).await {
+        Ok(Ok(())) => {}
+        other => panic!("client failed: {other:?}; issues={:?}", issues.snapshot()),
+    }
+    // Exactly the two malformed-magic connections and the
+    // trailing-byte connection are recorded failures; stage and
+    // native handshakes complete cleanly.
+    assert_eq!(issues.snapshot().len(), 3, "issues={:?}", issues.snapshot());
+    serve.abort();
+}
+
+#[tokio::test]
+async fn stage_refused_without_birth_authority() {
+    let path = SocketPath::new();
+    let authority = make_authority();
+    let mut server =
+        RpcServer::bind(&path.0, Arc::new(Echo::default()), CONFIG.to_owned()).unwrap();
+    server.set_connection_admission(Arc::new(Watch)).unwrap();
+    server.retain_connection_issues();
+    // Same hooks, but installed without stage routing.
+    server
+        .set_native_image_admission(authority.clone(), authority.clone())
+        .unwrap();
+    let serve = tokio::spawn(async move { server.serve().await });
+
+    let client_authority = authority.clone();
+    let client_path = path.0.clone();
+    let client = tokio::task::spawn_blocking(move || {
+        let tid = Tid::from_raw(pid());
+        let initial = BlockingRpcClient::<Echo>::connect_initial_image(
+            &client_path,
+            tid,
+            b"initial-only",
+            config_digest_value(),
+        )
+        .unwrap()
+        .into_client();
+        assert_eq!(initial.try_send_rpc(1).unwrap(), 2);
+        let mut stage = StageClient::new(UnixStream::connect(&client_path).unwrap());
+        assert!(
+            stage
+                .stage_snapshot(frame_tool_state(&vec![0x5A_u8; 6000]).unwrap())
+                .is_err(),
+            "stage frame must refuse without the authority route"
+        );
+        drop(stage);
+        drop(initial);
+        // Nothing was staged: issue at a recorded stop is Unavailable.
+        let captured = Arc::new(Mutex::new(None));
+        let stop = client_authority
+            .record_successor_stop(admitted(), &own_pidfd())
+            .unwrap();
+        assert!(matches!(
+            client_authority.at_successor_stop(stop, stamp_packet(&captured)),
+            Err(ExecControlError::Unavailable)
+        ));
+    });
+    match tokio::time::timeout(WAIT, client).await {
+        Ok(Ok(())) => {}
+        other => panic!("client failed: {other:?}"),
+    }
+    serve.abort();
+}
+
+#[tokio::test]
+async fn wrong_birth_stage_refuses_identity() {
+    let path = SocketPath::new();
+    let authority = Arc::new(
+        BirthAuthority::new(
+            Admitted {
+                process_id: pid() + 1,
+            },
+            config_digest_value(),
+            b"initial-only".to_vec(),
+            [7u8; 32],
+        )
+        .unwrap(),
+    );
+    let server = authority_server(&path, &authority);
+    let serve = tokio::spawn(async move { server.serve().await });
+
+    let client_path = path.0.clone();
+    let client = tokio::task::spawn_blocking(move || {
+        let mut stage = StageClient::new(UnixStream::connect(&client_path).unwrap());
+        assert!(matches!(
+            stage.stage_snapshot(frame_tool_state(b"wrong-birth").unwrap()),
+            Err(ExecControlError::Identity)
+        ));
+    });
+    match tokio::time::timeout(WAIT, client).await {
+        Ok(Ok(())) => {}
+        other => panic!("client failed: {other:?}"),
+    }
     serve.abort();
 }
