@@ -147,6 +147,163 @@ fn validation_dag_checks_the_reverie_ptrace_library_for_aarch64() {
     assert_eq!(step["hint"]["resources"]["cargo-build"], 1);
 }
 
+const AARCH64_COUNTS_RUNNER: &str = include_str!("../../scripts/run-liteinst-aarch64-counts.py");
+const AARCH64_COUNTS_MANIFEST: &str = include_str!("../../scripts/liteinst-aarch64-counts.json");
+
+#[test]
+fn liteinst_aarch64_counting_runner_pins_every_target() {
+    let manifest: serde_json::Value = serde_json::from_str(AARCH64_COUNTS_MANIFEST)
+        .expect("LiteInst aarch64 counts manifest must be valid JSON");
+    assert_eq!(manifest["schema_version"], 1);
+    assert_eq!(manifest["qemu"]["cpu"], "cortex-a72");
+    assert_eq!(manifest["qemu"]["target"], "aarch64-unknown-linux-musl");
+    assert_eq!(manifest["qemu"]["page_size"], 4096);
+    assert_eq!(manifest["native"]["host"], "devbig015");
+    assert_eq!(manifest["native"]["page_size"], 65536);
+    assert_eq!(manifest["native"]["counts_status"], "pinned");
+    assert_eq!(manifest["x86_64_reference"]["listed"], 2680);
+    assert_eq!(manifest["x86_64_reference"]["ignored"], 2);
+    assert_eq!(manifest["x86_64_reference"]["deduplicated_listed"], 993);
+    assert_eq!(manifest["x86_64_reference"]["deduplicated_ignored"], 2);
+    assert_eq!(
+        manifest["rust_toolchain"]["targets"],
+        serde_json::json!(["aarch64-unknown-linux-gnu", "aarch64-unknown-linux-musl"])
+    );
+    for required in [
+        "QEMU_CPU",
+        "refusing to skip",
+        "validate_inventory",
+        "parse_logfile",
+        "--require-pass",
+        "--mode",
+        "--allow-unpinned-native",
+        "--prebuilt-target-dir",
+        "load_artifacts",
+        "run_x86_reference",
+        "deduplicated_listed",
+        "source_identity",
+        "workspace_root",
+        "target_root",
+        "file_sha256",
+        "sha256 mismatch",
+        "runner host checkout is dirty",
+        "source identity changed during the build",
+        "producing_mode",
+        "validate_name_lists",
+        "--keep-going",
+        "guest_executables",
+        "changed during the run",
+        "the producing run did not build",
+        "totals_validated",
+        "compile-blocked",
+        "compile-refused-package",
+    ] {
+        assert!(
+            AARCH64_COUNTS_RUNNER.contains(required),
+            "aarch64 counting runner must contain {required}"
+        );
+    }
+
+    let packages = manifest["packages"]
+        .as_array()
+        .expect("manifest must declare packages");
+    let package_names: Vec<_> = packages
+        .iter()
+        .map(|package| package["name"].clone())
+        .collect();
+    assert_eq!(
+        package_names,
+        serde_json::json!([
+            "reverie-liteinst",
+            "reverie-liteinst-artifact",
+            "reverie-liteinst-preload"
+        ])
+        .as_array()
+        .unwrap()
+        .clone()
+    );
+
+    let count = |targets: &[serde_json::Value], arch: &str, key: &str| {
+        targets
+            .iter()
+            .map(|target| target[arch][key].as_u64().unwrap())
+            .sum::<u64>()
+    };
+    let mut targets = Vec::new();
+    let mut dispositions = std::collections::BTreeMap::<String, u64>::new();
+    for package in packages {
+        for target in package["targets"].as_array().unwrap() {
+            *dispositions
+                .entry(target["disposition"].as_str().unwrap().to_string())
+                .or_default() += 1;
+            if target["disposition"] == "qemu" {
+                let native = &target["native"];
+                assert_eq!(
+                    native["listed"].as_u64().unwrap(),
+                    native["passed"].as_u64().unwrap()
+                        + native["failed"].as_u64().unwrap()
+                        + native["ignored"].as_u64().unwrap(),
+                    "{}:{} native counts must sum to listed",
+                    package["name"],
+                    target["name"]
+                );
+                assert_eq!(
+                    native["failed_tests"].as_array().unwrap().len() as u64,
+                    native["failed"].as_u64().unwrap()
+                );
+                let aarch64 = &target["aarch64"];
+                assert_eq!(
+                    aarch64["listed"].as_u64().unwrap(),
+                    aarch64["passed"].as_u64().unwrap()
+                        + aarch64["failed"].as_u64().unwrap()
+                        + aarch64["ignored"].as_u64().unwrap(),
+                    "{}:{} aarch64 counts must sum to listed",
+                    package["name"],
+                    target["name"]
+                );
+                assert_eq!(
+                    aarch64["tests"].as_array().unwrap().len() as u64,
+                    aarch64["listed"].as_u64().unwrap()
+                );
+                assert_eq!(
+                    aarch64["failed_tests"].as_array().unwrap().len() as u64,
+                    aarch64["failed"].as_u64().unwrap()
+                );
+            } else {
+                assert!(
+                    target["compile_signatures"]
+                        .as_array()
+                        .is_some_and(|v| !v.is_empty()),
+                    "{}:{} non-qemu disposition needs a pinned signature",
+                    package["name"],
+                    target["name"]
+                );
+            }
+            targets.push(target.clone());
+        }
+    }
+    assert_eq!(targets.len(), 31);
+    assert_eq!(dispositions["qemu"], 18);
+    assert_eq!(dispositions["compile-blocked"], 10);
+    assert_eq!(dispositions["compile-refused-feature"], 1);
+    assert_eq!(dispositions["compile-refused-package"], 2);
+    assert_eq!(count(&targets, "x86_64", "listed"), 2680);
+    assert_eq!(count(&targets, "x86_64", "ignored"), 2);
+    assert_eq!(count(&targets, "aarch64", "listed"), 161);
+    assert_eq!(count(&targets, "aarch64", "passed"), 58);
+    assert_eq!(count(&targets, "aarch64", "failed"), 103);
+    assert_eq!(count(&targets, "aarch64", "ignored"), 0);
+    let qemu_targets: Vec<_> = targets
+        .iter()
+        .filter(|target| target["disposition"] == "qemu")
+        .cloned()
+        .collect();
+    assert_eq!(count(&qemu_targets, "native", "listed"), 161);
+    assert_eq!(count(&qemu_targets, "native", "passed"), 59);
+    assert_eq!(count(&qemu_targets, "native", "failed"), 102);
+    assert_eq!(count(&qemu_targets, "native", "ignored"), 0);
+}
+
 const WORKFLOW: &str = include_str!("../../.github/workflows/ci.yml");
 const CORE_MANIFEST: &str = include_str!("../../reverie-liteinst/Cargo.toml");
 const ALLOCATOR_TESTS: &str = include_str!("../../reverie-liteinst/tests/allocator_contract.rs");
