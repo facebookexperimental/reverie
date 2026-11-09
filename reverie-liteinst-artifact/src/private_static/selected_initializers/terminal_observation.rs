@@ -483,14 +483,17 @@ impl VerifiedStaticSource {
                 // The ELF header names the first-image entry for
                 // every consumer; a successor observation's root
                 // is joined by its exact symbol instead and must
-                // not be the header entry.
-                require(
-                    match generation {
-                        GenerationKind::First => elf.entry == root.address,
-                        GenerationKind::Successor => elf.entry != root.address,
-                    },
-                    "terminal root generation differs from actual e_entry",
-                )?;
+                // not be the header entry. The first-image text is
+                // the Detcore-only producer's, unchanged.
+                match generation {
+                    GenerationKind::First => {
+                        require(elf.entry == root.address, "terminal root is not actual e_entry")?
+                    }
+                    GenerationKind::Successor => require(
+                        elf.entry != root.address,
+                        "terminal successor root is actual e_entry",
+                    )?,
+                }
                 wrappers(&elf, &data, mapped, failed, terminal)?;
                 // Existing complete-page/source/member/map proof, not ordinary44's
                 // syscall ABI. The fixed native entry is page+124 in that exact page.

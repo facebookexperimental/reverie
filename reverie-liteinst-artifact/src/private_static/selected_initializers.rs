@@ -1774,8 +1774,6 @@ pub fn implementation_sha256() -> String {
     sha256(include_bytes!("selected_initializers.rs"))
 }
 
-/// Explicit file inputs for a fresh real link. These paths are inputs, not
-/// authority tuples. All byte/member/address facts are re-derived below.
 /// `--undefined` retention for every entry generation present
 /// in the consumer image, in first-then-successor order.
 fn entry_undefined_args(consumer: &MappedConsumerSource) -> Vec<String> {
@@ -1791,6 +1789,8 @@ fn elf_entry_arg(consumer: &MappedConsumerSource) -> String {
     format!("--entry={}", consumer.first.entry())
 }
 
+/// Explicit file inputs for a fresh real link. These paths are inputs, not
+/// authority tuples. All byte/member/address facts are re-derived below.
 pub struct InitializerLinkInputs<'a> {
     pub lld: &'a Path,
     pub script: &'a Path,
