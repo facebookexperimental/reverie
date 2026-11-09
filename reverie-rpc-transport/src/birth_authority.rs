@@ -1054,4 +1054,33 @@ mod tests {
             StageResponse::Unit
         ));
     }
+
+    #[test]
+    fn handle_stage_request_wrong_birth_invalidate_keeps_mailbox() {
+        let (authority, admitted) = test_authority();
+        authority.record_initial_consumed(admitted).unwrap();
+        let payload = codec_encode(&StageRequest::StageSnapshot {
+            framed_tool: frame_tool_state(b"wire-state").unwrap(),
+        })
+        .unwrap();
+        let response = handle_stage_request(&payload, &authority, admitted).unwrap();
+        assert!(matches!(
+            codec_decode::<StageResponse>(&response).unwrap(),
+            StageResponse::Unit
+        ));
+        assert!(authority.lock().mailbox.is_some());
+
+        // The wire Invalidate arm must act with the connection's
+        // server-derived Admitted, never the authority's own key:
+        // a wrong-birth invalidate refuses Identity and the staged
+        // snapshot survives.
+        let wrong = Admitted { process_id: 4243 };
+        let invalidate = codec_encode(&StageRequest::Invalidate).unwrap();
+        let response = handle_stage_request(&invalidate, &authority, wrong).unwrap();
+        assert!(matches!(
+            codec_decode::<StageResponse>(&response).unwrap(),
+            StageResponse::Refused(ExecControlError::Identity)
+        ));
+        assert!(authority.lock().mailbox.is_some());
+    }
 }
