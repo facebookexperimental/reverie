@@ -67394,9 +67394,36 @@ pub mod private_static {
         guard: Guard,
         cargo: FileIdentity,
         target_dir: PathBuf,
+        features: &'static [&'static str],
         metadata_sha256: String,
         archive_owner: Arc<ArchiveSourceOwner>,
     }
+    /// Target-dir rule by workspace binding kind. Hermit keeps
+    /// the sole canonical H/target rule; CargoGitRev requires a
+    /// canonical explicit target (already checked by caller)
+    /// with no workspace/target equality demand.
+    fn target_dir_accepted(
+        binding: selected_initializers::WorkspaceBinding,
+        workspace: &Path,
+        target_dir: &Path,
+    ) -> bool {
+        match binding {
+            selected_initializers::WorkspaceBinding::HermitGitlink { .. } => {
+                target_dir == workspace.join("target")
+            }
+            selected_initializers::WorkspaceBinding::CargoGitRev => target_dir.is_absolute(),
+        }
+    }
+
+    /// The root lockfile names the exact pinned Reverie git
+    /// source. A path-patched (source-less) Reverie package or
+    /// any other rev does not satisfy this.
+    fn cargo_git_rev_lock_accepts(lock_text: &str, pin: &str) -> bool {
+        lock_text.contains(&format!(
+            "source = \"git+https://github.com/rrnewton/reverie.git?rev={pin}#{pin}\""
+        ))
+    }
+
     impl VerifiedStaticSource {
         /// Metadata observation only; equal digests do not establish ownership.
         pub fn metadata_sha256(&self) -> &str {
@@ -67415,6 +67442,24 @@ pub mod private_static {
         /// path, including failure. The body cannot take ownership of this
         /// context or use it to construct a DSO source authority.
         pub fn with_resolved<T>(
+            expected: &SourceExpectation<'_>,
+            runner: &mut Runner,
+            body: impl FnOnce(&Self, &mut Runner) -> Result<T>,
+        ) -> Result<T> {
+            Self::with_resolved_for(
+                selected_initializers::MappedConsumer::Detcore,
+                expected,
+                runner,
+                body,
+            )
+        }
+
+        /// Consumer-selected form. The workspace binding kind
+        /// in the closed descriptor decides how the Reverie
+        /// source is bound; every other identity check reads
+        /// the same descriptor, never per-site literals.
+        pub fn with_resolved_for<T>(
+            consumer: selected_initializers::MappedConsumer,
             expected: &SourceExpectation<'_>,
             runner: &mut Runner,
             body: impl FnOnce(&Self, &mut Runner) -> Result<T>,
@@ -67446,25 +67491,25 @@ pub mod private_static {
                     format!("static compiler override forbidden: {key}"),
                 )?;
             }
+            // Package identity comes from the selected closed
+            // consumer descriptor, not per-site literals.
+            let consumer = consumer.source();
             require(
                 expected.target_dir.is_absolute()
                     && fs::canonicalize(expected.target_dir).map_err(|e| e.to_string())?
                         == expected.target_dir
-                    && expected.target_dir == expected.workspace.join("target"),
-                "static producer requires canonical sole H/target",
+                    && target_dir_accepted(
+                        consumer.binding(),
+                        expected.workspace,
+                        expected.target_dir,
+                    ),
+                "static producer requires canonical explicit target",
             )?;
-            // The Detcore source transaction is the only
-            // implemented workspace binding today; its package
-            // identity comes from the selected consumer
-            // descriptor, not per-site literals.
-            let consumer = selected_initializers::MappedConsumer::Detcore.source();
             let gitlink = match consumer.binding() {
                 selected_initializers::WorkspaceBinding::HermitGitlink {
                     reverie_gitlink_relative,
-                } => reverie_gitlink_relative,
-                selected_initializers::WorkspaceBinding::CargoGitRev => {
-                    return Err("static CargoGitRev workspace binding not yet implemented".into());
-                }
+                } => Some(reverie_gitlink_relative),
+                selected_initializers::WorkspaceBinding::CargoGitRev => None,
             };
             let mut guard = Guard {
                 roots: Vec::new(),
@@ -67473,20 +67518,22 @@ pub mod private_static {
             };
             let result = (|| {
                 guard.root(expected.workspace, expected.workspace_head, runner)?;
-                guard.root(
-                    &expected.workspace.join(gitlink),
-                    expected.reverie_pin,
-                    runner,
-                )?;
-                let link = runner.text(
-                    "git",
-                    &["--no-replace-objects", "ls-tree", "HEAD", "--", gitlink],
-                    expected.workspace,
-                )?;
-                require(
-                    link == format!("160000 commit {}\t{gitlink}\n", expected.reverie_pin),
-                    "static H gitlink mismatch",
-                )?;
+                if let Some(gitlink) = gitlink {
+                    guard.root(
+                        &expected.workspace.join(gitlink),
+                        expected.reverie_pin,
+                        runner,
+                    )?;
+                    let link = runner.text(
+                        "git",
+                        &["--no-replace-objects", "ls-tree", "HEAD", "--", gitlink],
+                        expected.workspace,
+                    )?;
+                    require(
+                        link == format!("160000 commit {}\t{gitlink}\n", expected.reverie_pin),
+                        "static H gitlink mismatch",
+                    )?;
+                }
                 for relative in [
                     consumer.root_manifest_relative(),
                     consumer.root_lock_relative(),
@@ -67499,6 +67546,18 @@ pub mod private_static {
                         relative,
                         runner,
                     )?);
+                }
+                if matches!(
+                    consumer.binding(),
+                    selected_initializers::WorkspaceBinding::CargoGitRev
+                ) {
+                    let lock =
+                        fs::read_to_string(expected.workspace.join(consumer.root_lock_relative()))
+                            .map_err(|e| e.to_string())?;
+                    require(
+                        cargo_git_rev_lock_accepts(&lock, expected.reverie_pin),
+                        "static CargoGitRev lock does not name the exact Reverie rev (local patch refused)",
+                    )?;
                 }
                 let manifest = expected.workspace.join(consumer.manifest_relative());
                 let output = runner.run(
@@ -67513,7 +67572,7 @@ pub mod private_static {
                         "--filter-platform".into(),
                         TARGET.into(),
                         "--features".into(),
-                        FEATURES.join(","),
+                        consumer.features().join(","),
                     ],
                     expected.workspace,
                 )?;
@@ -67628,6 +67687,7 @@ pub mod private_static {
                 guard,
                 cargo,
                 target_dir: expected.target_dir.to_owned(),
+                features: consumer.features(),
                 archive_owner: Arc::new(ArchiveSourceOwner { _reserved: 0 }),
             };
             let result = body(&context, runner);
@@ -67659,7 +67719,7 @@ pub mod private_static {
                         "--profile".into(),
                         "liteinst-runtime".into(),
                         "--features".into(),
-                        FEATURES.join(","),
+                        self.features.join(","),
                         "--crate-type".into(),
                         "staticlib".into(),
                         "--message-format=json-render-diagnostics".into(),
@@ -67678,6 +67738,7 @@ pub mod private_static {
                     &self.build_targets,
                     &self.target_dir,
                     &self.metadata_sha256,
+                    self.features,
                     &self.archive_owner,
                 )
             })();
@@ -67719,6 +67780,7 @@ pub mod private_static {
         build_targets: &[Value],
         target_dir: &Path,
         metadata_sha256: &str,
+        expected_features: &[&str],
         archive_owner: &Arc<ArchiveSourceOwner>,
     ) -> Result<StaticArchive> {
         let target_dir = fs::canonicalize(target_dir).map_err(|e| e.to_string())?;
@@ -67744,7 +67806,7 @@ pub mod private_static {
                 "static package/manifest disagreement",
             )?;
             require(
-                strings(&row["features"])? == FEATURES
+                strings(&row["features"])? == expected_features
                     && row["profile"]["test"] == false
                     && row["executable"].is_null(),
                 "static feature/test/executable mismatch",
@@ -68588,6 +68650,50 @@ pub mod private_static {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn workspace_binding_rules_are_kind_specific() {
+            let workspace = Path::new("/ws");
+            let hermit = selected_initializers::WorkspaceBinding::HermitGitlink {
+                reverie_gitlink_relative: "reverie",
+            };
+            let cargo = selected_initializers::WorkspaceBinding::CargoGitRev;
+            assert!(target_dir_accepted(
+                hermit,
+                workspace,
+                &workspace.join("target")
+            ));
+            assert!(!target_dir_accepted(
+                hermit,
+                workspace,
+                Path::new("/elsewhere/target")
+            ));
+            assert!(target_dir_accepted(
+                cargo,
+                workspace,
+                Path::new("/elsewhere/target")
+            ));
+            assert!(!target_dir_accepted(
+                cargo,
+                workspace,
+                Path::new("relative/target")
+            ));
+
+            let pin = "0123456789abcdef0123456789abcdef01234567";
+            let exact = format!(
+                "[[package]]\nsource = \"git+https://github.com/rrnewton/reverie.git?rev={pin}#{pin}\"\n"
+            );
+            assert!(cargo_git_rev_lock_accepts(&exact, pin));
+            assert!(!cargo_git_rev_lock_accepts(
+                "[[package]]\nname = \"reverie-core\"\n",
+                pin
+            ));
+            let wrong = exact.replace(pin, "ffffffffffffffffffffffffffffffffffffffff");
+            assert!(!cargo_git_rev_lock_accepts(&wrong, pin));
+            let patched = "[[package]]\nname = \"reverie-core\"\nversion = \"0.5.4\"\n";
+            assert!(!cargo_git_rev_lock_accepts(patched, pin));
+        }
+
         struct CacheFixture {
             base: PathBuf,
             root: PathBuf,
@@ -69183,6 +69289,7 @@ pub mod private_static {
                         &[],
                         Path::new("/"),
                         "not-authority",
+                        FEATURES,
                         &Arc::new(ArchiveSourceOwner { _reserved: 0 })
                     )
                     .is_err()
