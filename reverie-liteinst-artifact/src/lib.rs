@@ -66997,6 +66997,7 @@ pub mod private_static {
     const LAYOUT: &str = selected_initializers::MappedConsumer::Detcore
         .source()
         .layout();
+    #[cfg(test)]
     const FEATURES: &[&str] = selected_initializers::MappedConsumer::Detcore
         .source()
         .features();
@@ -67736,10 +67737,12 @@ pub mod private_static {
                     &self.package,
                     &self.target,
                     &self.build_targets,
-                    &self.target_dir,
-                    &self.metadata_sha256,
-                    self.features,
-                    &self.archive_owner,
+                    ArchiveSelectionExpectation {
+                        target_dir: &self.target_dir,
+                        metadata_sha256: &self.metadata_sha256,
+                        expected_features: self.features,
+                        archive_owner: &self.archive_owner,
+                    },
                 )
             })();
             close_result(result, self.guard.close(runner))
@@ -67773,16 +67776,26 @@ pub mod private_static {
             &self.cargo_messages_sha256
         }
     }
+    struct ArchiveSelectionExpectation<'a> {
+        target_dir: &'a Path,
+        metadata_sha256: &'a str,
+        expected_features: &'a [&'a str],
+        archive_owner: &'a Arc<ArchiveSourceOwner>,
+    }
+
     fn select_archive(
         output: &[u8],
         package: &PackageIdentity,
         target: &Value,
         build_targets: &[Value],
-        target_dir: &Path,
-        metadata_sha256: &str,
-        expected_features: &[&str],
-        archive_owner: &Arc<ArchiveSourceOwner>,
+        expectation: ArchiveSelectionExpectation<'_>,
     ) -> Result<StaticArchive> {
+        let ArchiveSelectionExpectation {
+            target_dir,
+            metadata_sha256,
+            expected_features,
+            archive_owner,
+        } = expectation;
         let target_dir = fs::canonicalize(target_dir).map_err(|e| e.to_string())?;
         let mut finished = Vec::new();
         let mut roots = Vec::new();
@@ -69287,10 +69300,12 @@ pub mod private_static {
                         &package,
                         &serde_json::json!({}),
                         &[],
-                        Path::new("/"),
-                        "not-authority",
-                        FEATURES,
-                        &Arc::new(ArchiveSourceOwner { _reserved: 0 })
+                        ArchiveSelectionExpectation {
+                            target_dir: Path::new("/"),
+                            metadata_sha256: "not-authority",
+                            expected_features: FEATURES,
+                            archive_owner: &Arc::new(ArchiveSourceOwner { _reserved: 0 }),
+                        },
                     )
                     .is_err()
                 );
