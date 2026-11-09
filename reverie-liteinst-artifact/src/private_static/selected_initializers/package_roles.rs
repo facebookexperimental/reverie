@@ -218,7 +218,7 @@ pub(super) fn validate_native_input(role: InitializerRole, object: &ObjectInput<
     native_input_form(role, object)
 }
 fn native_input_form(role: InitializerRole, object: &ObjectInput<'_>) -> Result<()> {
-    let (_, symbol) = named(&object.elf, role.symbol())?;
+    let (_, symbol) = named(&object.elf, role.symbol(&DETCORE))?;
     let (index, size, name, expected) = match role {
         InitializerRole::PackageLibc => (7, 413, ".text.__init_libc", LIBC_RELOCS),
         InitializerRole::PackageTp => (4, 107, ".text.__init_tp", TP_RELOCS),
@@ -444,8 +444,15 @@ fn strong_ssp<'o>(
     }
     require(selected.len() == 1, "package strong SSP absent/duplicate")?;
     let object = selected[0];
-    let joined =
-        join_selected_initializer(InitializerRole::MuslSsp, map, object, objects, elf, bytes)?;
+    let joined = join_selected_initializer(
+        InitializerRole::MuslSsp,
+        &DETCORE,
+        map,
+        object,
+        objects,
+        elf,
+        bytes,
+    )?;
     Ok((object, joined))
 }
 fn ssp_override(
@@ -930,9 +937,9 @@ fn role_body(
     let joined = if matches!(role, InitializerRole::PackageFallback) {
         join_fallback(owner, objects, map, elf, bytes)?
     } else {
-        join_selected_initializer(role, map, owner, objects, elf, bytes)?
+        join_selected_initializer(role, &DETCORE, map, owner, objects, elf, bytes)?
     };
-    let (_, symbol) = named(elf, role.symbol())?;
+    let (_, symbol) = named(elf, role.symbol(&DETCORE))?;
     let finals = emitted_rows(elf, bytes, symbol.st_shndx, joined.address, joined.bytes)?;
     let source = relocation_rows(owner, joined.section_index, joined.bytes)?;
     require(
@@ -1031,7 +1038,7 @@ fn role_body(
         BTreeMap::new()
     };
     Ok(RoleBody {
-        symbol: role.symbol(),
+        symbol: role.symbol(&DETCORE),
         member_name: owner.member_name.into(),
         member_ordinal: owner.ordinal,
         member_header: owner.header_offset,
@@ -1097,11 +1104,12 @@ pub(super) fn observe(
         InitializerRole::PackageLibc,
         InitializerRole::PackageTp,
     ] {
-        let owner = select_role(&role, &objects, &map, &core.runtime.path)?;
+        let owner = select_role(&role, &DETCORE, &objects, &map, &core.runtime.path)?;
         roles.push(role_body(role, owner, &objects, &map, &elf, &raw)?);
     }
     let libc = select_role(
         &InitializerRole::PackageLibc,
+        &DETCORE,
         &objects,
         &map,
         &core.runtime.path,
@@ -1327,7 +1335,7 @@ mod tests {
                     .unwrap_err()
                     .contains("physical member")
             );
-            let (_, s) = named(&obj.elf, role.symbol()).unwrap();
+            let (_, s) = named(&obj.elf, role.symbol(&DETCORE)).unwrap();
             let at = obj.elf.section_headers[s.st_shndx].sh_offset as usize;
             for n in [0, s.st_size as usize / 2, s.st_size as usize - 1] {
                 let mut bad = raw.to_vec();
@@ -1343,7 +1351,7 @@ mod tests {
             (TP, InitializerRole::PackageTp),
         ] {
             let obj = object(raw, role);
-            let (_, s) = named(&obj.elf, role.symbol()).unwrap();
+            let (_, s) = named(&obj.elf, role.symbol(&DETCORE)).unwrap();
             let rel = obj
                 .elf
                 .section_headers
@@ -1520,7 +1528,7 @@ mod tests {
         raw: &[u8],
     ) -> (Vec<u8>, Vec<u8>, Vec<InputRelocation>, Vec<FinalRelocation>) {
         let obj = object(raw, role);
-        let (_, s) = named(&obj.elf, role.symbol()).unwrap();
+        let (_, s) = named(&obj.elf, role.symbol(&DETCORE)).unwrap();
         let input = section_file_bytes(&obj.elf.section_headers[s.st_shndx], raw).unwrap()
             [..s.st_size as usize]
             .to_vec();
@@ -1692,7 +1700,7 @@ mod tests {
             (2, InitializerRole::MuslSsp, 0x403000),
         ] {
             let owner = &objects[which];
-            let (_, symbol) = named(&owner.elf, role.symbol()).unwrap();
+            let (_, symbol) = named(&owner.elf, role.symbol(&DETCORE)).unwrap();
             let mut body =
                 section_file_bytes(&owner.elf.section_headers[symbol.st_shndx], owner.bytes)
                     .unwrap()
@@ -1749,8 +1757,14 @@ mod tests {
             (1, InitializerRole::PackageTp, 107, 5),
         ] {
             checked_object_symbol_authority(&objects[i].elf, objects[i].bytes).unwrap();
-            let selected =
-                select_role(&role, &objects, &map, Path::new("/bound/runtime.a")).unwrap();
+            let selected = select_role(
+                &role,
+                &DETCORE,
+                &objects,
+                &map,
+                Path::new("/bound/runtime.a"),
+            )
+            .unwrap();
             let row = role_body(role, selected, &objects, &map, &elf, &raw).unwrap();
             assert_eq!((row.complete_bytes, row.relocations.len()), (size, count));
         }
@@ -2195,6 +2209,6 @@ mod tests {
         assert!(InitializerRole::PackageFallback.binding(symbol, false));
         symbol.st_other = 0;
         assert!(!InitializerRole::PackageFallback.binding(symbol, false));
-        assert!(!InitializerRole::PackageFallback.terminal_name("fallback_entry"));
+        assert!(!InitializerRole::PackageFallback.terminal_name(&DETCORE, "fallback_entry"));
     }
 }

@@ -32,6 +32,8 @@ use super::CleanupReceipt;
 use super::CleanupState;
 use super::LaunchFailure;
 use super::child::PreparedExec;
+use super::physical::BootstrapEntryCoordinates;
+use super::physical::EntryCoordinates;
 use super::supervisor::DetachedSupervisor;
 use super::supervisor::SuccessorStop;
 use super::supervisor::Supervisor;
@@ -557,6 +559,13 @@ impl<'fd> BridgeInitialStop<'fd> {
         &mut self.stop
     }
 
+    /// Entry coordinates for this stop: always the pair's
+    /// first-image member. Generation comes from this stop's
+    /// type, never from packet bytes or a caller flag.
+    pub fn entry_coordinates(&self, pair: &EntryCoordinates) -> BootstrapEntryCoordinates {
+        pair.first()
+    }
+
     /// Record the mapped first image as consumed, exactly once,
     /// while this initial stop is outstanding (the verified
     /// first-image admission point). Same mode guard as
@@ -730,6 +739,13 @@ impl<'fd> BridgeIssuedStop<'fd> {
     /// The exact issued ticket for this stop.
     pub fn ticket(&self) -> ExecTicket {
         self.ticket
+    }
+
+    /// Entry coordinates for this stop: always the pair's
+    /// successor member. Generation comes from this stop's
+    /// type, never from packet bytes or a caller flag.
+    pub fn entry_coordinates(&self, pair: &EntryCoordinates) -> BootstrapEntryCoordinates {
+        pair.successor()
     }
 
     /// The sealed successor expectation (config + state digests).
@@ -1076,6 +1092,11 @@ mod tests {
         let admitted = bridge.admitted();
 
         let initial = expect_initial(bridge.wait_next().unwrap());
+        // Typed generation choice: each stop type yields only
+        // its own pair member, with identical packet bytes.
+        let pair = EntryCoordinates::from_qualified_symbols((0x1111, 0x2222), (0x3333, 0x4444));
+        assert_eq!(initial.entry_coordinates(&pair), pair.first());
+        assert_ne!(initial.entry_coordinates(&pair), pair.successor());
         // Staging refuses until the single consumption path runs.
         assert!(matches!(
             authority.stage_snapshot(admitted, frame_tool_state(b"early").unwrap()),
@@ -1114,6 +1135,8 @@ mod tests {
                 Ok(_ticket.0.to_vec())
             })
             .unwrap();
+        assert_eq!(issued.entry_coordinates(&pair), pair.successor());
+        assert_ne!(issued.entry_coordinates(&pair), pair.first());
         let ticket = issued.ticket();
         let expected = issued.expected();
         assert_eq!(authority.stage(ticket), Some(ExecStage::Issued));

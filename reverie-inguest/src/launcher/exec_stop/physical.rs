@@ -32,6 +32,7 @@ use super::mapping_plan::interior;
 mod borrowed_entry;
 pub use borrowed_entry::BootstrapEntryCoordinates;
 pub use borrowed_entry::BootstrapTerminalStop;
+pub use borrowed_entry::EntryCoordinates;
 pub use borrowed_entry::ObservationDomain;
 pub use borrowed_entry::RcbGuestBoundary;
 pub use borrowed_entry::RcbNestedBoundary;

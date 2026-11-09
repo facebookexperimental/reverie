@@ -732,9 +732,202 @@ fn resolve_input_target(
     })
 }
 
+/// Which mapped generation a role or entry coordinate belongs
+/// to. The host birth record, never packet bytes, decides it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GenerationKind {
+    /// The first mapped image of a birth.
+    First,
+    /// A successor generation after an exec of that birth.
+    Successor,
+}
+
+/// One generation's mapped entry symbol set. Values come only
+/// from the closed consumer constants below; there is no
+/// public constructor, so a mixed set cannot be minted.
+#[derive(Clone, Copy, Debug)]
+pub struct MappedGenerationSymbols {
+    entry: &'static str,
+    observed_label: &'static str,
+    terminal_exact: Option<&'static str>,
+    observer_exact: Option<&'static str>,
+    terminal_path: &'static str,
+    observer_path: &'static str,
+}
+
+impl MappedGenerationSymbols {
+    /// C entry symbol for this generation.
+    pub const fn entry(&self) -> &'static str {
+        self.entry
+    }
+    /// Observed INT3 asm label for this generation.
+    pub fn observed_label(&self) -> &'static str {
+        self.observed_label
+    }
+}
+
+/// How a consumer workspace binds its Reverie source (A3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkspaceBinding {
+    /// Hermit workspace: the `reverie` gitlink must equal the pin.
+    HermitGitlink {
+        /// Workspace-relative gitlink path.
+        reverie_gitlink_relative: &'static str,
+    },
+    /// Standalone Cargo workspace: the exact Reverie rev must
+    /// appear in metadata source strings and the root lockfile.
+    CargoGitRev,
+}
+
+/// One reviewed mapped consumer instance. Fields are private:
+/// the only values are the `DETCORE` and `LITEROOT` constants
+/// behind [`MappedConsumer`], so stale-digest acceptance can
+/// never be made tautological by a caller-minted descriptor.
+#[derive(Clone, Copy, Debug)]
+pub struct MappedConsumerSource {
+    layout: &'static str,
+    member_prefix: &'static str,
+    first: MappedGenerationSymbols,
+    successor: Option<MappedGenerationSymbols>,
+    entry_source_relative: &'static str,
+    accepted_entry_sources: &'static [&'static str],
+    binding: WorkspaceBinding,
+    package_name: &'static str,
+    package_version: &'static str,
+    lib_target: &'static str,
+    manifest_relative: &'static str,
+    lib_rs_relative: &'static str,
+    root_manifest_relative: &'static str,
+    root_lock_relative: &'static str,
+    features: &'static [&'static str],
+}
+
+impl MappedConsumerSource {
+    /// One HLMLAY01 descriptor symbol per image.
+    pub const fn layout(&self) -> &'static str {
+        self.layout
+    }
+    /// First-image C entry symbol (also the ELF header entry).
+    pub const fn first_entry(&self) -> &'static str {
+        self.first.entry
+    }
+    /// Archive member owner prefix for mapped roles.
+    pub fn member_prefix(&self) -> &'static str {
+        self.member_prefix
+    }
+    /// Symbols for one generation, or `None` when this consumer
+    /// has no mapped entry for that generation.
+    pub const fn generation(&self, generation: GenerationKind) -> Option<&MappedGenerationSymbols> {
+        match generation {
+            GenerationKind::First => Some(&self.first),
+            GenerationKind::Successor => self.successor.as_ref(),
+        }
+    }
+    /// Accepted sha256 digests of the consumer entry source.
+    pub fn accepted_entry_sources(&self) -> &'static [&'static str] {
+        self.accepted_entry_sources
+    }
+    /// Consumer entry source path, workspace-relative.
+    pub fn entry_source_relative(&self) -> &'static str {
+        self.entry_source_relative
+    }
+}
+
+/// Closed set of mapped private-image consumers. New consumers
+/// arrive only as new reviewed variants/constants in this crate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MappedConsumer {
+    /// Hermit Detcore mapped first image (native successor route).
+    Detcore,
+    /// Literoot mapped first image and mapped successor.
+    Literoot,
+}
+
+const DETCORE: MappedConsumerSource = MappedConsumerSource {
+    layout: "detcore_liteinst_mapped_layout",
+    member_prefix: "detcore_liteinst-",
+    first: MappedGenerationSymbols {
+        entry: "detcore_liteinst_mapped_entry",
+        observed_label: "detcore_liteinst_mapped_entry_observed_int3",
+        terminal_exact: Some(
+            "_RNvNtNtCs2FQ3I8A8V8D_16detcore_liteinst12exec_initial12mapped_entry8terminal",
+        ),
+        observer_exact: Some(
+            "_RNvNtNtCs2FQ3I8A8V8D_16detcore_liteinst12exec_initial12mapped_entry26observe_initializer_return",
+        ),
+        terminal_path: "16detcore_liteinst12exec_initial12mapped_entry8terminal",
+        observer_path: "16detcore_liteinst12exec_initial12mapped_entry26observe_initializer_return",
+    },
+    successor: None,
+    entry_source_relative: "detcore-liteinst/src/exec_initial/mapped_entry.rs",
+    accepted_entry_sources: &[
+        "bc140aaea9d598480cdabddd070ca4bc853ebfa0d7525789c85063988fa91f42",
+        "34e21f21a41f2346889c242c869bc32c74821c625dd5b9cf9bd2181ca2d8d40e",
+    ],
+    binding: WorkspaceBinding::HermitGitlink {
+        reverie_gitlink_relative: "reverie",
+    },
+    package_name: "detcore-liteinst",
+    package_version: "0.5.6",
+    lib_target: "detcore_liteinst",
+    manifest_relative: "detcore-liteinst/Cargo.toml",
+    lib_rs_relative: "detcore-liteinst/src/lib.rs",
+    root_manifest_relative: "Cargo.toml",
+    root_lock_relative: "Cargo.lock",
+    features: &[
+        "exec-native-injection",
+        "exec-private-init",
+        "loader-private-runtime",
+    ],
+};
+
+const LITEROOT: MappedConsumerSource = MappedConsumerSource {
+    layout: "literoot_mapped_layout",
+    member_prefix: "literoot_preload-",
+    first: MappedGenerationSymbols {
+        entry: "literoot_mapped_first_entry",
+        observed_label: "literoot_mapped_first_entry_observed_int3",
+        terminal_exact: None,
+        observer_exact: None,
+        terminal_path: "16literoot_preload12mapped_entry8terminal",
+        observer_path: "16literoot_preload12mapped_entry26observe_initializer_return",
+    },
+    successor: Some(MappedGenerationSymbols {
+        entry: "literoot_mapped_successor_entry",
+        observed_label: "literoot_mapped_successor_entry_observed_int3",
+        terminal_exact: None,
+        observer_exact: None,
+        terminal_path: "16literoot_preload12mapped_entry8terminal",
+        observer_path: "16literoot_preload12mapped_entry26observe_initializer_return",
+    }),
+    entry_source_relative: "preload/src/mapped_entry.rs",
+    // SHA-256 of `preload/src/mapped_entry.rs` at the reviewed
+    // literoot head for this stack. Update only with that file.
+    accepted_entry_sources: &["b089e8f53e6285c21f411c1dce77741f0c9e081285914b55ef171eaa30d53559"],
+    binding: WorkspaceBinding::CargoGitRev,
+    package_name: "literoot-preload",
+    package_version: "0.0.1",
+    lib_target: "literoot_preload",
+    manifest_relative: "preload/Cargo.toml",
+    lib_rs_relative: "preload/src/lib.rs",
+    root_manifest_relative: "Cargo.toml",
+    root_lock_relative: "Cargo.lock",
+    features: &["mapped-successor"],
+};
+
+impl MappedConsumer {
+    /// The reviewed descriptor constant for this consumer.
+    pub const fn source(self) -> &'static MappedConsumerSource {
+        match self {
+            Self::Detcore => &DETCORE,
+            Self::Literoot => &LITEROOT,
+        }
+    }
+}
+
 // These are the ONLY roles allowed into this selector; ordinary exported roles
 // continue through existing strong_function/GLOBAL checks unchanged.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum InitializerRole {
     RustTls,
     RustMallocAlias,
@@ -744,14 +937,14 @@ enum InitializerRole {
     PackageFallback,
     PackageLibc,
     PackageTp,
-    MappedRoot,
-    MappedTerminal,
+    MappedRoot(GenerationKind),
+    MappedTerminal(GenerationKind),
     InitializationFailed,
     InitialTerminal,
-    MappedObserver,
+    MappedObserver(GenerationKind),
 }
 impl InitializerRole {
-    fn symbol(&self) -> &'static str {
+    fn symbol(&self, consumer: &MappedConsumerSource) -> &'static str {
         match self {
             Self::RustTls => "__init_tls",
             Self::RustMallocAlias => "__libc_malloc",
@@ -761,29 +954,36 @@ impl InitializerRole {
             Self::PackageFallback => "fallback_entry",
             Self::PackageLibc => "__init_libc",
             Self::PackageTp => "__init_tp",
-            Self::MappedRoot => "detcore_liteinst_mapped_entry",
-            Self::MappedTerminal => {
-                "_RNvNtNtCs2FQ3I8A8V8D_16detcore_liteinst12exec_initial12mapped_entry8terminal"
-            }
+            Self::MappedRoot(generation) => consumer
+                .generation(*generation)
+                .map(|symbols| symbols.entry)
+                .unwrap_or(""),
+            Self::MappedTerminal(generation) => consumer
+                .generation(*generation)
+                .and_then(|symbols| symbols.terminal_exact)
+                .unwrap_or(""),
             Self::InitializationFailed => {
                 "_RNvNtNtCsjyMJYRcpkaN_15reverie_inguest5guest12exec_private21initialization_failed"
             }
             Self::InitialTerminal => {
                 "_RNvNtNtCsjyMJYRcpkaN_15reverie_inguest5guest12exec_private16initial_terminal"
             }
-            Self::MappedObserver => {
-                "_RNvNtNtCs2FQ3I8A8V8D_16detcore_liteinst12exec_initial12mapped_entry26observe_initializer_return"
-            }
+            Self::MappedObserver(generation) => consumer
+                .generation(*generation)
+                .and_then(|symbols| symbols.observer_exact)
+                .unwrap_or(""),
         }
     }
     // Discovery only for four source-owned terminal paths. Crate disambiguators
     // are compiler choices, not source identity or acceptance credentials.
-    fn terminal_path(self) -> Option<&'static str> {
+    fn terminal_path(self, consumer: &MappedConsumerSource) -> Option<&'static str> {
         match self {
-            Self::MappedTerminal => Some("16detcore_liteinst12exec_initial12mapped_entry8terminal"),
-            Self::MappedObserver => {
-                Some("16detcore_liteinst12exec_initial12mapped_entry26observe_initializer_return")
-            }
+            Self::MappedTerminal(generation) => consumer
+                .generation(generation)
+                .map(|symbols| symbols.terminal_path),
+            Self::MappedObserver(generation) => consumer
+                .generation(generation)
+                .map(|symbols| symbols.observer_path),
             Self::InitializationFailed => {
                 Some("15reverie_inguest5guest12exec_private21initialization_failed")
             }
@@ -793,8 +993,8 @@ impl InitializerRole {
             _ => None,
         }
     }
-    fn terminal_name(self, name: &str) -> bool {
-        let Some(path) = self.terminal_path() else {
+    fn terminal_name(self, consumer: &MappedConsumerSource, name: &str) -> bool {
+        let Some(path) = self.terminal_path(consumer) else {
             return false;
         };
         // The shared normalizer permits LLVM suffixes for other roles; these
@@ -805,10 +1005,10 @@ impl InitializerRole {
     // Closed source roles only; original TLS/SSP binding checks stay identical.
     fn binding(self, symbol: sym::Sym, input: bool) -> bool {
         match self {
-            Self::MappedTerminal => {
+            Self::MappedTerminal(_) => {
                 symbol.st_bind() == sym::STB_LOCAL && symbol.st_visibility() == sym::STV_DEFAULT
             }
-            Self::MappedObserver
+            Self::MappedObserver(_)
             | Self::InitialTerminal
             | Self::PackageFallback
             | Self::PackageLibc
@@ -821,7 +1021,7 @@ impl InitializerRole {
                             sym::STB_LOCAL
                         }
             }
-            Self::MappedRoot => {
+            Self::MappedRoot(_) => {
                 symbol.st_bind() == sym::STB_GLOBAL && symbol.st_visibility() == sym::STV_PROTECTED
             }
             Self::InitializationFailed => {
@@ -1243,6 +1443,7 @@ fn selected_field_overlap(
 
 fn join_selected_initializer(
     role: InitializerRole,
+    consumer: &MappedConsumerSource,
     map: &str,
     selected: &ObjectInput<'_>,
     all_objects: &[ObjectInput<'_>],
@@ -1251,7 +1452,8 @@ fn join_selected_initializer(
 ) -> Result<RelocatedDefinition> {
     join_selected_initializer_named(
         role,
-        role.symbol(),
+        consumer,
+        role.symbol(consumer),
         map,
         selected,
         all_objects,
@@ -1262,6 +1464,7 @@ fn join_selected_initializer(
 
 fn join_selected_initializer_named(
     role: InitializerRole,
+    consumer: &MappedConsumerSource,
     actual_name: &str,
     map: &str,
     selected: &ObjectInput<'_>,
@@ -1270,7 +1473,7 @@ fn join_selected_initializer_named(
     final_bytes: &[u8],
 ) -> Result<RelocatedDefinition> {
     require(
-        actual_name == role.symbol() || role.terminal_name(actual_name),
+        actual_name == role.symbol(consumer) || role.terminal_name(consumer, actual_name),
         "initializer selected name outside exact role path",
     )?;
     require(
@@ -1525,6 +1728,21 @@ pub fn implementation_sha256() -> String {
 
 /// Explicit file inputs for a fresh real link. These paths are inputs, not
 /// authority tuples. All byte/member/address facts are re-derived below.
+/// `--undefined` retention for every entry generation present
+/// in the consumer image, in first-then-successor order.
+fn entry_undefined_args(consumer: &MappedConsumerSource) -> Vec<String> {
+    let mut args = vec![format!("--undefined={}", consumer.first.entry())];
+    if let Some(successor) = consumer.generation(GenerationKind::Successor) {
+        args.push(format!("--undefined={}", successor.entry()));
+    }
+    args
+}
+
+/// The ELF header entry is always the first-image entry.
+fn elf_entry_arg(consumer: &MappedConsumerSource) -> String {
+    format!("--entry={}", consumer.first.entry())
+}
+
 pub struct InitializerLinkInputs<'a> {
     pub lld: &'a Path,
     pub script: &'a Path,
@@ -1754,15 +1972,17 @@ fn role_section_is_selected(
 
 fn select_role<'o>(
     role: &InitializerRole,
+    consumer: &MappedConsumerSource,
     objects: &'o [ObjectInput<'o>],
     map: &str,
     runtime_path: &Path,
 ) -> Result<&'o ObjectInput<'o>> {
-    select_role_named(role, objects, map, runtime_path, false).map(|(object, _)| object)
+    select_role_named(role, consumer, objects, map, runtime_path, false).map(|(object, _)| object)
 }
 
 fn select_role_named<'o>(
     role: &InitializerRole,
+    consumer: &MappedConsumerSource,
     objects: &'o [ObjectInput<'o>],
     map: &str,
     runtime_path: &Path,
@@ -1774,9 +1994,9 @@ fn select_role_named<'o>(
             s.st_shndx != 0
                 && object.elf.strtab.get_at(s.st_name).is_some_and(|name| {
                     if terminal_discovery {
-                        role.terminal_name(name)
+                        role.terminal_name(consumer, name)
                     } else {
-                        name == role.symbol()
+                        name == role.symbol(consumer)
                     }
                 })
                 && role.binding(*s, true)
@@ -1795,10 +2015,10 @@ fn select_role_named<'o>(
                     object.member_name.starts_with("reverie_inguest-")
                         && object.archive_path == runtime_path
                 }
-                InitializerRole::MappedRoot
-                | InitializerRole::MappedTerminal
-                | InitializerRole::MappedObserver => {
-                    object.member_name.starts_with("detcore_liteinst-")
+                InitializerRole::MappedRoot(_)
+                | InitializerRole::MappedTerminal(_)
+                | InitializerRole::MappedObserver(_) => {
+                    object.member_name.starts_with(consumer.member_prefix())
                         && object.archive_path == runtime_path
                 }
                 InitializerRole::PackageLibc => {
@@ -1879,9 +2099,12 @@ fn join_from_files(
         checked_object_symbol_authority(&object.elf, object.bytes)?;
     }
     let text = fs::read_to_string(&link_map.path).map_err(|e| e.to_string())?;
+    // The source transaction is Detcore-only until the
+    // workspace-binding phase; mapped roles are not joined here.
+    let consumer = MappedConsumer::Detcore.source();
     let role_join = |role: InitializerRole| -> Result<RelocatedDefinition> {
-        let object = select_role(&role, &objects, &text, &runtime.path)?;
-        join_selected_initializer(role, &text, object, &objects, &elf, &bytes)
+        let object = select_role(&role, consumer, &objects, &text, &runtime.path)?;
+        join_selected_initializer(role, consumer, &text, object, &objects, &elf, &bytes)
     };
     let tls = role_join(InitializerRole::RustTls)?;
     let ssp = role_join(InitializerRole::MuslSsp)?;
@@ -2090,12 +2313,24 @@ impl VerifiedStaticSource {
                     "max-page-size=4096",
                     "-z",
                     "common-page-size=4096",
-                    "--undefined=detcore_liteinst_mapped_entry",
                     "--undefined=__stack_chk_fail",
                 ]
                 .into_iter()
                 .map(str::to_owned)
                 .collect();
+                // The source transaction is Detcore-only until the
+                // workspace-binding phase; entry retention comes
+                // from the selected consumer descriptor, inserted
+                // at the exact historical argv position.
+                let consumer = MappedConsumer::Detcore.source();
+                let entry_args = entry_undefined_args(consumer);
+                let stack_at = args
+                    .iter()
+                    .position(|arg| arg == "--undefined=__stack_chk_fail")
+                    .ok_or("initializer link argv anchor absent")?;
+                for (offset, arg) in entry_args.into_iter().enumerate() {
+                    args.insert(stack_at + offset, arg);
+                }
                 for name in [
                     "__init_tls",
                     "malloc",
@@ -2118,7 +2353,7 @@ impl VerifiedStaticSource {
                     args.push(format!("--undefined={name}"));
                 }
                 args.extend([
-                    "--entry=detcore_liteinst_mapped_entry".into(),
+                    elf_entry_arg(consumer),
                     "-T".into(),
                     script.path.to_str().ok_or("link script UTF8")?.into(),
                     format!("-Map={}", map_path.display()),
@@ -2339,7 +2574,7 @@ mod tests {
             (InitializerRole::MuslSsp, "__stack_chk_fail.lo", libc),
             (InitializerRole::MuslFail, "__stack_chk_fail.lo", libc),
         ] {
-            let bytes = role_selection_image(role.symbol());
+            let bytes = role_selection_image(role.symbol(&DETCORE));
             let selected = role_selection_object(&bytes, selected_path, selected_member);
             let discarded = role_selection_object(&bytes, libc, "unselected-native.lo");
             let map = role_selection_row(selected_path, selected_member);
@@ -2351,7 +2586,7 @@ mod tests {
                 checked_symtab(&objects[0].elf, &bytes).unwrap(),
             )
             .unwrap();
-            let found = select_role(&role, &objects, &map, runtime).unwrap();
+            let found = select_role(&role, &DETCORE, &objects, &map, runtime).unwrap();
             assert_eq!(found.member_name, selected_member);
             assert_eq!(found.archive_path, selected_path);
             assert!(
@@ -2370,26 +2605,44 @@ mod tests {
             role_selection_object(&bytes, libc, "lite_malloc.lo"),
         ];
         let role = InitializerRole::RustMallocAlias;
-        assert!(select_role(&role, &objects, "", runtime).is_err());
+        assert!(select_role(&role, &DETCORE, &objects, "", runtime).is_err());
         let wrong = role_selection_row(libc, "lite_malloc.lo");
         assert!(
-            select_role(&role, &objects, &wrong, runtime)
+            select_role(&role, &DETCORE, &objects, &wrong, runtime)
                 .err()
                 .unwrap()
                 .contains("wrong physical source owner")
         );
         let selected = role_selection_row(runtime, "reverie_inguest-first.o");
-        assert!(select_role(&role, &objects, &(selected.clone() + &wrong), runtime).is_err());
+        assert!(
+            select_role(
+                &role,
+                &DETCORE,
+                &objects,
+                &(selected.clone() + &wrong),
+                runtime
+            )
+            .is_err()
+        );
         let duplicate = selected.clone() + &role_selection_row(runtime, "reverie_inguest-second.o");
-        assert!(select_role(&role, &objects, &duplicate, runtime).is_err());
-        assert!(select_role(&role, &objects, &(selected.clone() + &selected), runtime).is_err());
+        assert!(select_role(&role, &DETCORE, &objects, &duplicate, runtime).is_err());
+        assert!(
+            select_role(
+                &role,
+                &DETCORE,
+                &objects,
+                &(selected.clone() + &selected),
+                runtime
+            )
+            .is_err()
+        );
         for malformed in [
             selected.replace("1000 1000", "1000 1001"),
             selected.replace("40 8", "3f 8"),
             selected.replace("40 8", "40 4"),
             selected.replace("1000 1000", "zzzz zzzz"),
         ] {
-            assert!(select_role(&role, &objects, &malformed, runtime).is_err());
+            assert!(select_role(&role, &DETCORE, &objects, &malformed, runtime).is_err());
         }
     }
     #[test]
@@ -2405,7 +2658,9 @@ mod tests {
                 _ => put(&mut bytes, 200, 8, 65),
             }
             let object = role_selection_object(&bytes, runtime, "reverie_inguest-bad.o");
-            assert!(select_role(&InitializerRole::RustTls, &[object], "", runtime).is_err());
+            assert!(
+                select_role(&InitializerRole::RustTls, &DETCORE, &[object], "", runtime).is_err()
+            );
         }
     }
 
@@ -2418,8 +2673,8 @@ mod tests {
         put(&mut bytes, 512 + 64 + 24, 8, 1024);
         put(&mut bytes, 512 + 64 + 32, 8, names.len() as u64);
         let (binding, visibility) = match role {
-            InitializerRole::MappedTerminal => (sym::STB_LOCAL, sym::STV_DEFAULT),
-            InitializerRole::MappedObserver | InitializerRole::InitialTerminal => {
+            InitializerRole::MappedTerminal(_) => (sym::STB_LOCAL, sym::STV_DEFAULT),
+            InitializerRole::MappedObserver(_) | InitializerRole::InitialTerminal => {
                 (sym::STB_GLOBAL, sym::STV_HIDDEN)
             }
             _ => (sym::STB_GLOBAL, sym::STV_DEFAULT),
@@ -2437,14 +2692,14 @@ mod tests {
     #[test]
     fn terminal_name_discovery_is_only_the_four_complete_v0_paths() {
         for role in [
-            InitializerRole::MappedTerminal,
-            InitializerRole::MappedObserver,
+            InitializerRole::MappedTerminal(GenerationKind::First),
+            InitializerRole::MappedObserver(GenerationKind::First),
             InitializerRole::InitializationFailed,
             InitializerRole::InitialTerminal,
         ] {
-            let path = role.terminal_path().unwrap();
+            let path = role.terminal_path(&DETCORE).unwrap();
             for disambiguator in ["0", "A9z", "j9ILj95Z7eA", "5RBfKwZN2n8"] {
-                assert!(role.terminal_name(&format!("_RNvNtNtCs{disambiguator}_{path}")));
+                assert!(role.terminal_name(&DETCORE, &format!("_RNvNtNtCs{disambiguator}_{path}")));
             }
             for bad in [
                 format!("_RNvNtNtCs_{path}"),
@@ -2464,22 +2719,22 @@ mod tests {
                 ),
             ] {
                 if bad != format!("_RNvNtNtCsA_{path}") {
-                    assert!(!role.terminal_name(&bad), "{bad}");
+                    assert!(!role.terminal_name(&DETCORE, &bad), "{bad}");
                 }
             }
         }
         for role in [
-            InitializerRole::MappedRoot,
+            InitializerRole::MappedRoot(GenerationKind::First),
             InitializerRole::RustTls,
             InitializerRole::MuslSsp,
             InitializerRole::RustMallocAlias,
         ] {
-            assert!(!role.terminal_name(role.symbol()));
+            assert!(!role.terminal_name(&DETCORE, role.symbol(&DETCORE)));
         }
     }
     #[test]
     fn terminal_discovery_keeps_actual_selected_owner_name_and_duplicate_refusal() {
-        let role = InitializerRole::MappedTerminal;
+        let role = InitializerRole::MappedTerminal(GenerationKind::First);
         let name = "_RNvNtNtCsj9ILj95Z7eA_16detcore_liteinst12exec_initial12mapped_entry8terminal";
         let bytes = terminal_selection_image(name, role);
         let runtime = Path::new("/runtime.a");
@@ -2489,17 +2744,18 @@ mod tests {
             runtime,
             "detcore_liteinst-first.o",
         )];
-        let (object, actual) = select_role_named(&role, &objects, &map, runtime, true).unwrap();
+        let (object, actual) =
+            select_role_named(&role, &DETCORE, &objects, &map, runtime, true).unwrap();
         assert_eq!(actual, name);
         assert_eq!(object.member_name, "detcore_liteinst-first.o");
-        assert!(select_role(&role, &objects, &map, runtime).is_err()); // default remains exact.
+        assert!(select_role(&role, &DETCORE, &objects, &map, runtime).is_err()); // default remains exact.
         let duplicate = [
             role_selection_object(&bytes, runtime, "detcore_liteinst-first.o"),
             role_selection_object(&bytes, runtime, "detcore_liteinst-second.o"),
         ];
         let both = map.clone() + &role_selection_row(runtime, "detcore_liteinst-second.o");
         assert!(
-            select_role_named(&role, &duplicate, &both, runtime, true)
+            select_role_named(&role, &DETCORE, &duplicate, &both, runtime, true)
                 .err()
                 .unwrap()
                 .contains("selected strong definition absent/duplicate")
@@ -2512,6 +2768,7 @@ mod tests {
         assert!(
             select_role_named(
                 &role,
+                &DETCORE,
                 &wrong,
                 &role_selection_row(runtime, "reverie_inguest-wrong.o"),
                 runtime,
@@ -2521,19 +2778,147 @@ mod tests {
             .unwrap()
             .contains("wrong physical source owner")
         );
-        assert!(select_role_named(&role, &objects, "", runtime, true).is_err());
+        assert!(select_role_named(&role, &DETCORE, &objects, "", runtime, true).is_err());
     }
 
     #[test]
     fn terminal_output_must_keep_the_exact_selected_full_name() {
-        let role = InitializerRole::MappedTerminal;
+        let role = InitializerRole::MappedTerminal(GenerationKind::First);
         let input_name = "_RNvNtNtCsA9z_16detcore_liteinst12exec_initial12mapped_entry8terminal";
         let output_name = "_RNvNtNtCsB8y_16detcore_liteinst12exec_initial12mapped_entry8terminal";
-        assert!(role.terminal_name(input_name) && role.terminal_name(output_name));
+        assert!(
+            role.terminal_name(&DETCORE, input_name) && role.terminal_name(&DETCORE, output_name)
+        );
         let bytes = terminal_selection_image(output_name, role);
         let elf = Elf::parse(&bytes).unwrap();
         assert!(terminal_observation::exact_terminal_output(&elf, input_name).is_err());
         assert!(terminal_observation::exact_terminal_output(&elf, output_name).is_ok());
+    }
+
+    #[test]
+    fn detcore_descriptor_matches_todays_literals() {
+        let detcore = MappedConsumer::Detcore.source();
+        assert_eq!(detcore.layout(), "detcore_liteinst_mapped_layout");
+        assert_eq!(detcore.member_prefix(), "detcore_liteinst-");
+        assert_eq!(detcore.first_entry(), "detcore_liteinst_mapped_entry");
+        assert!(detcore.generation(GenerationKind::Successor).is_none());
+        let first = detcore.generation(GenerationKind::First).unwrap();
+        assert_eq!(
+            first.observed_label(),
+            "detcore_liteinst_mapped_entry_observed_int3"
+        );
+        assert_eq!(
+            first.terminal_exact,
+            Some("_RNvNtNtCs2FQ3I8A8V8D_16detcore_liteinst12exec_initial12mapped_entry8terminal")
+        );
+        assert_eq!(
+            first.observer_exact,
+            Some(
+                "_RNvNtNtCs2FQ3I8A8V8D_16detcore_liteinst12exec_initial12mapped_entry26observe_initializer_return"
+            )
+        );
+        assert_eq!(
+            first.terminal_path,
+            "16detcore_liteinst12exec_initial12mapped_entry8terminal"
+        );
+        assert_eq!(
+            first.observer_path,
+            "16detcore_liteinst12exec_initial12mapped_entry26observe_initializer_return"
+        );
+        assert_eq!(
+            detcore.entry_source_relative(),
+            "detcore-liteinst/src/exec_initial/mapped_entry.rs"
+        );
+        assert_eq!(
+            detcore.accepted_entry_sources(),
+            [
+                "bc140aaea9d598480cdabddd070ca4bc853ebfa0d7525789c85063988fa91f42",
+                "34e21f21a41f2346889c242c869bc32c74821c625dd5b9cf9bd2181ca2d8d40e",
+            ]
+        );
+        assert_eq!(detcore.package_name, "detcore-liteinst");
+        assert_eq!(detcore.package_version, "0.5.6");
+        assert_eq!(detcore.lib_target, "detcore_liteinst");
+        assert_eq!(detcore.manifest_relative, "detcore-liteinst/Cargo.toml");
+        assert_eq!(detcore.lib_rs_relative, "detcore-liteinst/src/lib.rs");
+        assert_eq!(detcore.root_manifest_relative, "Cargo.toml");
+        assert_eq!(detcore.root_lock_relative, "Cargo.lock");
+        assert_eq!(
+            detcore.features,
+            [
+                "exec-native-injection",
+                "exec-private-init",
+                "loader-private-runtime"
+            ]
+        );
+        assert!(matches!(
+            detcore.binding,
+            WorkspaceBinding::HermitGitlink {
+                reverie_gitlink_relative: "reverie"
+            }
+        ));
+        // Constructed metadata expectations used by the leaf
+        // check, built from descriptor fields only.
+        let root = Path::new("/ws");
+        assert_eq!(
+            format!(
+                "path+file://{}#{}",
+                root.join(detcore.package_name).display(),
+                detcore.package_version
+            ),
+            "path+file:///ws/detcore-liteinst#0.5.6"
+        );
+        assert_eq!(
+            entry_undefined_args(detcore),
+            ["--undefined=detcore_liteinst_mapped_entry"]
+        );
+        assert_eq!(
+            elf_entry_arg(detcore),
+            "--entry=detcore_liteinst_mapped_entry"
+        );
+    }
+
+    #[test]
+    fn literoot_descriptor_selects_both_generations_and_refuses_wrong_consumer() {
+        let literoot = MappedConsumer::Literoot.source();
+        assert_eq!(
+            entry_undefined_args(literoot),
+            [
+                "--undefined=literoot_mapped_first_entry",
+                "--undefined=literoot_mapped_successor_entry",
+            ]
+        );
+        assert_eq!(
+            elf_entry_arg(literoot),
+            "--entry=literoot_mapped_first_entry"
+        );
+        let runtime = Path::new("/runtime.a");
+        for generation in [GenerationKind::First, GenerationKind::Successor] {
+            let role = InitializerRole::MappedRoot(generation);
+            let mut bytes = role_selection_image(role.symbol(literoot));
+            bytes[189] = sym::STV_PROTECTED;
+            let map = role_selection_row(runtime, "literoot_preload-first.o");
+            let objects = [role_selection_object(
+                &bytes,
+                runtime,
+                "literoot_preload-first.o",
+            )];
+            let found = select_role(&role, literoot, &objects, &map, runtime).unwrap();
+            assert_eq!(found.member_name, "literoot_preload-first.o");
+            // The other closed consumer never selects this fixture.
+            assert!(select_role(&role, &DETCORE, &objects, &map, runtime).is_err());
+        }
+        // Missing generation refuses instead of falling back to first.
+        let role = InitializerRole::MappedRoot(GenerationKind::Successor);
+        let bytes = role_selection_image("detcore_liteinst_mapped_entry");
+        let map = role_selection_row(runtime, "detcore_liteinst-first.o");
+        let objects = [role_selection_object(
+            &bytes,
+            runtime,
+            "detcore_liteinst-first.o",
+        )];
+        assert!(select_role(&role, &DETCORE, &objects, &map, runtime).is_err());
+        assert!(select_role(&role, literoot, &objects, &map, runtime).is_err());
     }
 
     fn binding_definition() -> RelocatedDefinition {

@@ -33,13 +33,55 @@ mod startup_auxv;
 /// Unauthenticated coordinates for a bootstrap-only unsafe operation.
 /// Safe construction does not qualify source, code, admission or entry.
 /// These are data, never a Ready token or a substitute for the live source owner.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BootstrapEntryCoordinates {
     /// Actual qualified private C entry, with arguments (handoff pointer, length).
     pub entry: u64,
     /// Actual source-qualified INT3 instruction, not its post-RIP.
     /// Recognizing this trap supplies only a stopped observation in this draft.
     pub terminal_int3: u64,
+}
+
+/// First-image and successor entry coordinates for one mapped
+/// private image, as one pair. Generation choice is made only
+/// through the typed stop accessors on `BridgeInitialStop` /
+/// `BridgeIssuedStop`; there is no boolean selector to flip and
+/// no packet inspection anywhere in the choice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EntryCoordinates {
+    first: BootstrapEntryCoordinates,
+    successor: BootstrapEntryCoordinates,
+}
+
+impl EntryCoordinates {
+    /// Build the pair from a producer-qualified ELF's
+    /// per-generation symbol addresses: `(entry, observed_int3)`
+    /// for the first image and for the successor. This is the
+    /// only constructor; harness call sites pass symbol-read
+    /// results from the qualified ELF evidence, never raw
+    /// address literals of their own.
+    pub fn from_qualified_symbols(first: (u64, u64), successor: (u64, u64)) -> Self {
+        Self {
+            first: BootstrapEntryCoordinates {
+                entry: first.0,
+                terminal_int3: first.1,
+            },
+            successor: BootstrapEntryCoordinates {
+                entry: successor.0,
+                terminal_int3: successor.1,
+            },
+        }
+    }
+
+    /// First-image entry coordinates.
+    pub fn first(&self) -> BootstrapEntryCoordinates {
+        self.first
+    }
+
+    /// Successor entry coordinates.
+    pub fn successor(&self) -> BootstrapEntryCoordinates {
+        self.successor
+    }
 }
 
 /// Interim runtime-entry specification for ToolInitialization:

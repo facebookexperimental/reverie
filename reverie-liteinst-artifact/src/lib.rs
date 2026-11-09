@@ -66991,8 +66991,12 @@ pub mod private_static {
     const LOW: u64 = 0x6000_e100_0000;
     const HIGH: u64 = 0x6000_ff00_0000;
     const GATE: u64 = LOW + 4096;
-    const ENTRY: &str = "detcore_liteinst_mapped_entry";
-    const LAYOUT: &str = "detcore_liteinst_mapped_layout";
+    const ENTRY: &str = selected_initializers::MappedConsumer::Detcore
+        .source()
+        .first_entry();
+    const LAYOUT: &str = selected_initializers::MappedConsumer::Detcore
+        .source()
+        .layout();
     const FEATURES: [&str; 3] = [
         "exec-native-injection",
         "exec-private-init",
@@ -70427,7 +70431,9 @@ pub mod private_machine_diagnostic {
         }
     }
 
-    const ENTRY: &str = "detcore_liteinst_mapped_entry";
+    const ENTRY: &str = crate::private_static::selected_initializers::MappedConsumer::Detcore
+        .source()
+        .first_entry();
 
     /// Immutable observations only. Even a complete root transfer census leaves
     /// every callee's semantics and pre-TLS closure explicitly unproved.
