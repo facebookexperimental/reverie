@@ -235,8 +235,7 @@ fn has_zero(bytes: &[u8]) -> Result<bool, Error> {
 pub fn valid_mapped_input_range(address: usize, bytes: usize) -> bool {
     address != 0
         && address.is_multiple_of(8)
-        && bytes >= HEADER_BYTES
-        && bytes <= MAX_BYTES
+        && (HEADER_BYTES..=MAX_BYTES).contains(&bytes)
         && bytes <= isize::MAX as usize
         && address
             .checked_add(bytes)

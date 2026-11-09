@@ -143,9 +143,7 @@ fn wrappers(
 fn aliases(
     elf: &Elf<'_>,
     input: bool,
-    role: InitializerRole,
-    observed_label: &str,
-    owner_name: &str,
+    selection: super::SelectedRole<'_>,
     section: usize,
     address: u64,
     bytes: usize,
@@ -163,6 +161,21 @@ fn aliases(
                 && s.st_type() != sym::STT_SECTION
         })
         .collect::<Vec<_>>();
+    let super::SelectedRole {
+        role,
+        consumer,
+        actual_name: owner_name,
+    } = selection;
+    let generation = match role {
+        InitializerRole::MappedRoot(generation)
+        | InitializerRole::MappedTerminal(generation)
+        | InitializerRole::MappedObserver(generation) => generation,
+        _ => GenerationKind::First,
+    };
+    let observed_label = consumer
+        .generation(generation)
+        .map(|symbols| symbols.observed_label)
+        .unwrap_or("");
     let is_observer = matches!(role, InitializerRole::MappedObserver(_));
     require(
         found.len() == if is_observer { 2 } else { 1 },
@@ -230,32 +243,16 @@ fn joined_role(
         runtime,
         role.terminal_path(consumer).is_some(),
     )?;
-    let proof = join_selected_initializer_named(
+    let selection = super::SelectedRole {
         role,
         consumer,
-        &actual_name,
-        map,
-        selected,
-        objects,
-        elf,
-        bytes,
-    )?;
-    let generation = match role {
-        InitializerRole::MappedRoot(generation)
-        | InitializerRole::MappedTerminal(generation)
-        | InitializerRole::MappedObserver(generation) => generation,
-        _ => GenerationKind::First,
+        actual_name: &actual_name,
     };
-    let observed_label = consumer
-        .generation(generation)
-        .map(|symbols| symbols.observed_label)
-        .unwrap_or("");
+    let proof = join_selected_initializer_named(selection, map, selected, objects, elf, bytes)?;
     aliases(
         &selected.elf,
         true,
-        role,
-        observed_label,
-        &actual_name,
+        selection,
         proof.section_index,
         0,
         proof.bytes,
@@ -264,9 +261,7 @@ fn joined_role(
     aliases(
         elf,
         false,
-        role,
-        observed_label,
-        &actual_name,
+        selection,
         final_symbol.st_shndx,
         proof.address,
         proof.bytes,
@@ -349,8 +344,7 @@ impl VerifiedStaticSource {
         callback: impl FnOnce(&super::MappedTerminalObservation, &mut Runner) -> Result<T>,
     ) -> Result<T> {
         self.with_mapped_terminal_observation_for(
-            MappedConsumer::Detcore,
-            GenerationKind::First,
+            (MappedConsumer::Detcore, GenerationKind::First),
             archive,
             definitions,
             objdump,
@@ -365,15 +359,14 @@ impl VerifiedStaticSource {
     /// does not carry refuses before any join.
     pub fn with_mapped_terminal_observation_for<T>(
         &self,
-        consumer: MappedConsumer,
-        generation: GenerationKind,
+        target: (MappedConsumer, GenerationKind),
         archive: &StaticArchive,
         definitions: &SelectedInitializerDefinitions,
         objdump: &FileIdentity,
         runner: &mut Runner,
         callback: impl FnOnce(&super::MappedTerminalObservation, &mut Runner) -> Result<T>,
     ) -> Result<T> {
-        let consumer = consumer.source();
+        let (consumer, generation) = (target.0.source(), target.1);
         if consumer.generation(generation).is_none() {
             return close_result(
                 Err("terminal generation absent for selected consumer".into()),

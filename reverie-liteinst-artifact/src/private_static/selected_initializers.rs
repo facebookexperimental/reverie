@@ -1477,6 +1477,13 @@ fn selected_field_overlap(
     }
 }
 
+#[derive(Clone, Copy)]
+struct SelectedRole<'a> {
+    role: InitializerRole,
+    consumer: &'a MappedConsumerSource,
+    actual_name: &'a str,
+}
+
 fn join_selected_initializer(
     role: InitializerRole,
     consumer: &MappedConsumerSource,
@@ -1487,9 +1494,11 @@ fn join_selected_initializer(
     final_bytes: &[u8],
 ) -> Result<RelocatedDefinition> {
     join_selected_initializer_named(
-        role,
-        consumer,
-        role.symbol(consumer),
+        SelectedRole {
+            role,
+            consumer,
+            actual_name: role.symbol(consumer),
+        },
         map,
         selected,
         all_objects,
@@ -1499,15 +1508,18 @@ fn join_selected_initializer(
 }
 
 fn join_selected_initializer_named(
-    role: InitializerRole,
-    consumer: &MappedConsumerSource,
-    actual_name: &str,
+    selection: SelectedRole<'_>,
     map: &str,
     selected: &ObjectInput<'_>,
     all_objects: &[ObjectInput<'_>],
     final_elf: &Elf<'_>,
     final_bytes: &[u8],
 ) -> Result<RelocatedDefinition> {
+    let SelectedRole {
+        role,
+        consumer,
+        actual_name,
+    } = selection;
     require(
         actual_name == role.symbol(consumer) || role.terminal_name(consumer, actual_name),
         "initializer selected name outside exact role path",
