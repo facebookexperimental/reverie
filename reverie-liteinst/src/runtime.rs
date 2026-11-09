@@ -3889,8 +3889,12 @@ unsafe fn process_syscall(event: &mut SyscallEvent) {
 /// aarch64 there is no vfork syscall number, and a vfork arrives as
 /// `clone(CLONE_VM | CLONE_VFORK | SIGCHLD, child_stack)` (musl passes a null
 /// child stack, glibc passes the current SP), refused by the flag-keyed first
-/// arm below regardless of the stack argument. This matches the preload
-/// dispatcher and Tool mode's nested and injected syscall guards. `ENOSYS` was
+/// arm below regardless of the stack argument. On x86-64 this matches the
+/// preload dispatcher and Tool mode's nested and injected syscall guards. On
+/// aarch64 the preload dispatcher differs: it refuses glibc's
+/// clone(0x4111, SP) only through its non-null child-stack check and admits
+/// musl's clone(0x4111, 0), because arch::is_vfork is always false there
+/// (reverie-inguest/src/dispatch.rs). `ENOSYS` was
 /// the alternative. Seccomp sandboxes conventionally deny with `ENOSYS` so that
 /// libc falls back to an older syscall (the containers-common 5.8 seccomp
 /// profile's default errno is `ENOSYS`), and glibc does retry a failed clone3
@@ -4045,7 +4049,7 @@ unsafe fn write_compatibility_event(output_fd: libc::c_int, bytes: &[u8]) {
         #[cfg(not(target_arch = "x86_64"))]
         let _ = unsafe {
             let mut timeout = libc::timespec {
-                tv_sec: (BACKPRESSURE_POLL_MILLISECONDS / 1000) as libc::time_t,
+                tv_sec: (BACKPRESSURE_POLL_MILLISECONDS / 1000) as _,
                 tv_nsec: ((BACKPRESSURE_POLL_MILLISECONDS % 1000) * 1_000_000) as libc::c_long,
             };
             raw_syscall6(

@@ -106,6 +106,13 @@ class GateFailure(RuntimeError):
 
 def run(cmd: list[str], *, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     full_env = dict(os.environ)
+    # validate.sh exports RUSTFLAGS="-D warnings -C link-arg=<host lzma>".
+    # The x86 link argument must never reach aarch64 links, and -D warnings
+    # must not turn path-dependency warnings into errors here (warnings in
+    # reverie-liteinst itself are enforced by G5 and by the G3 output check
+    # in main()). Pin an explicit empty RUSTFLAGS for every cargo call.
+    full_env["RUSTFLAGS"] = ""
+    full_env.pop("CARGO_ENCODED_RUSTFLAGS", None)
     if env:
         full_env.update(env)
     print("$", " ".join(cmd), flush=True)
@@ -122,10 +129,25 @@ def run(cmd: list[str], *, env: dict[str, str] | None = None) -> subprocess.Comp
     return result
 
 
-def require_success(label: str, cmd: list[str], *, env: dict[str, str] | None = None) -> None:
+def require_success(
+    label: str, cmd: list[str], *, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
     result = run(cmd, env=env)
     if result.returncode != 0:
         raise GateFailure(f"{label} failed with rc={result.returncode}")
+    return result
+
+
+def require_no_liteinst_warnings(label: str, output: str) -> None:
+    lines = output.splitlines()
+    offenders = []
+    for i, line in enumerate(lines):
+        if line.startswith("warning:") and "generated" not in line:
+            span = " ".join(lines[i : i + 3])
+            if "reverie-liteinst/src/" in span or "reverie-liteinst/Cargo.toml" in span:
+                offenders.append(line.strip())
+    if offenders:
+        raise GateFailure(f"{label} emitted reverie-liteinst warnings: {offenders[:5]}")
 
 
 def require_prerequisites() -> None:
@@ -148,6 +170,12 @@ def require_prerequisites() -> None:
         raise GateFailure("missing rust-lld (required; refusing to skip)")
     if not QEMU.is_file() or not os.access(QEMU, os.X_OK):
         raise GateFailure(f"missing qemu-aarch64 runner {QEMU} (refusing to skip)")
+    binfmt = Path("/proc/sys/fs/binfmt_misc/qemu-aarch64")
+    if not binfmt.is_file() or "enabled" not in binfmt.read_text():
+        raise GateFailure(
+            "binfmt_misc is not registered/enabled for qemu-aarch64 "
+            "(the C-entry subprocess test execs the aarch64 test binary; refusing to skip)"
+        )
 
 
 def alias_and_lazy_ref_checks() -> None:
@@ -277,12 +305,16 @@ def main() -> int:
                 "G2 gnu check",
                 ["cargo", "check", "--locked", "-p", "reverie-liteinst", "--lib", "--bins", "--target", GNU, *flags],
             )
-            # G3: musl codegen/build, lib + bins.
-            require_success(
+            # G3: musl codegen/build, lib + bins. RUSTFLAGS is pinned empty
+            # (path dependencies warn on aarch64), so warnings from
+            # reverie-liteinst itself are enforced here by output check;
+            # G5 clippy -D warnings is the lint-level twin.
+            built = require_success(
                 "G3 musl build",
                 ["cargo", "build", "--locked", "-p", "reverie-liteinst", "--lib", "--bins", "--target", MUSL, *flags],
                 env={"CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER": "rust-lld"},
             )
+            require_no_liteinst_warnings("G3 musl build", built.stdout)
             # G5: aarch64 clippy, no deps.
             require_success(
                 "G5 clippy",

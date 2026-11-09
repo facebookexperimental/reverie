@@ -10,10 +10,10 @@ fn main() {
     std::process::exit(2);
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(all(target_arch = "x86_64", target_os = "linux", not(test)))]
 mod real {
     include!("real_bodies/lifecycle_guest.rs");
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(all(target_arch = "x86_64", target_os = "linux", not(test)))]
 use real::main;
