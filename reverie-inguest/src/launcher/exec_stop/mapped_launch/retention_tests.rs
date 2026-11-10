@@ -80,7 +80,11 @@ fn preparing_without_an_initial_stop_refuses_by_name() {
 fn a_real_initial_stop_is_retained_then_retired_once_with_its_reap_confirmed() {
     let receipt = CleanupReceipt::default();
     let mut frame = RetainedPhysical::empty(receipt.clone());
-    frame.retain_spawn(ExecStop::spawn(true_request(), receipt.clone()));
+    assert!(
+        frame
+            .retain_spawn(ExecStop::spawn(true_request(), receipt.clone()))
+            .is_ok()
+    );
     assert!(frame.initial().is_ok());
     assert!(frame.has_cleanup_capability());
     assert_eq!(
@@ -109,7 +113,11 @@ fn a_real_initial_stop_is_retained_then_retired_once_with_its_reap_confirmed() {
 fn a_launch_failure_is_retained_named_and_never_released_by_retirement() {
     let receipt = CleanupReceipt::default();
     let mut first = RetainedPhysical::empty(receipt.clone());
-    first.retain_spawn(ExecStop::spawn(true_request(), receipt.clone()));
+    assert!(
+        first
+            .retain_spawn(ExecStop::spawn(true_request(), receipt.clone()))
+            .is_ok()
+    );
     assert!(first.initial().is_ok());
 
     // The same receipt cannot launch twice: a real LaunchFailure.
@@ -121,8 +129,10 @@ fn a_launch_failure_is_retained_named_and_never_released_by_retirement() {
         failure.error.to_string(),
         "exec-stop cleanup receipt already used"
     );
-    let mut refused = RetainedPhysical::empty(CleanupReceipt::default());
-    refused.retain_spawn(Err(failure));
+    // A frame retains only a capability of its own receipt, so the refusal is
+    // held by a frame on the same shared receipt.
+    let mut refused = RetainedPhysical::empty(receipt.clone());
+    assert!(refused.retain_spawn(Err(failure)).is_ok());
     assert!(refused.has_cleanup_capability());
     // The whole message, literally: the prefix, then the retained failure's
     // Debug form, which carries the shared receipt's snapshot (the first stop
@@ -156,7 +166,11 @@ fn a_refused_preparation_is_retained_named_and_never_released_by_retirement() {
     let receipt = CleanupReceipt::default();
     let mut frame = RetainedPhysical::empty(receipt.clone());
     // No inherited descriptors, so the real stop refuses the preparation.
-    frame.retain_spawn(ExecStop::spawn(true_request(), receipt.clone()));
+    assert!(
+        frame
+            .retain_spawn(ExecStop::spawn(true_request(), receipt.clone()))
+            .is_ok()
+    );
     assert!(frame.initial().is_ok());
     // SAFETY: original ptracer thread; the descriptors are not the stop's
     // inherited ones, so the preparation refuses before mapping anything and
@@ -193,43 +207,180 @@ fn a_refused_preparation_is_retained_named_and_never_released_by_retirement() {
     assert!(receipt.snapshot().confirmed);
 }
 
+/// Re-exec marker: `cleanup_all_retires_two_real_frames_and_returns` runs its
+/// body in a fresh exact-test process, in its own process group.
+const CLEANUP_COMPONENT: &str = "REVERIE_MAPPED_LAUNCH_CLEANUP_COMPONENT";
+const CLEANUP_COMPLETE: &[u8] = b"mapped-launch-cleanup-all-complete";
+
 #[test]
 #[allow(unsafe_code, unused_unsafe)]
 fn cleanup_all_retires_two_real_frames_and_returns() {
     // cleanup_all never returns if a retirement can neither confirm nor
-    // retain; run it on its own thread (which also owns the stops, as their
-    // ptracer) so a hang is reported as one, not as a stuck test.
-    let (done, outcome) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let first_receipt = CleanupReceipt::default();
-        let second_receipt = CleanupReceipt::default();
-        let mut first = RetainedPhysical::empty(first_receipt.clone());
-        let mut second = RetainedPhysical::empty(second_receipt.clone());
-        first.retain_spawn(ExecStop::spawn(true_request(), first_receipt.clone()));
-        second.retain_spawn(ExecStop::spawn(true_request(), second_receipt.clone()));
-        let mut payload = None;
-        // SAFETY: test containment: the frames hold only /bin/true stops that
-        // this thread spawned and retires.
-        unsafe { cleanup_all(&mut first, &mut second, &mut payload) };
-        let _ = done.send((
+    // retain, and its contract requires whole-subtree containment. The body
+    // therefore runs in a re-exec'd exact-test process in its own process
+    // group: the stops are its children (ExecStop never changes their process
+    // group, and each is traced with PTRACE_O_EXITKILL), so killing the group
+    // ends the whole subtree. On the bound that group is killed and reaped and
+    // the test fails.
+    if std::env::var_os(CLEANUP_COMPONENT).is_none() {
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "launcher::exec_stop::mapped_launch::retention_tests::\
+                 cleanup_all_retires_two_real_frames_and_returns",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CLEANUP_COMPONENT, "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let out = loop {
+            if child.try_wait().unwrap().is_some() {
+                break child.wait_with_output().unwrap();
+            }
+            if std::time::Instant::now() >= deadline {
+                // pgid == child pid under process_group(0).
+                // SAFETY: plain kill(2) of the group this test created.
+                unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+                let pgid = child.id();
+                let out = child.wait_with_output().unwrap();
+                panic!(
+                    "HANG: cleanup_all did not return within 60 s; killed process group {pgid}: \
+                     {}; stdout={}; stderr={}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert!(
+            out.status.success(),
+            "isolated cleanup failed: {}; stdout={}; stderr={}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            out.stdout
+                .windows(CLEANUP_COMPLETE.len())
+                .filter(|item| *item == CLEANUP_COMPLETE)
+                .count(),
+            1,
+            "exact-test child must print the completion marker exactly once: stdout={}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        return;
+    }
+    let first_receipt = CleanupReceipt::default();
+    let second_receipt = CleanupReceipt::default();
+    let mut first = RetainedPhysical::empty(first_receipt.clone());
+    let mut second = RetainedPhysical::empty(second_receipt.clone());
+    assert!(
+        first
+            .retain_spawn(ExecStop::spawn(true_request(), first_receipt.clone()))
+            .is_ok()
+    );
+    assert!(
+        second
+            .retain_spawn(ExecStop::spawn(true_request(), second_receipt.clone()))
+            .is_ok()
+    );
+    let mut payload = None;
+    // SAFETY: the parent test bounds this whole process group and kills it
+    // on the bound; the frames hold only /bin/true stops this thread spawned.
+    unsafe { cleanup_all(&mut first, &mut second, &mut payload) };
+    assert_eq!(
+        (
             first_receipt.snapshot().confirmed,
             second_receipt.snapshot().confirmed,
             first.has_cleanup_capability(),
             second.has_cleanup_capability(),
             payload.is_none(),
-        ));
-    });
-    match outcome.recv_timeout(std::time::Duration::from_secs(60)) {
-        Ok(state) => assert_eq!(state, (true, true, false, false, true)),
-        Err(_) => panic!("HANG: cleanup_all did not return within 60 s"),
+        ),
+        (true, true, false, false, true)
+    );
+    println!("{}", String::from_utf8_lossy(CLEANUP_COMPLETE));
+}
+
+#[test]
+fn a_spawn_with_another_receipt_is_handed_back_unretained() {
+    let receipt = CleanupReceipt::default();
+    let mut frame = RetainedPhysical::empty(receipt.clone());
+    let other = CleanupReceipt::default();
+    let stop = match frame.retain_spawn(ExecStop::spawn(true_request(), other.clone())) {
+        Ok(()) => panic!("a stop spawned with another receipt must be handed back"),
+        Err(handed_back) => match *handed_back {
+            Ok(stop) => stop,
+            Err(failure) => panic!("the launch itself failed: {failure}"),
+        },
+    };
+    assert!(!frame.has_cleanup_capability());
+    assert!(!receipt.snapshot().child_created);
+    // The caller still holds the actual stop and retires it through its owner.
+    assert!(stop.cancel().is_ok());
+    assert!(other.snapshot().confirmed);
+    // A launch failure of another receipt is handed back the same way.
+    match frame.retain_spawn(ExecStop::spawn(true_request(), other.clone())) {
+        Ok(()) => panic!("a refusal of another receipt must be handed back"),
+        Err(handed_back) => match *handed_back {
+            Err(failure) => assert_eq!(
+                failure.error.to_string(),
+                "exec-stop cleanup receipt already used"
+            ),
+            Ok(_) => panic!("a used receipt cannot launch"),
+        },
     }
+    assert!(!frame.has_cleanup_capability());
+    assert!(!receipt.snapshot().child_created);
+}
+
+#[test]
+fn a_retained_launch_failure_is_never_overwritten() {
+    let receipt = CleanupReceipt::default();
+    let mut frame = RetainedPhysical::empty(receipt.clone());
+    assert!(
+        frame
+            .retain_spawn(ExecStop::spawn(true_request(), receipt.clone()))
+            .is_ok()
+    );
+    // The used receipt refuses again: the first refusal is retained, and the
+    // second is handed back rather than replacing it.
+    assert!(
+        frame
+            .retain_spawn(ExecStop::spawn(true_request(), receipt.clone()))
+            .is_ok()
+    );
+    match frame.retain_spawn(ExecStop::spawn(true_request(), receipt.clone())) {
+        Ok(()) => panic!("an occupied launch-failure slot must not be overwritten"),
+        Err(handed_back) => match *handed_back {
+            Err(failure) => assert_eq!(
+                failure.error.to_string(),
+                "exec-stop cleanup receipt already used"
+            ),
+            Ok(_) => panic!("a used receipt cannot launch"),
+        },
+    }
+    frame.retire_once();
+    assert!(receipt.snapshot().confirmed);
+    // The retained refusal is never released by retirement.
+    assert!(frame.has_cleanup_capability());
 }
 
 #[test]
 fn a_real_frames_retirement_step_completes_once_its_reap_is_confirmed() {
     let receipt = CleanupReceipt::default();
     let mut frame = RetainedPhysical::empty(receipt.clone());
-    frame.retain_spawn(ExecStop::spawn(true_request(), receipt.clone()));
+    assert!(
+        frame
+            .retain_spawn(ExecStop::spawn(true_request(), receipt.clone()))
+            .is_ok()
+    );
     let mut first = None;
     let step = guarded_retirement(
         &mut frame,

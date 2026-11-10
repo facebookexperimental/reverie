@@ -5,11 +5,13 @@
 //! holds the actual physical capability of each launch step, and the
 //! retirement that confirms each one.
 //!
-//! Moved unchanged, apart from visibility, paths and accessors in place of
-//! public fields, from Hermit's
-//! `hermit-cli/src/bin/hermit/mapped_first_admission/runtime_support.rs` at
-//! Hermit `08fea553` (pair L-A of the mapped-launch promotion). `cleanup_all`
-//! is `unsafe` here, with its containment precondition stated.
+//! An embedder constructs a [`RetainedPhysical`] with a fresh
+//! [`CleanupReceipt`] before it spawns, retains the spawn result in it at
+//! once, and keeps the frame alive until [`cleanup_all`] has confirmed the
+//! child's terminal retirement through that receipt. A frame holds only
+//! capabilities spawned with its own receipt
+//! ([`RetainedPhysical::retain_spawn`] hands any other back), never overwrites
+//! one it holds, and no safe method moves one out of it.
 
 use std::io;
 use std::panic::AssertUnwindSafe;
@@ -27,6 +29,15 @@ use super::physical::PreparedMapping;
 fn invalid(message: &str) -> io::Error {
     io::Error::other(message)
 }
+
+/// Whether two receipts are the same shared receipt, not merely equal ones.
+fn same_receipt(a: &CleanupReceipt, b: &CleanupReceipt) -> bool {
+    std::rc::Rc::ptr_eq(&a.state, &b.state)
+}
+
+/// What [`super::ExecStop::spawn`] returns: the initial stop, or the failed
+/// launch retaining any child it created.
+pub type SpawnResult<'fd> = std::result::Result<InitialExecStop<'fd>, LaunchFailure<'fd>>;
 
 // H owns no kernel wait mechanism: each slot retains the actual existing R
 // capability. Place this value outside ALL block_on/catch_unwind expressions.
@@ -52,13 +63,32 @@ impl<'fd> RetainedPhysical<'fd> {
             cancelled: None,
         }
     }
+    /// Retain a spawn result that was spawned with this frame's receipt.
+    ///
+    /// A result spawned with any other receipt, or one whose slot is already
+    /// occupied, is handed back unretained: retirement confirms each capability
+    /// through this frame's receipt, so it may hold no other child, and it never
+    /// drops a capability it holds.
     pub fn retain_spawn(
         &mut self,
-        result: std::result::Result<InitialExecStop<'fd>, LaunchFailure<'fd>>,
-    ) {
+        result: SpawnResult<'fd>,
+    ) -> std::result::Result<(), Box<SpawnResult<'fd>>> {
         match result {
-            Ok(initial) => self.initial = Some(initial),
-            Err(failure) => self.launch_failure = Some(failure),
+            Ok(initial)
+                if self.initial.is_none()
+                    && same_receipt(&initial.owner.receipt, &self.receipt) =>
+            {
+                self.initial = Some(initial);
+                Ok(())
+            }
+            Err(failure)
+                if self.launch_failure.is_none()
+                    && same_receipt(&failure.receipt, &self.receipt) =>
+            {
+                self.launch_failure = Some(failure);
+                Ok(())
+            }
+            other => Err(Box::new(other)),
         }
     }
     pub fn has_cleanup_capability(&self) -> bool {
@@ -89,6 +119,7 @@ impl<'fd> RetainedPhysical<'fd> {
     /// Exact existing Preparation contract, including original-thread
     /// affinity, inherited leases, real context/PKRU and external containment.
     /// Image execution qualification is NOT asserted by this map-only adapter.
+    /// These are the obligations of [`InitialExecStop::prepare_mapping`].
     #[allow(unsafe_code)]
     pub unsafe fn prepare(&mut self, inputs: Preparation<'fd>) -> io::Result<()> {
         let initial = self
@@ -137,12 +168,16 @@ impl<'fd> RetainedPhysical<'fd> {
             self.unconfirmed_initial = Some(owner);
         }
     }
-    /// The retained initial stop, mutably, if it is still held here.
-    pub fn initial_mut(&mut self) -> Option<&mut InitialExecStop<'fd>> {
-        self.initial.as_mut()
-    }
     /// The retained prepared mapping, mutably, if it is still held here.
-    pub fn mapped_mut(&mut self) -> Option<&mut PreparedMapping<'fd>> {
+    ///
+    /// # Safety
+    ///
+    /// Use the mapping only through its own methods: never move it out,
+    /// replace it or swap it (for example with `std::mem::swap` or
+    /// `std::mem::replace`). Retirement confirms the child through this frame's
+    /// receipt, so the mapping held here must stay the one this frame prepared.
+    #[allow(unsafe_code)]
+    pub unsafe fn mapped_mut(&mut self) -> Option<&mut PreparedMapping<'fd>> {
         self.mapped.as_mut()
     }
     /// Take the actual parent pipe endpoints from the initial stop, or else
@@ -243,6 +278,11 @@ fn retain_unconfirmed_frame() -> ! {
 /// ends a frame which lost its capability: if a retirement can neither confirm
 /// nor retain its capability, this never returns (it holds every backing,
 /// descriptor and payload live, spinning, until that containment ends it).
+///
+/// Each frame must hold only capabilities of its own birth, as
+/// [`RetainedPhysical`] keeps them: [`RetainedPhysical::retain_spawn`] refuses
+/// any spawned with another receipt, and only a caller of the unsafe
+/// [`RetainedPhysical::mapped_mut`] could move one between frames.
 #[allow(unsafe_code)]
 pub unsafe fn cleanup_all(
     a: &mut RetainedPhysical<'_>,
