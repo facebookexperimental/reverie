@@ -1393,7 +1393,7 @@ impl MappedBirthArming for MappedBirth<'_> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     /// Facts with every field empty, for struct-update syntax.
@@ -2194,7 +2194,7 @@ mod tests {
     /// (HLMLAY01 at +512, `/dev/null` at +1024), gate page, text page (four
     /// bootstrap sites, one more ordinary site, entry, terminal int3, handler),
     /// data page with TLS, and the reference page.
-    fn qualifying_image() -> (Vec<u8>, RuntimeImageFacts) {
+    pub(crate) fn qualifying_image() -> (Vec<u8>, RuntimeImageFacts) {
         let base = RUNTIME_WINDOW.start;
         let text = base + 2 * PAGE;
         let mut gate = vec![0xcc_u8; PAGE as usize];
@@ -2609,14 +2609,14 @@ mod tests {
         }
     }
 
-    struct FakeAdmission {
+    pub(crate) struct FakeAdmission {
         packets: std::cell::RefCell<Vec<Vec<u8>>>,
         peer_checks: std::cell::Cell<u32>,
         failed: std::cell::Cell<bool>,
         foreign_peer: bool,
     }
     impl FakeAdmission {
-        fn new(packets: Vec<Vec<u8>>) -> Self {
+        pub(crate) fn new(packets: Vec<Vec<u8>>) -> Self {
             Self {
                 packets: std::cell::RefCell::new(packets),
                 peer_checks: std::cell::Cell::new(0),
