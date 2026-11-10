@@ -51,6 +51,15 @@ pub use native_leaves::NativeLeafInputs;
 pub use native_leaves::NativeLeafObservations;
 pub use native_leaves::native_leaf_implementation_sha256;
 
+// reverie-loader/src/handoff.rs at Reverie 71c29c66 (2026-11-08, "state the
+// successor table-3 route rule"). Its only change from the 85abd905 bootstrap
+// cohort is five doc comments: no item, impl order, signature or body moves,
+// so every symbol the four Bootstrap and two View consumers select is the one
+// they select for 85abd905. Each consumer accepts it exactly where it accepts
+// 85abd905, and every emitted-byte, relocation and alias check still runs.
+const HANDOFF_ROUTE_RULE_SOURCE_SHA: &str =
+    "e7c8f96840a3787ec4d05c70a14c3c7a6077feabc888ca9878064a9bd560eec4";
+
 // Private target identities produced from actual selected archive sections and
 // final map placement, including COMMON allocations; not final-name lookup.
 #[derive(Clone, Debug)]
@@ -2153,6 +2162,43 @@ impl VerifiedStaticSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn handoff_route_rule_source_selects_the_bootstrap_cohort_symbol_in_every_consumer() {
+        const BOOTSTRAP_COHORT: &str =
+            "85abd905256f3bc5b526840cf3cd5e090238e4aa770f03d320c2ae907ee7ae75";
+        type Select = fn(&str) -> Result<&'static str>;
+        let consumers: [(&str, Select); 6] = [
+            ("bootstrap_descriptor", bootstrap_descriptor::source_symbol),
+            ("bootstrap_env_aux", bootstrap_env_aux::source_symbol),
+            ("bootstrap_role", bootstrap_role::source_symbol),
+            ("bootstrap_site", bootstrap_site::source_symbol),
+            ("view_site", view_site::source_symbol),
+            ("view_table", view_table::source_symbol),
+        ];
+        let new = HANDOFF_ROUTE_RULE_SOURCE_SHA;
+        for (name, select) in consumers {
+            assert_eq!(select(new), select(BOOTSTRAP_COHORT), "{name}");
+            assert!(select(new).is_ok(), "{name}");
+            for refused in [
+                "0".repeat(64),
+                new[..63].to_owned(),
+                format!("{new}0"),
+                new.to_ascii_uppercase(),
+                format!("sha256:{new}"),
+            ] {
+                assert!(select(&refused).is_err(), "{name}: {refused}");
+            }
+            for index in 0..new.len() {
+                let mut modified = new.as_bytes().to_vec();
+                modified[index] = if modified[index] == b'0' { b'1' } else { b'0' };
+                assert!(
+                    select(&String::from_utf8(modified).unwrap()).is_err(),
+                    "{name}"
+                );
+            }
+        }
+    }
     // Tiny structural ET_REL fixtures exercise the production selector only;
     // they are not source-owned archives or selected-definition proof tokens.
     fn role_selection_image(name: &str) -> Vec<u8> {

@@ -84,18 +84,23 @@ const INPUT: [u8; CODE_BYTES] = [
 
 fn source_digest(digest: &str) -> Result<()> {
     require(
-        digest == SOURCE_SHA || digest == SERIALIZER_SOURCE_SHA || digest == BOOTSTRAP_SOURCE_SHA,
+        digest == SOURCE_SHA
+            || digest == SERIALIZER_SOURCE_SHA
+            || digest == BOOTSTRAP_SOURCE_SHA
+            || digest == HANDOFF_ROUTE_RULE_SOURCE_SHA,
         "View::site complete runtime source differs",
     )
 }
 // The complete retained source digest chooses one canonical role, never a union.
-fn source_symbol(digest: &str) -> Result<&'static str> {
+pub(super) fn source_symbol(digest: &str) -> Result<&'static str> {
     source_digest(digest)?;
-    Ok(if digest == BOOTSTRAP_SOURCE_SHA {
-        BOOTSTRAP_SYMBOL
-    } else {
-        SYMBOL
-    })
+    Ok(
+        if digest == BOOTSTRAP_SOURCE_SHA || digest == HANDOFF_ROUTE_RULE_SOURCE_SHA {
+            BOOTSTRAP_SYMBOL
+        } else {
+            SYMBOL
+        },
+    )
 }
 fn input_code(bytes: &[u8]) -> Result<()> {
     require(

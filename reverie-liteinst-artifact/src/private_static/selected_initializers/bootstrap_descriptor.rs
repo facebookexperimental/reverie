@@ -60,9 +60,9 @@ const INPUT: [u8; SIZE] = [
     0x02, 0xb0, 0x01, 0x88, 0x07, 0xc3, 0x4c, 0x89, 0x4f, 0x08, 0x48, 0x89, 0x77, 0x10, 0x48, 0x89,
     0x47, 0x18, 0x48, 0x89, 0x4f, 0x20, 0x31, 0xc0, 0x88, 0x07, 0xc3,
 ];
-fn source_symbol(digest: &str) -> Result<&'static str> {
+pub(super) fn source_symbol(digest: &str) -> Result<&'static str> {
     require(
-        digest == SOURCE_SHA,
+        digest == SOURCE_SHA || digest == HANDOFF_ROUTE_RULE_SOURCE_SHA,
         "Bootstrap::descriptor complete source differs",
     )?;
     Ok(SYMBOL)
