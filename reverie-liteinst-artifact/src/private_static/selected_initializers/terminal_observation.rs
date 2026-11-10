@@ -17,9 +17,18 @@ const PRIVATE_SOURCE: &str = "96005c0878ea34fd94109465db84ad0c66dd2c855c235c4160
 // bodies are unchanged; every emitted role/control check below remains required.
 const MAPPED_CALLBACK_PRIVATE_SOURCE: &str =
     "026cecaff9850b3bf916bc0ecb56d0e9021ca5130e7bfc1f64e21a48bc0dd4a9";
+// Reverie dea9681d: the mapped-successor seam, the slot-0 Tool TLS registry
+// in publish_control_slot, and a widened cfg on one extern declaration, over
+// the 026cecaf source. initial_terminal and initialization_failed are
+// byte-identical, as are all three global_asm! blocks; every emitted
+// role/control check below remains required.
+const SUCCESSOR_PRIVATE_SOURCE: &str =
+    "a5bf6d729d2ca8daeadfef5b85c22f03cc9d8073b560db2093954727d8b0ce3a";
 
 fn accepted_private_source(digest: &str) -> bool {
-    digest == PRIVATE_SOURCE || digest == MAPPED_CALLBACK_PRIVATE_SOURCE
+    digest == PRIVATE_SOURCE
+        || digest == MAPPED_CALLBACK_PRIVATE_SOURCE
+        || digest == SUCCESSOR_PRIVATE_SOURCE
 }
 
 const OBSERVED_LABEL: &str = "detcore_liteinst_mapped_entry_observed_int3";
@@ -751,7 +760,11 @@ mod tests {
     }
     #[test]
     fn terminal_private_sources_remain_exact_closed_declarations() {
-        for digest in [PRIVATE_SOURCE, MAPPED_CALLBACK_PRIVATE_SOURCE] {
+        for digest in [
+            PRIVATE_SOURCE,
+            MAPPED_CALLBACK_PRIVATE_SOURCE,
+            SUCCESSOR_PRIVATE_SOURCE,
+        ] {
             assert!(accepted_private_source(digest));
             for refused in [
                 "0".repeat(64),
@@ -774,5 +787,6 @@ mod tests {
             assert!(!accepted_private_source(digest));
         }
         assert!(!accepted_entry_source(MAPPED_CALLBACK_PRIVATE_SOURCE));
+        assert!(!accepted_entry_source(SUCCESSOR_PRIVATE_SOURCE));
     }
 }
