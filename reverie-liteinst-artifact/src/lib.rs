@@ -1399,8 +1399,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-inguest/src/guest/alloc.rs",
-        37723,
-        "e1304916625b1b166ce0d32b54965c6e3623d9a004b38e77b7ed26ba653e81dc",
+        46676,
+        "8b594686698976c7b3c88aa5bfeaa234163b3181c1e92a10977831a01bef71b2",
     ),
     (
         "reverie-inguest/src/guest/tool_region_constructor.rs",
@@ -1434,18 +1434,18 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-inguest/src/guest/rpc.rs",
-        41754,
-        "2902cd913d98db07dd8ae8c693d2d6b69e3e8f8884dcec932d9fdc3c0dd53f6e",
+        54138,
+        "e5e5c6592d505bda9a4c47bef7bba4ef266a09f5d833c6ae5a87e036f25a3984",
     ),
     (
         "reverie-inguest/src/guest/host.rs",
-        278679,
-        "440db985804a4d0811e835ed3928b5c147eac709c5955542350f9e48d208a53e",
+        406223,
+        "f31ba739d85a7671bb57d1c7f494bd6d751c296431bd5bd47a8e9d39966f32a6",
     ),
     (
         "reverie-inguest/src/guest/host_linux.rs",
-        25059,
-        "9eb8620667dff02d155300bbb35415ebbefbe32c4fc0586f9527308d921dad58",
+        25125,
+        "32716178d7f5dc17be65ebe23343b8e23706c3898f4acb9ed9501b8c4acb94ed",
     ),
     (
         "reverie-liteinst/src/tool_host.rs",
@@ -1477,11 +1477,13 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     // counter window must prove it ran throughout (time_running) before
     // any count is believed; the diagnostic counts it adds distinguish a
     // measured count from an unmeasured one instead of reporting an
-    // invented number. Size/digest cover both reviewed changes.
+    // invented number. Size/digest cover both reviewed changes, and the
+    // literoot sprint rebase's "fix interim PMU shim architecture
+    // refusals" (M1; reviewed as b8f4a6ebe, sprint commit eedaa8b6a).
     (
         "reverie/src/pmu_config.rs",
-        76782,
-        "637c6fa142ed96a215675e072f2c48152ca3fe11f18a4a0e6d8eaa4bf7124029",
+        78983,
+        "fa0e30d174f53dd047d94e9c55dba50fdc8d114586de4e9b4b706c6a954da5cc",
     ),
     (
         "reverie/src/in_guest_rcb.rs",
@@ -1554,11 +1556,14 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
         17031,
         "3195980ecdb940374c21fe38ccb98839798d078aed929b69edb179283b87536c",
     ),
-    // Bind the added input-ownership and facility-admission source premises.
+    // Bind the added input-ownership and facility-admission source premises,
+    // and the A6 static-executable floor (literoot sprint rebase, M1): a
+    // static program, ld.so target or `#!` interpreter is refused before
+    // spawn, and only regular files the exec loads are inspected.
     (
         "reverie-inguest/src/launcher/mod.rs",
-        94802,
-        "3e2a00f582f24652e81305e659e0960bcf6b334514b58140f886aa292de278f8",
+        137761,
+        "e39f4d6e7d89c7637502816d0ca4041940fc503abd56e62af0799b9a4722b0d9",
     ),
     (
         "reverie/src/native_syscall.rs",
@@ -38547,6 +38552,36 @@ mod tests {
         // Keep the fixed catalog authoritative and reject their prior tuples.
         assert_eq!(CONTENT_REVERIE_CATALOG.len(), 86);
         for (relative, old_size, old_digest) in [
+            (
+                "reverie-inguest/src/guest/alloc.rs",
+                37723,
+                "e1304916625b1b166ce0d32b54965c6e3623d9a004b38e77b7ed26ba653e81dc",
+            ),
+            (
+                "reverie-inguest/src/guest/rpc.rs",
+                41754,
+                "2902cd913d98db07dd8ae8c693d2d6b69e3e8f8884dcec932d9fdc3c0dd53f6e",
+            ),
+            (
+                "reverie-inguest/src/guest/host.rs",
+                278679,
+                "440db985804a4d0811e835ed3928b5c147eac709c5955542350f9e48d208a53e",
+            ),
+            (
+                "reverie-inguest/src/guest/host_linux.rs",
+                25059,
+                "9eb8620667dff02d155300bbb35415ebbefbe32c4fc0586f9527308d921dad58",
+            ),
+            (
+                "reverie/src/pmu_config.rs",
+                76782,
+                "637c6fa142ed96a215675e072f2c48152ca3fe11f18a4a0e6d8eaa4bf7124029",
+            ),
+            (
+                "reverie-inguest/src/launcher/mod.rs",
+                94802,
+                "3e2a00f582f24652e81305e659e0960bcf6b334514b58140f886aa292de278f8",
+            ),
             (
                 "reverie-liteinst/src/lib.rs",
                 25928,
