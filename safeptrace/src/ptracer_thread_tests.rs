@@ -1640,6 +1640,403 @@ fn dead_generic_owner_retained_driver_does_not_retain_generation() {
     drop(release);
 }
 
+/// Status opens on this thread through every retained status reader.
+#[cfg(not(sanitized))]
+fn status_opens_on_this_thread() -> usize {
+    RETAINED_STATUS_READS.with(Cell::get) + OTHER_STATUS_OPENS.with(Cell::get)
+}
+
+#[cfg(not(sanitized))]
+fn handle_detach_handoff_pending(handle: &EventHandle) -> bool {
+    handle.event().detach_handoff_pending()
+}
+
+/// Generic attach and generic synchronous wait, then detach: neither
+/// stamps a ptracer owner, so the detached Running is ownerless.
+#[cfg(not(sanitized))]
+fn ownerless_detached_running(tid: Pid) -> Running {
+    let running = Running::attach(tid.into()).unwrap();
+    let stopped = running.wait().unwrap().assume_stopped().0;
+    assert!(stopped.1.ptracer_owner.is_none());
+    stopped.detach(None).unwrap()
+}
+
+/// An ownerless public wait opens no status, attached or detached. Its
+/// record could only be `(id, None)`, which confers no handoff
+/// exemption, so its creation reads nothing.
+#[tokio::test(flavor = "current_thread")]
+#[cfg(not(sanitized))]
+async fn ownerless_public_wait_opens_no_status() {
+    let (root, tid, release, mut root_cleanup) = legacy_owner_guest();
+    let running = Running::attach(tid.into()).unwrap();
+    assert!(running.1.ptracer_owner.is_none());
+    let before = status_opens_on_this_thread();
+    let attached = running.wait_owned();
+    assert_eq!(
+        status_opens_on_this_thread() - before,
+        0,
+        "attached ownerless public wait opened status"
+    );
+    assert!(!handle_detach_handoff_pending(
+        attached.inner.as_ref().unwrap().token.event()
+    ));
+    // A Native decode stamps no owner into the returned stop.
+    let stopped = tokio::time::timeout(TRACEE_WAIT_TIMEOUT, attached)
+        .await
+        .unwrap()
+        .unwrap()
+        .assume_stopped()
+        .0;
+    assert!(stopped.1.ptracer_owner.is_none());
+    let running = stopped.detach(None).unwrap();
+    let before = status_opens_on_this_thread();
+    let detached = running.wait_owned();
+    assert_eq!(
+        status_opens_on_this_thread() - before,
+        0,
+        "detached ownerless public wait opened status"
+    );
+    assert!(!handle_detach_handoff_pending(
+        detached.inner.as_ref().unwrap().token.event()
+    ));
+    drop(detached);
+    legacy_owner_reap_root(root, &mut root_cleanup);
+    drop(release);
+}
+
+/// An owner-bearing public wait created after detach still reads status
+/// once and records the handoff note its live owner protects.
+#[test]
+#[cfg(not(sanitized))]
+fn owner_bearing_public_wait_after_detach_notes_handoff() {
+    let (root, tid, release, mut root_cleanup) = legacy_owner_guest();
+    let stopped = seized_stopped_sync(tid);
+    assert!(stopped.1.ptracer_owner.is_some());
+    let running = stopped.detach(None).unwrap();
+    let before = status_opens_on_this_thread();
+    let wait = running.wait_owned();
+    assert_eq!(status_opens_on_this_thread() - before, 1);
+    assert!(handle_detach_handoff_pending(
+        wait.inner.as_ref().unwrap().token.event()
+    ));
+    drop(wait);
+    legacy_owner_reap_root(root, &mut root_cleanup);
+    drop(release);
+}
+
+/// An explicit async driver created from an ownerless token after detach
+/// still notes the handoff: its affinity binds this owner thread.
+#[test]
+#[cfg(not(sanitized))]
+fn ownerless_explicit_async_driver_after_detach_notes_handoff() {
+    let (root, tid, release, mut root_cleanup) = legacy_owner_guest();
+    let running = ownerless_detached_running(tid);
+    let driver = running.wait_owned_on_ptracer_thread().into_driver();
+    assert!(handle_detach_handoff_pending(
+        driver.inner.inner.as_ref().unwrap().token.event()
+    ));
+    drop(driver);
+    legacy_owner_reap_root(root, &mut root_cleanup);
+    drop(release);
+}
+
+/// The synchronous counterpart of the explicit-driver control above.
+#[test]
+#[cfg(not(sanitized))]
+fn ownerless_explicit_sync_driver_after_detach_notes_handoff() {
+    let (root, tid, release, mut root_cleanup) = legacy_owner_guest();
+    let running = ownerless_detached_running(tid);
+    let driver = running.wait_sync_on_ptracer_thread().into_driver();
+    assert!(handle_detach_handoff_pending(
+        driver.input.as_ref().unwrap().1.event()
+    ));
+    drop(driver);
+    legacy_owner_reap_root(root, &mut root_cleanup);
+    drop(release);
+}
+
+/// Spawns a two-thread guest whose real parent is an intermediate
+/// process, not this test. Its leader pauses; its member writes
+/// `[leader, member]` and then execs `/bin/sleep` on command. Returns
+/// the intermediate's cleanup, the guest leader, and the command pipe.
+#[cfg(not(sanitized))]
+fn grandchild_exec_guest() -> (Pid, TraceeCleanupGuard, Pid, OwnedFd) {
+    extern "C" fn member(argument: *mut libc::c_void) -> *mut libc::c_void {
+        let descriptors = unsafe { &*argument.cast::<[i32; 2]>() };
+        let ids = [unsafe { libc::getpid() }, unsafe {
+            libc::syscall(libc::SYS_gettid)
+        } as i32];
+        if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } != 0
+            || unsafe { libc::write(descriptors[0], ids.as_ptr().cast(), 8) } != 8
+        {
+            unsafe { libc::_exit(125) };
+        }
+        let mut byte = 0u8;
+        if unsafe { libc::read(descriptors[1], (&mut byte as *mut u8).cast(), 1) } != 1 {
+            unsafe { libc::_exit(126) };
+        }
+        let argv = [c"sleep".as_ptr(), c"30".as_ptr(), std::ptr::null()];
+        unsafe {
+            libc::execv(c"/bin/sleep".as_ptr(), argv.as_ptr());
+            libc::_exit(127);
+        }
+    }
+    let [receipt, send_receipt] = legacy_pipe();
+    let [execute, release_execute] = legacy_pipe();
+    let intermediate = match unsafe { fork() }.unwrap() {
+        ForkResult::Parent { child } => child,
+        ForkResult::Child => {
+            unsafe {
+                libc::close(receipt.as_raw_fd());
+                libc::close(release_execute.as_raw_fd());
+            }
+            if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } != 0 {
+                unsafe { libc::_exit(124) };
+            }
+            match unsafe { libc::fork() } {
+                -1 => unsafe { libc::_exit(123) },
+                0 => {
+                    if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } != 0 {
+                        unsafe { libc::_exit(122) };
+                    }
+                    let mut descriptors = [send_receipt.as_raw_fd(), execute.as_raw_fd()];
+                    let mut thread = mem::MaybeUninit::<libc::pthread_t>::uninit();
+                    if unsafe {
+                        libc::pthread_create(
+                            thread.as_mut_ptr(),
+                            std::ptr::null(),
+                            member,
+                            descriptors.as_mut_ptr().cast(),
+                        )
+                    } != 0
+                    {
+                        unsafe { libc::_exit(121) };
+                    }
+                    loop {
+                        unsafe { libc::pause() };
+                    }
+                }
+                _ => loop {
+                    // Never waits: the guest stays this process's child.
+                    unsafe { libc::pause() };
+                },
+            }
+        }
+    };
+    drop((send_receipt, execute));
+    let cleanup = TraceeCleanupGuard::new(intermediate).unwrap();
+    let mut readiness = libc::pollfd {
+        fd: receipt.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    assert_eq!(
+        unsafe { libc::poll(&mut readiness, 1, TRACEE_WAIT_TIMEOUT.as_millis() as i32) },
+        1
+    );
+    let mut ids = [0u8; 8];
+    fs::File::from(receipt).read_exact(&mut ids).unwrap();
+    let leader = Pid::from_raw(i32::from_ne_bytes(ids[..4].try_into().unwrap()));
+    let member = Pid::from_raw(i32::from_ne_bytes(ids[4..].try_into().unwrap()));
+    assert_ne!(leader, intermediate);
+    assert_ne!(leader, member);
+    (intermediate, cleanup, leader, release_execute)
+}
+
+/// Liveness: an owner-bearing explicit wait created while attached must
+/// not keep a generation from retiring once its task becomes permanently
+/// untraced. Only the leader is seized (no PTRACE_O_TRACECLONE); its
+/// untraced member execs, so de_thread gives the member the leader's PID
+/// and start time. The owner stays alive, nothing reattaches, and this
+/// test is not the guest's parent, so the worker's wait reports ECHILD.
+#[tokio::test(flavor = "current_thread")]
+#[cfg(not(sanitized))]
+async fn attached_owner_wait_resolves_after_nonleader_exec_untraces() {
+    attached_owner_wait_after_nonleader_exec_case(false).await;
+}
+
+/// The forced-legacy arm: the seized leader has a `LegacyLeader` identity.
+/// A non-leader `Procfs` target cannot take this shape, because the exec
+/// that untraces it also ends its generation.
+#[tokio::test(flavor = "current_thread")]
+#[cfg(not(sanitized))]
+async fn forced_legacy_attached_owner_wait_resolves_after_nonleader_exec_untraces() {
+    attached_owner_wait_after_nonleader_exec_case(true).await;
+}
+
+#[cfg(not(sanitized))]
+async fn attached_owner_wait_after_nonleader_exec_case(force_legacy: bool) {
+    let (intermediate, mut intermediate_cleanup, leader, execute) = grandchild_exec_guest();
+    let _legacy = force_legacy.then(|| LegacyThreadGroup::new(leader));
+    let running =
+        Running::seize_on_ptracer_thread(leader.into(), Options::PTRACE_O_EXITKILL).unwrap();
+    running.interrupt().unwrap();
+    let (stopped, event) = running
+        .wait_sync_on_ptracer_thread()
+        .wait()
+        .unwrap()
+        .assume_stopped();
+    assert_eq!(event, crate::Event::Stop);
+    assert!(stopped.1.ptracer_owner.is_some());
+    let identity = stopped.1.event().identity().unwrap();
+    assert_eq!(
+        matches!(identity.pidfd, ThreadHandle::LegacyLeader { .. }),
+        force_legacy
+    );
+    let running = stopped.resume(None).unwrap();
+    let mut driver = running.wait_owned_on_ptracer_thread().into_driver();
+    assert_eq!(
+        unsafe { libc::write(execute.as_raw_fd(), b"x".as_ptr().cast(), 1) },
+        1
+    );
+    // Poll, which starts the worker, only once the exec has replaced the
+    // leader. A worker already blocked in waitid across de_thread can miss
+    // its only wakeup and hang: de_thread swaps the PIDs before it wakes
+    // the tracer, so the wakeup names a task that no longer carries the
+    // waited PID. That separate hang is tracked as dev-hermit bead
+    // dh-12yeks; this test pins retirement, not that wakeup.
+    legacy_owner_until(|| {
+        let status = fs::read_to_string(format!("/proc/{leader}/status")).unwrap_or_default();
+        status.lines().any(|line| line == "Name:\tsleep")
+            && status.lines().any(|line| line == "TracerPid:\t0")
+    });
+    let result = tokio::time::timeout(
+        TRACEE_WAIT_TIMEOUT,
+        futures::future::poll_fn(|cx| driver.poll_on_ptracer_thread(cx)),
+    )
+    .await;
+    println!("ACTUAL_UNTRACED_AFTER_NONLEADER_EXEC_RESULT {result:?}");
+    assert!(
+        matches!(result, Ok(Err(OwnedWaitError::Errno(Errno::ECHILD)))),
+        "owner-bearing attached wait did not retire with ECHILD after its task became untraced: {result:?}"
+    );
+    drop(driver);
+    assert_eq!(unsafe { libc::kill(leader.as_raw(), libc::SIGKILL) }, 0);
+    legacy_owner_reap_root(intermediate, &mut intermediate_cleanup);
+}
+
+#[cfg(not(sanitized))]
+fn assert_procfs_identity(token: &TraceeToken) {
+    assert!(matches!(
+        token.event().identity().unwrap().pidfd,
+        ThreadHandle::Procfs { .. }
+    ));
+}
+
+/// Seizes the forced-legacy member on this thread, then returns an
+/// ownerless Running for it after detaching. The ownerless tokens are built
+/// on a second thread: that thread is not the tracer, so it cannot capture
+/// an owner, and it shares this thread's `Procfs` identity. Also returns
+/// the attached ownerless public wait's status opens and handoff state.
+#[cfg(not(sanitized))]
+fn forced_legacy_ownerless_running(tid: Pid) -> (Running, usize, bool) {
+    let stopped = seized_stopped_sync(tid);
+    assert_procfs_identity(&stopped.1);
+    let (opens, pending, ownerless) = thread::spawn(move || {
+        let running = Running::new_on_ptracer_thread(tid.into()).unwrap();
+        assert!(running.1.ptracer_owner.is_none());
+        assert_procfs_identity(&running.1);
+        let before = status_opens_on_this_thread();
+        let wait = running.wait_owned();
+        let opens = status_opens_on_this_thread() - before;
+        let pending =
+            handle_detach_handoff_pending(wait.inner.as_ref().unwrap().token.event());
+        drop(wait);
+        let kept = Running::new_on_ptracer_thread(tid.into()).unwrap();
+        assert!(kept.1.ptracer_owner.is_none());
+        (opens, pending, kept)
+    })
+    .join()
+    .unwrap();
+    // Detach through the owner's capability. The kept ownerless Running
+    // names the same generation, now untraced.
+    drop(stopped.detach(None).unwrap());
+    assert_procfs_identity(&ownerless.1);
+    (ownerless, opens, pending)
+}
+
+/// The forced-legacy arm of [`ownerless_public_wait_opens_no_status`]: a
+/// non-leader with a `Procfs` identity. The skip runs before any identity
+/// inspection, so it applies to legacy identities too.
+#[test]
+#[cfg(not(sanitized))]
+fn forced_legacy_ownerless_public_wait_opens_no_status() {
+    let (root, tid, release, mut root_cleanup) = legacy_owner_guest();
+    let _legacy = LegacyThreadGroup::new(root);
+    let (running, attached_opens, attached_pending) = forced_legacy_ownerless_running(tid);
+    assert_eq!(
+        attached_opens, 0,
+        "attached ownerless legacy public wait opened status"
+    );
+    assert!(!attached_pending);
+    let before = status_opens_on_this_thread();
+    let detached = running.wait_owned();
+    assert_eq!(
+        status_opens_on_this_thread() - before,
+        0,
+        "detached ownerless legacy public wait opened status"
+    );
+    assert!(!handle_detach_handoff_pending(
+        detached.inner.as_ref().unwrap().token.event()
+    ));
+    drop(detached);
+    legacy_owner_reap_root(root, &mut root_cleanup);
+    drop(release);
+}
+
+/// The forced-legacy arm of
+/// [`owner_bearing_public_wait_after_detach_notes_handoff`].
+#[test]
+#[cfg(not(sanitized))]
+fn forced_legacy_owner_bearing_public_wait_after_detach_notes_handoff() {
+    let (root, tid, release, mut root_cleanup) = legacy_owner_guest();
+    let _legacy = LegacyThreadGroup::new(root);
+    let stopped = seized_stopped_sync(tid);
+    assert!(stopped.1.ptracer_owner.is_some());
+    assert_procfs_identity(&stopped.1);
+    let running = stopped.detach(None).unwrap();
+    let before = status_opens_on_this_thread();
+    let wait = running.wait_owned();
+    assert_eq!(status_opens_on_this_thread() - before, 1);
+    assert!(handle_detach_handoff_pending(
+        wait.inner.as_ref().unwrap().token.event()
+    ));
+    drop(wait);
+    legacy_owner_reap_root(root, &mut root_cleanup);
+    drop(release);
+}
+
+/// The forced-legacy counterpart of the explicit-driver controls. A
+/// `Procfs` identity cannot bind an owner once its task is untraced, so an
+/// explicit driver built from an ownerless token after detach records an
+/// ownerless detached wait that grants no exemption, at base as here. What
+/// N0 must keep is that both explicit drivers still take that record.
+#[test]
+#[cfg(not(sanitized))]
+fn forced_legacy_ownerless_explicit_drivers_after_detach_keep_their_record() {
+    let (root, tid, release, mut root_cleanup) = legacy_owner_guest();
+    let _legacy = LegacyThreadGroup::new(root);
+    let (running, _, _) = forced_legacy_ownerless_running(tid);
+    let generation = running.generation();
+    let driver = running.wait_owned_on_ptracer_thread().into_driver();
+    assert!(driver.inner.detached_wait.is_some());
+    assert!(!handle_detach_handoff_pending(
+        driver.inner.inner.as_ref().unwrap().token.event()
+    ));
+    drop(driver);
+    // The same ownerless generation, retained before the first driver.
+    let running = Running::from_token(generation.0, generation.1);
+    assert!(running.1.ptracer_owner.is_none());
+    let driver = running.wait_sync_on_ptracer_thread().into_driver();
+    assert!(driver.detached_wait.is_some());
+    assert!(!handle_detach_handoff_pending(
+        driver.input.as_ref().unwrap().1.event()
+    ));
+    drop(driver);
+    legacy_owner_reap_root(root, &mut root_cleanup);
+    drop(release);
+}
+
 #[tokio::test(flavor = "current_thread")]
 #[cfg(not(sanitized))]
 async fn explicit_copied_owner_namespace_refuses_before_consuming_any_report() {

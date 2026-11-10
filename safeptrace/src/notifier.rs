@@ -930,6 +930,11 @@ thread_local! {
     static PTRACER_ATTACHMENT_STATUS_READS: Cell<usize> = const { Cell::new(0) };
     /// Calls of `retained_proc_status` on this thread.
     static RETAINED_STATUS_READS: Cell<usize> = const { Cell::new(0) };
+    /// `status` opens on this thread by `retained_proc_snapshot`,
+    /// `retained_proc_parent`, `worker_proc_snapshot` and
+    /// `AlignedProcfs::from_root`, which `RETAINED_STATUS_READS` does not
+    /// count.
+    static OTHER_STATUS_OPENS: Cell<usize> = const { Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -2041,11 +2046,14 @@ impl Event {
         // reap an instantaneous ECHILD. That gap is explicit state, not
         // timing inference: a generation-bound wait created while the
         // task was detached records itself in `detached_waits` until it
-        // drops or completes. While such a wait exists, the same live
-        // generation is not unowned merely for being untraced at this
-        // instant. A zombie is exempt: Linux refuses ptrace attach once
-        // exit_state is set, so no reattach can ever consume it, and
-        // retirement must not wait for an unrelated parent's reap.
+        // drops or completes. Only waits that carry an owner, or an
+        // explicit driver that can bind one, record themselves; an
+        // ownerless public wait could never protect the handoff. While
+        // such a wait exists, the same live generation is not unowned
+        // merely for being untraced at this instant. A zombie is exempt:
+        // Linux refuses ptrace attach once exit_state is set, so no
+        // reattach can ever consume it, and retirement must not wait for
+        // an unrelated parent's reap.
         if self.detach_handoff_pending()
             && identity.observed_process_generation() == Some(true)
             && !identity.task_is_zombie()
@@ -3494,6 +3502,8 @@ fn retained_proc_status(directory: RawFd) -> Result<RetainedProcStatus, Errno> {
 /// tries to bind an untraced task. Host selection for a later attachment and
 /// all generic/native identity reads keep their original contract.
 fn retained_proc_parent(directory: RawFd) -> Result<Pid, Errno> {
+    #[cfg(test)]
+    OTHER_STATUS_OPENS.with(|opens| opens.set(opens.get() + 1));
     let _open = launch_window::TransientOpen::begin();
     let raw = unsafe {
         libc::openat(
@@ -4159,6 +4169,8 @@ impl AlignedProcfs {
             return Err(Errno::EXDEV);
         }
         let root = Self { root };
+        #[cfg(test)]
+        OTHER_STATUS_OPENS.with(|opens| opens.set(opens.get() + 1));
         let raw = unsafe {
             libc::openat(
                 root.root.as_raw_fd(),
@@ -5565,6 +5577,8 @@ fn retained_proc_snapshot(directory: RawFd) -> io::Result<WorkerProcSnapshot> {
         Ok(text)
     }
     let start_time = worker_stat_start_time(&read(directory, c"stat")?)?;
+    #[cfg(test)]
+    OTHER_STATUS_OPENS.with(|opens| opens.set(opens.get() + 1));
     let status = read(directory, c"status")?;
     let snapshot = WorkerProcSnapshot {
         tgid: worker_status_pid(&status, "Tgid:")?,
@@ -5604,6 +5618,8 @@ fn worker_status_pid(status: &str, name: &str) -> std::io::Result<Pid> {
 
 fn worker_proc_snapshot(pid: Pid) -> std::io::Result<WorkerProcSnapshot> {
     let start_time = worker_process_start_time(pid)?;
+    #[cfg(test)]
+    OTHER_STATUS_OPENS.with(|opens| opens.set(opens.get() + 1));
     let status = launch_window::read_to_string(format!("/proc/{pid}/status"))?;
     let snapshot = WorkerProcSnapshot {
         tgid: worker_status_pid(&status, "Tgid:")?,
@@ -7645,6 +7661,10 @@ pub enum OwnedWaitError {
 /// arbitrary constructing thread. A wait created while attached, or
 /// whose task is already gone, records nothing: no handoff is pending
 /// for it to protect.
+///
+/// A call whose token has a captured identity reads that task's retained
+/// `status`. Callers whose record could never carry an owner skip the call
+/// instead (see [`OwnedWaitFuture::new`]).
 fn note_detached_wait_if_untraced(
     token: &TraceeToken,
     affinity_owner: Option<Arc<LegacyWaitOwner>>,
@@ -7686,11 +7706,37 @@ pub struct OwnedWaitFuture {
     observed_death: bool,
     managed_guard: Option<PtracerThreadGuard>,
     /// Detached-wait note taken at creation while untraced, ended on drop.
+    /// Never taken for an ownerless public wait; see [`Self::new`].
     detached_wait: Option<(Arc<Event>, u64)>,
 }
 impl OwnedWaitFuture {
+    /// The public wait. An ownerless token records nothing and reads no
+    /// status: this future never binds an owner later (only a
+    /// [`PtracerWaitDriver`] binds one, when built or polled), and
+    /// [`Event::detach_handoff_pending`] discards an ownerless record
+    /// without granting an exemption. An owner-bearing token keeps the
+    /// detached-wait note.
     pub(super) fn new(running: Running) -> Self {
-        let detached_wait = note_detached_wait_if_untraced(&running.1, None);
+        let detached_wait = if running.1.ptracer_owner.is_some() {
+            note_detached_wait_if_untraced(&running.1, None)
+        } else {
+            None
+        };
+        Self::with_detached_wait(running, detached_wait)
+    }
+
+    /// The core of an explicit [`PtracerWaitDriver`]. Its affinity can
+    /// capture an owner after creation, so it notes a detached wait
+    /// whether or not the token or `affinity_owner` carries one yet.
+    fn new_for_ptracer_driver(
+        running: Running,
+        affinity_owner: Option<Arc<LegacyWaitOwner>>,
+    ) -> Self {
+        let detached_wait = note_detached_wait_if_untraced(&running.1, affinity_owner);
+        Self::with_detached_wait(running, detached_wait)
+    }
+
+    fn with_detached_wait(running: Running, detached_wait: Option<(Arc<Event>, u64)>) -> Self {
         Self {
             inner: Some(WaitFuture::new(running)),
             observed_death: false,
@@ -8242,8 +8288,7 @@ impl PtracerWaitDriver {
             running.1.ptracer_owner.clone(),
             running.1.ptracer_wait_role,
         );
-        let mut inner = OwnedWaitFuture::new(running);
-        inner.bind_detached_wait_owner(affinity.owner.clone());
+        let inner = OwnedWaitFuture::new_for_ptracer_driver(running, affinity.owner.clone());
         Self {
             inner,
             affinity,
