@@ -569,6 +569,15 @@ impl Event {
 #[cfg(target_arch = "aarch64")]
 const NT_ARM_HW_BREAK: i32 = 0x402;
 
+/// `NT_ARM_TLS` (include/uapi/linux/elf.h): a thread's TPIDR_EL0.
+#[cfg(target_arch = "aarch64")]
+const NT_ARM_TLS: i32 = 0x401;
+
+/// `NT_ARM_SYSTEM_CALL` (include/uapi/linux/elf.h): a thread's
+/// syscall number and restart control.
+#[cfg(target_arch = "aarch64")]
+const NT_ARM_SYSTEM_CALL: i32 = 0x404;
+
 /// The libc `ptrace` request word is `c_uint` on glibc and `c_int` on musl.
 #[cfg(target_env = "musl")]
 type PtraceRequest = libc::c_int;
@@ -1544,6 +1553,28 @@ impl Stopped {
     /// Gets the floating point registers.
     pub fn getfpregs(&self) -> Result<FpRegs, Error> {
         self.getregset(libc::NT_PRFPREG)
+    }
+
+    /// Gets the thread pointer (TPIDR_EL0) via `NT_ARM_TLS`.
+    #[cfg(target_arch = "aarch64")]
+    pub fn get_thread_pointer(&self) -> Result<u64, Error> {
+        self.getregset(NT_ARM_TLS)
+    }
+
+    /// Sets the thread pointer (TPIDR_EL0) via `NT_ARM_TLS`.
+    #[cfg(target_arch = "aarch64")]
+    pub fn set_thread_pointer(&self, value: u64) -> Result<(), Error> {
+        self.setregset(NT_ARM_TLS, &value)
+    }
+
+    /// Gets the syscall number via `NT_ARM_SYSTEM_CALL`. At an
+    /// exec-event stop this is the only place the number survives:
+    /// the GPRs (x8 included) are zeroed by `start_thread`. A read
+    /// of -1 is NO_SYSCALL (kernels before v6.0 forget the number);
+    /// callers must refuse it, not guess.
+    #[cfg(target_arch = "aarch64")]
+    pub fn get_syscall_number(&self) -> Result<i32, Error> {
+        self.getregset(NT_ARM_SYSTEM_CALL)
     }
 
     /// Sets the floating point registers. Fails with `EPERM` once
