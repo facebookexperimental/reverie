@@ -420,8 +420,10 @@ impl<'fd> PreparedExec<'fd> {
                 {
                     exit_child();
                 }
-                // x86-64 kernel sigaction layout, matching the ordinary
-                // SIG_IGN/SA_RESTART/empty-mask request for both signals.
+                // Kernel sigaction layout (handler, flags, restorer,
+                // mask: the same four words on x86-64 and aarch64),
+                // matching the ordinary SIG_IGN/SA_RESTART/empty-mask
+                // request for both signals.
                 // No handler executes: exec retains SIG_IGN, clearing action
                 // flags/restorer/mask. No libc restorer address is transplanted.
                 let ignored = [libc::SIG_IGN as u64, libc::SA_RESTART as u64, 0_u64, 0_u64];

@@ -2745,6 +2745,7 @@ mod tests {
 
     const FORK_GUEST_C: &str = r#"
 #define _DEFAULT_SOURCE 1
+#include <dirent.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
@@ -3075,6 +3076,28 @@ static int many_thread_exec_child_marker(const char *marker, int count) {
   return wait_status(pid) == 0 ? 7 : 9;
 }
 
+static int count_tasks(void) {
+  DIR *dir = opendir("/proc/self/task");
+  if (!dir) return -1;
+  int count = 0;
+  struct dirent *entry;
+  while ((entry = readdir(dir)) != NULL)
+    if (entry->d_name[0] >= '0' && entry->d_name[0] <= '9') count++;
+  closedir(dir);
+  return count;
+}
+
+/* Park `count` threads, prove they exist by counting
+ * /proc/self/task, and record the count in the marker. */
+static int park_count(const char *marker, int count) {
+  if (park_threads(count) != 0) return 14;
+  int tasks = count_tasks();
+  char text[32];
+  snprintf(text, sizeof(text), "tasks=%d\n", tasks);
+  if (write_text(marker, text) != 0) return 10;
+  return tasks == count + 1 ? 7 : 9;
+}
+
 static void *exit_group_zero(void *unused) {
   (void)unused;
   usleep(20000);
@@ -3228,6 +3251,8 @@ int main(int argc, char **argv) {
 #endif
   if (strcmp(argv[1], "many-thread-exec-child-marker") == 0 && argc == 4)
     return many_thread_exec_child_marker(argv[2], atoi(argv[3]));
+  if (strcmp(argv[1], "park-count") == 0 && argc == 4)
+    return park_count(argv[2], atoi(argv[3]));
   if (strcmp(argv[1], "many-thread-exit-group-nondumpable") == 0 && argc == 3)
     return many_thread_exit_group_nondumpable(atoi(argv[2]));
   if (strcmp(argv[1], "busy-sibling-main-exit") == 0 && argc == 3)
@@ -4723,6 +4748,44 @@ int main(int argc, char **argv) {
         assert_eq!(with(b"running", None), Live);
         assert_eq!(with(blocked, None), Live);
         assert_eq!(examine(&live), Gone, "no syscall file");
+    }
+
+    #[test]
+    fn sibling_exec_check_uses_the_host_execve_number() {
+        // The Exec classification must key on the host's execve
+        // numbers, not another architecture's: 59 is execve only on
+        // x86_64, and semtimedop on aarch64.
+        assert!(super::is_exec_entry(libc::SYS_execve, super::EntryAbi::Native));
+        assert!(super::is_exec_entry(
+            libc::SYS_execveat,
+            super::EntryAbi::Native
+        ));
+        assert!(!super::is_exec_entry(
+            libc::SYS_read,
+            super::EntryAbi::Native
+        ));
+    }
+
+    #[test]
+    fn parked_threads_really_exist() {
+        // The many-thread fixtures are only meaningful if the 2000
+        // parked threads were actually created (on aarch64 a 64 KiB
+        // stack request used to fail EINVAL and create none). The
+        // guest counts /proc/self/task and records it in the marker.
+        let marker = supervisor_test_file("park-count.marker");
+        let output = std::process::Command::new(fork_guest())
+            .arg("park-count")
+            .arg(&marker)
+            .arg("2000")
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(7),
+            "park-count guest failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(fs::read_to_string(&marker).unwrap().trim(), "tasks=2001");
     }
 
     #[test]
