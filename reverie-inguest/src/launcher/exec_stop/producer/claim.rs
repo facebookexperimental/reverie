@@ -458,23 +458,40 @@ mod tests {
 
     #[test]
     fn a_wrong_runtime_or_layout_digest_refuses_by_its_own_key() {
+        let label =
+            |binding: &[[u64; 4]; 5]| launch_label(&Err(refusal(binding, &every_slot_expected())));
         let mut runtime = bound();
         runtime[RUNTIME_SLOT] = words([0xee; 32]);
+        let refused = refusal(&runtime, &every_slot_expected());
         assert_eq!(
-            refusal(&runtime, &every_slot_expected()).gap.key,
-            RUNTIME_DIGEST_MISMATCH
+            (refused.gap.key, refused.slot),
+            (RUNTIME_DIGEST_MISMATCH, Some(RUNTIME_SLOT))
+        );
+        assert_eq!(
+            label(&runtime),
+            "mapped-unqualified:exec_stop_runtime_digest_mismatch:runtime"
         );
         let mut layout = bound();
         layout[LAYOUT_SLOT] = words([0xee; 32]);
+        let refused = refusal(&layout, &every_slot_expected());
         assert_eq!(
-            refusal(&layout, &every_slot_expected()).gap.key,
-            LAYOUT_DIGEST_MISMATCH
+            (refused.gap.key, refused.slot),
+            (LAYOUT_DIGEST_MISMATCH, Some(LAYOUT_SLOT))
+        );
+        assert_eq!(
+            label(&layout),
+            "mapped-unqualified:exec_stop_layout_digest_mismatch:layout"
         );
         let mut launch = bound();
         launch[0] = words([0xee; 32]);
+        let refused = refusal(&launch, &every_slot_expected());
         assert_eq!(
-            refusal(&launch, &every_slot_expected()).gap.key,
-            HANDOFF_BINDING_UNBOUND
+            (refused.gap.key, refused.slot),
+            (HANDOFF_BINDING_UNBOUND, Some(0))
+        );
+        assert_eq!(
+            label(&launch),
+            "mapped-unqualified:exec_stop_handoff_binding_unbound:launch"
         );
     }
 
