@@ -1,11 +1,11 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 // Licensed under the BSD-style license in the LICENSE file.
 
-//! Production producer of a mapped first image's runtime inputs: the qualified
+//! Production producer of a mapped first image's runtime inputs: the audited
 //! private runtime image, one birth's descriptor leases, and the fixed
 //! placement its copied inputs and handoff use.
 //!
-//! Qualification checks the image against the embedder's facts about it
+//! The audit checks the image against the embedder's facts about it
 //! ([`RuntimeImageFacts`]):
 //! - the SHA-256 that binds the facts to these exact bytes;
 //! - the runtime window policy and the private runtime metadata;
@@ -49,8 +49,32 @@ use reverie_loader::image::ValidatedImage;
 use reverie_loader::init_packet::MAX_PACKET_LEN;
 use sha2::Digest;
 
+use super::CopiedInitialData;
 use super::CopiedInputRequest;
 use super::Result;
+use super::initial_inputs::CapturedInitialInputs;
+use super::physical::Preparation;
+use super::physical::RuntimeEntrySpec;
+
+mod claim;
+mod filter;
+mod wire;
+
+pub use claim::ArtifactAudit;
+pub use claim::BINDING_SLOTS;
+pub use claim::ClaimRefusal;
+pub use claim::HANDOFF_BINDING_UNBOUND;
+pub use claim::HandoffBinding;
+pub use claim::LAYOUT_DIGEST_MISMATCH;
+pub use claim::MappedLaunchFacts;
+pub use claim::QUALIFICATION_GAPS;
+pub use claim::QualificationGap;
+pub use claim::QualifiedMappedLaunch;
+pub use claim::RUNTIME_ARTIFACT_UNAUDITED;
+pub use claim::RUNTIME_DIGEST_MISMATCH;
+pub use claim::launch_label;
+pub use filter::AllowedNumbers;
+pub use filter::FilterCoverage;
 
 const PAGE: u64 = 4096;
 /// Bound on a retained runtime image.
@@ -103,6 +127,27 @@ pub struct RuntimeImageFacts {
     pub sites: [[u64; 4]; 4],
     /// Sorted return addresses of the ordinary (ToolInit) syscall sites.
     pub ordinary_post_ips: Vec<u64>,
+    /// Address of the bootstrap SIGSYS handler.
+    pub handler_address: u64,
+    /// Length of the handler's code.
+    pub handler_bytes: u64,
+    /// SHA-256 of the handler's code.
+    pub handler_sha256: [u8; 32],
+    /// Address of the image's `/dev/null\0` literal, in a read-only segment.
+    pub dev_null_address: u64,
+    /// The runtime entry an initial birth uses, when the image has one.
+    pub initial_entry: Option<EntryPoint>,
+    /// The runtime entry a successor birth uses, when the image has one.
+    pub successor_entry: Option<EntryPoint>,
+}
+
+/// A runtime entry: the private C entry and its terminal trap instruction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EntryPoint {
+    /// The entry, called with (handoff pointer, length).
+    pub entry: u64,
+    /// The `int3` the entry reaches when initialization returns.
+    pub terminal_trap: u64,
 }
 
 impl RuntimeImageFacts {
@@ -126,12 +171,16 @@ pub struct MemfdNames {
     pub packet: &'static std::ffi::CStr,
 }
 
-/// A private runtime image qualified once, and its sealed bytes.
+/// A private runtime image audited once, and its retained bytes. "Audited"
+/// is not "qualified": whether a launch of it may be called qualified is
+/// [`QualifiedMappedLaunch::claim`]'s question.
 pub struct AuditedRuntimeImage {
     bytes: Vec<u8>,
     facts: RuntimeImageFacts,
     descriptor: [u64; 12],
+    layout_sha256: [u8; 32],
     census: SyscallCensus,
+    filter: FilterCoverage,
 }
 
 impl std::fmt::Debug for AuditedRuntimeImage {
@@ -140,12 +189,13 @@ impl std::fmt::Debug for AuditedRuntimeImage {
             .field("bytes", &self.bytes.len())
             .field("facts", &self.facts)
             .field("census", &self.census)
+            .field("filter", &self.filter)
             .finish_non_exhaustive()
     }
 }
 
 impl AuditedRuntimeImage {
-    /// Qualify `bytes` against `facts`: ELF and window policy, the private
+    /// Audit `bytes` against `facts`: ELF and window policy, the private
     /// runtime metadata, the exact HLMLAY01 descriptor, the read-only
     /// reference page, the native gate page, every declared site's `syscall`
     /// bytes, and no undeclared DECODED `syscall` instruction. A `0f 05` pair
@@ -161,12 +211,13 @@ impl AuditedRuntimeImage {
             "runtime image bytes differ from the facts' image_sha256",
         )?;
         let declared = facts.declared_sites()?;
-        let (descriptor, census) = {
+        let (descriptor, layout_sha256, census, filter) = {
             let image = validate(&bytes)?;
             image
                 .private_runtime_metadata()
                 .map_err(|e| format!("private metadata: {e:?}"))?;
             let raw = exact_ro(&image, facts.layout_address, 96)?;
+            let layout_sha256: [u8; 32] = sha2::Sha256::digest(&raw).into();
             let mut descriptor = [0; 12];
             for (out, row) in descriptor.iter_mut().zip(raw.as_chunks::<8>().0) {
                 *out = u64::from_le_bytes(*row);
@@ -196,22 +247,69 @@ impl AuditedRuntimeImage {
                     "actual syscall/post instruction bytes",
                 )?;
             }
+            let mut seen = [false; 4];
+            for [_, _, number, operation] in facts.sites {
+                let slot = match (operation, number) {
+                    (1, 158) => 0,
+                    (2, 218) => 1,
+                    (3, 7) => 2,
+                    (4, 2) => 3,
+                    _ => return Err("measured operation/number".into()),
+                };
+                require(!seen[slot], "duplicate measured role")?;
+                seen[slot] = true;
+            }
             require(
                 !facts.ordinary_post_ips.is_empty()
                     && facts.ordinary_post_ips.len() <= 4096
                     && facts.ordinary_post_ips.windows(2).all(|p| p[0] < p[1]),
                 "finite unique sorted ToolInit sites",
             )?;
+            require(
+                facts.handler_bytes > 0 && facts.handler_bytes <= 64 * 1024,
+                "handler observation bounds",
+            )?;
+            let handler = exact_rx(&image, facts.handler_address, facts.handler_bytes as usize)?;
+            require(
+                <[u8; 32]>::from(sha2::Sha256::digest(handler)) == facts.handler_sha256,
+                "actual handler bytes",
+            )?;
+            require(
+                exact_ro(&image, facts.dev_null_address, 10)? == b"/dev/null\0",
+                "actual ELF dev-null literal",
+            )?;
+            require(
+                facts.initial_entry.is_some() || facts.successor_entry.is_some(),
+                "no runtime entry",
+            )?;
+            for entry in [facts.initial_entry, facts.successor_entry]
+                .into_iter()
+                .flatten()
+            {
+                exact_rx(&image, entry.entry, 1).map_err(|_| "runtime entry is not executable")?;
+                require(
+                    exact_rx(&image, entry.terminal_trap, 1).ok() == Some(&[0xcc][..]),
+                    "runtime terminal trap is not int3",
+                )?;
+            }
+            let runs = executable_runs(&image)?;
             let island = constructor_island(&image, &bytes)?;
-            let census =
-                instruction_audit(&executable_runs(&image)?, &NATIVE_GATE, &declared, island)?;
-            (descriptor, census)
+            let census = instruction_audit(&runs, &NATIVE_GATE, &declared, island)?;
+            let filter = filter::prove(
+                &super::physical::target_recipe(NATIVE_GATE.start)?,
+                &runs,
+                &NATIVE_GATE,
+                &declared,
+            )?;
+            (descriptor, layout_sha256, census, filter)
         };
         Ok(Self {
             bytes,
             facts,
             descriptor,
+            layout_sha256,
             census,
+            filter,
         })
     }
 
@@ -227,12 +325,27 @@ impl AuditedRuntimeImage {
         &self.census
     }
 
+    /// What the filter proof established.
+    pub fn filter_coverage(&self) -> &FilterCoverage {
+        &self.filter
+    }
+
+    /// The audited form of [`ArtifactAudit`], for a qualification claim.
+    pub fn artifact_audit(&self) -> ArtifactAudit {
+        ArtifactAudit::audited(self.census.clone(), self.filter.clone())
+    }
+
+    /// SHA-256 of the 96-byte HLMLAY01 descriptor.
+    pub fn layout_sha256(&self) -> &[u8; 32] {
+        &self.layout_sha256
+    }
+
     /// The exact retained bytes.
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
 
-    /// The facts the image was qualified against.
+    /// The facts the image was audited against.
     pub fn facts(&self) -> &RuntimeImageFacts {
         &self.facts
     }
@@ -823,6 +936,7 @@ pub struct BirthLeases {
     handoff: File,
     attempted: AtomicBool,
     poisoned: AtomicBool,
+    sealed: std::sync::OnceLock<Vec<u8>>,
 }
 
 /// The stop a packet is filled at: proves a descriptor is inherited by this
@@ -858,6 +972,7 @@ impl BirthLeases {
             handoff: memfd_bytes(names.runtime, &[], false)?,
             attempted: AtomicBool::new(false),
             poisoned: AtomicBool::new(false),
+            sealed: std::sync::OnceLock::new(),
         };
         leases.packet_empty()?;
         require(
@@ -981,6 +1096,9 @@ impl BirthLeases {
                 admission.initial_packet()? == bytes,
                 "actual admission packet changed during sealing",
             )?;
+            self.sealed
+                .set(bytes.clone())
+                .map_err(|_| "mapped packet lease was already sealed")?;
             Ok(bytes)
         });
         if let Err(error) = &result {
@@ -990,9 +1108,238 @@ impl BirthLeases {
     }
 }
 
+impl BirthLeases {
+    /// The packet sealed by [`fill_packet`](Self::fill_packet), re-verified
+    /// against the retained descriptor.
+    fn sealed_packet(&self) -> Result<&[u8]> {
+        let bytes = self
+            .sealed
+            .get()
+            .ok_or("mapped packet lease is not filled and sealed")?;
+        self.checked(|| self.verify_packet(bytes))?;
+        Ok(bytes)
+    }
+}
+
+/// Which runtime entry a birth uses. Nothing else about the producer's work
+/// differs between births.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BirthKind {
+    /// The first image of a launch.
+    Initial,
+    /// An image after a watched exec.
+    Successor,
+}
+
+/// What the launch route observed at the stop, for [`MappedBirthArming::arm`].
+/// The pid and the 27 register words come from `captured`, the packet and its
+/// descriptor from the producer's own leases, so none can be passed apart.
+pub struct ArmingFacts<'a> {
+    /// The birth, which selects the runtime entry.
+    pub birth: BirthKind,
+    /// The stop's captured original inputs (pid, registers, stack, aux).
+    pub captured: &'a CapturedInitialInputs,
+    /// The copied inputs `prepare_copied_inputs` produced for this image and
+    /// its [`copied_input_request`](MappedBirthArming::copied_input_request).
+    pub copied: &'a CopiedInitialData,
+    /// The stopped task's signal mask.
+    pub mask: u64,
+    /// The stopped task's PKRU.
+    pub pkru: u32,
+    /// The signals the tool's subscriptions reserve: SIGSYS always, SIGSEGV
+    /// when it intercepts instructions. Nothing else.
+    pub reserved_signals: u64,
+}
+
+/// One armed birth: the preparation and entry the launch route uses, and
+/// what a qualification claim needs.
+pub struct Armed<'fd> {
+    /// The preparation for `prepare_mapping`.
+    pub preparation: Preparation<'fd>,
+    /// The entry for the ToolInitialization observation.
+    pub entry: RuntimeEntrySpec,
+    /// What the sealed handoff's binding digests say about the mapped bytes.
+    /// Today never bound: the digests are zero.
+    pub binding: HandoffBinding,
+    /// The image's audit, for [`QualifiedMappedLaunch::claim`].
+    pub audit: ArtifactAudit,
+}
+
+/// The producer side of a mapped birth, as the launch route calls it: the
+/// inherited descriptors before clone; then at the stop, the image and request
+/// for `prepare_copied_inputs`, the packet fill, and the arming.
+pub trait MappedBirthArming {
+    /// The descriptors for the launch request's inherited list: packet,
+    /// runtime, handoff.
+    fn inherited(&self) -> [BorrowedFd<'_>; 3];
+    /// The runtime image, for `prepare_copied_inputs`.
+    fn validated_image(&self) -> Result<ValidatedImage<'_>>;
+    /// The copied-input request, for `prepare_copied_inputs`.
+    fn copied_input_request(&self) -> Result<CopiedInputRequest>;
+    /// Fill and seal the packet at the stop (see [`BirthLeases::fill_packet`]).
+    fn fill_packet(&self, stop: &dyn BirthStop, admission: &dyn PacketAdmission)
+    -> Result<Vec<u8>>;
+    /// Build, write and seal the handoff, and return the preparation and the
+    /// entry. Once per birth. A qualification gap never refuses this; it is
+    /// reported in [`Armed::binding`] and [`Armed::audit`].
+    fn arm<'fd>(&'fd self, facts: &ArmingFacts<'_>) -> Result<Armed<'fd>>;
+}
+
+/// The producer's [`MappedBirthArming`]: one birth of an audited image.
+pub struct MappedBirth<'img> {
+    image: &'img AuditedRuntimeImage,
+    leases: BirthLeases,
+    handoff: std::sync::OnceLock<wire::Wire>,
+}
+
+impl<'img> MappedBirth<'img> {
+    /// Create one birth's descriptors for `image`.
+    pub fn new(image: &'img AuditedRuntimeImage, names: MemfdNames) -> Result<Self> {
+        Ok(Self {
+            image,
+            leases: BirthLeases::new(image, names)?,
+            handoff: std::sync::OnceLock::new(),
+        })
+    }
+
+    /// The leases, for the route's checks of the retained descriptors.
+    pub fn leases(&self) -> &BirthLeases {
+        &self.leases
+    }
+}
+
+const SIGSYS_BIT: u64 = 1 << (libc::SIGSYS - 1);
+const SIGSEGV_BIT: u64 = 1 << (libc::SIGSEGV - 1);
+
+impl MappedBirthArming for MappedBirth<'_> {
+    fn inherited(&self) -> [BorrowedFd<'_>; 3] {
+        self.leases.inherited()
+    }
+
+    fn validated_image(&self) -> Result<ValidatedImage<'_>> {
+        self.image.validated_image()
+    }
+
+    fn copied_input_request(&self) -> Result<CopiedInputRequest> {
+        self.image.copied_input_request()
+    }
+
+    fn fill_packet(
+        &self,
+        stop: &dyn BirthStop,
+        admission: &dyn PacketAdmission,
+    ) -> Result<Vec<u8>> {
+        self.leases.fill_packet(stop, admission)
+    }
+
+    fn arm<'fd>(&'fd self, facts: &ArmingFacts<'_>) -> Result<Armed<'fd>> {
+        require(
+            self.handoff.get().is_none(),
+            "exec_stop_producer_already_armed",
+        )?;
+        let entry = match facts.birth {
+            BirthKind::Initial => self.image.facts.initial_entry,
+            BirthKind::Successor => self.image.facts.successor_entry,
+        }
+        .ok_or("exec_stop_producer_no_entry_for_birth")?;
+        require(
+            facts.reserved_signals & SIGSYS_BIT != 0
+                && facts.reserved_signals & !(SIGSYS_BIT | SIGSEGV_BIT) == 0,
+            "exec_stop_producer_reserved_signals",
+        )?;
+        let packet = self.leases.sealed_packet()?;
+        let validated = self.image.validated_image()?;
+        let built = wire::build(
+            self.image,
+            &validated,
+            facts.copied,
+            packet,
+            wire::WireContext {
+                pid: facts.captured.pid().as_raw() as u64,
+                registers: *facts.captured.registers(),
+                mask: facts.mask,
+                input_fd: self.leases.packet.as_raw_fd() as u64,
+                pkru: facts.pkru,
+            },
+        )?;
+        let handoff = &self.leases.handoff;
+        require(
+            handoff.metadata()?.len() == 0 && seals(handoff)? == 0,
+            "exec_stop_producer_handoff_not_pristine",
+        )?;
+        handoff.write_all_at(&built.bytes, 0)?;
+        handoff.set_len(built.bytes.len() as u64)?;
+        handoff.sync_all()?;
+        seal(handoff)?;
+        require(
+            seals(handoff)? == SEALS && handoff.metadata()?.len() == built.bytes.len() as u64,
+            "exec_stop_producer_handoff_seal",
+        )?;
+        let view = handoff::View::parse(&built.bytes, built.address)
+            .map_err(|e| format!("handoff parse: {e:?}"))?;
+        let mut binding = [[0; 4]; 5];
+        for (index, slot) in binding.iter_mut().enumerate() {
+            *slot = view
+                .binding(index)
+                .map_err(|e| format!("handoff binding: {e:?}"))?;
+        }
+        // The expected digests come from the bytes this birth sealed and maps.
+        let mapped = MappedLaunchFacts::of_mapped(
+            sha2::Sha256::digest(self.image.bytes()).into(),
+            self.image.layout_sha256,
+        );
+        let binding = HandoffBinding::of(&binding, &mapped);
+        self.handoff
+            .set(built)
+            .map_err(|_| "exec_stop_producer_already_armed")?;
+        let wire = self
+            .handoff
+            .get()
+            .ok_or("exec_stop_producer_already_armed")?;
+        let placement = Placement::fixed()?;
+        Ok(Armed {
+            preparation: Preparation {
+                runtime_fd: self.leases.runtime.as_fd(),
+                runtime_bytes: self.image.bytes(),
+                layout_address: self.image.facts.layout_address,
+                handoff_fd: handoff.as_fd(),
+                handoff_bytes: &wire.bytes,
+                handoff_address: wire.address,
+                input_fd: self.leases.packet.as_fd(),
+                free_band: placement.free_band,
+                filter_scratch: placement.filter_scratch,
+            },
+            entry: RuntimeEntrySpec {
+                entry: entry.entry,
+                terminal_trap: entry.terminal_trap,
+                reserved_signals: facts.reserved_signals,
+            },
+            binding,
+            audit: self.image.artifact_audit(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Facts with every field empty, for struct-update syntax.
+    fn bare_facts() -> RuntimeImageFacts {
+        RuntimeImageFacts {
+            image_sha256: [0; 32],
+            layout_address: 0,
+            reference_address: 0,
+            sites: [[0; 4]; 4],
+            ordinary_post_ips: Vec::new(),
+            handler_address: 0,
+            handler_bytes: 0,
+            handler_sha256: [0; 32],
+            dev_null_address: 0,
+            initial_entry: None,
+            successor_entry: None,
+        }
+    }
 
     #[test]
     fn fixed_placement_matches_the_promoted_layout() {
@@ -1028,9 +1375,6 @@ mod tests {
     #[test]
     fn declared_sites_take_bootstrap_ips_and_ordinary_posts_minus_two() {
         let facts = RuntimeImageFacts {
-            image_sha256: [0; 32],
-            layout_address: 0,
-            reference_address: 0,
             sites: [
                 [10, 12, 158, 1],
                 [14, 16, 218, 2],
@@ -1038,6 +1382,7 @@ mod tests {
                 [22, 24, 2, 4],
             ],
             ordinary_post_ips: vec![102, 202],
+            ..bare_facts()
         };
         assert_eq!(
             facts.declared_sites().unwrap(),
@@ -1053,10 +1398,8 @@ mod tests {
     fn facts_for(bytes: &[u8]) -> RuntimeImageFacts {
         RuntimeImageFacts {
             image_sha256: sha2::Sha256::digest(bytes).into(),
-            layout_address: 0,
-            reference_address: 0,
-            sites: [[0; 4]; 4],
             ordinary_post_ips: vec![2],
+            ..bare_facts()
         }
     }
 
@@ -1606,6 +1949,10 @@ mod tests {
                 *cell = number(value);
             }
         }
+        let digest = |value: &serde_json::Value| -> [u8; 32] {
+            let hex = value.as_str().unwrap();
+            std::array::from_fn(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap())
+        };
         let facts = RuntimeImageFacts {
             image_sha256,
             layout_address: number(&observed["layout_address"]),
@@ -1617,6 +1964,15 @@ mod tests {
                 .iter()
                 .map(number)
                 .collect(),
+            handler_address: number(&observed["handler_address"]),
+            handler_bytes: number(&observed["handler_bytes"]),
+            handler_sha256: digest(&observed["handler_sha256"]),
+            dev_null_address: number(&observed["dev_null_address"]),
+            initial_entry: Some(EntryPoint {
+                entry: number(&data["entry"]),
+                terminal_trap: number(&data["terminal_int3"]),
+            }),
+            successor_entry: None,
         };
         let image = AuditedRuntimeImage::new(bytes, facts).unwrap();
         let census = image.census();
@@ -1630,7 +1986,337 @@ mod tests {
         assert_eq!(census.executable_bytes, 0xac0000);
         image.validated_image().unwrap();
         image.copied_input_request().unwrap();
+        let filter = image.filter_coverage();
+        eprintln!("{filter:?}");
+        let gate = NATIVE_GATE.start;
+        let sigreturn = libc::SYS_rt_sigreturn as u32;
+        assert_eq!(
+            filter.allowed.iter().map(|(ip, _)| *ip).collect::<Vec<_>>(),
+            vec![
+                gate + 0x80,
+                gate + 0x82,
+                gate + 0x200,
+                gate + 0x202,
+                gate + 0x30b
+            ]
+        );
+        assert_eq!(filter.allowed[4].1, AllowedNumbers::Only(vec![sigreturn]));
+        assert_eq!(filter.encodings, 300);
+        assert_eq!(filter.trapped_encodings, 297);
+        assert_eq!(filter.trapped_declared_sites, 229);
+        assert_eq!(
+            arm_prepare_and_cancel(&image).refusal(),
+            Some((0, HANDOFF_BINDING_UNBOUND))
+        );
     }
+    /// A small image that passes every qualification check: header page
+    /// (HLMLAY01 at +512, `/dev/null` at +1024), gate page, text page (four
+    /// bootstrap sites, one more ordinary site, entry, terminal int3, handler),
+    /// data page with TLS, and the reference page.
+    fn qualifying_image() -> (Vec<u8>, RuntimeImageFacts) {
+        let base = RUNTIME_WINDOW.start;
+        let text = base + 2 * PAGE;
+        let mut gate = vec![0xcc_u8; PAGE as usize];
+        gate[0x7c..0x85].copy_from_slice(&NATIVE_GATE_BYTES);
+        gate[0x200..0x202].copy_from_slice(&[0x0f, 0x05]);
+        gate[0x300..0x30d].copy_from_slice(&[
+            0xf3, 0x0f, 0x1e, 0xfa, 0xb8, 15, 0, 0, 0, 0x0f, 0x05, 0x0f, 0x0b,
+        ]);
+        let mut code = vec![0xcc_u8; PAGE as usize];
+        for at in [0x00, 0x10, 0x20, 0x30, 0x40] {
+            code[at..at + 2].copy_from_slice(&[0x0f, 0x05]);
+        }
+        code[0x100..0x104].copy_from_slice(&[0xf3, 0x0f, 0x1e, 0xfa]);
+        code[0x200..0x20f].fill(0x90);
+        code[0x20f] = 0xc3;
+        let mut bytes = vec![0_u8; 5 * PAGE as usize];
+        bytes[..7].copy_from_slice(&[0x7f, b'E', b'L', b'F', 2, 1, 1]);
+        bytes[16..18].copy_from_slice(&2_u16.to_le_bytes());
+        bytes[18..20].copy_from_slice(&62_u16.to_le_bytes());
+        bytes[24..32].copy_from_slice(&(text + 0x100).to_le_bytes());
+        bytes[32..40].copy_from_slice(&64_u64.to_le_bytes());
+        bytes[54..56].copy_from_slice(&56_u16.to_le_bytes());
+        bytes[56..58].copy_from_slice(&7_u16.to_le_bytes());
+        for (i, (kind, flags, offset, address, file, memory, align)) in [
+            (1_u32, 4_u32, 0_u64, base, PAGE, PAGE, PAGE),
+            (1, 5, PAGE, base + PAGE, 2 * PAGE, 2 * PAGE, PAGE),
+            (1, 6, 3 * PAGE, base + 3 * PAGE, 512, PAGE, PAGE),
+            (7, 4, 3 * PAGE, base + 3 * PAGE, 16, 80, 8),
+            (0x6474_e551, 6, 0, 0, 0, 8 * 1024 * 1024, 0),
+            (6, 4, 64, base + 64, 392, 392, 8),
+            (1, 4, 4 * PAGE, base + 4 * PAGE, PAGE, PAGE, PAGE),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let at = 64 + i * 56;
+            bytes[at..at + 4].copy_from_slice(&kind.to_le_bytes());
+            bytes[at + 4..at + 8].copy_from_slice(&flags.to_le_bytes());
+            for (relative, value) in [
+                (8, offset),
+                (16, address),
+                (32, file),
+                (40, memory),
+                (48, align),
+            ] {
+                bytes[at + relative..at + relative + 8].copy_from_slice(&value.to_le_bytes());
+            }
+        }
+        for (i, word) in [
+            u64::from_le_bytes(*b"HLMLAY01"),
+            1,
+            96,
+            handoff::VERSION,
+            handoff::HEADER_BYTES as u64,
+            handoff::MAX_BYTES as u64,
+            64,
+            16,
+            128,
+            8,
+            base + PAGE,
+            base + PAGE + 0x7c,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            bytes[512 + i * 8..520 + i * 8].copy_from_slice(&word.to_le_bytes());
+        }
+        bytes[1024..1034].copy_from_slice(b"/dev/null\0");
+        let page = |n: u64| (n * PAGE) as usize..((n + 1) * PAGE) as usize;
+        bytes[page(1)].copy_from_slice(&gate);
+        bytes[page(2)].copy_from_slice(&code);
+        bytes[page(4)].copy_from_slice(&gate);
+        let facts = RuntimeImageFacts {
+            image_sha256: sha2::Sha256::digest(&bytes).into(),
+            layout_address: base + 512,
+            reference_address: base + 4 * PAGE,
+            sites: [
+                [text, text + 2, 158, 1],
+                [text + 0x10, text + 0x12, 218, 2],
+                [text + 0x20, text + 0x22, 7, 3],
+                [text + 0x30, text + 0x32, 2, 4],
+            ],
+            ordinary_post_ips: vec![text + 2, text + 0x12, text + 0x22, text + 0x32, text + 0x42],
+            handler_address: text + 0x200,
+            handler_bytes: 16,
+            handler_sha256: sha2::Sha256::digest(&code[0x200..0x210]).into(),
+            dev_null_address: base + 1024,
+            initial_entry: Some(EntryPoint {
+                entry: text + 0x100,
+                terminal_trap: text + 0x104,
+            }),
+            successor_entry: None,
+        };
+        (bytes, facts)
+    }
+
+    #[test]
+    fn the_qualifying_image_qualifies_with_its_audit_and_filter_counts() {
+        let (bytes, facts) = qualifying_image();
+        let image = AuditedRuntimeImage::new(bytes, facts).unwrap();
+        assert_eq!(image.census().in_gate, 3);
+        assert_eq!(image.census().at_declared_sites, 5);
+        let filter = image.filter_coverage();
+        assert_eq!(filter.allowed.len(), 5);
+        assert_eq!(filter.encodings, 8);
+        assert_eq!(filter.trapped_encodings, 5);
+        assert_eq!(filter.trapped_declared_sites, 5);
+        assert!(image.artifact_audit().counts().is_some());
+    }
+
+    #[test]
+    fn each_fact_check_refuses_by_name() {
+        let (bytes, facts) = qualifying_image();
+        let refuse = |facts: RuntimeImageFacts| {
+            AuditedRuntimeImage::new(bytes.clone(), facts)
+                .unwrap_err()
+                .to_string()
+        };
+        let mut wrong_handler = facts.clone();
+        wrong_handler.handler_sha256[0] ^= 1;
+        assert_eq!(refuse(wrong_handler), "actual handler bytes");
+        let mut no_dev_null = facts.clone();
+        no_dev_null.dev_null_address += 1;
+        assert_eq!(refuse(no_dev_null), "actual ELF dev-null literal");
+        let mut wrong_role = facts.clone();
+        wrong_role.sites[0][2] = 159;
+        assert_eq!(refuse(wrong_role), "measured operation/number");
+        let mut twice = facts.clone();
+        twice.sites[1] = [twice.sites[0][0], twice.sites[0][1], 158, 1];
+        assert_eq!(refuse(twice), "duplicate measured role");
+        let mut no_entry = facts.clone();
+        no_entry.initial_entry = None;
+        assert_eq!(refuse(no_entry), "no runtime entry");
+        let mut not_int3 = facts.clone();
+        not_int3.initial_entry.as_mut().unwrap().terminal_trap -= 1;
+        assert_eq!(refuse(not_int3), "runtime terminal trap is not int3");
+    }
+
+    #[test]
+    fn the_fixed_placement_is_the_promoted_literal_layout() {
+        let placement = Placement::fixed().unwrap();
+        let roles: Vec<(u64, u64)> = placement.roles.iter().map(|r| (r.start, r.end)).collect();
+        assert_eq!(
+            roles,
+            vec![
+                (0x6000_0010_0000, 0x6000_0020_0000),
+                (0x6000_0020_0000, 0x6000_0024_0000),
+                (0x6000_0024_0000, 0x6000_0034_0000),
+                (0x6000_0034_0000, 0x6000_0044_0000),
+                (0x6000_0044_0000, 0x6000_0054_0000),
+            ]
+        );
+        assert_eq!(
+            (placement.free_band.start, placement.free_band.end),
+            (0x6000_0010_0000, 0x6000_0ffff000)
+        );
+        assert_eq!(placement.filter_scratch, 0x6000_0044_8000);
+    }
+
+    /// Arm one real birth of `image` on a held `/bin/true` exec stop, prepare
+    /// the mapping physically, check it, and cancel. Returns the binding.
+    fn arm_prepare_and_cancel(image: &AuditedRuntimeImage) -> HandoffBinding {
+        use crate::launcher::exec_stop::CleanupReceipt;
+        use crate::launcher::exec_stop::ExecStop;
+        use crate::launcher::exec_stop::InitPacketBirthKind;
+        use crate::launcher::exec_stop::InitPacketExpectation;
+        use crate::launcher::exec_stop::PreparedExec;
+        use crate::launcher::exec_stop::build_init_packet;
+
+        let birth = MappedBirth::new(
+            image,
+            MemfdNames {
+                runtime: c"producer-test-runtime",
+                packet: c"producer-test-packet",
+            },
+        )
+        .unwrap();
+        let request = PreparedExec::new(
+            std::path::Path::new("/bin/true"),
+            &["producer-arm".into()],
+            &[],
+            None,
+            birth.inherited().to_vec(),
+        )
+        .unwrap();
+        let stop = ExecStop::spawn(request, CleanupReceipt::default()).unwrap();
+        let captured = stop.capture_initial_inputs().unwrap();
+        let validated = birth.validated_image().unwrap();
+        let copied = stop
+            .prepare_copied_inputs(
+                &captured,
+                &validated,
+                &birth.copied_input_request().unwrap(),
+            )
+            .unwrap();
+        // SAFETY: the retained EntryContext owns this held stop's real XSAVE
+        // capture.
+        let pkru = unsafe { stop.entry().xstate().pkru() }.unwrap();
+        let facts = ArmingFacts {
+            birth: BirthKind::Initial,
+            captured: &captured,
+            copied: &copied,
+            mask: stop.entry().signal_mask(),
+            pkru,
+            reserved_signals: SIGSYS_BIT,
+        };
+        assert_eq!(
+            birth.arm(&facts).err().unwrap().to_string(),
+            "mapped packet lease is not filled and sealed"
+        );
+        let packet = build_init_packet(
+            InitPacketExpectation {
+                birth_kind: InitPacketBirthKind::FirstImage,
+                expected_config_digest: [0x11; 32],
+                expected_state_digest: [0; 32],
+            },
+            b"producer-test",
+        )
+        .unwrap();
+        birth
+            .fill_packet(&stop, &FakeAdmission::new(vec![packet]))
+            .unwrap();
+        let successor = ArmingFacts {
+            birth: BirthKind::Successor,
+            ..facts
+        };
+        if image.facts().successor_entry.is_none() {
+            assert_eq!(
+                birth.arm(&successor).err().unwrap().to_string(),
+                "exec_stop_producer_no_entry_for_birth"
+            );
+        }
+        let reserved = ArmingFacts {
+            reserved_signals: SIGSYS_BIT | 1,
+            ..facts
+        };
+        assert_eq!(
+            birth.arm(&reserved).err().unwrap().to_string(),
+            "exec_stop_producer_reserved_signals"
+        );
+        let armed = birth.arm(&facts).unwrap();
+        assert_eq!(
+            birth.arm(&facts).err().unwrap().to_string(),
+            "exec_stop_producer_already_armed"
+        );
+        let binding = armed.binding;
+        assert_eq!(
+            QualifiedMappedLaunch::claim(&armed.binding, &armed.audit)
+                .unwrap_err()
+                .gap
+                .key,
+            HANDOFF_BINDING_UNBOUND
+        );
+        assert_eq!(
+            armed.entry.entry,
+            image.facts().initial_entry.unwrap().entry
+        );
+        let original_regs = *captured.registers();
+        let original_mask = stop.entry().signal_mask();
+        // SAFETY: original ptracer thread; the inherited descriptors are the
+        // birth's own, retained by the launch request; genuine captured
+        // context of this stop. No runtime entry runs: preparation only.
+        let prepared = match unsafe { stop.prepare_mapping(armed.preparation) } {
+            Ok(prepared) => prepared,
+            Err(failure) => panic!(
+                "preparation refused: {} cleanup={:?}",
+                failure.error,
+                failure.cleanup()
+            ),
+        };
+        #[cfg(feature = "stage1a-probe")]
+        {
+            let observed = prepared.diagnostic_observation().unwrap();
+            assert_eq!(observed.registers, original_regs);
+            assert_eq!(observed.signal_mask, original_mask);
+            assert!(observed.runtime_contents_exact);
+            assert!(observed.handoff_exact);
+        }
+        #[cfg(not(feature = "stage1a-probe"))]
+        let _ = (original_regs, original_mask);
+        let cancelled = match prepared.cancel() {
+            Ok(cancelled) => cancelled,
+            Err(retained) => panic!("preparation cancel unconfirmed: {:?}", retained.cleanup()),
+        };
+        assert!(cancelled.cleanup.confirmed);
+        // The filter the preparation installed is the one the proof decided.
+        assert_eq!(
+            cancelled.filter_bytes,
+            super::super::physical::target_recipe(NATIVE_GATE.start).unwrap()
+        );
+        binding
+    }
+
+    #[test]
+    fn a_real_birth_arms_prepares_and_cancels_unbound() {
+        let (bytes, facts) = qualifying_image();
+        let image = AuditedRuntimeImage::new(bytes, facts).unwrap();
+        assert_eq!(
+            arm_prepare_and_cancel(&image).refusal(),
+            Some((0, HANDOFF_BINDING_UNBOUND))
+        );
+    }
+
     struct FakeStop;
     impl BirthStop for FakeStop {
         fn duplicate_birth_pidfd_for_inherited(&self, _fd: BorrowedFd<'_>) -> Result<OwnedFd> {
@@ -1724,6 +2410,7 @@ mod tests {
             handoff: memfd_bytes(c"test-runtime", &[], false).unwrap(),
             attempted: AtomicBool::new(false),
             poisoned: AtomicBool::new(false),
+            sealed: std::sync::OnceLock::new(),
         }
     }
 
