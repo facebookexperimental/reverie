@@ -166,6 +166,19 @@ pub fn substitute_event_x7(captured: &mut Regs, event: &Regs) {
     }
 }
 
+/// Whether a live register image matches a captured one. The
+/// captured image carries the event stop's x7; the live task is
+/// parked at a syscall stop, where the kernel overwrites x7 with
+/// the stop direction and discards tracer writes to it
+/// (`report_syscall`), so that one word is unobservable there and
+/// is normalized from the captured image before comparing. Every
+/// other word must match exactly.
+pub fn live_matches_captured(live: &Regs, captured: &Regs) -> bool {
+    let mut normalized = *live;
+    substitute_event_x7(&mut normalized, captured);
+    register_words(&normalized) == register_words(captured)
+}
+
 /// The drain predicate, pure so both architectures' refusals are
 /// unit-testable: the syscall-info architecture must be this
 /// target's, the event must have originated in execve, and the
@@ -307,17 +320,29 @@ mod confinement_tests {
     // module. These sibling sources are read as text; the check
     // is exact, not a pattern that can drift.
     #[test]
-    fn no_target_arch_cfg_outside_the_arch_module_in_capture_drain() {
+    fn no_target_arch_outside_the_arch_module_in_capture_drain() {
+        // Plain substring: cfg, cfg!, cfg_attr, not/all/any forms
+        // all contain it, so none can slip through spelled wider.
         for source in [
             include_str!("mod.rs"),
             include_str!("child.rs"),
             include_str!("initial_inputs.rs"),
         ] {
             assert!(
-                !source.contains("cfg(target_arch"),
-                "cfg(target_arch) outside exec_stop/arch.rs"
+                !source.contains("target_arch"),
+                "target_arch outside exec_stop/arch.rs"
             );
         }
+    }
+
+    #[test]
+    fn drain_calls_the_arch_predicate() {
+        // Wiring pin (N4): the drain must actually consult
+        // drain_accepts; replacing the call with `false` fails here.
+        assert!(
+            include_str!("mod.rs").contains("!arch::drain_accepts("),
+            "drain_and_capture does not call arch::drain_accepts"
+        );
     }
 }
 
@@ -360,6 +385,29 @@ mod tests {
         };
         super::substitute_event_x7(&mut captured, &event);
         assert_eq!(captured.regs[7], 0);
+    }
+
+    #[test]
+    fn live_syscall_stop_image_matches_captured_except_x7() {
+        // N1: the live task at the drained syscall stop reports
+        // x7=1 (kernel stop direction); the captured image holds
+        // the event stop's x7=0. They must compare equal, and any
+        // other differing word must not.
+        let captured = safeptrace::Regs {
+            regs: [0; 31],
+            sp: 0x5000,
+            pc: 0x4000,
+            pstate: 0,
+        };
+        let mut live = captured;
+        live.regs[7] = 1;
+        assert!(super::live_matches_captured(&live, &captured));
+        let mut other = live;
+        other.regs[3] = 9;
+        assert!(!super::live_matches_captured(&other, &captured));
+        let mut moved = live;
+        moved.pc += 4;
+        assert!(!super::live_matches_captured(&moved, &captured));
     }
 
     #[test]

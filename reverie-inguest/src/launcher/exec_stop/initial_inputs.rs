@@ -385,7 +385,7 @@ pub(super) fn unchanged_parts(
 ) -> Result<()> {
     if task.generation() != context.generation
         || task.generation() != owner.generation
-        || register_words(&task.getregs()?) != register_words(&context.regs)
+        || !super::arch::live_matches_captured(&task.getregs()?, &context.regs)
         || task.getsigmask()? != context.signal_mask
         || super::arch::capture_extended_state(task)? != context.xstate
         || read_exact_span(task, context.stack_start, context.stack_bytes.len())?
