@@ -514,10 +514,21 @@ pub fn print_tracee_output(output: &Output) {
     }
 }
 
+/// Log filter for [`run_tokio_test`] when `RUST_LOG` is unset.
+const DEFAULT_TEST_LOG_FILTER: &str = "warn";
+
+/// `RUST_LOG` when it is set, else [`DEFAULT_TEST_LOG_FILTER`]. A fixed
+/// `reverie=trace` filter once wrote 4.84 GB of stdout from one test case and
+/// broke the test runner's output transport.
+fn test_log_filter(rust_log: Option<&str>) -> tracing_subscriber::EnvFilter {
+    tracing_subscriber::EnvFilter::new(rust_log.unwrap_or(DEFAULT_TEST_LOG_FILTER))
+}
+
 /// Configure tokio and tracing in the way that we like, and run the future.
 pub fn run_tokio_test<F: Future>(fut: F) -> F::Output {
+    let rust_log = std::env::var("RUST_LOG").ok();
     let collector = tracing_subscriber::fmt()
-        .with_env_filter("reverie=trace")
+        .with_env_filter(test_log_filter(rust_log.as_deref()))
         .finish();
 
     // For reentrancy during testing we need to set up logging early because mio
@@ -622,4 +633,34 @@ where
     F: FnOnce(),
 {
     check_fn_with_config::<T, F>(f, Default::default(), true)
+}
+
+#[cfg(test)]
+mod tests {
+    use tracing::level_filters::LevelFilter;
+
+    use super::*;
+
+    #[test]
+    fn test_log_filter_is_quiet_without_rust_log() {
+        let hint = test_log_filter(None).max_level_hint();
+        assert_eq!(hint, Some(LevelFilter::WARN));
+        assert!(hint < Some(LevelFilter::DEBUG), "{hint:?}");
+    }
+
+    #[test]
+    fn test_log_filter_honours_rust_log() {
+        for (rust_log, level) in [
+            ("reverie=trace", LevelFilter::TRACE),
+            ("reverie_ptrace::timer=debug", LevelFilter::DEBUG),
+            ("error", LevelFilter::ERROR),
+            ("off", LevelFilter::OFF),
+        ] {
+            assert_eq!(
+                test_log_filter(Some(rust_log)).max_level_hint(),
+                Some(level),
+                "{rust_log}"
+            );
+        }
+    }
 }
