@@ -62,7 +62,9 @@ const INPUT: [u8; SIZE] = [
 ];
 pub(super) fn source_symbol(digest: &str) -> Result<&'static str> {
     require(
-        digest == SOURCE_SHA || digest == HANDOFF_ROUTE_RULE_SOURCE_SHA,
+        digest == SOURCE_SHA
+            || digest == HANDOFF_ROUTE_RULE_SOURCE_SHA
+            || digest == HANDOFF_MAX_BYTES_SOURCE_SHA,
         "Bootstrap::env_aux_words complete source differs",
     )?;
     Ok(SYMBOL)

@@ -59,6 +59,18 @@ pub use native_leaves::native_leaf_implementation_sha256;
 // 85abd905, and every emitted-byte, relocation and alias check still runs.
 const HANDOFF_ROUTE_RULE_SOURCE_SHA: &str =
     "e7c8f96840a3787ec4d05c70a14c3c7a6077feabc888ca9878064a9bd560eec4";
+// reverie-loader/src/handoff.rs after "loader: derive the handoff MAX_BYTES
+// bound from wire maxima" (dh-kn6yu). Outside `mod tests` its only change from
+// 71c29c66 is the MAX_BYTES initializer, now the sum of three new private
+// consts (MAX_TABLE_BYTES, MAX_STRING_BYTES, MAX_AUXV_PAYLOAD_BYTES) and their
+// doc comments. No impl block is added, so the Ms1_/Ms2_ impl disambiguators
+// stay; no item, impl order, signature or body of the six selected functions
+// moves, and only Bootstrap::project, View::parse and serialize read MAX_BYTES.
+// Every consumer therefore selects the symbol it selects for 71c29c66 and
+// accepts it exactly there; every emitted-byte, relocation and alias check
+// still runs.
+const HANDOFF_MAX_BYTES_SOURCE_SHA: &str =
+    "fa44be93468c2257d532fc8ad5631a541befb13af9f7e98f2771287350aaa76e";
 
 /// Test seam (see private_static::factory_source_self_check): the reviewed
 /// Reverie source identities the producer's providers enforce, each checked by
@@ -2233,26 +2245,27 @@ mod tests {
             ("view_site", view_site::source_symbol),
             ("view_table", view_table::source_symbol),
         ];
-        let new = HANDOFF_ROUTE_RULE_SOURCE_SHA;
-        for (name, select) in consumers {
-            assert_eq!(select(new), select(BOOTSTRAP_COHORT), "{name}");
-            assert!(select(new).is_ok(), "{name}");
-            for refused in [
-                "0".repeat(64),
-                new[..63].to_owned(),
-                format!("{new}0"),
-                new.to_ascii_uppercase(),
-                format!("sha256:{new}"),
-            ] {
-                assert!(select(&refused).is_err(), "{name}: {refused}");
-            }
-            for index in 0..new.len() {
-                let mut modified = new.as_bytes().to_vec();
-                modified[index] = if modified[index] == b'0' { b'1' } else { b'0' };
-                assert!(
-                    select(&String::from_utf8(modified).unwrap()).is_err(),
-                    "{name}"
-                );
+        for new in [HANDOFF_ROUTE_RULE_SOURCE_SHA, HANDOFF_MAX_BYTES_SOURCE_SHA] {
+            for (name, select) in consumers {
+                assert_eq!(select(new), select(BOOTSTRAP_COHORT), "{name}");
+                assert!(select(new).is_ok(), "{name}");
+                for refused in [
+                    "0".repeat(64),
+                    new[..63].to_owned(),
+                    format!("{new}0"),
+                    new.to_ascii_uppercase(),
+                    format!("sha256:{new}"),
+                ] {
+                    assert!(select(&refused).is_err(), "{name}: {refused}");
+                }
+                for index in 0..new.len() {
+                    let mut modified = new.as_bytes().to_vec();
+                    modified[index] = if modified[index] == b'0' { b'1' } else { b'0' };
+                    assert!(
+                        select(&String::from_utf8(modified).unwrap()).is_err(),
+                        "{name}"
+                    );
+                }
             }
         }
     }

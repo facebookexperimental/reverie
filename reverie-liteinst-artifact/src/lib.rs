@@ -1199,23 +1199,23 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers/bootstrap_env_aux.rs",
-        20586,
-        "4afada5329dc1f87a52293642fc8b5d588161f6fa8bfd13e031f9469d36ed85a",
+        20652,
+        "249b94a1689d5072659145a88b56e0a180ff6a2f7dc4f083504ac71b789d7b8c",
     ),
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers/bootstrap_descriptor.rs",
-        34023,
-        "b52ccee92a5a86760b2a106c431feae29cc4d58e78e6a5f91e08e9c5bf61fa6d",
+        34089,
+        "b3ec825b4db8276d0104fd46ff837b76b4bace7a8c1bd75c0f3d80808b0e835d",
     ),
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers/bootstrap_role.rs",
-        9301,
-        "40ed1b5dafe32e1a52f96fb03fde75226c955d0d902a796763ad401e4b31a4d3",
+        9367,
+        "b03c9ac9c70674c94bdcd15420fcec6338d109781af39440a6b86b563633e1a5",
     ),
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers/bootstrap_site.rs",
-        17971,
-        "a6a6b9818110da6d053c9aa4edd804e9e1145e436632e9b3b2acf3439474371c",
+        18037,
+        "51ebc548aec8eefa110d9be991f530d9235b412e659429ae4ecac76933c71337",
     ),
     (
         "reverie-loader/src/mapped_inputs.rs",
@@ -1239,8 +1239,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers/view_site.rs",
-        52866,
-        "2c8a72323b5a8b8bc3b071e719d12d20183fad75d1b9d95597204bca7f04969e",
+        52994,
+        "b831cb4c34929ef4b8929926429032441b5ae9f0ed379352ba579c79ce28cf2a",
     ),
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers/view_site/caller.rs",
@@ -1249,13 +1249,13 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers/view_table.rs",
-        41490,
-        "0dadc3bd659870589c6b7579e79b2832103f071b5304c647b5f03030614efc76",
+        41618,
+        "ad4f59df6c0b4bc33e36fc385077ec990cecd3ea6a2616dc761d9a95e1c2c34d",
     ),
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers.rs",
-        245432,
-        "9538dc41f8a93b9da2ef5b2960215eb5e8ae7a34ef429ad002962500b49af16c",
+        246390,
+        "8c51f952f7b366b34785e434d66a8b50be37a8b2b2afc0fce1ce645e80dac5a4",
     ),
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers/package_roles.rs",
@@ -39102,6 +39102,41 @@ mod tests {
                 "reverie-inguest/src/guest/alloc.rs",
                 46676,
                 "8b594686698976c7b3c88aa5bfeaa234163b3181c1e92a10977831a01bef71b2",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers/bootstrap_env_aux.rs",
+                20586,
+                "4afada5329dc1f87a52293642fc8b5d588161f6fa8bfd13e031f9469d36ed85a",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers/bootstrap_descriptor.rs",
+                34023,
+                "b52ccee92a5a86760b2a106c431feae29cc4d58e78e6a5f91e08e9c5bf61fa6d",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers/bootstrap_role.rs",
+                9301,
+                "40ed1b5dafe32e1a52f96fb03fde75226c955d0d902a796763ad401e4b31a4d3",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers/bootstrap_site.rs",
+                17971,
+                "a6a6b9818110da6d053c9aa4edd804e9e1145e436632e9b3b2acf3439474371c",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers/view_site.rs",
+                52866,
+                "2c8a72323b5a8b8bc3b071e719d12d20183fad75d1b9d95597204bca7f04969e",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers/view_table.rs",
+                41490,
+                "0dadc3bd659870589c6b7579e79b2832103f071b5304c647b5f03030614efc76",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers.rs",
+                245432,
+                "9538dc41f8a93b9da2ef5b2960215eb5e8ae7a34ef429ad002962500b49af16c",
             ),
         ] {
             let entries: Vec<_> = CONTENT_REVERIE_CATALOG
