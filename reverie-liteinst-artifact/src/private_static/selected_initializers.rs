@@ -71,6 +71,19 @@ const HANDOFF_ROUTE_RULE_SOURCE_SHA: &str =
 // still runs.
 const HANDOFF_MAX_BYTES_SOURCE_SHA: &str =
     "fa44be93468c2257d532fc8ad5631a541befb13af9f7e98f2771287350aaa76e";
+// reverie-loader/src/handoff.rs after the dh-axoec loader commits ("loader:
+// expose sealed coordinator carriage for mapped successors", "loader: add pure
+// mapped-input range predicate" and its RangeInclusive form). Outside `mod
+// tests` its only changes from fa44be93 are two methods appended to the
+// existing `impl View` after View::bytes (env_count, env) and one new free
+// function, valid_mapped_input_range, with their doc comments. No impl block
+// is added, so the Ms1_/Ms2_ impl disambiguators stay; no item, impl order,
+// signature or body of the six selected functions moves, and none of them
+// calls an added item. Every consumer therefore selects the symbol it selects
+// for fa44be93 and accepts it exactly there; every emitted-byte, relocation
+// and alias check still runs.
+const HANDOFF_ENTRY_PREDICATE_SOURCE_SHA: &str =
+    "97dc6312ea6916c4e506151e4a79870d4917f58ee3e06b008d38576b5cf3a2df";
 
 /// Test seam (see private_static::factory_source_self_check): the reviewed
 /// Reverie source identities the producer's providers enforce, each checked by
@@ -2600,7 +2613,11 @@ mod tests {
             ("view_site", view_site::source_symbol),
             ("view_table", view_table::source_symbol),
         ];
-        for new in [HANDOFF_ROUTE_RULE_SOURCE_SHA, HANDOFF_MAX_BYTES_SOURCE_SHA] {
+        for new in [
+            HANDOFF_ROUTE_RULE_SOURCE_SHA,
+            HANDOFF_MAX_BYTES_SOURCE_SHA,
+            HANDOFF_ENTRY_PREDICATE_SOURCE_SHA,
+        ] {
             for (name, select) in consumers {
                 assert_eq!(select(new), select(BOOTSTRAP_COHORT), "{name}");
                 assert!(select(new).is_ok(), "{name}");
