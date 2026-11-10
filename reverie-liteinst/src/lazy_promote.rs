@@ -1094,7 +1094,13 @@ impl Drop for LazyPromoter {
     }
 }
 
+// `reverie_asan` is a Meta-internal cfg, set for AddressSanitizer builds to
+// skip tests that ASan's runtime makes infeasible. It is allowed here instead
+// of declared in the crate manifest's [lints] table because
+// reverie-liteinst/Cargo.toml is a reviewed input in
+// reverie-liteinst-artifact's CONTENT_REVERIE_CATALOG.
 #[cfg(test)]
+#[allow(unexpected_cfgs)]
 mod tests {
     use super::*;
     use liteinst_aarch64_patch::mapping::Provenance;
@@ -1900,6 +1906,10 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    #[cfg_attr(
+        reverie_asan,
+        ignore = "AddressSanitizer build (cfg reverie_asan): ASan's allocator maps memory for a size class with a raw mmap (MAP_FIXED, 256 KiB) from its own runtime, outside the trusted gate, so the filter traps the child's allocation while it reads /proc/self/smaps (exit 77); mprotect_store_windows_restores_exact_protection and proc_mem_store_changes_word_in_rx_text run the stores without the filter; not a product pass"
+    )]
     fn stores_run_under_the_real_seccomp_filter() {
         // Child: install the exact-address filter, then drive the
         // stores, qualification and the signal mask. Any syscall
