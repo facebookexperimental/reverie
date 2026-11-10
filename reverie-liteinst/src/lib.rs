@@ -93,6 +93,14 @@ pub use reverie_inguest::guest::host::PhysicalCreation;
 pub use reverie_inguest::guest::host::PhysicalCreationHook;
 pub use reverie_inguest::guest::host::RefusedChild;
 pub use reverie_inguest::guest::host::set_physical_creation_hook;
+/// The runtime's records of guest calls it refused before any Tool ran (a
+/// signal handler or alternate stack; a fork-like call while process forks
+/// are not allowed). A take returns what was refused in this process since
+/// the last take and clears it.
+pub use reverie_inguest::guest::protect::RefusedProcessCreations;
+pub use reverie_inguest::guest::protect::RefusedSignalControls;
+pub use reverie_inguest::guest::protect::take_refused_process_creations;
+pub use reverie_inguest::guest::protect::take_refused_signal_controls;
 /// Native fixed-stack entry used by the owned standalone leaf.
 ///
 /// x86-64 only: on aarch64 this name is not exported (compile-time API

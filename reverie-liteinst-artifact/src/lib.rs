@@ -1379,8 +1379,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-liteinst/src/lib.rs",
-        35129,
-        "1270edf2571480add4843055dd5417b9886291c4f75d8399645f94cfc76e12ec",
+        35663,
+        "f90201e80854dda44cc9d76fdbf3fa45a01970baf6ff0b211a2f667c2401b50f",
     ),
     (
         "reverie-liteinst-preload/Cargo.toml",
@@ -38773,6 +38773,11 @@ mod tests {
         // Keep the fixed catalog authoritative and reject their prior tuples.
         assert_eq!(CONTENT_REVERIE_CATALOG.len(), 86);
         for (relative, old_size, old_digest) in [
+            (
+                "reverie-liteinst/src/lib.rs",
+                35129,
+                "1270edf2571480add4843055dd5417b9886291c4f75d8399645f94cfc76e12ec",
+            ),
             (
                 "reverie-liteinst-artifact/src/private_static/selected_initializers/bootstrap_env_aux.rs",
                 20532,
