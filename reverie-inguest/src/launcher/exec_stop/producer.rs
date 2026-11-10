@@ -470,10 +470,12 @@ fn check_native_gate(image: &ValidatedImage<'_>, reference_address: u64) -> Resu
 }
 
 /// The pinned address of the constructor message island in `bytes`, from the
-/// image's own symbol table: `reverie_inguest_constructor_entry` + 0x2c3, when
-/// exactly one symbol has that name, its size is the pinned 744 bytes, and the
-/// pinned `endbr64; ud2` sits at +0x2bd. `None` (no exemption) otherwise; more
-/// than one such symbol is refused.
+/// image's own symbol table: `reverie_inguest_constructor_entry` + 0x2c3.
+/// Without that symbol there is no exemption (`None`), and the message, if
+/// present, is swept as code. With it, the layout must not have drifted: more
+/// than one such symbol, a size other than the pinned 744 bytes, or anything
+/// but an executable `endbr64; ud2` at +0x2bd is refused by name, so a drift
+/// never turns the exemption off silently.
 fn constructor_island(image: &ValidatedImage<'_>, bytes: &[u8]) -> Result<Option<u64>> {
     let symbols = symbols_named(bytes, CONSTRUCTOR_SYMBOL)?;
     require(
@@ -484,19 +486,30 @@ fn constructor_island(image: &ValidatedImage<'_>, bytes: &[u8]) -> Result<Option
         return Ok(None);
     };
     if size != CONSTRUCTOR_BYTES {
-        return Ok(None);
+        return Err(format!(
+            "reverie_inguest_constructor_entry drifted: size {size} != {CONSTRUCTOR_BYTES}"
+        )
+        .into());
     }
     let lead = value
         .checked_add(CONSTRUCTOR_LEAD_OFFSET)
         .ok_or("constructor lead overflow")?;
-    match exact_rx(image, lead, CONSTRUCTOR_LEAD.len()) {
-        Ok(bytes) if bytes == CONSTRUCTOR_LEAD => Ok(Some(
-            value
-                .checked_add(CONSTRUCTOR_MESSAGE_OFFSET)
-                .ok_or("constructor island overflow")?,
-        )),
-        _ => Ok(None),
+    let bytes = exact_rx(image, lead, CONSTRUCTOR_LEAD.len()).map_err(|_| {
+        format!(
+            "reverie_inguest_constructor_entry drifted: +{CONSTRUCTOR_LEAD_OFFSET:#x} is not executable"
+        )
+    })?;
+    if bytes != CONSTRUCTOR_LEAD {
+        return Err(format!(
+            "reverie_inguest_constructor_entry drifted: the bytes at +{CONSTRUCTOR_LEAD_OFFSET:#x} are not endbr64; ud2"
+        )
+        .into());
     }
+    Ok(Some(
+        value
+            .checked_add(CONSTRUCTOR_MESSAGE_OFFSET)
+            .ok_or("constructor island overflow")?,
+    ))
 }
 
 /// `(st_value, st_size)` of every `.symtab` symbol named `name` in the ELF64
@@ -1854,7 +1867,12 @@ pub(super) mod tests {
             "instruction audit: constructor message at {:#x} is not the pinned island",
             elsewhere + 6
         );
-        let alone = island_image(&island_text(None, &[(elsewhere, &copy)]));
+        let alone = elf(
+            Some(RX),
+            &gate_page(),
+            &island_text(None, &[(elsewhere, &copy)]),
+            &gate_page(),
+        );
         assert_eq!(
             audit(&alone, &declared).unwrap_err().to_string(),
             not_pinned
@@ -1864,12 +1882,17 @@ pub(super) mod tests {
             audit(&second, &declared).unwrap_err().to_string(),
             not_pinned
         );
-        // Without the symbol there is no pinned island at all.
+        // Without the symbol there is no pinned island at all: no exemption,
+        // not a refusal, and the message is swept as code.
         let unpinned = elf(
             Some(RX),
             &gate_page(),
             &island_text(Some(pinned), &[]),
             &gate_page(),
+        );
+        assert_eq!(
+            constructor_island(&validate(&unpinned).unwrap(), &unpinned).unwrap(),
+            None
         );
         assert_eq!(
             audit(&unpinned, &declared).unwrap_err().to_string(),
@@ -1888,14 +1911,41 @@ pub(super) mod tests {
             );
         }
 
-        // The island not preceded by endbr64; ud2. Its symbol's pinned lead
-        // is then absent too, so the image's own bytes give no pin, and the
-        // message is just undecodable text.
-        let no_lead = island_image(&island_text(Some(pinned), &[(pinned, &[0x90; 6])]));
-        let error = audit(&no_lead, &declared).unwrap_err().to_string();
-        assert!(
-            error.starts_with("instruction audit: undecodable bytes"),
-            "{error}"
+        // The symbol's pinned lead is not endbr64; ud2 (here nops), or the
+        // lead's first byte alone differs: the layout drifted, refused by
+        // name rather than turning the exemption off.
+        let lead_mismatch =
+            "reverie_inguest_constructor_entry drifted: the bytes at +0x2bd are not endbr64; ud2";
+        for lead in [&[0x90_u8; 6][..], &[0xf2][..]] {
+            let no_lead = island_image(&island_text(Some(pinned), &[(pinned, lead)]));
+            let image = validate(&no_lead).unwrap();
+            assert_eq!(
+                constructor_island(&image, &no_lead)
+                    .unwrap_err()
+                    .to_string(),
+                lead_mismatch
+            );
+            assert_eq!(
+                audit(&no_lead, &declared).unwrap_err().to_string(),
+                lead_mismatch
+            );
+        }
+        // The symbol placed so that +0x2bd is outside every executable
+        // segment: refused by name.
+        let outside = with_symbol(
+            elf(
+                Some(RX),
+                &gate_page(),
+                &island_text(Some(pinned), &[]),
+                &gate_page(),
+            ),
+            CONSTRUCTOR_SYMBOL,
+            0x10,
+            CONSTRUCTOR_BYTES,
+        );
+        assert_eq!(
+            audit(&outside, &declared).unwrap_err().to_string(),
+            "reverie_inguest_constructor_entry drifted: +0x2bd is not executable"
         );
         // With the pin derived (the lead bytes are intact at +0x2bd), a sweep
         // that reaches the island other than straight after the lead is
@@ -1913,7 +1963,8 @@ pub(super) mod tests {
                 "instruction audit: constructor message island at {message:#x} is not preceded by endbr64; ud2"
             )
         );
-        // The pin needs the exact size and exactly one symbol.
+        // The pin needs the exact size and exactly one symbol: any other size
+        // is a drift, refused by name.
         for size in [CONSTRUCTOR_BYTES - 1, CONSTRUCTOR_BYTES + 1] {
             let resized = with_symbol(
                 elf(
@@ -1926,11 +1977,16 @@ pub(super) mod tests {
                 CONSTRUCTOR,
                 size,
             );
+            let image = validate(&resized).unwrap();
+            assert_eq!(
+                constructor_island(&image, &resized)
+                    .unwrap_err()
+                    .to_string(),
+                format!("reverie_inguest_constructor_entry drifted: size {size} != 744"),
+            );
             assert_eq!(
                 audit(&resized, &declared).unwrap_err().to_string(),
-                format!(
-                    "instruction audit: constructor message at {message:#x} is not the pinned island"
-                ),
+                format!("reverie_inguest_constructor_entry drifted: size {size} != 744"),
                 "size {size}"
             );
         }
