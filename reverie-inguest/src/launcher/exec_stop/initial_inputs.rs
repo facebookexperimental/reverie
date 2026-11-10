@@ -99,7 +99,8 @@ impl CapturedInitialInputs {
     pub fn pid(&self) -> safeptrace::Pid {
         self.pid
     }
-    /// Exact original27-register codec, including guest original FS/GS.
+    /// Exact original register image in the architecture's pinned
+    /// word order (x86-64: 27 words incl. FS/GS; aarch64: 34 words).
     pub fn registers(&self) -> &super::arch::RegisterWords {
         &self.registers
     }
@@ -161,8 +162,12 @@ impl CapturedInitialInputs {
         base: u64,
         capacity: usize,
     ) -> Result<PlacedInputs> {
-        let parsed = ParsedInitial::parse(self.stack_start, &self.stack_bytes, self.registers[19])
-            .map_err(parse_error)?;
+        let parsed = ParsedInitial::parse(
+            self.stack_start,
+            &self.stack_bytes,
+            super::arch::stack_pointer_word(&self.registers),
+        )
+        .map_err(parse_error)?;
         let reads: Vec<OwnedRead> = self
             .reads
             .iter()

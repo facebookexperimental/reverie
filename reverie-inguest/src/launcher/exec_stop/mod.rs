@@ -395,13 +395,9 @@ pub struct EntryContext {
     /// Kernel entry registers (x86-64: including FS/GS; aarch64: user_pt_regs).
     regs: Regs,
     generation: safeptrace::TraceeGeneration,
-    /// Extended processor state (x86-64: opaque xstate image;
-    /// aarch64: fpsimd image; see `arch::ExtendedState`).
+    /// Extended processor state (x86-64 xstate; aarch64 fpsimd
+    /// plus TPIDR_EL0 inside `arch::ExtendedState`).
     xstate: arch::ExtendedState,
-    /// Saved thread pointer (aarch64 TPIDR_EL0; x86-64 carries it
-    /// inside the register image and has no separate field).
-    #[cfg(target_arch = "aarch64")]
-    thread_pointer: u64,
     /// Original guest signal mask.
     signal_mask: u64,
     /// Start of the selected initial stack VMA.
@@ -417,12 +413,6 @@ impl EntryContext {
     /// Original extended processor state.
     pub fn xstate(&self) -> &arch::ExtendedState {
         &self.xstate
-    }
-
-    /// Original saved thread pointer (aarch64 TPIDR_EL0).
-    #[cfg(target_arch = "aarch64")]
-    pub fn thread_pointer(&self) -> u64 {
-        self.thread_pointer
     }
     /// Original signal mask.
     pub fn signal_mask(&self) -> u64 {
@@ -442,15 +432,11 @@ impl EntryContext {
         let regs = task.getregs()?;
         let signal_mask = task.getsigmask()?;
         let xstate = arch::capture_extended_state(task)?;
-        #[cfg(target_arch = "aarch64")]
-        let thread_pointer = arch::capture_thread_pointer(task)?;
         let (stack_start, stack_bytes) = snapshot_stack(task, arch::stack_pointer(&regs))?;
         Ok(Self {
             regs,
             generation: task.generation(),
             xstate,
-            #[cfg(target_arch = "aarch64")]
-            thread_pointer,
             signal_mask,
             stack_start,
             stack_bytes,
@@ -467,17 +453,11 @@ impl EntryContext {
             return Err("mapped_handover_foreign_context".into());
         }
         let current_stack = trace::read(task, self.stack_start, self.stack_bytes.len())?;
-        let restored_state = arch::restore_extended_state(task, &self.xstate)?;
-        #[cfg(target_arch = "aarch64")]
-        let restored_tp = arch::restore_thread_pointer(task, self.thread_pointer)?;
+        arch::write_extended_state(task, &self.xstate)?;
         task.setregs(&self.regs)?;
         task.setsigmask(mask)?;
-        #[cfg(target_arch = "aarch64")]
-        if restored_tp != self.thread_pointer {
-            return Err("mapped_handover_context_readback".into());
-        }
         if register_words(&task.getregs()?) != register_words(&self.regs)
-            || restored_state != self.xstate
+            || arch::capture_extended_state(task)? != self.xstate
             || task.getsigmask()? != mask
             || trace::read(task, self.stack_start, current_stack.len())? != current_stack
         {
@@ -495,17 +475,11 @@ impl EntryContext {
         if trace::read(task, self.stack_start, self.stack_bytes.len())? != self.stack_bytes {
             return Err("loader refused: bootstrap changed the kernel guest stack".into());
         }
-        let restored_state = arch::restore_extended_state(task, &self.xstate)?;
-        #[cfg(target_arch = "aarch64")]
-        let restored_tp = arch::restore_thread_pointer(task, self.thread_pointer)?;
+        arch::write_extended_state(task, &self.xstate)?;
         task.setregs(&self.regs)?;
         task.setsigmask(self.signal_mask)?;
-        #[cfg(target_arch = "aarch64")]
-        if restored_tp != self.thread_pointer {
-            return Err("loader refused: original kernel entry context did not restore".into());
-        }
         if register_words(&task.getregs()?) != register_words(&self.regs)
-            || restored_state != self.xstate
+            || arch::capture_extended_state(task)? != self.xstate
             || task.getsigmask()? != self.signal_mask
         {
             return Err("loader refused: original kernel entry context did not restore".into());
@@ -527,21 +501,20 @@ fn drain_and_capture(
     // The number the event originated in, read the only place it
     // survives at this stop (arch module). On aarch64 a forgotten
     // number (-1) refuses by name inside this call.
-    if arch::event_syscall_number(&exec, &at_event)? != arch::EXECVE_SYSCALL {
+    let event_number = arch::event_syscall_number(&exec, &at_event)?;
+    if event_number != arch::EXECVE_SYSCALL {
         return Err("exec-stop refused: exec event did not originate in execve".into());
     }
     let (task, event) = trace::stopped(exec.syscall(None)?, "exec syscall-exit drain")?;
     let info = task.getsyscallinfo()?;
     let entry = task.getregs()?;
     if !matches!(event, Event::Syscall)
-        || info.architecture != arch::AUDIT_ARCH
         || info.operation
             != (SyscallInfoOp::Exit {
                 return_value: 0,
                 is_error: false,
             })
-        || arch::instruction_pointer(&entry) != arch::instruction_pointer(&at_event)
-        || arch::stack_pointer(&entry) != arch::stack_pointer(&at_event)
+        || !arch::drain_accepts(info.architecture, event_number, &at_event, &entry)
         || info.instruction_pointer != arch::instruction_pointer(&entry)
         || info.stack_pointer != arch::stack_pointer(&entry)
     {
@@ -550,7 +523,10 @@ fn drain_and_capture(
         )
         .into());
     }
-    let context = EntryContext::capture(&task)?;
+    let mut context = EntryContext::capture(&task)?;
+    // The exit-stop GPR image carries the kernel's x7 syscall-stop
+    // clobber on aarch64; the event stop's x7 is the guest's (arch).
+    arch::substitute_event_x7(&mut context.regs, &at_event);
     let boundary = ExecBoundary {
         event_regs: at_event,
         event_info: at_event_info,
