@@ -8,6 +8,12 @@
 //! binding digests (see [`claim`](super::claim): the handoff is unbound and
 //! unqualified until real digests exist). HLSCAL01 version 1 is x86-64 only;
 //! another target refuses by name.
+//!
+//! HLSCAL01 prefix word 4 is the ARCH TAG: 0 = x86-64 (the value every v1
+//! wire has always carried), 1 = aarch64 (reserved: refused until its
+//! register layout lands with handoff version 2). Prefix words 5-7 stay
+//! reserved zero. Every existing handoff parser refuses a nonzero word 4 as
+//! a reserved word, so an aarch64 wire cannot reach an x86-64 runtime.
 
 use reverie_loader::artifact::TOOL_REGION;
 use reverie_loader::handoff;
@@ -21,6 +27,56 @@ use super::PAGE;
 use super::Placement;
 use super::aligned;
 use super::require;
+
+/// HLSCAL01 prefix word index of the arch tag.
+pub const WIRE_ARCH_WORD: usize = 4;
+/// Arch tag of an x86-64 wire: 0, so v1 wires are unchanged.
+pub const WIRE_ARCH_X86_64: u64 = 0;
+/// Arch tag of an aarch64 wire, reserved until handoff version 2.
+pub const WIRE_ARCH_AARCH64: u64 = 1;
+
+/// The architecture a handoff names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WireArch {
+    /// x86-64, the 27-word register layout.
+    X86_64,
+}
+
+/// Read the arch tag of a serialized HLSCAL01 `wire` and check it against
+/// this build: refuses an aarch64 tag (reserved), an unknown tag, a wire for
+/// another architecture than this build's, a header length other than the
+/// x86-64 layout's, and nonzero reserved words 5-7, each by name.
+pub fn wire_arch(wire: &[u8]) -> Result<WireArch> {
+    let word = |index: usize| -> Result<u64> {
+        Ok(u64::from_le_bytes(
+            wire.get(index * 8..index * 8 + 8)
+                .ok_or("exec_stop_wire_truncated")?
+                .try_into()?,
+        ))
+    };
+    require(
+        word(0)? == handoff::MAGIC && word(1)? == handoff::VERSION,
+        "exec_stop_wire_not_hlscal01_v1",
+    )?;
+    let arch = match word(WIRE_ARCH_WORD)? {
+        WIRE_ARCH_X86_64 => WireArch::X86_64,
+        WIRE_ARCH_AARCH64 => return Err("exec_stop_wire_arch_aarch64_reserved".into()),
+        _ => return Err("exec_stop_wire_arch_unknown".into()),
+    };
+    require(
+        cfg!(target_arch = "x86_64"),
+        "exec_stop_wire_arch_mismatch: an x86-64 wire on another architecture",
+    )?;
+    require(
+        word(3)? == handoff::HEADER_BYTES as u64,
+        "exec_stop_wire_register_layout_length",
+    )?;
+    require(
+        (5..8).all(|index| word(index).is_ok_and(|value| value == 0)),
+        "exec_stop_wire_reserved_nonzero",
+    )?;
+    Ok(arch)
+}
 
 /// The stopped birth's scalars the header records.
 pub(super) struct WireContext {
@@ -156,7 +212,7 @@ pub(super) fn build(
             handoff::VERSION,
             length as u64,
             handoff::HEADER_BYTES as u64,
-            0,
+            WIRE_ARCH_X86_64,
             0,
             0,
             0,
@@ -271,5 +327,76 @@ pub(super) fn build(
             == packet,
         "serialized table 3 lost the packet",
     )?;
+    wire_arch(&bytes)?;
     Ok(Wire { bytes, address })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A header-sized wire prefix: magic, version, length, header bytes,
+    /// arch, three reserved words.
+    fn prefix(words: [u64; 8]) -> Vec<u8> {
+        let mut bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        bytes.resize(handoff::HEADER_BYTES, 0);
+        bytes
+    }
+
+    fn v1(arch: u64) -> [u64; 8] {
+        [
+            handoff::MAGIC,
+            handoff::VERSION,
+            4096,
+            handoff::HEADER_BYTES as u64,
+            arch,
+            0,
+            0,
+            0,
+        ]
+    }
+
+    #[test]
+    fn the_arch_tag_is_x86_64_at_zero_and_every_other_form_is_refused_by_name() {
+        assert_eq!(
+            wire_arch(&prefix(v1(WIRE_ARCH_X86_64))).unwrap(),
+            WireArch::X86_64
+        );
+        let refusal = |words| wire_arch(&prefix(words)).unwrap_err().to_string();
+        assert_eq!(
+            refusal(v1(WIRE_ARCH_AARCH64)),
+            "exec_stop_wire_arch_aarch64_reserved"
+        );
+        assert_eq!(refusal(v1(2)), "exec_stop_wire_arch_unknown");
+        assert_eq!(refusal(v1(u64::MAX)), "exec_stop_wire_arch_unknown");
+        let mut length = v1(WIRE_ARCH_X86_64);
+        length[3] += 8;
+        assert_eq!(refusal(length), "exec_stop_wire_register_layout_length");
+        for index in 5..8 {
+            let mut reserved = v1(WIRE_ARCH_X86_64);
+            reserved[index] = 1;
+            assert_eq!(refusal(reserved), "exec_stop_wire_reserved_nonzero");
+        }
+        let mut version = v1(WIRE_ARCH_X86_64);
+        version[1] = 2;
+        assert_eq!(refusal(version), "exec_stop_wire_not_hlscal01_v1");
+        assert_eq!(
+            wire_arch(&handoff::MAGIC.to_le_bytes())
+                .unwrap_err()
+                .to_string(),
+            "exec_stop_wire_truncated"
+        );
+    }
+
+    #[test]
+    fn the_existing_parser_refuses_a_nonzero_arch_tag_as_reserved() {
+        // The fail-closed property the tag relies on: today's parser refuses
+        // word 4 = 1 (an aarch64 wire) before reading anything else.
+        let mut bytes = prefix(v1(WIRE_ARCH_AARCH64));
+        bytes.resize(4096, 0);
+        assert_eq!(
+            handoff::View::parse(&bytes, 0x6000_0034_1000).err(),
+            Some(handoff::Error::Reserved)
+        );
+    }
 }

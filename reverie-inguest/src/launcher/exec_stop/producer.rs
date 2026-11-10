@@ -77,6 +77,11 @@ pub use claim::RUNTIME_DIGEST_MISMATCH;
 pub use claim::launch_label;
 pub use filter::AllowedNumbers;
 pub use filter::FilterCoverage;
+pub use wire::WIRE_ARCH_AARCH64;
+pub use wire::WIRE_ARCH_WORD;
+pub use wire::WIRE_ARCH_X86_64;
+pub use wire::WireArch;
+pub use wire::wire_arch;
 
 const PAGE: u64 = 4096;
 /// Bound on a retained runtime image.
@@ -2291,6 +2296,15 @@ mod tests {
             claim,
         } = armed;
         assert_eq!(entry.entry, image.facts().initial_entry.unwrap().entry);
+        // The produced wire is x86-64 by its arch tag, word 4 = 0.
+        assert_eq!(
+            wire_arch(preparation.handoff_bytes).unwrap(),
+            WireArch::X86_64
+        );
+        assert_eq!(
+            preparation.handoff_bytes[WIRE_ARCH_WORD * 8..WIRE_ARCH_WORD * 8 + 8],
+            [0; 8]
+        );
         // A claim minted for another preparation, to show after_prepare
         // refuses a mapping that is not its own.
         let decoy = memfd_bytes(c"producer-test-decoy", b"decoy", true).unwrap();
