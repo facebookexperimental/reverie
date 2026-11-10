@@ -499,19 +499,9 @@ impl<'fd> PreparedExec<'fd> {
 /// Pointer-valued arguments must satisfy the selected Linux syscall's ABI.
 #[inline(always)]
 unsafe fn syscall6(number: u64, args: [u64; 6]) -> i64 {
-    let result: i64;
-    // SAFETY: the caller owns every pointer operand. All x86-64 syscall
-    // clobbers are declared and the stack is untouched by this instruction.
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            inlateout("rax") number => result,
-            in("rdi") args[0], in("rsi") args[1], in("rdx") args[2],
-            in("r10") args[3], in("r8") args[4], in("r9") args[5],
-            lateout("rcx") _, lateout("r11") _, options(nostack),
-        );
-    }
-    result
+    // SAFETY: forwarded to the arch bridge (the only place the
+    // register convention lives); same caller contract.
+    unsafe { super::arch::syscall6(number, args) }
 }
 
 unsafe fn exit_child() -> ! {

@@ -97,6 +97,42 @@ pub fn write_extended_state(task: &Stopped, state: &ExtendedState) -> Result<()>
     }
 }
 
+/// Raw syscall for the stopped-child bridge, with this
+/// architecture's register convention (x86-64: number in rax,
+/// result in rax; arguments rdi/rsi/rdx/r10/r8/r9). The aarch64
+/// bridge is PR2 work: its body is the single named refusal
+/// below, so the aarch64 build fails with exactly that error
+/// instead of incidental asm errors in child.rs.
+///
+/// # Safety
+/// Pointer-valued arguments must satisfy the selected Linux
+/// syscall's ABI.
+#[allow(unsafe_code)]
+pub(crate) unsafe fn syscall6(number: u64, args: [u64; 6]) -> i64 {
+    // SAFETY: the caller owns every pointer operand. All syscall
+    // clobbers are declared and the stack is untouched.
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let result: i64;
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") number => result,
+            in("rdi") args[0], in("rsi") args[1], in("rdx") args[2],
+            in("r10") args[3], in("r8") args[4], in("r9") args[5],
+            lateout("rcx") _, lateout("r11") _, options(nostack),
+        );
+        result
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        compile_error!(
+            "aarch64 exec_stop child syscall bridge lands in PR2 (svc ABI: x8 number, x0 inout)"
+        );
+        #[allow(unreachable_code)]
+        loop {}
+    }
+}
+
 /// The stack-pointer word inside a serialized register image.
 /// x86-64 word 19 is rsp; aarch64 word 31 is sp. Consumers must
 /// never index the image directly.
