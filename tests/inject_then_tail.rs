@@ -66,7 +66,7 @@ fn assert_rust_command_output(label: &str, output: &reverie::process::Output) {
 }
 
 fn rust_command_test() {
-    let program = env!("CARGO_BIN_EXE_inject-then-tail-rust-command-guest");
+    let program = reverie_test_support::guest_binary!("inject-then-tail-rust-command-guest");
     eprintln!("inject-then-tail Rust guest: image={program}");
 
     let native = std::process::Command::new(program).output().unwrap();

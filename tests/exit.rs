@@ -93,7 +93,7 @@ fn smoke() {
 }
 
 fn check_rust_command() {
-    let program = env!("CARGO_BIN_EXE_exit-rust-command-guest");
+    let program = reverie_test_support::guest_binary!("exit-rust-command-guest");
     eprintln!("injected exit Rust command: image={program}");
 
     let output = std::process::Command::new(program).output().unwrap();

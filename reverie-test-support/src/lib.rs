@@ -37,3 +37,22 @@ where
 {
     test_cmd_with_config::<T>(program, args, Default::default())
 }
+
+/// The path of one of this package's guest binaries, named as in its `[[bin]]`
+/// table, as a `&'static str`.
+///
+/// Cargo bakes the path in at compile time as `CARGO_BIN_EXE_<name>`. A build
+/// system that compiles a test on one host and runs it on another sets the same
+/// variable in the test's run-time environment, and that value wins; without it
+/// the compile-time path is used, so Cargo runs are unchanged.
+#[macro_export]
+macro_rules! guest_binary {
+    ($name:literal) => {{
+        static PATH: ::std::sync::OnceLock<::std::string::String> = ::std::sync::OnceLock::new();
+        PATH.get_or_init(|| {
+            ::std::env::var(concat!("CARGO_BIN_EXE_", $name))
+                .unwrap_or_else(|_| env!(concat!("CARGO_BIN_EXE_", $name)).to_owned())
+        })
+        .as_str()
+    }};
+}

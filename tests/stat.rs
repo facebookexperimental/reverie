@@ -40,7 +40,7 @@ mod tests {
 
 #[cfg(all(not(sanitized), test))]
 fn assert_rust_command(operation: &str) {
-    let program = env!("CARGO_BIN_EXE_stat-rust-command-guest");
+    let program = reverie_test_support::guest_binary!("stat-rust-command-guest");
     eprintln!("stat Rust command {operation}: image={program}");
     let output = std::process::Command::new(program)
         .arg(operation)

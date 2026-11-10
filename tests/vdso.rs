@@ -118,7 +118,7 @@ fn ptrace_vdso_command() {
 
 #[cfg(all(not(sanitized), test))]
 fn rust_clock_getres_command() {
-    let program = env!("CARGO_BIN_EXE_vdso-rust-command-guest");
+    let program = reverie_test_support::guest_binary!("vdso-rust-command-guest");
     eprintln!("vdso Rust clock_getres command: image={program}");
 
     let (output, ()) = reverie_test_support::test_cmd::<LocalState>(program, &[]).unwrap();
@@ -130,7 +130,7 @@ fn rust_clock_getres_command() {
 /// reject.
 #[cfg(all(not(sanitized), test))]
 fn clock_getres_control(label: &str) -> reverie::process::Output {
-    let program = env!("CARGO_BIN_EXE_vdso-rust-command-guest");
+    let program = reverie_test_support::guest_binary!("vdso-rust-command-guest");
     let (control, ()) = reverie_test_support::test_cmd::<LocalState>(program, &[]).unwrap();
     assert_command_output(
         &format!("rust/{label}/control-clock_getres/ptrace"),
@@ -157,7 +157,7 @@ fn assert_gettimeofday_command_output(label: &str, output: &reverie::process::Ou
 
 #[cfg(all(not(sanitized), test))]
 fn rust_gettimeofday_command() {
-    let program = env!("CARGO_BIN_EXE_vdso-rust-command-guest");
+    let program = reverie_test_support::guest_binary!("vdso-rust-command-guest");
     eprintln!("vdso Rust gettimeofday command: image={program}");
 
     let control = clock_getres_control("gettimeofday");
@@ -187,7 +187,7 @@ fn assert_getcpu_command_output(label: &str, output: &reverie::process::Output) 
 
 #[cfg(all(not(sanitized), test))]
 fn rust_getcpu_command() {
-    let program = env!("CARGO_BIN_EXE_vdso-rust-command-guest");
+    let program = reverie_test_support::guest_binary!("vdso-rust-command-guest");
     eprintln!("vdso Rust getcpu command: image={program}");
 
     let (output, ()) = reverie_test_support::test_cmd::<LocalState>(program, &["getcpu"]).unwrap();
@@ -222,7 +222,7 @@ fn assert_tod_command_output(label: &str, output: &reverie::process::Output) {
 #[cfg(all(not(sanitized), test))]
 #[test]
 fn rust_vdso_tod_command() {
-    let program = env!("CARGO_BIN_EXE_vdso-rust-command-guest");
+    let program = reverie_test_support::guest_binary!("vdso-rust-command-guest");
     eprintln!("vdso Rust tod command: image={program}");
 
     let (output, ()) = reverie_test_support::test_cmd::<LocalState>(program, &["tod"]).unwrap();

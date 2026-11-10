@@ -39,7 +39,7 @@ mod tests {
     /// The same guest body as an ordinary command under ptrace: the Tool
     /// suppresses all 100 tgkill calls, so the command exits 0 with no output.
     fn rust_command_test() {
-        let program = env!("CARGO_BIN_EXE_suppression-rust-command-guest");
+        let program = reverie_test_support::guest_binary!("suppression-rust-command-guest");
         eprintln!("suppression Rust command image={program}");
         let (output, state) =
             reverie_test_support::test_cmd_with_config::<TestTool>(program, &[], ())
