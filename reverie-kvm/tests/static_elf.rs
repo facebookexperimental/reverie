@@ -2787,6 +2787,38 @@ fn leader_self_exec_bounded_rejects_forged_stdout_without_execution_record() {
     );
 }
 
+/// [`leader_self_exec_bounded_capped`]'s CPU cap is enforced: a child that
+/// spins is stopped at its cap, not at the wall backstop, so a case with a
+/// CPU budget still fails fast when it spins, and the cap cannot quietly
+/// drop out of the harness.
+#[test]
+fn leader_self_exec_bounded_capped_stops_a_child_that_spins_past_its_cpu_cap() {
+    const TEST: &str = "leader_self_exec_bounded_capped_stops_a_child_that_spins_past_its_cpu_cap";
+    if !kvm_available(TEST) {
+        return;
+    }
+    if std::env::var("REVERIE_LEADER_EXEC_CHILD").as_deref() == Ok(TEST) {
+        // Spin in user code, as a case stuck in a loop would.
+        loop {
+            std::hint::spin_loop();
+        }
+    }
+    // The wall is far above what 1 CPU-s takes even on a loaded host, so
+    // only the cap can stop the child first.
+    let rejected = std::panic::catch_unwind(|| leader_self_exec_bounded_capped(TEST, 1, 60))
+        .expect_err("the capped child helper accepted a child that spun past its CPU cap");
+    let message = rejected
+        .downcast_ref::<String>()
+        .expect("the capped child helper did not emit a diagnostic");
+    // At its hard limit RLIMIT_CPU kills the child with SIGKILL, and GNU
+    // timeout ends itself with the signal that ended its child, so the
+    // status has no exit code; the wall backstop would have exited 124.
+    assert!(
+        message.starts_with(&format!("{TEST}: status=None ")),
+        "the child was not stopped by its CPU cap: {message}"
+    );
+}
+
 fn leader_self_exec_guest(
     directory: &std::path::Path,
     program: &std::path::Path,
@@ -23468,7 +23500,18 @@ fn shared_file_views_with_threads_match_native() {
 #[test]
 fn shared_file_publications_kick_running_and_new_vcpus_as_natively() {
     const TEST: &str = "shared_file_publications_kick_running_and_new_vcpus_as_natively";
-    if !leader_self_exec_bounded(TEST) {
+    // Budget (dh-lo9syu, owner rule 2026-11-01): two modes, each natively
+    // and in three KVM variants, with 200 thread creations beside 200
+    // mappings in every publish-vs-clone run; under load the case is short
+    // of CPU, not stuck. Measured 2026-11-10 (single case, 4 CPUs shared
+    // with 48 spinners, /usr/bin/time -v): it died at the old 30 s wall
+    // 3/3, inside the clone loop, while the unwrapped body passed 3/3 in
+    // 50.3-60.8 s at 6.0-6.9 CPU-s, progressing throughout (quiet: 5.2 s
+    // wall at 4.7 CPU-s). So the CPU cap is 11 (1.5x) and the wall
+    // backstop is 88 (8x). The 200 rounds are the case's chances to meet a
+    // close while a vCPU starts or retires, so they are not shrunk to fit
+    // the old wall.
+    if !leader_self_exec_bounded_capped(TEST, 11, 88) {
         return;
     }
     let directory = TestDirectory::new();
@@ -23826,7 +23869,15 @@ fn shared_file_vfork_child_view_changes_are_refused_by_name() {
 #[test]
 fn vfork_children_share_private_memory_with_their_parent_like_native() {
     const TEST: &str = "vfork_children_share_private_memory_with_their_parent_like_native";
-    if !leader_self_exec_bounded(TEST) {
+    // Budget (dh-lo9syu, owner rule 2026-11-01): one native run and three
+    // KVM runs of five vfork cases, each mostly a parent waiting on its
+    // child, so one runnable thread that gets a single CPU share under
+    // load. Measured 2026-11-10 (single case, 4 CPUs shared with 48
+    // spinners, /usr/bin/time -v): the unwrapped body passed in 38.3 and
+    // 40.9 s at 3.3 and 3.7 CPU-s, past the old 30 s wall (quiet: 6.1 s
+    // wall at 3.1 CPU-s). So the CPU cap is 6 (1.5x) and the wall
+    // backstop is 48 (8x).
+    if !leader_self_exec_bounded_capped(TEST, 6, 48) {
         return;
     }
     let directory = TestDirectory::new();
@@ -24082,7 +24133,15 @@ fn assert_vfork_fixture_refused(test: &str, args: &[&str], native_stdout: &str, 
 #[test]
 fn a_vfork_child_clears_its_clear_child_tid_word_in_its_parent_like_native() {
     const TEST: &str = "a_vfork_child_clears_its_clear_child_tid_word_in_its_parent_like_native";
-    if !leader_self_exec_bounded(TEST) {
+    // Budget (dh-lo9syu, owner rule 2026-11-01): six endings, each natively
+    // and in three KVM variants, each mostly a parent waiting on its child,
+    // so one runnable thread that gets a single CPU share under load. Measured
+    // 2026-11-10 (single case, 4 CPUs shared with 48 spinners,
+    // /usr/bin/time -v): the unwrapped body passed in 21.6 and 39.9 s at
+    // 2.7 and 3.1 CPU-s, the second past the old 30 s wall (quiet: 5.7 s
+    // wall at 2.4 CPU-s). So the CPU cap is 5 (1.5x) and the wall
+    // backstop is 40 (8x).
+    if !leader_self_exec_bounded_capped(TEST, 5, 40) {
         return;
     }
     for (ending, expected) in [
