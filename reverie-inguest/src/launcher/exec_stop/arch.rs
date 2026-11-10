@@ -98,11 +98,12 @@ pub fn write_extended_state(task: &Stopped, state: &ExtendedState) -> Result<()>
 }
 
 /// Raw syscall for the stopped-child bridge, with this
-/// architecture's register convention (x86-64: number in rax,
-/// result in rax; arguments rdi/rsi/rdx/r10/r8/r9). The aarch64
-/// bridge is PR2 work: its body is the single named refusal
-/// below, so the aarch64 build fails with exactly that error
-/// instead of incidental asm errors in child.rs.
+/// architecture's register convention. x86-64: number in rax,
+/// result in rax, arguments rdi/rsi/rdx/r10/r8/r9. aarch64:
+/// number in x8 (input only), result in x0, arguments x0-x5 —
+/// reading x8 back as the result was the PR1 F1 defect (getpid
+/// "returned" 172 and clone3 looked successful to the wrong
+/// branch), pinned by the native test below.
 ///
 /// # Safety
 /// Pointer-valued arguments must satisfy the selected Linux
@@ -124,12 +125,17 @@ pub(crate) unsafe fn syscall6(number: u64, args: [u64; 6]) -> i64 {
         result
     }
     #[cfg(target_arch = "aarch64")]
-    {
-        compile_error!(
-            "aarch64 exec_stop child syscall bridge lands in PR2 (svc ABI: x8 number, x0 inout)"
+    unsafe {
+        let result: i64;
+        core::arch::asm!(
+            "svc #0",
+            in("x8") number,
+            inlateout("x0") args[0] => result,
+            in("x1") args[1], in("x2") args[2], in("x3") args[3],
+            in("x4") args[4], in("x5") args[5],
+            options(nostack),
         );
-        #[allow(unreachable_code)]
-        loop {}
+        result
     }
 }
 
@@ -363,6 +369,20 @@ mod tests {
         assert!(super::check_event_syscall_number(0).is_err());
         assert!(super::check_event_syscall_number(220).is_err());
         assert!(super::check_event_syscall_number(-2).is_err());
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn syscall6_returns_the_result_register_not_the_number() {
+        // F1 regression pin: with the old x8 read-back, getpid
+        // returned its own syscall number (172) and a failing
+        // read returned the number too. The result must come
+        // from x0: the real pid, and -EBADF for a bad descriptor.
+        let pid = unsafe { super::syscall6(libc::SYS_getpid as u64, [0; 6]) };
+        assert_eq!(pid, i64::from(std::process::id()));
+        assert_ne!(pid, libc::SYS_getpid as i64);
+        let err = unsafe { super::syscall6(libc::SYS_read as u64, [u64::MAX, 0, 0, 0, 0, 0]) };
+        assert_eq!(err, -i64::from(libc::EBADF));
     }
 
     #[test]
