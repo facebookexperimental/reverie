@@ -474,8 +474,8 @@ fn check_native_gate(image: &ValidatedImage<'_>, reference_address: u64) -> Resu
 /// Without that symbol there is no exemption (`None`), and the message, if
 /// present, is swept as code. With it, the layout must not have drifted: more
 /// than one such symbol, a size other than the pinned 744 bytes, or anything
-/// but an executable `endbr64; ud2` at +0x2bd is refused by name, so a drift
-/// never turns the exemption off silently.
+/// but `endbr64; ud2` in initialized read-execute bytes at +0x2bd is refused
+/// by name, so a drift never turns the exemption off silently.
 fn constructor_island(image: &ValidatedImage<'_>, bytes: &[u8]) -> Result<Option<u64>> {
     let symbols = symbols_named(bytes, CONSTRUCTOR_SYMBOL)?;
     require(
@@ -496,7 +496,7 @@ fn constructor_island(image: &ValidatedImage<'_>, bytes: &[u8]) -> Result<Option
         .ok_or("constructor lead overflow")?;
     let bytes = exact_rx(image, lead, CONSTRUCTOR_LEAD.len()).map_err(|_| {
         format!(
-            "reverie_inguest_constructor_entry drifted: +{CONSTRUCTOR_LEAD_OFFSET:#x} is not executable"
+            "reverie_inguest_constructor_entry drifted: +{CONSTRUCTOR_LEAD_OFFSET:#x} is not in initialized read-execute bytes"
         )
     })?;
     if bytes != CONSTRUCTOR_LEAD {
@@ -1902,6 +1902,19 @@ pub(super) mod tests {
                 "instruction audit: constructor message at {message:#x} is not the pinned island"
             )
         );
+        // Without the symbol and without the lead, the message is entered as
+        // code and refused as undecodable: no exemption is granted.
+        let unpinned_no_lead = elf(
+            Some(RX),
+            &gate_page(),
+            &island_text(Some(pinned), &[(pinned, &[0x90; 6])]),
+            &gate_page(),
+        );
+        let error = audit(&unpinned_no_lead, &declared).unwrap_err().to_string();
+        assert!(
+            error.starts_with("instruction audit: undecodable bytes"),
+            "{error}"
+        );
 
         // The island with any one byte changed: refused.
         for index in 0..CONSTRUCTOR_MESSAGE.len() as u64 {
@@ -1947,7 +1960,7 @@ pub(super) mod tests {
         );
         assert_eq!(
             audit(&outside, &declared).unwrap_err().to_string(),
-            "reverie_inguest_constructor_entry drifted: +0x2bd is not executable"
+            "reverie_inguest_constructor_entry drifted: +0x2bd is not in initialized read-execute bytes"
         );
         // With the pin derived (the lead bytes are intact at +0x2bd), a sweep
         // that reaches the island other than straight after the lead is
