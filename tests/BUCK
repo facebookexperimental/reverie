@@ -1,0 +1,623 @@
+load("@bazel_skylib//lib:paths.bzl", "paths")
+load("@fbcode//hermetic_infra/reverie/fb-only:defs.bzl", "gated_test", "run_gated_only")
+load("@fbcode_macros//build_defs:cpp_binary.bzl", "cpp_binary")
+load("@fbcode_macros//build_defs:custom_rule.bzl", "custom_rule")
+load("@fbcode_macros//build_defs:native_rules.bzl", "buck_sh_binary", "buck_sh_test")
+load("@fbcode_macros//build_defs:sanitizers.bzl", "sanitizers")
+load("@fbsource//tools/build_defs:glob_defs.bzl", "subdir_glob")
+load("@fbsource//tools/build_defs:rust_binary.bzl", "rust_binary")
+load("@fbsource//tools/build_defs:rust_unittest.bzl", "rust_unittest")
+load("@fbsource//tools/build_defs:selects.bzl", "selects")
+
+oncall("hermit")
+
+# Some tests don't work when a sanitizer is in use (i.e., with @mode/dev). This
+# makes it easy to conditionally compile them with `#[cfg(not(sanitized))]`.
+sanitized_feature = selects.apply(
+    sanitizers.get_sanitizer_v2(),
+    lambda san: ["--cfg=sanitized"] if san else [],
+)
+
+# Reverie's generic conformance tests (upstream's generic-* targets): each runs
+# a Rust command guest built below, through reverie-test-support.
+CONFORMANCE_TESTS = [
+    "at_random.rs",
+    "basics.rs",
+    "exit.rs",
+    "initial_stack_pointer.rs",
+    "inject_then_tail.rs",
+    "stack.rs",
+    "stat.rs",
+    "suppression.rs",
+    "thread_start.rs",
+    "vdso.rs",
+]
+
+# Tests whose tools subscribe to CPUID, which Reverie's ptrace backend can
+# intercept only on a host with CPUID faulting.
+GATED_TESTS = ["cpuid.rs", "timer_semantics.rs"]
+
+[
+    rust_unittest(
+        name = paths.replace_extension(test, ""),
+        srcs = [test],
+        # timer_semantics and cpuid run through gated tests below (fb-only/gated_tests).
+        labels = run_gated_only() if test in GATED_TESTS else [],
+        rustc_flags = sanitized_feature,
+        deps = [
+            "fbsource//third-party/rust:close-err",
+            "fbsource//third-party/rust:futures",
+            "fbsource//third-party/rust:libc",
+            "fbsource//third-party/rust:nix",
+            "fbsource//third-party/rust:raw-cpuid",
+            "fbsource//third-party/rust:serde",
+            "fbsource//third-party/rust:syscalls",
+            "fbsource//third-party/rust:test-case",
+            "fbsource//third-party/rust:tokio",
+            "//hermetic_infra/reverie:reverie",
+            "//hermetic_infra/reverie:reverie-ptrace",
+            "//hermetic_infra/reverie:reverie-util",
+        ],
+    )
+    # first_instruction_cpuid.rs compiles its guests with rustc at test time,
+    # which Buck tests don't have; Cargo runs it upstream.
+    for test in glob(
+        ["*.rs"],
+        exclude = ["first_instruction_cpuid.rs"] + CONFORMANCE_TESTS,
+    )
+]
+
+[
+    gated_test(
+        name = paths.replace_extension(test, "") + "-gated",
+        test = "//hermetic_infra/reverie/tests:" + paths.replace_extension(test, ""),
+    )
+    for test in GATED_TESTS
+]
+
+# Command guests and conformance tests, as upstream declares them. The guests
+# use the system allocator, as their Cargo builds do: fbcode's default jemalloc
+# starts a background thread before main, which the thread-start tail test
+# cannot survive (https://github.com/rrnewton/reverie/issues/1402).
+rust_binary(
+    name = "basics-rust-command-guest",
+    srcs = [
+        "fixtures/basics-rust-command.rs",
+        "support/basics_rust_guest.rs",
+    ],
+    allocator = "malloc",
+    crate_root = "fixtures/basics-rust-command.rs",
+    unittests = False,
+    deps = [
+        "fbsource//third-party/rust:libc",
+        "fbsource//third-party/rust:nix",
+    ],
+)
+
+rust_binary(
+    name = "exit-rust-command-guest",
+    srcs = [
+        "fixtures/exit-rust-command.rs",
+        "support/exit_rust_guest.rs",
+    ],
+    allocator = "malloc",
+    crate_root = "fixtures/exit-rust-command.rs",
+    # The guest ends with an x86-64 `ud2`.
+    target_compatible_with = ["ovr_config//cpu:x86_64"],
+    unittests = False,
+    deps = [
+        "fbsource//third-party/rust:libc",
+    ],
+)
+
+rust_binary(
+    name = "stat-rust-command-guest",
+    srcs = [
+        "fixtures/stat-rust-command.rs",
+        "support/stat_rust_guest.rs",
+    ],
+    allocator = "malloc",
+    crate_root = "fixtures/stat-rust-command.rs",
+    unittests = False,
+    deps = [
+        "fbsource//third-party/rust:libc",
+    ],
+)
+
+rust_binary(
+    name = "vdso-rust-command-guest",
+    srcs = [
+        "fixtures/vdso-rust-command.rs",
+        "support/vdso_rust_guest.rs",
+    ],
+    allocator = "malloc",
+    crate_root = "fixtures/vdso-rust-command.rs",
+    unittests = False,
+    deps = [
+        "fbsource//third-party/rust:libc",
+    ],
+)
+
+rust_binary(
+    name = "inject-then-tail-rust-command-guest",
+    srcs = [
+        "fixtures/inject-then-tail-rust-command.rs",
+        "support/inject_then_tail_rust_guest.rs",
+        "tool_fixtures/inject_then_tail_constants.rs",
+    ],
+    allocator = "malloc",
+    crate_root = "fixtures/inject-then-tail-rust-command.rs",
+    unittests = False,
+    deps = [
+        "fbsource//third-party/rust:libc",
+        "fbsource//third-party/rust:nix",
+        "//hermetic_infra/reverie:reverie",
+    ],
+)
+
+rust_binary(
+    name = "at-random-rust-command-guest",
+    srcs = [
+        "fixtures/at-random-rust-command.rs",
+        "support/at_random_rust_guest.rs",
+        "tool_fixtures/at_random_constants.rs",
+    ],
+    allocator = "malloc",
+    crate_root = "fixtures/at-random-rust-command.rs",
+    unittests = False,
+    deps = [
+        "fbsource//third-party/rust:libc",
+    ],
+)
+
+rust_binary(
+    name = "stack-rust-command-guest",
+    srcs = [
+        "fixtures/stack-rust-command.rs",
+        "support/stack_rust_guest.rs",
+    ],
+    allocator = "malloc",
+    crate_root = "fixtures/stack-rust-command.rs",
+    unittests = False,
+    deps = [
+        "fbsource//third-party/rust:libc",
+    ],
+)
+
+rust_binary(
+    name = "thread-start-rust-command-guest",
+    srcs = [
+        "fixtures/thread-start-rust-command.rs",
+        "support/thread_start_guest.rs",
+    ],
+    allocator = "malloc",
+    crate_root = "fixtures/thread-start-rust-command.rs",
+    unittests = False,
+    deps = [],
+)
+
+rust_binary(
+    name = "suppression-rust-command-guest",
+    srcs = [
+        "fixtures/suppression-rust-command.rs",
+        "support/suppression_rust_guest.rs",
+    ],
+    allocator = "malloc",
+    crate_root = "fixtures/suppression-rust-command.rs",
+    unittests = False,
+    deps = [
+        "fbsource//third-party/rust:libc",
+        "fbsource//third-party/rust:syscalls",
+    ],
+)
+
+rust_unittest(
+    name = "basics",
+    srcs = [
+        "basics.rs",
+        "support/basics_commands.rs",
+        "support/basics_rust_guest.rs",
+        "tool_fixtures/basics.rs",
+    ],
+    crate_root = "basics.rs",
+    env = {
+        "CARGO_BIN_EXE_basics-rust-command-guest": "$(location :basics-rust-command-guest)",
+    },
+    features = ["nightly"],
+    resources = [":basics-rust-command-guest"],
+    # The compile-time path above is where rustc ran (possibly a remote
+    # worker); the test reads this one first (reverie-test-support guest_binary!).
+    run_env = {
+        "CARGO_BIN_EXE_basics-rust-command-guest": "$(location :basics-rust-command-guest)",
+    },
+    rustc_flags = sanitized_feature,
+    deps = [
+        "fbsource//third-party/rust:close-err",
+        "fbsource//third-party/rust:libc",
+        "fbsource//third-party/rust:nix",
+        "fbsource//third-party/rust:serde",
+        "//hermetic_infra/reverie:reverie",
+        "//hermetic_infra/reverie:reverie-ptrace",
+        "//hermetic_infra/reverie:reverie-test-support",
+    ],
+)
+
+rust_unittest(
+    name = "exit",
+    srcs = [
+        "exit.rs",
+        "fixtures/exit-command.S",
+        "support/exit_command.rs",
+        "support/exit_rust_guest.rs",
+        "tool_fixtures/exit.rs",
+    ],
+    crate_root = "exit.rs",
+    env = {
+        "CARGO_BIN_EXE_exit-rust-command-guest": "$(location :exit-rust-command-guest)",
+    },
+    resources = [":exit-rust-command-guest"],
+    # The compile-time path above is where rustc ran (possibly a remote
+    # worker); the test reads this one first (reverie-test-support guest_binary!).
+    run_env = {
+        "CARGO_BIN_EXE_exit-rust-command-guest": "$(location :exit-rust-command-guest)",
+    },
+    rustc_flags = sanitized_feature,
+    # Runs the x86-64-only guest above.
+    target_compatible_with = ["ovr_config//cpu:x86_64"],
+    deps = [
+        "fbsource//third-party/rust:libc",
+        "fbsource//third-party/rust:tempfile",
+        "//hermetic_infra/reverie:reverie",
+        "//hermetic_infra/reverie:reverie-ptrace",
+        "//hermetic_infra/reverie:reverie-test-support",
+    ],
+)
+
+rust_unittest(
+    name = "stat",
+    srcs = [
+        "fixtures/stat-command.c",
+        "fixtures/statx-command.c",
+        "stat.rs",
+        "support/stat_command.rs",
+        "support/stat_rust_guest.rs",
+        "tool_fixtures/stat.rs",
+    ],
+    crate_root = "stat.rs",
+    env = {
+        "CARGO_BIN_EXE_stat-rust-command-guest": "$(location :stat-rust-command-guest)",
+    },
+    resources = [":stat-rust-command-guest"],
+    # The compile-time path above is where rustc ran (possibly a remote
+    # worker); the test reads this one first (reverie-test-support guest_binary!).
+    run_env = {
+        "CARGO_BIN_EXE_stat-rust-command-guest": "$(location :stat-rust-command-guest)",
+    },
+    rustc_flags = sanitized_feature,
+    deps = [
+        "fbsource//third-party/rust:libc",
+        "fbsource//third-party/rust:tempfile",
+        "//hermetic_infra/reverie:reverie",
+        "//hermetic_infra/reverie:reverie-ptrace",
+        "//hermetic_infra/reverie:reverie-test-support",
+    ],
+)
+
+rust_unittest(
+    name = "vdso",
+    srcs = [
+        "fixtures/vdso-command.c",
+        "support/vdso_command.rs",
+        "support/vdso_rust_guest.rs",
+        "tool_fixtures/vdso.rs",
+        "vdso.rs",
+    ],
+    crate_root = "vdso.rs",
+    env = {
+        "CARGO_BIN_EXE_vdso-rust-command-guest": "$(location :vdso-rust-command-guest)",
+    },
+    resources = [":vdso-rust-command-guest"],
+    # The compile-time path above is where rustc ran (possibly a remote
+    # worker); the test reads this one first (reverie-test-support guest_binary!).
+    run_env = {
+        "CARGO_BIN_EXE_vdso-rust-command-guest": "$(location :vdso-rust-command-guest)",
+    },
+    rustc_flags = sanitized_feature,
+    deps = [
+        "fbsource//third-party/rust:libc",
+        "fbsource//third-party/rust:tempfile",
+        "//hermetic_infra/reverie:reverie",
+        "//hermetic_infra/reverie:reverie-ptrace",
+        "//hermetic_infra/reverie:reverie-test-support",
+    ],
+)
+
+rust_unittest(
+    name = "inject_then_tail",
+    srcs = [
+        "fixtures/inject-then-tail-command.c",
+        "inject_then_tail.rs",
+        "support/inject_then_tail_command.rs",
+        "tool_fixtures/inject_then_tail.rs",
+        "tool_fixtures/inject_then_tail_constants.rs",
+    ],
+    crate_root = "inject_then_tail.rs",
+    env = {
+        "CARGO_BIN_EXE_inject-then-tail-rust-command-guest": "$(location :inject-then-tail-rust-command-guest)",
+    },
+    resources = [":inject-then-tail-rust-command-guest"],
+    # The compile-time path above is where rustc ran (possibly a remote
+    # worker); the test reads this one first (reverie-test-support guest_binary!).
+    run_env = {
+        "CARGO_BIN_EXE_inject-then-tail-rust-command-guest": "$(location :inject-then-tail-rust-command-guest)",
+    },
+    rustc_flags = sanitized_feature,
+    deps = [
+        "fbsource//third-party/rust:tempfile",
+        "fbsource//third-party/rust:tracing",
+        "//hermetic_infra/reverie:reverie",
+        "//hermetic_infra/reverie:reverie-test-support",
+    ],
+)
+
+rust_unittest(
+    name = "thread_start",
+    srcs = [
+        "support/thread_start_guest.rs",
+        "thread_start.rs",
+        "tool_fixtures/thread_start.rs",
+        "tool_fixtures/thread_start_tail.rs",
+        "tool_fixtures/thread_start_tail_witness.rs",
+    ],
+    crate_root = "thread_start.rs",
+    env = {
+        "CARGO_BIN_EXE_thread-start-rust-command-guest": "$(location :thread-start-rust-command-guest)",
+    },
+    resources = [":thread-start-rust-command-guest"],
+    # The compile-time path above is where rustc ran (possibly a remote
+    # worker); the test reads this one first (reverie-test-support guest_binary!).
+    run_env = {
+        "CARGO_BIN_EXE_thread-start-rust-command-guest": "$(location :thread-start-rust-command-guest)",
+    },
+    rustc_flags = sanitized_feature,
+    # tool_fixtures/thread_start_tail_witness.rs reads x86-64 registers.
+    target_compatible_with = ["ovr_config//cpu:x86_64"],
+    deps = [
+        "//hermetic_infra/reverie:reverie",
+        "//hermetic_infra/reverie:reverie-ptrace",
+        "//hermetic_infra/reverie:reverie-test-support",
+    ],
+)
+
+rust_unittest(
+    name = "initial_stack_pointer",
+    srcs = [
+        "initial_stack_pointer.rs",
+        "tool_fixtures/initial_stack_pointer.rs",
+    ],
+    crate_root = "initial_stack_pointer.rs",
+    rustc_flags = sanitized_feature,
+    deps = [
+        "fbsource//third-party/rust:serde",
+        "//hermetic_infra/reverie:reverie",
+        "//hermetic_infra/reverie:reverie-test-support",
+    ],
+)
+
+rust_unittest(
+    name = "at_random",
+    srcs = [
+        "at_random.rs",
+        "fixtures/at-random-command.c",
+        "support/at_random_command.rs",
+        "tool_fixtures/at_random.rs",
+        "tool_fixtures/at_random_constants.rs",
+    ],
+    crate_root = "at_random.rs",
+    env = {
+        "CARGO_BIN_EXE_at-random-rust-command-guest": "$(location :at-random-rust-command-guest)",
+    },
+    resources = [":at-random-rust-command-guest"],
+    # The compile-time path above is where rustc ran (possibly a remote
+    # worker); the test reads this one first (reverie-test-support guest_binary!).
+    run_env = {
+        "CARGO_BIN_EXE_at-random-rust-command-guest": "$(location :at-random-rust-command-guest)",
+    },
+    rustc_flags = sanitized_feature,
+    deps = [
+        "fbsource//third-party/rust:tempfile",
+        "//hermetic_infra/reverie:reverie",
+        "//hermetic_infra/reverie:reverie-test-support",
+    ],
+)
+
+rust_unittest(
+    name = "stack",
+    srcs = [
+        "stack.rs",
+        "support/stack_rust_guest.rs",
+        "tool_fixtures/stack.rs",
+    ],
+    crate_root = "stack.rs",
+    env = {
+        "CARGO_BIN_EXE_stack-rust-command-guest": "$(location :stack-rust-command-guest)",
+    },
+    resources = [":stack-rust-command-guest"],
+    # The compile-time path above is where rustc ran (possibly a remote
+    # worker); the test reads this one first (reverie-test-support guest_binary!).
+    run_env = {
+        "CARGO_BIN_EXE_stack-rust-command-guest": "$(location :stack-rust-command-guest)",
+    },
+    rustc_flags = sanitized_feature,
+    deps = [
+        "fbsource//third-party/rust:libc",
+        "fbsource//third-party/rust:nix",
+        "//hermetic_infra/reverie:reverie",
+        "//hermetic_infra/reverie:reverie-ptrace",
+        "//hermetic_infra/reverie:reverie-test-support",
+    ],
+)
+
+rust_unittest(
+    name = "suppression",
+    srcs = [
+        "support/suppression_rust_guest.rs",
+        "suppression.rs",
+        "tool_fixtures/suppression.rs",
+    ],
+    crate_root = "suppression.rs",
+    env = {
+        "CARGO_BIN_EXE_suppression-rust-command-guest": "$(location :suppression-rust-command-guest)",
+    },
+    resources = [":suppression-rust-command-guest"],
+    # The compile-time path above is where rustc ran (possibly a remote
+    # worker); the test reads this one first (reverie-test-support guest_binary!).
+    run_env = {
+        "CARGO_BIN_EXE_suppression-rust-command-guest": "$(location :suppression-rust-command-guest)",
+    },
+    rustc_flags = sanitized_feature,
+    deps = [
+        "fbsource//third-party/rust:libc",
+        "fbsource//third-party/rust:syscalls",
+        "//hermetic_infra/reverie:reverie",
+        "//hermetic_infra/reverie:reverie-ptrace",
+        "//hermetic_infra/reverie:reverie-test-support",
+    ],
+)
+
+# Standalone tests
+rust_binary(
+    name = "inject-then-tail-inject",
+    srcs = ["standalone/inject_then_tail_inject.rs"]
+    + glob([
+        "support/*.rs",
+        "tool_fixtures/*.rs",
+    ]),
+    allocator = "malloc",
+    crate_root = "standalone/inject_then_tail_inject.rs",
+    deps = [
+        "fbsource//third-party/rust:libc",
+        "fbsource//third-party/rust:nix",
+        "fbsource//third-party/rust:serde",
+        "fbsource//third-party/rust:syscalls",
+        "fbsource//third-party/rust:tokio",
+        "fbsource//third-party/rust:tracing",
+        "//hermetic_infra/reverie:reverie",
+        "//hermetic_infra/reverie:reverie-ptrace",
+    ],
+)
+
+rust_binary(
+    name = "parallel-tasks",
+    srcs = ["standalone/parallel_tasks.rs"],
+    crate_root = "standalone/parallel_tasks.rs",
+    deps = [
+        "fbsource//third-party/rust:serde",
+        "fbsource//third-party/rust:tokio",
+        "//hermetic_infra/reverie:reverie",
+        "//hermetic_infra/reverie:reverie-ptrace",
+    ],
+)
+
+rust_binary(
+    name = "at-random",
+    srcs = ["standalone/at_random.rs"]
+    + glob([
+        "support/*.rs",
+        "tool_fixtures/*.rs",
+    ]),
+    crate_root = "standalone/at_random.rs",
+    deps = [
+        "fbsource//third-party/rust:libc",
+        "fbsource//third-party/rust:serde",
+        "fbsource//third-party/rust:tokio",
+        "//hermetic_infra/reverie:reverie",
+        "//hermetic_infra/reverie:reverie-ptrace",
+    ],
+)
+
+# Everything in the c_tests folder is an active test. To disable a test, delete
+# it or move it to the `disabled/` directory.
+reverie_tests = [
+    paths.replace_extension(
+        paths.basename(p),
+        "",
+    )
+    for p in glob(["c_tests/*.c"])
+]
+
+# These are assembly files without any external deps (nostdlib)
+reverie_standalone_tests = [
+    paths.replace_extension(
+        paths.basename(p),
+        "",
+    )
+    for p in glob(["c_tests/*.S"])
+]
+
+# call cc to build with `-nostdlib` flag
+# FIXME(T77896624): This is currently broken!
+buck_sh_binary(
+    name = "cc_no_shlib",
+    main = "c_tests/cc_no_shlib.sh",
+)
+
+# build tests from assembly without shlib
+[
+    custom_rule(
+        name = "test_binary_" + base,
+        srcs = ["c_tests/" + base + ".S"],
+        build_args = "c_tests/" + base + ".S",
+        build_script_dep = ":cc_no_shlib",
+        has_content_based_path = False,
+        output_gen_files = [
+            base,
+        ],
+    )
+    for base in reverie_standalone_tests
+]
+
+# Run natively without instrumentation:
+[
+    cpp_binary(
+        name = "test_" + base,
+        srcs = ["c_tests/" + base + ".c"],
+        headers = subdir_glob([
+            ("c_tests/", "*.h"),
+        ]),
+        allocator = "malloc",
+        compiler_flags = [
+            "-g",
+            "-Wall",
+            "-O2",
+            "-D_POSIX_C_SOURCE=20180920",
+            "-D_GNU_SOURCE=1",
+            "-fPIC",
+        ],
+    )
+    for base in reverie_tests
+]
+
+# The reverie-examples tools (noop, strace, counter1/2, chunky_print) are not
+# built in fbsource since the 0.5 import: upstream's shared examples backend
+# links the DynamoRIO and e9patch backends, whose vendored trees fbsource
+# excludes from its import.
+
+buck_sh_test(
+    name = "sh-test-at-random",
+    args = [],
+    test = ":at-random",
+    deps = [
+        ":at-random",
+    ],
+)
+
+# Run tests without any sort of syscall interception.
+[
+    buck_sh_test(
+        name = "run_" + base,
+        args = [],
+        test = ":test_" + base,
+    )
+    for base in reverie_tests
+]
