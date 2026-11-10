@@ -60,12 +60,14 @@ mod claim;
 mod filter;
 mod wire;
 
+pub use claim::ArmedClaim;
 pub use claim::ArtifactAudit;
 pub use claim::BINDING_SLOTS;
 pub use claim::ClaimRefusal;
 pub use claim::HANDOFF_BINDING_UNBOUND;
 pub use claim::HandoffBinding;
 pub use claim::LAYOUT_DIGEST_MISMATCH;
+pub use claim::MappedLaunchClaim;
 pub use claim::MappedLaunchFacts;
 pub use claim::QUALIFICATION_GAPS;
 pub use claim::QualificationGap;
@@ -111,10 +113,15 @@ fn require(ok: bool, why: &str) -> Result<()> {
 /// image's build published. They are checked against the retained bytes here
 /// and used by the handoff; they are DATA, not a qualification by themselves.
 ///
-/// The embedder reads them from the same authenticated package as the image
-/// bytes, never from free-form input. `image_sha256` binds them to those bytes: qualification
-/// refuses any other image, so the declared sites the audit allows are always
-/// the ones published for exactly the bytes it scans.
+/// `image_sha256` binds them to the bytes: the audit refuses any other image,
+/// so the declared sites it allows are always the ones published for exactly
+/// the bytes it scans. That is all the producer can check. It cannot tell an
+/// authentic image-and-facts pair from a forged pair that matches itself, and
+/// a facts file is not authenticated by being well-formed. AUTHENTICATING the
+/// pair is the embedder's job: read both from one package that only the
+/// trusted installer writes, check their owner and that neither changes, and
+/// retain the opened files for the whole run; never take facts from free-form
+/// input.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeImageFacts {
     /// SHA-256 of the exact image bytes these facts describe.
@@ -901,7 +908,9 @@ fn offset(file: &File) -> io::Result<i64> {
     }
 }
 
-fn seal(file: &File) -> io::Result<()> {
+/// Add the write, grow, shrink and seal seals to a memfd the caller owns and
+/// has finished filling.
+pub fn seal_memfd(file: &File) -> io::Result<()> {
     // SAFETY: adds immutable content/size/seal closure to a retained memfd no
     // guest or concurrent writer touches.
     if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_ADD_SEALS, SEALS) } < 0 {
@@ -910,14 +919,15 @@ fn seal(file: &File) -> io::Result<()> {
     Ok(())
 }
 
-/// A memfd holding `bytes`, sealed when `sealed`. Positional writes never
-/// advance the shared offset.
-fn memfd_bytes(name: &std::ffi::CStr, bytes: &[u8], sealed: bool) -> io::Result<File> {
+/// A new `MFD_CLOEXEC | MFD_ALLOW_SEALING` memfd holding `bytes`: a
+/// positional write (the shared offset stays 0), then `set_len`, then the
+/// seals of [`seal_memfd`] when `sealed`. No `sync_all`.
+pub fn memfd_bytes(name: &std::ffi::CStr, bytes: &[u8], sealed: bool) -> io::Result<File> {
     let file = new_unsealed_memfd(name)?;
     file.write_all_at(bytes, 0)?;
     file.set_len(bytes.len() as u64)?;
     if sealed {
-        seal(&file)?;
+        seal_memfd(&file)?;
     }
     Ok(file)
 }
@@ -1088,7 +1098,7 @@ impl BirthLeases {
             self.packet.write_all_at(&bytes, 0)?;
             self.packet.set_len(bytes.len() as u64)?;
             self.packet.sync_all()?;
-            seal(&self.packet)?;
+            seal_memfd(&self.packet)?;
             self.verify_packet(&bytes)?;
             let after = stop.duplicate_birth_pidfd_for_inherited(self.packet.as_fd())?;
             admission.require_watched_peer(&after)?;
@@ -1158,11 +1168,10 @@ pub struct Armed<'fd> {
     pub preparation: Preparation<'fd>,
     /// The entry for the ToolInitialization observation.
     pub entry: RuntimeEntrySpec,
-    /// What the sealed handoff's binding digests say about the mapped bytes.
-    /// Today never bound: the digests are zero.
-    pub binding: HandoffBinding,
-    /// The image's audit, for [`QualifiedMappedLaunch::claim`].
-    pub audit: ArtifactAudit,
+    /// The claim inputs, available only through
+    /// [`ArmedClaim::after_prepare`] on the mapping made from `preparation`.
+    /// The binding is never bound today: the digests are zero.
+    pub claim: ArmedClaim,
 }
 
 /// The producer side of a mapped birth, as the launch route calls it: the
@@ -1270,7 +1279,7 @@ impl MappedBirthArming for MappedBirth<'_> {
         handoff.write_all_at(&built.bytes, 0)?;
         handoff.set_len(built.bytes.len() as u64)?;
         handoff.sync_all()?;
-        seal(handoff)?;
+        seal_memfd(handoff)?;
         require(
             seals(handoff)? == SEALS && handoff.metadata()?.len() == built.bytes.len() as u64,
             "exec_stop_producer_handoff_seal",
@@ -1297,25 +1306,26 @@ impl MappedBirthArming for MappedBirth<'_> {
             .get()
             .ok_or("exec_stop_producer_already_armed")?;
         let placement = Placement::fixed()?;
+        let preparation = Preparation {
+            runtime_fd: self.leases.runtime.as_fd(),
+            runtime_bytes: self.image.bytes(),
+            layout_address: self.image.facts.layout_address,
+            handoff_fd: handoff.as_fd(),
+            handoff_bytes: &wire.bytes,
+            handoff_address: wire.address,
+            input_fd: self.leases.packet.as_fd(),
+            free_band: placement.free_band,
+            filter_scratch: placement.filter_scratch,
+        };
+        let claim = ArmedClaim::new(binding, self.image.artifact_audit(), &preparation);
         Ok(Armed {
-            preparation: Preparation {
-                runtime_fd: self.leases.runtime.as_fd(),
-                runtime_bytes: self.image.bytes(),
-                layout_address: self.image.facts.layout_address,
-                handoff_fd: handoff.as_fd(),
-                handoff_bytes: &wire.bytes,
-                handoff_address: wire.address,
-                input_fd: self.leases.packet.as_fd(),
-                free_band: placement.free_band,
-                filter_scratch: placement.filter_scratch,
-            },
+            preparation,
             entry: RuntimeEntrySpec {
                 entry: entry.entry,
                 terminal_trap: entry.terminal_trap,
                 reserved_signals: facts.reserved_signals,
             },
-            binding,
-            audit: self.image.artifact_audit(),
+            claim,
         })
     }
 }
@@ -2153,6 +2163,22 @@ mod tests {
     }
 
     #[test]
+    fn the_fixed_placement_matches_the_guest_tool_region_constants() {
+        // The guest's own declarations, read from its source: the data band
+        // starts at DATA_FIRST = CONTROL_BYTES / PAGE (1 MiB), and the tool
+        // band, which ends the free band, starts at page 65535.
+        let region = include_str!("../../guest/tool_region.rs");
+        assert!(region.contains("const CONTROL_BYTES: usize = 1024 * 1024;"));
+        assert!(region.contains("const DATA_FIRST: usize = CONTROL_BYTES / PAGE;"));
+        let arena = include_str!("../../guest/tool_region_arena.rs");
+        assert!(arena.contains("assert!(TOOL_BAND.0 == 65535 && TOOL_BAND.1 == 73729);"));
+        let placement = Placement::fixed().unwrap();
+        assert_eq!(placement.roles[0].start, TOOL_REGION.start + 1024 * 1024);
+        assert_eq!(placement.free_band.start, TOOL_REGION.start + 1024 * 1024);
+        assert_eq!(placement.free_band.end, TOOL_REGION.start + 65535 * PAGE);
+    }
+
+    #[test]
     fn the_fixed_placement_is_the_promoted_literal_layout() {
         let placement = Placement::fixed().unwrap();
         let roles: Vec<(u64, u64)> = placement.roles.iter().map(|r| (r.start, r.end)).collect();
@@ -2259,24 +2285,39 @@ mod tests {
             birth.arm(&facts).err().unwrap().to_string(),
             "exec_stop_producer_already_armed"
         );
-        let binding = armed.binding;
-        assert_eq!(
-            QualifiedMappedLaunch::claim(&armed.binding, &armed.audit)
-                .unwrap_err()
-                .gap
-                .key,
-            HANDOFF_BINDING_UNBOUND
-        );
-        assert_eq!(
-            armed.entry.entry,
-            image.facts().initial_entry.unwrap().entry
+        let Armed {
+            preparation,
+            entry,
+            claim,
+        } = armed;
+        assert_eq!(entry.entry, image.facts().initial_entry.unwrap().entry);
+        // A claim minted for another preparation, to show after_prepare
+        // refuses a mapping that is not its own.
+        let decoy = memfd_bytes(c"producer-test-decoy", b"decoy", true).unwrap();
+        let foreign = ArmedClaim::new(
+            HandoffBinding::of(
+                &[[0; 4]; 5],
+                &MappedLaunchFacts::of_mapped([0; 32], [0; 32]),
+            ),
+            ArtifactAudit::unaudited(),
+            &Preparation {
+                runtime_fd: decoy.as_fd(),
+                runtime_bytes: b"decoy",
+                layout_address: preparation.layout_address,
+                handoff_fd: decoy.as_fd(),
+                handoff_bytes: b"decoy",
+                handoff_address: preparation.handoff_address,
+                input_fd: decoy.as_fd(),
+                free_band: preparation.free_band,
+                filter_scratch: preparation.filter_scratch,
+            },
         );
         let original_regs = *captured.registers();
         let original_mask = stop.entry().signal_mask();
         // SAFETY: original ptracer thread; the inherited descriptors are the
         // birth's own, retained by the launch request; genuine captured
         // context of this stop. No runtime entry runs: preparation only.
-        let prepared = match unsafe { stop.prepare_mapping(armed.preparation) } {
+        let prepared = match unsafe { stop.prepare_mapping(preparation) } {
             Ok(prepared) => prepared,
             Err(failure) => panic!(
                 "preparation refused: {} cleanup={:?}",
@@ -2294,6 +2335,18 @@ mod tests {
         }
         #[cfg(not(feature = "stage1a-probe"))]
         let _ = (original_regs, original_mask);
+        assert_eq!(
+            foreign.after_prepare(&prepared).unwrap_err().to_string(),
+            "exec_stop_producer_claim_foreign_preparation"
+        );
+        let launch = claim.after_prepare(&prepared).unwrap();
+        let binding = *launch.binding();
+        let refused = QualifiedMappedLaunch::claim(&launch).unwrap_err();
+        assert_eq!(refused.gap.key, HANDOFF_BINDING_UNBOUND);
+        assert_eq!(
+            launch_label(&Err(refused)),
+            "mapped-unqualified:exec_stop_handoff_binding_unbound:launch"
+        );
         let cancelled = match prepared.cancel() {
             Ok(cancelled) => cancelled,
             Err(retained) => panic!("preparation cancel unconfirmed: {:?}", retained.cleanup()),

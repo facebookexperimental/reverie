@@ -112,6 +112,16 @@ pub struct PreparedMapping<'fd> {
     #[cfg(feature = "stage1a-probe")]
     prevalidation: Option<PrevalidationObservation>,
 }
+impl<'fd> PreparedMapping<'fd> {
+    /// The preparation this mapping was made from: read-only, with no task,
+    /// stop or release access. The producer's claim checks that a claim
+    /// belongs to this exact mapping.
+    #[cfg(feature = "exec-stop-producer")]
+    pub(crate) fn inputs(&self) -> &Preparation<'fd> {
+        &self._inputs
+    }
+}
+
 impl PreparedMapping<'_> {
     /// Duplicate the retained original clone pidfd for the existing coordinator
     /// admission. Same original ptracer and held-generation checks as the initial

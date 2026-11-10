@@ -19,6 +19,9 @@
 //! digests have no verifiable expected value yet. Every claim refuses with
 //! [`HANDOFF_BINDING_UNBOUND`] until all five are written and verified.
 
+use super::super::Result;
+use super::super::physical::Preparation;
+use super::super::physical::PreparedMapping;
 use super::FilterCoverage;
 use super::SyscallCensus;
 
@@ -200,6 +203,89 @@ impl std::fmt::Display for ClaimRefusal {
 
 impl std::error::Error for ClaimRefusal {}
 
+/// The exact preparation inputs one claim belongs to: the addresses and
+/// lengths of the runtime and handoff bytes, and the two child addresses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PreparedIdentity {
+    runtime: (usize, usize),
+    handoff: (usize, usize),
+    handoff_address: u64,
+    layout_address: u64,
+}
+
+impl PreparedIdentity {
+    fn of(preparation: &Preparation<'_>) -> Self {
+        Self {
+            runtime: (
+                preparation.runtime_bytes.as_ptr() as usize,
+                preparation.runtime_bytes.len(),
+            ),
+            handoff: (
+                preparation.handoff_bytes.as_ptr() as usize,
+                preparation.handoff_bytes.len(),
+            ),
+            handoff_address: preparation.handoff_address,
+            layout_address: preparation.layout_address,
+        }
+    }
+}
+
+/// An armed birth's claim inputs, held until its preparation succeeds.
+#[derive(Debug)]
+pub struct ArmedClaim {
+    binding: HandoffBinding,
+    audit: ArtifactAudit,
+    identity: PreparedIdentity,
+}
+
+impl ArmedClaim {
+    pub(super) fn new(
+        binding: HandoffBinding,
+        audit: ArtifactAudit,
+        preparation: &Preparation<'_>,
+    ) -> Self {
+        Self {
+            binding,
+            audit,
+            identity: PreparedIdentity::of(preparation),
+        }
+    }
+
+    /// The claim inputs, once `prepared` is the mapping made from exactly
+    /// this birth's preparation (the same runtime and handoff bytes, the same
+    /// handoff and layout addresses). Refuses any other mapping.
+    pub fn after_prepare(self, prepared: &PreparedMapping<'_>) -> Result<MappedLaunchClaim> {
+        if PreparedIdentity::of(prepared.inputs()) != self.identity {
+            return Err("exec_stop_producer_claim_foreign_preparation".into());
+        }
+        Ok(MappedLaunchClaim {
+            binding: self.binding,
+            audit: self.audit,
+        })
+    }
+}
+
+/// The claim inputs of a birth whose preparation succeeded: what
+/// [`QualifiedMappedLaunch::claim`] decides on. Only
+/// [`ArmedClaim::after_prepare`] builds one.
+#[derive(Debug)]
+pub struct MappedLaunchClaim {
+    binding: HandoffBinding,
+    audit: ArtifactAudit,
+}
+
+impl MappedLaunchClaim {
+    /// What the sealed handoff's binding digests say about the mapped bytes.
+    pub fn binding(&self) -> &HandoffBinding {
+        &self.binding
+    }
+
+    /// The image's audit.
+    pub fn audit(&self) -> &ArtifactAudit {
+        &self.audit
+    }
+}
+
 /// Proof that a mapped launch may be labelled qualified. The only constructor
 /// is [`QualifiedMappedLaunch::claim`].
 #[derive(Debug)]
@@ -208,12 +294,10 @@ pub struct QualifiedMappedLaunch {
 }
 
 impl QualifiedMappedLaunch {
-    /// Claim qualification for a launch armed with `binding` over an image
-    /// with `audit`. Refuses with the first catalog row whose predicate holds.
-    pub fn claim(
-        binding: &HandoffBinding,
-        audit: &ArtifactAudit,
-    ) -> std::result::Result<Self, ClaimRefusal> {
+    /// Claim qualification for a prepared launch. Refuses with the first
+    /// catalog row whose predicate holds.
+    pub fn claim(launch: &MappedLaunchClaim) -> std::result::Result<Self, ClaimRefusal> {
+        let (binding, audit) = (&launch.binding, &launch.audit);
         let row = |key: &str| {
             *QUALIFICATION_GAPS
                 .iter()
@@ -278,8 +362,14 @@ mod tests {
         ArtifactAudit::audited(SyscallCensus::default(), FilterCoverage::default())
     }
 
+    /// A claim as if its preparation succeeded.
+    fn prepared(binding: HandoffBinding, audit: ArtifactAudit) -> MappedLaunchClaim {
+        MappedLaunchClaim { binding, audit }
+    }
+
     fn refusal(binding: &[[u64; 4]; 5], facts: &MappedLaunchFacts) -> ClaimRefusal {
-        QualifiedMappedLaunch::claim(&HandoffBinding::of(binding, facts), &audited()).unwrap_err()
+        QualifiedMappedLaunch::claim(&prepared(HandoffBinding::of(binding, facts), audited()))
+            .unwrap_err()
     }
 
     #[test]
@@ -348,7 +438,8 @@ mod tests {
     fn a_claim_needs_an_audited_image_and_five_verified_digests() {
         let binding = HandoffBinding::of(&bound(), &every_slot_expected());
         assert!(binding.is_bound());
-        let unaudited = QualifiedMappedLaunch::claim(&binding, &ArtifactAudit::unaudited());
+        let unaudited =
+            QualifiedMappedLaunch::claim(&prepared(binding, ArtifactAudit::unaudited()));
         assert_eq!(
             unaudited.as_ref().unwrap_err().gap.key,
             RUNTIME_ARTIFACT_UNAUDITED
@@ -357,13 +448,13 @@ mod tests {
             launch_label(&unaudited),
             "mapped-unqualified:exec_stop_runtime_artifact_unaudited"
         );
-        let held = QualifiedMappedLaunch::claim(&binding, &audited());
+        let held = QualifiedMappedLaunch::claim(&prepared(binding, audited()));
         assert!(held.is_ok());
         assert_eq!(launch_label(&held), "mapped-qualified");
-        let zero = QualifiedMappedLaunch::claim(
-            &HandoffBinding::of(&[[0; 4]; 5], &every_slot_expected()),
-            &audited(),
-        );
+        let zero = QualifiedMappedLaunch::claim(&prepared(
+            HandoffBinding::of(&[[0; 4]; 5], &every_slot_expected()),
+            audited(),
+        ));
         assert_eq!(
             launch_label(&zero),
             "mapped-unqualified:exec_stop_handoff_binding_unbound:launch"
