@@ -399,6 +399,63 @@ const SHARED_INPUTS_055_THREADS: &[SourceRow] = &[
     ),
 ];
 
+// The reverie-inguest manifest gains the off-by-default `exec-stop-producer`
+// feature and its optional sha2/iced-x86 dependencies, plus a serde_json
+// dev-dependency. Every other row is exactly SHARED_INPUTS_055_THREADS; no TLS
+// source, feature the runtime build selects, or crate root changes.
+const SHARED_INPUTS_055_PRODUCER: &[SourceRow] = &[
+    (
+        "reverie-inguest/Cargo.toml",
+        6166,
+        "e30d39d15eb64c0ce1adb72fb92cd7a28268a4dc448d1c38690f868e979d63fb",
+    ),
+    (
+        "reverie-inguest/src/lib.rs",
+        13478,
+        "9b619884552f14046a056f68693c49fc46d065b2a084ad49ca07819a10ec27b1",
+    ),
+    (
+        "reverie-inguest/src/private_runtime/mod.rs",
+        2093,
+        "f6764939d2016bd3c9414b17b35f21f8cf7217f128135b83cfb5459aa3ae5e1e",
+    ),
+    (
+        "reverie-inguest/src/private_runtime/tls/mod.rs",
+        5001,
+        "ba3a02d320c26c283acde7dfc0e0273ff7b04e68b4b5daa7a4f72619758f9f98",
+    ),
+    (
+        "reverie-inguest/src/private_runtime/tls/abi.rs",
+        23446,
+        "a7d7e8e10f4883b2802f8442666c07b95ee61edafca7528add65428d9971cf4e",
+    ),
+    (
+        "reverie-inguest/src/private_runtime/tls/layout.rs",
+        743,
+        "8ee91d78869426196e2f4542dcffb2cf8be3b1372647bd407d9a28ca5b7d20c0",
+    ),
+    (
+        "reverie-loader/Cargo.toml",
+        343,
+        "1f0a18b134d7c34f0743899572b55a3e6ff20d9d5ae7ff4bf59b497fcd2dba7c",
+    ),
+    (
+        "reverie-loader/src/lib.rs",
+        2486,
+        "02aa2dae7b6eec327a0dcf68b92a66f512162d2fdd3a7f9ac89a3e8a51b1f5bf",
+    ),
+    (
+        "reverie-loader/src/musl_tls.rs",
+        17178,
+        "18ca3aec385c4dd8ec79ee5f45e8a30863e28e8a49422cf6c1ae90eb2743696d",
+    ),
+    (
+        "reverie-loader/src/mapped_inputs.rs",
+        17803,
+        "81cd7474215ff617fb1bc16b236461d4deb33697c7d559130f4bdb98b0f0e2c2",
+    ),
+];
+
 fn classify(observed: &[(String, u64, String)]) -> Result<Variant> {
     let same = |expected: &[SourceRow]| {
         observed.len() == expected.len()
@@ -414,14 +471,16 @@ fn classify(observed: &[(String, u64, String)]) -> Result<Variant> {
         same(SHARED_INPUTS_054),
         same(SHARED_INPUTS_055),
         same(SHARED_INPUTS_055_THREADS),
+        same(SHARED_INPUTS_055_PRODUCER),
     ) {
-        (true, false, false, false, false, false, false) => Ok(Variant::LegacyInguest),
-        (false, true, false, false, false, false, false)
-        | (false, false, true, false, false, false, false)
-        | (false, false, false, true, false, false, false)
-        | (false, false, false, false, true, false, false)
-        | (false, false, false, false, false, true, false)
-        | (false, false, false, false, false, false, true) => Ok(Variant::SharedLoader),
+        (true, false, false, false, false, false, false, false) => Ok(Variant::LegacyInguest),
+        (false, true, false, false, false, false, false, false)
+        | (false, false, true, false, false, false, false, false)
+        | (false, false, false, true, false, false, false, false)
+        | (false, false, false, false, true, false, false, false)
+        | (false, false, false, false, false, true, false, false)
+        | (false, false, false, false, false, false, true, false)
+        | (false, false, false, false, false, false, false, true) => Ok(Variant::SharedLoader),
         _ => Err("runtime TLS sources are not one complete reviewed tuple".into()),
     }
 }
@@ -686,6 +745,25 @@ mod tests {
             &[0, 1, 3, 4, 5, 7, 8],
         );
     }
+    // The producer manifest: only row 0 (reverie-inguest/Cargo.toml) differs
+    // from SHARED_INPUTS_055_THREADS, so swapping that one row back yields the
+    // threads tuple itself rather than a mixed one.
+    #[test]
+    fn tls_source_declarations_select_complete_055_producer() {
+        refuse_each_missing_changed_extra_or_duplicate_row(SHARED_INPUTS_055_PRODUCER);
+        assert_eq!(
+            SHARED_INPUTS_055_PRODUCER.len(),
+            SHARED_INPUTS_055_THREADS.len()
+        );
+        for (index, (producer, threads)) in SHARED_INPUTS_055_PRODUCER
+            .iter()
+            .zip(SHARED_INPUTS_055_THREADS)
+            .enumerate()
+        {
+            assert_eq!(producer.0, threads.0, "row {index} path");
+            assert_eq!(producer != threads, index == 0, "row {index} change set");
+        }
+    }
     #[test]
     fn tls_source_declarations_are_pairwise_distinct() {
         let lists = [
@@ -696,6 +774,7 @@ mod tests {
             SHARED_INPUTS_054,
             SHARED_INPUTS_055,
             SHARED_INPUTS_055_THREADS,
+            SHARED_INPUTS_055_PRODUCER,
         ];
         for (index, first) in lists.iter().enumerate() {
             for second in &lists[index + 1..] {

@@ -1224,8 +1224,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-liteinst-artifact/src/private_static/tls_sources.rs",
-        31145,
-        "32c2926c904342ede1c0cd0cb53734ffcf41baaef388f9ea139295c711173e67",
+        34033,
+        "f4b84be4c107f164de6f4f3d51bdccc4d7d73d253d3bf10e8709d2c29a056ac7",
     ),
     (
         "Cargo.toml",
@@ -1339,8 +1339,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-inguest/Cargo.toml",
-        5797,
-        "b99c37792f39a34e45cb42ab531504ba09bd0175b6547d8fcc540308d704eb9a",
+        6166,
+        "e30d39d15eb64c0ce1adb72fb92cd7a28268a4dc448d1c38690f868e979d63fb",
     ),
     (
         "reverie-inguest/src/lib.rs",
@@ -38812,6 +38812,16 @@ mod tests {
                 "reverie-inguest/src/launcher/mod.rs",
                 94802,
                 "3e2a00f582f24652e81305e659e0960bcf6b334514b58140f886aa292de278f8",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/tls_sources.rs",
+                31145,
+                "32c2926c904342ede1c0cd0cb53734ffcf41baaef388f9ea139295c711173e67",
+            ),
+            (
+                "reverie-inguest/Cargo.toml",
+                5797,
+                "b99c37792f39a34e45cb42ab531504ba09bd0175b6547d8fcc540308d704eb9a",
             ),
             (
                 "reverie-liteinst/src/lib.rs",
