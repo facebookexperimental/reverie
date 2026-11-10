@@ -2913,4 +2913,132 @@ pub(super) mod tests {
             assert!(admission.failed.get());
         }
     }
+
+    /// The packet descriptor keeps its number through a fill: the birth
+    /// inherited that number, and nothing closes, dups over or replaces it.
+    #[test]
+    fn the_packet_descriptor_keeps_its_number_through_a_fill() {
+        let leases = leases();
+        let raw = leases.packet.as_raw_fd();
+        assert_eq!(leases.packet().as_raw_fd(), raw);
+        assert_eq!(leases.inherited()[0].as_raw_fd(), raw);
+        leases
+            .fill_packet(&FakeStop, &FakeAdmission::new(vec![b"packet".to_vec()]))
+            .unwrap();
+        assert_eq!(leases.packet.as_raw_fd(), raw);
+        assert_eq!(leases.packet().as_raw_fd(), raw);
+        assert_eq!(leases.inherited()[0].as_raw_fd(), raw);
+    }
+
+    /// A sealed packet whose retained bytes differ from the sealed record
+    /// (same length, same seals, offset 0) is refused by its bytes, poisons
+    /// the lease and fails the admission.
+    #[test]
+    fn retained_packet_bytes_that_differ_are_refused() {
+        let sealed = std::sync::OnceLock::new();
+        sealed.set(b"packeX".to_vec()).unwrap();
+        let leases = BirthLeases {
+            packet: memfd_bytes(c"test-packet", b"packet", true).unwrap(),
+            sealed,
+            ..leases()
+        };
+        let admission = FakeAdmission::new(vec![b"packeX".to_vec()]);
+        assert_eq!(
+            leases
+                .verify_at(&FakeStop, &admission)
+                .unwrap_err()
+                .to_string(),
+            "mapped packet retained OFD bytes differ"
+        );
+        assert!(admission.failed.get());
+        assert!(leases.poisoned.load(Ordering::Acquire));
+    }
+
+    /// A packet that is not pristine (holding a byte, or at offset 1) refuses
+    /// the fill by name; nothing is written or sealed.
+    #[test]
+    fn a_packet_that_is_not_pristine_refuses_the_fill() {
+        use std::io::Seek as _;
+        let holding = leases();
+        holding.packet.write_all_at(b"x", 0).unwrap();
+        let moved = leases();
+        (&moved.packet).seek(std::io::SeekFrom::Start(1)).unwrap();
+        for (leases, length) in [(holding, 1), (moved, 0)] {
+            let admission = FakeAdmission::new(vec![b"packet".to_vec()]);
+            assert_eq!(
+                leases
+                    .fill_packet(&FakeStop, &admission)
+                    .unwrap_err()
+                    .to_string(),
+                "mapped packet lease is not pristine empty unsealed OFD"
+            );
+            assert!(admission.failed.get());
+            assert!(leases.poisoned.load(Ordering::Acquire));
+            assert_eq!(leases.packet.metadata().unwrap().len(), length);
+            assert_eq!(seals(&leases.packet).unwrap(), 0);
+        }
+    }
+
+    /// A packet outside the size bound is refused by name before anything
+    /// is written: the lease keeps length 0 and no seals.
+    #[test]
+    fn a_size_refusal_writes_and_seals_nothing() {
+        for packet in [Vec::new(), vec![0; MAX_PACKET_LEN + 1]] {
+            let leases = leases();
+            let admission = FakeAdmission::new(vec![packet]);
+            assert_eq!(
+                leases
+                    .fill_packet(&FakeStop, &admission)
+                    .unwrap_err()
+                    .to_string(),
+                "mapped packet size outside scalar packet bound"
+            );
+            assert_eq!(leases.packet.metadata().unwrap().len(), 0);
+            assert_eq!(seals(&leases.packet).unwrap(), 0);
+        }
+    }
+
+    /// Moving a sealed packet's shared offset is refused at the next
+    /// verification and poisons the lease; moving it back does not repair
+    /// the lease.
+    #[test]
+    fn a_moved_sealed_packet_offset_is_refused_and_not_repaired() {
+        use std::io::Seek as _;
+        let leases = leases();
+        leases
+            .fill_packet(&FakeStop, &FakeAdmission::new(vec![b"packet".to_vec()]))
+            .unwrap();
+        (&leases.packet).seek(std::io::SeekFrom::Start(1)).unwrap();
+        let admission = FakeAdmission::new(vec![b"packet".to_vec()]);
+        assert_eq!(
+            leases
+                .verify_at(&FakeStop, &admission)
+                .unwrap_err()
+                .to_string(),
+            "mapped packet sealed length/seals/offset differ"
+        );
+        assert!(admission.failed.get());
+        (&leases.packet).seek(std::io::SeekFrom::Start(0)).unwrap();
+        let good = FakeAdmission::new(vec![b"packet".to_vec()]);
+        assert_eq!(
+            leases.verify_at(&FakeStop, &good).unwrap_err().to_string(),
+            "mapped packet lease is permanently poisoned"
+        );
+        assert!(good.failed.get());
+    }
+
+    /// A poison stored while a checked operation runs fails that operation
+    /// at its final barrier, though the operation itself succeeded.
+    #[test]
+    fn a_poison_stored_during_a_checked_operation_fails_it() {
+        let leases = leases();
+        let result = leases.checked(|| {
+            leases.poisoned.store(true, Ordering::Release);
+            Ok(())
+        });
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "mapped packet lease is permanently poisoned"
+        );
+    }
 }
