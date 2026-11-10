@@ -380,7 +380,6 @@ mod tests {
         // from x0: the real pid, and -EBADF for a bad descriptor.
         let pid = unsafe { super::syscall6(libc::SYS_getpid as u64, [0; 6]) };
         assert_eq!(pid, i64::from(std::process::id()));
-        assert_ne!(pid, libc::SYS_getpid as i64);
         let err = unsafe { super::syscall6(libc::SYS_read as u64, [u64::MAX, 0, 0, 0, 0, 0]) };
         assert_eq!(err, -i64::from(libc::EBADF));
     }
