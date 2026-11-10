@@ -383,6 +383,23 @@ impl AuditedRuntimeImage {
         &self.facts
     }
 
+    /// The `length` bytes at virtual `address`, taken from one initialized
+    /// executable segment of this audited image. It returns audited bytes
+    /// and does not judge them: what they must be is the caller's check.
+    /// Refused, each by name: an empty range; a range whose end overflows;
+    /// and a range not wholly inside the initialized bytes of one
+    /// executable segment (crossing a segment edge, in a non-executable
+    /// segment, or outside every segment).
+    pub fn exact_executable(&self, address: u64, length: usize) -> Result<&[u8]> {
+        require(length != 0, "executable range is empty")?;
+        require(
+            address.checked_add(length as u64).is_some(),
+            "executable range end overflows",
+        )?;
+        exact_rx(&validate(&self.bytes)?, address, length)
+            .map_err(|_| "executable range is not inside one executable segment".into())
+    }
+
     /// The decoded HLMLAY01 words.
     pub fn descriptor(&self) -> &[u64; 12] {
         &self.descriptor
@@ -2780,6 +2797,57 @@ pub(super) mod tests {
             "mapped packet lease is permanently poisoned"
         );
         assert!(old.failed.get());
+    }
+
+    #[test]
+    fn exact_executable_returns_audited_bytes_and_refuses_by_name() {
+        let base = RUNTIME_WINDOW.start;
+        let text = base + 2 * PAGE;
+        // The executable segment (program header 1) maps two pages at
+        // base + PAGE; initialize only the first 2 * PAGE - 16 bytes, so its
+        // initialized end is mid-page and the mapped page holds bytes past
+        // it. A bound widened by one byte would admit one of them.
+        let (mut bytes, mut facts) = qualifying_image();
+        let filesz = 64 + 56 + 32;
+        bytes[filesz..filesz + 8].copy_from_slice(&(2 * PAGE - 16).to_le_bytes());
+        facts.image_sha256 = sha2::Sha256::digest(&bytes).into();
+        let image = AuditedRuntimeImage::new(bytes, facts).unwrap();
+        let end = base + 3 * PAGE - 16;
+        assert_eq!(image.exact_executable(text, 2).unwrap(), [0x0f, 0x05]);
+        assert_eq!(image.exact_executable(end - 1, 1).unwrap(), [0xcc]);
+        for (address, length, why) in [
+            (text, 0, "executable range is empty"),
+            (u64::MAX - 1, 2, "executable range end overflows"),
+            (
+                end - 1,
+                2,
+                "executable range is not inside one executable segment",
+            ),
+            (
+                end,
+                1,
+                "executable range is not inside one executable segment",
+            ),
+            (
+                base + 4 * PAGE,
+                1,
+                "executable range is not inside one executable segment",
+            ),
+            (
+                base - 1,
+                2,
+                "executable range is not inside one executable segment",
+            ),
+        ] {
+            assert_eq!(
+                image
+                    .exact_executable(address, length)
+                    .unwrap_err()
+                    .to_string(),
+                why,
+                "{address:#x}+{length}"
+            );
+        }
     }
 
     /// Leases built without an audited image, for the packet tests only.
