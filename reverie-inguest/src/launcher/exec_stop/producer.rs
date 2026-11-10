@@ -127,16 +127,16 @@ pub struct MemfdNames {
 }
 
 /// A private runtime image qualified once, and its sealed bytes.
-pub struct QualifiedRuntimeImage {
+pub struct AuditedRuntimeImage {
     bytes: Vec<u8>,
     facts: RuntimeImageFacts,
     descriptor: [u64; 12],
     census: SyscallCensus,
 }
 
-impl std::fmt::Debug for QualifiedRuntimeImage {
+impl std::fmt::Debug for AuditedRuntimeImage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("QualifiedRuntimeImage")
+        f.debug_struct("AuditedRuntimeImage")
             .field("bytes", &self.bytes.len())
             .field("facts", &self.facts)
             .field("census", &self.census)
@@ -144,11 +144,13 @@ impl std::fmt::Debug for QualifiedRuntimeImage {
     }
 }
 
-impl QualifiedRuntimeImage {
+impl AuditedRuntimeImage {
     /// Qualify `bytes` against `facts`: ELF and window policy, the private
     /// runtime metadata, the exact HLMLAY01 descriptor, the read-only
     /// reference page, the native gate page, every declared site's `syscall`
-    /// bytes, and no undeclared `syscall` encoding anywhere else.
+    /// bytes, and no undeclared DECODED `syscall` instruction. A `0f 05` pair
+    /// inside another instruction is not refused here (B3 stays open until the
+    /// filter proof).
     pub fn new(bytes: Vec<u8>, facts: RuntimeImageFacts) -> Result<Self> {
         require(
             !bytes.is_empty() && bytes.len() <= MAX_IMAGE_BYTES,
@@ -201,7 +203,8 @@ impl QualifiedRuntimeImage {
                 "finite unique sorted ToolInit sites",
             )?;
             let island = constructor_island(&image, &bytes)?;
-            let census = instruction_audit(&image, &NATIVE_GATE, &declared, island)?;
+            let census =
+                instruction_audit(&executable_runs(&image)?, &NATIVE_GATE, &declared, island)?;
             (descriptor, census)
         };
         Ok(Self {
@@ -309,15 +312,12 @@ fn check_native_gate(image: &ValidatedImage<'_>, reference_address: u64) -> Resu
 /// pinned `endbr64; ud2` sits at +0x2bd. `None` (no exemption) otherwise; more
 /// than one such symbol is refused.
 fn constructor_island(image: &ValidatedImage<'_>, bytes: &[u8]) -> Result<Option<u64>> {
-    let mut found = None;
-    for (value, size) in symbols_named(bytes, CONSTRUCTOR_SYMBOL)? {
-        require(
-            found.is_none(),
-            "more than one reverie_inguest_constructor_entry symbol",
-        )?;
-        found = Some((value, size));
-    }
-    let Some((value, size)) = found else {
+    let symbols = symbols_named(bytes, CONSTRUCTOR_SYMBOL)?;
+    require(
+        symbols.len() <= 1,
+        "more than one reverie_inguest_constructor_entry symbol",
+    )?;
+    let Some(&(value, size)) = symbols.first() else {
         return Ok(None);
     };
     if size != CONSTRUCTOR_BYTES {
@@ -338,71 +338,60 @@ fn constructor_island(image: &ValidatedImage<'_>, bytes: &[u8]) -> Result<Option
 
 /// `(st_value, st_size)` of every `.symtab` symbol named `name` in the ELF64
 /// little-endian `bytes`. No section headers or no symbol table gives none;
-/// malformed tables are refused.
+/// a malformed table is refused, with every offset computed checked.
 fn symbols_named(bytes: &[u8], name: &[u8]) -> Result<Vec<(u64, u64)>> {
-    let u16_at = |at: usize| -> Result<u64> {
-        Ok(u16::from_le_bytes(
-            bytes
-                .get(at..at + 2)
-                .ok_or("ELF section table bounds")?
-                .try_into()?,
-        )
-        .into())
+    fn field<const N: usize>(bytes: &[u8], at: usize) -> Result<[u8; N]> {
+        let end = at
+            .checked_add(N)
+            .ok_or("ELF section table offset overflow")?;
+        Ok(bytes
+            .get(at..end)
+            .ok_or("ELF section table bounds")?
+            .try_into()?)
+    }
+    let u16_at = |at: usize| {
+        Ok::<u64, Box<dyn std::error::Error>>(u16::from_le_bytes(field(bytes, at)?).into())
     };
-    let u32_at = |at: usize| -> Result<u64> {
-        Ok(u32::from_le_bytes(
-            bytes
-                .get(at..at + 4)
-                .ok_or("ELF section table bounds")?
-                .try_into()?,
-        )
-        .into())
+    let u32_at = |at: usize| {
+        Ok::<u64, Box<dyn std::error::Error>>(u32::from_le_bytes(field(bytes, at)?).into())
     };
-    let u64_at = |at: usize| -> Result<u64> {
-        Ok(u64::from_le_bytes(
-            bytes
-                .get(at..at + 8)
-                .ok_or("ELF section table bounds")?
-                .try_into()?,
-        ))
-    };
+    let u64_at =
+        |at: usize| Ok::<u64, Box<dyn std::error::Error>>(u64::from_le_bytes(field(bytes, at)?));
     let index = |value: u64| usize::try_from(value).map_err(|_| "ELF offset overflow");
+    let add = |a: usize, b: usize| a.checked_add(b).ok_or("ELF section table offset overflow");
+    let mul = |a: usize, b: usize| a.checked_mul(b).ok_or("ELF section table offset overflow");
     let shoff = index(u64_at(0x28)?)?;
     let shnum = index(u16_at(0x3c)?)?;
     if shoff == 0 || shnum == 0 {
         return Ok(Vec::new());
     }
     require(u16_at(0x3a)? == 64, "ELF section header size")?;
-    let header = |i: usize| shoff + i * 64;
+    let header = |i: usize| add(shoff, mul(i, 64)?);
     let mut symbols = Vec::new();
     for i in 0..shnum {
-        if u32_at(header(i) + 4)? != 2 {
+        if u32_at(add(header(i)?, 4)?)? != 2 {
             continue; // not SHT_SYMTAB
         }
-        require(u64_at(header(i) + 0x38)? == 24, "ELF symbol entry size")?;
-        let table = index(u64_at(header(i) + 0x18)?)?;
-        let count = index(u64_at(header(i) + 0x20)?)? / 24;
-        let strings = header(index(u32_at(header(i) + 0x28)?)?);
         require(
-            index(u32_at(header(i) + 0x28)?)? < shnum,
-            "ELF symbol string table index",
+            u64_at(add(header(i)?, 0x38)?)? == 24,
+            "ELF symbol entry size",
         )?;
-        let strtab = index(u64_at(strings + 0x18)?)?;
-        let strsize = index(u64_at(strings + 0x20)?)?;
+        let table = index(u64_at(add(header(i)?, 0x18)?)?)?;
+        let count = index(u64_at(add(header(i)?, 0x20)?)?)? / 24;
+        let link = index(u32_at(add(header(i)?, 0x28)?)?)?;
+        require(link < shnum, "ELF symbol string table index")?;
+        let strings = header(link)?;
+        let strtab = index(u64_at(add(strings, 0x18)?)?)?;
+        let strsize = index(u64_at(add(strings, 0x20)?)?)?;
         let names = bytes
-            .get(
-                strtab
-                    ..strtab
-                        .checked_add(strsize)
-                        .ok_or("ELF string table bounds")?,
-            )
+            .get(strtab..add(strtab, strsize)?)
             .ok_or("ELF string table bounds")?;
         for symbol in 0..count {
-            let at = table + symbol * 24;
+            let at = add(table, mul(symbol, 24)?)?;
             let offset = index(u32_at(at)?)?;
             let rest = names.get(offset..).ok_or("ELF symbol name bounds")?;
             if rest.len() > name.len() && &rest[..name.len()] == name && rest[name.len()] == 0 {
-                symbols.push((u64_at(at + 8)?, u64_at(at + 16)?));
+                symbols.push((u64_at(add(at, 8)?)?, u64_at(add(at, 16)?)?));
             }
         }
     }
@@ -425,32 +414,24 @@ pub struct SyscallCensus {
     pub data_island_bytes: u64,
 }
 
-/// Linear-sweep decode of every executable page of `image`, each byte exactly
-/// once: executable segments sorted by address, whose page ranges may abut but
-/// never share a page; an abutting run is decoded as one buffer, so an
-/// instruction that crosses a segment boundary is decoded whole. The bytes are
-/// what the mapping exposes: the file bytes from the page-aligned offset, then
-/// zeros to the end of the last page. Refuses any undecodable or truncated
-/// instruction (no resync), any decoded `syscall` outside `gate` that is not in
-/// `declared`, and any declared site that is not a decoded `syscall`.
-///
-/// The only bytes not decoded are the [`CONSTRUCTOR_MESSAGE`] at `island`, the
-/// pinned address [`constructor_island`] found, and only where the sweep
-/// reaches it straight after the pinned `endbr64; ud2`. The message anywhere
-/// else, a changed message, or the pinned address reached any other way is
-/// refused by name.
-fn instruction_audit(
-    image: &ValidatedImage<'_>,
-    gate: &Range<u64>,
-    declared: &[u64],
-    island: Option<u64>,
-) -> Result<SyscallCensus> {
+/// One run of abutting executable pages, as the mapping exposes them (the file
+/// bytes from the page-aligned offset, then zeros to the end of the last page),
+/// and the addresses where one executable segment hands over to the next.
+struct Run {
+    start: u64,
+    bytes: Vec<u8>,
+    boundaries: Vec<u64>,
+}
+
+/// Every executable page of `image`: segments sorted by address, abutting ones
+/// joined into one run, and a page shared by two of them refused.
+fn executable_runs(image: &ValidatedImage<'_>) -> Result<Vec<Run>> {
     let mut executable: Vec<_> = image
         .segments()
         .filter(|segment| segment.permissions.execute)
         .collect();
     executable.sort_unstable_by_key(|segment| segment.memory.start);
-    let mut runs: Vec<(u64, Vec<u8>)> = Vec::new();
+    let mut runs: Vec<Run> = Vec::new();
     for segment in executable {
         let pages = segment.pages().map_err(|e| format!("pages: {e:?}"))?;
         let length = usize::try_from(pages.end - pages.start)?;
@@ -460,46 +441,103 @@ fn instruction_audit(
         let mut bytes = file[..file.len().min(length)].to_vec();
         bytes.resize(length, 0);
         match runs.last_mut() {
-            Some((start, run)) if *start + run.len() as u64 == pages.start => {
-                run.extend_from_slice(&bytes)
+            Some(run) if run.start + run.bytes.len() as u64 == pages.start => {
+                run.boundaries.push(pages.start);
+                run.bytes.extend_from_slice(&bytes);
             }
-            Some((start, run)) if *start + run.len() as u64 > pages.start => {
+            Some(run) if run.start + run.bytes.len() as u64 > pages.start => {
                 return Err(
                     format!("executable segments share the page at {:#x}", pages.start).into(),
                 );
             }
-            _ => runs.push((pages.start, bytes)),
+            _ => runs.push(Run {
+                start: pages.start,
+                bytes,
+                boundaries: Vec::new(),
+            }),
         }
     }
+    Ok(runs)
+}
+
+/// The gate page offsets of its three `syscall` instructions: the native gate,
+/// the PKRU gate body and the `rt_sigreturn` restorer, as the gate template
+/// pins them (`trap/fixed_gates.rs`).
+const GATE_SYSCALL_OFFSETS: [u64; 3] = [0x80, 0x200, 0x309];
+
+/// Linear-sweep decode of the image's executable `runs`, each byte exactly
+/// once, with Intel and AMD decoding run in lockstep: the two must agree on
+/// every instruction's address, length and form, so no vendor-dependent
+/// decoding hides a syscall. Refuses:
+/// - any undecodable or truncated instruction (no resync);
+/// - an instruction that crosses from one executable segment into the next;
+/// - `int 0x80` and `sysenter` anywhere;
+/// - a `syscall` that is not the bare two-byte `0f 05`;
+/// - a `syscall` in the gate page other than one at each of
+///   [`GATE_SYSCALL_OFFSETS`], exactly once each;
+/// - a `syscall` outside the gate page that is not in `declared`;
+/// - a declared site that is not a decoded `syscall`.
+///
+/// The only bytes not decoded are the [`CONSTRUCTOR_MESSAGE`] at `island`, the
+/// pinned address [`constructor_island`] found, and only where the sweep
+/// reaches it straight after the pinned `endbr64; ud2`. The message anywhere
+/// else, a changed message, or the pinned address reached any other way is
+/// refused by name.
+fn instruction_audit(
+    runs: &[Run],
+    gate: &Range<u64>,
+    declared: &[u64],
+    island: Option<u64>,
+) -> Result<SyscallCensus> {
+    use iced_x86::Code;
     let mut declared: Vec<u64> = declared.to_vec();
     declared.sort_unstable();
     declared.dedup();
     let mut found = vec![false; declared.len()];
+    let mut in_gate = [0_u64; GATE_SYSCALL_OFFSETS.len()];
     let mut census = SyscallCensus::default();
-    let mut instruction = iced_x86::Instruction::default();
-    let mut previous = iced_x86::Code::INVALID;
-    for (start, bytes) in &runs {
-        let mut decoder =
-            iced_x86::Decoder::with_ip(64, bytes, *start, iced_x86::DecoderOptions::NONE);
+    let mut intel = iced_x86::Instruction::default();
+    let mut amd = iced_x86::Instruction::default();
+    for run in runs {
+        let (start, bytes) = (run.start, &run.bytes[..]);
+        let mut decoders = [
+            iced_x86::Decoder::with_ip(64, bytes, start, iced_x86::DecoderOptions::NONE),
+            iced_x86::Decoder::with_ip(64, bytes, start, iced_x86::DecoderOptions::AMD),
+        ];
+        let mut previous = Code::INVALID;
         let mut covered = 0_usize;
-        while decoder.can_decode() {
+        while decoders[0].can_decode() {
             let before = previous;
-            decoder.decode_out(&mut instruction);
-            previous = instruction.code();
-            let ip = instruction.ip();
-            if instruction.is_invalid() {
+            decoders[0].decode_out(&mut intel);
+            decoders[1].decode_out(&mut amd);
+            let ip = intel.ip();
+            if intel.is_invalid() || amd.is_invalid() {
                 return Err(format!(
                     "instruction audit: undecodable bytes at {ip:#x} ({:?})",
-                    decoder.last_error()
+                    decoders[0].last_error()
                 )
                 .into());
             }
-            covered += instruction.len();
+            require(
+                (amd.ip(), amd.len(), amd.code()) == (ip, intel.len(), intel.code()),
+                &format!("instruction audit: Intel and AMD decodings differ at {ip:#x}"),
+            )?;
+            previous = intel.code();
+            covered += intel.len();
             census.instructions += 1;
-            let position = decoder.position();
+            let position = decoders[0].position();
             let next_address = start + position as u64;
-            let lead =
-                instruction.code() == iced_x86::Code::Ud2 && before == iced_x86::Code::Endbr64;
+            if let Some(boundary) = run
+                .boundaries
+                .iter()
+                .find(|&&boundary| ip < boundary && boundary < next_address)
+            {
+                return Err(format!(
+                    "instruction audit: instruction at {ip:#x} crosses the executable segment boundary at {boundary:#x}"
+                )
+                .into());
+            }
+            let lead = intel.code() == Code::Ud2 && before == Code::Endbr64;
             if lead && island == Some(next_address) && census.data_island_bytes == 0 {
                 require(
                     bytes.get(position..position + CONSTRUCTOR_MESSAGE.len())
@@ -507,13 +545,15 @@ fn instruction_audit(
                     "instruction audit: constructor message island differs",
                 )?;
                 let next = position + CONSTRUCTOR_MESSAGE.len();
-                decoder
-                    .set_position(next)
-                    .map_err(|e| format!("instruction audit: island: {e}"))?;
-                decoder.set_ip(start + next as u64);
+                for decoder in &mut decoders {
+                    decoder
+                        .set_position(next)
+                        .map_err(|e| format!("instruction audit: island: {e}"))?;
+                    decoder.set_ip(start + next as u64);
+                }
                 covered += CONSTRUCTOR_MESSAGE.len();
                 census.data_island_bytes = CONSTRUCTOR_MESSAGE.len() as u64;
-                previous = iced_x86::Code::INVALID;
+                previous = Code::INVALID;
                 continue;
             }
             if let Some(island) = island
@@ -535,10 +575,30 @@ fn instruction_audit(
                 )
                 .into());
             }
-            if instruction.code() != iced_x86::Code::Syscall {
-                continue;
+            match intel.code() {
+                Code::Sysenter => {
+                    return Err(format!("instruction audit: sysenter at {ip:#x}").into());
+                }
+                Code::Int_imm8 if intel.immediate8() == 0x80 => {
+                    return Err(format!("instruction audit: int 0x80 at {ip:#x}").into());
+                }
+                Code::Syscall => {}
+                _ => continue,
             }
-            if gate.contains(&ip) && ip + 2 <= gate.end {
+            require(
+                intel.len() == 2,
+                &format!("instruction audit: syscall at {ip:#x} is not the bare 0f 05"),
+            )?;
+            if gate.contains(&ip) {
+                let at = GATE_SYSCALL_OFFSETS
+                    .iter()
+                    .position(|&offset| gate.start + offset == ip)
+                    .ok_or_else(|| {
+                        format!(
+                            "instruction audit: gate-page syscall at {ip:#x} is not a template site"
+                        )
+                    })?;
+                in_gate[at] += 1;
                 census.in_gate += 1;
             } else if let Ok(at) = declared.binary_search(&ip) {
                 found[at] = true;
@@ -548,11 +608,15 @@ fn instruction_audit(
             }
         }
         require(
-            covered == bytes.len() && decoder.position() == bytes.len(),
+            covered == bytes.len() && decoders[0].position() == bytes.len(),
             "instruction audit did not cover every executable byte exactly once",
         )?;
         census.executable_bytes += bytes.len() as u64;
     }
+    require(
+        in_gate == [1; GATE_SYSCALL_OFFSETS.len()],
+        "instruction audit: the gate page lacks one of its template syscalls",
+    )?;
     if let Some(at) = found.iter().position(|found| !found) {
         return Err(format!(
             "instruction audit: declared site {:#x} is not a decoded syscall",
@@ -786,7 +850,7 @@ pub trait PacketAdmission {
 
 impl BirthLeases {
     /// Create the three descriptors for one birth of `image`.
-    pub fn new(image: &QualifiedRuntimeImage, names: MemfdNames) -> Result<Self> {
+    pub fn new(image: &AuditedRuntimeImage, names: MemfdNames) -> Result<Self> {
         let packet = new_unsealed_memfd(names.packet)?;
         let leases = Self {
             packet,
@@ -998,15 +1062,15 @@ mod tests {
 
     #[test]
     fn an_empty_or_garbage_image_is_refused() {
-        assert!(QualifiedRuntimeImage::new(Vec::new(), facts_for(&[])).is_err());
+        assert!(AuditedRuntimeImage::new(Vec::new(), facts_for(&[])).is_err());
         let garbage = b"not an elf".to_vec();
-        let error = QualifiedRuntimeImage::new(garbage.clone(), facts_for(&garbage)).unwrap_err();
+        let error = AuditedRuntimeImage::new(garbage.clone(), facts_for(&garbage)).unwrap_err();
         assert!(error.to_string().starts_with("ELF"), "{error}");
     }
 
     #[test]
     fn facts_for_other_bytes_are_refused_before_any_audit() {
-        let error = QualifiedRuntimeImage::new(b"image".to_vec(), facts_for(b"other")).unwrap_err();
+        let error = AuditedRuntimeImage::new(b"image".to_vec(), facts_for(b"other")).unwrap_err();
         assert!(error.to_string().contains("image_sha256"), "{error}");
     }
 
@@ -1019,11 +1083,21 @@ mod tests {
     const RW: u32 = 4 | 2;
 
     /// A gate page: int3 fill with the native gate at 0x7c.
+    /// A gate page: int3 fill with the template's three syscalls: the native
+    /// gate at 0x7c (syscall at 0x80), a bare syscall at 0x200, and the
+    /// restorer at 0x300 (syscall at 0x309).
     fn gate_page() -> Vec<u8> {
         let mut page = vec![0xcc; PAGE as usize];
         page[0x7c..0x7c + NATIVE_GATE_BYTES.len()].copy_from_slice(&NATIVE_GATE_BYTES);
+        page[0x200..0x202].copy_from_slice(&[0x0f, 0x05]);
+        page[0x300..0x30d].copy_from_slice(&RESTORER);
         page
     }
+
+    /// `endbr64; mov eax, 15; syscall; ud2`.
+    const RESTORER: [u8; 13] = [
+        0xf3, 0x0f, 0x1e, 0xfa, 0xb8, 15, 0, 0, 0, 0x0f, 0x05, 0x0f, 0x0b,
+    ];
 
     /// `syscall; nop; nop; syscall; jne rel32` whose rel32 bytes are `0f 05 00
     /// 00`, then zeros: decoded syscalls at TEXT and TEXT+4, and a `0f 05`
@@ -1080,11 +1154,16 @@ mod tests {
     fn audit(bytes: &[u8], declared: &[u64]) -> Result<SyscallCensus> {
         let image = validate(bytes)?;
         let island = constructor_island(&image, bytes)?;
-        instruction_audit(&image, &NATIVE_GATE, declared, island)
+        instruction_audit(&executable_runs(&image)?, &NATIVE_GATE, declared, island)
     }
 
     /// `bytes` with a `.symtab` holding one FUNC symbol `name` at `value`.
-    fn with_symbol(mut bytes: Vec<u8>, name: &[u8], value: u64, size: u64) -> Vec<u8> {
+    fn with_symbol(bytes: Vec<u8>, name: &[u8], value: u64, size: u64) -> Vec<u8> {
+        with_symbols(bytes, name, &[(value, size)])
+    }
+
+    /// `bytes` with a `.symtab` holding a FUNC symbol `name` per `(value, size)`.
+    fn with_symbols(mut bytes: Vec<u8>, name: &[u8], symbols: &[(u64, u64)]) -> Vec<u8> {
         let mut strtab = vec![0];
         strtab.extend_from_slice(name);
         strtab.push(0);
@@ -1093,12 +1172,15 @@ mod tests {
         bytes.resize(bytes.len().next_multiple_of(8), 0);
         let symtab_at = bytes.len();
         bytes.extend_from_slice(&[0; 24]);
-        let mut symbol = [0_u8; 24];
-        symbol[..4].copy_from_slice(&1_u32.to_le_bytes());
-        symbol[4] = 2; // STT_FUNC
-        symbol[8..16].copy_from_slice(&value.to_le_bytes());
-        symbol[16..24].copy_from_slice(&size.to_le_bytes());
-        bytes.extend_from_slice(&symbol);
+        for &(value, size) in symbols {
+            let mut symbol = [0_u8; 24];
+            symbol[..4].copy_from_slice(&1_u32.to_le_bytes());
+            symbol[4] = 2; // STT_FUNC
+            symbol[8..16].copy_from_slice(&value.to_le_bytes());
+            symbol[16..24].copy_from_slice(&size.to_le_bytes());
+            bytes.extend_from_slice(&symbol);
+        }
+        let symtab_bytes = 24 * (symbols.len() + 1);
         let shoff = bytes.len();
         let section = |kind: u32, offset: usize, size: usize, link: u32, entsize: u64| {
             let mut header = [0_u8; 64];
@@ -1110,7 +1192,7 @@ mod tests {
             header
         };
         bytes.extend_from_slice(&[0; 64]);
-        bytes.extend_from_slice(&section(2, symtab_at, 48, 2, 24));
+        bytes.extend_from_slice(&section(2, symtab_at, symtab_bytes, 2, 24));
         bytes.extend_from_slice(&section(3, strtab_at, strtab.len(), 0, 0));
         bytes[0x28..0x30].copy_from_slice(&(shoff as u64).to_le_bytes());
         bytes[0x3a..0x3c].copy_from_slice(&64_u16.to_le_bytes());
@@ -1160,14 +1242,16 @@ mod tests {
         let bytes = elf(Some(RX), &gate_page(), &text_page(), &gate_page());
         let census = audit(&bytes, &[TEXT, TEXT + 4]).unwrap();
         assert_eq!(census.executable_bytes, 2 * PAGE);
-        assert_eq!(census.in_gate, 1);
+        assert_eq!(census.in_gate, 3);
         assert_eq!(census.at_declared_sites, 2);
         // The `0f 05` inside the `jne` is no instruction, so it is neither
         // counted nor refused. The gate and text pages abut and decode as one
         // run: the int3 fill, the gate, and the text instructions.
         assert_eq!(
             census.instructions,
-            (PAGE - 9) + 3 + 4 + 1 + (PAGE - 12) / 2
+            // gate page: int3 fill, the native gate (3), the bare syscall (1),
+            // the restorer (4); text page: 5 instructions, then zero pairs.
+            (PAGE - 9 - 2 - 13) + 3 + 1 + 4 + 5 + (PAGE - 12) / 2
         );
     }
 
@@ -1295,22 +1379,166 @@ mod tests {
             error.starts_with("instruction audit: undecodable bytes"),
             "{error}"
         );
-        // With the pin derived, a sweep that reaches the island other than
-        // straight after the lead is refused by name: here a `ud2` preceded
-        // by a nop rather than `endbr64` ends right at the island.
-        let wrong_lead = island_image(&island_text(
-            Some(pinned),
-            &[(pinned, &[0x90, 0x90, 0x90, 0x90, 0x0f, 0x0b])],
-        ));
-        let image = validate(&wrong_lead).unwrap();
-        assert_eq!(constructor_island(&image, &wrong_lead).unwrap(), None);
-        let error = instruction_audit(&image, &NATIVE_GATE, &declared, Some(message))
-            .unwrap_err()
-            .to_string();
+        // With the pin derived (the lead bytes are intact at +0x2bd), a sweep
+        // that reaches the island other than straight after the lead is
+        // refused by name: here a 10-byte `movabs rax, imm64` starting two
+        // bytes before the lead swallows it and runs into the message.
+        let swallowed = island_image(&island_text(Some(pinned), &[(pinned - 2, &[0x48, 0xb8])]));
+        let image = validate(&swallowed).unwrap();
         assert_eq!(
-            error,
+            constructor_island(&image, &swallowed).unwrap(),
+            Some(message)
+        );
+        assert_eq!(
+            audit(&swallowed, &declared).unwrap_err().to_string(),
             format!(
                 "instruction audit: constructor message island at {message:#x} is not preceded by endbr64; ud2"
+            )
+        );
+        // The pin needs the exact size and exactly one symbol.
+        for size in [CONSTRUCTOR_BYTES - 1, CONSTRUCTOR_BYTES + 1] {
+            let resized = with_symbol(
+                elf(
+                    Some(RX),
+                    &gate_page(),
+                    &island_text(Some(pinned), &[]),
+                    &gate_page(),
+                ),
+                CONSTRUCTOR_SYMBOL,
+                CONSTRUCTOR,
+                size,
+            );
+            assert_eq!(
+                audit(&resized, &declared).unwrap_err().to_string(),
+                format!(
+                    "instruction audit: constructor message at {message:#x} is not the pinned island"
+                ),
+                "size {size}"
+            );
+        }
+        let twice = with_symbols(
+            elf(
+                Some(RX),
+                &gate_page(),
+                &island_text(Some(pinned), &[]),
+                &gate_page(),
+            ),
+            CONSTRUCTOR_SYMBOL,
+            &[
+                (CONSTRUCTOR, CONSTRUCTOR_BYTES),
+                (CONSTRUCTOR + 0x400, CONSTRUCTOR_BYTES),
+            ],
+        );
+        assert_eq!(
+            audit(&twice, &declared).unwrap_err().to_string(),
+            "more than one reverie_inguest_constructor_entry symbol"
+        );
+    }
+
+    #[test]
+    fn a_malformed_section_table_is_refused_without_panicking() {
+        let mut bytes = island_image(&island_text(None, &[]));
+        bytes[0x28..0x30].copy_from_slice(&(u64::MAX - 3).to_le_bytes());
+        assert!(symbols_named(&bytes, CONSTRUCTOR_SYMBOL).is_err());
+        assert!(audit(&bytes, &[TEXT, TEXT + 4]).is_err());
+        let mut link = island_image(&island_text(None, &[]));
+        // Point the symbol table's string-table link past the section count.
+        let shoff = u64::from_le_bytes(link[0x28..0x30].try_into().unwrap()) as usize;
+        link[shoff + 64 + 0x28..shoff + 64 + 0x2c].copy_from_slice(&7_u32.to_le_bytes());
+        assert_eq!(
+            symbols_named(&link, CONSTRUCTOR_SYMBOL)
+                .unwrap_err()
+                .to_string(),
+            "ELF symbol string table index"
+        );
+    }
+
+    #[test]
+    fn only_the_template_gate_syscalls_and_bare_declared_syscalls_are_admitted() {
+        let declared = [TEXT, TEXT + 4];
+        // An extra syscall in the gate page, mirrored in the reference page.
+        let mut extra = gate_page();
+        extra[0x400..0x402].copy_from_slice(&[0x0f, 0x05]);
+        let bytes = elf(Some(RX), &extra, &text_page(), &extra);
+        gate_check(&bytes).unwrap();
+        assert_eq!(
+            audit(&bytes, &declared).unwrap_err().to_string(),
+            format!(
+                "instruction audit: gate-page syscall at {:#x} is not a template site",
+                GATE + 0x400
+            )
+        );
+        // A template syscall missing.
+        let mut missing = gate_page();
+        missing[0x200..0x202].copy_from_slice(&[0xcc, 0xcc]);
+        let bytes = elf(Some(RX), &missing, &text_page(), &missing);
+        assert_eq!(
+            audit(&bytes, &declared).unwrap_err().to_string(),
+            "instruction audit: the gate page lacks one of its template syscalls"
+        );
+        // `66 0f 05` at a declared site.
+        let mut text = text_page();
+        text[..12].copy_from_slice(&[
+            0x66, 0x0f, 0x05, 0x90, 0x0f, 0x05, 0x0f, 0x85, 0x0f, 0x05, 0x00, 0x00,
+        ]);
+        let bytes = elf(Some(RX), &gate_page(), &text, &gate_page());
+        assert_eq!(
+            audit(&bytes, &declared).unwrap_err().to_string(),
+            format!("instruction audit: syscall at {TEXT:#x} is not the bare 0f 05")
+        );
+    }
+
+    #[test]
+    fn int_0x80_and_sysenter_are_refused() {
+        let declared = [TEXT, TEXT + 4];
+        for (patch, name) in [
+            (&[0xcd_u8, 0x80][..], "int 0x80"),
+            (&[0x0f, 0x34][..], "sysenter"),
+        ] {
+            let mut text = text_page();
+            // Two nops at TEXT+2..4 become the refused instruction.
+            text[2..4].copy_from_slice(patch);
+            let bytes = elf(Some(RX), &gate_page(), &text, &gate_page());
+            assert_eq!(
+                audit(&bytes, &declared).unwrap_err().to_string(),
+                format!("instruction audit: {name} at {:#x}", TEXT + 2)
+            );
+        }
+        // `int 0x81` is an ordinary instruction here.
+        let mut text = text_page();
+        text[2..4].copy_from_slice(&[0xcd, 0x81]);
+        let bytes = elf(Some(RX), &gate_page(), &text, &gate_page());
+        audit(&bytes, &declared).unwrap();
+    }
+
+    #[test]
+    fn a_vendor_dependent_decoding_is_refused() {
+        // Intel: a 7-byte `66 je rel32` and a nop. AMD: a 5-byte `je rel16`,
+        // then a syscall at +5, then a nop.
+        let mut text = text_page();
+        text[12..20].copy_from_slice(&[0x66, 0x0f, 0x84, 0x00, 0x00, 0x0f, 0x05, 0x90]);
+        let bytes = elf(Some(RX), &gate_page(), &text, &gate_page());
+        assert_eq!(
+            audit(&bytes, &[TEXT, TEXT + 4]).unwrap_err().to_string(),
+            format!(
+                "instruction audit: Intel and AMD decodings differ at {:#x}",
+                TEXT + 12
+            )
+        );
+    }
+
+    #[test]
+    fn an_instruction_crossing_into_the_next_executable_segment_is_refused() {
+        // The gate and text segments abut; a `movabs` at the gate page's last
+        // two bytes runs eight bytes into the text page.
+        let mut gate = gate_page();
+        gate[PAGE as usize - 2..].copy_from_slice(&[0x48, 0xb8]);
+        let bytes = elf(Some(RX), &gate, &text_page(), &gate);
+        assert_eq!(
+            audit(&bytes, &[TEXT, TEXT + 4]).unwrap_err().to_string(),
+            format!(
+                "instruction audit: instruction at {:#x} crosses the executable segment boundary at {TEXT:#x}",
+                TEXT - 2
             )
         );
     }
@@ -1345,21 +1573,22 @@ mod tests {
     }
 
     /// The real staged private runtime image this audit was measured on,
-    /// pinned by its SHA-256. The 39 MB image is not in the repository, so
-    /// this runs only when `REVERIE_PRIVATE_RUNTIME_IMAGE` names the image and
+    /// pinned by its SHA-256. It comes from a private build pair of
+    /// 2026-11-03, not from any current release image; a current build must
+    /// repeat this measurement. The 39 MB image is not in the repository, so
+    /// this is ignored by default and run with `--ignored`, and then it FAILS
+    /// unless `REVERIE_PRIVATE_RUNTIME_IMAGE` names the image and
     /// `REVERIE_PRIVATE_RUNTIME_FACTS` its package descriptor (JSON with
     /// `image.sha256` and `observed.{layout_address, reference_address, sites,
     /// ordinary_post_ips}`).
     #[test]
+    #[ignore = "needs REVERIE_PRIVATE_RUNTIME_IMAGE and REVERIE_PRIVATE_RUNTIME_FACTS"]
     fn the_measured_staged_image_qualifies_with_its_recorded_counts() {
         const PINNED: &str = "2cf437588ab89fb97ca5a271374739c0e59d9ab4223f95a8d83b7a0e41f31268";
-        let (Some(image), Some(facts)) = (
-            std::env::var_os("REVERIE_PRIVATE_RUNTIME_IMAGE"),
-            std::env::var_os("REVERIE_PRIVATE_RUNTIME_FACTS"),
-        ) else {
-            eprintln!("REVERIE_PRIVATE_RUNTIME_IMAGE/_FACTS unset; real-image audit not run");
-            return;
-        };
+        let image = std::env::var_os("REVERIE_PRIVATE_RUNTIME_IMAGE")
+            .expect("REVERIE_PRIVATE_RUNTIME_IMAGE must name the staged image");
+        let facts = std::env::var_os("REVERIE_PRIVATE_RUNTIME_FACTS")
+            .expect("REVERIE_PRIVATE_RUNTIME_FACTS must name its package descriptor");
         let bytes = std::fs::read(image).unwrap();
         let data: serde_json::Value =
             serde_json::from_slice(&std::fs::read(facts).unwrap()).unwrap();
@@ -1389,7 +1618,7 @@ mod tests {
                 .map(number)
                 .collect(),
         };
-        let image = QualifiedRuntimeImage::new(bytes, facts).unwrap();
+        let image = AuditedRuntimeImage::new(bytes, facts).unwrap();
         let census = image.census();
         eprintln!("{census:?}");
         assert_eq!(census.at_declared_sites, 229);
@@ -1411,10 +1640,19 @@ mod tests {
         }
     }
 
+    /// A stop that refuses to vouch for the descriptor.
+    struct ForeignStop;
+    impl BirthStop for ForeignStop {
+        fn duplicate_birth_pidfd_for_inherited(&self, _fd: BorrowedFd<'_>) -> Result<OwnedFd> {
+            Err("descriptor not inherited by this birth".into())
+        }
+    }
+
     struct FakeAdmission {
         packets: std::cell::RefCell<Vec<Vec<u8>>>,
         peer_checks: std::cell::Cell<u32>,
         failed: std::cell::Cell<bool>,
+        foreign_peer: bool,
     }
     impl FakeAdmission {
         fn new(packets: Vec<Vec<u8>>) -> Self {
@@ -1422,12 +1660,16 @@ mod tests {
                 packets: std::cell::RefCell::new(packets),
                 peer_checks: std::cell::Cell::new(0),
                 failed: std::cell::Cell::new(false),
+                foreign_peer: false,
             }
         }
     }
     impl PacketAdmission for FakeAdmission {
         fn require_watched_peer(&self, _birth: &OwnedFd) -> Result<()> {
             self.peer_checks.set(self.peer_checks.get() + 1);
+            if self.foreign_peer {
+                return Err("birth is not the watched peer".into());
+            }
             Ok(())
         }
         fn initial_packet(&self) -> Result<Vec<u8>> {
@@ -1443,7 +1685,38 @@ mod tests {
         }
     }
 
-    /// Leases built without a qualified image, for the packet tests only.
+    #[test]
+    fn a_foreign_stop_or_peer_refuses_the_fill_and_fails_the_admission() {
+        let leases = leases();
+        let admission = FakeAdmission::new(vec![b"packet".to_vec()]);
+        assert_eq!(
+            leases
+                .fill_packet(&ForeignStop, &admission)
+                .unwrap_err()
+                .to_string(),
+            "descriptor not inherited by this birth"
+        );
+        assert!(admission.failed.get());
+        assert_eq!(seals(&leases.packet).unwrap(), 0);
+        let leases = self::leases();
+        let admission = FakeAdmission {
+            foreign_peer: true,
+            ..FakeAdmission::new(vec![b"packet".to_vec()])
+        };
+        assert_eq!(
+            leases
+                .fill_packet(&FakeStop, &admission)
+                .unwrap_err()
+                .to_string(),
+            "birth is not the watched peer"
+        );
+        assert!(admission.failed.get());
+        // A refused lease stays refused.
+        let good = FakeAdmission::new(vec![b"packet".to_vec()]);
+        assert!(leases.fill_packet(&FakeStop, &good).is_err());
+    }
+
+    /// Leases built without an audited image, for the packet tests only.
     fn leases() -> BirthLeases {
         BirthLeases {
             packet: new_unsealed_memfd(c"test-packet").unwrap(),
