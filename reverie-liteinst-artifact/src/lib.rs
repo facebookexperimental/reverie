@@ -1179,8 +1179,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-inguest/src/guest/sigalrm.rs",
-        55207,
-        "d31b0451697e6d475771bb6cf20ffbc6bd2ab71aa28c941172488d7125928fbc",
+        55729,
+        "85ca6bb23aca2309a91524aea5e7dab733ab0be384ed155fcc4f822d92eb1cd4",
     ),
     (
         "reverie-inguest/src/guest/signal.rs",
@@ -38777,6 +38777,11 @@ mod tests {
                 "reverie-liteinst/src/lib.rs",
                 35129,
                 "1270edf2571480add4843055dd5417b9886291c4f75d8399645f94cfc76e12ec",
+            ),
+            (
+                "reverie-inguest/src/guest/sigalrm.rs",
+                55207,
+                "d31b0451697e6d475771bb6cf20ffbc6bd2ab71aa28c941172488d7125928fbc",
             ),
             (
                 "reverie-liteinst-artifact/src/private_static/selected_initializers/bootstrap_env_aux.rs",

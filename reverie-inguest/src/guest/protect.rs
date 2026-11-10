@@ -1368,6 +1368,16 @@ pub(crate) mod tests {
         numbers
     }
 
+    /// Held by the tests here that take the signal-control record and
+    /// assert on what it holds, so that one does not take another's.
+    static SIGNAL_RECORD_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_signal_record() -> std::sync::MutexGuard<'static, ()> {
+        SIGNAL_RECORD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     pub(crate) fn event(number: i64, args: [u64; 6]) -> SyscallEvent {
         SyscallEvent {
             number,
@@ -2400,6 +2410,7 @@ pub(crate) mod tests {
     /// alternate-stack query are not refused and not recorded.
     #[test]
     fn refused_signal_controls_are_recorded_for_the_tool_once() {
+        let _record = lock_signal_record();
         // A struct sigaction whose handler is an address, read from this
         // process's own memory as the runtime reads the guest's.
         let handler: [u64; 4] = [0x4000, 0, 0, 0];
@@ -2456,6 +2467,34 @@ pub(crate) mod tests {
             take_refused_signal_controls(),
             RefusedSignalControls::default(),
             "taken once"
+        );
+    }
+
+    /// Where handlers are not admitted (always so for a private initial
+    /// image), a new SIGALRM handler is refused like any other signal's and
+    /// recorded as signal 14, and the refusal leaves SIGALRM handlers off:
+    /// not admitted and no handler installed.
+    #[test]
+    fn a_refused_sigalrm_handler_leaves_sigalrm_handlers_off() {
+        let _admission = crate::guest::sigalrm::lock_admission_for_test();
+        let _record = lock_signal_record();
+        crate::guest::sigalrm::set_admitted(false);
+        let _ = take_refused_signal_controls();
+        let handler: [u64; 4] = [0x4000, 0, 0, 0];
+        let mut install = event(
+            libc::SYS_rt_sigaction,
+            [libc::SIGALRM as u64, handler.as_ptr() as u64, 0, 8, 0, 0],
+        );
+        assert!(protect_runtime_control(&mut install));
+        assert_eq!(install.result, -i64::from(libc::EPERM));
+        assert!(!crate::guest::sigalrm::admitted());
+        assert!(!crate::guest::sigalrm::handled());
+        assert_eq!(
+            take_refused_signal_controls(),
+            RefusedSignalControls {
+                actions: 1 << (libc::SIGALRM - 1),
+                alternate_stack: false,
+            }
         );
     }
 
@@ -2566,6 +2605,7 @@ pub(crate) mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn the_tools_own_signal_controls_are_not_recorded() {
+        let _record = lock_signal_record();
         let handler: [u64; 4] = [0x4000, 0, 0, 0];
         let stack = [0u64; 3];
         let _ = take_refused_signal_controls();
