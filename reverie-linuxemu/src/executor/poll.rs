@@ -45,9 +45,22 @@ pub(crate) struct EpollIdentity {
     /// of it, with which a receive compares what it got ([`EpollTransfer`]).
     /// It goes with the epoll's end.
     pin: Mutex<Option<std::fs::File>>,
+    /// Whether the epoll came from outside the run ([`received_epoll`]),
+    /// where a process the run does not see can hold it, in a descriptor or
+    /// a message still to reach the run. Every descriptor of the epoll, a
+    /// dup's, a fork's or a received one's, shares it, as they share the
+    /// identity. No pidfd for a guest process is added to such an epoll
+    /// (`PIDFD_IMPORTED_EPOLL_REFUSAL`): its registration would have to last
+    /// while that process holds the epoll, which the run cannot see.
+    from_outside: bool,
 }
 
 impl EpollIdentity {
+    /// Whether the epoll came from outside the run (`from_outside`).
+    pub(super) fn came_from_outside(&self) -> bool {
+        self.from_outside
+    }
+
     /// Records the registration of guest descriptor number `fd` of `pidfd`
     /// in this epoll, for the epoll's end to end. The call that registers
     /// it reached a descriptor of the epoll, which keeps the epoll until the
@@ -157,12 +170,14 @@ impl EpollHold {
             .map(|_| Self(epoll.clone()))
     }
 
-    /// The first owner of a new epoll identity, which it names.
-    fn first() -> Self {
+    /// The first owner of a new epoll identity, which it names, of an epoll
+    /// that came from outside the run if `from_outside`.
+    fn first(from_outside: bool) -> Self {
         Self(Arc::new(EpollIdentity {
             live: std::sync::atomic::AtomicUsize::new(1),
             pidfd_registrations: Mutex::default(),
             pin: Mutex::default(),
+            from_outside,
         }))
     }
 }
@@ -203,8 +218,13 @@ impl Drop for EpollHold {
 ///
 /// While a peek is between its host receive and its lookup ([`PeekWindow`]),
 /// the hold of an epoll whose last right a receive takes goes to the windows
-/// until the last of them closes: the peek may have got the epoll, which it
-/// owns only once it has looked it up.
+/// open then, until each of them has closed: the peek may have got the epoll,
+/// which it owns only once it has looked it up.
+///
+/// A message that may leave the run carries no epoll (`EPOLL_EXPORT_REFUSAL`):
+/// a receiver outside the run would hold it where no record sees, so its
+/// record could neither keep it as long as Linux does nor end it when Linux
+/// does.
 #[derive(Debug)]
 pub(crate) struct EpollTransfer {
     epoll: std::sync::Weak<EpollIdentity>,
@@ -227,32 +247,46 @@ fn prune_epoll_transfers(table: &mut crate::elf::GuestFileIdentityTable) {
     });
 }
 
+/// What [`register_epoll_transfer`] did with an epoll right.
+pub(super) enum EpollRight {
+    /// Recorded in flight: the message owns the epoll (`EpollTransfer`).
+    Recorded,
+    /// Not recorded, on a host that cannot compare open file descriptions.
+    Unrecorded,
+    /// Not recorded: the message may leave the run (`sends_into_the_run`).
+    MayLeave,
+}
+
 /// Records one right in flight of `epoll`, whose host descriptor `host_fd` a
-/// send carries: true if recorded. On a host that cannot compare open file
-/// descriptions no receive could find the record, and no epoll has a pidfd
-/// registration to keep (`descriptions_comparable`), so the right goes
-/// unrecorded. Past the bound the send fails with ETOOMANYREFS, as Linux's
-/// does past its own; if the pin cannot be made, it fails as Linux fails an
-/// allocation, ENOMEM. Either way the host sees nothing.
+/// send from a socket at host object `sender` carries, if the send reaches a
+/// receiver in the run (`sends_into_the_run`). The check and the record are
+/// one critical section under the identity table's lock, so no export of the
+/// pair's other end comes between them (`admit_socket_export`). On a host
+/// that cannot compare open file descriptions no receive could find the
+/// record, and no epoll has a pidfd registration to keep
+/// (`descriptions_comparable`), so the right goes unrecorded. Past the bound
+/// the send fails with ETOOMANYREFS, as Linux's does past its own. A pin that
+/// cannot be made, under the hard descriptor limit either (`duplicate_epoll`),
+/// ends the run (`end_run_for_descriptors`): no receive could find the
+/// epoll's identity. Either way the host sees nothing.
 pub(super) fn register_epoll_transfer(
     state: &LoadedStaticElf,
     epoll: &Arc<EpollIdentity>,
     host_fd: RawFd,
-) -> Result<bool, i64> {
+    sender: Option<(libc::dev_t, libc::ino_t)>,
+) -> Result<EpollRight, i64> {
     if !super::mapping_list::descriptions_comparable() {
-        return Ok(false);
+        return Ok(EpollRight::Unrecorded);
     }
     let mut table = state
         .file_identity_table
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !sends_into_the_run(&table, sender) {
+        return Ok(EpollRight::MayLeave);
+    }
     prune_epoll_transfers(&mut table);
-    let in_flight: usize = table
-        .epoll_transfers
-        .iter()
-        .map(|transfer| transfer.in_flight)
-        .sum();
-    if in_flight >= PROC_TRANSFER_LIMIT {
+    if epoll_rights_in_flight_in(&table) >= PROC_TRANSFER_LIMIT {
         return Err(negative_errno(libc::ETOOMANYREFS));
     }
     {
@@ -262,8 +296,15 @@ pub(super) fn register_epoll_transfer(
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if pin.is_none() {
             match duplicate_epoll(host_fd) {
-                Some(copy) => *pin = Some(copy),
-                None => return Err(negative_errno(libc::ENOMEM)),
+                Ok(copy) => *pin = Some(copy),
+                Err(error) => {
+                    return Err(end_run_for_descriptors(format!(
+                        "KVM epoll identity: no host descriptor left to pin an epoll that a \
+                         send carries (host descriptor {host_fd}): {error}, under {}; no \
+                         receive of it could find its identity, so the run ends here",
+                        reverie_kvm_core::host_limits::descriptor_limit_text(),
+                    )));
+                }
             }
         }
     }
@@ -282,23 +323,47 @@ pub(super) fn register_epoll_transfer(
             in_flight: 1,
         }),
     }
-    Ok(true)
+    Ok(EpollRight::Recorded)
+}
+
+/// How many epoll rights sent in the run are in flight across the namespace,
+/// by `table`, the identity table, locked.
+pub(super) fn epoll_rights_in_flight_in(table: &crate::elf::GuestFileIdentityTable) -> usize {
+    table
+        .epoll_transfers
+        .iter()
+        .map(|transfer| transfer.in_flight)
+        .sum()
 }
 
 /// A new host descriptor of the epoll whose host descriptor is `fd`, for a
-/// pin, or `None` if the supervisor has no descriptor left.
-fn duplicate_epoll(fd: RawFd) -> Option<std::fs::File> {
-    // SAFETY: fd is the caller's live host descriptor of the epoll;
-    // F_DUPFD_CLOEXEC returns a new one above the standard descriptors.
-    let copy = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, libc::STDERR_FILENO + 1) };
-    // SAFETY: fcntl returned a new descriptor that nothing else owns.
-    (copy >= 0).then(|| unsafe { std::fs::File::from_raw_fd(copy) })
+/// pin, or the error that left the supervisor without one: past its soft
+/// descriptor limit, it is made under its hard limit
+/// (`with_hard_nofile_limit`).
+fn duplicate_epoll(fd: RawFd) -> std::io::Result<std::fs::File> {
+    let duplicate = || {
+        // SAFETY: fd is the caller's live host descriptor of the epoll;
+        // F_DUPFD_CLOEXEC returns a new one above the standard descriptors.
+        let copy = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, libc::STDERR_FILENO + 1) };
+        if copy < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: fcntl returned a new descriptor that nothing else owns.
+        Ok(unsafe { std::fs::File::from_raw_fd(copy) })
+    };
+    match duplicate() {
+        Err(error) if error.raw_os_error() == Some(libc::EMFILE) => {
+            super::fd_table::with_hard_nofile_limit(duplicate)
+        }
+        duplicated => duplicated,
+    }
 }
 
 /// Takes one right in flight of the record at `index`, if it has one, and
 /// returns the record's hold if that was its last, for the caller to drop
-/// once no lock is held, unless a peek window is open, which keeps it
-/// ([`EpollTransfer`]).
+/// once no lock is held, unless a peek window is open, which keeps it, with
+/// the newest window open now: no window opened later can have got the epoll
+/// ([`PeekWindow`]).
 fn take_epoll_transfer(
     table: &mut crate::elf::GuestFileIdentityTable,
     index: usize,
@@ -312,11 +377,13 @@ fn take_epoll_transfer(
         return None;
     }
     let hold = transfer.hold.take()?;
-    if table.open_peek_windows == 0 {
-        return Some(hold);
+    match table.open_peek_windows.last() {
+        None => Some(hold),
+        Some(&newest) => {
+            table.peek_window_holds.push((newest, hold));
+            None
+        }
     }
-    table.peek_window_holds.push(hold);
-    None
 }
 
 /// Takes back one right of each epoll in `epolls`, whose send queued
@@ -393,32 +460,39 @@ std::thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+/// An epoll a receive got: its identity, and the holds that keep it until
+/// the received descriptor owns it ([`received_epoll`]).
+pub(super) type ReceivedEpoll = (Arc<EpollIdentity>, Vec<EpollHold>);
+
 /// The identity of the epoll whose host descriptor `file` a receive got, or
 /// `None` if it is no epoll, with holds for the receive to drop once the
 /// received descriptor owns the epoll: its own, which keeps the epoll until
 /// then, and the record's, if the receive took the last right. The identity
 /// is the one whose record matches the descriptor; a receive that consumes
 /// the message, unlike a peek, takes one right of it. An epoll that no record
-/// matches came from outside the run: it gets an identity of its own, with a
-/// record of its pin, so that later descriptors of it, in the same message or
-/// another, join it. Without a pin, which only a supervisor with no
-/// descriptor left lacks, they get identities of their own. On a host that
-/// cannot compare open file descriptions every received epoll gets an
-/// identity of its own, which no pidfd registration tells apart
-/// (`descriptions_comparable`).
+/// matches came from outside the run: it gets an identity of its own, marked
+/// as from outside (`EpollIdentity::from_outside`), with a record of its pin,
+/// so that later descriptors of it, in the same message or another, join it
+/// while it lives.
+/// A pin that cannot be made, under the hard descriptor limit either
+/// (`duplicate_epoll`), ends the run (`end_run_for_descriptors`), whose
+/// result the caller returns: the epoll's later descriptors would get
+/// identities of their own. On a host that cannot compare open file
+/// descriptions every received epoll gets an identity of its own, which no
+/// pidfd registration tells apart (`descriptions_comparable`).
 pub(super) fn received_epoll(
     state: &LoadedStaticElf,
     file: &std::fs::File,
     peek: bool,
-) -> Option<(Arc<EpollIdentity>, Vec<EpollHold>)> {
+) -> Result<Option<ReceivedEpoll>, i64> {
     if !is_epoll(file.as_raw_fd()) {
-        return None;
+        return Ok(None);
     }
     #[cfg(test)]
     run_one_shot_test_hook(&EPOLL_RECEIVED_TEST_HOOK);
     if !super::mapping_list::descriptions_comparable() {
-        let hold = EpollHold::first();
-        return Some((hold.0.clone(), vec![hold]));
+        let hold = EpollHold::first(false);
+        return Ok(Some((hold.0.clone(), vec![hold])));
     }
     let mut table = state
         .file_identity_table
@@ -432,22 +506,32 @@ pub(super) fn received_epoll(
         if !peek {
             holds.extend(take_epoll_transfer(&mut table, index));
         }
-        return Some((epoll, holds));
+        return Ok(Some((epoll, holds)));
     }
-    let hold = EpollHold::first();
+    let pin = match duplicate_epoll(file.as_raw_fd()) {
+        Ok(pin) => pin,
+        Err(error) => {
+            return Err(end_run_for_descriptors(format!(
+                "KVM epoll identity: no host descriptor left to pin an epoll received from \
+                 outside the run (host descriptor {}): {error}, under {}; its later \
+                 descriptors would get identities of their own, so the run ends here",
+                file.as_raw_fd(),
+                reverie_kvm_core::host_limits::descriptor_limit_text(),
+            )));
+        }
+    };
+    let hold = EpollHold::first(true);
     let epoll = hold.0.clone();
-    if let Some(pin) = duplicate_epoll(file.as_raw_fd()) {
-        *epoll
-            .pin
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(pin);
-        table.epoll_transfers.push(EpollTransfer {
-            epoll: Arc::downgrade(&epoll),
-            hold: None,
-            in_flight: 0,
-        });
-    }
-    Some((epoll, vec![hold]))
+    *epoll
+        .pin
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(pin);
+    table.epoll_transfers.push(EpollTransfer {
+        epoll: Arc::downgrade(&epoll),
+        hold: None,
+        in_flight: 0,
+    });
+    Ok(Some((epoll, vec![hold])))
 }
 
 /// Takes back the rights of the epolls among `files`, which a receive got
@@ -483,38 +567,51 @@ pub(super) fn release_dropped_epoll_transfers<'a>(
 /// A peek between its host receive and its lookup of the epolls it got
 /// ([`received_epoll`]), which own nothing yet: another receive can take the
 /// message meanwhile and close what it got. Opened before the host receive,
-/// it keeps the hold of an epoll whose last right a receive takes meanwhile
-/// (`take_epoll_transfer`) until the last open window closes, so the peeked
-/// epoll outlives the window, and the peek's lookup holds it.
-pub(crate) struct PeekWindow(Arc<Mutex<crate::elf::GuestFileIdentityTable>>);
+/// with a number above every earlier window's, it keeps the hold of an epoll
+/// whose last right a receive takes meanwhile (`take_epoll_transfer`) until
+/// it, and every other window open then, has closed, so the peeked epoll
+/// outlives the window, and the peek's lookup holds it. A window opened after
+/// the take cannot have got the epoll, whose last message was off the queue
+/// by then, so it keeps no such hold.
+pub(crate) struct PeekWindow {
+    table: Arc<Mutex<crate::elf::GuestFileIdentityTable>>,
+    number: u64,
+}
 
 impl PeekWindow {
     pub(crate) fn open(state: &LoadedStaticElf) -> Self {
-        state
+        let mut table = state
             .file_identity_table
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .open_peek_windows += 1;
-        Self(state.file_identity_table.clone())
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let number = table.next_peek_window;
+        table.next_peek_window += 1;
+        table.open_peek_windows.insert(number);
+        Self {
+            table: state.file_identity_table.clone(),
+            number,
+        }
     }
 }
 
 impl Drop for PeekWindow {
-    /// Closes the window, and once it is the last, drops the holds the
-    /// windows kept, with no lock held.
+    /// Closes the window, and drops, with no lock held, the holds that no
+    /// open window keeps: those taken while only windows that have closed
+    /// were open.
     fn drop(&mut self) {
         // Declared before the table's guard, as in `release_epoll_transfers`.
-        let _released;
+        let _released: Vec<_>;
         let mut table = self
-            .0
+            .table
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        table.open_peek_windows -= 1;
-        _released = if table.open_peek_windows == 0 {
-            std::mem::take(&mut table.peek_window_holds)
-        } else {
-            Vec::new()
-        };
+        table.open_peek_windows.remove(&self.number);
+        let oldest = table.open_peek_windows.first().copied();
+        let (released, kept) = std::mem::take(&mut table.peek_window_holds)
+            .into_iter()
+            .partition(|(newest, _)| oldest.is_none_or(|oldest| *newest < oldest));
+        table.peek_window_holds = kept;
+        _released = released;
     }
 }
 
@@ -547,7 +644,11 @@ pub(super) fn epoll_transfer_census(state: &LoadedStaticElf) -> (usize, usize, u
                     .is_some_and(|epoll| epoll.live.load(Ordering::SeqCst) != 0)
         })
         .count();
-    (live, table.open_peek_windows, table.peek_window_holds.len())
+    (
+        live,
+        table.open_peek_windows.len(),
+        table.peek_window_holds.len(),
+    )
 }
 
 /// Export can hand an eventfd writer to an untracked actor. This one-way bit
@@ -1485,9 +1586,13 @@ pub(super) fn epoll_ctl(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u
                 return host_epoll_ctl(state, args, epoll_fd, pidfd.readiness_fd(), &mut event);
             };
             // Where open file descriptions cannot be compared, a received
-            // descriptor of this epoll could not join its registrations, so
-            // the registration is refused (`pidfd_epoll_refusal`).
-            if operation == libc::EPOLL_CTL_ADD && !super::mapping_list::descriptions_comparable() {
+            // descriptor of this epoll could not join its registrations, and
+            // an epoll from outside the run can be held where the run cannot
+            // see, past its last descriptor in the run, so the registration
+            // is refused (`pidfd_epoll_refusal`).
+            if operation == libc::EPOLL_CTL_ADD
+                && (!super::mapping_list::descriptions_comparable() || epoll.came_from_outside())
+            {
                 return negative_errno(libc::ENOSYS);
             }
             pidfd.epoll_control(guest_target, operation, epoll_fd, &epoll, |key| {

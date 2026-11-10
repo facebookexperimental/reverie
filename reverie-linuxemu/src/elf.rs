@@ -358,15 +358,26 @@ pub struct GuestFileIdentityTable {
     /// Epolls that a receive can get: those sent with SCM_RIGHTS, and those
     /// received from outside the run (`crate::executor::EpollTransfer`).
     pub(crate) epoll_transfers: Vec<crate::executor::EpollTransfer>,
-    /// Peeks between their host receive and their lookup of what they got
+    /// The number of the next peek window to open
     /// (`crate::executor::PeekWindow`).
-    pub(crate) open_peek_windows: usize,
+    pub(crate) next_peek_window: u64,
+    /// The numbers of the peeks between their host receive and their lookup
+    /// of what they got (`crate::executor::PeekWindow`).
+    pub(crate) open_peek_windows: std::collections::BTreeSet<u64>,
     /// The holds of epolls whose last right a receive took while a peek
-    /// window was open, which go when the last window closes.
-    pub(crate) peek_window_holds: Vec<crate::executor::EpollHold>,
-    /// Host receives that lost rights they could not install as descriptors
-    /// of this process (`crate::executor::note_lost_rights`).
-    pub(crate) lost_right_receives: usize,
+    /// window was open, each with the newest window open then: it goes once
+    /// no window that old or older is open.
+    pub(crate) peek_window_holds: Vec<(u64, crate::executor::EpollHold)>,
+    /// The ends of the Unix socket pairs the run made, each by its host
+    /// object, with its own identity and its peer's
+    /// (`crate::executor::sends_into_the_run`).
+    pub(crate) socket_peers: std::collections::BTreeMap<
+        (libc::dev_t, libc::ino_t),
+        (
+            std::sync::Weak<GuestFileIdentity>,
+            std::sync::Weak<GuestFileIdentity>,
+        ),
+    >,
 }
 
 /// Process-tree-wide state whose lifetime follows a guest task rather than an
@@ -2554,9 +2565,10 @@ fn load_executable(
             objects: std::collections::BTreeMap::new(),
             proc_transfers: std::collections::BTreeMap::new(),
             epoll_transfers: Vec::new(),
-            open_peek_windows: 0,
+            next_peek_window: 0,
+            open_peek_windows: std::collections::BTreeSet::new(),
             peek_window_holds: Vec::new(),
-            lost_right_receives: 0,
+            socket_peers: std::collections::BTreeMap::new(),
         })),
     })
 }

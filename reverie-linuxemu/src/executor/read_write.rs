@@ -2170,6 +2170,14 @@ fn staged_vectored_transfer<M: GuestMemoryAccess<Error = crate::Error> + Address
     } else {
         None
     };
+    // A copy that can fault puts back the peek offset (`SavedPeekOffset`).
+    let peek_offset = SavedPeekOffset::before_receive(
+        host_fd,
+        whole
+            && staged_vectors
+                .iter()
+                .any(|vector| vector.accessible_length < vector.guest.length),
+    );
     let result = invoke_vectored_read(state, number, host_fd, &mut host_iovecs, args, socket);
     if result >= 0 {
         let mut remaining = result as usize;
@@ -2185,7 +2193,7 @@ fn staged_vectored_transfer<M: GuestMemoryAccess<Error = crate::Error> + Address
                     .is_err())
                 || transferred > copied
             {
-                return negative_errno(libc::EFAULT);
+                return fault_after_receive(peek_offset.as_ref());
             }
             remaining -= transferred;
             if remaining == 0 {

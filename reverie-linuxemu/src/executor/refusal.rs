@@ -551,6 +551,26 @@ pub(super) fn madvise_refusal_diagnostic(advice: libc::c_int) -> &'static str {
 pub(crate) const PIDFD_RIGHTS_REFUSAL: &str =
     "KVM does not send a pidfd for a guest process in an SCM_RIGHTS message";
 
+/// Diagnostic for this backend's refusal to send an epoll set in an
+/// `SCM_RIGHTS` message that may leave the run (`sends_into_the_run`): a
+/// receiver outside the run would hold the epoll where this backend cannot
+/// see, so the backend could neither keep the epoll, and the pidfd
+/// registrations it keeps in it, while that receiver holds it, nor let it end
+/// when Linux would.
+pub(crate) const EPOLL_EXPORT_REFUSAL: &str = "KVM does not send an epoll set in an SCM_RIGHTS \
+     message on a socket that may carry it out of the run";
+
+/// Diagnostic for this backend's refusal to send a Unix socket in an
+/// `SCM_RIGHTS` message that may leave the run while an epoll right sent in
+/// the run is in flight (`admit_socket_export`): the socket takes its queue
+/// with it, and an epoll queued there, or in the queue of a socket queued
+/// there, would reach a receiver outside the run, where the backend could
+/// neither keep the epoll while that receiver holds it nor let it end when
+/// Linux would.
+pub(crate) const SOCKET_EXPORT_REFUSAL: &str = "KVM does not send a Unix socket in an \
+     SCM_RIGHTS message on a socket that may carry it out of the run while an epoll set sent in \
+     the run is in flight";
+
 /// Diagnostic for this backend's refusal to add a pidfd for a guest process
 /// to an epoll set where open file descriptions cannot be compared: a
 /// descriptor of the epoll passed in an `SCM_RIGHTS` message could not join
@@ -558,10 +578,21 @@ pub(crate) const PIDFD_RIGHTS_REFUSAL: &str =
 pub(crate) const PIDFD_EPOLL_REFUSAL: &str = "KVM does not add a pidfd for a guest process to an \
      epoll set on a host where neither kcmp nor F_DUPFD_QUERY compares open file descriptions";
 
+/// Diagnostic for this backend's refusal to add a pidfd for a guest process
+/// to an epoll set that came from outside the run
+/// (`EpollIdentity::from_outside`): a process outside the run can hold the
+/// epoll past its last descriptor in the run, where the backend cannot see,
+/// so the registration could neither last while that process holds the
+/// epoll nor end when it lets go.
+pub(crate) const PIDFD_IMPORTED_EPOLL_REFUSAL: &str = "KVM does not add a pidfd for a guest \
+     process to an epoll set that came from outside the run";
+
 /// The typed refusal, if any, that an `epoll_ctl` result carries for a pidfd
 /// for a guest process. Linux's epoll_ctl never fails with ENOSYS, so an
 /// ENOSYS answer to an EPOLL_CTL_ADD of such a pidfd is this backend's own
-/// refusal (`epoll_ctl`); every other result carries none.
+/// refusal (`epoll_ctl`): of an epoll that came from outside the run where
+/// open file descriptions can be compared, and of every epoll where they
+/// cannot. Every other result carries none.
 pub(super) fn pidfd_epoll_refusal(
     state: &LoadedStaticElf,
     request: &SyscallRequest,
@@ -573,10 +604,19 @@ pub(super) fn pidfd_epoll_refusal(
         && args[1] as libc::c_int == libc::EPOLL_CTL_ADD
         && guest_pidfd(state, args[2] as libc::c_int).is_some())
     .then(|| {
+        let imported = super::mapping_list::descriptions_comparable()
+            && matches!(
+                native_poll_description(state, args[0] as libc::c_int),
+                Some(NativePollDescription::Epoll(epoll)) if epoll.came_from_outside()
+            );
         reverie::UnsupportedRefusal::new(
             reverie::UnsupportedOperation::Pidfd,
             reverie::Errno::ENOSYS,
-            PIDFD_EPOLL_REFUSAL,
+            if imported {
+                PIDFD_IMPORTED_EPOLL_REFUSAL
+            } else {
+                PIDFD_EPOLL_REFUSAL
+            },
         )
     })
 }

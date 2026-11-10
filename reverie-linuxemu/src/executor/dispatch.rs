@@ -163,6 +163,13 @@ pub(super) fn execute_basic_syscall_with_read_context(
         output,
         terminal_read,
     );
+    // A call that ran out of host descriptors where no guest result can stand
+    // for what it did ends the run in place of its result
+    // (`end_run_for_descriptors`).
+    let action = match take_descriptor_failure() {
+        Some(error) => SyscallAction::Failure(error),
+        None => action,
+    };
     let action = match action {
         SyscallAction::Failure(error) => {
             SyscallAction::Failure(memory.capture_shared_file_error(error))
@@ -1124,6 +1131,7 @@ impl ElfExecutor {
         self.state.signal_refusal = None;
         self.state.pidfd_refusal = None;
         take_receive_refused_for_descriptors();
+        take_descriptor_failure();
         // The copies this call reaches stay its own until it returns, and
         // any whose entries another thread retired meanwhile are replaced
         // then, before the guest continues (`PrivateCopies`); a replacement

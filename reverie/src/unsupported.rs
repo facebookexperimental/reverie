@@ -125,8 +125,14 @@ pub enum UnsupportedOperation {
     /// An operation on a pidfd that the backend does not model, such as
     /// sending a pidfd for a process of the run in an `SCM_RIGHTS` message,
     /// or adding one to an epoll set where the backend cannot tell open file
-    /// descriptions apart. A backend that refuses one changed nothing; the
-    /// refusal's diagnostic names the operation.
+    /// descriptions apart, or to an epoll set that came from outside the run,
+    /// where a process the backend cannot see may hold it. It also names the
+    /// refusal of an epoll set, whose pidfd registrations the backend keeps,
+    /// in an `SCM_RIGHTS` message that may leave the run, where the backend
+    /// could not follow its lifetime, and of a Unix socket in such a message
+    /// while an epoll set sent in the run may be queued in it. A backend that
+    /// refuses one changed nothing; the refusal's diagnostic names the
+    /// operation.
     Pidfd,
 }
 

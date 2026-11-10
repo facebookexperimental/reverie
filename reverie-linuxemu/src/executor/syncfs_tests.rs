@@ -274,7 +274,7 @@ fn syncfs_transfer_after_sender_close(
     let outgoing = unsafe {
         std::slice::from_raw_parts_mut(message.msg_control.cast::<u8>(), message.msg_controllen)
     };
-    translate_outgoing_control(outgoing, state).unwrap();
+    translate_outgoing_control(outgoing, state, sender.as_raw_fd()).unwrap();
     assert_eq!(unsafe { libc::sendmsg(sender.as_raw_fd(), &message, 0) }, 1);
     assert_eq!(close(state, fd as u64), 0);
     assert_eq!(

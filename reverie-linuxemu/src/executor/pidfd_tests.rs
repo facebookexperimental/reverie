@@ -791,7 +791,7 @@ fn a_pidfd_for_the_caller_itself_is_refused_in_scm_rights() {
     assert!(own >= 0);
     let mut control = rights_control(&[own as i32]);
     assert_eq!(
-        translate_outgoing_control(&mut control, &mut parent.state),
+        translate_outgoing_control(&mut control, &mut parent.state, -1),
         Err(negative_errno(libc::ENOSYS))
     );
     assert_eq!(parent.state.pidfd_refusal, Some(PIDFD_RIGHTS_REFUSAL));
@@ -2583,7 +2583,7 @@ fn a_refused_pidfd_right_leaves_the_rights_before_it_unexported() {
     let [pipe, _] = owner_test_pipe(&mut parent.state);
     let mut control = rights_control(&[pipe, fd as i32]);
     assert_eq!(
-        translate_outgoing_control(&mut control, &mut parent.state),
+        translate_outgoing_control(&mut control, &mut parent.state, -1),
         Err(negative_errno(libc::ENOSYS))
     );
     assert_eq!(parent.state.pidfd_refusal, Some(PIDFD_RIGHTS_REFUSAL));
@@ -2901,6 +2901,36 @@ fn reviewer_inflight_epoll_wait_has_no_pidfd_ghost_after_both_logical_closes() {
 /// The guest descriptor of the host socket through which a test sends from
 /// outside the run.
 const PIDFD_TEST_OUTSIDE: i32 = 40;
+
+/// The typed refusal of an epoll in an SCM_RIGHTS message that may leave the
+/// run.
+fn pidfd_test_epoll_export_refusal() -> Option<reverie::UnsupportedRefusal> {
+    Some(reverie::UnsupportedRefusal::new(
+        reverie::UnsupportedOperation::Pidfd,
+        reverie::Errno::ENOSYS,
+        EPOLL_EXPORT_REFUSAL,
+    ))
+}
+
+/// The typed refusal of a Unix socket in an SCM_RIGHTS message that may leave
+/// the run while an epoll right sent in the run is in flight.
+fn pidfd_test_socket_export_refusal() -> Option<reverie::UnsupportedRefusal> {
+    Some(reverie::UnsupportedRefusal::new(
+        reverie::UnsupportedOperation::Pidfd,
+        reverie::Errno::ENOSYS,
+        SOCKET_EXPORT_REFUSAL,
+    ))
+}
+
+/// The typed refusal of an EPOLL_CTL_ADD of a pidfd for a guest process to
+/// an epoll set that came from outside the run.
+fn pidfd_test_imported_epoll_refusal() -> Option<reverie::UnsupportedRefusal> {
+    Some(reverie::UnsupportedRefusal::new(
+        reverie::UnsupportedOperation::Pidfd,
+        reverie::Errno::ENOSYS,
+        PIDFD_IMPORTED_EPOLL_REFUSAL,
+    ))
+}
 
 /// A connected pair of guest Unix sockets of `kind`: the sender, then the
 /// receiver.
@@ -3522,12 +3552,13 @@ fn an_epoll_right_that_a_truncated_receive_drops_leaves_flight() {
 }
 
 /// An epoll received from outside the run matches no right in flight, so it
-/// gets an identity of its own (`received_epoll`), and two of them keep their
-/// registrations of one pidfd apart: a DEL through one removes its own, and
-/// the pidfd's last close removes the other's, though a copy of the shadow,
-/// as a fork of the supervisor holds, stays open.
+/// gets an identity of its own (`received_epoll`), and neither of two such
+/// epolls takes a registration of a pidfd for a guest process: each ADD is
+/// refused by name (`PIDFD_IMPORTED_EPOLL_REFUSAL`), a DEL finds none, and
+/// after the pidfd's last close, with a copy of the shadow open as a fork of
+/// the supervisor holds, neither epoll reports the pidfd's process's exit.
 #[test]
-fn epolls_received_from_outside_the_run_keep_their_pidfd_registrations_apart() {
+fn epolls_received_from_outside_the_run_have_identities_of_their_own_and_take_no_pidfd() {
     let root = TestDir::new();
     let memory = pidfd_test_memory();
     let mut state = test_state(&root.0);
@@ -3588,14 +3619,18 @@ fn epolls_received_from_outside_the_run_keep_their_pidfd_registrations_apart() {
                 libc::EPOLLIN as u32,
                 101 + index as u64,
             ),
-            0
+            negative_errno(libc::ENOSYS)
+        );
+        assert_eq!(
+            parent.take_unsupported_refusal(),
+            pidfd_test_imported_epoll_refusal()
         );
     }
     assert_eq!(
         pidfd_test_epoll_ctl(&mut parent, &memory, imported[1], libc::EPOLL_CTL_DEL, fd, 0, 0),
-        0
+        negative_errno(libc::ENOENT)
     );
-    assert_eq!(pidfd_test_record(&parent, fd).epoll_registrations(), 1);
+    assert_eq!(pidfd_test_record(&parent, fd).epoll_registrations(), 0);
     let shadow = pidfd_test_record(&parent, fd).readiness_fd();
     // SAFETY: duplicate the live shadow, as a fork of the supervisor would.
     let raw_copy = unsafe { libc::fcntl(shadow, libc::F_DUPFD_CLOEXEC, 3) };
@@ -3933,8 +3968,9 @@ fn a_host_that_cannot_compare_descriptions_refuses_a_pidfd_in_an_epoll() {
 
 /// An epoll from outside the run, received in two messages, has one
 /// identity: the first receive records its pin (`received_epoll`), which the
-/// second matches, so a registration added through one descriptor is found,
-/// and removed, through the other once the first has closed.
+/// second matches. A registration of a pidfd for a guest process through
+/// either is refused by name (`PIDFD_IMPORTED_EPOLL_REFUSAL`), so after the
+/// first closes, a DEL through the other finds none.
 #[test]
 fn an_epoll_from_outside_received_in_two_messages_has_one_identity() {
     let root = TestDir::new();
@@ -3988,7 +4024,11 @@ fn an_epoll_from_outside_received_in_two_messages_has_one_identity() {
             libc::EPOLLIN as u32,
             1,
         ),
-        0
+        negative_errno(libc::ENOSYS)
+    );
+    assert_eq!(
+        parent.take_unsupported_refusal(),
+        pidfd_test_imported_epoll_refusal()
     );
     pidfd_test_close(&mut parent, &memory, received[0]);
     assert_eq!(
@@ -4001,8 +4041,8 @@ fn an_epoll_from_outside_received_in_two_messages_has_one_identity() {
             0,
             0,
         ),
-        0,
-        "the second message's descriptor finds the registration"
+        negative_errno(libc::ENOENT),
+        "the second message's descriptor finds no registration"
     );
     assert_eq!(
         (
@@ -5099,7 +5139,11 @@ fn reviewer_external_epoll_alias_keeps_registration_after_first_alias_closes() {
             libc::EPOLLIN as u32,
             0x1410,
         ),
-        0
+        negative_errno(libc::ENOSYS)
+    );
+    assert_eq!(
+        parent.take_unsupported_refusal(),
+        pidfd_test_imported_epoll_refusal()
     );
     pidfd_test_close(&mut parent, &memory, first);
     assert_eq!(
@@ -5112,8 +5156,8 @@ fn reviewer_external_epoll_alias_keeps_registration_after_first_alias_closes() {
             0,
             0,
         ),
-        0,
-        "the surviving external alias must still find the original registration"
+        negative_errno(libc::ENOENT),
+        "the refused registration left none for the surviving external alias to find"
     );
     assert_eq!(pidfd_test_record(&parent, pidfd).epoll_registrations(), 0);
     assert_eq!(pidfd_test_socket_descriptors(&shadow), 1);
@@ -5494,6 +5538,7 @@ fn reviewer_two_consuming_receives_keep_each_epoll_until_its_binding_is_installe
     // SAFETY: recvmsg installed this descriptor once; this frame now owns it.
     let first_file = unsafe { std::fs::File::from_raw_fd(native_rights[0]) };
     let (first_identity, first_holds) = received_epoll(&parent.state, &first_file, false)
+        .unwrap()
         .expect("the native receive returned the tracked epoll");
     assert_eq!(epoll_rights_in_flight(&parent.state), 1);
 
@@ -6331,122 +6376,248 @@ fn a_recvmmsg_with_too_few_descriptors_left_is_refused_and_takes_nothing() {
     pidfd_test_receive_refused_for_descriptors(libc::SYS_recvmmsg);
 }
 
+/// A guest syscall `number` with `args` through the checked execution the
+/// backend's runtime makes, whose failure ends the run.
+fn pidfd_test_checked_call(
+    executor: &mut ElfExecutor,
+    memory: &GuestMemory,
+    number: libc::c_long,
+    args: [u64; 6],
+) -> crate::Result<i64> {
+    executor.execute_checked(&SyscallRequest::new(number as u64, args), memory)
+}
+
+/// Asserts that `result` is the failure that ends a run for want of host
+/// descriptors (`end_run_for_descriptors`), which leaves the guest no result.
+fn pidfd_test_assert_run_ended_for_descriptors(result: crate::Result<i64>, case: &str) {
+    match result {
+        Err(crate::Error::HostResources {
+            resource: reverie_kvm_core::host_limits::HostResource::Descriptors,
+            ..
+        }) => {}
+        other => panic!("{case}: the run goes on: {other:?}"),
+    }
+}
+
+/// Arms `RECEIVE_BEGUN_TEST_HOOK` to lower this process's soft descriptor
+/// limit, under `hard`, to its lowest free descriptor, where none can be
+/// installed, at the receive after the first `skip` that reach the host: past
+/// the count that found room under the limit (`host_receive_room`), so no
+/// receive raises it. Returns whether it has.
+fn pidfd_test_lower_nofile_at_receive(
+    skip: usize,
+    hard: libc::rlim_t,
+) -> std::rc::Rc<std::cell::Cell<bool>> {
+    fn arm(skip: usize, hard: libc::rlim_t, lowered: std::rc::Rc<std::cell::Cell<bool>>) {
+        RECEIVE_BEGUN_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                if skip != 0 {
+                    arm(skip - 1, hard, lowered);
+                    return;
+                }
+                let lowest = std::fs::File::open("/dev/null").unwrap().as_raw_fd() as libc::rlim_t;
+                pidfd_test_set_nofile(lowest, hard);
+                lowered.set(true);
+            }));
+        });
+    }
+    let lowered = std::rc::Rc::new(std::cell::Cell::new(false));
+    arm(skip, hard, lowered.clone());
+    lowered
+}
+
 /// A host receive that cannot install the rights it got, at the limit it
-/// receives with, returns MSG_CTRUNC with room for every record, as Linux's
-/// does (`scm_detach_fds`): the rights it lost are unknown, so their records
-/// stay in flight, never released, and the receive is counted
-/// (`GuestFileIdentityTable::lost_right_receives`). The soft limit is lowered
-/// to the descriptors open where the receive is about to ask the host
-/// (`RECEIVE_BEGUN_TEST_HOOK`), past the count that found room under it
-/// (`host_receive_room`), so recvmsg and recvmmsg do not raise it either. The
-/// guest gets the payload and MSG_CTRUNC with no right, and the next receive
-/// finds the queue empty.
+/// receives with, returns MSG_CTRUNC with room for every record
+/// (`scm_detach_fds`). A receive that consumed the message lost rights, which
+/// ones unknown, and a peek through recvmsg or recvmmsg would give its guest
+/// fewer than Linux gives, so the call ends the run: its checked execution
+/// returns `Error::HostResources` for descriptors, with no result for the
+/// guest, and installs nothing (`end_run_for_lost_rights`). So for read,
+/// readv, preadv2, recvfrom, recvmsg and recvmmsg, and for a peek through
+/// recvmsg and recvmmsg. A read or recvfrom peek, whose guest gets no right,
+/// lost none: it gets the byte, and the record stays queued with its right.
+/// The soft limit is lowered where the receive is about to ask the host
+/// (`pidfd_test_lower_nofile_at_receive`).
 #[test]
-fn a_receive_that_loses_rights_at_the_limit_keeps_them_in_flight_and_counts_it() {
-    if pidfd_test_run_isolated(
-        "a_receive_that_loses_rights_at_the_limit_keeps_them_in_flight_and_counts_it",
-    ) {
+fn a_receive_that_loses_rights_at_the_limit_ends_the_run() {
+    if pidfd_test_run_isolated("a_receive_that_loses_rights_at_the_limit_ends_the_run") {
         return;
     }
-    for (index, number) in [libc::SYS_recvfrom, libc::SYS_recvmsg, libc::SYS_recvmmsg]
-        .into_iter()
-        .enumerate()
-    {
+    for (number, peek) in [
+        (libc::SYS_read, false),
+        (libc::SYS_readv, false),
+        (libc::SYS_preadv2, false),
+        (libc::SYS_recvfrom, false),
+        (libc::SYS_recvfrom, true),
+        (libc::SYS_recvmsg, false),
+        (libc::SYS_recvmsg, true),
+        (libc::SYS_recvmmsg, false),
+        (libc::SYS_recvmmsg, true),
+    ] {
+        let case = format!("syscall {number}, peek {peek}");
         let root = TestDir::new();
         let memory = pidfd_test_memory();
         let (mut parent, _child, fd, link, sender, receiver) =
             pidfd_test_queued_epoll(&root, &memory, libc::SOCK_DGRAM | libc::SOCK_NONBLOCK);
         let original = pidfd_test_nofile();
-        // Taken now and given back after the receive, so that the receive
-        // after it has room again under the lowered limit.
-        let spare = std::rc::Rc::new(std::cell::RefCell::new(pidfd_test_spare_descriptors(400)));
-        let hook_spare = spare.clone();
-        RECEIVE_BEGUN_TEST_HOOK.with(|hook| {
-            *hook.borrow_mut() = Some(Box::new(move || {
-                // The lowest free descriptor: under a limit there, no
-                // descriptor can be installed.
-                let lowest = std::fs::File::open("/dev/null").unwrap().as_raw_fd() as libc::rlim_t;
-                pidfd_test_set_nofile(lowest, original.rlim_max);
-                assert_eq!(hook_spare.borrow().len(), 400);
-            }));
-        });
-        if number == libc::SYS_recvmsg {
-            let (result, rights, flags) = pidfd_test_receive_rights(
+        let lowest_free = available_guest_fds_up_to(&parent.state, 1, libc::c_int::MAX)[0];
+        memory
+            .write_raw(PIDFD_TEST_CONTROL, &[0_u8; RIGHTS_CONTROL_CAPACITY])
+            .unwrap();
+        pidfd_test_message(&memory, RIGHTS_CONTROL_CAPACITY);
+        let flags = (libc::MSG_DONTWAIT | if peek { libc::MSG_PEEK } else { 0 }) as u64;
+        let args = match number {
+            libc::SYS_read => [receiver as u64, PIDFD_TEST_BYTE, 1, 0, 0, 0],
+            libc::SYS_readv => [receiver as u64, PIDFD_TEST_IOV, 1, 0, 0, 0],
+            libc::SYS_preadv2 => [receiver as u64, PIDFD_TEST_IOV, 1, -1_i64 as u64, 0, 0],
+            libc::SYS_recvfrom => [receiver as u64, PIDFD_TEST_BYTE, 1, flags, 0, 0],
+            libc::SYS_recvmsg => [receiver as u64, PIDFD_TEST_MESSAGE, flags, 0, 0, 0],
+            _ => [receiver as u64, PIDFD_TEST_MESSAGE, 1, flags, 0, 0],
+        };
+        let lowered = pidfd_test_lower_nofile_at_receive(0, original.rlim_max);
+        let result = pidfd_test_checked_call(&mut parent, &memory, number, args);
+        pidfd_test_set_nofile(original.rlim_cur, original.rlim_max);
+        RECEIVE_BEGUN_TEST_HOOK.with(|hook| hook.borrow_mut().take());
+        assert!(lowered.get(), "{case}: the receive reached the host");
+        if number == libc::SYS_recvfrom && peek {
+            assert_eq!(result.unwrap(), 1, "{case}");
+            assert_eq!(
+                pidfd_test_epoll_census(&parent, fd, &link),
+                (1, 1, 2),
+                "{case}: the peek left the record and its right queued"
+            );
+            let (result, rights, _) = pidfd_test_receive_rights(
                 &mut parent,
                 &memory,
                 receiver,
                 0,
                 RIGHTS_CONTROL_CAPACITY,
             );
+            assert_eq!((result, rights.len()), (1, 1), "{case}");
+            pidfd_test_close(&mut parent, &memory, i64::from(rights[0]));
             assert_eq!(
-                (result, rights.len(), flags & libc::MSG_CTRUNC),
-                (1, 0, libc::MSG_CTRUNC)
-            );
-        } else if number == libc::SYS_recvmmsg {
-            let (result, rights, flags, length) = pidfd_test_receive_rights_batch(
-                &mut parent,
-                &memory,
-                receiver,
-                0,
-                RIGHTS_CONTROL_CAPACITY,
-            );
-            assert_eq!(
-                (result, length, rights.len(), flags & libc::MSG_CTRUNC),
-                (1, 1, 0, libc::MSG_CTRUNC)
+                pidfd_test_epoll_census(&parent, fd, &link),
+                (0, 0, 1),
+                "{case}"
             );
         } else {
+            pidfd_test_assert_run_ended_for_descriptors(result, &case);
             assert_eq!(
-                pidfd_test_read_socket(&mut parent, &memory, number, receiver, 1),
-                1
+                available_guest_fds_up_to(&parent.state, 1, libc::c_int::MAX)[0],
+                lowest_free,
+                "{case}: the receive installed nothing"
             );
         }
-        spare.borrow_mut().clear();
-        pidfd_test_set_nofile(original.rlim_cur, original.rlim_max);
-        assert_eq!(
-            (
-                pidfd_test_epoll_census(&parent, fd, &link),
-                parent
-                    .state
-                    .file_identity_table
-                    .lock()
-                    .unwrap()
-                    .lost_right_receives,
-            ),
-            ((1, 1, 2), 1),
-            "syscall {number} (case {index}): the lost right stays in flight, counted"
-        );
-        let next = if number == libc::SYS_recvmmsg {
-            pidfd_test_receive_rights_batch(&mut parent, &memory, receiver, 0, 0).0
-        } else if number == libc::SYS_recvmsg {
-            // A failed recvmsg writes nothing back, so only its result counts.
-            memory
-                .write_raw(PIDFD_TEST_CONTROL, &[0_u8; RIGHTS_CONTROL_CAPACITY])
-                .unwrap();
-            pidfd_test_message(&memory, RIGHTS_CONTROL_CAPACITY);
-            pidfd_test_call(
-                &mut parent,
-                &memory,
-                libc::SYS_recvmsg,
-                [
-                    receiver as u64,
-                    PIDFD_TEST_MESSAGE,
-                    libc::MSG_DONTWAIT as u64,
-                    0,
-                    0,
-                    0,
-                ],
-            )
-        } else {
-            pidfd_test_read_socket(&mut parent, &memory, number, receiver, 1)
-        };
-        assert_eq!(
-            next,
-            negative_errno(libc::EAGAIN),
-            "syscall {number}: the receive took the record"
-        );
         for socket in [sender, receiver] {
             pidfd_test_close(&mut parent, &memory, socket);
         }
+    }
+}
+
+/// A recvmmsg whose second message loses rights at the limit ends the run
+/// (`end_run_for_lost_rights`) though it delivered its first, whose result a
+/// batch otherwise returns: its checked execution returns
+/// `Error::HostResources` for descriptors. The first message's entry has its
+/// length and its right, installed before the second message's receive asked
+/// the host (`pidfd_test_lower_nofile_at_receive`).
+#[test]
+fn a_batch_that_loses_rights_after_delivering_a_message_ends_the_run() {
+    if pidfd_test_run_isolated("a_batch_that_loses_rights_after_delivering_a_message_ends_the_run")
+    {
+        return;
+    }
+    const SECOND_IOV: u64 = 0x2000;
+    const SECOND_BYTE: u64 = 0x2010;
+    const SECOND_CONTROL: u64 = 0x2100;
+    let root = TestDir::new();
+    let memory = pidfd_test_memory();
+    let (mut parent, _child, fd, link, sender, receiver) =
+        pidfd_test_queued_epoll(&root, &memory, libc::SOCK_DGRAM | libc::SOCK_NONBLOCK);
+    // A second message, with a second epoll registered with the pidfd.
+    let epoll = pidfd_test_call(&mut parent, &memory, libc::SYS_epoll_create1, [0; 6]);
+    assert_eq!(
+        pidfd_test_epoll_ctl(
+            &mut parent,
+            &memory,
+            epoll,
+            libc::EPOLL_CTL_ADD,
+            fd,
+            libc::EPOLLIN as u32,
+            2,
+        ),
+        0
+    );
+    assert_eq!(
+        pidfd_test_send_rights(&mut parent, &memory, sender, &[epoll as libc::c_int]),
+        1
+    );
+    pidfd_test_close(&mut parent, &memory, epoll);
+    assert_eq!(epoll_rights_in_flight(&parent.state), 2);
+    // The batch's two entries: the test message, and one of its own.
+    memory
+        .write_raw(PIDFD_TEST_CONTROL, &[0_u8; RIGHTS_CONTROL_CAPACITY])
+        .unwrap();
+    pidfd_test_message(&memory, RIGHTS_CONTROL_CAPACITY);
+    let iov = libc::iovec {
+        iov_base: SECOND_BYTE as usize as *mut libc::c_void,
+        iov_len: 1,
+    };
+    assert_eq!(
+        write_struct(&mut ProviderMemory(&memory), SECOND_IOV, &iov),
+        0
+    );
+    // SAFETY: mmsghdr is plain data; a zeroed one names nothing.
+    let mut second = unsafe { std::mem::zeroed::<libc::mmsghdr>() };
+    second.msg_hdr.msg_iov = SECOND_IOV as usize as *mut libc::iovec;
+    second.msg_hdr.msg_iovlen = 1;
+    second.msg_hdr.msg_control = SECOND_CONTROL as usize as *mut libc::c_void;
+    second.msg_hdr.msg_controllen = RIGHTS_CONTROL_CAPACITY;
+    let entry = std::mem::size_of::<libc::mmsghdr>() as u64;
+    assert_eq!(
+        write_struct(
+            &mut ProviderMemory(&memory),
+            PIDFD_TEST_MESSAGE + entry,
+            &second
+        ),
+        0
+    );
+    let original = pidfd_test_nofile();
+    let lowered = pidfd_test_lower_nofile_at_receive(1, original.rlim_max);
+    let result = pidfd_test_checked_call(
+        &mut parent,
+        &memory,
+        libc::SYS_recvmmsg,
+        [
+            receiver as u64,
+            PIDFD_TEST_MESSAGE,
+            2,
+            libc::MSG_DONTWAIT as u64,
+            0,
+            0,
+        ],
+    );
+    pidfd_test_set_nofile(original.rlim_cur, original.rlim_max);
+    RECEIVE_BEGUN_TEST_HOOK.with(|hook| hook.borrow_mut().take());
+    assert!(
+        lowered.get(),
+        "the second message's receive reached the host"
+    );
+    pidfd_test_assert_run_ended_for_descriptors(result, "recvmmsg's second message");
+    let first: libc::mmsghdr = read_struct(&memory, PIDFD_TEST_MESSAGE);
+    let mut control = vec![0_u8; first.msg_hdr.msg_controllen.min(RIGHTS_CONTROL_CAPACITY)];
+    memory.read_raw(PIDFD_TEST_CONTROL, &mut control).unwrap();
+    assert_eq!(
+        (first.msg_len, control_rights(&control).len()),
+        (1, 1),
+        "the first message was delivered, with its right"
+    );
+    assert_eq!(
+        pidfd_test_epoll_census(&parent, fd, &link).0,
+        1,
+        "the second message's lost right is the one still in flight"
+    );
+    for socket in [sender, receiver] {
+        pidfd_test_close(&mut parent, &memory, socket);
     }
 }
 
@@ -6764,4 +6935,1788 @@ fn the_description_comparison_probe_runs_before_the_guest_can_use_up_descriptors
         mapping_list::comparison_probe()
     );
     drop(state);
+}
+
+/// A second real external SCM_RIGHTS message owns the epoll while the
+/// guest closes its first received descriptor. Linux keeps the epoll's
+/// interest set for that queued reference, so the second receive must
+/// still find the registration. Unlike the existing two-message test,
+/// this receives the second message only after the first descriptor closes.
+#[test]
+fn reviewer_external_queued_alias_keeps_registration_between_receives() {
+    let root = TestDir::new();
+    let memory = pidfd_test_memory();
+    let mut state = test_state(&root.0);
+    let (outside, inside) = std::os::unix::net::UnixStream::pair().unwrap();
+    assert!(state
+        .insert_file(
+            PIDFD_TEST_OUTSIDE,
+            std::fs::File::from(std::os::fd::OwnedFd::from(inside)),
+        )
+        .is_empty());
+    let mut parent = ElfExecutor::new(state, false);
+    let _child = parent.fork_child(2, false, false).unwrap();
+    let pidfd = pidfd_test_open(&mut parent, &memory, 2, 0);
+    let shadow = pidfd_test_shadow_link(&parent, pidfd);
+    // SAFETY: epoll_create1 takes no memory arguments.
+    let raw = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+    assert!(raw >= 0);
+    // SAFETY: epoll_create1 returned this new descriptor once.
+    let native = unsafe { std::fs::File::from_raw_fd(raw) };
+    for _ in 0..2 {
+        pidfd_test_native_send_rights(outside.as_raw_fd(), &[native.as_raw_fd()]);
+    }
+    drop(native);
+
+    let (result, first, _) = pidfd_test_receive_rights(
+        &mut parent,
+        &memory,
+        i64::from(PIDFD_TEST_OUTSIDE),
+        0,
+        RIGHTS_CONTROL_CAPACITY,
+    );
+    assert_eq!((result, first.len()), (1, 1));
+    let first = i64::from(first[0]);
+    assert_eq!(
+        pidfd_test_epoll_ctl(
+            &mut parent,
+            &memory,
+            first,
+            libc::EPOLL_CTL_ADD,
+            pidfd,
+            libc::EPOLLIN as u32,
+            0x1410,
+        ),
+        negative_errno(libc::ENOSYS)
+    );
+    assert_eq!(
+        parent.take_unsupported_refusal(),
+        pidfd_test_imported_epoll_refusal()
+    );
+    pidfd_test_close(&mut parent, &memory, first);
+    let between = (
+        pidfd_test_record(&parent, pidfd).epoll_registrations(),
+        pidfd_test_socket_descriptors(&shadow),
+    );
+
+    let (result, second, _) = pidfd_test_receive_rights(
+        &mut parent,
+        &memory,
+        i64::from(PIDFD_TEST_OUTSIDE),
+        0,
+        RIGHTS_CONTROL_CAPACITY,
+    );
+    assert_eq!((result, second.len()), (1, 1));
+    let second = i64::from(second[0]);
+    let deleted = pidfd_test_epoll_ctl(
+        &mut parent,
+        &memory,
+        second,
+        libc::EPOLL_CTL_DEL,
+        pidfd,
+        0,
+        0,
+    );
+    assert_eq!(
+        (between, deleted),
+        ((0, 1), negative_errno(libc::ENOENT)),
+        "the refused registration leaves none to keep between the native queued messages"
+    );
+    assert_eq!(pidfd_test_record(&parent, pidfd).epoll_registrations(), 0);
+    assert_eq!(pidfd_test_socket_descriptors(&shadow), 1);
+    pidfd_test_close(&mut parent, &memory, second);
+    pidfd_test_close(&mut parent, &memory, i64::from(PIDFD_TEST_OUTSIDE));
+}
+
+/// Losing the extra identity pin under transient supervisor descriptor
+/// exhaustion must not turn one externally received epoll into two
+/// identities. Both native descriptors below come from one real recvmsg.
+/// The existing lookup hook changes only this isolated process's soft
+/// limit after native receive; a second hook restores it before the next
+/// lookup and before file-table publication or any final assertion.
+#[test]
+fn reviewer_external_epoll_alias_survives_identity_pin_allocation_failure() {
+    if pidfd_test_run_isolated(
+        "reviewer_external_epoll_alias_survives_identity_pin_allocation_failure",
+    ) {
+        return;
+    }
+    let root = TestDir::new();
+    let memory = pidfd_test_memory();
+    let mut state = test_state(&root.0);
+    let (outside, inside) = std::os::unix::net::UnixStream::pair().unwrap();
+    assert!(state
+        .insert_file(
+            PIDFD_TEST_OUTSIDE,
+            std::fs::File::from(std::os::fd::OwnedFd::from(inside)),
+        )
+        .is_empty());
+    let mut parent = ElfExecutor::new(state, false);
+    let _child = parent.fork_child(2, false, false).unwrap();
+    let pidfd = pidfd_test_open(&mut parent, &memory, 2, 0);
+    // SAFETY: epoll_create1 has no pointer arguments.
+    let raw = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+    assert!(raw >= 0);
+    // SAFETY: this frame owns epoll_create1's new descriptor.
+    let native = unsafe { std::fs::File::from_raw_fd(raw) };
+    pidfd_test_native_send_rights(outside.as_raw_fd(), &[native.as_raw_fd(), native.as_raw_fd()]);
+    drop(native);
+
+    let original = pidfd_test_nofile();
+    struct RestoreNofile(libc::rlimit);
+    impl Drop for RestoreNofile {
+        fn drop(&mut self) {
+            // SAFETY: restoring the original soft limit under the unchanged
+            // hard limit requires no privilege. This also runs on unwind.
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &self.0) };
+        }
+    }
+    let restore = RestoreNofile(original);
+    let soft = original.rlim_cur;
+    let hard = original.rlim_max;
+    let hook_count = std::rc::Rc::new(std::cell::Cell::new(0));
+    let hook_exhausted = std::rc::Rc::new(std::cell::Cell::new(false));
+    let first_count = hook_count.clone();
+    let first_exhausted = hook_exhausted.clone();
+    poll::EPOLL_RECEIVED_TEST_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            // Temporary File drops at this statement's end. Its number is
+            // the lowest free native descriptor at the lookup boundary.
+            let lowest = std::fs::File::open("/dev/null").unwrap().as_raw_fd() as libc::rlim_t;
+            assert!(lowest > 2);
+            pidfd_test_set_nofile(lowest, hard);
+            first_exhausted.set(
+                std::fs::File::open("/dev/null")
+                    .is_err_and(|error| error.raw_os_error() == Some(libc::EMFILE)),
+            );
+            first_count.set(1);
+            poll::EPOLL_RECEIVED_TEST_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    pidfd_test_set_nofile(soft, hard);
+                    first_count.set(2);
+                }));
+            });
+        }));
+    });
+    let received = pidfd_test_receive_rights(
+        &mut parent,
+        &memory,
+        i64::from(PIDFD_TEST_OUTSIDE),
+        0,
+        RIGHTS_CONTROL_CAPACITY,
+    );
+    // Restore even if a future implementation refuses the first lookup
+    // before reaching the second; assertions never run under the low limit.
+    drop(restore);
+    poll::EPOLL_RECEIVED_TEST_HOOK.with(|hook| hook.borrow_mut().take());
+    let (result, rights, flags) = received;
+    assert_eq!(hook_count.get(), 2, "both actual received Files reached lookup");
+    assert!(hook_exhausted.get(), "first lookup had no spare native descriptor");
+    assert_eq!((result, rights.len(), flags & libc::MSG_CTRUNC), (1, 2, 0));
+    let first = i64::from(rights[0]);
+    let second = i64::from(rights[1]);
+    let same = Arc::ptr_eq(
+        &pidfd_test_epoll_identity(&parent, first),
+        &pidfd_test_epoll_identity(&parent, second),
+    );
+    assert_eq!(
+        pidfd_test_epoll_ctl(
+            &mut parent,
+            &memory,
+            first,
+            libc::EPOLL_CTL_ADD,
+            pidfd,
+            libc::EPOLLIN as u32,
+            0x1410,
+        ),
+        negative_errno(libc::ENOSYS)
+    );
+    assert_eq!(
+        parent.take_unsupported_refusal(),
+        pidfd_test_imported_epoll_refusal()
+    );
+    pidfd_test_close(&mut parent, &memory, first);
+    let deleted = pidfd_test_epoll_ctl(
+        &mut parent,
+        &memory,
+        second,
+        libc::EPOLL_CTL_DEL,
+        pidfd,
+        0,
+        0,
+    );
+    assert_eq!(
+        (same, deleted),
+        (true, negative_errno(libc::ENOENT)),
+        "a successful receive cannot lose alias identity when its optional pin allocation fails"
+    );
+    pidfd_test_close(&mut parent, &memory, second);
+    pidfd_test_close(&mut parent, &memory, i64::from(PIDFD_TEST_OUTSIDE));
+}
+
+/// Linux v6.17 __unix_dgram_recvmsg skips both sk_peek_offset_fwd and
+/// sk_peek_offset_bwd when skb_copy_datagram_msg faults. A fully writable
+/// staging buffer must not commit either update before emulating that fault.
+#[test]
+fn reviewer_faulting_datagram_receive_preserves_so_peek_off() {
+    const SO_PEEK_OFF: u64 = 42;
+    const OPTION: u64 = 0xe00;
+    let mut observations = Vec::new();
+    for kind in [libc::SOCK_DGRAM, libc::SOCK_SEQPACKET] {
+        for number in [libc::SYS_recvfrom, libc::SYS_recvmsg] {
+            for peek in [true, false] {
+                let root = TestDir::new();
+                let memory = pidfd_test_memory();
+                let (mut parent, _child, fd, link, sender, receiver) =
+                    pidfd_test_queued_epoll(&root, &memory, kind | libc::SOCK_NONBLOCK);
+                let starting: libc::c_int = if peek { 0 } else { 1 };
+                assert_eq!(write_struct(&mut ProviderMemory(&memory), OPTION, &starting), 0);
+                assert_eq!(pidfd_test_call(&mut parent, &memory, libc::SYS_setsockopt,
+                    [receiver as u64, libc::SOL_SOCKET as u64, SO_PEEK_OFF, OPTION, 4, 0]), 0);
+                let faulting = pidfd_test_inaccessible_page(&memory);
+                let flags = libc::MSG_DONTWAIT | if peek { libc::MSG_PEEK } else { 0 };
+                let args = if number == libc::SYS_recvmsg {
+                    pidfd_test_message(&memory, RIGHTS_CONTROL_CAPACITY);
+                    let iov = libc::iovec {
+                        iov_base: faulting as usize as *mut libc::c_void,
+                        iov_len: 1,
+                    };
+                    assert_eq!(write_struct(&mut ProviderMemory(&memory), PIDFD_TEST_IOV, &iov), 0);
+                    [receiver as u64, PIDFD_TEST_MESSAGE, flags as u64, 0, 0, 0]
+                } else {
+                    [receiver as u64, faulting, 1, flags as u64, 0, 0]
+                };
+                let result = pidfd_test_call(&mut parent, &memory, number, args);
+                // This backend does not expose SO_PEEK_OFF through guest
+                // getsockopt. Inspect the native value only as a diagnostic;
+                // the following guest PEEK is the observable oracle.
+                let receiver_raw = host_fd(&parent.state, receiver as libc::c_int).unwrap();
+                let mut offset: libc::c_int = -2;
+                let mut option_length: libc::socklen_t = 4;
+                // SAFETY: the socket remains live and both output buffers
+                // belong to this frame with exactly the supplied sizes.
+                assert_eq!(unsafe { libc::getsockopt(receiver_raw, libc::SOL_SOCKET,
+                    SO_PEEK_OFF as libc::c_int, std::ptr::from_mut(&mut offset).cast(),
+                    &mut option_length) }, 0);
+                assert_eq!(option_length, 4);
+                if !peek {
+                    // Linux leaves the offset at 1 after consuming the
+                    // faulting record. A fresh one-byte message is therefore
+                    // skipped by PEEK; an incorrect rewind to 0 reveals it.
+                    memory.write_raw(PIDFD_TEST_BYTE, b"y").unwrap();
+                    assert_eq!(pidfd_test_call(&mut parent, &memory, libc::SYS_write,
+                        [sender as u64, PIDFD_TEST_BYTE, 1, 0, 0, 0]), 1);
+                }
+                let next_peek = pidfd_test_call(&mut parent, &memory, libc::SYS_recvfrom,
+                    [receiver as u64, PIDFD_TEST_BYTE, 1, (libc::MSG_PEEK | libc::MSG_DONTWAIT) as u64, 0, 0]);
+                // Consume the original tracked record after a faulting peek,
+                // or the new plain byte after a consuming fault. No tracked
+                // rights are abandoned on an unread receiving socket.
+                assert_eq!(pidfd_test_read_socket(&mut parent, &memory, libc::SYS_recvfrom, receiver, 1), 1);
+                assert_eq!(pidfd_test_epoll_census(&parent, fd, &link), (0, 0, 1));
+                for closing in [sender, receiver] {
+                    pidfd_test_close(&mut parent, &memory, closing);
+                }
+                observations.push((kind, number, peek, result, starting, offset, next_peek));
+            }
+        }
+    }
+    eprintln!("SO_PEEK_OFF observations: {observations:?}");
+    for (kind, number, peek, result, starting, offset, next_peek) in observations {
+        assert_eq!(result, negative_errno(libc::EFAULT), "kind {kind}, syscall {number}, peek {peek}");
+        assert_eq!(next_peek, if peek { 1 } else { negative_errno(libc::EAGAIN) },
+            "kind {kind}, syscall {number}, peek {peek}: following guest peek sees Linux's queue position; native offset {offset}, expected {starting}");
+        assert_eq!(offset, starting,
+            "kind {kind}, syscall {number}, peek {peek}: a failed payload copy does not advance or rewind SO_PEEK_OFF");
+    }
+}
+
+/// Finished native nonblocking peek attempts can overlap at the legal
+/// boundary before their error returns drop PeekWindow. A later attempt,
+/// begun after an epoll right was consumed, cannot have received that right
+/// and must not extend the earlier attempt's retention. Alternating two
+/// guest processes makes every earlier attempt finish while keeping one
+/// newer attempt open. All sends and consuming receives use the executor.
+#[test]
+fn reviewer_later_peek_windows_do_not_retain_completed_attempts_epolls() {
+    const CYCLES: usize = 32;
+    let root = TestDir::new();
+    let memory = pidfd_test_memory();
+    let (mut parent, _target) = pidfd_test_family(&root, 2);
+    let pidfd = pidfd_test_open(&mut parent, &memory, 2, 0);
+    let shadow = pidfd_test_shadow_link(&parent, pidfd);
+    let (sender, receiver) = pidfd_test_socket_pair(
+        &mut parent,
+        &memory,
+        libc::SOCK_DGRAM | libc::SOCK_NONBLOCK,
+    );
+    // Separate descriptor tables; the peeks never block a mutating table.
+    let peekers = [
+        parent.fork_child(3, false, false).unwrap(),
+        parent.fork_child(4, false, false).unwrap(),
+    ];
+
+    fn native_empty_peek(executor: &ElfExecutor, receiver: i64) {
+        let raw = host_fd(&executor.state, receiver as libc::c_int).unwrap();
+        let mut byte = [0_u8; 1];
+        let mut control = [0_u8; RIGHTS_CONTROL_CAPACITY];
+        let mut iov = libc::iovec {
+            iov_base: byte.as_mut_ptr().cast(),
+            iov_len: byte.len(),
+        };
+        // SAFETY: msghdr is plain data; the fields below name live storage.
+        let mut message = unsafe { std::mem::zeroed::<libc::msghdr>() };
+        message.msg_iov = &mut iov;
+        message.msg_iovlen = 1;
+        message.msg_control = control.as_mut_ptr().cast();
+        message.msg_controllen = control.len();
+        // SAFETY: raw is this executor's live socket, and message names
+        // initialized buffers. DONTWAIT makes this a bounded host attempt.
+        let result = unsafe {
+            libc::recvmsg(
+                raw,
+                &mut message,
+                libc::MSG_PEEK | libc::MSG_DONTWAIT | libc::MSG_CMSG_CLOEXEC,
+            )
+        };
+        let error = std::io::Error::last_os_error().raw_os_error();
+        assert_eq!((result, error), (-1, Some(libc::EAGAIN)));
+    }
+
+    let mut current = 0;
+    let mut call = peekers[current].state.private_copy_gate.call_scope();
+    let mut window = PeekWindow::open(&peekers[current].state);
+    native_empty_peek(&peekers[current], receiver);
+    // Scheduling seam: recvmsg has returned EAGAIN; its frame has not yet
+    // executed the return that drops its window. No native call is blocked,
+    // and these stable socket descriptors are never closed during the loop.
+    let mut censuses = Vec::new();
+    for cycle in 0..CYCLES {
+        let epoll = pidfd_test_call(&mut parent, &memory, libc::SYS_epoll_create1, [0; 6]);
+        assert!(epoll >= 0);
+        assert_eq!(
+            pidfd_test_epoll_ctl(
+                &mut parent,
+                &memory,
+                epoll,
+                libc::EPOLL_CTL_ADD,
+                pidfd,
+                libc::EPOLLIN as u32,
+                cycle as u64,
+            ),
+            0
+        );
+        assert_eq!(
+            pidfd_test_send_rights(&mut parent, &memory, sender, &[epoll as libc::c_int]),
+            1
+        );
+        pidfd_test_close(&mut parent, &memory, epoll);
+        let (result, rights, _) = pidfd_test_receive_rights(
+            &mut parent,
+            &memory,
+            receiver,
+            0,
+            RIGHTS_CONTROL_CAPACITY,
+        );
+        assert_eq!((result, rights.len()), (1, 1));
+        pidfd_test_close(&mut parent, &memory, i64::from(rights[0]));
+        assert_eq!(epoll_rights_in_flight(&parent.state), 0);
+
+        // This newer window starts strictly after the epoll's message was
+        // consumed and its only guest descriptor closed. Its real native
+        // peek sees an empty queue, so it cannot own that epoll.
+        let next = 1 - current;
+        let next_call = peekers[next].state.private_copy_gate.call_scope();
+        let next_window = PeekWindow::open(&peekers[next].state);
+        native_empty_peek(&peekers[next], receiver);
+        drop(window);
+        call.end(peekers[current].state.tid).unwrap();
+        censuses.push((
+            epoll_transfer_census(&parent.state),
+            epoll_rights_in_flight(&parent.state),
+            pidfd_test_record(&parent, pidfd).epoll_registrations(),
+            pidfd_test_socket_descriptors(&shadow),
+        ));
+        current = next;
+        window = next_window;
+        call = next_call;
+    }
+    // Complete the final attempt before assertions, ensuring normal cleanup
+    // even for the candidate that accumulates all 32 old epoll holds.
+    drop(window);
+    call.end(peekers[current].state.tid).unwrap();
+    let final_census = (
+        epoll_transfer_census(&parent.state),
+        epoll_rights_in_flight(&parent.state),
+        pidfd_test_record(&parent, pidfd).epoll_registrations(),
+        pidfd_test_socket_descriptors(&shadow),
+    );
+    assert_eq!(final_census, ((0, 0, 0), 0, 0, 1));
+    assert_eq!(
+        censuses,
+        vec![((0, 1, 0), 0, 0, 1); CYCLES],
+        "once all earlier windows finish, a later empty peek must not keep \
+         their epolls, registrations, pins or keys; every native attempt completed"
+    );
+    for socket in [sender, receiver] {
+        pidfd_test_close(&mut parent, &memory, socket);
+    }
+}
+
+/// Exporting an epoll to a native peer succeeds without a refusal. Once
+/// that peer consumes the real SCM_RIGHTS message and closes its received
+/// descriptor, no queued message or guest descriptor owns the epoll. Its
+/// transfer, private pin and pidfd registration must therefore be gone.
+/// This is a consumed-and-closed right, not the accepted unread-socket-close
+/// retention case.
+///
+/// Adopted with the export refused, as the export ruling for
+/// https://github.com/rrnewton/reverie/pull/1410 requires: the send is refused
+/// by name before any effect (`EPOLL_EXPORT_REFUSAL`), so the native peer
+/// finds nothing to receive. The original lines are kept beside the new ones;
+/// the final cleanup oracle is unchanged.
+#[test]
+fn reviewer_native_receiver_close_releases_exported_epoll_ownership() {
+    let root = TestDir::new();
+    let memory = pidfd_test_memory();
+    let mut state = test_state(&root.0);
+    let (outside, inside) = std::os::unix::net::UnixStream::pair().unwrap();
+    assert!(state
+        .insert_file(
+            PIDFD_TEST_OUTSIDE,
+            std::fs::File::from(std::os::fd::OwnedFd::from(inside)),
+        )
+        .is_empty());
+    let mut parent = ElfExecutor::new(state, false);
+    let mut child = parent.fork_child(2, false, false).unwrap();
+    // The target child need not retain the sender's socket. The epoll is
+    // created only afterward, so no forked guest alias of it exists.
+    pidfd_test_close(&mut child, &pidfd_test_memory(), i64::from(PIDFD_TEST_OUTSIDE));
+    let pidfd = pidfd_test_open(&mut parent, &memory, 2, 0);
+    let shadow = pidfd_test_shadow_link(&parent, pidfd);
+    let epoll = pidfd_test_call(&mut parent, &memory, libc::SYS_epoll_create1, [0; 6]);
+    assert!(epoll >= 0);
+    assert_eq!(
+        pidfd_test_epoll_ctl(
+            &mut parent,
+            &memory,
+            epoll,
+            libc::EPOLL_CTL_ADD,
+            pidfd,
+            libc::EPOLLIN as u32,
+            0x1410,
+        ),
+        0
+    );
+    // Original: `1`, "the existing send guard permits the registered epoll's
+    // export"; then `take_unsupported_refusal() == None` and
+    // `epoll_rights_in_flight == 1`.
+    assert_eq!(
+        pidfd_test_send_rights(
+            &mut parent,
+            &memory,
+            i64::from(PIDFD_TEST_OUTSIDE),
+            &[epoll as libc::c_int],
+        ),
+        negative_errno(libc::ENOSYS),
+        "a send that may leave the run refuses the epoll before any effect"
+    );
+    assert_eq!(
+        parent.take_unsupported_refusal(),
+        pidfd_test_epoll_export_refusal()
+    );
+    assert_eq!(epoll_rights_in_flight(&parent.state), 0);
+    pidfd_test_close(&mut parent, &memory, epoll);
+
+    // This helper issues an actual native recvmsg, constructs a File for
+    // each returned descriptor, and drops each File before returning.
+    // Original: `(result, rights, flags & MSG_CTRUNC) == (1, 1, 0)`; the
+    // refused send queued nothing, so the native receive finds nothing.
+    let (result, rights, _, _) =
+        pidfd_test_native_receive(outside.as_raw_fd(), RIGHTS_CONTROL_CAPACITY);
+    let nothing_sent = std::io::Error::last_os_error().raw_os_error();
+    assert_eq!((result, rights, nothing_sent), (-1, 0, Some(libc::EAGAIN)));
+    // Prove the message was consumed before closing either socket endpoint.
+    let (result, rights, _, _) =
+        pidfd_test_native_receive(outside.as_raw_fd(), RIGHTS_CONTROL_CAPACITY);
+    let empty_errno = std::io::Error::last_os_error().raw_os_error();
+    assert_eq!((result, rights, empty_errno), (-1, 0, Some(libc::EAGAIN)));
+    pidfd_test_close(&mut parent, &memory, i64::from(PIDFD_TEST_OUTSIDE));
+    drop(outside);
+    assert_eq!(
+        (
+            epoll_transfer_census(&parent.state),
+            epoll_rights_in_flight(&parent.state),
+            pidfd_test_record(&parent, pidfd).epoll_registrations(),
+            pidfd_test_socket_descriptors(&shadow),
+        ),
+        ((0, 0, 0), 0, 0, 1),
+        "the native peer received and closed the final external epoll owner; \
+         no unread message remains to justify retention"
+    );
+}
+
+/// An epoll's final real close removes it from another epoll's interest
+/// set. Retaining its native pin after the external peer closes it must
+/// not keep a ghost nested registration visible to the guest. This checks
+/// ordinary epoll_wait, not the restricted epoll_pwait2 admission path.
+///
+/// Adopted with the export refused, as the export ruling for
+/// https://github.com/rrnewton/reverie/pull/1410 requires: the send is refused
+/// by name before any effect (`EPOLL_EXPORT_REFUSAL`), so the native peer
+/// finds nothing to receive. The original lines are kept beside the new ones;
+/// the final oracle, a quiet outer epoll, is unchanged.
+#[test]
+fn reviewer_closed_external_inner_epoll_leaves_no_outer_readiness() {
+    let root = TestDir::new();
+    let memory = pidfd_test_memory();
+    let mut state = test_state(&root.0);
+    let (outside, inside) = std::os::unix::net::UnixStream::pair().unwrap();
+    assert!(state
+        .insert_file(
+            PIDFD_TEST_OUTSIDE,
+            std::fs::File::from(std::os::fd::OwnedFd::from(inside)),
+        )
+        .is_empty());
+    let mut parent = ElfExecutor::new(state, false);
+    let mut child = parent.fork_child(2, false, false).unwrap();
+    pidfd_test_close(&mut child, &pidfd_test_memory(), i64::from(PIDFD_TEST_OUTSIDE));
+    let pidfd = pidfd_test_open(&mut parent, &memory, 2, 0);
+    let inner = pidfd_test_call(&mut parent, &memory, libc::SYS_epoll_create1, [0; 6]);
+    let outer = pidfd_test_call(&mut parent, &memory, libc::SYS_epoll_create1, [0; 6]);
+    assert!(inner >= 0 && outer >= 0);
+    assert_eq!(
+        pidfd_test_epoll_ctl(
+            &mut parent,
+            &memory,
+            inner,
+            libc::EPOLL_CTL_ADD,
+            pidfd,
+            libc::EPOLLIN as u32,
+            0x1110,
+        ),
+        0
+    );
+    assert_eq!(
+        pidfd_test_epoll_ctl(
+            &mut parent,
+            &memory,
+            outer,
+            libc::EPOLL_CTL_ADD,
+            inner,
+            libc::EPOLLIN as u32,
+            0x1410,
+        ),
+        0
+    );
+    assert!(pidfd_test_epoll_wait(&mut parent, &memory, outer).is_empty());
+    // Original: `1`, then `take_unsupported_refusal() == None`.
+    assert_eq!(
+        pidfd_test_send_rights(
+            &mut parent,
+            &memory,
+            i64::from(PIDFD_TEST_OUTSIDE),
+            &[inner as libc::c_int],
+        ),
+        negative_errno(libc::ENOSYS)
+    );
+    assert_eq!(
+        parent.take_unsupported_refusal(),
+        pidfd_test_epoll_export_refusal()
+    );
+    pidfd_test_close(&mut parent, &memory, inner);
+    // Actual native recvmsg installs and closes the final external inner
+    // epoll descriptor. The next receive proves no message remains unread.
+    // Original: `(result, rights, flags & MSG_CTRUNC) == (1, 1, 0)`; the
+    // refused send queued nothing, so the native receive finds nothing.
+    let (result, rights, _, _) =
+        pidfd_test_native_receive(outside.as_raw_fd(), RIGHTS_CONTROL_CAPACITY);
+    let nothing_sent = std::io::Error::last_os_error().raw_os_error();
+    assert_eq!((result, rights, nothing_sent), (-1, 0, Some(libc::EAGAIN)));
+    let (result, rights, _, _) =
+        pidfd_test_native_receive(outside.as_raw_fd(), RIGHTS_CONTROL_CAPACITY);
+    let empty_errno = std::io::Error::last_os_error().raw_os_error();
+    assert_eq!((result, rights, empty_errno), (-1, 0, Some(libc::EAGAIN)));
+    pidfd_test_close(&mut parent, &memory, i64::from(PIDFD_TEST_OUTSIDE));
+    drop(outside);
+
+    pidfd_test_exit(&mut parent, &mut child);
+    let events = pidfd_test_epoll_wait(&mut parent, &memory, outer);
+    pidfd_test_reap(&mut parent, &memory, 2);
+    pidfd_test_close(&mut parent, &memory, outer);
+    pidfd_test_close(&mut parent, &memory, pidfd);
+    assert!(
+        events.is_empty(),
+        "an inner epoll with no real owner must be absent from the outer interest set: {events:?}"
+    );
+}
+
+/// An epoll from outside the run takes no pidfd for a guest process through
+/// any descriptor of it (`PIDFD_IMPORTED_EPOLL_REFUSAL`): the one received, a
+/// dup, a descriptor a message in the run carried, and a forked process's
+/// copy all share its identity, which came from outside the run
+/// (`EpollIdentity::from_outside`). Interests in it that are not pidfds for a
+/// guest process are the host's: an eventfd's ADD succeeds.
+#[test]
+fn an_epoll_from_outside_the_run_takes_no_pidfd_through_any_alias() {
+    let root = TestDir::new();
+    let memory = pidfd_test_memory();
+    let mut state = test_state(&root.0);
+    let (outside, inside) = std::os::unix::net::UnixStream::pair().unwrap();
+    assert!(
+        state
+            .insert_file(
+                PIDFD_TEST_OUTSIDE,
+                std::fs::File::from(std::os::fd::OwnedFd::from(inside)),
+            )
+            .is_empty()
+    );
+    let mut parent = ElfExecutor::new(state, false);
+    let _child = parent.fork_child(2, false, false).unwrap();
+    let pidfd = pidfd_test_open(&mut parent, &memory, 2, 0);
+    let link = pidfd_test_shadow_link(&parent, pidfd);
+    // SAFETY: epoll_create1 has no memory arguments.
+    let raw = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+    assert!(raw >= 0);
+    // SAFETY: epoll_create1 returned a new descriptor that this frame owns.
+    let native = unsafe { std::fs::File::from_raw_fd(raw) };
+    pidfd_test_native_send_rights(outside.as_raw_fd(), &[native.as_raw_fd()]);
+    drop(native);
+    let (result, rights, _) = pidfd_test_receive_rights(
+        &mut parent,
+        &memory,
+        i64::from(PIDFD_TEST_OUTSIDE),
+        0,
+        RIGHTS_CONTROL_CAPACITY,
+    );
+    assert_eq!((result, rights.len()), (1, 1));
+    let received = i64::from(rights[0]);
+    let duplicate = pidfd_test_call(
+        &mut parent,
+        &memory,
+        libc::SYS_dup,
+        [received as u64, 0, 0, 0, 0, 0],
+    );
+    assert!(duplicate >= 0);
+    let (sender, receiver) =
+        pidfd_test_socket_pair(&mut parent, &memory, libc::SOCK_DGRAM | libc::SOCK_NONBLOCK);
+    assert_eq!(
+        pidfd_test_send_rights(&mut parent, &memory, sender, &[received as libc::c_int]),
+        1
+    );
+    let (result, rights, _) =
+        pidfd_test_receive_rights(&mut parent, &memory, receiver, 0, RIGHTS_CONTROL_CAPACITY);
+    assert_eq!((result, rights.len()), (1, 1));
+    let carried = i64::from(rights[0]);
+    let identity = pidfd_test_epoll_identity(&parent, received);
+    for alias in [duplicate, carried] {
+        assert!(Arc::ptr_eq(
+            &pidfd_test_epoll_identity(&parent, alias),
+            &identity
+        ));
+    }
+    drop(identity);
+    for alias in [received, duplicate, carried] {
+        assert_eq!(
+            pidfd_test_epoll_ctl(
+                &mut parent,
+                &memory,
+                alias,
+                libc::EPOLL_CTL_ADD,
+                pidfd,
+                libc::EPOLLIN as u32,
+                1,
+            ),
+            negative_errno(libc::ENOSYS),
+            "alias {alias}"
+        );
+        assert_eq!(
+            parent.take_unsupported_refusal(),
+            pidfd_test_imported_epoll_refusal()
+        );
+    }
+    let forked_memory = pidfd_test_memory();
+    let mut forked = parent.fork_child(3, false, false).unwrap();
+    assert_eq!(
+        pidfd_test_epoll_ctl(
+            &mut forked,
+            &forked_memory,
+            received,
+            libc::EPOLL_CTL_ADD,
+            pidfd,
+            libc::EPOLLIN as u32,
+            1,
+        ),
+        negative_errno(libc::ENOSYS),
+        "a forked process's copy"
+    );
+    assert_eq!(
+        forked.take_unsupported_refusal(),
+        pidfd_test_imported_epoll_refusal()
+    );
+    let event = pidfd_test_call(&mut parent, &memory, libc::SYS_eventfd2, [0; 6]);
+    assert!(event >= 0);
+    assert_eq!(
+        pidfd_test_epoll_ctl(
+            &mut parent,
+            &memory,
+            received,
+            libc::EPOLL_CTL_ADD,
+            event,
+            libc::EPOLLIN as u32,
+            2,
+        ),
+        0
+    );
+    assert_eq!(
+        (
+            pidfd_test_record(&parent, pidfd).epoll_registrations(),
+            pidfd_test_socket_descriptors(&link),
+        ),
+        (0, 1)
+    );
+    for closing in [received, duplicate, carried] {
+        pidfd_test_close(&mut forked, &forked_memory, closing);
+    }
+    for closing in [
+        received,
+        duplicate,
+        carried,
+        event,
+        sender,
+        receiver,
+        i64::from(PIDFD_TEST_OUTSIDE),
+    ] {
+        pidfd_test_close(&mut parent, &memory, closing);
+    }
+}
+
+/// The supported twin of
+/// `reviewer_closed_external_inner_epoll_leaves_no_outer_readiness`: an inner
+/// epoll that an outer one watches, and that watches a live pidfd, goes to
+/// another guest process over a socket pair the run made, and its last close
+/// in the run, the receiver's, ends it, so the outer epoll stays quiet when
+/// the pidfd's process exits, as Linux's final close removes the inner epoll
+/// from every epoll watching it.
+#[test]
+fn an_inner_epoll_passed_in_the_run_leaves_no_outer_readiness_after_its_last_close() {
+    let root = TestDir::new();
+    let memory = pidfd_test_memory();
+    let (mut parent, mut child) = pidfd_test_family(&root, 2);
+    let (sender, receiver) =
+        pidfd_test_socket_pair(&mut parent, &memory, libc::SOCK_DGRAM | libc::SOCK_NONBLOCK);
+    let peer_memory = pidfd_test_memory();
+    let mut peer = parent.fork_child(3, false, false).unwrap();
+    pidfd_test_close(&mut parent, &memory, receiver);
+    pidfd_test_close(&mut peer, &peer_memory, sender);
+    let pidfd = pidfd_test_open(&mut parent, &memory, 2, 0);
+    let inner = pidfd_test_call(&mut parent, &memory, libc::SYS_epoll_create1, [0; 6]);
+    let outer = pidfd_test_call(&mut parent, &memory, libc::SYS_epoll_create1, [0; 6]);
+    assert!(inner >= 0 && outer >= 0);
+    assert_eq!(
+        pidfd_test_epoll_ctl(
+            &mut parent,
+            &memory,
+            inner,
+            libc::EPOLL_CTL_ADD,
+            pidfd,
+            libc::EPOLLIN as u32,
+            0x1110,
+        ),
+        0
+    );
+    assert_eq!(
+        pidfd_test_epoll_ctl(
+            &mut parent,
+            &memory,
+            outer,
+            libc::EPOLL_CTL_ADD,
+            inner,
+            libc::EPOLLIN as u32,
+            0x1410,
+        ),
+        0
+    );
+    assert!(pidfd_test_epoll_wait(&mut parent, &memory, outer).is_empty());
+    assert_eq!(
+        pidfd_test_send_rights(&mut parent, &memory, sender, &[inner as libc::c_int]),
+        1
+    );
+    assert_eq!(parent.take_unsupported_refusal(), None);
+    pidfd_test_close(&mut parent, &memory, inner);
+    let (result, rights, _) = pidfd_test_receive_rights(
+        &mut peer,
+        &peer_memory,
+        receiver,
+        0,
+        RIGHTS_CONTROL_CAPACITY,
+    );
+    assert_eq!((result, rights.len()), (1, 1));
+    pidfd_test_close(&mut peer, &peer_memory, i64::from(rights[0]));
+    pidfd_test_exit(&mut parent, &mut child);
+    let events = pidfd_test_epoll_wait(&mut parent, &memory, outer);
+    pidfd_test_reap(&mut parent, &memory, 2);
+    pidfd_test_close(&mut peer, &peer_memory, receiver);
+    for closing in [outer, pidfd, sender] {
+        pidfd_test_close(&mut parent, &memory, closing);
+    }
+    assert!(
+        events.is_empty(),
+        "an inner epoll whose last descriptor closed must be absent from the outer interest set: \
+         {events:?}"
+    );
+}
+
+/// An epoll in an `SCM_RIGHTS` message that may leave the run is refused by
+/// name before any effect (`EPOLL_EXPORT_REFUSAL`): the host sends nothing,
+/// the epoll gets no right in flight and no record, and a pipe right before
+/// it in the same message is not marked as exported, so its owner can still
+/// be set, as the typed refusal promises. The epoll keeps its registration
+/// until its own last close.
+#[test]
+fn an_epoll_in_a_message_that_may_leave_the_run_is_refused_before_any_effect() {
+    let root = TestDir::new();
+    let memory = pidfd_test_memory();
+    let mut state = test_state(&root.0);
+    let (outside, inside) = std::os::unix::net::UnixStream::pair().unwrap();
+    outside.set_nonblocking(true).unwrap();
+    assert!(
+        state
+            .insert_file(
+                PIDFD_TEST_OUTSIDE,
+                std::fs::File::from(std::os::fd::OwnedFd::from(inside)),
+            )
+            .is_empty()
+    );
+    let mut parent = ElfExecutor::new(state, false);
+    let _child = parent.fork_child(2, false, false).unwrap();
+    let pidfd = pidfd_test_open(&mut parent, &memory, 2, 0);
+    let link = pidfd_test_shadow_link(&parent, pidfd);
+    let epoll = pidfd_test_call(&mut parent, &memory, libc::SYS_epoll_create1, [0; 6]);
+    assert_eq!(
+        pidfd_test_epoll_ctl(
+            &mut parent,
+            &memory,
+            epoll,
+            libc::EPOLL_CTL_ADD,
+            pidfd,
+            libc::EPOLLIN as u32,
+            1,
+        ),
+        0
+    );
+    assert_eq!(
+        pidfd_test_call(
+            &mut parent,
+            &memory,
+            libc::SYS_pipe2,
+            [PIDFD_TEST_PAIR, libc::O_NONBLOCK as u64, 0, 0, 0, 0],
+        ),
+        0
+    );
+    let [pipe, pipe_writer]: [libc::c_int; 2] = read_struct(&memory, PIDFD_TEST_PAIR);
+    assert_eq!(
+        pidfd_test_send_rights(
+            &mut parent,
+            &memory,
+            i64::from(PIDFD_TEST_OUTSIDE),
+            &[pipe, epoll as libc::c_int],
+        ),
+        negative_errno(libc::ENOSYS)
+    );
+    assert_eq!(
+        parent.take_unsupported_refusal(),
+        pidfd_test_epoll_export_refusal()
+    );
+    assert_eq!(
+        (
+            epoll_transfer_census(&parent.state),
+            pidfd_test_epoll_census(&parent, pidfd, &link)
+        ),
+        ((0, 0, 0), (0, 1, 2)),
+        "no record, no right in flight; the registration stays"
+    );
+    let (result, rights, _, _) =
+        pidfd_test_native_receive(outside.as_raw_fd(), RIGHTS_CONTROL_CAPACITY);
+    let nothing_sent = std::io::Error::last_os_error().raw_os_error();
+    assert_eq!((result, rights, nothing_sent), (-1, 0, Some(libc::EAGAIN)));
+    assert_eq!(
+        pidfd_test_call(
+            &mut parent,
+            &memory,
+            libc::SYS_fcntl,
+            [pipe as u64, libc::F_SETOWN as u64, 0, 0, 0, 0],
+        ),
+        0,
+        "the typed refusal marked nothing as exported"
+    );
+    pidfd_test_close(&mut parent, &memory, epoll);
+    assert_eq!(pidfd_test_epoll_census(&parent, pidfd, &link), (0, 0, 1));
+    for closing in [
+        i64::from(pipe),
+        i64::from(pipe_writer),
+        i64::from(PIDFD_TEST_OUTSIDE),
+    ] {
+        pidfd_test_close(&mut parent, &memory, closing);
+    }
+}
+
+/// A socket pair the run made keeps its messages in the run only while no end
+/// of it has left the run (`sends_into_the_run`): an epoll goes over it, but
+/// once a message on a socket that may leave the run has carried one end, a
+/// send of an epoll over the pair is refused by name before any effect
+/// (`EPOLL_EXPORT_REFUSAL`), though a guest still holds both ends.
+#[test]
+fn a_socket_pair_whose_end_left_the_run_carries_no_epoll() {
+    let root = TestDir::new();
+    let memory = pidfd_test_memory();
+    let mut state = test_state(&root.0);
+    let (outside, inside) = std::os::unix::net::UnixStream::pair().unwrap();
+    outside.set_nonblocking(true).unwrap();
+    assert!(
+        state
+            .insert_file(
+                PIDFD_TEST_OUTSIDE,
+                std::fs::File::from(std::os::fd::OwnedFd::from(inside)),
+            )
+            .is_empty()
+    );
+    let mut parent = ElfExecutor::new(state, false);
+    let epoll = pidfd_test_call(&mut parent, &memory, libc::SYS_epoll_create1, [0; 6]);
+    assert!(epoll >= 0);
+    let (sender, receiver) =
+        pidfd_test_socket_pair(&mut parent, &memory, libc::SOCK_DGRAM | libc::SOCK_NONBLOCK);
+    assert_eq!(
+        pidfd_test_send_rights(&mut parent, &memory, sender, &[epoll as libc::c_int]),
+        1
+    );
+    let (result, rights, _) =
+        pidfd_test_receive_rights(&mut parent, &memory, receiver, 0, RIGHTS_CONTROL_CAPACITY);
+    assert_eq!((result, rights.len()), (1, 1));
+    pidfd_test_close(&mut parent, &memory, i64::from(rights[0]));
+    assert_eq!(
+        pidfd_test_send_rights(
+            &mut parent,
+            &memory,
+            i64::from(PIDFD_TEST_OUTSIDE),
+            &[receiver as libc::c_int],
+        ),
+        1
+    );
+    assert_eq!(parent.take_unsupported_refusal(), None);
+    let (result, rights, _, _) =
+        pidfd_test_native_receive(outside.as_raw_fd(), RIGHTS_CONTROL_CAPACITY);
+    assert_eq!((result, rights), (1, 1));
+    assert_eq!(
+        pidfd_test_send_rights(&mut parent, &memory, sender, &[epoll as libc::c_int]),
+        negative_errno(libc::ENOSYS)
+    );
+    assert_eq!(
+        parent.take_unsupported_refusal(),
+        pidfd_test_epoll_export_refusal()
+    );
+    for closing in [epoll, sender, receiver, i64::from(PIDFD_TEST_OUTSIDE)] {
+        pidfd_test_close(&mut parent, &memory, closing);
+    }
+}
+
+/// An epoll received from outside the run whose pin cannot be made, under the
+/// hard descriptor limit either, ends the run (`received_epoll`): its later
+/// descriptors would get identities of their own. The receive's checked
+/// execution returns `Error::HostResources` for descriptors and installs
+/// nothing. Both limits are lowered to the lowest free descriptor where the
+/// receive looks the epoll up (`EPOLL_RECEIVED_TEST_HOOK`), so neither leaves
+/// room: irreversible, so in a process of its own.
+#[test]
+fn an_epoll_from_outside_whose_pin_cannot_be_made_ends_the_run() {
+    if pidfd_test_run_isolated("an_epoll_from_outside_whose_pin_cannot_be_made_ends_the_run") {
+        return;
+    }
+    let root = TestDir::new();
+    let memory = pidfd_test_memory();
+    let mut state = test_state(&root.0);
+    let (outside, inside) = std::os::unix::net::UnixStream::pair().unwrap();
+    assert!(
+        state
+            .insert_file(
+                PIDFD_TEST_OUTSIDE,
+                std::fs::File::from(std::os::fd::OwnedFd::from(inside)),
+            )
+            .is_empty()
+    );
+    let mut parent = ElfExecutor::new(state, false);
+    // SAFETY: epoll_create1 has no memory arguments.
+    let raw = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+    assert!(raw >= 0);
+    // SAFETY: epoll_create1 returned a new descriptor that this frame owns.
+    let native = unsafe { std::fs::File::from_raw_fd(raw) };
+    pidfd_test_native_send_rights(outside.as_raw_fd(), &[native.as_raw_fd()]);
+    drop(native);
+    let lowest_free = available_guest_fds_up_to(&parent.state, 1, libc::c_int::MAX)[0];
+    let lowered = std::rc::Rc::new(std::cell::Cell::new(false));
+    let hook_lowered = lowered.clone();
+    poll::EPOLL_RECEIVED_TEST_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            let lowest = std::fs::File::open("/dev/null").unwrap().as_raw_fd() as libc::rlim_t;
+            // Irreversible, but this test runs in a process of its own.
+            pidfd_test_set_nofile(lowest, lowest);
+            hook_lowered.set(true);
+        }));
+    });
+    memory
+        .write_raw(PIDFD_TEST_CONTROL, &[0_u8; RIGHTS_CONTROL_CAPACITY])
+        .unwrap();
+    pidfd_test_message(&memory, RIGHTS_CONTROL_CAPACITY);
+    let result = pidfd_test_checked_call(
+        &mut parent,
+        &memory,
+        libc::SYS_recvmsg,
+        [
+            PIDFD_TEST_OUTSIDE as u64,
+            PIDFD_TEST_MESSAGE,
+            libc::MSG_DONTWAIT as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    poll::EPOLL_RECEIVED_TEST_HOOK.with(|hook| hook.borrow_mut().take());
+    assert!(lowered.get(), "the receive looked the epoll up");
+    pidfd_test_assert_run_ended_for_descriptors(result, "a receive of an epoll from outside");
+    assert_eq!(
+        available_guest_fds_up_to(&parent.state, 1, libc::c_int::MAX)[0],
+        lowest_free,
+        "the receive installed nothing"
+    );
+}
+
+/// A send of an epoll whose pin cannot be made, under the hard descriptor
+/// limit either, ends the run (`register_epoll_transfer`): no receive could
+/// find its identity. The send's checked execution returns
+/// `Error::HostResources` for descriptors, and the host sends nothing. Both
+/// limits are lowered to the lowest free descriptor before the send:
+/// irreversible, so in a process of its own.
+#[test]
+fn a_send_of_an_epoll_whose_pin_cannot_be_made_ends_the_run() {
+    if pidfd_test_run_isolated("a_send_of_an_epoll_whose_pin_cannot_be_made_ends_the_run") {
+        return;
+    }
+    let root = TestDir::new();
+    let memory = pidfd_test_memory();
+    let (mut parent, _child) = pidfd_test_family(&root, 2);
+    let epoll = pidfd_test_call(&mut parent, &memory, libc::SYS_epoll_create1, [0; 6]);
+    assert!(epoll >= 0);
+    let (sender, receiver) =
+        pidfd_test_socket_pair(&mut parent, &memory, libc::SOCK_DGRAM | libc::SOCK_NONBLOCK);
+    memory.write_raw(PIDFD_TEST_BYTE, b"x").unwrap();
+    let control = rights_control(&[epoll as libc::c_int]);
+    memory.write_raw(PIDFD_TEST_CONTROL, &control).unwrap();
+    pidfd_test_message(&memory, control.len());
+    let lowest = std::fs::File::open("/dev/null").unwrap().as_raw_fd() as libc::rlim_t;
+    // Irreversible, but this test runs in a process of its own.
+    pidfd_test_set_nofile(lowest, lowest);
+    let result = pidfd_test_checked_call(
+        &mut parent,
+        &memory,
+        libc::SYS_sendmsg,
+        [sender as u64, PIDFD_TEST_MESSAGE, 0, 0, 0, 0],
+    );
+    pidfd_test_assert_run_ended_for_descriptors(result, "a send of an epoll");
+    assert_eq!(epoll_rights_in_flight(&parent.state), 0);
+    let raw = host_fd(&parent.state, receiver as libc::c_int).unwrap();
+    let mut byte = [0_u8; 1];
+    // SAFETY: byte is writable for its one byte, and raw is a live socket.
+    let peeked = unsafe {
+        libc::recv(
+            raw,
+            byte.as_mut_ptr().cast(),
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    let nothing_sent = std::io::Error::last_os_error().raw_os_error();
+    assert_eq!((peeked, nothing_sent), (-1, Some(libc::EAGAIN)));
+}
+
+/// A datagram or seqpacket receive whose copy into the guest's buffer faults
+/// leaves the socket's peek offset (`SO_PEEK_OFF`) where it was, as Linux's
+/// faults before it moves the offset (`__unix_dgram_recvmsg`): this backend
+/// puts back what its own host receive moved (`SavedPeekOffset`). Through
+/// readv and preadv2 at the current position, which stage the guest's whole
+/// buffer writable (`receive_stages_whole_buffer`), into an inaccessible
+/// page, as `reviewer_faulting_datagram_receive_preserves_so_peek_off` covers
+/// recvfrom and recvmsg: the guest's own setsockopt sets the offset, and its
+/// next peek shows where it is.
+#[test]
+fn a_faulting_datagram_vectored_read_leaves_the_peek_offset() {
+    const OPTION: u64 = 0xe00;
+    for kind in [libc::SOCK_DGRAM, libc::SOCK_SEQPACKET] {
+        for (number, peek) in [(libc::SYS_readv, false), (libc::SYS_preadv2, false)] {
+            let case = format!("kind {kind}, syscall {number}, peek {peek}");
+            let root = TestDir::new();
+            let memory = pidfd_test_memory();
+            let (mut parent, _child, fd, link, sender, receiver) =
+                pidfd_test_queued_epoll(&root, &memory, kind | libc::SOCK_NONBLOCK);
+            // A peek would move the offset from 0 to 1, a consuming receive
+            // from 1 to 0.
+            let starting: libc::c_int = if peek { 0 } else { 1 };
+            assert_eq!(
+                write_struct(&mut ProviderMemory(&memory), OPTION, &starting),
+                0
+            );
+            assert_eq!(
+                pidfd_test_call(
+                    &mut parent,
+                    &memory,
+                    libc::SYS_setsockopt,
+                    [
+                        receiver as u64,
+                        libc::SOL_SOCKET as u64,
+                        libc::SO_PEEK_OFF as u64,
+                        OPTION,
+                        4,
+                        0
+                    ],
+                ),
+                0,
+                "{case}"
+            );
+            let buffer = pidfd_test_inaccessible_page(&memory);
+            let iov = libc::iovec {
+                iov_base: buffer as usize as *mut libc::c_void,
+                iov_len: 1,
+            };
+            assert_eq!(
+                write_struct(&mut ProviderMemory(&memory), PIDFD_TEST_IOV, &iov),
+                0
+            );
+            let args = if number == libc::SYS_readv {
+                [receiver as u64, PIDFD_TEST_IOV, 1, 0, 0, 0]
+            } else {
+                [receiver as u64, PIDFD_TEST_IOV, 1, -1_i64 as u64, 0, 0]
+            };
+            assert_eq!(
+                pidfd_test_call(&mut parent, &memory, number, args),
+                negative_errno(libc::EFAULT),
+                "{case}"
+            );
+            if !peek {
+                // Linux leaves the offset at 1 after consuming the faulting
+                // record, so a peek skips a fresh one-byte message; an offset
+                // moved to 0 shows it.
+                memory.write_raw(PIDFD_TEST_BYTE, b"y").unwrap();
+                assert_eq!(
+                    pidfd_test_call(
+                        &mut parent,
+                        &memory,
+                        libc::SYS_write,
+                        [sender as u64, PIDFD_TEST_BYTE, 1, 0, 0, 0],
+                    ),
+                    1,
+                    "{case}"
+                );
+            }
+            let next_peek = pidfd_test_call(
+                &mut parent,
+                &memory,
+                libc::SYS_recvfrom,
+                [
+                    receiver as u64,
+                    PIDFD_TEST_BYTE,
+                    1,
+                    (libc::MSG_PEEK | libc::MSG_DONTWAIT) as u64,
+                    0,
+                    0,
+                ],
+            );
+            assert_eq!(
+                next_peek,
+                if peek {
+                    1
+                } else {
+                    negative_errno(libc::EAGAIN)
+                },
+                "{case}: the next peek sees Linux's offset"
+            );
+            assert_eq!(
+                pidfd_test_read_socket(&mut parent, &memory, libc::SYS_recvfrom, receiver, 1),
+                1,
+                "{case}"
+            );
+            assert_eq!(
+                pidfd_test_epoll_census(&parent, fd, &link),
+                (0, 0, 1),
+                "{case}"
+            );
+            for socket in [sender, receiver] {
+                pidfd_test_close(&mut parent, &memory, socket);
+            }
+        }
+    }
+}
+
+/// An initially internal epoll right can escape inside its receiving
+/// socket's queue. The first send is an ordinary internal socketpair send;
+/// only afterward is the receiving socket itself sent to a native peer.
+/// Both messages are actually received before either queue is destroyed.
+/// If the socket export succeeds, final-close semantics must still hold.
+#[test]
+fn reviewer_queued_epoll_cannot_escape_in_its_receiving_socket_and_leave_a_ghost() {
+    // Adapted (opuskvm): Astra's helper below serves only her original
+    // native receipt of R, which the refusal leaves commented out further on.
+    // fn take_one_native_right(socket: RawFd) -> std::fs::File {
+    //     let mut byte = [0_u8; 1];
+    //     let mut control = [0_u8; RIGHTS_CONTROL_CAPACITY];
+    //     let mut iov = libc::iovec {
+    //         iov_base: byte.as_mut_ptr().cast(),
+    //         iov_len: byte.len(),
+    //     };
+    //     // SAFETY: msghdr is plain data; fields below name initialized storage.
+    //     let mut message = unsafe { std::mem::zeroed::<libc::msghdr>() };
+    //     message.msg_iov = &mut iov;
+    //     message.msg_iovlen = 1;
+    //     message.msg_control = control.as_mut_ptr().cast();
+    //     message.msg_controllen = control.len();
+    //     // SAFETY: socket is live, and all header buffers are valid.
+    //     assert_eq!(
+    //         unsafe {
+    //             libc::recvmsg(
+    //                 socket,
+    //                 &mut message,
+    //                 libc::MSG_DONTWAIT | libc::MSG_CMSG_CLOEXEC,
+    //             )
+    //         },
+    //         1
+    //     );
+    //     assert_eq!(byte, *b"x");
+    //     assert_eq!(message.msg_flags & libc::MSG_CTRUNC, 0);
+    //     assert!(message.msg_controllen <= control.len());
+    //     let rights = control_rights(&control[..message.msg_controllen]);
+    //     assert_eq!(rights.len(), 1);
+    //     assert!(rights[0] >= 0);
+    //     // SAFETY: recvmsg installed this new descriptor exactly once.
+    //     unsafe { std::fs::File::from_raw_fd(rights[0]) }
+    // }
+
+    let root = TestDir::new();
+    let memory = pidfd_test_memory();
+    let mut state = test_state(&root.0);
+    let (outside, inside) = std::os::unix::net::UnixStream::pair().unwrap();
+    assert!(state
+        .insert_file(
+            PIDFD_TEST_OUTSIDE,
+            std::fs::File::from(std::os::fd::OwnedFd::from(inside)),
+        )
+        .is_empty());
+    let mut parent = ElfExecutor::new(state, false);
+    let mut child = parent.fork_child(2, false, false).unwrap();
+    pidfd_test_close(&mut child, &pidfd_test_memory(), i64::from(PIDFD_TEST_OUTSIDE));
+    let pidfd = pidfd_test_open(&mut parent, &memory, 2, 0);
+    // Created after the target fork: parent holds the pair's only guest
+    // descriptors, and neither endpoint has escaped when E is sent.
+    let (sender, receiver) = pidfd_test_socket_pair(
+        &mut parent,
+        &memory,
+        libc::SOCK_DGRAM | libc::SOCK_NONBLOCK,
+    );
+    let inner = pidfd_test_call(&mut parent, &memory, libc::SYS_epoll_create1, [0; 6]);
+    let outer = pidfd_test_call(&mut parent, &memory, libc::SYS_epoll_create1, [0; 6]);
+    assert!(inner >= 0 && outer >= 0);
+    assert_eq!(
+        pidfd_test_epoll_ctl(
+            &mut parent, &memory, inner, libc::EPOLL_CTL_ADD, pidfd,
+            libc::EPOLLIN as u32, 0x1110,
+        ),
+        0
+    );
+    assert_eq!(
+        pidfd_test_epoll_ctl(
+            &mut parent, &memory, outer, libc::EPOLL_CTL_ADD, inner,
+            libc::EPOLLIN as u32, 0x1410,
+        ),
+        0
+    );
+    assert_eq!(
+        pidfd_test_send_rights(&mut parent, &memory, sender, &[inner as libc::c_int]),
+        1,
+        "the initial internal E send remains supported"
+    );
+    assert_eq!(parent.take_unsupported_refusal(), None);
+    pidfd_test_close(&mut parent, &memory, inner);
+    // R is a socket right, not an epoll right. Exporting it also makes the
+    // queued message carrying E accessible to the external receiver.
+    // Adapted (opuskvm): this design refuses the export by name before any
+    // effect while E is in flight (`SOCKET_EXPORT_REFUSAL`). Astra's original
+    // lines for the export and for the native receipt stay in comments. E's
+    // receive moves into the run, still before R's final close, so E is
+    // consumed before its queue is destroyed, as in the original.
+    // assert_eq!(
+    //     pidfd_test_send_rights(
+    //         &mut parent, &memory, i64::from(PIDFD_TEST_OUTSIDE),
+    //         &[receiver as libc::c_int],
+    //     ),
+    //     1,
+    //     "a design permitting this socket export must account for its queued E"
+    // );
+    // assert_eq!(parent.take_unsupported_refusal(), None);
+    assert_eq!(
+        pidfd_test_send_rights(
+            &mut parent,
+            &memory,
+            i64::from(PIDFD_TEST_OUTSIDE),
+            &[receiver as libc::c_int],
+        ),
+        negative_errno(libc::ENOSYS),
+        "the export of a socket with E queued in it is refused before any effect"
+    );
+    assert_eq!(
+        parent.take_unsupported_refusal(),
+        pidfd_test_socket_export_refusal()
+    );
+    let (result, rights, _, _) =
+        pidfd_test_native_receive(outside.as_raw_fd(), RIGHTS_CONTROL_CAPACITY);
+    let empty_errno = std::io::Error::last_os_error().raw_os_error();
+    assert_eq!(
+        (result, rights, empty_errno),
+        (-1, 0, Some(libc::EAGAIN)),
+        "nothing reached the native peer"
+    );
+    let (result, rights, _) =
+        pidfd_test_receive_rights(&mut parent, &memory, receiver, 0, RIGHTS_CONTROL_CAPACITY);
+    assert_eq!((result, rights.len()), (1, 1));
+    pidfd_test_close(&mut parent, &memory, i64::from(rights[0]));
+    pidfd_test_close(&mut parent, &memory, receiver);
+    pidfd_test_close(&mut parent, &memory, sender);
+    // let native_receiver = take_one_native_right(outside.as_raw_fd());
+    // let (result, rights, _, flags) =
+    //     pidfd_test_native_receive(native_receiver.as_raw_fd(), RIGHTS_CONTROL_CAPACITY);
+    // assert_eq!((result, rights, flags & libc::MSG_CTRUNC), (1, 1, 0));
+    // // The actual E descriptor has already closed in the helper, and its
+    // // message was consumed before the receiving socket's final close.
+    // let (result, rights, _, _) =
+    //     pidfd_test_native_receive(native_receiver.as_raw_fd(), RIGHTS_CONTROL_CAPACITY);
+    // let empty_errno = std::io::Error::last_os_error().raw_os_error();
+    // assert_eq!((result, rights, empty_errno), (-1, 0, Some(libc::EAGAIN)));
+    // drop(native_receiver);
+    pidfd_test_close(&mut parent, &memory, i64::from(PIDFD_TEST_OUTSIDE));
+    drop(outside);
+
+    pidfd_test_exit(&mut parent, &mut child);
+    let events = pidfd_test_epoll_wait(&mut parent, &memory, outer);
+    pidfd_test_reap(&mut parent, &memory, 2);
+    pidfd_test_close(&mut parent, &memory, outer);
+    pidfd_test_close(&mut parent, &memory, pidfd);
+    assert!(
+        events.is_empty(),
+        "all E and socket owners closed after real receipt; no outer ghost may remain: {events:?}"
+    );
+}
+
+/// The right a native receive from `socket` with `flags` gets, kept open: a
+/// receiver outside the run holds it, or a peek's frame has yet to look it up.
+fn pidfd_test_native_take_right(socket: RawFd, flags: libc::c_int) -> std::fs::File {
+    let mut byte = [0_u8; 1];
+    let mut control = [0_u8; RIGHTS_CONTROL_CAPACITY];
+    let mut iov = libc::iovec {
+        iov_base: byte.as_mut_ptr().cast(),
+        iov_len: byte.len(),
+    };
+    // SAFETY: msghdr is plain data; a zeroed one names nothing.
+    let mut message = unsafe { std::mem::zeroed::<libc::msghdr>() };
+    message.msg_iov = &mut iov;
+    message.msg_iovlen = 1;
+    message.msg_control = control.as_mut_ptr().cast();
+    message.msg_controllen = control.len();
+    // SAFETY: the header names live buffers of the lengths it gives.
+    let result = unsafe {
+        libc::recvmsg(
+            socket,
+            &mut message,
+            flags | libc::MSG_DONTWAIT | libc::MSG_CMSG_CLOEXEC,
+        )
+    };
+    assert_eq!(result, 1);
+    let rights = control_rights(&control[..message.msg_controllen.min(control.len())]);
+    assert_eq!(rights.len(), 1);
+    // SAFETY: the receive installed this descriptor once, for this frame.
+    unsafe { std::fs::File::from_raw_fd(rights[0]) }
+}
+
+/// An epoll right queued in a socket that is itself queued in another socket
+/// keeps the outer socket in the run too: the export of the outer socket, by a
+/// message that may leave the run, is refused by name before any effect
+/// (`SOCKET_EXPORT_REFUSAL`), while the epoll is in flight. No record says
+/// which queue holds the epoll, so every Unix socket waits. Received in the
+/// run, through both queues, and closed, the epoll ends with its last owner:
+/// the outer epoll that watched it reports nothing at the exit.
+#[test]
+fn an_epoll_queued_two_sockets_deep_keeps_the_outer_socket_in_the_run() {
+    let root = TestDir::new();
+    let memory = pidfd_test_memory();
+    let mut state = test_state(&root.0);
+    let (outside, inside) = std::os::unix::net::UnixStream::pair().unwrap();
+    assert!(
+        state
+            .insert_file(
+                PIDFD_TEST_OUTSIDE,
+                std::fs::File::from(std::os::fd::OwnedFd::from(inside)),
+            )
+            .is_empty()
+    );
+    let mut parent = ElfExecutor::new(state, false);
+    let mut child = parent.fork_child(2, false, false).unwrap();
+    pidfd_test_close(
+        &mut child,
+        &pidfd_test_memory(),
+        i64::from(PIDFD_TEST_OUTSIDE),
+    );
+    let pidfd = pidfd_test_open(&mut parent, &memory, 2, 0);
+    let (inner_sender, inner_receiver) =
+        pidfd_test_socket_pair(&mut parent, &memory, libc::SOCK_DGRAM | libc::SOCK_NONBLOCK);
+    let (outer_sender, outer_receiver) =
+        pidfd_test_socket_pair(&mut parent, &memory, libc::SOCK_DGRAM | libc::SOCK_NONBLOCK);
+    let inner = pidfd_test_call(&mut parent, &memory, libc::SYS_epoll_create1, [0; 6]);
+    let outer = pidfd_test_call(&mut parent, &memory, libc::SYS_epoll_create1, [0; 6]);
+    assert!(inner >= 0 && outer >= 0);
+    assert_eq!(
+        pidfd_test_epoll_ctl(
+            &mut parent,
+            &memory,
+            inner,
+            libc::EPOLL_CTL_ADD,
+            pidfd,
+            libc::EPOLLIN as u32,
+            0x1110,
+        ),
+        0
+    );
+    assert_eq!(
+        pidfd_test_epoll_ctl(
+            &mut parent,
+            &memory,
+            outer,
+            libc::EPOLL_CTL_ADD,
+            inner,
+            libc::EPOLLIN as u32,
+            0x1410,
+        ),
+        0
+    );
+    assert_eq!(
+        pidfd_test_send_rights(&mut parent, &memory, inner_sender, &[inner as libc::c_int]),
+        1
+    );
+    pidfd_test_close(&mut parent, &memory, inner);
+    assert_eq!(
+        pidfd_test_send_rights(
+            &mut parent,
+            &memory,
+            outer_sender,
+            &[inner_receiver as libc::c_int],
+        ),
+        1,
+        "a socket sent in the run is admitted while the epoll is in flight"
+    );
+    assert_eq!(parent.take_unsupported_refusal(), None);
+    pidfd_test_close(&mut parent, &memory, inner_receiver);
+    assert_eq!(
+        pidfd_test_send_rights(
+            &mut parent,
+            &memory,
+            i64::from(PIDFD_TEST_OUTSIDE),
+            &[outer_receiver as libc::c_int],
+        ),
+        negative_errno(libc::ENOSYS),
+        "the outer socket, with the epoll two queues deep, stays in the run"
+    );
+    assert_eq!(
+        parent.take_unsupported_refusal(),
+        pidfd_test_socket_export_refusal()
+    );
+    let (result, rights, _, _) =
+        pidfd_test_native_receive(outside.as_raw_fd(), RIGHTS_CONTROL_CAPACITY);
+    let empty_errno = std::io::Error::last_os_error().raw_os_error();
+    assert_eq!(
+        (result, rights, empty_errno),
+        (-1, 0, Some(libc::EAGAIN)),
+        "nothing reached the receiver outside the run"
+    );
+    assert_eq!(epoll_rights_in_flight(&parent.state), 1);
+    let (result, sockets, _) = pidfd_test_receive_rights(
+        &mut parent,
+        &memory,
+        outer_receiver,
+        0,
+        RIGHTS_CONTROL_CAPACITY,
+    );
+    assert_eq!((result, sockets.len()), (1, 1));
+    let (result, epolls, _) = pidfd_test_receive_rights(
+        &mut parent,
+        &memory,
+        i64::from(sockets[0]),
+        0,
+        RIGHTS_CONTROL_CAPACITY,
+    );
+    assert_eq!((result, epolls.len()), (1, 1));
+    assert_eq!(epoll_rights_in_flight(&parent.state), 0);
+    for closing in [
+        i64::from(epolls[0]),
+        i64::from(sockets[0]),
+        outer_receiver,
+        outer_sender,
+        inner_sender,
+        i64::from(PIDFD_TEST_OUTSIDE),
+    ] {
+        pidfd_test_close(&mut parent, &memory, closing);
+    }
+    drop(outside);
+
+    pidfd_test_exit(&mut parent, &mut child);
+    let events = pidfd_test_epoll_wait(&mut parent, &memory, outer);
+    pidfd_test_reap(&mut parent, &memory, 2);
+    pidfd_test_close(&mut parent, &memory, outer);
+    pidfd_test_close(&mut parent, &memory, pidfd);
+    assert!(
+        events.is_empty(),
+        "the epoll's last owner closed in the run; the outer epoll stays quiet: {events:?}"
+    );
+}
+
+/// An end of a socket pair the run made that leaves the run in the queue of
+/// another socket, which a message that may leave the run carries, takes its
+/// pair out of the run: every pair recorded before the export is forgotten
+/// (`admit_socket_export`). So a send of an epoll over the pair's other end
+/// is refused by name before any effect (`EPOLL_EXPORT_REFUSAL`), though no
+/// message carried that end alone, and the receiver outside the run, which
+/// holds it, gets nothing.
+#[test]
+fn a_socket_pair_whose_end_left_inside_another_socket_carries_no_epoll() {
+    let root = TestDir::new();
+    let memory = pidfd_test_memory();
+    let mut state = test_state(&root.0);
+    let (outside, inside) = std::os::unix::net::UnixStream::pair().unwrap();
+    assert!(
+        state
+            .insert_file(
+                PIDFD_TEST_OUTSIDE,
+                std::fs::File::from(std::os::fd::OwnedFd::from(inside)),
+            )
+            .is_empty()
+    );
+    let mut parent = ElfExecutor::new(state, false);
+    let epoll = pidfd_test_call(&mut parent, &memory, libc::SYS_epoll_create1, [0; 6]);
+    assert!(epoll >= 0);
+    let (sender, receiver) =
+        pidfd_test_socket_pair(&mut parent, &memory, libc::SOCK_DGRAM | libc::SOCK_NONBLOCK);
+    let (carrier_sender, carrier) =
+        pidfd_test_socket_pair(&mut parent, &memory, libc::SOCK_DGRAM | libc::SOCK_NONBLOCK);
+    assert_eq!(
+        pidfd_test_send_rights(
+            &mut parent,
+            &memory,
+            carrier_sender,
+            &[receiver as libc::c_int],
+        ),
+        1
+    );
+    pidfd_test_close(&mut parent, &memory, receiver);
+    assert_eq!(
+        pidfd_test_send_rights(
+            &mut parent,
+            &memory,
+            i64::from(PIDFD_TEST_OUTSIDE),
+            &[carrier as libc::c_int],
+        ),
+        1,
+        "with no epoll right in flight, a socket may leave the run"
+    );
+    assert_eq!(parent.take_unsupported_refusal(), None);
+    let native_carrier = pidfd_test_native_take_right(outside.as_raw_fd(), 0);
+    let native_receiver = pidfd_test_native_take_right(native_carrier.as_raw_fd(), 0);
+    assert_eq!(
+        pidfd_test_send_rights(&mut parent, &memory, sender, &[epoll as libc::c_int]),
+        negative_errno(libc::ENOSYS),
+        "the pair's other end is held outside the run"
+    );
+    assert_eq!(
+        parent.take_unsupported_refusal(),
+        pidfd_test_epoll_export_refusal()
+    );
+    assert_eq!(epoll_rights_in_flight(&parent.state), 0);
+    let (result, rights, _, _) =
+        pidfd_test_native_receive(native_receiver.as_raw_fd(), RIGHTS_CONTROL_CAPACITY);
+    let empty_errno = std::io::Error::last_os_error().raw_os_error();
+    assert_eq!(
+        (result, rights, empty_errno),
+        (-1, 0, Some(libc::EAGAIN)),
+        "nothing reached the receiver outside the run"
+    );
+    drop(native_receiver);
+    drop(native_carrier);
+    for closing in [
+        epoll,
+        sender,
+        carrier_sender,
+        carrier,
+        i64::from(PIDFD_TEST_OUTSIDE),
+    ] {
+        pidfd_test_close(&mut parent, &memory, closing);
+    }
+}
+
+/// An end of a socket pair the run made that crosses the run in a message
+/// while no guest holds it gets a new identity when a guest receives it, as
+/// every description that no guest holds does. Its pair's record names the
+/// old identity, and a socket that a host reusing the inode number put at
+/// the same host object would not match it either, so the record no longer
+/// proves the pair (`sends_into_the_run`): a send of an epoll over the
+/// received end is refused by name before any effect
+/// (`EPOLL_EXPORT_REFUSAL`). The other end, which a guest held throughout,
+/// still sends one into the run.
+#[test]
+fn a_socket_pair_end_received_after_no_guest_held_it_carries_no_epoll() {
+    let root = TestDir::new();
+    let memory = pidfd_test_memory();
+    let mut parent = ElfExecutor::new(test_state(&root.0), false);
+    let epoll = pidfd_test_call(&mut parent, &memory, libc::SYS_epoll_create1, [0; 6]);
+    assert!(epoll >= 0);
+    let (kept, crossing) =
+        pidfd_test_socket_pair(&mut parent, &memory, libc::SOCK_DGRAM | libc::SOCK_NONBLOCK);
+    let (carrier_sender, carrier) =
+        pidfd_test_socket_pair(&mut parent, &memory, libc::SOCK_DGRAM | libc::SOCK_NONBLOCK);
+    assert_eq!(
+        pidfd_test_send_rights(
+            &mut parent,
+            &memory,
+            carrier_sender,
+            &[crossing as libc::c_int],
+        ),
+        1
+    );
+    pidfd_test_close(&mut parent, &memory, crossing);
+    let (result, rights, _) =
+        pidfd_test_receive_rights(&mut parent, &memory, carrier, 0, RIGHTS_CONTROL_CAPACITY);
+    assert_eq!((result, rights.len()), (1, 1));
+    let crossed = i64::from(rights[0]);
+    assert_eq!(
+        pidfd_test_send_rights(&mut parent, &memory, crossed, &[epoll as libc::c_int]),
+        negative_errno(libc::ENOSYS),
+        "the received end's identity is not the one its pair's record names"
+    );
+    assert_eq!(
+        parent.take_unsupported_refusal(),
+        pidfd_test_epoll_export_refusal()
+    );
+    assert_eq!(epoll_rights_in_flight(&parent.state), 0);
+    assert_eq!(
+        pidfd_test_send_rights(&mut parent, &memory, kept, &[epoll as libc::c_int]),
+        1,
+        "the end a guest held throughout still sends into the run"
+    );
+    assert_eq!(parent.take_unsupported_refusal(), None);
+    let (result, rights, _) =
+        pidfd_test_receive_rights(&mut parent, &memory, crossed, 0, RIGHTS_CONTROL_CAPACITY);
+    assert_eq!((result, rights.len()), (1, 1));
+    assert_eq!(epoll_rights_in_flight(&parent.state), 0);
+    for closing in [
+        i64::from(rights[0]),
+        epoll,
+        kept,
+        crossed,
+        carrier_sender,
+        carrier,
+    ] {
+        pidfd_test_close(&mut parent, &memory, closing);
+    }
+}
+
+/// A hold deferred while two peek windows are open waits for the newer one
+/// as well (`PeekWindow`): opened before the epoll's last right was taken,
+/// it may have got the epoll, and here its native peek did. The older
+/// window's close releases nothing. The newer window's lookup then joins
+/// the epoll's identity, pidfd registration and all, and the epoll ends once
+/// that window and its frame are done.
+#[test]
+fn an_older_peek_window_closing_first_keeps_the_hold_a_newer_one_may_need() {
+    let root = TestDir::new();
+    let memory = pidfd_test_memory();
+    let (mut parent, _target) = pidfd_test_family(&root, 2);
+    let pidfd = pidfd_test_open(&mut parent, &memory, 2, 0);
+    let shadow = pidfd_test_shadow_link(&parent, pidfd);
+    let (sender, receiver) =
+        pidfd_test_socket_pair(&mut parent, &memory, libc::SOCK_DGRAM | libc::SOCK_NONBLOCK);
+    // Separate descriptor tables for the two peeks.
+    let peekers = [
+        parent.fork_child(3, false, false).unwrap(),
+        parent.fork_child(4, false, false).unwrap(),
+    ];
+    let epoll = pidfd_test_call(&mut parent, &memory, libc::SYS_epoll_create1, [0; 6]);
+    assert!(epoll >= 0);
+    assert_eq!(
+        pidfd_test_epoll_ctl(
+            &mut parent,
+            &memory,
+            epoll,
+            libc::EPOLL_CTL_ADD,
+            pidfd,
+            libc::EPOLLIN as u32,
+            1,
+        ),
+        0
+    );
+    assert_eq!(
+        pidfd_test_send_rights(&mut parent, &memory, sender, &[epoll as libc::c_int]),
+        1
+    );
+    pidfd_test_close(&mut parent, &memory, epoll);
+    // Two peeks begin while the epoll is in flight, the older first.
+    let older_call = peekers[0].state.private_copy_gate.call_scope();
+    let older = PeekWindow::open(&peekers[0].state);
+    let newer_call = peekers[1].state.private_copy_gate.call_scope();
+    let newer = PeekWindow::open(&peekers[1].state);
+    // The newer peek's native receive gets the epoll. Scheduling seam: its
+    // frame has not looked the epoll up yet.
+    let peeked = pidfd_test_native_take_right(
+        host_fd(&peekers[1].state, receiver as libc::c_int).unwrap(),
+        libc::MSG_PEEK,
+    );
+    // The parent's receive takes the last right, and its descriptor closes.
+    let (result, rights, _) =
+        pidfd_test_receive_rights(&mut parent, &memory, receiver, 0, RIGHTS_CONTROL_CAPACITY);
+    assert_eq!((result, rights.len()), (1, 1));
+    pidfd_test_close(&mut parent, &memory, i64::from(rights[0]));
+    assert_eq!(epoll_rights_in_flight(&parent.state), 0);
+    assert_eq!(epoll_transfer_census(&parent.state), (1, 2, 1));
+    drop(older);
+    older_call.end(peekers[0].state.tid).unwrap();
+    assert_eq!(
+        (
+            epoll_transfer_census(&parent.state),
+            pidfd_test_record(&parent, pidfd).epoll_registrations(),
+        ),
+        ((1, 1, 1), 1),
+        "the older window's close keeps the hold the newer window may need"
+    );
+    let (identity, holds) = received_epoll(&peekers[1].state, &peeked, true)
+        .unwrap()
+        .unwrap();
+    assert!(
+        !identity.came_from_outside(),
+        "the newer window's lookup joins the epoll's identity"
+    );
+    assert_eq!(pidfd_test_record(&parent, pidfd).epoll_registrations(), 1);
+    drop((identity, holds, peeked, newer));
+    newer_call.end(peekers[1].state.tid).unwrap();
+    assert_eq!(
+        (
+            epoll_transfer_census(&parent.state),
+            epoll_rights_in_flight(&parent.state),
+            pidfd_test_record(&parent, pidfd).epoll_registrations(),
+            pidfd_test_socket_descriptors(&shadow),
+        ),
+        ((0, 0, 0), 0, 0, 1)
+    );
+    for socket in [sender, receiver] {
+        pidfd_test_close(&mut parent, &memory, socket);
+    }
 }

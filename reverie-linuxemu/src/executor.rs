@@ -582,9 +582,10 @@ pub fn native_loaded_state(cwd: &std::path::Path) -> LoadedStaticElf {
             objects: std::collections::BTreeMap::new(),
             proc_transfers: std::collections::BTreeMap::new(),
             epoll_transfers: Vec::new(),
-            open_peek_windows: 0,
+            next_peek_window: 0,
+            open_peek_windows: std::collections::BTreeSet::new(),
             peek_window_holds: Vec::new(),
-            lost_right_receives: 0,
+            socket_peers: std::collections::BTreeMap::new(),
         })),
     }
 }
