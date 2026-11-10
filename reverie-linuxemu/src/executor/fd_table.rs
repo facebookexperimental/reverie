@@ -223,6 +223,18 @@ impl FileTableState {
                     .map(|pidfd| (*fd, pidfd))
             })
             .collect();
+        // The epolls of the retired entries, for the calls that reached their
+        // copies to hold. The retiring task holds each until its call ends
+        // (`LoadedStaticElf::retired_epolls`), so none has ended yet.
+        let retired_epolls: std::collections::BTreeMap<_, _> = retired
+            .iter()
+            .filter_map(
+                |(fd, _)| match &self.slots.get(fd)?.native_poll.as_ref()?.description {
+                    NativePollDescription::Epoll(epoll) => Some((*fd, epoll.clone())),
+                    NativePollDescription::EventFd(_) => None,
+                },
+            )
+            .collect();
         // A copy that this process's descriptor limits would not let the
         // retirement replace ends the run before anything changes: the table,
         // every copy and every record stay as they were.
@@ -250,6 +262,7 @@ impl FileTableState {
             &retired,
             retired_stdin.as_ref(),
             &retired_pidfds,
+            &retired_epolls,
         );
         next.private_copies.register(state);
         // Past the check, the guest's change is published whatever the
@@ -1079,7 +1092,8 @@ impl PrivateCopies {
     /// Deals with each copy that a task other than `publisher` holds of a
     /// retired entry (`retired`, with stdin's old identity when it changed):
     /// leaves a reached one to its call, with the entry's pidfd record in
-    /// `retired_pidfds` if it names one, and replaces any other
+    /// `retired_pidfds` if it names one, and a hold on its epoll in
+    /// `retired_epolls` if it is one, and replaces any other
     /// ([`CopyLedger::retire_copy`]). A copy leaves its task's record only
     /// once that is done; one that could not be replaced stays, and is
     /// returned. A task whose gate is closed holds no copy and is forgotten.
@@ -1089,6 +1103,7 @@ impl PrivateCopies {
         retired: &[(i32, Option<Arc<crate::elf::FdEntry>>)],
         retired_stdin: Option<&Arc<()>>,
         retired_pidfds: &std::collections::BTreeMap<i32, Arc<GuestPidfd>>,
+        retired_epolls: &std::collections::BTreeMap<i32, Arc<EpollIdentity>>,
     ) -> Vec<UnreplacedCopy> {
         let mut unreplaced = Vec::new();
         if retired.is_empty() && retired_stdin.is_none() {
@@ -1113,7 +1128,7 @@ impl PrivateCopies {
                 continue;
             }
             for (fd, host) in targets {
-                match ledger.retire_copy(host, retired_pidfds.get(&fd)) {
+                match ledger.retire_copy(host, retired_pidfds.get(&fd), retired_epolls.get(&fd)) {
                     Ok(()) => {
                         task.files.remove(&fd);
                     }
@@ -1133,7 +1148,7 @@ impl PrivateCopies {
                 }
             }
             if let Some(host) = stdin {
-                match ledger.retire_copy(host, None) {
+                match ledger.retire_copy(host, None, None) {
                     Ok(()) => task.stdin = None,
                     Err(failure) => {
                         if failure.replaced() {
@@ -1195,6 +1210,11 @@ struct CopyLedger {
     /// finds a pidfd's copy finds its record, however the call and the
     /// retirement interleave.
     deferred_pidfds: Vec<Arc<GuestPidfd>>,
+    /// A hold on the epoll of each of those entries that is an epoll: the
+    /// call owns the epoll until it ends, as Linux's `fdget` holds the file
+    /// for the call that looked it up, so the epoll, and its pidfd
+    /// registrations, outlive its last descriptor's close until then.
+    deferred_epolls: Vec<EpollHold>,
     /// Copies a retirement replaced with the placeholder. The task treats
     /// each as closed until its next install replaces it.
     revoked: std::collections::BTreeSet<RawFd>,
@@ -1213,6 +1233,7 @@ impl Default for CopyLedger {
             reached: Default::default(),
             deferred: Default::default(),
             deferred_pidfds: Vec::new(),
+            deferred_epolls: Vec::new(),
             revoked: Default::default(),
             foreign: Default::default(),
         }
@@ -1235,12 +1256,14 @@ impl CopyLedger {
 
     /// A retirement's part for one copy: leaves a reached copy to its call,
     /// with `pidfd`, the record of the pidfd its entry is, if it is one, and
-    /// otherwise replaces it now. A descriptor that is no longer the task's
-    /// copy is left alone.
+    /// a hold on `epoll`, the epoll its entry is, if it is one; otherwise
+    /// replaces it now. A descriptor that is no longer the task's copy is
+    /// left alone.
     fn retire_copy(
         &mut self,
         host: RawFd,
         pidfd: Option<&Arc<GuestPidfd>>,
+        epoll: Option<&Arc<EpollIdentity>>,
     ) -> Result<(), ReplaceFailure> {
         if self.foreign.contains(&host) {
             return Ok(());
@@ -1248,6 +1271,7 @@ impl CopyLedger {
         if self.reached.contains(&host) {
             self.deferred.insert(host);
             self.deferred_pidfds.extend(pidfd.cloned());
+            self.deferred_epolls.extend(epoll.map(EpollHold::new));
             return Ok(());
         }
         let result = replace_copy(host);
@@ -1333,14 +1357,17 @@ impl PrivateCopyGate {
     /// description: its descriptor stays open, for its owner to close, on
     /// the placeholder. A retirement after this skips the task.
     pub(crate) fn close<'a>(&self, copies: impl IntoIterator<Item = &'a std::fs::File>) {
-        // Declared before the ledger's guard, so that the pidfd records a
-        // call kept are dropped once the guard is released.
-        let _kept_pidfds;
+        // Declared before the ledger's guard, so that the pidfd records and
+        // epoll holds a call kept are dropped once the guard is released.
+        let _kept;
         let mut ledger = self.ledger();
         ledger.open = false;
         ledger.reached.clear();
         ledger.deferred.clear();
-        _kept_pidfds = std::mem::take(&mut ledger.deferred_pidfds);
+        _kept = (
+            std::mem::take(&mut ledger.deferred_pidfds),
+            std::mem::take(&mut ledger.deferred_epolls),
+        );
         // A copy that cannot be replaced without raising the soft limit
         // keeps its description until its owner closes it, later in this
         // exit: the exit raises no limit.
@@ -1383,13 +1410,16 @@ impl CallScope {
     }
 
     fn finish(ledger: &Mutex<CopyLedger>, tid: i32) -> crate::Result<()> {
-        // Declared before the ledger's guard, so that the pidfd records the
-        // call kept are dropped once the guard is released.
-        let _kept_pidfds;
+        // Declared before the ledger's guard, so that the pidfd records and
+        // epoll holds the call kept are dropped once the guard is released.
+        let _kept;
         let mut ledger = ledger
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        _kept_pidfds = std::mem::take(&mut ledger.deferred_pidfds);
+        _kept = (
+            std::mem::take(&mut ledger.deferred_pidfds),
+            std::mem::take(&mut ledger.deferred_epolls),
+        );
         ledger.in_call = false;
         ledger.reached.clear();
         if !ledger.open {

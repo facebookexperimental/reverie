@@ -1135,6 +1135,11 @@ impl ElfExecutor {
         // The call has published any pidfd it opened: its table holds the
         // record from here (`LoadedStaticElf::pidfd_holds`).
         self.state.pidfd_holds.clear();
+        // Its publication has left each copy of an epoll entry it retired
+        // that another thread's call reached to that call, with a hold of
+        // its own, so the entries' ownership goes now, with no lock held
+        // (`LoadedStaticElf::retired_epolls`).
+        self.state.retired_epolls.clear();
         if let Some(failure) = memory.entry_gate().pending_failure() {
             return Err(failure.error());
         }

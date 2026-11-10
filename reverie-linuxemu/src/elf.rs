@@ -355,6 +355,9 @@ pub struct GuestFileIdentityTable {
     /// keyed by their pinned backing memfd.
     pub proc_transfers:
         std::collections::BTreeMap<(libc::dev_t, libc::ino_t), crate::executor::ProcTransfer>,
+    /// Epolls sent with SCM_RIGHTS and not yet received
+    /// (`crate::executor::EpollTransfer`).
+    pub(crate) epoll_transfers: Vec<crate::executor::EpollTransfer>,
 }
 
 /// Process-tree-wide state whose lifetime follows a guest task rather than an
@@ -1336,6 +1339,11 @@ pub struct LoadedStaticElf {
     pub(crate) poll_table_id: std::sync::Arc<crate::executor::NativePollTable>,
     pub(crate) native_poll_fds:
         std::collections::BTreeMap<i32, std::sync::Arc<crate::executor::NativePollBinding>>,
+    /// The epoll entries this task's current call retired, each as a hold
+    /// on its epoll (`NativePollBinding::retire`), released when the call
+    /// ends, after its publication has left any copy of them that another
+    /// thread's call reached to that call (`CopyLedger::retire_copy`).
+    pub(crate) retired_epolls: Vec<crate::executor::EpollHold>,
     pub stdout_alias_fds: std::collections::BTreeSet<i32>,
     pub stderr_alias_fds: std::collections::BTreeSet<i32>,
     // AUTONOMOUS-BOT-IMPLEMENTED: Model guest close-on-exec state independently.
@@ -1471,21 +1479,20 @@ impl LoadedStaticElf {
         stdin
     }
 
-    /// Retires `fd`'s native poll binding under the epoll domain lock. Once
-    /// that leaf lock is released, it ends the epoll whose last descriptor
-    /// this was and drops the binding: an epoll's end ends its pidfd
-    /// registrations, which closes host descriptors (`EpollIdentity`).
+    /// Retires `fd`'s native poll binding under the epoll domain lock, and
+    /// drops the binding once that leaf lock is released. An epoll entry's
+    /// ownership goes to `retired_epolls`, for the call's end to release:
+    /// the epoll's end ends its pidfd registrations, which closes host
+    /// descriptors (`EpollIdentity`).
     fn retire_native_poll(&mut self, fd: i32) {
-        let (_binding, ended) = {
+        let (_binding, retired) = {
             let domain = self.epoll_domain.clone();
             let _proof = domain.lock().expect("KVM epoll provenance lock poisoned");
             let binding = self.native_poll_fds.remove(&fd);
-            let ended = binding.as_ref().and_then(|binding| binding.retire());
-            (binding, ended)
+            let retired = binding.as_ref().and_then(|binding| binding.retire());
+            (binding, retired)
         };
-        if let Some(epoll) = ended {
-            epoll.end();
-        }
+        self.retired_epolls.extend(retired);
     }
 
     pub(crate) fn remove_file(&mut self, fd: i32) -> Option<std::fs::File> {
@@ -1606,6 +1613,7 @@ impl LoadedStaticElf {
             epoll_domain,
             poll_table_id,
             native_poll_fds,
+            retired_epolls: Vec::new(),
             stdout_alias_fds,
             stderr_alias_fds,
             cloexec_fds,
@@ -1650,12 +1658,12 @@ impl LoadedStaticElf {
         let regular_create_directory_policy = previous.regular_create_directory_policy;
         let host_vm_facts = previous.host_vm_facts;
         let cloexec_fds = previous.cloexec_fds;
-        // The epolls whose last descriptors were close-on-exec end, and the
-        // close-on-exec bindings drop, once the epoll domain lock, a leaf, is
-        // released: an epoll's end ends its pidfd registrations
-        // (`EpollIdentity`).
+        // The close-on-exec bindings drop once the epoll domain lock, a leaf,
+        // is released, and their epoll entries join the call's retired ones,
+        // which its end releases (`retired_epolls`): an epoll's end ends its
+        // pidfd registrations (`EpollIdentity`).
         let mut retired_bindings = Vec::new();
-        let mut ended_epolls = Vec::new();
+        let mut retired_epolls = previous.retired_epolls;
         let native_poll_fds = {
             let _proof = previous
                 .epoll_domain
@@ -1666,7 +1674,7 @@ impl LoadedStaticElf {
                 .into_iter()
                 .filter_map(|(fd, binding)| {
                     if cloexec_fds.contains(&fd) {
-                        ended_epolls.extend(binding.retire());
+                        retired_epolls.extend(binding.retire());
                         retired_bindings.push(binding);
                         None
                     } else {
@@ -1675,10 +1683,8 @@ impl LoadedStaticElf {
                 })
                 .collect()
         };
-        for epoll in ended_epolls {
-            epoll.end();
-        }
         drop(retired_bindings);
+        self.retired_epolls.extend(retired_epolls);
         let mut retired = Vec::new();
         previous
             .file_retirement
@@ -2519,6 +2525,7 @@ fn load_executable(
         epoll_domain: Default::default(),
         poll_table_id: Default::default(),
         native_poll_fds: Default::default(),
+        retired_epolls: Vec::new(),
         stdout_alias_fds: std::collections::BTreeSet::new(),
         stderr_alias_fds: std::collections::BTreeSet::new(),
         cloexec_fds: std::collections::BTreeSet::new(),
@@ -2535,6 +2542,7 @@ fn load_executable(
             next_inode: 0x2100_0000,
             objects: std::collections::BTreeMap::new(),
             proc_transfers: std::collections::BTreeMap::new(),
+            epoll_transfers: Vec::new(),
         })),
     })
 }

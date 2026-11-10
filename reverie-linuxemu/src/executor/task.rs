@@ -1840,6 +1840,7 @@ impl ElfExecutor {
         self.state.private_copy_gate.close(std::iter::empty());
         self.state.fd_entry_ids.clear();
         self.state.native_poll_fds.clear();
+        self.state.retired_epolls.clear();
         self.state.pipe_owners.clear();
         self.state.guest_pidfds.clear();
         self.state.pidfd_holds.clear();
@@ -1922,6 +1923,7 @@ impl ElfExecutor {
         self.state.fd_entry_ids.clear();
         // Snapshot retirement is not a logical close in a surviving table.
         self.state.native_poll_fds.clear();
+        self.state.retired_epolls.clear();
         self.state.pipe_owners.clear();
         self.state.guest_pidfds.clear();
         self.state.pidfd_holds.clear();
@@ -2598,6 +2600,10 @@ impl ElfExecutor {
         self.clear_child_tid = None;
         drop(_transaction);
         drop(files);
+        // The close-on-exec epoll entries the publication retired go now,
+        // with no lock held, as a call's do at its end
+        // (`LoadedStaticElf::retired_epolls`).
+        self.state.retired_epolls.clear();
         published
     }
 

@@ -56,6 +56,7 @@
 use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
+use std::os::fd::RawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -234,22 +235,43 @@ fn file_name(fd: libc::c_int) -> Option<Vec<u8>> {
     (!name.is_empty()).then_some(name)
 }
 
-/// Whether host descriptors `a` and `b` are one open file description.
-fn same_description(a: &std::fs::File, b: &std::fs::File) -> bool {
+#[cfg(test)]
+thread_local! {
+    /// Makes this thread's next `compare_descriptions` fail its `kcmp`, as a
+    /// kernel without `CONFIG_KCMP` (ENOSYS) or a policy that denies it
+    /// (EPERM) would.
+    pub(crate) static KCMP_FAILS_TEST_HOOK: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Whether host descriptors `a` and `b` are one open file description, or
+/// `None` if `kcmp` fails.
+pub(crate) fn compare_descriptions(a: RawFd, b: RawFd) -> Option<bool> {
+    #[cfg(test)]
+    if KCMP_FAILS_TEST_HOOK.with(|fails| fails.replace(false)) {
+        return None;
+    }
     const KCMP_FILE: libc::c_int = 0;
     // SAFETY: getpid has no preconditions.
     let pid = unsafe { libc::getpid() };
     // SAFETY: kcmp reads no memory of this process.
-    unsafe {
+    let answer = unsafe {
         libc::syscall(
             libc::SYS_kcmp,
             pid,
             pid,
             KCMP_FILE,
-            a.as_raw_fd() as libc::c_ulong,
-            b.as_raw_fd() as libc::c_ulong,
-        ) == 0
-    }
+            a as libc::c_ulong,
+            b as libc::c_ulong,
+        )
+    };
+    (answer >= 0).then_some(answer == 0)
+}
+
+/// Whether host descriptors `a` and `b` are one open file description. A
+/// `kcmp` that fails answers no.
+fn same_description(a: &std::fs::File, b: &std::fs::File) -> bool {
+    compare_descriptions(a.as_raw_fd(), b.as_raw_fd()) == Some(true)
 }
 
 /// What a process's image fixed that its list reads: where its first

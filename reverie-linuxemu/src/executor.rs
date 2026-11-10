@@ -561,6 +561,7 @@ pub fn native_loaded_state(cwd: &std::path::Path) -> LoadedStaticElf {
         epoll_domain: Default::default(),
         poll_table_id: Default::default(),
         native_poll_fds: Default::default(),
+        retired_epolls: Vec::new(),
         stdout_alias_fds: std::collections::BTreeSet::new(),
         stderr_alias_fds: std::collections::BTreeSet::new(),
         cloexec_fds: std::collections::BTreeSet::new(),
@@ -578,6 +579,7 @@ pub fn native_loaded_state(cwd: &std::path::Path) -> LoadedStaticElf {
             next_inode: 0x2100_0000,
             objects: std::collections::BTreeMap::new(),
             proc_transfers: std::collections::BTreeMap::new(),
+            epoll_transfers: Vec::new(),
         })),
     }
 }

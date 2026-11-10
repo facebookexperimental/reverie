@@ -988,6 +988,34 @@ pub(super) fn host_read(memory: &mut GuestMemory, fd: RawFd, address: u64, lengt
     finish_host_read(memory, address, &bytes, count)
 }
 
+/// [`host_read`] for a guest's read of host descriptor `fd`. While rights
+/// this backend tracks are in flight, a socket's read receives the rights of
+/// the message it consumes, which Linux discards, to release them
+/// (`receive_discarding_rights`).
+fn guest_host_read(
+    memory: &mut GuestMemory,
+    state: &LoadedStaticElf,
+    fd: RawFd,
+    address: u64,
+    length: usize,
+) -> i64 {
+    if !reads_tracked_rights(state, fd) {
+        return host_read(memory, fd, address, length);
+    }
+    let mut bytes = match prepare_host_read(&ProviderMemory(memory), address, length) {
+        Ok(bytes) => bytes,
+        Err(error) => return error,
+    };
+    let mut iov = libc::iovec {
+        iov_base: bytes.as_mut_ptr().cast(),
+        iov_len: bytes.len(),
+    };
+    match receive_discarding_rights(state, fd, std::slice::from_mut(&mut iov), 0, None) {
+        Ok(count) => finish_host_read(memory, address, &bytes, count as isize),
+        Err(error) => io_error(error),
+    }
+}
+
 fn finish_host_read(memory: &mut GuestMemory, address: u64, bytes: &[u8], count: isize) -> i64 {
     let count = count as usize;
     if count == 0 {
@@ -1101,7 +1129,13 @@ pub(super) fn read(
         if !range_is_valid(&ProviderMemory(memory), args[1], args[2]) {
             return Ok(negative_errno(libc::EFAULT));
         }
-        return Ok(host_read(memory, stdin.as_raw_fd(), args[1], length));
+        return Ok(guest_host_read(
+            memory,
+            state,
+            stdin.as_raw_fd(),
+            args[1],
+            length,
+        ));
     }
     let Some(file) = state.files.get(&fd) else {
         return Ok(negative_errno(libc::EBADF));
@@ -1181,7 +1215,7 @@ pub(super) fn read(
         Ok(false) => {}
         Err(error) => return Ok(error),
     }
-    Ok(host_read(memory, host_fd, args[1], length))
+    Ok(guest_host_read(memory, state, host_fd, args[1], length))
 }
 
 pub(super) fn pread64<M: GuestMemoryAccess<Error = crate::Error> + AddressSpace>(
@@ -1738,11 +1772,38 @@ fn invoke_vectored_write_reporting(
 }
 
 fn invoke_vectored_read(
+    state: &LoadedStaticElf,
     number: libc::c_long,
     host_fd: RawFd,
     host_iovecs: &mut [libc::iovec],
     args: &[u64; 6],
 ) -> i64 {
+    // As for read: a readv of a socket, or a preadv2 at its current position,
+    // receives the rights it consumes while tracked rights are in flight
+    // (`guest_host_read`). Linux returns 0 for a read of no byte before it
+    // reaches the socket (`sock_read_iter`), and refuses RWF_ATOMIC and
+    // RWF_DONTCACHE for a socket before reading (`kiocb_set_rw_flags`); the
+    // host call below gives both.
+    let flags = if number == libc::SYS_preadv2 {
+        args[5] as libc::c_int
+    } else {
+        0
+    };
+    if (number == libc::SYS_readv || number == libc::SYS_preadv2 && args[3] as i64 == -1)
+        && host_iovecs.iter().any(|vector| vector.iov_len != 0)
+        && flags & (libc::RWF_ATOMIC | libc::RWF_DONTCACHE) == 0
+        && reads_tracked_rights(state, host_fd)
+    {
+        let receive = if flags & libc::RWF_NOWAIT != 0 {
+            libc::MSG_DONTWAIT
+        } else {
+            0
+        };
+        return match receive_discarding_rights(state, host_fd, host_iovecs, receive, None) {
+            Ok(count) => count as i64,
+            Err(error) => io_error(error),
+        };
+    }
     // SAFETY: every host iovec points into a live writable buffer for its
     // declared length, and host_fd belongs to the translated guest descriptor.
     let result = unsafe {
@@ -2067,7 +2128,7 @@ fn staged_vectored_transfer<M: GuestMemoryAccess<Error = crate::Error> + Address
     } else {
         None
     };
-    let result = invoke_vectored_read(number, host_fd, &mut host_iovecs, args);
+    let result = invoke_vectored_read(state, number, host_fd, &mut host_iovecs, args);
     if result >= 0 {
         let mut remaining = result as usize;
         for vector in &staged_vectors {

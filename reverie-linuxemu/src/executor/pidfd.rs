@@ -51,11 +51,10 @@ struct EpollKey {
 /// One epoll's registration of an epoll key.
 #[derive(Debug)]
 struct KeyRegistration {
-    /// The epoll's identity, whose end ends the registration. An epoll that
-    /// has none, as one received in an `SCM_RIGHTS` message has not, is
-    /// `None`: its registration lasts until its DEL or the pidfd's end, as
-    /// does one in an epoll that such a message carried.
-    identity: Option<std::sync::Weak<EpollIdentity>>,
+    /// The epoll's identity, which every descriptor of its open file
+    /// description shares, received ones included, and whose end ends the
+    /// registration.
+    identity: std::sync::Weak<EpollIdentity>,
     /// A host descriptor of the epoll, through which the pidfd's end removes
     /// the registration (`GuestPidfd`'s `Drop`). It goes with the
     /// registration, so it keeps the epoll no longer than the registration
@@ -66,14 +65,10 @@ struct KeyRegistration {
 impl EpollKey {
     /// Where `epolls` holds the registration in the epoll whose identity is
     /// `epoll`.
-    fn position(&self, epoll: Option<&EpollIdentity>) -> Option<usize> {
+    fn position(&self, epoll: &EpollIdentity) -> Option<usize> {
         self.epolls
             .iter()
-            .position(|held| match (&held.identity, epoll) {
-                (Some(held), Some(epoll)) => std::ptr::eq(held.as_ptr(), epoll),
-                (None, None) => true,
-                _ => false,
-            })
+            .position(|held| std::ptr::eq(held.identity.as_ptr(), epoll))
     }
 }
 
@@ -139,24 +134,25 @@ impl GuestPidfd {
     }
 
     /// `epoll_ctl` of `operation` in the epoll with host descriptor
-    /// `epoll_fd` and identity `epoll`, if it has one, for guest descriptor
-    /// number `fd` of the pidfd, which `control` makes on the host
-    /// descriptor it is given: the number's epoll key. An ADD makes the key
-    /// if the number has none and closes it again if the ADD fails; it also
-    /// keeps a host descriptor of the epoll, for the pidfd's end. An ADD
-    /// that cannot make either fails as Linux fails an allocation, ENOMEM,
-    /// before the host sees it. A MOD or DEL of a number without a key names
-    /// the shadow itself, which no registration names, so the host answers
-    /// it as Linux answers for a registration that does not exist: ENOENT,
-    /// after its other checks. A DEL that succeeds closes the key with its
-    /// last registration. A successful ADD also tells the epoll, whose end
-    /// ends the registration ([`Self::epoll_ended`]).
+    /// `epoll_fd` and identity `epoll`, for guest descriptor number `fd` of
+    /// the pidfd, which `control` makes on the host descriptor it is given:
+    /// the number's epoll key. An ADD makes the key if the number has none
+    /// and closes it again if the ADD fails; it also keeps a host descriptor
+    /// of the epoll, for the pidfd's end. An ADD that cannot make either
+    /// fails as Linux fails an allocation, ENOMEM, before the host sees it. A
+    /// MOD or DEL of a number without a key names the shadow itself, which no
+    /// registration names, so the host answers it as Linux answers for a
+    /// registration that does not exist: ENOENT, after its other checks. A
+    /// DEL that succeeds removes the registration in the epoll it named,
+    /// whichever descriptor of the epoll named it, and closes the key with
+    /// its last registration. A successful ADD also tells the epoll, whose
+    /// end ends the registration ([`Self::epoll_ended`]).
     pub(super) fn epoll_control(
         self: &Arc<Self>,
         fd: libc::c_int,
         operation: libc::c_int,
         epoll_fd: RawFd,
-        epoll: Option<&Arc<EpollIdentity>>,
+        epoll: &Arc<EpollIdentity>,
         control: impl FnOnce(RawFd) -> i64,
     ) -> i64 {
         let mut keys = self
@@ -205,35 +201,21 @@ impl GuestPidfd {
                     })
                     .epolls
                     .push(KeyRegistration {
-                        identity: epoll.map(Arc::downgrade),
+                        identity: Arc::downgrade(epoll),
                         epoll: epoll_copy.take().expect("an ADD made its epoll copy"),
                     });
-                // An epoll whose last descriptor another thread closed since
-                // this call found it ends the registration with the call.
-                if let Some(epoll) = epoll
-                    && !epoll.register_pidfd(self, fd)
-                    && let std::collections::btree_map::Entry::Occupied(mut key) = keys.entry(fd)
-                {
-                    if let Some(held) = key.get().position(Some(epoll)) {
-                        key.get_mut().epolls.swap_remove(held);
-                    }
-                    if key.get().epolls.is_empty() {
-                        key.remove();
-                    }
-                }
+                epoll.register_pidfd(self, fd);
             }
             (libc::EPOLL_CTL_DEL, 0) => {
                 if let std::collections::btree_map::Entry::Occupied(mut key) = keys.entry(fd) {
-                    if let Some(held) = key.get().position(epoll.map(Arc::as_ref)) {
+                    if let Some(held) = key.get().position(epoll) {
                         key.get_mut().epolls.swap_remove(held);
                     }
                     if key.get().epolls.is_empty() {
                         key.remove();
                     }
                 }
-                if let Some(epoll) = epoll {
-                    epoll.unregister_pidfd(self, fd);
-                }
+                epoll.unregister_pidfd(self, fd);
             }
             _ => {}
         }
@@ -250,7 +232,7 @@ impl GuestPidfd {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let std::collections::btree_map::Entry::Occupied(mut key) = keys.entry(fd) {
-            if let Some(held) = key.get().position(Some(epoll)) {
+            if let Some(held) = key.get().position(epoll) {
                 key.get_mut().epolls.swap_remove(held);
             }
             if key.get().epolls.is_empty() {
