@@ -988,6 +988,14 @@ impl BirthStop for super::InitialExecStop<'_> {
     }
 }
 
+/// The mapping prepared from a birth's stop, still held by its original owner:
+/// for re-verifying the packet after mapping ([`BirthLeases::verify_at`]).
+impl BirthStop for super::physical::PreparedMapping<'_> {
+    fn duplicate_birth_pidfd_for_inherited(&self, fd: BorrowedFd<'_>) -> Result<OwnedFd> {
+        super::physical::PreparedMapping::duplicate_birth_pidfd_for_inherited(self, fd)
+    }
+}
+
 /// The admission a packet comes from, supplied by the embedder.
 pub trait PacketAdmission {
     /// Refuse unless `birth` is the admission's watched peer.
@@ -1145,6 +1153,33 @@ impl BirthLeases {
 }
 
 impl BirthLeases {
+    /// Re-verify the sealed packet at `stop` (the initial stop, or the mapping
+    /// prepared from it) against `admission`: the lease is not poisoned; `stop`
+    /// is the birth that inherited this exact packet descriptor; that birth is
+    /// the admission's watched peer; the retained descriptor holds exactly the
+    /// sealed bytes; and the admission still yields those bytes. Any failure
+    /// poisons this lease permanently and fails the admission. This grants no
+    /// entry or readiness.
+    pub fn verify_at(&self, stop: &dyn BirthStop, admission: &dyn PacketAdmission) -> Result<()> {
+        let result = self.checked(|| {
+            let bytes = self
+                .sealed
+                .get()
+                .ok_or("mapped packet lease is not filled and sealed")?;
+            let birth = stop.duplicate_birth_pidfd_for_inherited(self.packet.as_fd())?;
+            admission.require_watched_peer(&birth)?;
+            self.verify_packet(bytes)?;
+            require(
+                admission.initial_packet()? == *bytes,
+                "mapped packet no longer matches actual admission",
+            )
+        });
+        if let Err(error) = &result {
+            admission.fail(error);
+        }
+        result
+    }
+
     /// The packet sealed by [`fill_packet`](Self::fill_packet), re-verified
     /// against the retained descriptor.
     fn sealed_packet(&self) -> Result<&[u8]> {
@@ -2416,9 +2451,10 @@ mod tests {
             b"producer-test",
         )
         .unwrap();
-        birth
-            .fill_packet(&stop, &FakeAdmission::new(vec![packet]))
-            .unwrap();
+        let admission = FakeAdmission::new(vec![packet]);
+        birth.fill_packet(&stop, &admission).unwrap();
+        // Re-verified at the initial stop after the fill.
+        birth.leases().verify_at(&stop, &admission).unwrap();
         let successor = ArmingFacts {
             birth: BirthKind::Successor,
             ..facts
@@ -2500,6 +2536,10 @@ mod tests {
                 failure.cleanup()
             ),
         };
+        // Re-verified after mapping, through the prepared mapping that still
+        // holds the stop.
+        birth.leases().verify_at(&prepared, &admission).unwrap();
+        assert!(!admission.failed.get());
         #[cfg(feature = "stage1a-probe")]
         {
             let observed = prepared.diagnostic_observation().unwrap();
@@ -2635,6 +2675,87 @@ mod tests {
         // A refused lease stays refused.
         let good = FakeAdmission::new(vec![b"packet".to_vec()]);
         assert!(leases.fill_packet(&FakeStop, &good).is_err());
+    }
+
+    #[test]
+    fn verify_at_rechecks_poison_birth_peer_bytes_and_admission() {
+        let packet = b"packet".to_vec();
+        let filled = || {
+            let leases = leases();
+            leases
+                .fill_packet(&FakeStop, &FakeAdmission::new(vec![packet.clone()]))
+                .unwrap();
+            leases
+        };
+        // A healthy sealed lease verifies, again and again.
+        let healthy = filled();
+        let admission = FakeAdmission::new(vec![packet.clone()]);
+        healthy.verify_at(&FakeStop, &admission).unwrap();
+        healthy.verify_at(&FakeStop, &admission).unwrap();
+        assert!(!admission.failed.get());
+        assert_eq!(admission.peer_checks.get(), 2);
+        // Each refusal poisons the lease and fails its admission; a later
+        // verification with a good stop and admission is refused as poisoned.
+        let refusals: [(BirthLeases, &dyn BirthStop, FakeAdmission, &str); 4] = [
+            (
+                leases(),
+                &FakeStop,
+                FakeAdmission::new(vec![packet.clone()]),
+                "mapped packet lease is not filled and sealed",
+            ),
+            (
+                filled(),
+                &ForeignStop,
+                FakeAdmission::new(vec![packet.clone()]),
+                "descriptor not inherited by this birth",
+            ),
+            (
+                filled(),
+                &FakeStop,
+                FakeAdmission {
+                    foreign_peer: true,
+                    ..FakeAdmission::new(vec![packet.clone()])
+                },
+                "birth is not the watched peer",
+            ),
+            (
+                filled(),
+                &FakeStop,
+                FakeAdmission::new(vec![b"other".to_vec()]),
+                "mapped packet no longer matches actual admission",
+            ),
+        ];
+        for (leases, stop, admission, why) in refusals {
+            assert_eq!(
+                leases.verify_at(stop, &admission).unwrap_err().to_string(),
+                why
+            );
+            assert!(admission.failed.get(), "{why}");
+            let good = FakeAdmission::new(vec![packet.clone()]);
+            assert_eq!(
+                leases.verify_at(&FakeStop, &good).unwrap_err().to_string(),
+                "mapped packet lease is permanently poisoned",
+                "after {why}"
+            );
+            assert!(good.failed.get());
+        }
+        // A second fill of a sealed lease poisons it, so the old sealed packet
+        // no longer verifies (the poison case the embedder's tests assert).
+        let leases = filled();
+        let again = FakeAdmission::new(vec![packet.clone()]);
+        assert_eq!(
+            leases
+                .fill_packet(&FakeStop, &again)
+                .unwrap_err()
+                .to_string(),
+            "mapped packet lease fill was already attempted"
+        );
+        let old = FakeAdmission::new(vec![packet]);
+        assert_eq!(
+            leases.verify_at(&FakeStop, &old).unwrap_err().to_string(),
+            "mapped packet lease is permanently poisoned"
+        );
+        assert!(old.failed.get());
     }
 
     /// Leases built without an audited image, for the packet tests only.
