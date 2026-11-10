@@ -1316,11 +1316,18 @@ pub struct LoadedStaticElf {
     pub file_retirement: FileRetirement,
     pub(crate) pipe_owners:
         std::collections::BTreeMap<i32, std::sync::Arc<crate::executor::pipe_owner::PipeOwner>>,
-    /// The pidfds for other guest processes (`crate::executor::ForeignPidfd`).
-    /// Every alias of one, from dup or fork, shares its record; insertion and
-    /// removal drop the record of the descriptor they replace.
-    pub(crate) foreign_pidfds:
-        std::collections::BTreeMap<i32, std::sync::Arc<crate::executor::ForeignPidfd>>,
+    /// The pidfds for guest processes (`crate::executor::GuestPidfd`), by
+    /// guest descriptor. Every alias of one, from dup or fork, shares its
+    /// record, which the descriptor tables that hold the pidfd hold: a task
+    /// only names it here, so that a task between calls keeps no pidfd that
+    /// its table has closed. Insertion and removal drop the name of the
+    /// descriptor they replace.
+    pub(crate) guest_pidfds:
+        std::collections::BTreeMap<i32, std::sync::Weak<crate::executor::GuestPidfd>>,
+    /// The pidfd records this task holds that no descriptor table holds yet:
+    /// one its current call opened, until the call has published it, and a
+    /// new task's, until its table holds them.
+    pub(crate) pidfd_holds: Vec<std::sync::Arc<crate::executor::GuestPidfd>>,
     /// Identity of each descriptor entry, independent of its filesystem object.
     /// Insertion, including a dup destination, creates a new identity. Table
     /// snapshots and fork copies retain it so unchanged host handles stay stable.
@@ -1375,8 +1382,8 @@ pub struct LoadedStaticElf {
     /// same syscall boundary, which turns it into the typed refusal
     /// `UnsupportedOperation::Signal`. Never carried across fork or exec.
     pub(crate) signal_refusal: Option<&'static str>,
-    /// Why the call just executed was refused with ENOSYS for a pidfd for
-    /// another process (`crate::executor::ForeignPidfd`), if it was. Taken at
+    /// Why the call just executed was refused with ENOSYS for a pidfd for a
+    /// guest process (`crate::executor::GuestPidfd`), if it was. Taken at
     /// the same syscall boundary as `signal_refusal`, as the typed refusal
     /// `UnsupportedOperation::Pidfd`. Never carried across fork or exec.
     pub(crate) pidfd_refusal: Option<&'static str>,
@@ -1432,7 +1439,7 @@ impl LoadedStaticElf {
             }
         }
         self.pipe_owners.remove(&fd);
-        self.foreign_pidfds.remove(&fd);
+        self.guest_pidfds.remove(&fd);
         let mut retired: Vec<_> = self.files.insert(fd, file).into_iter().collect();
         if fd == libc::STDIN_FILENO {
             retired.extend(self.take_stdin());
@@ -1479,7 +1486,7 @@ impl LoadedStaticElf {
             }
         }
         self.pipe_owners.remove(&fd);
-        self.foreign_pidfds.remove(&fd);
+        self.guest_pidfds.remove(&fd);
         let file = self.files.remove(&fd);
         self.fd_entry_ids.remove(&fd);
         file
@@ -1509,7 +1516,7 @@ impl LoadedStaticElf {
             poll_table_id,
             native_poll_fds,
             pipe_owners,
-            foreign_pidfds,
+            guest_pidfds,
             stdout_alias_fds,
             stderr_alias_fds,
             cloexec_fds,
@@ -1521,6 +1528,11 @@ impl LoadedStaticElf {
         } = descriptors;
         let cwd_fd = self.file_retirement.stage_clone(&self.fs_context.cwd_fd)?;
         let private_copy_gate = crate::executor::PrivateCopyGate::default();
+        // The new task holds its pidfds' records until its table does.
+        let pidfd_names = guest_pidfds
+            .iter()
+            .map(|(&fd, pidfd)| (fd, std::sync::Arc::downgrade(pidfd)))
+            .collect();
         let process_signals = self
             .process_signals
             .lock()
@@ -1583,7 +1595,8 @@ impl LoadedStaticElf {
             signal_refusal: None,
             pidfd_refusal: None,
             pipe_owners,
-            foreign_pidfds,
+            guest_pidfds: pidfd_names,
+            pidfd_holds: guest_pidfds.into_values().collect(),
             fd_entry_ids,
             epoll_domain,
             poll_table_id,
@@ -1679,8 +1692,8 @@ impl LoadedStaticElf {
             .into_iter()
             .filter(|(fd, _)| files.contains_key(fd))
             .collect();
-        let foreign_pidfds = previous
-            .foreign_pidfds
+        let guest_pidfds = previous
+            .guest_pidfds
             .into_iter()
             .filter(|(fd, _)| files.contains_key(fd))
             .collect();
@@ -1816,7 +1829,7 @@ impl LoadedStaticElf {
         self.file_retirement = previous.file_retirement;
         self.pipe_owner_process = previous.pipe_owner_process;
         self.pipe_owners = pipe_owners;
-        self.foreign_pidfds = foreign_pidfds;
+        self.guest_pidfds = guest_pidfds;
         self.fd_entry_ids = fd_entry_ids;
         self.epoll_domain = previous.epoll_domain;
         self.poll_table_id = previous.poll_table_id;
@@ -2484,7 +2497,8 @@ fn load_executable(
         signal_refusal: None,
         pidfd_refusal: None,
         pipe_owners: Default::default(),
-        foreign_pidfds: Default::default(),
+        guest_pidfds: Default::default(),
+        pidfd_holds: Vec::new(),
         fd_entry_ids: std::collections::BTreeMap::new(),
         epoll_domain: Default::default(),
         poll_table_id: Default::default(),

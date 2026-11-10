@@ -20,7 +20,7 @@ pub(super) struct FdSlot {
     pub(super) entry_id: Option<Arc<crate::elf::FdEntry>>,
     pub(super) native_poll: Option<Arc<NativePollBinding>>,
     pub(super) pipe_owner: Option<Arc<pipe_owner::PipeOwner>>,
-    pub(super) foreign_pidfd: Option<Arc<ForeignPidfd>>,
+    pub(super) guest_pidfd: Option<Arc<GuestPidfd>>,
     pub(super) proc_inode: Option<u64>,
     pub(super) fdinfo: Option<Arc<FdinfoDescription>>,
     pub(super) object_inode: Option<Arc<GuestFileIdentity>>,
@@ -85,6 +85,16 @@ impl FileTableState {
             .and_then(|slot| slot.description.clone())
     }
 
+    /// Takes the table's pidfd records out (`GuestPidfd`), for the last
+    /// task's exit, which closes the table's descriptors whoever else holds
+    /// the table: the caller drops them once it has released the table.
+    pub(super) fn take_pidfds(&mut self) -> Vec<Arc<GuestPidfd>> {
+        self.slots
+            .values_mut()
+            .filter_map(|slot| slot.guest_pidfd.take())
+            .collect()
+    }
+
     /// The published entry identity for `fd` (slot-owned since slice 16).
     pub(super) fn entry_id(&self, fd: i32) -> Option<&Arc<crate::elf::FdEntry>> {
         self.slots.get(&fd).and_then(|slot| slot.entry_id.as_ref())
@@ -115,12 +125,17 @@ impl FileTableState {
                     pipe_owner: state
                         .and_then(|state| state.pipe_owners.get(&fd).cloned())
                         .or_else(|| self.slots.get(&fd).and_then(|slot| slot.pipe_owner.clone())),
-                    foreign_pidfd: state
-                        .and_then(|state| state.foreign_pidfds.get(&fd).cloned())
+                    guest_pidfd: state
+                        .and_then(|state| {
+                            state
+                                .guest_pidfds
+                                .get(&fd)
+                                .and_then(std::sync::Weak::upgrade)
+                        })
                         .or_else(|| {
                             self.slots
                                 .get(&fd)
-                                .and_then(|slot| slot.foreign_pidfd.clone())
+                                .and_then(|slot| slot.guest_pidfd.clone())
                         }),
                     proc_inode: state
                         .and_then(|state| state.proc_files.get(&fd).copied())
@@ -186,6 +201,17 @@ impl FileTableState {
             .collect();
         let retired_stdin =
             (!same_stdin && self.stdin.is_some()).then(|| self.stdin_entry_id.clone());
+        // The pidfd records of the retired entries, for the calls that
+        // reached their copies to keep (`CopyLedger::retire_copy`).
+        let retired_pidfds: std::collections::BTreeMap<_, _> = retired
+            .iter()
+            .filter_map(|(fd, _)| {
+                self.slots
+                    .get(fd)
+                    .and_then(|slot| slot.guest_pidfd.clone())
+                    .map(|pidfd| (*fd, pidfd))
+            })
+            .collect();
         // A copy that this process's descriptor limits would not let the
         // retirement replace ends the run before anything changes: the table,
         // every copy and every record stay as they were.
@@ -208,9 +234,12 @@ impl FileTableState {
             });
         }
         next.private_copies = std::mem::take(&mut self.private_copies);
-        let unreplaced = next
-            .private_copies
-            .revoke(state.tid, &retired, retired_stdin.as_ref());
+        let unreplaced = next.private_copies.revoke(
+            state.tid,
+            &retired,
+            retired_stdin.as_ref(),
+            &retired_pidfds,
+        );
         next.private_copies.register(state);
         // Past the check, the guest's change is published whatever the
         // copies' fate: it has happened, as it has on Linux. A copy that still
@@ -409,13 +438,15 @@ impl FileTableState {
                 let slot_pidfds: Vec<_> = self
                     .slots
                     .iter()
-                    .filter_map(|(&fd, slot)| slot.foreign_pidfd.as_ref().map(|p| (fd, p)))
+                    .filter_map(|(&fd, slot)| slot.guest_pidfd.as_ref().map(|p| (fd, p)))
                     .collect();
-                slot_pidfds.len() == state.foreign_pidfds.len()
+                slot_pidfds.len() == state.guest_pidfds.len()
                     && slot_pidfds
                         .into_iter()
-                        .zip(&state.foreign_pidfds)
-                        .all(|((fa, va), (fb, vb))| fa == *fb && Arc::ptr_eq(va, vb))
+                        .zip(&state.guest_pidfds)
+                        .all(|((fa, va), (fb, vb))| {
+                            fa == *fb && std::ptr::eq(Arc::as_ptr(va), vb.as_ptr())
+                        })
             }
             && *stdout_alias_fds == state.stdout_alias_fds
             && *stderr_alias_fds == state.stderr_alias_fds
@@ -555,10 +586,12 @@ impl FileTableState {
             .iter()
             .filter_map(|(&fd, slot)| slot.pipe_owner.clone().map(|o| (fd, o)))
             .collect();
-        state.foreign_pidfds = self
+        // The table holds each pidfd record; the task only names it
+        // (`GuestPidfd`).
+        state.guest_pidfds = self
             .slots
             .iter()
-            .filter_map(|(&fd, slot)| slot.foreign_pidfd.clone().map(|p| (fd, p)))
+            .filter_map(|(&fd, slot)| slot.guest_pidfd.as_ref().map(|p| (fd, Arc::downgrade(p))))
             .collect();
         state.stdout_alias_fds.clone_from(&self.stdout_alias_fds);
         state.stderr_alias_fds.clone_from(&self.stderr_alias_fds);
@@ -610,10 +643,10 @@ impl FileTableState {
             .iter()
             .filter_map(|(&fd, slot)| slot.pipe_owner.clone().map(|o| (fd, o)))
             .collect();
-        let foreign_pidfds: std::collections::BTreeMap<_, _> = self
+        let guest_pidfds: std::collections::BTreeMap<_, _> = self
             .slots
             .iter()
-            .filter_map(|(&fd, slot)| slot.foreign_pidfd.clone().map(|p| (fd, p)))
+            .filter_map(|(&fd, slot)| slot.guest_pidfd.clone().map(|p| (fd, p)))
             .collect();
         let fd_entry_ids: std::collections::BTreeMap<_, _> = self
             .slots
@@ -651,7 +684,7 @@ impl FileTableState {
                 poll_table_id: &self.poll_table_id,
                 native_poll_fds: &native_poll_fds,
                 pipe_owners: &pipe_owners,
-                foreign_pidfds: &foreign_pidfds,
+                guest_pidfds: &guest_pidfds,
                 stdout_alias_fds: &self.stdout_alias_fds,
                 stderr_alias_fds: &self.stderr_alias_fds,
                 cloexec_fds: &self.cloexec_fds,
@@ -672,7 +705,7 @@ struct ForkFacts<'a> {
     poll_table_id: &'a Arc<NativePollTable>,
     native_poll_fds: &'a std::collections::BTreeMap<i32, Arc<NativePollBinding>>,
     pipe_owners: &'a std::collections::BTreeMap<i32, Arc<pipe_owner::PipeOwner>>,
-    foreign_pidfds: &'a std::collections::BTreeMap<i32, Arc<ForeignPidfd>>,
+    guest_pidfds: &'a std::collections::BTreeMap<i32, Arc<GuestPidfd>>,
     stdout_alias_fds: &'a std::collections::BTreeSet<i32>,
     stderr_alias_fds: &'a std::collections::BTreeSet<i32>,
     cloexec_fds: &'a std::collections::BTreeSet<i32>,
@@ -698,7 +731,7 @@ pub(crate) struct ForkDescriptors {
     pub(crate) poll_table_id: Arc<NativePollTable>,
     pub(crate) native_poll_fds: std::collections::BTreeMap<i32, Arc<NativePollBinding>>,
     pub(crate) pipe_owners: std::collections::BTreeMap<i32, Arc<pipe_owner::PipeOwner>>,
-    pub(crate) foreign_pidfds: std::collections::BTreeMap<i32, Arc<ForeignPidfd>>,
+    pub(crate) guest_pidfds: std::collections::BTreeMap<i32, Arc<GuestPidfd>>,
     pub(crate) stdout_alias_fds: std::collections::BTreeSet<i32>,
     pub(crate) stderr_alias_fds: std::collections::BTreeSet<i32>,
     pub(crate) cloexec_fds: std::collections::BTreeSet<i32>,
@@ -733,7 +766,7 @@ impl ForkDescriptors {
                 .map(|(&fd, binding)| (fd, binding.fork_binding()))
                 .collect(),
             pipe_owners: facts.pipe_owners.clone(),
-            foreign_pidfds: facts.foreign_pidfds.clone(),
+            guest_pidfds: facts.guest_pidfds.clone(),
             stdout_alias_fds: facts.stdout_alias_fds.clone(),
             stderr_alias_fds: facts.stderr_alias_fds.clone(),
             cloexec_fds: facts.cloexec_fds.clone(),
@@ -748,6 +781,11 @@ impl ForkDescriptors {
     /// `state`'s own descriptors, as of its last install, for a thread it
     /// makes: the thread installs the table they share before it runs.
     pub(crate) fn of_state(state: &LoadedStaticElf) -> std::io::Result<Self> {
+        let guest_pidfds = state
+            .guest_pidfds
+            .iter()
+            .filter_map(|(&fd, pidfd)| pidfd.upgrade().map(|pidfd| (fd, pidfd)))
+            .collect();
         Self::new(
             state.files.copies(),
             state.stdin.as_ref(),
@@ -759,7 +797,7 @@ impl ForkDescriptors {
                 poll_table_id: &state.poll_table_id,
                 native_poll_fds: &state.native_poll_fds,
                 pipe_owners: &state.pipe_owners,
-                foreign_pidfds: &state.foreign_pidfds,
+                guest_pidfds: &guest_pidfds,
                 stdout_alias_fds: &state.stdout_alias_fds,
                 stderr_alias_fds: &state.stderr_alias_fds,
                 cloexec_fds: &state.cloexec_fds,
@@ -1029,7 +1067,8 @@ impl PrivateCopies {
 
     /// Deals with each copy that a task other than `publisher` holds of a
     /// retired entry (`retired`, with stdin's old identity when it changed):
-    /// leaves a reached one to its call, replaces any other
+    /// leaves a reached one to its call, with the entry's pidfd record in
+    /// `retired_pidfds` if it names one, and replaces any other
     /// ([`CopyLedger::retire_copy`]). A copy leaves its task's record only
     /// once that is done; one that could not be replaced stays, and is
     /// returned. A task whose gate is closed holds no copy and is forgotten.
@@ -1038,6 +1077,7 @@ impl PrivateCopies {
         publisher: i32,
         retired: &[(i32, Option<Arc<crate::elf::FdEntry>>)],
         retired_stdin: Option<&Arc<()>>,
+        retired_pidfds: &std::collections::BTreeMap<i32, Arc<GuestPidfd>>,
     ) -> Vec<UnreplacedCopy> {
         let mut unreplaced = Vec::new();
         if retired.is_empty() && retired_stdin.is_none() {
@@ -1062,7 +1102,7 @@ impl PrivateCopies {
                 continue;
             }
             for (fd, host) in targets {
-                match ledger.retire_copy(host) {
+                match ledger.retire_copy(host, retired_pidfds.get(&fd)) {
                     Ok(()) => {
                         task.files.remove(&fd);
                     }
@@ -1082,7 +1122,7 @@ impl PrivateCopies {
                 }
             }
             if let Some(host) = stdin {
-                match ledger.retire_copy(host) {
+                match ledger.retire_copy(host, None) {
                     Ok(()) => task.stdin = None,
                     Err(failure) => {
                         if failure.replaced() {
@@ -1138,6 +1178,12 @@ struct CopyLedger {
     /// Reached copies whose entries a retirement retired: the call's end
     /// replaces them (`CallScope`).
     deferred: std::collections::BTreeSet<RawFd>,
+    /// The pidfd records of those entries that are pidfds (`GuestPidfd`):
+    /// the call keeps each, as it keeps the copy's description, until it
+    /// ends. The table held the record until the retirement, so a call that
+    /// finds a pidfd's copy finds its record, however the call and the
+    /// retirement interleave.
+    deferred_pidfds: Vec<Arc<GuestPidfd>>,
     /// Copies a retirement replaced with the placeholder. The task treats
     /// each as closed until its next install replaces it.
     revoked: std::collections::BTreeSet<RawFd>,
@@ -1155,6 +1201,7 @@ impl Default for CopyLedger {
             in_call: false,
             reached: Default::default(),
             deferred: Default::default(),
+            deferred_pidfds: Vec::new(),
             revoked: Default::default(),
             foreign: Default::default(),
         }
@@ -1176,14 +1223,20 @@ impl CopyLedger {
     }
 
     /// A retirement's part for one copy: leaves a reached copy to its call,
-    /// and otherwise replaces it now. A descriptor that is no longer the
-    /// task's copy is left alone.
-    fn retire_copy(&mut self, host: RawFd) -> Result<(), ReplaceFailure> {
+    /// with `pidfd`, the record of the pidfd its entry is, if it is one, and
+    /// otherwise replaces it now. A descriptor that is no longer the task's
+    /// copy is left alone.
+    fn retire_copy(
+        &mut self,
+        host: RawFd,
+        pidfd: Option<&Arc<GuestPidfd>>,
+    ) -> Result<(), ReplaceFailure> {
         if self.foreign.contains(&host) {
             return Ok(());
         }
         if self.reached.contains(&host) {
             self.deferred.insert(host);
+            self.deferred_pidfds.extend(pidfd.cloned());
             return Ok(());
         }
         let result = replace_copy(host);
@@ -1269,10 +1322,14 @@ impl PrivateCopyGate {
     /// description: its descriptor stays open, for its owner to close, on
     /// the placeholder. A retirement after this skips the task.
     pub(crate) fn close<'a>(&self, copies: impl IntoIterator<Item = &'a std::fs::File>) {
+        // Declared before the ledger's guard, so that the pidfd records a
+        // call kept are dropped once the guard is released.
+        let _kept_pidfds;
         let mut ledger = self.ledger();
         ledger.open = false;
         ledger.reached.clear();
         ledger.deferred.clear();
+        _kept_pidfds = std::mem::take(&mut ledger.deferred_pidfds);
         // A copy that cannot be replaced without raising the soft limit
         // keeps its description until its owner closes it, later in this
         // exit: the exit raises no limit.
@@ -1315,9 +1372,13 @@ impl CallScope {
     }
 
     fn finish(ledger: &Mutex<CopyLedger>, tid: i32) -> crate::Result<()> {
+        // Declared before the ledger's guard, so that the pidfd records the
+        // call kept are dropped once the guard is released.
+        let _kept_pidfds;
         let mut ledger = ledger
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        _kept_pidfds = std::mem::take(&mut ledger.deferred_pidfds);
         ledger.in_call = false;
         ledger.reached.clear();
         if !ledger.open {
@@ -2027,7 +2088,7 @@ pub(super) struct DuplicateFdSource {
     pub(super) signalfd_mask: Option<Arc<KernelSigset>>,
     pub(super) native_poll: Option<NativePollDescription>,
     pub(super) pipe_owner: Option<Arc<pipe_owner::PipeOwner>>,
-    pub(super) foreign_pidfd: Option<Arc<ForeignPidfd>>,
+    pub(super) guest_pidfd: Option<Arc<GuestPidfd>>,
 }
 
 /// Stops supported generic writes from reaching the eventfd that privately
@@ -2152,8 +2213,8 @@ pub(super) fn duplicate_fd_at_or_above(
     if let Some(owner) = source.pipe_owner {
         state.pipe_owners.insert(fd, owner);
     }
-    if let Some(pidfd) = source.foreign_pidfd {
-        state.foreign_pidfds.insert(fd, pidfd);
+    if let Some(pidfd) = source.guest_pidfd {
+        state.guest_pidfds.insert(fd, Arc::downgrade(&pidfd));
     }
     if let Some(description) = source.native_poll {
         install_native_poll_description(state, fd, description);
@@ -2213,7 +2274,7 @@ pub(super) fn duplicate_fd(
     let source_native_poll = native_poll_description(state, old_fd);
     let source_signalfd_mask = signalfd_mask(state, old_fd);
     let source_pipe_owner = state.pipe_owners.get(&old_fd).cloned();
-    let source_foreign_pidfd = foreign_pidfd(state, old_fd).cloned();
+    let source_pidfd = guest_pidfd(state, old_fd);
     let Some(old_host_fd) = host_fd(state, old_fd) else {
         return negative_errno(libc::EBADF);
     };
@@ -2255,8 +2316,8 @@ pub(super) fn duplicate_fd(
         if let Some(owner) = source_pipe_owner {
             state.pipe_owners.insert(new_fd, owner);
         }
-        if let Some(pidfd) = source_foreign_pidfd {
-            state.foreign_pidfds.insert(new_fd, pidfd);
+        if let Some(pidfd) = source_pidfd {
+            state.guest_pidfds.insert(new_fd, Arc::downgrade(&pidfd));
         }
         if let Some(description) = source_native_poll {
             install_native_poll_description(state, new_fd, description);
@@ -2299,8 +2360,10 @@ pub(super) fn duplicate_fd(
             if let Some(owner) = source_pipe_owner {
                 state.pipe_owners.insert(new_fd as i32, owner);
             }
-            if let Some(pidfd) = source_foreign_pidfd {
-                state.foreign_pidfds.insert(new_fd as i32, pidfd);
+            if let Some(pidfd) = source_pidfd {
+                state
+                    .guest_pidfds
+                    .insert(new_fd as i32, Arc::downgrade(&pidfd));
             }
             if let Some(description) = source_native_poll {
                 install_native_poll_description(state, new_fd as i32, description);

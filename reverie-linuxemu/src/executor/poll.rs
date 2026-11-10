@@ -268,7 +268,7 @@ pub(super) fn pselect6(
         if !membership.into_iter().any(|present| present) {
             continue;
         }
-        // A pidfd for another process shows its readiness through its shadow
+        // A pidfd for a guest process shows its readiness through its shadow
         // socket (`readiness_host_fd`).
         let Some(host_fd) = readiness_host_fd(state, fd) else {
             return negative_errno(libc::EBADF);
@@ -277,13 +277,9 @@ pub(super) fn pselect6(
         let signalfd = signalfd_mask(state, fd);
         let events = if signalfd.is_some() {
             if membership[0] { libc::POLLIN } else { 0 }
-        } else if foreign_pidfd(state, fd).is_some() {
+        } else if guest_pidfd(state, fd).is_some() {
             // Only ever readable, never writable or exceptional.
-            if membership[0] {
-                FOREIGN_PIDFD_POLL_EVENTS
-            } else {
-                0
-            }
+            if membership[0] { PIDFD_POLL_EVENTS } else { 0 }
         } else {
             // Linux includes the exception mask in its poll key unconditionally.
             EXCEPT | if membership[0] { READ } else { 0 } | if membership[1] { WRITE } else { 0 }
@@ -423,8 +419,8 @@ pub(super) fn select(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[
             return negative_errno(libc::EBADF);
         };
         let signalfd = signalfd_mask(state, guest_fd);
-        // A pidfd for another process is only ever readable, as is a signalfd.
-        let read_only = signalfd.is_some() || foreign_pidfd(state, guest_fd).is_some();
+        // A pidfd for a guest process is only ever readable, as is a signalfd.
+        let read_only = signalfd.is_some() || guest_pidfd(state, guest_fd).is_some();
         let mut events = 0;
         if membership[0] {
             events |= libc::POLLIN;
@@ -662,8 +658,8 @@ fn poll_with_timeout<M: GuestMemoryAccess<Error = crate::Error>>(
             // shows the shared queue, which wakes a wait below.
             poll_fd.events &= libc::POLLIN;
         }
-        if foreign_pidfd(state, poll_fd.fd).is_some() {
-            poll_fd.events &= FOREIGN_PIDFD_POLL_EVENTS;
+        if guest_pidfd(state, poll_fd.fd).is_some() {
+            poll_fd.events &= PIDFD_POLL_EVENTS;
         }
         match readiness_host_fd(state, poll_fd.fd) {
             Some(host_fd) => poll_fd.fd = host_fd,
@@ -887,13 +883,10 @@ pub(super) fn epoll_ctl(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u
     let Some(epoll_fd) = host_fd(state, args[0] as libc::c_int) else {
         return negative_errno(libc::EBADF);
     };
-    // A registration of a pidfd for another process watches the pidfd's
-    // shadow socket, through a host descriptor that closes with the pidfd, so
-    // the registration ends where Linux ends it (`epoll_host_fd`).
-    let target_fd = match epoll_host_fd(state, args[2] as libc::c_int) {
-        Ok(Some(target_fd)) => target_fd,
-        Ok(None) => return negative_errno(libc::EBADF),
-        Err(error) => return error,
+    let guest_target = args[2] as libc::c_int;
+    let pidfd = guest_pidfd(state, guest_target);
+    let Some(target_fd) = host_fd(state, guest_target) else {
+        return negative_errno(libc::EBADF);
     };
     let operation = args[1] as libc::c_int;
     let mut event = if operation == libc::EPOLL_CTL_DEL {
@@ -904,16 +897,39 @@ pub(super) fn epoll_ctl(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u
             Err(error) => return error,
         }
     };
-    if foreign_pidfd(state, args[2] as libc::c_int).is_some() {
-        event.events = foreign_pidfd_epoll_events(event.events);
-    }
     if matches!(operation, libc::EPOLL_CTL_ADD | libc::EPOLL_CTL_MOD)
-        && signalfd_mask(state, args[2] as libc::c_int).is_some()
+        && signalfd_mask(state, guest_target).is_some()
     {
         // Otherwise a blocking ppoll of this epoll descriptor could wait on
         // virtual signal readiness without carrying signalfd metadata itself.
         return negative_errno(libc::ENOSYS);
     }
+    match pidfd {
+        // A registration of a pidfd for a guest process watches the pidfd's
+        // shadow socket for what a pidfd can report, through a host
+        // descriptor of the shadow for the guest descriptor number, which
+        // closes with the pidfd, so the registration ends where Linux ends
+        // it (`GuestPidfd::epoll_control`).
+        Some(pidfd) => {
+            event.events = pidfd_epoll_events(event.events);
+            pidfd.epoll_control(guest_target, operation, |key| {
+                host_epoll_ctl(state, args, epoll_fd, key, &mut event)
+            })
+        }
+        None => host_epoll_ctl(state, args, epoll_fd, target_fd, &mut event),
+    }
+}
+
+/// The host `epoll_ctl` of guest `args`, on host descriptors `epoll_fd` and
+/// `target_fd` with `event`, and the provenance it leaves for syscall 441.
+fn host_epoll_ctl(
+    state: &LoadedStaticElf,
+    args: &[u64; 6],
+    epoll_fd: RawFd,
+    target_fd: RawFd,
+    event: &mut libc::epoll_event,
+) -> i64 {
+    let operation = args[1] as libc::c_int;
     // Complete guest copies and signal/capture classification before taking
     // the leaf domain lock. Existing ctl outcomes remain native; unsafe
     // histories only remove admission to the newly supported syscall 441.
@@ -965,8 +981,7 @@ pub(super) fn epoll_ctl(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u
     }
     // SAFETY: both descriptors were translated from live snapshot Files;
     // event is initialized and Linux validates the requested operation.
-    let result =
-        zero_or_errno(unsafe { libc::epoll_ctl(epoll_fd, operation, target_fd, &mut event) });
+    let result = zero_or_errno(unsafe { libc::epoll_ctl(epoll_fd, operation, target_fd, event) });
     if result == 0
         && let Some(proof) = proof
         && !proof.unsafe_history

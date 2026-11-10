@@ -544,13 +544,14 @@ pub(super) fn madvise_refusal_diagnostic(advice: libc::c_int) -> &'static str {
     }
 }
 
-/// Diagnostic for this backend's refusal to send a pidfd for another process
-/// in an `SCM_RIGHTS` message: the receiver would get the stand-in alone
-/// (`ForeignPidfd`), without the process it names or its readiness.
+/// Diagnostic for this backend's refusal to send a pidfd for a guest process
+/// in an `SCM_RIGHTS` message: the receiver would get the stand-in alone, a
+/// pidfd for the supervisor (`GuestPidfd`), without the process it names or
+/// its readiness.
 pub(crate) const PIDFD_RIGHTS_REFUSAL: &str =
-    "KVM does not send a pidfd for another process in an SCM_RIGHTS message";
+    "KVM does not send a pidfd for a guest process in an SCM_RIGHTS message";
 
-/// The typed refusal, if any, that a call refused for a pidfd for another
+/// The typed refusal, if any, that a call refused for a pidfd for a guest
 /// process carries: `reason` is the one the call recorded, and the call
 /// answered ENOSYS, which Linux's sendmsg never answers.
 pub(super) fn pidfd_refusal_record(

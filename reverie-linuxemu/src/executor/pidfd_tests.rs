@@ -1,8 +1,10 @@
-// pidfds for other guest processes (`executor/pidfd.rs`) and the shadow sockets
-// that show their readiness (`pidfd_shadow.rs`): Linux's answers from
-// kernel/pid.c, kernel/exit.c and fs/pidfs.c, and the shadow's privacy: it is
-// never a guest descriptor, every alias of the pidfd shares it, and it closes
-// with the pidfd's last descriptor.
+// pidfds for guest processes (`executor/pidfd.rs`) and the shadow sockets that
+// show their readiness (`pidfd_shadow.rs`): Linux's answers from kernel/pid.c,
+// kernel/fork.c, kernel/exit.c, fs/pidfs.c and fs/eventpoll.c; the shadow's
+// privacy: it is never a guest descriptor, and every alias of the pidfd shares
+// it; and its lifetime, the pidfd's open file description's: it closes with
+// the pidfd's last descriptor, whatever another thread of the process is
+// doing, and a call that found the pidfd keeps it until the call ends.
 
 const PIDFD_TEST_MEMORY: usize = 4 * PAGE_SIZE as usize;
 const PIDFD_TEST_POLL: u64 = 0x100;
@@ -15,6 +17,8 @@ const PIDFD_TEST_MESSAGE: u64 = 0x900;
 const PIDFD_TEST_IOV: u64 = 0xa00;
 const PIDFD_TEST_CONTROL: u64 = 0xb00;
 const PIDFD_TEST_BYTE: u64 = 0xc00;
+const PIDFD_TEST_STATX: u64 = 0xd00;
+const PIDFD_TEST_EMPTY_PATH: u64 = 0xf00;
 /// Every event a pidfd reports, and every other event poll can be asked for,
 /// which a pidfd never reports; its shadow socket would report `POLLOUT`,
 /// `POLLWRNORM` and, once hung up, `POLLRDHUP`.
@@ -130,6 +134,14 @@ fn pidfd_test_guest_fds(executor: &ElfExecutor) -> BTreeMap<i32, RawFd> {
         .collect()
 }
 
+/// The record of `executor`'s guest descriptor `fd`, a pidfd for a guest
+/// process, which its table holds.
+fn pidfd_test_record(executor: &ElfExecutor, fd: i64) -> Arc<GuestPidfd> {
+    executor.state.guest_pidfds[&(fd as i32)]
+        .upgrade()
+        .expect("the table holds the pidfd's record")
+}
+
 /// The (file type, inode) of host descriptor `fd`.
 fn pidfd_test_host_identity(fd: RawFd) -> (libc::mode_t, u64) {
     // SAFETY: stat is plain data and fstat fills it.
@@ -210,7 +222,7 @@ fn a_pidfd_shadow_socket_never_enters_the_guest_descriptor_table() {
         b"anon_inode:[pidfd]"
     ));
 
-    let pidfd = parent.state.foreign_pidfds[&(fd as i32)].clone();
+    let pidfd = pidfd_test_record(&parent, fd);
     let writers = parent.signal_registry.pidfd_shadow_writers(pidfd.target());
     assert_eq!(writers.len(), 1, "the registry holds the one write end");
     let shadow_fds = [pidfd.readiness_fd(), writers[0].as_raw_fd()];
@@ -306,10 +318,10 @@ fn dup_and_fork_of_a_pidfd_keep_one_shadow_socket() {
     assert_eq!((dup2, dup3), (20, 21));
     assert!(dup >= 0 && dupfd >= 30);
     let aliases = [fd, dup, dup2, dup3, dupfd];
-    let record = parent.state.foreign_pidfds[&(fd as i32)].clone();
+    let record = pidfd_test_record(&parent, fd);
     for alias in aliases {
         assert!(
-            Arc::ptr_eq(&parent.state.foreign_pidfds[&(alias as i32)], &record),
+            Arc::ptr_eq(&pidfd_test_record(&parent, alias), &record),
             "alias {alias}"
         );
     }
@@ -317,7 +329,7 @@ fn dup_and_fork_of_a_pidfd_keep_one_shadow_socket() {
     let mut sibling = parent.fork_child(3, false, false).unwrap();
     for alias in aliases {
         assert!(
-            Arc::ptr_eq(&sibling.state.foreign_pidfds[&(alias as i32)], &record),
+            Arc::ptr_eq(&pidfd_test_record(&sibling, alias), &record),
             "forked alias {alias}"
         );
     }
@@ -439,7 +451,7 @@ fn closing_the_last_descriptor_of_a_pidfd_closes_its_shadow_socket() {
     let (mut parent, _child) = pidfd_test_family(&root, 2);
     let fd = pidfd_test_open(&mut parent, &memory, 2, 0);
     assert!(fd >= 0);
-    let record = parent.state.foreign_pidfds[&(fd as i32)].clone();
+    let record = pidfd_test_record(&parent, fd);
     let target = record.target();
     let shadow = record.shadow();
     drop(record);
@@ -518,10 +530,11 @@ fn closing_the_last_descriptor_of_a_pidfd_closes_its_shadow_socket() {
     assert_eq!(parent.signal_registry.pidfd_shadow_writers(target).len(), 0);
 }
 
-/// `pidfd_open` names processes as Linux's does (kernel/pid.c): EINVAL for a
-/// pid of 0 or less and for a thread that leads no thread group, ESRCH for a
-/// pid no process has, including a reaped child's. An exited child that has
-/// not been reaped gets a pidfd, readable at once.
+/// `pidfd_open` names processes as Linux's does (kernel/pid.c and
+/// kernel/fork.c in v6.17): EINVAL for a pid of 0 or less, ENOENT for a
+/// thread that leads no thread group, ESRCH for a pid no process has,
+/// including a reaped child's. An exited child that has not been reaped gets
+/// a pidfd, readable at once.
 #[test]
 fn pidfd_open_names_another_process_as_linux_does() {
     let root = TestDir::new();
@@ -532,7 +545,7 @@ fn pidfd_open_names_another_process_as_linux_does() {
         (0, 0, negative_errno(libc::EINVAL)),
         (-1, 0, negative_errno(libc::EINVAL)),
         (2, 0x100, negative_errno(libc::EINVAL)),
-        (9, 0, negative_errno(libc::EINVAL)),
+        (9, 0, negative_errno(libc::ENOENT)),
         (99, 0, negative_errno(libc::ESRCH)),
     ] {
         assert_eq!(
@@ -766,6 +779,24 @@ fn a_pidfd_for_another_process_is_refused_in_scm_rights() {
     );
 }
 
+/// So is sending a pidfd for the caller itself, whose stand-in names the
+/// supervisor too.
+#[test]
+fn a_pidfd_for_the_caller_itself_is_refused_in_scm_rights() {
+    let root = TestDir::new();
+    let memory = pidfd_test_memory();
+    let (mut parent, _child) = pidfd_test_family(&root, 2);
+    let own_pid = i64::from(parent.state.pid);
+    let own = pidfd_test_open(&mut parent, &memory, own_pid, 0);
+    assert!(own >= 0);
+    let mut control = rights_control(&[own as i32]);
+    assert_eq!(
+        translate_outgoing_control(&mut control, &mut parent.state),
+        Err(negative_errno(libc::ENOSYS))
+    );
+    assert_eq!(parent.state.pidfd_refusal, Some(PIDFD_RIGHTS_REFUSAL));
+}
+
 /// The executor's own `waitid(P_PIDFD)` resolves the descriptor as Linux does
 /// (kernel/exit.c): EINVAL for a negative descriptor, EBADF for one that is
 /// not a pidfd, ECHILD for a pidfd for no child of the caller; a nonblocking
@@ -922,7 +953,7 @@ fn a_reap_hangs_a_pidfd_up_while_a_copy_of_its_write_end_is_open() {
     let (mut parent, mut child) = pidfd_test_family(&root, 2);
     let fd = pidfd_test_open(&mut parent, &memory, 2, 0);
     assert!(fd >= 0);
-    let target = parent.state.foreign_pidfds[&(fd as i32)].target();
+    let target = pidfd_test_record(&parent, fd).target();
     let writers = parent.signal_registry.pidfd_shadow_writers(target);
     assert_eq!(writers.len(), 1);
     // SAFETY: F_DUPFD_CLOEXEC of a live descriptor returns a new one, which
@@ -1083,5 +1114,693 @@ fn a_pidfd_reports_only_what_pidfd_poll_reports() {
     assert_eq!(
         pidfd_test_epoll_wait(&mut parent, &memory, epoll),
         BTreeMap::from([(1, reaped), (2, libc::EPOLLHUP as u32), (3, reaped)])
+    );
+}
+
+/// How many of this process's descriptors are of the socket whose
+/// `/proc/self/fd` link is `link`: a shadow and its epoll keys.
+fn pidfd_test_socket_descriptors(link: &std::path::Path) -> usize {
+    std::fs::read_dir("/proc/self/fd")
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| std::fs::read_link(entry.path()).ok().as_deref() == Some(link))
+        .count()
+}
+
+/// The `/proc/self/fd` link of the shadow of `executor`'s pidfd `fd`.
+fn pidfd_test_shadow_link(executor: &ElfExecutor, fd: i64) -> std::path::PathBuf {
+    let raw = pidfd_test_record(executor, fd).readiness_fd();
+    std::fs::read_link(format!("/proc/self/fd/{raw}")).unwrap()
+}
+
+/// Every pidfd for one process reports one inode, whoever opened it: a
+/// child's pidfd for itself and its parent's pidfd for it alike, as Linux
+/// gives each process one pidfs inode (`pidfs_add_pid`, fs/pidfs.c), and
+/// another process's pidfd for itself reports another; statx agrees with
+/// fstat. Reviewer regression from
+/// https://github.com/rrnewton/reverie/pull/1410.
+#[test]
+fn a_pidfd_reports_its_process_inode_whoever_opened_it() {
+    let root = TestDir::new();
+    let memory = pidfd_test_memory();
+    let (mut parent, mut child) = pidfd_test_family(&root, 2);
+    let mut sibling = parent.fork_child(3, false, false).unwrap();
+    let foreign = pidfd_test_open(&mut parent, &memory, 2, 0);
+    let own = pidfd_test_open(&mut child, &memory, 2, 0);
+    let sibling_own = pidfd_test_open(&mut sibling, &memory, 3, 0);
+    assert!(foreign >= 0 && own >= 0 && sibling_own >= 0);
+    let inode = |task: &mut ElfExecutor, fd: i64| {
+        assert_eq!(
+            pidfd_test_call(
+                task,
+                &memory,
+                libc::SYS_fstat,
+                [fd as u64, PIDFD_TEST_STAT, 0, 0, 0, 0]
+            ),
+            0
+        );
+        read_struct::<libc::stat>(&memory, PIDFD_TEST_STAT).st_ino
+    };
+    assert_eq!(
+        inode(&mut parent, foreign),
+        inode(&mut child, own),
+        "same guest process must have one pidfs inode irrespective of opener"
+    );
+    assert_ne!(
+        inode(&mut child, own),
+        inode(&mut sibling, sibling_own),
+        "two processes' own pidfds must have different inodes"
+    );
+    let statx_inode = |task: &mut ElfExecutor, fd: i64| {
+        memory.write_raw(PIDFD_TEST_EMPTY_PATH, &[0]).unwrap();
+        assert_eq!(
+            pidfd_test_call(
+                task,
+                &memory,
+                libc::SYS_statx,
+                [
+                    fd as u64,
+                    PIDFD_TEST_EMPTY_PATH,
+                    libc::AT_EMPTY_PATH as u64,
+                    libc::STATX_INO as u64,
+                    PIDFD_TEST_STATX,
+                    0
+                ]
+            ),
+            0
+        );
+        read_struct::<libc::statx>(&memory, PIDFD_TEST_STATX).stx_ino
+    };
+    assert_eq!(statx_inode(&mut child, own), inode(&mut child, own));
+    assert_eq!(statx_inode(&mut parent, foreign), inode(&mut child, own));
+}
+
+/// The last close of a pidfd ends its epoll registration and closes its
+/// shadow even while another thread of the process, which shares the
+/// table, makes no call: that thread names the pidfd and holds nothing.
+/// Reviewer regression from https://github.com/rrnewton/reverie/pull/1410.
+#[test]
+fn the_last_close_of_a_pidfd_ends_it_beside_an_idle_thread() {
+    let root = TestDir::new();
+    let memory = pidfd_test_memory();
+    let (mut parent, mut child) = pidfd_test_family(&root, 2);
+    let fd = pidfd_test_open(&mut parent, &memory, 2, 0);
+    let epoll = pidfd_test_call(&mut parent, &memory, libc::SYS_epoll_create1, [0; 6]);
+    assert_eq!(
+        pidfd_test_epoll_ctl(
+            &mut parent,
+            &memory,
+            epoll,
+            libc::EPOLL_CTL_ADD,
+            fd,
+            libc::EPOLLIN as u32,
+            91
+        ),
+        0
+    );
+    let shadow = pidfd_test_record(&parent, fd).shadow();
+    let link = pidfd_test_shadow_link(&parent, fd);
+    let _idle_thread = parent.thread_child(9).unwrap();
+    assert_eq!(
+        pidfd_test_call(
+            &mut parent,
+            &memory,
+            libc::SYS_close,
+            [fd as u64, 0, 0, 0, 0, 0]
+        ),
+        0
+    );
+    assert_eq!(
+        pidfd_test_socket_descriptors(&link),
+        0,
+        "the closed pidfd's shadow and epoll key are closed"
+    );
+    pidfd_test_exit(&mut parent, &mut child);
+    pidfd_test_reap(&mut parent, &memory, 2);
+    let events = pidfd_test_epoll_wait(&mut parent, &memory, epoll);
+    assert!(
+        events.is_empty(),
+        "last closed pidfd still reports {:?}; shadow_alive={}",
+        events,
+        shadow.upgrade().is_some()
+    );
+    assert!(shadow.upgrade().is_none());
+}
+
+/// So do a dup2 over a pidfd's last descriptor and a close_range of it,
+/// beside an idle thread.
+#[test]
+fn replacing_or_closing_a_range_over_a_pidfd_ends_it_beside_an_idle_thread() {
+    for operation in [libc::SYS_dup2, libc::SYS_close_range] {
+        let root = TestDir::new();
+        let memory = pidfd_test_memory();
+        let (mut parent, mut child) = pidfd_test_family(&root, 2);
+        let fd = pidfd_test_open(&mut parent, &memory, 2, 0);
+        let epoll = pidfd_test_call(&mut parent, &memory, libc::SYS_epoll_create1, [0; 6]);
+        assert_eq!(
+            pidfd_test_epoll_ctl(
+                &mut parent,
+                &memory,
+                epoll,
+                libc::EPOLL_CTL_ADD,
+                fd,
+                libc::EPOLLIN as u32,
+                92
+            ),
+            0
+        );
+        let shadow = pidfd_test_record(&parent, fd).shadow();
+        let link = pidfd_test_shadow_link(&parent, fd);
+        let _idle_thread = parent.thread_child(9).unwrap();
+        let args = if operation == libc::SYS_dup2 {
+            [epoll as u64, fd as u64, 0, 0, 0, 0]
+        } else {
+            [fd as u64, fd as u64, 0, 0, 0, 0]
+        };
+        let expected = if operation == libc::SYS_dup2 { fd } else { 0 };
+        assert_eq!(
+            pidfd_test_call(&mut parent, &memory, operation, args),
+            expected,
+            "syscall {operation}"
+        );
+        assert!(
+            !parent.state.guest_pidfds.contains_key(&(fd as i32)),
+            "syscall {operation}"
+        );
+        assert_eq!(
+            pidfd_test_socket_descriptors(&link),
+            0,
+            "syscall {operation}"
+        );
+        assert!(shadow.upgrade().is_none(), "syscall {operation}");
+        pidfd_test_exit(&mut parent, &mut child);
+        pidfd_test_reap(&mut parent, &memory, 2);
+        assert!(
+            pidfd_test_epoll_wait(&mut parent, &memory, epoll).is_empty(),
+            "syscall {operation}"
+        );
+    }
+}
+
+/// A call that found a pidfd keeps it until the call ends, even when another
+/// thread closes it meanwhile, as Linux's `fdget` keeps the file: its poll
+/// shows the pidfd's readiness, never a stand-in's or a closed descriptor's.
+/// The pidfd's shadow goes when the call ends.
+#[test]
+fn a_call_that_found_a_pidfd_keeps_it_when_another_thread_closes_it() {
+    let root = TestDir::new();
+    let memory = pidfd_test_memory();
+    let (parent, mut child) = pidfd_test_family(&root, 2);
+    let parent = std::rc::Rc::new(std::cell::RefCell::new(parent));
+    let fd = pidfd_test_open(&mut parent.borrow_mut(), &memory, 2, 0);
+    let mut thread = parent.borrow().thread_child(9).unwrap();
+    pidfd_test_exit(&mut parent.borrow_mut(), &mut child);
+    let shadow = pidfd_test_record(&parent.borrow(), fd).shadow();
+    let closer = parent.clone();
+    COPY_REACHED_TEST_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            let memory = pidfd_test_memory();
+            assert_eq!(
+                pidfd_test_call(
+                    &mut closer.borrow_mut(),
+                    &memory,
+                    libc::SYS_close,
+                    [fd as u64, 0, 0, 0, 0, 0]
+                ),
+                0
+            );
+        }))
+    });
+    assert_eq!(
+        pidfd_test_poll(&mut thread, &memory, fd),
+        PIDFD_TEST_EXITED,
+        "the poll found the pidfd before the close"
+    );
+    assert!(
+        COPY_REACHED_TEST_HOOK.with(|hook| hook.borrow().is_none()),
+        "the close ran inside the poll"
+    );
+    assert!(shadow.upgrade().is_none(), "the shadow goes with the call");
+    assert_eq!(pidfd_test_poll(&mut thread, &memory, fd), libc::POLLNVAL);
+}
+
+/// A call that had not found a pidfd when another thread closed it finds it
+/// closed, and the pidfd is gone at once.
+#[test]
+fn a_call_that_had_not_found_a_pidfd_finds_it_closed() {
+    let root = TestDir::new();
+    let memory = pidfd_test_memory();
+    let (parent, mut child) = pidfd_test_family(&root, 2);
+    let parent = std::rc::Rc::new(std::cell::RefCell::new(parent));
+    let fd = pidfd_test_open(&mut parent.borrow_mut(), &memory, 2, 0);
+    let mut thread = parent.borrow().thread_child(9).unwrap();
+    pidfd_test_exit(&mut parent.borrow_mut(), &mut child);
+    let shadow = pidfd_test_record(&parent.borrow(), fd).shadow();
+    let closer = parent.clone();
+    let closed_shadow = shadow.clone();
+    TABLE_RELEASED_TEST_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            let memory = pidfd_test_memory();
+            assert_eq!(
+                pidfd_test_call(
+                    &mut closer.borrow_mut(),
+                    &memory,
+                    libc::SYS_close,
+                    [fd as u64, 0, 0, 0, 0, 0]
+                ),
+                0
+            );
+            assert!(
+                closed_shadow.upgrade().is_none(),
+                "a call that has not found the pidfd holds nothing of it"
+            );
+        }))
+    });
+    assert_eq!(pidfd_test_poll(&mut thread, &memory, fd), libc::POLLNVAL);
+    assert!(
+        TABLE_RELEASED_TEST_HOOK.with(|hook| hook.borrow().is_none()),
+        "the close ran inside the poll"
+    );
+    assert!(shadow.upgrade().is_none());
+}
+
+/// A dup2 of a pidfd onto itself, and duplications that fail, leave the
+/// pidfd as it was.
+#[test]
+fn dup2_onto_itself_and_failed_duplications_keep_a_pidfd() {
+    let root = TestDir::new();
+    let memory = pidfd_test_memory();
+    let (mut parent, mut child) = pidfd_test_family(&root, 2);
+    let fd = pidfd_test_open(&mut parent, &memory, 2, 0);
+    let record = pidfd_test_record(&parent, fd);
+    let fd_arg = fd as u64;
+    for (number, args, expected) in [
+        (libc::SYS_dup2, [fd_arg, fd_arg, 0, 0, 0, 0], fd),
+        (
+            libc::SYS_dup3,
+            [fd_arg, fd_arg, 0, 0, 0, 0],
+            negative_errno(libc::EINVAL),
+        ),
+        (
+            libc::SYS_dup2,
+            [fd_arg, 1 << 20, 0, 0, 0, 0],
+            negative_errno(libc::EBADF),
+        ),
+        (
+            libc::SYS_fcntl,
+            [fd_arg, libc::F_DUPFD as u64, u64::MAX, 0, 0, 0],
+            negative_errno(libc::EINVAL),
+        ),
+    ] {
+        assert_eq!(
+            pidfd_test_call(&mut parent, &memory, number, args),
+            expected,
+            "syscall {number} {args:?}"
+        );
+        assert!(
+            Arc::ptr_eq(&pidfd_test_record(&parent, fd), &record),
+            "syscall {number} {args:?}"
+        );
+    }
+    drop(record);
+    pidfd_test_exit(&mut parent, &mut child);
+    assert_eq!(pidfd_test_poll(&mut parent, &memory, fd), PIDFD_TEST_EXITED);
+}
+
+/// A descriptor number reused after a pidfd's close reports its new file,
+/// in every thread of the process, never the closed pidfd's readiness.
+#[test]
+fn a_number_reused_after_a_pidfd_closes_reports_its_new_file() {
+    let root = TestDir::new();
+    let memory = pidfd_test_memory();
+    let (mut parent, mut child) = pidfd_test_family(&root, 2);
+    let fd = pidfd_test_open(&mut parent, &memory, 2, 0);
+    let mut thread = parent.thread_child(9).unwrap();
+    assert_eq!(
+        pidfd_test_call(
+            &mut parent,
+            &memory,
+            libc::SYS_close,
+            [fd as u64, 0, 0, 0, 0, 0]
+        ),
+        0
+    );
+    assert_eq!(
+        pidfd_test_call(&mut parent, &memory, libc::SYS_eventfd2, [0; 6]),
+        fd,
+        "the eventfd takes the pidfd's number"
+    );
+    pidfd_test_exit(&mut parent, &mut child);
+    // An eventfd with a zero count is writable and not readable
+    // (`eventfd_poll`, fs/eventfd.c).
+    assert_eq!(pidfd_test_poll(&mut parent, &memory, fd), libc::POLLOUT);
+    assert_eq!(pidfd_test_poll(&mut thread, &memory, fd), libc::POLLOUT);
+}
+
+/// The last task's exit ends its table's pidfds, as Linux's `exit_files`
+/// closes them, even while something else holds the table.
+#[test]
+fn the_last_tasks_exit_ends_its_pidfds_while_an_observer_holds_its_table() {
+    let root = TestDir::new();
+    let memory = pidfd_test_memory();
+    let (mut parent, _child) = pidfd_test_family(&root, 2);
+    let fd = pidfd_test_open(&mut parent, &memory, 2, 0);
+    let shadow = pidfd_test_record(&parent, fd).shadow();
+    let link = pidfd_test_shadow_link(&parent, fd);
+    let _observer = parent.file_table.clone();
+    parent.release_files_on_exit();
+    assert!(shadow.upgrade().is_none());
+    assert_eq!(pidfd_test_socket_descriptors(&link), 0);
+}
+
+/// An epoll registration of a pidfd lasts as Linux's does: one epoll's DEL
+/// leaves the pidfd's registration in another, a registration by a closed
+/// descriptor number lasts while another descriptor of the pidfd is open,
+/// and the host descriptor that stands for a number in epoll closes with the
+/// number's last registration.
+#[test]
+fn epoll_registrations_of_a_pidfd_last_as_linux_registrations_do() {
+    let root = TestDir::new();
+    let memory = pidfd_test_memory();
+    let (mut parent, mut child) = pidfd_test_family(&root, 2);
+    let fd = pidfd_test_open(&mut parent, &memory, 2, 0);
+    let alias = pidfd_test_call(
+        &mut parent,
+        &memory,
+        libc::SYS_dup,
+        [fd as u64, 0, 0, 0, 0, 0],
+    );
+    let link = pidfd_test_shadow_link(&parent, fd);
+    let first = pidfd_test_call(&mut parent, &memory, libc::SYS_epoll_create1, [0; 6]);
+    let second = pidfd_test_call(&mut parent, &memory, libc::SYS_epoll_create1, [0; 6]);
+    for (epoll, target, data) in [(first, fd, 1), (second, fd, 2), (second, alias, 3)] {
+        assert_eq!(
+            pidfd_test_epoll_ctl(
+                &mut parent,
+                &memory,
+                epoll,
+                libc::EPOLL_CTL_ADD,
+                target,
+                libc::EPOLLIN as u32,
+                data
+            ),
+            0
+        );
+    }
+    // The shadow, and a key for each of the two numbers.
+    assert_eq!(pidfd_test_socket_descriptors(&link), 3);
+    assert_eq!(
+        pidfd_test_epoll_ctl(&mut parent, &memory, first, libc::EPOLL_CTL_DEL, fd, 0, 0),
+        0
+    );
+    // The second epoll still names `fd`'s number.
+    assert_eq!(pidfd_test_socket_descriptors(&link), 3);
+    assert_eq!(
+        pidfd_test_call(
+            &mut parent,
+            &memory,
+            libc::SYS_close,
+            [alias as u64, 0, 0, 0, 0, 0]
+        ),
+        0
+    );
+    pidfd_test_exit(&mut parent, &mut child);
+    assert!(pidfd_test_epoll_wait(&mut parent, &memory, first).is_empty());
+    let exited = libc::EPOLLIN as u32;
+    assert_eq!(
+        pidfd_test_epoll_wait(&mut parent, &memory, second),
+        BTreeMap::from([(2, exited), (3, exited)]),
+        "the closed number's registration lasts while the pidfd is open"
+    );
+    assert_eq!(
+        pidfd_test_epoll_ctl(&mut parent, &memory, second, libc::EPOLL_CTL_DEL, fd, 0, 0),
+        0
+    );
+    assert_eq!(pidfd_test_socket_descriptors(&link), 2);
+    assert_eq!(
+        pidfd_test_call(
+            &mut parent,
+            &memory,
+            libc::SYS_dup2,
+            [fd as u64, alias as u64, 0, 0, 0, 0]
+        ),
+        alias
+    );
+    assert_eq!(
+        pidfd_test_epoll_ctl(
+            &mut parent,
+            &memory,
+            second,
+            libc::EPOLL_CTL_DEL,
+            alias,
+            0,
+            0
+        ),
+        0
+    );
+    assert_eq!(pidfd_test_socket_descriptors(&link), 1);
+    assert!(pidfd_test_epoll_wait(&mut parent, &memory, second).is_empty());
+}
+
+/// Epoll controls of a pidfd that fail leave no host descriptor of its
+/// shadow behind, as Linux's leave nothing: here 32 DELs of numbers the
+/// epoll does not name. Reviewer regression from
+/// https://github.com/rrnewton/reverie/pull/1410.
+#[test]
+fn failed_epoll_controls_of_a_pidfd_leave_no_shadow_descriptor() {
+    let root = TestDir::new();
+    let memory = pidfd_test_memory();
+    let (mut parent, _child) = pidfd_test_family(&root, 2);
+    let fd = pidfd_test_open(&mut parent, &memory, 2, 0);
+    let epoll = pidfd_test_call(&mut parent, &memory, libc::SYS_epoll_create1, [0; 6]);
+    let raw = pidfd_test_record(&parent, fd).readiness_fd();
+    let link = std::fs::read_link(format!("/proc/self/fd/{raw}")).unwrap();
+    let count = || {
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| std::fs::read_link(entry.path()).ok().as_ref() == Some(&link))
+            .count()
+    };
+    let before = count();
+    for alias in 100..132 {
+        assert_eq!(
+            pidfd_test_call(
+                &mut parent,
+                &memory,
+                libc::SYS_dup2,
+                [fd as u64, alias as u64, 0, 0, 0, 0]
+            ),
+            alias
+        );
+        assert_eq!(
+            pidfd_test_epoll_ctl(
+                &mut parent,
+                &memory,
+                epoll,
+                libc::EPOLL_CTL_DEL,
+                alias,
+                0,
+                0
+            ),
+            negative_errno(libc::ENOENT)
+        );
+        assert_eq!(
+            pidfd_test_call(
+                &mut parent,
+                &memory,
+                libc::SYS_close,
+                [alias as u64, 0, 0, 0, 0, 0]
+            ),
+            0
+        );
+    }
+    assert_eq!(
+        count(),
+        before,
+        "failed DELs must not retain shadow duplicates"
+    );
+    // Nor do a MOD of a number the epoll does not name, or an ADD that fails.
+    assert_eq!(
+        pidfd_test_epoll_ctl(
+            &mut parent,
+            &memory,
+            epoll,
+            libc::EPOLL_CTL_MOD,
+            fd,
+            libc::EPOLLIN as u32,
+            0
+        ),
+        negative_errno(libc::ENOENT)
+    );
+    assert_eq!(
+        pidfd_test_epoll_ctl(
+            &mut parent,
+            &memory,
+            epoll,
+            libc::EPOLL_CTL_ADD,
+            fd,
+            (libc::EPOLLIN | libc::EPOLLEXCLUSIVE | libc::EPOLLRDHUP) as u32,
+            0
+        ),
+        negative_errno(libc::EINVAL)
+    );
+    assert_eq!(count(), before);
+}
+
+/// Exec keeps a pidfd's descriptors that are not close-on-exec, and the
+/// pidfd with them. Reviewer test from
+/// https://github.com/rrnewton/reverie/pull/1410.
+#[test]
+fn exec_keeps_the_pidfds_that_are_not_close_on_exec() {
+    let root = TestDir::new();
+    let memory = pidfd_test_memory();
+    let (mut parent, mut child) = pidfd_test_family(&root, 2);
+    let fd = pidfd_test_open(&mut parent, &memory, 2, 0);
+    let keep = pidfd_test_call(
+        &mut parent,
+        &memory,
+        libc::SYS_dup,
+        [fd as u64, 0, 0, 0, 0, 0],
+    );
+    let clo = pidfd_test_call(
+        &mut parent,
+        &memory,
+        libc::SYS_fcntl,
+        [fd as u64, libc::F_DUPFD_CLOEXEC as u64, 30, 0, 0, 0],
+    );
+    let shadow = pidfd_test_record(&parent, fd).shadow();
+    parent.replace_after_exec(test_state(&root.0)).unwrap();
+    assert!(!parent.state.guest_pidfds.contains_key(&(fd as i32)));
+    assert!(!parent.state.guest_pidfds.contains_key(&(clo as i32)));
+    assert!(parent.state.guest_pidfds.contains_key(&(keep as i32)));
+    assert!(shadow.upgrade().is_some());
+    assert_eq!(pidfd_test_poll(&mut parent, &memory, keep), 0);
+    pidfd_test_exit(&mut parent, &mut child);
+    assert_eq!(
+        pidfd_test_poll(&mut parent, &memory, keep),
+        PIDFD_TEST_EXITED
+    );
+    pidfd_test_reap(&mut parent, &memory, 2);
+    assert_eq!(
+        pidfd_test_poll(&mut parent, &memory, keep),
+        PIDFD_TEST_REAPED
+    );
+    assert_eq!(
+        pidfd_test_call(
+            &mut parent,
+            &memory,
+            libc::SYS_close,
+            [keep as u64, 0, 0, 0, 0, 0]
+        ),
+        0
+    );
+    assert!(shadow.upgrade().is_none());
+}
+
+/// Edge-triggered and one-shot epoll registrations of a pidfd report the
+/// exit once and the reap once, and a MOD rearms a one-shot registration;
+/// none reports what a pidfd never does. Reviewer test from
+/// https://github.com/rrnewton/reverie/pull/1410.
+#[test]
+fn epoll_edge_and_one_shot_registrations_of_a_pidfd_report_as_linux_does() {
+    let root = TestDir::new();
+    let memory = pidfd_test_memory();
+    let (mut parent, mut child) = pidfd_test_family(&root, 2);
+    let fd = pidfd_test_open(&mut parent, &memory, 2, 0);
+    let alias = pidfd_test_call(
+        &mut parent,
+        &memory,
+        libc::SYS_dup,
+        [fd as u64, 0, 0, 0, 0, 0],
+    );
+    let epoll = pidfd_test_call(&mut parent, &memory, libc::SYS_epoll_create1, [0; 6]);
+    let mask = (libc::EPOLLIN | libc::EPOLLOUT | libc::EPOLLRDHUP | libc::EPOLLPRI) as u32;
+    for (target, modifier, data) in [(fd, libc::EPOLLET, 1), (alias, libc::EPOLLONESHOT, 2)] {
+        assert_eq!(
+            pidfd_test_epoll_ctl(
+                &mut parent,
+                &memory,
+                epoll,
+                libc::EPOLL_CTL_ADD,
+                target,
+                mask | modifier as u32,
+                data
+            ),
+            0
+        );
+    }
+    assert!(pidfd_test_epoll_wait(&mut parent, &memory, epoll).is_empty());
+    pidfd_test_exit(&mut parent, &mut child);
+    assert_eq!(
+        pidfd_test_epoll_wait(&mut parent, &memory, epoll),
+        BTreeMap::from([(1, libc::EPOLLIN as u32), (2, libc::EPOLLIN as u32)])
+    );
+    assert!(pidfd_test_epoll_wait(&mut parent, &memory, epoll).is_empty());
+    pidfd_test_reap(&mut parent, &memory, 2);
+    let reaped = (libc::EPOLLIN | libc::EPOLLHUP) as u32;
+    assert_eq!(
+        pidfd_test_epoll_wait(&mut parent, &memory, epoll),
+        BTreeMap::from([(1, reaped)])
+    );
+    assert!(pidfd_test_epoll_wait(&mut parent, &memory, epoll).is_empty());
+    assert_eq!(
+        pidfd_test_epoll_ctl(
+            &mut parent,
+            &memory,
+            epoll,
+            libc::EPOLL_CTL_MOD,
+            alias,
+            mask | libc::EPOLLONESHOT as u32,
+            2
+        ),
+        0
+    );
+    assert_eq!(
+        pidfd_test_epoll_wait(&mut parent, &memory, epoll),
+        BTreeMap::from([(2, reaped)])
+    );
+    assert!(pidfd_test_epoll_wait(&mut parent, &memory, epoll).is_empty());
+}
+
+/// The refusal of a pidfd in an `SCM_RIGHTS` message changes nothing, as
+/// the typed refusal promises: a pipe right earlier in the same message is
+/// not marked as exported, so its owner can still be set. Reviewer
+/// regression from https://github.com/rrnewton/reverie/pull/1410.
+#[test]
+fn a_refused_pidfd_right_leaves_the_rights_before_it_unexported() {
+    let root = TestDir::new();
+    let mut memory = pidfd_test_memory();
+    let (mut parent, _child) = pidfd_test_family(&root, 2);
+    let fd = pidfd_test_open(&mut parent, &memory, 2, 0);
+    let [pipe, _] = owner_test_pipe(&mut parent.state);
+    let mut control = rights_control(&[pipe, fd as i32]);
+    assert_eq!(
+        translate_outgoing_control(&mut control, &mut parent.state),
+        Err(negative_errno(libc::ENOSYS))
+    );
+    assert_eq!(parent.state.pidfd_refusal, Some(PIDFD_RIGHTS_REFUSAL));
+    assert_eq!(
+        owner_test_call(&mut memory, &mut parent.state, pipe, libc::F_SETOWN, 0),
+        0,
+        "typed pidfd refusal promises changed nothing"
+    );
+}
+
+/// `pidfd_open` of a live thread that leads no thread group is ENOENT, as
+/// Linux's `pidfd_prepare` answers when the pid has no thread group leader
+/// link (kernel/fork.c:1844 in v6.17,
+/// https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/fork.c?h=v6.17#n1844);
+/// a native probe of a live thread measures errno 2. Reviewer regression
+/// from https://github.com/rrnewton/reverie/pull/1410.
+#[test]
+fn pidfd_open_of_a_thread_that_leads_no_group_is_enoent() {
+    let root = TestDir::new();
+    let memory = pidfd_test_memory();
+    let (mut parent, _child) = pidfd_test_family(&root, 2);
+    let _thread = parent.thread_child(9).unwrap();
+    assert_eq!(
+        pidfd_test_open(&mut parent, &memory, 9, 0),
+        negative_errno(libc::ENOENT)
     );
 }

@@ -6,15 +6,15 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! The shadow sockets that show the readiness of pidfds for other guest
-//! processes (gVisor: pkg/sentry/kernel/pidfd.go, whose pidfd reports itself
-//! readable once its thread group has exited).
+//! The shadow sockets that show the readiness of pidfds for guest processes
+//! (gVisor: pkg/sentry/kernel/pidfd.go, whose pidfd reports itself readable
+//! once its thread group has exited).
 //!
 //! In the guest's descriptor table, the supervisor's own pidfd stands in for
-//! a pidfd for another guest process (`crate::executor::pidfd_open`), so the
-//! kernel answers every call that it answers alike for any pidfd: read,
-//! write, `F_GETFL`, the `/proc/self/fd` link and its refused reopen. What the
-//! stand-in cannot show is the other process's life: the supervisor outlives
+//! a pidfd for a guest process (`crate::executor::pidfd_open`), so the kernel
+//! answers every call that it answers alike for any pidfd: read, write,
+//! `F_GETFL`, the `/proc/self/fd` link and its refused reopen. What the
+//! stand-in cannot show is the guest process's life: the supervisor outlives
 //! every guest process. Linux's `pidfd_poll` (fs/pidfs.c) reports
 //! `EPOLLIN | EPOLLRDNORM` once the process has exited, adds `EPOLLHUP` once
 //! it has been reaped, and never reports anything else. So each such pidfd
@@ -22,7 +22,7 @@
 //! shadow, reports `POLLIN | POLLRDNORM` once the other has sent it one
 //! byte, and `POLLHUP` as well once the other has been shut down; poll,
 //! select and epoll watch it in the stand-in's place, asking it only for
-//! `POLLIN | POLLRDNORM` (`crate::executor::ForeignPidfd`), since a socket
+//! `POLLIN | POLLRDNORM` (`crate::executor::GuestPidfd`), since a socket
 //! also reports that it is writable and, once shut down, `POLLRDHUP`. The
 //! registry keeps the other socket, the write end, with the process it
 //! shows: it sends the byte once the process has exited and shuts the write
@@ -36,25 +36,37 @@
 //!
 //! The sockets are the supervisor's alone. Neither is ever in a guest's
 //! descriptor table, and both are close-on-exec and above the standard
-//! descriptors. Every descriptor of the pidfd holds the shadow, so the shadow
-//! closes with the pidfd's last descriptor, which also ends any epoll
-//! registration of the pidfd, as Linux ends one when the pidfd's open file
-//! description is released. The write end closes when the process is reaped,
-//! or once the shadow is gone.
+//! descriptors. The pidfd's record holds the shadow, and only the descriptor
+//! tables that hold the pidfd, and a call while it uses the pidfd, hold the
+//! record (`crate::executor::GuestPidfd`). So the shadow closes with the
+//! pidfd's last descriptor, which also ends any epoll registration of the
+//! pidfd, as Linux ends one when the pidfd's open file description is
+//! released. The write end closes when the process is reaped, or once the
+//! shadow is gone.
 //!
 //! The registry decides what each shadow shows under the family lock, from
 //! the family's own record of each exit (`ProcessFamilyState::terminal`) and
-//! of each wait (`ProcessFamilyState::wait_publications`). The sends,
-//! shutdowns and closes that decision calls for run after the lock is
-//! released, as every host close of the registry does. Each change of those
-//! records ends with `ProcessSignalRegistry::sync_pidfd_shadows`, so a shadow
-//! shows an exit before the exiting process's Tool callback runs, which is
-//! before any other task can learn of the exit from the Tool.
+//! of each wait (`ProcessFamilyState::wait_publications`). The sends and
+//! shutdowns that decision calls for are done once the lock is released, as
+//! every host close of the registry is, and in the order they were decided,
+//! under a lock of their own ([`ShadowActions::perform`]): whichever task
+//! gets there first does every one decided so far, its own and any that
+//! another task decided and has not done yet, and waits for any being done.
+//! So a sync returns only once every shadow shows what the records it saw
+//! call for, and no send ever follows the shutdown of its write end. Each
+//! change of those records ends with
+//! `ProcessSignalRegistry::sync_pidfd_shadows`, so a shadow shows an exit
+//! before the exiting process's Tool callback runs, which is before any other
+//! task can learn of the exit from the Tool, and shows a reap before the wait
+//! that reaped returns.
 
+use std::collections::BTreeMap;
+use std::collections::VecDeque;
 use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::Weak;
 
 use reverie::SignalProcessId;
@@ -79,67 +91,113 @@ pub(crate) enum PidfdTargetState {
     Reaped,
 }
 
-/// The write ends of the shadow sockets of the pidfds for one process.
+/// A family's pidfd shadows: the write ends for each process, and the sends
+/// and shutdowns decided for them.
 #[derive(Debug, Default)]
-pub(super) struct PidfdShadowWriters(Vec<ShadowWriter>);
+pub(super) struct PidfdShadows {
+    writers: BTreeMap<ProcessKey, Vec<ShadowWriter>>,
+    effects: Arc<ShadowEffects>,
+}
 
 #[derive(Debug)]
 struct ShadowWriter {
-    /// The shadow, which every descriptor of the pidfd holds.
+    /// The shadow, which the pidfd's record holds.
     reader: Weak<File>,
     writer: Arc<File>,
-    /// Whether the shadow has its byte: it was sent one once the process had
+    /// Whether the shadow's byte is decided: it is sent once the process has
     /// exited.
     written: bool,
 }
 
-/// What the registry decided for the shadows, done once the family lock is
-/// released.
-#[must_use]
-pub(super) struct ShadowActions {
-    /// Each write end to send its shadow the byte, with the shadow, held so
-    /// that the send has a receiver.
-    writes: Vec<(Arc<File>, Arc<File>)>,
-    /// Write ends to shut down and close.
-    closes: Vec<Arc<File>>,
+/// The sends and shutdowns decided for the shadows, in the order decided,
+/// and the lock under which they are done.
+#[derive(Debug, Default)]
+struct ShadowEffects {
+    queue: Mutex<VecDeque<ShadowEffect>>,
+    io: Mutex<()>,
 }
 
-impl ShadowActions {
+#[derive(Debug)]
+enum ShadowEffect {
+    /// The write end sends its shadow the byte, if the shadow is still open.
+    /// The shadow is not held meanwhile: holding it would hold the pidfd's
+    /// open file description, and with it any epoll registration of the
+    /// pidfd, past the pidfd's last close.
+    Send {
+        reader: Weak<File>,
+        writer: Arc<File>,
+    },
+    /// The write end is shut down, then closed.
+    Shutdown(Arc<File>),
+}
+
+impl ShadowEffect {
     fn perform(self) {
-        for (reader, writer) in self.writes {
-            let byte = 1_u8;
-            loop {
-                // SAFETY: writer owns a live descriptor, and the byte is one
-                // byte of readable memory.
-                let sent = unsafe {
-                    libc::send(
-                        writer.as_raw_fd(),
-                        std::ptr::from_ref(&byte).cast(),
-                        1,
-                        libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
-                    )
-                };
-                if sent < 0
-                    && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
-                {
-                    continue;
+        match self {
+            Self::Send { reader, writer } => {
+                if reader.strong_count() == 0 {
+                    return;
                 }
-                // A connected socket with nothing queued takes one byte
-                // without waiting.
-                debug_assert_eq!(sent, 1, "pidfd shadow socket refused its byte");
-                break;
+                let byte = 1_u8;
+                loop {
+                    // SAFETY: writer owns a live descriptor, and the byte is
+                    // one byte of readable memory.
+                    let sent = unsafe {
+                        libc::send(
+                            writer.as_raw_fd(),
+                            std::ptr::from_ref(&byte).cast(),
+                            1,
+                            libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                        )
+                    };
+                    if sent < 0
+                        && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                    {
+                        continue;
+                    }
+                    // A connected socket with nothing queued takes one byte
+                    // without waiting, and its shutdown comes after this send
+                    // (`ShadowActions::perform`); only a shadow closed since
+                    // the check above refuses it (EPIPE).
+                    debug_assert!(
+                        sent == 1 || reader.strong_count() == 0,
+                        "pidfd shadow socket refused its byte"
+                    );
+                    break;
+                }
             }
-            drop(reader);
+            Self::Shutdown(writer) => {
+                // The shutdown hangs the shadow up whatever other copies of
+                // this descriptor exist (see the module documentation).
+                // SAFETY: writer owns a live descriptor.
+                let shut = unsafe { libc::shutdown(writer.as_raw_fd(), libc::SHUT_RDWR) };
+                debug_assert!(
+                    shut == 0
+                        || std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOTCONN),
+                    "pidfd shadow socket refused its shutdown"
+                );
+            }
         }
-        for writer in self.closes {
-            // The shutdown hangs the shadow up whatever other copies of this
-            // descriptor exist (see the module documentation).
-            // SAFETY: writer owns a live descriptor.
-            let shut = unsafe { libc::shutdown(writer.as_raw_fd(), libc::SHUT_RDWR) };
-            debug_assert!(
-                shut == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOTCONN),
-                "pidfd shadow socket refused its shutdown"
-            );
+    }
+}
+
+/// The sends and shutdowns the registry decided under the family lock, for
+/// the decider to do once it has released that lock ([`Self::perform`]).
+#[must_use]
+pub(super) struct ShadowActions(Arc<ShadowEffects>);
+
+impl ShadowActions {
+    /// Does every send and shutdown decided so far, in the order decided,
+    /// under the family's shadow lock. One that another task decided and has
+    /// not done yet is done here, and one being done is waited for, so this
+    /// returns only once each shadow shows what the decisions before it
+    /// called for, and a write end's send, decided at the exit, is always
+    /// done before its shutdown, decided at the reap.
+    fn perform(self) {
+        let _io = self.0.io.lock().unwrap_or_else(|p| p.into_inner());
+        let effects = std::mem::take(&mut *self.0.queue.lock().unwrap_or_else(|p| p.into_inner()));
+        for effect in effects {
+            effect.perform();
         }
     }
 }
@@ -181,51 +239,61 @@ impl ProcessFamilyState {
         }
     }
 
-    /// Brings every shadow in line with its process, returning the sends and
-    /// shutdowns that takes. The write end of a shadow that is gone is closed.
+    /// Decides what brings every shadow in line with its process, and queues
+    /// the sends and shutdowns that takes, for the caller to do once it has
+    /// released the family lock. The write end of a shadow that is gone is
+    /// closed.
     // TODO-HUMAN-REVIEW(https://github.com/rrnewton/reverie/pull/1410): Review when each shadow
     // shows an exit and a reap.
     fn take_pidfd_shadow_actions(&mut self) -> ShadowActions {
-        let mut actions = ShadowActions {
-            writes: Vec::new(),
-            closes: Vec::new(),
-        };
+        let mut effects = Vec::new();
         let states: Vec<_> = self
             .pidfd_shadows
+            .writers
             .keys()
             .map(|&key| (key, self.pidfd_target_state(key)))
             .collect();
         for (key, state) in states {
-            let writers = &mut self
+            let writers = self
                 .pidfd_shadows
+                .writers
                 .get_mut(&key)
-                .expect("a listed shadow entry")
-                .0;
+                .expect("a listed shadow entry");
             let (live, gone): (Vec<_>, Vec<_>) = std::mem::take(writers)
                 .into_iter()
                 .partition(|writer| writer.reader.strong_count() != 0);
             *writers = live;
-            actions
-                .closes
-                .extend(gone.into_iter().map(|writer| writer.writer));
+            effects.extend(
+                gone.into_iter()
+                    .map(|writer| ShadowEffect::Shutdown(writer.writer)),
+            );
             if state >= PidfdTargetState::Exited {
                 for writer in writers.iter_mut().filter(|writer| !writer.written) {
-                    if let Some(reader) = writer.reader.upgrade() {
-                        actions.writes.push((reader, writer.writer.clone()));
-                    }
+                    effects.push(ShadowEffect::Send {
+                        reader: writer.reader.clone(),
+                        writer: writer.writer.clone(),
+                    });
                     writer.written = true;
                 }
             }
             if state == PidfdTargetState::Reaped {
-                actions
-                    .closes
-                    .extend(writers.drain(..).map(|writer| writer.writer));
+                effects.extend(
+                    writers
+                        .drain(..)
+                        .map(|writer| ShadowEffect::Shutdown(writer.writer)),
+                );
             }
             if writers.is_empty() {
-                self.pidfd_shadows.remove(&key);
+                self.pidfd_shadows.writers.remove(&key);
             }
         }
-        actions
+        let shadow_effects = &self.pidfd_shadows.effects;
+        shadow_effects
+            .queue
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .extend(effects);
+        ShadowActions(shadow_effects.clone())
     }
 }
 
@@ -266,9 +334,9 @@ impl ProcessSignalRegistry {
             }
             family
                 .pidfd_shadows
+                .writers
                 .entry(key)
                 .or_default()
-                .0
                 .push(ShadowWriter {
                     reader: Arc::downgrade(&reader),
                     writer: Arc::new(writer),
@@ -298,13 +366,10 @@ impl ProcessSignalRegistry {
             .lock()
             .unwrap()
             .pidfd_shadows
+            .writers
             .get(&process_key(target))
             .map_or_else(Vec::new, |writers| {
-                writers
-                    .0
-                    .iter()
-                    .map(|writer| writer.writer.clone())
-                    .collect()
+                writers.iter().map(|writer| writer.writer.clone()).collect()
             })
     }
 }
@@ -349,4 +414,166 @@ fn above_standard(file: File) -> std::io::Result<File> {
     }
     // SAFETY: fcntl returned a new descriptor that nothing else owns.
     Ok(unsafe { File::from_raw_fd(moved) })
+}
+
+/// Sends and shutdowns that one task decided and has not done yet when
+/// another task syncs, as the effects of an unrelated sync wait for their
+/// decider, who decided them under the family lock, to do them once it has
+/// released that lock. Reviewer regressions from
+/// https://github.com/rrnewton/reverie/pull/1410.
+#[cfg(test)]
+mod interleaving_tests {
+    use super::super::ChildExitSnapshot;
+    use super::super::PublicationDisposition;
+    use super::super::child_wait::WaitPublication;
+    use super::*;
+
+    /// Records `target`'s waitable exit, with `parent`'s wait for it ready,
+    /// and decides what that shows, without doing it.
+    fn exit_decided_and_not_done(
+        registry: &ProcessSignalRegistry,
+        parent: SignalProcessId,
+        target: SignalProcessId,
+    ) -> ShadowActions {
+        let mut family = registry.family.lock().unwrap();
+        family.terminal.insert(
+            process_key(target),
+            ProcessFamilyExit::Child(ChildExitSnapshot {
+                completion: reverie::ChildExitCompletion {
+                    parent,
+                    child: target,
+                    status: reverie::ExitStatus::Exited(7),
+                    waitable: true,
+                    uid: 0,
+                    user_ticks: 0,
+                    system_ticks: 0,
+                },
+                disposition: PublicationDisposition::Default,
+                pending_generation: 0,
+            }),
+        );
+        family.wait_publications.insert(
+            process_key(target),
+            WaitPublication {
+                parent,
+                phase: WaitPhase::Ready,
+            },
+        );
+        family.take_pidfd_shadow_actions()
+    }
+
+    /// The exit's send, decided by one task, is not overtaken by the reap's
+    /// shutdown: whichever task gets to the queue first does the send first,
+    /// and the decider then has nothing left to do, so it never sends on a
+    /// shut-down socket.
+    #[test]
+    fn a_reap_does_not_overtake_an_exit_another_task_decided() {
+        let registry = ProcessSignalRegistry::default();
+        let parent = SignalProcessId {
+            tgid: reverie::Pid::from_raw(1),
+            generation: 1,
+        };
+        let target = SignalProcessId {
+            tgid: reverie::Pid::from_raw(2),
+            generation: 2,
+        };
+        let shadow = registry.open_pidfd_shadow(target).unwrap();
+        let key = process_key(target);
+        let deferred_exit = exit_decided_and_not_done(&registry, parent, target);
+        // One unrelated sync selected the exit write and got descheduled
+        // after unlocking. The exiting task's own sync can now return.
+        registry.sync_pidfd_shadows();
+        // Completion becomes waitable; its parent consumes it and syncs.
+        registry
+            .family
+            .lock()
+            .unwrap()
+            .wait_publications
+            .get_mut(&key)
+            .unwrap()
+            .phase = WaitPhase::Consumed;
+        registry.sync_pidfd_shadows();
+        let mut pfd = libc::pollfd {
+            fd: shadow.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: pfd is one initialized pollfd of this frame.
+        assert_eq!(unsafe { libc::poll(&mut pfd, 1, 0) }, 1);
+        // The earlier sync resumes at its exact post-unlock point.
+        // Correct ordering must not send on an already-shutdown socket.
+        deferred_exit.perform();
+    }
+
+    /// The last close of a pidfd is not held back by a send that another task
+    /// decided and has not done: the decision names the shadow without
+    /// holding it, so the shadow, and with it the pidfd's open file
+    /// description and any epoll registration of the pidfd, goes with the
+    /// pidfd's last descriptor, and the late send finds no shadow.
+    #[test]
+    fn a_last_close_is_not_held_back_by_a_send_another_task_decided() {
+        let registry = ProcessSignalRegistry::default();
+        let parent = SignalProcessId {
+            tgid: reverie::Pid::from_raw(1),
+            generation: 1,
+        };
+        let target = SignalProcessId {
+            tgid: reverie::Pid::from_raw(2),
+            generation: 2,
+        };
+        let shadow = registry.open_pidfd_shadow(target).unwrap();
+        let closed = Arc::downgrade(&shadow);
+        let deferred_exit = exit_decided_and_not_done(&registry, parent, target);
+        // The pidfd's last descriptor closes.
+        drop(shadow);
+        assert!(
+            closed.upgrade().is_none(),
+            "a decided send held the closed pidfd's shadow open"
+        );
+        deferred_exit.perform();
+        registry.sync_pidfd_shadows();
+        assert!(registry.pidfd_shadow_writers(target).is_empty());
+    }
+
+    /// The sync of the wait that reaps returns only once the shadow shows the
+    /// reap, even when another task decided the shutdown and has not done it.
+    #[test]
+    fn a_reap_sync_waits_for_a_shutdown_another_task_decided() {
+        let registry = ProcessSignalRegistry::default();
+        let parent = SignalProcessId {
+            tgid: reverie::Pid::from_raw(1),
+            generation: 1,
+        };
+        let target = SignalProcessId {
+            tgid: reverie::Pid::from_raw(2),
+            generation: 2,
+        };
+        let shadow = registry.open_pidfd_shadow(target).unwrap();
+        let key = process_key(target);
+        let deferred_exit = exit_decided_and_not_done(&registry, parent, target);
+        deferred_exit.perform();
+        // The child is exited and readable before its parent consumes it.
+        let deferred_reap = {
+            let mut family = registry.family.lock().unwrap();
+            family.wait_publications.get_mut(&key).unwrap().phase = WaitPhase::Consumed;
+            // An unrelated operation selected this global reap action,
+            // then paused after dropping the family lock.
+            family.take_pidfd_shadow_actions()
+        };
+        // The consuming wait's own sync must not return before the effect.
+        registry.sync_pidfd_shadows();
+        let mut pfd = libc::pollfd {
+            fd: shadow.as_raw_fd(),
+            events: libc::POLLIN | libc::POLLRDNORM,
+            revents: 0,
+        };
+        // SAFETY: pfd is one initialized pollfd of this frame.
+        assert_eq!(unsafe { libc::poll(&mut pfd, 1, 0) }, 1);
+        assert_eq!(
+            pfd.revents,
+            libc::POLLIN | libc::POLLRDNORM | libc::POLLHUP,
+            "consuming wait's sync returned before the HUP effect"
+        );
+        deferred_reap.perform();
+    }
 }

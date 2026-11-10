@@ -226,12 +226,12 @@ pub(super) fn finish_waitid<M: GuestMemoryAccess<Error = crate::Error>>(
 /// is nonblocking, as Linux resolves the descriptor (`kernel_waitid_prepare`
 /// and `pidfd_get_pid`, kernel/exit.c and kernel/pid.c): EINVAL for a
 /// negative descriptor, EBADF for one that is not open or not a pidfd. A
-/// pidfd for another guest process names its process ([`ForeignPidfd`]),
-/// which is no child to wait for once it has been reaped (ECHILD). Any other
-/// pidfd names the caller's own process or a process outside the run, which
-/// is no child of the caller either (ECHILD); that includes a pidfd for the
-/// caller that another guest process sent it, which this executor cannot
-/// tell apart from those.
+/// pidfd for a guest process names its process ([`GuestPidfd`]), which is
+/// no child to wait for once it has been reaped (ECHILD), nor when it is the
+/// caller's own (the wait finds no such child: ECHILD). Any other pidfd
+/// names a process outside the run, which is no child of the caller either
+/// (ECHILD); so does the stand-in alone that a task outside any process
+/// family gets for its own process.
 // TODO-HUMAN-REVIEW(https://github.com/rrnewton/reverie/pull/1410): Review waitid(P_PIDFD).
 pub(super) fn pidfd_wait_target(
     state: &LoadedStaticElf,
@@ -246,7 +246,7 @@ pub(super) fn pidfd_wait_target(
     let Some(host_fd) = host_fd(state, fd) else {
         return Err(libc::EBADF);
     };
-    let Some(pidfd) = foreign_pidfd(state, fd) else {
+    let Some(pidfd) = guest_pidfd(state, fd) else {
         return Err(if fd_link_target_is(host_fd, b"anon_inode:[pidfd]") {
             libc::ECHILD
         } else {

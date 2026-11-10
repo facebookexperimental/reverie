@@ -39,7 +39,7 @@
 //!
 //! An object the executor keeps itself, whose host carrier is not the guest's
 //! object, is not provided: a virtual signalfd (an eventfd carrier), a pidfd
-//! for another guest process (a pidfd for the supervisor), a memfd
+//! for a guest process (a pidfd for the supervisor), a memfd
 //! of the executor's own, such as a synthetic `/proc` file or `fdinfo`
 //! description, and with captured output the supervisor's standard output or
 //! error. The last two are recognized by the host object itself, not by what
@@ -137,12 +137,12 @@ fn descriptor_source(
     if table.signalfd_fds.contains(&fd) {
         return Err(reverie::FactError::NotProvided);
     }
-    // A pidfd for another process is backed by a pidfd for the supervisor,
-    // whose fdinfo names the supervisor (`ForeignPidfd`).
+    // A pidfd for a guest process is backed by a pidfd for the supervisor,
+    // whose fdinfo names the supervisor (`GuestPidfd`).
     if table
         .slots
         .get(&fd)
-        .is_some_and(|slot| slot.foreign_pidfd.is_some())
+        .is_some_and(|slot| slot.guest_pidfd.is_some())
     {
         return Err(reverie::FactError::NotProvided);
     }

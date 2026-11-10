@@ -810,8 +810,8 @@ pub(super) fn sanitize_guest_fd_stat(
         sanitize_proc_stat(stat, inode);
         return;
     }
-    if let Some(pidfd) = foreign_pidfd(state, guest_fd) {
-        stat.st_ino = foreign_pidfd_inode(pidfd.target());
+    if let Some(pidfd) = guest_pidfd(state, guest_fd) {
+        stat.st_ino = pidfd_inode(pidfd.target());
     }
     if let Some(seconds) = synthetic_descriptor_seconds(state, guest_fd) {
         set_stat_timestamps(stat, seconds);
@@ -827,8 +827,8 @@ pub(super) fn sanitize_guest_fd_statx(
         *stat = synthetic_proc_statx(inode, stat.stx_size);
         return;
     }
-    if let Some(pidfd) = foreign_pidfd(state, guest_fd) {
-        stat.stx_ino = foreign_pidfd_inode(pidfd.target());
+    if let Some(pidfd) = guest_pidfd(state, guest_fd) {
+        stat.stx_ino = pidfd_inode(pidfd.target());
     }
     if let Some(seconds) = synthetic_descriptor_seconds(state, guest_fd) {
         set_statx_timestamps(stat, seconds);

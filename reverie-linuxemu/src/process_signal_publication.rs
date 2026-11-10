@@ -332,7 +332,7 @@ pub struct ProcessFamilyState {
     >,
     // The write ends of the shadow sockets of the pidfds that name each
     // process, kept in line with its exit and its reaping (`pidfd_shadow`).
-    pidfd_shadows: BTreeMap<ProcessKey, pidfd_shadow::PidfdShadowWriters>,
+    pidfd_shadows: pidfd_shadow::PidfdShadows,
 }
 
 impl ProcessFamilyState {

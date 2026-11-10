@@ -1132,6 +1132,9 @@ impl ElfExecutor {
             .execute_checked_dispatch(request, memory, terminal_read)
             .map_err(|error| memory.capture_shared_file_error(error));
         let ended = call.end(self.state.tid);
+        // The call has published any pidfd it opened: its table holds the
+        // record from here (`LoadedStaticElf::pidfd_holds`).
+        self.state.pidfd_holds.clear();
         if let Some(failure) = memory.entry_gate().pending_failure() {
             return Err(failure.error());
         }

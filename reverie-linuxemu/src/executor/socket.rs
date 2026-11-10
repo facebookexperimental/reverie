@@ -946,6 +946,52 @@ pub(super) fn translate_outgoing_rights(
     state: &mut LoadedStaticElf,
     transfers: &mut Vec<(libc::dev_t, libc::ino_t)>,
 ) -> Result<(), i64> {
+    let mut exported = Vec::new();
+    match check_outgoing_rights(control, state, transfers, &mut exported) {
+        // The refusal of a pidfd marks nothing as exported, as the typed
+        // refusal promises (`UnsupportedOperation::Pidfd`); the caller
+        // releases the proc transfers registered so far
+        // (`translate_outgoing_control`).
+        Err(OutgoingRightRefusal::Pidfd) => {
+            state.pidfd_refusal = Some(PIDFD_RIGHTS_REFUSAL);
+            Err(negative_errno(libc::ENOSYS))
+        }
+        // Otherwise each right that got past its own checks is marked as
+        // exported, as a send exports it; a refusal by a later right leaves
+        // those marked, conservatively.
+        Err(OutgoingRightRefusal::Errno(error)) => {
+            mark_exported_rights(state, &exported)?;
+            Err(error)
+        }
+        Ok(()) => mark_exported_rights(state, &exported),
+    }
+}
+
+/// Why an outgoing `SCM_RIGHTS` message is refused.
+enum OutgoingRightRefusal {
+    /// A right Linux refuses, or this backend refuses by errno alone.
+    Errno(i64),
+    /// A pidfd for a guest process, which this backend refuses by name
+    /// (`PIDFD_RIGHTS_REFUSAL`).
+    Pidfd,
+}
+
+impl From<i64> for OutgoingRightRefusal {
+    fn from(error: i64) -> Self {
+        Self::Errno(error)
+    }
+}
+
+/// Checks the rights of `control`, in order, and puts each right's host
+/// descriptor in place of its guest descriptor. Each guest descriptor that
+/// passed its own checks goes in `exported`, for its export marks
+/// ([`mark_exported_rights`]), which wait until every right is checked.
+fn check_outgoing_rights(
+    control: &mut [u8],
+    state: &LoadedStaticElf,
+    transfers: &mut Vec<(libc::dev_t, libc::ino_t)>,
+    exported: &mut Vec<libc::c_int>,
+) -> Result<(), OutgoingRightRefusal> {
     for message in control_messages(control)? {
         // SCM_RIGHTS is the only ancillary input whose payload is meaningful in
         // the guest descriptor namespace. Other control inputs (credentials,
@@ -953,50 +999,30 @@ pub(super) fn translate_outgoing_rights(
         // virtualization rules; fail before sendmsg rather than forwarding
         // guest/host identity bytes under an accidental pass-through policy.
         if message.level != libc::SOL_SOCKET || message.kind != libc::SCM_RIGHTS {
-            return Err(negative_errno(libc::EOPNOTSUPP));
+            return Err(negative_errno(libc::EOPNOTSUPP).into());
         }
         let data_length = message.end - message.data_offset;
         if data_length == 0 || data_length % std::mem::size_of::<libc::c_int>() != 0 {
-            return Err(negative_errno(libc::EINVAL));
+            return Err(negative_errno(libc::EINVAL).into());
         }
         for offset in (message.data_offset..message.end).step_by(std::mem::size_of::<libc::c_int>())
         {
             let guest_fd = read_control_fd(control, offset)?;
             let host_fd = host_fd(state, guest_fd).ok_or_else(|| negative_errno(libc::EBADF))?;
-            if foreign_pidfd(state, guest_fd).is_some() {
+            if state.guest_pidfds.contains_key(&guest_fd) {
                 // The receiver would get the supervisor's pidfd that stands
                 // in for it, which neither names the process nor shows its
                 // readiness. Refuse before host sendmsg sends anything.
-                state.pidfd_refusal = Some(PIDFD_RIGHTS_REFUSAL);
-                return Err(negative_errno(libc::ENOSYS));
+                return Err(OutgoingRightRefusal::Pidfd);
             }
-            if let Some(owner) = state.pipe_owners.get(&guest_fd) {
-                owner.before_export()?;
+            if state
+                .pipe_owners
+                .get(&guest_fd)
+                .is_some_and(|owner| owner.export_refused())
+            {
+                return Err(negative_errno(libc::ENOSYS).into());
             }
-            if let Some(description) = native_poll_description(state, guest_fd) {
-                // Once an untracked receiver might control this description,
-                // no known alias can prove its registration set. Invalidate
-                // BEFORE host sendmsg, then release the leaf lock. Even a
-                // later malformed element/failed send keeps new syscall 441
-                // outside admission; the existing send result is unchanged.
-                let mut domain = state
-                    .epoll_domain
-                    .lock()
-                    .expect("KVM epoll provenance lock poisoned");
-                match description {
-                    NativePollDescription::Epoll(identity) => {
-                        if let Some(proof) = domain.proofs.get_mut(&epoll_identity_key(&identity)) {
-                            proof.unsafe_history = true;
-                        }
-                    }
-                    NativePollDescription::EventFd(identity) => {
-                        // A foreign writer controls readiness even when nobody
-                        // exports the epoll itself. Never infer determinism
-                        // from the native carrier merely being an eventfd.
-                        identity.escaped.store(true, Ordering::SeqCst);
-                    }
-                }
-            }
+            exported.push(guest_fd);
             if state
                 .fdinfo_files
                 .get(&guest_fd)
@@ -1012,9 +1038,45 @@ pub(super) fn translate_outgoing_rights(
                 // The receiver cannot reconstruct private stream/signalfd
                 // metadata. Refuse before host sendmsg delivers any payload or
                 // descriptors.
-                return Err(negative_errno(libc::ENOSYS));
+                return Err(negative_errno(libc::ENOSYS).into());
             }
             write_control_fd(control, offset, host_fd)?;
+        }
+    }
+    Ok(())
+}
+
+/// Marks each of the guest descriptors `exported` as exported, before host
+/// sendmsg: a pipe's owner record, and the provenance of a native poll
+/// description.
+fn mark_exported_rights(state: &LoadedStaticElf, exported: &[libc::c_int]) -> Result<(), i64> {
+    for &guest_fd in exported {
+        if let Some(owner) = state.pipe_owners.get(&guest_fd) {
+            owner.before_export()?;
+        }
+        if let Some(description) = native_poll_description(state, guest_fd) {
+            // Once an untracked receiver might control this description,
+            // no known alias can prove its registration set. Invalidate
+            // BEFORE host sendmsg, then release the leaf lock. Even a
+            // later malformed element/failed send keeps new syscall 441
+            // outside admission; the existing send result is unchanged.
+            let mut domain = state
+                .epoll_domain
+                .lock()
+                .expect("KVM epoll provenance lock poisoned");
+            match description {
+                NativePollDescription::Epoll(identity) => {
+                    if let Some(proof) = domain.proofs.get_mut(&epoll_identity_key(&identity)) {
+                        proof.unsafe_history = true;
+                    }
+                }
+                NativePollDescription::EventFd(identity) => {
+                    // A foreign writer controls readiness even when nobody
+                    // exports the epoll itself. Never infer determinism
+                    // from the native carrier merely being an eventfd.
+                    identity.escaped.store(true, Ordering::SeqCst);
+                }
+            }
         }
     }
     Ok(())
