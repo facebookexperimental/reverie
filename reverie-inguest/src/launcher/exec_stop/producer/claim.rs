@@ -15,11 +15,14 @@
 //!
 //! Today's handoff is UNBOUND AND UNQUALIFIED: its five binding digests
 //! (launch, loader, runtime, source, layout) are all zero, byte-identical to
-//! the wire this producer was promoted from, and the launch, loader and source
-//! digests have no verifiable expected value yet. Every claim refuses with
-//! [`HANDOFF_BINDING_UNBOUND`] until all five are written and verified.
+//! the wire this producer was promoted from. A mapped first image has no
+//! loader, so its loader digest must stay zero; the launch and source digests
+//! have no verifiable expected value yet. Every claim refuses with
+//! [`HANDOFF_BINDING_UNBOUND`] until the launch, runtime, source and layout
+//! digests are written and verified.
 
-use super::super::Result;
+use std::marker::PhantomData;
+
 use super::super::physical::Preparation;
 use super::super::physical::PreparedMapping;
 use super::FilterCoverage;
@@ -34,9 +37,12 @@ pub const RUNTIME_DIGEST_MISMATCH: &str = "exec_stop_runtime_digest_mismatch";
 pub const LAYOUT_DIGEST_MISMATCH: &str = "exec_stop_layout_digest_mismatch";
 /// The runtime image did not pass the instruction audit and filter proof.
 pub const RUNTIME_ARTIFACT_UNAUDITED: &str = "exec_stop_runtime_artifact_unaudited";
+/// The claim was not armed for the preparation that was mapped.
+pub const CLAIM_FOREIGN_PREPARATION: &str = "exec_stop_claim_foreign_preparation";
 
 /// The five binding digest slots, in header order.
 pub const BINDING_SLOTS: [&str; 5] = ["launch", "loader", "runtime", "source", "layout"];
+const LOADER_SLOT: usize = 1;
 const RUNTIME_SLOT: usize = 2;
 const LAYOUT_SLOT: usize = 4;
 
@@ -50,14 +56,19 @@ pub struct QualificationGap {
 }
 
 /// Every gap that refuses a qualification claim, in the order checked.
-pub const QUALIFICATION_GAPS: [QualificationGap; 4] = [
+pub const QUALIFICATION_GAPS: [QualificationGap; 5] = [
+    QualificationGap {
+        key: CLAIM_FOREIGN_PREPARATION,
+        predicate: "the claim is not the one armed for the preparation that was mapped",
+    },
     QualificationGap {
         key: RUNTIME_ARTIFACT_UNAUDITED,
         predicate: "the runtime image did not pass the instruction audit and the filter proof",
     },
     QualificationGap {
         key: HANDOFF_BINDING_UNBOUND,
-        predicate: "a handoff binding digest is all-zero, or has no verifiable expected value",
+        predicate: "a required handoff binding digest is all-zero or has no verifiable \
+                    expected value, or a digest that must be zero is not",
     },
     QualificationGap {
         key: RUNTIME_DIGEST_MISMATCH,
@@ -69,27 +80,40 @@ pub const QUALIFICATION_GAPS: [QualificationGap; 4] = [
     },
 ];
 
-/// The expected value of each binding digest, from the bytes actually sealed
-/// and mapped for one birth. A slot with no defined source of truth has none,
-/// and so can never verify.
+/// What one binding digest slot must hold for a birth.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExpectedDigest {
+    /// This SHA-256, of the bytes actually sealed and mapped.
+    Sha256([u8; 32]),
+    /// Required, but with no defined source of truth yet: it never verifies.
+    Unverifiable,
+    /// Not part of this birth: the slot must be zero.
+    Zero,
+}
+
+/// What each binding digest must hold for one birth, from the bytes actually
+/// sealed and mapped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MappedLaunchFacts {
-    expected: [Option<[u8; 32]>; 5],
+    expected: [ExpectedDigest; 5],
 }
 
 impl MappedLaunchFacts {
-    /// From the mapped runtime image's and its layout descriptor's SHA-256.
-    /// The launch, loader and source digests have no defined source yet.
+    /// A mapped first image: the runtime and layout digests are the mapped
+    /// runtime image's and its layout descriptor's SHA-256; the birth has no
+    /// loader, so the loader digest must be zero; the launch and source
+    /// digests have no defined source yet.
     pub(super) fn of_mapped(runtime_sha256: [u8; 32], layout_sha256: [u8; 32]) -> Self {
-        let mut expected = [None; 5];
-        expected[RUNTIME_SLOT] = Some(runtime_sha256);
-        expected[LAYOUT_SLOT] = Some(layout_sha256);
+        let mut expected = [ExpectedDigest::Unverifiable; 5];
+        expected[LOADER_SLOT] = ExpectedDigest::Zero;
+        expected[RUNTIME_SLOT] = ExpectedDigest::Sha256(runtime_sha256);
+        expected[LAYOUT_SLOT] = ExpectedDigest::Sha256(layout_sha256);
         Self { expected }
     }
 
-    /// The expected digest for `slot` (an index into [`BINDING_SLOTS`]).
-    pub fn expected(&self, slot: usize) -> Option<[u8; 32]> {
-        self.expected.get(slot).copied().flatten()
+    /// What `slot` (an index into [`BINDING_SLOTS`]) must hold.
+    pub fn expected(&self, slot: usize) -> Option<ExpectedDigest> {
+        self.expected.get(slot).copied()
     }
 }
 
@@ -108,14 +132,18 @@ pub struct HandoffBinding(BindingState);
 
 impl HandoffBinding {
     /// Check each of the five digests (four little-endian words each), in
-    /// slot order: it must be non-zero, have an expected value, and equal it.
+    /// slot order: a slot that must be zero is zero; any other slot is
+    /// non-zero, has an expected value, and equals it.
     pub(super) fn of(binding: &[[u64; 4]; 5], facts: &MappedLaunchFacts) -> Self {
         for (slot, digest) in binding.iter().enumerate() {
-            if digest == &[0; 4] {
-                return Self(BindingState::Zero(slot));
-            }
-            let Some(expected) = facts.expected(slot) else {
-                return Self(BindingState::Unverified(slot));
+            let expected = match (facts.expected[slot], digest == &[0; 4]) {
+                (ExpectedDigest::Zero, true) => continue,
+                (ExpectedDigest::Zero, false) => return Self(BindingState::Unverified(slot)),
+                (_, true) => return Self(BindingState::Zero(slot)),
+                (ExpectedDigest::Unverifiable, false) => {
+                    return Self(BindingState::Unverified(slot));
+                }
+                (ExpectedDigest::Sha256(expected), false) => expected,
             };
             let words: [u64; 4] = std::array::from_fn(|i| {
                 u64::from_le_bytes(expected[8 * i..8 * i + 8].try_into().expect("8 bytes"))
@@ -127,7 +155,7 @@ impl HandoffBinding {
         Self(BindingState::Bound)
     }
 
-    /// Whether all five digests are non-zero and verified.
+    /// Whether every digest holds what this birth requires.
     pub fn is_bound(&self) -> bool {
         self.0 == BindingState::Bound
     }
@@ -203,6 +231,13 @@ impl std::fmt::Display for ClaimRefusal {
 
 impl std::error::Error for ClaimRefusal {}
 
+fn catalog_row(key: &str) -> QualificationGap {
+    *QUALIFICATION_GAPS
+        .iter()
+        .find(|row| row.key == key)
+        .expect("every key has a catalog row")
+}
+
 /// The exact preparation inputs one claim belongs to: the addresses and
 /// lengths of the runtime and handoff bytes, and the two child addresses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -231,32 +266,62 @@ impl PreparedIdentity {
 }
 
 /// An armed birth's claim inputs, held until its preparation succeeds.
+///
+/// It identifies its preparation by the addresses of the bytes it was armed
+/// with, and borrows the birth that owns those bytes for `'fd`. The bytes
+/// therefore stay allocated while the claim exists, so no other birth's bytes
+/// can occupy the same addresses. A claim that outlives its birth does not
+/// compile; with the borrow held, it does:
+///
+/// ```compile_fail
+/// # use reverie_inguest::launcher::exec_stop::producer::*;
+/// fn outlives(birth: MappedBirth<'_>, facts: &ArmingFacts<'_>) -> ArmedClaim<'static> {
+///     birth.arm(facts).unwrap().claim
+/// }
+/// ```
+///
+/// ```
+/// # use reverie_inguest::launcher::exec_stop::producer::*;
+/// fn borrows<'fd>(birth: &'fd MappedBirth<'_>, facts: &ArmingFacts<'_>) -> ArmedClaim<'fd> {
+///     birth.arm(facts).unwrap().claim
+/// }
+/// ```
 #[derive(Debug)]
-pub struct ArmedClaim {
+pub struct ArmedClaim<'fd> {
     binding: HandoffBinding,
     audit: ArtifactAudit,
     identity: PreparedIdentity,
+    _birth: PhantomData<&'fd ()>,
 }
 
-impl ArmedClaim {
+impl<'fd> ArmedClaim<'fd> {
     pub(super) fn new(
         binding: HandoffBinding,
         audit: ArtifactAudit,
-        preparation: &Preparation<'_>,
+        preparation: &Preparation<'fd>,
     ) -> Self {
         Self {
             binding,
             audit,
             identity: PreparedIdentity::of(preparation),
+            _birth: PhantomData,
         }
     }
 
     /// The claim inputs, once `prepared` is the mapping made from exactly
     /// this birth's preparation (the same runtime and handoff bytes, the same
-    /// handoff and layout addresses). Refuses any other mapping.
-    pub fn after_prepare(self, prepared: &PreparedMapping<'_>) -> Result<MappedLaunchClaim> {
+    /// handoff and layout addresses). Any other mapping refuses the claim with
+    /// [`CLAIM_FOREIGN_PREPARATION`]; the launch itself is unaffected and is
+    /// labelled unqualified.
+    pub fn after_prepare(
+        self,
+        prepared: &PreparedMapping<'fd>,
+    ) -> std::result::Result<MappedLaunchClaim, ClaimRefusal> {
         if PreparedIdentity::of(prepared.inputs()) != self.identity {
-            return Err("exec_stop_producer_claim_foreign_preparation".into());
+            return Err(ClaimRefusal {
+                gap: catalog_row(CLAIM_FOREIGN_PREPARATION),
+                slot: None,
+            });
         }
         Ok(MappedLaunchClaim {
             binding: self.binding,
@@ -298,21 +363,15 @@ impl QualifiedMappedLaunch {
     /// catalog row whose predicate holds.
     pub fn claim(launch: &MappedLaunchClaim) -> std::result::Result<Self, ClaimRefusal> {
         let (binding, audit) = (&launch.binding, &launch.audit);
-        let row = |key: &str| {
-            *QUALIFICATION_GAPS
-                .iter()
-                .find(|row| row.key == key)
-                .expect("every key has a catalog row")
-        };
         if audit.counts().is_none() {
             return Err(ClaimRefusal {
-                gap: row(RUNTIME_ARTIFACT_UNAUDITED),
+                gap: catalog_row(RUNTIME_ARTIFACT_UNAUDITED),
                 slot: None,
             });
         }
         match binding.refusal() {
             Some((slot, key)) => Err(ClaimRefusal {
-                gap: row(key),
+                gap: catalog_row(key),
                 slot: Some(slot),
             }),
             None => Ok(Self { _private: () }),
@@ -350,7 +409,7 @@ mod tests {
     /// Facts with an expected value for every slot.
     fn every_slot_expected() -> MappedLaunchFacts {
         MappedLaunchFacts {
-            expected: std::array::from_fn(|slot| Some(digest(slot))),
+            expected: std::array::from_fn(|slot| ExpectedDigest::Sha256(digest(slot))),
         }
     }
 
@@ -387,7 +446,7 @@ mod tests {
     fn each_digest_without_an_expected_value_refuses_the_claim_as_unbound() {
         for slot in 0..5 {
             let mut facts = every_slot_expected();
-            facts.expected[slot] = None;
+            facts.expected[slot] = ExpectedDigest::Unverifiable;
             let refused = refusal(&bound(), &facts);
             assert_eq!(refused.gap.key, HANDOFF_BINDING_UNBOUND, "slot {slot}");
             assert_eq!(refused.slot, Some(slot));
@@ -462,12 +521,29 @@ mod tests {
     }
 
     #[test]
+    fn a_digest_that_must_be_zero_binds_only_when_zero() {
+        let mut facts = every_slot_expected();
+        facts.expected[LOADER_SLOT] = ExpectedDigest::Zero;
+        let mut binding = bound();
+        assert_eq!(
+            refusal(&binding, &facts),
+            ClaimRefusal {
+                gap: catalog_row(HANDOFF_BINDING_UNBOUND),
+                slot: Some(LOADER_SLOT),
+            }
+        );
+        binding[LOADER_SLOT] = [0; 4];
+        assert!(HandoffBinding::of(&binding, &facts).is_bound());
+    }
+
+    #[test]
     fn every_key_has_exactly_one_catalog_row() {
         for key in [
             HANDOFF_BINDING_UNBOUND,
             RUNTIME_DIGEST_MISMATCH,
             LAYOUT_DIGEST_MISMATCH,
             RUNTIME_ARTIFACT_UNAUDITED,
+            CLAIM_FOREIGN_PREPARATION,
         ] {
             assert_eq!(
                 QUALIFICATION_GAPS

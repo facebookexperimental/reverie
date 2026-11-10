@@ -63,7 +63,9 @@ mod wire;
 pub use claim::ArmedClaim;
 pub use claim::ArtifactAudit;
 pub use claim::BINDING_SLOTS;
+pub use claim::CLAIM_FOREIGN_PREPARATION;
 pub use claim::ClaimRefusal;
+pub use claim::ExpectedDigest;
 pub use claim::HANDOFF_BINDING_UNBOUND;
 pub use claim::HandoffBinding;
 pub use claim::LAYOUT_DIGEST_MISMATCH;
@@ -1176,7 +1178,7 @@ pub struct Armed<'fd> {
     /// The claim inputs, available only through
     /// [`ArmedClaim::after_prepare`] on the mapping made from `preparation`.
     /// The binding is never bound today: the digests are zero.
-    pub claim: ArmedClaim,
+    pub claim: ArmedClaim<'fd>,
 }
 
 /// The producer side of a mapped birth, as the launch route calls it: the
@@ -2349,9 +2351,15 @@ mod tests {
         }
         #[cfg(not(feature = "stage1a-probe"))]
         let _ = (original_regs, original_mask);
+        let foreign = foreign.after_prepare(&prepared).map(|_| ()).unwrap_err();
         assert_eq!(
-            foreign.after_prepare(&prepared).unwrap_err().to_string(),
-            "exec_stop_producer_claim_foreign_preparation"
+            (foreign.gap.key, foreign.slot),
+            (CLAIM_FOREIGN_PREPARATION, None)
+        );
+        // The route labels the launch unqualified; the launch goes on.
+        assert_eq!(
+            launch_label(&Err(foreign)),
+            "mapped-unqualified:exec_stop_claim_foreign_preparation"
         );
         let launch = claim.after_prepare(&prepared).unwrap();
         let binding = *launch.binding();
