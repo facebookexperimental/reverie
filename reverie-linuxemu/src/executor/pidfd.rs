@@ -224,7 +224,13 @@ impl GuestPidfd {
 
     /// Ends the registration of guest descriptor number `fd` of the pidfd
     /// in `epoll`, whose open file description has ended, and closes the
-    /// number's key if it was the last.
+    /// number's key if it was the last. The host's registration goes too,
+    /// with a DEL through the registration's host descriptor of the epoll:
+    /// a host descriptor of the epoll that outlives its guest owners, as a
+    /// fork of the supervisor or a retained descriptor table holds one, would
+    /// otherwise keep watching the shadow, and report the exit to an epoll
+    /// that watches it, after Linux has freed the registration
+    /// (`eventpoll_release`).
     pub(super) fn epoll_ended(&self, fd: libc::c_int, epoll: &EpollIdentity) {
         let _ended;
         let mut keys = self
@@ -233,7 +239,17 @@ impl GuestPidfd {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let std::collections::btree_map::Entry::Occupied(mut key) = keys.entry(fd) {
             if let Some(held) = key.get().position(epoll) {
-                key.get_mut().epolls.swap_remove(held);
+                let registration = key.get_mut().epolls.swap_remove(held);
+                // SAFETY: both descriptors are live, and a DEL reads no
+                // event.
+                unsafe {
+                    libc::epoll_ctl(
+                        registration.epoll.as_raw_fd(),
+                        libc::EPOLL_CTL_DEL,
+                        key.get().file.as_raw_fd(),
+                        std::ptr::null_mut(),
+                    )
+                };
             }
             if key.get().epolls.is_empty() {
                 _ended = key.remove();

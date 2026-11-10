@@ -207,8 +207,9 @@ impl Drop for EpollHold {
 /// rights; a read, readv, preadv2 or recv of a socket, which this backend
 /// makes with room for every right and then drops those the guest does not
 /// get, as Linux discards them (`receive_discarding_rights`); and a receive
-/// whose copy into the guest's buffer faults after Linux took the record off
-/// the queue (`receive_stages_whole_buffer`). One that the host discards
+/// whose copy into the guest's buffer faults after the host took the record
+/// off the queue, which ends the run (`end_run_for_late_receive_fault`). One
+/// that the host discards
 /// unseen never goes: with the receiving socket closed while the message is
 /// unread. Its record then keeps the epoll, with its pidfd registrations and
 /// their host descriptors, for the rest of the run, and after
@@ -261,7 +262,9 @@ pub(super) enum EpollRight {
 /// send from a socket at host object `sender` carries, if the send reaches a
 /// receiver in the run (`sends_into_the_run`). The check and the record are
 /// one critical section under the identity table's lock, so no export of the
-/// pair's other end comes between them (`admit_socket_export`). On a host
+/// pair's other end comes between them (`admit_socket_export`), and the send
+/// relies on the pair's route until its host send ends (`route`), so no
+/// connect of the socket does either (`RouteReliance`). On a host
 /// that cannot compare open file descriptions no receive could find the
 /// record, and no epoll has a pidfd registration to keep
 /// (`descriptions_comparable`), so the right goes unrecorded. Past the bound
@@ -274,6 +277,7 @@ pub(super) fn register_epoll_transfer(
     epoll: &Arc<EpollIdentity>,
     host_fd: RawFd,
     sender: Option<(libc::dev_t, libc::ino_t)>,
+    route: &mut Option<RouteReliance>,
 ) -> Result<EpollRight, i64> {
     if !super::mapping_list::descriptions_comparable() {
         return Ok(EpollRight::Unrecorded);
@@ -282,8 +286,11 @@ pub(super) fn register_epoll_transfer(
         .file_identity_table
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if !sends_into_the_run(&table, sender) {
+    let Some(key) = sender.filter(|_| sends_into_the_run(&table, sender)) else {
         return Ok(EpollRight::MayLeave);
+    };
+    if route.is_none() {
+        *route = Some(RouteReliance::take(state, &mut table, key));
     }
     prune_epoll_transfers(&mut table);
     if epoll_rights_in_flight_in(&table) >= PROC_TRANSFER_LIMIT {

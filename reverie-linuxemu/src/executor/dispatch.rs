@@ -163,10 +163,9 @@ pub(super) fn execute_basic_syscall_with_read_context(
         output,
         terminal_read,
     );
-    // A call that ran out of host descriptors where no guest result can stand
-    // for what it did ends the run in place of its result
-    // (`end_run_for_descriptors`).
-    let action = match take_descriptor_failure() {
+    // A call where no guest result can stand for what it did ends the run in
+    // place of its result (`end_run`).
+    let action = match take_run_failure() {
         Some(error) => SyscallAction::Failure(error),
         None => action,
     };
@@ -1131,7 +1130,8 @@ impl ElfExecutor {
         self.state.signal_refusal = None;
         self.state.pidfd_refusal = None;
         take_receive_refused_for_descriptors();
-        take_descriptor_failure();
+        take_receive_refused_for_unwritable_buffer();
+        take_run_failure();
         // The copies this call reaches stay its own until it returns, and
         // any whose entries another thread retired meanwhile are replaced
         // then, before the guest continues (`PrivateCopies`); a replacement
@@ -1313,6 +1313,7 @@ impl ElfExecutor {
                     .or_else(|| signalfd_refusal(&self.state, request, result))
                     .or_else(|| pidfd_epoll_refusal(&self.state, request, result))
                     .or_else(|| receive_descriptors_refusal(result))
+                    .or_else(|| unwritable_record_buffer_refusal(result))
                     .or_else(|| userfaultfd_refusal(request, result))
                 {
                     self.unsupported_refusal = Some(refusal);

@@ -1013,8 +1013,13 @@ fn guest_host_read(
         iov_base: bytes.as_mut_ptr().cast(),
         iov_len: bytes.len(),
     };
-    match receive_discarding_rights(state, fd, std::slice::from_mut(&mut iov), 0, None) {
-        Ok(count) => finish_host_read(memory, address, &bytes, count as isize),
+    match receive_discarding_rights(state, fd, std::slice::from_mut(&mut iov), 0, None, false) {
+        Ok(0) => 0,
+        // The bytes were accessible when the read began (`prepare_host_read`).
+        Ok(count) => match memory.user().write(address, &bytes[..count]) {
+            Ok(()) => count as i64,
+            Err(_) => end_run_for_late_receive_fault("read", address),
+        },
         Err(error) => io_error(error),
     }
 }
@@ -1538,22 +1543,6 @@ impl StagedIoVector {
         })
     }
 
-    /// Staging for `guest` that the host can write throughout, for a receive
-    /// that takes its record before the copy that can fault
-    /// (`receive_stages_whole_buffer`): `accessible_length` is still the
-    /// guest's accessible prefix, which the copy back to the guest keeps to,
-    /// and past which a received byte is one whose copy faults.
-    pub(super) fn whole(
-        guest: GuestIoVec,
-        accessible_length: usize,
-        alignment: usize,
-    ) -> Result<Self, i64> {
-        debug_assert!(accessible_length <= guest.length);
-        let mut staged = Self::new(guest, guest.length, alignment)?;
-        staged.accessible_length = accessible_length;
-        Ok(staged)
-    }
-
     fn host_iovec(&mut self) -> libc::iovec {
         libc::iovec {
             iov_base: self
@@ -1805,6 +1794,7 @@ fn invoke_vectored_read(
     host_iovecs: &mut [libc::iovec],
     args: &[u64; 6],
     socket: bool,
+    unwritable: bool,
 ) -> i64 {
     // As for read: a readv of a Unix socket, or a preadv2 at its current
     // position, receives the rights it consumes (`guest_host_read`). Linux
@@ -1828,7 +1818,14 @@ fn invoke_vectored_read(
         } else {
             0
         };
-        return match receive_discarding_rights(state, host_fd, host_iovecs, receive, None) {
+        return match receive_discarding_rights(
+            state,
+            host_fd,
+            host_iovecs,
+            receive,
+            None,
+            unwritable,
+        ) {
             Ok(count) => count as i64,
             Err(error) => io_error(error),
         };
@@ -2108,10 +2105,6 @@ fn staged_vectored_transfer<M: GuestMemoryAccess<Error = crate::Error> + Address
     } else {
         (false, false)
     };
-    // A Unix datagram or seqpacket socket's read stages the guest's whole
-    // buffer writable, and this backend makes a fault of its copy itself
-    // (`receive_stages_whole_buffer`).
-    let whole = socket && receive_stages_whole_buffer(host_fd);
     let staging_alignment = direct_io_memory_alignment(host_fd);
 
     // Give the host one iovec for every bounded guest iovec, with the same
@@ -2130,12 +2123,7 @@ fn staged_vectored_transfer<M: GuestMemoryAccess<Error = crate::Error> + Address
             memory.accessible_prefix(vector.base, vector.length, Access::Read)
         }
         .unwrap_or(0);
-        let staged = if whole {
-            StagedIoVector::whole(*vector, prefix, staging_alignment)
-        } else {
-            StagedIoVector::new(*vector, prefix, staging_alignment)
-        };
-        let mut staged = match staged {
+        let mut staged = match StagedIoVector::new(*vector, prefix, staging_alignment) {
             Ok(staged) => staged,
             Err(error) => return error,
         };
@@ -2170,30 +2158,46 @@ fn staged_vectored_transfer<M: GuestMemoryAccess<Error = crate::Error> + Address
     } else {
         None
     };
-    // A copy that can fault puts back the peek offset (`SavedPeekOffset`).
-    let peek_offset = SavedPeekOffset::before_receive(
+    // A receive from a Unix datagram or seqpacket socket into a buffer that
+    // is not all writable may be refused (`refuse_unwritable_record_buffer`).
+    let unwritable = socket
+        && receives_records(host_fd)
+        && staged_vectors
+            .iter()
+            .any(|vector| vector.accessible_length < vector.guest.length);
+    let result = invoke_vectored_read(
+        state,
+        number,
         host_fd,
-        whole
-            && staged_vectors
-                .iter()
-                .any(|vector| vector.accessible_length < vector.guest.length),
+        &mut host_iovecs,
+        args,
+        socket,
+        unwritable,
     );
-    let result = invoke_vectored_read(state, number, host_fd, &mut host_iovecs, args, socket);
     if result >= 0 {
         let mut remaining = result as usize;
         for vector in &staged_vectors {
             let transferred = remaining.min(vector.guest.length);
             let copied = transferred.min(vector.accessible_length);
-            // A byte received past the guest's accessible prefix is one whose
-            // copy faults, after Linux took the record, whose rights the
-            // receive released (`receive_stages_whole_buffer`).
-            if (copied != 0
+            if copied != 0
                 && memory
                     .write_exact(vector.guest.base, vector.accessible_slice(copied))
-                    .is_err())
-                || transferred > copied
+                    .is_err()
             {
-                return fault_after_receive(peek_offset.as_ref());
+                // The prefix was accessible when the read began; a read of a
+                // Unix socket has received (`invoke_vectored_read`).
+                return if socket && is_unix_socket(host_fd) {
+                    end_run_for_late_receive_fault(
+                        if number == libc::SYS_readv {
+                            "readv"
+                        } else {
+                            "preadv2"
+                        },
+                        vector.guest.base,
+                    )
+                } else {
+                    negative_errno(libc::EFAULT)
+                };
             }
             remaining -= transferred;
             if remaining == 0 {

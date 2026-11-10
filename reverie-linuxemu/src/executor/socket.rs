@@ -604,18 +604,22 @@ fn host_object(fd: RawFd) -> Option<(libc::dev_t, libc::ino_t)> {
     Some((stat.st_dev, stat.st_ino))
 }
 
-/// Whether a message that a socket at host object `sender` sends can reach no
-/// receiver outside the run, by `table`, the identity table, locked: the
-/// socket is one end of a Unix socket pair the run made
+/// Whether a message that a socket at host object `sender` sends to its peer
+/// can reach no receiver outside the run, by `table`, the identity table,
+/// locked: the socket is one end of a Unix socket pair the run made
 /// (`record_socket_pair`), made since the last message that may leave the run
-/// carried a Unix socket (`admit_socket_export`). Its other end has then never
-/// left the run, alone or in the queue of a socket that left: a guest holds
-/// it, a message in the run carries it, or it is closed, and the host refuses
-/// the send. A message on any other socket may leave the run, to a receiver
-/// that no record sees: one inherited or received from outside the run, one
-/// that connect or accept made, and an unconnected datagram socket's. The
-/// caller holds the lock across this answer and what it admits
-/// (`register_epoll_transfer`), so no export comes between them.
+/// carried a Unix socket (`admit_socket_export`), and not connected since
+/// (`forget_pair_before_connect`). Its peer has then never left the run,
+/// alone or in the queue of a socket that left: a guest holds it, a message
+/// in the run carries it, or it is closed, and the host refuses the send. A
+/// message on any other socket may leave the run, to a receiver that no
+/// record sees: one inherited or received from outside the run, one that
+/// connect or accept made, and an unconnected datagram socket's, as may a
+/// datagram that names its destination (`sendmsg`, whose `sender` is then
+/// `None`). The caller holds the lock across this answer and what it admits
+/// (`register_epoll_transfer`, `admit_socket_export`), and takes a reliance
+/// on the route with it (`RouteReliance`), so no export or connect comes
+/// between them and the host send.
 pub(super) fn sends_into_the_run(
     table: &crate::elf::GuestFileIdentityTable,
     sender: Option<(libc::dev_t, libc::ino_t)>,
@@ -635,6 +639,96 @@ pub(super) fn sends_into_the_run(
         .is_some_and(|identity| std::ptr::eq(Arc::as_ptr(&identity), own.as_ptr()))
 }
 
+/// A send's reliance on its socket pair's route, from the check that its
+/// message goes into the run (`sends_into_the_run`) until its host send
+/// ends, however it ends: a connect of the sending socket meanwhile, which
+/// could give it a peer outside the run, is refused
+/// (`forget_pair_before_connect`). A send takes one whether its message
+/// carries an epoll set (`register_epoll_transfer`) or only a Unix socket
+/// (`admit_socket_export`). Counted in the identity table by the socket's
+/// host object, which names its one open file description, whichever
+/// descriptor reaches it in whichever process: Linux opens no socket anew
+/// (`sock_no_open`), so every alias of one duplicates that description. The
+/// send's rights in flight keep it (`RightTransfers`), until sendmsg returns.
+pub(super) struct RouteReliance {
+    table: Arc<Mutex<crate::elf::GuestFileIdentityTable>>,
+    socket: (libc::dev_t, libc::ino_t),
+}
+
+impl RouteReliance {
+    /// Takes a reliance on the route of the socket at host object `socket`,
+    /// under `table`, the lock of `state`'s identity table, held.
+    pub(super) fn take(
+        state: &LoadedStaticElf,
+        table: &mut crate::elf::GuestFileIdentityTable,
+        socket: (libc::dev_t, libc::ino_t),
+    ) -> Self {
+        *table.route_reliances.entry(socket).or_default() += 1;
+        Self {
+            table: state.file_identity_table.clone(),
+            socket,
+        }
+    }
+}
+
+impl std::fmt::Debug for RouteReliance {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RouteReliance")
+            .field("socket", &self.socket)
+            .finish()
+    }
+}
+
+impl Drop for RouteReliance {
+    fn drop(&mut self) {
+        let mut table = self
+            .table
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let std::collections::btree_map::Entry::Occupied(mut count) =
+            table.route_reliances.entry(self.socket)
+        {
+            *count.get_mut() -= 1;
+            if *count.get() == 0 {
+                count.remove();
+            }
+        }
+    }
+}
+
+/// Before a connect of host socket `fd`, which can give a datagram socket a
+/// new peer (`unix_dgram_connect`): forgets the socket pair whose end it is,
+/// so that no message relies on the pair's route any more
+/// (`sends_into_the_run`). A send from the socket that relies on that route
+/// now (`RouteReliance`) could reach the new peer after its check, so the
+/// connect is then refused by name before any effect (`CONNECT_REFUSAL`).
+/// A stream or seqpacket socket pair's ends stay connected to each other:
+/// Linux refuses their connect.
+fn forget_pair_before_connect(state: &mut LoadedStaticElf, fd: RawFd) -> Result<(), i64> {
+    if !is_datagram_socket(fd) {
+        return Ok(());
+    }
+    let Some(key) = host_object(fd) else {
+        return Ok(());
+    };
+    let mut table = state
+        .file_identity_table
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if table.route_reliances.contains_key(&key) {
+        drop(table);
+        state.pidfd_refusal = Some(CONNECT_REFUSAL);
+        return Err(negative_errno(libc::ENOSYS));
+    }
+    if let Some((_, peer)) = table.socket_peers.remove(&key) {
+        table
+            .socket_peers
+            .retain(|_, (own, _)| !std::ptr::eq(own.as_ptr(), peer.as_ptr()));
+    }
+    Ok(())
+}
+
 /// Admits a message that a socket at host object `sender` sends with a Unix
 /// socket among its rights. A socket that leaves the run takes its queue
 /// with it. An epoll right sent in the run (`EpollTransfer`), queued there or
@@ -648,16 +742,23 @@ pub(super) fn sends_into_the_run(
 /// The check and the forgetting are one critical section under the identity
 /// table's lock, as are an epoll right's check and its reservation
 /// (`register_epoll_transfer`). A send that reserved first is in flight here,
-/// and one that comes after finds its pair forgotten.
+/// and one that comes after finds its pair forgotten. A message into the run
+/// relies on its route until its host send ends (`route`).
 fn admit_socket_export(
     state: &LoadedStaticElf,
     sender: Option<(libc::dev_t, libc::ino_t)>,
+    route: &mut Option<RouteReliance>,
 ) -> Result<(), OutgoingRightRefusal> {
     let mut table = state
         .file_identity_table
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if sends_into_the_run(&table, sender) {
+    if let Some(key) = sender
+        && sends_into_the_run(&table, sender)
+    {
+        if route.is_none() {
+            *route = Some(RouteReliance::take(state, &mut table, key));
+        }
         return Ok(());
     }
     if epoll_rights_in_flight_in(&table) != 0 {
@@ -670,7 +771,7 @@ fn admit_socket_export(
 // TODO-HUMAN-REVIEW(PR-92): Review this KVM compatibility implementation.
 // TODO-HUMAN-REVIEW(PR-217): Review filesystem-backed AF_UNIX connect translation.
 // TODO-HUMAN-REVIEW(PR-349): Review host-backed AF_INET/AF_INET6 connect translation.
-pub(super) fn connect(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
+pub(super) fn connect(memory: &GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
     let Some(host_fd) = host_fd(state, args[0] as libc::c_int) else {
         return negative_errno(libc::EBADF);
     };
@@ -703,6 +804,9 @@ pub(super) fn connect(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64
             let path = path.split(|byte| *byte == 0).next().unwrap_or(path);
             if path == b"/dev/log" {
                 return 0;
+            }
+            if let Err(refused) = forget_pair_before_connect(state, host_fd) {
+                return refused;
             }
         }
         // AF_INET / AF_INET6 connect is forwarded to the host exactly like the
@@ -826,24 +930,19 @@ pub(super) fn recvfrom<M: GuestMemoryAccess<Error = crate::Error> + AddressSpace
     // decisions for the guest's buffer: a datagram or seqpacket record is
     // taken off the queue before the copy that faults, and freed (EFAULT,
     // unix_dgram_recvmsg); a stream returns what it copied before the fault;
-    // MSG_PEEK takes nothing. A Unix datagram or seqpacket socket's staging
-    // is writable throughout, and this backend makes the fault itself
-    // (`receive_stages_whole_buffer`).
+    // MSG_PEEK takes nothing. One that would free a right this backend tracks
+    // unseen is refused first (`refuse_unwritable_record_buffer`).
     let accessible = memory
         .accessible_prefix(args[1], length, Access::Write)
         .unwrap_or(0);
-    let unix = is_unix_socket(host_fd);
-    let guest = GuestIoVec {
-        base: args[1],
-        length,
-    };
-    let whole = unix && !is_stream_socket(host_fd);
-    let staged = if whole {
-        StagedIoVector::whole(guest, accessible, PAGE_SIZE as usize)
-    } else {
-        StagedIoVector::new(guest, accessible, PAGE_SIZE as usize)
-    };
-    let mut staged = match staged {
+    let mut staged = match StagedIoVector::new(
+        GuestIoVec {
+            base: args[1],
+            length,
+        },
+        accessible,
+        PAGE_SIZE as usize,
+    ) {
         Ok(staged) => staged,
         Err(error) => return error,
     };
@@ -884,10 +983,9 @@ pub(super) fn recvfrom<M: GuestMemoryAccess<Error = crate::Error> + AddressSpace
         std::ptr::from_mut(&mut address_length)
     };
 
-    // A copy that can fault puts back the peek offset (`SavedPeekOffset`).
-    let peek_offset = SavedPeekOffset::before_receive(host_fd, whole && accessible < length);
     // A receive from a Unix socket that asks for no control data still sees
     // the rights it consumes, to release them (`receive_discarding_rights`).
+    let unix = is_unix_socket(host_fd);
     let received = if unix {
         receive_discarding_rights(
             state,
@@ -895,6 +993,7 @@ pub(super) fn recvfrom<M: GuestMemoryAccess<Error = crate::Error> + AddressSpace
             std::slice::from_mut(&mut host_iov),
             flags,
             (!address_pointer.is_null()).then_some((address_pointer, length_pointer)),
+            receives_records(host_fd) && accessible < length,
         )
     } else {
         // SAFETY: host_iov is the staging for the guest's `length` bytes (its
@@ -939,13 +1038,12 @@ pub(super) fn recvfrom<M: GuestMemoryAccess<Error = crate::Error> + AddressSpace
             .write_exact(args[1], staged.accessible_slice(copy_length))
             .is_err()
     {
-        return fault_after_receive(peek_offset.as_ref());
-    }
-    // A byte received past the guest's accessible prefix is one whose copy
-    // faults, after Linux took the record, whose rights the receive released
-    // (`receive_stages_whole_buffer`).
-    if (result as usize).min(length) > copy_length {
-        return fault_after_receive(peek_offset.as_ref());
+        // The prefix was accessible when the receive began.
+        return if unix {
+            end_run_for_late_receive_fault("recvfrom", args[1])
+        } else {
+            negative_errno(libc::EFAULT)
+        };
     }
 
     if args[4] != 0 {
@@ -1071,11 +1169,14 @@ pub(super) fn is_socket_timestamp_cmsg(message: ControlMessage) -> bool {
 }
 
 /// The rights in flight that a send registered: process proc descriptions,
-/// by their pinned memfds, and epolls ([`EpollTransfer`]).
+/// by their pinned memfds, and epolls ([`EpollTransfer`]), with the send's
+/// reliance on its socket pair's route, if it took one ([`RouteReliance`]),
+/// which the caller keeps until its host send ends.
 #[derive(Debug, Default)]
 pub(super) struct RightTransfers {
     proc: Vec<(libc::dev_t, libc::ino_t)>,
     epolls: Vec<Arc<EpollIdentity>>,
+    route: Option<RouteReliance>,
 }
 
 /// Equal when they name the same rights, epolls by identity.
@@ -1101,8 +1202,9 @@ impl RightTransfers {
 }
 
 /// Returns the rights in flight registered for `control`, which host socket
-/// `socket` sends. The caller releases them if the host does not queue the
-/// message.
+/// `socket` sends to its peer, or which a message that names its own
+/// destination carries, for `socket` -1. The caller releases them if the
+/// host does not queue the message, and keeps them until its host send ends.
 pub(super) fn translate_outgoing_control(
     control: &mut [u8],
     state: &mut LoadedStaticElf,
@@ -1228,7 +1330,8 @@ fn check_outgoing_rights(
                 // epoll where no record sees (`EPOLL_EXPORT_REFUSAL`). A host
                 // that cannot compare open file descriptions records no
                 // epoll, and holds none.
-                match register_epoll_transfer(state, &epoll, host_fd, sender)? {
+                match register_epoll_transfer(state, &epoll, host_fd, sender, &mut transfers.route)?
+                {
                     EpollRight::Recorded => transfers.epolls.push(epoll),
                     EpollRight::Unrecorded => {}
                     EpollRight::MayLeave => {
@@ -1248,7 +1351,7 @@ fn check_outgoing_rights(
         }
     }
     if carries_unix_socket {
-        admit_socket_export(state, sender)?;
+        admit_socket_export(state, sender, &mut transfers.route)?;
     }
     Ok(())
 }
@@ -1565,16 +1668,14 @@ pub(super) fn is_unix_socket(fd: RawFd) -> bool {
     result == 0 && domain == libc::AF_UNIX
 }
 
-/// Whether a receive from host socket `fd` stages the guest's whole buffer
-/// writable: a Unix datagram or seqpacket socket, whose receive takes a
-/// record, and its rights, off the queue before the copy that can fault, and
-/// frees them if it does (`__unix_dgram_recvmsg`). The host's receive then
-/// gets the record whole, rights included, and this backend makes the guest's
-/// copy, and its fault, itself, so that it sees, and releases, the rights the
-/// record carried. A stream's receive leaves a message whose copy faults
-/// queued (`unix_stream_read_generic`), so its staging is inaccessible where
-/// the guest's buffer is (`StagedIoVector::new`), and the host decides.
-pub(super) fn receive_stages_whole_buffer(fd: RawFd) -> bool {
+/// Whether host socket `fd` is a Unix datagram or seqpacket socket, whose
+/// receive takes a record, and its rights, off the queue before the copy
+/// that can fault, and frees them if it does (`__unix_dgram_recvmsg`): the
+/// host's receive into staging that faults where the guest's buffer does
+/// (`StagedIoVector::new`) frees them unseen (`refuse_unwritable_record_buffer`).
+/// A stream's receive leaves a message whose copy faults queued, with its
+/// rights (`unix_stream_read_generic`), as does a peek.
+pub(super) fn receives_records(fd: RawFd) -> bool {
     is_unix_socket(fd) && !is_stream_socket(fd)
 }
 
@@ -1653,33 +1754,62 @@ pub(super) fn take_receive_refused_for_descriptors() -> bool {
 
 std::thread_local! {
     /// The failure that ends the run, which this thread's call recorded
-    /// (`end_run_for_descriptors`), for the call's end to return in place of
-    /// the call's result (`take_descriptor_failure`).
-    static DESCRIPTOR_FAILURE: std::cell::RefCell<Option<crate::Error>> =
+    /// (`end_run`), for the call's end to return in place of the call's
+    /// result (`take_run_failure`).
+    static RUN_FAILURE: std::cell::RefCell<Option<crate::Error>> =
         const { std::cell::RefCell::new(None) };
 }
 
+/// Ends the run with `failure`, for a call where no guest result can stand
+/// for what it did. The call returns the failure in place of its result,
+/// which the guest never sees (`take_run_failure`). The first failure of a
+/// call stands.
+fn end_run(failure: crate::Error) {
+    RUN_FAILURE.with(|recorded| {
+        recorded.borrow_mut().get_or_insert(failure);
+    });
+}
+
 /// Ends the run, for a call that ran out of host descriptors where no guest
-/// result can stand for what it did: `diagnostic` says what. The call returns
-/// the failure (`crate::Error::HostResources`) in place of its result, which
-/// the guest never sees (`take_descriptor_failure`); the result returned here
-/// is for the caller to return meanwhile. The first failure of a call stands.
+/// result can stand for what it did: `diagnostic` says what
+/// (`crate::Error::HostResources`, `end_run`). The result returned here is
+/// for the caller to return meanwhile.
 pub(super) fn end_run_for_descriptors(diagnostic: String) -> i64 {
-    DESCRIPTOR_FAILURE.with(|failure| {
-        failure
-            .borrow_mut()
-            .get_or_insert(crate::Error::HostResources {
-                resource: reverie_kvm_core::host_limits::HostResource::Descriptors,
-                diagnostic,
-            });
+    end_run(crate::Error::HostResources {
+        resource: reverie_kvm_core::host_limits::HostResource::Descriptors,
+        diagnostic,
     });
     negative_errno(libc::ENOMEM)
 }
 
+/// Ends the run for a receive from a Unix socket, made by `operation`, whose
+/// copy of the data it received into the guest's buffer, at `address`,
+/// faulted after the host's receive had taken effect: it took the data, and
+/// any rights, off the queue, or moved the socket's peek offset
+/// (`SO_PEEK_OFF`). The copy reaches only the part of the buffer that was
+/// accessible when the receive began, where the host's receive stops
+/// (`StagedIoVector`, `prepare_host_read`), so another thread sharing the
+/// guest's memory changed its mapping meanwhile. Linux faults inside its own
+/// copy, before those
+/// effects, and they cannot be undone here, so not even EFAULT stands for
+/// what the receive did (`crate::Error::LateReceiveFault`, `end_run`). The
+/// result returned here is for the caller to return meanwhile.
+///
+/// Holding the guest's mapping still through the copy instead would hold the
+/// lock of every change to its layout across a host receive that can wait
+/// for a message, which a thread that maps memory before it sends would then
+/// wait for in turn. Such a lease would need a regression on real threads
+/// for the order it allows, not one that makes the thread changing the
+/// mapping finish while the lease is held.
+pub(super) fn end_run_for_late_receive_fault(operation: &'static str, address: u64) -> i64 {
+    end_run(crate::Error::LateReceiveFault { operation, address });
+    negative_errno(libc::EFAULT)
+}
+
 /// The failure that ends the run, if this thread's call since the last one
-/// recorded one (`end_run_for_descriptors`), which this forgets.
-pub(super) fn take_descriptor_failure() -> Option<crate::Error> {
-    DESCRIPTOR_FAILURE.with(|failure| failure.borrow_mut().take())
+/// recorded one (`end_run`), which this forgets.
+pub(super) fn take_run_failure() -> Option<crate::Error> {
+    RUN_FAILURE.with(|failure| failure.borrow_mut().take())
 }
 
 /// Ends the run for a host receive from Unix socket `fd` that returned
@@ -1702,79 +1832,89 @@ fn end_run_for_lost_rights(state: &LoadedStaticElf, fd: RawFd, control: &[u8], p
     ))
 }
 
-/// The peek offset (`SO_PEEK_OFF`) of a Unix datagram or seqpacket socket,
-/// read before a receive whose copy into the guest's buffer can fault, for
-/// that fault to put back. Linux's receive faults before it moves the offset
-/// (`__unix_dgram_recvmsg`); this backend's host receive, into a buffer of
-/// its own that cannot fault, moves it, and then makes the fault itself
-/// (`receive_stages_whole_buffer`). Another receive from the socket between
-/// the two loses its own move of the offset: one that runs alongside, in a
-/// thread that is not one at a time with this one, or in a process outside
-/// the run.
-pub(super) struct SavedPeekOffset {
-    fd: RawFd,
-    offset: libc::c_int,
+std::thread_local! {
+    /// Whether this thread's last receive was refused for a buffer that is
+    /// not all writable (`refuse_unwritable_record_buffer`), for the call's
+    /// typed refusal (`unwritable_record_buffer_refusal`).
+    static RECEIVE_REFUSED_FOR_UNWRITABLE_BUFFER: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
-impl SavedPeekOffset {
-    /// The offset of host socket `fd`, before a receive whose copy can fault
-    /// (`faultable`), or `None` if it cannot fault, or if the socket has no
-    /// offset set, which no receive moves.
-    pub(super) fn before_receive(fd: RawFd, faultable: bool) -> Option<Self> {
-        if !faultable {
-            return None;
-        }
-        let mut offset: libc::c_int = -1;
-        let mut length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-        // SAFETY: offset and length are writable and describe each other.
-        let result = unsafe {
-            libc::getsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_PEEK_OFF,
-                std::ptr::from_mut(&mut offset).cast(),
-                &mut length,
-            )
-        };
-        (result == 0 && offset >= 0).then_some(Self { fd, offset })
-    }
-
-    /// Puts the offset back, after a receive whose copy faulted.
-    pub(super) fn restore(&self) {
-        loop {
-            // SAFETY: setsockopt reads only the offset, of the length given.
-            let result = unsafe {
-                libc::setsockopt(
-                    self.fd,
-                    libc::SOL_SOCKET,
-                    libc::SO_PEEK_OFF,
-                    std::ptr::from_ref(&self.offset).cast(),
-                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                )
-            };
-            let error = std::io::Error::last_os_error();
-            if result == 0 || error.raw_os_error() != Some(libc::EINTR) {
-                if result != 0 {
-                    tracing::error!(
-                        "KVM could not put back the peek offset {} of host socket {} after \
-                         a receive whose copy faulted: {error}",
-                        self.offset,
-                        self.fd,
-                    );
-                }
-                return;
-            }
-        }
-    }
+/// Whether a right this backend tracks is in flight across the namespace: an
+/// epoll set (`epoll_rights_in_flight_in`) or a process proc description
+/// (`proc_rights_in_flight_in`) sent in the run, whose record only a receive
+/// that sees the right can release.
+fn tracked_rights_in_flight(state: &LoadedStaticElf) -> bool {
+    let table = state
+        .file_identity_table
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    epoll_rights_in_flight_in(&table) != 0 || proc_rights_in_flight_in(&table) != 0
 }
 
-/// Puts back the peek offset `saved`, if any, after a receive whose copy
-/// faulted, and returns that receive's result, EFAULT.
-pub(super) fn fault_after_receive(saved: Option<&SavedPeekOffset>) -> i64 {
-    if let Some(saved) = saved {
-        saved.restore();
-    }
-    negative_errno(libc::EFAULT)
+/// Refuses, before it asks the host, a consuming receive from a Unix datagram
+/// or seqpacket socket into a buffer that is not all writable (`at_risk`)
+/// while a right this backend tracks is in flight
+/// (`tracked_rights_in_flight`). The host's receive into staging that faults
+/// where the guest's buffer does makes Linux's decisions: a copy that faults
+/// takes and frees the record, but moves no peek offset (`SO_PEEK_OFF`,
+/// `__unix_dgram_recvmsg`). It frees the record's rights unseen, though, and
+/// the record of a tracked right it freed would stay in flight for the rest
+/// of the run. So while one is in flight the receive answers ENOSYS
+/// (`UNWRITABLE_RECORD_BUFFER_REFUSAL`), and the host receives nothing: a
+/// conservative restriction, which also refuses receives that Linux
+/// completes, of a record that fits the writable part, of an empty record,
+/// or from an empty queue. A right sent after this check, which the host's
+/// receive frees unseen, ends the run instead
+/// (`end_run_for_unseen_right_discard`). A peek takes nothing, a buffer that
+/// is all writable or empty faults nothing, and with no tracked right in
+/// flight, the receive runs as Linux's does.
+pub(super) fn refuse_unwritable_record_buffer(
+    state: &LoadedStaticElf,
+    at_risk: bool,
+) -> Option<i64> {
+    (at_risk && tracked_rights_in_flight(state)).then(|| {
+        RECEIVE_REFUSED_FOR_UNWRITABLE_BUFFER.with(|refused| refused.set(true));
+        negative_errno(libc::ENOSYS)
+    })
+}
+
+/// Ends the run for a consuming receive from a Unix datagram or seqpacket
+/// socket into a buffer that is not all writable, whose host receive faulted
+/// (`at_risk`, EFAULT), freeing the record it took with its rights unseen,
+/// while a right this backend tracks is in flight: one sent after the check
+/// that found none (`refuse_unwritable_record_buffer`). The record may have
+/// carried it, and so no guest result stands for the receive
+/// (`crate::Error::UnseenRightDiscard`, `end_run`). Returns `error` for the
+/// caller to return meanwhile, or nothing if no tracked right is in flight:
+/// the fault, the host kernel's, is then Linux's.
+fn end_run_for_unseen_right_discard(
+    state: &LoadedStaticElf,
+    at_risk: bool,
+    error: &std::io::Error,
+) -> Option<std::io::Error> {
+    (at_risk && error.raw_os_error() == Some(libc::EFAULT) && tracked_rights_in_flight(state)).then(
+        || {
+            end_run(crate::Error::UnseenRightDiscard);
+            std::io::Error::from_raw_os_error(libc::EFAULT)
+        },
+    )
+}
+
+/// Whether this thread's last receive was refused for a buffer that is not
+/// all writable (`refuse_unwritable_record_buffer`), which this clears.
+pub(super) fn take_receive_refused_for_unwritable_buffer() -> bool {
+    RECEIVE_REFUSED_FOR_UNWRITABLE_BUFFER.with(|refused| refused.replace(false))
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// Runs once on the calling thread when a send has admitted the rights
+    /// it carries, relying on its socket pair's route (`RouteReliance`), and
+    /// has yet to ask the host: where another process can connect the socket
+    /// meanwhile.
+    pub(crate) static SEND_BEGUN_TEST_HOOK: OneShotTestHook =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -1793,15 +1933,20 @@ std::thread_local! {
 /// tracks ([`release_dropped_rights`]) and closes them all. A peek's rights
 /// stay in flight. Returns the host's count, or its error. A receive that
 /// consumed the message and lost rights it could not install ends the run
-/// (`end_run_for_lost_rights`); a peek lost none, and its guest gets none.
+/// (`end_run_for_lost_rights`); a peek lost none, and its guest gets none. A
+/// consuming receive of a record (`receives_records`) into a buffer that is
+/// not all writable (`unwritable`) may be refused, or end the run
+/// (`refuse_unwritable_record_buffer`).
 pub(super) fn receive_discarding_rights(
     state: &LoadedStaticElf,
     fd: RawFd,
     iovecs: &mut [libc::iovec],
     flags: libc::c_int,
     name: Option<(*mut libc::sockaddr, *mut libc::socklen_t)>,
+    unwritable: bool,
 ) -> std::io::Result<usize> {
     let peek = flags & libc::MSG_PEEK != 0;
+    let at_risk = unwritable && !peek;
     if host_receive_room(false) == ReceiveRoom::Short {
         return Err(std::io::Error::from_raw_os_error(
             -refuse_receive_for_descriptors() as i32,
@@ -1818,13 +1963,17 @@ pub(super) fn receive_discarding_rights(
         msg_controllen: control.len(),
         msg_flags: 0,
     };
+    if let Some(refused) = refuse_unwritable_record_buffer(state, at_risk) {
+        return Err(std::io::Error::from_raw_os_error(-refused as i32));
+    }
     #[cfg(test)]
     run_one_shot_test_hook(&RECEIVE_BEGUN_TEST_HOOK);
     // SAFETY: the header names the caller's live buffers, and the control
     // buffer of its length; fd is a live socket.
     let result = unsafe { libc::recvmsg(fd, &mut header, flags | libc::MSG_CMSG_CLOEXEC) };
     if result < 0 {
-        return Err(std::io::Error::last_os_error());
+        let error = std::io::Error::last_os_error();
+        return Err(end_run_for_unseen_right_discard(state, at_risk, &error).unwrap_or(error));
     }
     if let Some((_, length)) = name {
         // SAFETY: as above.
@@ -2078,7 +2227,16 @@ pub(super) fn sendmsg(memory: &GuestMemory, state: &mut LoadedStaticElf, args: &
     {
         return negative_errno(libc::EFAULT);
     }
-    let transfers = match translate_outgoing_control(&mut control, state, host_fd) {
+    // A datagram socket sends a message that names a destination there, not
+    // to its peer (`unix_dgram_sendmsg`), so the socket's pair says nothing
+    // about where it goes. A seqpacket send ignores the name
+    // (`unix_seqpacket_sendmsg`), and a stream send with one fails.
+    let route = if !name.is_empty() && is_datagram_socket(host_fd) {
+        -1
+    } else {
+        host_fd
+    };
+    let transfers = match translate_outgoing_control(&mut control, state, route) {
         Ok(transfers) => transfers,
         Err(error) => return error,
     };
@@ -2105,6 +2263,8 @@ pub(super) fn sendmsg(memory: &GuestMemory, state: &mut LoadedStaticElf, args: &
         msg_flags: 0,
     };
     let flags = args[2] as libc::c_int;
+    #[cfg(test)]
+    run_one_shot_test_hook(&SEND_BEGUN_TEST_HOOK);
     // SAFETY: payload/name/control are readable host buffers matching the
     // header's declared lengths, and host_fd belongs to the guest descriptor
     // table. The supervisor cannot safely accept a guest SIGPIPE, so KVM's
@@ -2131,6 +2291,23 @@ pub(super) fn sendmsg(memory: &GuestMemory, state: &mut LoadedStaticElf, args: &
         }
         result as i64
     }
+}
+
+/// Whether host descriptor `fd` is a datagram socket.
+fn is_datagram_socket(fd: RawFd) -> bool {
+    let mut kind: libc::c_int = 0;
+    let mut length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: kind and length are writable and describe each other.
+    let result = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            std::ptr::from_mut(&mut kind).cast(),
+            &mut length,
+        )
+    };
+    result == 0 && kind == libc::SOCK_DGRAM
 }
 
 /// Whether host descriptor `fd` is a stream socket.
@@ -2260,11 +2437,9 @@ pub(super) fn recvmsg(
 
     // Each segment is received into staging whose inaccessible part is
     // PROT_NONE where the guest's is, as `recvfrom` receives, so the host
-    // kernel takes and frees a record whose copy faults, as Linux does. A
-    // Unix datagram or seqpacket socket's staging is writable throughout, so
-    // that this backend sees the rights of a record whose copy faults, and
-    // makes the fault itself (`receive_stages_whole_buffer`).
-    let whole = full_control && !is_stream_socket(host_fd);
+    // kernel takes and frees a record whose copy faults, as Linux does. One
+    // that would free a right this backend tracks unseen is refused first
+    // (`refuse_unwritable_record_buffer`).
     let mut staged_vectors = Vec::with_capacity(guest_iovecs.len());
     for iov in &guest_iovecs {
         let guest = GuestIoVec {
@@ -2274,12 +2449,7 @@ pub(super) fn recvmsg(
         let accessible = ProviderMemory(memory)
             .accessible_prefix(guest.base, guest.length, Access::Write)
             .unwrap_or(0);
-        let staged = if whole {
-            StagedIoVector::whole(guest, accessible, PAGE_SIZE as usize)
-        } else {
-            StagedIoVector::new(guest, accessible, PAGE_SIZE as usize)
-        };
-        let mut staged = match staged {
+        let mut staged = match StagedIoVector::new(guest, accessible, PAGE_SIZE as usize) {
             Ok(staged) => staged,
             Err(error) => return error,
         };
@@ -2320,17 +2490,17 @@ pub(super) fn recvmsg(
     if room == ReceiveRoom::Short {
         return refuse_receive_for_descriptors();
     }
+    let at_risk = receives_records(host_fd)
+        && !peek
+        && staged_vectors
+            .iter()
+            .any(|vector| vector.accessible_length < vector.guest.length);
+    if let Some(refused) = refuse_unwritable_record_buffer(state, at_risk) {
+        return refused;
+    }
     // A peek keeps the epolls whose last right a consuming receive takes
     // meanwhile until it has looked up what it got (`PeekWindow`).
     let _peek_window = (full_control && peek).then(|| PeekWindow::open(state));
-    // A copy that can fault puts back the peek offset (`SavedPeekOffset`).
-    let peek_offset = SavedPeekOffset::before_receive(
-        host_fd,
-        whole
-            && staged_vectors
-                .iter()
-                .any(|vector| vector.accessible_length < vector.guest.length),
-    );
     #[cfg(test)]
     run_one_shot_test_hook(&RECEIVE_BEGUN_TEST_HOOK);
     // Keep the VM executor cooperative: Detcore's scheduler owns blocking and
@@ -2354,6 +2524,9 @@ pub(super) fn recvmsg(
     };
     if received < 0 {
         let error = std::io::Error::last_os_error();
+        if let Some(ended) = end_run_for_unseen_right_discard(state, at_risk, &error) {
+            return io_error(ended);
+        }
         // Linux may have copied into the segments' accessible prefixes, up to
         // the first fault, before reporting EFAULT; the staging was filled
         // from guest memory, so publishing those prefixes keeps both the
@@ -2407,18 +2580,19 @@ pub(super) fn recvmsg(
     for vector in &staged_vectors {
         let transferred = remaining.min(vector.guest.length);
         let copied = transferred.min(vector.accessible_length);
-        // A byte received past the guest's accessible prefix is one whose
-        // copy faults: Linux copies up to it, then frees the record and its
-        // rights (`receive_stages_whole_buffer`).
-        if (copied != 0
+        if copied != 0
             && ProviderMemory(memory)
                 .write_exact(vector.guest.base, vector.accessible_slice(copied))
-                .is_err())
-            || transferred > copied
+                .is_err()
         {
             let dropped = rights.iter().map(|right| &right.file);
             release_dropped_rights(state, dropped, flags & libc::MSG_PEEK != 0);
-            return fault_after_receive(peek_offset.as_ref());
+            // The prefix was accessible when the receive began.
+            return if full_control {
+                end_run_for_late_receive_fault("recvmsg", vector.guest.base)
+            } else {
+                negative_errno(libc::EFAULT)
+            };
         }
         remaining -= transferred;
         if remaining == 0 {
@@ -2819,6 +2993,13 @@ pub(super) fn recvmmsg(
             {
                 let dropped = rights.iter().map(|right| &right.file);
                 release_dropped_rights(state, dropped, flags & libc::MSG_PEEK != 0);
+                // The buffer was accessible when the receive began.
+                if full_control {
+                    return end_run_for_late_receive_fault(
+                        "recvmmsg",
+                        iov.iov_base as usize as u64,
+                    );
+                }
                 return if delivered == 0 {
                     negative_errno(libc::EFAULT)
                 } else {

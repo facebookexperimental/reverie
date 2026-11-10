@@ -378,6 +378,10 @@ pub struct GuestFileIdentityTable {
             std::sync::Weak<GuestFileIdentity>,
         ),
     >,
+    /// How many sends from each socket, by its host object, rely on its
+    /// socket pair's route, between their check and their host send
+    /// (`crate::executor::RouteReliance`).
+    pub(crate) route_reliances: std::collections::BTreeMap<(libc::dev_t, libc::ino_t), usize>,
 }
 
 /// Process-tree-wide state whose lifetime follows a guest task rather than an
@@ -2569,6 +2573,7 @@ fn load_executable(
             open_peek_windows: std::collections::BTreeSet::new(),
             peek_window_holds: Vec::new(),
             socket_peers: std::collections::BTreeMap::new(),
+            route_reliances: std::collections::BTreeMap::new(),
         })),
     })
 }

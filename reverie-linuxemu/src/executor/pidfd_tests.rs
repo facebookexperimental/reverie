@@ -2912,6 +2912,27 @@ fn pidfd_test_epoll_export_refusal() -> Option<reverie::UnsupportedRefusal> {
     ))
 }
 
+/// The typed refusal of a connect of a socket pair's end while a send from it
+/// relies on the pair's route.
+fn pidfd_test_connect_refusal() -> Option<reverie::UnsupportedRefusal> {
+    Some(reverie::UnsupportedRefusal::new(
+        reverie::UnsupportedOperation::Pidfd,
+        reverie::Errno::ENOSYS,
+        CONNECT_REFUSAL,
+    ))
+}
+
+/// The typed refusal of a consuming receive from a Unix datagram or seqpacket
+/// socket into a buffer that is not all writable while a right this backend
+/// tracks is in flight.
+fn pidfd_test_unwritable_record_buffer_refusal() -> Option<reverie::UnsupportedRefusal> {
+    Some(reverie::UnsupportedRefusal::new(
+        reverie::UnsupportedOperation::UnwritableRecordBuffer,
+        reverie::Errno::ENOSYS,
+        UNWRITABLE_RECORD_BUFFER_REFUSAL,
+    ))
+}
+
 /// The typed refusal of a Unix socket in an SCM_RIGHTS message that may leave
 /// the run while an epoll right sent in the run is in flight.
 fn pidfd_test_socket_export_refusal() -> Option<reverie::UnsupportedRefusal> {
@@ -5243,26 +5264,30 @@ fn reviewer_faulted_datagram_receive_releases_consumed_epoll_right() {
                 0,
             ],
         ),
-        negative_errno(libc::EFAULT),
-        "the datagram's payload copy faults"
-    );
-
-    // Restore a valid destination. EAGAIN proves that the preceding EFAULT
-    // consumed the datagram; returning EFAULT during preflight and leaving
-    // the message queued must not make this regression pass.
-    pidfd_test_message(&memory, RIGHTS_CONTROL_CAPACITY);
-    let next_result = pidfd_test_call(
-        &mut parent,
-        &memory,
-        libc::SYS_recvmsg,
-        [receiver as u64, PIDFD_TEST_MESSAGE, libc::MSG_DONTWAIT as u64, 0, 0, 0],
+        // Adapted (opuskvm): a consuming receive into a buffer that is not
+        // all writable, while its epoll right is in flight, is refused by
+        // name before any effect (`refuse_unwritable_record_buffer`).
+        // Original: `negative_errno(libc::EFAULT)`.
+        negative_errno(libc::ENOSYS),
+        "the datagram's receive is refused"
     );
     assert_eq!(
-        next_result,
-        negative_errno(libc::EAGAIN),
-        "the faulting receive consumed the sole datagram"
+        parent.take_unsupported_refusal(),
+        pidfd_test_unwritable_record_buffer_refusal()
     );
-    for socket in [sender, receiver] {
+
+    // Adapted (opuskvm): the refused receive left the datagram queued, so the
+    // receive with a valid destination takes it, with its right, which the
+    // guest then closes. Original: a recvmsg here answered EAGAIN, "the
+    // faulting receive consumed the sole datagram".
+    let (next_result, rights, _) =
+        pidfd_test_receive_rights(&mut parent, &memory, receiver, 0, RIGHTS_CONTROL_CAPACITY);
+    assert_eq!(
+        (next_result, rights.len()),
+        (1, 1),
+        "the refused receive left the sole datagram queued"
+    );
+    for socket in [i64::from(rights[0]), sender, receiver] {
         pidfd_test_close(&mut parent, &memory, socket);
     }
     assert_eq!(
@@ -6116,56 +6141,6 @@ fn pidfd_test_inaccessible_page(memory: &GuestMemory) -> u64 {
         .map_user_permissions(page, PAGE_SIZE, false, false)
         .unwrap();
     page
-}
-
-/// A datagram or seqpacket read whose copy into the guest faults after Linux
-/// took the record: recvfrom, readv and preadv2 at the current position stage
-/// the guest's whole buffer writable (`receive_stages_whole_buffer`), so the
-/// host's receive gets the record and its right, which the read releases, and
-/// the fault is this backend's own. The next read finds the queue empty, as
-/// Linux leaves it.
-#[test]
-fn a_faulting_datagram_read_releases_the_right_of_the_record_it_took() {
-    for kind in [libc::SOCK_DGRAM, libc::SOCK_SEQPACKET] {
-        for number in [libc::SYS_recvfrom, libc::SYS_readv, libc::SYS_preadv2] {
-            let root = TestDir::new();
-            let memory = pidfd_test_memory();
-            let (mut parent, _child, fd, link, sender, receiver) =
-                pidfd_test_queued_epoll(&root, &memory, kind | libc::SOCK_NONBLOCK);
-            let faulting = pidfd_test_inaccessible_page(&memory);
-            let iov = libc::iovec {
-                iov_base: faulting as usize as *mut libc::c_void,
-                iov_len: 1,
-            };
-            assert_eq!(
-                write_struct(&mut ProviderMemory(&memory), PIDFD_TEST_IOV, &iov),
-                0
-            );
-            let args = match number {
-                libc::SYS_readv => [receiver as u64, PIDFD_TEST_IOV, 1, 0, 0, 0],
-                libc::SYS_preadv2 => [receiver as u64, PIDFD_TEST_IOV, 1, -1_i64 as u64, 0, 0],
-                _ => [receiver as u64, faulting, 1, 0, 0, 0],
-            };
-            assert_eq!(
-                pidfd_test_call(&mut parent, &memory, number, args),
-                negative_errno(libc::EFAULT),
-                "kind {kind}, syscall {number}: the copy faults"
-            );
-            assert_eq!(
-                pidfd_test_read_socket(&mut parent, &memory, number, receiver, 1),
-                negative_errno(libc::EAGAIN),
-                "kind {kind}, syscall {number}: the faulting read took the record"
-            );
-            assert_eq!(
-                pidfd_test_epoll_census(&parent, fd, &link),
-                (0, 0, 1),
-                "kind {kind}, syscall {number}: the record's right was the epoll's last owner"
-            );
-            for socket in [sender, receiver] {
-                pidfd_test_close(&mut parent, &memory, socket);
-            }
-        }
-    }
 }
 
 /// A receive whose copy into the guest faults and that Linux leaves queued
@@ -7223,8 +7198,19 @@ fn reviewer_faulting_datagram_receive_preserves_so_peek_off() {
     }
     eprintln!("SO_PEEK_OFF observations: {observations:?}");
     for (kind, number, peek, result, starting, offset, next_peek) in observations {
-        assert_eq!(result, negative_errno(libc::EFAULT), "kind {kind}, syscall {number}, peek {peek}");
-        assert_eq!(next_peek, if peek { 1 } else { negative_errno(libc::EAGAIN) },
+        // Adapted (opuskvm): a consuming receive into a buffer that is not
+        // all writable, while the record's epoll right is in flight, is
+        // refused before any effect (`refuse_unwritable_record_buffer`), so
+        // its record stays queued, and the next peek, at offset 1, skips it
+        // to the fresh byte behind it. A peek runs as Linux's does. Original:
+        // `assert_eq!(result, negative_errno(libc::EFAULT), ...)` and
+        // `assert_eq!(next_peek, if peek { 1 } else { negative_errno(libc::EAGAIN) }, ...)`.
+        assert_eq!(
+            result,
+            negative_errno(if peek { libc::EFAULT } else { libc::ENOSYS }),
+            "kind {kind}, syscall {number}, peek {peek}"
+        );
+        assert_eq!(next_peek, 1,
             "kind {kind}, syscall {number}, peek {peek}: following guest peek sees Linux's queue position; native offset {offset}, expected {starting}");
         assert_eq!(offset, starting,
             "kind {kind}, syscall {number}, peek {peek}: a failed payload copy does not advance or rewind SO_PEEK_OFF");
@@ -8038,119 +8024,586 @@ fn a_send_of_an_epoll_whose_pin_cannot_be_made_ends_the_run() {
     assert_eq!((peeked, nothing_sent), (-1, Some(libc::EAGAIN)));
 }
 
-/// A datagram or seqpacket receive whose copy into the guest's buffer faults
-/// leaves the socket's peek offset (`SO_PEEK_OFF`) where it was, as Linux's
-/// faults before it moves the offset (`__unix_dgram_recvmsg`): this backend
-/// puts back what its own host receive moved (`SavedPeekOffset`). Through
-/// readv and preadv2 at the current position, which stage the guest's whole
-/// buffer writable (`receive_stages_whole_buffer`), into an inaccessible
-/// page, as `reviewer_faulting_datagram_receive_preserves_so_peek_off` covers
-/// recvfrom and recvmsg: the guest's own setsockopt sets the offset, and its
-/// next peek shows where it is.
-#[test]
-fn a_faulting_datagram_vectored_read_leaves_the_peek_offset() {
-    const OPTION: u64 = 0xe00;
-    for kind in [libc::SOCK_DGRAM, libc::SOCK_SEQPACKET] {
-        for (number, peek) in [(libc::SYS_readv, false), (libc::SYS_preadv2, false)] {
-            let case = format!("kind {kind}, syscall {number}, peek {peek}");
-            let root = TestDir::new();
-            let memory = pidfd_test_memory();
-            let (mut parent, _child, fd, link, sender, receiver) =
-                pidfd_test_queued_epoll(&root, &memory, kind | libc::SOCK_NONBLOCK);
-            // A peek would move the offset from 0 to 1, a consuming receive
-            // from 1 to 0.
-            let starting: libc::c_int = if peek { 0 } else { 1 };
+/// What a receive by syscall `number` from guest socket `socket` into the
+/// `length` bytes at guest `buffer`, peeking if `peek`, returns through the
+/// checked execution, whose failure ends the run: read; readv, or preadv2 at
+/// the current position, of one vector; recvfrom with no address; recvmsg or
+/// recvmmsg of one message of one vector, with room for every right.
+fn pidfd_test_receive_into(
+    executor: &mut ElfExecutor,
+    memory: &GuestMemory,
+    number: libc::c_long,
+    socket: i64,
+    buffer: u64,
+    length: usize,
+    peek: bool,
+) -> crate::Result<i64> {
+    let flags = (libc::MSG_DONTWAIT | if peek { libc::MSG_PEEK } else { 0 }) as u64;
+    let args = match number {
+        libc::SYS_read => [socket as u64, buffer, length as u64, 0, 0, 0],
+        libc::SYS_readv => [socket as u64, PIDFD_TEST_IOV, 1, 0, 0, 0],
+        libc::SYS_preadv2 => [socket as u64, PIDFD_TEST_IOV, 1, -1_i64 as u64, 0, 0],
+        libc::SYS_recvfrom => [socket as u64, buffer, length as u64, flags, 0, 0],
+        libc::SYS_recvmmsg => {
+            pidfd_test_message(memory, RIGHTS_CONTROL_CAPACITY);
+            let message: libc::msghdr = read_struct(memory, PIDFD_TEST_MESSAGE);
+            let message = libc::mmsghdr {
+                msg_hdr: message,
+                msg_len: 0,
+            };
             assert_eq!(
-                write_struct(&mut ProviderMemory(&memory), OPTION, &starting),
+                write_struct(&mut ProviderMemory(memory), PIDFD_TEST_MESSAGE, &message),
                 0
             );
+            [socket as u64, PIDFD_TEST_MESSAGE, 1, flags, 0, 0]
+        }
+        _ => {
+            pidfd_test_message(memory, RIGHTS_CONTROL_CAPACITY);
+            [socket as u64, PIDFD_TEST_MESSAGE, flags, 0, 0, 0]
+        }
+    };
+    // After the message, which points its vector at the test byte.
+    let iov = libc::iovec {
+        iov_base: buffer as usize as *mut libc::c_void,
+        iov_len: length,
+    };
+    assert_eq!(
+        write_struct(&mut ProviderMemory(memory), PIDFD_TEST_IOV, &iov),
+        0
+    );
+    pidfd_test_checked_call(executor, memory, number, args)
+}
+
+/// Sets guest socket `socket`'s peek offset (`SO_PEEK_OFF`) to `offset`.
+fn pidfd_test_set_peek_offset(
+    executor: &mut ElfExecutor,
+    memory: &GuestMemory,
+    socket: i64,
+    offset: libc::c_int,
+) {
+    const OPTION: u64 = 0xe00;
+    assert_eq!(
+        write_struct(&mut ProviderMemory(memory), OPTION, &offset),
+        0
+    );
+    assert_eq!(
+        pidfd_test_call(
+            executor,
+            memory,
+            libc::SYS_setsockopt,
+            [
+                socket as u64,
+                libc::SOL_SOCKET as u64,
+                libc::SO_PEEK_OFF as u64,
+                OPTION,
+                4,
+                0
+            ],
+        ),
+        0
+    );
+}
+
+/// Guest socket `socket`'s peek offset (`SO_PEEK_OFF`), read from the host
+/// socket, since this backend does not answer a guest's getsockopt of it.
+fn pidfd_test_peek_offset(executor: &ElfExecutor, socket: i64) -> libc::c_int {
+    let raw = host_fd(&executor.state, socket as libc::c_int).unwrap();
+    let mut offset: libc::c_int = -2;
+    let mut length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: the socket is live, and offset and length are this frame's, of
+    // the sizes given.
+    assert_eq!(
+        unsafe {
+            libc::getsockopt(
+                raw,
+                libc::SOL_SOCKET,
+                libc::SO_PEEK_OFF,
+                std::ptr::from_mut(&mut offset).cast(),
+                &mut length,
+            )
+        },
+        0
+    );
+    offset
+}
+
+/// A consuming receive from a Unix datagram or seqpacket socket into a buffer
+/// that is not all writable is refused by name before any effect while a
+/// right this backend tracks is in flight (`refuse_unwritable_record_buffer`):
+/// here the epoll right that the record itself carries. Through readv and
+/// preadv2 at the current position, recvfrom and recvmsg, with no peek offset
+/// and with one set, into an inaccessible page and into a buffer whose first
+/// byte alone is writable, which Linux fills with the one-byte record: the
+/// call answers ENOSYS with `UnsupportedOperation::UnwritableRecordBuffer`,
+/// the offset stays as it was, and the record stays queued with its right,
+/// for a receive with a writable buffer to take. A peek into the inaccessible
+/// page, which takes nothing, runs as Linux's does: its copy faults (EFAULT),
+/// and leaves the record and the offset.
+#[test]
+fn a_consuming_record_receive_into_a_buffer_not_all_writable_is_refused_while_a_right_is_in_flight()
+{
+    for kind in [libc::SOCK_DGRAM, libc::SOCK_SEQPACKET] {
+        for (number, peek) in [
+            (libc::SYS_readv, false),
+            (libc::SYS_preadv2, false),
+            (libc::SYS_recvfrom, false),
+            (libc::SYS_recvfrom, true),
+            (libc::SYS_recvmsg, false),
+            (libc::SYS_recvmsg, true),
+        ] {
+            for offset in [None, Some(0)] {
+                // A peek of a record that fits the writable byte succeeds.
+                for writable in if peek { &[0][..] } else { &[0, 1][..] } {
+                    let case = format!(
+                        "kind {kind}, syscall {number}, peek {peek}, offset {offset:?}, \
+                         writable {writable}"
+                    );
+                    let root = TestDir::new();
+                    let memory = pidfd_test_memory();
+                    let (mut parent, _child, fd, link, sender, receiver) =
+                        pidfd_test_queued_epoll(&root, &memory, kind | libc::SOCK_NONBLOCK);
+                    if let Some(offset) = offset {
+                        pidfd_test_set_peek_offset(&mut parent, &memory, receiver, offset);
+                    }
+                    let buffer = pidfd_test_inaccessible_page(&memory) - *writable as u64;
+                    let result = pidfd_test_receive_into(
+                        &mut parent,
+                        &memory,
+                        number,
+                        receiver,
+                        buffer,
+                        writable + 1,
+                        peek,
+                    );
+                    assert_eq!(
+                        format!("{result:?}"),
+                        format!(
+                            "{:?}",
+                            crate::Result::Ok(negative_errno(if peek {
+                                libc::EFAULT
+                            } else {
+                                libc::ENOSYS
+                            }))
+                        ),
+                        "{case}"
+                    );
+                    assert_eq!(
+                        parent.take_unsupported_refusal(),
+                        if peek {
+                            None
+                        } else {
+                            pidfd_test_unwritable_record_buffer_refusal()
+                        },
+                        "{case}"
+                    );
+                    assert_eq!(
+                        pidfd_test_peek_offset(&parent, receiver),
+                        offset.unwrap_or(-1),
+                        "{case}: the offset did not move"
+                    );
+                    assert_eq!(
+                        pidfd_test_epoll_census(&parent, fd, &link),
+                        (1, 1, 2),
+                        "{case}: the record and its right stay queued"
+                    );
+                    let (result, rights, _) = pidfd_test_receive_rights(
+                        &mut parent,
+                        &memory,
+                        receiver,
+                        0,
+                        RIGHTS_CONTROL_CAPACITY,
+                    );
+                    assert_eq!((result, rights.len()), (1, 1), "{case}");
+                    pidfd_test_close(&mut parent, &memory, i64::from(rights[0]));
+                    assert_eq!(
+                        pidfd_test_epoll_census(&parent, fd, &link),
+                        (0, 0, 1),
+                        "{case}"
+                    );
+                    for closing in [sender, receiver] {
+                        pidfd_test_close(&mut parent, &memory, closing);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The refusal of a receive into a buffer that is not all writable is
+/// conservative (`refuse_unwritable_record_buffer`): while a right this
+/// backend tracks is in flight, here a process proc description, it also
+/// refuses such receives that Linux completes, from an empty queue (EAGAIN
+/// there) and of an empty record (0), as it refuses one of a record that
+/// fits the writable part. A buffer of no bytes is received into as Linux
+/// does, as is one that is all writable: the receive takes the record.
+#[test]
+fn the_unwritable_record_buffer_refusal_also_covers_receives_linux_completes() {
+    const PATH: u64 = 0xe80;
+    let proc_rights_in_flight = |executor: &ElfExecutor| {
+        proc_rights_in_flight_in(&executor.state.file_identity_table.lock().unwrap())
+    };
+    for kind in [libc::SOCK_DGRAM, libc::SOCK_SEQPACKET] {
+        let case = format!("kind {kind}");
+        let root = TestDir::new();
+        let memory = pidfd_test_memory();
+        let (mut parent, _child) = pidfd_test_family(&root, 2);
+        let (sender, receiver) =
+            pidfd_test_socket_pair(&mut parent, &memory, kind | libc::SOCK_NONBLOCK);
+        memory.write_raw(PATH, b"/proc/self/status\0").unwrap();
+        let status = pidfd_test_call(
+            &mut parent,
+            &memory,
+            libc::SYS_openat,
+            [libc::AT_FDCWD as u64, PATH, libc::O_RDONLY as u64, 0, 0, 0],
+        );
+        assert!(status >= 0, "{case}: {status}");
+        assert_eq!(
+            pidfd_test_send_rights(&mut parent, &memory, sender, &[status as libc::c_int]),
+            1,
+            "{case}"
+        );
+        pidfd_test_close(&mut parent, &memory, status);
+        assert_eq!(proc_rights_in_flight(&parent), 1, "{case}");
+        let page = pidfd_test_inaccessible_page(&memory);
+        let refused = |parent: &mut ElfExecutor, socket: i64, case: &str| {
+            assert_eq!(
+                pidfd_test_receive_into(parent, &memory, libc::SYS_recvfrom, socket, page, 1, false)
+                    .unwrap(),
+                negative_errno(libc::ENOSYS),
+                "{case}"
+            );
+            assert_eq!(
+                parent.take_unsupported_refusal(),
+                pidfd_test_unwritable_record_buffer_refusal(),
+                "{case}"
+            );
+        };
+        // The sender's queue is empty.
+        refused(&mut parent, sender, &format!("{case}: an empty queue"));
+        assert_eq!(
+            pidfd_test_call(
+                &mut parent,
+                &memory,
+                libc::SYS_sendto,
+                [receiver as u64, PIDFD_TEST_BYTE, 0, 0, 0, 0],
+            ),
+            0,
+            "{case}"
+        );
+        refused(&mut parent, sender, &format!("{case}: an empty record"));
+        // A buffer of no bytes takes the empty record.
+        assert_eq!(
+            pidfd_test_receive_into(&mut parent, &memory, libc::SYS_recvfrom, sender, page, 0, false)
+                .unwrap(),
+            0,
+            "{case}"
+        );
+        assert_eq!(
+            pidfd_test_receive_into(&mut parent, &memory, libc::SYS_recvfrom, sender, page, 0, false)
+                .unwrap(),
+            negative_errno(libc::EAGAIN),
+            "{case}: the empty record was taken"
+        );
+        // The receiver's one-byte record with the right.
+        refused(&mut parent, receiver, &format!("{case}: a record in a writable byte"));
+        assert_eq!(proc_rights_in_flight(&parent), 1, "{case}");
+        let (result, rights, _) =
+            pidfd_test_receive_rights(&mut parent, &memory, receiver, 0, RIGHTS_CONTROL_CAPACITY);
+        assert_eq!((result, rights.len()), (1, 1), "{case}");
+        assert_eq!(proc_rights_in_flight(&parent), 0, "{case}");
+        for closing in [i64::from(rights[0]), sender, receiver] {
+            pidfd_test_close(&mut parent, &memory, closing);
+        }
+    }
+}
+
+/// With no right this backend tracks in flight, a consuming receive from a
+/// Unix datagram or seqpacket socket into an inaccessible buffer runs as
+/// Linux's does (`refuse_unwritable_record_buffer`): the host's receive into
+/// staging that faults where the guest's buffer does takes and frees the
+/// record, and answers EFAULT, and it leaves the socket's peek offset where
+/// it was (`__unix_dgram_recvmsg`), so a later one-byte record is skipped by
+/// a peek at offset 1. Through readv, preadv2 at the current position,
+/// recvfrom and recvmsg.
+#[test]
+fn a_faulting_record_receive_with_no_right_in_flight_runs_as_linux_does() {
+    for kind in [libc::SOCK_DGRAM, libc::SOCK_SEQPACKET] {
+        for number in [
+            libc::SYS_readv,
+            libc::SYS_preadv2,
+            libc::SYS_recvfrom,
+            libc::SYS_recvmsg,
+        ] {
+            let case = format!("kind {kind}, syscall {number}");
+            let root = TestDir::new();
+            let memory = pidfd_test_memory();
+            let (mut parent, _child) = pidfd_test_family(&root, 2);
+            let (sender, receiver) =
+                pidfd_test_socket_pair(&mut parent, &memory, kind | libc::SOCK_NONBLOCK);
+            memory.write_raw(PIDFD_TEST_BYTE, b"x").unwrap();
             assert_eq!(
                 pidfd_test_call(
                     &mut parent,
                     &memory,
-                    libc::SYS_setsockopt,
-                    [
-                        receiver as u64,
-                        libc::SOL_SOCKET as u64,
-                        libc::SO_PEEK_OFF as u64,
-                        OPTION,
-                        4,
-                        0
-                    ],
+                    libc::SYS_write,
+                    [sender as u64, PIDFD_TEST_BYTE, 1, 0, 0, 0],
                 ),
-                0,
-                "{case}"
+                1
             );
-            let buffer = pidfd_test_inaccessible_page(&memory);
-            let iov = libc::iovec {
-                iov_base: buffer as usize as *mut libc::c_void,
-                iov_len: 1,
-            };
+            pidfd_test_set_peek_offset(&mut parent, &memory, receiver, 1);
+            let page = pidfd_test_inaccessible_page(&memory);
             assert_eq!(
-                write_struct(&mut ProviderMemory(&memory), PIDFD_TEST_IOV, &iov),
-                0
-            );
-            let args = if number == libc::SYS_readv {
-                [receiver as u64, PIDFD_TEST_IOV, 1, 0, 0, 0]
-            } else {
-                [receiver as u64, PIDFD_TEST_IOV, 1, -1_i64 as u64, 0, 0]
-            };
-            assert_eq!(
-                pidfd_test_call(&mut parent, &memory, number, args),
+                pidfd_test_receive_into(&mut parent, &memory, number, receiver, page, 1, false)
+                    .unwrap(),
                 negative_errno(libc::EFAULT),
                 "{case}"
             );
-            if !peek {
-                // Linux leaves the offset at 1 after consuming the faulting
-                // record, so a peek skips a fresh one-byte message; an offset
-                // moved to 0 shows it.
-                memory.write_raw(PIDFD_TEST_BYTE, b"y").unwrap();
-                assert_eq!(
-                    pidfd_test_call(
-                        &mut parent,
-                        &memory,
-                        libc::SYS_write,
-                        [sender as u64, PIDFD_TEST_BYTE, 1, 0, 0, 0],
-                    ),
-                    1,
-                    "{case}"
-                );
-            }
-            let next_peek = pidfd_test_call(
-                &mut parent,
-                &memory,
-                libc::SYS_recvfrom,
-                [
-                    receiver as u64,
-                    PIDFD_TEST_BYTE,
-                    1,
-                    (libc::MSG_PEEK | libc::MSG_DONTWAIT) as u64,
-                    0,
-                    0,
-                ],
+            assert_eq!(parent.take_unsupported_refusal(), None, "{case}");
+            assert_eq!(pidfd_test_peek_offset(&parent, receiver), 1, "{case}");
+            memory.write_raw(PIDFD_TEST_BYTE, b"y").unwrap();
+            assert_eq!(
+                pidfd_test_call(
+                    &mut parent,
+                    &memory,
+                    libc::SYS_write,
+                    [sender as u64, PIDFD_TEST_BYTE, 1, 0, 0, 0],
+                ),
+                1
             );
             assert_eq!(
-                next_peek,
-                if peek {
-                    1
-                } else {
-                    negative_errno(libc::EAGAIN)
-                },
-                "{case}: the next peek sees Linux's offset"
+                pidfd_test_receive_into(
+                    &mut parent,
+                    &memory,
+                    libc::SYS_recvfrom,
+                    receiver,
+                    PIDFD_TEST_BYTE,
+                    1,
+                    true
+                )
+                .unwrap(),
+                negative_errno(libc::EAGAIN),
+                "{case}: the faulting receive freed the first record and moved no offset"
             );
             assert_eq!(
                 pidfd_test_read_socket(&mut parent, &memory, libc::SYS_recvfrom, receiver, 1),
                 1,
                 "{case}"
             );
+            for closing in [sender, receiver] {
+                pidfd_test_close(&mut parent, &memory, closing);
+            }
+        }
+    }
+}
+
+/// A right this backend tracks sent after a consuming receive into a buffer
+/// that is not all writable found none in flight, and before its host
+/// receive, ends the run if that receive faults
+/// (`end_run_for_unseen_right_discard`): the host freed the record it took,
+/// with its rights, unseen, and the record of the epoll right sent may be
+/// among them, never to be released. Another process sends the epoll at the
+/// receive's seam, into the empty queue the receive then faults on, and,
+/// conservatively, behind a plain record that the receive frees instead. A
+/// receive that faults nothing, here one that finds its queue empty while the
+/// epoll goes to another socket, answers as Linux does. Through readv,
+/// preadv2 at the current position, recvfrom and recvmsg.
+#[test]
+fn a_tracked_right_sent_into_a_faulting_record_receive_ends_the_run() {
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Sent {
+        IntoTheEmptyQueue,
+        BehindAPlainRecord,
+        Elsewhere,
+    }
+    for kind in [libc::SOCK_DGRAM, libc::SOCK_SEQPACKET] {
+        for number in [
+            libc::SYS_readv,
+            libc::SYS_preadv2,
+            libc::SYS_recvfrom,
+            libc::SYS_recvmsg,
+        ] {
+            for sent_where in [Sent::IntoTheEmptyQueue, Sent::BehindAPlainRecord, Sent::Elsewhere] {
+                let case = format!("kind {kind}, syscall {number}, sent {sent_where:?}");
+                let root = TestDir::new();
+                let memory = pidfd_test_memory();
+                let (mut parent, _child) = pidfd_test_family(&root, 2);
+                let fd = pidfd_test_open(&mut parent, &memory, 2, 0);
+                let link = pidfd_test_shadow_link(&parent, fd);
+                let epoll = pidfd_test_call(&mut parent, &memory, libc::SYS_epoll_create1, [0; 6]);
+                assert_eq!(
+                    pidfd_test_epoll_ctl(
+                        &mut parent,
+                        &memory,
+                        epoll,
+                        libc::EPOLL_CTL_ADD,
+                        fd,
+                        libc::EPOLLIN as u32,
+                        1,
+                    ),
+                    0
+                );
+                let (sender, receiver) =
+                    pidfd_test_socket_pair(&mut parent, &memory, kind | libc::SOCK_NONBLOCK);
+                let (elsewhere, elsewhere_peer) =
+                    pidfd_test_socket_pair(&mut parent, &memory, kind | libc::SOCK_NONBLOCK);
+                let into = if sent_where == Sent::Elsewhere {
+                    elsewhere
+                } else {
+                    sender
+                };
+                if sent_where == Sent::BehindAPlainRecord {
+                    memory.write_raw(PIDFD_TEST_BYTE, b"p").unwrap();
+                    assert_eq!(
+                        pidfd_test_call(
+                            &mut parent,
+                            &memory,
+                            libc::SYS_write,
+                            [sender as u64, PIDFD_TEST_BYTE, 1, 0, 0, 0],
+                        ),
+                        1
+                    );
+                }
+                let racer = std::rc::Rc::new(std::cell::RefCell::new(
+                    parent.fork_child(3, false, false).unwrap(),
+                ));
+                let sent = std::rc::Rc::new(std::cell::Cell::new(None));
+                let hook_racer = racer.clone();
+                let hook_sent = sent.clone();
+                RECEIVE_BEGUN_TEST_HOOK.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || {
+                        let other_memory = pidfd_test_memory();
+                        hook_sent.set(Some(pidfd_test_send_rights(
+                            &mut hook_racer.borrow_mut(),
+                            &other_memory,
+                            into,
+                            &[epoll as libc::c_int],
+                        )));
+                    }));
+                });
+                assert_eq!(epoll_rights_in_flight(&parent.state), 0, "{case}");
+                let page = pidfd_test_inaccessible_page(&memory);
+                let result =
+                    pidfd_test_receive_into(&mut parent, &memory, number, receiver, page, 1, false);
+                assert!(
+                    RECEIVE_BEGUN_TEST_HOOK.with(|hook| hook.borrow_mut().take().is_none()),
+                    "{case}: the receive reached its seam"
+                );
+                assert_eq!(sent.get(), Some(1), "{case}: the other process sent the epoll");
+                // The record of the right sent stays in flight whether or not
+                // the receive freed it: why a faulting one ends the run.
+                assert_eq!(epoll_rights_in_flight(&parent.state), 1, "{case}");
+                if sent_where == Sent::Elsewhere {
+                    assert_eq!(
+                        format!("{result:?}"),
+                        format!("{:?}", crate::Result::Ok(negative_errno(libc::EAGAIN))),
+                        "{case}"
+                    );
+                    let (result, rights, _) = pidfd_test_receive_rights(
+                        &mut parent,
+                        &memory,
+                        elsewhere_peer,
+                        0,
+                        RIGHTS_CONTROL_CAPACITY,
+                    );
+                    assert_eq!((result, rights.len()), (1, 1), "{case}");
+                    for closing in [i64::from(rights[0]), epoll] {
+                        pidfd_test_close(&mut parent, &memory, closing);
+                    }
+                    assert_eq!(pidfd_test_epoll_census(&parent, fd, &link), (0, 1, 2), "{case}");
+                } else {
+                    assert!(
+                        matches!(result, Err(crate::Error::UnseenRightDiscard)),
+                        "{case}: {result:?}"
+                    );
+                    assert!(
+                        crate::Error::UnseenRightDiscard.is_named_refusal(),
+                        "{case}: the run ends with a refusal by name"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// A receive from a Unix socket whose buffer was accessible when it began,
+/// and loses its access to another task's mprotect before the host's
+/// receive, ends the run by name when its copy into the guest faults
+/// (`end_run_for_late_receive_fault`): the host has taken the data, or moved
+/// the peek offset, which Linux's faulting copy would not have, and which
+/// cannot be undone, so not even EFAULT stands for the call. Through read,
+/// readv, preadv2 at the current position and recvfrom, with a thread of the
+/// same process changing the buffer; through recvmsg and recvmmsg, which
+/// hold the descriptor table that the process's threads share until they
+/// return, with a vfork-style child, which shares the memory but not the
+/// table. On stream, datagram and seqpacket sockets.
+#[test]
+fn a_late_copy_fault_after_a_unix_receive_ends_the_run() {
+    let buffer = (PIDFD_TEST_MEMORY - PAGE_SIZE as usize) as u64;
+    for kind in [libc::SOCK_STREAM, libc::SOCK_DGRAM, libc::SOCK_SEQPACKET] {
+        for (number, operation) in [
+            (libc::SYS_read, "read"),
+            (libc::SYS_readv, "readv"),
+            (libc::SYS_preadv2, "preadv2"),
+            (libc::SYS_recvfrom, "recvfrom"),
+            (libc::SYS_recvmsg, "recvmsg"),
+            (libc::SYS_recvmmsg, "recvmmsg"),
+        ] {
+            let case = format!("kind {kind}, syscall {operation}");
+            let root = TestDir::new();
+            let memory = std::rc::Rc::new(pidfd_test_memory());
+            let (mut parent, _child) = pidfd_test_family(&root, 2);
+            let (sender, receiver) =
+                pidfd_test_socket_pair(&mut parent, &memory, kind | libc::SOCK_NONBLOCK);
+            memory.write_raw(PIDFD_TEST_BYTE, b"x").unwrap();
             assert_eq!(
-                pidfd_test_epoll_census(&parent, fd, &link),
-                (0, 0, 1),
+                pidfd_test_call(
+                    &mut parent,
+                    &memory,
+                    libc::SYS_write,
+                    [sender as u64, PIDFD_TEST_BYTE, 1, 0, 0, 0],
+                ),
+                1
+            );
+            assert_eq!(memory.user().user_writable_prefix(buffer, 1).unwrap(), 1);
+            let racer = std::rc::Rc::new(std::cell::RefCell::new(
+                if matches!(number, libc::SYS_recvmsg | libc::SYS_recvmmsg) {
+                    parent.fork_child(3, false, true).unwrap()
+                } else {
+                    parent.thread_child(3).unwrap()
+                },
+            ));
+            let protected = std::rc::Rc::new(std::cell::Cell::new(None));
+            let hook_memory = memory.clone();
+            let hook_racer = racer.clone();
+            let hook_protected = protected.clone();
+            RECEIVE_BEGUN_TEST_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    hook_protected.set(Some(pidfd_test_call(
+                        &mut hook_racer.borrow_mut(),
+                        &hook_memory,
+                        libc::SYS_mprotect,
+                        [buffer, PAGE_SIZE, libc::PROT_NONE as u64, 0, 0, 0],
+                    )));
+                }));
+            });
+            let result =
+                pidfd_test_receive_into(&mut parent, &memory, number, receiver, buffer, 1, false);
+            assert!(
+                RECEIVE_BEGUN_TEST_HOOK.with(|hook| hook.borrow_mut().take().is_none()),
+                "{case}: the receive reached its seam"
+            );
+            assert_eq!(protected.get(), Some(0), "{case}: the other thread's mprotect");
+            assert_eq!(
+                format!("{result:?}"),
+                format!(
+                    "{:?}",
+                    Err::<i64, _>(crate::Error::LateReceiveFault {
+                        operation,
+                        address: buffer,
+                    })
+                ),
                 "{case}"
             );
-            for socket in [sender, receiver] {
-                pidfd_test_close(&mut parent, &memory, socket);
-            }
         }
     }
 }
@@ -8718,5 +9171,595 @@ fn an_older_peek_window_closing_first_keeps_the_hold_a_newer_one_may_need() {
     );
     for socket in [sender, receiver] {
         pidfd_test_close(&mut parent, &memory, socket);
+    }
+}
+
+/// A socketpair sender's origin does not establish the destination of a
+/// Unix datagram: sendmsg can name another socket, and connect can replace
+/// its peer. In either case the possibly external epoll right must be
+/// refused before reaching the native receiver. All routing uses ordinary
+/// guest calls; the peer performs real native recvmsg and closes its right.
+fn reviewer_dgram_pair_external_epoll_route(named_send: bool) {
+    let root = TestDir::new();
+    let memory = pidfd_test_memory();
+    let (mut parent, mut child) = pidfd_test_family(&root, 2);
+    let pidfd = pidfd_test_open(&mut parent, &memory, 2, 0);
+    let (sender, receiver) = pidfd_test_socket_pair(
+        &mut parent,
+        &memory,
+        libc::SOCK_DGRAM | libc::SOCK_NONBLOCK,
+    );
+    // Abstract namespace avoids filesystem translation. TestDir's unique
+    // basename keeps concurrent test instances' native addresses distinct.
+    let name = format!(
+        "r1410-route-{}",
+        root.0.file_name().unwrap().to_string_lossy(),
+    );
+    // SAFETY: sockaddr_un is plain data; zero initializes the abstract prefix.
+    let mut address = unsafe { std::mem::zeroed::<libc::sockaddr_un>() };
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    assert!(name.len() < address.sun_path.len());
+    for (slot, byte) in address.sun_path[1..].iter_mut().zip(name.as_bytes()) {
+        *slot = *byte as libc::c_char;
+    }
+    let address_len = std::mem::offset_of!(libc::sockaddr_un, sun_path) + 1 + name.len();
+    // SAFETY: socket takes no pointer arguments.
+    let raw = unsafe {
+        libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK, 0)
+    };
+    assert!(raw >= 0);
+    // SAFETY: socket returned this new descriptor exactly once.
+    let outside = unsafe { std::fs::File::from_raw_fd(raw) };
+    // SAFETY: address is initialized for address_len bytes.
+    assert_eq!(
+        unsafe {
+            libc::bind(
+                outside.as_raw_fd(),
+                std::ptr::from_ref(&address).cast(),
+                address_len as libc::socklen_t,
+            )
+        },
+        0
+    );
+    assert_eq!(write_struct(&mut ProviderMemory(&memory), PIDFD_TEST_INFO, &address), 0);
+    if !named_send {
+        assert_eq!(
+            pidfd_test_call(
+                &mut parent,
+                &memory,
+                libc::SYS_connect,
+                [sender as u64, PIDFD_TEST_INFO, address_len as u64, 0, 0, 0],
+            ),
+            0,
+            "Linux permits replacing a datagram socketpair endpoint's peer"
+        );
+    }
+    let inner = pidfd_test_call(&mut parent, &memory, libc::SYS_epoll_create1, [0; 6]);
+    let outer = pidfd_test_call(&mut parent, &memory, libc::SYS_epoll_create1, [0; 6]);
+    assert!(inner >= 0 && outer >= 0);
+    assert_eq!(
+        pidfd_test_epoll_ctl(
+            &mut parent, &memory, inner, libc::EPOLL_CTL_ADD, pidfd,
+            libc::EPOLLIN as u32, 0x1110,
+        ),
+        0
+    );
+    assert_eq!(
+        pidfd_test_epoll_ctl(
+            &mut parent, &memory, outer, libc::EPOLL_CTL_ADD, inner,
+            libc::EPOLLIN as u32, 0x1410,
+        ),
+        0
+    );
+    memory.write_raw(PIDFD_TEST_BYTE, b"x").unwrap();
+    let control = rights_control(&[inner as libc::c_int]);
+    memory.write_raw(PIDFD_TEST_CONTROL, &control).unwrap();
+    pidfd_test_message(&memory, control.len());
+    if named_send {
+        let mut message: libc::msghdr = read_struct(&memory, PIDFD_TEST_MESSAGE);
+        message.msg_name = PIDFD_TEST_INFO as usize as *mut libc::c_void;
+        message.msg_namelen = address_len as libc::socklen_t;
+        assert_eq!(write_struct(&mut ProviderMemory(&memory), PIDFD_TEST_MESSAGE, &message), 0);
+    }
+    let sent = pidfd_test_call(
+        &mut parent,
+        &memory,
+        libc::SYS_sendmsg,
+        [sender as u64, PIDFD_TEST_MESSAGE, libc::MSG_DONTWAIT as u64, 0, 0, 0],
+    );
+    let refusal = parent.take_unsupported_refusal();
+    pidfd_test_close(&mut parent, &memory, inner);
+    let (native_result, native_rights, _, native_flags) =
+        pidfd_test_native_receive(outside.as_raw_fd(), RIGHTS_CONTROL_CAPACITY);
+    let native_errno = if native_result < 0 {
+        std::io::Error::last_os_error().raw_os_error()
+    } else {
+        None
+    };
+    // A violating implementation's real external File has now closed too.
+    for socket in [sender, receiver] {
+        pidfd_test_close(&mut parent, &memory, socket);
+    }
+    drop(outside);
+    pidfd_test_exit(&mut parent, &mut child);
+    let events = pidfd_test_epoll_wait(&mut parent, &memory, outer);
+    pidfd_test_reap(&mut parent, &memory, 2);
+    pidfd_test_close(&mut parent, &memory, outer);
+    pidfd_test_close(&mut parent, &memory, pidfd);
+    assert_eq!(
+        (
+            sent,
+            refusal,
+            native_result,
+            native_rights,
+            native_errno,
+            native_flags & libc::MSG_CTRUNC,
+            events,
+        ),
+        (
+            negative_errno(libc::ENOSYS),
+            pidfd_test_epoll_export_refusal(),
+            -1,
+            0,
+            Some(libc::EAGAIN),
+            0,
+            BTreeMap::new(),
+        ),
+        "named_send={named_send}: the actual destination is outside the run, \
+         despite the sender's socketpair origin; no export or ghost is allowed"
+    );
+}
+
+#[test]
+fn reviewer_dgram_pair_named_send_refuses_external_epoll() {
+    reviewer_dgram_pair_external_epoll_route(true);
+}
+
+#[test]
+fn reviewer_reconnected_dgram_pair_refuses_external_epoll() {
+    reviewer_dgram_pair_external_epoll_route(false);
+}
+
+/// A faulting receive may overlap a successful peek of the same socket.
+/// Linux applies no SO_PEEK_OFF change for the fault; it must preserve the
+/// successful call's movement. The hook is a legal scheduling seam after A
+/// sampled the offset and before A's native receive, not a fake consume.
+#[test]
+fn reviewer_faulting_receive_does_not_undo_another_processes_peek() {
+    const OPTION: u64 = 0xe00;
+    let mut observations = Vec::new();
+    for kind in [libc::SOCK_DGRAM, libc::SOCK_SEQPACKET] {
+        for number in [libc::SYS_recvfrom, libc::SYS_recvmsg] {
+            let root = TestDir::new();
+            let memory = pidfd_test_memory();
+            let (mut parent, _child) = pidfd_test_family(&root, 2);
+            let (sender, receiver) = pidfd_test_socket_pair(
+                &mut parent, &memory, kind | libc::SOCK_NONBLOCK);
+            for payload in [b"a", b"b"] {
+                memory.write_raw(PIDFD_TEST_BYTE, payload).unwrap();
+                assert_eq!(pidfd_test_call(&mut parent, &memory, libc::SYS_write,
+                    [sender as u64, PIDFD_TEST_BYTE, 1, 0, 0, 0]), 1);
+            }
+            let zero: libc::c_int = 0;
+            assert_eq!(write_struct(&mut ProviderMemory(&memory), OPTION, &zero), 0);
+            assert_eq!(pidfd_test_call(&mut parent, &memory, libc::SYS_setsockopt,
+                [receiver as u64, libc::SOL_SOCKET as u64, libc::SO_PEEK_OFF as u64,
+                 OPTION, 4, 0]), 0);
+            let racer = std::rc::Rc::new(std::cell::RefCell::new(
+                parent.fork_child(3, false, false).unwrap()));
+            assert!(!Arc::ptr_eq(&parent.file_table, &racer.borrow().file_table));
+            let raced = std::rc::Rc::new(std::cell::Cell::new(None));
+            let hook_racer = racer.clone();
+            let hook_raced = raced.clone();
+            RECEIVE_BEGUN_TEST_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    let other_memory = pidfd_test_memory();
+                    let result = pidfd_test_call(&mut hook_racer.borrow_mut(), &other_memory,
+                        libc::SYS_recvfrom, [receiver as u64, PIDFD_TEST_BYTE, 1,
+                            (libc::MSG_PEEK | libc::MSG_DONTWAIT) as u64, 0, 0]);
+                    let mut byte = [0u8; 1];
+                    other_memory.read_raw(PIDFD_TEST_BYTE, &mut byte).unwrap();
+                    hook_raced.set(Some((result, byte[0])));
+                }));
+            });
+            let faulting = pidfd_test_inaccessible_page(&memory);
+            let flags = (libc::MSG_PEEK | libc::MSG_DONTWAIT) as u64;
+            let args = if number == libc::SYS_recvmsg {
+                pidfd_test_message(&memory, RIGHTS_CONTROL_CAPACITY);
+                let iov = libc::iovec {
+                    iov_base: faulting as usize as *mut libc::c_void,
+                    iov_len: 1,
+                };
+                assert_eq!(write_struct(&mut ProviderMemory(&memory), PIDFD_TEST_IOV, &iov), 0);
+                [receiver as u64, PIDFD_TEST_MESSAGE, flags, 0, 0, 0]
+            } else {
+                [receiver as u64, faulting, 1, flags, 0, 0]
+            };
+            let faulted = pidfd_test_call(&mut parent, &memory, number, args);
+            let next = pidfd_test_call(&mut parent, &memory, libc::SYS_recvfrom,
+                [receiver as u64, PIDFD_TEST_BYTE, 1, flags, 0, 0]);
+            let mut next_byte = [0u8; 1];
+            memory.read_raw(PIDFD_TEST_BYTE, &mut next_byte).unwrap();
+            // Drain both actual messages and close both processes' aliases.
+            for _ in 0..2 {
+                assert_eq!(pidfd_test_read_socket(&mut parent, &memory,
+                    libc::SYS_recvfrom, receiver, 1), 1);
+            }
+            for socket in [sender, receiver] {
+                pidfd_test_close(&mut parent, &memory, socket);
+                pidfd_test_close(&mut racer.borrow_mut(), &pidfd_test_memory(), socket);
+            }
+            observations.push((kind, number, faulted, raced.get(), next, next_byte[0]));
+        }
+    }
+    eprintln!("peek interleaving observations: {observations:?}");
+    for (kind, number, faulted, raced, next, next_byte) in observations {
+        assert_eq!(faulted, negative_errno(libc::EFAULT), "kind {kind}, syscall {number}");
+        assert_eq!(raced, Some((1, b'a')), "the other process really peeked the first byte");
+        assert_eq!((next, next_byte), (1, b'b'),
+            "kind {kind}, syscall {number}: A's fault must not undo B's successful peek");
+    }
+}
+
+/// The raw copy represents an implementation-only native reference, such as
+/// an inherited descriptor, not an additional guest epoll owner. Logical E
+/// closure must remove its guest-pidfd interest even while this copy survives.
+#[test]
+fn reviewer_last_epoll_close_removes_pidfd_interest_despite_native_epoll_copy() {
+    let root = TestDir::new();
+    let memory = pidfd_test_memory();
+    let (mut parent, mut child) = pidfd_test_family(&root, 2);
+    let pidfd = pidfd_test_open(&mut parent, &memory, 2, 0);
+    let inner = pidfd_test_call(&mut parent, &memory, libc::SYS_epoll_create1, [0; 6]);
+    let outer = pidfd_test_call(&mut parent, &memory, libc::SYS_epoll_create1, [0; 6]);
+    assert!(inner >= 0 && outer >= 0);
+    assert_eq!(pidfd_test_epoll_ctl(
+        &mut parent, &memory, inner, libc::EPOLL_CTL_ADD, pidfd,
+        libc::EPOLLIN as u32, 0x1110,
+    ), 0);
+    assert_eq!(pidfd_test_epoll_ctl(
+        &mut parent, &memory, outer, libc::EPOLL_CTL_ADD, inner,
+        libc::EPOLLIN as u32, 0x1410,
+    ), 0);
+    let native_copy = parent.state.guest_file(inner as i32).unwrap().try_clone().unwrap();
+    pidfd_test_close(&mut parent, &memory, inner);
+    let registrations_after_close = pidfd_test_record(&parent, pidfd).epoll_registrations();
+    pidfd_test_exit(&mut parent, &mut child);
+    let events = pidfd_test_epoll_wait(&mut parent, &memory, outer);
+    pidfd_test_reap(&mut parent, &memory, 2);
+    drop(native_copy);
+    pidfd_test_close(&mut parent, &memory, outer);
+    pidfd_test_close(&mut parent, &memory, pidfd);
+    assert_eq!((registrations_after_close, events), (0, BTreeMap::new()),
+        "the final logical epoll close must remove its native pidfd interest, not only forget its bookkeeping");
+}
+
+/// A table observer is explicitly not a guest descriptor owner. The existing
+/// last-task-exit regression checks only shadow descriptor counts; this one
+/// also checks kernel effects through a surviving outer epoll. FileTableState
+/// slots can retain FileDescription host duplicates after exit takes files and
+/// native poll bindings, so this needs no native fork or manufactured raw dup.
+#[test]
+fn reviewer_last_task_exit_removes_pidfd_interest_despite_table_observer() {
+    let root = TestDir::new();
+    let memory = pidfd_test_memory();
+    let (mut parent, mut child) = pidfd_test_family(&root, 2);
+    let pidfd = pidfd_test_open(&mut parent, &memory, 2, 0);
+    let inner = pidfd_test_call(&mut parent, &memory, libc::SYS_epoll_create1, [0; 6]);
+    let outer = pidfd_test_call(&mut parent, &memory, libc::SYS_epoll_create1, [0; 6]);
+    assert!(inner >= 0 && outer >= 0);
+    assert_eq!(pidfd_test_epoll_ctl(
+        &mut parent, &memory, inner, libc::EPOLL_CTL_ADD, pidfd,
+        libc::EPOLLIN as u32, 0x1110,
+    ), 0);
+    assert_eq!(pidfd_test_epoll_ctl(
+        &mut parent, &memory, outer, libc::EPOLL_CTL_ADD, inner,
+        libc::EPOLLIN as u32, 0x1410,
+    ), 0);
+    let mut holder = parent.fork_child(3, false, false).unwrap();
+    pidfd_test_close(&mut holder, &pidfd_test_memory(), outer);
+    pidfd_test_close(&mut parent, &memory, inner);
+    let observer = holder.file_table.clone();
+    holder.release_files_on_exit();
+    let registrations_after_exit = pidfd_test_record(&parent, pidfd).epoll_registrations();
+    pidfd_test_exit(&mut parent, &mut child);
+    let events = pidfd_test_epoll_wait(&mut parent, &memory, outer);
+    pidfd_test_reap(&mut parent, &memory, 2);
+    drop(observer);
+    pidfd_test_close(&mut parent, &memory, outer);
+    pidfd_test_close(&mut parent, &memory, pidfd);
+    assert_eq!((registrations_after_exit, events), (0, BTreeMap::new()),
+        "an observer of an exited task's table must not preserve the epoll's native pidfd interest");
+}
+
+/// The writable-prefix probe is not a permission lease. A sibling can revoke
+/// access after that probe and before the native receive. Linux's failed copy
+/// leaves SO_PEEK_OFF unchanged; staging must not turn it into a successful
+/// native peek followed by a guest EFAULT with the offset already advanced.
+///
+/// Adopted with two oracle changes for the terminal late-fault design
+/// (`end_run_for_late_receive_fault`): the faulting call ends the run with
+/// `crate::Error::LateReceiveFault` instead of answering EFAULT, and the peek
+/// after it is gone, since no guest call follows a run's end to observe the
+/// offset that the host's receive moved. A future implementation that holds
+/// a real permission lease through the copy instead needs a real-thread
+/// regression for the serialization that lease allows, not one that requires
+/// the thread changing the permission to finish while the lease is held.
+#[test]
+fn reviewer_late_permission_loss_does_not_advance_peek_offset() {
+    const OPTION: u64 = 0xe00;
+    let buffer = (PIDFD_TEST_MEMORY - PAGE_SIZE as usize) as u64;
+    let mut observations = Vec::new();
+    for kind in [libc::SOCK_DGRAM, libc::SOCK_SEQPACKET] {
+        let root = TestDir::new();
+        let memory = std::rc::Rc::new(pidfd_test_memory());
+        let (mut parent, _child) = pidfd_test_family(&root, 2);
+        let (sender, receiver) = pidfd_test_socket_pair(
+            &mut parent, &memory, kind | libc::SOCK_NONBLOCK);
+        memory.write_raw(PIDFD_TEST_BYTE, b"x").unwrap();
+        assert_eq!(pidfd_test_call(&mut parent, &memory, libc::SYS_write,
+            [sender as u64, PIDFD_TEST_BYTE, 1, 0, 0, 0]), 1);
+        let zero: libc::c_int = 0;
+        assert_eq!(write_struct(&mut ProviderMemory(&memory), OPTION, &zero), 0);
+        assert_eq!(pidfd_test_call(&mut parent, &memory, libc::SYS_setsockopt,
+            [receiver as u64, libc::SOL_SOCKET as u64, libc::SO_PEEK_OFF as u64,
+             OPTION, 4, 0]), 0);
+        assert_eq!(memory.user().user_writable_prefix(buffer, 1).unwrap(), 1,
+            "the receive starts with its entire buffer writable");
+
+        // This is a real CLONE_THREAD executor and the same GuestMemory, not
+        // a fork with fabricated shared memory or direct page-state editing.
+        let racer = std::rc::Rc::new(std::cell::RefCell::new(
+            parent.thread_child(3).unwrap()));
+        assert!(Arc::ptr_eq(&parent.file_table, &racer.borrow().file_table));
+        let hook_count = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let raced = std::rc::Rc::new(std::cell::Cell::new(None));
+        let hook_memory = memory.clone();
+        let hook_racer = racer.clone();
+        let hook_counted = hook_count.clone();
+        let hook_raced = raced.clone();
+        RECEIVE_BEGUN_TEST_HOOK.with(|hook| {
+            let mut hook = hook.borrow_mut();
+            assert!(hook.is_none());
+            *hook = Some(Box::new(move || {
+                // receive_discarding_rights runs this after recvfrom has
+                // probed/copied its guest buffer and immediately before the
+                // native recvmsg. No other receive runs in this hook.
+                hook_counted.set(hook_counted.get() + 1);
+                let before = hook_memory.user()
+                    .user_writable_prefix(buffer, 1).unwrap();
+                let changed = pidfd_test_call(&mut hook_racer.borrow_mut(),
+                    &hook_memory, libc::SYS_mprotect,
+                    [buffer, PAGE_SIZE, libc::PROT_NONE as u64, 0, 0, 0]);
+                let after = hook_memory.user()
+                    .user_accessible_prefix(buffer, 1).unwrap();
+                hook_raced.set(Some((before, changed, after)));
+            }));
+        });
+        let flags = (libc::MSG_PEEK | libc::MSG_DONTWAIT) as u64;
+        // Oracle change 1: the checked call, whose failure ends the run.
+        let faulted = format!("{:?}", pidfd_test_checked_call(&mut parent, &memory,
+            libc::SYS_recvfrom, [receiver as u64, buffer, 1, flags, 0, 0]));
+        let hook_left = RECEIVE_BEGUN_TEST_HOOK.with(|hook| hook.borrow_mut().take().is_some());
+        let restored = pidfd_test_call(&mut racer.borrow_mut(), &memory,
+            libc::SYS_mprotect,
+            [buffer, PAGE_SIZE, (libc::PROT_READ | libc::PROT_WRITE) as u64, 0, 0, 0]);
+        let writable_again = memory.user().user_writable_prefix(buffer, 1).unwrap();
+        // Oracle change 2: no peek follows the run's end.
+        memory.write_raw(PIDFD_TEST_BYTE, b"?").unwrap();
+
+        // Drain the actual record, without PEEK, and close the shared table's
+        // two entries before checking the semantic oracle for either kind.
+        let drained = pidfd_test_call(&mut parent, &memory, libc::SYS_recvfrom,
+            [receiver as u64, PIDFD_TEST_BYTE, 1, libc::MSG_DONTWAIT as u64, 0, 0]);
+        let mut drained_byte = [0u8; 1];
+        memory.read_raw(PIDFD_TEST_BYTE, &mut drained_byte).unwrap();
+        let empty = pidfd_test_call(&mut parent, &memory, libc::SYS_recvfrom,
+            [receiver as u64, PIDFD_TEST_BYTE, 1, libc::MSG_DONTWAIT as u64, 0, 0]);
+        pidfd_test_close(&mut parent, &memory, sender);
+        pidfd_test_close(&mut parent, &memory, receiver);
+        observations.push((kind, hook_count.get(), hook_left, raced.get(), faulted,
+            restored, writable_again, drained, drained_byte[0], empty));
+    }
+    eprintln!("late permission peek observations: {observations:?}");
+    let ended = format!("{:?}", Err::<i64, _>(crate::Error::LateReceiveFault {
+        operation: "recvfrom",
+        address: buffer,
+    }));
+    for (kind, hook_count, hook_left, raced, faulted, restored, writable_again,
+         drained, drained_byte, empty) in observations {
+        assert_eq!(hook_count, 1, "kind {kind}: the receive hook ran exactly once");
+        assert!(!hook_left, "kind {kind}: A consumed the armed receive hook");
+        assert_eq!(raced, Some((1, 0, 0)),
+            "kind {kind}: B changed the initially writable page via successful guest mprotect");
+        assert_eq!(faulted, ended,
+            "kind {kind}: a late copy fault ends the run by name, never as EFAULT");
+        assert_eq!((restored, writable_again), (0, 1), "kind {kind}");
+        assert_eq!((drained, drained_byte), (1, b'x'), "kind {kind}: PEEK retained the record");
+        assert_eq!(empty, negative_errno(libc::EAGAIN), "kind {kind}: queue drained");
+    }
+}
+
+/// What a connect of guest socket `socket` to the abstract Unix address
+/// `name` returns, and the typed refusal it left.
+fn pidfd_test_connect(
+    executor: &mut ElfExecutor,
+    memory: &GuestMemory,
+    socket: i64,
+    name: &str,
+) -> (i64, Option<reverie::UnsupportedRefusal>) {
+    // SAFETY: sockaddr_un is plain data; zero starts the abstract name.
+    let mut address = unsafe { std::mem::zeroed::<libc::sockaddr_un>() };
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    assert!(name.len() < address.sun_path.len());
+    for (slot, byte) in address.sun_path[1..].iter_mut().zip(name.as_bytes()) {
+        *slot = *byte as libc::c_char;
+    }
+    let length = std::mem::offset_of!(libc::sockaddr_un, sun_path) + 1 + name.len();
+    assert_eq!(
+        write_struct(&mut ProviderMemory(memory), PIDFD_TEST_INFO, &address),
+        0
+    );
+    let result = pidfd_test_call(
+        executor,
+        memory,
+        libc::SYS_connect,
+        [socket as u64, PIDFD_TEST_INFO, length as u64, 0, 0, 0],
+    );
+    (result, executor.take_unsupported_refusal())
+}
+
+/// A connect of an end of a datagram socket pair, by any alias of it, while a
+/// send from it that relies on the pair's route is in progress, is refused by
+/// name before any effect (`forget_pair_before_connect`, `CONNECT_REFUSAL`):
+/// the send was admitted as one into the run, and a new peer could take its
+/// message out of the run. The send relies on the route from its check until
+/// its host send ends (`RouteReliance`), whether its message carries an epoll
+/// set or only a Unix socket. Here another process connects the end at the
+/// send's seam, to an address that names nothing. Once the send has ended,
+/// its message is the peer's, and the same connect runs, fails, and still
+/// forgets the pair: a later send of an epoll from that end may leave the run,
+/// and is refused.
+#[test]
+fn a_connect_while_a_send_relies_on_its_pair_is_refused_before_any_effect() {
+    for carries_epoll in [true, false] {
+        let case = format!("carries an epoll {carries_epoll}");
+        let root = TestDir::new();
+        let memory = pidfd_test_memory();
+        let (mut parent, _child) = pidfd_test_family(&root, 2);
+        let fd = pidfd_test_open(&mut parent, &memory, 2, 0);
+        let epoll = pidfd_test_call(&mut parent, &memory, libc::SYS_epoll_create1, [0; 6]);
+        assert_eq!(
+            pidfd_test_epoll_ctl(
+                &mut parent,
+                &memory,
+                epoll,
+                libc::EPOLL_CTL_ADD,
+                fd,
+                libc::EPOLLIN as u32,
+                1,
+            ),
+            0
+        );
+        let (sender, receiver) =
+            pidfd_test_socket_pair(&mut parent, &memory, libc::SOCK_DGRAM | libc::SOCK_NONBLOCK);
+        let (carried, carried_peer) =
+            pidfd_test_socket_pair(&mut parent, &memory, libc::SOCK_DGRAM | libc::SOCK_NONBLOCK);
+        let racer = std::rc::Rc::new(std::cell::RefCell::new(
+            parent.fork_child(3, false, false).unwrap(),
+        ));
+        let name = format!(
+            "r1410-connect-{}",
+            root.0.file_name().unwrap().to_string_lossy()
+        );
+        let connected = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let hook_racer = racer.clone();
+        let hook_connected = connected.clone();
+        let hook_name = name.clone();
+        SEND_BEGUN_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let other_memory = pidfd_test_memory();
+                *hook_connected.borrow_mut() = Some(pidfd_test_connect(
+                    &mut hook_racer.borrow_mut(),
+                    &other_memory,
+                    sender,
+                    &hook_name,
+                ));
+            }));
+        });
+        let right = if carries_epoll { epoll } else { carried };
+        assert_eq!(
+            pidfd_test_send_rights(&mut parent, &memory, sender, &[right as libc::c_int]),
+            1,
+            "{case}: the send runs"
+        );
+        assert!(
+            SEND_BEGUN_TEST_HOOK.with(|hook| hook.borrow_mut().take().is_none()),
+            "{case}: the send reached its seam"
+        );
+        assert_eq!(
+            connected.borrow_mut().take(),
+            Some((negative_errno(libc::ENOSYS), pidfd_test_connect_refusal())),
+            "{case}: the connect meanwhile was refused by name"
+        );
+        // The message reached the pair's other end, in the run.
+        let (result, rights, _) =
+            pidfd_test_receive_rights(&mut parent, &memory, receiver, 0, RIGHTS_CONTROL_CAPACITY);
+        assert_eq!((result, rights.len()), (1, 1), "{case}");
+        pidfd_test_close(&mut parent, &memory, i64::from(rights[0]));
+        // With the send over, the connect runs, and fails: nothing has the
+        // name.
+        let other_memory = pidfd_test_memory();
+        assert_eq!(
+            pidfd_test_connect(&mut racer.borrow_mut(), &other_memory, sender, &name),
+            (negative_errno(libc::ECONNREFUSED), None),
+            "{case}"
+        );
+        assert_eq!(
+            pidfd_test_send_rights(&mut parent, &memory, sender, &[epoll as libc::c_int]),
+            negative_errno(libc::ENOSYS),
+            "{case}: the failed connect forgot the pair"
+        );
+        assert_eq!(
+            parent.take_unsupported_refusal(),
+            pidfd_test_epoll_export_refusal(),
+            "{case}"
+        );
+        for closing in [epoll, sender, receiver, carried, carried_peer] {
+            pidfd_test_close(&mut parent, &memory, closing);
+            pidfd_test_close(&mut racer.borrow_mut(), &other_memory, closing);
+        }
+    }
+}
+
+/// A connect of an end of a stream or seqpacket socket pair, which cannot give
+/// it a new peer (`unix_stream_connect`: the ends stay connected to each
+/// other; here it fails for a name that names nothing, before it would find
+/// the socket connected), leaves the pair recorded
+/// (`forget_pair_before_connect`): an epoll set sent from that end still goes
+/// into the run.
+#[test]
+fn a_refused_connect_of_a_stream_or_seqpacket_pair_end_keeps_its_pair() {
+    for kind in [libc::SOCK_STREAM, libc::SOCK_SEQPACKET] {
+        let case = format!("kind {kind}");
+        let root = TestDir::new();
+        let memory = pidfd_test_memory();
+        let (mut parent, _child) = pidfd_test_family(&root, 2);
+        let fd = pidfd_test_open(&mut parent, &memory, 2, 0);
+        let epoll = pidfd_test_call(&mut parent, &memory, libc::SYS_epoll_create1, [0; 6]);
+        assert_eq!(
+            pidfd_test_epoll_ctl(
+                &mut parent,
+                &memory,
+                epoll,
+                libc::EPOLL_CTL_ADD,
+                fd,
+                libc::EPOLLIN as u32,
+                1,
+            ),
+            0
+        );
+        let (sender, receiver) =
+            pidfd_test_socket_pair(&mut parent, &memory, kind | libc::SOCK_NONBLOCK);
+        let name = format!(
+            "r1410-connected-{}",
+            root.0.file_name().unwrap().to_string_lossy()
+        );
+        assert_eq!(
+            pidfd_test_connect(&mut parent, &memory, sender, &name),
+            (negative_errno(libc::ECONNREFUSED), None),
+            "{case}"
+        );
+        assert_eq!(
+            pidfd_test_send_rights(&mut parent, &memory, sender, &[epoll as libc::c_int]),
+            1,
+            "{case}: the pair is still recorded"
+        );
+        let (result, rights, _) =
+            pidfd_test_receive_rights(&mut parent, &memory, receiver, 0, RIGHTS_CONTROL_CAPACITY);
+        assert_eq!((result, rights.len()), (1, 1), "{case}");
+        for closing in [i64::from(rights[0]), epoll, sender, receiver] {
+            pidfd_test_close(&mut parent, &memory, closing);
+        }
     }
 }

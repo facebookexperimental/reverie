@@ -134,6 +134,15 @@ pub enum UnsupportedOperation {
     /// refuses one changed nothing; the refusal's diagnostic names the
     /// operation.
     Pidfd,
+    /// A receive that takes a record from a Unix datagram or seqpacket socket
+    /// into a buffer that is not all writable, on a backend that must see
+    /// every right such a receive takes, and whose own receive, like Linux's,
+    /// would free the record with its rights unseen where the copy faults.
+    /// The refusal is conservative: it also covers receives that Linux
+    /// completes, such as of a record that fits the writable part, and the
+    /// refusal's diagnostic names when the backend makes it. A backend that
+    /// refuses one received nothing.
+    UnwritableRecordBuffer,
 }
 
 /// A backend's refusal of an injected syscall, or of a `Guest` operation,

@@ -571,6 +571,15 @@ pub(crate) const SOCKET_EXPORT_REFUSAL: &str = "KVM does not send a Unix socket 
      SCM_RIGHTS message on a socket that may carry it out of the run while an epoll set sent in \
      the run is in flight";
 
+/// Diagnostic for this backend's refusal to connect a datagram socket that
+/// is an end of a socket pair the run made while a send from it relies on
+/// the pair's route (`forget_pair_before_connect`): the connect could give
+/// the socket a peer outside the run between that send's check and its
+/// host send, and an epoll set or a Unix socket the send carries would
+/// leave the run unseen.
+pub(crate) const CONNECT_REFUSAL: &str = "KVM does not connect an end of a socket pair while a \
+     send from it that carries an epoll set or a Unix socket into the run is in progress";
+
 /// Diagnostic for this backend's refusal to add a pidfd for a guest process
 /// to an epoll set where open file descriptions cannot be compared: a
 /// descriptor of the epoll passed in an `SCM_RIGHTS` message could not join
@@ -642,9 +651,35 @@ pub(super) fn receive_descriptors_refusal(result: i64) -> Option<reverie::Unsupp
     })
 }
 
+/// Diagnostic for this backend's refusal of a consuming receive from a Unix
+/// datagram or seqpacket socket into a buffer that is not all writable while
+/// a right it tracks is in flight (`refuse_unwritable_record_buffer`).
+pub(crate) const UNWRITABLE_RECORD_BUFFER_REFUSAL: &str = "KVM does not take a record from a \
+     Unix datagram or seqpacket socket into a buffer that is not all writable while an epoll \
+     set or a process proc description sent in the run is in flight: a faulting copy would \
+     discard the record's rights unseen. This conservative restriction also refuses receives \
+     that Linux completes, of a record that fits the writable part, of an empty record, or \
+     from an empty queue";
+
+/// The typed refusal, if any, of the receive this call made: one refused
+/// for a buffer that is not all writable, while a right this backend tracks
+/// was in flight, answered ENOSYS and said so
+/// (`refuse_unwritable_record_buffer`); every other result carries none.
+pub(super) fn unwritable_record_buffer_refusal(result: i64) -> Option<reverie::UnsupportedRefusal> {
+    (take_receive_refused_for_unwritable_buffer() && result == negative_errno(libc::ENOSYS)).then(
+        || {
+            reverie::UnsupportedRefusal::new(
+                reverie::UnsupportedOperation::UnwritableRecordBuffer,
+                reverie::Errno::ENOSYS,
+                UNWRITABLE_RECORD_BUFFER_REFUSAL,
+            )
+        },
+    )
+}
+
 /// The typed refusal, if any, that a call refused for a pidfd for a guest
 /// process carries: `reason` is the one the call recorded, and the call
-/// answered ENOSYS, which Linux's sendmsg never answers.
+/// answered ENOSYS, which Linux's sendmsg and connect never answer.
 pub(super) fn pidfd_refusal_record(
     reason: Option<&'static str>,
     result: i64,

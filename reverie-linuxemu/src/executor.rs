@@ -586,6 +586,7 @@ pub fn native_loaded_state(cwd: &std::path::Path) -> LoadedStaticElf {
             open_peek_windows: std::collections::BTreeSet::new(),
             peek_window_holds: Vec::new(),
             socket_peers: std::collections::BTreeMap::new(),
+            route_reliances: std::collections::BTreeMap::new(),
         })),
     }
 }

@@ -43,12 +43,7 @@ pub(super) fn register_proc_transfer(
         .file_identity_table
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let in_flight: usize = table
-        .proc_transfers
-        .values()
-        .map(|transfer| transfer.in_flight)
-        .sum();
-    if in_flight >= PROC_TRANSFER_LIMIT {
+    if proc_rights_in_flight_in(&table) >= PROC_TRANSFER_LIMIT {
         return Err(negative_errno(libc::ETOOMANYREFS));
     }
     match table.proc_transfers.entry(key) {
@@ -76,6 +71,16 @@ pub(super) fn register_proc_transfer(
         }
     }
     Ok(key)
+}
+
+/// How many process proc rights are in flight across the namespace, by
+/// `table`, the identity table, locked.
+pub(super) fn proc_rights_in_flight_in(table: &crate::elf::GuestFileIdentityTable) -> usize {
+    table
+        .proc_transfers
+        .values()
+        .map(|transfer| transfer.in_flight)
+        .sum()
 }
 
 /// Finds the process proc description sent with a received backing memfd. A
