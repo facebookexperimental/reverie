@@ -703,10 +703,12 @@ fn instruction_audit(
                 )
                 .into());
             }
-            require(
-                (amd.ip(), amd.len(), amd.code()) == (ip, intel.len(), intel.code()),
-                &format!("instruction audit: Intel and AMD decodings differ at {ip:#x}"),
-            )?;
+            if (amd.ip(), amd.len(), amd.code()) != (ip, intel.len(), intel.code()) {
+                return Err(format!(
+                    "instruction audit: Intel and AMD decodings differ at {ip:#x}"
+                )
+                .into());
+            }
             previous = intel.code();
             covered += intel.len();
             census.instructions += 1;
