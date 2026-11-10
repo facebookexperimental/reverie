@@ -4083,7 +4083,7 @@ const DETCORE_DIRECT_TLS_CENSUS_POLICY_V3: &str =
 fn detcore_direct_tls_offset_accepted(address: u64) -> bool {
     matches!(
         address,
-        0x98 | 0xa0 | 0xd8 | 0xe0 | 0xe8 | 0x100 | 0x110 | 0x128
+        0x98 | 0xa0 | 0xd8 | 0xe0 | 0xe8 | 0x100 | 0x108 | 0x110 | 0x128 | 0x148
     )
 }
 
@@ -27767,6 +27767,186 @@ const DETCORE_VALIDATE_TEMPLATES: &[DetcoreValidateTemplate] = &[
         ],
         transfers: &[(14, 0), (58, 2), (188, 3), (201, 5), (222, 7), (235, 9)],
     },
+    // Retained pinned normal ELF, VA 0x1289ac0, exact LOCAL8 cell 0x108.
+    // Complete 241-byte body SHA256: 35e6645a7743d95b2328662b8218da2b59094e51091a67c04a5210eca436b164.
+    DetcoreValidateTemplate {
+        role: "fixed_patch_alloc",
+        hex: "41574156415453504889d34989f6ff155c782d004885c0747c4989c44c8b782041f6c7070f85a50000004d85ff0f84b1000000488d3dbefd2c00e881c022004883b80801000000745d498b542410498b07498d76ff49f7de31c94889c74801d772354801f772304c21f74989f84929d072504901d8410f92c14981f801000002410f93c24508ca750ef04d0fb10775ca4889f9eb0231c94889c84883c4085b415c415e415fc3bf010000004c89f64889da4883c4085b415c415e415fff25ce772d00488d3d97772900ff15a1002d00488d154a782900bf080000004c89feff153c082d00488d3d35782900ff15cf492d00",
+        operands: &[
+            DetcoreValidateOperand {
+                displacement: 16,
+                next: 20,
+                key: "fixed_arena_backing",
+                got: true,
+            },
+            DetcoreValidateOperand {
+                displacement: 54,
+                next: 58,
+                key: "fixed_publication_tls_descriptor",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 59,
+                next: 63,
+                key: "fixed_tls_get_addr_plt",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 190,
+                next: 194,
+                key: "fixed_tool_alloc",
+                got: true,
+            },
+            DetcoreValidateOperand {
+                displacement: 197,
+                next: 201,
+                key: "fixed_detcore_validate_fixed_patch_alloc_194_data",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 203,
+                next: 207,
+                key: "fixed_heap_panic_sub_overflow",
+                got: true,
+            },
+            DetcoreValidateOperand {
+                displacement: 210,
+                next: 214,
+                key: "fixed_detcore_validate_fixed_patch_alloc_207_data",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 224,
+                next: 228,
+                key: "fixed_heap_panic_misaligned",
+                got: true,
+            },
+            DetcoreValidateOperand {
+                displacement: 231,
+                next: 235,
+                key: "fixed_detcore_validate_fixed_patch_alloc_228_data",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 237,
+                next: 241,
+                key: "fixed_panic_null_reference",
+                got: true,
+            },
+        ],
+        transfers: &[(14, 0), (58, 2), (188, 3), (201, 5), (222, 7), (235, 9)],
+    },
+    // Retained pinned diagnostic ELF, VA 0x128d8d0, exact LOCAL8 cell 0x148.
+    // Complete 241-byte body SHA256: a8ebcb1ad9b229aca79d2c5e29344b716eef9df78cf7caf015b9274d8a5ae148.
+    DetcoreValidateTemplate {
+        role: "fixed_patch_alloc",
+        hex: "41574156415453504889d34989f6ff157c812d004885c0747c4989c44c8b782041f6c7070f85a50000004d85ff0f84b1000000488d3d2e062d00e8b1cb22004883b84801000000745d498b542410498b07498d76ff49f7de31c94889c74801d772354801f772304c21f74989f84929d072504901d8410f92c14981f801000002410f93c24508ca750ef04d0fb10775ca4889f9eb0231c94889c84883c4085b415c415e415fc3bf010000004c89f64889da4883c4085b415c415e415fff25fe802d00488d3d47842900ff1549092d00488d156a842900bf080000004c89feff15e4102d00488d3d55842900ff15c7532d00",
+        operands: &[
+            DetcoreValidateOperand {
+                displacement: 16,
+                next: 20,
+                key: "fixed_arena_backing",
+                got: true,
+            },
+            DetcoreValidateOperand {
+                displacement: 54,
+                next: 58,
+                key: "fixed_publication_tls_descriptor",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 59,
+                next: 63,
+                key: "fixed_tls_get_addr_plt",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 190,
+                next: 194,
+                key: "fixed_tool_alloc",
+                got: true,
+            },
+            DetcoreValidateOperand {
+                displacement: 197,
+                next: 201,
+                key: "fixed_detcore_validate_fixed_patch_alloc_194_data",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 203,
+                next: 207,
+                key: "fixed_heap_panic_sub_overflow",
+                got: true,
+            },
+            DetcoreValidateOperand {
+                displacement: 210,
+                next: 214,
+                key: "fixed_detcore_validate_fixed_patch_alloc_207_data",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 224,
+                next: 228,
+                key: "fixed_heap_panic_misaligned",
+                got: true,
+            },
+            DetcoreValidateOperand {
+                displacement: 231,
+                next: 235,
+                key: "fixed_detcore_validate_fixed_patch_alloc_228_data",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 237,
+                next: 241,
+                key: "fixed_panic_null_reference",
+                got: true,
+            },
+        ],
+        transfers: &[(14, 0), (58, 2), (188, 3), (201, 5), (222, 7), (235, 9)],
+    },
+    // Retained pinned normal ELF, VA 0x1289e50, exact LOCAL8 cell 0x108.
+    // Complete 22-byte body SHA256: ae2842200f1c3de93b9716d589a3df0cbc340767c98f2a2affd89a0509c7992e.
+    DetcoreValidateTemplate {
+        role: "fixed_tls_fn_once",
+        hex: "50488d3d60fa2c00e823bd2200488d800801000059c3",
+        operands: &[
+            DetcoreValidateOperand {
+                displacement: 4,
+                next: 8,
+                key: "fixed_publication_tls_descriptor",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 9,
+                next: 13,
+                key: "fixed_tls_get_addr_plt",
+                got: false,
+            },
+        ],
+        transfers: &[(8, 1)],
+    },
+    // Retained pinned diagnostic ELF, VA 0x128dc60, exact LOCAL8 cell 0x148.
+    // Complete 22-byte body SHA256: a350560648d73fb7dbd68c2dfbd3e4fa91c30a21e096d015c2121538678053bb.
+    DetcoreValidateTemplate {
+        role: "fixed_tls_fn_once",
+        hex: "50488d3dd0022d00e853c82200488d804801000059c3",
+        operands: &[
+            DetcoreValidateOperand {
+                displacement: 4,
+                next: 8,
+                key: "fixed_publication_tls_descriptor",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 9,
+                next: 13,
+                key: "fixed_tls_get_addr_plt",
+                got: false,
+            },
+        ],
+        transfers: &[(8, 1)],
+    },
 ];
 
 // Distinct from every historical TLS-bearing241B recipe. Measured in the true
@@ -29887,6 +30067,40 @@ const FIXED_NAKED_PINNED_STANDALONE_INCOMING: &[FixedScalarHelperIncoming] = &[
         &[("fixed_native_owner_gettid", 12, false)],
     ),
 ];
+// The pinned standalone image at add6180b retains this complete tuple,
+// but its gettid C bridge is the already-authenticated 16-byte tail form.
+// All other roles and incoming edges remain the pinned standalone ones.
+const FIXED_NAKED_PINNED_STANDALONE_GETTID_TAIL_COHORT: &[(&str, usize)] = &[
+    ("fixed_region_publication_get_opaque", 67),
+    ("fixed_region_publication_set_opaque", 80),
+    ("fixed_tool_heap_metadata", 57),
+    ("fixed_arena_backing", 58),
+    ("fixed_tool_require_owned", 59),
+    ("fixed_tool_alloc", 60),
+    ("fixed_tool_dealloc", 72),
+    ("fixed_tool_realloc", 73),
+    ("fixed_native_from_native", 78),
+    ("fixed_constructor_prepare", 88),
+    ("fixed_generic_prepare", 92),
+    ("fixed_arena_setup", 82),
+    ("fixed_native_owner_gettid", 108),
+];
+const FIXED_NAKED_PINNED_STANDALONE_GETTID_TAIL_INCOMING: &[FixedScalarHelperIncoming] = &[
+    // Reuse the eight unchanged incoming sets; only gettid's CALL+12 becomes
+    // JMP+11. The bridge still targets the same authenticated raw syscall.
+    FIXED_NAKED_PINNED_STANDALONE_INCOMING[0],
+    FIXED_NAKED_PINNED_STANDALONE_INCOMING[1],
+    FIXED_NAKED_PINNED_STANDALONE_INCOMING[2],
+    FIXED_NAKED_PINNED_STANDALONE_INCOMING[3],
+    FIXED_NAKED_PINNED_STANDALONE_INCOMING[4],
+    FIXED_NAKED_PINNED_STANDALONE_INCOMING[5],
+    FIXED_NAKED_PINNED_STANDALONE_INCOMING[6],
+    FIXED_NAKED_PINNED_STANDALONE_INCOMING[7],
+    (
+        "fixed_scalar_syscall",
+        &[("fixed_native_owner_gettid", 11, false)],
+    ),
+];
 const FIXED_NAKED_PINNED_NATIVE_COHORT: &[(&str, usize)] = &[
     ("fixed_region_publication_get_opaque", 55),
     ("fixed_region_publication_set_opaque", 81),
@@ -30414,6 +30628,13 @@ const FIXED_NAKED_COMPOSITIONS: &[FixedNakedComposition] = &[
         setup_bitmap_template: None,
     },
     FixedNakedComposition {
+        image_kind: FixedImageKind::Standalone,
+        native_syscalls: false,
+        cohort: FIXED_NAKED_PINNED_STANDALONE_GETTID_TAIL_COHORT,
+        incoming: FIXED_NAKED_PINNED_STANDALONE_GETTID_TAIL_INCOMING,
+        setup_bitmap_template: None,
+    },
+    FixedNakedComposition {
         image_kind: FixedImageKind::Detcore,
         native_syscalls: true,
         cohort: FIXED_NAKED_PINNED_NATIVE_COHORT,
@@ -30483,7 +30704,7 @@ const FIXED_NAKED_COMPOSITIONS: &[FixedNakedComposition] = &[
 // carries 78 and 82, so including 108 changes no complete build. The
 // stable 0x100 alloc template at 111 (dh-r5tic) follows the same
 // rule: it can only add refusals through this over-approximation.
-const FIXED_SOURCE_OWNED_TEMPLATE_END: usize = 112;
+const FIXED_SOURCE_OWNED_TEMPLATE_END: usize = 116;
 
 fn fixed_naked_publication_present(
     witnesses: &BTreeMap<String, AuthenticatedDetcoreOperation>,
@@ -60378,9 +60599,10 @@ mod tests {
     // same 241-byte fixed_patch_alloc shape as the 0x110/0x128 cohorts
     // (sha256 0be4c788adc82d1f0562d9d3b6123cc17a7ff871075414fab9af5d1b339aea8d
     // for the body extracted from that image, its encoded cell operand
-    // reading 0x100). Its existing-installation boundary must validate;
-    // the neighbouring IN_HANDLER cell at 0x108 is not the alloc cell
-    // and must refuse.
+    // reading 0x100). At add6180b the normal and diagnostic images have
+    // direct cells 0x108 and 0x148 respectively. The ELF qualifier separately
+    // binds the allocation's encoded read to the named cell in that image;
+    // these descriptor controls retain the exact observed offset allow-list.
     #[test]
     fn detcore_allocator_tls_boundary_accepts_stable_cell_0x100() {
         let boundary = |cell: u64| {
@@ -60440,15 +60662,197 @@ mod tests {
             ]),
         }
         };
-        assert!(
-            validate_existing_allocator_tls_boundary(&boundary(0x100), FixedImageKind::Detcore,)
-                .is_ok(),
-            "stable Detcore cell 0x100 must validate"
+        for cell in [0x100, 0x108, 0x148] {
+            assert!(
+                validate_existing_allocator_tls_boundary(&boundary(cell), FixedImageKind::Detcore)
+                    .is_ok(),
+                "observed direct cell {cell:#x} must validate"
+            );
+        }
+        for cell in [0x10c, 0x140, 0x150] {
+            assert!(
+                validate_existing_allocator_tls_boundary(&boundary(cell), FixedImageKind::Detcore)
+                    .is_err(),
+                "unreviewed neighbouring cell {cell:#x} must refuse"
+            );
+        }
+    }
+
+    #[test]
+    fn detcore_allocation_refuses_in_handler_0x108_in_installation_depth_0x100_layout() {
+        // The stable 1.97.1/2465470e allocation body and 0x100/0x108
+        // INSTALLATION_DEPTH/IN_HANDLER layout were retained in 867e1510.
+        // This miniature parsed ELF is a focused symbol/section binding
+        // control, not that complete image. The unmodified body must reach
+        // the later descriptor-mapping gate; complete positive qualification
+        // remains the actual product-staging gate.
+        let allocation = fixed_hex(
+            "41574156415453504889d34989f6ff15d4818a004885c0747c4989c44c8b782041f6c7070f85a50000004d85ff0f84b1000000488d3dde248a00e851c47f004883b80001000000745d498b542410498b07498d76ff49f7de31c94889c74801d772354801f772304c21f74989f84929d072504901d8410f92c14981f801000002410f93c24508ca750ef04d0fb10775ca4889f9eb0231c94889c84883c4085b415c415e415fc3bf010000004c89f64889da4883c4085b415c415e415fff2566818a00488d3da7fd8200ff15c9278a00488d155afe8200bf080000004c89feff156c2f8a00488d3d45fe8200ff1557698a00",
         );
-        assert!(
-            validate_existing_allocator_tls_boundary(&boundary(0x108), FixedImageKind::Detcore,)
-                .is_err(),
-            "the neighbouring IN_HANDLER cell 0x108 must refuse"
+        assert_eq!(
+            sha256(&allocation),
+            "0be4c788adc82d1f0562d9d3b6123cc17a7ff871075414fab9af5d1b339aea8d"
+        );
+        assert_eq!(&allocation[66..70], &0x100_u32.to_le_bytes());
+        fn put(bytes: &mut [u8], at: usize, width: usize, value: u64) {
+            bytes[at..at + width].copy_from_slice(&value.to_le_bytes()[..width]);
+        }
+        let mut image = vec![0_u8; 0x5000];
+        image[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+        for (at, width, value) in [
+            (16, 2, 3),
+            (18, 2, 62),
+            (20, 4, 1),
+            (32, 8, 64),
+            (40, 8, 0x3000),
+            (52, 2, 64),
+            (54, 2, 56),
+            (56, 2, 3),
+            (58, 2, 64),
+            (60, 2, 5),
+        ] {
+            put(&mut image, at, width, value);
+        }
+        for (index, kind, flags, offset, address, file_size, memory_size, alignment) in [
+            (0, 1, 5, 0, 0x1000, 0x4000, 0x4000, 0x1000),
+            (1, 1, 6, 0x4000, 0x6000, 0x100, 0x110, 0x1000),
+            (2, 7, 4, 0x4000, 0x6000, 0x100, 0x110, 8),
+        ] {
+            for (delta, width, value) in [
+                (0, 4, kind),
+                (4, 4, flags),
+                (8, 8, offset),
+                (16, 8, address),
+                (24, 8, address),
+                (32, 8, file_size),
+                (40, 8, memory_size),
+                (48, 8, alignment),
+            ] {
+                put(&mut image, 64 + index * 56 + delta, width, value);
+            }
+        }
+        let mut symbols: Vec<_> = FIXED_REQUIRED_ROLES
+            .iter()
+            .enumerate()
+            .map(|(index, role)| {
+                let name = FIXED_EMITTED_ROLE_SYMBOLS
+                    .iter()
+                    .find(|(name, _)| name == role)
+                    .unwrap()
+                    .1
+                    .replace("Cs_", "CsTest_");
+                (
+                    name,
+                    sym::STT_FUNC,
+                    1,
+                    0x1800 + index as u64 * 0x100,
+                    if *role == "fixed_patch_alloc" { 241 } else { 9 },
+                )
+            })
+            .collect();
+        symbols.extend([
+            (FIXED_TLS_CELL_ROLE.replace("Cs_", "CsTest_"), sym::STT_TLS, 4, 0x100, 8),
+            ("_RNvNCNKNvNtCsTest_15reverie_inguest4trap10IN_HANDLER0s_023___RUST_STD_INTERNAL_VAL".into(), sym::STT_TLS, 4, 0x108, 1),
+        ]);
+        let mut strings = vec![0];
+        for (index, (name, kind, section, address, size)) in symbols.iter().enumerate() {
+            let row = 0x2000 + (index + 1) * 24;
+            for (delta, width, value) in [
+                (0, 4, strings.len() as u64),
+                (4, 1, u64::from(*kind)),
+                (6, 2, *section),
+                (8, 8, *address),
+                (16, 8, *size),
+            ] {
+                put(&mut image, row + delta, width, value);
+            }
+            strings.extend_from_slice(name.as_bytes());
+            strings.push(0);
+        }
+        assert!(strings.len() < 0x1000);
+        image[0x1000..0x1000 + strings.len()].copy_from_slice(&strings);
+        image[0x800..0x800 + allocation.len()].copy_from_slice(&allocation);
+        for (index, kind, flags, address, offset, size, link, entry) in [
+            (1, 1, 6, 0x1800, 0x800, 0x500, 0, 0),
+            (2, 3, 0, 0, 0x1000, strings.len() as u64, 0, 0),
+            (3, 2, 0, 0, 0x2000, 24 * (symbols.len() + 1) as u64, 2, 24),
+            (4, 8, 0x403, 0x6100, 0x4100, 0x10, 0, 0),
+        ] {
+            for (delta, width, value) in [
+                (4, 4, kind),
+                (8, 8, flags),
+                (16, 8, address),
+                (24, 8, offset),
+                (32, 8, size),
+                (40, 4, link),
+                (48, 8, 8),
+                (56, 8, entry),
+            ] {
+                put(&mut image, 0x3000 + index * 64 + delta, width, value);
+            }
+        }
+        let elf = Elf::parse(&image).unwrap();
+        let named_cell = fixed_tls_cell(&elf).unwrap();
+        assert_eq!(named_cell.address, 0x100);
+        assert_eq!(
+            canonical_rust_symbol(&named_cell.name).as_deref(),
+            Some(FIXED_TLS_CELL_ROLE)
+        );
+        let handler = elf
+            .syms
+            .iter()
+            .find(|symbol| {
+                elf.strtab
+                    .get_at(symbol.st_name)
+                    .is_some_and(|name| name.contains("IN_HANDLER"))
+            })
+            .unwrap();
+        assert_eq!(
+            (handler.st_type(), handler.st_value, handler.st_size),
+            (sym::STT_TLS, 0x108, 1)
+        );
+        let qualify = |body: &[u8]| {
+            let mut specimen = image.clone();
+            specimen[0x800..0x800 + body.len()].copy_from_slice(body);
+            let parsed = Elf::parse(&specimen).unwrap();
+            let code = BTreeMap::from([(0x1800, specimen[0x800..0x800 + body.len()].to_vec())]);
+            qualify_allocator_tls_boundary_in_source_context(
+                &parsed,
+                &specimen,
+                &code,
+                "",
+                &BTreeMap::new(),
+                FixedImageKind::Detcore,
+                None,
+            )
+            .expect_err("this focused metadata fixture omits the full TLS descriptor/provider")
+        };
+        assert_eq!(
+            qualify(&allocation),
+            "Fixed data has overlapping or absent actual page mappings",
+            "the retained 0x100 allocation must pass named-cell binding and reach the later descriptor mapping gate"
+        );
+        let mut wrong_cell = allocation.clone();
+        wrong_cell[66..70].copy_from_slice(&0x108_u32.to_le_bytes());
+        assert_eq!(
+            DETCORE_VALIDATE_TEMPLATES
+                .iter()
+                .filter(|template| {
+                    template.role == "fixed_patch_alloc"
+                        && fixed_template_shape(
+                            &wrong_cell,
+                            &fixed_hex(template.hex),
+                            template.operands.iter().map(|op| op.displacement),
+                        )
+                })
+                .count(),
+            1,
+            "the 0x108 allocation has a recognized whole shape, so name binding must reject it"
+        );
+        assert_eq!(
+            qualify(&wrong_cell),
+            "Detcore allocation reads another TLS cell",
+            "IN_HANDLER at 0x108 in the INSTALLATION_DEPTH 0x100 layout must refuse by ELF name binding"
         );
     }
 
@@ -62432,6 +62836,35 @@ mod tests {
                 }
                 samples
             }
+            // Pinned standalone at add6180b: the complete tuple retains the
+            // pinned bodies, with the observed tail forms for both C bridges.
+            7 => {
+                let mut samples = naked_owner_publication_samples(3);
+                for sample in &mut samples {
+                    match sample.0 {
+                        "fixed_native_owner_gettid" => {
+                            *sample = (
+                                "fixed_native_owner_gettid",
+                                108,
+                                "bfba00000031f631d231c9e910e8ffff",
+                                &[0, 5, 7, 9, 11],
+                                &[(12, 16, "fixed_scalar_syscall", false)],
+                            );
+                        }
+                        "fixed_arena_mprotect" => {
+                            *sample = (
+                                "fixed_arena_mprotect",
+                                84,
+                                "4889febf0a000000ba00000002b903000000e939f2ffff",
+                                &[0, 3, 8, 13, 18],
+                                &[(19, 23, "fixed_scalar_syscall", false)],
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+                samples
+            }
             _ => panic!("unknown naked-owner control fixture"),
         }
     }
@@ -62441,7 +62874,7 @@ mod tests {
         mutations: bool,
     ) -> DetcorePublicationControlGraph {
         let samples = naked_owner_publication_samples(case);
-        let native = [false, true, false, false, true, false, false][case];
+        let native = [false, true, false, false, true, false, false, false][case];
         let mut targets: BTreeMap<String, u64> = BTreeMap::from([
             ("fixed_initializing".into(), 0x600000),
             ("fixed_region".into(), 0x600008),
@@ -62790,13 +63223,13 @@ mod tests {
             )?;
             fixed_detcore_full_result_contract(&g.witnesses, &g.transfers, &g.selected, &g.targets)
         };
-        for case in 0..7 {
-            let kind = if [true, false, false, true, false, false, true][case] {
+        for case in 0..8 {
+            let kind = if [true, false, false, true, false, false, true, true][case] {
                 FixedImageKind::Standalone
             } else {
                 FixedImageKind::Detcore
             };
-            let native = [false, true, false, false, true, false, false][case];
+            let native = [false, true, false, false, true, false, false, false][case];
             let graph = naked_owner_publication_control_graph(case, true);
             check(&graph, kind, native).unwrap();
             assert_eq!(
@@ -62976,7 +63409,7 @@ mod tests {
                     "unknown or mixed naked-owner publication whole composition"
                 );
             }
-            for other in 0..7 {
+            for other in 0..8 {
                 if other == case {
                     continue;
                 }
@@ -63293,6 +63726,171 @@ mod tests {
         }
         for role in FIXED_SCALAR_ROLES {
             assert!(fixed_scalar_recipe_role(role), "{role} lost scalar scope");
+        }
+    }
+
+    #[test]
+    fn detcore_retained_0108_and_0148_recipes_bind_exact_tls_cells() {
+        // These literal bodies and hashes were extracted from the retained
+        // normal and diagnostic ELF images, not from the production templates.
+        // Allocation controls prove unique shape and the exact named-cell gate;
+        // the getter controls additionally bind both operands and mint identity.
+        // Complete source/ELF qualification remains a product-staging gate.
+        let fixtures = [
+            // Retained new-normal ELF 03994a6bf992405ea6b8ceb8bb7922fa2ec23c48211c1e28bb1a20e46ee0142e, VA 0x1289ac0.
+            (
+                "fixed_patch_alloc",
+                0x1289ac0_u64,
+                0x108_u64,
+                66_usize,
+                241_usize,
+                "35e6645a7743d95b2328662b8218da2b59094e51091a67c04a5210eca436b164",
+                "41574156415453504889d34989f6ff155c782d004885c0747c4989c44c8b782041f6c7070f85a50000004d85ff0f84b1000000488d3dbefd2c00e881c022004883b80801000000745d498b542410498b07498d76ff49f7de31c94889c74801d772354801f772304c21f74989f84929d072504901d8410f92c14981f801000002410f93c24508ca750ef04d0fb10775ca4889f9eb0231c94889c84883c4085b415c415e415fc3bf010000004c89f64889da4883c4085b415c415e415fff25ce772d00488d3d97772900ff15a1002d00488d154a782900bf080000004c89feff153c082d00488d3d35782900ff15cf492d00",
+                0x15598b8_u64,
+                0x14b5b80_u64,
+            ),
+            // Retained new-diagnostic ELF 43f4dc48ed4e44a506658241e60d4695a0b27c6a5964a3444edee53ecccf3c8d, VA 0x128d8d0.
+            (
+                "fixed_patch_alloc",
+                0x128d8d0_u64,
+                0x148_u64,
+                66_usize,
+                241_usize,
+                "a8ebcb1ad9b229aca79d2c5e29344b716eef9df78cf7caf015b9274d8a5ae148",
+                "41574156415453504889d34989f6ff157c812d004885c0747c4989c44c8b782041f6c7070f85a50000004d85ff0f84b1000000488d3d2e062d00e8b1cb22004883b84801000000745d498b542410498b07498d76ff49f7de31c94889c74801d772354801f772304c21f74989f84929d072504901d8410f92c14981f801000002410f93c24508ca750ef04d0fb10775ca4889f9eb0231c94889c84883c4085b415c415e415fc3bf010000004c89f64889da4883c4085b415c415e415fff25fe802d00488d3d47842900ff1549092d00488d156a842900bf080000004c89feff15e4102d00488d3d55842900ff15c7532d00",
+                0x155df38_u64,
+                0x14ba4c0_u64,
+            ),
+            // Retained new-normal ELF 03994a6bf992405ea6b8ceb8bb7922fa2ec23c48211c1e28bb1a20e46ee0142e, VA 0x1289e50.
+            (
+                "fixed_tls_fn_once",
+                0x1289e50_u64,
+                0x108_u64,
+                16_usize,
+                22_usize,
+                "ae2842200f1c3de93b9716d589a3df0cbc340767c98f2a2affd89a0509c7992e",
+                "50488d3d60fa2c00e823bd2200488d800801000059c3",
+                0x15598b8_u64,
+                0x14b5b80_u64,
+            ),
+            // Retained new-diagnostic ELF 43f4dc48ed4e44a506658241e60d4695a0b27c6a5964a3444edee53ecccf3c8d, VA 0x128dc60.
+            (
+                "fixed_tls_fn_once",
+                0x128dc60_u64,
+                0x148_u64,
+                16_usize,
+                22_usize,
+                "a350560648d73fb7dbd68c2dfbd3e4fa91c30a21e096d015c2121538678053bb",
+                "50488d3dd0022d00e853c82200488d804801000059c3",
+                0x155df38_u64,
+                0x14ba4c0_u64,
+            ),
+        ];
+        let matching = |role: &str, bytes: &[u8]| -> Vec<usize> {
+            DETCORE_VALIDATE_TEMPLATES
+                .iter()
+                .enumerate()
+                .filter(|(_, template)| {
+                    template.role == role
+                        && fixed_template_shape(
+                            bytes,
+                            &fixed_hex(template.hex),
+                            template.operands.iter().map(|op| op.displacement),
+                        )
+                })
+                .map(|(index, _)| index)
+                .collect()
+        };
+        let candidates: Vec<_> = fixtures
+            .iter()
+            .map(|&(role, _, cell, tls_at, size, digest, hex, _, _)| {
+                let bytes = fixed_hex(hex);
+                assert_eq!(bytes.len(), size);
+                assert_eq!(sha256(&bytes), digest);
+                assert_eq!(
+                    u64::from(u32::from_le_bytes(
+                        bytes[tls_at..tls_at + 4].try_into().unwrap()
+                    )),
+                    cell
+                );
+                matching(role, &bytes)
+            })
+            .collect();
+        assert_eq!(
+            candidates.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![1; fixtures.len()],
+            "each independently retained allocation/getter must match exactly once"
+        );
+        for ((role, address, cell, tls_at, _, _, hex, descriptor, plt), matches) in
+            fixtures.into_iter().zip(candidates)
+        {
+            let bytes = fixed_hex(hex);
+            let template = &DETCORE_VALIDATE_TEMPLATES[matches[0]];
+            assert!(
+                template
+                    .operands
+                    .iter()
+                    .all(|op| { op.displacement + 4 <= tls_at || op.displacement >= tls_at + 4 }),
+                "the exact TLS read must never be masked for {role}"
+            );
+            let targets = BTreeMap::from([
+                ("fixed_publication_tls_descriptor".into(), descriptor),
+                ("fixed_tls_get_addr_plt".into(), plt),
+            ]);
+            let got = BTreeMap::new();
+            let readonly = BTreeMap::new();
+            let context = BTreeMap::new();
+            let bindings = || DetcoreRecipeBindings {
+                targets: &targets,
+                got: &got,
+                readonly: &readonly,
+                context: &context,
+            };
+            if role == "fixed_tls_fn_once" {
+                let identity =
+                    fixed_detcore_validate_recipe_identity(role, address, &bytes, bindings(), cell)
+                        .unwrap();
+                assert_eq!(identity.template_index, matches[0]);
+                assert_eq!(identity.edges.len(), 1);
+                assert_eq!(identity.edges[0].instruction, address + 8);
+                assert_eq!(identity.edges[0].target, plt);
+                assert_eq!(identity.edges[0].local_got_slot, None);
+            }
+            for wrong_cell in [0x100, 0x108, 0x110, 0x148, 0x10c, 0x140, 0x150] {
+                if wrong_cell == cell {
+                    continue;
+                }
+                assert_eq!(
+                    fixed_detcore_validate_recipe_identity(
+                        role,
+                        address,
+                        &bytes,
+                        bindings(),
+                        wrong_cell,
+                    )
+                    .err()
+                    .expect("a wrong named cell must not mint an identity"),
+                    "validate TLS read differs from authenticated exact LOCAL8 cell"
+                );
+            }
+            for neighbour in [0x10c_u32, 0x140, 0x150] {
+                let mut bad = bytes.clone();
+                bad[tls_at..tls_at + 4].copy_from_slice(&neighbour.to_le_bytes());
+                assert!(
+                    matching(role, &bad).is_empty(),
+                    "unreviewed {role} cell {neighbour:#x} must have no whole-body template"
+                );
+                assert!(
+                    fixed_detcore_validate_recipe_identity(
+                        role,
+                        address,
+                        &bad,
+                        bindings(),
+                        u64::from(neighbour),
+                    )
+                    .is_err()
+                );
+            }
         }
     }
 
@@ -64918,7 +65516,7 @@ mod tests {
 
     #[test]
     fn source_owned_template_end_covers_stable_prepare_identities() {
-        for index in [108, 109, 110] {
+        for index in [108, 109, 110, 112, 113, 114, 115] {
             let mut graph = scalar_ordinary_bit_result_control_graph(false);
             fixed_scalar_publication_syscall_mode(&graph.witnesses, FixedImageKind::Detcore, false)
                 .unwrap();
