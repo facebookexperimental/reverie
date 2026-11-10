@@ -12,7 +12,7 @@ oncall("hermit")
 # not define functions (Buck2 rejects `def` outside .bzl files), so each target
 # extends this shared table with its own documentation URL through dict().
 _PUBLIC_CRATE_METADATA = {
-    "version": "0.5.5",
+    "version": "0.5.6",
     "readme": "README.md",
     "homepage": "https://hermetic-infra.org",
     "keywords": ["linux", "instrumentation", "hermit"],
@@ -232,7 +232,7 @@ rust_library(
     autocargo = {
         "cargo_toml_config": {
             "package": {
-                "version": "0.5.5",
+                "version": "0.5.6",
                 "description": "Command helpers for generic Reverie conformance tests.",
                 "publish": False,
             },
@@ -746,7 +746,7 @@ rust_library(
     autocargo = {
         "cargo_toml_config": {
             "package": {
-                "version": "0.5.5",
+                "version": "0.5.6",
                 "description": "Hermit's in-guest loader: validation of the fixed-address loader and runtime images, and the loader's initialization stages.",
                 "publish": False,
             },

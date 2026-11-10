@@ -302,7 +302,7 @@ fn qualify_runtime() -> Result<QualifiedRuntime, String> {
             return Err("leaf path needs unsupported Cargo URL escaping".into());
         }
         let package = artifact::PackageIdentity {
-            id: format!("path+file://{leaf_text}#0.5.5"),
+            id: format!("path+file://{leaf_text}#0.5.6"),
             name: "reverie-liteinst-preload".into(),
             manifest: artifact::real_file(&leaf.join("Cargo.toml"))?,
             source: None,
