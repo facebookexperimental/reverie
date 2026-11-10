@@ -47,6 +47,9 @@ exec-private-init = ["fixed-syscall-gates"]
 # GNU builds, including all-features, retain the legacy fixed gate ABI.
 # This selects coordinates only; it does not admit or initialize an image.
 loader-private-runtime = ["exec-private-init", "dep:reverie-loader"]
+# Host producer of a mapped first image's qualified runtime image, birth
+# descriptor leases and fixed placement. Holds no stop, admission or Ready.
+exec-stop-producer = ["exec-stop", "loader-private-runtime", "dep:sha2", "dep:iced-x86"]
 # Inactive continuity for the actual shared scalar collector.
 native-exec-state = ["coordinator-rpc"]
 # Real collector test adapters; only cross-crate dev dependencies enable this.
@@ -70,6 +73,7 @@ reverie-memory = { version = "0.5.5", path = "../reverie-memory", optional = tru
 nix = { version = "0.30.1", features = ["fs", "process", "signal"], optional = true }
 serde_json = { version = "1.0.149", optional = true }
 sha2 = { version = "0.10.9", optional = true }
+iced-x86 = { version = "1.21.0", default-features = false, features = ["std", "decoder"], optional = true }
 libc = "0.2.186"
 syscalls = "0.6.18"
 reverie-syscalls = { version = "0.5.5", path = "../reverie-syscalls" }
@@ -86,7 +90,9 @@ tracing = { version = "0.1.41", optional = true }
 reverie-loader = { version = "0.5.5", path = "../reverie-loader" }
 tokio = { version = "1.54.1", features = ["test-util"] }
 tracing-subscriber = "0.3.23"
-iced-x86 = { version = "1.21.0", default-features = false, features = ["std", "decoder"] }
+iced-x86 = { version = "1.21.0", default-features = false, features = ["std", "decoder", "instr_info"] }
+object = { version = "0.40.0", default-features = false, features = ["std", "read", "elf"] }
+serde_json = "1.0.149"
 
 [[bin]]
 name = "reverie-inguest-probe"

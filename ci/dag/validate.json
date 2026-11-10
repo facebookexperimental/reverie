@@ -30,6 +30,30 @@
       "jobs_flag": ""
     },
     {
+      "group": "check",
+      "job": "oss_cargo_twins",
+      "desc": "oss_cargo manifest twins",
+      "description": "Runs scripts/check-oss-cargo-twins.sh: its self-test, then the check that every oss_cargo/<crate>/Cargo.toml.oss has the bytes and mode of <crate>/Cargo.toml.",
+      "labels": [
+        "full"
+      ],
+      "cmd": "./scripts/check-oss-cargo-twins.sh --self-test && ./scripts/check-oss-cargo-twins.sh",
+      "deps": [],
+      "env": {},
+      "timeout": 120,
+      "cpu_timeout": 30,
+      "priority": 60,
+      "hint": {
+        "resources": {},
+        "est_duration_s": 1,
+        "rss_baseline_bytes": 100000000,
+        "hard_mem_max_bytes": 1000000000,
+        "classification": "cpu-bound",
+        "preferred_inner_jobs": 1
+      },
+      "jobs_flag": ""
+    },
+    {
       "group": "lint",
       "job": "rustfmt",
       "desc": "Rustfmt",

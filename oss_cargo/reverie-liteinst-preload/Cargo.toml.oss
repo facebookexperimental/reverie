@@ -11,13 +11,14 @@ description = "Guest preload leaf for Reverie LiteInst"
 crate-type = ["cdylib"]
 
 [features]
+default = ["liteinst"]
 allocator-fixture = ["reverie-liteinst/allocator-fixture"]
 liteinst = ["reverie-liteinst/liteinst"]
 
 [dependencies]
 libc = "0.2.186"
 reverie = { package = "reverie-core", version = "0.5.5", path = "../reverie" }
-reverie-liteinst = { version = "0.5.5", path = "../reverie-liteinst", default-features = false, features = ["liteinst"] }
+reverie-liteinst = { version = "0.5.5", path = "../reverie-liteinst", default-features = false }
 
 [dev-dependencies]
 tempfile = "3.27.0"
