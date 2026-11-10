@@ -935,6 +935,20 @@ where
     ///   runtime-owned, and eight such misfires fill the recorded
     ///   set and end the process (pre-existing, measured at the
     ///   respin head).
+    /// - In `inject`, the `ThreadBirth` and clone3 `KernelDecides`
+    ///   arms are matched before the admitted-native-exec
+    ///   `ThreadCreation` refusal, so with admission on, the admitted
+    ///   native exec route forwards a thread birth (or hands the
+    ///   kernel a clone3 it rejects) instead of refusing it by name.
+    ///   The refusal must come first. Found by code reading in the
+    ///   M1 rebase review, as is the next entry.
+    /// - `reinit_after_fork` force-releases its locks
+    ///   (`crate::sync`'s `force_unlock`) on the premise that only
+    ///   the forking thread survives, without checking that it runs
+    ///   in a genuine fork child (child pid differs from the
+    ///   parent's). With sibling threads, a call outside a fork child
+    ///   would release a lock a live thread holds. It must check
+    ///   first.
     pub fn set_thread_admission(&mut self, enabled: bool) {
         self.admit_threads = enabled;
     }
@@ -1184,15 +1198,15 @@ where
         // ExecComplete publication uses the same restored state. Dispatch now
         // observes an existing state and cannot repeat either startup hook.
         let completed = pending.take().expect("owned successor state");
-        self.prepared_exec_pending
-            .store(false, core::sync::atomic::Ordering::Release);
         drop(pending);
         self.states
             .publish(tid.as_raw(), completed.state)
             .map_err(|_| io::Error::other("successor thread state already exists"))?;
-        // Release-store after the publish above: a dispatch whose
-        // Acquire load observes it clear synchronizes-with the
-        // publish and must see the published state.
+        // The only clear, a Release-store after the publish above: a
+        // dispatch whose Acquire load observes it clear synchronizes-with
+        // the publish and must see the published state. A failed publish
+        // leaves it set, so a later dispatch ends the process
+        // (`refuse_if_prepared_exec_pending`) rather than run without it.
         self.prepared_exec_pending
             .store(false, core::sync::atomic::Ordering::Release);
         Ok(())
