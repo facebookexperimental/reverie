@@ -11,9 +11,22 @@ const BODY: [u8; 44] = [
     0xd6, 0x48, 0x89, 0xca, 0x4d, 0x89, 0xc2, 0x4d, 0x89, 0xc8, 0x4c, 0x8b, 0x4c, 0x24, 0x10, 0x0f,
     0x05, 0x41, 0xff, 0xe4, 0xf3, 0x0f, 0x1e, 0xfa, 0x41, 0x5c, 0xc3,
 ];
+const TRAP_SOURCE: &str = "reverie-inguest/src/trap.rs";
+const FIXED_SOURCE: &str = "reverie-inguest/src/trap/fixed_gates.rs";
 const TRAP_SHA: &str = "5c9249419574f00c540dec767359181c8ac03a47aa2df0f19e5cef0a59b5755b";
-const DEDICATED_TRAP_SHA: &str = "91c07be60ab719c9d353991a0230c058b22a457676d05f3866aab943ea55d6eb";
 const DEDICATED_SECTION: &str = ".text.reverie_inguest_trusted_syscall";
+// The DedicatedFunction cohort's source identity is the gate's shape, not the
+// whole trap.rs file. The compiled half is checked below: a 44-byte input
+// section of exactly DEDICATED_SECTION (Cohort::text_size, BODY). The x86_64
+// global_asm! block that defines OWNER in that section is the reviewed
+// identity; its whole-line bytes are the same at Reverie e39f78dd, add6180b,
+// 44ef088f and dea9681d. The aarch64 block is hashed for the shape check; it
+// is not guarded or recorded. A new x86_64 value needs review of that block,
+// not a regenerated literal.
+// Hermit's private-static producer applies the same rule (runtime_cohort.py).
+const TRUSTED_SYSCALL_X86_64_BLOCK_SHA256: &str =
+    "095374039289c0c2063acdc8eabbd7bb1cbaf6a07e44d50db32ee9ab796fd4e2";
+const GATE_SOURCE_BOUND: usize = 2 * 1024 * 1024;
 const FIXED_SHA: &str = "ff3f6f6c46e872734ae921e869dbccc0ce1aeefe4bc3af8f29363cf276501e54";
 #[cfg(test)]
 const MEMBER: &str =
@@ -251,12 +264,319 @@ fn source_digest(actual: &str, gate: bool) -> Result<()> {
         "ordinary actual source differs",
     )
 }
-fn source_cohort(actual: &str, cohort: Cohort) -> Result<()> {
-    let expected = match cohort {
-        Cohort::LegacyE3 | Cohort::CheckedHandoff5b3 => TRAP_SHA,
-        Cohort::DedicatedFunction => DEDICATED_TRAP_SHA,
+// RAW is the trap.rs content whose sha256 is ACTUAL.
+fn source_cohort(raw: &[u8], actual: &str, cohort: Cohort) -> Result<()> {
+    require(
+        sha256(raw) == actual,
+        "ordinary trap source changed while read",
+    )?;
+    cohort_identity(raw, actual, cohort)
+}
+// The historical container shapes keep their whole-file identity; the
+// dedicated function keeps its gate.
+fn cohort_identity(raw: &[u8], actual: &str, cohort: Cohort) -> Result<()> {
+    match cohort {
+        Cohort::LegacyE3 | Cohort::CheckedHandoff5b3 => {
+            require(actual == TRAP_SHA, "ordinary source/input cohort differs")
+        }
+        Cohort::DedicatedFunction => gate_guard(raw)
+            .map(drop)
+            .map_err(|e| format!("ordinary source/input cohort differs: {e}")),
+    }
+}
+#[derive(Debug)]
+struct GateBlock {
+    line: usize,
+    start: usize,
+    end: usize,
+    arch: Option<String>,
+    sha256: String,
+    contributes: bool,
+    defines_entry: bool,
+}
+#[derive(Debug, PartialEq, Eq)]
+struct GateShape {
+    x86_64: String,
+    aarch64: String,
+}
+fn line_of(raw: &[u8], at: usize) -> usize {
+    raw[..at].iter().filter(|&&b| b == b'\n').count() + 1
+}
+fn skip_blanks(raw: &[u8], mut at: usize) -> usize {
+    while at < raw.len() && matches!(raw[at], b' ' | b'\t') {
+        at += 1;
+    }
+    at
+}
+fn word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+// Offset just past `global_asm!(` when the line at START opens the macro.
+fn macro_open(raw: &[u8], start: usize) -> Option<usize> {
+    let mut at = skip_blanks(raw, start);
+    for prefix in [&b"core::arch::"[..], b"std::arch::"] {
+        if raw[at..].starts_with(prefix) {
+            at += prefix.len();
+            break;
+        }
+    }
+    at = at
+        .checked_add(b"global_asm!".len())
+        .filter(|_| raw[at..].starts_with(b"global_asm!"))?;
+    at = skip_blanks(raw, at);
+    (raw.get(at) == Some(&b'(')).then_some(at + 1)
+}
+// Offset of the bracket closing a macro opened before AT, past literals and comments.
+fn macro_end(raw: &[u8], mut at: usize) -> Result<usize> {
+    let mut depth = 1;
+    while at < raw.len() {
+        let char = raw[at];
+        let hashes = (char == b'r' && !word_byte(raw[at - 1]))
+            .then(|| {
+                raw[at + 1..]
+                    .iter()
+                    .take(299)
+                    .take_while(|&&b| b == b'#')
+                    .count()
+            })
+            .filter(|n| raw.get(at + 1 + n) == Some(&b'"'));
+        if let Some(n) = hashes {
+            let mut close = b"\"".to_vec();
+            close.extend(std::iter::repeat_n(b'#', n));
+            let body = at + 2 + n;
+            let found = raw[body..]
+                .windows(close.len())
+                .position(|w| w == close.as_slice());
+            at = body
+                + found.ok_or("trusted syscall gate shape: unterminated raw string")?
+                + close.len();
+        } else if char == b'"' {
+            at += 1;
+            while at < raw.len() && raw[at] != b'"' {
+                at += if raw[at] == b'\\' { 2 } else { 1 };
+            }
+            require(
+                at < raw.len(),
+                "trusted syscall gate shape: unterminated string",
+            )?;
+            at += 1;
+        } else if raw[at..].starts_with(b"//") {
+            at = raw[at..]
+                .iter()
+                .position(|&b| b == b'\n')
+                .map_or(raw.len(), |n| at + n);
+        } else if raw[at..].starts_with(b"/*") {
+            let found = raw[at + 2..].windows(2).position(|w| w == b"*/");
+            at += 2 + found.ok_or("trusted syscall gate shape: unterminated comment")? + 2;
+        } else {
+            if matches!(char, b'(' | b'[' | b'{') {
+                depth += 1;
+            } else if matches!(char, b')' | b']' | b'}') {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok(at);
+                }
+            }
+            at += 1;
+        }
+    }
+    Err("trusted syscall gate shape: unterminated global_asm! block".into())
+}
+fn trim(text: &[u8]) -> &[u8] {
+    let blank = |b: &u8| b.is_ascii_whitespace() || *b == 0x0b;
+    let begin = text.iter().position(|b| !blank(b)).unwrap_or(text.len());
+    let end = text
+        .iter()
+        .rposition(|b| !blank(b))
+        .map_or(begin, |n| n + 1);
+    &text[begin..end]
+}
+// `#[cfg(target_arch = "NAME")]` exactly, NAME in [a-z0-9_]+.
+fn target_arch(cfg: &[u8]) -> Option<String> {
+    let name = cfg
+        .strip_prefix(b"#[cfg(target_arch = \"")?
+        .strip_suffix(b"\")]")?;
+    (!name.is_empty()
+        && name
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'_'))
+    .then(|| String::from_utf8_lossy(name).into_owned())
+}
+fn section_names(raw: &[u8]) -> Vec<usize> {
+    let name = DEDICATED_SECTION.as_bytes();
+    (0..raw.len().saturating_sub(name.len() - 1))
+        .filter(|&at| {
+            raw[at..].starts_with(name)
+                && !raw
+                    .get(at + name.len())
+                    .is_some_and(|&b| word_byte(b) || b == b'$')
+        })
+        .collect()
+}
+fn defines_entry(body: &[u8]) -> bool {
+    body.split(|&b| b == b'\n').any(|line| {
+        let line = &line[skip_blanks(line, 0)..];
+        line.strip_prefix(OWNER.as_bytes())
+            .is_some_and(|rest| rest.starts_with(b":"))
+    })
+}
+/// Hash every global_asm! block that fills the gate section, one per arch.
+///
+/// A block is its whole lines, from the macro line through the line holding
+/// the closing bracket. Exactly one x86_64 and one aarch64 block, each gated
+/// by a single target_arch cfg and each defining OWNER, may name the section;
+/// nothing else in the file may.
+fn gate_shape(raw: &[u8]) -> Result<GateShape> {
+    require(
+        raw.len() <= GATE_SOURCE_BOUND,
+        "trusted syscall gate shape: source bound",
+    )?;
+    let line_starts = std::iter::once(0)
+        .chain(
+            raw.iter()
+                .enumerate()
+                .filter(|&(_, &b)| b == b'\n')
+                .map(|(at, _)| at + 1),
+        )
+        .filter(|&at| at <= raw.len());
+    let mut blocks: Vec<GateBlock> = Vec::new();
+    for start in line_starts {
+        let Some(open) = macro_open(raw, start) else {
+            continue;
+        };
+        let line = line_of(raw, start);
+        require(
+            blocks.last().is_none_or(|b| start >= b.end),
+            format!("trusted syscall gate shape: overlapping global_asm! block at line {line}"),
+        )?;
+        let close = macro_end(raw, open)?;
+        require(
+            raw.get(close + 1) == Some(&b';'),
+            format!("trusted syscall gate shape: global_asm! at line {line} is not a statement"),
+        )?;
+        let end = raw[close..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(raw.len(), |n| close + n + 1);
+        let mut attributes = Vec::new();
+        let mut above = start;
+        while above > 0 {
+            let previous = raw[..above - 1]
+                .iter()
+                .rposition(|&b| b == b'\n')
+                .map_or(0, |n| n + 1);
+            let text = trim(&raw[previous..above]);
+            if !text.starts_with(b"#[") {
+                break;
+            }
+            attributes.push(text);
+            above = previous;
+        }
+        let cfgs = attributes
+            .iter()
+            .filter(|t| t.starts_with(b"#[cfg"))
+            .collect::<Vec<_>>();
+        let arch = match cfgs.as_slice() {
+            [cfg] => target_arch(cfg),
+            _ => None,
+        };
+        let body = &raw[start..end];
+        blocks.push(GateBlock {
+            line,
+            start,
+            end,
+            arch,
+            sha256: sha256(body),
+            contributes: !section_names(body).is_empty(),
+            defines_entry: defines_entry(body),
+        });
+    }
+    for at in section_names(raw) {
+        require(
+            blocks.iter().any(|b| b.start <= at && at < b.end),
+            format!(
+                "trusted syscall gate shape: section named outside a global_asm! block at line {}",
+                line_of(raw, at)
+            ),
+        )?;
+    }
+    let contributing = blocks.iter().filter(|b| b.contributes).collect::<Vec<_>>();
+    for block in &contributing {
+        require(
+            block.arch.is_some(),
+            format!(
+                "trusted syscall gate shape: contributing block at line {} has no single target_arch cfg",
+                block.line
+            ),
+        )?;
+    }
+    let mut arches = contributing
+        .iter()
+        .filter_map(|b| b.arch.as_deref())
+        .collect::<Vec<_>>();
+    arches.sort_unstable();
+    require(
+        arches == ["aarch64", "x86_64"],
+        format!(
+            "trusted syscall gate shape: exactly one contributing block per target_arch x86_64 and aarch64 required, found {:?}",
+            contributing
+                .iter()
+                .map(|b| (b.arch.as_deref(), b.line))
+                .collect::<Vec<_>>()
+        ),
+    )?;
+    for block in &blocks {
+        require(
+            block.contributes || !block.defines_entry,
+            format!(
+                "trusted syscall gate shape: block at line {} defines {OWNER} outside the section",
+                block.line
+            ),
+        )?;
+        require(
+            !block.contributes || block.defines_entry,
+            format!(
+                "trusted syscall gate shape: contributing {} block at line {} does not define {OWNER}",
+                block.arch.as_deref().unwrap_or("?"),
+                block.line
+            ),
+        )?;
+    }
+    let digest = |arch: &str| {
+        contributing
+            .iter()
+            .find(|b| b.arch.as_deref() == Some(arch))
+            .map(|b| b.sha256.clone())
+            .unwrap_or_default()
     };
-    require(actual == expected, "ordinary source/input cohort differs")
+    Ok(GateShape {
+        x86_64: digest("x86_64"),
+        aarch64: digest("aarch64"),
+    })
+}
+/// The x86_64 block is the guard; the aarch64 block is shape-checked only.
+fn gate_guard(raw: &[u8]) -> Result<GateShape> {
+    gate_guard_against(raw, TRUSTED_SYSCALL_X86_64_BLOCK_SHA256)
+}
+fn gate_guard_against(raw: &[u8], reviewed: &str) -> Result<GateShape> {
+    let shape = gate_shape(raw)?;
+    require(
+        shape.x86_64 == reviewed,
+        format!(
+            "trusted syscall gate shape: x86_64 block sha256 {} differs from reviewed {reviewed}",
+            shape.x86_64
+        ),
+    )?;
+    Ok(shape)
+}
+fn trap_bytes(trap: &FileIdentity) -> Result<Vec<u8>> {
+    let mut raw = Vec::new();
+    fs::File::open(&trap.path)
+        .map_err(|e| e.to_string())?
+        .take(GATE_SOURCE_BOUND as u64 + 1)
+        .read_to_end(&mut raw)
+        .map_err(|e| e.to_string())?;
+    Ok(raw)
 }
 fn code_bytes(bytes: &[u8], gate: bool) -> Result<()> {
     if gate {
@@ -829,10 +1149,10 @@ impl VerifiedStaticSource {
                 .map(|(path, _)| path)
                 .collect::<Vec<_>>();
             require(roots.len() == 1, "ordinary resolved source ambiguous")?;
-            let trap_source = FileIdentity::read(&roots[0].join("reverie-inguest/src/trap.rs"))?;
+            let trap_source = FileIdentity::read(&roots[0].join(TRAP_SOURCE))?;
             files.push(trap_source.clone());
-            let fixed_source =
-                FileIdentity::read(&roots[0].join("reverie-inguest/src/trap/fixed_gates.rs"))?;
+            let trap_raw = trap_bytes(&trap_source)?;
+            let fixed_source = FileIdentity::read(&roots[0].join(FIXED_SOURCE))?;
             files.push(fixed_source.clone());
             source_digest(&fixed_source.sha256, true)?;
             let members = extract_objects(&archive.file, 0)?;
@@ -856,7 +1176,7 @@ impl VerifiedStaticSource {
                 elf: Elf::parse(&g.bytes).map_err(|e| e.to_string())?,
             };
             let cohort = closed_input_shape(&object)?;
-            source_cohort(&trap_source.sha256, cohort)?;
+            source_cohort(&trap_raw, &trap_source.sha256, cohort)?;
             let section = input(&object, false, cohort)?;
             let gate_section = input(&gate, true, cohort)?;
             require(
@@ -1397,22 +1717,253 @@ mod tests {
         member.header = 1024;
         member
     }
+    // A trap.rs-shaped source: the x86_64 and aarch64 gate blocks, an
+    // unrelated x86_64 block in .text, and ordinary Rust around them.
+    const GATE_X86_64: &str = concat!(
+        "#[cfg(target_arch = \"x86_64\")]\n",
+        "core::arch::global_asm!(\n",
+        "    r#\"\n",
+        "    .pushsection .text.reverie_inguest_trusted_syscall,\"ax\",@progbits\n",
+        "reverie_inguest_trusted_syscall:\n",
+        "    // ( unbalanced in a raw string\n",
+        "    push r12\n",
+        "    syscall\n",
+        "    .popsection\n",
+        "\"#\n",
+        ");\n",
+    );
+    const GATE_AARCH64: &str = concat!(
+        "#[cfg(target_arch = \"aarch64\")]\n",
+        "core::arch::global_asm!(\n",
+        "    r#\"\n",
+        "    .pushsection .text.reverie_inguest_trusted_syscall,\"ax\",@progbits\n",
+        "reverie_inguest_trusted_syscall:\n",
+        "    bti c\n",
+        "    svc #0\n",
+        "    .popsection\n",
+        "\"#\n",
+        ");\n",
+    );
+    const OTHER_X86_64: &str = concat!(
+        "#[cfg(target_arch = \"x86_64\")]\n",
+        "core::arch::global_asm!(\n",
+        "    \".text\",\n",
+        "    \"reverie_inguest_guest_syscall:\",\n",
+        "    \"ret\",\n",
+        ");\n",
+    );
+    fn trap_fixture(x86_64: &str, aarch64: &str) -> String {
+        format!(
+            "use core::arch;\n// The gate.\n{x86_64}\nfn ordinary() -> u64 {{ 1 }}\n\n{aarch64}\n{OTHER_X86_64}fn tail() {{}}\n"
+        )
+    }
+    fn refusal(raw: &str) -> String {
+        gate_shape(raw.as_bytes()).unwrap_err()
+    }
+    #[test]
+    fn ordinary44_gate_shape_hashes_each_whole_line_block() {
+        let raw = trap_fixture(GATE_X86_64, GATE_AARCH64);
+        let shape = gate_shape(raw.as_bytes()).unwrap();
+        assert_eq!(
+            shape.x86_64,
+            sha256(&GATE_X86_64.as_bytes()[GATE_X86_64.find("core").unwrap()..])
+        );
+        assert_eq!(
+            shape.aarch64,
+            sha256(&GATE_AARCH64.as_bytes()[GATE_AARCH64.find("core").unwrap()..])
+        );
+        // Every prefix form of the macro opens a block.
+        for prefix in ["", "std::arch::", "  core::arch::"] {
+            let edited = raw.replace(
+                "core::arch::global_asm!(\n    r#",
+                &format!("{prefix}global_asm! (\n    r#"),
+            );
+            assert_eq!(
+                gate_shape(edited.as_bytes()).unwrap().aarch64.len(),
+                64,
+                "{prefix}"
+            );
+        }
+    }
+    #[test]
+    fn ordinary44_gate_guard_binds_x86_64_and_records_aarch64() {
+        let raw = trap_fixture(GATE_X86_64, GATE_AARCH64);
+        let reviewed = gate_shape(raw.as_bytes()).unwrap().x86_64;
+        gate_guard_against(raw.as_bytes(), &reviewed).unwrap();
+        // Edits outside the gate blocks and inside the aarch64 block pass.
+        let outside = raw
+            .replace("{ 1 }", "{ 2 }")
+            .replace("fn tail() {}", "fn tail() { let _ = 3; }");
+        gate_guard_against(outside.as_bytes(), &reviewed).unwrap();
+        let aarch64 = trap_fixture(GATE_X86_64, &GATE_AARCH64.replace("svc #0", "svc #1"));
+        assert_ne!(
+            gate_shape(aarch64.as_bytes()).unwrap().aarch64,
+            gate_shape(raw.as_bytes()).unwrap().aarch64
+        );
+        gate_guard_against(aarch64.as_bytes(), &reviewed).unwrap();
+        // Any byte of the x86_64 block, comment or not, is refused.
+        for (from, to) in [
+            ("push r12", "push r13"),
+            ("( unbalanced", "(  unbalanced"),
+            ("    syscall\n", "    syscall \n"),
+        ] {
+            let edited = trap_fixture(&GATE_X86_64.replacen(from, to, 1), GATE_AARCH64);
+            let error = gate_guard_against(edited.as_bytes(), &reviewed).unwrap_err();
+            assert!(
+                error.contains("x86_64 block sha256") && error.contains(&reviewed),
+                "{from}: {error}"
+            );
+        }
+        // The production guard is the reviewed constant, not this fixture.
+        assert!(
+            gate_guard(raw.as_bytes())
+                .unwrap_err()
+                .contains(TRUSTED_SYSCALL_X86_64_BLOCK_SHA256)
+        );
+    }
+    #[test]
+    fn ordinary44_gate_shape_refuses_each_shape_change_by_name() {
+        let base = trap_fixture(GATE_X86_64, GATE_AARCH64);
+        let cases = [
+            (
+                trap_fixture(GATE_X86_64, ""),
+                "exactly one contributing block per target_arch",
+            ),
+            (
+                trap_fixture(GATE_X86_64, &GATE_AARCH64.replace("aarch64", "x86_64")),
+                "exactly one contributing block per target_arch",
+            ),
+            (
+                base.replace("fn tail() {}", &format!("{GATE_X86_64}fn tail() {{}}")),
+                "exactly one contributing block per target_arch",
+            ),
+            (
+                trap_fixture(
+                    &GATE_X86_64.replace("#[cfg(target_arch = \"x86_64\")]\n", ""),
+                    GATE_AARCH64,
+                ),
+                "has no single target_arch cfg",
+            ),
+            (
+                trap_fixture(
+                    &GATE_X86_64.replace("\")]\n", "\")]\n#[cfg(unix)]\n"),
+                    GATE_AARCH64,
+                ),
+                "has no single target_arch cfg",
+            ),
+            (
+                trap_fixture(
+                    &GATE_X86_64
+                        .replace("target_arch = \"x86_64\"", "all(target_arch = \"x86_64\")"),
+                    GATE_AARCH64,
+                ),
+                "has no single target_arch cfg",
+            ),
+            (
+                base.replace(
+                    "// The gate.",
+                    "// See .text.reverie_inguest_trusted_syscall.",
+                ),
+                "section named outside a global_asm! block at line 2",
+            ),
+            (
+                base.replace(
+                    "\"reverie_inguest_guest_syscall:\"",
+                    "\"reverie_inguest_guest_syscall:\",\nreverie_inguest_trusted_syscall:",
+                ),
+                "defines reverie_inguest_trusted_syscall outside the section",
+            ),
+            (
+                trap_fixture(
+                    &GATE_X86_64.replace("reverie_inguest_trusted_syscall:\n", "other:\n"),
+                    GATE_AARCH64,
+                ),
+                "contributing x86_64 block at line 4 does not define",
+            ),
+            (
+                trap_fixture(&GATE_X86_64.replace(");\n", ")\n"), GATE_AARCH64),
+                "global_asm! at line 4 is not a statement",
+            ),
+            (
+                format!("{base}core::arch::global_asm!(r#\"x\"\n"),
+                "unterminated raw string",
+            ),
+            (
+                base.replace("    push r12\n", "core::arch::global_asm!(\"\");\n"),
+                "overlapping global_asm! block",
+            ),
+            (
+                format!("{base}core::arch::global_asm!(\"x\"\n"),
+                "unterminated global_asm! block",
+            ),
+            (
+                format!("{base}core::arch::global_asm!(\"x\n"),
+                "unterminated string",
+            ),
+            (
+                format!("{base}core::arch::global_asm!(/* x\n"),
+                "unterminated comment",
+            ),
+        ];
+        for (raw, expected) in cases {
+            let error = refusal(&raw);
+            assert!(
+                error.starts_with("trusted syscall gate shape: ") && error.contains(expected),
+                "{expected}: {error}"
+            );
+        }
+        // A section name followed by a further name byte is another name.
+        let longer = base.replace(
+            "fn tail()",
+            "// .text.reverie_inguest_trusted_syscall_ip\nfn tail()",
+        );
+        gate_shape(longer.as_bytes()).unwrap();
+        let bound = vec![b' '; GATE_SOURCE_BOUND + 1];
+        assert_eq!(
+            gate_shape(&bound).unwrap_err(),
+            "trusted syscall gate shape: source bound"
+        );
+    }
     #[test]
     fn ordinary44_dedicated_source_and_historical_geometries_do_not_mix() {
+        let legacy = b"historical trap.rs";
         for cohort in [Cohort::LegacyE3, Cohort::CheckedHandoff5b3] {
-            source_cohort(TRAP_SHA, cohort).unwrap();
+            // The historical shapes accept their whole-file identity, and only it.
+            cohort_identity(legacy, TRAP_SHA, cohort).unwrap();
+            for other in [FIXED_SHA, &sha256(legacy)[..]] {
+                assert_eq!(
+                    cohort_identity(legacy, other, cohort).unwrap_err(),
+                    "ordinary source/input cohort differs"
+                );
+            }
             assert_eq!(
-                source_cohort(DEDICATED_TRAP_SHA, cohort).unwrap_err(),
+                source_cohort(legacy, TRAP_SHA, cohort).unwrap_err(),
+                "ordinary trap source changed while read"
+            );
+            let gate = trap_fixture(GATE_X86_64, GATE_AARCH64);
+            assert_eq!(
+                source_cohort(gate.as_bytes(), &sha256(gate.as_bytes()), cohort).unwrap_err(),
                 "ordinary source/input cohort differs"
             );
         }
-        source_cohort(DEDICATED_TRAP_SHA, Cohort::DedicatedFunction).unwrap();
-        for source in [TRAP_SHA, FIXED_SHA, "unknown"] {
-            assert_eq!(
-                source_cohort(source, Cohort::DedicatedFunction).unwrap_err(),
-                "ordinary source/input cohort differs"
+        // The dedicated cohort is the shape guard, named in the refusal.
+        for raw in [
+            &legacy[..],
+            trap_fixture(GATE_X86_64, GATE_AARCH64).as_bytes(),
+        ] {
+            let error = source_cohort(raw, &sha256(raw), Cohort::DedicatedFunction).unwrap_err();
+            assert!(
+                error.starts_with(
+                    "ordinary source/input cohort differs: trusted syscall gate shape: "
+                ),
+                "{error}"
             );
         }
+        let raw = trap_fixture(GATE_X86_64, GATE_AARCH64);
+        assert_eq!(
+            source_cohort(raw.as_bytes(), FIXED_SHA, Cohort::DedicatedFunction).unwrap_err(),
+            "ordinary trap source changed while read"
+        );
     }
     #[test]
     fn ordinary44_dedicated_input_joins_actual_member_and_complete_map_extent() {
