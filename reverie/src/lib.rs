@@ -65,8 +65,10 @@ mod backend;
 pub mod backend_stats;
 mod backtrace;
 mod capabilities;
+mod connection_identity;
 mod dispatch_stats;
 mod error;
+mod facts;
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 pub mod glibc_symbol;
 mod guest;
@@ -75,18 +77,24 @@ pub mod in_guest_rcb;
 mod inherited_input;
 /// Shared Linux perf event mechanics; no tracer or timer policy.
 pub mod perf;
+pub mod pidfd_self;
 #[cfg(target_arch = "x86_64")]
 pub mod pmu;
 /// Process-wide PMU configuration shared by counters and precise timers.
 pub mod pmu_config;
+pub mod probes;
 pub use in_guest_rcb::InGuestRcbCounter;
 pub use perf::is_perf_supported;
+pub use pidfd_self::PidfdSelfSpelling;
 mod mapping_capture;
+pub mod native_syscall;
 mod process_signal_control;
 pub mod provider;
-#[cfg(target_arch = "x86_64")]
 mod rdtsc;
 mod regs;
+/// Nonserialized ownership for private input and physical native attempts.
+pub mod reserved_input;
+pub mod selection;
 mod signal;
 mod signal_delivery;
 mod signal_observation;
@@ -95,27 +103,33 @@ mod subscription;
 pub mod task_ids;
 mod timer;
 mod tool;
+mod tool_configuration;
+pub mod tool_outcome;
+mod tool_process;
 mod unsupported;
 mod user_address;
 pub mod vdso;
+mod watchpoint;
 
 pub use auxv::*;
 pub use backend::*;
 pub use backend_stats::*;
 pub use backtrace::*;
 pub use capabilities::*;
+pub use connection_identity::ConnectionIdentity;
 pub use dispatch_stats::*;
 pub use error::*;
+pub use facts::*;
 pub use guest::*;
 pub use inherited_input::*;
 pub use mapping_capture::*;
 pub use process::ExitStatus;
 pub use process::Pid;
-#[cfg(target_arch = "x86_64")]
 pub use rdtsc::*;
 pub use regs::RegDisplay;
 pub use regs::RegDisplayOptions;
 pub use reverie_process as process;
+pub use selection::*;
 pub use signal::*;
 pub use signal_delivery::*;
 pub use signal_observation::*;
@@ -123,9 +137,13 @@ pub use stack::*;
 pub use subscription::*;
 pub use timer::*;
 pub use tool::*;
+pub use tool_configuration::ToolConfiguration;
+pub use tool_outcome::*;
+pub use tool_process::ToolProcess;
 pub use unsupported::*;
 pub use user_address::UserAddressLimit;
 pub use user_address::X86_64_FOUR_LEVEL_USER_ADDRESS_LIMIT;
+pub use watchpoint::*;
 
 /// The identifier for a specific thread, corresponding to the output of gettid.
 /// In many cases, Linux blurs the Pid/Tid distinction, but Reverie should

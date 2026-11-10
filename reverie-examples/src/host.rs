@@ -55,7 +55,6 @@ mod strace_minimal;
 
 pub(crate) use strace::config;
 pub(crate) use strace::filter;
-pub(crate) use strace::global_state;
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-139): Review the LiteInst example-tool selector.

@@ -12,23 +12,33 @@ pub(crate) mod filter;
 pub(crate) mod global_state;
 pub(crate) mod tool;
 
+#[cfg(feature = "runtime")]
 #[path = "../backend.rs"]
 mod backend;
 
+#[cfg(feature = "host")]
 use clap::Parser;
 // TODO-HUMAN-REVIEW(PR-139): Review type visibility for the shared LiteInst host.
-pub(crate) use config::Config;
-pub(crate) use filter::Filter;
+pub use config::Config;
+pub use filter::Filter;
+pub use global_state::GlobalState;
+pub use global_state::OutputEvent;
+#[cfg(feature = "host")]
 use reverie_util::CommonToolArguments;
-pub(crate) use tool::Strace;
+pub use tool::Strace;
+#[cfg(any(test, feature = "test-support"))]
+pub fn take_handled_syscalls() -> usize {
+    tool::take_handled_syscalls()
+}
 
 /// A tool to trace system calls.
+#[cfg(feature = "host")]
 #[derive(Parser, Debug)]
-struct Opts {
+pub struct Opts {
     // TODO-HUMAN-REVIEW(PR-151): Review strace runner selection.
     /// The Reverie backend to run the program on (`--runner` is accepted).
     #[clap(long, value_enum, default_value = "ptrace", alias = "runner")]
-    backend: backend::BackendKind,
+    backend: reverie_examples::host::BackendKind,
 
     /// The example preload the in-guest backends host the tool in; by
     /// default `libreverie_examples.so` beside this binary.
@@ -42,13 +52,15 @@ struct Opts {
     /// this is used, then only the specified syscalls are traced. By limiting
     /// the set of traced syscalls, we can reduce the overhead of the tracer.
     #[clap(long)]
-    trace: Vec<Filter>,
+    pub trace: Vec<Filter>,
 }
 
+#[cfg(feature = "runtime")]
 fn main() -> anyhow::Result<()> {
     run_main(Opts::parse())
 }
 
+#[cfg(feature = "runtime")]
 fn run_main(args: Opts) -> anyhow::Result<()> {
     let config = Config {
         filters: args.trace,
@@ -66,11 +78,11 @@ fn run_main(args: Opts) -> anyhow::Result<()> {
     status.raise_or_exit()
 }
 
-#[cfg(all(test, target_arch = "x86_64"))]
+#[cfg(all(test, feature = "runtime", target_arch = "x86_64"))]
 #[path = "../kvm_test_support.rs"]
 mod kvm_test_support;
 
-#[cfg(all(test, target_arch = "x86_64"))]
+#[cfg(all(test, feature = "runtime", target_arch = "x86_64"))]
 mod kvm_tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;

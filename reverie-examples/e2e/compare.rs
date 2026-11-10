@@ -131,7 +131,15 @@ fn first_difference(native: &Record, backend: &Record) -> Option<String> {
 /// the `execve` that starts the program, which runs before DynamoRIO takes
 /// over. They cannot see those calls, at the start and again after each
 /// successful `execve`.
-const LATE_START: &[&str] = &["liteinst", "in-guest-trap", "e9patch", "dbt", "sabre"];
+// The external DynamoRIO name retains the legacy dbt startup semantics.
+const LATE_START: &[&str] = &[
+    "liteinst",
+    "in-guest-trap",
+    "e9patch",
+    "dbt",
+    "dynamorio",
+    "sabre",
+];
 
 /// How many calls, by name, place a late-starting backend's record in the
 /// native one.

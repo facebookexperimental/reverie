@@ -45,6 +45,9 @@ pub enum NativeFrameError {
 pub struct NativeFrameReply<'a, G: GlobalTool> {
     owner: &'a CoordinatorRpc<G>,
     _connection: SpinGuard<'a, RpcConnection<G>>,
+    // Owns the mutex `_connection` guards (per-thread connection map);
+    // declared after the guard so the guard drops first.
+    _connection_arc: std::sync::Arc<super::ThreadConnection<G>>,
     length: usize,
 }
 
@@ -98,8 +101,27 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
         {
             return Err(NativeFrameError::Bounds);
         }
-        let connection = self
-            .connection
+        // Native frames run only on the root thread (pid == tid is
+        // checked below against this connection's stamps), so the
+        // current thread's connection is the root one whenever this
+        // exchange can proceed; a missing one is reported as in-flight,
+        // as the native-configuration owner's refusal was.
+        //
+        // Connection-first is safe here: the cheap refusals (poisoned,
+        // bounds) already ran above, and the remaining stamp checks
+        // compare against the connection's own connect-time stamps, so
+        // the connection must be in hand to evaluate them. A lazy open
+        // on a thread that then fails the pid == tid check leaves behind
+        // only that thread's ordinary per-thread connection -- the same
+        // one its next ordinary send would open -- and no frame is
+        // exchanged on the refusal path.
+        let connection_arc = match &self.connection {
+            super::ConnectionOwner::NativeConfiguration => {
+                return Err(NativeFrameError::InFlight);
+            }
+            super::ConnectionOwner::Ordinary(_) => self.thread_connection(),
+        };
+        let connection = connection_arc
             .try_lock()
             .ok_or(NativeFrameError::InFlight)?;
         if self.native_failed.load(Ordering::Acquire) {
@@ -124,7 +146,16 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
         let length = exchange_frame(fd, request, response)?;
         Ok(NativeFrameReply {
             owner: self,
-            _connection: connection,
+            // SAFETY: the guard borrows the mutex inside
+            // `_connection_arc`, which this reply owns and which is
+            // declared (hence dropped) after the guard.
+            _connection: unsafe {
+                core::mem::transmute::<
+                    crate::sync::SpinGuard<'_, RpcConnection<G>>,
+                    crate::sync::SpinGuard<'_, RpcConnection<G>>,
+                >(connection)
+            },
+            _connection_arc: connection_arc,
             length,
         })
     }
@@ -292,7 +323,7 @@ mod tests {
                     assert_eq!(received.length(), 3);
                     assert_eq!(&reply[..3], b"yes");
                     assert!(rpc.native_failed.load(Ordering::Acquire));
-                    assert!(rpc.connection.try_lock().is_none());
+                    assert!(rpc.thread_connection().try_lock().is_none());
                     unsafe { received.accept() };
                     assert!(!rpc.native_failed.load(Ordering::Acquire));
                     assert_eq!(rpc.raw_fd(), fd);
@@ -388,7 +419,8 @@ mod tests {
                     unsafe { rpc.exchange_native_frame(b"seal", &mut []) }.err(),
                     Some(NativeFrameError::Bounds)
                 );
-                let guard = rpc.connection.lock();
+                let conn = rpc.thread_connection();
+                let guard = conn.lock();
                 assert_eq!(
                     unsafe { rpc.exchange_native_frame(b"seal", &mut reply) }.err(),
                     Some(NativeFrameError::InFlight)

@@ -240,6 +240,7 @@ fn run_cell(seccomp: bool) {
         (),
         Arc::new(()),
         TracedTaskOptions {
+            reserved_input: None,
             command_bootstrap: false,
             events: &events,
             injected_syscall_trap: None,

@@ -23,6 +23,8 @@ use super::Command;
 use super::Container;
 use super::Mount;
 use super::Namespace;
+use super::Pid;
+use super::PreparedStdio;
 use super::PtyChild;
 use super::Stdio;
 use super::seccomp;
@@ -65,6 +67,7 @@ impl Command {
             pre_exec: Vec::new(),
             terminal_execve: None,
             container: Container::new(),
+            pid: None,
         }
     }
 
@@ -373,6 +376,24 @@ impl Command {
         self
     }
 
+    /// Consumes and prepares this command's standard stream configurations.
+    ///
+    /// All three configurations are replaced with [`Stdio::inherit`], including
+    /// when preparation fails. The returned plan owns the materialized child
+    /// and parent descriptors without registering them with an async runtime.
+    ///
+    /// This handles only stdio. It does not apply PTY, container, or `pre_exec`
+    /// setup, or replace the caller's existing domain checks. A fork-based
+    /// launcher must perform its common child setup before installing the
+    /// prepared streams, so explicit streams override PTY descriptors.
+    pub fn take_prepared_stdio(&mut self) -> io::Result<PreparedStdio> {
+        PreparedStdio::new(
+            std::mem::take(&mut self.container.stdin),
+            std::mem::take(&mut self.container.stdout),
+            std::mem::take(&mut self.container.stderr),
+        )
+    }
+
     /// Changes the root directory of the calling process to the specified path.
     /// This directory will be inherited by all child processes of the calling
     /// process.
@@ -390,6 +411,36 @@ impl Command {
     pub fn unshare(&mut self, namespace: Namespace) -> &mut Self {
         self.container.unshare(namespace);
         self
+    }
+
+    /// Asks for process ID `pid` for the child, through `clone3`'s `set_tid`
+    /// (Linux 5.5 and later), in the PID namespace this process creates its
+    /// children in (normally its own). Without it the kernel picks the next
+    /// free ID, so a caller that starts the same program twice can give it the
+    /// same ID both times only this way.
+    ///
+    /// [`Command::spawn`] then fails with the kernel's error in the
+    /// [`Context::Clone`](crate::Context::Clone) context (a spawn without a
+    /// requested ID reports a failed clone in
+    /// [`Context::Unknown`](crate::Context::Unknown), as before): `EPERM` without `CAP_SYS_ADMIN`
+    /// or `CAP_CHECKPOINT_RESTORE` over that namespace, `EEXIST` when a task,
+    /// process group or session holds `pid`, `EINVAL` when `pid` is not in
+    /// `1..pid_max`, `E2BIG` on Linux 5.3 and 5.4, and `ENOSYS` where `clone3`
+    /// is unavailable (before Linux 5.3, or refused by a seccomp filter).
+    ///
+    /// A command that also unshares a namespace is refused with `EINVAL`
+    /// before anything is created: with a new PID namespace the requested ID
+    /// would name a PID inside it, and the other namespaces are not supported
+    /// with a requested ID yet. The child starts as after `fork`, on a copy of
+    /// the calling thread's stack.
+    pub fn pid(&mut self, pid: Pid) -> &mut Self {
+        self.pid = Some(pid);
+        self
+    }
+
+    /// The process ID asked for with [`Command::pid`], if any.
+    pub fn get_pid(&self) -> Option<Pid> {
+        self.pid
     }
 
     /// Schedules a closure to be run just before the `exec` function is invoked.

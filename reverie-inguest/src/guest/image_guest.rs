@@ -111,6 +111,12 @@ impl<T: Tool, R: HostRuntime> GlobalRPC<T::GlobalState> for ImageGuest<'_, T, R>
 
 #[reverie::tool]
 impl<'a, T: Tool, R: HostRuntime> Guest<T> for ImageGuest<'a, T, R> {
+    // This backend has no stopped-generation private input implementation.
+    // The typed default injection methods refuse without issuing a native call.
+    fn reserved_input_control(&self) -> Option<reverie::reserved_input::ReservedInputControl> {
+        None
+    }
+
     type Memory = GuestMemory<'a>;
     type Stack = LocalStack;
 
@@ -125,6 +131,13 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for ImageGuest<'a, T, R> {
 
     fn ppid(&self) -> Option<Pid> {
         None
+    }
+
+    /// The runtime's own descriptors in this process: the coordinator
+    /// connection, the Tool output socket, the performance counters and any
+    /// native-exec lease ([`crate::guest::protect::is_runtime_owned_fd`]).
+    fn is_runtime_owned_fd(&self, fd: i32) -> bool {
+        crate::guest::protect::is_runtime_owned_fd(fd)
     }
 
     // Guest::auxv's ordinary implementation reads this actual process's
@@ -558,8 +571,9 @@ mod tests {
                 );
                 assert_eq!(*memory, [0x5a; 16]);
                 assert_eq!(
-                    host.states.lock().get(&raw_pid(libc::SYS_gettid).as_raw()),
-                    Some(&2)
+                    host.states
+                        .with_state(raw_pid(libc::SYS_gettid).as_raw(), |state| state.copied()),
+                    Some(2)
                 );
                 assert!(host.initialize_initial_image_lifecycle(&owner).is_err());
                 assert_eq!(
@@ -593,7 +607,7 @@ mod tests {
                     } else {
                         assert!(calls.lock().unwrap().is_empty());
                     }
-                    assert!(host.states.lock().is_empty());
+                    assert!(host.states.is_empty());
                     assert_eq!(*memory, [0; 16]);
                     assert!(owner.finish().is_err());
                     assert!(host.initialize_initial_image_lifecycle(&owner).is_err());
@@ -620,8 +634,9 @@ mod tests {
                 assert_eq!(*memory, [0x5a; 16]);
                 assert_eq!(*calls.lock().unwrap(), ["init", "start", "post-exec"]);
                 assert_eq!(
-                    host.states.lock().get(&raw_pid(libc::SYS_gettid).as_raw()),
-                    Some(&2)
+                    host.states
+                        .with_state(raw_pid(libc::SYS_gettid).as_raw(), |state| state.copied()),
+                    Some(2)
                 );
                 // Component dispatch of a controlled Getpid event. This is not
                 // a claimed real SIGSYS/native-entry execution.
@@ -641,8 +656,9 @@ mod tests {
                     ["init", "start", "post-exec", "syscall"]
                 );
                 assert_eq!(
-                    host.states.lock().get(&raw_pid(libc::SYS_gettid).as_raw()),
-                    Some(&3)
+                    host.states
+                        .with_state(raw_pid(libc::SYS_gettid).as_raw(), |state| state.copied()),
+                    Some(3)
                 );
                 drop(host);
                 assert_eq!(worker.join().unwrap(), [1, 2, 3]);
@@ -672,7 +688,7 @@ mod tests {
                         _ => unreachable!(),
                     };
                     assert!(error.to_string().contains(operation));
-                    assert!(host.states.lock().is_empty());
+                    assert!(host.states.is_empty());
                     assert_eq!(*memory, [0; 16]);
                     assert!(
                         owner
@@ -722,7 +738,7 @@ mod tests {
                     mark_lifecycle_test_frontend_installed(&owner);
                     let error = host.initialize_initial_image_lifecycle(&owner).unwrap_err();
                     assert_eq!(error.raw_os_error(), Some(libc::EIO));
-                    assert!(host.states.lock().is_empty());
+                    assert!(host.states.is_empty());
                     assert_eq!(*memory, [0; 16]);
                     assert!(
                         owner
@@ -750,14 +766,17 @@ mod tests {
                 let (host, worker) = host(0, memory.as_mut_ptr() as usize, calls.clone());
                 unsafe { host.bind_initial_image_control(&owner) }.unwrap();
                 mark_lifecycle_test_frontend_installed(&owner);
-                host.states
-                    .lock()
-                    .insert(raw_pid(libc::SYS_gettid).as_raw(), 41);
+                assert!(
+                    host.states
+                        .try_publish(raw_pid(libc::SYS_gettid).as_raw(), 41)
+                        .is_ok()
+                );
                 let error = host.initialize_initial_image_lifecycle(&owner).unwrap_err();
                 assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
                 assert_eq!(
-                    host.states.lock().get(&raw_pid(libc::SYS_gettid).as_raw()),
-                    Some(&41)
+                    host.states
+                        .with_state(raw_pid(libc::SYS_gettid).as_raw(), |state| state.copied()),
+                    Some(41)
                 );
                 assert!(calls.lock().unwrap().is_empty());
                 drop(host);

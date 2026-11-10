@@ -1,7 +1,7 @@
 # Isolate the received-rights closure test
 
 `received_rights_reservation_and_rewrite_failures_are_transactional` in
-[`executor.rs`](../reverie-kvm/src/executor.rs) requires immediate peer EOF
+[`executor.rs`](../reverie-linuxemu/src/executor.rs) requires immediate peer EOF
 after rollback or removal of an unsupported received descriptor. A concurrent
 library test can spawn a host subprocess between socket creation and close.
 Even `CLOEXEC` sockets remain inherited until that subprocess execs, so closing

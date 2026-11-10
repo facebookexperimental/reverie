@@ -159,7 +159,7 @@ mod entry_wait_tests {
                 .gate
                 .try_close()
                 .unwrap()
-                .expect("distinct close must begin from Open")
+                .unwrap()
                 .finish()
                 .now_or_never()
                 .expect("all fixture participants are stopped")

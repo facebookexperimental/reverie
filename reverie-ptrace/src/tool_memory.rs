@@ -51,7 +51,7 @@ impl ToolMemory {
         self.0.pid()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_arch = "x86_64"))]
     pub(crate) fn stopped(&self) -> &Stopped {
         &self.0
     }

@@ -8,6 +8,11 @@
 
 //! `Tracer` type, plus ways to spawn it and retrieve its output.
 
+#![allow(
+    unexpected_cfgs,
+    reason = "`fbcode_build` is supplied by the internal Buck build"
+)]
+
 use std::collections::HashMap;
 use std::fs;
 use std::fs::OpenOptions;
@@ -157,10 +162,12 @@ struct TraceeSnapshot {
 pub(crate) struct TraceeIdentity {
     tid: Pid,
     snapshot: TraceeSnapshot,
-    /// Only test assertions (`same_process`) read the retained procfs handle
-    /// and inode; production still captures them as before.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// The task's `/proc/<tid>` directory, opened while the task was
+    /// certainly traced here (`capture` checks before and after the open).
+    /// It names that task until the task is reaped, and no task after.
     proc_dir: OwnedFd,
+    /// Only test assertions (`same_process`) read the inode; production still
+    /// captures it as before.
     #[cfg_attr(not(test), allow(dead_code))]
     proc_inode: u64,
     pidfd: Option<OwnedFd>,
@@ -178,6 +185,8 @@ pub(crate) struct HeldRootStop {
     observation: safeptrace::StoppedObservation,
     root_tid: Pid,
     status: HeldRootStopStatus,
+    /// One-use origin of this directly awaited first-exec CONT stop.
+    first_exec_cont: bool,
     /// The child generation a held `NewChild` stop names. Nothing reads it
     /// now; the held stop still retains the child's cleanup handle for as long
     /// as it did before.
@@ -501,6 +510,17 @@ pub(crate) struct PtracerWaitOwner {
 }
 
 impl PtracerWaitOwner {
+    /// Retain the original bound generation without looking up its numeric TID.
+    pub(crate) fn generation(&self) -> Option<TraceeGeneration> {
+        self.generation.lock().unwrap().clone()
+    }
+
+    /// Obtain the shared terminal facade from that same retained generation.
+    pub(crate) fn terminal_cleanup(&self) -> Option<safeptrace::TerminalCleanup> {
+        self.generation()
+            .map(|generation| generation.terminal_cleanup())
+    }
+
     pub(crate) fn bind_running(&self, running: &Running) {
         self.bind(running.generation(), || {
             running.terminal_cleanup_on_ptracer_thread().into_driver()
@@ -2128,9 +2148,49 @@ impl HeldRootStop {
             observation: task.observation(),
             root_tid: task.pid(),
             status,
+            first_exec_cont: false,
             child,
             armed: true,
         }
+    }
+
+    /// Called synchronously after arming the directly awaited CONT result.
+    /// Every transition removes the held stop; EXIT replacement drops it too.
+    pub(crate) fn mark_first_exec_cont(
+        slot: &Arc<StdMutex<Option<Self>>>,
+        task: &Stopped,
+    ) -> Result<(), TraceError> {
+        let mut slot = slot.lock().unwrap();
+        let held = slot.as_mut().ok_or(Errno::EINVAL)?;
+        if !held.armed
+            || held.root_tid != task.pid()
+            || !held.terminal.same_generation(&task.terminal_cleanup())
+            || held.status != HeldRootStopStatus::Signal(Signal::SIGTRAP)
+            || held.first_exec_cont
+        {
+            return Err(Errno::EINVAL.into());
+        }
+        held.first_exec_cont = true;
+        Ok(())
+    }
+
+    pub(crate) fn take_first_exec_cont(
+        slot: &Arc<StdMutex<Option<Self>>>,
+        task: &Stopped,
+    ) -> Result<bool, TraceError> {
+        let mut slot = slot.lock().unwrap();
+        let Some(held) = slot.as_mut().filter(|held| held.first_exec_cont) else {
+            return Ok(false);
+        };
+        if !held.armed
+            || held.root_tid != task.pid()
+            || !held.terminal.same_generation(&task.terminal_cleanup())
+            || held.status != HeldRootStopStatus::Signal(Signal::SIGTRAP)
+        {
+            return Err(Errno::EINVAL.into());
+        }
+        held.first_exec_cont = false;
+        Ok(true)
     }
 
     pub(crate) fn callback_observation(
@@ -2505,6 +2565,13 @@ impl TraceeIdentity {
         })
     }
 
+    /// The task's retained `/proc/<tid>` directory: a file opened through it
+    /// is this task's, never that of a task that took its number over, and
+    /// none once this task is reaped (`ENOENT`).
+    pub(crate) fn proc_dir(&self) -> BorrowedFd<'_> {
+        std::os::fd::AsFd::as_fd(&self.proc_dir)
+    }
+
     pub(crate) fn signal_owned_process_group(&self) -> Result<(), Errno> {
         if self.tid != self.snapshot.tgid || self.pidfd.is_none() {
             return Err(Errno::EINVAL);
@@ -2634,7 +2701,9 @@ pub(crate) fn newborn_own_process_parent(child: Pid) -> std::io::Result<Option<P
     Ok(Some(status_pid(&status, "PPid:")?))
 }
 
-fn tracer_is_current(tracer_tid: Pid) -> bool {
+/// Whether `tracer_tid`, a tracee's `TracerPid`, names a thread of this
+/// process: a tracer of ours traces the tracee.
+pub(crate) fn tracer_is_current(tracer_tid: Pid) -> bool {
     tracer_tid.as_raw() > 0
         && std::path::Path::new(&format!("/proc/self/task/{tracer_tid}")).exists()
 }
@@ -3677,8 +3746,7 @@ fn init_tracee(intercept_rdtsc: bool) -> Result<(), Errno> {
     // Allocating between a fork() and execve() can cause deadlocks in glibc
     // when using jemalloc.
 
-    // hardcoded because `libc` does not export these.
-    const PER_LINUX: u64 = 0x0;
+    // hardcoded because `libc` does not export this.
     const ADDR_NO_RANDOMIZE: u64 = 0x0004_0000;
 
     if intercept_rdtsc {
@@ -3699,7 +3767,14 @@ fn init_tracee(intercept_rdtsc: bool) -> Result<(), Errno> {
                 b"ERROR: Reverie could not enable PR_SET_NO_NEW_PRIVS for seccomp interception\n",
             ));
         }
-        if libc::personality(PER_LINUX | ADDR_NO_RANDOMIZE) == -1 {
+        // Inherit the launcher's personality, as a child process does, and
+        // add the one bit this launcher implements: no address-space
+        // randomization for the tracee's fixed layout.
+        let inherited = libc::personality(0xffff_ffff);
+        if inherited == -1
+            || libc::personality(inherited as libc::c_ulong | ADDR_NO_RANDOMIZE as libc::c_ulong)
+                == -1
+        {
             return Err(report_pre_exec_capability_error(
                 b"ERROR: Reverie could not disable address-space randomization with personality(2)\n",
             ));
@@ -3860,6 +3935,22 @@ type AttachedRun = (
     Arc<FatalSession>,
 );
 
+fn input_facility<T: Tool>(
+    config: &<T::GlobalState as GlobalTool>::Config,
+) -> Result<Option<reverie::reserved_input::ReservedInputControl>, Error> {
+    if T::reserved_input_requirement(config).is_none() {
+        return Ok(None);
+    }
+    if !T::enforces_serialized_execution(config) {
+        return Err(reverie::Error::Tool(anyhow::Error::new(
+            reverie::reserved_input::InputUnavailable::new("input-serialized-execution-required"),
+        )));
+    }
+    reverie::reserved_input::ReservedInputControl::new_backend()
+        .map(Some)
+        .map_err(|error| reverie::Error::Tool(anyhow::Error::new(error)))
+}
+
 /// Helper function for everything after the child is spawned.
 #[tracing::instrument(
     target = "reverie_ptrace::lifecycle",
@@ -3934,14 +4025,15 @@ async fn postspawn<L: Tool + 'static>(
     tests::retain_fatal_root_observer_for_test(&child);
     tracer.arm_liteinst_root_stop(&child, &Event::Signal(Signal::SIGSTOP));
     ordinary_session.capture_root(&child);
+    tracer.initialize_reserved_input_root(&child)?;
     if !ordinary_session.is_failed() {
         child = match tracer.postspawn_preinit(child).await? {
+            PostspawnPreinit::Outcome(PreinitOutcome::Ready(child)) => child,
             // A refused initialization has published its named primary
             // failure. The ordinary driver must still consume the owned tree;
             // returning a bare spawn errno here would bypass that cleanup.
-            PostspawnPreinit::Outcome(
-                PreinitOutcome::Ready(child) | PreinitOutcome::Refused(child),
-            ) => child,
+            #[cfg(target_arch = "x86_64")]
+            PostspawnPreinit::Outcome(PreinitOutcome::Refused(child)) => child,
             PostspawnPreinit::Outcome(PreinitOutcome::Exited(pid, exit_status)) => {
                 return Err(PostspawnError::Exited { pid, exit_status });
             }
@@ -4127,7 +4219,7 @@ impl<T: Tool + 'static> TracerBuilder<T> {
 
     /// Shows `hook` the registers at the final resume of each Tool-visible
     /// seccomp stop, and leaves the signal it picks pending for that resume.
-    #[cfg(test)]
+    #[cfg(all(test, target_arch = "x86_64"))]
     fn final_resume_signal_for_test(mut self, hook: crate::task::FinalResumeSignalForTest) -> Self {
         self.final_resume_signal_for_test = Some(hook);
         self
@@ -4135,7 +4227,7 @@ impl<T: Tool + 'static> TracerBuilder<T> {
 
     /// Awaits `hook` immediately before each Tool-visible syscall runs (see
     /// [`crate::task::PreSyscallForTest`]).
-    #[cfg(test)]
+    #[cfg(all(test, target_arch = "x86_64"))]
     fn pre_syscall_for_test(mut self, hook: crate::task::PreSyscallForTest) -> Self {
         self.pre_syscall_for_test = Some(hook);
         self
@@ -4191,7 +4283,20 @@ impl<T: Tool + 'static> TracerBuilder<T> {
     }
 
     /// Spawns the tracer.
+    ///
+    /// Fails without starting the guest if an injected-syscall trap is
+    /// configured on an architecture other than x86_64: the trap's ABI is
+    /// x86_64's (`injected_syscall_trap`), nothing else handles it, and the
+    /// guest's traps would otherwise run as ordinary signals.
     pub async fn spawn(self) -> Result<Tracer<T::GlobalState>, Error> {
+        #[cfg(not(target_arch = "x86_64"))]
+        if self.injected_syscall_trap.is_some() {
+            return Err(anyhow::anyhow!(
+                "an injected-syscall trap is supported only on x86_64, not on {}",
+                std::env::consts::ARCH
+            )
+            .into());
+        }
         // A retained failed tree must not acquire peers through another mode.
         let _ordinary_admission = OrdinaryAdmission::acquire()?;
         let backend_stats = PtraceBackendStatsSource::from_request(self.backend_stats_request);
@@ -4201,7 +4306,12 @@ impl<T: Tool + 'static> TracerBuilder<T> {
 
         // Because this ptrace backend is CENTRALIZED, it can keep all the
         // tool's state here in a single address space.
-        let global_state = <T::GlobalState as GlobalTool>::init_global_state(&config).await;
+        T::facility_admission(&config)?;
+        let reserved_input = input_facility::<T>(&config)?;
+        let mut global_state = <T::GlobalState as GlobalTool>::init_global_state(&config).await;
+        if let Some(control) = reserved_input.clone() {
+            global_state.install_reserved_input_control(control)?;
+        }
         let events = T::subscriptions(&config);
         let gref = Arc::new(global_state);
 
@@ -4213,9 +4323,9 @@ impl<T: Tool + 'static> TracerBuilder<T> {
         // `execve`, but that is tricky when ptracing the `execve` call.
         resolve_program(&mut command)?;
 
-        // Disable sanitizers that use ptrace from running on tracer.
-        command.env("LSAN_OPTIONS", "detect_leaks=0");
-        command.env("ASAN_OPTIONS", "detect_leaks=0");
+        // A sanitizer build's leak check cannot run under this tracer; turn
+        // it off and keep the guest's other sanitizer settings.
+        command.turn_off_leak_check();
 
         let intercept_rdtsc = events.has_rdtsc();
         #[cfg(all(test, target_arch = "x86_64"))]
@@ -4285,6 +4395,7 @@ impl<T: Tool + 'static> TracerBuilder<T> {
             gref.clone(),
             config,
             TracedTaskOptions {
+                reserved_input,
                 command_bootstrap: true,
                 events: &events,
                 injected_syscall_trap: self.injected_syscall_trap,
@@ -4420,7 +4531,12 @@ where
     let _ordinary_admission = OrdinaryAdmission::acquire()?;
     // Because this ptrace backend is CENTRALIZED, it can keep all the
     // tool's state here in a single address space.
-    let global_state = <L::GlobalState as GlobalTool>::init_global_state(&config).await;
+    L::facility_admission(&config)?;
+    let reserved_input = input_facility::<L>(&config)?;
+    let mut global_state = <L::GlobalState as GlobalTool>::init_global_state(&config).await;
+    if let Some(control) = reserved_input.clone() {
+        global_state.install_reserved_input_control(control)?;
+    }
     let events = L::subscriptions(&config);
     let gref = Arc::new(global_state);
 
@@ -4499,6 +4615,7 @@ where
                 gref.clone(),
                 config,
                 TracedTaskOptions {
+                    reserved_input,
                     command_bootstrap: false,
                     events: &events,
                     injected_syscall_trap: None,
@@ -4573,6 +4690,28 @@ mod tests {
     include!("tracer/fatal_capacity_tests.rs");
     include!("tracer/fatal_group_lifetime_tests.rs");
     include!("tracer/fatal_dead_exec_tests.rs");
+    include!("tracer/signal_sets_session_tests.rs");
+    include!("tracer/link_path_session_tests.rs");
+    include!("tracer/memory_map_session_tests.rs");
+
+    #[cfg(not(target_arch = "x86_64"))]
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_injected_syscall_trap_is_refused_off_x86_64() {
+        let error = TracerBuilder::<()>::new(Command::new("/bin/true"))
+            .injected_syscall_trap(u64::MAX, u64::MAX)
+            .spawn()
+            .await
+            .err()
+            .expect("an injected-syscall trap must be refused off x86_64");
+        assert!(
+            error.to_string().contains("supported only on x86_64"),
+            "{error}"
+        );
+    }
+
+    // The injected-syscall trap exists only on x86_64; elsewhere `spawn`
+    // refuses it (`an_injected_syscall_trap_is_refused_off_x86_64`).
+    #[cfg(target_arch = "x86_64")]
     #[tokio::test(flavor = "current_thread")]
     async fn unsupported_injected_completion_returns_original_pipes_and_usable_tracer() {
         let mut command = Command::new("/bin/sh");
@@ -4631,7 +4770,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn supervisor_termination_keeps_healthy_loop_owned_until_actual_completion() {
         let started = Instant::now();
-        let deadline = started + Duration::from_secs(3);
+        let deadline = started + GENEROUS_WALL_BACKSTOP;
         let words = FatalWords::new();
         let address = words.0 as usize;
         let tracer = spawn_fn::<(), _>(move || {
@@ -4876,6 +5015,18 @@ mod tests {
     /// `FatalTool` config for the timer-decoded fork control.
     const FATAL_TIMER_FORK_MODE: u8 = 4;
 
+    /// The syscall a guest's `libc::pause()` waits in, as procfs's
+    /// `/proc/<pid>/syscall` names it. aarch64 has no `pause`, and glibc's
+    /// wrapper there calls `ppoll(NULL, 0, NULL, NULL)` instead
+    /// (sysdeps/unix/sysv/linux/pause.c, since glibc 2.26:
+    /// https://sourceware.org/git/?p=glibc.git;a=blob;f=sysdeps/unix/sysv/linux/pause.c;hb=glibc-2.39).
+    /// An older glibc used `rt_sigsuspend` there, which this never matches,
+    /// so the wait below would time out rather than pass.
+    #[cfg(target_arch = "x86_64")]
+    const LIBC_PAUSE_SYSCALL: i64 = libc::SYS_pause;
+    #[cfg(not(target_arch = "x86_64"))]
+    const LIBC_PAUSE_SYSCALL: i64 = libc::SYS_ppoll;
+
     #[derive(Default)]
     struct FatalTool {
         starts: std::sync::atomic::AtomicUsize,
@@ -4953,7 +5104,7 @@ mod tests {
                         .ok()
                         .and_then(|text| text.split_whitespace().next().map(str::to_owned))
                         .and_then(|value| value.parse::<i64>().ok())
-                        == Some(libc::SYS_pause);
+                        == Some(LIBC_PAUSE_SYSCALL);
                     if ready && paused {
                         break;
                     }
@@ -5155,7 +5306,7 @@ mod tests {
         let deadline = Instant::now()
             + handed_deadline
                 .map(fatal_remaining)
-                .unwrap_or(Duration::from_secs(3));
+                .unwrap_or(GENEROUS_WALL_BACKSTOP);
         let mut natural_reaper = handed_deadline.map(|_| {
             assert!(fail && fork_descendant && !blocked_newborn);
             assert_eq!(
@@ -5584,7 +5735,7 @@ mod tests {
             }
             return;
         }
-        let deadline = fatal_monotonic_ns() + 3_000_000_000;
+        let deadline = fatal_monotonic_ns() + GENEROUS_WALL_BACKSTOP_NS;
         let mut reaper = fatal_child_command(TEST, "reaper");
         reaper.env("REVERIE_FATAL_HANDED_DEADLINE_NS", deadline.to_string());
         unsafe {
@@ -5792,7 +5943,10 @@ mod tests {
     // and is missing on the test host when the binary was built remotely.
     pub(super) fn fixture(name: &str) -> PathBuf {
         std::env::var_os("CARGO_MANIFEST_DIR")
-            .map_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")), PathBuf::from)
+            .map_or_else(
+                || PathBuf::from(option_env!("CARGO_MANIFEST_DIR").unwrap_or("reverie-ptrace")),
+                PathBuf::from,
+            )
             .join("tests/fixtures")
             .join(name)
     }
@@ -5801,21 +5955,11 @@ mod tests {
             let source = fixture("fatal_exec_timer.c");
             let output = std::env::temp_dir()
                 .join(format!("reverie-fatal-exec-timer-{}", std::process::id()));
-            let status = std::process::Command::new("timeout")
-                .args([
-                    "--signal=TERM",
-                    "--kill-after=1s",
-                    "1s",
-                    "cc",
-                    "-std=c11",
-                    "-O1",
-                ])
-                .arg(&source)
-                .arg("-o")
-                .arg(&output)
-                .status()
-                .unwrap();
-            assert!(status.success(), "compile bounded exec timer payload");
+            let status = crate::compile_c_fixture(&source, &output);
+            assert!(
+                status.success(),
+                "compile bounded exec timer payload: {status}"
+            );
             eprintln!("exec timer payload: {}", output.display());
             std::ffi::CString::new(output.as_os_str().as_encoded_bytes()).unwrap()
         });
@@ -5927,7 +6071,7 @@ mod tests {
         crate::task::EXEC_TIMER_TRANSFERS
             .with(|slot| *slot.borrow_mut() = Some(timer_transfers.clone()));
         let started = Instant::now();
-        let deadline = started + Duration::from_secs(3);
+        let deadline = started + GENEROUS_WALL_BACKSTOP;
         let payload = (timer_mode == 0 || timer_mode >= 3).then(fatal_exec_timer_payload);
         // A raw exec thread runs only timer mode 0's body: exec the payload.
         assert!(
@@ -6067,7 +6211,9 @@ mod tests {
                     "exec owner rescue only: signal={signal:?}, completed={}",
                     matches!(rescued, Ok(ToolRunOutcome::Complete(_)))
                 );
-                panic!("exec owner did not Complete within original3s predicate: {description}");
+                panic!(
+                    "exec owner did not Complete within original generous-backstop predicate: {description}"
+                );
             }
         };
         verify_exec_owner_completion(
@@ -6147,7 +6293,7 @@ mod tests {
         markers: Vec<(i32, i32, i32, i32, u64, bool, bool)>,
     ) {
         assert_exec_owner_completed_result(fail, root, &events, &completed.result);
-        assert!(started.elapsed() <= Duration::from_secs(3));
+        assert!(started.elapsed() <= GENEROUS_WALL_BACKSTOP);
         assert!(
             root_absent,
             "original product completion did not reap root before rescue"
@@ -6821,7 +6967,11 @@ mod tests {
     /// take a guest's own SIGTRAP for the exit stop. A thread may queue
     /// itself a SIGTRAP whose si_code is the exit signature (0x605); only
     /// PF_SIGNALED tells the real exit stop apart. Refusing this resume would
-    /// leave a live, stopped leader that nothing resumes.
+    /// leave a live, stopped leader that nothing resumes. The guest ignores
+    /// SIGTRAP, so Linux drops the signal and the guest exits 0, and Reverie
+    /// drops it and resumes the stop too; a SIGTRAP of this kind that the
+    /// guest does not ignore ends the run (`UnattributedSigtrap`,
+    /// https://github.com/rrnewton/reverie/issues/1268).
     #[tokio::test(flavor = "current_thread")]
     async fn a_forged_exit_siginfo_does_not_refuse_the_resume() {
         let refusals_before = crate::task::EXIT_STOP_RESUME_REFUSALS.with(std::cell::Cell::get);
@@ -6842,6 +6992,7 @@ mod tests {
                 while !running.load(Ordering::Acquire) {
                     std::thread::sleep(Duration::from_millis(1));
                 }
+                unsafe { libc::signal(libc::SIGTRAP, libc::SIG_IGN) };
                 let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
                 info.si_signo = libc::SIGTRAP;
                 info.si_code = libc::SIGTRAP | (libc::PTRACE_EVENT_EXIT << 8);
@@ -8084,7 +8235,7 @@ mod tests {
             freeze_refusal_recovery(true).await;
             return;
         }
-        let deadline = fatal_monotonic_ns() + 3_000_000_000;
+        let deadline = fatal_monotonic_ns() + GENEROUS_WALL_BACKSTOP_NS;
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
             .env(CHILD, NAME)
@@ -8306,6 +8457,17 @@ mod tests {
         })
     }
 
+    /// Hang backstop for the fatal families' shared original deadline,
+    /// not a latency gate: the work inside it is milliseconds, so at
+    /// three seconds it measured host scheduling, not the product
+    /// (owner rule: tests pass at high load; dh-ovzxo). Every ordering
+    /// assertion that reads a deadline below keeps its form and moves
+    /// with this bound, so an event must still land before the deadline
+    /// it hands on. What this knowingly gives up: a still-correct
+    /// 10x slowdown on these paths is no longer caught here.
+    const GENEROUS_WALL_BACKSTOP: Duration = Duration::from_secs(60);
+    const GENEROUS_WALL_BACKSTOP_NS: u64 = 60_000_000_000;
+
     fn fatal_monotonic_ns() -> u64 {
         let mut now: libc::timespec = unsafe { std::mem::zeroed() };
         assert_eq!(
@@ -8318,7 +8480,7 @@ mod tests {
     fn fatal_remaining(deadline: u64) -> Duration {
         let remaining = deadline
             .checked_sub(fatal_monotonic_ns())
-            .expect("combined fatal cleanup exceeded its one 3s deadline");
+            .expect("combined fatal cleanup exceeded its one generous-backstop deadline");
         assert_ne!(remaining, 0);
         Duration::from_nanos(remaining)
     }
@@ -8371,7 +8533,8 @@ mod tests {
             fs::metadata(format!("/proc/{root}")).unwrap().ino(),
             root_inode
         );
-        let deadline = handed_deadline.unwrap_or_else(|| fatal_monotonic_ns() + 3_000_000_000);
+        let deadline =
+            handed_deadline.unwrap_or_else(|| fatal_monotonic_ns() + GENEROUS_WALL_BACKSTOP_NS);
         channel
             .set_read_timeout(Some(fatal_remaining(deadline)))
             .unwrap();
@@ -9071,9 +9234,11 @@ mod tests {
                 assert_eq!(argument.as_bytes(), *expected, "exec must retain argv");
             }
             assert_eq!(read(stack + 24)?, 0, "argv terminator");
-            // TracerBuilder adds these two sanitizer settings after env_clear.
+            // TracerBuilder turns the leak check off in the command's sanitizer
+            // options, keeping its other settings, and sets the two variables
+            // when the command does not.
             for (index, expected) in [
-                b"ASAN_OPTIONS=detect_leaks=0".as_slice(),
+                b"ASAN_OPTIONS=exitcode=42:detect_leaks=0".as_slice(),
                 b"LSAN_OPTIONS=detect_leaks=0",
                 b"REVERIE_PREINIT_TEST=retained",
             ]
@@ -9140,6 +9305,7 @@ mod tests {
         command
             .arg("canonical-exec")
             .env_clear()
+            .env("ASAN_OPTIONS", "exitcode=42")
             .env("REVERIE_PREINIT_TEST", "retained");
         let tracer = TracerBuilder::<CanonicalExecTool>::new(command)
             .spawn()
@@ -9749,6 +9915,7 @@ mod tests {
         }
 
         /// Hands the child to an owner that reaps it itself.
+        #[cfg(target_arch = "x86_64")]
         fn into_pid(self) -> Pid {
             let mut this = std::mem::ManuallyDrop::new(self);
             drop(this.pidfd.take());
@@ -10416,6 +10583,550 @@ mod tests {
             slot.lock().unwrap().take();
             resume_held_stop_child("first generation child", first).await;
             resume_held_stop_child("second generation child", second).await;
+        }
+    }
+
+    // These two x86 tests exercise actual owned CONT, STEP and EXIT waits.
+    // Cleanup is separate from each test's oracle and never signals a numeric PID.
+    #[cfg(target_arch = "x86_64")]
+    fn first_exec_cont_log_status(pid: Pid, phase: &str, actual: &Wait) {
+        use std::io::Write;
+        let (event, status) = match actual {
+            Wait::Stopped(_, event) => (Some(event), None),
+            Wait::Exited(_, status) => (None, Some(status)),
+        };
+        let _ = writeln!(
+            std::io::stderr(),
+            "CONT_LEASE_STATUS pid={pid} phase={phase} actual_pid={} stop={event:?} exit={status:?}",
+            actual.pid()
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    struct FirstExecContChild {
+        pid: Pid,
+        cleanup: PtracerCleanupDriver,
+        // Captured before the initial wait/options; cancellation only borrows it.
+        exit: Option<PtracerExitDriver>,
+        // Own a claimed EXIT before assertions, or a failed retaining resume.
+        stopped: Option<Stopped>,
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    impl FirstExecContChild {
+        fn resume_stopped(&mut self) -> Result<Running, Errno> {
+            let stopped = self.stopped.take().expect("CONT lease retained stop");
+            match stopped.resume_retaining(None) {
+                Ok(running) => Ok(running),
+                Err((stopped, error)) => {
+                    self.stopped = Some(stopped);
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    impl Drop for FirstExecContChild {
+        fn drop(&mut self) {
+            use std::io::Write;
+            use std::task::Context;
+            use std::task::Poll;
+            if self.cleanup.shared().wait(Duration::ZERO) {
+                let status = self.cleanup.shared().observed_exit_status();
+                if !matches!(status, Ok(Some(_))) {
+                    cleanup_unconfirmed(
+                        self.pid,
+                        &format!("CONT lease retired without status: {status:?}"),
+                    );
+                    return;
+                }
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "CONT_LEASE_CLEANUP_RETIRED pid={} source=already-retired status={status:?}",
+                    self.pid
+                );
+                return;
+            }
+            let _ = writeln!(
+                std::io::stderr(),
+                "CONT_LEASE_CLEANUP_KILL_BEGIN pid={}",
+                self.pid
+            );
+            let killed = self.cleanup.shared().request_sigkill();
+            let _ = writeln!(
+                std::io::stderr(),
+                "CONT_LEASE_CLEANUP_KILL_RETURN pid={} result={killed:?}",
+                self.pid
+            );
+            if !matches!(killed, Ok(()) | Err(Errno::ESRCH)) {
+                cleanup_unconfirmed(self.pid, &format!("CONT lease cleanup kill: {killed:?}"));
+                return;
+            }
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let waker = futures::task::noop_waker();
+            let mut context = Context::from_waker(&waker);
+            while Instant::now() < deadline {
+                match self.cleanup.wait_on_ptracer_thread(Duration::ZERO) {
+                    Ok(true) => {
+                        let status = self.cleanup.shared().observed_exit_status();
+                        if !matches!(status, Ok(Some(_))) {
+                            cleanup_unconfirmed(
+                                self.pid,
+                                &format!("CONT lease retired without status: {status:?}"),
+                            );
+                            return;
+                        }
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "CONT_LEASE_CLEANUP_RETIRED pid={} source=ptracer-wait status={status:?}",
+                            self.pid
+                        );
+                        return;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        cleanup_unconfirmed(self.pid, &format!("CONT lease cleanup wait: {error}"));
+                        return;
+                    }
+                }
+                if self.stopped.is_none()
+                    && let Some(exit) = self.exit.as_mut()
+                {
+                    match exit.poll_on_ptracer_thread(&mut context) {
+                        Poll::Ready(Ok(stopped)) => {
+                            self.stopped = Some(stopped);
+                            self.exit = None;
+                        }
+                        Poll::Ready(Err(error)) => {
+                            if matches!(self.cleanup.shared().observed_exit_status(), Ok(Some(_))) {
+                                // A real terminal status may arrive without TRACEEXIT.
+                                self.exit = None;
+                            } else {
+                                cleanup_unconfirmed(
+                                    self.pid,
+                                    &format!("CONT lease cleanup EXIT: {error}"),
+                                );
+                                return;
+                            }
+                        }
+                        Poll::Pending => {}
+                    }
+                }
+                if let Some(stopped) = self.stopped.take() {
+                    if stopped.pid() != self.pid
+                        || !stopped
+                            .terminal_cleanup()
+                            .same_generation(self.cleanup.shared())
+                    {
+                        self.stopped = Some(stopped);
+                        cleanup_unconfirmed(
+                            self.pid,
+                            "CONT lease cleanup stop generation mismatch",
+                        );
+                        return;
+                    }
+                    match stopped.resume_retaining(None) {
+                        Ok(running) => drop(running),
+                        Err((stopped, error)) => {
+                            self.stopped = Some(stopped);
+                            cleanup_unconfirmed(
+                                self.pid,
+                                &format!("CONT lease cleanup retained resume: {error}"),
+                            );
+                            return;
+                        }
+                    }
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if self.exit.is_some() {
+                    // SIGKILL advances old stops to EXIT. Do not resume a stale
+                    // FIFO stop behind the still-unclaimed exit capability.
+                    self.cleanup
+                        .shared()
+                        .wait(remaining.min(Duration::from_millis(1)));
+                    continue;
+                }
+                let pending = match self
+                    .cleanup
+                    .reserve_pending_on_ptracer_thread(remaining.min(Duration::from_millis(1)))
+                {
+                    Ok(Some(pending)) => pending,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        cleanup_unconfirmed(
+                            self.pid,
+                            &format!("CONT lease cleanup reserve: {error}"),
+                        );
+                        return;
+                    }
+                };
+                let actual = match pending.decode() {
+                    Ok(actual) => actual,
+                    Err(error) => {
+                        cleanup_unconfirmed(
+                            self.pid,
+                            &format!("CONT lease cleanup decode: {error}"),
+                        );
+                        return;
+                    }
+                };
+                first_exec_cont_log_status(self.pid, "cleanup-reserved", &actual);
+                pending.commit();
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "CONT_LEASE_CLEANUP_COMMIT_RETURN pid={}",
+                    self.pid
+                );
+                if let Wait::Stopped(stopped, _) = actual
+                    && let Err((stopped, error)) = stopped.resume_retaining(None)
+                {
+                    self.stopped = Some(stopped);
+                    cleanup_unconfirmed(self.pid, &format!("CONT lease cleanup resume: {error}"));
+                    return;
+                }
+            }
+            cleanup_unconfirmed(self.pid, "CONT lease generation not retired within 2 s");
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    async fn first_exec_cont_wait(
+        pid: Pid,
+        phase: &str,
+        wait: safeptrace::PtracerOwnedWaitFuture,
+        deadline: Instant,
+    ) -> Wait {
+        use std::io::Write;
+        let _ = writeln!(
+            std::io::stderr(),
+            "CONT_LEASE_WAIT_BEGIN pid={pid} phase={phase} remaining={:?}",
+            deadline.saturating_duration_since(Instant::now())
+        );
+        let actual = tokio::time::timeout_at(deadline.into(), wait)
+            .await
+            .expect("CONT lease actual wait exceeded its fixed 3 s test deadline")
+            .expect("CONT lease original-generation wait refused");
+        first_exec_cont_log_status(pid, phase, &actual);
+        actual
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    async fn first_exec_cont_exit(
+        child: &mut FirstExecContChild,
+        phase: &str,
+        deadline: Instant,
+    ) -> i32 {
+        use std::io::Write;
+        let _ = writeln!(
+            std::io::stderr(),
+            "CONT_LEASE_EXIT_BEGIN pid={} phase={phase} remaining={:?}",
+            child.pid,
+            deadline.saturating_duration_since(Instant::now())
+        );
+        let stopped = tokio::time::timeout_at(
+            deadline.into(),
+            future::poll_fn(|context| {
+                child
+                    .exit
+                    .as_mut()
+                    .expect("CONT lease original EXIT driver")
+                    .poll_on_ptracer_thread(context)
+            }),
+        )
+        .await
+        .expect("CONT lease actual EXIT exceeded its fixed 3 s test deadline")
+        .expect("CONT lease original-generation EXIT refused");
+        child.stopped = Some(stopped); // ownership precedes every fallible check
+        child.exit = None;
+        let stopped = child.stopped.as_ref().unwrap();
+        assert_eq!(stopped.pid(), child.pid);
+        assert!(
+            stopped
+                .terminal_cleanup()
+                .same_generation(child.cleanup.shared())
+        );
+        let info = stopped.getsiginfo().expect("actual EXIT stop siginfo");
+        let _ = writeln!(
+            std::io::stderr(),
+            "CONT_LEASE_EXIT_RETURN pid={} phase={phase} actual_pid={} signo={} code={:#x}",
+            child.pid,
+            stopped.pid(),
+            info.si_signo,
+            info.si_code
+        );
+        assert_eq!(info.si_signo, libc::SIGTRAP);
+        info.si_code
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    async fn first_exec_cont_child(deadline: Instant) -> (FirstExecContChild, Stopped) {
+        let pid = match unsafe { unistd::fork() }.expect("fork CONT lease child") {
+            ForkResult::Child => unsafe {
+                let mut mask: libc::sigset_t = std::mem::zeroed();
+                if libc::signal(libc::SIGTRAP, libc::SIG_DFL) == libc::SIG_ERR
+                    || libc::sigemptyset(&mut mask) != 0
+                    || libc::sigaddset(&mut mask, libc::SIGTRAP) != 0
+                    || libc::sigprocmask(libc::SIG_UNBLOCK, &mask, std::ptr::null_mut()) != 0
+                    || safeptrace::traceme_and_stop().is_err()
+                {
+                    libc::_exit(100);
+                }
+                // CONT reaches this real INT3. A subsequent STEP executes only NOP.
+                std::arch::asm!("int3", "nop", options(nomem, nostack));
+                libc::_exit(0);
+            },
+            ForkResult::Parent { child } => Pid::from(child),
+        };
+        // Before registration/TRACEEXIT, reuse the existing bounded fork owner.
+        let early = PausedChild::new(pid);
+        let running = Running::new_on_ptracer_thread(pid).expect("capture CONT lease child");
+        let exit = running.exit_event_on_ptracer_thread().into_driver();
+        let child = FirstExecContChild {
+            pid,
+            cleanup: running.terminal_cleanup_on_ptracer_thread().into_driver(),
+            exit: Some(exit),
+            stopped: None,
+        };
+        early.into_pid();
+        let (stopped, event) = first_exec_cont_wait(
+            pid,
+            "initial-SIGSTOP",
+            running.wait_owned_on_ptracer_thread(),
+            deadline,
+        )
+        .await
+        .assume_stopped();
+        assert_eq!(event, Event::Signal(Signal::SIGSTOP));
+        stopped
+            .setoptions(ptrace::Options::PTRACE_O_TRACEEXIT | ptrace::Options::PTRACE_O_EXITKILL)
+            .expect("set CONT lease TRACEEXIT and EXITKILL");
+        let running = stopped.resume(None).expect("CONT to actual INT3");
+        let (stopped, event) = first_exec_cont_wait(
+            pid,
+            "CONT-INT3",
+            running.wait_owned_on_ptracer_thread(),
+            deadline,
+        )
+        .await
+        .assume_stopped();
+        assert_eq!(event, Event::Signal(Signal::SIGTRAP));
+        let info = stopped.getsiginfo().expect("actual CONT INT3 siginfo");
+        assert_eq!(info.si_signo, libc::SIGTRAP);
+        assert_eq!(info.si_code, libc::SI_KERNEL);
+        // Bind the guard before external stopped values, so they drop first.
+        (child, stopped)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    async fn first_exec_cont_reap(
+        running: Running,
+        child: &mut FirstExecContChild,
+        expected: ExitStatus,
+        deadline: Instant,
+    ) {
+        use std::io::Write;
+        let actual = first_exec_cont_wait(
+            child.pid,
+            "terminal-status",
+            running.wait_owned_on_ptracer_thread(),
+            deadline,
+        )
+        .await;
+        assert_eq!(actual.assume_exited(), (child.pid, expected));
+        let _ = writeln!(
+            std::io::stderr(),
+            "CONT_LEASE_RETIRE_BEGIN pid={} remaining={:?}",
+            child.pid,
+            deadline.saturating_duration_since(Instant::now())
+        );
+        assert!(
+            child
+                .cleanup
+                .wait_on_ptracer_thread(deadline.saturating_duration_since(Instant::now()))
+                .expect("CONT lease retirement refused"),
+            "CONT lease actual terminal status did not retire"
+        );
+        let _ = writeln!(
+            std::io::stderr(),
+            "CONT_LEASE_RETIRE_RETURN pid={} retired=true",
+            child.pid
+        );
+        assert_eq!(
+            child.cleanup.shared().observed_exit_status(),
+            Ok(Some(expected))
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn first_exec_cont_authority_is_consumed_before_a_real_step_stop() {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let (mut child, stopped) = first_exec_cont_child(deadline).await;
+        let slot = Arc::new(StdMutex::new(Some(HeldRootStop::from_event(
+            &stopped,
+            &Event::Signal(Signal::SIGTRAP),
+        ))));
+        HeldRootStop::mark_first_exec_cont(&slot, &stopped).expect("mark actual CONT stop");
+        assert!(slot.lock().unwrap().as_ref().unwrap().first_exec_cont);
+
+        let (mut other_child, other) = first_exec_cont_child(deadline).await;
+        assert!(
+            !stopped
+                .terminal_cleanup()
+                .same_generation(&other.terminal_cleanup()),
+            "wrong-generation negative requires distinct actual children"
+        );
+        assert_eq!(
+            HeldRootStop::take_first_exec_cont(&slot, &other),
+            Err(TraceError::Errno(Errno::EINVAL))
+        );
+        assert!(slot.lock().unwrap().as_ref().unwrap().first_exec_cont);
+        let running = other.resume(None).expect("resume unrelated CONT child");
+        let event = first_exec_cont_exit(&mut other_child, "unrelated-EXIT-stop", deadline).await;
+        drop(running); // superseded only by this original generation's claimed EXIT
+        assert_eq!(event, libc::SIGTRAP | (libc::PTRACE_EVENT_EXIT << 8));
+        first_exec_cont_reap(
+            other_child
+                .resume_stopped()
+                .expect("resume unrelated actual EXIT"),
+            &mut other_child,
+            ExitStatus::Exited(0),
+            deadline,
+        )
+        .await;
+
+        let next_rip = stopped.getregs().expect("CONT stop registers").rip;
+        let running = RootStopLease::new(stopped, Some(Arc::clone(&slot)))
+            .step(None)
+            .expect("STEP the actual marked CONT stop");
+        // This check precedes the next wait/arm: an arm cannot hide stale authority.
+        assert!(slot.lock().unwrap().is_none());
+        let (stepped, event) = first_exec_cont_wait(
+            child.pid,
+            "marked-STEP-stop",
+            running.wait_owned_on_ptracer_thread(),
+            deadline,
+        )
+        .await
+        .assume_stopped();
+        assert_eq!(event, Event::Signal(Signal::SIGTRAP));
+        let info = stepped.getsiginfo().expect("actual STEP siginfo");
+        assert_eq!(info.si_signo, libc::SIGTRAP);
+        assert_eq!(info.si_code, libc::TRAP_TRACE);
+        assert_eq!(stepped.getregs().expect("STEP registers").rip, next_rip + 1);
+        HeldRootStop::arm_empty(&slot, &stepped, &event).expect("arm new actual TRACE stop");
+        assert!(!HeldRootStop::take_first_exec_cont(&slot, &stepped).unwrap());
+        let running = RootStopLease::new(stepped, Some(Arc::clone(&slot)))
+            .resume(None)
+            .expect("resume unmarked actual TRACE stop");
+        assert!(slot.lock().unwrap().is_none());
+        let event = first_exec_cont_exit(&mut child, "after-STEP-EXIT-stop", deadline).await;
+        drop(running); // superseded only by this original generation's claimed EXIT
+        assert_eq!(event, libc::SIGTRAP | (libc::PTRACE_EVENT_EXIT << 8));
+        first_exec_cont_reap(
+            child
+                .resume_stopped()
+                .expect("resume actual EXIT after STEP"),
+            &mut child,
+            ExitStatus::Exited(0),
+            deadline,
+        )
+        .await;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_actual_exit_stop_drops_still_held_first_exec_cont_authority() {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let (mut child, stopped) = first_exec_cont_child(deadline).await;
+        let slot = Arc::new(StdMutex::new(Some(HeldRootStop::from_event(
+            &stopped,
+            &Event::Signal(Signal::SIGTRAP),
+        ))));
+        HeldRootStop::mark_first_exec_cont(&slot, &stopped).expect("mark actual CONT stop");
+        assert!(slot.lock().unwrap().as_ref().unwrap().first_exec_cont);
+        child
+            .cleanup
+            .shared()
+            .request_sigkill()
+            .expect("kill only the retained original CONT generation");
+        // No RootStopLease transition or numeric recapture clears this old slot.
+        let event = first_exec_cont_exit(&mut child, "killed-EXIT-stop", deadline).await;
+        drop(stopped); // its old SIGTRAP stop is superseded by the claimed EXIT
+        assert_eq!(
+            event,
+            libc::SIGTRAP | (libc::PTRACE_EVENT_EXIT << 8),
+            "must observe actual PTRACE_EVENT_EXIT"
+        );
+        assert!(slot.lock().unwrap().as_ref().unwrap().first_exec_cont);
+        let exiting = child.stopped.as_ref().expect("guard owns actual EXIT");
+        HeldRootStop::supersede_with_exit(&slot, exiting)
+            .expect("actual same-generation EXIT supersedes the marked stop");
+        {
+            let held = slot.lock().unwrap();
+            let held = held
+                .as_ref()
+                .expect("actual EXIT must retain its own lease");
+            assert!(held.armed);
+            assert!(held.terminal.same_generation(child.cleanup.shared()));
+            assert_eq!(held.status, HeldRootStopStatus::Exit);
+            assert!(!held.first_exec_cont);
+        }
+        assert!(!HeldRootStop::take_first_exec_cont(&slot, exiting).unwrap());
+        // The existing consuming lease API owns the stop from this boundary.
+        // If it refuses, cleanup must report uncertainty, never remint a stop.
+        let exiting = child.stopped.take().expect("transfer actual EXIT to lease");
+        let running = RootStopLease::new(exiting, Some(Arc::clone(&slot)))
+            .resume(None)
+            .expect("resume only the actual EXIT stop");
+        assert!(slot.lock().unwrap().is_none());
+        first_exec_cont_reap(
+            running,
+            &mut child,
+            ExitStatus::Signaled(Signal::SIGKILL, false),
+            deadline,
+        )
+        .await;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn first_exec_cont_cleanup_retires_unclaimed_and_claimed_exit_stops() {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        for claim_exit in [false, true] {
+            let (mut child, stopped) = first_exec_cont_child(deadline).await;
+            let terminal = stopped.terminal_cleanup();
+            assert!(terminal.same_generation(child.cleanup.shared()));
+            if claim_exit {
+                child
+                    .cleanup
+                    .shared()
+                    .request_sigkill()
+                    .expect("kill retained child before claiming cleanup EXIT");
+                let event =
+                    first_exec_cont_exit(&mut child, "cleanup-claimed-EXIT-stop", deadline).await;
+                assert_eq!(event, libc::SIGTRAP | (libc::PTRACE_EVENT_EXIT << 8));
+                assert!(child.exit.is_none());
+                assert!(child.stopped.is_some());
+            } else {
+                assert!(child.exit.is_some());
+                assert!(child.stopped.is_none());
+            }
+            drop(stopped); // no old stopped token outlives the cleanup owner
+            assert!(
+                !terminal.wait(Duration::ZERO),
+                "cleanup must retire a real child"
+            );
+            drop(child); // same original two-second Drop, no async cleanup substitute
+            assert!(
+                terminal.wait(Duration::ZERO),
+                "Drop did not confirm worker retirement"
+            );
+            assert_eq!(
+                terminal.observed_exit_status(),
+                Ok(Some(ExitStatus::Signaled(Signal::SIGKILL, false)))
+            );
         }
     }
 
@@ -11183,6 +11894,10 @@ mod tests {
     /// same address. Initialization must still fail with the kill, and its
     /// page population must not reach the replacement. Runs in a fresh user
     /// and PID namespace, where the PID can be reused exactly.
+    #[cfg_attr(
+        fbcode_build,
+        ignore = "fbsource-disabled: sandcastle-env: needs mount(2) in a fresh user and PID namespace"
+    )]
     #[tokio::test(flavor = "current_thread")]
     async fn preinit_page_population_never_writes_a_replacement() {
         if std::env::var_os(POPULATE_REUSE_INNER).is_none() {
@@ -11322,6 +12037,10 @@ mod tests {
     /// its injection must not reach the replacement: its registers must be
     /// unchanged. Runs in a fresh user and PID namespace, where the PID can be
     /// reused exactly.
+    #[cfg_attr(
+        fbcode_build,
+        ignore = "fbsource-disabled: sandcastle-env: needs mount(2) in a fresh user and PID namespace"
+    )]
     #[tokio::test(flavor = "current_thread")]
     async fn preinit_injection_never_reaches_a_replacement() {
         if std::env::var_os(INJECTION_REUSE_INNER).is_none() {
@@ -11918,7 +12637,7 @@ mod tests {
         }
         let error = tokio::time::timeout_at(deadline, initialization_error(pid, died))
             .await
-            .expect("initialization conversion exceeded the one total three-second bound");
+            .expect("initialization conversion exceeded the one total generous-backstop bound");
         assert!(matches!(error, Error::Tool(_)));
         let message = error.to_string();
         if consume_elsewhere {
@@ -12062,7 +12781,7 @@ mod tests {
                     TracerBuilder::<InitialWaitCallbackWitness>::new(command).spawn(),
                 )
                 .await
-                .expect("public spawn exceeded the one total three-second bound")
+                .expect("public spawn exceeded the one total generous-backstop bound")
                 {
                     Err(error) => error,
                     Ok(_) => panic!("early pre-TRACEME exit must not construct a Tracer"),
@@ -12099,7 +12818,7 @@ mod tests {
 
         // As with the precise-timer control, re-exec just this test to isolate
         // process-global state. One deadline includes startup and final wait.
-        let deadline = initial_wait_monotonic_ns() + 3_000_000_000;
+        let deadline = initial_wait_monotonic_ns() + GENEROUS_WALL_BACKSTOP_NS;
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
             .env(INNER, test_name)
@@ -12117,7 +12836,7 @@ mod tests {
             }
             assert!(
                 initial_wait_monotonic_ns() < deadline,
-                "initial-wait regression exceeded its one total three-second bound; child not known terminal"
+                "initial-wait regression exceeded its one total generous-backstop bound; child not known terminal"
             );
             std::thread::sleep(Duration::from_millis(1));
         }

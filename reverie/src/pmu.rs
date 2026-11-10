@@ -16,11 +16,50 @@ const AMD_DEFAULT_SKID_MARGIN: u64 = 10_000;
 const AMD_EPYC_9D85_SKID_MARGIN: u64 = 2_000;
 const AMD_FAMILY_19H_MODEL_A0H_SKID_MARGIN: u64 = 1_000;
 
+/// What a profile's event counts: the unit of every RCB coordinate a run
+/// records. Different raw selectors can count the same quantity (AMD `0xD1`,
+/// Intel `C4/01` before Ice Lake, Intel `C4/11` from Ice Lake on), so
+/// recorded histories compare this, not the selector.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum RcbMetric {
+    /// Every retired conditional branch, user mode only, per thread.
+    ConditionalBranchesRetiredUserV1,
+}
+
+impl RcbMetric {
+    /// The stable identifier histories store.
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::ConditionalBranchesRetiredUserV1 => "rcb:cond-retired:user:v1",
+        }
+    }
+
+    /// The metric a stored identifier names, or `None` for one this build
+    /// does not know.
+    pub fn from_id(id: &str) -> Option<Self> {
+        match id {
+            "rcb:cond-retired:user:v1" => Some(Self::ConditionalBranchesRetiredUserV1),
+            _ => None,
+        }
+    }
+}
+
+/// Whether `family` is a family of `vendor` (the CPUID leaf 0 string) that
+/// the profile table describes. The table is keyed by family and model only.
+pub fn vendor_has_family(vendor: &str, family_id: u8) -> bool {
+    match vendor {
+        "GenuineIntel" => family_id == 0x06,
+        "AuthenticAMD" => matches!(family_id, 0x17 | 0x19 | 0x1A),
+        _ => false,
+    }
+}
+
 /// A raw retired conditional branch event and its default ptrace timer margin.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PmuProfile {
     rcb_event: u64,
     skid_margin: u64,
+    metric: Option<RcbMetric>,
 }
 
 impl PmuProfile {
@@ -43,9 +82,9 @@ impl PmuProfile {
                 0x4E | 0x55 | 0x5E => (0x5101c4, 100),        // Intel Skylake
                 0x8E | 0x9E => (0x5101c4, 100),               // Intel Kabylake
                 0xA5 | 0xA6 => (0x5101c4, 100),               // Intel Cometlake
-                0x8D => (0x5101c4, 100),                      // Intel Tiger Lake
+                0x8D => (0x5111c4, 100),                      // Intel Tiger Lake
                 0x9A => (0x5101c4, 125),                      // Intel Alder Lake
-                0x8F => (0x5101c4, 125),                      // Intel Sapphire Rapids
+                0x8F => (0x5111c4, 125),                      // Intel Sapphire Rapids
                 0x86 => (0x5101c4, 100),                      // Intel Icelake
                 // Intel Emerald Rapids (Raptor Cove; Linux INTEL_EMERALDRAPIDS_X).
                 // Intel's perfmon tables encode BR_INST_RETIRED as Sapphire
@@ -53,16 +92,19 @@ impl PmuProfile {
                 // sapphirerapids_core.json v1.40: event C4, umask 01 COND_TAKEN,
                 // 10 COND_NTAKEN, 11 COND), and rr gives both the same profile,
                 // so this repeats Sapphire Rapids' entry.
-                0xCF => (0x5101c4, 125),
+                0xCF => (0x5111c4, 125),
                 // Intel Ice Lake, Sunny Cove: server (Linux INTEL_ICELAKE_X 0x6A,
                 // INTEL_ICELAKE_D 0x6C) and client (INTEL_ICELAKE 0x7D,
                 // INTEL_ICELAKE_L 0x7E). Intel's perfmon icelakex_core.json v1.31
                 // and icelake_core.json v1.25 encode BR_INST_RETIRED as Sapphire
                 // Rapids does (event C4, umask 01 COND_TAKEN, 10 COND_NTAKEN,
                 // 11 COND), and rr's Ice Lake profile (models 0x6A and 0x7E) has
-                // a margin of 100. The umask (01 here, 11 in rr) is
-                // https://github.com/rrnewton/reverie/issues/965.
-                0x6A | 0x6C | 0x7D | 0x7E => (0x5101c4, 100),
+                // a margin of 100. On these cores, as on Tiger Lake
+                // (tigerlake_core.json v1.20), Sapphire Rapids and Emerald
+                // Rapids, umask 01 counts only taken conditional branches; the
+                // RCB clock counts all of them, umask 11, as rr does
+                // (https://github.com/rrnewton/reverie/issues/965).
+                0x6A | 0x6C | 0x7D | 0x7E => (0x5111c4, 100),
                 _ => return None,
             },
             // Turin EPYC family 1Ah model 11h (measured on an EPYC 9D85).
@@ -87,10 +129,29 @@ impl PmuProfile {
             _ => return None,
         };
 
+        // What each event counts, from the vendors' event tables: Intel
+        // perfmon 8da58930a226 defines C4/01 as BR_INST_RETIRED.CONDITIONAL
+        // on every Intel family-6 entry above through Comet Lake and C4/11 as
+        // BR_INST_RETIRED.COND from Ice Lake on; Linux perf 5b0764a53235
+        // defines AMD D1 as retired conditional branches on Zen 1 to 6.
+        // Alder Lake is hybrid (its E-cores count C4/7E) and 0x86 has no
+        // C4/01 definition, so what their selectors count is not established.
+        let metric = match (family_id, model_id) {
+            (0x06, 0x9A | 0x86) => None,
+            _ => Some(RcbMetric::ConditionalBranchesRetiredUserV1),
+        };
+
         Some(Self {
             rcb_event,
             skid_margin,
+            metric,
         })
+    }
+
+    /// What this profile's event counts, or `None` where that is not
+    /// established.
+    pub fn metric(&self) -> Option<RcbMetric> {
+        self.metric
     }
 
     /// Returns the raw retired conditional branch event selector.

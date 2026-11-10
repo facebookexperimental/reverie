@@ -89,6 +89,12 @@ impl Auxv {
         }
     }
 
+    /// Reads the process auxiliary vector through the normal launch-window
+    /// reader. Backends with a distinct application vector use from_entries.
+    pub fn from_pid(pid: Pid) -> io::Result<Self> {
+        Self::new(pid)
+    }
+
     /// Reads the auxiliary values from `/proc/{pid}/auxv`.
     pub(crate) fn new(pid: Pid) -> io::Result<Self> {
         let mut map = BTreeMap::new();
@@ -176,6 +182,17 @@ impl Auxv {
     pub fn at_egid(&self) -> Option<libc::gid_t> {
         self.map.get(&libc::AT_EGID).map(|val| *val as libc::gid_t)
     }
+
+    /// Whether the image runs in secure-execution mode (`AT_SECURE`). Linux
+    /// sets it when the exec that started the image changed the process's
+    /// user or group IDs or raised its capabilities (`bprm->secureexec`), as
+    /// executing a set-user-ID or set-group-ID program, or one with file
+    /// capabilities, can.
+    ///
+    /// Returns `None` if `AT_SECURE` does not exist in the auxv table.
+    pub fn at_secure(&self) -> Option<bool> {
+        self.map.get(&libc::AT_SECURE).map(|val| *val != 0)
+    }
 }
 
 #[cfg(test)]
@@ -193,6 +210,15 @@ mod tests {
         assert_eq!(map.len(), 3);
         assert_eq!(map.at_uid(), Some(123));
         assert_eq!(map.at_gid(), Some(456));
+        assert_eq!(map.at_secure(), None);
+        assert_eq!(
+            Auxv::from_entries([(libc::AT_SECURE, 0)]).at_secure(),
+            Some(false)
+        );
+        assert_eq!(
+            Auxv::from_entries([(libc::AT_SECURE, 1)]).at_secure(),
+            Some(true)
+        );
         assert_eq!(
             map.at_random().map(|address| address.as_raw()),
             Some(0x1000),

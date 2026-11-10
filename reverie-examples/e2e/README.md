@@ -7,27 +7,18 @@ defect: it must be a row of the expected-mismatch ledger, naming its issue, or
 the check fails. A row that no longer describes what a backend does fails too.
 
 Run it with `run.sh` (Reverie's `validate.sh` does, and so does Reverie CI).
-It builds what each requested backend needs, refuses by name a backend whose
-inputs the host lacks (`/dev/kvm`; cmake and the vendored DynamoRIO source;
-the SaBRe loader), and runs the comparator against the ledger for this host's
-environment.
+It builds what each requested first-party backend needs, refuses by name a
+backend whose inputs the host lacks (including `/dev/kvm`), and runs the
+comparator against the ledger for this host's environment. Its backend set is
+`ptrace,kvm,liteinst,in-guest-trap`.
 
 - `../recorder.rs` (binary `recorder`): runs a program under the pass-through
   recorder (`../recorder_tool.rs`) on `--backend native|ptrace|kvm|liteinst|
-  in-guest-trap|e9patch|dbt|sabre` and writes each syscall with its result.
+  in-guest-trap` and writes each syscall with its result.
   `native` observes the program with plain ptrace syscall stops, with no
-  Reverie. The in-guest backends (LiteInst, in-guest-trap, e9patch) host the
+  Reverie. The in-guest backends (LiteInst and in-guest-trap) host the
   recorder in the example preload, `libreverie_examples.so`, which selects it
-  by name. DBT hosts it in reverie-dbt's prototype runtime and needs the
-  DynamoRIO client (`reverie-dbt/scripts/build-client.sh`, found beside the
-  recorder or through `REVERIE_DBT_CLIENT`). SaBRe hosts it in the example-tool
-  plugin of `experimental/reverie-sabre-strace` and needs SaBRe's loader
-  (`SABRE_BINARY`, which `reverie-sabre-strace --print-sabre` names, or `sabre`
-  beside the recorder) and the plugin (`SABRE_PLUGIN`, or
-  `libreverie_sabre_strace_plugin.so` beside the recorder). For DBT and SaBRe
-  the tool's GlobalState is in the recorder, served to the program's
-  processes over a socket. A backend that cannot run the tool refuses by name
-  (`REFUSED:`).
+  by name. A backend that cannot run the tool refuses by name (`REFUSED:`).
 - `../backend.rs`: the run-time backend selector the tools share.
 - `run.sh`: the entry point; `run.sh --help` lists its options.
 - `compare.rs` (binary `reverie-e2e-compare`): runs each program of
@@ -39,6 +30,17 @@ environment.
   backends the comparator first moves the native record to where the
   backend's next calls appear by name, then compares exactly.
 
+## External backends
+
+[hermit-dynamorio](https://github.com/rrnewton/hermit-dynamorio) and
+[hermit-3rdparty-patching](https://github.com/rrnewton/hermit-3rdparty-patching)
+own the DynamoRIO and SaBRe/e9patch recorders, physical prerequisites and
+backend ledger rows. Their E2E entries require explicit `--core-comparator`
+and `--core-e2e-dir` inputs, and reuse this comparator and corpus. The legacy
+`dbt` and renamed `dynamorio` identities retain the same late-start alignment
+as SaBRe; the 300-second timeout and eight-call alignment are unchanged.
+Moving a ledger row is not a new execution or a passing qualification.
+
 A ledger row records a program's first difference, which depends on the
 host's libraries and tools (glibc's loader, coreutils, `/proc`). So a ledger
 belongs to one environment: `ledgers/<os id>-<os version>-glibc<version>.tsv`,
@@ -48,7 +50,9 @@ verdicts without judging them and says so (`NO LEDGER`). To add an
 environment, run `run.sh --write-ledger FILE` there twice, check that the
 rows agree, and commit them under `ledgers/` with a comment naming each
 group's defect. `cargo test` runs the environment-independent part
-(`../tests/recorder.rs`).
+(`../tests/recorder.rs`, `../tests/conformance.rs`). `CONFORMANCE.md`
+defines the tool-by-backend matrix and each tool's oracle beyond the
+recorder row this directory judges today.
 
 ```text
 reverie-examples/e2e/run.sh                      # every backend this host has

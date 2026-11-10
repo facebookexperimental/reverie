@@ -19,6 +19,30 @@
 //! through the caller's raw syscall entry, so it allocates nothing and is safe
 //! to call while dispatching a guest syscall.
 
+// Numbers with no entry in the aarch64 generic table (`getdents`,
+// `signalfd`, and `epoll_wait` exist there only as `getdents64`,
+// `signalfd4`, and `epoll_pwait`) are `None` off x86-64. Callers compare
+// with `Some(number) == SYS_...`, so absence can never equal a real
+// (even invalid, e.g. -1) input number. `fchmodat2` does exist on
+// aarch64 (452); libc's musl table has no constant for it yet, so the
+// number is named directly there.
+#[cfg(target_arch = "x86_64")]
+const SYS_GETDENTS: Option<i64> = Some(libc::SYS_getdents);
+#[cfg(not(target_arch = "x86_64"))]
+const SYS_GETDENTS: Option<i64> = None;
+#[cfg(target_arch = "x86_64")]
+const SYS_SIGNALFD: Option<i64> = Some(libc::SYS_signalfd);
+#[cfg(not(target_arch = "x86_64"))]
+const SYS_SIGNALFD: Option<i64> = None;
+#[cfg(target_arch = "x86_64")]
+const SYS_EPOLL_WAIT: Option<i64> = Some(libc::SYS_epoll_wait);
+#[cfg(not(target_arch = "x86_64"))]
+const SYS_EPOLL_WAIT: Option<i64> = None;
+#[cfg(target_arch = "x86_64")]
+const SYS_FCHMODAT2: i64 = libc::SYS_fchmodat2;
+#[cfg(not(target_arch = "x86_64"))]
+const SYS_FCHMODAT2: i64 = 452;
+
 /// Syscall argument `index` as the kernel reads a descriptor, a `close_range`
 /// bound or its flags: the low 32 bits of the register. Comparing the full
 /// register would let `fd | 1 << 32` reach a reserved descriptor.
@@ -34,6 +58,9 @@ pub fn descriptor_arg(args: &[u64; 6], index: usize) -> u64 {
 pub fn names_descriptor(number: i64, args: &[u64; 6], fd: u64) -> bool {
     let is = |index| descriptor_arg(args, index) == fd;
     match number {
+        // Numbers absent from this architecture's table (see the Option
+        // constants above) name the descriptor only where they exist.
+        n if Some(n) == SYS_GETDENTS || Some(n) == SYS_SIGNALFD => is(0),
         libc::SYS_read
         | libc::SYS_readv
         | libc::SYS_pread64
@@ -67,12 +94,10 @@ pub fn names_descriptor(number: i64, args: &[u64; 6], fd: u64) -> bool {
         | libc::SYS_fadvise64
         | libc::SYS_readahead
         | libc::SYS_getdents64
-        | libc::SYS_getdents
         | libc::SYS_syncfs
         | libc::SYS_fchdir
         // Descriptors of special kinds: a reserved number is not one, and to
         // the guest it is not open at all.
-        | libc::SYS_signalfd
         | libc::SYS_signalfd4
         | libc::SYS_timerfd_settime
         | libc::SYS_timerfd_gettime
@@ -94,7 +119,11 @@ pub fn names_descriptor(number: i64, args: &[u64; 6], fd: u64) -> bool {
         libc::SYS_waitid => args[0] as u32 == 3 && is(1),
         // A file mapping of the descriptor.
         libc::SYS_mmap => args[3] & libc::MAP_ANONYMOUS as u64 == 0 && is(4),
+        // dup2 has no aarch64 number (dup3 only there).
+        #[cfg(target_arch = "x86_64")]
         libc::SYS_dup2 | libc::SYS_dup3 => is(0) || is(1),
+        #[cfg(not(target_arch = "x86_64"))]
+        libc::SYS_dup3 => is(0) || is(1),
         libc::SYS_splice | libc::SYS_copy_file_range => is(0) || is(2),
         libc::SYS_tee => is(0) || is(1),
         // The pidfd, and the number it copies from the target's table, which
@@ -109,7 +138,7 @@ pub fn names_descriptor(number: i64, args: &[u64; 6], fd: u64) -> bool {
         // the descriptor is used only for a relative path, which would take a
         // guest-memory read to tell from an absolute one, so those calls are
         // not checked and run as Linux runs them.
-        libc::SYS_newfstatat | libc::SYS_fchmodat2 => empty_path(args[3]) && is(0),
+        libc::SYS_newfstatat | SYS_FCHMODAT2 => empty_path(args[3]) && is(0),
         libc::SYS_statx | libc::SYS_open_tree => empty_path(args[2]) && is(0),
         libc::SYS_execveat
         | libc::SYS_fchownat
@@ -170,19 +199,19 @@ pub fn socket_call_names_descriptor(number: i64, args: &[u64; 6], fd: u64) -> bo
 /// would cost correct programs' calls a guest-memory read, so a buggy program
 /// that passes a reserved number there is a known limit.)
 pub fn epoll_wait_result(number: i64, args: &[u64; 6], fd: u64) -> Option<i64> {
-    match number {
-        libc::SYS_epoll_wait | libc::SYS_epoll_pwait | libc::SYS_epoll_pwait2
-            if descriptor_arg(args, 0) == fd =>
-        {
-            let events = args[2] as i32;
-            let most = i32::MAX / core::mem::size_of::<libc::epoll_event>() as i32;
-            Some(-i64::from(if events <= 0 || events > most {
-                libc::EINVAL
-            } else {
-                libc::EBADF
-            }))
-        }
-        _ => None,
+    let is_epoll_wait = number == libc::SYS_epoll_pwait
+        || number == libc::SYS_epoll_pwait2
+        || Some(number) == SYS_EPOLL_WAIT;
+    if is_epoll_wait && descriptor_arg(args, 0) == fd {
+        let events = args[2] as i32;
+        let most = i32::MAX / core::mem::size_of::<libc::epoll_event>() as i32;
+        Some(-i64::from(if events <= 0 || events > most {
+            libc::EINVAL
+        } else {
+            libc::EBADF
+        }))
+    } else {
+        None
     }
 }
 
@@ -397,18 +426,46 @@ mod tests {
 
     #[test]
     fn epoll_wait_on_a_reserved_descriptor_fails_as_linux_does() {
+        // epoll_pwait exists on every architecture; epoll_wait itself is
+        // x86-only, so its positives run only there. The pwait positives
+        // must hold everywhere the family is recognized.
+        for wait in [libc::SYS_epoll_pwait, libc::SYS_epoll_pwait2] {
+            assert_eq!(
+                epoll_wait_result(wait, &[9, 0, 8, 0, 0, 0], 9),
+                Some(-i64::from(libc::EBADF)),
+                "{wait}"
+            );
+            assert_eq!(
+                epoll_wait_result(wait, &[9, 0, 0, 0, 0, 0], 9),
+                Some(-i64::from(libc::EINVAL)),
+                "{wait}"
+            );
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert_eq!(
+                epoll_wait_result(libc::SYS_epoll_wait, &[9, 0, 8, 0, 0, 0], 9),
+                Some(-i64::from(libc::EBADF))
+            );
+            assert_eq!(
+                epoll_wait_result(libc::SYS_epoll_wait, &[9, 0, 0, 0, 0, 0], 9),
+                Some(-i64::from(libc::EINVAL))
+            );
+            assert_eq!(
+                epoll_wait_result(libc::SYS_epoll_wait, &[8, 0, 8, 0, 0, 0], 9),
+                None
+            );
+        }
         assert_eq!(
-            epoll_wait_result(libc::SYS_epoll_wait, &[9, 0, 8, 0, 0, 0], 9),
-            Some(-i64::from(libc::EBADF))
-        );
-        assert_eq!(
-            epoll_wait_result(libc::SYS_epoll_wait, &[9, 0, 0, 0, 0, 0], 9),
-            Some(-i64::from(libc::EINVAL))
-        );
-        assert_eq!(
-            epoll_wait_result(libc::SYS_epoll_wait, &[8, 0, 8, 0, 0, 0], 9),
+            epoll_wait_result(libc::SYS_epoll_pwait, &[8, 0, 8, 0, 0, 0], 9),
             None
         );
+        // An invalid or unknown number is not an epoll wait anywhere:
+        // absence must never be encoded as a matchable sentinel value.
+        for unknown in [-1, i64::MAX] {
+            assert_eq!(epoll_wait_result(unknown, &[9, 0, 8, 0, 0, 0], 9), None);
+            assert!(!names_descriptor(unknown, &[9, 0, 8, 0, 0, 0], 9));
+        }
     }
 
     #[test]

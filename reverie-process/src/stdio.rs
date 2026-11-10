@@ -24,6 +24,14 @@ use super::fd::AsyncFd;
 use super::fd::Fd;
 use super::fd::pipe;
 
+mod prepared;
+
+#[cfg(test)]
+mod async_tests;
+
+pub use prepared::ParentStdio;
+pub use prepared::PreparedStdio;
+
 /// Describes what to do with a standard I/O stream for a child process when
 /// passed to the [`stdin`], [`stdout`], and [`stderr`] methods of [`Command`].
 ///
@@ -127,6 +135,27 @@ impl Stdio {
             InnerStdio::File(file) => Ok((None, Some(file.dup()?))),
         }
     }
+
+    /// Materializes owned streams before entering a fork-based launch.
+    /// Every newly created staging descriptor must be close-on-exec from birth.
+    pub(super) fn into_pipes(self, readable: bool) -> Result<(Option<Fd>, Option<Fd>), Errno> {
+        match self.0 {
+            // Transfer the existing owner directly: plain dup would create a
+            // non-CLOEXEC copy that another launch can inherit before promotion.
+            InnerStdio::File(fd) => Ok((None, Some(fd))),
+            InnerStdio::Null => Fd::open_c(
+                c"/dev/null".as_ptr(),
+                libc::O_CLOEXEC
+                    | if readable {
+                        libc::O_RDONLY
+                    } else {
+                        libc::O_WRONLY
+                    },
+            )
+            .map(|fd| (None, Some(fd))),
+            inner @ (InnerStdio::Inherit | InnerStdio::Piped) => Self(inner).pipes(readable),
+        }
+    }
 }
 
 impl<T: IntoRawFd> From<T> for Stdio {
@@ -156,12 +185,47 @@ impl ChildStdout {
     pub(super) fn new(fd: Fd) -> Result<Self, Errno> {
         AsyncFd::readable(fd).map(Self)
     }
+
+    /// Registers an owned stdout reader, returning the original descriptor
+    /// together with an I/O error if registration or nonblocking setup fails.
+    /// Registration errors leave its shared status flags unchanged. On success
+    /// this endpoint's open file description is made nonblocking.
+    ///
+    /// # Panics
+    ///
+    /// Requires an active I/O-enabled Tokio runtime. Tokio can panic if its
+    /// reactor is absent or disabled; this method does not catch such panics.
+    pub fn try_from_owned_fd(fd: OwnedFd) -> Result<Self, (OwnedFd, io::Error)> {
+        try_readable_owned(fd).map(Self)
+    }
 }
 
 impl ChildStderr {
     pub(super) fn new(fd: Fd) -> Result<Self, Errno> {
         AsyncFd::readable(fd).map(Self)
     }
+
+    /// Registers an owned stderr reader, returning the original descriptor
+    /// together with an I/O error if registration or nonblocking setup fails.
+    /// Registration errors leave its shared status flags unchanged. On success
+    /// this endpoint's open file description is made nonblocking.
+    ///
+    /// # Panics
+    ///
+    /// Requires an active I/O-enabled Tokio runtime. Tokio can panic if its
+    /// reactor is absent or disabled; this method does not catch such panics.
+    pub fn try_from_owned_fd(fd: OwnedFd) -> Result<Self, (OwnedFd, io::Error)> {
+        try_readable_owned(fd).map(Self)
+    }
+}
+
+fn try_readable_owned(fd: OwnedFd) -> Result<AsyncFd, (OwnedFd, io::Error)> {
+    AsyncFd::try_readable(fd.into()).map_err(|(fd, error)| {
+        // SAFETY: the failed conversion returned the original uniquely owned
+        // descriptor, which into_raw_fd transfers without closing it.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd.into_raw_fd()) };
+        (fd, error)
+    })
 }
 
 impl AsyncWrite for ChildStdin {

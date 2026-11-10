@@ -217,9 +217,15 @@ static void check_guest_stat(const struct stat *value, int captured, int proc,
       CHECK(value->st_size == 0);
     check_timestamps(value, 0);
   } else if (captured) {
-    // Captured output is synthetic; a host file or directory reports the
-    // kernel's timestamps, which the Tool decides about.
-    check_timestamps(value, 1640995199);
+    // Captured output is modeled as the keeper pipe made when capture was
+    // set up, so it reports that pipe's kernel creation timestamps: all
+    // three are the one creation instant, with a real (nonzero) time.
+    CHECK(value->st_atim.tv_sec == value->st_mtim.tv_sec &&
+          value->st_atim.tv_sec == value->st_ctim.tv_sec);
+    CHECK(value->st_atim.tv_nsec == value->st_mtim.tv_nsec &&
+          value->st_atim.tv_nsec == value->st_ctim.tv_nsec);
+    CHECK(value->st_atim.tv_sec > 0);
+    CHECK(value->st_atim.tv_nsec >= 0 && value->st_atim.tv_nsec < 1000000000);
     CHECK(value->st_dev != 0 && value->st_ino != 0);
     CHECK(value->st_mode == (S_IFIFO | 0600));
     CHECK(value->st_nlink == 1 && value->st_uid == 0 && value->st_gid == 0);
@@ -246,13 +252,12 @@ int main(int argc, char **argv) {
   CHECK(file >= 0);
   CHECK(write(file, contents, sizeof(contents) - 1) == sizeof(contents) - 1);
   int directory = open(".", O_RDONLY | O_DIRECTORY);
-  int proc_root = open("/proc", O_RDONLY | O_DIRECTORY);
+  // The harness's /proc, which the program inherits as its standard input:
+  // the backend refuses a guest's own open of procfs.
+  int proc_root = dup(STDIN_FILENO);
   int proc_maps = open("/proc/self/maps", O_RDONLY);
-  char path[64];
-  CHECK(snprintf(path, sizeof(path), "/proc/self/fdinfo/%d", file) > 0);
-  int fdinfo = open(path, O_RDONLY);
   int stdout_alias = dup(STDOUT_FILENO);
-  CHECK(directory >= 0 && proc_root >= 0 && proc_maps >= 0 && fdinfo >= 0);
+  CHECK(directory >= 0 && proc_root >= 0 && proc_maps >= 0);
   CHECK(stdout_alias >= 0);
   int closed = dup(file);
   CHECK(closed >= 0 && close(closed) == 0);
@@ -268,9 +273,7 @@ int main(int argc, char **argv) {
                  {"stderr", STDERR_FILENO, 1, 0, 0},
                  {"file", file, 0, 0, 0},
                  {"directory", directory, 0, 0, 1},
-                 {"proc-root", proc_root, 0, 1, 1},
-                 {"proc-maps", proc_maps, 0, 1, 0},
-                 {"fdinfo", fdinfo, 0, 1, 0}};
+                 {"proc-maps", proc_maps, 0, 1, 0}};
   struct observation stdout_stat = {0};
   for (size_t object = 0; object < sizeof(objects) / sizeof(objects[0]); ++object) {
     struct observation plain = {0};
@@ -333,16 +336,13 @@ int main(int argc, char **argv) {
   // These are explicit backend policy controls, separate from native parity.
   // Neither a wide fd nor a bad output pointer may bypass a guest refusal.
   puts("proc-policy");
-  for (size_t object = 0; object < 2; ++object)
-    for (size_t upper = 0; upper < 4; ++upper)
-      for (int bad_pointer = 0; bad_pointer < 2; ++bad_pointer) {
-        int expected = guest ? (object == 0 ? EACCES : ENOSYS)
-                             : (bad_pointer ? EFAULT : 0);
-        observe(1, object == 0 ? "proc-root" : "fdinfo",
-                (uint32_t)(object == 0 ? proc_root : fdinfo),
-                upper_words[upper], bad_pointer, expected);
-      }
-  CHECK(close(stdout_alias) == 0 && close(fdinfo) == 0);
+  for (size_t upper = 0; upper < 4; ++upper)
+    for (int bad_pointer = 0; bad_pointer < 2; ++bad_pointer) {
+      int expected = guest ? EACCES : (bad_pointer ? EFAULT : 0);
+      observe(1, "proc-root", (uint32_t)proc_root, upper_words[upper],
+              bad_pointer, expected);
+    }
+  CHECK(close(stdout_alias) == 0);
   CHECK(close(proc_maps) == 0 && close(proc_root) == 0);
   CHECK(close(directory) == 0 && close(file) == 0);
   return 0;

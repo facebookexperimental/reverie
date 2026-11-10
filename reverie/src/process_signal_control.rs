@@ -223,6 +223,92 @@ pub enum ParentDeathPublicationResult {
     },
 }
 
+/// The new parent of one child of an exiting process
+/// ([`ProcessSignalControl::place_orphans`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum OrphanReaper {
+    /// A live process of this run, by exact lifetime: the child becomes its
+    /// child, as when Linux's `find_new_reaper` picks a child subreaper.
+    Process(SignalProcessId),
+    /// The PID namespace's init, which the backend keeps outside the guest
+    /// process tree. No guest process can wait for the child. Where the
+    /// namespace init is the exited process itself, or the exit happens in a
+    /// namespace whose init has exited, this is the only reaper accepted: the
+    /// namespace is being torn down ([`ProcessSignalControl::place_orphans`]).
+    NamespaceInit,
+}
+
+/// One placement in [`ProcessSignalControl::place_orphans`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OrphanPlacement {
+    /// Exact child lifetime of the exiting process.
+    pub child: SignalProcessId,
+    /// Its new parent.
+    pub reaper: OrphanReaper,
+}
+
+/// What a placement did to one child.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum PlacedOrphanEffect {
+    /// A live child: its parent is now the reaper, for its waits, its later
+    /// exit notification and `getppid`.
+    Live,
+    /// A child that had already exited (a zombie), now waitable by the reaper
+    /// process. Its exit was announced to the reaper again with `SIGCHLD`, as
+    /// Linux's `reparent_leader` does; the effect of that publication.
+    Zombie(ChildExitPublicationEffect),
+    /// A zombie the reaper process reaps at once: its `SIGCHLD` is ignored or
+    /// carries `SA_NOCLDWAIT`.
+    AutoReaped,
+    /// A zombie that moved to the reaper process, whose announcement the
+    /// backend could not publish. Only in
+    /// [`OrphanPlacementResult::FailedAfterCommit`], which names the error.
+    ZombieUnannounced,
+    /// Adopted by the namespace init, live or exited. Where the namespace is
+    /// being torn down (the exited process is its init, or exited after it),
+    /// nothing moved: the child keeps its parent and goes with the teardown,
+    /// and no guest process waits for it.
+    NamespaceInit,
+}
+
+/// One child in an [`OrphanPlacementReceipt`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PlacedOrphan {
+    /// Exact child lifetime.
+    pub child: SignalProcessId,
+    /// Its new parent.
+    pub reaper: OrphanReaper,
+    /// What the placement did.
+    pub effect: PlacedOrphanEffect,
+}
+
+/// Receipt for the placement of every child of one exited process.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OrphanPlacementReceipt {
+    /// Exact process lifetime whose exit left the children.
+    pub exited: SignalProcessId,
+    /// Each child, in the order of the placements, then any child the caller
+    /// did not name (adopted by the namespace init), in ascending pid order.
+    pub placed: Vec<PlacedOrphan>,
+}
+
+/// Placement never converts a partial commit into a retry.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum OrphanPlacementResult {
+    /// No child moved and nothing was published.
+    RejectedBeforeCommit(Errno),
+    /// Every child moved, and every announcement committed.
+    Committed(OrphanPlacementReceipt),
+    /// Every child moved, but a reaper's `SIGCHLD` readiness failed after its
+    /// pending state committed. Never retry it.
+    FailedAfterCommit {
+        /// Committed effect.
+        receipt: OrphanPlacementReceipt,
+        /// Original readiness failure.
+        errno: Errno,
+    },
+}
+
 /// Immediate result of an original-callback parent-death preflight with no
 /// guest-visible effects (retained-image exec may stage private callback state).
 /// Neither result is a reusable permit for a later or rewritten syscall.
@@ -331,6 +417,81 @@ pub trait ProcessSignalControl: Debug + Send + Sync {
         ChildExitPublicationResult::RejectedBeforeCommit(Errno::ENOSYS)
     }
 
+    /// Opt into orphan placement before starting any guest task: from then
+    /// on, a process's exit leaves its children waiting for
+    /// [`Self::place_orphans`] rather than giving them to the namespace init
+    /// at once. A Tool that opts in promises to place the children of every
+    /// process exit it observes, before releasing the fence of that exit.
+    /// The backend keeps the new parents in its own records, which its waits,
+    /// child-exit notifications and `getppid` read; it never chooses one.
+    fn enable_orphan_placement(&self) -> Result<(), Errno> {
+        Err(Errno::ENOSYS)
+    }
+
+    /// Give each child of `exited` its new parent, as Linux's
+    /// `forget_original_parent` does in `exit_notify`, with the parents the
+    /// caller chose (for example, the nearest child subreaper).
+    ///
+    /// Every child named must be one the exit of `exited` left waiting for a
+    /// parent; a child the caller does not name goes to the namespace init.
+    /// A live child's waits, later exit notification and `getppid` then name
+    /// its reaper. A child that had already exited becomes the reaper's
+    /// zombie: the backend announces it with `SIGCHLD` (the child's siginfo),
+    /// or reaps it at once if the reaper's `SIGCHLD` is ignored or carries
+    /// `SA_NOCLDWAIT`, both decided from the reaper's disposition at this
+    /// call, as Linux's `do_notify_parent` decides them. A reaper must be a
+    /// live process of the run.
+    ///
+    /// Where the exited process is itself its PID namespace's init, or exits
+    /// in a namespace whose init has already exited, Linux tears the
+    /// namespace down (`zap_pid_ns_processes`) and the dying init reaps every
+    /// orphan: any [`OrphanReaper::Process`] is refused (`EINVAL`), and each
+    /// child, named or not, is placed with [`OrphanReaper::NamespaceInit`] as
+    /// a no-op ([`PlacedOrphanEffect::NamespaceInit`]: nothing moves, nothing
+    /// is announced, and no child exit needs to have been claimed first).
+    ///
+    /// The backend must already have recorded the exit (a backend records it
+    /// before it reports the exit's terminal boundary); before that the call
+    /// changes nothing and answers `EAGAIN`. Nothing moves unless every
+    /// placement is valid (`EINVAL` otherwise, and `ESRCH` for a reaper that
+    /// is gone). An exact duplicate returns the retained result. Like every
+    /// method here it is synchronous, takes the backend's locks after the
+    /// caller's, and calls no Tool code; the caller supplies the causal fence
+    /// (the exit's own).
+    fn place_orphans(
+        &self,
+        _exited: SignalProcessId,
+        _placements: &[OrphanPlacement],
+    ) -> OrphanPlacementResult {
+        OrphanPlacementResult::RejectedBeforeCommit(Errno::ENOSYS)
+    }
+
+    /// Publish one parent-death signal the Tool decided to an exact process
+    /// lifetime: a complete process-directed event for a signal the backend
+    /// declares it publishes
+    /// ([`BackendCapabilities::publishable_parent_death_signals`](crate::BackendCapabilities::publishable_parent_death_signals);
+    /// it rejects any other before commit, `EINVAL`), whose siginfo has
+    /// `si_code` `SI_USER`, as Linux's `group_send_sig_info` builds it for the
+    /// exiting parent thread (its tgid in `si_pid`, its real uid in
+    /// `si_uid`).
+    ///
+    /// The caller owns the parent-death registrations, decides when a parent
+    /// thread exits and orders the sends; the backend only publishes the
+    /// pending signal, with the same shared pending ownership,
+    /// standard-signal coalescing and disposition handling as
+    /// [`Self::publish_timer_expiry`]. `SIGKILL` is published the same way:
+    /// it cannot be caught, blocked or ignored, so it ends the process at the
+    /// first delivery boundary of any of its threads. No Tool hook, guest
+    /// instruction or wait completion is performed. Backends without a
+    /// controlled signal queue keep the default `ENOSYS`.
+    fn publish_parent_death_signal(
+        &self,
+        _process: SignalProcessId,
+        _event: SignalEvent,
+    ) -> ProcessSignalPublicationResult {
+        ProcessSignalPublicationResult::RejectedBeforeCommit(Errno::ENOSYS)
+    }
+
     /// Eligible live recipients for one pending signal, in ascending numeric
     /// TID order. The caller intersects these with its causally admitted task
     /// generations.
@@ -344,6 +505,57 @@ pub trait ProcessSignalControl: Debug + Send + Sync {
     /// intersects these with its causally admitted task generations.
     fn alarm_recipients(&self, process: SignalProcessId) -> Result<Vec<SignalRecipient>, Errno> {
         self.signal_recipients(process, libc::SIGALRM)
+    }
+
+    /// Returns the signal sets of `task`, a live task of this run in any of
+    /// its processes: what is pending for the task and for its process, its
+    /// mask, and its process's ignored and caught signals, as Linux shows them
+    /// in the task's `/proc/<pid>/task/<tid>/status` (`SigPnd`, `ShdPnd`,
+    /// `SigBlk`, `SigIgn` and `SigCgt`); see [`crate::SignalSets`].
+    ///
+    /// This is [`crate::Guest::signal_sets`] for code that holds no `Guest`,
+    /// such as a global tool. A backend that provides both answers from the
+    /// same state, so the two agree for the same task at the same moment, and
+    /// they differ from Linux in the same ways, which the backend documents.
+    /// Only this method can answer `EAGAIN`, for a read that an exec of the
+    /// task's process overlaps (below).
+    ///
+    /// It only reports state. It dequeues no signal, changes no mask, action
+    /// or pending set, records nothing, and calls no Tool code. Like every
+    /// method here it is synchronous and takes the backend's signal locks
+    /// after any lock the caller holds (see [`Self::publish_child_exit`] for
+    /// that order); no backend path may wait for a caller's lock while holding
+    /// those.
+    ///
+    /// `task` names an exact task lifetime, so a task that later received the
+    /// same numeric TID is not the task it names.
+    /// `Err(FactError::Errno(ESRCH))` means that it names no live task of this
+    /// run: an exited task, a reused TID with another generation, or a
+    /// lifetime the backend never had. An exec never makes a live task read as
+    /// gone: `Err(FactError::Errno(EAGAIN))` means that the task's process
+    /// replaced its image while the sets were read, and asking again reads the
+    /// new image. `Err(FactError::NotProvided)` is the default, for a backend
+    /// that does not report this fact.
+    ///
+    /// The answer describes the moment of the call. Any task can change
+    /// another's sets by signalling it, and any task of the process can change
+    /// its actions, so a caller that needs a stable answer asks while the task,
+    /// and every task that could do either, cannot run. Three changes need no
+    /// task to run guest code, and such a caller rules them out as well:
+    ///
+    /// - a task that holds a delivery permit ([`Self::reserve_delivery`]) may
+    ///   take its signal at any moment, which dequeues it and installs the
+    ///   handler's mask;
+    /// - a backend may retire an exiting task after the Tool has handled its
+    ///   exit, so an answer of `Ok` can become `ESRCH` for a task whose exit
+    ///   the caller has already seen;
+    /// - an exec of the task's process makes a call that overlaps it wait for
+    ///   the exec and then answer `EAGAIN`.
+    fn signal_sets(
+        &self,
+        _task: SignalTaskIdentity,
+    ) -> Result<crate::SignalSets, crate::FactError> {
+        Err(crate::FactError::NotProvided)
     }
 
     /// Register one selected task. A second outstanding permit is not a retry.
@@ -376,4 +588,63 @@ pub trait ProcessSignalControl: Debug + Send + Sync {
 pub struct BackendSignalControl {
     /// Run-local weak backend facade.
     pub process: Arc<dyn ProcessSignalControl>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A control that implements only the required methods, as a backend that
+    /// keeps no readable signal state would.
+    #[derive(Debug)]
+    struct RequiredOnly;
+
+    impl ProcessSignalControl for RequiredOnly {
+        fn publish_alarm(
+            &self,
+            _process: SignalProcessId,
+            _event: SignalEvent,
+        ) -> ProcessSignalPublicationResult {
+            ProcessSignalPublicationResult::RejectedBeforeCommit(Errno::ENOSYS)
+        }
+
+        fn signal_recipients(
+            &self,
+            _process: SignalProcessId,
+            _signal: i32,
+        ) -> Result<Vec<SignalRecipient>, Errno> {
+            Ok(Vec::new())
+        }
+
+        fn reserve_delivery(&self, _permit: SignalDeliveryPermit) -> Result<(), Errno> {
+            Err(Errno::ENOSYS)
+        }
+
+        fn release_delivery(&self, _permit: SignalDeliveryPermit) -> Result<(), Errno> {
+            Err(Errno::ENOSYS)
+        }
+
+        fn finish_publication_failure(&self, _process: SignalProcessId) -> Result<(), Errno> {
+            Err(Errno::ENOSYS)
+        }
+    }
+
+    /// The default is the fact's "not provided", never an answer, and never
+    /// an errno that would read as a statement about the task.
+    #[test]
+    fn a_control_that_reports_nothing_does_not_provide_signal_sets() {
+        let task = SignalTaskIdentity {
+            process: SignalProcessId {
+                tgid: crate::Pid::from_raw(1),
+                generation: 1,
+            },
+            tid: crate::Pid::from_raw(1),
+            task_generation: 1,
+        };
+        let control: Arc<dyn ProcessSignalControl> = Arc::new(RequiredOnly);
+        assert_eq!(
+            control.signal_sets(task),
+            Err(crate::FactError::NotProvided)
+        );
+    }
 }

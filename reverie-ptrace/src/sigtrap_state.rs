@@ -141,25 +141,88 @@ pub(crate) fn mask_after_sigprocmask(before: u64, how: i32, set: Option<u64>) ->
 #[cfg(target_arch = "x86_64")]
 pub(crate) const SIGRETURN_UC_SIGMASK_OFFSET: usize = 8 + 8 + 24 + 256;
 
+/// The offset from the stack pointer at an `rt_sigreturn` instruction to the
+/// frame's `uc_sigmask` on aarch64: the stack pointer is the frame
+/// (`struct rt_sigframe`), whose `siginfo` (128) precedes its `ucontext`,
+/// where `uc_sigmask` follows `uc_flags` (8), `uc_link` (8) and `uc_stack`
+/// (24).
+#[cfg(target_arch = "aarch64")]
+pub(crate) const SIGRETURN_UC_SIGMASK_OFFSET: usize = 128 + 8 + 8 + 24;
+
 /// Whether an x86-64 instruction that begins with `bytes` raises a SIGTRAP
 /// of its own: `int3` (`cc`), `int 3` (`cd 03`) or `int1` (`f1`), after any
 /// run of legacy and REX prefixes, within the 15-byte limit of an
 /// instruction. A prefix does not change what these instructions do, so
 /// `66 cc` is an `int3` too; and the CPU ignores a REX prefix that does not
 /// directly precede the opcode, so `48 48 cc` and `48 66 cc` are as well.
+#[cfg(all(test, target_arch = "x86_64"))]
 pub(crate) fn instruction_raises_sigtrap(bytes: &[u8]) -> bool {
-    let bytes = &bytes[..bytes.len().min(15)];
-    let mut i = 0;
-    while i < bytes.len()
-        && matches!(
-            bytes[i],
+    instruction_raises_sigtrap_from(|offset| bytes.get(offset).copied())
+}
+
+/// The single instruction grammar for both a slice and forced word reads.
+/// Request no byte after the deciding opcode/immediate or the 15-byte limit.
+#[cfg(target_arch = "x86_64")]
+fn instruction_raises_sigtrap_from(mut byte_at: impl FnMut(usize) -> Option<u8>) -> bool {
+    for i in 0..15 {
+        let Some(byte) = byte_at(i) else {
+            return false;
+        };
+        if matches!(
+            byte,
             0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 | 0x66 | 0x67 | 0xf0 | 0xf2 | 0xf3 | 0x40
                 ..=0x4f
-        )
-    {
-        i += 1;
+        ) {
+            continue;
+        }
+        return match byte {
+            0xcc | 0xf1 => true,
+            0xcd if i < 14 => byte_at(i + 1) == Some(0x03),
+            _ => false,
+        };
     }
-    matches!(bytes[i..], [0xcc, ..] | [0xf1, ..] | [0xcd, 0x03, ..])
+    false
+}
+
+/// Read aligned native-endian words only as the shared grammar needs them.
+/// The caller supplies the same stopped-generation forced read on every
+/// request. The word cache lasts for this call only; no read authorizes resume.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn instruction_raises_sigtrap_with_words(
+    rip: usize,
+    mut read_word: impl FnMut(usize) -> Option<u64>,
+) -> bool {
+    let start = rip & !7;
+    let mut bytes = [0u8; 24];
+    let mut len = 0;
+    let skip = rip - start;
+
+    instruction_raises_sigtrap_from(|offset| {
+        let needed = skip + offset;
+        while needed >= len {
+            if len == bytes.len() {
+                return None;
+            }
+            // Check only words the grammar needs: a deciding opcode at the
+            // last address does not require a representable 15-byte window.
+            let address = start.checked_add(len)?;
+            let word = read_word(address)?;
+            bytes[len..len + 8].copy_from_slice(&word.to_ne_bytes());
+            len += 8;
+        }
+        Some(bytes[needed])
+    })
+}
+
+/// Whether the aarch64 instruction that begins with `bytes` raises a SIGTRAP
+/// of its own: `brk #imm` (`0xd4200000 | imm16 << 5`), which Linux reports
+/// with a forced SIGTRAP as it does a single-step. Instructions are 4 bytes,
+/// little-endian.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn instruction_raises_sigtrap(bytes: &[u8]) -> bool {
+    const BRK_MASK: u32 = 0xffe0_001f;
+    const BRK: u32 = 0xd420_0000;
+    matches!(bytes, [a, b, c, d, ..] if u32::from_le_bytes([*a, *b, *c, *d]) & BRK_MASK == BRK)
 }
 
 #[cfg(test)]
@@ -222,6 +285,7 @@ mod tests {
         assert_eq!(mask_after_sigprocmask(before, 7, Some(0)), before);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn trap_instructions_are_found_behind_prefixes() {
         for bytes in [
@@ -267,6 +331,44 @@ mod tests {
         assert!(!instruction_raises_sigtrap(&rex_long));
     }
 
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn brk_raises_sigtrap_and_other_instructions_do_not() {
+        // brk #0, brk #1, brk #0xffff, then trailing bytes after a brk.
+        for word in [0xd420_0000u32, 0xd420_0020, 0xd43f_ffe0] {
+            assert!(instruction_raises_sigtrap(&word.to_le_bytes()), "{word:#x}");
+        }
+        assert!(instruction_raises_sigtrap(&[
+            0x20, 0x00, 0x20, 0xd4, 0x1f, 0x20
+        ]));
+        // svc #0, hlt #0, udf #0, nop, a brk with nonzero low bits (not a
+        // brk encoding), and a partial word.
+        for word in [
+            0xd400_0001u32,
+            0xd440_0000,
+            0x0000_0000,
+            0xd503_201f,
+            0xd420_0001,
+        ] {
+            assert!(
+                !instruction_raises_sigtrap(&word.to_le_bytes()),
+                "{word:#x}"
+            );
+        }
+        assert!(!instruction_raises_sigtrap(&[0x00, 0x00, 0x20]));
+        assert!(!instruction_raises_sigtrap(&[]));
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn the_sigreturn_mask_offset_matches_the_kernel_frame() {
+        // siginfo_t is 128 bytes; ucontext's uc_sigmask follows two words
+        // and a stack_t.
+        assert_eq!(std::mem::size_of::<libc::siginfo_t>(), 128);
+        assert_eq!(std::mem::size_of::<libc::stack_t>(), 24);
+        assert_eq!(SIGRETURN_UC_SIGMASK_OFFSET, 168);
+    }
+
     #[test]
     fn only_sig_ign_is_ignored() {
         let mut action = KernelSigaction {
@@ -278,5 +380,261 @@ mod tests {
         assert!(!action.ignored());
         action.handler = 0x401000;
         assert!(!action.ignored());
+    }
+
+    /// A byte-backed word transport, without a second instruction grammar.
+    /// Address zero models the production Addr refusal before PEEKDATA.
+    #[cfg(target_arch = "x86_64")]
+    fn decode_words(rip: usize, instruction: &[u8], unreadable: &[usize]) -> (bool, Vec<usize>) {
+        let start = rip & !7;
+        let skip = rip - start;
+        let mut memory = [0x90u8; 24];
+        assert!(instruction.len() <= 16);
+        memory[skip..skip + instruction.len()].copy_from_slice(instruction);
+        let mut reads = Vec::new();
+        let result = instruction_raises_sigtrap_with_words(rip, |address| {
+            reads.push(address);
+            if address == 0 || unreadable.contains(&address) {
+                return None;
+            }
+            let offset = address.checked_sub(start)?;
+            let mut word = [0u8; 8];
+            word.copy_from_slice(memory.get(offset..offset.checked_add(8)?)?);
+            Some(u64::from_ne_bytes(word))
+        });
+        (result, reads)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn word_reader_stops_at_first_deciding_opcode_in_every_alignment() {
+        for alignment in 0..8 {
+            let rip = 0x2000 + alignment;
+            for (bytes, expected) in [
+                (&[0xcc][..], true),
+                (&[0xf1][..], true),
+                (&[0x90][..], false),
+                (&[0x0f, 0xcc][..], false),
+            ] {
+                let (result, reads) = decode_words(rip, bytes, &[0x2008, 0x2010]);
+                assert_eq!(result, expected, "alignment={alignment} bytes={bytes:02x?}");
+                assert_eq!(result, instruction_raises_sigtrap(bytes));
+                assert_eq!(reads, [0x2000]);
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn word_reader_fetches_the_int3_immediate_only_when_needed() {
+        for alignment in 0..8 {
+            let rip = 0x2000 + alignment;
+            for (bytes, expected) in [(&[0xcd, 0x03][..], true), (&[0xcd, 0x80][..], false)] {
+                let (result, reads) = decode_words(rip, bytes, &[]);
+                assert_eq!(result, expected, "alignment={alignment}");
+                assert_eq!(result, instruction_raises_sigtrap(bytes));
+                assert_eq!(
+                    reads,
+                    if alignment == 7 {
+                        vec![0x2000, 0x2008]
+                    } else {
+                        vec![0x2000]
+                    }
+                );
+            }
+        }
+        let (result, reads) = decode_words(0x2007, &[0xcd, 0x03], &[0x2008]);
+        assert!(!result, "an unreadable split immediate is not int 3");
+        assert_eq!(reads, [0x2000, 0x2008]);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn word_reader_needs_each_prefix_word_and_never_a_fourth() {
+        for alignment in 0..8 {
+            let rip = 0x2000 + alignment;
+            let words = (alignment + 15usize).div_ceil(8);
+            let expected_reads: Vec<_> = (0..words).map(|i| 0x2000 + 8 * i).collect();
+            let mut int3 = vec![0x66; 14];
+            int3.push(0xcc);
+            let mut int_3 = vec![0x48; 13];
+            int_3.extend_from_slice(&[0xcd, 0x03]);
+            for (bytes, expected) in [
+                (&int3[..], true),
+                (&int_3[..], true),
+                (&[0x66; 15][..], false),
+            ] {
+                let (result, reads) = decode_words(rip, bytes, &[0x2018]);
+                assert_eq!(result, expected, "alignment={alignment} bytes={bytes:02x?}");
+                assert_eq!(result, instruction_raises_sigtrap(bytes));
+                assert_eq!(reads, expected_reads);
+                assert!(reads.len() <= 3);
+                if words == 3 {
+                    let (result, reads) = decode_words(rip, bytes, &[0x2010]);
+                    assert!(!result);
+                    assert_eq!(reads, [0x2000, 0x2008, 0x2010]);
+                }
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn word_reader_preserves_every_prefix_and_fifteen_byte_limit() {
+        for alignment in 0..8 {
+            let rip = 0x2000 + alignment;
+            for prefix in [
+                0x26, 0x2e, 0x36, 0x3e, 0x64, 0x65, 0x66, 0x67, 0xf0, 0xf2, 0xf3,
+            ]
+            .into_iter()
+            .chain(0x40..=0x4f)
+            {
+                for opcode in [0xcc, 0xf1] {
+                    let bytes = [prefix, opcode];
+                    let (result, reads) = decode_words(rip, &bytes, &[]);
+                    assert!(result, "alignment={alignment} bytes={bytes:02x?}");
+                    assert_eq!(result, instruction_raises_sigtrap(&bytes));
+                    assert_eq!(reads.len(), if alignment == 7 { 2 } else { 1 });
+                }
+            }
+            let mut late_int3 = vec![0x66; 15];
+            late_int3.push(0xcc);
+            let mut late_immediate = vec![0x48; 14];
+            late_immediate.extend_from_slice(&[0xcd, 0x03]);
+            for bytes in [&late_int3[..], &late_immediate[..]] {
+                let (result, reads) = decode_words(rip, bytes, &[0x2018]);
+                assert!(!result);
+                assert_eq!(result, instruction_raises_sigtrap(bytes));
+                assert_eq!(reads.len(), (alignment + 15).div_ceil(8));
+            }
+        }
+        let mut requested = Vec::new();
+        let mut bytes = vec![0x66; 14];
+        bytes.extend_from_slice(&[0xcd, 0x03]);
+        assert!(!instruction_raises_sigtrap_from(|offset| {
+            assert!(offset < 15, "the sixteenth byte must not be requested");
+            requested.push(offset);
+            bytes.get(offset).copied()
+        }));
+        assert_eq!(requested, (0..15).collect::<Vec<_>>());
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn word_reader_rejects_missing_needed_words_in_every_alignment() {
+        for alignment in 0..8 {
+            let rip = 0x2000 + alignment;
+            let (result, reads) = decode_words(rip, &[0xcc], &[0x2000]);
+            assert!(!result);
+            assert_eq!(reads, [0x2000]);
+
+            let mut bytes = vec![0x66; 8 - alignment];
+            bytes.push(0xcc);
+            let (result, reads) = decode_words(rip, &bytes, &[]);
+            assert!(result);
+            assert_eq!(reads, [0x2000, 0x2008]);
+            let (result, reads) = decode_words(rip, &bytes, &[0x2008]);
+            assert!(
+                !result,
+                "a prefix without its unreadable opcode cannot qualify"
+            );
+            assert_eq!(reads, [0x2000, 0x2008]);
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn word_reader_does_not_touch_unused_failing_words() {
+        for alignment in 0..8 {
+            for (opcode, expected) in [(0xcc, true), (0xf1, true), (0x90, false)] {
+                let mut word = [0x90u8; 8];
+                word[alignment] = opcode;
+                let mut count = 0;
+                let result = instruction_raises_sigtrap_with_words(0x2000 + alignment, |address| {
+                    assert_eq!(address, 0x2000, "an unused word must not be requested");
+                    count += 1;
+                    Some(u64::from_ne_bytes(word))
+                });
+                assert_eq!(result, expected);
+                assert_eq!(count, 1, "do not pass without invoking the reader");
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn word_reader_preserves_null_and_page_boundary_behavior() {
+        for rip in 0..8 {
+            let (result, reads) = decode_words(rip, &[0xcc], &[]);
+            assert!(
+                !result,
+                "the original Addr guard refuses the aligned null word"
+            );
+            assert_eq!(reads, [0]);
+        }
+        let (result, reads) = decode_words(0x2fff, &[0xcc], &[0x3000]);
+        assert!(result, "unreadable unused next page does not hide int3");
+        assert_eq!(reads, [0x2ff8]);
+        let (result, reads) = decode_words(0x2fff, &[0xcd, 0x03], &[0x3000]);
+        assert!(
+            !result,
+            "an unreadable necessary next page cannot supply int 3"
+        );
+        assert_eq!(reads, [0x2ff8, 0x3000]);
+        let (result, reads) = decode_words(0x2fff, &[0xcd, 0x03], &[]);
+        assert!(result);
+        assert_eq!(reads, [0x2ff8, 0x3000]);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn word_reader_decodes_deciding_opcodes_at_the_top_address() {
+        for start in [usize::MAX - 23, usize::MAX - 15, usize::MAX - 7] {
+            for alignment in 0..8 {
+                for (opcode, expected) in [(0xcc, true), (0xf1, true), (0x90, false)] {
+                    let rip = start + alignment;
+                    let (result, reads) = decode_words(rip, &[opcode], &[]);
+                    assert_eq!(result, expected, "rip={rip:#x} opcode={opcode:#x}");
+                    assert_eq!(reads, [start], "do not request an unused next word");
+                }
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn word_reader_rejects_a_needed_word_beyond_the_address_space() {
+        for bytes in [&[0x66][..], &[0x48], &[0xcd, 0x03]] {
+            let (result, reads) = decode_words(usize::MAX, bytes, &[]);
+            assert!(!result, "truncated instruction bytes={bytes:02x?}");
+            assert_eq!(reads, [usize::MAX - 7], "never wrap a read to address zero");
+        }
+        for alignment in 0..8 {
+            let (result, reads) = decode_words(usize::MAX - 7 + alignment, &[0x66; 8], &[]);
+            assert!(!result);
+            assert_eq!(reads, [usize::MAX - 7]);
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn word_reader_handles_full_length_traps_at_the_address_space_boundary() {
+        let mut int3 = vec![0x66; 14];
+        int3.push(0xcc);
+        let mut int_3 = vec![0x48; 13];
+        int_3.extend_from_slice(&[0xcd, 0x03]);
+        for bytes in [&int3[..], &int_3[..]] {
+            let (result, reads) = decode_words(usize::MAX - 14, bytes, &[]);
+            assert!(result, "the final byte is representable: {bytes:02x?}");
+            assert_eq!(reads, [usize::MAX - 15, usize::MAX - 7]);
+
+            let (result, reads) = decode_words(usize::MAX - 14, bytes, &[usize::MAX - 7]);
+            assert!(!result, "a required unreadable final word cannot qualify");
+            assert_eq!(reads, [usize::MAX - 15, usize::MAX - 7]);
+
+            let (result, reads) = decode_words(usize::MAX - 13, bytes, &[]);
+            assert!(!result, "the final byte would overflow: {bytes:02x?}");
+            assert_eq!(reads, [usize::MAX - 15, usize::MAX - 7]);
+        }
     }
 }

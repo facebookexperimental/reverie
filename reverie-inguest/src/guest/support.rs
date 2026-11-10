@@ -245,7 +245,8 @@ pub struct ToolCallbackGuard {
 impl ToolCallbackGuard {
     /// Marks the calling thread as running a Tool callback.
     pub fn enter() -> Self {
-        let previous = TOOL_CALLBACK_ACTIVE.with(|active| active.swap(true, Ordering::Relaxed));
+        // SAFETY: this thread's own cell, used only on this thread.
+        let previous = unsafe { (*tool_callback_active_cell()).swap(true, Ordering::Relaxed) };
         Self {
             previous,
             _same_thread: PhantomData,
@@ -255,7 +256,8 @@ impl ToolCallbackGuard {
 
 impl Drop for ToolCallbackGuard {
     fn drop(&mut self) {
-        TOOL_CALLBACK_ACTIVE.with(|active| active.store(self.previous, Ordering::Relaxed));
+        // SAFETY: this thread's own cell, used only on this thread.
+        unsafe { (*tool_callback_active_cell()).store(self.previous, Ordering::Relaxed) };
     }
 }
 
@@ -471,8 +473,37 @@ pub fn page_size() -> std::io::Result<u64> {
 /// Whether the calling thread is running a Tool callback. Syscalls and faulting
 /// instructions reached from inside one bypass the Tool (they are the Tool's
 /// own) and must not allocate or patch.
+/// The one outlined access site for the TOOL_CALLBACK_ACTIVE cell:
+/// every read and write of the cell goes through the pointer this
+/// returns, so the built image holds exactly one TLS access to the
+/// cell, in this function (the recognizer authenticates it).
+#[inline(never)]
+pub(crate) fn tool_callback_active_cell() -> *mut core::sync::atomic::AtomicBool {
+    TOOL_CALLBACK_ACTIVE.with(|active| active as *const core::sync::atomic::AtomicBool as *mut _)
+}
+
+/// Retention for the five authenticated TLS cell accessors: holding
+/// their addresses here keeps each outlined access site in the built
+/// image whatever code generation does with its callers.
+#[allow(dead_code)]
+struct RetainedTlsCellAccessors([*const (); 5]);
+
+// SAFETY: the table holds only function addresses, never dereferenced.
+unsafe impl Sync for RetainedTlsCellAccessors {}
+
+#[used]
+static RETAINED_TLS_CELL_ACCESSORS: RetainedTlsCellAccessors = RetainedTlsCellAccessors([
+    tool_callback_active_cell as *const (),
+    super::alloc::dispatch_depth_cell as *const (),
+    super::continuation::owner_cell as *const (),
+    super::continuation::pending_cell as *const (),
+    super::continuation::ready_cell as *const (),
+]);
+
 pub fn tool_callback_active() -> bool {
-    TOOL_CALLBACK_ACTIVE.with(|active| active.load(Ordering::Relaxed))
+    // SAFETY: the cell is this thread's own AtomicBool; the pointer is
+    // used only on the calling thread.
+    unsafe { (*tool_callback_active_cell()).load(Ordering::Relaxed) }
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -756,7 +787,13 @@ mod tests {
         // Fork while this page is still live: only this thread survives in the
         // child's private address space, and its unmap/scan/exit path uses no
         // allocation, formatting, or inherited userspace locks.
+        #[cfg(target_arch = "x86_64")]
         let child = unsafe { raw_syscall6(libc::SYS_fork, [0; 6]) };
+        #[cfg(not(target_arch = "x86_64"))]
+        let child = unsafe {
+            // aarch64 has no fork number; a plain SIGCHLD clone is fork.
+            raw_syscall6(libc::SYS_clone, [libc::SIGCHLD as u64, 0, 0, 0, 0, 0])
+        };
         assert!(child >= 0, "raw fork failed: {child}");
         if child == 0 {
             let unmapped =
@@ -791,10 +828,12 @@ mod tests {
     #[test]
     fn own_byte_reads_stop_at_an_unreadable_page_without_faulting() {
         use super::read_own_bytes;
+        // Hosts run 4 KiB and 64 KiB pages; geometry follows the runtime.
+        let page = crate::arch::page_size().unwrap() as usize;
         let pages = unsafe {
             libc::mmap(
                 core::ptr::null_mut(),
-                8192,
+                page * 2,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
                 -1,
@@ -804,25 +843,25 @@ mod tests {
         .cast::<u8>();
         assert_ne!(pages.cast(), libc::MAP_FAILED);
         unsafe {
-            pages.add(4094).write(0x0f);
-            pages.add(4095).write(0xa2);
+            pages.add(page - 2).write(0x0f);
+            pages.add(page - 1).write(0xa2);
             assert_eq!(
-                libc::mprotect(pages.add(4096).cast(), 4096, libc::PROT_NONE),
+                libc::mprotect(pages.add(page).cast(), page, libc::PROT_NONE),
                 0
             );
         }
         let mut bytes = [0_u8; 8];
         assert_eq!(
-            unsafe { read_own_bytes(pages as u64 + 4094, &mut bytes) },
+            unsafe { read_own_bytes(pages as u64 + (page - 2) as u64, &mut bytes) },
             2
         );
         assert_eq!(&bytes[..2], &[0x0f, 0xa2]);
         assert_eq!(
-            unsafe { read_own_bytes(pages as u64 + 4096, &mut bytes) },
+            unsafe { read_own_bytes(pages as u64 + page as u64, &mut bytes) },
             0
         );
         assert_eq!(unsafe { read_own_bytes(0, &mut bytes) }, 0);
         assert_eq!(unsafe { read_own_bytes(u64::MAX - 1, &mut bytes) }, 0);
-        unsafe { libc::munmap(pages.cast(), 8192) };
+        unsafe { libc::munmap(pages.cast(), page * 2) };
     }
 }

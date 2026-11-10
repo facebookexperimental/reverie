@@ -89,7 +89,7 @@ impl ConnectionAdmission for Refusing {
 fn serve_with(admission: Arc<dyn ConnectionAdmission>, tag: &str) -> std::path::PathBuf {
     let path = unique_sock_path(tag);
     let mut server = RpcServer::bind(&path, Arc::new(Echo), "cfg".to_string()).unwrap();
-    server.set_connection_admission(admission);
+    server.set_connection_admission(admission).unwrap();
     let server_path = server.path().to_path_buf();
     tokio::spawn(async move { server.serve().await });
     server_path

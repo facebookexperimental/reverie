@@ -12,15 +12,26 @@ use super::Pid;
 
 /// Usable bytes in a cloned child's stack, excluding the guard pages.
 ///
-/// The in-container tracer's main thread runs on this stack, including the
-/// tokio `block_on` frames and everything the tool does underneath them, so it
-/// gets what an ordinary main thread gets: 8 MiB is the default
-/// `RLIMIT_STACK`. 2 MiB was measured to be too small for a debug build of
-/// Hermit's LiteInst statistics path behind `--backend-engagement-json`: with
-/// the guard pages below, it faults in them; a core taken before they existed
-/// showed all 0x200000 bytes in use, about 1.1 MB in Hermit's own async frames.
-/// Only the pages the child actually touches are backed by memory.
-pub(super) const CHILD_STACK_SIZE: usize = 8 * 1024 * 1024;
+/// A command's child runs on this stack only until it execs; exec replaces
+/// its address space, so the program never runs on it. A container's child
+/// does not exec: the in-container tracer's main thread runs on this stack
+/// for the whole run, including the tokio `block_on` frames and everything
+/// the tool does underneath them. That can be a whole guest process: the KVM
+/// backend runs a run's first process on the thread that polls the run,
+/// where a debug build of a large Tool used 2,412 KiB. So the child gets 16
+/// MiB, twice the 8 MiB default `RLIMIT_STACK` of a main thread, and the KVM
+/// backend gives each of its own host threads the same: reverie-kvm-core
+/// defines `KVM_SUPERVISOR_THREAD_STACK_BYTES` as this constant, and keeps
+/// the measurements behind it. `RUST_MIN_STACK` does not change this stack:
+/// that variable sizes the threads the standard library spawns without an
+/// explicit size, and a cloned child is not one of them. 2 MiB was measured
+/// to be too small for a debug build of an embedder's LiteInst statistics
+/// path: with the guard pages below, it faulted in them, and a core taken
+/// before they existed showed all 0x200000 bytes in use, about 1.1 MB of it
+/// in the embedder's own async frames. Only the pages the child actually
+/// touches get physical memory, though strict overcommit charges the whole
+/// mapping.
+pub const CHILD_STACK_SIZE: usize = 16 * 1024 * 1024;
 
 // Supported Linux clone ABIs grow the stack down. Keep several inaccessible
 // pages below the usable stack; they are in addition to CHILD_STACK_SIZE.
@@ -87,6 +98,84 @@ impl Drop for ChildStack {
         // exec/exit. The child must never unmap the stack it is executing on.
         unsafe { libc::munmap(self.mapping, self.mapping_len) };
     }
+}
+
+/// `struct clone_args` through `set_tid_size`: `CLONE_ARGS_SIZE_VER1`, the
+/// layout since Linux 5.5 (include/uapi/linux/sched.h).
+#[repr(C)]
+#[derive(Default)]
+struct CloneArgs {
+    flags: u64,
+    pidfd: u64,
+    child_tid: u64,
+    parent_tid: u64,
+    exit_signal: u64,
+    stack: u64,
+    stack_size: u64,
+    tls: u64,
+    set_tid: u64,
+    set_tid_size: u64,
+}
+
+/// Linux's `CSIGNAL`: the exit-signal bits of `clone`'s flags. Spelled here
+/// because the `libc` crate does not define it for Android.
+const CSIGNAL: libc::c_int = 0xff;
+
+/// Like [`clone`] without namespaces, but the child gets process ID `pid`
+/// through `clone3`'s `set_tid`, in the PID namespace this process creates
+/// its children in (normally its own). `flags` may hold only the child's exit
+/// signal; any other flag is refused with `EINVAL` before the call (see
+/// [`Command::pid`](crate::Command::pid)).
+///
+/// The kernel's errors stand: `EPERM` without `CAP_SYS_ADMIN` or
+/// `CAP_CHECKPOINT_RESTORE` over that namespace, `EEXIST` when a task,
+/// process group or session holds `pid`, `EINVAL` when `pid` is not in
+/// `1..pid_max`, `E2BIG` on Linux 5.3 and 5.4 (`clone3` without `set_tid`),
+/// and `ENOSYS` where `clone3` is unavailable: before Linux 5.3, or refused by
+/// a seccomp filter.
+///
+/// The child runs on a copy of the calling thread's stack, as after `fork`:
+/// a raw `clone3` cannot start a function on a new stack without an assembly
+/// trampoline, and without `CLONE_VM` it needs none. `cb` runs behind an
+/// `extern "C"` frame, as [`clone`]'s callback does, so a panic in it aborts
+/// the child rather than unwinding into the frames it copied from its
+/// parent. As after the raw `clone` of [`clone`], a C library that caches the
+/// process ID (bionic does) still holds the parent's in the child, so `cb`
+/// must not rely on `getpid()`.
+pub(super) fn clone_with_pid<F>(cb: F, flags: libc::c_int, pid: Pid) -> Result<Pid, Errno>
+where
+    F: FnMut() -> i32,
+{
+    extern "C" fn run<G: FnMut() -> i32>(cb: &mut G) -> libc::c_int {
+        // No pthread_atfork handler runs in this child.
+        super::launch_window::reset_after_raw_clone();
+        cb()
+    }
+
+    if flags & !CSIGNAL != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let set_tid: libc::pid_t = pid.as_raw();
+    let args = CloneArgs {
+        exit_signal: (flags & CSIGNAL) as u64,
+        set_tid: std::ptr::from_ref(&set_tid) as u64,
+        set_tid_size: 1,
+        ..CloneArgs::default()
+    };
+    // The callback stays on this thread's stack: the child gets its own copy.
+    let mut cb = cb;
+    let res = unsafe {
+        libc::syscall(
+            libc::SYS_clone3,
+            std::ptr::from_ref(&args),
+            std::mem::size_of::<CloneArgs>(),
+        )
+    };
+    if res == 0 {
+        let code = run(&mut cb);
+        unsafe { libc::_exit(code) }
+    }
+    Errno::result(res).map(|child| Pid::from_raw(child as libc::pid_t))
 }
 
 pub fn clone<F>(cb: F, flags: libc::c_int) -> Result<Pid, Errno>
@@ -278,16 +367,17 @@ mod tests {
     }
 
     #[test]
-    fn default_child_stack_is_a_main_thread_stack() {
+    fn default_child_stack_holds_a_backends_first_guest_process() {
         if crate::test_runs_in_own_process() {
             return;
         }
         let mut stack = child_stack().unwrap();
         let size = stack.top() as usize - stack.bottom() as usize;
         assert!(
-            size >= 8 * 1024 * 1024,
-            "the in-container tracer's main thread runs on the child stack and needs the \
-             8 MiB a main thread gets; 2 MiB was measured to overflow"
+            size >= 16 * 1024 * 1024,
+            "the in-container tracer's main thread runs on the child stack, and with \
+             it a KVM run's first guest process, which needs the 16 MiB the KVM \
+             backend gives each of its process threads"
         );
         // The guard pages are added to the mapping, not carved out of the
         // usable stack.

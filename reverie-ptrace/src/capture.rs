@@ -134,7 +134,7 @@ impl CaptureDrain {
         self.state != ReadState::Open
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_arch = "x86_64"))]
     pub(crate) fn observed_prefix_for_test(&self) -> Option<&[u8]> {
         self.prefix.as_deref()
     }

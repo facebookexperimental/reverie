@@ -461,6 +461,38 @@ fn managed_native_exit_preserves_claim_across_waker_callbacks() {
 
 #[test]
 #[cfg(not(sanitized))]
+fn managed_native_exit_wakes_after_a_contended_poll() {
+    const NAME: &str = "managed_native_exit_wakes_after_a_contended_poll";
+    const MARKER: &str = "ACTUAL_MANAGED_NATIVE_CONTENDED_EXIT_EXERCISED";
+    const UNAVAILABLE: &str = "NATIVE_THREAD_PIDFD_UNAVAILABLE_FOR_MANAGED_CONTENDED_EXIT";
+    if run_managed_native_outer(NAME, MARKER, UNAVAILABLE) {
+        return;
+    }
+    let Some(mut guest) = managed_native_guest(false, UNAVAILABLE) else {
+        return;
+    };
+    let handle = guest.running.as_ref().unwrap().1.event().clone();
+    let counter = Arc::new(WakeCounter::default());
+    let waker = Waker::from(Arc::clone(&counter));
+    // Mechanism test: holding the lock stands in for any contender. The exit
+    // stop is already published, so the only wake counted is the contended
+    // poll's own.
+    let contender = handle.event().exit_publication.lock();
+    assert!(
+        guest
+            .exit
+            .poll_with_ptracer_guard(&mut Context::from_waker(&waker), &guest.guard)
+            .is_pending()
+    );
+    assert_eq!(counter.0.load(Ordering::SeqCst), 1);
+    assert!(guest.exit.managed_delivery.is_none());
+    drop(contender);
+    finish_managed_native_guest(guest, None);
+    emit_completion_marker(MARKER);
+}
+
+#[test]
+#[cfg(not(sanitized))]
 fn managed_native_reservation_preserves_front_on_foreign_refusal() {
     const NAME: &str = "managed_native_reservation_preserves_front_on_foreign_refusal";
     const MARKER: &str = "ACTUAL_MANAGED_NATIVE_RESERVATION_RECOVERY_EXERCISED";
@@ -508,4 +540,153 @@ fn managed_native_reservation_preserves_front_on_foreign_refusal() {
     assert!(guest.terminal.pending_is_empty());
     finish_managed_native_guest(guest, Some(stopped));
     emit_completion_marker(MARKER);
+}
+
+#[test]
+#[cfg(not(sanitized))]
+fn managed_native_wait_rechecks_the_host_only_after_waker_callbacks() {
+    const NAME: &str = "managed_native_wait_rechecks_the_host_only_after_waker_callbacks";
+    const MARKER: &str = "ACTUAL_MANAGED_NATIVE_CALLBACK_RECHECK_EXERCISED";
+    const UNAVAILABLE: &str = "NATIVE_THREAD_PIDFD_UNAVAILABLE_FOR_MANAGED_CALLBACK_RECHECK";
+    if run_managed_native_outer(NAME, MARKER, UNAVAILABLE) {
+        return;
+    }
+    for fresh_waker in [false, true] {
+        let Some(mut guest) = managed_native_guest(true, UNAVAILABLE) else {
+            return;
+        };
+        let handle = guest.running.as_ref().unwrap().1.event().clone();
+        let registered = Waker::from(Arc::new(WakeCounter::default()));
+        handle.event().status_waker.register(&registered);
+        let waker = if fresh_waker {
+            Waker::from(Arc::new(WakeCounter::default()))
+        } else {
+            registered.clone()
+        };
+        let mut owned = guest.running.take().unwrap().wait_owned();
+        let before = WAKER_CALLBACK_RECHECKS.with(Cell::get);
+        let result = owned.poll_with_ptracer_guard(&mut Context::from_waker(&waker), &guest.guard);
+        let rechecks = WAKER_CALLBACK_RECHECKS.with(Cell::get) - before;
+        let stopped = match result {
+            Poll::Ready(Ok(Wait::Stopped(stopped, crate::Event::Signal(Signal::SIGUSR1)))) => {
+                stopped
+            }
+            other => panic!("managed wait did not return the queued SIGUSR1: {other:?}"),
+        };
+        // A fresh waker's registration runs its clone callback and the old
+        // waker's drop callback between the poll's entry check and the FIFO
+        // reservation, so the host is checked again there. A SIGUSR1 decode
+        // adopts no Event, so the decode does not check again.
+        assert_eq!(
+            rechecks,
+            usize::from(fresh_waker),
+            "fresh waker: {fresh_waker}"
+        );
+        finish_managed_native_guest(guest, Some(stopped));
+    }
+    emit_completion_marker(MARKER);
+}
+
+#[test]
+#[cfg(not(sanitized))]
+fn managed_native_decode_rechecks_the_host_after_child_stops() {
+    for child_op in [
+        crate::ChildOp::Fork,
+        crate::ChildOp::Vfork,
+        crate::ChildOp::Clone,
+    ] {
+        let (pid, stopped, mut cleanup) = spawn_new_child_tracee(child_op).unwrap();
+        if stopped.terminal_cleanup().has_thread_pidfd() != Ok(true) {
+            cleanup.cleanup().unwrap();
+            println!("NATIVE_THREAD_PIDFD_UNAVAILABLE_FOR_MANAGED_CHILD_RECHECK");
+            return;
+        }
+        let guard = stopped
+            .generation()
+            .ptracer_thread_guard_for_wait()
+            .unwrap();
+        let waker = Waker::from(Arc::new(WakeCounter::default()));
+        stopped.1.event().event().status_waker.register(&waker);
+        let running = stopped.resume(None).unwrap();
+        cleanup
+            .store_terminal(TerminalCleanup::new_unregistered(pid.into(), &running.1))
+            .unwrap();
+        let mut owned = running.wait_owned();
+        let mut cx = Context::from_waker(&waker);
+        let deadline = Instant::now() + TRACEE_WAIT_TIMEOUT;
+        let (wait, rechecks) = loop {
+            let before = WAKER_CALLBACK_RECHECKS.with(Cell::get);
+            match owned.poll_with_ptracer_guard(&mut cx, &guard) {
+                Poll::Ready(result) => {
+                    let rechecks = WAKER_CALLBACK_RECHECKS.with(Cell::get) - before;
+                    break (result.unwrap(), rechecks);
+                }
+                Poll::Pending => {
+                    assert!(Instant::now() < deadline, "{child_op:?} stop deadline");
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+        };
+        let (parent, event) = wait.assume_stopped();
+        let crate::Event::NewChild(observed, child) = event else {
+            cleanup.cleanup().unwrap();
+            panic!("expected a {child_op:?} stop, got {event:?}");
+        };
+        drop(parent);
+        reap_new_child_bounded(child).unwrap();
+        cleanup.cleanup().unwrap();
+        assert_eq!(observed, child_op);
+        // The waker was registered before the wait, so only the decode,
+        // which adopts the child's Event, checks the host again.
+        assert_eq!(rechecks, 1, "{child_op:?}");
+    }
+}
+
+#[test]
+fn waker_slot_records_its_callbacks_after_they_run() {
+    // Every callback of this waker clears the flag, as a nested managed poll
+    // inside a callback would.
+    fn clear() {
+        WAKER_CALLBACKS_MAY_HAVE_RUN.with(|flag| flag.set(false));
+    }
+    unsafe fn clone(data: *const ()) -> std::task::RawWaker {
+        clear();
+        std::task::RawWaker::new(data, &VTABLE)
+    }
+    unsafe fn wake(_: *const ()) {
+        clear();
+    }
+    unsafe fn wake_by_ref(_: *const ()) {
+        clear();
+    }
+    unsafe fn drop_waker(_: *const ()) {
+        clear();
+    }
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop_waker);
+    let waker = |data: usize| unsafe {
+        Waker::from_raw(std::task::RawWaker::new(data as *const (), &VTABLE))
+    };
+    let flag = || WAKER_CALLBACKS_MAY_HAVE_RUN.with(Cell::get);
+
+    let slot = WakerSlot::default();
+    let first = waker(1);
+    clear();
+    assert!(slot.register(&first));
+    assert!(flag(), "storing a waker runs its clone");
+    clear();
+    assert!(!slot.register(&first));
+    assert!(!flag(), "the same waker again runs nothing");
+    let second = waker(2);
+    clear();
+    assert!(slot.register(&second));
+    assert!(
+        flag(),
+        "replacing a waker runs the new one's clone and the old one's drop"
+    );
+    clear();
+    slot.wake();
+    assert!(flag(), "a wake runs the waker's clone and wake");
+    clear();
+    drop(slot);
+    assert!(flag(), "dropping the slot runs the waker's drop");
 }

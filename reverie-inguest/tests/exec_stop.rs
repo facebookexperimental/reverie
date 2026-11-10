@@ -149,7 +149,10 @@ fn retained_command(command: &mut Command, dir: &Path, name: &str, wall: Duratio
 fn fixture_source(dir: &Path, name: &str) -> PathBuf {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     // Shared with Hermit's CLI sentinel: keep one canonical guest source.
-    let fixtures = if matches!(name, "guest_cpuid.rs" | "guest_static.ld") {
+    let fixtures = if matches!(
+        name,
+        "guest_cpuid.rs" | "guest_first_store.rs" | "guest_static.ld"
+    ) {
         root.join("../reverie-loader/tests/fixtures")
     } else {
         root.join("tests/fixtures")

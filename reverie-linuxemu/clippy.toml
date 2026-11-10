@@ -1,0 +1,25 @@
+# The KVM crates' thread rule (reverie-kvm-core's supervisor_thread module):
+# outside tests, every Rust thread that reverie-kvm-core, reverie-kvm and
+# reverie-linuxemu create comes from supervisor_thread::builder(), which gives
+# it the supervisor stack, and nothing shrinks that stack afterwards. These
+# three crates each have this same file; clippy reads the one in the crate's
+# own directory, so no other Reverie crate is affected. Clippy matches resolved
+# paths, so a type alias, a renamed import or a re-export is caught as well.
+#
+# Only crates in these crates' dependency graph are listed: tokio is only a
+# dev-dependency (of reverie-kvm), and rayon and crossbeam are not dependencies
+# of the KVM crates at all. A raw syscall of SYS_clone, SYS_clone3, SYS_fork or
+# SYS_vfork looks like any other syscall here, so those are reviewed by hand:
+# the native exit broker's clone and its job workers' fork are the only ones.
+disallowed-methods = [
+    { path = "std::thread::spawn", reason = "the KVM thread rule: spawn from reverie_kvm_core::supervisor_thread::builder(), which sizes the stack" },
+    { path = "std::thread::scope", reason = "the KVM thread rule: scoped threads cannot be given the supervisor stack" },
+    { path = "std::thread::Builder::new", reason = "the KVM thread rule: take the builder from reverie_kvm_core::supervisor_thread::builder()" },
+    { path = "std::thread::Builder::stack_size", reason = "the KVM thread rule: supervisor_thread::builder() sets the stack; nothing may shrink it" },
+    { path = "std::thread::Builder::spawn_scoped", reason = "the KVM thread rule: scoped threads cannot be given the supervisor stack" },
+    { path = "std::thread::Scope::spawn", reason = "the KVM thread rule: it gives the thread the default stack, also on a scope that a caller passes in" },
+    { path = "libc::fork", reason = "the KVM thread rule: a raw process or thread outside the named exceptions" },
+    { path = "libc::vfork", reason = "the KVM thread rule: a raw process or thread outside the named exceptions" },
+    { path = "libc::clone", reason = "the KVM thread rule: a raw process or thread outside the named exceptions" },
+    { path = "libc::pthread_create", reason = "the KVM thread rule: a raw thread outside the named exceptions" },
+]

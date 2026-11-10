@@ -191,8 +191,17 @@ static KEYED: Publication = Publication::new();
 
 pub(super) trait NativeCalls {
     fn ospke(&self) -> bool {
-        let maximum = core::arch::x86_64::__cpuid(0).eax;
-        maximum >= 7 && core::arch::x86_64::__cpuid_count(7, 0).ecx & (1 << 4) != 0
+        #[cfg(target_arch = "x86_64")]
+        {
+            let maximum = core::arch::x86_64::__cpuid(0).eax;
+            maximum >= 7 && core::arch::x86_64::__cpuid_count(7, 0).ecx & (1 << 4) != 0
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            // Protection keys for userspace are an x86 feature; with no
+            // OSPKE the keyed region refuses construction as unsupported.
+            false
+        }
     }
 
     unsafe fn syscall(&self, number: i64, args: [u64; 6]) -> i64;
@@ -210,6 +219,7 @@ impl NativeCalls for Native {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 unsafe fn read_pkru() -> u32 {
     let value: u32;
     unsafe {
@@ -221,6 +231,7 @@ unsafe fn read_pkru() -> u32 {
     value
 }
 
+#[cfg(target_arch = "x86_64")]
 unsafe fn write_pkru(value: u32) {
     unsafe {
         core::arch::asm!(
@@ -228,6 +239,18 @@ unsafe fn write_pkru(value: u32) {
             options(nostack, preserves_flags)
         );
     }
+}
+
+// Unreachable off x86-64: `construct` refuses as unsupported when `ospke`
+// is false before any PKRU access, and no descriptor can exist without it.
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn read_pkru() -> u32 {
+    unreachable!("PKRU does not exist on this architecture")
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn write_pkru(_value: u32) {
+    unreachable!("PKRU does not exist on this architecture")
 }
 
 fn zero(result: i64) -> Result<(), i32> {

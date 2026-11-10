@@ -34,6 +34,7 @@ use paste::paste;
 use reverie::ExitStatus;
 use reverie::Pid;
 use reverie::Signal;
+use safeptrace::AnySignal;
 use safeptrace::ChildOp;
 use safeptrace::Stopped;
 use thiserror::Error;
@@ -46,9 +47,11 @@ use crate::gdbstub::Inferior;
 use crate::gdbstub::InferiorThreadId;
 use crate::gdbstub::ResumeInferior;
 use crate::gdbstub::StoppedInferior;
+use crate::gdbstub::ThreadView;
 use crate::gdbstub::hex::*;
 use crate::gdbstub::request::*;
 use crate::gdbstub::response::*;
+use crate::gdbstub::signals;
 use crate::regs::RegAccess;
 
 mod base;
@@ -336,6 +339,7 @@ commands! {
             "m" => m,
             "M" => M,
             "qAttached" => qAttached,
+            "QPassSignals" => QPassSignals,
             "QThreadEvents" => QThreadEvents,
             "qC" => qC,
             "qfThreadInfo" => qfThreadInfo,
@@ -378,9 +382,9 @@ commands! {
 #[derive(PartialEq, Clone, Copy, Debug)]
 pub enum ResumeAction {
     /// signal step, with optional signal.
-    Step(Option<Signal>),
+    Step(Option<AnySignal>),
     /// cointinue, with optional signal.
-    Continue(Option<Signal>),
+    Continue(Option<AnySignal>),
     /// Stop, not sure what it means exactly.
     Stop,
     /// Keep stepping until rip doesn't belong to start..=end.
@@ -414,8 +418,9 @@ impl From<libc::user_regs_struct> for ExpediatedRegs {
 
 #[derive(PartialEq, Clone, Debug)]
 pub enum StopEvent {
-    /// Stopped by signal.
-    Signal(Signal),
+    /// Stopped by signal: a trap (SIGTRAP), or a guest signal about to be
+    /// delivered.
+    Signal(AnySignal),
     /// Stopped by softwrae breakpoint.
     SwBreak,
     /// Stopped due to vforkdone event.
@@ -456,6 +461,8 @@ pub struct NewTask {
     pub resume_tx: Option<mpsc::Sender<ResumeInferior>>,
     /// channel to receive new gdb stop event
     pub stop_rx: Option<mpsc::Receiver<StoppedInferior>>,
+    /// Where the new child is when another thread is in a gdb stop.
+    pub view: ThreadView,
 }
 
 /// Reasons why inferior has stopped, reported to gdb (client).
@@ -491,6 +498,7 @@ impl StopReason {
         request_tx: Option<mpsc::Sender<GdbRequest>>,
         resume_tx: Option<mpsc::Sender<ResumeInferior>>,
         stop_rx: Option<mpsc::Receiver<StoppedInferior>>,
+        view: ThreadView,
     ) -> Self {
         StopReason::NewTask(NewTask {
             pid,
@@ -501,6 +509,7 @@ impl StopReason {
             request_tx,
             resume_tx,
             stop_rx,
+            view,
         })
     }
 
@@ -560,7 +569,14 @@ impl WriteResponse for StopReason {
                 writer.put_str(";");
             }
             StopReason::Stopped(stopped) => {
-                writer.put_str("T05");
+                // `T` names the signal by gdb's number; every other stop is a
+                // trap.
+                writer.put_str("T");
+                let signal = match &stopped.event {
+                    StopEvent::Signal(signal) => signals::to_gdb(signal.raw()),
+                    _ => signals::to_gdb(libc::SIGTRAP),
+                };
+                writer.put_hex_encoded(&[signal]);
                 match &stopped.event {
                     StopEvent::Signal(_) => {}
                     StopEvent::SwBreak => {
@@ -599,13 +615,15 @@ impl WriteResponse for StopReason {
                         writer.put_str("W");
                         writer.put_hex_encoded(&[*code as u8]);
                     }
+                    // `X` takes gdb's number for the signal, not the wait
+                    // status, whose 0x80 bit flags a core dump.
                     ExitStatus::Signaled(sig, _) => {
                         writer.put_str("X");
-                        writer.put_hex_encoded(&[(*sig as u8) | 0x80]);
+                        writer.put_hex_encoded(&[signals::to_gdb(*sig as i32)]);
                     }
                     ExitStatus::SignaledRaw(sig, _) => {
                         writer.put_str("X");
-                        writer.put_hex_encoded(&[(*sig as u8) | 0x80]);
+                        writer.put_hex_encoded(&[signals::to_gdb(*sig)]);
                     }
                 }
                 writer.put_str(";process:");
@@ -630,6 +648,101 @@ impl WriteResponse for StopReason {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    /// The reply `reason` writes, as `ResponseWriter` frames it.
+    fn reply(reason: StopReason) -> ResponseWriter {
+        let mut writer = ResponseWriter::new(BytesMut::new(), true);
+        reason.write_response(&mut writer);
+        writer
+    }
+
+    /// `expected`, framed the same way.
+    fn framed(expected: &str) -> ResponseWriter {
+        let mut writer = ResponseWriter::new(BytesMut::new(), true);
+        writer.put_str(expected);
+        writer
+    }
+
+    #[test]
+    fn exit_by_a_signal_names_it_by_gdbs_number() {
+        let pid = Pid::from_raw(3);
+        assert_eq!(
+            reply(StopReason::exit(
+                pid,
+                ExitStatus::Signaled(Signal::SIGABRT, true)
+            )),
+            framed("X06;process:03"),
+            "the core-dump bit is not part of the signal"
+        );
+        assert_eq!(
+            reply(StopReason::exit(
+                pid,
+                ExitStatus::Signaled(Signal::SIGUSR1, false)
+            )),
+            framed("X1e;process:03"),
+            "gdb numbers SIGUSR1 30"
+        );
+        assert_eq!(
+            reply(StopReason::exit(pid, ExitStatus::SignaledRaw(34, false))),
+            framed("X2e;process:03"),
+            "gdb numbers real-time signal 34 46"
+        );
+        assert_eq!(
+            reply(StopReason::exit(pid, ExitStatus::Exited(7))),
+            framed("W07;process:03")
+        );
+    }
+
+    #[test]
+    fn a_signal_stop_names_the_signal_by_gdbs_number() {
+        // SAFETY: user_regs_struct contains only integer register values.
+        let regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
+        let stop = |event| {
+            let mut writer = ResponseWriter::new(BytesMut::new(), true);
+            StopReason::stopped(Pid::from_raw(3), Pid::from_raw(3), event, regs.into())
+                .write_response(&mut writer);
+            let text = format!("{writer:?}");
+            text[text.find("$T").expect("a T reply") + 1..].to_owned()
+        };
+        assert!(stop(StopEvent::Signal(Signal::SIGSEGV.into())).starts_with("T0b06:"));
+        assert!(
+            stop(StopEvent::Signal(Signal::SIGUSR1.into())).starts_with("T1e06:"),
+            "gdb numbers SIGUSR1 30"
+        );
+        assert!(
+            stop(StopEvent::Signal(AnySignal::new(34).unwrap())).starts_with("T2e06:"),
+            "gdb numbers real-time signal 34 46"
+        );
+        assert!(stop(StopEvent::Signal(Signal::SIGTRAP.into())).starts_with("T0506:"));
+        assert!(
+            stop(StopEvent::SwBreak).starts_with("T05swbreak:;"),
+            "a breakpoint is a trap"
+        );
+    }
+
+    #[test]
+    fn vcont_signals_are_gdbs_numbers() {
+        assert_eq!(
+            vCont::parse(BytesMut::from("$vCont;C1e:p3.3")),
+            Some(vCont::Actions(vec![(
+                ResumeAction::Continue(Some(Signal::SIGUSR1.into())),
+                ThreadId::pid_tid(3, 3)
+            )])),
+            "gdb's 30 is SIGUSR1, not Linux's 30, SIGPWR"
+        );
+        assert_eq!(
+            vCont::parse(BytesMut::from("$vCont;S0a:p3.3")),
+            Some(vCont::Actions(vec![(
+                ResumeAction::Step(Some(Signal::SIGBUS.into())),
+                ThreadId::pid_tid(3, 3)
+            )]))
+        );
+        assert_eq!(
+            vCont::parse(BytesMut::from("$vCont;C07:p3.3")),
+            None,
+            "gdb's SIGEMT has no Linux signal"
+        );
+    }
 
     #[test]
     fn decode_vcont_test() {

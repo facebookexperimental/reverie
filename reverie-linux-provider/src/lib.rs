@@ -13,7 +13,7 @@
 //! Reverie's core, as [`reverie::provider`](mod@reverie::provider). This
 //! crate only re-exports that module, unchanged, for one release so that
 //! existing imports keep compiling; import from `reverie::provider` instead.
-//! It will then be deleted (<https://github.com/rrnewton/hermit/issues/4485>).
+//! It will then be deleted (<https://github.com/rrnewton/hermit/issues/4659>).
 //!
 //! The re-export does not preserve the old trait signature. Since provider
 //! step E2a, [`LinuxProvider::execute`] is an `async` method. Since step E2b

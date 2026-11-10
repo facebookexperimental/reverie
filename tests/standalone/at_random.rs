@@ -8,47 +8,18 @@
 
 use std::env;
 
-use reverie::Errno;
 use reverie::Error;
 use reverie::ExitStatus;
-use reverie::Guest;
-use reverie::Tool;
-use reverie::syscalls::MemoryAccess;
 
-#[derive(Debug, Default, Clone)]
-struct TestTool {}
+#[path = "../tool_fixtures/at_random.rs"]
+mod at_random_tool;
 
-const PRNG_SEED: [u8; 16] = [
-    0x12, 0x34, 0x56, 0x78, 0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xca, 0xfe, 0x87, 0x65, 0x43, 0x21,
-];
+use at_random_tool::TestTool;
 
-#[reverie::tool]
-impl Tool for TestTool {
-    type GlobalState = ();
-    type ThreadState = ();
+#[path = "../support/at_random_rust_guest.rs"]
+mod at_random_rust_guest;
 
-    async fn handle_post_exec<T: Guest<Self>>(&self, guest: &mut T) -> Result<(), Errno> {
-        if let Some(ptr) = guest.auxv().at_random() {
-            // It is safe to mutate this address since libc has not yet had a
-            // chance to modify or copy the auxv table.
-            let ptr = unsafe { ptr.into_mut() };
-            guest.memory().write_value(ptr, &PRNG_SEED)?;
-        }
-
-        Ok(())
-    }
-}
-
-fn guest_mode() {
-    println!("Running in guest mode (actual test).");
-
-    let at_random = unsafe { libc::getauxval(libc::AT_RANDOM) as *const u8 };
-    let slice = unsafe { std::slice::from_raw_parts(at_random, 16) };
-
-    println!("Entropy (intercepted) at at_random {:02x?}", slice);
-
-    assert_eq!(slice, PRNG_SEED);
-}
+use at_random_rust_guest::guest_mode;
 
 async fn host_mode() -> Result<ExitStatus, Error> {
     println!("Running in HOST mode (ReverieTool)");

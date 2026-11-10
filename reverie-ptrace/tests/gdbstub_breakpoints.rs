@@ -30,6 +30,11 @@
 //! two breakpoint sites 6 bytes apart. It checks where the guest stops and
 //! reads the guest's code through `/proc/<pid>/mem`, which shows the inserted
 //! `int3` bytes that the server's `m` packet hides.
+//!
+//! The file also drives GDB's interrupt (the byte 0x03 of Ctrl-C) against a
+//! guest that never stops on its own (`fixtures/gdbstub_interrupt.c`), and
+//! the fork, vfork and exec stops a client gets only if it asks for them in
+//! its `qSupported` (`fixtures/gdbstub_fork_events.c`, `gdbstub_exec.c`).
 
 #![cfg(target_arch = "x86_64")]
 
@@ -40,13 +45,27 @@ use std::path::PathBuf;
 use std::sync::LazyLock;
 use std::time::Duration;
 
+use reverie::Error;
 use reverie::ExitStatus;
+use reverie::Guest as TracedGuest;
+use reverie::Signal;
 use reverie::Tool;
 use reverie::process::Command;
+use reverie::syscalls::Errno;
+use reverie::syscalls::Getpid;
+use reverie::syscalls::Syscall;
+use reverie::syscalls::SyscallInfo;
+use reverie::syscalls::Sysno;
 use reverie_ptrace::TracerBuilder;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
+
+#[path = "gdbstub_breakpoints/reserved_input_signals.rs"]
+mod reserved_input_signals;
+
+#[path = "gdbstub_breakpoints/reserved_input_interrupts.rs"]
+mod reserved_input_interrupts;
 
 #[derive(Default)]
 struct NoopTool;
@@ -266,6 +285,15 @@ impl Remote {
         assert_eq!(self.request(&format!("z0,{addr:x},1")).await, "OK");
     }
 
+    /// Lists the client's features, as GDB's first packet does, and checks
+    /// that the server answers with its own. Then has SIGCHLD passed without
+    /// a stop, as GDB does by default (`QPassSignals`, gdb's number 0x14).
+    async fn supported(&mut self, features: &str) {
+        let reply = self.request(&format!("qSupported:{features}")).await;
+        assert!(reply.starts_with("PacketSize="), "{reply:?}");
+        assert_eq!(self.request("QPassSignals:14").await, "OK");
+    }
+
     /// Resumes every thread of the guest, as GDB's `continue` does.
     async fn resume(&mut self) -> String {
         let pid = self.pid;
@@ -276,6 +304,30 @@ impl Remote {
         let thread = self.thread.clone();
         self.request(&format!("vCont;s:{thread}")).await
     }
+
+    /// Resumes every thread of the guest without waiting for the stop.
+    async fn resume_in_background(&mut self) {
+        let pid = self.pid;
+        self.send(&format!("vCont;c:p{pid:x}.-1")).await;
+    }
+
+    /// Sends GDB's interrupt, the byte 0x03 that GDB sends for Ctrl-C, and
+    /// returns the stop that answers it.
+    async fn interrupt(&mut self) -> String {
+        self.stream
+            .write_all(&[0x03])
+            .await
+            .expect("send the interrupt to the GDB server");
+        self.recv().await
+    }
+}
+
+/// The `p<pid>.<tid>` thread a stop reply names.
+fn stop_thread(reply: &str) -> &str {
+    reply
+        .split(';')
+        .find_map(|field| field.strip_prefix("thread:"))
+        .unwrap_or_else(|| panic!("no thread in the stop reply {reply:?}"))
 }
 
 /// The %rip, register 0x10, in a SIGTRAP stop reply.
@@ -331,15 +383,53 @@ where
     F: FnOnce(Remote) -> Fut,
     Fut: Future<Output = ()>,
 {
+    debug_to_end_with::<NoopTool, _, _>(path, name, false, client).await
+}
+
+/// Runs `path` under Reverie's GDB server and Tool `T`, with `client` as GDB,
+/// and returns how the guest ended. `sequentialized` tells the server that
+/// `T` runs one thread at a time (`TracerBuilder::sequentialized_guest`).
+async fn debug_to_end_with<T, F, Fut>(
+    path: &Path,
+    name: &str,
+    sequentialized: bool,
+    client: F,
+) -> ExitStatus
+where
+    T: Tool + Default + 'static,
+    T::GlobalState: Default,
+    F: FnOnce(Remote) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    debug_command_to_end::<T, _, _>(Command::new(path), name, sequentialized, client).await
+}
+
+/// `debug_to_end_with` for a `command`, which can carry arguments.
+async fn debug_command_to_end<T, F, Fut>(
+    command: Command,
+    name: &str,
+    sequentialized: bool,
+    client: F,
+) -> ExitStatus
+where
+    T: Tool + Default + 'static,
+    T::GlobalState: Default,
+    F: FnOnce(Remote) -> Fut,
+    Fut: Future<Output = ()>,
+{
     let socket = std::env::temp_dir().join(format!(
         "reverie-gdbstub-{name}-{}.sock",
         std::process::id()
     ));
     let _ = std::fs::remove_file(&socket);
-    let command = Command::new(path);
     let tracer = async {
-        TracerBuilder::<NoopTool>::new(command)
-            .gdbserver(socket.clone())
+        let builder = TracerBuilder::<T>::new(command).gdbserver(socket.clone());
+        let builder = if sequentialized {
+            builder.sequentialized_guest()
+        } else {
+            builder
+        };
+        builder
             .spawn()
             .await
             .expect("spawn the guest under the GDB server")
@@ -568,4 +658,761 @@ async fn a_guest_int3_that_gdb_passes_on_kills_the_guest() {
         matches!(status, ExitStatus::Signaled(reverie::Signal::SIGTRAP, _)),
         "{status:?}"
     );
+}
+
+/// A Tool whose signal callback injects `getpid` before it delivers SIGUSR1,
+/// so that the thread's latest stop is the injection's, not the signal's.
+#[derive(Default)]
+struct InjectInSignal;
+
+#[reverie::tool]
+impl Tool for InjectInSignal {
+    type GlobalState = ();
+    type ThreadState = ();
+
+    async fn handle_signal_event<G: TracedGuest<Self>>(
+        &self,
+        guest: &mut G,
+        signal: Signal,
+    ) -> Result<Option<Signal>, Errno> {
+        if signal == Signal::SIGUSR1 {
+            guest.inject(Getpid::new()).await?;
+        }
+        Ok(Some(signal))
+    }
+}
+
+/// As `InjectInSignal`, but the callback first chooses SIGUSR1's siginfo
+/// (`Guest::set_signal_info`): `SI_QUEUE` with value 4242.
+#[derive(Default)]
+struct ReplaceInSignal;
+
+#[reverie::tool]
+impl Tool for ReplaceInSignal {
+    type GlobalState = ();
+    type ThreadState = ();
+
+    async fn handle_signal_event<G: TracedGuest<Self>>(
+        &self,
+        guest: &mut G,
+        signal: Signal,
+    ) -> Result<Option<Signal>, Errno> {
+        if signal == Signal::SIGUSR1 {
+            // SAFETY: an all-zero siginfo is valid.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            info.si_signo = libc::SIGUSR1;
+            info.si_code = libc::SI_QUEUE;
+            // SAFETY: both are 128 bytes of plain integers on Linux.
+            let mut bytes: [u8; reverie::SIGNAL_INFO_SIZE] = unsafe { std::mem::transmute(info) };
+            // `si_value` follows the sender's pid and uid in the queue
+            // member, after the three leading ints and their padding.
+            bytes[24..28].copy_from_slice(&4242i32.to_ne_bytes());
+            guest.set_signal_info(bytes)?;
+            guest.inject(Getpid::new()).await?;
+        }
+        Ok(Some(signal))
+    }
+}
+
+/// The guest that queues itself SIGUSR1 and checks the siginfo its handler
+/// gets.
+fn signal_guest() -> &'static Path {
+    static GUEST: LazyLock<PathBuf> =
+        LazyLock::new(|| build_guest("gdbstub_guest_signal", &[], &[]).0);
+    &GUEST
+}
+
+/// GDB's `stepi` at a signal stop: SIGUSR1 stops the guest and is reported
+/// as `T1e` (gdb's number for it), and GDB steps with it (`vCont;S1e`).
+/// The step takes the same resume as a continue, so the handler gets
+/// `want`'s siginfo: the signal's own after the callback's injection, or the
+/// one the callback chose. Before, a step skipped that resume, and the
+/// handler got a siginfo the kernel made up.
+async fn step_with_a_signal_keeps_its_siginfo<T>(name: &str, want: &str)
+where
+    T: Tool + Default + 'static,
+    T::GlobalState: Default,
+{
+    let mut command = Command::new(signal_guest());
+    command.arg(want);
+    let status = debug_command_to_end::<T, _, _>(command, name, false, |mut remote| async move {
+        let stop = remote.resume().await;
+        assert!(
+            stop.starts_with("T1e"),
+            "expected a SIGUSR1 stop, got {stop:?}"
+        );
+        let thread = remote.thread.clone();
+        let stepped = remote.request(&format!("vCont;S1e:{thread}")).await;
+        assert!(
+            stepped.starts_with("T05"),
+            "expected the step's SIGTRAP stop, got {stepped:?}"
+        );
+        assert_exited_zero(&remote.resume().await, "after stepping into the handler");
+    })
+    .await;
+    assert_eq!(
+        status,
+        ExitStatus::Exited(0),
+        "the handler saw another siginfo"
+    );
+}
+
+#[tokio::test]
+async fn a_step_with_a_signal_keeps_its_own_siginfo_after_an_injection() {
+    step_with_a_signal_keeps_its_siginfo::<InjectInSignal>("step-signal-own", "own").await;
+}
+
+#[tokio::test]
+async fn a_step_with_a_signal_keeps_the_siginfo_the_tool_chose() {
+    step_with_a_signal_keeps_its_siginfo::<ReplaceInSignal>("step-signal-tool", "tool").await;
+}
+
+/// The interrupt guest and the address of its `reverie_stop_worker` flag.
+struct InterruptGuest {
+    path: PathBuf,
+    stop_worker: u64,
+}
+
+fn interrupt_guest() -> &'static InterruptGuest {
+    static GUEST: LazyLock<InterruptGuest> = LazyLock::new(|| {
+        let (path, addresses) =
+            build_guest("gdbstub_interrupt", &["-pthread"], &["reverie_stop_worker"]);
+        InterruptGuest {
+            path,
+            stop_worker: addresses[0],
+        }
+    });
+    &GUEST
+}
+
+/// Arms, as the guest's image starts, a write watch on the word at the
+/// configured address, and keeps every hit.
+#[derive(Default)]
+struct WatchStoreTool;
+
+#[derive(Debug, Default)]
+struct WatchHits(std::sync::Mutex<Vec<reverie::WatchHit>>);
+
+#[reverie::global_tool]
+impl reverie::GlobalTool for WatchHits {
+    type Request = ();
+    type Response = ();
+    /// The watched word's address.
+    type Config = u64;
+
+    async fn receive_rpc(&self, _from: reverie::Pid, _request: ()) {}
+
+    fn on_watchpoint_hit(&self, hit: &reverie::WatchHit) {
+        self.0.lock().unwrap().push(hit.clone());
+    }
+}
+
+#[reverie::tool]
+impl Tool for WatchStoreTool {
+    type GlobalState = WatchHits;
+    type ThreadState = ();
+
+    async fn handle_post_exec<G: reverie::Guest<Self>>(
+        &self,
+        guest: &mut G,
+    ) -> Result<(), reverie::Errno> {
+        let addr = *guest.config();
+        guest
+            .set_watchpoints(&[reverie::WatchSpec {
+                addr,
+                len: 8,
+                kind: reverie::WatchKind::Write,
+                backtraces: 0,
+            }])
+            .expect("arm the watch");
+        Ok(())
+    }
+}
+
+/// The guest with one store to a watched word, and the addresses around it.
+struct WatchedStoreGuest {
+    path: PathBuf,
+    /// `reverie_before_store`, a nop.
+    before: u64,
+    /// `reverie_store`, the store.
+    store: u64,
+    /// `reverie_after_store`, the instruction after it.
+    after: u64,
+    /// `reverie_watched`, the word.
+    word: u64,
+}
+
+fn watched_store_guest() -> &'static WatchedStoreGuest {
+    static GUEST: LazyLock<WatchedStoreGuest> = LazyLock::new(|| {
+        let (path, addresses) = build_guest(
+            "gdbstub_watched_store",
+            &[],
+            &[
+                "reverie_before_store",
+                "reverie_store",
+                "reverie_after_store",
+                "reverie_watched",
+            ],
+        );
+        WatchedStoreGuest {
+            path,
+            before: addresses[0],
+            store: addresses[1],
+            after: addresses[2],
+            word: addresses[3],
+        }
+    });
+    &GUEST
+}
+
+/// Waits until process `pid` has one thread left.
+async fn wait_for_one_thread(pid: u32) {
+    for _ in 0..3000 {
+        let threads = std::fs::read_dir(format!("/proc/{pid}/task"))
+            .expect("list the guest's threads")
+            .count();
+        if threads == 1 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the guest's second thread did not exit");
+}
+
+/// Counts the threads that reached the Tool's gate (`GateTool`).
+static GATE_REACHED: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(0);
+/// Lets threads through the gate.
+static GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(0);
+
+/// A Tool that holds a thread's getppid() until the test lets it through,
+/// as a Tool that runs one thread at a time holds a thread whose turn has not
+/// come: the thread waits inside the Tool's callback, and no thread runs.
+#[derive(Default)]
+struct GateTool;
+
+#[reverie::tool]
+impl Tool for GateTool {
+    type GlobalState = ();
+    type ThreadState = ();
+
+    async fn handle_syscall_event<G: reverie::Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Error> {
+        if syscall.number() == Sysno::getppid {
+            GATE_REACHED.add_permits(1);
+            GATE.acquire()
+                .await
+                .expect("the gate is never closed")
+                .forget();
+        }
+        guest.tail_inject(syscall).await
+    }
+}
+
+/// GDB's interrupt stops a guest that never stops on its own, as Ctrl-C does
+/// natively, and GDB is told of a SIGINT (`T02`) on the stopped thread. While
+/// a thread runs, it stops at its next system call, and GDB can read the
+/// registers of the thread that waits inside the Tool. When no thread runs,
+/// because the only thread left waits inside the Tool, that thread stops where
+/// it waits, and GDB can read memory through it. Each `continue` lets the
+/// guest go on as before; the guest exits 0.
+#[tokio::test]
+async fn an_interrupt_stops_a_running_thread_or_one_that_waits_in_the_tool() {
+    let InterruptGuest { path, stop_worker } = interrupt_guest();
+    let stop_worker = *stop_worker;
+    let status =
+        debug_to_end_with::<GateTool, _, _>(path, "interrupt", true, |mut remote| async move {
+            let main = remote.thread.clone();
+            let stop = remote.resume().await;
+            let worker = stop
+                .strip_prefix("T05create:")
+                .and_then(|rest| rest.split(';').next())
+                .unwrap_or_else(|| panic!("expected a thread-creation stop, got {stop:?}"))
+                .to_owned();
+
+            // The worker makes system calls while main waits in the Tool.
+            remote.resume_in_background().await;
+            GATE_REACHED
+                .acquire()
+                .await
+                .expect("the gate count is never closed")
+                .forget();
+            let stop = remote.interrupt().await;
+            assert!(stop.starts_with("T02"), "expected a SIGINT stop: {stop:?}");
+            assert_eq!(stop_thread(&stop), worker, "the running thread stops");
+            assert_eq!(remote.request(&format!("Hg{main}")).await, "OK");
+            let regs = remote.request("g").await;
+            assert!(
+                !regs.starts_with('E'),
+                "the registers of main, which waits in the Tool: {regs:?}"
+            );
+
+            // End the worker's loop: then no thread runs.
+            assert_eq!(remote.request(&format!("Hg{worker}")).await, "OK");
+            assert_eq!(
+                remote
+                    .request(&format!("M{stop_worker:x},4:01000000"))
+                    .await,
+                "OK"
+            );
+            remote.resume_in_background().await;
+            // The worker exits within a few system calls.
+            wait_for_one_thread(remote.pid).await;
+            for interrupt in 0..2 {
+                let stop = remote.interrupt().await;
+                assert!(
+                    stop.starts_with("T02"),
+                    "interrupt {interrupt}: expected a SIGINT stop: {stop:?}"
+                );
+                assert_eq!(stop_thread(&stop), main, "main stops where it waits");
+                assert_eq!(
+                    remote.request(&format!("m{stop_worker:x},4")).await,
+                    "01000000",
+                    "memory read through the thread stopped in the Tool"
+                );
+                remote.resume_in_background().await;
+            }
+            GATE.add_permits(1);
+            assert_exited_zero(&remote.recv().await, "after the gate opened");
+        })
+        .await;
+    assert_eq!(status, ExitStatus::Exited(0));
+}
+
+/// Under a Tool that lets threads run at once, the thread that takes GDB's
+/// interrupt at its next system call freezes the others, as a breakpoint
+/// does; GDB's kill then ends the guest.
+#[tokio::test]
+async fn an_interrupt_stops_a_guest_whose_threads_run_at_once_and_kill_ends_it() {
+    let InterruptGuest { path, .. } = interrupt_guest();
+    let status = debug_to_end(path, "interrupt-parallel", |mut remote| async move {
+        let stop = remote.resume().await;
+        assert!(stop.starts_with("T05create:"), "{stop:?}");
+        for interrupt in 0..2 {
+            remote.resume_in_background().await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let stop = remote.interrupt().await;
+            assert!(
+                stop.starts_with("T02"),
+                "interrupt {interrupt}: expected a SIGINT stop: {stop:?}"
+            );
+            let regs = remote.request("g").await;
+            assert!(!regs.starts_with('E'), "{regs:?}");
+        }
+        let pid = remote.pid;
+        assert_eq!(remote.request(&format!("vKill;{pid:x}")).await, "OK");
+    })
+    .await;
+    assert!(
+        matches!(status, ExitStatus::Signaled(reverie::Signal::SIGKILL, _)),
+        "{status:?}"
+    );
+}
+
+/// After an interrupt's stop, GDB's step ends at the stopped thread's next
+/// stop, and GDB's `signal SIGINT` delivers the signal it was shown, whose
+/// default action ends the guest, as natively.
+#[tokio::test]
+async fn a_step_or_a_signal_from_an_interrupt_stop_is_carried_out() {
+    let InterruptGuest { path, .. } = interrupt_guest();
+    let status = debug_to_end(path, "interrupt-step", |mut remote| async move {
+        let stop = remote.resume().await;
+        assert!(stop.starts_with("T05create:"), "{stop:?}");
+        remote.resume_in_background().await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let stop = remote.interrupt().await;
+        assert!(stop.starts_with("T02"), "{stop:?}");
+        let thread = stop_thread(&stop).to_owned();
+        let step = remote.request(&format!("vCont;s:{thread}")).await;
+        assert!(step.starts_with("T05"), "the step's stop: {step:?}");
+        assert_eq!(stop_thread(&step), thread, "the stepped thread stops");
+
+        remote.resume_in_background().await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let stop = remote.interrupt().await;
+        assert!(stop.starts_with("T02"), "{stop:?}");
+        let thread = stop_thread(&stop).to_owned();
+        let end = remote.request(&format!("vCont;C02:{thread}")).await;
+        assert!(
+            end.starts_with("X02"),
+            "the guest dies of the SIGINT gdb passed on, without a second stop: {end:?}"
+        );
+    })
+    .await;
+    assert!(
+        matches!(status, ExitStatus::Signaled(reverie::Signal::SIGINT, _)),
+        "{status:?}"
+    );
+}
+
+/// A guest whose only thread blocks in the kernel makes no stop of its own.
+/// Under a Tool that lets threads run at once, GDB's interrupt stops it all
+/// the same, as gdbserver's SIGINT does natively, and `continue` lets it
+/// block again: its pause() does not return.
+#[tokio::test]
+async fn an_interrupt_stops_a_guest_blocked_in_the_kernel() {
+    static GUEST: LazyLock<PathBuf> = LazyLock::new(|| build_guest("gdbstub_blocked", &[], &[]).0);
+    let status = debug_to_end(&GUEST, "interrupt-blocked", |mut remote| async move {
+        for interrupt in 0..2 {
+            remote.resume_in_background().await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let stop = remote.interrupt().await;
+            assert!(
+                stop.starts_with("T02"),
+                "interrupt {interrupt}: expected a SIGINT stop: {stop:?}"
+            );
+            let regs = remote.request("g").await;
+            assert!(!regs.starts_with('E'), "{regs:?}");
+        }
+        let pid = remote.pid;
+        assert_eq!(remote.request(&format!("vKill;{pid:x}")).await, "OK");
+    })
+    .await;
+    assert!(
+        matches!(status, ExitStatus::Signaled(reverie::Signal::SIGKILL, _)),
+        "{status:?}"
+    );
+}
+
+/// A Tool that runs every system call the guest makes as its own injection,
+/// as Detcore runs many: a fork, a vfork or an exec then happens inside the
+/// Tool's callback.
+#[derive(Default)]
+struct InjectTool;
+
+#[reverie::tool]
+impl Tool for InjectTool {
+    type GlobalState = ();
+    type ThreadState = ();
+
+    async fn handle_syscall_event<G: reverie::Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Error> {
+        Ok(guest.inject(syscall).await?)
+    }
+}
+
+/// The fork-events guest and the address of `in_child`.
+struct ForkGuest {
+    path: PathBuf,
+    in_child: u64,
+}
+
+fn fork_guest() -> &'static ForkGuest {
+    static GUEST: LazyLock<ForkGuest> = LazyLock::new(|| {
+        let (path, addresses) = build_guest("gdbstub_fork_events", &[], &["in_child"]);
+        ForkGuest {
+            path,
+            in_child: addresses[0],
+        }
+    });
+    &GUEST
+}
+
+/// GDB's features less the optional stop events.
+const NO_EVENTS: &str = "multiprocess+;swbreak+;hwbreak+;vContSupported+;QThreadEvents+";
+
+/// A client that follows no forks is told of none ("General Query Packets",
+/// `qSupported`): the guest's vforks and fork run as if no client were
+/// there. Its children run through the breakpoint the client set before
+/// they were made, which a fork child carries in its copy of the memory and
+/// a vfork child shares, and the breakpoint still stops the parent.
+async fn a_client_that_follows_no_forks_sees_none<T>(name: &str)
+where
+    T: Tool + Default + 'static,
+    T::GlobalState: Default,
+{
+    let ForkGuest { path, in_child } = fork_guest();
+    let in_child = *in_child;
+    let status = debug_to_end_with::<T, _, _>(path, name, false, |mut remote| async move {
+        remote.supported(NO_EVENTS).await;
+        remote.insert(in_child).await;
+        let main = remote.thread.clone();
+        let stop = remote.resume().await;
+        assert!(
+            stop.starts_with("T05swbreak:"),
+            "the parent's own call, and no fork stop, comes first: {stop:?}"
+        );
+        assert_eq!(stop_thread(&stop), main);
+        assert_eq!(stop_rip(&stop), in_child);
+        remote.remove(in_child).await;
+        assert_exited_zero(&remote.resume().await, "after the parent's breakpoint");
+    })
+    .await;
+    assert_eq!(
+        status,
+        ExitStatus::Exited(0),
+        "every child exited as expected"
+    );
+}
+
+#[tokio::test]
+async fn a_client_that_follows_no_forks_sees_none_and_its_breakpoint_stays_in_the_parent() {
+    a_client_that_follows_no_forks_sees_none::<NoopTool>("no-forks").await;
+}
+
+#[tokio::test]
+async fn a_client_that_follows_no_forks_sees_none_of_those_a_tool_injects() {
+    a_client_that_follows_no_forks_sees_none::<InjectTool>("no-forks-injected").await;
+}
+
+/// A client that follows vforks, and not forks, is told of each vfork and,
+/// once it has let the child go, of the parent's return from it
+/// (`vforkdone`), which it waits for before it reports another fork: GDB
+/// fails an internal assertion otherwise. The fork is not reported.
+async fn a_client_that_follows_vforks_is_told_when_each_is_done<T>(name: &str)
+where
+    T: Tool + Default + 'static,
+    T::GlobalState: Default,
+{
+    let ForkGuest { path, .. } = fork_guest();
+    let status = debug_to_end_with::<T, _, _>(path, name, false, |mut remote| async move {
+        remote
+            .supported(&format!("{NO_EVENTS};vfork-events+"))
+            .await;
+        let main = remote.thread.clone();
+        let mut stop = remote.resume().await;
+        for vfork in 0..2 {
+            let child = stop
+                .strip_prefix("T05vfork:")
+                .and_then(|rest| rest.split(';').next())
+                .unwrap_or_else(|| panic!("vfork {vfork}: expected a vfork stop: {stop:?}"))
+                .to_owned();
+            assert_eq!(stop_thread(&stop), main);
+            let pid = child
+                .strip_prefix('p')
+                .and_then(|id| id.split('.').next())
+                .expect("the child's process");
+            assert_eq!(remote.request(&format!("D;{pid}")).await, "OK");
+            let done = remote.request(&format!("vCont;c:{main}")).await;
+            assert!(
+                done.starts_with("T05vforkdone:"),
+                "vfork {vfork}: expected the parent's vforkdone: {done:?}"
+            );
+            assert_eq!(stop_thread(&done), main);
+            stop = remote.resume().await;
+        }
+        assert_exited_zero(&stop, "the fork is not reported");
+    })
+    .await;
+    assert_eq!(
+        status,
+        ExitStatus::Exited(0),
+        "every child exited as expected"
+    );
+}
+
+#[tokio::test]
+async fn a_client_that_follows_vforks_is_told_when_each_vfork_is_done() {
+    a_client_that_follows_vforks_is_told_when_each_is_done::<NoopTool>("vforks").await;
+}
+
+#[tokio::test]
+async fn a_client_that_follows_vforks_is_told_when_each_injected_one_is_done() {
+    a_client_that_follows_vforks_is_told_when_each_is_done::<InjectTool>("vforks-injected").await;
+}
+
+/// A client that follows forks, and not vforks, is told of the fork with
+/// a `fork` stop naming the child, which it detaches; the vforks are not
+/// reported. Nothing here yet observes the guest's `vforkdone` after a
+/// vfork injected from a signal callback.
+#[tokio::test]
+async fn a_client_that_follows_forks_is_told_of_the_fork() {
+    let ForkGuest { path, .. } = fork_guest();
+    let status = debug_to_end(path, "fork-events", |mut remote| async move {
+        remote.supported(&format!("{NO_EVENTS};fork-events+")).await;
+        let main = remote.thread.clone();
+        let stop = remote.resume().await;
+        let child = stop
+            .strip_prefix("T05fork:")
+            .and_then(|rest| rest.split(';').next())
+            .unwrap_or_else(|| panic!("expected a fork stop: {stop:?}"))
+            .to_owned();
+        assert_eq!(stop_thread(&stop), main);
+        let pid = child
+            .strip_prefix('p')
+            .and_then(|id| id.split('.').next())
+            .expect("the child's process");
+        assert_eq!(remote.request(&format!("D;{pid}")).await, "OK");
+        assert_exited_zero(&remote.resume().await, "after the fork");
+    })
+    .await;
+    assert_eq!(
+        status,
+        ExitStatus::Exited(0),
+        "every child exited as expected"
+    );
+}
+
+/// An exec is reported as an `exec` stop only to a client that follows
+/// execs; to another it is the trap that stops the thread after an exec
+/// natively, when the tracer does not ask Linux for exec events.
+#[tokio::test]
+async fn an_exec_is_reported_as_one_only_to_a_client_that_follows_execs() {
+    static GUEST: LazyLock<PathBuf> = LazyLock::new(|| build_guest("gdbstub_exec", &[], &[]).0);
+    for follows in [false, true] {
+        let features = if follows {
+            format!("{NO_EVENTS};exec-events+")
+        } else {
+            NO_EVENTS.to_owned()
+        };
+        let name = if follows {
+            "exec-events"
+        } else {
+            "no-exec-events"
+        };
+        let status = debug_to_end(&GUEST, name, |mut remote| async move {
+            remote.supported(&features).await;
+            let stop = remote.resume().await;
+            assert!(stop.starts_with("T05"), "{stop:?}");
+            assert_eq!(
+                stop.contains("exec:"),
+                follows,
+                "the exec's stop as a client that follows execs: {follows}: {stop:?}"
+            );
+            assert_exited_zero(&remote.resume().await, "after the exec");
+        })
+        .await;
+        assert_eq!(status, ExitStatus::Exited(0));
+    }
+}
+
+/// A breakpoint the client inserts while a vfork child it was told of lives,
+/// through the parent, is in the memory the child shares and in the child's
+/// breakpoints too. Once the client has let the child go without removing it
+/// (GDB removes its breakpoints first; the protocol does not require it), the
+/// child runs through it, and it still stops the parent.
+#[tokio::test]
+async fn a_breakpoint_inserted_while_a_vfork_child_lives_is_the_childs_too() {
+    let ForkGuest { path, in_child } = fork_guest();
+    let in_child = *in_child;
+    let status = debug_to_end(path, "vfork-insert", |mut remote| async move {
+        remote
+            .supported(&format!("{NO_EVENTS};vfork-events+"))
+            .await;
+        let main = remote.thread.clone();
+        let mut stop = remote.resume().await;
+        for vfork in 0..2 {
+            let child = stop
+                .strip_prefix("T05vfork:p")
+                .and_then(|rest| rest.split('.').next())
+                .unwrap_or_else(|| panic!("vfork {vfork}: expected a vfork stop: {stop:?}"))
+                .to_owned();
+            if vfork == 0 {
+                remote.insert(in_child).await;
+            }
+            assert_eq!(remote.request(&format!("D;{child}")).await, "OK");
+            let done = remote.request(&format!("vCont;c:{main}")).await;
+            assert!(done.starts_with("T05vforkdone:"), "{done:?}");
+            stop = remote.resume().await;
+        }
+        assert!(
+            stop.starts_with("T05swbreak:"),
+            "the children ran through the breakpoint, which stops the parent: {stop:?}"
+        );
+        assert_eq!(stop_thread(&stop), main);
+        assert_eq!(stop_rip(&stop), in_child);
+        remote.remove(in_child).await;
+        assert_exited_zero(&remote.resume().await, "after the parent's breakpoint");
+    })
+    .await;
+    assert_eq!(
+        status,
+        ExitStatus::Exited(0),
+        "every child exited as expected"
+    );
+}
+
+/// Runs the watched-store guest under Reverie's GDB server with a write watch
+/// on its word, with `client` as GDB; checks that it exits 0 and returns the
+/// hits.
+async fn debug_watched<F, Fut>(name: &str, client: F) -> Vec<reverie::WatchHit>
+where
+    F: FnOnce(Remote) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    let guest = watched_store_guest();
+    let socket = std::env::temp_dir().join(format!(
+        "reverie-gdbstub-{name}-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let command = Command::new(&guest.path);
+    let tracer = async {
+        TracerBuilder::<WatchStoreTool>::new(command)
+            .config(guest.word)
+            .gdbserver(socket.clone())
+            .spawn()
+            .await
+            .expect("spawn the guest under the GDB server")
+            .wait()
+            .await
+            .expect("wait for the guest")
+    };
+    let gdb = async {
+        let remote = Remote::connect(&socket).await;
+        client(remote).await;
+    };
+    let ((status, hits), ()) = tokio::time::timeout(Duration::from_secs(120), async {
+        tokio::join!(tracer, gdb)
+    })
+    .await
+    .expect("the guest and the GDB session finish");
+    let _ = std::fs::remove_file(&socket);
+    assert_eq!(status, ExitStatus::Exited(0));
+    hits.0.into_inner().unwrap()
+}
+
+/// GDB's step over a breakpoint on a store to a watched word: the server
+/// removes nothing itself, GDB removes the breakpoint, and the server's
+/// step-over runs the store. Its hit comes with the step's trap, and is
+/// reported once, at the instruction after the store.
+#[tokio::test]
+async fn a_step_over_a_breakpoint_on_a_watched_store_reports_the_hit() {
+    let WatchedStoreGuest { store, after, .. } = *watched_store_guest();
+    let hits = debug_watched("watched-step-over", |mut remote| async move {
+        remote.insert(store).await;
+        let stop = remote.resume().await;
+        assert!(stop.starts_with("T05swbreak:"), "{stop:?}");
+        assert_eq!(stop_rip(&stop), store);
+        remote.remove(store).await;
+        let stop = remote.step().await;
+        assert_eq!(stop_rip(&stop), after, "the step did not run the store");
+        assert_exited_zero(&remote.resume().await, "after the step");
+    })
+    .await;
+    assert_eq!(hits.len(), 1, "{hits:#?}");
+    assert_eq!(hits[0].ip, after);
+    assert_eq!(hits[0].sigtrap, reverie::SigtrapAtHit::Unchanged);
+}
+
+/// A plain GDB single step, not over a breakpoint, that runs a store to a
+/// watched word: the step's stop is handled as any SIGTRAP of a stepped
+/// thread, and the hit is reported once.
+#[tokio::test]
+async fn a_debugger_step_over_a_watched_store_reports_the_hit() {
+    let WatchedStoreGuest {
+        before,
+        store,
+        after,
+        ..
+    } = *watched_store_guest();
+    let hits = debug_watched("watched-step", |mut remote| async move {
+        remote.insert(before).await;
+        let stop = remote.resume().await;
+        assert_eq!(stop_rip(&stop), before);
+        remote.remove(before).await;
+        // Over the breakpoint's nop, then over the store.
+        assert_eq!(stop_rip(&remote.step().await), store);
+        assert_eq!(stop_rip(&remote.step().await), after);
+        assert_exited_zero(&remote.resume().await, "after the steps");
+    })
+    .await;
+    assert_eq!(hits.len(), 1, "{hits:#?}");
+    assert_eq!(hits[0].ip, after);
+    assert_eq!(hits[0].sigtrap, reverie::SigtrapAtHit::Unchanged);
 }

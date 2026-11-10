@@ -22,7 +22,7 @@
 //! So the task repairs at the trap what it knows was reset
 //! (`TracedTask::restore_segv_after_trap`), before the Tool sees the event:
 //! - SIGSEGV's bit in the mask the guest code ran under, recorded as each
-//!   `PTRACE_CONT` resumed it ([`SegvRun`]);
+//!   `PTRACE_CONT` resumed it ([`SignalRun`]);
 //! - SIGSEGV's whole action, recorded per signal-action table from every
 //!   change Reverie sees.
 //!
@@ -75,10 +75,13 @@ impl KernelSigaction {
     }
 }
 
-/// SIGSEGV's bit in the mask a thread's guest code runs under since its last
-/// `PTRACE_CONT`.
+/// One signal's bit in the mask a thread's guest code runs under since its
+/// last `PTRACE_CONT`: SIGSEGV's, and SIGTRAP's on a thread with hardware
+/// watchpoints armed, whose hits force a SIGTRAP as the traps here force a
+/// SIGSEGV (`TracedTask::restore_sigtrap_after_hit`). The variants below
+/// say "SIGSEGV" for that signal.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) enum SegvRun {
+pub(crate) enum SignalRun {
     /// Not known.
     #[default]
     Unknown,
@@ -94,7 +97,7 @@ pub(crate) enum SegvRun {
     /// Reverie traces, under the Tool's serialized-execution contract, and
     /// every stop of the receiving thread is followed by a `PTRACE_CONT` that
     /// records anew, so the action read at the trap is the delivery's
-    /// ([`SegvRun::resolve`]). On a table a thread Reverie does not trace may
+    /// ([`SignalRun::resolve`]). On a table a thread Reverie does not trace may
     /// use, it is not read at all.
     Delivered {
         signal: i32,
@@ -103,21 +106,27 @@ pub(crate) enum SegvRun {
     },
 }
 
-impl SegvRun {
-    /// SIGSEGV's bit, given the mask at the trap (`now`) and, for
-    /// [`SegvRun::Delivered`], the delivered signal's action as read at the
+impl SignalRun {
+    /// The bit of the signal whose mask bit is `bit`, given the mask at the
+    /// trap (`now`) and, for
+    /// [`SignalRun::Delivered`], the delivered signal's action as read at the
     /// trap (`None` if it could not be read or is not to be trusted). The
     /// trap leaves SIGSEGV unblocked either way, so a mask that blocks it at
     /// the trap contradicts every record, and nothing is known.
-    pub(crate) fn resolve(self, now: u64, action: Option<KernelSigaction>) -> Option<bool> {
-        if now & SIGSEGV_BIT != 0 {
+    pub(crate) fn resolve(
+        self,
+        bit: u64,
+        now: u64,
+        action: Option<KernelSigaction>,
+    ) -> Option<bool> {
+        if now & bit != 0 {
             return None;
         }
         match self {
-            SegvRun::Unknown => None,
-            SegvRun::Known(blocked) => Some(blocked),
-            SegvRun::Delivered { blocked, saved, .. } => {
-                let handled = |action: KernelSigaction| blocked || action.mask & SIGSEGV_BIT != 0;
+            SignalRun::Unknown => None,
+            SignalRun::Known(blocked) => Some(blocked),
+            SignalRun::Delivered { blocked, saved, .. } => {
+                let handled = |action: KernelSigaction| blocked || action.mask & bit != 0;
                 match action {
                     Some(action) if action.caught() => Some(handled(action)),
                     Some(action) if action.ignored() => Some(saved),
@@ -145,13 +154,13 @@ impl SegvRun {
         before: Option<KernelSigaction>,
         blocked: bool,
         saved: bool,
-    ) -> SegvRun {
+    ) -> SignalRun {
         match before {
-            Some(action) if action.caught() => SegvRun::Known(
+            Some(action) if action.caught() => SignalRun::Known(
                 blocked || action.mask & SIGSEGV_BIT != 0 || action.flags & SA_NODEFER == 0,
             ),
-            Some(_) => SegvRun::Known(saved),
-            None => SegvRun::Unknown,
+            Some(_) => SignalRun::Known(saved),
+            None => SignalRun::Unknown,
         }
     }
 }
@@ -293,76 +302,89 @@ mod tests {
 
     #[test]
     fn a_delivered_signal_resolves_by_its_action() {
-        let run = SegvRun::Delivered {
+        let run = SignalRun::Delivered {
             signal: libc::SIGUSR1,
             blocked: false,
             saved: false,
         };
         assert_eq!(
-            run.resolve(0, Some(action(HANDLER, 0, SIGSEGV_BIT))),
+            run.resolve(SIGSEGV_BIT, 0, Some(action(HANDLER, 0, SIGSEGV_BIT))),
             Some(true)
         );
-        assert_eq!(run.resolve(0, Some(action(HANDLER, 0, 0))), Some(false));
         assert_eq!(
-            run.resolve(0, Some(action(ign(), 0, SIGSEGV_BIT))),
+            run.resolve(SIGSEGV_BIT, 0, Some(action(HANDLER, 0, 0))),
             Some(false)
         );
         assert_eq!(
-            run.resolve(0, Some(action(dfl(), 0, SIGSEGV_BIT))),
+            run.resolve(SIGSEGV_BIT, 0, Some(action(ign(), 0, SIGSEGV_BIT))),
+            Some(false)
+        );
+        assert_eq!(
+            run.resolve(SIGSEGV_BIT, 0, Some(action(dfl(), 0, SIGSEGV_BIT))),
             Some(false)
         );
         // A reset one-shot handler or a default action: undecided when the
         // two differ.
         assert_eq!(
-            run.resolve(0, Some(action(dfl(), SA_RESETHAND, SIGSEGV_BIT))),
+            run.resolve(
+                SIGSEGV_BIT,
+                0,
+                Some(action(dfl(), SA_RESETHAND, SIGSEGV_BIT))
+            ),
             None
         );
         assert_eq!(
-            run.resolve(0, Some(action(dfl(), SA_RESETHAND, 0))),
+            run.resolve(SIGSEGV_BIT, 0, Some(action(dfl(), SA_RESETHAND, 0))),
             Some(false)
         );
-        assert_eq!(run.resolve(0, None), None);
-        let blocked = SegvRun::Delivered {
+        assert_eq!(run.resolve(SIGSEGV_BIT, 0, None), None);
+        let blocked = SignalRun::Delivered {
             signal: libc::SIGUSR1,
             blocked: true,
             saved: true,
         };
-        assert_eq!(blocked.resolve(0, None), Some(true));
-        let swapped = SegvRun::Delivered {
+        assert_eq!(blocked.resolve(SIGSEGV_BIT, 0, None), Some(true));
+        let swapped = SignalRun::Delivered {
             signal: libc::SIGUSR1,
             blocked: true,
             saved: false,
         };
-        assert_eq!(swapped.resolve(0, Some(action(HANDLER, 0, 0))), Some(true));
-        assert_eq!(swapped.resolve(0, Some(action(ign(), 0, 0))), Some(false));
-        assert_eq!(swapped.resolve(0, None), None);
+        assert_eq!(
+            swapped.resolve(SIGSEGV_BIT, 0, Some(action(HANDLER, 0, 0))),
+            Some(true)
+        );
+        assert_eq!(
+            swapped.resolve(SIGSEGV_BIT, 0, Some(action(ign(), 0, 0))),
+            Some(false)
+        );
+        assert_eq!(swapped.resolve(SIGSEGV_BIT, 0, None), None);
     }
 
     #[test]
     fn a_delivered_sigsegv_blocks_itself_unless_nodefer() {
         assert_eq!(
-            SegvRun::after_segv_delivery(Some(action(HANDLER, 0, 0)), false, false),
-            SegvRun::Known(true)
+            SignalRun::after_segv_delivery(Some(action(HANDLER, 0, 0)), false, false),
+            SignalRun::Known(true)
         );
         assert_eq!(
-            SegvRun::after_segv_delivery(Some(action(HANDLER, SA_NODEFER, 0)), false, false),
-            SegvRun::Known(false)
+            SignalRun::after_segv_delivery(Some(action(HANDLER, SA_NODEFER, 0)), false, false),
+            SignalRun::Known(false)
         );
         assert_eq!(
-            SegvRun::after_segv_delivery(
+            SignalRun::after_segv_delivery(
                 Some(action(HANDLER, SA_NODEFER, SIGSEGV_BIT)),
                 false,
                 false
             ),
-            SegvRun::Known(true)
+            SignalRun::Known(true)
         );
         assert_eq!(
-            SegvRun::after_segv_delivery(Some(action(ign(), 0, 0)), true, false),
-            SegvRun::Known(false)
+            SignalRun::after_segv_delivery(Some(action(ign(), 0, 0)), true, false),
+            SignalRun::Known(false)
         );
         assert_eq!(
-            SegvRun::after_segv_delivery(None, false, false),
-            SegvRun::Unknown
+            SignalRun::after_segv_delivery(None, false, false),
+            SignalRun::Unknown
         );
     }
 

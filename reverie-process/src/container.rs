@@ -6,6 +6,11 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#![allow(
+    unexpected_cfgs,
+    reason = "`fbcode_build` is supplied by the internal Buck build"
+)]
+
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::ffi::CString;
@@ -872,7 +877,7 @@ impl Container {
         // NOTE: Must use a dynamically allocated stack here. Programs expect to
         // have at least 2 MB of stack space and if we've already used up some
         // stack space before this is called we could overflow the stack. See
-        // CHILD_STACK_SIZE for the size child_stack() provides (8 MiB).
+        // CHILD_STACK_SIZE for the size child_stack() provides (16 MiB).
         let mut stack = child_stack()?;
 
         // Disable io redirection just before forking. We want the child process to
@@ -5362,6 +5367,10 @@ mod tests {
         );
     }
 
+    #[cfg_attr(
+        fbcode_build,
+        ignore = "fbsource-disabled: sandcastle-env: needs mount(2) in a fresh user and PID namespace"
+    )]
     #[test]
     fn test_directory_is_available_after_mount() {
         if crate::test_runs_in_own_process() {

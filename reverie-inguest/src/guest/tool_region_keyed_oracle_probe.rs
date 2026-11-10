@@ -28,11 +28,18 @@ unsafe extern "C" {
 
 static CURRENT: AtomicPtr<Observation> = AtomicPtr::new(core::ptr::null_mut());
 
+#[cfg(target_arch = "x86_64")]
 pub(super) fn supported() -> bool {
     // Native x86-64 CPUID is available before any PKRU instruction.
     core::arch::x86_64::__cpuid_count(7, 0).ecx & (1 << 4) != 0
 }
 
+#[cfg(not(target_arch = "x86_64"))]
+pub(super) fn supported() -> bool {
+    false
+}
+
+#[cfg(target_arch = "x86_64")]
 pub(super) fn rights() -> u32 {
     let value: u32;
     // SAFETY: all callers first check native OSPKE. Read has no memory access.
@@ -41,6 +48,12 @@ pub(super) fn rights() -> u32 {
             out("edx") _, options(nostack, preserves_flags));
     }
     value
+}
+
+// Unreachable off x86-64: callers check `supported()` first.
+#[cfg(not(target_arch = "x86_64"))]
+pub(super) fn rights() -> u32 {
+    unreachable!("PKRU does not exist on this architecture")
 }
 
 pub(super) fn instruction(write: bool) -> usize {

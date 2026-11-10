@@ -53,6 +53,28 @@ impl InGuestRcbCounter {
         unsafe { std::os::fd::BorrowedFd::borrow_raw(self.counter.raw_fd()) }
     }
 
+    /// This clock's descriptor number, for a runtime that records which of the
+    /// guest's descriptor numbers it owns.
+    pub fn descriptor(&self) -> libc::c_int {
+        self.counter.raw_fd()
+    }
+
+    /// Moves this clock's descriptor to the lowest free number at or above
+    /// `minimum` (see `PerfCounter::move_fd_at_least`), for a runtime that keeps
+    /// its descriptors clear of the numbers a guest program allocates first.
+    ///
+    /// # Safety
+    ///
+    /// No borrow from [`Self::boundary_fd`] may be live, and only the owning
+    /// thread may use the clock.
+    pub unsafe fn move_descriptor_at_least(
+        &mut self,
+        minimum: libc::c_int,
+    ) -> Result<libc::c_int, Errno> {
+        // SAFETY: the caller guarantees exclusive use and no live borrow.
+        unsafe { self.counter.move_fd_at_least(minimum) }
+    }
+
     /// Read a disabled clock once through its trusted gate, without retrying,
     /// allocating, panicking or changing its cumulative value in this wrapper.
     /// The supplied gate must independently satisfy these requirements.

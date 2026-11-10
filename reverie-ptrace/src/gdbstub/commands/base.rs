@@ -17,6 +17,7 @@ mod _m;
 mod _m_upper;
 //mod _p;
 //mod _p_upper;
+mod _QPassSignals;
 mod _QStartNoAckMode;
 mod _QThreadEvents;
 mod _QThreadSuffixSupported;
@@ -41,6 +42,7 @@ mod _z_upper;
 
 //pub use _p::*;
 //pub use _p_upper::*;
+pub use _QPassSignals::*;
 pub use _QStartNoAckMode::*;
 pub use _QThreadEvents::*;
 pub use _QThreadSuffixSupported::*;

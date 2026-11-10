@@ -85,10 +85,30 @@ impl From<StatBuf> for libc::stat {
         unsafe { core::mem::transmute(buf) }
     }
 
-    // aarch64 cannot transmute
+    // libc's aarch64 `stat` keeps its padding fields private, so it cannot be
+    // built field by field; start from zeroes, which Linux leaves in the
+    // padding too, and copy every public field.
     #[cfg(target_arch = "aarch64")]
     fn from(buf: StatBuf) -> libc::stat {
-        todo!("aarch64 implementation is incomplete");
+        // SAFETY: `libc::stat` holds only integers, so all zeroes is a valid value.
+        let mut stat: libc::stat = unsafe { core::mem::zeroed() };
+        stat.st_dev = buf.st_dev;
+        stat.st_ino = buf.st_ino;
+        stat.st_mode = buf.st_mode;
+        stat.st_nlink = buf.st_nlink;
+        stat.st_uid = buf.st_uid;
+        stat.st_gid = buf.st_gid;
+        stat.st_rdev = buf.st_rdev;
+        stat.st_size = buf.st_size;
+        stat.st_blksize = buf.st_blksize;
+        stat.st_blocks = buf.st_blocks;
+        stat.st_atime = buf.st_atime;
+        stat.st_atime_nsec = buf.st_atime_nsec;
+        stat.st_mtime = buf.st_mtime;
+        stat.st_mtime_nsec = buf.st_mtime_nsec;
+        stat.st_ctime = buf.st_ctime;
+        stat.st_ctime_nsec = buf.st_ctime_nsec;
+        stat
     }
 }
 
@@ -189,6 +209,75 @@ mod tests {
             size_of::<StatxTimestamp>(),
             size_of::<libc::statx_timestamp>()
         );
+    }
+
+    /// Every public field survives the conversion to `libc::stat`, which
+    /// deserializing a recorded `stat` result (`#[serde(with = "StatBuf")]`)
+    /// performs. Each field gets a distinct value, so a swapped or dropped
+    /// field fails.
+    #[test]
+    fn a_stat_buffer_converts_field_for_field() {
+        #[cfg(target_arch = "x86_64")]
+        let buf = StatBuf {
+            st_dev: 1,
+            st_ino: 2,
+            st_nlink: 4,
+            st_mode: 3,
+            st_uid: 5,
+            st_gid: 6,
+            __pad0: 0,
+            st_rdev: 7,
+            st_size: 8,
+            st_blksize: 9,
+            st_blocks: 10,
+            st_atime: 11,
+            st_atime_nsec: 12,
+            st_mtime: 13,
+            st_mtime_nsec: 14,
+            st_ctime: 15,
+            st_ctime_nsec: 16,
+            __unused: [0; 3],
+        };
+        #[cfg(target_arch = "aarch64")]
+        let buf = StatBuf {
+            st_dev: 1,
+            st_ino: 2,
+            st_mode: 3,
+            st_nlink: 4,
+            st_uid: 5,
+            st_gid: 6,
+            st_rdev: 7,
+            __pad1: 0,
+            st_size: 8,
+            st_blksize: 9,
+            __pad2: 0,
+            st_blocks: 10,
+            st_atime: 11,
+            st_atime_nsec: 12,
+            st_mtime: 13,
+            st_mtime_nsec: 14,
+            st_ctime: 15,
+            st_ctime_nsec: 16,
+            __unused4: 0,
+            __unused5: 0,
+        };
+        let stat = libc::stat::from(buf);
+        assert_eq!(
+            (stat.st_dev, stat.st_ino, stat.st_mode, stat.st_nlink),
+            (1, 2, 3, 4)
+        );
+        assert_eq!((stat.st_uid, stat.st_gid, stat.st_rdev), (5, 6, 7));
+        assert_eq!((stat.st_size, stat.st_blksize, stat.st_blocks), (8, 9, 10));
+        assert_eq!(
+            (
+                stat.st_atime,
+                stat.st_atime_nsec,
+                stat.st_mtime,
+                stat.st_mtime_nsec
+            ),
+            (11, 12, 13, 14)
+        );
+        assert_eq!((stat.st_ctime, stat.st_ctime_nsec), (15, 16));
     }
 
     #[test]

@@ -15,13 +15,16 @@
 mod breakpoint;
 mod commands;
 mod error;
+mod features;
 mod hex;
 mod inferior;
+mod interrupt;
 mod logger;
 mod packet;
 mod request;
 mod server;
 mod session;
+mod signals;
 
 mod regs;
 
@@ -36,10 +39,17 @@ pub use commands::ResumeAction;
 pub use commands::StopEvent;
 pub use commands::StopReason;
 pub use error::Error;
+pub use features::ClientFeatures;
 pub use inferior::Inferior;
 pub use inferior::InferiorThreadId;
 pub use inferior::ResumeInferior;
 pub use inferior::StoppedInferior;
+pub use inferior::ThreadState;
+pub use inferior::ThreadStateGuard;
+pub use inferior::ThreadView;
+pub use interrupt::Interrupt;
 pub use regs::CoreRegs;
 pub use request::GdbRequest;
 pub use server::GdbServer;
+pub use signals::PassedSignals;
+pub use signals::signal_has_gdb_number;

@@ -124,6 +124,9 @@ impl Stopped {
     /// and instruction/stack pointers. This request does not resume the tracee.
     /// Unknown operations and incomplete replies are named errors.
     pub fn getsyscallinfo(&self) -> Result<SyscallInfo, SyscallInfoError> {
+        // The kernel reports the stop's syscall number and arguments
+        // from its registers: a dirty `setregs` must reach it first.
+        self.flush_regs().map_err(SyscallInfoError::Trace)?;
         let mut bytes = [0_u8; BUFFER_SIZE];
         let reported = self
             .1

@@ -31,6 +31,7 @@ mod net;
 mod pid;
 mod pinned_mount;
 mod pty;
+pub mod sanitizer;
 pub mod seccomp;
 mod spawn;
 mod stdio;
@@ -41,6 +42,7 @@ use std::io;
 
 pub use child::Child;
 pub use child::Output;
+pub use clone::CHILD_STACK_SIZE;
 pub use container::ChildCleanupObservation;
 pub use container::ChildParentResourceStartContext;
 pub use container::ChildStartContext;
@@ -82,6 +84,8 @@ pub use pty::PtyChild;
 pub use stdio::ChildStderr;
 pub use stdio::ChildStdin;
 pub use stdio::ChildStdout;
+pub use stdio::ParentStdio;
+pub use stdio::PreparedStdio;
 pub use stdio::Stdio;
 use syscalls::Errno;
 
@@ -104,6 +108,9 @@ pub struct Command {
     pre_exec: Vec<Box<dyn FnMut() -> Result<(), Errno> + Send + Sync>>,
     terminal_execve: Option<TerminalExecve>,
     container: Container,
+    /// The process ID the child is to get, if the caller chose one
+    /// ([`Command::pid`]).
+    pid: Option<Pid>,
 }
 
 impl Command {
@@ -148,9 +155,13 @@ impl Command {
     /// This fails if the command contains container configuration that cannot
     /// be represented by [`std::process::Command`], rather than silently
     /// discarding that configuration. This includes namespaces, mounts,
-    /// seccomp filters, pseudoterminals, and CPU affinity.
+    /// seccomp filters, pseudoterminals, CPU affinity, and a requested process
+    /// ID.
     pub fn try_into_std(self) -> io::Result<std::process::Command> {
-        let blockers = self.container.std_conversion_blockers();
+        let mut blockers = self.container.std_conversion_blockers();
+        if self.pid.is_some() {
+            blockers.push("a requested process ID");
+        }
         if self.terminal_execve.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -195,7 +206,13 @@ impl Command {
             pre_exec,
             terminal_execve,
             container,
+            pid,
         } = self;
+
+        assert!(
+            pid.is_none(),
+            "a requested process ID requires the native command owner"
+        );
 
         assert!(
             terminal_execve.is_none(),
@@ -376,6 +393,70 @@ mod tests {
             Command::new("/iprobablydonotexist").spawn().unwrap_err(),
             Error::new(Errno::ENOENT, Context::Exec)
         );
+    }
+
+    /// A child spawned with a requested PID has exactly that PID, as its own
+    /// `$$` shows, and can have it again once reaped; the kernel's refusals
+    /// reach the caller unchanged. Run as the init of a new user and PID
+    /// namespace, where this test may choose PIDs without privilege on the
+    /// host; and in a new user namespace alone, whose PID namespace (the
+    /// host's) it has no capability over, where the kernel answers `EPERM`.
+    #[test]
+    fn spawn_with_requested_pid() {
+        if crate::test_runs_in_own_process() {
+            return;
+        }
+        let outcomes = Container::new()
+            .unshare(Namespace::USER | Namespace::PID)
+            .run(|| {
+                let spawn = |pid: libc::pid_t, unshare: Namespace| {
+                    let mut command = Command::new("/bin/sh");
+                    command
+                        .arg("-c")
+                        .arg(format!("[ $$ -eq {pid} ]"))
+                        .unshare(unshare)
+                        .pid(Pid::from_raw(pid));
+                    let mut child = command.spawn()?;
+                    let status = child.wait_blocking().map_err(|_| Errno::ECHILD)?;
+                    Ok::<_, Error>((child.id().as_raw(), status == ExitStatus::Exited(0)))
+                };
+                let pid_max: libc::pid_t = fs::read_to_string("/proc/sys/kernel/pid_max")
+                    .unwrap()
+                    .trim()
+                    .parse()
+                    .unwrap();
+                [
+                    spawn(4242, Namespace::empty()),
+                    spawn(4242, Namespace::empty()),
+                    // This test's own process holds PID 1 here.
+                    spawn(1, Namespace::empty()),
+                    spawn(pid_max, Namespace::empty()),
+                    spawn(4243, Namespace::UTS),
+                ]
+            })
+            .unwrap();
+        assert_eq!(
+            outcomes,
+            [
+                Ok((4242, true)),
+                Ok((4242, true)),
+                Err(Error::new(Errno::EEXIST, Context::Clone)),
+                Err(Error::new(Errno::EINVAL, Context::Clone)),
+                Err(Error::new(Errno::EINVAL, Context::Clone)),
+            ]
+        );
+
+        let unprivileged = Container::new()
+            .unshare(Namespace::USER)
+            .map_root()
+            .run(|| {
+                Command::new("/bin/true")
+                    .pid(Pid::from_raw(4244))
+                    .spawn()
+                    .map(|child| child.id().as_raw())
+            })
+            .unwrap();
+        assert_eq!(unprivileged, Err(Error::new(Errno::EPERM, Context::Clone)));
     }
 
     #[tokio::test]
@@ -997,6 +1078,14 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "cannot convert to std::process::Command without losing: CPU affinity"
+        );
+        let mut command = Command::new("true");
+        command.pid(Pid::from_raw(4242));
+        let error = command.try_into_std().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error.to_string(),
+            "cannot convert to std::process::Command without losing: a requested process ID"
         );
     }
 

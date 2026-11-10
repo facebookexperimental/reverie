@@ -79,6 +79,186 @@ fn child_driver_rebinds_inherited_callback_view_and_preserves_generation() {
     assert_eq!(parent_origin.lifecycle(), DriverLifecycle::Retired);
 }
 
+fn same_part<T>(left: Option<&T>, right: Option<&T>, same: impl Fn(&T, &T) -> bool) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => same(left, right),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+/// The same failure context and the same operation origin, by identity.
+fn same_entry_origin(left: &crate::entry::EntryOrigin, right: &crate::entry::EntryOrigin) -> bool {
+    same_part(
+        left.failure.as_ref(),
+        right.failure.as_ref(),
+        crate::failure::FailureContext::same_as,
+    ) && same_part(
+        left.operation.as_ref(),
+        right.operation.as_ref(),
+        crate::entry::owner::OperationOrigin::same_as,
+    )
+}
+
+/// What the participant held before it took its attribution by move: a copy
+/// of the vCPU handle's attribution after each set, which every set made
+/// equal to the backend handle's.
+#[track_caller]
+fn assert_participant_matches_backend(backend: &KvmBackend, step: &str) {
+    assert!(
+        same_entry_origin(
+            backend.vcpu.participant_origin(),
+            &backend.memory.entry_origin()
+        ),
+        "{step}"
+    );
+    let handle = backend.vcpu.handle_origin();
+    assert!(
+        handle.failure.is_none() && handle.operation.is_none(),
+        "{step}: the vCPU handle kept a copy"
+    );
+}
+
+fn failure_context(
+    run: &Arc<crate::failure::RunFailure>,
+    tid: i32,
+) -> crate::failure::FailureContext {
+    crate::failure::FailureContext::new(run.clone(), Pid::from_raw(1), Pid::from_raw(tid))
+}
+
+/// Every failure the vCPU's participant records is attributed to exactly what
+/// it was before its origin was moved in rather than copied: the backend
+/// handle's failure context and operation origin, as of the last set, through
+/// the driver origin, each callback, a nested callback and the restore of the
+/// enclosing one, failure-context changes inside a callback, and retirement.
+#[test]
+fn the_vcpu_participant_records_the_backend_attribution_after_every_set() {
+    let mut backend =
+        KvmBackend::new(0x10000).expect("participant origin control requires /dev/kvm");
+    let unset = backend.vcpu.participant_origin();
+    assert!(unset.failure.is_none() && unset.operation.is_none());
+    let global = Arc::new(());
+    let run = crate::failure::RunFailure::new(&global);
+    let failure = failure_context(&run, 1);
+    backend.set_tool_failure(Some(failure.clone()));
+    assert_participant_matches_backend(&backend, "tool failure");
+    let driver = backend.start_entry_driver();
+    assert_participant_matches_backend(&backend, "driver");
+    let owner = backend.entry_driver_owner().unwrap();
+    let operation =
+        |backend: &KvmBackend| backend.vcpu.participant_origin().operation.clone().unwrap();
+    assert!(operation(&backend).same_as(&owner.origin()));
+    for round in 0..3 {
+        let callback = backend.begin_entry_callback().unwrap().unwrap();
+        assert_participant_matches_backend(&backend, "callback");
+        assert!(operation(&backend).same_as(&callback.origin()), "{round}");
+        let nested = owner.begin_callback(Some(&callback.origin())).unwrap();
+        backend.set_operation_origin(Some(nested.origin()));
+        assert_participant_matches_backend(&backend, "nested");
+        assert!(operation(&backend).same_as(&nested.origin()), "{round}");
+        backend.set_operation_origin(Some(callback.origin()));
+        assert_participant_matches_backend(&backend, "enclosing restored");
+        assert!(operation(&backend).same_as(&callback.origin()), "{round}");
+        drop(nested);
+        if round == 1 {
+            backend.set_tool_failure(Some(failure.for_thread(Pid::from_raw(2))));
+            assert_participant_matches_backend(&backend, "failure in callback");
+            assert!(operation(&backend).same_as(&callback.origin()));
+            backend.set_tool_failure(Some(failure.clone()));
+            assert_participant_matches_backend(&backend, "failure restored");
+        }
+        drop(callback);
+        backend.restore_entry_origin();
+        assert_participant_matches_backend(&backend, "callback ended");
+        assert!(operation(&backend).same_as(&owner.origin()), "{round}");
+    }
+    backend.set_tool_failure(None);
+    assert_participant_matches_backend(&backend, "no tool failure");
+    backend.finish_entry_driver(driver, Ok(())).unwrap();
+    assert_participant_matches_backend(&backend, "retired");
+    let retired = backend.vcpu.participant_origin();
+    assert!(retired.failure.is_none() && retired.operation.is_none());
+}
+
+/// A vCPU made from a handle that already carries attribution (a fork
+/// child's inherited memory) starts with an empty participant, as before.
+/// Its first set gives the participant the part that set names and the
+/// handle's other part, which it used to read back from its own handle;
+/// later sets replace one part each.
+#[test]
+fn a_new_vcpu_takes_the_part_its_first_set_does_not_name_from_its_handle() {
+    for first in ["operation", "failure"] {
+        let mut parent =
+            KvmBackend::new(0x10000).expect("participant seed control requires /dev/kvm");
+        let global = Arc::new(());
+        let run = crate::failure::RunFailure::new(&global);
+        let inherited_failure = failure_context(&run, 1);
+        parent.set_tool_failure(Some(inherited_failure.clone()));
+        let parent_scope = parent.start_entry_driver();
+        let parent_callback = parent.begin_entry_callback().unwrap().unwrap();
+        let inherited = parent.memory.entry_origin();
+        let mut child = KvmBackend::new_with_memory(parent.memory.clone(), None)
+            .expect("participant seed control requires /dev/kvm");
+        let unset = child.vcpu.participant_origin();
+        assert!(
+            unset.failure.is_none() && unset.operation.is_none(),
+            "{first}"
+        );
+        let handle = child.vcpu.handle_origin();
+        assert!(
+            handle.failure.is_none() && handle.operation.is_none(),
+            "{first}"
+        );
+        assert!(same_entry_origin(&child.memory.entry_origin(), &inherited));
+
+        let own_failure = failure_context(&run, 2);
+        let child_scope = match first {
+            "operation" => {
+                let scope = child.start_entry_driver();
+                let origin = child.vcpu.participant_origin();
+                assert!(origin.failure.as_ref().unwrap().same_as(&inherited_failure));
+                assert!(
+                    origin
+                        .operation
+                        .as_ref()
+                        .unwrap()
+                        .same_as(&child.entry_driver_owner().unwrap().origin())
+                );
+                Some(scope)
+            }
+            _ => {
+                child.set_tool_failure(Some(own_failure.clone()));
+                let origin = child.vcpu.participant_origin();
+                assert!(origin.failure.as_ref().unwrap().same_as(&own_failure));
+                assert!(
+                    origin
+                        .operation
+                        .as_ref()
+                        .unwrap()
+                        .same_as(inherited.operation.as_ref().unwrap())
+                );
+                None
+            }
+        };
+        assert_participant_matches_backend(&child, first);
+        // Every later set replaces only the part it names.
+        child.set_tool_failure(Some(own_failure.clone()));
+        assert_participant_matches_backend(&child, "then failure");
+        child.set_operation_origin(Some(parent_callback.origin()));
+        assert_participant_matches_backend(&child, "then operation");
+        child.set_operation_origin(None);
+        assert_participant_matches_backend(&child, "then no operation");
+        if let Some(scope) = child_scope {
+            child.finish_entry_driver(scope, Ok(())).unwrap();
+            assert_participant_matches_backend(&child, "child retired");
+        }
+        drop(child);
+        drop(parent_callback);
+        parent.restore_entry_origin();
+        parent.finish_entry_driver(parent_scope, Ok(())).unwrap();
+    }
+}
+
 struct CallbackDrop {
     payload: Option<PanicPayload>,
 }

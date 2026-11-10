@@ -68,11 +68,56 @@ pub enum UnsupportedOperation {
     SignalDelivery,
     /// A call whose answer the tool decides on every backend, on a backend
     /// that therefore keeps no copy of that answer: for example the CPU,
-    /// scheduling and priority queries and changes, `getrandom`,
-    /// `prlimit64`, the user and group id calls, `seccomp` or `getpgrp`. A
-    /// backend that refuses one performed none of the call's own effects. A
-    /// tool that answers the call itself never sees this refusal.
+    /// scheduling and priority queries and changes, `prlimit64`, the user
+    /// and group id calls, `seccomp` or `getpgrp`. A backend that refuses one
+    /// performed none of the call's own effects. A tool that answers the call
+    /// itself never sees this refusal.
     ToolDecided,
+    /// `madvise(2)` advice whose effect a program can observe, such as what a
+    /// fork copies or a core dump holds, on a backend that does not implement
+    /// that advice. A backend that refuses it changed no mapping and no page;
+    /// the refusal's diagnostic names the advice.
+    MemoryAdvice,
+    /// An operation on a `signalfd(2)` descriptor that the backend does not
+    /// model, such as a read that would wait for a signal, or creating a
+    /// process that inherits the descriptor. A backend that refuses it read no
+    /// signal, created nothing and registered nothing; the refusal's
+    /// diagnostic names the operation.
+    Signalfd,
+    /// `clone` or `clone3` asking for a child the backend cannot create: flags,
+    /// an exit signal or `struct clone_args` fields it does not implement,
+    /// such as `CLONE_VM` for a new process without `CLONE_VFORK`, or
+    /// `CLONE_THREAD` without `CLONE_FS` or `CLONE_FILES`. The backend does
+    /// not check every rule by which Linux refuses a clone, so a tool that
+    /// gives Linux's answers to those first sees this only for clones Linux
+    /// would perform. A backend that refuses one created no child and the
+    /// caller runs on unchanged; the refusal's diagnostic names the case.
+    Clone,
+    /// `pkey_alloc`, `pkey_mprotect` or `pkey_free`, on a backend that does
+    /// not implement memory protection keys. A backend that refuses one
+    /// allocated, applied and freed no key and changed no mapping.
+    ProtectionKeys,
+    /// `userfaultfd(2)`, on a backend that does not implement it. A backend
+    /// that refuses it created no descriptor.
+    Userfaultfd,
+    /// An operation Linux would perform for the guest, which the backend could
+    /// not carry out because a host resource of its own ran out: for example
+    /// host address space, when the host refuses the memory the backend
+    /// reserves for an `execve` under the supervisor's `RLIMIT_AS`. The guest's
+    /// request was valid, and the errno says nothing Linux would report for
+    /// the guest's own reasons. A backend that refuses it performed none of
+    /// the operation: an exec ran none of the new image and left the old
+    /// image, its threads and its address space in place. The refusal's
+    /// diagnostic names the resource, the request and the limit.
+    HostResources,
+    /// `prctl(PR_SET_PDEATHSIG)` arming a signal the backend cannot send when
+    /// the caller's parent thread exits, such as a stop signal on a backend
+    /// with no stopped state, a real-time signal on one whose signal queues
+    /// hold standard signals only, or `SIGCHLD` on one whose queues carry it
+    /// only for a child's exit. Linux accepts every signal from 1 to 64. A
+    /// backend that refuses it armed nothing and kept the caller's previous
+    /// parent-death signal; the refusal's diagnostic names the reason.
+    ParentDeathSignal,
 }
 
 /// A backend's refusal of an injected syscall, or of a `Guest` operation,

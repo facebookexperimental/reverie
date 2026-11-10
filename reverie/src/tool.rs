@@ -17,6 +17,7 @@ use reverie_syscalls::Syscall;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use crate::ConnectionIdentity;
 use crate::ExitStatus;
 use crate::Pid;
 use crate::Signal;
@@ -26,10 +27,25 @@ use crate::Tid;
 use crate::error::Errno;
 use crate::error::Error;
 use crate::guest::Guest;
-#[cfg(target_arch = "x86_64")]
 use crate::rdtsc::Rdtsc;
-#[cfg(target_arch = "x86_64")]
 use crate::rdtsc::RdtscResult;
+
+/// Static stream role of a Tool, independent of mutable run configuration.
+///
+/// This pure declaration is not serialized. A composing Tool must explicitly
+/// propagate its inner role; absence of a declaration is not a plain stream.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ToolStreamRole {
+    /// The stream contract is not known.
+    #[default]
+    Unknown,
+    /// No binary recording or replay stream is interpreted.
+    Plain,
+    /// Produces a binary stream.
+    BinaryRecord,
+    /// Interprets a binary stream.
+    BinaryReplay,
+}
 
 /// Whether code running in the observed address space creates execution only
 /// through the backend's managed runtime.
@@ -154,6 +170,44 @@ pub trait GlobalTool: Send + Sync + Default {
     /// Initialize the tool, allocating the global state.
     async fn init_global_state(_cfg: &Self::Config) -> Self {
         Default::default()
+    }
+
+    /// Install the backend-owned local input registry before guest creation.
+    /// The handle is never part of Config, RPC, or serialized thread state.
+    fn install_reserved_input_control(
+        &mut self,
+        _control: crate::reserved_input::ReservedInputControl,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
+    /// Observe a native task incarnation before logical retirement can name it.
+    /// Called synchronously outside all registry locks.
+    fn on_reserved_input_task(
+        &self,
+        _task: crate::reserved_input::InputTaskRegistration,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
+    /// Admit physical initial facts before callbacks can expose a target image.
+    /// The default does not certify an environment for private input.
+    fn admit_reserved_input_initial_state(
+        &self,
+        _facts: &crate::reserved_input::InputNativeFacts,
+    ) -> Result<crate::reserved_input::InputAdmission, Error> {
+        Ok(crate::reserved_input::InputAdmission::Unqualified(
+            crate::reserved_input::InputUnavailable::new("input-native-state-not-admitted"),
+        ))
+    }
+
+    /// Observe actual target-image setup, including unsuccessful qualification.
+    /// A launch bootstrap is not a target image. No default or Drop path emits it.
+    fn on_reserved_input_setup(
+        &self,
+        _receipt: crate::reserved_input::InputSetupReceipt,
+    ) -> Result<(), Error> {
+        Ok(())
     }
 
     /// Offer the actual launcher-created input before sharing this run's global
@@ -314,6 +368,24 @@ pub trait GlobalTool: Send + Sync + Default {
     /// cleanup possible for requests that were admitted but did not complete.
     async fn receive_rpc(&self, _from: Tid, _message: Self::Request) -> Self::Response;
 
+    /// [`GlobalTool::receive_rpc`] for a request that arrived on a connection
+    /// whose opening process the transport identified, for a coordinator that
+    /// asked for that (`reverie_rpc_transport::RpcServer::require_connection_identity`).
+    /// `identity` names the process that opened the connection; see
+    /// [`ConnectionIdentity`] for what it does and does not prove.
+    ///
+    /// The default ignores `identity` and forwards to
+    /// [`GlobalTool::receive_rpc`], so a tool that does not use it behaves as
+    /// before.
+    async fn receive_rpc_with_identity(
+        &self,
+        from: Tid,
+        message: Self::Request,
+        _identity: ConnectionIdentity,
+    ) -> Self::Response {
+        self.receive_rpc(from, message).await
+    }
+
     /// Reports a fatal backend failure before cleanup can wait on another Tool
     /// callback. This is a failed run, not a guest exit, signal, or RPC reply.
     /// Implementations must finish their terminal transition synchronously,
@@ -362,6 +434,32 @@ pub trait GlobalTool: Send + Sync + Default {
     /// must not panic, must not wait for guest progress, and must not modify
     /// the guest. The default does nothing. Only the ptrace backend calls it.
     fn on_fatal_signal_exit(&self, _exit: &FatalSignalExit) {}
+
+    /// Receives an access that a hardware watchpoint caught
+    /// ([`Guest::set_watchpoints`](crate::Guest::set_watchpoints)). Hits of
+    /// one thread arrive in the order the thread made the accesses.
+    ///
+    /// The call runs synchronously on the tracing thread of the accessing
+    /// thread while that thread is stopped, between two of its instructions,
+    /// so its host time stalls the guest. Hits of different threads can be
+    /// reported at the same time on different tracing threads, so their order
+    /// across threads is the host's unless the Tool runs one guest thread at
+    /// a time ([`Tool::enforces_serialized_execution`](crate::Tool::enforces_serialized_execution));
+    /// the method must be safe to call concurrently. It is not a Tool
+    /// callback: nothing is injected, no request is sent and the guest is not
+    /// modified. The method must be bounded, must not panic, must not wait
+    /// for guest progress and must not take a lock that a Tool callback holds
+    /// across an `await`; the default does nothing. Only the ptrace backend
+    /// calls it.
+    ///
+    /// [`WatchHit::sigtrap`](crate::WatchHit::sigtrap) says whether the hit's
+    /// SIGTRAP may have changed the guest's SIGTRAP mask bit or action.
+    ///
+    /// The hit's stop is one the Tool does not observe, so the thread's
+    /// timer event is finished as it would have been without it, where
+    /// [`Guest::watch_hits_keep_timer_events`](crate::Guest::watch_hits_keep_timer_events)
+    /// holds.
+    fn on_watchpoint_hit(&self, _hit: &crate::WatchHit) {}
 
     /// Waits until this run cannot continue faithfully. Each call must subscribe
     /// independently: multiple Tool callbacks and the scheduler may be waiting.
@@ -675,11 +773,71 @@ pub trait Tool: Send + Sync + Default {
         Default::default()
     }
 
+    /// Pure static role of this Tool's stream, independent of Config booleans.
+    fn stream_role() -> ToolStreamRole {
+        ToolStreamRole::Unknown
+    }
+
+    /// Pure opt-in to synchronous final-native-call observations. The default
+    /// performs no additional native queries or descriptor pinning.
+    fn observes_native_syscalls(_cfg: &<Self::GlobalState as GlobalTool>::Config) -> bool {
+        false
+    }
+
+    /// Observe an actual request after all guest-capable preparation and before
+    /// native issue. The provider cannot inject, resume or await. Returned
+    /// cookies are retained by the backend, independently of callback lifetime.
+    fn observe_native_syscall(
+        &self,
+        _state: &Self::ThreadState,
+        _facts: &dyn crate::native_syscall::NativeSyscallFacts,
+        _call: &crate::native_syscall::NativeSyscallCall,
+    ) -> Result<Option<std::sync::Arc<dyn crate::native_syscall::NativeSyscallObserver>>, Error>
+    {
+        Ok(None)
+    }
+
+    /// Operational facility admission before global initialization or launch.
+    /// Backends call this explicitly; subscription queries must remain pure.
+    fn facility_admission(_cfg: &<Self::GlobalState as GlobalTool>::Config) -> Result<(), Error> {
+        Ok(())
+    }
+
+    /// Pure request for one fixed private input page, or no mapping at all.
+    /// Backends additionally require serialized execution before enabling it.
+    fn reserved_input_requirement(
+        _cfg: &<Self::GlobalState as GlobalTool>::Config,
+    ) -> Option<crate::reserved_input::ReservedInputRequirement> {
+        None
+    }
+
     /// Events the tool subscribes to. This is only called *once* for the entire
     /// tree. By default, all syscalls are traced (but CPUID/RDTSC instructions
     /// are not).
     fn subscriptions(_cfg: &<Self::GlobalState as GlobalTool>::Config) -> Subscription {
         Subscription::all_syscalls()
+    }
+
+    /// What this tool needs from whichever cell runs it: unmonitored
+    /// window tolerance, instruction classes beyond
+    /// [`Tool::subscriptions`], lifecycle guarantees, placement, debugger
+    /// coexistence, and density. See [`crate::selection`].
+    ///
+    /// This is only called once for the entire tree, next to
+    /// `subscriptions`, and is pure like it. The default is the strictest
+    /// reading: where a host runs selection admission, a tool that says
+    /// nothing gets reference semantics or a typed refusal — never a
+    /// window or weaker lifecycle it did not declare. Collecting the
+    /// value alone enforces nothing; enforcement happens in
+    /// [`selection::admit`](crate::selection::admit). Relaxation is
+    /// explicit and appears in run reports.
+    ///
+    /// These are guest-behaviour requirements, not event interests: they
+    /// are never inferred from (or relaxed by) syscall subscriptions.
+    fn requirements(
+        _cfg: &<Self::GlobalState as GlobalTool>::Config,
+    ) -> crate::selection::ToolRequirements {
+        crate::selection::ToolRequirements::default()
     }
 
     /// Declare native executor ownership for Tool code running in the observed
@@ -817,6 +975,31 @@ pub trait Tool: Send + Sync + Default {
         Ok(())
     }
 
+    /// Called once an `execve` or `execveat` this Tool injected can no longer
+    /// fail, on a backend that carries the exec out itself rather than through
+    /// a host kernel exec (today the KVM backend). The backend has finished
+    /// every step that could fail: it has read the path, the argument strings
+    /// and the environment strings out of guest memory and validated the new
+    /// image. The old image's memory is still this guest's, and the image is
+    /// replaced only after this returns; `handle_post_exec` then follows in
+    /// the new image, and the injection does not return. This is the point
+    /// Linux's `begin_new_exec` reaches past `point_of_no_return`, where
+    /// `exec_mmap` runs `exec_mm_release` on the old address space
+    /// (`fs/exec.c`), after `do_execveat_common` has copied the strings. A
+    /// Tool that models what Linux does to the old image there, such as the
+    /// robust-futex walk `futex_exec_release` makes, does it here, where the
+    /// strings the new image receives can no longer change.
+    ///
+    /// The handler may read and write guest memory and its own state. It must
+    /// not inject a syscall: the backend refuses one and the run fails. Other
+    /// threads of the process have not been stopped yet; a Tool that runs one
+    /// thread at a time already holds them off. An exec that fails never
+    /// reaches this point, and a backend whose exec is the host kernel's
+    /// (ptrace, for one) does not call it. An error fails the run.
+    async fn handle_exec_commit<T: Guest<Self>>(&self, _guest: &mut T) -> Result<(), Errno> {
+        Ok(())
+    }
+
     /// The tool receives an event from the guest, via the Reverie program
     /// instrumentation. A Reverie syscall handler fires in the moment *before* a
     /// guest syscall executes (like a "prehook").
@@ -843,15 +1026,28 @@ pub trait Tool: Send + Sync + Default {
     /// NOTE:
     ///  * This is never called by default unless cpuid events are subscribed
     ///    to.
-    ///  * This is only available on x86_64.
-    #[cfg(target_arch = "x86_64")]
+    ///  * Delivered only where instruction faulting is admitted
+    ///    (x86_64 today); other architectures refuse the subscription.
     async fn handle_cpuid_event<T: Guest<Self>>(
         &self,
         _guest: &mut T,
         eax: u32,
         ecx: u32,
     ) -> Result<raw_cpuid::CpuIdResult, Errno> {
-        Ok(raw_cpuid::cpuid!(eax, ecx))
+        #[cfg(target_arch = "x86_64")]
+        {
+            Ok(raw_cpuid::cpuid!(eax, ecx))
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = (eax, ecx);
+            Ok(raw_cpuid::CpuIdResult {
+                eax: 0,
+                ebx: 0,
+                ecx: 0,
+                edx: 0,
+            })
+        }
     }
 
     /// rdtsc/rdtscp is trapped, the tool should implement this function to
@@ -860,8 +1056,8 @@ pub trait Tool: Send + Sync + Default {
     /// NOTE:
     ///  * This is never called by default unless rdtsc events are subscribed
     ///    to.
-    ///  * This is only available on x86_64.
-    #[cfg(target_arch = "x86_64")]
+    ///  * Delivered only where instruction faulting is admitted
+    ///    (x86_64 today); other architectures refuse the subscription.
     async fn handle_rdtsc_event<T: Guest<Self>>(
         &self,
         _guest: &mut T,

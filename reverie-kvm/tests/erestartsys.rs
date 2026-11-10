@@ -26,6 +26,7 @@ use reverie::Errno;
 use reverie::Guest;
 use reverie::Tool;
 use reverie::syscalls::Syscall;
+use reverie::syscalls::SyscallInfo;
 use reverie_kvm::GuestMemory;
 use reverie_kvm::KvmBackend;
 use reverie_kvm::SyscallRequest;
@@ -155,4 +156,80 @@ fn erestartsys_restarts_repeatedly_until_the_tool_settles() {
         3,
         "the restart must repeat while the tool keeps returning ERESTARTSYS",
     );
+}
+
+/// The class `RestartClassOnceTool` returns from its first call, and the
+/// `(syscall number, rdi)` of every call it saw. Only
+/// `other_restart_classes_take_the_linux_no_handler_rule` uses them.
+static RESTART_CLASS: AtomicUsize = AtomicUsize::new(0);
+static RESTART_CLASS_CALLS: std::sync::Mutex<Vec<(usize, usize)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Returns `RESTART_CLASS` once, then settles.
+#[derive(Default)]
+struct RestartClassOnceTool;
+
+#[reverie::tool]
+impl Tool for RestartClassOnceTool {
+    type GlobalState = ();
+    type ThreadState = ();
+
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        _guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, reverie::Error> {
+        let (number, args) = syscall.into_parts();
+        let mut calls = RESTART_CLASS_CALLS.lock().unwrap();
+        calls.push((number as usize, args.arg0));
+        if calls.len() == 1 {
+            return Err(Errno::new(RESTART_CLASS.load(Ordering::SeqCst) as i32).into());
+        }
+        Ok(SETTLED_RESULT)
+    }
+}
+
+/// This transport delivers no signals, so every restart class takes Linux's
+/// no-handler rule (arch/x86/kernel/signal.c, v6.17,
+/// `arch_do_signal_or_restart`): `ERESTARTNOINTR` and `ERESTARTNOHAND` re-run
+/// the same syscall, as `ERESTARTSYS` does, and `ERESTART_RESTARTBLOCK` runs
+/// `restart_syscall` with the interrupted call's argument registers.
+#[test]
+fn other_restart_classes_take_the_linux_no_handler_rule() {
+    if !kvm_available("other_restart_classes_take_the_linux_no_handler_rule") {
+        return;
+    }
+    const MARKER: u64 = 0x5150;
+    let getpid = libc::SYS_getpid as usize;
+    let restart = libc::SYS_restart_syscall as usize;
+    let marker = MARKER as usize;
+    for (class, second) in [
+        (libc::EINTR as usize, None),
+        (513, Some((getpid, marker))),
+        (514, Some((getpid, marker))),
+        (516, Some((restart, marker))),
+    ] {
+        RESTART_CLASS.store(class, Ordering::SeqCst);
+        RESTART_CLASS_CALLS.lock().unwrap().clear();
+        let mut backend = KvmBackend::new(MEMORY_SIZE).unwrap();
+        backend
+            .install_syscall(
+                ENTRY_POINT,
+                FRAME_ADDRESS,
+                SyscallRequest::new(libc::SYS_getpid as u64, [MARKER, 0, 0, 0, 0, 0]),
+            )
+            .unwrap();
+        futures::executor::block_on(
+            backend.run_with_tool::<RestartClassOnceTool, _>((), null_executor),
+        )
+        .unwrap();
+        // EINTR is an ordinary result: the control that the first call alone
+        // happens when nothing asks for a restart.
+        let expected: Vec<_> = std::iter::once((getpid, marker)).chain(second).collect();
+        assert_eq!(
+            *RESTART_CLASS_CALLS.lock().unwrap(),
+            expected,
+            "restart class {class}"
+        );
+    }
 }

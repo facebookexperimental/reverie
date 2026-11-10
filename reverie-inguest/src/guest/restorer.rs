@@ -1402,7 +1402,10 @@ mod tests {
     /// file holding the same bytes is refused, read-only or writable. And the
     /// C library's own mapping is refused once `MADV_DONTFORK` marks it (a
     /// fork child would lose it), checked in a child process so this test
-    /// process keeps its C library across later forks.
+    /// process keeps its C library across later forks. Needs a dynamic
+    /// glibc executable to introspect; a static binary has no dynamic
+    /// section and no glibc restorer to recognize.
+    #[cfg(all(target_arch = "x86_64", target_env = "gnu"))]
     #[test]
     fn only_the_c_librarys_own_mapping_qualifies() {
         record_libc_identity().unwrap();
@@ -1946,7 +1949,9 @@ mod tests {
     /// glibc's own restorer, as `sigaction` installs it, is accepted; its
     /// bytes copied to a heap buffer or to an anonymous executable mapping,
     /// the runtime's private restorer, and another address in the C library
-    /// are each refused.
+    /// are each refused. Needs a dynamic glibc executable (see
+    /// `only_the_c_librarys_own_mapping_qualifies`).
+    #[cfg(all(target_arch = "x86_64", target_env = "gnu"))]
     #[test]
     fn only_glibc_restorer_in_the_c_library_is_accepted() {
         record_libc_identity().unwrap();

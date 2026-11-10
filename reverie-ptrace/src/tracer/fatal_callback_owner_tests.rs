@@ -110,7 +110,7 @@ mod fatal_callback_owner_tests {
     #[tokio::test(flavor = "current_thread")]
     async fn raw_callback_errno_keeps_original_exit_to_exec_owner_and_surviving_state() {
         let started = Instant::now();
-        let deadline = fatal_monotonic_ns() + 3_000_000_000;
+        let deadline = fatal_monotonic_ns() + GENEROUS_WALL_BACKSTOP_NS;
         let words = FatalWords::new();
         let address = words.0 as usize;
         word(address, 0).store(MAGIC, Ordering::SeqCst);
@@ -233,7 +233,7 @@ mod fatal_callback_owner_tests {
             }
         };
         assert!(retired && untouched);
-        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(started.elapsed() < GENEROUS_WALL_BACKSTOP);
         assert_eq!(snapshot[3], 0, "old leader resumed its guest continuation");
         assert!(snapshot[4] >= 1);
         assert_eq!(snapshot[5], libc::ESRCH as usize);

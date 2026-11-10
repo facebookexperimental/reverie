@@ -3,7 +3,7 @@
 [package]
 name = "reverie-process"
 description = "Deterministic async process spawning and management for the Reverie framework."
-version = "0.5.3"
+version = "0.5.5"
 authors = ["Meta Platforms"]
 edition = "2024"
 repository = "https://github.com/facebookexperimental/reverie"
@@ -18,7 +18,7 @@ categories = ["development-tools::debugging", "os::linux-apis"]
 # fork-based tests); declare it as a known cfg name so the open-source build
 # does not warn under `unexpected_cfgs`. Reflect this in the autocargo source.
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(sanitized)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(reverie_asan)', 'cfg(sanitized)'] }
 
 [dependencies]
 bincode = { version = "2", features = ["serde"] }
@@ -30,7 +30,7 @@ nix = { version = "0.30.1", features = ["dir", "event", "hostname", "inotify", "
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 syscalls = { version = "0.6.18", features = ["serde"] }
 thiserror = "2.0.18"
-tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.54.1", features = ["full", "test-util", "tracing"] }
 
 [dev-dependencies]
 num_cpus = "1.16"

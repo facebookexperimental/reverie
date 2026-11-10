@@ -17,48 +17,67 @@
 //! for this backend. First vCPU entry installs a process-wide handler that is
 //! not restored when a backend is dropped. Existing or later signal ownership
 //! conflicts cause entry errors; these checks do not make concurrent use by
-//! another library safe. SIGURG remains the separate worker-cancellation signal.
-//! See the crate README for the complete host signal requirements.
+//! another library safe. A thread that arms a preemption timer also reserves
+//! SIGSTKFLT, which the timer uses only to end `KVM_RUN`: the thread keeps it
+//! blocked outside `KVM_RUN`, so it interrupts no host call. SIGURG remains the
+//! separate worker-cancellation signal. See the crate README for the complete
+//! host signal requirements.
 
 #![cfg(target_arch = "x86_64")]
-#![cfg_attr(test, feature(thread_spawn_hook))]
 
-mod bootstrap;
 mod clock;
 mod cpuid_instruction;
-mod elf;
-mod entry;
-mod error;
-mod executor;
-mod failure;
-mod fdinfo;
-mod memory;
-pub mod native_exit_broker;
-mod provider;
-mod provider_memory;
+mod entry_driver;
+mod host_xss;
+mod preemption_timer;
 mod runtime;
-mod signal;
 mod stats;
-mod syscall;
-mod terminal_cleanup;
-mod terminal_read;
+mod step_filter;
 mod timestamp;
 mod tools;
 mod vm;
 
 #[cfg(test)]
-#[path = "../tests/support/broker_library_tests.rs"]
-mod broker_library_tests;
+#[path = "entry_cleanup_tests.rs"]
+#[allow(clippy::disallowed_methods, reason = "tests may make threads freely")]
+mod entry_cleanup_tests;
 
 #[cfg(test)]
-#[path = "../tests/support/alias_failure.rs"]
-mod alias_failure;
+#[path = "linuxemu_tests.rs"]
+#[allow(clippy::disallowed_methods, reason = "tests may make threads freely")]
+mod linuxemu_tests;
 
-pub use error::Error;
+#[cfg(test)]
+#[path = "../../reverie-linuxemu/tests/support/broker_library_tests.rs"]
+#[expect(
+    dead_code,
+    reason = "this crate's tests use only the cleanup fixture of the shared adapter"
+)]
+mod broker_library_tests;
+
+// LinuxEmu (reverie-linuxemu) and the machine it runs on (reverie-kvm-core),
+// under the names they had when they were modules of this crate.
 pub use memory::GuestMemory;
 pub use reverie::syscalls::Syscall;
 pub use reverie::syscalls::SyscallInfo;
 pub use reverie::syscalls::Sysno;
+pub use reverie_kvm_core::Error;
+use reverie_kvm_core::bootstrap;
+use reverie_kvm_core::entry;
+use reverie_kvm_core::error_ext as error;
+use reverie_kvm_core::failure;
+pub use reverie_kvm_core::host_limits::HostResource;
+use reverie_kvm_core::memory;
+use reverie_kvm_core::supervisor_thread;
+use reverie_kvm_core::syscall;
+use reverie_linuxemu::elf;
+use reverie_linuxemu::executor;
+pub use reverie_linuxemu::native_exit_broker;
+use reverie_linuxemu::provider;
+use reverie_linuxemu::signal;
+#[cfg(test)]
+use reverie_linuxemu::terminal_cleanup;
+use reverie_linuxemu::terminal_read;
 pub use runtime::KvmStack;
 pub use runtime::KvmStackGuard;
 pub use runtime::SyscallExecutor;

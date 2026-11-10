@@ -286,7 +286,13 @@ impl Builder {
         attr.set_precise_ip(self.precise_ip.into());
         attr.__bindgen_anon_2.wakeup_events = 1; // generate a wakeup (overflow) after one sample event
         if self.sample_time {
-            attr.sample_type = perf::PERF_SAMPLE_TIME as u64;
+            #[allow(
+                clippy::unnecessary_cast,
+                reason = "the generated constant is u32 on x86_64 and u64 on aarch64"
+            )]
+            {
+                attr.sample_type = perf::PERF_SAMPLE_TIME as u64;
+            }
             attr.set_use_clockid(1);
             attr.clockid = libc::CLOCK_MONOTONIC;
         }
@@ -646,6 +652,16 @@ impl PerfCounter {
     /// Perform a fast read, which doesn't involve a syscall in the fast path.
     /// This falls back to a slow syscall read where necessary, including if
     /// fast reads weren't enabled in the `Builder`.
+    ///
+    /// The counter's thread must be switched out, as it is once a ptrace
+    /// request on its stop has returned. The page's `offset` holds the count
+    /// only from the moment the counter is switched out; while it is switched
+    /// in, `offset` lags by every event since it was switched in, and only a
+    /// nonzero `index` says so. A kernel that does not grant user space the
+    /// counter publishes `index` 0 live or not (arm64 without user access, x86
+    /// with `rdpmc` disabled), and then the read cannot detect the lag and fall
+    /// back. A ptrace stop alone is not enough: Linux wakes the tracer before
+    /// the stopping thread schedules out.
     pub fn ctr_value_fast(&self) -> Result<u64, Errno> {
         match self.mmap {
             Some(ptr) => {
@@ -657,6 +673,20 @@ impl PerfCounter {
             }
             None => self.ctr_value_fallback(),
         }
+    }
+
+    /// Whether [`PerfCounter::ctr_value_fast`] needs the counter's thread
+    /// switched out: its page does not publish a live counter's index
+    /// (`cap_user_rdpmc` clear), so a lagging `offset` cannot be detected.
+    /// `false` without fast reads, which always use `read`.
+    pub fn fast_read_needs_switch_out(&self) -> bool {
+        self.mmap.is_some_and(|page| {
+            // SAFETY: `self.mmap` is the counter's metadata page or absent;
+            // the capabilities do not change while it is mapped.
+            let caps = unsafe { (*page.as_ptr()).__bindgen_anon_1.capabilities };
+            // `cap_user_rdpmc` is bit 2 (see `ctr_value_rdpmc_loop`).
+            (caps >> 2) & 1 == 0
+        })
     }
 
     #[cold]
@@ -878,6 +908,44 @@ impl PerfCounter {
         self.fd
     }
 
+    /// Moves the perf descriptor to the lowest free number at or above
+    /// `minimum`, close-on-exec, and closes its old number. The counter's
+    /// mapping and programming belong to the open file, not to the number, so
+    /// they are unchanged. Returns the new number. When no number at or above
+    /// `minimum` can be had (`EINVAL` past `RLIMIT_NOFILE`, `EMFILE`), the
+    /// counter keeps its old number and the error is returned. When closing
+    /// the old number fails, the counter already uses the new one and that
+    /// error is returned. Either way the old number may still be open (a
+    /// seccomp filter can report success for a close it did not run), so a
+    /// caller that must know asks.
+    ///
+    /// # Safety
+    ///
+    /// No borrow of the old number (such as one from an `InGuestRcbCounter`'s
+    /// `boundary_fd`) may be live, and no other thread may use the counter.
+    pub unsafe fn move_fd_at_least(&mut self, minimum: libc::c_int) -> Result<libc::c_int, Errno> {
+        let moved = if let Some(raw_syscall) = self.raw_syscall {
+            Errno::from_ret(unsafe {
+                raw_syscall(
+                    libc::SYS_fcntl,
+                    [
+                        self.fd as u64,
+                        libc::F_DUPFD_CLOEXEC as u64,
+                        minimum as u64,
+                        0,
+                        0,
+                        0,
+                    ],
+                ) as usize
+            })? as libc::c_int
+        } else {
+            Errno::result(unsafe { libc::fcntl(self.fd, libc::F_DUPFD_CLOEXEC, minimum) })?
+        };
+        let old = std::mem::replace(&mut self.fd, moved);
+        try_close_perf_fd(old, self.raw_syscall)?;
+        Ok(moved)
+    }
+
     /// Consume terminal resources without allowing a release error to skip the
     /// other release or panic over the run's original failure. Each resource is
     /// taken before the syscall: Linux may have released an fd even when close
@@ -1047,7 +1115,7 @@ struct SampleScan {
 
 /// Count the `PERF_RECORD_SAMPLE` records from `tail` to `head` of a ring
 /// buffer, where `read_header` reads the header of the record at a position.
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64"))]
 fn count_sample_records(
     tail: u64,
     head: u64,
@@ -1675,6 +1743,80 @@ pub mod terminal_close_tests {
             std::mem::size_of_val(&value) as isize
         );
         assert_eq!(value, 42, "the exact replacement eventfd must remain open");
+    }
+}
+
+// Runs on every architecture, unlike `test` below.
+#[cfg(test)]
+mod ptrace_stop_test {
+    use nix::sys::ptrace;
+    use nix::sys::wait::WaitStatus;
+    use nix::sys::wait::waitpid;
+    use nix::unistd::ForkResult;
+    use nix::unistd::fork;
+
+    use super::*;
+
+    /// Retired branches: the architected `BR_RETIRED` on aarch64, which
+    /// lacks a generic mapping that works here (see `test`).
+    #[cfg(target_arch = "aarch64")]
+    const BRANCHES: Event = Event::Raw(0x21);
+    #[cfg(not(target_arch = "aarch64"))]
+    const BRANCHES: Event = Event::Hardware(HardwareEvent::BranchInstructions);
+
+    /// Once a ptrace request on a stop has returned, the page gives what
+    /// `read` gives, at every single step of a branching loop. Where the
+    /// kernel publishes a live counter's index (x86 with `rdpmc` enabled) the
+    /// page is never read while the counter is live, and this holds
+    /// trivially.
+    #[test]
+    fn fast_read_after_a_ptrace_request_is_current() {
+        ret_without_perf!();
+        // SAFETY: the child only makes async-signal-safe calls and spins.
+        let child = match unsafe { fork() }.expect("fork") {
+            ForkResult::Child => {
+                // Dies with this test's thread, even if an assertion fails.
+                if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } != 0
+                    || ptrace::traceme().is_err()
+                {
+                    unsafe { libc::_exit(1) };
+                }
+                let _ = nix::sys::signal::raise(Signal::SIGSTOP);
+                loop {
+                    do_branches(1);
+                }
+            }
+            ForkResult::Parent { child } => child,
+        };
+        assert!(matches!(waitpid(child, None), Ok(WaitStatus::Stopped(..))));
+        let pc = Builder::new(child.as_raw(), -1)
+            .sample_period(PerfCounter::DISABLE_SAMPLE_PERIOD)
+            .event(BRANCHES)
+            .fast_reads(true)
+            .create()
+            .expect("perf test operation should succeed");
+        pc.reset().expect("perf test operation should succeed");
+        pc.enable().expect("perf test operation should succeed");
+        let mut lagged = 0;
+        const STEPS: usize = 2000;
+        for _ in 0..STEPS {
+            ptrace::step(child, None).expect("single step");
+            assert!(matches!(waitpid(child, None), Ok(WaitStatus::Stopped(..))));
+            ptrace::getsiginfo(child).expect("the stop's siginfo");
+            // The page itself, not `ctr_value_fast`, whose debug assertion
+            // would end the test at the first lagging read.
+            let page = pc.mmap.expect("fast reads map the page");
+            // SAFETY: `page` is `pc`'s own metadata page.
+            let fast = unsafe { pc.ctr_value_fast_loop(page) }.expect("fast read");
+            let read = pc.ctr_value().expect("syscall read");
+            lagged += usize::from(fast != read);
+        }
+        let _ = nix::sys::signal::kill(child, Signal::SIGKILL);
+        let _ = waitpid(child, None);
+        assert_eq!(
+            lagged, 0,
+            "{lagged} of {STEPS} fast reads lagged the syscall read"
+        );
     }
 }
 

@@ -26,6 +26,10 @@ This implementation of the tool uses a *distributed* notion of state,
 maintaining a per-thread, per-process, and global state. Basically, this is
 an example of "MapReduce" style tracing of a process tree.
 
+The default Counter2 thread report goes through the Tool's GlobalState, so a
+coordinated caller can report even after the guest closes stderr. The process
+contributes its totals once; a thread report does not add them again.
+
 # noop: Identity Function Tool
 
 This instrumentation tool intercepts events but does nothing with them. It is

@@ -289,7 +289,7 @@ pub unsafe extern "C" fn __init_tls(aux: *mut usize) {
     if unsafe { __init_tp(tp) } < 0 {
         die(Failure::SetThreadPointer)
     }
-    // TLS initializer returned, NOT DetcoreReady or ToolRegion adopted. __init_libc
+    // TLS initializer returned, NOT ToolReady or ToolRegion adopted. __init_libc
     // must still execute SSP/security setup; constructors remain prohibited until
     // a separate genuine one-use existing-owner adoption and full initialization.
     STATE.store(3, Ordering::Release);

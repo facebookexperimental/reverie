@@ -9,40 +9,43 @@
 //! This instrumentation tool intercepts events but does nothing with them. It is
 //! useful for observing the overhead of interception, and as a starting point.
 
+#[cfg(feature = "runtime")]
 #[path = "backend.rs"]
 mod backend;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "runtime"))]
 use std::sync::atomic::AtomicUsize;
-#[cfg(test)]
+#[cfg(all(test, feature = "runtime"))]
 use std::sync::atomic::Ordering;
 
+#[cfg(feature = "runtime")]
 use clap::Parser;
-#[cfg(test)]
+#[cfg(all(test, feature = "runtime"))]
 use reverie::Error;
-#[cfg(test)]
+#[cfg(all(test, feature = "runtime"))]
 use reverie::Guest;
 use reverie::Subscription;
 use reverie::Tool;
-#[cfg(test)]
+#[cfg(all(test, feature = "runtime"))]
 use reverie::syscalls::Syscall;
+#[cfg(feature = "runtime")]
 use reverie_util::CommonToolArguments;
 
 #[derive(Debug, Default)]
 // TODO-HUMAN-REVIEW(PR-139): Review visibility for the shared LiteInst host.
-pub(crate) struct NoopTool;
+pub struct NoopTool;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "runtime"))]
 static SUBSCRIPTION_CALLS: AtomicUsize = AtomicUsize::new(0);
-#[cfg(test)]
+#[cfg(all(test, feature = "runtime"))]
 static HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 
-#[cfg(test)]
+#[cfg(all(test, feature = "runtime"))]
 fn take_subscription_calls() -> usize {
     SUBSCRIPTION_CALLS.swap(0, Ordering::SeqCst)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "runtime"))]
 fn take_handler_calls() -> usize {
     HANDLER_CALLS.swap(0, Ordering::SeqCst)
 }
@@ -53,12 +56,12 @@ impl Tool for NoopTool {
     type ThreadState = ();
 
     fn subscriptions(_cfg: &()) -> Subscription {
-        #[cfg(test)]
+        #[cfg(all(test, feature = "runtime"))]
         SUBSCRIPTION_CALLS.fetch_add(1, Ordering::SeqCst);
         Subscription::none()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "runtime"))]
     async fn handle_syscall_event<T: Guest<Self>>(
         &self,
         guest: &mut T,
@@ -69,6 +72,7 @@ impl Tool for NoopTool {
     }
 }
 
+#[cfg(feature = "runtime")]
 #[derive(Debug, Parser)]
 struct Opts {
     // TODO-HUMAN-REVIEW(PR-151): Review noop runner selection.
@@ -85,10 +89,12 @@ struct Opts {
     common: CommonToolArguments,
 }
 
+#[cfg(feature = "runtime")]
 fn main() -> anyhow::Result<()> {
     run_main(Opts::parse())
 }
 
+#[cfg(feature = "runtime")]
 fn run_main(args: Opts) -> anyhow::Result<()> {
     let log_guard = args.common.init_tracing();
     let run = backend::run_blocking::<NoopTool>(
@@ -103,11 +109,11 @@ fn run_main(args: Opts) -> anyhow::Result<()> {
     status.raise_or_exit()
 }
 
-#[cfg(all(test, target_arch = "x86_64"))]
+#[cfg(all(test, feature = "runtime", target_arch = "x86_64"))]
 #[path = "kvm_test_support.rs"]
 mod kvm_test_support;
 
-#[cfg(all(test, target_arch = "x86_64"))]
+#[cfg(all(test, feature = "runtime", target_arch = "x86_64"))]
 mod kvm_tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;

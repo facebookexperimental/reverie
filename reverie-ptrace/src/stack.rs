@@ -7,8 +7,6 @@
  */
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
 
 use reverie::Errno;
 use reverie::Pid;
@@ -32,43 +30,11 @@ const REDZONE_SIZE: usize = 128;
 // guest stack is bigger than that.
 const STACK_CAPACITY: usize = 1024 - REDZONE_SIZE;
 
-/// RAII token recording that a task's single guest stack is currently checked
-/// out. Acquiring flips the per-task flag; dropping the token -- whether from an
-/// uncommitted [`GuestStack`] or from the [`StackGuard`] that [`Stack::commit`]
-/// hands back -- clears the flag so the next `stack()` acquisition can succeed.
-///
-/// Previously the flag was cleared *only* by `StackGuard::drop`, and
-/// `StackGuard` is produced only by a successful `commit`. Because `GuestStack`
-/// had no `Drop`, any acquisition that was dropped without committing leaked the
-/// flag forever: every error path inside `commit` itself (the `EFAULT` and
-/// `write_exact` returns), a failed register read in `new`, and any early return
-/// between `stack()` and `commit()` in a consumer. The next `stack()` on that
-/// task then panicked with "already a StackGuard still alive" even though no
-/// stack was actually live. Making the checkout RAII releases the flag on every
-/// drop path while still catching a genuine *simultaneous* second checkout.
-#[derive(Debug)]
-struct StackToken {
-    flag: Arc<AtomicBool>,
-}
-
-impl StackToken {
-    /// Acquire the checkout. Returns `None` when a stack is already checked out
-    /// for this task, i.e. a real reentrant acquisition while another handle is
-    /// still alive.
-    fn acquire(flag: Arc<AtomicBool>) -> Option<Self> {
-        if flag.swap(true, Ordering::SeqCst) {
-            None
-        } else {
-            Some(StackToken { flag })
-        }
-    }
-}
-
-impl Drop for StackToken {
-    fn drop(&mut self) {
-        self.flag.store(false, Ordering::SeqCst);
-    }
-}
+#[path = "stack_frames.rs"]
+mod frames;
+use frames::CheckoutError;
+pub(crate) use frames::StackArena;
+use frames::StackToken;
 
 // keep in mind stack grows towards lower address, at least on major
 // platforms.
@@ -92,39 +58,38 @@ impl GuestStack {
             reason = "Preserve the Native constructor; production callbacks retain their existing stopped capability."
         )
     )]
-    pub fn new(pid: Pid, flag: Arc<AtomicBool>) -> Result<Self, TraceError> {
-        let token = Self::checkout(flag);
-        Self::from_stopped(Stopped::new_unchecked(pid), token)
+    pub(crate) fn new(pid: Pid, arena: Arc<StackArena>) -> Result<Self, TraceError> {
+        Self::from_stopped(Stopped::new_unchecked(pid), arena)
     }
 
     /// Retain the task's original generation and ptracer-thread authority.
     /// The caller supplies its already stopped capability, without a new PID lookup.
     pub(crate) fn new_on_ptracer_thread(
         task: Stopped,
-        flag: Arc<AtomicBool>,
+        arena: Arc<StackArena>,
     ) -> Result<Self, TraceError> {
-        let token = Self::checkout(flag);
-        Self::from_stopped(task, token)
+        Self::from_stopped(task, arena)
     }
 
-    fn checkout(flag: Arc<AtomicBool>) -> StackToken {
-        match StackToken::acquire(flag) {
-            Some(token) => token,
-            None => panic!(
-                "Invariant violation, cannot retrieve handle on guest Stack when there is already a StackGuard still alive."
-            ),
-        }
-    }
-
-    fn from_stopped(task: Stopped, token: StackToken) -> Result<Self, TraceError> {
-        // If the register read fails, `token` is dropped on this early return and
-        // the flag is released, so a later retry on the same task is not poisoned.
+    fn from_stopped(task: Stopped, arena: Arc<StackArena>) -> Result<Self, TraceError> {
+        // Read through the existing stopped capability before claiming space.
+        // A failed/foreign-owner read cannot acquire or release any frame.
         let rsp = task.getregs()?.stack_ptr() as usize;
-        let top = rsp - REDZONE_SIZE;
+        let token = match StackToken::acquire(arena, task.generation(), rsp) {
+            Ok(token) => token,
+            Err(CheckoutError::Uncommitted) => panic!(
+                "Invariant violation, cannot retrieve guest Stack while an uncommitted stack builder is still alive."
+            ),
+            Err(CheckoutError::ChangedContext) => return Err(Errno::EBUSY.into()),
+            Err(CheckoutError::AddressUnderflow | CheckoutError::IdExhausted) => {
+                return Err(Errno::EFAULT.into());
+            }
+        };
+        let top = token.top();
         Ok(GuestStack {
             top,
             sp: top,
-            capacity: STACK_CAPACITY,
+            capacity: token.capacity(),
             buf: Vec::new(),
             task: ToolMemory::new(task),
             token,
@@ -150,21 +115,18 @@ impl GuestStack {
     }
 }
 
-// We need to use the StackGuard to prevent REENTRANCY.  That is, you cannot call
-// `Stack::new` while there is still an outstanding guard.  We don't have any way to keep
-// them from colliding at the moment.
+// A committed frame cannot grow. Its token reserves its interval until Drop,
+// so a nested Tool can allocate below it without overwriting live bytes.
 #[derive(Debug)]
 // TODO: Ideally we would have some way to connect the actual `Addr` references into the
 // guest heap to the lifetime of the StackGuard (like the ST monad in Haskell).
 pub struct StackGuard {
-    // Holding the checkout token keeps the per-task flag set for as long as the
-    // committed stack data must stay live; dropping the guard releases it.
+    // This token owns only this frame, including when guards drop out of order.
     _token: StackToken,
 }
 
-// `reverie::Stack::StackGuard` requires `Drop`. The flag release itself happens
-// in the `StackToken` field's own drop glue, which runs after this; an explicit
-// (empty) impl is only needed to satisfy that trait bound.
+// `reverie::Stack::StackGuard` requires Drop. The token releases its own
+// reservation after this empty implementation.
 impl Drop for StackGuard {
     fn drop(&mut self) {}
 }
@@ -190,12 +152,12 @@ impl Stack for GuestStack {
         self.buf.reverse();
         let from =
             unsafe { core::slice::from_raw_parts(self.buf.as_ptr() as *const u8, self.size()) };
-        // Any `?` above returns early and drops `self`, releasing the checkout
-        // token so a failed commit does not poison the next acquisition. On
-        // success we transfer the token into the guard, which keeps the flag set
-        // until the caller drops the guard.
+        // A failed write drops only this uncommitted reservation. Existing
+        // frames remain reserved, and the next checkout can retry this space.
         self.task.write_exact(remote_sp, from)?;
-        Ok(StackGuard { _token: self.token })
+        Ok(StackGuard {
+            _token: self.token.commit(self.sp),
+        })
     }
 }
 
@@ -312,8 +274,8 @@ mod tests {
                 assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
                 assert!(libc::WIFSTOPPED(status));
                 assert_eq!(libc::WSTOPSIG(status), libc::SIGSTOP);
-                let flag = Arc::new(AtomicBool::new(false));
-                let mut stack = GuestStack::new(Pid::from_raw(pid), flag.clone()).unwrap();
+                let arena = Arc::new(StackArena::default());
+                let mut stack = GuestStack::new(Pid::from_raw(pid), arena.clone()).unwrap();
                 let address = AddrMut::from_raw(mapping as usize + offset).unwrap();
                 assert_eq!(
                     stack.write_with_user_access(address, b"12345678"),
@@ -339,7 +301,79 @@ mod tests {
                 expected[offset..offset + count].copy_from_slice(&b"12345678"[..count]);
                 assert_eq!(actual, expected);
                 drop(stack);
-                assert!(!flag.load(Ordering::SeqCst));
+                assert_eq!(arena.live(), 0);
+
+                // Use a controlled stack window: its lower page is protected,
+                // while the outer frame and a small inner frame are writable.
+                // A failed inner commit must not poison the arena or outer bytes.
+                let saved_regs = memory.getregs().unwrap();
+                let generation = memory.generation();
+                let mut regs = saved_regs;
+                *regs.stack_ptr_mut() = (mapping as usize + 2 * page + 256) as _;
+                memory.setregs(&regs).unwrap();
+                let mut outer =
+                    GuestStack::new_on_ptracer_thread(generation.assume_stopped(), arena.clone())
+                        .unwrap();
+                let outer_address = outer.push([0x3cu8; 16]);
+                let outer_guard = outer.commit().unwrap();
+                let mut bad =
+                    GuestStack::new_on_ptracer_thread(generation.assume_stopped(), arena.clone())
+                        .unwrap();
+                bad.reserve::<[u8; 256]>();
+                assert!(matches!(bad.commit(), Err(Errno::EFAULT)));
+                assert_eq!(arena.live(), 1);
+                let mut outer_bytes = [0u8; 16];
+                memory
+                    .read_exact(outer_address.cast(), &mut outer_bytes)
+                    .unwrap();
+                assert_eq!(outer_bytes, [0x3cu8; 16]);
+                let mut retry =
+                    GuestStack::new_on_ptracer_thread(generation.assume_stopped(), arena.clone())
+                        .unwrap();
+                let retry_address = retry.push([0x7du8; 8]);
+                let retry_guard = retry.commit().unwrap();
+                assert!(retry_address.as_raw() + 8 <= outer_address.as_raw());
+                memory
+                    .read_exact(outer_address.cast(), &mut outer_bytes)
+                    .unwrap();
+                assert_eq!(outer_bytes, [0x3cu8; 16]);
+                drop(retry_guard);
+                drop(outer_guard);
+                assert_eq!(arena.live(), 0);
+
+                // Now place the entire unchanged 896-byte arena in the final
+                // writable page. Filling it exactly succeeds; one more word
+                // fails while the outer payload remains byte-identical.
+                *regs.stack_ptr_mut() = (mapping as usize + 3 * page) as _;
+                memory.setregs(&regs).unwrap();
+                let mut full =
+                    GuestStack::new_on_ptracer_thread(generation.assume_stopped(), arena.clone())
+                        .unwrap();
+                assert_eq!(full.capacity(), STACK_CAPACITY);
+                let full_address = full.push([0x69u8; STACK_CAPACITY]);
+                let full_guard = full.commit().unwrap();
+                let overflow = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut extra = GuestStack::new_on_ptracer_thread(
+                        generation.assume_stopped(),
+                        arena.clone(),
+                    )
+                    .unwrap();
+                    assert_eq!(extra.capacity(), 0);
+                    extra.reserve::<u64>();
+                }));
+                assert!(
+                    overflow.is_err(),
+                    "aggregate capacity must not grow with nesting"
+                );
+                assert_eq!(arena.live(), 1);
+                let mut full_bytes = [0u8; STACK_CAPACITY];
+                memory
+                    .read_exact(full_address.cast(), &mut full_bytes)
+                    .unwrap();
+                assert_eq!(full_bytes, [0x69u8; STACK_CAPACITY]);
+                drop(full_guard);
+                assert_eq!(arena.live(), 0);
+                memory.setregs(&saved_regs).unwrap();
                 assert_eq!(
                     unsafe {
                         libc::ptrace(
@@ -360,58 +394,52 @@ mod tests {
         }
     }
 
-    // Regression test for the "already a StackGuard still alive" panic: a stack
-    // checkout dropped without a successful `commit` must release the per-task
-    // flag so the next acquisition does not spuriously panic. Before the RAII
-    // fix, the flag was only cleared by `StackGuard::drop`, so this sequence left
-    // it stuck set.
+    fn test_token(arena: Arc<StackArena>) -> StackToken {
+        let generation =
+            Stopped::new_unchecked(Pid::from_raw(std::process::id() as i32)).generation();
+        StackToken::acquire(arena, generation, 0x10000).unwrap()
+    }
+
     #[test]
     fn stack_token_releases_on_drop_without_commit() {
-        let flag = Arc::new(AtomicBool::new(false));
-        {
-            let _token = StackToken::acquire(flag.clone()).expect("first acquire succeeds");
-            assert!(flag.load(Ordering::SeqCst), "flag is set while checked out");
-            // Dropped here WITHOUT transferring into a StackGuard, mirroring an
-            // error path or early return between `stack()` and `commit()`.
-        }
-        assert!(
-            !flag.load(Ordering::SeqCst),
-            "flag is cleared once the uncommitted checkout drops"
-        );
-        assert!(
-            StackToken::acquire(flag).is_some(),
-            "a fresh acquisition after a dropped checkout succeeds instead of panicking"
-        );
+        let arena = Arc::new(StackArena::default());
+        let token = test_token(arena.clone());
+        assert_eq!(arena.live(), 1);
+        drop(token);
+        assert_eq!(arena.live(), 0);
+        let retry = test_token(arena.clone());
+        assert_eq!(retry.capacity(), STACK_CAPACITY);
+        drop(retry);
+        assert_eq!(arena.live(), 0);
     }
 
-    // The genuine reentrancy invariant is preserved: an overlapping second
-    // checkout is still detected while the first token is alive.
     #[test]
     fn stack_token_detects_simultaneous_checkout() {
-        let flag = Arc::new(AtomicBool::new(false));
-        let _first = StackToken::acquire(flag.clone()).expect("first acquire succeeds");
-        assert!(
-            StackToken::acquire(flag).is_none(),
-            "an overlapping checkout is refused while the first is still alive"
+        let arena = Arc::new(StackArena::default());
+        let generation =
+            Stopped::new_unchecked(Pid::from_raw(std::process::id() as i32)).generation();
+        let first = StackToken::acquire(arena.clone(), generation.clone(), 0x10000).unwrap();
+        assert_eq!(
+            StackToken::acquire(arena.clone(), generation, 0x10000).unwrap_err(),
+            CheckoutError::Uncommitted,
+            "a builder can still grow, so another checkout must be refused"
         );
+        assert_eq!(arena.live(), 1);
+        drop(first);
+        assert_eq!(arena.live(), 0);
     }
 
-    // Transferring the token into a StackGuard keeps the flag set until the guard
-    // itself drops, matching the committed-stack lifetime.
     #[test]
     fn stack_guard_holds_then_releases_flag() {
-        let flag = Arc::new(AtomicBool::new(false));
-        let token = StackToken::acquire(flag.clone()).expect("acquire succeeds");
-        let guard = StackGuard { _token: token };
-        assert!(
-            flag.load(Ordering::SeqCst),
-            "flag stays set while the guard is alive"
-        );
+        let arena = Arc::new(StackArena::default());
+        let token = test_token(arena.clone());
+        let top = token.top();
+        let guard = StackGuard {
+            _token: token.commit(top - 16),
+        };
+        assert_eq!(arena.live(), 1);
         drop(guard);
-        assert!(
-            !flag.load(Ordering::SeqCst),
-            "flag is cleared after the guard drops"
-        );
+        assert_eq!(arena.live(), 0);
     }
 
     #[test]

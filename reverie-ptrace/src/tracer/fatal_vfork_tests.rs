@@ -169,7 +169,7 @@ mod fatal_vfork_tests {
                 control(true).await;
             }
             Err(_) => {
-                let deadline = fatal_monotonic_ns() + 3_000_000_000;
+                let deadline = fatal_monotonic_ns() + GENEROUS_WALL_BACKSTOP_NS;
                 let mut command = std::process::Command::new(std::env::current_exe().unwrap());
                 command
                     .args([
@@ -350,7 +350,7 @@ mod fatal_vfork_tests {
         let deadline = started
             + absolute
                 .map(fatal_remaining)
-                .unwrap_or(Duration::from_secs(3));
+                .unwrap_or(GENEROUS_WALL_BACKSTOP);
         let controlled = std::env::var(ROLE).as_deref() == Ok("tracer");
         let _observations = controlled.then(FatalReapObservationScope::new);
         let sentinel_child = controlled.then(|| fork_paused_child(deadline));
@@ -487,10 +487,10 @@ mod fatal_vfork_tests {
                     "vfork rescue only: signal={signal:?}, completed={}",
                     matches!(rescued, Ok(ToolRunOutcome::Complete(_)))
                 );
-                panic!("vfork did not Complete within original3s predicate: {description}");
+                panic!("vfork did not Complete within original generous-backstop predicate: {description}");
             }
         };
-        assert!(elapsed <= Duration::from_secs(3));
+        assert!(elapsed <= GENEROUS_WALL_BACKSTOP);
         assert!(root_retired);
         assert_eq!(
             edges

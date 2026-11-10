@@ -1,7 +1,32 @@
 name: Rust
 
+# Owner decision, 2026-10-27: run CI automatically only for pull requests not
+# opened by the project bot (hermit-bot3). The hosted `regular` job runs for
+# such a pull request once it is out of draft, from a branch or a fork; it uses
+# no secrets and the read-only token below. The self-hosted `hardware` job runs
+# for a pull request only when the owner opened it, its head branch is in this
+# repository (not a fork), and it is not a draft: a third party's code must not
+# run unreviewed on the PMU hosts, and an owner-opened pull request from someone
+# else's fork would otherwise run every later push from that fork there.
+# The producer-only `allocator-fixtures` job is deliberately broader: it
+# runs on every non-draft pull request, bot-authored included, because the
+# allocator-fixture producer otherwise went dark while its compiled cohort
+# drifted. It is hosted, uses no secrets, and is best-effort signal only:
+# local validation (`validate.sh`, which hard-fails on a producer refusal)
+# and its ledger remain the gate; no GitHub check is a required status check.
 on:
   workflow_dispatch:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+# One run per pull request: a newer push cancels the older run, so pushes do
+# not queue up on the small self-hosted pool. Dispatches keep their own group.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -10,6 +35,7 @@ env:
 jobs:
   regular:
     name: Regular tests (GitHub-hosted)
+    if: github.event_name != 'pull_request' || (github.event.pull_request.user.login != 'hermit-bot3' && !github.event.pull_request.draft)
     runs-on: ubuntu-latest
 
     steps:
@@ -17,7 +43,11 @@ jobs:
       with:
         submodules: false
     - name: Dependencies
-      run: sudo apt-get install -y libunwind-dev liblzma-dev cmake zlib1g-dev
+      # Refresh the index first: the runner image's index can name package
+      # versions the mirror no longer serves, and install then fails with 404.
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libunwind-dev liblzma-dev cmake zlib1g-dev
     - name: Establish ordinary-user namespace prerequisite
       id: userns
       timeout-minutes: 1
@@ -65,24 +95,23 @@ jobs:
         fi
         echo 'Namespace probe passed after the controlled restriction change.'
     - name: Rust toolchain
-      id: toolchain
-      uses: dtolnay/rust-toolchain@nightly
-      with:
-        components: clippy, rustfmt
+      run: |
+        if ! command -v rustup >/dev/null 2>&1; then
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+          export PATH="$HOME/.cargo/bin:$PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+        fi
+        channel="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml | head -n 1)"
+        rustup toolchain install "$channel" --profile minimal --component clippy --component rustfmt
+        rustc --version
     - name: Cross-client skill discovery
       run: |
         rustc scripts/check-skill-discovery.rs -o "$RUNNER_TEMP/check-skill-discovery"
         "$RUNNER_TEMP/check-skill-discovery"
-    # reverie-dbt/build.rs compiles the vendored DynamoRIO source on first use.
-    # Cache the content-addressed install tree; both the Actions key and the
-    # restored directory require the exact vendored source + recipe content.
-    - name: Cache DynamoRIO build
-      uses: actions/cache@v4
-      with:
-        path: target/*/reverie-dbt-native-cache/dynamorio-install-*
-        key: dynamorio-${{ runner.os }}-${{ hashFiles('reverie-dbt/vendor/dynamorio/**', 'reverie-dbt/build.rs') }}
     - name: Build
-      run: cargo build --workspace --all-features
+      run: |
+        source scripts/stable-features.sh
+        cargo build --workspace --features "${STABLE_FEATURES}"
     - name: LiteInst allocator fixtures
       timeout-minutes: 10
       run: |
@@ -91,43 +120,44 @@ jobs:
         generation="$RUNNER_TEMP/liteinst-allocator-$GITHUB_JOB-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
         scripts/build-liteinst-test-runtime.rs --for-ci "$generation"
         cat "$generation/bundle/github.env" >> "$GITHUB_ENV"
-    - name: DBT virtual identity and pidfd_open policy
-      run: reverie-dbt/scripts/test-identity-policy.sh
     - name: Test regular workspace cases
-      run: >-
-        cargo test --workspace --exclude reverie-kvm --exclude reverie-inguest --all-features --no-fail-fast --
-        --test-threads=1
-        --skip container::tests::bind_to_low_port
-        --skip container::tests::mount_error_from_child_is_returned
-        --skip container::tests::test_directory_is_available_after_mount
-        --skip container::tests::pin_affinity_to_all_cores
-        --skip tests::domainname
-        --skip tests::hostname
-        --skip tests::local_networking_loopback_flags
-        --skip tests::local_networking_ping
-        --skip tests::local_networking_there_can_be_only_one
-        --skip tests::mount_and_move_tmpfs
-        --skip tests::mount_bind
-        --skip tests::mount_bind_readonly_rejects_writes
-        --skip tests::mount_devpts_basic
-        --skip tests::mount_devpts_isolated
-        --skip tests::mount_proc
-        --skip tests::mount_tmpfs
-        --skip tests::pid_namespace
-        --skip tests::port_isolation
-        --skip tests::seccomp_notify
+      run: |
+        source scripts/stable-features.sh
+        cargo test --workspace --exclude reverie-kvm --exclude reverie-kvm-core --exclude reverie-linuxemu --exclude reverie-inguest --features "${STABLE_FEATURES_REGULAR}" --no-fail-fast -- \
+        --test-threads=1 \
+        --skip container::tests::bind_to_low_port \
+        --skip container::tests::mount_error_from_child_is_returned \
+        --skip container::tests::test_directory_is_available_after_mount \
+        --skip container::tests::pin_affinity_to_all_cores \
+        --skip tests::domainname \
+        --skip tests::hostname \
+        --skip tests::local_networking_loopback_flags \
+        --skip tests::local_networking_ping \
+        --skip tests::local_networking_there_can_be_only_one \
+        --skip tests::mount_and_move_tmpfs \
+        --skip tests::mount_bind \
+        --skip tests::mount_bind_readonly_rejects_writes \
+        --skip tests::mount_devpts_basic \
+        --skip tests::mount_devpts_isolated \
+        --skip tests::mount_proc \
+        --skip tests::mount_tmpfs \
+        --skip tests::pid_namespace \
+        --skip tests::port_isolation \
+        --skip tests::seccomp_notify \
         --skip tests::uid_namespace
     - name: Documentation tests
       run: cargo test --workspace --doc
     - name: Clippy
-      run: cargo clippy --workspace --all-targets --all-features
+      run: |
+        source scripts/stable-features.sh
+        cargo clippy --workspace --all-targets --features "${STABLE_FEATURES}"
     - name: Format
       run: cargo fmt --all -- --check
     # The cross-backend check on every backend that needs no device. A hosted
     # runner's environment has no ledger, so its verdicts are reported, not
     # judged (reverie-examples/e2e/README.md).
     - name: Reverie-layer cross-backend e2e (no device)
-      run: reverie-examples/e2e/run.sh --backends ptrace,liteinst,in-guest-trap,e9patch,dbt,sabre
+      run: reverie-examples/e2e/run.sh --backends ptrace,liteinst,in-guest-trap
     - name: Restore hosted-runner namespace restriction
       if: ${{ always() && steps.userns.outputs.restore_required == 'true' }}
       timeout-minutes: 1
@@ -143,6 +173,40 @@ jobs:
         sudo -n sysctl -w "kernel.apparmor_restrict_unprivileged_userns=$ORIGINAL_RESTRICTION"
         [[ $(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns) == "$ORIGINAL_RESTRICTION" ]]
         echo "Restored namespace restriction to recorded value $ORIGINAL_RESTRICTION."
+
+  allocator-fixtures:
+    name: LiteInst allocator fixtures (producer)
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: false
+    - name: Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libunwind-dev liblzma-dev cmake zlib1g-dev
+    - name: Rust toolchain
+      run: |
+        if ! command -v rustup >/dev/null 2>&1; then
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+          export PATH="$HOME/.cargo/bin:$PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+        fi
+        channel="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml | head -n 1)"
+        rustup toolchain install "$channel" --profile minimal
+        rustc --version
+    - name: Fetch locked dependencies
+      run: cargo fetch --locked
+    - name: LiteInst allocator fixtures (producer)
+      timeout-minutes: 20
+      run: |
+        set -euo pipefail
+        cargo install --locked rust-script
+        generation="$RUNNER_TEMP/liteinst-allocator-$GITHUB_JOB-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+        scripts/build-liteinst-test-runtime.rs --for-ci "$generation"
 
   hardware:
     name: Host-dependent tests (self-hosted)
@@ -166,7 +230,9 @@ jobs:
           ) ||
           (
             github.event_name == 'pull_request' &&
-            github.event.pull_request.user.login == 'rrnewton'
+            github.event.pull_request.user.login == 'rrnewton' &&
+            github.event.pull_request.head.repo.full_name == github.repository &&
+            !github.event.pull_request.draft
           )
         )
       }}
@@ -184,7 +250,7 @@ jobs:
     #
     # This 10-minute budget assumes the WARM self-hosted cache (incremental build
     # + ~2min tests) that is the steady state on a persistent runner. A COLD
-    # DynamoRIO/workspace build can exceed 10 min; per policy that overflow is a
+    # A workspace build can exceed 10 min; per policy that overflow is a
     # surfaced FINDING, not a reason to pre-emptively raise the bound -- the
     # informative watchdog below attributes exactly which step overran and for how
     # long, so a cold-build overflow is diagnosable rather than a bare timeout.
@@ -233,9 +299,19 @@ jobs:
           sudo apt-get install -y libunwind-dev liblzma-dev cmake zlib1g-dev
         fi
     - name: Rust toolchain
-      uses: dtolnay/rust-toolchain@nightly
+      run: |
+        if ! command -v rustup >/dev/null 2>&1; then
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+          export PATH="$HOME/.cargo/bin:$PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+        fi
+        channel="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml | head -n 1)"
+        rustup toolchain install "$channel" --profile minimal
+        rustc --version
     - name: Build
-      run: cargo build --workspace --all-features
+      run: |
+        source scripts/stable-features.sh
+        cargo build --workspace --features "${STABLE_FEATURES}"
     - name: LiteInst allocator fixtures
       timeout-minutes: 10
       run: |
@@ -262,7 +338,8 @@ jobs:
           --soft-deadline 300 --hard-box 540 &
         watchdog=$!
         set +e
-        cargo test --workspace --all-features -- --test-threads=1
+        source scripts/stable-features.sh
+        cargo test --workspace --features "${STABLE_FEATURES}" -- --test-threads=1
         status=$?
         kill "$watchdog" 2>/dev/null || true
         wait "$watchdog" 2>/dev/null || true

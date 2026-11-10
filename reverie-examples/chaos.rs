@@ -22,8 +22,9 @@ use serde::Deserialize;
 use serde::Serialize;
 
 // TODO-HUMAN-REVIEW(PR-157): Review crate-local reuse of the production chaos config.
+/// Configuration shared by the public Chaos Tool and its caller runtime.
 #[derive(Parser, Debug, Serialize, Deserialize, Clone, Default, Eq, PartialEq)]
-pub(crate) struct ChaosOpts {
+pub struct ChaosOpts {
     /// Skips the first N syscalls of a process before doing any intervention.
     /// This is useful when you need to skip past an error caused by the tool.
     #[clap(long, value_name = "N", default_value = "0")]
@@ -44,13 +45,7 @@ pub(crate) struct ChaosOpts {
 
 impl ChaosOpts {
     // TODO-HUMAN-REVIEW(PR-157): Review the narrow LiteInst config constructor API.
-    #[allow(dead_code)]
-    pub(crate) fn for_liteinst(
-        skip: Option<u64>,
-        no_read: bool,
-        no_recv: bool,
-        no_interrupt: bool,
-    ) -> Self {
+    pub fn new(skip: Option<u64>, no_read: bool, no_recv: bool, no_interrupt: bool) -> Self {
         Self {
             skip: skip.unwrap_or_default(),
             no_read,
@@ -58,11 +53,21 @@ impl ChaosOpts {
             no_interrupt,
         }
     }
+
+    pub fn for_liteinst(
+        skip: Option<u64>,
+        no_read: bool,
+        no_recv: bool,
+        no_interrupt: bool,
+    ) -> Self {
+        Self::new(skip, no_read, no_recv, no_interrupt)
+    }
 }
 
 // TODO-HUMAN-REVIEW(PR-157): Review crate-local reuse of the production chaos tool.
+/// The shared Chaos Tool, including its syscall count and intervention policy.
 #[derive(Debug, Default)]
-pub(crate) struct ChaosTool {
+pub struct ChaosTool {
     count: AtomicU64,
 }
 
@@ -75,8 +80,9 @@ impl Clone for ChaosTool {
 }
 
 // TODO-HUMAN-REVIEW(PR-157): Review crate-local reuse of the chaos global state.
+/// Global state and typed configuration for the shared Chaos Tool.
 #[derive(Debug, Default, Clone)]
-pub(crate) struct ChaosToolGlobal {}
+pub struct ChaosToolGlobal {}
 
 #[reverie::global_tool]
 impl GlobalTool for ChaosToolGlobal {

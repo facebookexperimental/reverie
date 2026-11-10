@@ -202,7 +202,7 @@ impl Running {
             ready.clone(),
         )
         .unwrap();
-        server.set_connection_admission(auth.clone());
+        server.set_connection_admission(auth.clone()).unwrap();
         let issues = server.retain_connection_issues();
         server.set_initial_image_admission(auth).unwrap();
         let task = tokio::spawn(server.serve());
@@ -551,7 +551,7 @@ async fn initial_mode_requires_watcher_and_retained_issue_monitor_and_ordinary_i
     let mut server = RpcServer::bind(&path, Arc::new(Echo::default()), CONFIG.to_string()).unwrap();
     let auth = Arc::new(TestAuthorization::new(false));
     assert!(server.set_initial_image_admission(auth.clone()).is_err());
-    server.set_connection_admission(auth.clone());
+    server.set_connection_admission(auth.clone()).unwrap();
     assert!(server.set_initial_image_admission(auth).is_err());
     let monitor_only_path = self::path("monitor-only");
     let mut monitor_only = RpcServer::bind(

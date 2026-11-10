@@ -49,6 +49,9 @@ use crate::image::ImageError;
 use crate::image::PAGE_SIZE;
 use crate::image::Policy;
 use crate::image::ValidatedImage;
+use crate::manifest::InitContract;
+use crate::manifest::ManifestError;
+use crate::manifest::ToolManifest;
 
 /// Reverie's in-guest `ToolRegion` reservation, which both windows lie in.
 pub const TOOL_REGION: Range<u64> = 0x6000_0000_0000..0x6001_0000_0000;
@@ -103,6 +106,7 @@ const _: () = assert!(disjoint(&LOADER_WINDOW, &RUNTIME_WINDOW));
 
 /// Why a built image may not be mapped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ArtifactError {
     /// The image failed parsing or validation.
     Image(ImageError),
@@ -117,6 +121,15 @@ pub enum ArtifactError {
     NoGateSyscall {
         /// The gate's first address.
         gate: u64,
+    },
+    /// The manifest the image was checked against is not internally
+    /// consistent.
+    Manifest(ManifestError),
+    /// The manifest's init address is not inside an executable segment
+    /// of the image.
+    InitNotExecutable {
+        /// The init address.
+        address: u64,
     },
 }
 
@@ -172,6 +185,56 @@ fn check_gate(image: &ValidatedImage<'_>, gate: &Range<u64>) -> Result<(), Artif
     } else {
         Err(ArtifactError::NoGateSyscall { gate: gate.start })
     }
+}
+
+impl From<ManifestError> for ArtifactError {
+    fn from(error: ManifestError) -> Self {
+        Self::Manifest(error)
+    }
+}
+
+/// Checks `bytes` against a tool manifest: the manifest must
+/// [`validate`](ToolManifest::validate), the image must pass [`check`]
+/// under the manifest's policy and declared gates, and an
+/// [`InitContract::Address`] must lie inside an executable segment of
+/// the image (an [`InitContract::ImageEntry`] needs no extra check —
+/// image validation already requires an executable entry). On success
+/// the image may be mapped under this manifest.
+///
+/// This form assumes the loader's own [`PAGE_SIZE`]; a launcher on a
+/// real host should call [`check_image_with_page_size`] with the
+/// host page size so an unsupported host is refused by name here,
+/// at image-check time, instead of being assumed away.
+pub fn check_image<'a>(
+    bytes: &'a [u8],
+    manifest: &ToolManifest,
+) -> Result<ValidatedImage<'a>, ArtifactError> {
+    check_image_with_page_size(bytes, manifest, PAGE_SIZE)
+}
+
+/// [`check_image`] against an explicit host page size: the manifest
+/// must [`validate_with_page_size`](ToolManifest::validate_with_page_size),
+/// so any page size other than the one this x86-64 loader maps with
+/// refuses as [`ManifestError::UnsupportedPageSize`] before the image
+/// bytes are even parsed. The size is a parameter (this crate is
+/// `no_std` and cannot ask the host) so the refused case is testable
+/// without a 64 KiB-page host.
+pub fn check_image_with_page_size<'a>(
+    bytes: &'a [u8],
+    manifest: &ToolManifest,
+    page_size: u64,
+) -> Result<ValidatedImage<'a>, ArtifactError> {
+    manifest.validate_with_page_size(page_size)?;
+    let image = check(bytes, &manifest.image.policy, manifest.gates)?;
+    if let InitContract::Address(address) = manifest.init {
+        let executable = image
+            .segments()
+            .any(|segment| segment.permissions.execute && segment.memory.contains(&address));
+        if !executable {
+            return Err(ArtifactError::InitNotExecutable { address });
+        }
+    }
+    Ok(image)
 }
 
 /// [`check`] with the loader's policy and gate.
@@ -265,6 +328,79 @@ mod tests {
         assert_eq!(
             check_loader(&bytes).map(|_| ()),
             Err(ArtifactError::Image(ImageError::OutsideWindow { index: 0 }))
+        );
+    }
+
+    #[test]
+    fn check_image_agrees_with_check_runtime_and_check_loader() {
+        use crate::manifest::LOADER_MANIFEST;
+        use crate::manifest::PROBE_RUNTIME_MANIFEST;
+        use crate::manifest::RUNTIME_MANIFEST;
+        let good = image(RX, &body(&[0x0f, 0x05, 0xc3], &[0x90]));
+        assert_eq!(check_image(&good, &RUNTIME_MANIFEST), check_runtime(&good));
+        assert_eq!(
+            check_image(&good, &PROBE_RUNTIME_MANIFEST),
+            check_runtime(&good)
+        );
+        assert_eq!(check_image(&good, &LOADER_MANIFEST), check_loader(&good));
+        let stray = image(RX, &body(&[0x0f, 0x05], &[0x0f, 0x05]));
+        assert_eq!(
+            check_image(&stray, &RUNTIME_MANIFEST),
+            check_runtime(&stray)
+        );
+        assert_eq!(
+            check_image(&[0u8; 10], &RUNTIME_MANIFEST),
+            check_runtime(&[0u8; 10])
+        );
+    }
+
+    #[test]
+    fn check_image_refuses_a_bad_manifest_and_a_non_executable_init() {
+        use crate::manifest::ManifestError;
+        use crate::manifest::RUNTIME_MANIFEST;
+        let bytes = image(RX, &body(&[0x0f, 0x05, 0xc3], &[0x90]));
+        let mut no_gates = RUNTIME_MANIFEST.clone();
+        no_gates.gates = &[];
+        assert_eq!(
+            check_image(&bytes, &no_gates).map(|_| ()),
+            Err(ArtifactError::Manifest(ManifestError::NoGates))
+        );
+        // Inside the window but in no executable segment.
+        let mut dead_init = RUNTIME_MANIFEST.clone();
+        dead_init.init = InitContract::Address(TEXT + PAGE_SIZE);
+        assert_eq!(
+            check_image(&bytes, &dead_init).map(|_| ()),
+            Err(ArtifactError::InitNotExecutable {
+                address: TEXT + PAGE_SIZE
+            })
+        );
+        // Inside the executable text segment: accepted.
+        let mut live_init = RUNTIME_MANIFEST;
+        live_init.init = InitContract::Address(TEXT);
+        assert_eq!(check_image(&bytes, &live_init).map(|_| ()), Ok(()));
+    }
+
+    #[test]
+    fn check_image_with_page_size_refuses_an_unsupported_host_by_name() {
+        use crate::manifest::ManifestError;
+        use crate::manifest::RUNTIME_MANIFEST;
+        let bytes = image(RX, &body(&[0x0f, 0x05, 0xc3], &[0x90]));
+        // A synthetic 64 KiB host page size refuses by name, before
+        // the (valid) image bytes matter; the loader's own page
+        // size accepts the same bytes.
+        assert_eq!(
+            check_image_with_page_size(&bytes, &RUNTIME_MANIFEST, 65_536).map(|_| ()),
+            Err(ArtifactError::Manifest(
+                ManifestError::UnsupportedPageSize { page_size: 65_536 }
+            ))
+        );
+        assert_eq!(
+            check_image_with_page_size(&bytes, &RUNTIME_MANIFEST, PAGE_SIZE).map(|_| ()),
+            Ok(())
+        );
+        assert_eq!(
+            check_image_with_page_size(&bytes, &RUNTIME_MANIFEST, PAGE_SIZE),
+            check_image(&bytes, &RUNTIME_MANIFEST)
         );
     }
 

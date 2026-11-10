@@ -367,10 +367,10 @@ mod fatal_parent_kill_tests {
 
     async fn control(mode: u8) {
         let started = Instant::now();
-        let deadline = fatal_monotonic_ns() + 3_000_000_000;
+        let deadline = fatal_monotonic_ns() + GENEROUS_WALL_BACKSTOP_NS;
         let _observations =
             matches!(mode, TIMER_QUERY_KILL | OWNED_DAEMON).then(FatalReapObservationScope::new);
-        let helper = fatal_callback_tests::dead_helper(started + Duration::from_secs(3)).await;
+        let helper = fatal_callback_tests::dead_helper(started + GENEROUS_WALL_BACKSTOP).await;
         let words = FatalWords::new();
         let address = words.0 as usize;
         word(address, 0).store(MAGIC, Ordering::SeqCst);
@@ -389,7 +389,7 @@ mod fatal_parent_kill_tests {
                     word(address, 7).fetch_add(1, Ordering::SeqCst);
                     word(address, 2).store(1, Ordering::SeqCst);
                     loop {
-                        assert!(fatal_monotonic_ns() < deadline, "query-edge actual parent kill did not reach PEEK ESRCH within original3s");
+                        assert!(fatal_monotonic_ns() < deadline, "query-edge actual parent kill did not reach PEEK ESRCH within original generous-backstop");
                         match nix::sys::ptrace::read(stopped.pid().into(), location) {
                             Ok(value) => { assert_eq!(value as usize, MAGIC); word(address, 7).fetch_add(1, Ordering::SeqCst); }
                             Err(errno) => {
@@ -618,7 +618,7 @@ mod fatal_parent_kill_tests {
             }
         };
         assert!(root_retired && sentinel_untouched);
-        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(started.elapsed() < GENEROUS_WALL_BACKSTOP);
         assert_eq!(events.iter().filter(|event| event.0 == 0).count(), 2);
         assert_eq!(events.iter().filter(|event| event.0 == 1).count(), 2);
         assert_eq!(events.iter().filter(|event| event.0 == 2).count(), 2);

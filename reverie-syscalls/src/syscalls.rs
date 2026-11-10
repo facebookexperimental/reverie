@@ -83,7 +83,6 @@ syscall_list! {
         lstat => Lstat,
         #[cfg(not(target_arch = "aarch64"))]
         poll => Poll,
-        #[cfg(not(target_arch = "aarch64"))]
         lseek => Lseek,
         mmap => Mmap,
         mprotect => Mprotect,
@@ -610,8 +609,6 @@ typed_syscall! {
     }
 }
 
-// Lseek not available in aarch64
-#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     pub struct Lseek {
         fd: i32,
@@ -3816,6 +3813,24 @@ mod test {
                     .display(&memory)
             ),
             "fcntl(1, F_DUPFD, 2)"
+        );
+    }
+
+    /// Every 64-bit Linux table has `lseek` (number 62 on aarch64), so it
+    /// decodes to its typed form on every architecture.
+    #[test]
+    fn test_syscall_lseek() {
+        let memory = LocalMemory::new();
+        let raw = SyscallArgs::new(3, 4096, libc::SEEK_END as usize, 0, 0, 0);
+        let Syscall::Lseek(call) = Syscall::from_raw(Sysno::lseek, raw) else {
+            panic!("lseek did not decode to Syscall::Lseek");
+        };
+        assert_eq!(call.fd(), 3);
+        assert_eq!(call.offset(), 4096);
+        assert_eq!(call.whence(), args::Whence::SEEK_END);
+        assert_eq!(
+            format!("{}", call.display(&memory)),
+            "lseek(3, 4096, SEEK_END)"
         );
     }
 

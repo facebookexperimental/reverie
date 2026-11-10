@@ -14,6 +14,7 @@ use syscalls::Errno;
 use super::Child;
 use super::Command;
 use super::clone::clone;
+use super::clone::clone_with_pid;
 use super::container::ChildContext;
 use super::error::Context;
 use super::error::Error;
@@ -29,6 +30,9 @@ use super::stdio::ChildStdout;
 use super::util::CStringArray;
 use super::util::SharedValue;
 
+#[cfg(test)]
+mod tests;
+
 /// The allocated parts of a launch, made before its lock (`Command::prepare`).
 struct Prepared {
     env: CStringArray,
@@ -42,6 +46,7 @@ impl Command {
     /// By default, stdin, stdout and stderr are inherited from the parent.
     pub fn spawn(&mut self) -> Result<Child, Error> {
         self.container.validate_pinned_clone()?;
+        self.validate_requested_pid()?;
         let prepared = self.prepare();
 
         // Every descriptor the child may inherit is made under the launch
@@ -77,8 +82,18 @@ impl Command {
         F: FnMut(Error) -> i32,
     {
         self.container.validate_pinned_clone()?;
+        self.validate_requested_pid()?;
         let prepared = self.prepare();
         self.spawn_launched(prepared, Launch::begin(), onfail)
+    }
+
+    /// Refuses a requested process ID beside a namespace (`Command::pid`),
+    /// before the launch allocates anything.
+    fn validate_requested_pid(&self) -> Result<(), Error> {
+        if self.pid.is_some() && !self.container.namespace.is_empty() {
+            return Err(Error::new(Errno::EINVAL, Context::Clone));
+        }
+        Ok(())
     }
 
     /// Builds what a launch needs that allocates, before the launch lock is
@@ -120,7 +135,7 @@ impl Command {
             let (stdout, child_stdout) =
                 launch.allocate(|| self.container.stdout.pipes(false), Errno::into_raw)?;
             let (stderr, child_stderr) =
-                launch.allocate(|| self.container.stdout.pipes(false), Errno::into_raw)?;
+                launch.allocate(|| self.container.stderr.pipes(false), Errno::into_raw)?;
 
             let seccomp_fd = if self.container.seccomp_notify {
                 Some(SharedValue::new(core::sync::atomic::AtomicI32::new(0))?)
@@ -137,13 +152,16 @@ impl Command {
                 seccomp_fd: seccomp_fd.as_ref().map(|x| x.as_ref()),
             };
 
-            let pid = clone(
-                || {
-                    let code = onfail(self.do_exec(&context, &env));
-                    unsafe { libc::_exit(code) }
-                },
-                clone_flags,
-            )?;
+            let requested_pid = self.pid;
+            let mut child = || -> i32 {
+                let code = onfail(self.do_exec(&context, &env));
+                unsafe { libc::_exit(code) }
+            };
+            let pid = match requested_pid {
+                Some(pid) => clone_with_pid(&mut child, clone_flags, pid)
+                    .map_err(|errno| Error::new(errno, Context::Clone))?,
+                None => clone(&mut child, clone_flags)?,
+            };
             Ok::<_, Error>((
                 pid,
                 [stdin, stdout, stderr],

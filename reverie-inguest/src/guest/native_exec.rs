@@ -461,6 +461,17 @@ impl<'a, T: Tool> ExecInjection<'a, T> {
                 "reverie-inguest: native exec already attempted in this dispatch",
             ));
         }
+        // Named scope exclusion, through the single-attempt latch above:
+        // empty-path/memfd images have no admitted route, and refusing
+        // here still consumes the one attempt for this dispatch.
+        if operation.0 == libc::SYS_execveat && operation.1[4] & libc::AT_EMPTY_PATH as u64 != 0 {
+            return Err(UnsupportedRefusal::new(
+                UnsupportedOperation::Exec,
+                Errno::EOPNOTSUPP,
+                "execveat with AT_EMPTY_PATH is not admitted by the native exec \
+                 route: only plain path execve/execveat images are admitted",
+            ));
+        }
         let (cut, session) = self.captured.as_mut().map_err(|error| *error)?;
         cut.revalidate(event, site)?;
         if !cut.original.accepts(operation.0, operation.1) {
@@ -496,23 +507,50 @@ impl<'a, T: Tool> ExecInjection<'a, T> {
             attempt.cancel(rpc);
             return Err(error);
         }
-        let result = unsafe {
-            attempt
-                .prepared
-                .as_mut()
-                .unwrap()
-                .issue_and_call(self.tool, state, cut, rpc)
-        };
-        match result {
-            Err(NativeExecFailure::Terminal(error)) => terminate(error),
-            returned => {
-                attempt.cancel(rpc);
-                match returned {
-                    Ok(errno) => Ok(errno),
-                    Err(error) => failed(error),
+        // Stage-1 final refusal, host-enforced: preparation and both
+        // revalidations above are the admitted route's evidence, but no
+        // successor execution is permitted in this stage regardless of
+        // driver behavior. Cancel the owned attempt (consuming every
+        // provision lease) and refuse by typed name. The sole exception
+        // is the test-only issue latch below: it exists only in test
+        // builds, is armed only inside a fixture's own forked child
+        // process (the S2a-1 physical witness and the generic driver's
+        // armed leaf witness), and never exists in production builds,
+        // where removing this refusal remains the single seam that
+        // re-enables issue.
+        #[cfg(test)]
+        let witness_armed = TEST_ISSUE_ARMED.load(core::sync::atomic::Ordering::Acquire);
+        #[cfg(not(test))]
+        let witness_armed = false;
+        if !witness_armed {
+            attempt.cancel(rpc);
+            return Err(refusal(
+                "reverie-inguest: admitted native exec is refused at the final \
+                 step in this stage; no successor image is executed",
+            ));
+        }
+        #[cfg(test)]
+        {
+            let result = unsafe {
+                attempt
+                    .prepared
+                    .as_mut()
+                    .unwrap()
+                    .issue_and_call(self.tool, state, cut, rpc)
+            };
+            match result {
+                Err(NativeExecFailure::Terminal(error)) => terminate(error),
+                returned => {
+                    attempt.cancel(rpc);
+                    match returned {
+                        Ok(errno) => Ok(errno),
+                        Err(error) => failed(error),
+                    }
                 }
             }
         }
+        #[cfg(not(test))]
+        unreachable!("production builds always refuse above")
     }
 }
 
@@ -521,6 +559,21 @@ fn failed<T>(failure: NativeExecFailure) -> Result<T, UnsupportedRefusal> {
         NativeExecFailure::Refused(error) => Err(error),
         NativeExecFailure::Terminal(error) => terminate(error),
     }
+}
+
+/// Test-only issue arming latch. Armed only inside a fixture's own
+/// forked child process before guest execution (the S2a-1 physical
+/// witness and the generic driver's armed leaf witness); every
+/// other test (and every production build, where this does not
+/// exist) keeps the stage-1 final refusal.
+#[cfg(test)]
+static TEST_ISSUE_ARMED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Arm test-only issue for this process. Fork-isolated witness use only.
+#[cfg(test)]
+pub(crate) fn arm_test_issue() {
+    TEST_ISSUE_ARMED.store(true, core::sync::atomic::Ordering::Release);
 }
 
 pub(super) fn is_exec(number: i64) -> bool {

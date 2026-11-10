@@ -27,16 +27,24 @@ use std::time::Duration;
 use images::Kind;
 use images::SealedImage;
 use protocol::*;
+use reverie_inguest::launcher::exec_stop::ChildOwner;
 use reverie_inguest::launcher::exec_stop::CleanupConfirmation;
 use reverie_inguest::launcher::exec_stop::CleanupOwner;
 use reverie_inguest::launcher::exec_stop::CleanupReceipt;
 use reverie_inguest::launcher::exec_stop::CleanupState;
+use reverie_inguest::launcher::exec_stop::EntryContext;
 use reverie_inguest::launcher::exec_stop::ExecStop;
 use reverie_inguest::launcher::exec_stop::PreparedExec;
 use reverie_inguest::launcher::exec_stop::images;
 use reverie_inguest::launcher::exec_stop::inject as trace;
 use reverie_inguest::launcher::exec_stop::register_words;
 use reverie_loader::artifact;
+use reverie_loader::manifest::COUNTER_RUNTIME_MANIFEST;
+use reverie_loader::manifest::Controls;
+use reverie_loader::manifest::ToolManifest;
+use reverie_loader::stage::Armed;
+use reverie_loader::stage::Mapped;
+use reverie_loader::stage::ToolReady;
 use safeptrace::Event;
 use safeptrace::ExitStatus;
 use safeptrace::Regs;
@@ -57,9 +65,196 @@ enum Fault {
     CpuidArmEnosys,
 }
 
+/// Which test runtime image this run arms. One host serves both: the
+/// kind selects the image manifest (through [`Kind`]), the required
+/// control word written into the control page, and the ready
+/// evidence demanded. The protocol control word is the test-ABI
+/// expression of the kind's manifest controls plus the mechanics
+/// bits (alternate stack, closed descriptors, self-test probes) that
+/// have no manifest counterpart and are mapped by [`armed_controls`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RuntimeKind {
+    /// The mechanics probe runtime: every control, canary self-tests.
+    Probe,
+    /// The counting runtime: trap filter and SIGSYS handler only.
+    Counter,
+}
+
+impl RuntimeKind {
+    fn image_kind(self) -> Kind {
+        match self {
+            RuntimeKind::Probe => Kind::Runtime,
+            RuntimeKind::Counter => Kind::Custom(&COUNTER_RUNTIME_MANIFEST),
+        }
+    }
+
+    /// The protocol bits with no manifest counterpart (alternate
+    /// stack, closed descriptors, self-test probes) for this kind.
+    fn mechanics_controls(self) -> u64 {
+        match self {
+            RuntimeKind::Probe => {
+                CONTROL_ALTSTACK
+                    | CONTROL_FDS_CLOSED
+                    | CONTROL_CPUID_PROBE
+                    | CONTROL_TSC_PROBE
+                    | CONTROL_SYSCALL_PROBE
+            }
+            RuntimeKind::Counter => CONTROL_ALTSTACK | CONTROL_FDS_CLOSED | CONTROL_SYSCALL_PROBE,
+        }
+    }
+
+    /// The required protocol control word, derived from this kind's
+    /// manifest controls plus its mechanics bits — never a second
+    /// hard-coded table that could drift from the manifest. The
+    /// checked-in manifests derive exactly `REQUIRED_CONTROLS` /
+    /// `COUNTER_REQUIRED_CONTROLS`, which the fixture images are
+    /// built against; the unit tests pin that agreement.
+    fn required_controls(self) -> u64 {
+        protocol_controls_for(
+            self.image_kind().manifest().controls,
+            self.mechanics_controls(),
+        )
+    }
+
+    fn ready_evidence(self) -> control::ReadyEvidence {
+        match self {
+            RuntimeKind::Probe => control::ReadyEvidence::InstructionProbes,
+            RuntimeKind::Counter => control::ReadyEvidence::SyscallTrapOnly,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            RuntimeKind::Probe => "probe",
+            RuntimeKind::Counter => "counter",
+        }
+    }
+}
+
 struct ProbeControls<'a> {
     fault: Fault,
     pause_checkpoint: Option<&'a Path>,
+    runtime_kind: RuntimeKind,
+    /// Link-time virtual address of a guest witness slot: an
+    /// eight-byte cell the guest's first instruction (or its first
+    /// constructor) overwrites. The host resolves it through the
+    /// image load bias and reads it at the exec-drain stop and again
+    /// at the ready stop; an untouched value at both proves zero
+    /// guest instructions ran before arming, independently of the
+    /// journal.
+    witness: Option<u64>,
+}
+
+/// The stopped-task bundle the loader's stage chain carries from
+/// mapping to handover: the task itself, its saved entry context and
+/// the child owner that waits for it after detach. `task` is an
+/// `Option` only so [`bootstrap_until_ready`], which consumes and
+/// returns the stop, can run it through [`ProbeStop::run_task`]; it is
+/// `Some` at every stage boundary.
+struct ProbeStop<'fd> {
+    task: Option<Stopped>,
+    context: EntryContext,
+    owner: ChildOwner<'fd>,
+}
+
+impl ProbeStop<'_> {
+    fn task(&self) -> &Stopped {
+        self.task.as_ref().expect("probe stop retains its task")
+    }
+
+    fn task_mut(&mut self) -> &mut Stopped {
+        self.task.as_mut().expect("probe stop retains its task")
+    }
+
+    fn run_task<T>(&mut self, run: impl FnOnce(Stopped) -> Result<(Stopped, T)>) -> Result<T> {
+        let task = self.task.take().expect("probe stop retains its task");
+        let (task, value) = run(task)?;
+        self.task = Some(task);
+        Ok(value)
+    }
+}
+
+/// Maps the probe runtime's reported control word (probe_protocol
+/// `CONTROL_*` bits) onto the manifest's [`Controls`]. The probe has
+/// no vDSO-rewrite bit — its runtime performs no vDSO rewrite — so
+/// `vdso_rewrite` is always false here, which is exactly why the
+/// probe is checked against the separate probe manifest that does
+/// not require it. Probe-only bits (altstack, fds-closed and the
+/// self-test probes) have no manifest counterpart and are enforced
+/// by `control::ready` instead.
+fn armed_controls(controls: u64) -> Controls {
+    Controls {
+        trap_filter: controls & CONTROL_FILTER != 0,
+        cpuid_faulting: controls & CONTROL_CPUID != 0,
+        rdtsc_trapping: controls & CONTROL_TSC != 0,
+        vdso_rewrite: false,
+        sigsys_handler: controls & CONTROL_SIGSYS != 0,
+        sigsegv_handler: controls & CONTROL_SIGSEGV != 0,
+    }
+}
+
+/// The inverse of [`armed_controls`]: the protocol word a manifest's
+/// controls require, plus `mechanics` bits with no manifest
+/// counterpart. There is no vDSO-rewrite protocol bit, so a manifest
+/// requiring it can never be reported armed on this lane and is
+/// refused by name at [`claim_armed`] — never silently dropped.
+fn protocol_controls_for(controls: Controls, mechanics: u64) -> u64 {
+    let mut word = mechanics;
+    if controls.trap_filter {
+        word |= CONTROL_FILTER;
+    }
+    if controls.cpuid_faulting {
+        word |= CONTROL_CPUID;
+    }
+    if controls.rdtsc_trapping {
+        word |= CONTROL_TSC;
+    }
+    if controls.sigsys_handler {
+        word |= CONTROL_SIGSYS;
+    }
+    if controls.sigsegv_handler {
+        word |= CONTROL_SIGSEGV;
+    }
+    word
+}
+
+/// The entry this launcher will launch for `manifest`, or a named
+/// refusal. This launcher only ever enters an image at its own
+/// entry point, so it reads `manifest.init` and refuses any
+/// contract other than `ImageEntry` by name, before anything is
+/// spawned or mapped — a `Custom` manifest declaring `Address(x)`
+/// or `None` is never run as if it said `ImageEntry`.
+fn launcher_entry_for(manifest: &ToolManifest, image_entry: u64) -> Result<u64> {
+    manifest
+        .require_image_entry_init()
+        .map_err(|refusal| format!("loader refused: unsupported init contract: {refusal:?}"))?;
+    manifest
+        .check_init_entry(image_entry, Some(image_entry))
+        .map_err(|refusal| format!("loader refused: init entry mismatch: {refusal:?}"))?;
+    Ok(image_entry)
+}
+
+// The host page size refusal lives in `SealedImage::checked`
+// (through `check_image_with_page_size`), shared by every launcher
+// on that path; this probe no longer carries a private copy.
+
+/// Claims the `Armed` stage from the reported protocol word: the
+/// loader's single armed-transition call site. The evidence is
+/// only the word mapped through [`armed_controls`]; the required
+/// set is the one bound into `ready` from the manifest its
+/// `tool_ready` accepted, so this site cannot re-derive "required"
+/// from a manifest (or word) of its own choosing. The stage
+/// transition itself performs the manifest `unmet` check and this
+/// helper names any unmet control as a total refusal.
+fn claim_armed<S>(ready: ToolReady<S>, controls: u64) -> Result<Armed<S>> {
+    ready
+        .armed(armed_controls(controls))
+        .map_err(|(_stage, unmet)| {
+            format!(
+                "loader refused: required control not armed: {unmet:?} (controls={controls:#x})"
+            )
+            .into()
+        })
 }
 
 fn run(
@@ -74,9 +269,19 @@ fn run(
     let ProbeControls {
         fault,
         pause_checkpoint,
+        runtime_kind,
+        witness,
     } = controls;
+    report["runtime_kind"] = json!(runtime_kind.name());
+    // Refuse before spawning anything: `checked` now includes the
+    // host page size (this x86-64 loader contract is 4 KiB-page
+    // only), and this launcher only honours ImageEntry init. Both
+    // manifests are read here; the entries below are the only
+    // entries this run will launch.
     let loader_image = loader.checked()?;
     let runtime_image = runtime.checked()?;
+    let loader_entry = launcher_entry_for(loader.kind().manifest(), loader_image.entry())?;
+    let runtime_entry = launcher_entry_for(runtime.kind().manifest(), runtime_image.entry())?;
     let inherited = [loader.fd(), runtime.fd(), observations.as_raw_fd()];
     let environment: Vec<_> = std::env::vars_os().collect();
     let launch = PreparedExec::new(
@@ -113,6 +318,18 @@ fn run(
     report["entry_sp"] = json!(entry.rsp);
     report["entry_rax"] = json!(entry.rax);
     report["exec_return_drained"] = json!(true);
+    // The task is stopped with no guest instruction run since the
+    // exec stop: resolve and read the witness slot now, and again at
+    // the ready stop below.
+    let witness_address = match witness {
+        Some(link_vaddr) => {
+            let address = resolve_witness(&task, entry.rsp, link_vaddr)?;
+            report["witness_address"] = json!(address);
+            report["witness_at_exec_drain"] = json!(read_witness(&task, address)?);
+            Some(address)
+        }
+        None => None,
+    };
     if let Some(path) = pause_checkpoint {
         return pause_after_exec_drain(task, entry, path, report);
     }
@@ -126,8 +343,9 @@ fn run(
         observations,
         &entry,
         mask,
-        runtime_image.entry(),
+        runtime_entry,
         &inherited,
+        runtime_kind.required_controls(),
     )?;
     let mut injector = trace::Injector::new(task)?;
     let mapped = (|| -> Result<()> {
@@ -179,12 +397,22 @@ fn run(
             .collect::<Vec<_>>()
     );
     report["entry_bytes_restored"] = json!(true);
+    // The images are mapped at their fixed addresses and no guest
+    // instruction has run since the exec stop: the stop enters the
+    // loader's stage chain (Mapped::from_mapped_stop's trust
+    // boundary) and is touched only through it until handover.
+    let bundle = ProbeStop {
+        task: Some(task),
+        context,
+        owner,
+    };
+    let mut mapped = Mapped::from_mapped_stop(bundle);
     let mut bootstrap = entry;
-    bootstrap.rip = loader_image.entry();
+    bootstrap.rip = loader_entry;
     bootstrap.rsp = STACK_TOP - 8; // SysV function entry, private zero return slot.
     bootstrap.rdi = CONTROL_ADDRESS;
     bootstrap.orig_rax = u64::MAX;
-    task.setregs(&bootstrap)?;
+    mapped.stop_mut().task_mut().setregs(&bootstrap)?;
     let executable: Vec<_> = loader_image
         .segments()
         .chain(runtime_image.segments())
@@ -192,15 +420,42 @@ fn run(
         .map(|s| s.pages())
         .collect::<std::result::Result<_, _>>()
         .map_err(|e| format!("executable segment: {e:?}"))?;
-    let task = bootstrap_until_ready(task, &executable, fault, report)?;
-    let ready_regs = task.getregs()?;
+    mapped.stop_mut().run_task(|task| {
+        bootstrap_until_ready(task, &executable, fault, &mut *report).map(|task| (task, ()))
+    })?;
+    let started = mapped.runtime_started();
+    let ready_regs = started.stop().task().getregs()?;
     // Retain the actual unauthenticated observation on refusal as well.
     report["ready_stop_ip"] = json!(ready_regs.rip);
     report["ready_rax"] = json!(ready_regs.rax);
     if ready_regs.rip != READY_STOP_IP || ready_regs.rax != READY_MAGIC {
         return Err("loader refused: unauthenticated ready breakpoint".into());
     }
-    let controls = control::ready(observations, nonce)?;
+    let controls = control::ready(
+        observations,
+        nonce,
+        runtime_kind.required_controls(),
+        runtime_kind.ready_evidence(),
+    )?;
+    // Still stopped at the ready marker, guest not yet released: the
+    // second witness read. Equal, untouched values at both stops
+    // prove zero guest instructions ran across the arming window.
+    if let Some(address) = witness_address {
+        report["witness_at_ready"] = json!(read_witness(started.stop().task(), address)?);
+    }
+    // ToolReady is claimed only with init evidence: the runtime
+    // manifest, its image entry, and the entry actually launched
+    // above. A mismatch is a named refusal, never a silent pass.
+    let ready = match started.tool_ready(
+        runtime.kind().manifest(),
+        runtime_image.entry(),
+        Some(runtime_entry),
+    ) {
+        Ok(ready) => ready,
+        Err((_stage, refusal)) => {
+            return Err(format!("loader refused: init entry mismatch: {refusal:?}").into());
+        }
+    };
     for fd in inherited {
         match std::fs::symlink_metadata(format!("/proc/{pid}/fd/{fd}")) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -211,15 +466,30 @@ fn run(
             }
         }
     }
-    context.restore(&task)?;
+    // Armed is claimed only once every control the running runtime's
+    // manifest requires is reported armed; an unmet control is a
+    // named refusal at this single call site, never a partially
+    // armed handoff.
+    let armed = claim_armed(ready, controls)?;
+    {
+        let stop = armed.stop();
+        stop.context.restore(stop.task())?;
+    }
     report["controls"] = json!(controls);
     report["ready_stop_ip"] = json!(ready_regs.rip);
     report["ready_nonce_matches"] = json!(true);
     report["stack_unchanged"] = json!(true);
-    report["stack_bytes"] = json!(context.stack_bytes().len());
+    report["stack_bytes"] = json!(armed.stop().context.stack_bytes().len());
     report["bootstrap_fds_closed"] = json!(true);
-    report["pre_arm_guest_syscalls"] = json!(0);
-    let running = task.detach(None)?;
+    // Measured from the committed journal rows at this ready stop, not
+    // asserted: `control::ready` already refused a nonzero count, and
+    // this reports what the journal actually holds before handover.
+    report["pre_arm_guest_syscalls"] = json!(control::pre_arm_guest_events(observations)?);
+    let (_handed_off, bundle) = armed.hand_over();
+    let ProbeStop { task, owner, .. } = bundle;
+    let running = task
+        .ok_or("loader refused: probe stop lost its task")?
+        .detach(None)?;
     report["detached"] = json!(true);
     report["outcome"] = json!("handoff");
     let terminal = match owner.wait(running) {
@@ -236,6 +506,78 @@ fn run(
     }
 
     Ok(())
+}
+
+/// Reads the eight witness bytes at `address` from the stopped guest.
+fn read_witness(task: &Stopped, address: u64) -> Result<u64> {
+    let bytes = trace::read(task, address, 8)?;
+    Ok(u64::from_le_bytes(
+        bytes.try_into().map_err(|_| "short witness read")?,
+    ))
+}
+
+/// Resolves a guest link-time virtual address through the image load
+/// bias, derived from `AT_PHDR` and the `PT_PHDR` segment read from
+/// the stopped guest: bias = AT_PHDR - PT_PHDR.vaddr. That is zero
+/// for a fixed-address static image and the PIE load bias for a
+/// dynamic one, so one rule serves both witness guests.
+fn resolve_witness(task: &Stopped, rsp: u64, link_vaddr: u64) -> Result<u64> {
+    const AT_NULL: u64 = 0;
+    const AT_PHDR: u64 = 3;
+    const AT_PHNUM: u64 = 5;
+    const PT_PHDR: u32 = 6;
+    const MAX_WORDS: u64 = 4096;
+    // The initial stack at rsp is argc, the argv pointers and their
+    // NULL, the envp pointers and their NULL, then the auxv pairs.
+    // Read word at a time so no read crosses the top of the mapping.
+    let word = |index: u64| -> Result<u64> {
+        if index > MAX_WORDS {
+            return Err("loader refused: initial stack scan bound exceeded".into());
+        }
+        let address = rsp
+            .checked_add(index.checked_mul(8).ok_or("witness stack overflow")?)
+            .ok_or("witness stack overflow")?;
+        read_witness(task, address)
+    };
+    let argc = word(0)?;
+    if argc > MAX_WORDS {
+        return Err("loader refused: implausible guest argc at witness resolution".into());
+    }
+    let mut index = argc + 2; // past argv[0..argc] and its NULL.
+    while word(index)? != 0 {
+        index += 1;
+    }
+    index += 1; // past the envp NULL terminator.
+    let (mut phdr, mut phnum) = (None, None);
+    loop {
+        let (key, value) = (word(index)?, word(index + 1)?);
+        index += 2;
+        match key {
+            AT_NULL => break,
+            AT_PHDR => phdr = Some(value),
+            AT_PHNUM => phnum = Some(value),
+            _ => {}
+        }
+    }
+    let phdr = phdr.ok_or("loader refused: no AT_PHDR for witness resolution")?;
+    let phnum = phnum.ok_or("loader refused: no AT_PHNUM for witness resolution")?;
+    if !(1..=128).contains(&phnum) {
+        return Err("loader refused: implausible AT_PHNUM for witness resolution".into());
+    }
+    let headers = trace::read(task, phdr, (phnum * 56) as usize)?;
+    for header in headers.as_chunks::<56>().0 {
+        let p_type = u32::from_le_bytes(header[0..4].try_into().expect("phdr type"));
+        if p_type == PT_PHDR {
+            let p_vaddr = u64::from_le_bytes(header[16..24].try_into().expect("phdr vaddr"));
+            let bias = phdr
+                .checked_sub(p_vaddr)
+                .ok_or("loader refused: AT_PHDR below PT_PHDR vaddr")?;
+            return link_vaddr
+                .checked_add(bias)
+                .ok_or("loader refused: witness address overflow".into());
+        }
+    }
+    Err("loader refused: guest image has no PT_PHDR for witness resolution".into())
 }
 
 fn syscall_info_json(info: &safeptrace::SyscallInfo) -> Value {
@@ -487,7 +829,7 @@ fn bootstrap_until_ready(
         .ok_or("invalid trace record")?;
     for _ in 0..100_000 {
         let (stopped, event) =
-            trace::stopped(task.syscall(signal.take())?, "Hermit bootstrap stop")?;
+            trace::stopped(task.syscall(signal.take())?, "runtime bootstrap stop")?;
         task = stopped;
         match event {
             Event::Syscall => {
@@ -683,9 +1025,40 @@ fn main() {
     } else {
         Fault::None
     };
-    if (pause_checkpoint.is_some() && fault != Fault::None) || args.len() < 5 || args[3] != "--" {
+    let runtime_kind = if args.first().is_some_and(|a| a == "--runtime-kind=counter") {
+        args.remove(0);
+        RuntimeKind::Counter
+    } else {
+        RuntimeKind::Probe
+    };
+    let witness = if args.first().is_some_and(|a| a == "--witness") {
+        args.remove(0);
+        let text = args
+            .first()
+            .and_then(|a| a.to_str())
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                eprintln!("loader refused: missing witness link address");
+                std::process::exit(REFUSAL_EXIT);
+            });
+        args.remove(0);
+        let parsed = text
+            .strip_prefix("0x")
+            .map_or_else(|| text.parse::<u64>(), |hex| u64::from_str_radix(hex, 16));
+        Some(parsed.unwrap_or_else(|_| {
+            eprintln!("loader refused: invalid witness link address {text:?}");
+            std::process::exit(REFUSAL_EXIT);
+        }))
+    } else {
+        None
+    };
+    if (pause_checkpoint.is_some() && fault != Fault::None)
+        || (runtime_kind == RuntimeKind::Counter && fault != Fault::None)
+        || args.len() < 5
+        || args[3] != "--"
+    {
         eprintln!(
-            "usage: reverie-loader-stage1a-probe [--inject-cpuid-arm-enosys | --pause-after-exec-drain CHECKPOINT] LOADER RUNTIME REPORT -- PROGRAM [ARGS...]"
+            "usage: reverie-loader-stage1a-probe [--inject-cpuid-arm-enosys | --pause-after-exec-drain CHECKPOINT] [--runtime-kind=counter] [--witness LINK_VADDR] LOADER RUNTIME REPORT -- PROGRAM [ARGS...]"
         );
         std::process::exit(REFUSAL_EXIT);
     }
@@ -700,7 +1073,7 @@ fn main() {
     let mut observation = None;
     let result = (|| -> Result<()> {
         let loader = SealedImage::read(Path::new(&args[0]), Kind::Loader)?;
-        let runtime = SealedImage::read(Path::new(&args[1]), Kind::Runtime)?;
+        let runtime = SealedImage::read(Path::new(&args[1]), runtime_kind.image_kind())?;
         let file = control::observation_file(CONTROL_BYTES as u64 + JOURNAL_BYTES)?;
         observation = Some(file);
         run(
@@ -711,6 +1084,8 @@ fn main() {
             ProbeControls {
                 fault,
                 pause_checkpoint: pause_checkpoint.as_deref(),
+                runtime_kind,
+                witness,
             },
             cleanup_evidence.clone(),
             &mut report,
@@ -767,4 +1142,133 @@ fn main() {
         REFUSAL_EXIT
     };
     std::process::exit(status);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reverie_loader::manifest::InitContract;
+    use reverie_loader::manifest::PROBE_RUNTIME_MANIFEST;
+
+    fn dummy_ready() -> ToolReady<u32> {
+        Mapped::from_mapped_stop(7_u32)
+            .runtime_started()
+            .tool_ready(&PROBE_RUNTIME_MANIFEST, 0x1000, Some(0x1000))
+            .map_err(|(_stage, refusal)| refusal)
+            .expect("probe manifest init at its image entry")
+    }
+
+    fn counter_ready() -> ToolReady<u32> {
+        Mapped::from_mapped_stop(7_u32)
+            .runtime_started()
+            .tool_ready(&COUNTER_RUNTIME_MANIFEST, 0x1000, Some(0x1000))
+            .map_err(|(_stage, refusal)| refusal)
+            .expect("counter manifest init at its image entry")
+    }
+
+    #[test]
+    fn required_controls_are_derived_from_the_manifest() {
+        // The derived words agree exactly with the protocol
+        // constants the fixture images are built against.
+        assert_eq!(RuntimeKind::Probe.required_controls(), REQUIRED_CONTROLS);
+        assert_eq!(
+            RuntimeKind::Counter.required_controls(),
+            COUNTER_REQUIRED_CONTROLS
+        );
+        // Derivation is from the manifest controls, not a constant:
+        // dropping the trap filter drops exactly its protocol bit.
+        let mut without_filter = PROBE_RUNTIME_MANIFEST.controls;
+        without_filter.trap_filter = false;
+        assert_eq!(
+            protocol_controls_for(without_filter, RuntimeKind::Probe.mechanics_controls()),
+            REQUIRED_CONTROLS & !CONTROL_FILTER
+        );
+        // Round trip: the derived word arms exactly its manifest.
+        assert_eq!(
+            armed_controls(RuntimeKind::Probe.required_controls()),
+            PROBE_RUNTIME_MANIFEST.controls
+        );
+        assert_eq!(
+            armed_controls(RuntimeKind::Counter.required_controls()),
+            COUNTER_RUNTIME_MANIFEST.controls
+        );
+    }
+
+    #[test]
+    fn launcher_refuses_at_the_armed_site_when_a_control_is_unmet() {
+        // The refused case at the launcher's single armed-transition
+        // call site (`claim_armed` in `run`), not a loader-crate
+        // unmet() unit: a word missing the trap-filter bit is a
+        // named refusal, and the full derived word arms.
+        let missing_filter = RuntimeKind::Probe.required_controls() & !CONTROL_FILTER;
+        let error = match claim_armed(dummy_ready(), missing_filter) {
+            Ok(_) => panic!("unarmed trap filter must refuse"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("required control not armed: TrapFilter"),
+            "refusal names the unmet control: {error}"
+        );
+        // The required set comes from the manifest `tool_ready`
+        // accepted, not from this call site: a counter-ready stage
+        // refuses the empty word by the counter manifest's own
+        // first required control.
+        let error = match claim_armed(counter_ready(), 0) {
+            Ok(_) => panic!("no armed controls must refuse"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("required control not armed: TrapFilter"),
+            "counter refusal names the unmet control: {error}"
+        );
+        let (_handed_off, stop) =
+            claim_armed(dummy_ready(), RuntimeKind::Probe.required_controls())
+                .expect("the derived word arms the probe manifest")
+                .hand_over();
+        assert_eq!(stop, 7);
+    }
+
+    #[test]
+    fn launcher_refuses_a_manifest_whose_init_is_not_image_entry() {
+        let entry = 0x1000_u64;
+        assert_eq!(
+            launcher_entry_for(&PROBE_RUNTIME_MANIFEST, entry).ok(),
+            Some(entry)
+        );
+        let mut address = PROBE_RUNTIME_MANIFEST.clone();
+        address.init = InitContract::Address(entry);
+        let error = launcher_entry_for(&address, entry)
+            .expect_err("Address init must refuse on this launcher")
+            .to_string();
+        assert!(
+            error.contains("unsupported init contract") && error.contains("Address"),
+            "refusal names the init contract: {error}"
+        );
+        let mut none = PROBE_RUNTIME_MANIFEST.clone();
+        none.init = InitContract::None;
+        let error = launcher_entry_for(&none, entry)
+            .expect_err("None init must refuse on this launcher")
+            .to_string();
+        assert!(
+            error.contains("unsupported init contract") && error.contains("None"),
+            "refusal names the init contract: {error}"
+        );
+    }
+
+    #[test]
+    fn launcher_refuses_an_unsupported_host_page_size() {
+        // The refusal this launcher gets through `SealedImage::
+        // checked`, exercised at its shared check with a synthetic
+        // 64 KiB page size (the refusal precedes image parsing, so
+        // the bytes need not be a valid image).
+        use reverie_loader::artifact::ArtifactError;
+        use reverie_loader::artifact::check_image_with_page_size;
+        use reverie_loader::manifest::ManifestError;
+        assert_eq!(
+            check_image_with_page_size(&[0u8; 16], &PROBE_RUNTIME_MANIFEST, 65_536).map(|_| ()),
+            Err(ArtifactError::Manifest(
+                ManifestError::UnsupportedPageSize { page_size: 65_536 }
+            ))
+        );
+    }
 }

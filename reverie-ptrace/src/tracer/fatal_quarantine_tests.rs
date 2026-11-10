@@ -18,7 +18,7 @@ mod fatal_quarantine_tests {
         if std::env::var(CHILD).as_deref() != Ok(NAME) {
             // Deliberate TLS-owner retention is process-wide. Keep this case
             // in an exact-name subprocess, never a shared parallel test worker.
-            let deadline = fatal_monotonic_ns() + 3_000_000_000;
+            let deadline = fatal_monotonic_ns() + GENEROUS_WALL_BACKSTOP_NS;
             let mut child = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
                 .env(CHILD, NAME)

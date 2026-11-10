@@ -368,7 +368,7 @@ where
             memory,
             &[],
             // No instruction executes; operations requiring real registers are outside this seam.
-            unsafe { std::mem::zeroed() },
+            &crate::runtime::ZEROED_USER_REGISTERS,
             self.thread.as_mut().unwrap(),
             &mut executor,
             self.global.as_ref(),
@@ -413,8 +413,10 @@ where
         let completion = Arc::new(ChildCompletionSlot::default());
         let child_completion = completion.clone();
         let (observed, observations) = std::sync::mpsc::channel();
-        let handle =
-            ChildThread::spawn_owned(std::thread::Builder::new(), child, move |mut child| {
+        let handle = ChildThread::spawn_owned(
+            crate::supervisor_thread::builder(),
+            child,
+            move |mut child| {
                 let outcome = match receiver.recv() {
                     Ok(
                         command @ (ChildStartCommand::Cancel
@@ -457,7 +459,8 @@ where
                     wait_context.publish_fixture_owner(*status, &child_completion)?;
                 }
                 result.map(|_| ())
-            });
+            },
+        );
         let handle = match handle {
             Ok(handle) => handle,
             Err((error, mut child)) => {
@@ -487,21 +490,25 @@ where
     ) {
         let failure = self.failure.clone();
         let group = self.workers.clone();
-        let handle = std::thread::spawn(move || {
-            crate::vm::finish_host_worker_outcome(Some(&failure), tid, work(), |failed| {
-                if failed {
-                    group.record_worker_failure(tid.as_raw());
-                }
+        let handle = crate::supervisor_thread::builder()
+            .spawn(move || {
+                crate::vm::finish_host_worker_outcome(Some(&failure), tid, work(), |failed| {
+                    if failed {
+                        group.record_worker_failure(tid.as_raw());
+                    }
+                })
+                .map(|()| (ExitStatus::Exited(0), Vec::new(), Vec::new()))
             })
-            .map(|()| (ExitStatus::Exited(0), Vec::new(), Vec::new()))
-        });
+            .expect("failed to spawn the native host worker");
         self.workers.add_worker_handle(tid.as_raw(), handle);
     }
 
     #[cfg(test)]
     pub(super) fn unreported_worker_for_test(&mut self, tid: Pid, error: Error) {
-        self.workers
-            .add_worker_handle(tid.as_raw(), std::thread::spawn(move || Err(error)));
+        let handle = crate::supervisor_thread::builder()
+            .spawn(move || Err(error))
+            .expect("failed to spawn the unreported worker");
+        self.workers.add_worker_handle(tid.as_raw(), handle);
     }
 
     #[cfg(test)]

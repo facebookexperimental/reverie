@@ -498,7 +498,7 @@ mod fatal_daemon_group_tests {
         );
         eprintln!("natural reaper retained pre-broadcast daemon: {binding:?}");
         fatal_control_write(&mut channel, [1]);
-        // A failed original3s outcome may need its separate2s rescue before the
+        // A failed original-backstop outcome may need its separate2s rescue before the
         // natural parent can receive the notifier's completed terminal handoff.
         socket_budget(&channel, deadline + 2_000_000_000);
         let [original_ready] = fatal_control_read::<1>(&mut channel);
@@ -618,7 +618,7 @@ mod fatal_daemon_group_tests {
             }
             return;
         }
-        let deadline = fatal_monotonic_ns() + 3_000_000_000;
+        let deadline = fatal_monotonic_ns() + GENEROUS_WALL_BACKSTOP_NS;
         let mut child = command("reaper", deadline);
         child.process_group(0);
         unsafe {
@@ -642,7 +642,7 @@ mod fatal_daemon_group_tests {
             }
             assert!(
                 fatal_monotonic_ns() < deadline + 2_000_000_000,
-                "isolated daemon fixture exceeded original3s plus rescue2s"
+                "isolated daemon fixture exceeded original generous-backstop plus rescue2s"
             );
             tokio::time::sleep(Duration::from_millis(1)).await;
         }

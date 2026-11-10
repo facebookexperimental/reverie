@@ -26,6 +26,9 @@ use nix::sys::memfd::MFdFlags;
 use nix::sys::memfd::memfd_create;
 use reverie_loader::artifact;
 use reverie_loader::image::ValidatedImage;
+use reverie_loader::manifest::LOADER_MANIFEST;
+use reverie_loader::manifest::PROBE_RUNTIME_MANIFEST;
+use reverie_loader::manifest::ToolManifest;
 
 use super::Result;
 
@@ -36,6 +39,25 @@ pub enum Kind {
     Loader,
     /// Fixed runtime window and audited gate, with TLS refused.
     Runtime,
+    /// A runtime image checked against a caller-supplied manifest,
+    /// through the same [`artifact::check_image`] path. This is how a
+    /// second tool image (for example a counting runtime) rides the
+    /// probe lane without a new fixed kind per tool.
+    Custom(&'static ToolManifest),
+}
+
+impl Kind {
+    /// The manifest this probe checks the image against. The probe's
+    /// runtime is the separate TLS-off [`PROBE_RUNTIME_MANIFEST`], not
+    /// the production runtime manifest: this mechanics probe
+    /// deliberately initializes no TLS.
+    pub fn manifest(self) -> &'static ToolManifest {
+        match self {
+            Kind::Loader => &LOADER_MANIFEST,
+            Kind::Runtime => &PROBE_RUNTIME_MANIFEST,
+            Kind::Custom(manifest) => manifest,
+        }
+    }
 }
 
 /// Validated bytes and their immutable source descriptor, inseparable for mapping.
@@ -79,28 +101,37 @@ impl SealedImage {
         Ok(this)
     }
 
-    /// Validate the retained sealed bytes under this fixed image contract.
+    /// The image contract these sealed bytes were read under.
+    pub fn kind(&self) -> Kind {
+        self.kind
+    }
+
+    /// Validate the retained sealed bytes under this fixed image
+    /// contract, on this host: the host page size (from the
+    /// auxiliary vector) is part of the check, so a host whose page
+    /// size this x86-64/4 KiB loader contract does not support is
+    /// refused by name here — every launcher through this type
+    /// (sealing at [`read`](Self::read), mapping, the probe host)
+    /// gets that refusal instead of assuming 4 KiB pages.
     pub fn checked(&self) -> Result<ValidatedImage<'_>> {
-        match self.kind {
-            Kind::Loader => artifact::check_loader(&self.bytes),
-            // The generic artifact contract permits a later runtime to own
-            // TLS. This mechanics probe deliberately initializes none.
-            Kind::Runtime => artifact::check(
-                &self.bytes,
-                &reverie_loader::image::Policy {
-                    window: artifact::RUNTIME_WINDOW,
-                    allow_tls: false,
-                },
-                &[artifact::RUNTIME_GATE],
-            ),
-        }
-        .map_err(|e| {
-            let reason = match self.kind {
-                Kind::Loader => "invalid_loader_image",
-                Kind::Runtime => "invalid_runtime_image",
-            };
-            format!("{reason}: {e:?}").into()
-        })
+        let page_size = crate::guest::support::page_size()
+            .map_err(|e| format!("loader refused: host page size unavailable: {e}"))?;
+        self.checked_with_page_size(page_size)
+    }
+
+    /// [`checked`](Self::checked) against an explicit host page
+    /// size, so the unsupported-host refusal is testable without a
+    /// 64 KiB-page host.
+    pub fn checked_with_page_size(&self, page_size: u64) -> Result<ValidatedImage<'_>> {
+        artifact::check_image_with_page_size(&self.bytes, self.kind.manifest(), page_size).map_err(
+            |e| {
+                let reason = match self.kind {
+                    Kind::Loader => "invalid_loader_image",
+                    Kind::Runtime | Kind::Custom(_) => "invalid_runtime_image",
+                };
+                format!("{reason}: {e:?}").into()
+            },
+        )
     }
 
     /// Exact descriptor inherited by the child and used for image mapping.
@@ -112,5 +143,35 @@ impl SealedImage {
 impl AsFd for SealedImage {
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.file.as_fd()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checked_with_a_synthetic_64k_page_size_refuses_by_name() {
+        // The page-size refusal precedes image parsing, so the
+        // bytes need not be a valid image: a synthetic 64 KiB host
+        // page size must refuse naming UnsupportedPageSize, at this
+        // launcher-library check every SealedImage consumer shares.
+        let file = File::from(
+            memfd_create(c"reverie-test-image", MFdFlags::MFD_CLOEXEC)
+                .expect("memfd for test image"),
+        );
+        let image = SealedImage {
+            file,
+            bytes: vec![0; 16],
+            kind: Kind::Runtime,
+        };
+        let error = match image.checked_with_page_size(65_536) {
+            Ok(_) => panic!("64 KiB pages must refuse"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("UnsupportedPageSize") && error.contains("65536"),
+            "refusal names the unsupported page size: {error}"
+        );
     }
 }

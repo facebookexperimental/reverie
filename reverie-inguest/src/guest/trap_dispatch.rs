@@ -21,6 +21,8 @@ use crate::dispatch::SyscallEventSource;
 use crate::guest::continuation;
 use crate::guest::event::SyscallDispatch;
 use crate::guest::event::SyscallEvent;
+use crate::guest::isa::Isa;
+use crate::guest::isa::NativeIsa;
 use crate::guest::protect::protect_runtime_control;
 use crate::guest::protect::protect_runtime_descriptors;
 use crate::guest::support::exit_now;
@@ -97,7 +99,7 @@ pub unsafe trait TrapSeam: Send + Sync {
     /// `resume_address` is the arrival resume address of a SIGSYS-delivered
     /// trap that has not run, so the code just before it was executing.
     unsafe fn syscall_site(&self, resume_address: u64) -> u64 {
-        resume_address.saturating_sub(2)
+        NativeIsa::syscall_site(resume_address)
     }
 
     /// Patches the trap's syscall site, if the backend patches.
@@ -250,7 +252,7 @@ impl<S: TrapSeam> InGuestDispatcher<S> {
             }
             instruction_pointer
         } else {
-            resume_address.saturating_sub(2)
+            NativeIsa::syscall_site(resume_address)
         };
 
         self.seam.record_fallback(event.number());
@@ -309,13 +311,7 @@ pub(crate) fn nested_tool_control_result(number: i64, private_registrations: boo
     }
     let unsupported_process =
         // AUTONOMOUS-BOT-IMPLEMENTED
-        number == libc::SYS_clone
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        || number == libc::SYS_clone3
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        || number == libc::SYS_fork
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        || number == libc::SYS_vfork
+        crate::arch::is_fork_family(number)
         // AUTONOMOUS-BOT-IMPLEMENTED
         || number == libc::SYS_execve
         // AUTONOMOUS-BOT-IMPLEMENTED
@@ -536,7 +532,11 @@ mod tests {
             })
         };
         for number in [libc::SYS_read, libc::SYS_getpid, libc::SYS_write] {
-            let mut event = TrapEvent::new(number, [0; 6], 0x1002);
+            let mut event = TrapEvent::new(
+                number,
+                [0; 6],
+                0x1000 + crate::guest::isa::NativeIsa::SYSCALL_LEN,
+            );
             dispatcher.dispatch(&mut event);
             if number == libc::SYS_getpid {
                 assert_eq!(event.result(), Some(-i64::from(libc::EOPNOTSUPP)));
@@ -565,7 +565,11 @@ mod tests {
                 replace: true,
             })
         };
-        let mut event = TrapEvent::new(libc::SYS_read, [0; 6], 0x1002);
+        let mut event = TrapEvent::new(
+            libc::SYS_read,
+            [0; 6],
+            0x1000 + crate::guest::isa::NativeIsa::SYSCALL_LEN,
+        );
         dispatcher.dispatch(&mut event);
         assert_eq!(
             *dispatcher.seam.seen.lock().unwrap(),
@@ -594,7 +598,12 @@ mod tests {
         assert_eq!(event.result(), None);
         assert_eq!(
             calls(&dispatcher),
-            ["path Sigsys", "intercept 39", "site 0x1002", "patch 0x1000"]
+            [
+                "path Sigsys".to_string(),
+                format!("intercept {}", libc::SYS_getpid),
+                "site 0x1002".to_string(),
+                "patch 0x1000".to_string(),
+            ]
         );
     }
 
@@ -607,14 +616,14 @@ mod tests {
         assert_eq!(
             calls(&dispatcher),
             [
-                "path Sigsys",
-                "intercept 39",
-                "site 0x1002",
-                "patch 0x1000",
-                "fallback 39",
-                "continuation?",
-                "refusal 39",
-                "path FallbackRefusal",
+                "path Sigsys".to_string(),
+                format!("intercept {}", libc::SYS_getpid),
+                "site 0x1002".to_string(),
+                "patch 0x1000".to_string(),
+                format!("fallback {}", libc::SYS_getpid),
+                "continuation?".to_string(),
+                format!("refusal {}", libc::SYS_getpid),
+                "path FallbackRefusal".to_string(),
             ]
         );
     }
@@ -628,13 +637,13 @@ mod tests {
         assert_eq!(
             calls(&dispatcher),
             [
-                "path Sigsys",
-                "intercept 39",
-                "site 0x1002",
-                "patch 0x1000",
-                "fallback 39",
-                "refusal 39",
-                "path FallbackRefusal",
+                "path Sigsys".to_string(),
+                format!("intercept {}", libc::SYS_getpid),
+                "site 0x1002".to_string(),
+                "patch 0x1000".to_string(),
+                format!("fallback {}", libc::SYS_getpid),
+                format!("refusal {}", libc::SYS_getpid),
+                "path FallbackRefusal".to_string(),
             ]
         );
     }
@@ -650,7 +659,13 @@ mod tests {
             "the interceptor's result stands"
         );
         assert_eq!(event.resume_address(), None);
-        assert_eq!(calls(&dispatcher), ["path Sigsys", "intercept 39"]);
+        assert_eq!(
+            calls(&dispatcher),
+            [
+                "path Sigsys".to_string(),
+                format!("intercept {}", libc::SYS_getpid)
+            ]
+        );
     }
     #[test]
     fn a_direct_event_never_reaches_the_site_methods() {
@@ -662,12 +677,12 @@ mod tests {
         assert_eq!(
             calls(&dispatcher),
             [
-                "path Sigsys",
-                "intercept 39",
-                "fallback 39",
-                "continuation?",
-                "refusal 39",
-                "path FallbackRefusal",
+                "path Sigsys".to_string(),
+                format!("intercept {}", libc::SYS_getpid),
+                format!("fallback {}", libc::SYS_getpid),
+                "continuation?".to_string(),
+                format!("refusal {}", libc::SYS_getpid),
+                "path FallbackRefusal".to_string(),
             ]
         );
     }

@@ -208,10 +208,7 @@ pub trait SyscallDispatcher: Send + Sync {
 /// state (for example a coordinator connection) must be re-established. See
 /// [`crate::fork`].
 pub fn is_fork_like(number: i64) -> bool {
-    number == libc::SYS_fork
-        || number == libc::SYS_vfork
-        || number == libc::SYS_clone
-        || number == libc::SYS_clone3
+    crate::arch::is_fork_family(number)
 }
 
 /// The default dispatcher: forward every syscall to the kernel, applying the
@@ -282,7 +279,7 @@ impl PassthroughDispatcher {
             event.fail(libc::ENOTSUP);
             return true;
         }
-        if number == libc::SYS_clone3 || number == libc::SYS_vfork {
+        if number == libc::SYS_clone3 || crate::arch::is_vfork(number) {
             event.fail(libc::ENOTSUP);
             return true;
         }
@@ -317,8 +314,12 @@ mod tests {
 
     #[test]
     fn fork_like_classification() {
-        assert!(is_fork_like(libc::SYS_fork));
-        assert!(is_fork_like(libc::SYS_vfork));
+        if let Some(fork) = crate::arch::SYS_FORK {
+            assert!(is_fork_like(fork));
+        }
+        if let Some(vfork) = crate::arch::SYS_VFORK {
+            assert!(is_fork_like(vfork));
+        }
         assert!(is_fork_like(libc::SYS_clone));
         assert!(is_fork_like(libc::SYS_clone3));
         assert!(!is_fork_like(libc::SYS_write));

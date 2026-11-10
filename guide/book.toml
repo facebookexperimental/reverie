@@ -1,0 +1,13 @@
+[book]
+title = "The Reverie Guide"
+authors = ["The Reverie contributors"]
+description = "A guide to building syscall-interception tools with Reverie: the Tool API, backends, loaders, and the safety contract."
+src = "src"
+language = "en"
+
+[output.html]
+git-repository-url = "https://github.com/rrnewton/reverie"
+edit-url-template = "https://github.com/rrnewton/reverie/edit/main/guide/{path}"
+
+[rust]
+edition = "2024"

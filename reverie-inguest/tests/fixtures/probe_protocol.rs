@@ -64,6 +64,12 @@ pub const CONTROL_CPUID_PROBE: u64 = 1 << 7;
 pub const CONTROL_TSC_PROBE: u64 = 1 << 8;
 pub const CONTROL_SYSCALL_PROBE: u64 = 1 << 9;
 pub const REQUIRED_CONTROLS: u64 = (1 << 10) - 1;
+/// The counting runtime's required control word: the SIGSYS handler,
+/// its alternate stack, the trap filter, closed bootstrap descriptors
+/// and the trapped-syscall self-test. No CPUID/TSC/SIGSEGV bits: the
+/// counting image arms none of those controls.
+pub const COUNTER_REQUIRED_CONTROLS: u64 =
+    CONTROL_SIGSYS | CONTROL_ALTSTACK | CONTROL_FILTER | CONTROL_FDS_CLOSED | CONTROL_SYSCALL_PROBE;
 
 pub const EVENT_BOOTSTRAP: u32 = 1;
 pub const EVENT_SYSCALL_ENTER: u32 = 2;
@@ -134,7 +140,14 @@ pub struct ProbeControlV1 {
     /// Version1 has no selectable behavioral flags. Nonzero is refused.
     pub flags: u32,
     pub fds: [i32; 8],
-    pub reserved_input: [u64; 43],
+    /// The control word the host requires this runtime to report
+    /// armed before the ready marker is accepted. The host writes it
+    /// from the runtime kind's manifest controls (plus the mechanics
+    /// bits with no manifest counterpart); the loader checks the
+    /// reported word against this field, and each runtime refuses a
+    /// page whose required word is not its own. Zero is refused.
+    pub required_controls: u64,
+    pub reserved_input: [u64; 42],
     pub phase: AtomicU32,
     pub error: AtomicU32,
     pub controls: AtomicU64,
@@ -170,7 +183,8 @@ impl ProbeControlV1 {
             fd_count: 0,
             flags: 0,
             fds: [-1; 8],
-            reserved_input: [0; 43],
+            required_controls: 0,
+            reserved_input: [0; 42],
             phase: AtomicU32::new(PHASE_BOOTSTRAP),
             error: AtomicU32::new(ERROR_NONE),
             controls: AtomicU64::new(0),
@@ -214,6 +228,7 @@ const _: () = {
     assert!(align_of::<ProbeControlV1>() == 8);
     assert!(offset_of!(ProbeControlV1, runtime_entry) == 32);
     assert!(offset_of!(ProbeControlV1, fds) == 136);
+    assert!(offset_of!(ProbeControlV1, required_controls) == 168);
     assert!(offset_of!(ProbeControlV1, phase) == 512);
     assert!(offset_of!(ProbeControlV1, controls) == 520);
     assert!(offset_of!(ProbeControlV1, events_reserved) == 528);

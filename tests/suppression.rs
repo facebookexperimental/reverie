@@ -10,49 +10,48 @@
 //! we should not run the real syscall.
 
 #[cfg(all(not(sanitized), test))]
+#[path = "support/suppression_rust_guest.rs"]
+mod suppression_rust_guest;
+
+#[cfg(all(not(sanitized), test))]
+#[path = "tool_fixtures/suppression.rs"]
+mod suppression_tool;
+
+#[cfg(all(not(sanitized), test))]
 mod tests {
-    use reverie::Error;
-    use reverie::Guest;
-    use reverie::Tool;
-    use reverie::syscalls::Syscall;
+    use std::sync::atomic::Ordering;
+
     use reverie_ptrace::testing::check_fn;
-    use syscalls::Sysno;
-    use syscalls::syscall;
 
-    #[derive(Debug, Default, Clone)]
-    struct TestTool;
-
-    #[reverie::tool]
-    impl Tool for TestTool {
-        type GlobalState = ();
-        type ThreadState = ();
-
-        async fn handle_syscall_event<T: Guest<Self>>(
-            &self,
-            guest: &mut T,
-            syscall: Syscall,
-        ) -> Result<i64, Error> {
-            match syscall {
-                Syscall::Tgkill(_) => {
-                    // Suppress this syscall. This thread shall not be killed.
-                    Ok(0)
-                }
-                _ => guest.tail_inject(syscall).await,
-            }
-        }
-    }
+    use super::suppression_rust_guest;
+    use super::suppression_tool::TestTool;
 
     #[test]
     fn suppress_tgkill() {
-        check_fn::<TestTool, _>(|| {
-            let pid = unsafe { syscall!(Sysno::getpid) }.unwrap();
-            let tid = unsafe { syscall!(Sysno::gettid) }.unwrap();
+        let state = check_fn::<TestTool, _>(suppression_rust_guest::guest);
+        let count = state.count.load(Ordering::SeqCst);
+        eprintln!("suppression function: count={count}");
+        assert_eq!(count, 100);
 
-            // This shouldn't work.
-            for _ in 0..100 {
-                let ret = unsafe { syscall!(Sysno::tgkill, pid, tid, libc::SIGTERM) };
-                assert_eq!(ret, Ok(0));
-            }
-        });
+        rust_command_test();
+    }
+
+    /// The same guest body as an ordinary command under ptrace: the Tool
+    /// suppresses all 100 tgkill calls, so the command exits 0 with no output.
+    fn rust_command_test() {
+        let program = reverie_test_support::guest_binary!("suppression-rust-command-guest");
+        eprintln!("suppression Rust command image={program}");
+        let (output, state) =
+            reverie_test_support::test_cmd_with_config::<TestTool>(program, &[], ())
+                .expect("Rust suppression command should succeed");
+        let count = state.count.load(Ordering::SeqCst);
+        eprintln!(
+            "suppression Rust command ptrace: status={:?} stdout={:02x?} stderr={:02x?} count={count}",
+            output.status, output.stdout, output.stderr,
+        );
+        assert_eq!(output.status, reverie::ExitStatus::Exited(0));
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
+        assert_eq!(count, 100);
     }
 }

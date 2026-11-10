@@ -14,16 +14,14 @@
 //! captured guest image with the Tool's results. This is the path every call
 //! takes when nothing is patched.
 
-use core::arch::global_asm;
 use core::cell::Cell;
-use core::sync::atomic::AtomicU32;
-use core::sync::atomic::AtomicU64;
-use core::sync::atomic::Ordering;
 use std::io;
 use std::sync::OnceLock;
 
 use super::context::RegisterContext;
 use super::event::InstructionEventKind;
+use super::isa::Isa;
+use super::isa::NativeIsa;
 use super::tool_region::StackBacking;
 use super::tool_region::StackLease;
 use crate::trap::frame::FrameError;
@@ -31,11 +29,7 @@ use crate::trap::frame::SavedState;
 use crate::trap::frame::SignalFrame;
 use crate::trap::raw_syscall6;
 
-static SAVE_BYTES: AtomicU32 = AtomicU32::new(512);
-static SAVE_MASK: AtomicU64 = AtomicU64::new(0);
-static PKRU_OFFSET: AtomicU32 = AtomicU32::new(0);
 static SAVE_CONFIG: OnceLock<Result<(), &'static str>> = OnceLock::new();
-static CALLBACK_MXCSR: u32 = 0x1f80;
 
 static HANDLERS: OnceLock<ContinuationHandlers> = OnceLock::new();
 
@@ -60,6 +54,58 @@ thread_local! {
     static MAPPED_CALLBACK: Cell<Option<MappedCallbackStamp>> = const { Cell::new(None) };
 }
 
+/// The one outlined access site for the OWNER cell (see
+/// `tool_callback_active_cell` in super::support).
+#[inline(never)]
+pub(crate) fn owner_cell() -> *mut core::cell::Cell<*mut Continuation> {
+    OWNER.with(|cell| cell as *const core::cell::Cell<*mut Continuation> as *mut _)
+}
+
+/// The one outlined access site for the READY cell (see
+/// `tool_callback_active_cell` in super::support).
+#[inline(never)]
+pub(crate) fn ready_cell() -> *mut core::cell::Cell<bool> {
+    READY.with(|cell| cell as *const core::cell::Cell<bool> as *mut _)
+}
+
+fn ready_get() -> bool {
+    // SAFETY: this thread's own cell, used only on this thread.
+    unsafe { (*ready_cell()).get() }
+}
+
+fn ready_set(value: bool) {
+    // SAFETY: this thread's own cell, used only on this thread.
+    unsafe { (*ready_cell()).set(value) }
+}
+
+/// The one outlined access site for the PENDING cell. The address is
+/// type-erased so the retained-accessor table in super::support does
+/// not name the private Pending type.
+#[inline(never)]
+pub(crate) fn pending_cell() -> *mut core::ffi::c_void {
+    PENDING.with(|cell| cell as *const core::cell::Cell<Option<Pending>> as *mut core::ffi::c_void)
+}
+
+fn owner_get() -> *mut Continuation {
+    // SAFETY: this thread's own cell, used only on this thread.
+    unsafe { (*owner_cell()).get() }
+}
+
+fn owner_set(value: *mut Continuation) {
+    // SAFETY: this thread's own cell, used only on this thread.
+    unsafe { (*owner_cell()).set(value) }
+}
+
+fn pending_get() -> Option<Pending> {
+    // SAFETY: this thread's own cell, used only on this thread.
+    unsafe { (*pending_cell().cast::<core::cell::Cell<Option<Pending>>>()).get() }
+}
+
+fn pending_set(value: Option<Pending>) {
+    // SAFETY: this thread's own cell, used only on this thread.
+    unsafe { (*pending_cell().cast::<core::cell::Cell<Option<Pending>>>()).set(value) }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Pending {
     instruction: u64,
@@ -82,7 +128,7 @@ impl PendingKind {
     /// Bytes from the instruction's address to its saved resume address.
     fn frame_offset(self) -> u64 {
         match self {
-            Self::Syscall => 2,
+            Self::Syscall => NativeIsa::SYSCALL_LEN,
             Self::Instruction(_) => 0,
         }
     }
@@ -90,56 +136,13 @@ impl PendingKind {
     /// Bytes the committed guest context advances past the instruction.
     fn length(self) -> u64 {
         match self {
-            Self::Syscall => 2,
+            Self::Syscall => NativeIsa::SYSCALL_LEN,
             Self::Instruction(kind) => kind.encoded_len(),
         }
     }
 }
 
-fn configure_save() -> Result<(), &'static str> {
-    let features = core::arch::x86_64::__cpuid(1);
-    if features.ecx & ((1 << 26) | (1 << 27)) == ((1 << 26) | (1 << 27)) {
-        // XCR0 includes every enabled user component, including components
-        // unknown to this runtime. Never silently discard a component here.
-        let enabled = unsafe { core::arch::x86_64::_xgetbv(0) };
-        let state = core::arch::x86_64::__cpuid_count(0xD, 0);
-        let supported = u64::from(state.eax) | (u64::from(state.edx) << 32);
-        let (mask, bytes) = save_configuration(enabled, supported, state.ebx)?;
-        // Choose the PKRU-aware entry before returning from SIGSYS. It must
-        // open runtime memory before reading any global or TLS storage.
-        let features = core::arch::x86_64::__cpuid_count(7, 0);
-        if mask & (1 << 9) != 0 && features.ecx & (1 << 4) != 0 {
-            let component = core::arch::x86_64::__cpuid_count(0xD, 9);
-            let offset = pkru_offset(component.ebx, component.eax, state.ebx)?;
-            PKRU_OFFSET.store(offset, Ordering::Relaxed);
-        }
-        SAVE_BYTES.store(bytes, Ordering::Relaxed);
-        SAVE_MASK.store(mask, Ordering::Relaxed);
-    }
-    Ok(())
-}
-
-fn save_configuration(
-    enabled: u64,
-    supported: u64,
-    bytes: u32,
-) -> Result<(u64, u32), &'static str> {
-    let bytes = bytes.checked_add(63).ok_or("XSAVE size overflow")? & !63;
-    if enabled == 0 || enabled & !supported != 0 || bytes < 576 || bytes > i32::MAX as u32 {
-        return Err("unsupported XSAVE configuration");
-    }
-    Ok((enabled, bytes))
-}
-
-fn pkru_offset(offset: u32, size: u32, bytes: u32) -> Result<u32, &'static str> {
-    if size != 8 || offset < 576 || offset.checked_add(size).is_none_or(|end| end > bytes) {
-        return Err("unsupported PKRU XSAVE layout");
-    }
-    Ok(offset)
-}
-
 const CALLBACK_STACK_BYTES: usize = 8 * 1024 * 1024;
-const COMPLETION_COOKIE: u64 = 0x4c49_4641_4c4c_424b;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Phase {
@@ -277,11 +280,11 @@ pub fn native_exec_resume_receipt(
     if !matches!(event.dispatch, super::event::SyscallDispatch::Fallback) {
         return None;
     }
-    let pointer = OWNER.get();
+    let pointer = owner_get();
     if pointer.is_null() {
         return None;
     }
-    let pending = PENDING.get()?;
+    let pending = pending_get()?;
     // Retained storage, exclusively owned by this thread; disjoint fields.
     let receipt = unsafe { (&raw const (*pointer).native_exec_resume).read() }?;
     let phase = unsafe { (&raw const (*pointer).phase).read() };
@@ -305,7 +308,7 @@ pub fn native_exec_resume_receipt(
     Some(receipt)
 }
 
-struct Continuation {
+pub(crate) struct Continuation {
     stack: CallbackStack,
     saved: SavedState,
     context: RegisterContext,
@@ -317,6 +320,10 @@ struct Continuation {
     mapped_signal_mask: u64,
     #[cfg(feature = "exec-native-injection")]
     native_exec_resume: Option<NativeExecResumeReceipt>,
+    /// While the runtime delivers signals itself (`runtime_mask`): the
+    /// guest's mask, from the trap frame, which the completion installs; the
+    /// calls on the blocked set act on it meanwhile. Unused otherwise.
+    guest_mask: u64,
     phase: Phase,
     entries: u64,
     callbacks: u64,
@@ -361,7 +368,7 @@ impl Drop for MappedCallbackScope {
 // full Continuation or its mutably borrowed RegisterContext crosses Tool code.
 #[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
 fn mapped_running_owner(pointer: *mut Continuation) -> Option<u64> {
-    if pointer.is_null() || PENDING.get().is_none() {
+    if pointer.is_null() || pending_get().is_none() {
         return None;
     }
     // SAFETY: OWNER is this thread's retained continuation; these disjoint
@@ -395,7 +402,7 @@ pub(super) unsafe fn enter_mapped_callback(
     if !super::exec_private::mapped_callback_origin() {
         return None;
     }
-    let pointer = OWNER.get();
+    let pointer = owner_get();
     let Some(generation) = mapped_running_owner(pointer) else {
         fatal()
     };
@@ -441,7 +448,7 @@ pub(super) fn mapped_callback_facts(
     region: &'static super::tool_region::ToolRegion,
 ) -> Option<MappedCallbackFacts> {
     let stamp = MAPPED_CALLBACK.get()?;
-    let pointer = OWNER.get();
+    let pointer = owner_get();
     let generation = mapped_running_owner(pointer)?;
     if !same_mapped_scope(stamp, pointer as usize, generation) {
         return None;
@@ -531,13 +538,13 @@ pub fn initialize_with_stack_backing(backing: StackBacking) -> io::Result<()> {
         return Err(io::Error::other("no continuation handlers are registered"));
     }
     SAVE_CONFIG
-        .get_or_init(configure_save)
+        .get_or_init(NativeIsa::configure_saved_state)
         .as_ref()
         .map_err(|error| io::Error::other(*error))?;
-    if PENDING.get().is_some() {
+    if pending_get().is_some() {
         return Err(io::Error::other("a syscall continuation is still active"));
     }
-    if OWNER.get().is_null() {
+    if owner_get().is_null() {
         let saved = SavedState::new()?;
         let stack = CallbackStack::new(backing)?;
         let owner = Box::new(Continuation {
@@ -552,16 +559,17 @@ pub fn initialize_with_stack_backing(backing: StackBacking) -> io::Result<()> {
             mapped_signal_mask: 0,
             #[cfg(feature = "exec-native-injection")]
             native_exec_resume: None,
+            guest_mask: 0,
             phase: Phase::Idle,
             entries: 0,
             callbacks: 0,
             completions: 0,
         });
-        OWNER.set(Box::into_raw(owner));
+        owner_set(Box::into_raw(owner));
     } else {
         // The current thread exclusively owns the retained continuation. Only
         // inspect its backing; never reset a live COW-inherited stack/image.
-        let region = unsafe { &(*OWNER.get()).stack.region };
+        let region = unsafe { &(*owner_get()).stack.region };
         let same = match (region.as_ref(), backing) {
             (None, StackBacking::Legacy) => true,
             (Some(lease), StackBacking::ToolRegion(owner)) => lease.belongs_to(owner),
@@ -571,7 +579,7 @@ pub fn initialize_with_stack_backing(backing: StackBacking) -> io::Result<()> {
             return Err(io::Error::from_raw_os_error(libc::EEXIST));
         }
     }
-    READY.set(true);
+    ready_set(true);
     Ok(())
 }
 
@@ -587,13 +595,11 @@ pub(crate) fn prepare(instruction: u64) -> Option<u64> {
 /// Reserve the existing single activation without overwriting a pending one.
 /// Kept separate from frame capture so its reentry contract remains testable.
 fn prepare_pending(request: Pending) -> Option<u64> {
-    PENDING.with(|pending| {
-        if !READY.get() || pending.get().is_some() {
-            return None;
-        }
-        pending.set(Some(request));
-        Some(fallback_entry as *const () as u64)
-    })
+    if !ready_get() || pending_get().is_some() {
+        return None;
+    }
+    pending_set(Some(request));
+    Some(NativeIsa::fallback_entry())
 }
 
 /// Capture a trapped `syscall`'s `SIGSYS` frame for ordinary-context dispatch.
@@ -605,7 +611,7 @@ fn prepare_pending(request: Pending) -> Option<u64> {
 /// be that signal's handler.
 /// On `Ok(Some(entry))` the continuation is reserved and the frame's stack,
 /// first argument, flags and PKRU are set for it: the caller must make the
-/// handler return to `entry` (by setting the frame's RIP, or by deferring the
+/// handler return to `entry` (by setting the frame's resume address, or by deferring the
 /// event to it) and must not resume the guest from this frame any other way.
 /// On `Ok(None)` nothing was reserved or changed. On `Err` the frame may be
 /// partly changed and the caller must end the process.
@@ -634,7 +640,7 @@ pub unsafe fn prepare_signal(
 /// caller must be that signal's handler.
 /// On `Ok(Some(entry))` the continuation is reserved and the frame's stack,
 /// first argument, flags and PKRU are set for it: the caller must make the
-/// handler return to `entry` (by setting the frame's RIP, or by deferring the
+/// handler return to `entry` (by setting the frame's resume address, or by deferring the
 /// event to it) and must not resume the guest from this frame any other way.
 /// On `Ok(None)` nothing was reserved or changed. On `Err` the frame may be
 /// partly changed and the caller must end the process.
@@ -660,7 +666,7 @@ fn prepare_signal_for(
     let Some(entry) = prepare_pending(request) else {
         return Ok(None);
     };
-    let pointer = OWNER.get();
+    let pointer = owner_get();
     if pointer.is_null() {
         return Err(FrameError);
     }
@@ -678,7 +684,7 @@ fn prepare_signal_for(
     let resume = instruction
         .checked_add(request.kind.frame_offset())
         .ok_or(FrameError)?;
-    if frame.register(libc::REG_RIP as usize) as u64 != resume {
+    if NativeIsa::frame_pc(frame) != resume {
         return Err(FrameError);
     }
     owner.context = context_from_image(&owner.saved, instruction);
@@ -696,27 +702,21 @@ fn prepare_signal_for(
                 tid: owner.owner_tid,
                 generation: owner.generation,
                 mask: frame.signal_mask(),
-                number: owner.context.rax as i64,
-                args: [
-                    owner.context.rdi,
-                    owner.context.rsi,
-                    owner.context.rdx,
-                    owner.context.r10,
-                    owner.context.r8,
-                    owner.context.r9,
-                ],
+                number: NativeIsa::syscall_number(&owner.context),
+                args: NativeIsa::syscall_args(&owner.context),
                 instruction,
                 pkru: owner.saved.pkru(),
             });
     }
+    if super::runtime_mask::delivers_signals() {
+        // The guest's mask is kept for the completion, and the continuation
+        // is entered under the runtime mask, which the SIGSYS and SIGSEGV
+        // actions already installed for this handler (`runtime_mask`).
+        owner.guest_mask = frame.signal_mask();
+        frame.set_signal_mask(super::runtime_mask::runtime_mask());
+    }
     owner.phase = Phase::Captured;
-    frame.set_register(libc::REG_RSP as usize, (owner.stack.top & !15) as i64);
-    frame.set_register(libc::REG_RDI as usize, pointer as i64);
-    frame.set_register(
-        libc::REG_EFL as usize,
-        frame.register(libc::REG_EFL as usize) & !(1 << 10),
-    );
-    frame.set_pkru(owner.saved.pkru().map(|_| 0))?;
+    NativeIsa::prepare_frame_for_entry(frame, owner.stack.top, pointer as usize, &owner.saved)?;
     owner.entries += 1;
     #[cfg(feature = "exec-private-init")]
     super::exec_private::callback_prepared();
@@ -724,59 +724,46 @@ fn prepare_signal_for(
 }
 
 fn context_from_image(saved: &SavedState, instruction: u64) -> RegisterContext {
-    let r = &saved.registers;
-    let mut context = RegisterContext::default();
-    context.instruction_pointer = instruction;
-    context.stack_pointer = r[libc::REG_RSP as usize] as u64;
-    context.rax = r[libc::REG_RAX as usize] as u64;
-    context.rbx = r[libc::REG_RBX as usize] as u64;
-    context.rcx = r[libc::REG_RCX as usize] as u64;
-    context.rdx = r[libc::REG_RDX as usize] as u64;
-    context.rsi = r[libc::REG_RSI as usize] as u64;
-    context.rdi = r[libc::REG_RDI as usize] as u64;
-    context.rbp = r[libc::REG_RBP as usize] as u64;
-    context.r8 = r[libc::REG_R8 as usize] as u64;
-    context.r9 = r[libc::REG_R9 as usize] as u64;
-    context.r10 = r[libc::REG_R10 as usize] as u64;
-    context.r11 = r[libc::REG_R11 as usize] as u64;
-    context.r12 = r[libc::REG_R12 as usize] as u64;
-    context.r13 = r[libc::REG_R13 as usize] as u64;
-    context.r14 = r[libc::REG_R14 as usize] as u64;
-    context.r15 = r[libc::REG_R15 as usize] as u64;
-    context.rflags = r[libc::REG_EFL as usize] as u64;
-    debug_assert!(context.extended_state_unavailable());
-    context
+    NativeIsa::context_from_saved(saved, instruction)
 }
 
 fn commit_context(owner: &mut Continuation, length: u64) -> Result<(), FrameError> {
-    let c = &owner.context;
-    let r = &mut owner.saved.registers;
-    for (index, value) in [
-        (libc::REG_R8, c.r8),
-        (libc::REG_R9, c.r9),
-        (libc::REG_R10, c.r10),
-        (libc::REG_R11, c.r11),
-        (libc::REG_R12, c.r12),
-        (libc::REG_R13, c.r13),
-        (libc::REG_R14, c.r14),
-        (libc::REG_R15, c.r15),
-        (libc::REG_RDI, c.rdi),
-        (libc::REG_RSI, c.rsi),
-        (libc::REG_RBP, c.rbp),
-        (libc::REG_RBX, c.rbx),
-        (libc::REG_RDX, c.rdx),
-        (libc::REG_RAX, c.rax),
-        (libc::REG_RCX, c.rcx),
-        (libc::REG_RSP, c.stack_pointer),
-        (libc::REG_EFL, c.rflags),
-    ] {
-        r[index as usize] = value as i64;
+    NativeIsa::commit_context(&mut owner.saved, &owner.context, length)
+}
+
+/// While the runtime delivers signals itself (`runtime_mask`), the guest mask
+/// this thread's running continuation saved from its trap frame and its
+/// completion installs; `None` with no callback running on this thread, or
+/// with the gate off.
+pub fn saved_guest_mask() -> Option<u64> {
+    let pointer = running_owner()?;
+    // Raw field read: the running callback may hold a reference into the
+    // owner's context, a disjoint field.
+    Some(unsafe { core::ptr::addr_of!((*pointer).guest_mask).read() })
+}
+
+/// Replaces the mask [`saved_guest_mask`] reports, which the completion then
+/// installs. Returns false, changing nothing, where it reports `None`.
+pub fn set_saved_guest_mask(mask: u64) -> bool {
+    let Some(pointer) = running_owner() else {
+        return false;
+    };
+    unsafe { core::ptr::addr_of_mut!((*pointer).guest_mask).write(mask) };
+    true
+}
+
+/// This thread's continuation while a callback runs on it, under the gate.
+fn running_owner() -> Option<*mut Continuation> {
+    if !super::runtime_mask::delivers_signals() {
+        return None;
     }
-    r[libc::REG_RIP as usize] = c
-        .instruction_pointer
-        .checked_add(length)
-        .ok_or(FrameError)? as i64;
-    Ok(())
+    let pointer = owner_get();
+    if pointer.is_null()
+        || unsafe { core::ptr::addr_of!((*pointer).phase).read() } != Phase::Running
+    {
+        return None;
+    }
+    Some(pointer)
 }
 
 /// The current handler prefix has already opened runtime permissions before
@@ -785,8 +772,16 @@ pub fn enable_nested_runtime_access() {}
 
 /// A raw fork copies the active image and ordinary stack. Rebind only after
 /// the real child result, in ordinary context, before child callbacks/return.
+///
+/// The saved guest mask is kept: Linux's child starts with its parent's
+/// blocked set (`copy_process` copies `blocked`), and the child's completion
+/// installs it. Under the gate the cached thread and process ids are the
+/// child's from here on.
 pub fn rebind_fork_child() {
-    let pointer = OWNER.get();
+    if super::runtime_mask::delivers_signals() {
+        super::runtime_mask::rebind_identity();
+    }
+    let pointer = owner_get();
     if !pointer.is_null() {
         unsafe {
             (*pointer).owner_tid = current_tid();
@@ -810,14 +805,14 @@ fn fatal() -> ! {
     }
 }
 
-unsafe extern "C" fn dispatch(pointer: *mut Continuation) {
-    let Some(pending) = PENDING.get() else {
+pub(crate) unsafe extern "C" fn dispatch(pointer: *mut Continuation) {
+    let Some(pending) = pending_get() else {
         fatal()
     };
     let Some(handlers) = HANDLERS.get() else {
         fatal()
     };
-    if pointer.is_null() || pointer != OWNER.get() {
+    if pointer.is_null() || pointer != owner_get() {
         fatal()
     }
     // No reference to the full owner is held across Tool dispatch: child fork
@@ -834,13 +829,7 @@ unsafe extern "C" fn dispatch(pointer: *mut Continuation) {
     let mut pkru = unsafe { (*pointer).saved.pkru() };
     // The registers the syscall dispatch writes, for a syscall that is to
     // start again (signal phase 1's delivery at syscall entry).
-    let entry = unsafe {
-        (
-            (*pointer).context.rax,
-            (*pointer).context.rcx,
-            (*pointer).context.r11,
-        )
-    };
+    let entry = unsafe { NativeIsa::restart_snapshot(&(*pointer).context) };
     unsafe {
         let context = core::ptr::addr_of_mut!((*pointer).context);
         match pending.kind {
@@ -871,7 +860,7 @@ unsafe extern "C" fn dispatch(pointer: *mut Continuation) {
         if !matches!(pending.kind, PendingKind::Syscall) {
             fatal()
         }
-        (owner.context.rax, owner.context.rcx, owner.context.r11) = entry;
+        NativeIsa::restore_restart_snapshot(&mut owner.context, entry);
         length = 0;
     }
     if owner.owner_tid != current_tid()
@@ -887,11 +876,11 @@ unsafe extern "C" fn dispatch(pointer: *mut Continuation) {
 /// A genuine frame may reuse the same alt-stack address as the consumed first
 /// frame; address inequality is not evidence of freshness.
 pub fn complete(frame: &mut SignalFrame<'_>) -> Result<bool, FrameError> {
-    let resume = core::ptr::addr_of!(fallback_completion_return) as usize as u64;
-    if frame.register(libc::REG_RIP as usize) as u64 != resume {
+    let resume = NativeIsa::completion_return_address();
+    if NativeIsa::frame_pc(frame) != resume {
         return Ok(false);
     }
-    let pointer = OWNER.get();
+    let pointer = owner_get();
     if pointer.is_null() {
         return Err(FrameError);
     }
@@ -902,21 +891,21 @@ pub fn complete(frame: &mut SignalFrame<'_>) -> Result<bool, FrameError> {
     let phase = unsafe { core::ptr::addr_of!((*pointer).phase).read() };
     let owner_tid = unsafe { core::ptr::addr_of!((*pointer).owner_tid).read() };
     let generation = unsafe { core::ptr::addr_of!((*pointer).generation).read() };
-    let instruction = core::ptr::addr_of!(fallback_completion_syscall) as usize;
-    if instruction.checked_add(2) != Some(resume as usize)
-        || unsafe { core::slice::from_raw_parts(instruction as *const u8, 2) } != [0x0f, 0x05]
-        || phase != Phase::ReadyToReturn
+    if phase != Phase::ReadyToReturn
         || owner_tid != current_tid()
-        || PENDING.get().is_none()
-        || frame.register(libc::REG_RAX as usize) != libc::SYS_getpid
-        || frame.register(libc::REG_RDI as usize) as u64 != COMPLETION_COOKIE
-        || frame.register(libc::REG_RSI as usize) as u64 != generation
-        || frame.register(libc::REG_RDX as usize) as usize != pointer as usize
+        || pending_get().is_none()
+        || !NativeIsa::validate_completion_frame(frame, generation, pointer as usize)
     {
         return Err(FrameError);
     }
     let owner = unsafe { &mut *pointer };
     frame.restore(&owner.saved)?;
+    if super::runtime_mask::delivers_signals() {
+        // The guest's own mask, saved at the trap and changed only by the
+        // calls on the blocked set; the kernel delivers what it lets in as
+        // this frame returns, before any guest instruction.
+        frame.set_signal_mask(owner.guest_mask);
+    }
     // Signal phase 1: a prepared SIGALRM delivery opens its window here, so
     // the queued instance arrives as this frame returns, before any guest
     // instruction.
@@ -925,7 +914,7 @@ pub fn complete(frame: &mut SignalFrame<'_>) -> Result<bool, FrameError> {
     }
     owner.completions += 1;
     owner.phase = Phase::Idle;
-    PENDING.set(None);
+    pending_set(None);
     #[cfg(feature = "exec-private-init")]
     super::exec_private::guest_completed();
     Ok(true)
@@ -935,7 +924,7 @@ pub fn complete(frame: &mut SignalFrame<'_>) -> Result<bool, FrameError> {
 /// Selectors 0/1/2 are actual fallback entry, reached ordinary callback, and
 /// prepared genuine completion frame. They are not a kernel-stop census.
 pub fn owned_observation(selector: u32) -> u64 {
-    let pointer = OWNER.get();
+    let pointer = owner_get();
     if pointer.is_null() {
         return 0;
     }
@@ -951,7 +940,7 @@ pub fn owned_observation(selector: u32) -> u64 {
 
 /// Check a fixture's actual callback local address against owned stack bounds.
 pub fn on_owned_stack(address: usize) -> bool {
-    let pointer = OWNER.get();
+    let pointer = owner_get();
     if pointer.is_null() {
         return false;
     }
@@ -966,7 +955,7 @@ pub fn on_owned_stack(address: usize) -> bool {
 #[cfg(feature = "allocator-fixture")]
 #[doc(hidden)]
 pub fn fixture_stack_descriptor() -> Option<(usize, usize, u32)> {
-    let pointer = OWNER.get();
+    let pointer = owner_get();
     if pointer.is_null() {
         return None;
     }
@@ -976,61 +965,17 @@ pub fn fixture_stack_descriptor() -> Option<(usize, usize, u32)> {
     Some((top - CALLBACK_STACK_BYTES, top, tid as u32))
 }
 
-unsafe extern "C" fn completion_generation() -> u64 {
-    let pointer = OWNER.get();
+pub(crate) unsafe extern "C" fn completion_generation() -> u64 {
+    let pointer = owner_get();
     if pointer.is_null() || unsafe { (*pointer).phase != Phase::ReadyToReturn } {
         fatal()
     }
     unsafe { (*pointer).generation }
 }
 
-unsafe extern "C" {
-    fn fallback_entry();
-    static fallback_completion_syscall: u8;
-    static fallback_completion_return: u8;
-}
-
-global_asm!(
-    r#"
-    .text
-    .p2align 4
-    .global fallback_entry
-    .hidden fallback_entry
-    .type fallback_entry,@function
-fallback_entry:
-    // First genuine sigreturn supplied an owned, aligned stack and open PKRU.
-    // The saved guest image retains DF and every FP component independently.
-    cld
-    fninit
-    ldmxcsr [rip + {callback_mxcsr}]
-    mov r12, rdi
-    call {dispatch}
-    call {generation}
-    mov rsi, rax
-    mov rdx, r12
-    mov rdi, {cookie}
-    mov eax, {getpid}
-    .global fallback_completion_syscall
-    .hidden fallback_completion_syscall
-fallback_completion_syscall:
-    syscall
-    .global fallback_completion_return
-    .hidden fallback_completion_return
-fallback_completion_return:
-    // A correct completion resumes the saved guest, never this continuation.
-    ud2
-    .size fallback_entry, .-fallback_entry
-"#,
-    dispatch = sym dispatch,
-    generation = sym completion_generation,
-    callback_mxcsr = sym CALLBACK_MXCSR,
-    cookie = const COMPLETION_COOKIE,
-    getpid = const libc::SYS_getpid,
-);
-
 #[cfg(feature = "exec-private-init")]
 pub(crate) fn is_completion_address(address: u64) -> bool {
-    address == core::ptr::addr_of!(fallback_completion_return) as usize as u64
+    address == NativeIsa::completion_return_address()
 }
 
 /// Test-only violations against an already captured genuine running event.
@@ -1060,7 +1005,7 @@ pub(crate) fn native_exec_test_binding_controls(event: &super::event::SyscallEve
         }
         assert!(native_exec_resume_receipt(&changed).is_none());
     }
-    let pointer = OWNER.get();
+    let pointer = owner_get();
     unsafe {
         let generation = (&raw const (*pointer).generation).read();
         (&raw mut (*pointer).generation).write(generation.checked_add(1).unwrap());
@@ -1077,83 +1022,26 @@ pub(crate) fn native_exec_test_binding_controls(event: &super::event::SyscallEve
         assert!(native_exec_resume_receipt(event).is_none());
         (&raw mut (*pointer).owner_tid).write(tid);
     }
-    let pending = PENDING.get();
-    PENDING.set(None);
+    let pending = pending_get();
+    pending_set(None);
     assert!(native_exec_resume_receipt(event).is_none());
-    PENDING.set(Some(Pending {
+    pending_set(Some(Pending {
         instruction: event.instruction_pointer,
         kind: PendingKind::Instruction(InstructionEventKind::Cpuid),
     }));
     assert!(native_exec_resume_receipt(event).is_none());
-    PENDING.set(Some(Pending {
+    pending_set(Some(Pending {
         instruction: event.instruction_pointer ^ 1,
         kind: PendingKind::Syscall,
     }));
     assert!(native_exec_resume_receipt(event).is_none());
-    PENDING.set(pending);
+    pending_set(pending);
     assert_eq!(native_exec_resume_receipt(event), Some(receipt));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn synthesized_context_preserves_registers_and_has_no_extended_state() {
-        let mut saved = SavedState::new().unwrap();
-        for (index, register) in saved.registers.iter_mut().enumerate() {
-            *register = 0x1000 + index as i64;
-        }
-
-        let context = context_from_image(&saved, 0xfeed_face_cafe_beef);
-        assert_eq!(context.instruction_pointer, 0xfeed_face_cafe_beef);
-        for (index, actual) in [
-            (libc::REG_RSP, context.stack_pointer),
-            (libc::REG_RAX, context.rax),
-            (libc::REG_RBX, context.rbx),
-            (libc::REG_RCX, context.rcx),
-            (libc::REG_RDX, context.rdx),
-            (libc::REG_RSI, context.rsi),
-            (libc::REG_RDI, context.rdi),
-            (libc::REG_RBP, context.rbp),
-            (libc::REG_R8, context.r8),
-            (libc::REG_R9, context.r9),
-            (libc::REG_R10, context.r10),
-            (libc::REG_R11, context.r11),
-            (libc::REG_R12, context.r12),
-            (libc::REG_R13, context.r13),
-            (libc::REG_R14, context.r14),
-            (libc::REG_R15, context.r15),
-            (libc::REG_EFL, context.rflags),
-        ] {
-            assert_eq!(actual, saved.registers[index as usize] as u64);
-        }
-        assert!(context.extended_state_unavailable());
-    }
-
-    #[test]
-    fn every_enabled_user_component_is_saved_without_a_fixed_mask() {
-        // Include MPX, AMX, and a future high component bit: CPU-provided
-        // layout and XCR0, rather than an instruction-set list, own the mask.
-        let enabled = 0x2ff | (3 << 17) | (1 << 40);
-        assert_eq!(
-            save_configuration(enabled, enabled, 11_009),
-            Ok((enabled, 11_072))
-        );
-        assert!(save_configuration(enabled, 0x2e7, 11_009).is_err());
-        assert!(save_configuration(0, 0, 576).is_err());
-        assert!(save_configuration(3, 3, 512).is_err());
-        assert!(save_configuration(3, 3, u32::MAX).is_err());
-    }
-
-    #[test]
-    fn pkru_layout_must_fit_the_standard_save_area() {
-        assert_eq!(pkru_offset(2688, 8, 2696), Ok(2688));
-        assert!(pkru_offset(2688, 8, 2695).is_err());
-        assert!(pkru_offset(512, 8, 2696).is_err());
-        assert!(pkru_offset(2688, 4, 2696).is_err());
-        assert!(pkru_offset(u32::MAX - 3, 8, u32::MAX).is_err());
-    }
 
     unsafe fn no_syscall(_: *mut RegisterContext, _: &mut Option<u32>) {
         unreachable!("these tests never run a continuation");
@@ -1199,18 +1087,18 @@ mod tests {
             initialize_registered(&owner, HANDLERS_FOR_TESTS, StackBacking::Legacy)
         };
         initialize_owner().unwrap();
-        let first_stack = OWNER.get() as usize;
+        let first_stack = owner_get() as usize;
         assert_ne!(first_stack, 0);
         initialize_owner().unwrap();
-        assert_eq!(OWNER.get() as usize, first_stack);
+        assert_eq!(owner_get() as usize, first_stack);
         std::thread::scope(|scope| {
             scope
                 .spawn(|| {
-                    assert!(OWNER.get().is_null());
+                    assert!(owner_get().is_null());
                     initialize_owner().unwrap();
-                    assert!(READY.get());
-                    assert_ne!(OWNER.get() as usize, 0);
-                    assert_ne!(OWNER.get() as usize, first_stack);
+                    assert!(ready_get());
+                    assert_ne!(owner_get() as usize, 0);
+                    assert_ne!(owner_get() as usize, first_stack);
                 })
                 .join()
                 .unwrap();
@@ -1220,8 +1108,8 @@ mod tests {
             initialize_owner().unwrap_err().to_string(),
             "a syscall continuation is still active"
         );
-        assert_eq!(PENDING.get().unwrap().instruction, 0x1000);
-        PENDING.set(None);
+        assert_eq!(pending_get().unwrap().instruction, 0x1000);
+        pending_set(None);
         initialize_owner().unwrap();
 
         let other_owner = OnceLock::new();
@@ -1250,31 +1138,31 @@ mod tests {
         assert!(prepare(0x1000).is_some());
         assert!(prepare(0x2000).is_none());
         assert_eq!(
-            PENDING.get(),
+            pending_get(),
             Some(Pending {
                 instruction: 0x1000,
                 kind: PendingKind::Syscall,
             })
         );
         assert!(initialize().is_err());
-        PENDING.set(None);
+        pending_set(None);
         assert!(prepare(0x3000).is_some());
         assert_eq!(
-            PENDING.get(),
+            pending_get(),
             Some(Pending {
                 instruction: 0x3000,
                 kind: PendingKind::Syscall,
             })
         );
-        PENDING.set(None);
+        pending_set(None);
     }
 
     #[test]
     fn instruction_continuations_resume_after_their_own_encoding() {
         // A SIGSYS frame already points after the 2-byte syscall; a SIGSEGV
         // instruction fault points at the instruction itself.
-        assert_eq!(PendingKind::Syscall.frame_offset(), 2);
-        assert_eq!(PendingKind::Syscall.length(), 2);
+        assert_eq!(PendingKind::Syscall.frame_offset(), NativeIsa::SYSCALL_LEN);
+        assert_eq!(PendingKind::Syscall.length(), NativeIsa::SYSCALL_LEN);
         for (kind, length) in [
             (InstructionEventKind::Cpuid, 2),
             (InstructionEventKind::Rdtsc, 2),
@@ -1294,6 +1182,7 @@ mod tests {
             mapped_signal_mask: 0,
             #[cfg(feature = "exec-native-injection")]
             native_exec_resume: None,
+            guest_mask: 0,
             phase: Phase::Idle,
             entries: 0,
             callbacks: 0,
@@ -1301,7 +1190,7 @@ mod tests {
         };
         owner.context.instruction_pointer = 0x7000;
         commit_context(&mut owner, 3).unwrap();
-        assert_eq!(owner.saved.registers[libc::REG_RIP as usize], 0x7003);
+        assert_eq!(NativeIsa::saved_instruction_pointer(&owner.saved), 0x7003);
         owner.context.instruction_pointer = u64::MAX - 1;
         assert!(commit_context(&mut owner, 3).is_err());
     }

@@ -104,7 +104,7 @@ struct Seen {
     status: ExitStatus,
     dumping: bool,
     failed_run: bool,
-    rip: u64,
+    ip: u64,
     /// The guest's bytes at the page, read through `/proc/<tid>/mem` from
     /// inside the hook.
     page: Vec<u8>,
@@ -149,7 +149,10 @@ impl GlobalTool for FatalLog {
             status: exit.status,
             dumping: exit.dumping,
             failed_run: exit.deadline.is_some(),
-            rip: exit.regs.rip,
+            #[cfg(target_arch = "x86_64")]
+            ip: exit.regs.rip,
+            #[cfg(target_arch = "aarch64")]
+            ip: exit.regs.pc,
             page: bytes,
         });
     }
@@ -192,7 +195,7 @@ fn a_segfault_is_offered_once_with_its_memory_still_mapped() {
     assert!(seen.dumping, "the faulting thread ran the core dump step");
     assert!(!seen.failed_run);
     assert!(seen.tid.as_raw() > 0);
-    assert_ne!(seen.rip, 0);
+    assert_ne!(seen.ip, 0);
     assert_eq!(
         seen.page,
         DYING,

@@ -16,7 +16,7 @@
 //! its runtime services, and its runtime option selectors. [`TrapHost`] has no
 //! patcher: every trapped syscall runs through the fallback continuation, the
 //! vDSO gets the trapping stubs, and CPUID/RDTSC are emulated, with no
-//! liteinst2 code in the process.
+//! liteinst code in the process.
 //!
 //! The order of the steps below is LiteInst's installation order, which the
 //! corpus gate holds identical; a step a host does not need is a no-op.
@@ -26,8 +26,10 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use reverie::GlobalRPC;
+use reverie::GlobalTool;
 use reverie::Pid;
 use reverie::Tool;
+use reverie::ToolConfiguration;
 
 use crate::guest::context::RegisterContext;
 use crate::guest::continuation;
@@ -38,6 +40,8 @@ use crate::guest::host::HostRuntime;
 use crate::guest::host::ToolHost;
 use crate::guest::installed_tool;
 use crate::guest::instruction::InstructionSubscriptions;
+use crate::guest::isa::Isa;
+use crate::guest::isa::NativeIsa;
 use crate::guest::rpc::CoordinatorRpc;
 use crate::guest::runtime_seam::PatcherRef;
 use crate::guest::runtime_seam::RuntimeSeam;
@@ -85,6 +89,14 @@ pub unsafe trait PatchHost {
     /// [`process_tool_syscall_callback`].
     fn initialize_continuation(&self) -> io::Result<()> {
         initialize_shared_continuation()
+    }
+
+    /// The stack backing the seccomp controller's continuation
+    /// stacks use. The default reserves the ToolRegion; a host
+    /// without ToolRegion arenas may select the legacy anonymous
+    /// backing where the ToolRegion layout is refused.
+    fn stack_backing(&self) -> io::Result<StackBacking> {
+        Ok(StackBacking::ToolRegion(ToolRegion::reserve()?))
     }
 
     /// After the coordinator and statistics are connected and before the
@@ -146,6 +158,114 @@ where
     T: Tool + 'static,
     H: PatchHost,
 {
+    // SAFETY: identity preserves the caller's runtime and every installation
+    // precondition. Existing consumers retain their original concrete host.
+    unsafe {
+        install_tool_with_runtime::<T, H, H::Runtime, _>(
+            coordinator,
+            remove_coordinator_environment,
+            host,
+            core::convert::identity,
+        )
+    }
+}
+
+/// Install a Tool after projecting the mechanism's runtime services into one
+/// caller-owned concrete runtime type.
+///
+/// Different entry mechanisms can share the same `ToolHost<T, R>` and Guest
+/// instantiations in a single linked runtime. The projection runs once, inside
+/// the private allocation scope, before the host is published. It must preserve
+/// the mechanism's services; it grants no image or callback authority.
+///
+/// # Safety
+///
+/// All [`install_tool_with`] preconditions apply. `project` must retain the
+/// actual runtime services and their image lifetime, including fork rebinding,
+/// signal control, clock and statistics behavior. Rust objects supplied here
+/// remain within one linked build; this is not a dynamic-library ABI.
+pub unsafe fn install_tool_with_runtime<T, H, R, F>(
+    coordinator: &Path,
+    remove_coordinator_environment: bool,
+    host: H,
+    project: F,
+) -> io::Result<()>
+where
+    T: Tool + 'static,
+    H: PatchHost,
+    R: HostRuntime,
+    F: FnOnce(H::Runtime) -> R,
+{
+    // Existing callers keep lazy state construction and all original ordering.
+    unsafe {
+        install_tool_with_runtime_impl::<T, H, R, F>(
+            coordinator,
+            remove_coordinator_environment,
+            host,
+            project,
+            None,
+        )
+    }
+}
+
+/// A one-use ordinary root-state initializer. This is not an initial-image or
+/// successor permit: the consumer must authenticate any opaque handoff itself.
+/// The normal thread-start and post-exec callbacks still run on the first event.
+pub type OrdinaryRootInitializer<T> = fn(
+    &<<T as Tool>::GlobalState as GlobalTool>::Config,
+    Pid,
+    &mut <T as Tool>::ThreadState,
+) -> io::Result<()>;
+
+/// Install a projected runtime with an authenticated ordinary root-state handoff.
+///
+/// After the normal config handshake and Tool construction, `initialize` runs
+/// on the normally initialized root, before host publication or activation. It
+/// receives no RPC client and cannot manufacture coordinator readiness. Its
+/// error aborts installation; no freshly seeded replacement is published.
+/// Inherited fork state and all private installers retain their existing paths.
+///
+/// # Safety
+/// All [`install_tool_with_runtime`] preconditions apply. The caller owns the
+/// initializer's payload/schema/config/image checks and may change only its
+/// declared state fields. This does not authorize private phase callbacks.
+pub unsafe fn install_tool_with_runtime_and_root_initializer<T, H, R, F>(
+    coordinator: &Path,
+    remove_coordinator_environment: bool,
+    host: H,
+    project: F,
+    initialize: OrdinaryRootInitializer<T>,
+) -> io::Result<()>
+where
+    T: Tool + 'static,
+    H: PatchHost,
+    R: HostRuntime,
+    F: FnOnce(H::Runtime) -> R,
+{
+    unsafe {
+        install_tool_with_runtime_impl::<T, H, R, F>(
+            coordinator,
+            remove_coordinator_environment,
+            host,
+            project,
+            Some(initialize),
+        )
+    }
+}
+
+unsafe fn install_tool_with_runtime_impl<T, H, R, F>(
+    coordinator: &Path,
+    remove_coordinator_environment: bool,
+    host: H,
+    project: F,
+    initialize: Option<OrdinaryRootInitializer<T>>,
+) -> io::Result<()>
+where
+    T: Tool + 'static,
+    H: PatchHost,
+    R: HostRuntime,
+    F: FnOnce(H::Runtime) -> R,
+{
     // Everything installation allocates lives in the runtime's private Tool
     // heap, never in the guest's own malloc heap; see LiteInst's installer.
     let _private_allocations = crate::guest::alloc::enter_dispatch();
@@ -169,6 +289,10 @@ where
         coordinator,
         crate::guest::protect::replace_coordinator_fd,
     )?;
+    // The coordinator supplies the actual typed configuration. Admit this
+    // concrete Tool before selecting subscriptions, constructing it or
+    // publishing its runtime; Config flags cannot substitute for its role.
+    T::facility_admission(rpc.config()).map_err(io::Error::other)?;
     crate::guest::protect::reserve_coordinator_fd(rpc.raw_fd())?;
     let stats = if let Some(stats_coordinator) = crate::bootstrap::bootstrap_stats_coordinator() {
         crate::stats::initialize_guest_stats(stats_coordinator)?
@@ -188,19 +312,23 @@ where
     crate::guest::clock::initialize_rcb_clock()?;
     // The raw syscall, not libc's interposable getpid.
     let pid = Pid::from_raw(unsafe { raw_syscall6(libc::SYS_getpid, [0; 6]) } as i32);
-    let subscriptions = T::subscriptions(rpc.config());
+    let configuration = ToolConfiguration::<T>::select(rpc.shared_config());
+    let subscriptions = configuration.subscriptions();
+    // Read once, inside select() above: this query's contract is one
+    // evaluation when the runtime starts in a process, so consume the
+    // retained answer instead of asking the tool again.
+    let delivers = configuration
+        .requirements()
+        .queries
+        .in_guest_signal_delivery;
     let instruction_subscriptions = InstructionSubscriptions {
         cpuid: subscriptions.has_cpuid(),
         rdtsc: subscriptions.has_rdtsc(),
     };
     crate::guest::instruction::preflight_instruction_faulting(instruction_subscriptions)?;
     let site_patching = host.site_patching()?;
-    let vdso_sites = if site_patching {
-        reverie::vdso::patch_current_vdso(&subscriptions)
-    } else {
-        reverie::vdso::patch_current_vdso_trapping(&subscriptions).map(|()| Vec::new())
-    }
-    .map_err(|error| io::Error::other(crate::guest::host::describe_reverie_error(&error)))?;
+    let vdso_sites = NativeIsa::patch_current_vdso(subscriptions, site_patching)
+        .map_err(|error| io::Error::other(crate::guest::host::describe_reverie_error(&error)))?;
     let _signal_state =
         crate::guest::signal::prepare_guest_signal_state(instruction_subscriptions)?;
     let syscall_subscriptions = subscriptions.iter_syscalls().collect();
@@ -208,18 +336,43 @@ where
         // SAFETY: tool installation runs before application-created threads.
         unsafe { std::env::remove_var(crate::bootstrap::COORDINATOR_ENV) };
     }
-    let tool = T::new(pid, rpc.config());
-    let tool_host = ToolHost::<T, H::Runtime>::new(
+    let tool = configuration.new_process(pid);
+    let mut tool_host = ToolHost::<T, R>::with_configuration(
         tool,
         rpc,
         pid,
+        configuration,
         syscall_subscriptions,
-        instruction_subscriptions.cpuid,
-        host.runtime(stats),
+        project(host.runtime(stats)),
     );
+    if let Some(initialize) = initialize {
+        tool_host.prepare_ordinary_root_state(initialize)?;
+    }
+    if delivers && site_patching {
+        // A patched site reaches the Tool without the fallback continuation,
+        // which keeps the guest's mask apart from the runtime's.
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "in-guest signal delivery refuses a runtime with site patching on",
+        ));
+    }
     // SAFETY: the one installing thread publishes the one host, before any
     // dispatch or controller activation.
     unsafe { installed_tool::publish_tool(tool_host)? };
+    // The Tool's signal-delivery predicate, read once for this process image,
+    // before any runtime signal action exists: with it the runtime runs under
+    // its own mask and keeps the guest's apart (`runtime_mask`). A fork child
+    // inherits the decision with the rest of the process's memory.
+    // SAFETY: once, on the installing thread, before the actions below.
+    unsafe {
+        crate::guest::runtime_mask::enable(
+            delivers,
+            crate::guest::runtime_mask::reserved_for(
+                instruction_subscriptions.cpuid || instruction_subscriptions.rdtsc,
+                crate::guest::signal::routed_signal(),
+            ),
+        )
+    };
     let result = activate_runtime(
         &host,
         stats,
@@ -227,6 +380,18 @@ where
         site_patching,
         &vdso_sites,
     );
+    // A guard router reserves its signal from the guest, which the runtime
+    // mask does not leave out, so the gate refuses it.
+    let result = result.and_then(|()| {
+        if delivers && crate::guest::signal::routed_signal() != 0 {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "in-guest signal delivery refuses a runtime with a signal routing handler",
+            ))
+        } else {
+            Ok(())
+        }
+    });
     #[cfg(feature = "fixed-syscall-gates")]
     {
         fixed_install.complete = result.is_ok();
@@ -272,8 +437,7 @@ fn activate_runtime(
         ));
     }
     // Reserve before any instruction, guard or SIGSYS handler is installed.
-    let region = ToolRegion::reserve()?;
-    let controller = InProcessSeccomp::with_stack_backing(StackBacking::ToolRegion(region));
+    let controller = InProcessSeccomp::with_stack_backing(host.stack_backing()?);
     host.prepare_patcher(vdso_sites)?;
     let config = host.runtime_config()?;
     let patcher = host.patcher();
@@ -311,7 +475,7 @@ impl Drop for FixedGateInstallation {
                 // Even stderr may be a full blocking pipe. Publication has
                 // made returning unsafe, so diagnostics cannot precede exit.
                 raw_syscall6(libc::SYS_exit_group, [127, 0, 0, 0, 0, 0]);
-                core::arch::asm!("ud2", options(noreturn));
+                crate::arch::trap_unreachable();
             }
         }
     }
@@ -422,6 +586,41 @@ unsafe impl PatchHost for TrapHost {
 
     fn patcher(&self) -> &'static PatcherRef {
         &TRAP_PATCHER
+    }
+
+    fn initialize_continuation(&self) -> io::Result<()> {
+        // The shared continuation stacks on the ToolRegion, whose
+        // version-one layout is expressed in 4096-byte pages and
+        // refuses other page sizes by name. TrapHost has no patcher
+        // and no ToolRegion arenas, so on those hosts its
+        // continuation runs on the legacy anonymous stack instead;
+        // the patching backends keep the refusal until the layout
+        // itself is page-size-generic.
+        if NativeIsa::page_size()? == crate::guest::tool_region::LAYOUT_PAGE as u64 {
+            return initialize_shared_continuation();
+        }
+        // SAFETY: the shared handlers below are this module's own
+        // continuation callbacks, bound to this same registration
+        // cache for the process lifetime, as in
+        // initialize_shared_continuation.
+        unsafe {
+            continuation::initialize_registered(
+                &SHARED_REGISTRATION,
+                continuation::ContinuationHandlers {
+                    syscall: continue_syscall,
+                    instruction: continue_instruction,
+                },
+                StackBacking::Legacy,
+            )
+        }
+    }
+
+    fn stack_backing(&self) -> io::Result<StackBacking> {
+        if NativeIsa::page_size()? == crate::guest::tool_region::LAYOUT_PAGE as u64 {
+            Ok(StackBacking::ToolRegion(ToolRegion::reserve()?))
+        } else {
+            Ok(StackBacking::Legacy)
+        }
     }
 
     fn stage_stream(&self) -> io::Result<bool> {

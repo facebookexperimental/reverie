@@ -268,7 +268,7 @@ fn self_tid() -> Result<i64, i32> {
 /// Copy `len` bytes from `from` to `to`, both in this address space, through
 /// `process_vm_writev`, so an unreadable or unwritable guest address fails
 /// with EFAULT instead of faulting the runtime.
-fn copy_within_process(from: u64, to: u64, len: usize) -> Result<(), i32> {
+pub(crate) fn copy_within_process(from: u64, to: u64, len: usize) -> Result<(), i32> {
     let tid = self_tid()?;
     let source = libc::iovec {
         iov_base: from as usize as *mut libc::c_void,
@@ -333,7 +333,7 @@ impl GuestRights {
         !self.applies(address) || self.pkru.is_none_or(|pkru| pkru & 1 == 0)
     }
 
-    fn may_write(self, address: u64) -> bool {
+    pub(crate) fn may_write(self, address: u64) -> bool {
         !self.applies(address) || self.pkru.is_none_or(|pkru| pkru & 0b11 == 0)
     }
 }
@@ -351,7 +351,7 @@ pub fn original_input_denied(rights: GuestRights, number: i64, args: [u64; 6]) -
         && !rights.may_read(args[1])
 }
 
-fn read_guest<T: Default>(rights: GuestRights, address: u64) -> Result<T, i32> {
+pub(crate) fn read_guest<T: Default>(rights: GuestRights, address: u64) -> Result<T, i32> {
     if !rights.may_read(address) {
         return Err(libc::EFAULT);
     }
@@ -360,7 +360,7 @@ fn read_guest<T: Default>(rights: GuestRights, address: u64) -> Result<T, i32> {
     Ok(value)
 }
 
-fn write_guest<T>(rights: GuestRights, address: u64, value: &T) -> Result<(), i32> {
+pub(crate) fn write_guest<T>(rights: GuestRights, address: u64, value: &T) -> Result<(), i32> {
     if !rights.may_write(address) {
         return Err(libc::EFAULT);
     }
@@ -386,7 +386,14 @@ fn physical_sigalrm_pending() -> Result<bool, i32> {
     }
 }
 
+/// The guest's physical mask: the kernel's, or, while the runtime delivers
+/// signals itself (`runtime_mask`), the one the running continuation saved
+/// and installs at its completion, since the kernel's is then the runtime's.
 fn current_physical_mask() -> Result<u64, i32> {
+    if super::runtime_mask::delivers_signals() {
+        return Ok(super::continuation::saved_guest_mask()
+            .unwrap_or_else(|| super::runtime_mask::refuse(super::runtime_mask::NO_SAVED_MASK)));
+    }
     let mut mask = 0_u64;
     unsafe { raw_sigprocmask(libc::SIG_BLOCK, None, Some(&mut mask)) }?;
     Ok(mask)
@@ -394,6 +401,14 @@ fn current_physical_mask() -> Result<u64, i32> {
 
 fn install_physical_mask(virtual_mask: u64, handled: bool, reserved: u64) -> Result<(), i32> {
     let physical = physical_mask(virtual_mask, handled, reserved);
+    if super::runtime_mask::delivers_signals() {
+        // The completion installs it (`continuation::complete`); nothing
+        // reaches the kernel's mask, which is the runtime's meanwhile.
+        if !super::continuation::set_saved_guest_mask(physical) {
+            super::runtime_mask::refuse(super::runtime_mask::NO_SAVED_MASK);
+        }
+        return Ok(());
+    }
     unsafe { raw_sigprocmask(libc::SIG_SETMASK, Some(&physical), None) }?;
     // Read it back into a sentinel: a call that reported success without
     // running (a seccomp filter's errno of 0) leaves the sentinel.
@@ -489,6 +504,9 @@ fn sigaction(policy: &Policy, args: [u64; 6]) -> Result<i64, i32> {
     Ok(0)
 }
 
+// Off x86-64 the to-handler path refuses early (below), leaving the
+// physical-install tail unreachable and its locals unused on that target.
+#[cfg_attr(not(target_arch = "x86_64"), allow(unreachable_code, unused_variables))]
 fn change_action(
     policy: &Policy,
     mut new: KernelSigaction,
@@ -539,11 +557,18 @@ fn change_action(
         }
         current_physical_mask()? & !UNBLOCKABLE
     };
-    let physical = physical_action(
-        &new,
-        sigalrm_trampoline as *const () as u64,
-        policy.reserved,
-    );
+    // The physical delivery trampoline edits an x86-64 frame; until an
+    // aarch64 frame implementation exists, installing a guest SIGALRM
+    // handler there is refused rather than approximated.
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        return Err(libc::EOPNOTSUPP);
+    }
+    #[cfg(target_arch = "x86_64")]
+    let trampoline = sigalrm_trampoline as *const () as u64;
+    #[cfg(not(target_arch = "x86_64"))]
+    let trampoline = 0_u64;
+    let physical = physical_action(&new, trampoline, policy.reserved);
     install_physical_action(&physical)?;
     if let Err(error) = install_physical_mask(next_mask, true, policy.reserved) {
         restore_physical_action(&old_physical);
@@ -592,6 +617,14 @@ fn sigprocmask(policy: &Policy, args: [u64; 6]) -> Result<i64, i32> {
     if args[1] != 0 {
         let set = read_guest::<u64>(policy.rights, args[1])?;
         let next = next_mask(old, args[0] as i32, set)?;
+        if super::runtime_mask::delivers_signals() {
+            // As for any change of the saved mask: the ignored instances
+            // that arrived while the runtime ran, outside the guest's mask.
+            super::runtime_mask::discard_ignored_outside(
+                physical_mask(old, true, policy.reserved),
+                policy.reserved,
+            );
+        }
         install_physical_mask(next, true, policy.reserved)?;
         VIRTUAL_MASK.store(next, Ordering::Release);
     }
@@ -864,6 +897,22 @@ pub fn take_entry_delivery() -> bool {
     ENTRY_DELIVERY.swap(false, Ordering::AcqRel)
 }
 
+/// The mask the guest's handler runs under when the prepared delivery's
+/// window is open (the completion has not taken it yet): the window mask,
+/// plus the physical action's mask and SIGALRM, as the kernel blocks them
+/// when it delivers the queued instance (`physical_action`, `window_mask`),
+/// which is the activation mask's physical form. `None` while no window is
+/// open.
+pub fn open_window_handler_mask() -> Option<u64> {
+    WINDOW_OPEN.load(Ordering::Acquire).then(|| {
+        let activation = activation_mask(
+            PREPARED_ACTIVATION_BASE.load(Ordering::Acquire),
+            PREPARED_ACTION_MASK.load(Ordering::Acquire),
+        );
+        physical_mask(activation, true, RESERVED.load(Ordering::Acquire))
+    })
+}
+
 /// The delivery window for the completion marker's fresh frame, taken once.
 pub fn take_window() -> Option<u64> {
     WINDOW_OPEN
@@ -872,10 +921,13 @@ pub fn take_window() -> Option<u64> {
 }
 
 /// Offsets in Linux's x86-64 `ucontext_t` prefix.
+#[cfg(target_arch = "x86_64")]
 const UC_STACK_OFFSET: usize = 16;
+#[cfg(target_arch = "x86_64")]
 const UC_SIGMASK_OFFSET: usize = 296;
 /// `uc_mcontext.gregs[REG_OLDMASK]` (Linux's `sigcontext.oldmask`): the
 /// kernel stores the first word of the pre-delivery mask there too.
+#[cfg(target_arch = "x86_64")]
 const UC_OLDMASK_OFFSET: usize = 40 + 8 * libc::REG_OLDMASK as usize;
 
 fn delivery_lost(message: &[u8]) -> ! {
@@ -895,6 +947,7 @@ fn delivery_lost(message: &[u8]) -> ! {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 // Calls the guest's SIGALRM handler (rcx) with the trampoline's three
 // arguments (rdi, rsi, rdx; Linux passes all three whatever SA_SIGINFO says),
 // and on its return restores the rights in r8d before any memory write when
@@ -931,6 +984,7 @@ reverie_inguest_sigalrm_call_handler:
 "#
 );
 
+#[cfg(target_arch = "x86_64")]
 unsafe extern "C" {
     fn reverie_inguest_sigalrm_call_handler(
         signal: libc::c_int,
@@ -943,6 +997,7 @@ unsafe extern "C" {
 }
 
 /// The current PKRU; only with OSPKE.
+#[cfg(target_arch = "x86_64")]
 fn read_pkru() -> u32 {
     let rights: u32;
     unsafe {
@@ -969,6 +1024,7 @@ fn read_pkru() -> u32 {
 /// runtime's own alternate stack back in the frame, and returns through the
 /// runtime's restorer. The frame's saved PKRU is never touched, so
 /// rt_sigreturn restores it (or the guest's edit of it) as Linux would.
+#[cfg(target_arch = "x86_64")]
 unsafe extern "C" fn sigalrm_trampoline(
     signal: libc::c_int,
     info: *mut libc::siginfo_t,

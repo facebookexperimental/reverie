@@ -7,10 +7,18 @@
  */
 
 use bytes::BytesMut;
-use nix::sys::signal::Signal;
+use safeptrace::AnySignal;
 
 use crate::gdbstub::commands::*;
 use crate::gdbstub::hex::*;
+use crate::gdbstub::signals;
+
+/// The signal of a `C` or `S` action, which gdb sends by its own number
+/// (`gdbstub::signals`).
+fn decode_signal(hex: &[u8]) -> Option<AnySignal> {
+    let gdb = decode_hex::<u8>(hex).ok()?;
+    AnySignal::new(signals::from_gdb(gdb)?)
+}
 
 #[derive(PartialEq, Debug)]
 pub enum vCont {
@@ -40,18 +48,10 @@ impl ParseCommand for vCont {
                         match action[0] {
                             b'c' => Some(ResumeAction::Continue(None)),
                             b'C' => {
-                                let sig = decode_hex::<i32>(&action[1..])
-                                    .ok()
-                                    .and_then(|s| Signal::try_from(s).ok())?;
-                                Some(ResumeAction::Continue(Some(sig)))
+                                Some(ResumeAction::Continue(Some(decode_signal(&action[1..])?)))
                             }
                             b's' => Some(ResumeAction::Step(None)),
-                            b'S' => {
-                                let sig = decode_hex::<i32>(&action[1..])
-                                    .ok()
-                                    .and_then(|s| Signal::try_from(s).ok())?;
-                                Some(ResumeAction::Step(Some(sig)))
-                            }
+                            b'S' => Some(ResumeAction::Step(Some(decode_signal(&action[1..])?))),
                             b't' => Some(ResumeAction::Stop),
                             b'r' => {
                                 let mut iter = action[1..].split_mut(|c| *c == b',');

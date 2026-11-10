@@ -19,6 +19,11 @@
 //!    Runtime-private calls use [`raw_syscall6`]. Neither site re-traps.
 //! 5. The handler writes the result into `RAX` and returns, resuming the guest.
 
+#![allow(
+    unexpected_cfgs,
+    reason = "`fbcode_build` is supplied by the internal Buck build"
+)]
+
 use core::sync::atomic::AtomicBool;
 use core::sync::atomic::AtomicPtr;
 use core::sync::atomic::Ordering;
@@ -30,12 +35,21 @@ use crate::dispatch::SyscallDispatcher;
 use crate::dispatch::SyscallEvent;
 use crate::seccomp::TrustedGate;
 use crate::signal;
-#[cfg(feature = "fixed-syscall-gates")]
+#[cfg(all(feature = "fixed-syscall-gates", target_arch = "x86_64"))]
 mod fixed_gates;
-#[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+#[cfg(all(
+    feature = "loader-private-runtime",
+    target_env = "musl",
+    target_arch = "x86_64"
+))]
 pub use fixed_gates::mapped_initial_gate_reference;
+#[cfg(target_arch = "x86_64")]
+pub mod frame;
+#[cfg(not(target_arch = "x86_64"))]
+#[path = "trap/frame_aarch64.rs"]
 pub mod frame;
 mod panic_report;
+#[cfg(target_arch = "x86_64")]
 mod pkru;
 
 /// Frozen optional gate ABI. These constants emit no default-path code.
@@ -61,11 +75,11 @@ pub const FIXED_SIGNAL_RESTORER_RETURN_IP: u64 = FIXED_GATE_BASE + 0x30b;
 
 /// Whether this process permanently selected the fully sealed fixed gate page.
 pub fn fixed_gates_published() -> bool {
-    #[cfg(feature = "fixed-syscall-gates")]
+    #[cfg(all(feature = "fixed-syscall-gates", target_arch = "x86_64"))]
     {
         fixed_gates::published()
     }
-    #[cfg(not(feature = "fixed-syscall-gates"))]
+    #[cfg(not(all(feature = "fixed-syscall-gates", target_arch = "x86_64")))]
     {
         false
     }
@@ -86,11 +100,11 @@ pub fn fixed_gate_region() -> Option<(u64, u64)> {
 /// Later installation failure must terminate through the selected gate; the
 /// page must never be unmapped or reverted after successful publication.
 pub unsafe fn prepare_fixed_gates() -> io::Result<()> {
-    #[cfg(feature = "fixed-syscall-gates")]
+    #[cfg(all(feature = "fixed-syscall-gates", target_arch = "x86_64"))]
     {
         unsafe { fixed_gates::prepare() }
     }
-    #[cfg(not(feature = "fixed-syscall-gates"))]
+    #[cfg(not(all(feature = "fixed-syscall-gates", target_arch = "x86_64")))]
     {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -102,19 +116,35 @@ pub unsafe fn prepare_fixed_gates() -> io::Result<()> {
 /// Whether the runtime's installation found OSPKE enabled (RDPKRU and WRPKRU
 /// run); false before installation.
 pub fn pkru_present() -> bool {
-    pkru::present()
+    #[cfg(target_arch = "x86_64")]
+    {
+        pkru::present()
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        // This implementation does not use protection keys off x86-64
+        // (aarch64 POE rights are not observed yet), so none is present.
+        false
+    }
 }
 
-#[cfg(feature = "exec-private-init")]
+#[cfg(all(feature = "exec-private-init", target_arch = "x86_64"))]
 pub(crate) fn prepare_private_signal_features() -> io::Result<bool> {
     frame::initialize()?;
     pkru::initialize()
 }
+
+#[cfg(all(feature = "exec-private-init", not(target_arch = "x86_64")))]
+pub(crate) fn prepare_private_signal_features() -> io::Result<bool> {
+    frame::initialize()?;
+    Ok(false)
+}
 const SYS_SECCOMP_CODE: libc::c_int = 1;
 
+#[cfg(target_arch = "x86_64")]
 core::arch::global_asm!(
     r#"
-    .text
+    .pushsection .text.reverie_inguest_trusted_syscall,"ax",@progbits
     .p2align 4
     .global reverie_inguest_trusted_syscall
     .hidden reverie_inguest_trusted_syscall
@@ -146,7 +176,9 @@ reverie_inguest_trusted_syscall_return_ip:
     pop r12
     ret
     .size reverie_inguest_trusted_syscall, .-reverie_inguest_trusted_syscall
+    .popsection
 
+    .text
     .p2align 4
     .global reverie_inguest_guest_syscall
     .hidden reverie_inguest_guest_syscall
@@ -207,11 +239,79 @@ reverie_inguest_guest_syscall_return_ip:
 "#
 );
 
+// The aarch64 gates keep the same symbols and Rust signatures. Differences
+// from x86-64, all forced by the architecture: `svc` preserves x30, so no
+// continuation register is needed (the native entry takes kernel registers
+// with x30 as its continuation, as a plain `bl` leaves it); each entry
+// starts with the `bti c` landing pad a BTI-guarded indirect call requires;
+// and there is no PKRU, so the guest gate performs no permission switch
+// and its result's rights word is zero (callers on this architecture never
+// observe it: see `raw_syscall6_with_result`).
+#[cfg(target_arch = "aarch64")]
+core::arch::global_asm!(
+    r#"
+    .pushsection .text.reverie_inguest_trusted_syscall,"ax",@progbits
+    .p2align 4
+    .global reverie_inguest_trusted_syscall
+    .hidden reverie_inguest_trusted_syscall
+    .type reverie_inguest_trusted_syscall,@function
+reverie_inguest_trusted_syscall:
+    // AAPCS64 entry: x0 = number, x1..x6 = args. Shuffle to kernel regs.
+    bti c
+    mov x8, x0
+    mov x0, x1
+    mov x1, x2
+    mov x2, x3
+    mov x3, x4
+    mov x4, x5
+    mov x5, x6
+    .global reverie_inguest_trusted_syscall_ip
+    .hidden reverie_inguest_trusted_syscall_ip
+reverie_inguest_trusted_syscall_ip:
+    // Native assembly entry: Linux syscall registers, x30 = continuation.
+    svc #0
+    .global reverie_inguest_trusted_syscall_return_ip
+    .hidden reverie_inguest_trusted_syscall_return_ip
+reverie_inguest_trusted_syscall_return_ip:
+    ret
+    .size reverie_inguest_trusted_syscall, .-reverie_inguest_trusted_syscall
+    .popsection
+
+    .text
+    .p2align 4
+    .global reverie_inguest_guest_syscall
+    .hidden reverie_inguest_guest_syscall
+    .type reverie_inguest_guest_syscall,@function
+reverie_inguest_guest_syscall:
+    // AAPCS64: x0 = number, x1 = args pointer, w2 = rights (none here).
+    bti c
+    mov x8, x0
+    mov x9, x1
+    ldr x0, [x9]
+    ldr x1, [x9, #8]
+    ldr x2, [x9, #16]
+    ldr x3, [x9, #24]
+    ldr x4, [x9, #32]
+    ldr x5, [x9, #40]
+    .global reverie_inguest_guest_syscall_ip
+    .hidden reverie_inguest_guest_syscall_ip
+reverie_inguest_guest_syscall_ip:
+    svc #0
+    .global reverie_inguest_guest_syscall_return_ip
+    .hidden reverie_inguest_guest_syscall_return_ip
+reverie_inguest_guest_syscall_return_ip:
+    mov x1, xzr
+    ret
+    .size reverie_inguest_guest_syscall, .-reverie_inguest_guest_syscall
+"#
+);
+
 // SysV classifies this concrete 16-byte integer pair into RAX and RDX. Rust's
 // Option layout never crosses the assembly boundary.
 #[repr(C)]
 struct GuestSyscallResult {
     result: i64,
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     pkru: u64,
 }
 
@@ -254,6 +354,307 @@ thread_local! {
     static IN_HANDLER: Cell<bool> = const { Cell::new(false) };
 }
 
+/// Maximum number of distinct lazy-promotion candidates retained as known
+/// for the process lifetime; draining advances a cursor and frees no slots
+/// in this slice. Overflow attempts are counted (including repeats of an
+/// address that was never retained) and the affected sites remain on the
+/// ordinary trap path; capacity never changes syscall forwarding behavior,
+/// and a full table does not imply promotion coverage.
+#[cfg(target_arch = "aarch64")]
+pub const PENDING_PROMOTION_CAPACITY: usize = 64;
+
+/// Result of attempting to record one first-seen trapped `svc` site.
+#[cfg(target_arch = "aarch64")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PendingPromotionRecord {
+    /// This is the first observation of the site and it is now pending.
+    NewSite,
+    /// This site has already been recorded, whether or not it has drained.
+    AlreadyKnown,
+    /// The fixed table is full; this candidate was not retained.
+    TableFull,
+    /// Ordinary-context code held the table when the handler ran. The
+    /// handler does not spin or wait; this candidate was not retained.
+    Contended,
+}
+
+/// Snapshot of lazy-promotion candidate accounting.
+///
+/// Known sites are retained after drain so an unflipped site that traps
+/// again is recognized rather than repeatedly queued for the promoter.
+#[cfg(target_arch = "aarch64")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PendingPromotionStats {
+    /// Distinct candidates currently waiting to be drained.
+    pub pending: usize,
+    /// Distinct known candidates accepted since process start, including
+    /// drained candidates retained for de-duplication.
+    pub recorded_new: u64,
+    /// Record attempts rejected because the fixed table was full. This
+    /// counts attempts, including repeats of an address never retained,
+    /// not distinct dropped sites.
+    pub capacity_dropped: u64,
+    /// Record attempts dropped because the handler could not immediately
+    /// acquire the table without waiting.
+    pub contended_dropped: u64,
+}
+
+#[cfg(target_arch = "aarch64")]
+struct PendingPromotionData {
+    sites: [u64; PENDING_PROMOTION_CAPACITY],
+    known_len: usize,
+    drained_len: usize,
+    capacity_dropped: u64,
+}
+
+#[cfg(target_arch = "aarch64")]
+struct PendingPromotions {
+    /// Owner word: 0 = unowned, a plain pid = that process owns the
+    /// contents, pid | PENDING_OWNER_RESETTING = that pid is resetting.
+    /// Tagging the resetting state with its pid lets a fork child tell a
+    /// live same-process reset (wait or drop) from a copied marker whose
+    /// resetter vanished with the parent (steal and complete it).
+    owner: core::sync::atomic::AtomicU64,
+    locked: core::sync::atomic::AtomicBool,
+    data: core::cell::UnsafeCell<PendingPromotionData>,
+    contended_dropped: core::sync::atomic::AtomicU64,
+}
+
+// SAFETY: data is accessed only under `locked`, or by the single thread
+// performing a post-fork reset while every other accessor either spins on
+// the resetting owner word or (handler path) drops its record attempt.
+#[cfg(target_arch = "aarch64")]
+unsafe impl Sync for PendingPromotions {}
+
+#[cfg(target_arch = "aarch64")]
+const PENDING_OWNER_RESETTING: u64 = 1 << 63;
+
+// No thread-local owner cache exists, by design: a fork copies the
+// parent thread's TLS, so any cached pid would falsely match the copied
+// owner word in the child and the handler fast path would trust the
+// parent's ownership. Every record revalidates by getpid instead.
+
+#[cfg(target_arch = "aarch64")]
+impl PendingPromotions {
+    const fn new() -> Self {
+        Self {
+            owner: core::sync::atomic::AtomicU64::new(0),
+            locked: core::sync::atomic::AtomicBool::new(false),
+            data: core::cell::UnsafeCell::new(PendingPromotionData {
+                sites: [0; PENDING_PROMOTION_CAPACITY],
+                known_len: 0,
+                drained_len: 0,
+                capacity_dropped: 0,
+            }),
+            contended_dropped: core::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn gate_getpid() -> u64 {
+        // SAFETY: scalar getpid through the trusted gate.
+        unsafe { raw_syscall6_gate(libc::SYS_getpid, [0; 6]) as u64 }
+    }
+
+    /// The reset body shared by both reset paths. Caller guarantees no
+    /// other accessor can hold or race the table (owner-word protocol
+    /// for ensure_owner, sole-survivor for the fork-child path).
+    fn reset_contents(&self, pid: u64) {
+        use core::sync::atomic::Ordering;
+        // SAFETY: exclusive by the caller's guarantee above.
+        unsafe {
+            *self.data.get() = PendingPromotionData {
+                sites: [0; PENDING_PROMOTION_CAPACITY],
+                known_len: 0,
+                drained_len: 0,
+                capacity_dropped: 0,
+            };
+        }
+        self.contended_dropped.store(0, Ordering::Relaxed);
+        self.locked.store(false, Ordering::Relaxed);
+        self.owner.store(pid, Ordering::Release);
+    }
+
+    /// Establish this process as table owner, resetting inherited fork
+    /// state without ever acquiring the inherited lock bit. The resetting
+    /// owner word carries its pid: a same-process reset is waited out
+    /// (or, with `wait == false` on the handler path, reported
+    /// not-established), while a copied marker naming another pid is a
+    /// dead parent's interrupted reset and is stolen and completed here.
+    fn ensure_owner(&self, wait: bool) -> bool {
+        use core::sync::atomic::Ordering;
+        let pid = Self::gate_getpid();
+        loop {
+            let word = self.owner.load(Ordering::Acquire);
+            let tagged = word & PENDING_OWNER_RESETTING != 0;
+            let owner_pid = word & !PENDING_OWNER_RESETTING;
+            if !tagged && owner_pid == pid {
+                return true;
+            }
+            if tagged && owner_pid == pid {
+                // A live reset by another thread of THIS process.
+                if !wait {
+                    return false;
+                }
+                core::hint::spin_loop();
+                continue;
+            }
+            if !tagged && owner_pid == 0 {
+                // First establishment in this process: the table has
+                // no previous owner, so its lock and contents are
+                // legitimate and must not be reset.
+                if self
+                    .owner
+                    .compare_exchange(0, pid, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    return true;
+                }
+                continue;
+            }
+            // A different pid owns it, settled or mid-reset: that process
+            // is gone from this address space (fresh start or fork), and
+            // its threads cannot hold the lock here. Claim the reset.
+            if self
+                .owner
+                .compare_exchange(
+                    word,
+                    pid | PENDING_OWNER_RESETTING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                self.reset_contents(pid);
+                return true;
+            }
+        }
+    }
+
+    /// Reset after a physically proven fork (see the handler): the
+    /// kernel returned 0 for a fork-family call AND this process's TGID
+    /// differs from the table owner. A dispatcher-synthesized zero in
+    /// the parent (TGID still the owner's) and a clone-thread return
+    /// (same TGID) both fail the second conjunct, so neither can clear
+    /// a live parent's lock or contents. In a proven child this thread
+    /// is the sole survivor and guest code has not run yet.
+    fn reset_if_physical_child(&self) {
+        use core::sync::atomic::Ordering;
+        let pid = Self::gate_getpid();
+        let owner_pid = self.owner.load(Ordering::Acquire) & !PENDING_OWNER_RESETTING;
+        if owner_pid == pid {
+            return;
+        }
+        self.reset_contents(pid);
+    }
+
+    fn try_lock(&self) -> bool {
+        self.locked
+            .compare_exchange(
+                false,
+                true,
+                core::sync::atomic::Ordering::Acquire,
+                core::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+    }
+
+    fn lock(&self) {
+        while !self.try_lock() {
+            core::hint::spin_loop();
+        }
+    }
+
+    fn unlock(&self) {
+        self.locked
+            .store(false, core::sync::atomic::Ordering::Release);
+    }
+
+    fn try_record(&self, site: u64) -> PendingPromotionRecord {
+        use core::sync::atomic::Ordering;
+        if !self.ensure_owner(false) {
+            self.contended_dropped.fetch_add(1, Ordering::Relaxed);
+            return PendingPromotionRecord::Contended;
+        }
+        if !self.try_lock() {
+            self.contended_dropped.fetch_add(1, Ordering::Relaxed);
+            return PendingPromotionRecord::Contended;
+        }
+        // SAFETY: lock held; see Sync impl.
+        let state = unsafe { &mut *self.data.get() };
+        let result = if state.sites[..state.known_len].contains(&site) {
+            PendingPromotionRecord::AlreadyKnown
+        } else if state.known_len == PENDING_PROMOTION_CAPACITY {
+            state.capacity_dropped += 1;
+            PendingPromotionRecord::TableFull
+        } else {
+            let insertion = state.known_len;
+            state.sites[insertion] = site;
+            state.known_len += 1;
+            PendingPromotionRecord::NewSite
+        };
+        self.unlock();
+        result
+    }
+
+    fn drain(&self, out: &mut [u64]) -> usize {
+        self.ensure_owner(true);
+        self.lock();
+        // SAFETY: lock held; see Sync impl.
+        let state = unsafe { &mut *self.data.get() };
+        let available = state.known_len - state.drained_len;
+        let count = available.min(out.len());
+        let start = state.drained_len;
+        out[..count].copy_from_slice(&state.sites[start..start + count]);
+        state.drained_len += count;
+        self.unlock();
+        count
+    }
+
+    fn stats(&self) -> PendingPromotionStats {
+        self.ensure_owner(true);
+        self.lock();
+        // SAFETY: lock held; see Sync impl.
+        let state = unsafe { &*self.data.get() };
+        let stats = PendingPromotionStats {
+            pending: state.known_len - state.drained_len,
+            recorded_new: state.known_len as u64,
+            capacity_dropped: state.capacity_dropped,
+            contended_dropped: self
+                .contended_dropped
+                .load(core::sync::atomic::Ordering::Relaxed),
+        };
+        self.unlock();
+        stats
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+static PENDING_PROMOTIONS: PendingPromotions = PendingPromotions::new();
+
+/// Record the first observation of a candidate lazy-promotion site without
+/// allocating or waiting in signal context.
+///
+/// This is record-only plumbing for a future patch promoter. It does not
+/// inspect, patch, or otherwise alter guest code.
+#[cfg(target_arch = "aarch64")]
+pub fn record_pending_promotion_site(site: u64) -> PendingPromotionRecord {
+    PENDING_PROMOTIONS.try_record(site)
+}
+
+/// Remove up to `out.len()` pending sites in first-observed order and
+/// return how many were copied. Intended for ordinary runtime context; this
+/// function may briefly spin if a handler currently holds the table.
+#[cfg(target_arch = "aarch64")]
+pub fn drain_pending_promotion_sites(out: &mut [u64]) -> usize {
+    PENDING_PROMOTIONS.drain(out)
+}
+
+/// Snapshot pending-site accounting from ordinary runtime context.
+#[cfg(target_arch = "aarch64")]
+pub fn pending_promotion_stats() -> PendingPromotionStats {
+    PENDING_PROMOTIONS.stats()
+}
+
 /// Execute a real syscall through the trusted gate.
 ///
 /// The gate's `syscall` instruction is whitelisted in the seccomp filter, so
@@ -266,7 +667,22 @@ thread_local! {
 /// The call must return through its original stack; this is not an ordinary
 /// wrapper for `rt_sigreturn` or `clone` with a replaced child stack.
 pub unsafe fn raw_syscall6(number: i64, args: [u64; 6]) -> i64 {
-    #[cfg(feature = "fixed-syscall-gates")]
+    // Fixed-VL envelope (aarch64): never issue a VL-changing prctl from
+    // inside the SIGSYS handler, whatever entry a dispatcher took.
+    #[cfg(target_arch = "aarch64")]
+    if IN_HANDLER.get() && vl_change_refused(number, args) {
+        return refuse_vl_change();
+    }
+    unsafe { raw_syscall6_gate(number, args) }
+}
+
+/// The trusted-gate call itself, without the fixed-VL boundary check
+/// (the boundary's own VL probe must not recurse into it).
+///
+/// # Safety
+/// As [`raw_syscall6`].
+unsafe fn raw_syscall6_gate(number: i64, args: [u64; 6]) -> i64 {
+    #[cfg(all(feature = "fixed-syscall-gates", target_arch = "x86_64"))]
     if fixed_gates_published() {
         return unsafe { fixed_gates::scalar(number, args) };
     }
@@ -292,7 +708,11 @@ pub unsafe fn raw_syscall6(number: i64, args: [u64; 6]) -> i64 {
 /// as for `raw_syscall6`; unused syscall arguments are zero.
 #[inline(never)]
 pub(crate) unsafe fn raw_syscall3(number: i64, arg0: u64, arg1: u64, arg2: u64) -> i64 {
-    #[cfg(feature = "fixed-syscall-gates")]
+    #[cfg(target_arch = "aarch64")]
+    if IN_HANDLER.get() && vl_change_refused(number, [arg0, arg1, arg2, 0, 0, 0]) {
+        return refuse_vl_change();
+    }
+    #[cfg(all(feature = "fixed-syscall-gates", target_arch = "x86_64"))]
     if fixed_gates_published() {
         return unsafe { fixed_gates::scalar3_or6(number, arg0, arg1, arg2, 0, 0, 0) };
     }
@@ -312,7 +732,11 @@ pub(crate) unsafe fn raw_syscall3(number: i64, arg0: u64, arg1: u64, arg2: u64) 
 /// Like the ordinary gate, this cannot resume a clone with a different stack
 /// and must not be used as an ordinary wrapper around rt_sigreturn.
 pub unsafe fn raw_syscall6_with_pkru(number: i64, args: [u64; 6], pkru: u32) -> i64 {
-    #[cfg(feature = "fixed-syscall-gates")]
+    #[cfg(target_arch = "aarch64")]
+    if IN_HANDLER.get() && vl_change_refused(number, args) {
+        return refuse_vl_change();
+    }
+    #[cfg(all(feature = "fixed-syscall-gates", target_arch = "x86_64"))]
     if fixed_gates_published() {
         return unsafe { fixed_gates::guest(number, &args, pkru).result };
     }
@@ -358,19 +782,36 @@ pub unsafe fn raw_syscall6_with_result(
     args: [u64; 6],
     guest_pkru: Option<u32>,
 ) -> NativeSyscallResult {
+    // Fixed-VL boundary at the forwarding issue point: a dispatcher that
+    // rewrote a forwarded event into a VL change is refused here, with
+    // the caller's observed rights unchanged (nothing was issued).
+    #[cfg(target_arch = "aarch64")]
+    if IN_HANDLER.get() && vl_change_refused(number, args) {
+        return NativeSyscallResult {
+            result: refuse_vl_change(),
+            pkru: guest_pkru,
+        };
+    }
     match guest_pkru {
         Some(pkru) => {
-            #[cfg(feature = "fixed-syscall-gates")]
+            #[cfg(all(feature = "fixed-syscall-gates", target_arch = "x86_64"))]
             let result = if fixed_gates_published() {
                 unsafe { fixed_gates::guest(number, &args, pkru) }
             } else {
                 unsafe { reverie_inguest_guest_syscall(number, args.as_ptr(), pkru) }
             };
-            #[cfg(not(feature = "fixed-syscall-gates"))]
+            #[cfg(not(all(feature = "fixed-syscall-gates", target_arch = "x86_64")))]
             let result = unsafe { reverie_inguest_guest_syscall(number, args.as_ptr(), pkru) };
+            // This implementation observes no protection-key rights off
+            // x86-64 (aarch64 POE is not observed yet):
+            // the guest gate executes with caller rights and reports none.
+            #[cfg(target_arch = "x86_64")]
+            let observed_pkru = Some(result.pkru as u32);
+            #[cfg(not(target_arch = "x86_64"))]
+            let observed_pkru = None;
             NativeSyscallResult {
                 result: result.result,
-                pkru: Some(result.pkru as u32),
+                pkru: observed_pkru,
             }
         }
         None => NativeSyscallResult {
@@ -392,7 +833,7 @@ pub unsafe fn physical_guest_syscall6(
     args: [u64; 6],
     pkru: Option<u32>,
 ) -> NativeSyscallResult {
-    #[cfg(feature = "exec-private-init")]
+    #[cfg(all(feature = "exec-private-init", target_arch = "x86_64"))]
     if crate::guest::exec_private::active() {
         return unsafe { crate::guest::exec_private::physical_syscall(number, args, pkru) };
     }
@@ -558,6 +999,7 @@ only the runtime's signal restorer may return from a signal, so the process ends
 /// # Safety
 ///
 /// Only the kernel calls this, on a real `SIGSYS`.
+#[cfg(target_arch = "x86_64")]
 pub(crate) unsafe extern "C" fn sigsys_handler(
     signal_number: libc::c_int,
     info: *mut libc::siginfo_t,
@@ -636,6 +1078,188 @@ pub(crate) unsafe extern "C" fn sigsys_handler(
     IN_HANDLER.set(false);
 }
 
+/// Fixed-VL admission envelope decision, pure over the kernel-effective
+/// classification: Linux takes the syscall number and the prctl option as
+/// `int`, so both are classified at that width — a register value whose
+/// low 32 bits name the call IS that call, whatever its high bits carry.
+/// `current` is the queried current length, or `None` when the query
+/// failed: a denied GET is not evidence a SET cannot change state (a
+/// filter or hook can deny them independently), so an unestablishable
+/// current length refuses rather than forwards. Requests naming the
+/// current length, an ONEXEC-deferred change, or a zero length (the
+/// kernel rejects it itself before changing state) are not refused.
+#[cfg(target_arch = "aarch64")]
+fn vl_change_decision(number: i64, args: [u64; 6], current: Option<u64>) -> bool {
+    const PR_SVE_SET_VL: i32 = 50;
+    const PR_SME_SET_VL: i32 = 63;
+    const VL_LEN_MASK: u64 = 0xffff;
+    const VL_ONEXEC: u64 = 1 << 18;
+    if number as i32 != libc::SYS_prctl as i32 {
+        return false;
+    }
+    if !matches!(args[0] as i32, PR_SVE_SET_VL | PR_SME_SET_VL) {
+        return false;
+    }
+    if args[1] & VL_ONEXEC != 0 {
+        return false;
+    }
+    let requested = args[1] & VL_LEN_MASK;
+    if requested == 0 {
+        return false;
+    }
+    match current {
+        Some(current) => requested != (current & VL_LEN_MASK),
+        None => true,
+    }
+}
+
+/// Whether this call, issued from inside the SIGSYS handler, would change
+/// the thread's vector length under a live frame. The current length is
+/// read through the unchecked gate entry, so the probe itself never traps
+/// and the boundary cannot recurse into itself.
+#[cfg(target_arch = "aarch64")]
+fn vl_change_refused(number: i64, args: [u64; 6]) -> bool {
+    const PR_SVE_SET_VL: i32 = 50;
+    const PR_SVE_GET_VL: u64 = 51;
+    const PR_SME_SET_VL: i32 = 63;
+    const PR_SME_GET_VL: u64 = 64;
+    if number as i32 != libc::SYS_prctl as i32 {
+        return false;
+    }
+    let get_op = match args[0] as i32 {
+        PR_SVE_SET_VL => PR_SVE_GET_VL,
+        PR_SME_SET_VL => PR_SME_GET_VL,
+        _ => return false,
+    };
+    // Pass-through shapes decide without a query (deferred, or the
+    // kernel's own zero rejection): only a would-be change probes.
+    if args[1] & (1 << 18) != 0 || args[1] & 0xffff == 0 {
+        return false;
+    }
+    // SAFETY: a scalar prctl query through the trusted gate.
+    let queried = unsafe { raw_syscall6_gate(libc::SYS_prctl, [get_op, 0, 0, 0, 0, 0]) };
+    let current = (queried >= 0).then_some(queried as u64);
+    vl_change_decision(number, args, current)
+}
+
+/// Issue the fixed-VL refusal: the guest sees the kernel-faithful EINVAL,
+/// and the host stderr gets the envelope's name at the refusal site, so a
+/// synthetic errno is never indistinguishable from a kernel decision.
+#[cfg(target_arch = "aarch64")]
+fn refuse_vl_change() -> i64 {
+    const MESSAGE: &[u8] =
+        b"reverie-inguest: fixed-VL envelope: refusing VL-changing prctl while a signal frame is live\n";
+    // SAFETY: a scalar write of a static buffer through the trusted gate.
+    unsafe {
+        raw_syscall6_gate(
+            libc::SYS_write,
+            [2, MESSAGE.as_ptr() as u64, MESSAGE.len() as u64, 0, 0, 0],
+        )
+    };
+    -i64::from(libc::EINVAL)
+}
+
+/// The `SA_SIGINFO` handler for `SIGSYS` on aarch64: same provenance,
+/// reentry, and dispatch flow as the x86-64 handler, over the aarch64
+/// frame (number in x8, arguments in x0-x5, result in x0, resume at pc).
+/// This implementation preserves no protection-key rights here yet
+/// (aarch64 POE rights are a later stage, not an architecture claim).
+///
+/// # Safety
+///
+/// Only the kernel calls this, on a real `SIGSYS`.
+#[cfg(target_arch = "aarch64")]
+pub(crate) unsafe extern "C" fn sigsys_handler(
+    signal_number: libc::c_int,
+    info: *mut libc::siginfo_t,
+    context: *mut libc::c_void,
+) {
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-133): Review fail-closed SIGSYS provenance validation.
+    if signal_number != libc::SIGSYS
+        || info.is_null()
+        || context.is_null()
+        || unsafe { (*info).si_code } != SYS_SECCOMP_CODE
+    {
+        unsafe { exit_now(126) };
+    }
+
+    // Reentrancy guard: a trapped syscall inside the handler is a bug (the
+    // dispatcher must use the trusted gate). Fail closed rather than recurse.
+    if IN_HANDLER.get() {
+        unsafe { exit_now(125) };
+    }
+    IN_HANDLER.set(true);
+
+    let mut frame = match unsafe { frame::SignalFrame::from_raw(context, info) } {
+        Ok(frame) => frame,
+        Err(_) => unsafe { exit_now(126) },
+    };
+    // The filter traps `rt_sigreturn` only when it admits it at the
+    // runtime's restorer alone, so a trapped one is never the runtime's.
+    if is_rt_sigreturn(frame.register(8)) {
+        unsafe { refuse_guest_signal_return() };
+    }
+    // Record-only lazy-promotion evidence: the validated frame's PC is the
+    // instruction after the 4-byte `svc`. Recording neither examines nor
+    // changes the instruction and never changes whether this call is
+    // dispatched or forwarded.
+    if let Some(site) = (frame.register(32) as u64).checked_sub(4) {
+        let _ = record_pending_promotion_site(site);
+    }
+    if dispatcher().is_some_and(|dispatcher| dispatcher.dispatch_private_signal(&mut frame)) {
+        IN_HANDLER.set(false);
+        return;
+    }
+    let mut event = SyscallEvent::new(
+        frame.register(8),
+        [
+            frame.register(0) as u64,
+            frame.register(1) as u64,
+            frame.register(2) as u64,
+            frame.register(3) as u64,
+            frame.register(4) as u64,
+            frame.register(5) as u64,
+        ],
+        frame.register(32) as u64,
+    );
+    event.set_guest_pkru(None);
+
+    // Admission is a fixed-VL envelope (see vl_change_refused): a guest
+    // prctl that would change the vector length under this live frame is
+    // refused by name before any dispatcher can forward it.
+    if vl_change_refused(event.number(), event.args()) {
+        frame.set_register(0, refuse_vl_change());
+        IN_HANDLER.set(false);
+        return;
+    }
+
+    if let Some(dispatcher) = dispatcher() {
+        dispatcher.dispatch_signal(&mut event, &mut frame);
+    } else {
+        event.fail(libc::ENOSYS);
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    if let Some(resume_address) = event.resume_address() {
+        // Preserve the syscall-number register so the replacement callback
+        // observes the original entry state after sigreturn.
+        frame.set_register(32, resume_address as i64);
+    } else {
+        frame.set_register(0, event.resolved_result());
+    }
+    // In the fork child (result register 0) this thread is the sole
+    // survivor and guest code has not run yet: reset the pending-site
+    // table it inherited (possibly locked by a vanished parent thread)
+    // before returning. Forks the handler never mediated are healed by
+    // the table's PID-ownership check on first access instead.
+    if crate::arch::is_fork_family(event.number()) && frame.register(0) == 0 {
+        PENDING_PROMOTIONS.reset_if_physical_child();
+    }
+    IN_HANDLER.set(false);
+}
+
+#[cfg(target_arch = "x86_64")]
 core::arch::global_asm!(
     r#"
     .text
@@ -660,6 +1284,7 @@ reverie_inguest_sigsys_pkru:
     handler = sym sigsys_handler,
 );
 
+#[cfg(target_arch = "x86_64")]
 unsafe extern "C" {
     fn reverie_inguest_sigsys_pkru(
         signal_number: libc::c_int,
@@ -730,6 +1355,7 @@ impl PreparedHandler {
 }
 /// Finish possibly allocating/trapping preparation before an owned frontend
 /// replacement interval. This does not register a stack or change a disposition.
+#[cfg(target_arch = "x86_64")]
 pub(crate) fn prepare_handler() -> io::Result<PreparedHandler> {
     panic_report::install();
     frame::initialize()?;
@@ -748,7 +1374,16 @@ pub(crate) fn prepare_handler() -> io::Result<PreparedHandler> {
     Ok(PreparedHandler { entry: handler })
 }
 
-#[cfg(feature = "exec-private-init")]
+#[cfg(not(target_arch = "x86_64"))]
+pub(crate) fn prepare_handler() -> io::Result<PreparedHandler> {
+    panic_report::install();
+    frame::initialize()?;
+    Ok(PreparedHandler {
+        entry: sigsys_handler,
+    })
+}
+
+#[cfg(all(feature = "exec-private-init", target_arch = "x86_64"))]
 pub(crate) unsafe fn adopt_authenticated_initial_gate() -> io::Result<()> {
     unsafe { fixed_gates::adopt_authenticated_initial_page() }
 }
@@ -768,7 +1403,8 @@ pub(crate) unsafe fn adopt_authenticated_initial_gate() -> io::Result<()> {
 #[cfg(all(
     feature = "exec-private-init",
     feature = "loader-private-runtime",
-    target_env = "musl"
+    target_env = "musl",
+    target_arch = "x86_64"
 ))]
 pub(crate) unsafe fn adopt_mapped_initial_gate(expected: &'static [u8; 4096]) -> Result<(), i32> {
     // SAFETY: forwarded complete physical-producer contract.
@@ -781,7 +1417,11 @@ pub(crate) unsafe fn adopt_mapped_initial_gate(expected: &'static [u8; 4096]) ->
 /// The caller owns the actual inherited qualified gate/filter and excludes
 /// Guest execution, workers and mapping changes. This proves neither admission
 /// nor permission to publish a Tool or native control.
-#[cfg(all(feature = "exec-private-init", feature = "coordinator-rpc"))]
+#[cfg(all(
+    feature = "exec-private-init",
+    feature = "coordinator-rpc",
+    target_arch = "x86_64"
+))]
 pub(crate) unsafe fn verify_native_io_gate() -> io::Result<()> {
     unsafe { fixed_gates::verify_initial_page() }
 }
@@ -792,12 +1432,16 @@ pub(crate) unsafe fn verify_native_io_gate() -> io::Result<()> {
 /// A checked native I/O scope must retain the real qualified RX page/filter,
 /// original task/private FS and valid scalar arguments/return stack. No Guest
 /// may invoke this mechanism, and it supplies no image admission authority.
-#[cfg(all(feature = "exec-private-init", feature = "coordinator-rpc"))]
+#[cfg(all(
+    feature = "exec-private-init",
+    feature = "coordinator-rpc",
+    target_arch = "x86_64"
+))]
 pub(crate) unsafe fn native_io_syscall(number: i64, args: [u64; 6]) -> i64 {
     unsafe { fixed_gates::scalar(number, args) }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64"))]
 mod tests {
     use super::*;
 
@@ -867,6 +1511,10 @@ mod tests {
         }
     }
 
+    #[cfg_attr(
+        fbcode_build,
+        ignore = "fbsource-disabled: jemalloc background thread is killed by the SIGSYS filter (intermittent exit 31); https://github.com/rrnewton/reverie/issues/867"
+    )]
     #[test]
     fn a_panic_inside_the_handler_is_reported_and_aborts() {
         use std::os::unix::process::ExitStatusExt;
@@ -1214,6 +1862,10 @@ mod tests {
         panic!("deliberate panic outside the SIGSYS handler")
     }
 
+    #[cfg_attr(
+        fbcode_build,
+        ignore = "fbsource-disabled: jemalloc background thread is killed by the SIGSYS filter; https://github.com/rrnewton/reverie/issues/867"
+    )]
     #[test]
     fn a_panic_outside_the_handler_reaches_the_previous_hook() {
         const CHILD: &str = "REVERIE_TEST_SIGSYS_PANIC_OUTSIDE";
@@ -1254,5 +1906,676 @@ mod tests {
             !stderr.contains("panic in the SIGSYS handler"),
             "{output:?}"
         );
+    }
+}
+
+/// Real-architecture proof for the aarch64 gates: the trusted gate executes
+/// a syscall through an installed filter, a nearby non-gate site traps, and
+/// the guest gate executes with caller rights. The handler here is test
+/// scaffolding only — it proves gate/filter semantics, not runtime
+/// admission, which waits for signal-frame support.
+#[cfg(all(test, target_arch = "aarch64"))]
+mod aarch64_gate_tests {
+    use super::*;
+    use core::sync::atomic::AtomicU64;
+
+    static ENTRIES: AtomicU64 = AtomicU64::new(0);
+
+    unsafe extern "C" fn spoofing_handler(
+        _signal: libc::c_int,
+        info: *mut libc::siginfo_t,
+        context: *mut libc::c_void,
+    ) {
+        ENTRIES.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: the kernel built this SA_SIGINFO frame for this call.
+        unsafe {
+            if (*info).si_code != SYS_SECCOMP_CODE {
+                raw_syscall6(libc::SYS_exit_group, [44, 0, 0, 0, 0, 0]);
+                core::hint::unreachable_unchecked()
+            }
+            let uc = &mut *context.cast::<libc::ucontext_t>();
+            if uc.uc_mcontext.regs[8] != libc::SYS_getpid as u64 {
+                raw_syscall6(libc::SYS_exit_group, [45, 0, 0, 0, 0, 0]);
+                core::hint::unreachable_unchecked()
+            }
+            uc.uc_mcontext.regs[0] = 424_242;
+        }
+    }
+
+    fn gate_child() -> ! {
+        let pid = std::process::id() as i64;
+        // The spoof sentinel must be provably distinct from the real pid,
+        // or an untrapped getpid could satisfy the interception check.
+        assert_ne!(pid, 424_242, "spoof sentinel collides with child pid");
+        // SAFETY: single-threaded child before any filter exists.
+        unsafe {
+            if crate::signal::install_sigsys_handler(spoofing_handler, false).is_err() {
+                raw_syscall6(libc::SYS_exit_group, [52, 0, 0, 0, 0, 0]);
+            }
+            let mut filter = crate::seccomp::SeccompFilter::for_trusted_gates(
+                trusted_gate(),
+                guest_syscall_gate(),
+            )
+            .unwrap();
+            if filter.install().is_err() {
+                raw_syscall6(libc::SYS_exit_group, [51, 0, 0, 0, 0, 0]);
+            }
+            // Through the gate: executes, no trap.
+            let via_gate = raw_syscall6(libc::SYS_getpid, [0; 6]);
+            if via_gate != pid || ENTRIES.load(Ordering::Relaxed) != 0 {
+                raw_syscall6(libc::SYS_exit_group, [61, 0, 0, 0, 0, 0]);
+            }
+            // Through the guest gate: executes, no trap.
+            let via_guest = raw_syscall6_with_pkru(libc::SYS_getpid, [0; 6], 0);
+            if via_guest != pid || ENTRIES.load(Ordering::Relaxed) != 0 {
+                raw_syscall6(libc::SYS_exit_group, [62, 0, 0, 0, 0, 0]);
+            }
+            // Nearby non-gate site (libc's own syscall stub): must trap.
+            let direct = libc::syscall(libc::SYS_getpid);
+            if direct != 424_242 || ENTRIES.load(Ordering::Relaxed) != 1 {
+                raw_syscall6(libc::SYS_exit_group, [63, 0, 0, 0, 0, 0]);
+            }
+            raw_syscall6(libc::SYS_exit_group, [0, 0, 0, 0, 0, 0]);
+        }
+        unreachable!("exit_group through the gate returned")
+    }
+
+    #[test]
+    fn pending_promotions_dedup_drain_in_order_and_count_capacity() {
+        let table = PendingPromotions::new();
+        assert_eq!(table.try_record(0x1000), PendingPromotionRecord::NewSite);
+        assert_eq!(
+            table.try_record(0x1000),
+            PendingPromotionRecord::AlreadyKnown
+        );
+        assert_eq!(table.try_record(0x2000), PendingPromotionRecord::NewSite);
+
+        let mut first = [0_u64; 1];
+        assert_eq!(table.drain(&mut first), 1);
+        assert_eq!(first, [0x1000]);
+        assert_eq!(
+            table.stats(),
+            PendingPromotionStats {
+                pending: 1,
+                recorded_new: 2,
+                capacity_dropped: 0,
+                contended_dropped: 0,
+            }
+        );
+
+        // A drained site remains known, so a later trap at that site does
+        // not repeatedly queue the same candidate before promotion.
+        assert_eq!(
+            table.try_record(0x1000),
+            PendingPromotionRecord::AlreadyKnown
+        );
+        let mut rest = [0_u64; PENDING_PROMOTION_CAPACITY];
+        assert_eq!(table.drain(&mut rest), 1);
+        assert_eq!(&rest[..1], &[0x2000]);
+
+        let capacity_table = PendingPromotions::new();
+        for index in 0..PENDING_PROMOTION_CAPACITY {
+            let site = 0x4000 + index as u64 * 4;
+            assert_eq!(
+                capacity_table.try_record(site),
+                PendingPromotionRecord::NewSite
+            );
+        }
+        assert_eq!(
+            capacity_table.try_record(0x9000),
+            PendingPromotionRecord::TableFull
+        );
+        let mut drained = [0_u64; PENDING_PROMOTION_CAPACITY];
+        assert_eq!(
+            capacity_table.drain(&mut drained),
+            PENDING_PROMOTION_CAPACITY
+        );
+        // Retained known-site identity still occupies the bounded table
+        // after drain; capacity is a lifetime-known bound in this slice.
+        assert_eq!(
+            capacity_table.try_record(0x9000),
+            PendingPromotionRecord::TableFull
+        );
+        assert_eq!(capacity_table.stats().capacity_dropped, 2);
+    }
+
+    #[test]
+    fn pending_promotions_never_spin_from_handler_context() {
+        let table = PendingPromotions::new();
+        table.lock();
+        let result = table.try_record(0x3000);
+        table.unlock();
+        assert_eq!(result, PendingPromotionRecord::Contended);
+        assert_eq!(table.stats().contended_dropped, 1);
+    }
+
+    /// Bounded fork witness: with the table lock held across fork, the
+    /// child (whose locking thread vanished) must still record, drain,
+    /// and report stats — self-healed by PID ownership — instead of
+    /// spinning on the inherited held bit. The child's alarm(1) turns
+    /// any hang into a SIGALRM death the parent asserts against, so the
+    /// test is bounded either way. The parent's own table is untouched
+    /// by the child's reset (separate address spaces after fork).
+    #[test]
+    fn pending_table_self_heals_in_fork_child_with_lock_held() {
+        let table = Box::leak(Box::new(PendingPromotions::new()));
+        assert_eq!(table.try_record(0x1000), PendingPromotionRecord::NewSite);
+        table.lock();
+        // SAFETY: the child below runs only table calls and _exit.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed: {child}");
+        if child == 0 {
+            // SAFETY: async-signal-safe calls only in the fork child.
+            unsafe {
+                libc::alarm(1);
+                // Record FIRST, before any stats/drain slow path can heal
+                // ownership: a copied thread-local cache must not let the
+                // handler path trust the parent's owner word.
+                if table.try_record(0x2000) != PendingPromotionRecord::NewSite {
+                    libc::_exit(82);
+                }
+                if table.stats().pending != 1 {
+                    libc::_exit(81);
+                }
+                let mut out = [0_u64; 4];
+                if table.drain(&mut out) != 1 || out[0] != 0x2000 {
+                    libc::_exit(83);
+                }
+                libc::_exit(0);
+            }
+        }
+        table.unlock();
+        let mut status = 0;
+        // SAFETY: reaping the exact child forked above.
+        let waited = unsafe { libc::waitpid(child, &mut status, 0) };
+        assert_eq!(waited, child);
+        assert!(libc::WIFEXITED(status), "child status {status:#x}");
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+        // The parent's table kept its own entry across the child's reset.
+        let mut out = [0_u64; 4];
+        assert_eq!(table.drain(&mut out), 1);
+        assert_eq!(out[0], 0x1000);
+    }
+
+    #[test]
+    fn pending_table_recovers_copied_resetting_owner() {
+        // A fork that copies the owner word mid-reset leaves a resetting
+        // marker whose owner thread vanished with the parent. Ordinary
+        // access must steal and complete the reset, never spin on the
+        // dead resetter; if it spins, the test harness timeout is the
+        // failure signal.
+        let table = PendingPromotions::new();
+        table.owner.store(
+            PENDING_OWNER_RESETTING | 0x7fff_fffe,
+            core::sync::atomic::Ordering::Relaxed,
+        );
+        table
+            .locked
+            .store(true, core::sync::atomic::Ordering::Relaxed);
+        let stats = table.stats();
+        assert_eq!(stats.pending, 0);
+        assert_eq!(table.try_record(0x4000), PendingPromotionRecord::NewSite);
+    }
+
+    #[test]
+    fn aarch64_gate_executes_and_nearby_site_traps() {
+        const CHILD: &str = "REVERIE_TEST_AARCH64_GATE";
+        if std::env::var_os(CHILD).is_some() {
+            gate_child();
+        }
+        // Gate geometry: the reported return IP follows the 4-byte svc.
+        for gate in [trusted_gate(), guest_syscall_gate()] {
+            assert_eq!(gate.return_ip, gate.syscall_ip + 4);
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "trap::aarch64_gate_tests::aarch64_gate_executes_and_nearby_site_traps",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+    }
+
+    /// Admission evidence: the real handler reconstructs events from
+    /// aarch64 frames, a dispatcher captures/restores the frame and
+    /// mutates one result, and another syscall forwards untouched.
+    struct CaptureSpoofGetpid;
+
+    thread_local! {
+        static CAPTURE: core::cell::RefCell<Option<frame::SavedState>> =
+            const { core::cell::RefCell::new(None) };
+    }
+
+    // Two distinct local SVC sites for pending-promotion evidence. A libc
+    // variadic syscall wrapper would make distinct guest calls share its one
+    // internal SVC address, so it cannot prove site identity by itself.
+    #[unsafe(naked)]
+    unsafe extern "C" fn local_svc_getpid_a() -> i64 {
+        core::arch::naked_asm!("mov x8, #172", "svc #0", "ret")
+    }
+
+    #[unsafe(naked)]
+    unsafe extern "C" fn local_svc_getpid_b() -> i64 {
+        core::arch::naked_asm!("nop", "mov x8, #172", "svc #0", "ret")
+    }
+
+    static SYNTH_FORK_ARMED: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+    static VL_ATTEMPT_ARMED: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+    static VL_DIRECT_RESULT: core::sync::atomic::AtomicI64 =
+        core::sync::atomic::AtomicI64::new(i64::MIN);
+    static VL_ATTEMPT_TO: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+    impl SyscallDispatcher for CaptureSpoofGetpid {
+        fn dispatch(&self, event: &mut SyscallEvent) {
+            event.forward();
+        }
+
+        fn dispatch_signal(&self, event: &mut SyscallEvent, frame: &mut frame::SignalFrame<'_>) {
+            if event.number() == libc::SYS_clone
+                && SYNTH_FORK_ARMED.swap(false, core::sync::atomic::Ordering::Relaxed)
+            {
+                // Synthesize a fork-child zero in the PARENT: no fork
+                // happened, so the pending table must not reset. Only a
+                // physical TGID change may prove a fork child.
+                event.set_result(0);
+                return;
+            }
+            if event.number() == libc::SYS_gettid
+                && VL_ATTEMPT_ARMED.swap(false, core::sync::atomic::Ordering::Relaxed)
+            {
+                // Direct gate issue from inside dispatch, bypassing the
+                // handler's own pre-check: the forwarding boundary in the
+                // gate helpers must still refuse the VL change.
+                // SAFETY: scalar prctl through the trusted gate.
+                let result = unsafe {
+                    raw_syscall6(
+                        libc::SYS_prctl,
+                        [
+                            50,
+                            VL_ATTEMPT_TO.load(core::sync::atomic::Ordering::Relaxed),
+                            0,
+                            0,
+                            0,
+                            0,
+                        ],
+                    )
+                };
+                VL_DIRECT_RESULT.store(result, core::sync::atomic::Ordering::Relaxed);
+                event.forward();
+                return;
+            }
+            if event.number() != libc::SYS_getpid {
+                event.forward();
+                return;
+            }
+            CAPTURE.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                let saved = slot.as_mut().expect("capture storage prepared");
+                if frame.capture(saved).is_err() {
+                    // SAFETY: exit through the gate; libc exit would trap.
+                    unsafe { raw_syscall6(libc::SYS_exit_group, [71, 0, 0, 0, 0, 0]) };
+                }
+                frame.set_register(0, -999);
+                if frame.restore(saved).is_err() || frame.register(0) as u64 != saved.registers[0] {
+                    // SAFETY: as above.
+                    unsafe { raw_syscall6(libc::SYS_exit_group, [72, 0, 0, 0, 0, 0]) };
+                }
+            });
+            event.set_result(424_243);
+        }
+    }
+
+    fn admission_child() -> ! {
+        let pid = std::process::id() as i64;
+        let ppid: i64 = std::env::var("REVERIE_TEST_AARCH64_ADMISSION_PPID")
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_ne!(pid, 424_243, "spoof sentinel collides with child pid");
+        CAPTURE.with(|slot| *slot.borrow_mut() = Some(frame::SavedState::new().unwrap()));
+        set_dispatcher(Box::new(CaptureSpoofGetpid));
+        // SAFETY: single-threaded child; handler before filter, as the
+        // lifecycle install orders them.
+        unsafe {
+            if install_handler(false).is_err() {
+                raw_syscall6(libc::SYS_exit_group, [51, 0, 0, 0, 0, 0]);
+            }
+            let mut filter = crate::seccomp::SeccompFilter::for_trusted_gates(
+                trusted_gate(),
+                guest_syscall_gate(),
+            )
+            .unwrap();
+            if filter.install().is_err() {
+                raw_syscall6(libc::SYS_exit_group, [52, 0, 0, 0, 0, 0]);
+            }
+            // Trapped and spoofed, with capture/restore in between. The two
+            // local SVC sites prove pending recording is by exact trapped
+            // instruction address, not merely syscall number.
+            if local_svc_getpid_a() != 424_243 {
+                raw_syscall6(libc::SYS_exit_group, [61, 0, 0, 0, 0, 0]);
+            }
+            let mut first_sites = [0_u64; PENDING_PROMOTION_CAPACITY];
+            if drain_pending_promotion_sites(&mut first_sites) != 1
+                || first_sites[0] != local_svc_getpid_a as *const () as u64 + 4
+                || pending_promotion_stats().pending != 0
+                || pending_promotion_stats().recorded_new != 1
+            {
+                raw_syscall6(libc::SYS_exit_group, [75, 0, 0, 0, 0, 0]);
+            }
+            if local_svc_getpid_a() != 424_243 {
+                raw_syscall6(libc::SYS_exit_group, [61, 0, 0, 0, 0, 0]);
+            }
+            let mut repeated_sites = [0_u64; PENDING_PROMOTION_CAPACITY];
+            let repeated_count = drain_pending_promotion_sites(&mut repeated_sites);
+            if repeated_count != 0 {
+                let diagnostic = if repeated_count == 1 && repeated_sites[0] == first_sites[0] {
+                    76
+                } else {
+                    79
+                };
+                raw_syscall6(libc::SYS_exit_group, [diagnostic, 0, 0, 0, 0, 0]);
+            }
+            if local_svc_getpid_b() != 424_243 {
+                raw_syscall6(libc::SYS_exit_group, [77, 0, 0, 0, 0, 0]);
+            }
+            let mut second_sites = [0_u64; PENDING_PROMOTION_CAPACITY];
+            let pending_stats = pending_promotion_stats();
+            if drain_pending_promotion_sites(&mut second_sites) != 1
+                || second_sites[0] != local_svc_getpid_b as *const () as u64 + 8
+                || pending_stats.recorded_new != 2
+                || pending_stats.capacity_dropped != 0
+                || pending_stats.contended_dropped != 0
+            {
+                raw_syscall6(libc::SYS_exit_group, [78, 0, 0, 0, 0, 0]);
+            }
+            // Trapped and forwarded: the real parent pid comes back.
+            if libc::syscall(libc::SYS_getppid) != ppid {
+                raw_syscall6(libc::SYS_exit_group, [62, 0, 0, 0, 0, 0]);
+            }
+            // Through the gate, untrapped: still the real pid.
+            if raw_syscall6(libc::SYS_getpid, [0; 6]) != pid {
+                raw_syscall6(libc::SYS_exit_group, [63, 0, 0, 0, 0, 0]);
+            }
+            // Fixed-VL envelope witness, only where SVE VL exists: a
+            // trapped SET_VL naming the current length forwards, one
+            // naming a different length is refused EINVAL by the handler
+            // (VL unchanged after), and the same request through the gate
+            // reaches the kernel (native control). Last, since the
+            // native control may round the length it reports.
+            const PR_SVE_SET_VL: i64 = 50;
+            const PR_SVE_GET_VL: u64 = 51;
+            let current = raw_syscall6(libc::SYS_prctl, [PR_SVE_GET_VL, 0, 0, 0, 0, 0]);
+            if current >= 0 {
+                let cur_vl = current as u64 & 0xffff;
+                if libc::syscall(libc::SYS_prctl, PR_SVE_SET_VL, cur_vl as i64) < 0 {
+                    raw_syscall6(libc::SYS_exit_group, [64, 0, 0, 0, 0, 0]);
+                }
+                // The handler writes -EINVAL into the frame; libc's
+                // syscall wrapper surfaces that as -1 with errno set.
+                let refused = libc::syscall(libc::SYS_prctl, PR_SVE_SET_VL, (cur_vl + 16) as i64);
+                if refused != -1
+                    || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINVAL)
+                {
+                    raw_syscall6(libc::SYS_exit_group, [65, 0, 0, 0, 0, 0]);
+                }
+                // Kernel-effective aliases of the same call (Linux takes
+                // the syscall number and the prctl option as int) must be
+                // refused identically, never forwarded by truncation.
+                for (number, option, code) in [
+                    (0x1_0000_00a7_i64, PR_SVE_SET_VL, 73_u64),
+                    (libc::SYS_prctl, 0x1_0000_0032, 74),
+                ] {
+                    let refused = libc::syscall(number, option, (cur_vl + 16) as i64);
+                    if refused != -1
+                        || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINVAL)
+                    {
+                        raw_syscall6(libc::SYS_exit_group, [code, 0, 0, 0, 0, 0]);
+                    }
+                }
+                // The same change attempted directly through the gate
+                // from inside dispatch (trapped gettid as the carrier)
+                // hits the forwarding boundary, not just the handler's.
+                VL_ATTEMPT_TO.store(cur_vl + 16, core::sync::atomic::Ordering::Relaxed);
+                VL_ATTEMPT_ARMED.store(true, core::sync::atomic::Ordering::Relaxed);
+                // This child body runs on a libtest thread, whose tid is
+                // not the pid: the forwarded gettid must match the tid
+                // observed directly through the gate, not the pid.
+                let tid = raw_syscall6(libc::SYS_gettid, [0; 6]);
+                if libc::syscall(libc::SYS_gettid) != tid {
+                    raw_syscall6(libc::SYS_exit_group, [68, 0, 0, 0, 0, 0]);
+                }
+                if VL_DIRECT_RESULT.load(core::sync::atomic::Ordering::Relaxed)
+                    != -i64::from(libc::EINVAL)
+                {
+                    raw_syscall6(libc::SYS_exit_group, [69, 0, 0, 0, 0, 0]);
+                }
+                let after = raw_syscall6(libc::SYS_prctl, [PR_SVE_GET_VL, 0, 0, 0, 0, 0]);
+                if after as u64 & 0xffff != cur_vl {
+                    raw_syscall6(libc::SYS_exit_group, [66, 0, 0, 0, 0, 0]);
+                }
+                if raw_syscall6(
+                    libc::SYS_prctl,
+                    [PR_SVE_SET_VL as u64, cur_vl + 16, 0, 0, 0, 0],
+                ) < 0
+                {
+                    raw_syscall6(libc::SYS_exit_group, [67, 0, 0, 0, 0, 0]);
+                }
+            }
+            // Synthesized fork-child zero (dispatcher sets result 0 for a
+            // clone it never forwards): the table must retain everything
+            // recorded so far — a result register alone is not physical
+            // proof of a fork child.
+            let recorded_before_synth = pending_promotion_stats().recorded_new;
+            SYNTH_FORK_ARMED.store(true, core::sync::atomic::Ordering::Relaxed);
+            if libc::syscall(
+                libc::SYS_clone,
+                libc::SIGCHLD as i64,
+                0_i64,
+                0_i64,
+                0_i64,
+                0_i64,
+            ) != 0
+            {
+                raw_syscall6(libc::SYS_exit_group, [70, 0, 0, 0, 0, 0]);
+            }
+            // The clone reuses the libc wrapper site already recorded
+            // by the VL phase, so the count may stay equal; a reset
+            // would drop it below the pre-synth value.
+            if pending_promotion_stats().recorded_new < recorded_before_synth {
+                raw_syscall6(libc::SYS_exit_group, [71, 0, 0, 0, 0, 0]);
+            }
+            raw_syscall6(libc::SYS_exit_group, [0, 0, 0, 0, 0, 0]);
+        }
+        unreachable!("exit_group through the gate returned")
+    }
+
+    #[test]
+    fn aarch64_handler_admits_dispatches_and_restores() {
+        const CHILD: &str = "REVERIE_TEST_AARCH64_ADMISSION";
+        if std::env::var_os(CHILD).is_some() {
+            admission_child();
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "trap::aarch64_gate_tests::aarch64_handler_admits_dispatches_and_restores",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env(
+                "REVERIE_TEST_AARCH64_ADMISSION_PPID",
+                std::process::id().to_string(),
+            )
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+    }
+
+    /// S6b witness: the fallback continuation itself runs on aarch64.
+    /// A trapped svc is captured, resumed at the aarch64 fallback
+    /// entry on the owned stack, answered by the ordinary-context
+    /// handler, and completed through the completion svc — twice.
+    struct ContinuationSpoof;
+
+    static CONTINUATION_CALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+    unsafe fn continuation_syscall(
+        context: *mut crate::guest::context::RegisterContext,
+        _guest_pkru: &mut Option<u32>,
+    ) {
+        use crate::guest::isa::Isa as _;
+        use crate::guest::isa::NativeIsa;
+        let local = 0_usize;
+        if !crate::guest::continuation::on_owned_stack(&local as *const usize as usize) {
+            // SAFETY: exit through the gate from callback context.
+            unsafe { raw_syscall6(libc::SYS_exit_group, [84, 0, 0, 0, 0, 0]) };
+        }
+        // SAFETY: the continuation owns this live context for the callback.
+        let context = unsafe { &mut *context };
+        if NativeIsa::syscall_number(context) != libc::SYS_getpid {
+            unsafe { raw_syscall6(libc::SYS_exit_group, [85, 0, 0, 0, 0, 0]) };
+        }
+        CONTINUATION_CALLBACKS.fetch_add(1, Ordering::Relaxed);
+        NativeIsa::finish_syscall(context, 424_244);
+    }
+
+    unsafe fn continuation_instruction(
+        _context: *mut crate::guest::context::RegisterContext,
+        _kind: crate::guest::event::InstructionEventKind,
+    ) {
+        // SAFETY: no instruction event can be admitted in this child.
+        unsafe { raw_syscall6(libc::SYS_exit_group, [86, 0, 0, 0, 0, 0]) };
+    }
+
+    impl SyscallDispatcher for ContinuationSpoof {
+        fn dispatch(&self, event: &mut SyscallEvent) {
+            event.forward();
+        }
+
+        fn dispatch_private_signal(&self, frame: &mut frame::SignalFrame<'_>) -> bool {
+            match crate::guest::continuation::complete(frame) {
+                Ok(handled) => handled,
+                Err(_) => unsafe {
+                    raw_syscall6(libc::SYS_exit_group, [87, 0, 0, 0, 0, 0]);
+                    core::hint::unreachable_unchecked()
+                },
+            }
+        }
+
+        fn dispatch_signal(&self, event: &mut SyscallEvent, frame: &mut frame::SignalFrame<'_>) {
+            use crate::guest::isa::Isa as _;
+            use crate::guest::isa::NativeIsa;
+            if event.number() != libc::SYS_getpid {
+                event.forward();
+                return;
+            }
+            let instruction = NativeIsa::syscall_site(event.instruction_pointer());
+            // SAFETY: this is the SIGSYS handler for the trapped svc
+            // at `instruction`; the entry is deferred to below.
+            match unsafe { crate::guest::continuation::prepare_signal(instruction, frame) } {
+                Ok(Some(entry)) => event.defer_to(entry),
+                Ok(None) => unsafe {
+                    raw_syscall6(libc::SYS_exit_group, [88, 0, 0, 0, 0, 0]);
+                },
+                Err(_) => unsafe {
+                    raw_syscall6(libc::SYS_exit_group, [89, 0, 0, 0, 0, 0]);
+                },
+            }
+        }
+    }
+
+    fn continuation_child() -> ! {
+        let pid = std::process::id() as i64;
+        assert_ne!(pid, 424_244, "spoof sentinel collides with child pid");
+        // SAFETY: single-threaded child; handlers and continuation are
+        // installed before the filter, as lifecycle orders them.
+        unsafe {
+            if crate::guest::continuation::register_handlers(
+                crate::guest::continuation::ContinuationHandlers {
+                    syscall: continuation_syscall,
+                    instruction: continuation_instruction,
+                },
+            )
+            .is_err()
+                || crate::guest::continuation::initialize().is_err()
+            {
+                raw_syscall6(libc::SYS_exit_group, [80, 0, 0, 0, 0, 0]);
+            }
+            set_dispatcher(Box::new(ContinuationSpoof));
+            if install_handler(false).is_err() {
+                raw_syscall6(libc::SYS_exit_group, [81, 0, 0, 0, 0, 0]);
+            }
+            let mut filter = crate::seccomp::SeccompFilter::for_trusted_gates(
+                trusted_gate(),
+                guest_syscall_gate(),
+            )
+            .unwrap();
+            if filter.install().is_err() {
+                raw_syscall6(libc::SYS_exit_group, [82, 0, 0, 0, 0, 0]);
+            }
+            for expected in 1..=2 {
+                if local_svc_getpid_a() != 424_244
+                    || CONTINUATION_CALLBACKS.load(Ordering::Relaxed) != expected
+                {
+                    raw_syscall6(libc::SYS_exit_group, [83, 0, 0, 0, 0, 0]);
+                }
+            }
+            // Through the gate, untrapped: the real pid, no callback.
+            if raw_syscall6(libc::SYS_getpid, [0; 6]) != pid
+                || CONTINUATION_CALLBACKS.load(Ordering::Relaxed) != 2
+            {
+                raw_syscall6(libc::SYS_exit_group, [90, 0, 0, 0, 0, 0]);
+            }
+            raw_syscall6(libc::SYS_exit_group, [0, 0, 0, 0, 0, 0]);
+        }
+        unreachable!("exit_group through the gate returned")
+    }
+
+    #[test]
+    fn aarch64_fallback_continuation_runs_on_owned_stack() {
+        const CHILD: &str = "REVERIE_TEST_AARCH64_CONTINUATION";
+        if std::env::var_os(CHILD).is_some() {
+            continuation_child();
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "trap::aarch64_gate_tests::aarch64_fallback_continuation_runs_on_owned_stack",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+    }
+
+    #[test]
+    fn aarch64_runtime_page_geometry_is_usable() {
+        let page = crate::arch::page_size().unwrap() as usize;
+        assert!(page.is_power_of_two() && page >= 4096);
+        // SAFETY: one anonymous page, unmapped below on every path.
+        unsafe {
+            let base = libc::mmap(
+                core::ptr::null_mut(),
+                page,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            );
+            assert_ne!(base, libc::MAP_FAILED);
+            base.cast::<u8>().add(page - 1).write(0xa5);
+            assert_eq!(base.cast::<u8>().add(page - 1).read(), 0xa5);
+            assert_eq!(
+                libc::mprotect(base, page, libc::PROT_READ | libc::PROT_EXEC),
+                0
+            );
+            assert_eq!(libc::munmap(base, page), 0);
+        }
     }
 }

@@ -10,6 +10,7 @@
 //! require KVM and the raw PMU event; unavailable hardware is not a pass.
 
 #![cfg(target_arch = "x86_64")]
+#![allow(clippy::disallowed_methods, reason = "tests may make threads freely")]
 
 use std::future::Future;
 use std::path::PathBuf;

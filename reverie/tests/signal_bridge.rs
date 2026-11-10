@@ -171,6 +171,72 @@ fn tool_syscall_default_preserves_native_success_and_errno() {
     }
 }
 
+/// The same fake takes `Guest::descriptor_status`'s default: a backend that
+/// states nothing does not provide the fact, for any descriptor.
+#[test]
+fn descriptor_status_default_is_not_provided() {
+    let guest = TestGuest::default();
+    for fd in [-1, 0, 1, 2, 1000] {
+        assert_eq!(
+            <TestGuest as Guest<()>>::descriptor_status(&guest, fd),
+            Err(reverie::FactError::NotProvided),
+            "fd {fd}"
+        );
+    }
+}
+
+/// The same fake takes `Guest::signal_sets`'s default: a backend that states
+/// nothing does not provide the fact, for any thread ID, its own included.
+#[test]
+fn signal_sets_default_is_not_provided() {
+    let guest = TestGuest::default();
+    let own = <TestGuest as Guest<()>>::tid(&guest);
+    for tid in [own, Pid::from_raw(-1), Pid::from_raw(0), Pid::from_raw(1)] {
+        assert_eq!(
+            <TestGuest as Guest<()>>::signal_sets(&guest, tid),
+            Err(reverie::FactError::NotProvided),
+            "tid {tid}"
+        );
+    }
+}
+
+/// The same fake takes `Guest::link_path`'s default: a backend that states
+/// nothing does not provide the fact, for any thread ID and any link.
+#[test]
+fn link_path_default_is_not_provided() {
+    let guest = TestGuest::default();
+    let own = <TestGuest as Guest<()>>::tid(&guest);
+    for tid in [own, Pid::from_raw(-1), Pid::from_raw(0), Pid::from_raw(1)] {
+        for link in [
+            reverie::PathLink::Descriptor(0),
+            reverie::PathLink::Descriptor(-1),
+            reverie::PathLink::Executable,
+            reverie::PathLink::WorkingDirectory,
+        ] {
+            assert_eq!(
+                <TestGuest as Guest<()>>::link_path(&guest, tid, link),
+                Err(reverie::FactError::NotProvided),
+                "tid {tid}, {link:?}"
+            );
+        }
+    }
+}
+
+/// The same fake takes `Guest::memory_map`'s default: a backend that states
+/// nothing does not provide the fact, for any thread ID.
+#[test]
+fn memory_map_default_is_not_provided() {
+    let guest = TestGuest::default();
+    let own = <TestGuest as Guest<()>>::tid(&guest);
+    for tid in [own, Pid::from_raw(-1), Pid::from_raw(0), Pid::from_raw(1)] {
+        assert_eq!(
+            <TestGuest as Guest<()>>::memory_map(&guest, tid),
+            Err(reverie::FactError::NotProvided),
+            "tid {tid}"
+        );
+    }
+}
+
 struct LegacyTool {
     response: Option<Signal>,
     calls: AtomicUsize,

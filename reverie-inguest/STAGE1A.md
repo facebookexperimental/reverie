@@ -34,7 +34,7 @@ sealed-image mapping and injection are restricted to `stage1a-probe`; they serve
 the separate fixture protocol. Commit 3 must add a genuine Detcore-ready release
 transition before a production caller can proceed. The library contains no fixture journal, READY nonce,
 control mask, runtime syscall policy, or fault-injection mode, and grants no
-`DetcoreReady` or runtime-readiness token.
+`ToolReady` or runtime-readiness token.
 
 Cleanup receipts are opaque, cloneable, single-launch observation handles.
 Explicit cancellation returns an unresolved original owner when its bounded
@@ -110,7 +110,7 @@ workload deadline; the stop-count bound is not a wall timeout.
    entry or interpreter begins with the test controls already installed.
    The prototype reports the eventual child status and committed observations.
 
-`TestControlsReady` is deliberately **not `DetcoreReady`**. A synthetic reply,
+`TestControlsReady` is deliberately **not `ToolReady`**. A synthetic reply,
 a connected channel, a control-bit claim, or a successful guest exit alone does
 not establish the release preconditions. `pre_arm_guest_syscalls = 0` is emitted
 only after the validated handoff path. Its evidence is the exec-exit boundary,

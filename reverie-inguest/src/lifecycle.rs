@@ -150,6 +150,11 @@ unsafe fn install_in_process_trap(config: &RuntimeConfig, backing: StackBacking)
     }
     unsafe { trap::install_handler_with_backing(config.use_alt_stack, backing)? };
     let mut filter = build_trap_filter(config)?;
+    // The last point at which the runtime's own syscalls meet no filter of
+    // its own: qualify the image's pidfd self-sentinel spelling here, through
+    // the raw gate, so that no Tool callback has to.
+    #[cfg(feature = "coordinator-rpc")]
+    crate::guest::pidfd_self::initialize_before_runtime_filter();
     unsafe { filter.install() }?;
     if config.restrict_signal_return {
         trap::set_signal_return_restricted();

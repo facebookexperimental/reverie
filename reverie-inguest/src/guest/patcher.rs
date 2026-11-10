@@ -24,6 +24,8 @@ use crate::guest::event::InstructionEventKind;
 use crate::guest::event::SyscallEvent;
 use crate::guest::instruction::FaultSite;
 use crate::guest::instruction::PatchOutcome;
+use crate::guest::isa::Isa;
+use crate::guest::isa::NativeIsa;
 use crate::guest::trap_dispatch::SitePatch;
 use crate::stats::LiteinstDispatchPath;
 
@@ -54,7 +56,7 @@ pub unsafe trait Patcher: Send + Sync + 'static {
     /// `resume_address` is the arrival resume address of a SIGSYS-delivered
     /// trap that has not run, so the code just before it was executing.
     unsafe fn syscall_site(&self, resume_address: u64) -> u64 {
-        resume_address.saturating_sub(2)
+        NativeIsa::syscall_site(resume_address)
     }
 
     /// Selects or installs a hook for this trap's site; [`SitePatch::NotPatched`]

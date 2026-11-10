@@ -178,7 +178,7 @@ fn terminal_read_injection_keeps_nonreturning_cancellation_and_typed_failures() 
             GuestMemory::new(0, STACK_CAPACITY).unwrap(),
             &[],
             // This mock has no vCPU and never accesses registers.
-            unsafe { std::mem::zeroed() },
+            &crate::runtime::ZEROED_USER_REGISTERS,
             &mut state,
             &mut executor,
             &(),
@@ -252,8 +252,7 @@ fn terminal_cancellation_and_into_guest_forwarding_do_not_inject_or_start_childr
                 Arc::new(AdapterTool::default()),
                 memory,
                 &[],
-                // SAFETY: this test never reads the register fields.
-                unsafe { std::mem::zeroed() },
+                &crate::runtime::ZEROED_USER_REGISTERS,
                 &mut state,
                 &mut executor,
                 &(),
@@ -318,8 +317,7 @@ fn natural_retirement_and_into_guest_forwarding_do_not_inject_or_start_children(
                 Arc::new(AdapterTool::default()),
                 memory,
                 &[],
-                // SAFETY: this test never reads the register fields.
-                unsafe { std::mem::zeroed() },
+                &crate::runtime::ZEROED_USER_REGISTERS,
                 &mut state,
                 &mut executor,
                 &(),
@@ -600,7 +598,9 @@ fn parked_retirement_rejects_reused_task_and_process_generations() {
     let site = executor.begin_signal_callback().unwrap();
     executor.retain_parked_effects(site).unwrap();
     let context = executor.signal_failure_context().unwrap();
-    executor.replace_after_exec(crate::executor::test_loaded_state_for_vm(&cwd));
+    executor
+        .replace_after_exec(crate::executor::test_loaded_state_for_vm(&cwd))
+        .unwrap();
     // The post-exec constructor is a new callback, not either bound driver
     // continuation. Its unchanged fresh-nonce fence invalidates the old site.
     let fresh = executor.begin_signal_callback().unwrap();
@@ -628,7 +628,7 @@ fn shared_failure_wins_over_retirement_before_and_after_callback_poll() {
             GuestMemory::new(0, STACK_CAPACITY).unwrap(),
             &[],
             // No instruction or register access occurs in this callback control.
-            unsafe { std::mem::zeroed() },
+            &crate::runtime::ZEROED_USER_REGISTERS,
             &mut state,
             &mut executor,
             &(),
@@ -842,7 +842,7 @@ fn wait_group_exit_injection_is_nonreturning_and_failure_still_wins() {
             GuestMemory::new(0, STACK_CAPACITY).unwrap(),
             &[],
             // The transport mock never reads vCPU registers.
-            unsafe { std::mem::zeroed() },
+            &crate::runtime::ZEROED_USER_REGISTERS,
             &mut state,
             &mut executor,
             global.as_ref(),
