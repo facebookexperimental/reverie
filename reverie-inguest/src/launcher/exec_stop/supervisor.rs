@@ -3045,7 +3045,13 @@ static int park_threads(int count) {
   pthread_attr_t attr;
   pthread_t thread;
   if (pthread_attr_init(&attr) != 0) return -1;
-  if (pthread_attr_setstacksize(&attr, 65536) != 0) return -1;
+  /* 65536 is below the thread-stack minimum on aarch64 (128 KiB), where
+   * setstacksize fails EINVAL and no thread is created; use the larger
+   * of the two so the parked threads exist on both architectures. */
+  long min_stack = sysconf(_SC_THREAD_STACK_MIN);
+  size_t stack_size = 65536;
+  if (min_stack > (long)stack_size) stack_size = (size_t)min_stack;
+  if (pthread_attr_setstacksize(&attr, stack_size) != 0) return -1;
   for (int i = 0; i < count; i++)
     if (pthread_create(&thread, &attr, park_forever, NULL) != 0) return -1;
   return 0;
@@ -4657,7 +4663,14 @@ int main(int argc, char **argv) {
         );
         // Dying: SIGKILL pending, PF_SIGNALED or PF_EXITING; this wins
         // over an exec number.
-        let in_execve = b"59 0x0 0x0 0x0 0x0 0x0 0x0 0x7ffd0000 0x100";
+        // The host's execve number (59 on x86_64, 221 on aarch64): a
+        // literal 59 is a different syscall on aarch64 and never Exec.
+        let in_execve: &'static [u8] = format!(
+            "{} 0x0 0x0 0x0 0x0 0x0 0x0 0x7ffd0000 0x100",
+            libc::SYS_execve
+        )
+        .leak()
+        .as_bytes();
         assert_eq!(
             examine(&[
                 ("status", STATUS_SIGKILL),
