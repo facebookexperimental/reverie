@@ -14,14 +14,17 @@
 //!   byte-identical to the read-only reference page, and holding the exact
 //!   native gate encoding at word 11;
 //! - an instruction audit: a linear-sweep decode of every executable page,
-//!   which refuses any undecodable byte and any decoded `syscall` outside the
-//!   gate page that is not a declared site of the facts ([`SyscallCensus`]).
+//!   which refuses any undecodable byte, every `int 0x80` and `sysenter`, and
+//!   any decoded `syscall` outside the gate page that is not a declared site of
+//!   the facts ([`SyscallCensus`]);
+//! - an IP-filter proof ([`filter`]): the filter the preparation installs
+//!   allows syscalls only at the gate's own template sites, for x86-64 only,
+//!   and traps or kills everything else, including every `0f 05` pair inside
+//!   another instruction's bytes, which the sweep does not see.
 //!
-//! A `0f 05` pair inside another instruction's bytes is not an instruction of
-//! the sweep, so this audit does not refuse it. Control flow into the middle of
-//! an instruction is held only by the installed filter, which traps every
-//! syscall whose instruction pointer is not the gate; that proof is a separate
-//! obligation of the arming slice, not of this module.
+//! Status (B3): instruction audit and IP-filter proof present; B3(d), the same
+//! counts measured on an image built at the current pins, pending. Nothing
+//! here claims B3 closed.
 //!
 //! The producer holds no stop, wait, supervisor, admission or Ready state. The
 //! launch route owns every operation on the task; the only task-facing step
@@ -154,9 +157,9 @@ pub struct RuntimeImageFacts {
     /// The runtime entry a successor birth uses, when the image has one.
     pub successor_entry: Option<EntryPoint>,
     /// Data the image's build placed inside executable segments (literal
-    /// pools), as sorted, disjoint address ranges; empty when it placed none.
-    /// The instruction audit steps over exactly these bytes and refuses any
-    /// range that holds a decodable `syscall`, `sysenter` or `int 0x80`.
+    /// pools), as address ranges. Reserved for an architecture whose audit
+    /// admits them; this x86-64 audit refuses any non-empty value, so on
+    /// x86-64 the only data stepped over is the pinned constructor island.
     pub data_ranges: Vec<Range<u64>>,
 }
 
@@ -217,9 +220,10 @@ impl AuditedRuntimeImage {
     /// Audit `bytes` against `facts`: ELF and window policy, the private
     /// runtime metadata, the exact HLMLAY01 descriptor, the read-only
     /// reference page, the native gate page, every declared site's `syscall`
-    /// bytes, and no undeclared DECODED `syscall` instruction. A `0f 05` pair
-    /// inside another instruction is not refused here (B3 stays open until the
-    /// filter proof).
+    /// bytes, no undeclared decoded `syscall`, `int 0x80` or `sysenter`, and
+    /// the IP-filter proof, which covers the `0f 05` pairs inside other
+    /// instructions. B3: instruction audit and IP-filter proof present; B3(d),
+    /// counts on a current-pin image, pending.
     pub fn new(bytes: Vec<u8>, facts: RuntimeImageFacts) -> Result<Self> {
         require(
             !bytes.is_empty() && bytes.len() <= MAX_IMAGE_BYTES,
@@ -334,8 +338,8 @@ impl AuditedRuntimeImage {
     }
 
     /// The retained bytes, revalidated against the runtime policy (validation
-    /// borrows them, so it is not stored). The full qualification, audit
-    /// included, already passed on these exact immutable bytes.
+    /// borrows them, so it is not stored). The whole audit already passed on
+    /// these exact immutable bytes.
     pub fn validated_image(&self) -> Result<ValidatedImage<'_>> {
         validate(&self.bytes)
     }
@@ -545,8 +549,6 @@ pub struct SyscallCensus {
     pub at_declared_sites: u64,
     /// Bytes stepped over as the constructor message island (0 or its length).
     pub data_island_bytes: u64,
-    /// Bytes stepped over as declared data ranges.
-    pub data_bytes: u64,
 }
 
 /// One run of abutting executable pages, as the mapping exposes them (the file
@@ -613,15 +615,15 @@ const GATE_SYSCALL_OFFSETS: [u64; 3] = [0x80, 0x200, 0x309];
 /// - a `syscall` outside the gate page that is not in `declared`;
 /// - a declared site that is not a decoded `syscall`.
 ///
-/// The only bytes not decoded as instructions are:
-/// - the [`CONSTRUCTOR_MESSAGE`] at `island`, the pinned address
-///   [`constructor_island`] found, and only where the sweep reaches it
-///   straight after the pinned `endbr64; ud2`. The message anywhere else, a
-///   changed message, or the pinned address reached any other way is refused
-///   by name;
-/// - the declared `data` ranges, which [`check_data_ranges`] admits first. The
-///   sweep must land exactly on each range's start; an instruction running
-///   into a range is refused.
+/// The only bytes not decoded as instructions are the [`CONSTRUCTOR_MESSAGE`]
+/// at `island`, the pinned address [`constructor_island`] found, and only
+/// where the sweep reaches it straight after the pinned `endbr64; ud2`. The
+/// message anywhere else, a changed message, or the pinned address reached any
+/// other way is refused by name.
+///
+/// Declared `data` ranges are refused on x86-64, by name, before the sweep:
+/// a range can start where the instruction before it falls through, and so
+/// hide a system call the CPU reaches by straight-line execution.
 fn instruction_audit(
     runs: &[Run],
     gate: &Range<u64>,
@@ -633,8 +635,10 @@ fn instruction_audit(
     let mut declared: Vec<u64> = declared.to_vec();
     declared.sort_unstable();
     declared.dedup();
-    check_data_ranges(data, runs, gate, &declared, island)?;
-    let mut ranges = data.iter().peekable();
+    require(
+        data.is_empty(),
+        "instruction audit: declared data ranges are not admitted on x86-64",
+    )?;
     let mut found = vec![false; declared.len()];
     let mut in_gate = [0_u64; GATE_SYSCALL_OFFSETS.len()];
     let mut census = SyscallCensus::default();
@@ -649,20 +653,6 @@ fn instruction_audit(
         let mut previous = Code::INVALID;
         let mut covered = 0_usize;
         while decoders[0].can_decode() {
-            let here = start + decoders[0].position() as u64;
-            if let Some(range) = ranges.next_if(|range| range.start == here) {
-                let next = usize::try_from(range.end - start)?;
-                for decoder in &mut decoders {
-                    decoder
-                        .set_position(next)
-                        .map_err(|e| format!("instruction audit: data range: {e}"))?;
-                    decoder.set_ip(range.end);
-                }
-                covered += usize::try_from(range.end - range.start)?;
-                census.data_bytes += range.end - range.start;
-                previous = Code::INVALID;
-                continue;
-            }
             let before = previous;
             decoders[0].decode_out(&mut intel);
             decoders[1].decode_out(&mut amd);
@@ -690,16 +680,6 @@ fn instruction_audit(
             {
                 return Err(format!(
                     "instruction audit: instruction at {ip:#x} crosses the executable segment boundary at {boundary:#x}"
-                )
-                .into());
-            }
-            if let Some(range) = ranges.peek()
-                && ip < range.start
-                && range.start < next_address
-            {
-                return Err(format!(
-                    "instruction audit: instruction at {ip:#x} runs into the data range at {:#x}",
-                    range.start
                 )
                 .into());
             }
@@ -780,10 +760,6 @@ fn instruction_audit(
         census.executable_bytes += bytes.len() as u64;
     }
     require(
-        ranges.next().is_none(),
-        "instruction audit: the sweep did not reach every data range",
-    )?;
-    require(
         in_gate == [1; GATE_SYSCALL_OFFSETS.len()],
         "instruction audit: the gate page lacks one of its template syscalls",
     )?;
@@ -795,96 +771,6 @@ fn instruction_audit(
         .into());
     }
     Ok(census)
-}
-
-/// At most this many declared data ranges.
-const MAX_DATA_RANGES: usize = 4096;
-
-/// Admit the declared data ranges before the sweep steps over them: at most
-/// [`MAX_DATA_RANGES`], each non-empty, sorted and disjoint, inside one
-/// executable run without crossing a segment boundary, clear of the gate page,
-/// every declared site's `syscall` bytes and the constructor message island,
-/// and holding no `syscall`, `sysenter` or `int 0x80` in a linear decode from
-/// the range's start, Intel and AMD alike.
-fn check_data_ranges(
-    data: &[Range<u64>],
-    runs: &[Run],
-    gate: &Range<u64>,
-    declared: &[u64],
-    island: Option<u64>,
-) -> Result<()> {
-    use iced_x86::Code;
-    require(
-        data.len() <= MAX_DATA_RANGES,
-        "instruction audit: too many data ranges",
-    )?;
-    let overlaps =
-        |range: &Range<u64>, other: Range<u64>| range.start < other.end && other.start < range.end;
-    let mut previous_end = 0;
-    for range in data {
-        let named = format!("instruction audit: data range {range:#x?}");
-        require(range.start < range.end, &format!("{named} is empty"))?;
-        require(
-            previous_end <= range.start,
-            &format!("{named} is not sorted after the range before it, or overlaps it"),
-        )?;
-        previous_end = range.end;
-        let run = runs
-            .iter()
-            .find(|run| run.start <= range.start && range.end <= run.start + run.bytes.len() as u64)
-            .ok_or_else(|| format!("{named} is not inside one executable run"))?;
-        if let Some(boundary) = run
-            .boundaries
-            .iter()
-            .find(|&&boundary| range.start < boundary && boundary < range.end)
-        {
-            return Err(format!(
-                "{named} crosses the executable segment boundary at {boundary:#x}"
-            )
-            .into());
-        }
-        require(
-            !overlaps(range, gate.clone()),
-            &format!("{named} overlaps the gate page"),
-        )?;
-        if let Some(site) = declared
-            .iter()
-            .find(|&&site| overlaps(range, site..site.saturating_add(2)))
-        {
-            return Err(format!("{named} overlaps the declared site at {site:#x}").into());
-        }
-        if let Some(island) = island {
-            let message = island..island + CONSTRUCTOR_MESSAGE.len() as u64;
-            require(
-                !overlaps(range, message),
-                &format!("{named} overlaps the constructor message island"),
-            )?;
-        }
-        let offset = usize::try_from(range.start - run.start)?;
-        let bytes = &run.bytes[offset..offset + usize::try_from(range.end - range.start)?];
-        for options in [
-            iced_x86::DecoderOptions::NONE,
-            iced_x86::DecoderOptions::AMD,
-        ] {
-            let decoder = iced_x86::Decoder::with_ip(64, bytes, range.start, options);
-            for instruction in decoder {
-                let ip = instruction.ip();
-                match instruction.code() {
-                    Code::Syscall => {
-                        return Err(format!("{named} holds a syscall at {ip:#x}").into());
-                    }
-                    Code::Sysenter => {
-                        return Err(format!("{named} holds sysenter at {ip:#x}").into());
-                    }
-                    Code::Int_imm8 if instruction.immediate8() == 0x80 => {
-                        return Err(format!("{named} holds int 0x80 at {ip:#x}").into());
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Proposed roles (stack, TLS, bootstrap signal stack, handoff, scalar state;
@@ -1328,9 +1214,10 @@ pub trait MappedBirthArming {
     /// Fill and seal the packet at the stop (see [`BirthLeases::fill_packet`]).
     fn fill_packet(&self, stop: &dyn BirthStop, admission: &dyn PacketAdmission)
     -> Result<Vec<u8>>;
-    /// Build, write and seal the handoff, and return the preparation and the
-    /// entry. Once per birth. A qualification gap never refuses this; it is
-    /// reported in [`Armed::binding`] and [`Armed::audit`].
+    /// Build, write and seal the handoff, and return the preparation, the
+    /// entry and the claim inputs. Once per birth. A qualification gap never
+    /// refuses this; it is refused only by the claim, after preparation
+    /// ([`ArmedClaim::after_prepare`], [`QualifiedMappedLaunch::claim`]).
     fn arm<'fd>(&'fd self, facts: &ArmingFacts<'_>) -> Result<Armed<'fd>>;
 }
 
@@ -1830,172 +1717,58 @@ mod tests {
         elf(Some(RX), &gate_page(), &text, &gate_page())
     }
 
-    #[test]
-    fn no_data_ranges_audit_exactly_as_before() {
-        let bytes = elf(Some(RX), &gate_page(), &text_page(), &gate_page());
-        let declared = [TEXT, TEXT + 4];
-        let census = audit_with_data(&bytes, &declared, &[]).unwrap();
-        assert_eq!(census, audit(&bytes, &declared).unwrap());
-        assert_eq!(census.data_bytes, 0);
-    }
-
+    /// Declared data ranges are refused on x86-64 before the sweep. The three
+    /// constructions are each a system call the CPU reaches by falling through
+    /// from the `add [rax], al` pair at +0x3e into the range: refused as such
+    /// with no range, and refused by name, never passed, with the range that
+    /// would hide it. A range over harmless bytes is refused the same way.
     #[test]
     #[allow(
         clippy::single_range_in_vec_init,
         reason = "a list holding one declared data range"
     )]
-    fn a_declared_data_range_is_stepped_over_and_counted() {
-        // Eight bytes invalid in 64-bit mode (push es), on an instruction
-        // boundary of the zero run.
-        let junk = [0x06; 8];
-        let bytes = text_with(0x40, &junk);
+    fn declared_data_ranges_are_refused_on_x86_64() {
         let declared = [TEXT, TEXT + 4];
-        assert!(
-            audit(&bytes, &declared)
-                .unwrap_err()
-                .to_string()
-                .starts_with(&format!(
-                    "instruction audit: undecodable bytes at {:#x}",
-                    TEXT + 0x40
-                ))
-        );
-        let census = audit_with_data(&bytes, &declared, &[TEXT + 0x40..TEXT + 0x48]).unwrap();
-        let plain = audit(
-            &elf(Some(RX), &gate_page(), &text_page(), &gate_page()),
-            &declared,
-        )
-        .unwrap();
-        assert_eq!(census.data_bytes, 8);
-        // Four zero pairs became data.
-        assert_eq!(census.instructions, plain.instructions - 4);
-        assert_eq!(census.executable_bytes, plain.executable_bytes);
-        // A range ending at the end of the executable pages, too.
-        let tail = text_with(PAGE - 8, &junk);
-        let census = audit_with_data(&tail, &declared, &[TEXT + PAGE - 8..TEXT + PAGE]).unwrap();
-        assert_eq!(census.data_bytes, 8);
-    }
-
-    #[test]
-    #[allow(
-        clippy::single_range_in_vec_init,
-        reason = "a list holding one declared data range"
-    )]
-    fn each_data_range_check_refuses_by_name() {
-        let bytes = text_with(0x40, &[0x06; 8]);
-        let declared = [TEXT, TEXT + 4];
-        let refuse = |data: &[Range<u64>]| {
-            audit_with_data(&bytes, &declared, data)
-                .unwrap_err()
-                .to_string()
-        };
-        let named = |range: Range<u64>| format!("instruction audit: data range {range:#x?}");
-        let good = TEXT + 0x40..TEXT + 0x48;
-        assert_eq!(
-            refuse(&[TEXT + 0x40..TEXT + 0x40]),
-            format!("{} is empty", named(TEXT + 0x40..TEXT + 0x40))
-        );
-        assert_eq!(
-            refuse(&[good.clone(), TEXT + 0x44..TEXT + 0x50]),
-            format!(
-                "{} is not sorted after the range before it, or overlaps it",
-                named(TEXT + 0x44..TEXT + 0x50)
-            )
-        );
-        assert_eq!(
-            refuse(&[TEXT + 0x50..TEXT + 0x58, good.clone()]),
-            format!(
-                "{} is not sorted after the range before it, or overlaps it",
-                named(good.clone())
-            )
-        );
-        let outside = REFERENCE..REFERENCE + 8;
-        assert_eq!(
-            refuse(std::slice::from_ref(&outside)),
-            format!("{} is not inside one executable run", named(outside))
-        );
-        let past_end = TEXT + PAGE - 4..TEXT + PAGE + 4;
-        assert_eq!(
-            refuse(std::slice::from_ref(&past_end)),
-            format!("{} is not inside one executable run", named(past_end))
-        );
-        let crossing = TEXT - 4..TEXT + 4;
-        assert_eq!(
-            refuse(std::slice::from_ref(&crossing)),
-            format!(
-                "{} crosses the executable segment boundary at {TEXT:#x}",
-                named(crossing)
-            )
-        );
-        let in_gate = GATE + 0x10..GATE + 0x18;
-        assert_eq!(
-            refuse(std::slice::from_ref(&in_gate)),
-            format!("{} overlaps the gate page", named(in_gate))
-        );
-        let over_site = TEXT + 5..TEXT + 6;
-        assert_eq!(
-            refuse(std::slice::from_ref(&over_site)),
-            format!(
-                "{} overlaps the declared site at {:#x}",
-                named(over_site),
-                TEXT + 4
-            )
-        );
-        let too_many = vec![good.clone(); MAX_DATA_RANGES + 1];
-        assert_eq!(refuse(&too_many), "instruction audit: too many data ranges");
-        // An instruction that runs into a range: the zero pair at +0x3e
-        // decodes as `add [rax], al` and the range starts inside it.
-        let late = TEXT + 0x3f..TEXT + 0x48;
-        assert_eq!(
-            refuse(&[late]),
-            format!(
-                "instruction audit: instruction at {:#x} runs into the data range at {:#x}",
-                TEXT + 0x3e,
-                TEXT + 0x3f
-            )
-        );
-    }
-
-    #[test]
-    fn a_data_range_holding_a_system_call_instruction_is_refused() {
-        let declared = [TEXT, TEXT + 4];
-        let range = TEXT + 0x40..TEXT + 0x48;
-        for (bytes, what) in [
+        let by_name = "instruction audit: declared data ranges are not admitted on x86-64";
+        for (bytes, range, without) in [
             (
-                [0x06, 0x06, 0x0f, 0x05, 0x06, 0x06, 0x06, 0x06],
-                "a syscall",
+                [0x90, 0x90, 0x90, 0x0f, 0x05, 0, 0, 0, 0, 0x90],
+                TEXT + 0x40..TEXT + 0x44,
+                format!(
+                    "instruction audit: undeclared syscall at {:#x}",
+                    TEXT + 0x43
+                ),
             ),
-            ([0x06, 0x06, 0x0f, 0x34, 0x06, 0x06, 0x06, 0x06], "sysenter"),
-            ([0x06, 0x06, 0xcd, 0x80, 0x06, 0x06, 0x06, 0x06], "int 0x80"),
-            // A prefixed form is still a syscall.
             (
-                [0x06, 0x06, 0x66, 0x0f, 0x05, 0x06, 0x06, 0x06],
-                "a syscall",
+                [0xb8, 0x00, 0x48, 0xb8, 0, 0, 0, 0x0f, 0x05, 0x90],
+                TEXT + 0x40..TEXT + 0x42,
+                format!(
+                    "instruction audit: undeclared syscall at {:#x}",
+                    TEXT + 0x47
+                ),
+            ),
+            (
+                [0x90, 0x90, 0x90, 0xcd, 0x80, 0, 0, 0, 0, 0x90],
+                TEXT + 0x40..TEXT + 0x44,
+                format!("instruction audit: int 0x80 at {:#x}", TEXT + 0x43),
             ),
         ] {
             let image = text_with(0x40, &bytes);
-            let at = TEXT + 0x42;
+            assert_eq!(audit(&image, &declared).unwrap_err().to_string(), without);
             assert_eq!(
                 audit_with_data(&image, &declared, std::slice::from_ref(&range))
                     .unwrap_err()
                     .to_string(),
-                format!("instruction audit: data range {range:#x?} holds {what} at {at:#x}")
+                by_name
             );
         }
-    }
-
-    #[test]
-    fn a_data_range_may_not_cover_the_constructor_message_island() {
-        let pinned = CONSTRUCTOR + CONSTRUCTOR_LEAD_OFFSET;
-        let message = pinned + CONSTRUCTOR_LEAD.len() as u64;
-        let bytes = island_image(&island_text(Some(pinned), &[]));
-        let range = message + 4..message + 8;
+        let plain = elf(Some(RX), &gate_page(), &text_page(), &gate_page());
+        audit(&plain, &declared).unwrap();
         assert_eq!(
-            audit_with_data(&bytes, &[TEXT, TEXT + 4], std::slice::from_ref(&range))
+            audit_with_data(&plain, &declared, &[TEXT + 0x40..TEXT + 0x48])
                 .unwrap_err()
                 .to_string(),
-            format!(
-                "instruction audit: data range {range:#x?} overlaps the constructor message island"
-            )
+            by_name
         );
     }
 
@@ -2262,12 +2035,14 @@ mod tests {
     /// repeat this measurement. The 39 MB image is not in the repository, so
     /// this is ignored by default and run with `--ignored`, and then it FAILS
     /// unless `REVERIE_PRIVATE_RUNTIME_IMAGE` names the image and
-    /// `REVERIE_PRIVATE_RUNTIME_FACTS` its package descriptor (JSON with
-    /// `image.sha256` and `observed.{layout_address, reference_address, sites,
-    /// ordinary_post_ips}`).
+    /// `REVERIE_PRIVATE_RUNTIME_FACTS` its package descriptor. The JSON fields
+    /// read: `image.sha256`, `entry`, `terminal_int3`, and
+    /// `observed.{layout_address, reference_address, sites, ordinary_post_ips,
+    /// handler_address, handler_bytes, handler_sha256, dev_null_address}`, plus
+    /// the optional `observed.data_ranges` (absent and `[]` both mean none).
     #[test]
     #[ignore = "needs REVERIE_PRIVATE_RUNTIME_IMAGE and REVERIE_PRIVATE_RUNTIME_FACTS"]
-    fn the_measured_staged_image_qualifies_with_its_recorded_counts() {
+    fn the_measured_staged_image_passes_the_audit_with_its_recorded_counts() {
         const PINNED: &str = "2cf437588ab89fb97ca5a271374739c0e59d9ab4223f95a8d83b7a0e41f31268";
         let image = std::env::var_os("REVERIE_PRIVATE_RUNTIME_IMAGE")
             .expect("REVERIE_PRIVATE_RUNTIME_IMAGE must name the staged image");
@@ -2335,7 +2110,6 @@ mod tests {
         assert_eq!(census.in_gate, 3);
         assert_eq!(census.instructions, 2_614_665);
         assert_eq!(census.executable_bytes, 0xac0000);
-        assert_eq!(census.data_bytes, 0);
         image.validated_image().unwrap();
         image.copied_input_request().unwrap();
         let filter = image.filter_coverage();
@@ -2488,41 +2262,23 @@ mod tests {
         clippy::single_range_in_vec_init,
         reason = "a list holding one declared data range"
     )]
-    fn declared_data_ranges_reach_the_audit_through_the_facts() {
+    fn declared_data_ranges_in_the_facts_are_refused_on_x86_64() {
         let (bytes, facts) = qualifying_image();
         let text = RUNTIME_WINDOW.start + 2 * PAGE;
-        let without = AuditedRuntimeImage::new(bytes.clone(), facts.clone()).unwrap();
-        let mut stepped = facts.clone();
-        stepped.data_ranges = vec![text + 0x300..text + 0x308];
-        let with = AuditedRuntimeImage::new(bytes.clone(), stepped).unwrap();
-        assert_eq!(without.census().data_bytes, 0);
-        assert_eq!(with.census().data_bytes, 8);
-        // The eight int3 bytes are no longer instructions; nothing else moves.
+        AuditedRuntimeImage::new(bytes.clone(), facts.clone()).unwrap();
+        // Eight int3 bytes: harmless, and still refused.
+        let mut ranged = facts;
+        ranged.data_ranges = vec![text + 0x300..text + 0x308];
         assert_eq!(
-            with.census().instructions,
-            without.census().instructions - 8
-        );
-        assert_eq!(
-            with.census().executable_bytes,
-            without.census().executable_bytes
-        );
-        assert_eq!(with.filter_coverage(), without.filter_coverage());
-        let mut over_site = facts;
-        over_site.data_ranges = vec![text + 0x41..text + 0x48];
-        assert_eq!(
-            AuditedRuntimeImage::new(bytes, over_site)
+            AuditedRuntimeImage::new(bytes, ranged)
                 .unwrap_err()
                 .to_string(),
-            format!(
-                "instruction audit: data range {:#x?} overlaps the declared site at {:#x}",
-                text + 0x41..text + 0x48,
-                text + 0x40
-            )
+            "instruction audit: declared data ranges are not admitted on x86-64"
         );
     }
 
     #[test]
-    fn the_qualifying_image_qualifies_with_its_audit_and_filter_counts() {
+    fn the_qualifying_image_passes_the_audit_with_its_counts() {
         let (bytes, facts) = qualifying_image();
         let image = AuditedRuntimeImage::new(bytes, facts).unwrap();
         assert_eq!(image.census().in_gate, 3);
@@ -2673,14 +2429,23 @@ mod tests {
                 "exec_stop_producer_no_entry_for_birth"
             );
         }
-        let reserved = ArmingFacts {
-            reserved_signals: SIGSYS_BIT | 1,
+        // Reserved signals: SIGSYS is required, SIGSEGV is the only other bit
+        // allowed.
+        for refused in [0, SIGSEGV_BIT, SIGSYS_BIT | 1, SIGSEGV_BIT | 1] {
+            let reserved = ArmingFacts {
+                reserved_signals: refused,
+                ..facts
+            };
+            assert_eq!(
+                birth.arm(&reserved).err().unwrap().to_string(),
+                "exec_stop_producer_reserved_signals",
+                "{refused:#x}"
+            );
+        }
+        let facts = ArmingFacts {
+            reserved_signals: SIGSYS_BIT | SIGSEGV_BIT,
             ..facts
         };
-        assert_eq!(
-            birth.arm(&reserved).err().unwrap().to_string(),
-            "exec_stop_producer_reserved_signals"
-        );
         let armed = birth.arm(&facts).unwrap();
         assert_eq!(
             birth.arm(&facts).err().unwrap().to_string(),
@@ -2768,7 +2533,8 @@ mod tests {
             Err(retained) => panic!("preparation cancel unconfirmed: {:?}", retained.cleanup()),
         };
         assert!(cancelled.cleanup.confirmed);
-        // The filter the preparation installed is the one the proof decided.
+        // The preparation recorded the recipe for the same gate address the
+        // proof was run on. (This compares recipes, not the kernel's copy.)
         assert_eq!(
             cancelled.filter_bytes,
             super::super::physical::target_recipe(NATIVE_GATE.start).unwrap()

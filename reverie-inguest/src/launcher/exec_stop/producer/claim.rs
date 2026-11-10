@@ -186,7 +186,10 @@ enum AuditState {
 
 /// Whether the runtime image passed the instruction audit and filter proof.
 /// Only an [`AuditedRuntimeImage`](super::AuditedRuntimeImage) produces the
-/// audited form; any other image is [`ArtifactAudit::unaudited`].
+/// audited form; any other image is [`ArtifactAudit::unaudited`]. The audit is
+/// against facts the embedder asserts ([`RuntimeImageFacts`](super::RuntimeImageFacts)):
+/// it checks them against the bytes, but authenticating the image-and-facts
+/// pair is the embedder's job.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArtifactAudit(AuditState);
 

@@ -1,25 +1,32 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 // Licensed under the BSD-style license in the LICENSE file.
 
-//! Proof that the installed filter traps every syscall of a runtime image
-//! except its gate's own.
+//! Proof that the installed filter lets a runtime image's syscalls run only at
+//! its gate's own template sites.
 //!
 //! The filter the physical preparation installs compares only the
 //! architecture, the syscall number and the two instruction-pointer words, and
 //! only for equality. For such a program the verdict depends only on which of
 //! the program's own constants each loaded word equals. Evaluating it on every
-//! combination of those constants, plus one value equal to none of them,
-//! therefore yields its complete ALLOW set. The evaluator refuses any other
+//! combination of those constants, plus one value equal to none of them, for
+//! the architecture, the number and both instruction-pointer words, therefore
+//! yields its complete verdict table. The evaluator refuses any other
 //! instruction, so the decision is never partial.
 //!
-//! Against that set the proof requires:
-//! - a foreign architecture is never allowed;
+//! Each verdict is classified by its action, `k & 0xffff_0000`, as the kernel
+//! does. Against the table the proof requires:
+//! - every action is ALLOW, TRAP, KILL_PROCESS or KILL_THREAD (never LOG,
+//!   USER_NOTIF, TRACE or ERRNO, under which a syscall still runs or is
+//!   answered by someone else);
+//! - ALLOW only for x86-64: every other architecture (`int 0x80`, `sysenter`,
+//!   x32) traps or is killed;
 //! - every allowed instruction pointer is a specific address inside the gate
 //!   page (no "any address" allowance);
 //! - the instruction pointer after every declared site traps, for every
 //!   syscall number;
-//! - so every `0f 05` pair of the image, decoded or inside another
-//!   instruction, traps unless it ends at an allowed address in the gate page.
+//! - the `0f 05` pairs of the executable bytes whose following address is
+//!   allowed, decoded or inside another instruction, are exactly the gate's
+//!   three template sites.
 
 use std::collections::BTreeSet;
 use std::ops::Range;
@@ -30,7 +37,11 @@ use super::require;
 const LD_W_ABS: u16 = 0x20;
 const JEQ_K: u16 = 0x15;
 const RET_K: u16 = 0x06;
+const ACTION: u32 = 0xffff_0000;
 const ALLOW: u32 = 0x7fff_0000;
+const TRAP: u32 = 0x0003_0000;
+const KILL_PROCESS: u32 = 0x8000_0000;
+const KILL_THREAD: u32 = 0x0000_0000;
 const ARCH: u32 = 4;
 const NR: u32 = 0;
 const IP_LOW: u32 = 8;
@@ -151,35 +162,36 @@ pub(super) fn prove(
         .find(|value| !constants.contains(value))
         .ok_or("filter proof: no free value")?;
     constants.insert(other);
-    for &nr in &constants {
-        for &high in &constants {
-            for &low in &constants {
-                let ip = (u64::from(high) << 32) | u64::from(low);
-                require(
-                    run(&instructions, other ^ AUDIT_ARCH_X86_64 ^ 1, nr, ip)? != ALLOW
-                        || other ^ AUDIT_ARCH_X86_64 ^ 1 == AUDIT_ARCH_X86_64,
-                    "filter proof: a foreign architecture is allowed",
-                )?;
-            }
-        }
-    }
     let mut allowed: Vec<(u64, u32)> = Vec::new();
-    for &nr in &constants {
-        for &high in &constants {
-            for &low in &constants {
-                let ip = (u64::from(high) << 32) | u64::from(low);
-                if run(&instructions, AUDIT_ARCH_X86_64, nr, ip)? != ALLOW {
-                    continue;
+    for &arch in &constants {
+        for &nr in &constants {
+            for &high in &constants {
+                for &low in &constants {
+                    let ip = (u64::from(high) << 32) | u64::from(low);
+                    let action = run(&instructions, arch, nr, ip)? & ACTION;
+                    if action != ALLOW {
+                        require(
+                            [TRAP, KILL_PROCESS, KILL_THREAD].contains(&action),
+                            &format!(
+                                "filter proof: action {action:#010x} is not allow, trap or kill"
+                            ),
+                        )?;
+                        continue;
+                    }
+                    require(
+                        arch == AUDIT_ARCH_X86_64,
+                        "filter proof: a foreign architecture is allowed",
+                    )?;
+                    require(
+                        high != other && low != other,
+                        "filter proof: an unspecific instruction pointer is allowed",
+                    )?;
+                    require(
+                        gate.contains(&ip),
+                        "filter proof: an allowed instruction pointer is outside the gate page",
+                    )?;
+                    allowed.push((ip, nr));
                 }
-                require(
-                    high != other && low != other,
-                    "filter proof: an unspecific instruction pointer is allowed",
-                )?;
-                require(
-                    gate.contains(&ip),
-                    "filter proof: an allowed instruction pointer is outside the gate page",
-                )?;
-                allowed.push((ip, nr));
             }
         }
     }
@@ -218,6 +230,11 @@ pub(super) fn prove(
         }
         coverage.trapped_declared_sites += 1;
     }
+    let templates: Vec<u64> = super::GATE_SYSCALL_OFFSETS
+        .iter()
+        .map(|offset| gate.start + offset)
+        .collect();
+    let mut untrapped: Vec<u64> = Vec::new();
     for run in runs {
         let start = run.start;
         for (offset, pair) in run.bytes.windows(2).enumerate() {
@@ -225,17 +242,24 @@ pub(super) fn prove(
                 continue;
             }
             coverage.encodings += 1;
-            let after = start + offset as u64 + 2;
-            if allowed_at(after) {
+            let at = start + offset as u64;
+            if allowed_at(at + 2) {
                 require(
-                    gate.contains(&after),
-                    "filter proof: an allowed encoding ends outside the gate page",
+                    templates.contains(&at),
+                    &format!(
+                        "filter proof: the syscall encoding at {at:#x} runs, and is not a gate template site"
+                    ),
                 )?;
+                untrapped.push(at);
             } else {
                 coverage.trapped_encodings += 1;
             }
         }
     }
+    require(
+        untrapped == templates,
+        "filter proof: the gate template sites are not exactly the encodings that run",
+    )?;
     Ok(coverage)
 }
 
@@ -365,6 +389,116 @@ mod tests {
                 why
             );
         }
+    }
+
+    /// `program` with instruction `index`'s constant replaced by `k`.
+    fn with_k(program: &[u8], index: usize, k: u32) -> Vec<u8> {
+        let mut program = program.to_vec();
+        program[8 * index + 4..8 * index + 8].copy_from_slice(&k.to_le_bytes());
+        program
+    }
+
+    /// Instructions as canonical bytes.
+    fn assemble(instructions: &[(u16, u8, u8, u32)]) -> Vec<u8> {
+        let mut program = Vec::new();
+        for &(code, jt, jf, k) in instructions {
+            program.extend_from_slice(&code.to_le_bytes());
+            program.extend_from_slice(&[jt, jf]);
+            program.extend_from_slice(&k.to_le_bytes());
+        }
+        program
+    }
+
+    fn refusal(program: &[u8], runs: &[super::super::Run]) -> String {
+        prove(program, runs, &(GATE..GATE + 4096), &[GATE + 4096 + 0x10])
+            .unwrap_err()
+            .to_string()
+    }
+
+    #[test]
+    fn a_foreign_architecture_allow_is_refused() {
+        const AUDIT_ARCH_I386: u32 = 0x4000_0003;
+        // `ld arch; jeq i386 -> ret allow` before the recipe, which runs
+        // every `int 0x80` and `sysenter` from any address. The no-op
+        // `ld nr; jeq 0` makes 0 a constant, so the value standing for "every
+        // other" is not 0.
+        let mut program = assemble(&[
+            (LD_W_ABS, 0, 0, NR),
+            (JEQ_K, 0, 0, 0),
+            (LD_W_ABS, 0, 0, ARCH),
+            (JEQ_K, 0, 1, AUDIT_ARCH_I386),
+            (RET_K, 0, 0, ALLOW),
+        ]);
+        program.extend_from_slice(&recipe(GATE + 0x200));
+        assert_eq!(
+            refusal(&program, &runs()),
+            "filter proof: a foreign architecture is allowed"
+        );
+    }
+
+    #[test]
+    fn a_verdict_other_than_allow_trap_or_kill_is_refused() {
+        // Instruction 21 is the recipe's TRAP for every non-gate address.
+        let program = recipe(GATE + 0x200);
+        assert_eq!(
+            u32::from_le_bytes(program[8 * 21 + 4..8 * 21 + 8].try_into().unwrap()),
+            TRAP
+        );
+        for (k, why) in [
+            (
+                0x7ffc_0000,
+                "filter proof: action 0x7ffc0000 is not allow, trap or kill",
+            ),
+            (
+                0x7fc0_0000,
+                "filter proof: action 0x7fc00000 is not allow, trap or kill",
+            ),
+            (
+                0x0005_0001,
+                "filter proof: action 0x00050000 is not allow, trap or kill",
+            ),
+            // ALLOW with data bits is ALLOW to the kernel, at any address.
+            (
+                0x7fff_0001,
+                "filter proof: an unspecific instruction pointer is allowed",
+            ),
+        ] {
+            assert_eq!(refusal(&with_k(&program, 21, k), &runs()), why, "{k:#x}");
+        }
+        // KILL_THREAD and TRAP with data bits are still a trap or a kill.
+        for k in [KILL_THREAD, TRAP | 1] {
+            prove(
+                &with_k(&program, 21, k),
+                &runs(),
+                &(GATE..GATE + 4096),
+                &[GATE + 4096 + 0x10],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn only_the_gate_template_encodings_may_run() {
+        let program = recipe(GATE + 0x200);
+        // A pair at +0x1fe, inside a movabs whose immediate ends there, ends
+        // at the allowed +0x200.
+        let mut extra = runs();
+        extra[0].bytes[0x1f6..0x200]
+            .copy_from_slice(&[0x48, 0xb8, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0x0f, 0x05]);
+        assert_eq!(
+            refusal(&program, &extra),
+            format!(
+                "filter proof: the syscall encoding at {:#x} runs, and is not a gate template site",
+                GATE + 0x1fe
+            )
+        );
+        // A template site without its encoding.
+        let mut missing = runs();
+        missing[0].bytes[0x309..0x30b].copy_from_slice(&[0xcc, 0xcc]);
+        assert_eq!(
+            refusal(&program, &missing),
+            "filter proof: the gate template sites are not exactly the encodings that run"
+        );
     }
 
     #[test]

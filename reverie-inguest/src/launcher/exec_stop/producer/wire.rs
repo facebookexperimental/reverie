@@ -3,17 +3,21 @@
 
 //! The HLSCAL01 handoff for one birth of an audited runtime image.
 //!
-//! The bytes are those of the embedder wire this was promoted from, for the
-//! same inputs: the same header words, table order and alignment, and all-zero
-//! binding digests (see [`claim`](super::claim): the handoff is unbound and
-//! unqualified until real digests exist). HLSCAL01 version 1 is x86-64 only;
-//! another target refuses by name.
+//! The bytes are, by construction, those of the embedder wire this was
+//! promoted from, for the same inputs: the same header words, table order and
+//! alignment, and all-zero binding digests (see [`claim`](super::claim): the
+//! handoff is unbound and unqualified until real digests exist). Byte identity
+//! with that wire is NOT yet measured; a differential test against it is
+//! pending. HLSCAL01 version 1 is x86-64 only; another target refuses by name.
 //!
-//! HLSCAL01 prefix word 4 is the ARCH TAG: 0 = x86-64 (the value every v1
-//! wire has always carried), 1 = aarch64 (reserved: refused until its
-//! register layout lands with handoff version 2). Prefix words 5-7 stay
-//! reserved zero. Every existing handoff parser refuses a nonzero word 4 as
-//! a reserved word, so an aarch64 wire cannot reach an x86-64 runtime.
+//! The arch tag is a refinement of HLSCAL01 prefix word 4 that, in version 1,
+//! only ever takes the value 0 (x86-64, the value every v1 wire has always
+//! carried). The canonical HLSCAL01 format doc (`reverie_loader::handoff`,
+//! "four zero reserved words") is unchanged, and every existing handoff parser
+//! refuses a nonzero word 4 as a reserved word. Here a v1 word 4 of 1 is
+//! refused by name as reserved for aarch64, and any other nonzero value as
+//! unknown. These values are v1-only: HLSCAL02 assigns its own (1 = x86-64,
+//! 2 = aarch64, 0 refused). Prefix words 5-7 stay reserved zero.
 
 use reverie_loader::artifact::TOOL_REGION;
 use reverie_loader::handoff;
@@ -32,7 +36,8 @@ use super::require;
 pub const WIRE_ARCH_WORD: usize = 4;
 /// Arch tag of an x86-64 wire: 0, so v1 wires are unchanged.
 pub const WIRE_ARCH_X86_64: u64 = 0;
-/// Arch tag of an aarch64 wire, reserved until handoff version 2.
+/// A v1 word 4 of 1, refused by name as reserved for aarch64 (HLSCAL02
+/// assigns aarch64 its own value, 2).
 pub const WIRE_ARCH_AARCH64: u64 = 1;
 
 /// The architecture a handoff names.
