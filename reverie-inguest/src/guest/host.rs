@@ -297,19 +297,35 @@ fn perform_pkey_alloc(event: &mut SyscallEvent, number: i64, args: [u64; 6]) -> 
 
 const STACK_CAPACITY: usize = 4096;
 
+/// The type of [`COMMITTED_STACKS`]. It must not need dropping: see there.
+type CommittedStacks = core::mem::ManuallyDrop<core::cell::RefCell<Vec<Box<[u8]>>>>;
+
 thread_local! {
     /// Arenas committed by this thread's in-flight dispatch. Per-thread:
     /// a sibling dispatch's scope entry/exit must never free arenas this
     /// thread committed and may still reference through stack guards.
     ///
-    /// Only ever touch this with `try_with`: dispatch also runs for the
-    /// syscalls a thread makes after libc destroyed its TLS — the
-    /// `exit_group` that follows `exit()`'s `__cxa_thread_atexit`
-    /// destructors, and the thread-exit syscall after pthread teardown —
-    /// where `.with()` panics with `AccessError` inside the nounwind
-    /// trap handler and aborts the guest.
-    static COMMITTED_STACKS: core::cell::RefCell<Vec<Box<[u8]>>> =
-        const { core::cell::RefCell::new(Vec::new()) };
+    /// Destructor-free on purpose. A thread-local whose type needs
+    /// dropping makes std register a thread-exit destructor on first
+    /// access, through libc's `__cxa_thread_atexit_impl`, which allocates
+    /// its record from the C library heap. The first access is
+    /// [`ToolHost::from_parts`], which for an in-guest runtime runs while
+    /// the preload's constructor installs the Tool, before the guest's
+    /// `main`: the guest's heap then started with libc's per-thread cache
+    /// and that record in it. Every dispatch touches the slot as well. No
+    /// destructor is needed, because [`DispatchScratchScope`] empties the
+    /// vector and releases its buffer whenever a dispatch ends, so a
+    /// thread exits holding nothing; only a thread that exits inside a
+    /// dispatch leaks what that dispatch retained, the vector's buffer
+    /// included, which freeing could not have made sound anyway.
+    ///
+    /// Without a destructor the slot is never destroyed, so the syscalls a
+    /// thread makes after libc ran its TLS destructors (the `exit_group`
+    /// after `exit()`, the thread-exit syscall after pthread teardown)
+    /// still reach it. Access stays on `try_with` regardless: `.with()`
+    /// panicking inside the nounwind trap handler would abort the guest.
+    static COMMITTED_STACKS: CommittedStacks =
+        const { core::mem::ManuallyDrop::new(core::cell::RefCell::new(Vec::new())) };
 }
 
 fn retain_committed_stack(arena: Box<[u8]>) {
@@ -320,10 +336,9 @@ fn retain_committed_stack(arena: Box<[u8]>) {
             .push(arena.take().expect("arena retained once"));
     });
     if retained.is_err() {
-        // This thread's TLS is already destroyed (exit teardown): no
-        // later dispatch on it will clear the vector. Leaking the arena
-        // is the only sound answer — freeing it here could release
-        // memory a stack guard of this final dispatch still references.
+        // Unreachable while the slot has no destructor. Leaking is the
+        // only sound answer if it ever is: freeing here could release
+        // memory a stack guard of this dispatch still references.
         std::mem::forget(arena.take().expect("arena retained once"));
     }
 }
@@ -334,9 +349,6 @@ struct DispatchScratchScope {
 
 impl DispatchScratchScope {
     fn enter() -> Self {
-        // A destroyed thread-local means this dispatch is part of exit
-        // teardown; the vector was already dropped with the TLS, so
-        // there is nothing left to clear.
         let _ = COMMITTED_STACKS.try_with(|stacks| stacks.borrow_mut().clear());
         Self {
             _allocation_scope: super::alloc::enter_dispatch(),
@@ -346,9 +358,14 @@ impl DispatchScratchScope {
 
 impl Drop for DispatchScratchScope {
     fn drop(&mut self) {
-        // A forked child inherits this thread's vector; clearing it here
+        // A forked child inherits this thread's vector; releasing it here
         // only ever touches the calling thread's own committed arenas.
-        let _ = COMMITTED_STACKS.try_with(|stacks| stacks.borrow_mut().clear());
+        // Its buffer goes too, not only its arenas: the slot has no
+        // destructor, so nothing else would free it when the thread exits.
+        let _ = COMMITTED_STACKS.try_with(|stacks| {
+            let released = core::mem::take(&mut *stacks.borrow_mut());
+            drop(released);
+        });
     }
 }
 
@@ -6581,18 +6598,47 @@ mod tests {
         }
     }
 
+    fn needs_drop_of<T: 'static>(_: &'static std::thread::LocalKey<T>) -> bool {
+        core::mem::needs_drop::<T>()
+    }
+
+    /// `ToolHost::from_parts` touches `COMMITTED_STACKS`, and for an
+    /// in-guest runtime it runs while the preload's constructor installs
+    /// the Tool, before the guest's `main`. std registers a thread-exit
+    /// destructor for a thread-local exactly when its type needs dropping,
+    /// through libc's `__cxa_thread_atexit_impl`, which allocates from the
+    /// C library heap: the guest's heap then reached `main` holding libc's
+    /// per-thread cache and that record (704 bytes with glibc 2.34).
+    #[test]
+    fn committed_stacks_registers_no_thread_exit_destructor() {
+        assert!(!needs_drop_of(&COMMITTED_STACKS));
+    }
+
+    /// With no destructor, ending a dispatch is the only thing that frees
+    /// the vector's buffer: a thread exits holding whatever the last
+    /// dispatch scope left behind.
+    #[test]
+    fn dispatch_scratch_scope_releases_the_committed_stack_buffer() {
+        let capacity = || COMMITTED_STACKS.with(|stacks| stacks.borrow().capacity());
+        let scope = DispatchScratchScope::enter();
+        retain_committed_stack(vec![0; STACK_CAPACITY].into_boxed_slice());
+        assert_ne!(capacity(), 0);
+        drop(scope);
+        assert_eq!(capacity(), 0);
+    }
+
     /// Regression for the W7 TLS-teardown abort: a guest thread's last
     /// syscalls dispatch after libc destroyed that thread's TLS
     /// (`exit_group` after `exit()` ran the main thread's
     /// `__cxa_thread_atexit` destructors, the thread-exit syscall after
     /// pthread teardown on a worker), and every dispatch enters
     /// [`DispatchScratchScope`]. Its `COMMITTED_STACKS` access must
-    /// survive a destroyed thread-local instead of panicking in the
-    /// nounwind trap handler. The probe TLS below is touched before
-    /// `COMMITTED_STACKS` on each thread, so its destructor runs after
-    /// `COMMITTED_STACKS` is destroyed and re-enters the scope exactly
-    /// like that late dispatch. Subprocess-isolated: the failure this
-    /// guards against is a process abort, not a catchable panic.
+    /// survive libc's TLS teardown instead of panicking in the nounwind
+    /// trap handler. The probe TLS below is touched before
+    /// `COMMITTED_STACKS` on each thread, so its destructor runs during
+    /// that teardown and re-enters the scope exactly like that late
+    /// dispatch. Subprocess-isolated: the failure this guards against is
+    /// a process abort, not a catchable panic.
     #[test]
     fn dispatch_scratch_scope_survives_tls_teardown_at_exit() {
         use std::io::Write;
@@ -6624,9 +6670,9 @@ mod tests {
         }
 
         let states = std::sync::Arc::new(super::thread_lease::ThreadStates::<u32>::new());
-        // Worker-thread teardown: at pthread exit COMMITTED_STACKS is
-        // destroyed before the probe destructor re-enters the scope,
-        // while the thread holds a live lease.
+        // Worker-thread teardown: the probe destructor re-enters the
+        // scope during pthread exit's TLS teardown, while the thread
+        // holds a live lease.
         let worker_states = std::sync::Arc::clone(&states);
         std::thread::spawn(move || {
             REENTER_ON_TEARDOWN.with(|_| {});
