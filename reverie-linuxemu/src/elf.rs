@@ -355,9 +355,18 @@ pub struct GuestFileIdentityTable {
     /// keyed by their pinned backing memfd.
     pub proc_transfers:
         std::collections::BTreeMap<(libc::dev_t, libc::ino_t), crate::executor::ProcTransfer>,
-    /// Epolls sent with SCM_RIGHTS and not yet received
-    /// (`crate::executor::EpollTransfer`).
+    /// Epolls that a receive can get: those sent with SCM_RIGHTS, and those
+    /// received from outside the run (`crate::executor::EpollTransfer`).
     pub(crate) epoll_transfers: Vec<crate::executor::EpollTransfer>,
+    /// Peeks between their host receive and their lookup of what they got
+    /// (`crate::executor::PeekWindow`).
+    pub(crate) open_peek_windows: usize,
+    /// The holds of epolls whose last right a receive took while a peek
+    /// window was open, which go when the last window closes.
+    pub(crate) peek_window_holds: Vec<crate::executor::EpollHold>,
+    /// Host receives that lost rights they could not install as descriptors
+    /// of this process (`crate::executor::note_lost_rights`).
+    pub(crate) lost_right_receives: usize,
 }
 
 /// Process-tree-wide state whose lifetime follows a guest task rather than an
@@ -2451,6 +2460,8 @@ fn load_executable(
     // allocate the copy refuses only an image Linux would load.
     let executable_image = copy_image(image)?;
     let private_copy_gate = crate::executor::PrivateCopyGate::default();
+    // Before the guest has a descriptor, whatever it opens later.
+    crate::executor::mapping_list::comparison_probe();
     Ok(LoadedStaticElf {
         entry_point,
         stack_pointer,
@@ -2543,6 +2554,9 @@ fn load_executable(
             objects: std::collections::BTreeMap::new(),
             proc_transfers: std::collections::BTreeMap::new(),
             epoll_transfers: Vec::new(),
+            open_peek_windows: 0,
+            peek_window_holds: Vec::new(),
+            lost_right_receives: 0,
         })),
     })
 }

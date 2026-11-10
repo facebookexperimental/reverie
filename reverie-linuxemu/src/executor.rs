@@ -487,6 +487,8 @@ const fn negative_errno(errno: libc::c_int) -> i64 {
 #[cfg(any(test, feature = "test-support", feature = "native-test-support"))]
 pub fn native_loaded_state(cwd: &std::path::Path) -> LoadedStaticElf {
     let private_copy_gate = PrivateCopyGate::default();
+    // As a loaded guest's (`load_static_elf`).
+    mapping_list::comparison_probe();
     LoadedStaticElf {
         entry_point: 0,
         stack_pointer: 0,
@@ -580,6 +582,9 @@ pub fn native_loaded_state(cwd: &std::path::Path) -> LoadedStaticElf {
             objects: std::collections::BTreeMap::new(),
             proc_transfers: std::collections::BTreeMap::new(),
             epoll_transfers: Vec::new(),
+            open_peek_windows: 0,
+            peek_window_holds: Vec::new(),
+            lost_right_receives: 0,
         })),
     }
 }

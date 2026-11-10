@@ -551,6 +551,57 @@ pub(super) fn madvise_refusal_diagnostic(advice: libc::c_int) -> &'static str {
 pub(crate) const PIDFD_RIGHTS_REFUSAL: &str =
     "KVM does not send a pidfd for a guest process in an SCM_RIGHTS message";
 
+/// Diagnostic for this backend's refusal to add a pidfd for a guest process
+/// to an epoll set where open file descriptions cannot be compared: a
+/// descriptor of the epoll passed in an `SCM_RIGHTS` message could not join
+/// its registrations (`descriptions_comparable`).
+pub(crate) const PIDFD_EPOLL_REFUSAL: &str = "KVM does not add a pidfd for a guest process to an \
+     epoll set on a host where neither kcmp nor F_DUPFD_QUERY compares open file descriptions";
+
+/// The typed refusal, if any, that an `epoll_ctl` result carries for a pidfd
+/// for a guest process. Linux's epoll_ctl never fails with ENOSYS, so an
+/// ENOSYS answer to an EPOLL_CTL_ADD of such a pidfd is this backend's own
+/// refusal (`epoll_ctl`); every other result carries none.
+pub(super) fn pidfd_epoll_refusal(
+    state: &LoadedStaticElf,
+    request: &SyscallRequest,
+    result: i64,
+) -> Option<reverie::UnsupportedRefusal> {
+    let args = request.args();
+    (result == negative_errno(libc::ENOSYS)
+        && request.number() == libc::SYS_epoll_ctl as u64
+        && args[1] as libc::c_int == libc::EPOLL_CTL_ADD
+        && guest_pidfd(state, args[2] as libc::c_int).is_some())
+    .then(|| {
+        reverie::UnsupportedRefusal::new(
+            reverie::UnsupportedOperation::Pidfd,
+            reverie::Errno::ENOSYS,
+            PIDFD_EPOLL_REFUSAL,
+        )
+    })
+}
+
+/// Diagnostic for this backend's refusal of a receive from a Unix socket
+/// with fewer than `SCM_MAX_FD` descriptors free under the descriptor limit
+/// it receives with: the host would drop, unseen, the rights it could not
+/// install (`host_receive_room`).
+pub(crate) const RECEIVE_DESCRIPTORS_REFUSAL: &str = "KVM does not receive from a Unix socket \
+     with fewer than 253 descriptors free under its RLIMIT_NOFILE: the host would drop, unseen, \
+     the rights it could not install";
+
+/// The typed refusal, if any, of the receive this call made: one that
+/// refused for want of host descriptors answered ENOMEM and said so
+/// (`refuse_receive_for_descriptors`); every other result carries none.
+pub(super) fn receive_descriptors_refusal(result: i64) -> Option<reverie::UnsupportedRefusal> {
+    (take_receive_refused_for_descriptors() && result == negative_errno(libc::ENOMEM)).then(|| {
+        reverie::UnsupportedRefusal::new(
+            reverie::UnsupportedOperation::HostResources,
+            reverie::Errno::ENOMEM,
+            RECEIVE_DESCRIPTORS_REFUSAL,
+        )
+    })
+}
+
 /// The typed refusal, if any, that a call refused for a pidfd for a guest
 /// process carries: `reason` is the one the call recorded, and the call
 /// answered ENOSYS, which Linux's sendmsg never answers.

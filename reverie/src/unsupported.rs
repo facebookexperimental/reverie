@@ -123,8 +123,9 @@ pub enum UnsupportedOperation {
     /// parent-death signal; the refusal's diagnostic names the reason.
     ParentDeathSignal,
     /// An operation on a pidfd that the backend does not model, such as
-    /// sending a pidfd for a process of the run in an `SCM_RIGHTS` message. A
-    /// backend that refuses one sent nothing and changed nothing; the
+    /// sending a pidfd for a process of the run in an `SCM_RIGHTS` message,
+    /// or adding one to an epoll set where the backend cannot tell open file
+    /// descriptions apart. A backend that refuses one changed nothing; the
     /// refusal's diagnostic names the operation.
     Pidfd,
 }

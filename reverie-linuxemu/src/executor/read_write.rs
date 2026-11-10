@@ -988,18 +988,21 @@ pub(super) fn host_read(memory: &mut GuestMemory, fd: RawFd, address: u64, lengt
     finish_host_read(memory, address, &bytes, count)
 }
 
-/// [`host_read`] for a guest's read of host descriptor `fd`. While rights
-/// this backend tracks are in flight, a socket's read receives the rights of
-/// the message it consumes, which Linux discards, to release them
-/// (`receive_discarding_rights`).
+/// [`host_read`] for a guest's read of host descriptor `fd`, which may be a
+/// socket if `socket`. A Unix socket's read receives the rights of the
+/// message it consumes, which Linux discards, to release them
+/// (`receive_discarding_rights`), whatever is in flight when it starts: a
+/// read can wait for a message that another process sends meanwhile
+/// (`is_unix_socket`).
 fn guest_host_read(
     memory: &mut GuestMemory,
     state: &LoadedStaticElf,
     fd: RawFd,
     address: u64,
     length: usize,
+    socket: bool,
 ) -> i64 {
-    if !reads_tracked_rights(state, fd) {
+    if !(socket && is_unix_socket(fd)) {
         return host_read(memory, fd, address, length);
     }
     let mut bytes = match prepare_host_read(&ProviderMemory(memory), address, length) {
@@ -1135,6 +1138,7 @@ pub(super) fn read(
             stdin.as_raw_fd(),
             args[1],
             length,
+            true,
         ));
     }
     let Some(file) = state.files.get(&fd) else {
@@ -1215,7 +1219,14 @@ pub(super) fn read(
         Ok(false) => {}
         Err(error) => return Ok(error),
     }
-    Ok(guest_host_read(memory, state, host_fd, args[1], length))
+    Ok(guest_host_read(
+        memory,
+        state,
+        host_fd,
+        args[1],
+        length,
+        mode & libc::S_IFMT == libc::S_IFSOCK,
+    ))
 }
 
 pub(super) fn pread64<M: GuestMemoryAccess<Error = crate::Error> + AddressSpace>(
@@ -1527,6 +1538,22 @@ impl StagedIoVector {
         })
     }
 
+    /// Staging for `guest` that the host can write throughout, for a receive
+    /// that takes its record before the copy that can fault
+    /// (`receive_stages_whole_buffer`): `accessible_length` is still the
+    /// guest's accessible prefix, which the copy back to the guest keeps to,
+    /// and past which a received byte is one whose copy faults.
+    pub(super) fn whole(
+        guest: GuestIoVec,
+        accessible_length: usize,
+        alignment: usize,
+    ) -> Result<Self, i64> {
+        debug_assert!(accessible_length <= guest.length);
+        let mut staged = Self::new(guest, guest.length, alignment)?;
+        staged.accessible_length = accessible_length;
+        Ok(staged)
+    }
+
     fn host_iovec(&mut self) -> libc::iovec {
         libc::iovec {
             iov_base: self
@@ -1777,13 +1804,14 @@ fn invoke_vectored_read(
     host_fd: RawFd,
     host_iovecs: &mut [libc::iovec],
     args: &[u64; 6],
+    socket: bool,
 ) -> i64 {
-    // As for read: a readv of a socket, or a preadv2 at its current position,
-    // receives the rights it consumes while tracked rights are in flight
-    // (`guest_host_read`). Linux returns 0 for a read of no byte before it
-    // reaches the socket (`sock_read_iter`), and refuses RWF_ATOMIC and
-    // RWF_DONTCACHE for a socket before reading (`kiocb_set_rw_flags`); the
-    // host call below gives both.
+    // As for read: a readv of a Unix socket, or a preadv2 at its current
+    // position, receives the rights it consumes (`guest_host_read`). Linux
+    // returns 0 for a read of no byte before it reaches the socket
+    // (`sock_read_iter`), and refuses RWF_ATOMIC and RWF_DONTCACHE for a
+    // socket before reading (`kiocb_set_rw_flags`); the host call below gives
+    // both.
     let flags = if number == libc::SYS_preadv2 {
         args[5] as libc::c_int
     } else {
@@ -1792,7 +1820,8 @@ fn invoke_vectored_read(
     if (number == libc::SYS_readv || number == libc::SYS_preadv2 && args[3] as i64 == -1)
         && host_iovecs.iter().any(|vector| vector.iov_len != 0)
         && flags & (libc::RWF_ATOMIC | libc::RWF_DONTCACHE) == 0
-        && reads_tracked_rights(state, host_fd)
+        && socket
+        && is_unix_socket(host_fd)
     {
         let receive = if flags & libc::RWF_NOWAIT != 0 {
             libc::MSG_DONTWAIT
@@ -2067,14 +2096,22 @@ fn staged_vectored_transfer<M: GuestMemoryAccess<Error = crate::Error> + Address
     args: &[u64; 6],
     reading: bool,
 ) -> i64 {
-    let inotify = if reading {
-        match host_fd_is_inotify(host_fd) {
-            Ok(inotify) => inotify,
+    let (inotify, socket) = if reading {
+        let mode = match fd_mode(host_fd) {
+            Ok(mode) => mode,
+            Err(error) => return error,
+        };
+        match host_fd_mode_is_inotify(host_fd, mode) {
+            Ok(inotify) => (inotify, mode & libc::S_IFMT == libc::S_IFSOCK),
             Err(error) => return error,
         }
     } else {
-        false
+        (false, false)
     };
+    // A Unix datagram or seqpacket socket's read stages the guest's whole
+    // buffer writable, and this backend makes a fault of its copy itself
+    // (`receive_stages_whole_buffer`).
+    let whole = socket && receive_stages_whole_buffer(host_fd);
     let staging_alignment = direct_io_memory_alignment(host_fd);
 
     // Give the host one iovec for every bounded guest iovec, with the same
@@ -2093,7 +2130,12 @@ fn staged_vectored_transfer<M: GuestMemoryAccess<Error = crate::Error> + Address
             memory.accessible_prefix(vector.base, vector.length, Access::Read)
         }
         .unwrap_or(0);
-        let mut staged = match StagedIoVector::new(*vector, prefix, staging_alignment) {
+        let staged = if whole {
+            StagedIoVector::whole(*vector, prefix, staging_alignment)
+        } else {
+            StagedIoVector::new(*vector, prefix, staging_alignment)
+        };
+        let mut staged = match staged {
             Ok(staged) => staged,
             Err(error) => return error,
         };
@@ -2128,16 +2170,20 @@ fn staged_vectored_transfer<M: GuestMemoryAccess<Error = crate::Error> + Address
     } else {
         None
     };
-    let result = invoke_vectored_read(state, number, host_fd, &mut host_iovecs, args);
+    let result = invoke_vectored_read(state, number, host_fd, &mut host_iovecs, args, socket);
     if result >= 0 {
         let mut remaining = result as usize;
         for vector in &staged_vectors {
             let transferred = remaining.min(vector.guest.length);
             let copied = transferred.min(vector.accessible_length);
-            if copied != 0
+            // A byte received past the guest's accessible prefix is one whose
+            // copy faults, after Linux took the record, whose rights the
+            // receive released (`receive_stages_whole_buffer`).
+            if (copied != 0
                 && memory
                     .write_exact(vector.guest.base, vector.accessible_slice(copied))
-                    .is_err()
+                    .is_err())
+                || transferred > copied
             {
                 return negative_errno(libc::EFAULT);
             }

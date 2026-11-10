@@ -1488,7 +1488,8 @@ std::thread_local! {
         const { std::cell::RefCell::new(None) };
     /// Runs once on the calling thread right after a replacement raised the
     /// soft limit for a copy's `dup3`, before it puts the limit back
-    /// (`replace_copy`): where another process can change the limits.
+    /// (`replace_copy`): where another process can change the limits. A
+    /// receive's raise runs it too (`with_hard_nofile_limit`).
     pub(crate) static SOFT_LIMIT_RAISED_TEST_HOOK: OneShotTestHook =
         const { std::cell::RefCell::new(None) };
     /// When set, the next restoration of a raised soft limit on this thread
@@ -1763,8 +1764,48 @@ fn replace_copy(host: RawFd) -> Result<(), ReplaceFailure> {
     }
 }
 
+/// Runs `receive`, a host receive that cannot wait, or its count of the
+/// descriptors free for one, with this process's soft `RLIMIT_NOFILE` raised
+/// to its hard limit under [`NOFILE_LIMIT_ADJUSTMENT`], as [`replace_copy`]
+/// raises it for its one call: only where the soft limit leaves too little
+/// room for one message's rights (`host_receive_room`). The host installs
+/// every right a message carries as a descriptor of this process, and drops,
+/// unseen, those it cannot (`scm_detach_fds`), so the receive gets every right
+/// short of the hard limit; the caller gives the guest as many as the guest's
+/// own limit allows (`install_received_rights`). The soft limit is then put
+/// back as a replacement puts it back; one that cannot be put back is logged.
+pub(super) fn with_hard_nofile_limit<T>(receive: impl FnOnce() -> T) -> T {
+    let _adjustment = NOFILE_LIMIT_ADJUSTMENT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(limit) = nofile_limit().filter(|limit| limit.rlim_cur < limit.rlim_max) else {
+        return receive();
+    };
+    let raised = libc::rlimit {
+        rlim_cur: limit.rlim_max,
+        rlim_max: limit.rlim_max,
+    };
+    // SAFETY: setrlimit reads only `raised`, a soft limit equal to the hard
+    // one, which this process may always set.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } != 0 {
+        return receive();
+    }
+    #[cfg(test)]
+    run_one_shot_test_hook(&SOFT_LIMIT_RAISED_TEST_HOOK);
+    let received = receive();
+    if let Err(error) = restore_soft_limit(limit.rlim_cur, limit.rlim_max) {
+        tracing::error!(
+            "KVM could not put back its soft RLIMIT_NOFILE of {} after a receive \
+             raised it to {}: {error}",
+            limit.rlim_cur,
+            limit.rlim_max,
+        );
+    }
+    received
+}
+
 /// This process's `RLIMIT_NOFILE`, if it can be read.
-fn nofile_limit() -> Option<libc::rlimit> {
+pub(super) fn nofile_limit() -> Option<libc::rlimit> {
     let mut limit = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,

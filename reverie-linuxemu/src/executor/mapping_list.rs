@@ -242,15 +242,106 @@ thread_local! {
     /// (EPERM) would.
     pub(crate) static KCMP_FAILS_TEST_HOOK: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    /// While set, makes this thread's `compare_descriptions` fail its
+    /// `F_DUPFD_QUERY`, as a kernel before 6.10 would (EINVAL).
+    pub(crate) static DUPFD_QUERY_FAILS_TEST_HOOK: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// While set, makes this thread's `descriptions_comparable` answer no, as
+    /// on a host where neither way of comparing works.
+    pub(crate) static DESCRIPTIONS_INCOMPARABLE_TEST_HOOK: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 /// Whether host descriptors `a` and `b` are one open file description, or
-/// `None` if `kcmp` fails.
+/// `None` if neither way of asking can tell: `kcmp`'s `KCMP_FILE`, which
+/// needs `CONFIG_KCMP` and a policy that allows it (seccomp profiles that
+/// deny `kcmp`, Docker's default among them, do not), then `fcntl`'s
+/// `F_DUPFD_QUERY`, which needs Linux 6.10.
 pub(crate) fn compare_descriptions(a: RawFd, b: RawFd) -> Option<bool> {
     #[cfg(test)]
-    if KCMP_FAILS_TEST_HOOK.with(|fails| fails.replace(false)) {
-        return None;
+    let kcmp_fails = KCMP_FAILS_TEST_HOOK.with(|fails| fails.replace(false));
+    #[cfg(not(test))]
+    let kcmp_fails = false;
+    let kcmp = if kcmp_fails { None } else { kcmp_files(a, b) };
+    kcmp.or_else(|| {
+        #[cfg(test)]
+        if DUPFD_QUERY_FAILS_TEST_HOOK.with(std::cell::Cell::get) {
+            return None;
+        }
+        query_duplicate(a, b)
+    })
+}
+
+/// Which ways of comparing open file descriptions this host answers
+/// ([`compare_descriptions`]), as one probe of a pipe's two ends found them.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ComparisonProbe {
+    pub(crate) kcmp: bool,
+    pub(crate) dupfd_query: bool,
+}
+
+/// The ways of comparing open file descriptions that this host answers,
+/// probed once, when the first guest is loaded, before it has a descriptor:
+/// whether each tells a pipe's read end from itself and from its write end.
+/// A probe that cannot make its pipe finds neither, and says so in the log.
+pub(crate) fn comparison_probe() -> ComparisonProbe {
+    static PROBE: std::sync::OnceLock<ComparisonProbe> = std::sync::OnceLock::new();
+    *PROBE.get_or_init(|| {
+        let mut ends = [-1; 2];
+        // SAFETY: ends has room for the two descriptors pipe2 returns.
+        if unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+            tracing::error!(
+                "KVM could not make the pipe that probes how this host compares open file \
+                 descriptions ({}); no pidfd can join an epoll in this process",
+                std::io::Error::last_os_error(),
+            );
+            return ComparisonProbe {
+                kcmp: false,
+                dupfd_query: false,
+            };
+        }
+        // SAFETY: pipe2 returned two new descriptors that nothing else owns.
+        let (read, write) = unsafe {
+            (
+                std::fs::File::from_raw_fd(ends[0]),
+                std::fs::File::from_raw_fd(ends[1]),
+            )
+        };
+        let answers = |compare: fn(RawFd, RawFd) -> Option<bool>| {
+            compare(read.as_raw_fd(), read.as_raw_fd()) == Some(true)
+                && compare(read.as_raw_fd(), write.as_raw_fd()) == Some(false)
+        };
+        ComparisonProbe {
+            kcmp: answers(kcmp_files),
+            dupfd_query: answers(query_duplicate),
+        }
+    })
+}
+
+/// Whether this host can compare open file descriptions at all
+/// ([`comparison_probe`]).
+pub(crate) fn descriptions_comparable() -> bool {
+    #[cfg(test)]
+    if DESCRIPTIONS_INCOMPARABLE_TEST_HOOK.with(std::cell::Cell::get) {
+        return false;
     }
+    let probe = comparison_probe();
+    probe.kcmp || probe.dupfd_query
+}
+
+/// `fcntl(a, F_DUPFD_QUERY, b)`: whether `b` is `a`'s open file description,
+/// or `None` if the kernel, before 6.10, does not know the command.
+fn query_duplicate(a: RawFd, b: RawFd) -> Option<bool> {
+    // F_LINUX_SPECIFIC_BASE + 3 (include/uapi/linux/fcntl.h).
+    const F_DUPFD_QUERY: libc::c_int = 1024 + 3;
+    // SAFETY: F_DUPFD_QUERY reads no memory of this process.
+    let answer = unsafe { libc::fcntl(a, F_DUPFD_QUERY, b) };
+    (answer >= 0).then_some(answer == 1)
+}
+
+/// `kcmp(KCMP_FILE)` of this process's host descriptors `a` and `b`, or
+/// `None` if it fails.
+fn kcmp_files(a: RawFd, b: RawFd) -> Option<bool> {
     const KCMP_FILE: libc::c_int = 0;
     // SAFETY: getpid has no preconditions.
     let pid = unsafe { libc::getpid() };
@@ -269,7 +360,7 @@ pub(crate) fn compare_descriptions(a: RawFd, b: RawFd) -> Option<bool> {
 }
 
 /// Whether host descriptors `a` and `b` are one open file description. A
-/// `kcmp` that fails answers no.
+/// comparison that fails answers no.
 fn same_description(a: &std::fs::File, b: &std::fs::File) -> bool {
     compare_descriptions(a.as_raw_fd(), b.as_raw_fd()) == Some(true)
 }

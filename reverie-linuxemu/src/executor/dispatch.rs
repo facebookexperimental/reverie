@@ -1123,6 +1123,7 @@ impl ElfExecutor {
         self.unsupported_refusal = None;
         self.state.signal_refusal = None;
         self.state.pidfd_refusal = None;
+        take_receive_refused_for_descriptors();
         // The copies this call reaches stay its own until it returns, and
         // any whose entries another thread retired meanwhile are replaced
         // then, before the guest continues (`PrivateCopies`); a replacement
@@ -1302,6 +1303,8 @@ impl ElfExecutor {
                     .or_else(|| tool_decided_refusal(request, result))
                     .or_else(|| madvise_refusal(request, result))
                     .or_else(|| signalfd_refusal(&self.state, request, result))
+                    .or_else(|| pidfd_epoll_refusal(&self.state, request, result))
+                    .or_else(|| receive_descriptors_refusal(result))
                     .or_else(|| userfaultfd_refusal(request, result))
                 {
                     self.unsupported_refusal = Some(refusal);
