@@ -3929,6 +3929,31 @@ impl ThreadHandle {
         })
         .map(|_| ())
     }
+
+    /// Process-directed delivery for every descriptor form. A native
+    /// thread pidfd names its thread group explicitly with
+    /// `PIDFD_SIGNAL_THREAD_GROUP` (the kernel would otherwise deliver
+    /// thread-directed); ordinary leader pidfds and proc directories are
+    /// already process-directed and take no flag.
+    fn send_process_signal(&self, signal: i32) -> Result<(), Errno> {
+        const PIDFD_SIGNAL_THREAD_GROUP: libc::c_uint = 1 << 1;
+        let flags = match self {
+            Self::Pidfd(_) => PIDFD_SIGNAL_THREAD_GROUP,
+            Self::LegacyLeader { .. } | Self::Procfs { .. } => 0,
+        };
+        // SAFETY: pidfd_send_signal reads only its scalar arguments; the
+        // descriptor is owned by this handle and a null siginfo is allowed.
+        Errno::result(unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.as_raw_fd(),
+                signal,
+                std::ptr::null::<libc::siginfo_t>(),
+                flags,
+            )
+        })
+        .map(|_| ())
+    }
 }
 
 /// One bounded numeric WNOWAIT observation of `pid`, with no lifetime check.
@@ -7054,6 +7079,31 @@ impl TerminalCleanup {
     /// an exit: callers must consume the actual exit and terminal wait status.
     pub fn request_sigkill(&self) -> Result<(), Errno> {
         self.request_cancellation_signal(libc::SIGKILL)
+    }
+
+    /// Requests a process-directed SIGKILL for the whole thread group of
+    /// this already-bound generation's task.
+    ///
+    /// [`Self::request_sigkill`] through a native thread pidfd is
+    /// thread-directed. If the bound thread is an exited group leader (a
+    /// zombie whose sibling threads still run), such a signal stays in that
+    /// zombie's private pending set and kills nothing. This request is
+    /// process-directed for every descriptor form, so a live sibling takes
+    /// the fatal signal and the whole group exits. Like `request_sigkill`, it
+    /// uses the retained descriptor, never a numeric PID, and neither success
+    /// nor ESRCH acknowledges an exit.
+    pub fn request_process_sigkill(&self) -> Result<(), Errno> {
+        if let Some(error) = self.registration_error() {
+            return Err(error);
+        }
+        let identity = self
+            .event
+            .identity()
+            .ok_or_else(|| self.registration_error().unwrap_or(Errno::ENODATA))?;
+        let sent = identity.pidfd.send_process_signal(libc::SIGKILL);
+        // SIGKILL ends every stop of the group without a ptrace request.
+        self.event.stop_may_have_ended();
+        sent
     }
 
     /// Stops this already-bound generation for fatal tree cancellation.

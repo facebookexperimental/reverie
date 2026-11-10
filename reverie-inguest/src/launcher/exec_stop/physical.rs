@@ -418,6 +418,27 @@ impl<'fd> InitialExecStop<'fd> {
     }
 }
 
+fn prepared_mapping_state<'fd>(
+    task: Stopped,
+    context: EntryContext,
+    boundary: ExecBoundary,
+    owner: ChildOwner<'fd>,
+    inputs: Preparation<'fd>,
+) -> PreparedMapping<'fd> {
+    PreparedMapping {
+        owner: Box::new(owner),
+        task: Some(task),
+        entry: borrowed_entry::RetainedEntry::default(),
+        context,
+        _boundary: boundary,
+        _inputs: inputs,
+        calls: Vec::new(),
+        filter: Vec::new(),
+        #[cfg(feature = "stage1a-probe")]
+        prevalidation: None,
+    }
+}
+
 /// Physical preparation over stopped-image parts, shared by the
 /// first-image stop and the exec supervisor's successor stops.
 ///
@@ -446,18 +467,7 @@ pub(crate) unsafe fn prepare_mapping_parts<'fd>(
     owner: ChildOwner<'fd>,
     inputs: Preparation<'fd>,
 ) -> std::result::Result<PreparedMapping<'fd>, Box<PreparationFailure<'fd>>> {
-    let mut state = PreparedMapping {
-        owner: Box::new(owner),
-        task: Some(task),
-        entry: borrowed_entry::RetainedEntry::default(),
-        context,
-        _boundary: boundary,
-        _inputs: inputs,
-        calls: Vec::new(),
-        filter: Vec::new(),
-        #[cfg(feature = "stage1a-probe")]
-        prevalidation: None,
-    };
+    let mut state = prepared_mapping_state(task, context, boundary, owner, inputs);
     let result = (|| -> Result<()> {
         let stopped = state.task.as_ref().ok_or("mapped_preparation_lost_stop")?;
         if stopped.generation() != state.context.generation
@@ -673,7 +683,15 @@ impl<'fd> SuccessorStop<'fd> {
         self,
         inputs: Preparation<'fd>,
     ) -> std::result::Result<PreparedMapping<'fd>, Box<PreparationFailure<'fd>>> {
-        let (task, context, boundary, owner) = self.into_parts();
+        let (task, context, boundary, owner, detach) = self.into_parts();
+        if let Err(error) = detach {
+            // No mapping work runs after a failed fork-child
+            // detach; retain the same stopped owner in the
+            // preparation failure for terminal cleanup.
+            let mut state = prepared_mapping_state(task, context, boundary, owner, inputs);
+            state.owner.retire();
+            return Err(Box::new(PreparationFailure { error, state }));
+        }
         // SAFETY: the parts are this stop's own, paired by
         // construction at its drained exec stop; every caller
         // obligation above carries over to the parts form unchanged.

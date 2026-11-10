@@ -2236,6 +2236,31 @@ impl Stopped {
             .map_err(|err| self.map_err(err))
     }
 
+    /// Put this seized tracee, stopped in a group stop, into the
+    /// kernel's listening state (`PTRACE_LISTEN`): it stays in its
+    /// job-control stop like an untraced task until a real SIGCONT
+    /// (or SIGKILL) arrives, then re-traps so the tracer can
+    /// forward the delivery. The task is not resumed. Valid only
+    /// at a `PTRACE_EVENT_STOP` trap under seize; other stops fail
+    /// with the kernel errno.
+    pub fn listen(self) -> Result<Running, Error> {
+        self.flush_regs()?;
+        self.1
+            .on_held_tid(|| {
+                Errno::result(unsafe {
+                    libc::ptrace(
+                        libc::PTRACE_LISTEN,
+                        self.0.as_raw(),
+                        std::ptr::null_mut::<libc::c_void>(),
+                        std::ptr::null_mut::<libc::c_void>(),
+                    )
+                })
+                .map(drop)
+            })
+            .map_err(|err| self.map_err(err))?;
+        Ok(self.into_running())
+    }
+
     /// Detach while retaining the original generation-bound stop on error.
     /// An errno does not establish unchanged kernel state or terminal status;
     /// the original owner must retain and settle that uncertainty.
@@ -2257,6 +2282,18 @@ impl Stopped {
         self.flush_regs()?;
         self.1
             .on_held_tid(|| ptrace::detach(self.0.into(), sig).map_err(nix_errno))
+            .map_err(|err| self.map_err(err))?;
+        Ok(self.into_running())
+    }
+
+    /// Detaches from and then resumes the stopped tracee, delivering
+    /// the raw signal `sig`, which may be one `nix`'s `Signal`
+    /// cannot name (a realtime signal; see [`Event::RawSignal`]).
+    /// `0` delivers nothing.
+    pub fn detach_raw(self, sig: i32) -> Result<Running, Error> {
+        self.flush_regs()?;
+        self.1
+            .on_held_tid(|| ptrace_resume_raw(libc::PTRACE_DETACH, self.0, sig))
             .map_err(|err| self.map_err(err))?;
         Ok(self.into_running())
     }
@@ -3001,6 +3038,111 @@ mod test {
         assert!(same_generation);
         assert_eq!(after, before);
         assert_eq!(after_mask, mask);
+        Ok(())
+    }
+
+    #[test]
+    fn listen_keeps_group_stop_until_sigcont() -> Result<(), Box<dyn std::error::Error>> {
+        let (pid, stopped) = trace(
+            || {
+                // Process-directed, not raise(): a thread-directed
+                // stop signal reports as a signal-delivery stop,
+                // while the shared-pending stop takes the group-stop
+                // trap LISTEN is defined for.
+                signal::kill(nix::unistd::Pid::this(), Signal::SIGSTOP).unwrap();
+                7
+            },
+            Options::PTRACE_O_EXITKILL,
+        )?;
+        let mut running = stopped.resume(None)?;
+        // A stop signal first reports as a signal-delivery stop;
+        // forwarding it lets the kernel take the group-stop trap.
+        // (The helper's initial stop was already suppressed above.)
+        let stopped = loop {
+            match running.wait()?.assume_stopped() {
+                (stopped, Event::Stop) => break stopped,
+                (stopped, Event::Signal(sig)) => {
+                    running = stopped.resume(Some(sig))?;
+                }
+                (_stopped, event) => panic!("expected group stop, got {event:?}"),
+            }
+        };
+        let mut running = stopped.listen()?;
+        let status = std::fs::read_to_string(format!("/proc/{}/status", pid.as_raw())).unwrap();
+        let state = status
+            .lines()
+            .find(|line| line.starts_with("State:"))
+            .expect("proc status state");
+        assert!(
+            state.contains("(stopped)") || state.contains("(tracing stop)"),
+            "listening task must stay stopped, got {state}"
+        );
+        signal::kill(nix::unistd::Pid::from_raw(pid.as_raw()), Signal::SIGCONT)?;
+        for _ in 0..8 {
+            match running.wait()? {
+                Wait::Exited(got, status) => {
+                    assert_eq!((got, status), (pid, ExitStatus::Exited(7)));
+                    return Ok(());
+                }
+                Wait::Stopped(task, Event::Signal(Signal::SIGCONT)) => {
+                    running = task.resume(Some(Signal::SIGCONT))?;
+                }
+                Wait::Stopped(task, _) => {
+                    running = task.resume(None)?;
+                }
+            }
+        }
+        panic!("listened child did not exit after SIGCONT");
+    }
+
+    #[cfg(feature = "notifier")]
+    #[test]
+    fn process_sigkill_kills_group_of_exited_leader_thread()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (pid, stopped) = trace(
+            || {
+                thread::spawn(|| {
+                    thread::sleep(std::time::Duration::from_secs(5));
+                    unsafe { libc::_exit(0) }
+                });
+                // End only the traced main thread. The sibling keeps the
+                // group alive, leaving a zombie group leader.
+                loop {
+                    unsafe { libc::syscall(libc::SYS_exit, 0) };
+                }
+            },
+            Options::PTRACE_O_EXITKILL,
+        )?;
+        let cleanup = stopped.terminal_cleanup();
+        let running = stopped.resume(None)?;
+        let status_path = format!("/proc/{}/status", pid.as_raw());
+        let zombie = (0..200).any(|_| {
+            let state = std::fs::read_to_string(&status_path).unwrap_or_default();
+            if state
+                .lines()
+                .any(|line| line.starts_with("State:") && line.contains("zombie"))
+            {
+                return true;
+            }
+            thread::sleep(std::time::Duration::from_millis(10));
+            false
+        });
+        assert!(zombie, "traced leader thread did not become a zombie");
+        // A thread-directed SIGKILL would stay pending on the zombie and
+        // the sibling would exit 0 after 5 s instead.
+        let started = std::time::Instant::now();
+        cleanup.request_process_sigkill()?;
+        match running.wait()? {
+            Wait::Exited(got, status) => {
+                assert_eq!(got, pid);
+                assert!(
+                    matches!(status, ExitStatus::Signaled(Signal::SIGKILL, _)),
+                    "unexpected status {status:?}"
+                );
+            }
+            other => panic!("expected the group's terminal status, got {other:?}"),
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
         Ok(())
     }
 
@@ -4176,6 +4318,45 @@ mod test {
             stopped.resume(None)?.wait()?,
             Wait::Exited(pid, ExitStatus::Exited(0))
         );
+        Ok(())
+    }
+
+    #[cfg(not(sanitized))]
+    #[test]
+    fn detach_raw_delivers_a_realtime_signal() -> Result<(), Box<dyn std::error::Error + 'static>> {
+        let (pid, tracee) = trace(
+            || {
+                RT_HANDLED.store(0, std::sync::atomic::Ordering::SeqCst);
+                let mut action: libc::sigaction = unsafe { MaybeUninit::zeroed().assume_init() };
+                action.sa_sigaction = note_realtime as *const () as usize;
+                assert_eq!(
+                    unsafe { libc::sigaction(40, &action, std::ptr::null_mut()) },
+                    0
+                );
+                let ret = unsafe {
+                    let pid = libc::syscall(libc::SYS_getpid);
+                    let tid = libc::syscall(libc::SYS_gettid);
+                    libc::syscall(libc::SYS_tgkill, pid, tid, 40)
+                };
+                assert_eq!(ret, 0);
+                if RT_HANDLED.load(std::sync::atomic::Ordering::SeqCst) == 1 << 39 {
+                    0
+                } else {
+                    1
+                }
+            },
+            Options::PTRACE_O_EXITKILL,
+        )?;
+        let stopped = match tracee.resume(None)?.wait()? {
+            Wait::Stopped(stopped, Event::RawSignal(40)) => stopped,
+            other => panic!("expected a raw 40 delivery stop, got {other:?}"),
+        };
+        let running = stopped.detach_raw(40)?;
+        // The fixture child's pre-seize group stop can still be
+        // reported to its natural parent after detach; continue it
+        // so its handler/exit path can finish.
+        let _ = signal::kill(nix::unistd::Pid::from_raw(pid.as_raw()), Signal::SIGCONT);
+        assert_eq!(running.wait()?, Wait::Exited(pid, ExitStatus::Exited(0)));
         Ok(())
     }
 
