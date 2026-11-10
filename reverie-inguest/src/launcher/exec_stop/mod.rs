@@ -49,7 +49,6 @@ mod mapping_plan;
 #[cfg(feature = "loader-private-runtime")]
 #[allow(unsafe_code)]
 pub mod physical;
-/// Audited runtime image, birth descriptor leases and fixed placement.
 #[cfg(feature = "exec-stop-producer")]
 #[allow(unsafe_code)]
 pub mod producer;

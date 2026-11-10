@@ -496,11 +496,11 @@
       "group": "test",
       "job": "doc",
       "desc": "Documentation tests",
-      "description": "Counted doctests via the serial libtest runner (nextest does not run doctests): cargo test --workspace --doc with per-test CPU caps.",
+      "description": "Counted doctests via the serial libtest runner (nextest does not run doctests): cargo test --workspace --doc --features \"$STABLE_FEATURES\" with per-test CPU caps. The stable set (scripts/stable-features.sh, as in validate.sh's serial test step) is required: doctests of feature-gated modules, such as the reverie-inguest exec-stop producer's ArmedClaim borrow guard (a compile_fail doctest), are not compiled without it.",
       "labels": [
         "full"
       ],
-      "cmd": "./scripts/libtest-counts.rs run target/validate/counts-doc.json -- cargo test --workspace --doc",
+      "cmd": "source scripts/stable-features.sh && ./scripts/libtest-counts.rs run target/validate/counts-doc.json -- cargo test --workspace --doc --features \"$STABLE_FEATURES\"",
       "deps": [],
       "env": {},
       "timeout": 600,

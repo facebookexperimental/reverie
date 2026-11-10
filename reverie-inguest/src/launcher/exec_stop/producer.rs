@@ -17,8 +17,9 @@
 //!   which refuses any undecodable byte, every `int 0x80` and `sysenter`, and
 //!   any decoded `syscall` outside the gate page that is not a declared site of
 //!   the facts ([`SyscallCensus`]);
-//! - an IP-filter proof ([`filter`]): the filter the preparation installs
-//!   allows syscalls only at the gate's own template sites, for x86-64 only,
+//! - an IP-filter proof ([`FilterCoverage`]): the filter the preparation
+//!   installs allows syscalls only at the gate's own template sites, for
+//!   `AUDIT_ARCH_X86_64` only (x32 calls included, as Linux reports them),
 //!   and traps or kills everything else, including every `0f 05` pair inside
 //!   another instruction's bytes, which the sweep does not see.
 //!
@@ -157,9 +158,17 @@ pub struct RuntimeImageFacts {
     /// The runtime entry a successor birth uses, when the image has one.
     pub successor_entry: Option<EntryPoint>,
     /// Data the image's build placed inside executable segments (literal
-    /// pools), as address ranges. Reserved for an architecture whose audit
-    /// admits them; this x86-64 audit refuses any non-empty value, so on
-    /// x86-64 the only data stepped over is the pinned constructor island.
+    /// pools), as address ranges. x86-64 images declare none: this audit
+    /// refuses any non-empty value, so on x86-64 the only data stepped over
+    /// is the pinned constructor island. The aarch64 audit may admit ranges
+    /// only under these conditions: each range starts a run, abuts another
+    /// range or the island, or follows an instruction that never falls
+    /// through (an unconditional branch, a return, `udf` or `brk`); no range
+    /// covers an entry, a terminal trap, the handler, a declared site or the
+    /// gate page; no range holds a syscall encoding at any alignment; the
+    /// total bytes are bounded as well as the count; the facts come from an
+    /// authenticated source; and refusal tests cover fall-through
+    /// constructions.
     pub data_ranges: Vec<Range<u64>>,
 }
 
@@ -2694,9 +2703,18 @@ pub(super) mod tests {
         healthy.verify_at(&FakeStop, &admission).unwrap();
         assert!(!admission.failed.get());
         assert_eq!(admission.peer_checks.get(), 2);
+        // A filled lease whose packet offset has moved: sealing does not
+        // forbid seeking, and the birth shares this open file description,
+        // so the move is visible through the retained descriptor.
+        let moved = || {
+            use std::io::Seek as _;
+            let leases = filled();
+            (&leases.packet).seek(std::io::SeekFrom::Start(1)).unwrap();
+            leases
+        };
         // Each refusal poisons the lease and fails its admission; a later
         // verification with a good stop and admission is refused as poisoned.
-        let refusals: [(BirthLeases, &dyn BirthStop, FakeAdmission, &str); 4] = [
+        let refusals: [(BirthLeases, &dyn BirthStop, FakeAdmission, &str); 5] = [
             (
                 leases(),
                 &FakeStop,
@@ -2717,6 +2735,12 @@ pub(super) mod tests {
                     ..FakeAdmission::new(vec![packet.clone()])
                 },
                 "birth is not the watched peer",
+            ),
+            (
+                moved(),
+                &FakeStop,
+                FakeAdmission::new(vec![packet.clone()]),
+                "mapped packet sealed length/seals/offset differ",
             ),
             (
                 filled(),

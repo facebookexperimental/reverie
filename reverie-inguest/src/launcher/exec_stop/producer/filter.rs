@@ -18,8 +18,12 @@
 //! - every action is ALLOW, TRAP, KILL_PROCESS or KILL_THREAD (never LOG,
 //!   USER_NOTIF, TRACE or ERRNO, under which a syscall still runs or is
 //!   answered by someone else);
-//! - ALLOW only for x86-64: every other architecture (`int 0x80`, `sysenter`,
-//!   x32) traps or is killed;
+//! - ALLOW only for `AUDIT_ARCH_X86_64`: a call under any other audit
+//!   architecture (an `int 0x80` or `sysenter` call is `AUDIT_ARCH_I386`)
+//!   traps or is killed. An x32 call is not one of these: Linux reports it
+//!   as `AUDIT_ARCH_X86_64` with `__X32_SYSCALL_BIT` in the number, so it is
+//!   an x86-64 call, governed by the same instruction-pointer check as any
+//!   number;
 //! - every allowed instruction pointer is a specific address inside the gate
 //!   page (no "any address" allowance);
 //! - the instruction pointer after every declared site traps, for every

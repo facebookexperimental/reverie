@@ -1008,7 +1008,7 @@ run_test_check "Test regular workspace cases" cargo test --workspace --features 
     -- --test-threads=1 "${REGULAR_TEST_SKIP_ARGS[@]}"
 export -n REVERIE_LITEINST_PRELOAD REVERIE_LITEINST_TEST_RUNTIME_MANIFEST \
     REVERIE_LITEINST_ALLOCATOR_GUEST REVERIE_LITEINST_ALLOCATOR_GUEST_MANIFEST
-run_test_check "Documentation tests" cargo test --workspace --doc
+run_test_check "Documentation tests" cargo test --workspace --doc --features "$STABLE_FEATURES"
 # Every backend this host has, against the ledger for its environment; a
 # backend whose inputs are missing is refused by name, and a host with no
 # ledger gets its verdicts reported, not judged (reverie-examples/e2e/README.md).
