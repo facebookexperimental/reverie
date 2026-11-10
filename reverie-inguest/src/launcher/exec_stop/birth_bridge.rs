@@ -2,7 +2,8 @@
 // Licensed under the BSD-style license in the LICENSE file.
 
 //! Supervisor bridge between the exec-stop watched supervisor and
-//! the coordinator-side [`BirthAuthority`].
+//! the coordinator-side
+//! [`BirthAuthority`](reverie_rpc_transport::birth_authority::BirthAuthority).
 //!
 //! The bridge owns the sequencing the authority cannot see: a
 //! caught exec stop becomes an authority stop record with that

@@ -1399,8 +1399,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-inguest/src/guest/alloc.rs",
-        46676,
-        "8b594686698976c7b3c88aa5bfeaa234163b3181c1e92a10977831a01bef71b2",
+        46692,
+        "05d881f55c0c89e41c86b8ff5521b13430bbbf7d2bd72a6cf430b9e2d7be118a",
     ),
     (
         "reverie-inguest/src/guest/tool_region_constructor.rs",
@@ -39087,6 +39087,11 @@ mod tests {
                 "reverie-liteinst-artifact/src/private_static/selected_initializers.rs",
                 240984,
                 "386d565e8ef2d80ae52a9069f7a7cda61df761601907f6594cedd47301c1b6e5",
+            ),
+            (
+                "reverie-inguest/src/guest/alloc.rs",
+                46676,
+                "8b594686698976c7b3c88aa5bfeaa234163b3181c1e92a10977831a01bef71b2",
             ),
         ] {
             let entries: Vec<_> = CONTENT_REVERIE_CATALOG

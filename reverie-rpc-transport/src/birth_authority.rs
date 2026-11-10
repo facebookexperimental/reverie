@@ -833,7 +833,7 @@ impl<S: Read + Write> StageClient<S> {
 /// response payload. The decode is exact and bounded: a malformed
 /// or trailing-byte payload is an `Err` before any mailbox
 /// mutation, never a clean close. Authority refusals are encoded
-/// as [`StageResponse::Refused`] inside the `Ok` payload.
+/// as the module-private `StageResponse::Refused` inside the `Ok` payload.
 /// `admitted` is server-derived from the accepted connection;
 /// frames carry no birth key.
 pub fn handle_stage_request(

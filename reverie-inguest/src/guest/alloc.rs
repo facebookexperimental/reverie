@@ -539,7 +539,7 @@ unsafe impl GlobalAlloc for PrivateToolAllocator {
 /// This allocator never initializes a reservation or chooses BSS/System. Its
 /// contents and scalar metadata inherit through COW on a plain fork the
 /// runtime itself performs: the forwarding path holds this heap's lock
-/// across the physical fork ([`quiesce_for_fork`]), so the child inherits
+/// across the physical fork (the crate-private `quiesce_for_fork`), so the child inherits
 /// a consistent free list and a released lock. A fork made around the
 /// runtime (Tool code calling `fork` itself) can still inherit a held
 /// lock; that remains unsupported, exactly as for the Legacy heap.
