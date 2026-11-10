@@ -1888,7 +1888,7 @@ mod tests {
         // kernel argv/env string ceiling. The pre-raise 1 MiB cap refused
         // legitimate blobs whose only excess was copied string payload.
         const OLD_MAX: usize = 1024 * 1024;
-        assert!(MAX_BYTES > OLD_MAX, "cap must exceed the old 1 MiB");
+        const { assert!(MAX_BYTES > OLD_MAX, "cap must exceed the old 1 MiB") };
         // Pin the derived VALUE, not only its self-consistency: a
         // silent change to any term must fail here by name.
         assert_eq!(MAX_BYTES, 960 + 56_330 + 6 * 1024 * 1024 + 81);
