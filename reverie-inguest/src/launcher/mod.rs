@@ -792,7 +792,9 @@ struct ElfProgramHeaders {
 /// kernel's ELF loader never reads `EI_CLASS` (`load_elf_binary` in
 /// fs/binfmt_elf.c checks the magic, `e_type` and `e_machine`), so such a
 /// file can run, and one whose headers cannot be read must not run
-/// unconfined.
+/// unconfined. Classes 1 and 2 still choose the header layout from
+/// `EI_CLASS`, while the kernel chooses by `e_machine`, so this path is
+/// not kernel-faithful for a class/machine mismatch (dh-yv5oyh item 2).
 fn elf_program_headers(path: &Path) -> io::Result<Option<ElfProgramHeaders>> {
     let Some(mut file) = open_regular(path)? else {
         return Ok(None);
@@ -1012,9 +1014,10 @@ fn linker_target(
             return None;
         }
     };
-    // glibc's loader looks a target name without a slash up as a
-    // library (cache and library path), never in the working directory,
-    // so no file here is the one it runs: no recognised target.
+    // glibc's loader looks a target name without a slash up through its
+    // library search (on glibc 2.34 only its cache, measured), never in
+    // the working directory, so no file here is the one it runs: no
+    // recognised target.
     if !target.as_encoded_bytes().contains(&b'/') {
         return None;
     }
@@ -1042,6 +1045,13 @@ const MAX_SCRIPT_DEPTH: usize = 8;
 /// `#!` interpreters it names, and, when `program` has no PT_INTERP and
 /// may be the dynamic linker run as a program, the linker's target
 /// argument. Arguments of an ordinary dynamic program are never opened.
+///
+/// Not covered: a file the kernel fails with `ENOEXEC` (a script without
+/// `#!`, a `#!` name that may be truncated, an ELF-magic file too short
+/// for its header) is admitted here, and the spawn's `ENOEXEC` fallback
+/// (`execvpe_zeroed_tail` in reverie-process) then runs it under
+/// `/bin/sh`, which this floor does not inspect. A static `/bin/sh` runs
+/// it unconfined (dh-yv5oyh).
 fn refuse_static_target(
     program: &Path,
     args: &[std::ffi::OsString],
@@ -3577,7 +3587,9 @@ ran_text: .ascii "ran"
             None,
         );
         // A name that may be truncated (no newline or terminator in the
-        // first 256 bytes) is refused by the kernel (ENOEXEC).
+        // first 256 bytes): the kernel fails it with ENOEXEC; the spawn's
+        // /bin/sh fallback then runs it, which the floor does not inspect
+        // (dh-yv5oyh).
         let long = format!("#!{s}{}", "/".repeat(300));
         admitted(&script("truncated", long), None);
         // A chain that names itself ends (the kernel fails it with ELOOP).
@@ -3625,7 +3637,9 @@ ran_text: .ascii "ran"
             assert_eq!(error.kind(), io::ErrorKind::Unsupported, "{file}: {error}");
         }
         // A name still running at byte 255, with no newline, may be
-        // truncated: the kernel refuses it (ENOEXEC), so nothing runs.
+        // truncated: the kernel fails it with ENOEXEC; the spawn's /bin/sh
+        // fallback then runs it, which the floor does not inspect
+        // (dh-yv5oyh).
         refuse_static_target(&script("name-past-255", b"xyz"), &[], None).unwrap();
     }
 

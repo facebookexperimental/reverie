@@ -1562,8 +1562,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     // spawn, and only regular files the exec loads are inspected.
     (
         "reverie-inguest/src/launcher/mod.rs",
-        143434,
-        "bc2b4bf95a77dbdb3c11b59db85a04023fb41a347060b97e24c432ae43352b48",
+        144269,
+        "def24cd44c55b43e78759a1f87aac9eb227bb98b1f178b5aaa700a10249ed646",
     ),
     (
         "reverie/src/native_syscall.rs",
@@ -38552,6 +38552,11 @@ mod tests {
         // Keep the fixed catalog authoritative and reject their prior tuples.
         assert_eq!(CONTENT_REVERIE_CATALOG.len(), 86);
         for (relative, old_size, old_digest) in [
+            (
+                "reverie-inguest/src/launcher/mod.rs",
+                143434,
+                "bc2b4bf95a77dbdb3c11b59db85a04023fb41a347060b97e24c432ae43352b48",
+            ),
             (
                 "reverie-inguest/src/launcher/mod.rs",
                 137761,
