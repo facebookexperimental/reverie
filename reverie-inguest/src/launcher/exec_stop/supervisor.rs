@@ -4755,7 +4755,10 @@ int main(int argc, char **argv) {
         // The Exec classification must key on the host's execve
         // numbers, not another architecture's: 59 is execve only on
         // x86_64, and semtimedop on aarch64.
-        assert!(super::is_exec_entry(libc::SYS_execve, super::EntryAbi::Native));
+        assert!(super::is_exec_entry(
+            libc::SYS_execve,
+            super::EntryAbi::Native
+        ));
         assert!(super::is_exec_entry(
             libc::SYS_execveat,
             super::EntryAbi::Native
