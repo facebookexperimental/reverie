@@ -23,7 +23,6 @@ use std::io::Read as _;
 use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::os::unix::process::ExitStatusExt;
-#[cfg(feature = "exec-private-init")]
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Output;
@@ -721,103 +720,84 @@ tokio::task_local! {
     static STATIC_OPTOUT: AllowStaticExecutables;
 }
 
-/// Read the target ELF's program headers; true when PT_INTERP is
-/// absent (static executable). A file shorter than the ELF ident
-/// or without ELF magic is not a static ELF at all (a script);
-/// the normal exec/shebang path owns it. Read/parse failures
-/// AFTER a full ELF ident are errors: an uninspectable ELF must
-/// not run unconfined either.
-fn target_is_static(program: &std::path::Path) -> io::Result<bool> {
-    use std::io::Seek;
-    use std::io::SeekFrom;
-    let mut file = std::fs::File::open(program)?;
-    let mut ident = [0u8; 20];
-    let mut total = 0;
-    while total < ident.len() {
-        match file.read(&mut ident[total..])? {
-            0 => break,
-            n => total += n,
-        }
+/// Open `path` for header inspection, or `None` when it is not a regular
+/// file. A FIFO, terminal, or device named on the command line belongs to
+/// the guest: opening a FIFO blocks until a writer appears, reading a pipe
+/// or terminal consumes the guest's input, and opening a device can have
+/// side effects. Such a path is never opened. The open is non-blocking and
+/// acquires no controlling terminal, and the opened file is checked again
+/// in case the path was replaced after the first check.
+fn open_regular(path: &Path) -> io::Result<Option<std::fs::File>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    if !std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file()) {
+        return Ok(None);
     }
-    if total < ident.len() || &ident[0..4] != b"\x7fELF" {
-        return Ok(false);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Ok(None);
     }
-    let class = ident[4];
-    let read_u16 = |file: &mut std::fs::File, offset: u64| -> io::Result<u16> {
-        file.seek(SeekFrom::Start(offset))?;
-        let mut buf = [0u8; 2];
-        file.read_exact(&mut buf)?;
-        Ok(u16::from_ne_bytes(buf))
-    };
-    let read_u64 = |file: &mut std::fs::File, offset: u64| -> io::Result<u64> {
-        file.seek(SeekFrom::Start(offset))?;
-        let mut buf = [0u8; 8];
-        file.read_exact(&mut buf)?;
-        Ok(u64::from_ne_bytes(buf))
-    };
-    let (phoff, phentsize, phnum) = match class {
-        2 => (
-            read_u64(&mut file, 32)?,
-            read_u16(&mut file, 54)?,
-            read_u16(&mut file, 56)?,
-        ),
-        1 => (
-            read_u16(&mut file, 28).map(u64::from)?,
-            read_u16(&mut file, 42)?,
-            read_u16(&mut file, 44)?,
-        ),
-        _ => return Ok(false),
-    };
-    if phoff == 0 || phnum == 0 || phentsize < 4 {
-        return Ok(true);
-    }
-    const PT_INTERP: u32 = 3;
-    for index in 0..u64::from(phnum) {
-        file.seek(SeekFrom::Start(phoff + index * u64::from(phentsize)))?;
-        let mut kind = [0u8; 4];
-        file.read_exact(&mut kind)?;
-        if u32::from_ne_bytes(kind) == PT_INTERP {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+    Ok(Some(file))
 }
 
-/// Read an ELF's PT_INTERP string, if any.
-fn elf_interp(path: &std::path::Path) -> io::Result<Option<String>> {
-    use std::io::Seek;
-    use std::io::SeekFrom;
-    let mut file = std::fs::File::open(path)?;
-    let mut ident = [0u8; 20];
+/// Read up to `buf.len()` bytes from the start of `file`; returns the count.
+fn read_prefix(file: &mut std::fs::File, buf: &mut [u8]) -> io::Result<usize> {
     let mut total = 0;
-    while total < ident.len() {
-        match file.read(&mut ident[total..])? {
+    while total < buf.len() {
+        match file.read(&mut buf[total..])? {
             0 => break,
             n => total += n,
         }
     }
-    if total < 20 || &ident[0..4] != b"\x7fELF" {
+    Ok(total)
+}
+
+/// Fixed-width native-endian reads at absolute offsets of an ELF file.
+fn read_at<const N: usize>(file: &mut std::fs::File, offset: u64) -> io::Result<[u8; N]> {
+    use std::io::Seek;
+    use std::io::SeekFrom;
+    file.seek(SeekFrom::Start(offset))?;
+    let mut buf = [0u8; N];
+    file.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+fn read_u16(file: &mut std::fs::File, offset: u64) -> io::Result<u16> {
+    read_at(file, offset).map(u16::from_ne_bytes)
+}
+
+fn read_u32(file: &mut std::fs::File, offset: u64) -> io::Result<u32> {
+    read_at(file, offset).map(u32::from_ne_bytes)
+}
+
+fn read_u64(file: &mut std::fs::File, offset: u64) -> io::Result<u64> {
+    read_at(file, offset).map(u64::from_ne_bytes)
+}
+
+/// An opened ELF with its class and program-header table location.
+struct ElfProgramHeaders {
+    file: std::fs::File,
+    class: u8,
+    phoff: u64,
+    phentsize: u16,
+    phnum: u16,
+}
+
+/// An ELF's class and program-header table location (`e_phoff`,
+/// `e_phentsize`, `e_phnum`), or `None` for a file that is not an ELF the
+/// kernel's ELF loader would run: missing, not a regular file, shorter than
+/// the ident, without ELF magic (a script), or of an unknown class.
+fn elf_program_headers(path: &Path) -> io::Result<Option<ElfProgramHeaders>> {
+    let Some(mut file) = open_regular(path)? else {
+        return Ok(None);
+    };
+    let mut ident = [0u8; 20];
+    if read_prefix(&mut file, &mut ident)? < ident.len() || &ident[0..4] != b"\x7fELF" {
         return Ok(None);
     }
     let class = ident[4];
-    let read_u16 = |file: &mut std::fs::File, offset: u64| -> io::Result<u16> {
-        file.seek(SeekFrom::Start(offset))?;
-        let mut buf = [0u8; 2];
-        file.read_exact(&mut buf)?;
-        Ok(u16::from_ne_bytes(buf))
-    };
-    let read_u64 = |file: &mut std::fs::File, offset: u64| -> io::Result<u64> {
-        file.seek(SeekFrom::Start(offset))?;
-        let mut buf = [0u8; 8];
-        file.read_exact(&mut buf)?;
-        Ok(u64::from_ne_bytes(buf))
-    };
-    let read_u32 = |file: &mut std::fs::File, offset: u64| -> io::Result<u32> {
-        file.seek(SeekFrom::Start(offset))?;
-        let mut buf = [0u8; 4];
-        file.read_exact(&mut buf)?;
-        Ok(u32::from_ne_bytes(buf))
-    };
     let (phoff, phentsize, phnum) = match class {
         2 => (
             read_u64(&mut file, 32)?,
@@ -831,7 +811,57 @@ fn elf_interp(path: &std::path::Path) -> io::Result<Option<String>> {
         ),
         _ => return Ok(None),
     };
-    const PT_INTERP: u32 = 3;
+    Ok(Some(ElfProgramHeaders {
+        file,
+        class,
+        phoff,
+        phentsize,
+        phnum,
+    }))
+}
+
+const PT_INTERP: u32 = 3;
+
+/// Read the target ELF's program headers; true when PT_INTERP is
+/// absent (static executable). A file that is not an ELF (see
+/// [`elf_program_headers`]) is not a static ELF; a script's interpreter
+/// is checked by [`refuse_static_target`]. Read/parse failures AFTER a
+/// full ELF ident are errors: an uninspectable ELF must not run
+/// unconfined either.
+fn target_is_static(program: &Path) -> io::Result<bool> {
+    let Some(ElfProgramHeaders {
+        mut file,
+        phoff,
+        phentsize,
+        phnum,
+        ..
+    }) = elf_program_headers(program)?
+    else {
+        return Ok(false);
+    };
+    if phoff == 0 || phnum == 0 || phentsize < 4 {
+        return Ok(true);
+    }
+    for index in 0..u64::from(phnum) {
+        if read_u32(&mut file, phoff + index * u64::from(phentsize))? == PT_INTERP {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Read an ELF's PT_INTERP string, if any.
+fn elf_interp(path: &Path) -> io::Result<Option<String>> {
+    let Some(ElfProgramHeaders {
+        mut file,
+        class,
+        phoff,
+        phentsize,
+        phnum,
+    }) = elf_program_headers(path)?
+    else {
+        return Ok(None);
+    };
     for index in 0..u64::from(phnum) {
         let base = phoff + index * u64::from(phentsize);
         if read_u32(&mut file, base)? != PT_INTERP {
@@ -850,6 +880,8 @@ fn elf_interp(path: &std::path::Path) -> io::Result<Option<String>> {
         if filesz == 0 || filesz > 4096 {
             return Ok(None);
         }
+        use std::io::Seek;
+        use std::io::SeekFrom;
         file.seek(SeekFrom::Start(offset))?;
         let mut bytes = vec![0u8; filesz as usize];
         file.read_exact(&mut bytes)?;
@@ -861,45 +893,112 @@ fn elf_interp(path: &std::path::Path) -> io::Result<Option<String>> {
     Ok(None)
 }
 
+/// `path`, resolved the way the guest's exec resolves it: a relative
+/// path is relative to the command's working directory.
+fn resolve_in(current_dir: Option<&Path>, path: &Path) -> PathBuf {
+    match current_dir {
+        Some(directory) if path.is_relative() => directory.join(path),
+        _ => path.to_path_buf(),
+    }
+}
+
+/// The interpreter a `#!` script names, parsed as the kernel's
+/// `load_script` (fs/binfmt_script.c) parses the first `BINPRM_BUF_SIZE`
+/// (256) bytes: after `#!`, skip spaces and tabs; the name ends at a
+/// space, tab, NUL, or the end of the first line. `None` when the file is
+/// not a script, or when the kernel would refuse it (`ENOEXEC`: no name,
+/// or a name that may be truncated because the buffer holds no newline
+/// and no terminator after it).
+fn shebang_interpreter(path: &Path, current_dir: Option<&Path>) -> io::Result<Option<PathBuf>> {
+    use std::os::unix::ffi::OsStrExt;
+    let Some(mut file) = open_regular(path)? else {
+        return Ok(None);
+    };
+    // Zero-filled: the kernel's buffer is NUL-padded past the end of a
+    // short file.
+    let mut buf = [0u8; 256];
+    let len = read_prefix(&mut file, &mut buf)?;
+    if len < 2 || &buf[..2] != b"#!" {
+        return Ok(None);
+    }
+    let spacetab = |byte: u8| byte == b' ' || byte == b'\t';
+    let terminator = |byte: u8| spacetab(byte) || byte == 0;
+    let line = match buf.iter().position(|&byte| byte == b'\n') {
+        Some(newline) => &buf[2..newline],
+        None => &buf[2..buf.len() - 1],
+    };
+    let Some(start) = line.iter().position(|&byte| !spacetab(byte)) else {
+        return Ok(None);
+    };
+    let name = &line[start..];
+    let end = name.iter().position(|&byte| terminator(byte));
+    let name = match end {
+        Some(end) => &name[..end],
+        // Without a newline, a name running to the end of the buffer
+        // may be truncated; the kernel refuses rather than guess.
+        None if !buf.contains(&b'\n') => return Ok(None),
+        None => name,
+    };
+    if name.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(resolve_in(
+        current_dir,
+        Path::new(std::ffi::OsStr::from_bytes(name)),
+    )))
+}
+
 /// Precise linker recognition (musereview bar): `program` counts as
 /// a dynamic linker ONLY when its target argument's own PT_INTERP
 /// names it (string-equal or canonical-equal). A bare ET_DYN
 /// exemption would admit static-pie guests, so there is none.
 /// Returns the target to check instead, when recognized.
 fn linker_target(
-    program: &std::path::Path,
+    program: &Path,
     args: &[std::ffi::OsString],
-) -> Option<std::path::PathBuf> {
-    // The executable a linker loads is its first non-option
-    // argument. Skip options, including the known value-taking
-    // ones; anything we cannot parse confidently falls through to
-    // checking `program` itself, which refuses a no-PT_INTERP
-    // program. Fail-safe, never an exemption.
+    current_dir: Option<&Path>,
+) -> Option<PathBuf> {
+    // The executable glibc's loader runs is the first argument that
+    // does not start with `--`, after its options, which it parses
+    // exactly as below (`ld.so --help`, glibc 2.34): only these
+    // spellings, each value as the next argument, no `--opt=value`
+    // form, and `--` is not an end-of-options marker. ld.so rejects
+    // any other `--` argument, so an unrecognised one gives no target
+    // and `program` itself, which has no PT_INTERP, is refused.
     const VALUE_OPTIONS: &[&str] = &[
         "--argv0",
-        "--hwcap",
+        "--audit",
+        "--glibc-hwcaps-mask",
+        "--glibc-hwcaps-prepend",
         "--inhibit-rpath",
         "--library-path",
-        "--platform",
         "--preload",
     ];
-    let mut tokens = args.iter().map(|arg| arg.to_string_lossy());
+    const FLAG_OPTIONS: &[&str] = &[
+        "--help",
+        "--inhibit-cache",
+        "--list",
+        "--list-diagnostics",
+        "--list-tunables",
+        "--verify",
+        "--version",
+    ];
+    let mut tokens = args.iter();
     let target = loop {
-        match tokens.next() {
-            None => return None,
-            Some(text) if text.is_empty() => continue,
-            Some(text) if text == "--" => break tokens.next(),
-            Some(text) if text.starts_with('-') => {
-                if !text.contains('=') && VALUE_OPTIONS.contains(&text.as_ref()) {
-                    tokens.next();
-                }
-            }
-            Some(text) => break Some(text),
+        let token = tokens.next()?;
+        let text = token.to_string_lossy();
+        if !text.starts_with("--") {
+            break token;
         }
-    }?;
-    let target = std::path::PathBuf::from(target.into_owned());
+        if VALUE_OPTIONS.contains(&text.as_ref()) {
+            tokens.next()?;
+        } else if !FLAG_OPTIONS.contains(&text.as_ref()) {
+            return None;
+        }
+    };
+    let target = resolve_in(current_dir, Path::new(target));
     let interp = elf_interp(&target).ok()??;
-    let interp_path = std::path::Path::new(&interp);
+    let interp_path = Path::new(&interp);
     let names_program = interp_path == program
         || matches!(
             (interp_path.canonicalize(), program.canonicalize()),
@@ -908,25 +1007,69 @@ fn linker_target(
     names_program.then_some(target)
 }
 
+/// Bound on the `#!` chain followed. The kernel itself stops earlier
+/// (`exec_binprm` in fs/exec.c fails with `ELOOP` after six binary
+/// handler passes), so a longer chain never runs at all.
+const MAX_SCRIPT_DEPTH: usize = 8;
+
 /// Refuse static targets before spawn unless the typed opt-out is in
 /// scope. A static guest has no interpreter to load the preload
 /// runtime, so launching it would run it unconfined.
-fn refuse_static_target(program: &std::path::Path, args: &[std::ffi::OsString]) -> io::Result<()> {
+///
+/// Only files the exec itself would load are inspected: `program`, the
+/// `#!` interpreters it names, and, when `program` has no PT_INTERP and
+/// may be the dynamic linker run as a program, the linker's target
+/// argument. Arguments of an ordinary dynamic program are never opened.
+fn refuse_static_target(
+    program: &Path,
+    args: &[std::ffi::OsString],
+    current_dir: Option<&Path>,
+) -> io::Result<()> {
     if STATIC_OPTOUT.try_with(|_| ()).is_ok() {
         return Ok(());
     }
-    // Linker-as-program: when the target argument's PT_INTERP
-    // names `program`, `program` is the dynamic linker itself and
-    // the target is the guest that will actually run (with the
-    // preload loaded by that linker), so check the target instead.
-    // A no-PT_INTERP program with no such target -- a static or
-    // static-pie guest, or a linker invoked alone -- is refused.
-    let effective = linker_target(program, args).unwrap_or_else(|| program.to_path_buf());
-    if target_is_static(&effective)? {
-        return Err(io::Error::new(
+    let refusal = |path: &Path| {
+        io::Error::new(
             io::ErrorKind::Unsupported,
-            "static executables are not supported by the in-guest backend (no PT_INTERP)",
-        ));
+            format!(
+                "{}: static executables are not supported by the in-guest backend (no PT_INTERP)",
+                path.display()
+            ),
+        )
+    };
+    let inspect = |path: &Path| {
+        target_is_static(path).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("cannot inspect {} for PT_INTERP: {error}", path.display()),
+            )
+        })
+    };
+    if inspect(program)? {
+        // Linker-as-program: when the target argument's PT_INTERP
+        // names `program`, `program` is the dynamic linker itself and
+        // the target is the guest that will actually run (with the
+        // preload loaded by that linker), so check the target instead.
+        // A no-PT_INTERP program with no such target -- a static or
+        // static-pie guest, or a linker invoked alone -- is refused.
+        return match linker_target(program, args, current_dir) {
+            Some(target) if !inspect(&target)? => Ok(()),
+            Some(target) => Err(refusal(&target)),
+            None => Err(refusal(program)),
+        };
+    }
+    // A script runs its `#!` interpreter, which needs the same check.
+    // A static interpreter is refused even when it is the dynamic
+    // linker: the kernel passes it the script, not an ELF to load.
+    let mut script = program.to_path_buf();
+    for _ in 0..MAX_SCRIPT_DEPTH {
+        let Some(interpreter) = shebang_interpreter(&script, current_dir)? else {
+            return Ok(());
+        };
+        if inspect(&interpreter)? {
+            return Err(refusal(&interpreter));
+        }
+        script = interpreter;
     }
     Ok(())
 }
@@ -1264,7 +1407,7 @@ where
     let program = command.find_program()?;
     let guest_args: Vec<std::ffi::OsString> =
         command.get_args().map(|arg| arg.to_os_string()).collect();
-    refuse_static_target(&program, &guest_args)?;
+    refuse_static_target(&program, &guest_args, command.get_current_dir())?;
     command.program(program).arg0(arg0);
 
     let directory = tempfile::Builder::new()
@@ -2851,7 +2994,7 @@ ran_text: .ascii "ran"
                 !target_is_static(&path).unwrap(),
                 "{name} misclassified as static"
             );
-            refuse_static_target(&path, &[]).unwrap();
+            refuse_static_target(&path, &[], None).unwrap();
         }
     }
 
@@ -2874,11 +3017,11 @@ ran_text: .ascii "ran"
             bytes[56..58].copy_from_slice(&1u16.to_ne_bytes());
             bytes
         }
-        fn elf32_header(phoff_low: u16) -> Vec<u8> {
+        fn elf32_header(phoff: u32) -> Vec<u8> {
             let mut bytes = vec![0u8; 52];
             bytes[..4].copy_from_slice(b"\x7fELF");
             bytes[4] = 1;
-            bytes[28..30].copy_from_slice(&phoff_low.to_ne_bytes());
+            bytes[28..32].copy_from_slice(&phoff.to_ne_bytes());
             bytes[42..44].copy_from_slice(&32u16.to_ne_bytes());
             bytes[44..46].copy_from_slice(&1u16.to_ne_bytes());
             bytes
@@ -2911,7 +3054,7 @@ ran_text: .ascii "ran"
                 io::ErrorKind::UnexpectedEof,
                 "{name}: {error}"
             );
-            let error = refuse_static_target(&path, &[]).unwrap_err();
+            let error = refuse_static_target(&path, &[], None).unwrap_err();
             assert_eq!(
                 error.kind(),
                 io::ErrorKind::UnexpectedEof,
@@ -2925,12 +3068,12 @@ ran_text: .ascii "ran"
         let dir = short_socket_tempdir();
         let marker = dir.path().join("marker");
         let statik = build_fixture(dir.path(), "fx-static2", &marker, true);
-        let err = refuse_static_target(&statik, &[]).unwrap_err();
+        let err = refuse_static_target(&statik, &[], None).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Unsupported);
         assert!(err.to_string().contains("no PT_INTERP"), "{err}");
         assert!(!marker.exists());
         let dynamic = build_fixture(dir.path(), "fx-dynamic2", &marker, false);
-        refuse_static_target(&dynamic, &[]).unwrap();
+        refuse_static_target(&dynamic, &[], None).unwrap();
     }
 
     #[tokio::test]
@@ -2997,16 +3140,17 @@ ran_text: .ascii "ran"
         let ldso = fixture_ldso(&dynamic);
         // Linker + static target: refused (target would run
         // unconfined -- no interpreter loads the preload into it).
-        let err = refuse_static_target(&ldso, &[statik.as_os_str().to_os_string()]).unwrap_err();
+        let err =
+            refuse_static_target(&ldso, &[statik.as_os_str().to_os_string()], None).unwrap_err();
         assert!(err.to_string().contains("no PT_INTERP"), "{err}");
         // Linker + dynamic target: admitted (the linker loads the
         // preload into its target).
-        refuse_static_target(&ldso, &[dynamic.as_os_str().to_os_string()]).unwrap();
+        refuse_static_target(&ldso, &[dynamic.as_os_str().to_os_string()], None).unwrap();
         // Linker alone: refused. No target names it as an
         // interpreter, so it is indistinguishable from a static-pie
         // guest at this layer; admitting it would be the bare
         // ET_DYN exemption the review bar rejects.
-        let err = refuse_static_target(&ldso, &[]).unwrap_err();
+        let err = refuse_static_target(&ldso, &[], None).unwrap_err();
         assert!(err.to_string().contains("no PT_INTERP"), "{err}");
         // Linker options are skipped when finding the target,
         // including value-taking ones in both spellings.
@@ -3016,6 +3160,7 @@ ran_text: .ascii "ran"
                 "--inhibit-cache".to_owned().into(),
                 statik.as_os_str().to_os_string(),
             ],
+            None,
         )
         .unwrap_err();
         assert!(err.to_string().contains("no PT_INTERP"), "{err}");
@@ -3026,6 +3171,7 @@ ran_text: .ascii "ran"
                 "/nonexistent".to_owned().into(),
                 dynamic.as_os_str().to_os_string(),
             ],
+            None,
         )
         .unwrap();
         let err = refuse_static_target(
@@ -3034,6 +3180,7 @@ ran_text: .ascii "ran"
                 "--library-path=/nonexistent".to_owned().into(),
                 statik.as_os_str().to_os_string(),
             ],
+            None,
         )
         .unwrap_err();
         assert!(err.to_string().contains("no PT_INTERP"), "{err}");
@@ -3064,16 +3211,16 @@ ran_text: .ascii "ran"
         assert!(elf_interp(&out).unwrap().is_none());
         assert!(target_is_static(&out).unwrap());
         // As program: refused (no target names it as interpreter).
-        assert!(refuse_static_target(&out, &[]).is_err());
+        assert!(refuse_static_target(&out, &[], None).is_err());
         // As a would-be linker in front of a dynamic target: still
         // refused -- the target's PT_INTERP names the real linker,
         // not this guest.
         let dynamic = build_fixture(dir.path(), "fx-dynamic5", &marker, false);
-        assert!(refuse_static_target(&out, &[dynamic.as_os_str().to_os_string()]).is_err());
+        assert!(refuse_static_target(&out, &[dynamic.as_os_str().to_os_string()], None).is_err());
         // As ld.so's target argument: refused (it has no PT_INTERP
         // naming the linker).
         let ldso = fixture_ldso(&dynamic);
-        assert!(refuse_static_target(&ldso, &[out.as_os_str().to_os_string()]).is_err());
+        assert!(refuse_static_target(&ldso, &[out.as_os_str().to_os_string()], None).is_err());
     }
 
     #[tokio::test]
@@ -3124,5 +3271,280 @@ ran_text: .ascii "ran"
             "ld.so + static target refusal: {err}"
         );
         assert!(!static_marker.exists(), "static target ran unconfined");
+    }
+
+    /// Runs `check` on another thread and fails the test, rather than
+    /// hanging it, when the check does not return within ten seconds.
+    fn within_deadline<T: Send + 'static>(
+        what: &str,
+        check: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(check());
+        });
+        receiver
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap_or_else(|_| panic!("{what}: the static check blocked"))
+    }
+
+    #[test]
+    fn guest_arguments_that_are_pipes_are_never_opened() {
+        // A FIFO or pipe named as the first argument belongs to the
+        // guest: opening a FIFO with no writer blocks, and reading a
+        // pipe consumes the guest's input (`python3 /dev/stdin` lost its
+        // first 20 bytes). Neither an ordinary program's arguments nor
+        // ld.so's target may be opened unless they are regular files.
+        // MUTATION ARM: open_regular checks the path before opening and
+        // the opened file after; dropping both loses the pipe's bytes in
+        // the ld.so case, and also dropping O_NONBLOCK blocks on the
+        // FIFO. Either check alone keeps both cases correct.
+        let dir = short_socket_tempdir();
+        let marker = dir.path().join("marker");
+        let dynamic = build_fixture(dir.path(), "fx-dynamic9", &marker, false);
+        let ldso = fixture_ldso(&dynamic);
+        let fifo = dir.path().join("fifo");
+        let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        let (mut reader, mut writer) = std::io::pipe().unwrap();
+        let input = b"AAAAAAAAAAAAAAAAAAAABBBB-rest-of-input\n";
+        std::io::Write::write_all(&mut writer, input).unwrap();
+        drop(writer);
+        // The path /dev/stdin resolves to when the pipe is fd 0.
+        let pipe = PathBuf::from(format!("/proc/self/fd/{}", reader.as_raw_fd()));
+        for argument in [fifo, pipe] {
+            for (program, expected) in [
+                (dynamic.clone(), Ok(())),
+                (ldso.clone(), Err(io::ErrorKind::Unsupported)),
+            ] {
+                let args = vec![argument.clone().into_os_string()];
+                let result = within_deadline("pipe argument", move || {
+                    refuse_static_target(&program, &args, None).map_err(|error| error.kind())
+                });
+                assert_eq!(result, expected, "{}", argument.display());
+            }
+        }
+        let mut survived = Vec::new();
+        reader.read_to_end(&mut survived).unwrap();
+        assert_eq!(survived, input, "the guest's input was consumed");
+    }
+
+    #[tokio::test]
+    async fn pipe_argument_keeps_its_input_through_launch() {
+        // The reviewer's reproduction as a launch: `cat /dev/stdin` with
+        // piped input must print every byte. /dev/stdin is a procfs link
+        // to the launcher's fd 0, which the guest inherits; the same
+        // link to the launcher's pipe, `/proc/<launcher>/fd/<n>`, names
+        // one pipe for the check and the guest without replacing the
+        // test harness's stdin.
+        // MUTATION ARM: consulting linker_target for this dynamic
+        // program and dropping both regular-file checks in open_regular
+        // drops the first 20 bytes.
+        #[derive(Default, Debug)]
+        struct EchoGlobal;
+        #[reverie::tool]
+        impl reverie::GlobalTool for EchoGlobal {
+            type Request = u64;
+            type Response = u64;
+            type Config = u64;
+            async fn receive_rpc(&self, _from: reverie::Pid, message: u64) -> u64 {
+                message
+            }
+        }
+        #[derive(Default)]
+        struct EchoTool;
+        #[reverie::tool]
+        impl reverie::Tool for EchoTool {
+            type GlobalState = EchoGlobal;
+            type ThreadState = ();
+        }
+        let dir = short_socket_tempdir();
+        let preload = dir.path().join("preload.so");
+        std::fs::write(&preload, b"unused-before-refusal").unwrap();
+        let out = dir.path().join("out");
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        let input = b"AAAAAAAAAAAAAAAAAAAABBBB-rest-of-input\n";
+        std::io::Write::write_all(&mut writer, input).unwrap();
+        drop(writer);
+        let pipe = format!("/proc/{}/fd/{}", std::process::id(), reader.as_raw_fd());
+        let mut command = reverie::process::Command::new("/bin/cat");
+        command
+            .arg(&pipe)
+            .stdout(std::fs::File::create(&out).unwrap());
+        let _ = PreloadBackend::run_with_preload::<EchoTool>(command, 7, preload).await;
+        drop(reader);
+        assert_eq!(std::fs::read(&out).unwrap(), input);
+    }
+
+    #[test]
+    fn linker_options_match_glibc_rtld() {
+        // ld.so's target is the first argument after the options glibc's
+        // rtld accepts (`ld.so --help`, glibc 2.34). A value option
+        // consumes its value even when the value names a dynamic ELF;
+        // anything else that starts with `--` is not an ld.so option,
+        // so no target is found and ld.so itself is refused.
+        // MUTATION ARM: dropping `--audit` or a `--glibc-hwcaps-*` from
+        // VALUE_OPTIONS, or skipping unknown options, admits the static
+        // target behind them.
+        let dir = short_socket_tempdir();
+        let marker = dir.path().join("marker");
+        let statik = build_fixture(dir.path(), "fx-static10", &marker, true).into_os_string();
+        let dynamic = build_fixture(dir.path(), "fx-dynamic10", &marker, false).into_os_string();
+        let ldso = fixture_ldso(Path::new(&dynamic));
+        let check = |args: &[&OsStr]| {
+            let args: Vec<OsString> = args.iter().map(|arg| arg.to_os_string()).collect();
+            refuse_static_target(&ldso, &args, None).map_err(|error| error.kind())
+        };
+        let refused = Err(io::ErrorKind::Unsupported);
+        for option in [
+            "--argv0",
+            "--audit",
+            "--glibc-hwcaps-mask",
+            "--glibc-hwcaps-prepend",
+            "--inhibit-rpath",
+            "--library-path",
+            "--preload",
+        ] {
+            let option = OsStr::new(option);
+            assert_eq!(check(&[option, &dynamic, &statik]), refused, "{option:?}");
+            assert_eq!(check(&[option, &statik, &dynamic]), Ok(()), "{option:?}");
+            assert_eq!(check(&[option]), refused, "{option:?} without a value");
+        }
+        for flag in [
+            "--help",
+            "--inhibit-cache",
+            "--list",
+            "--list-diagnostics",
+            "--list-tunables",
+            "--verify",
+            "--version",
+        ] {
+            let flag = OsStr::new(flag);
+            assert_eq!(check(&[flag, &statik]), refused, "{flag:?}");
+            assert_eq!(check(&[flag, &dynamic]), Ok(()), "{flag:?}");
+        }
+        for unknown in [
+            "--",
+            "--argv0=name",
+            "--bogus",
+            "--hwcap",
+            "--library-path=/nonexistent",
+            "--platform",
+        ] {
+            let unknown = OsStr::new(unknown);
+            assert_eq!(check(&[unknown, &dynamic]), refused, "{unknown:?}");
+        }
+    }
+
+    #[test]
+    fn elf32_phoff_reads_all_four_bytes() {
+        // ELF32 e_phoff is four bytes. Here it is 0x10034: the real
+        // table, past 64 KiB, holds only PT_LOAD, while a decoy
+        // PT_INTERP sits at 0x34, where a two-byte read would look.
+        // MUTATION ARM: reading e_phoff with read_u16 finds the decoy
+        // and admits this static file.
+        let dir = short_socket_tempdir();
+        let mut bytes = vec![0u8; 0x10034 + 32];
+        bytes[..4].copy_from_slice(b"\x7fELF");
+        bytes[4] = 1;
+        bytes[28..32].copy_from_slice(&0x10034u32.to_ne_bytes());
+        bytes[42..44].copy_from_slice(&32u16.to_ne_bytes());
+        bytes[44..46].copy_from_slice(&1u16.to_ne_bytes());
+        bytes[0x34..0x38].copy_from_slice(&PT_INTERP.to_ne_bytes());
+        bytes[0x10034..0x10038].copy_from_slice(&1u32.to_ne_bytes());
+        let path = dir.path().join("elf32-phoff-high-half");
+        std::fs::write(&path, bytes).unwrap();
+        assert!(target_is_static(&path).unwrap());
+        let error = refuse_static_target(&path, &[], None).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported, "{error}");
+    }
+
+    #[test]
+    fn linker_target_resolves_against_command_directory() {
+        // ld.so opens a relative target in the guest's working
+        // directory, so the check resolves it there too.
+        // MUTATION ARM: resolving against the launcher's directory
+        // refuses the dynamic case and cannot see the static one.
+        let dir = short_socket_tempdir();
+        let marker = dir.path().join("marker");
+        build_fixture(dir.path(), "fx-static11", &marker, true);
+        let dynamic = build_fixture(dir.path(), "fx-dynamic11", &marker, false);
+        let ldso = fixture_ldso(&dynamic);
+        let check = |name: &str, directory: Option<&Path>| {
+            refuse_static_target(&ldso, &[OsString::from(name)], directory)
+        };
+        check("fx-dynamic11", Some(dir.path())).unwrap();
+        let error = check("fx-static11", Some(dir.path())).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        // From the launcher's directory the name finds nothing, so ld.so
+        // has no recognised target and is refused itself.
+        let error = check("fx-dynamic11", None).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn script_interpreter_is_checked() {
+        // The kernel runs a script's `#!` interpreter, so a static
+        // interpreter would run unconfined just as a static program
+        // would. The chain is followed, and parsed as load_script does.
+        // MUTATION ARM: admitting a program once it has PT_INTERP or no
+        // ELF magic, without following `#!`, admits every refused case.
+        let dir = short_socket_tempdir();
+        let marker = dir.path().join("marker");
+        let statik = build_fixture(dir.path(), "fx-static12", &marker, true);
+        let dynamic = build_fixture(dir.path(), "fx-dynamic12", &marker, false);
+        let script = |name: &str, text: String| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, text).unwrap();
+            path
+        };
+        let refused = |path: &Path, directory: Option<&Path>, interpreter: &str| {
+            let error = refuse_static_target(path, &[], directory).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Unsupported, "{error}");
+            assert!(error.to_string().contains(interpreter), "{error}");
+        };
+        let admitted = |path: &Path, directory: Option<&Path>| {
+            refuse_static_target(path, &[], directory)
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        };
+        let s = statik.display();
+        let d = dynamic.display();
+        refused(&script("static", format!("#!{s}\n")), None, "fx-static12");
+        refused(
+            &script("static-arg", format!("#! \t{s} -x\necho\n")),
+            None,
+            "fx-static12",
+        );
+        refused(
+            &script("static-unterminated", format!("#!{s}")),
+            None,
+            "fx-static12",
+        );
+        let relative = script("relative", "#!fx-static12\n".to_owned());
+        refused(&relative, Some(dir.path()), "fx-static12");
+        // Resolved against the launcher's directory, the name finds no
+        // interpreter, and that exec fails before anything runs.
+        admitted(&relative, None);
+        let inner = script("inner", format!("#!{s}\n"));
+        refused(
+            &script("outer", format!("#!{}\n", inner.display())),
+            None,
+            "fx-static12",
+        );
+        admitted(&script("dynamic", format!("#!{d} -x\n")), None);
+        let inner = script("inner-dynamic", format!("#!{d}\n"));
+        admitted(
+            &script("outer-dynamic", format!("#!{}\n", inner.display())),
+            None,
+        );
+        // A name that may be truncated (no newline or terminator in the
+        // first 256 bytes) is refused by the kernel (ENOEXEC).
+        let long = format!("#!{s}{}", "/".repeat(300));
+        admitted(&script("truncated", long), None);
+        // A chain that names itself ends (the kernel fails it with ELOOP).
+        let looped = dir.path().join("loop");
+        std::fs::write(&looped, format!("#!{}\n", looped.display())).unwrap();
+        admitted(&looped, None);
     }
 }
