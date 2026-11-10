@@ -4873,7 +4873,10 @@ int main(int argc, char **argv) {
                     execs += 1;
                     assert_eq!(stop.pid(), watched_pid);
                     assert_eq!(stop.former_tid(), watched_pid);
-                    assert_eq!(stop.entry().regs().rip, stop.boundary().exit_regs.rip);
+                    assert_eq!(
+                        super::super::arch::instruction_pointer(stop.entry().regs()),
+                        super::super::arch::instruction_pointer(&stop.boundary().exit_regs)
+                    );
                     watched = stop
                         .rearm_and_resume(|task, _entry, _boundary| Ok(task))
                         .unwrap();
@@ -4922,7 +4925,7 @@ int main(int argc, char **argv) {
                     watched = stop
                         .rearm_and_resume(|task, _entry, _boundary| {
                             let mut regs = task.getregs()?;
-                            regs.rip = 0x4141_4141;
+                            super::super::arch::set_instruction_pointer(&mut regs, 0x4141_4141);
                             task.setregs(&regs)?;
                             Ok(task)
                         })

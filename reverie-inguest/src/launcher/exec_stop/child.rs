@@ -500,8 +500,9 @@ impl<'fd> PreparedExec<'fd> {
 #[inline(always)]
 unsafe fn syscall6(number: u64, args: [u64; 6]) -> i64 {
     let result: i64;
-    // SAFETY: the caller owns every pointer operand. All x86-64 syscall
+    // SAFETY: the caller owns every pointer operand. All syscall
     // clobbers are declared and the stack is untouched by this instruction.
+    #[cfg(target_arch = "x86_64")]
     unsafe {
         core::arch::asm!(
             "syscall",
@@ -509,6 +510,16 @@ unsafe fn syscall6(number: u64, args: [u64; 6]) -> i64 {
             in("rdi") args[0], in("rsi") args[1], in("rdx") args[2],
             in("r10") args[3], in("r8") args[4], in("r9") args[5],
             lateout("rcx") _, lateout("r11") _, options(nostack),
+        );
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            inlateout("x8") number => result,
+            in("x0") args[0], in("x1") args[1], in("x2") args[2],
+            in("x3") args[3], in("x4") args[4], in("x5") args[5],
+            options(nostack),
         );
     }
     result

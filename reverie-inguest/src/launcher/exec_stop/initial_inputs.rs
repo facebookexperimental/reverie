@@ -84,7 +84,7 @@ struct RetainedRead {
 pub struct CapturedInitialInputs {
     generation: safeptrace::TraceeGeneration,
     pid: safeptrace::Pid,
-    registers: [u64; 27],
+    registers: super::arch::RegisterWords,
     stack_start: u64,
     stack_bytes: Vec<u8>,
     maps_before: Vec<u8>,
@@ -100,7 +100,7 @@ impl CapturedInitialInputs {
         self.pid
     }
     /// Exact original27-register codec, including guest original FS/GS.
-    pub fn registers(&self) -> &[u64; 27] {
+    pub fn registers(&self) -> &super::arch::RegisterWords {
         &self.registers
     }
     /// Original stack VMA start.
@@ -382,7 +382,7 @@ pub(super) fn unchanged_parts(
         || task.generation() != owner.generation
         || register_words(&task.getregs()?) != register_words(&context.regs)
         || task.getsigmask()? != context.signal_mask
-        || task.getxstate()? != context.xstate
+        || super::arch::capture_extended_state(task)? != context.xstate
         || read_exact_span(task, context.stack_start, context.stack_bytes.len())?
             != context.stack_bytes
     {
@@ -430,8 +430,12 @@ pub(crate) fn capture_initial_inputs_parts(
     {
         return Err("exec-stop current maps do not retain exact original stack VMA".into());
     }
-    let parsed = ParsedInitial::parse(context.stack_start, &context.stack_bytes, context.regs.rsp)
-        .map_err(parse_error)?;
+    let parsed = ParsedInitial::parse(
+        context.stack_start,
+        &context.stack_bytes,
+        super::arch::stack_pointer(&context.regs),
+    )
+    .map_err(parse_error)?;
     let mut budget = 0;
     let mut reads = Vec::new();
     for request in parsed.read_requests().map_err(parse_error)? {
@@ -589,7 +593,8 @@ mod tests {
         .unwrap();
         let receipt = super::super::CleanupReceipt::default();
         let mut stop = super::super::ExecStop::spawn(request, receipt.clone()).unwrap();
-        stop.context.regs.rsp ^= 8;
+        let sp = super::super::arch::stack_pointer(&stop.context.regs);
+        super::super::arch::set_stack_pointer(&mut stop.context.regs, sp ^ 8);
         assert!(stop.capture_initial_inputs().is_err());
         assert!(!receipt.snapshot().confirmed);
         let cancelled = stop.cancel().unwrap();
