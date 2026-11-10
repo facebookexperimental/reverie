@@ -569,6 +569,19 @@ fn gate_guard_against(raw: &[u8], reviewed: &str) -> Result<GateShape> {
     )?;
     Ok(shape)
 }
+/// Test seam (see private_static::factory_source_self_check): the provider's
+/// own trap.rs or fixed_gates.rs check over the file it reads under ROOT.
+pub(super) fn source_self_check(root: &Path, gate: bool) -> Result<()> {
+    if gate {
+        let fixed = FileIdentity::read(&root.join(FIXED_SOURCE))?;
+        return source_digest(&fixed.sha256, true)
+            .map_err(|e| format!("{e}: {FIXED_SOURCE} sha256 {}", fixed.sha256));
+    }
+    let trap = FileIdentity::read(&root.join(TRAP_SOURCE))?;
+    let raw = trap_bytes(&trap)?;
+    source_cohort(&raw, &trap.sha256, Cohort::DedicatedFunction)
+        .map_err(|e| format!("{e}: {TRAP_SOURCE} sha256 {}", trap.sha256))
+}
 fn trap_bytes(trap: &FileIdentity) -> Result<Vec<u8>> {
     let mut raw = Vec::new();
     fs::File::open(&trap.path)

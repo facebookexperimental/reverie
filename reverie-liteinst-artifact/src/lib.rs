@@ -66810,6 +66810,17 @@ pub mod private_static {
         tls_sources::self_check(root)
     }
 
+    /// Test seam only: the reviewed Reverie source identities the producer's
+    /// providers enforce (trap.rs gate shape, fixed_gates.rs, exec_private.rs
+    /// and the six handoff.rs consumers), each checked by its consumer's real
+    /// predicate over one checkout root. One named result per consumer. Not
+    /// covered: view_site/caller.rs's installer source identity, which no
+    /// producer calls and which does not match this tree (dh-rtkedo).
+    #[doc(hidden)]
+    pub fn factory_source_self_check(root: &Path) -> Vec<(&'static str, Result<()>)> {
+        selected_initializers::source_identity_self_check(root)
+    }
+
     const TARGET: &str = "x86_64-unknown-linux-musl";
     const LOW: u64 = 0x6000_e100_0000;
     const HIGH: u64 = 0x6000_ff00_0000;

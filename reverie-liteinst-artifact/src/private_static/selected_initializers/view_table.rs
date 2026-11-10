@@ -38,7 +38,7 @@ use super::*;
 
 const SYMBOL: &str = "_RNvMs1_NtCs_14reverie_loader7handoffNtB5_4View5table";
 const BOOTSTRAP_SYMBOL: &str = "_RNvMs2_NtCs_14reverie_loader7handoffNtB5_4View5table";
-const SOURCE: &str = "reverie-loader/src/handoff.rs";
+pub(super) const SOURCE: &str = "reverie-loader/src/handoff.rs";
 const SOURCE_SHA: &str = "85e0f1cb9393c1ed11db4d6115f81dbce5d3f0afcfc733aa4d0cd2d6725245c7";
 // Declared whole-file source cohort: the additive numeric serializer leaves all
 // existing accessor definitions and prerequisites unchanged. Actual source-owned

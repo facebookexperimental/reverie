@@ -60,6 +60,63 @@ pub use native_leaves::native_leaf_implementation_sha256;
 const HANDOFF_ROUTE_RULE_SOURCE_SHA: &str =
     "e7c8f96840a3787ec4d05c70a14c3c7a6077feabc888ca9878064a9bd560eec4";
 
+/// Test seam (see private_static::factory_source_self_check): the reviewed
+/// Reverie source identities the producer's providers enforce, each checked by
+/// its own consumer's predicate over the file that consumer reads under ROOT.
+/// view_site/caller.rs's installer identity is not covered (dh-rtkedo).
+pub(super) fn source_identity_self_check(root: &Path) -> Vec<(&'static str, Result<()>)> {
+    let observed = |relative: &str, accept: &dyn Fn(&str) -> Result<()>| {
+        let file = FileIdentity::read(&root.join(relative))?;
+        accept(&file.sha256).map_err(|e| format!("{e}: {relative} sha256 {}", file.sha256))
+    };
+    let symbol = |relative: &str, select: fn(&str) -> Result<&'static str>| {
+        observed(relative, &|digest| select(digest).map(drop))
+    };
+    vec![
+        (
+            "ordinary_gate trap.rs gate shape",
+            ordinary_gate::source_self_check(root, false),
+        ),
+        (
+            "ordinary_gate fixed_gates.rs",
+            ordinary_gate::source_self_check(root, true),
+        ),
+        (
+            "terminal_observation exec_private.rs",
+            observed(terminal_observation::PRIVATE_SOURCE_PATH, &|digest| {
+                require(
+                    terminal_observation::accepted_private_source(digest),
+                    "terminal actual source differs",
+                )
+            }),
+        ),
+        (
+            "bootstrap_descriptor handoff.rs",
+            symbol(view_table::SOURCE, bootstrap_descriptor::source_symbol),
+        ),
+        (
+            "bootstrap_env_aux handoff.rs",
+            symbol(view_table::SOURCE, bootstrap_env_aux::source_symbol),
+        ),
+        (
+            "bootstrap_role handoff.rs",
+            symbol(view_table::SOURCE, bootstrap_role::source_symbol),
+        ),
+        (
+            "bootstrap_site handoff.rs",
+            symbol(view_site::SOURCE, bootstrap_site::source_symbol),
+        ),
+        (
+            "view_site handoff.rs",
+            symbol(view_site::SOURCE, view_site::source_symbol),
+        ),
+        (
+            "view_table handoff.rs",
+            symbol(view_table::SOURCE, view_table::source_symbol),
+        ),
+    ]
+}
+
 // Private target identities produced from actual selected archive sections and
 // final map placement, including COMMON allocations; not final-name lookup.
 #[derive(Clone, Debug)]
