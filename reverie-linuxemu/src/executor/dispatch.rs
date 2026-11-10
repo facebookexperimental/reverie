@@ -1191,9 +1191,6 @@ impl ElfExecutor {
             return Ok(negative_errno(libc::ENOSYS));
         }
         let _retirement = self.state.file_retirement.hold();
-        if let Some(result) = self.execute_child_wait(request, memory) {
-            return result;
-        }
         if let Some(result) = self.execute_accept(request, memory) {
             return result;
         }
@@ -1228,6 +1225,16 @@ impl ElfExecutor {
             self.state.file_retirement.drain_unlocked();
             #[cfg(test)]
             run_one_shot_test_hook(&TABLE_RELEASED_TEST_HOOK);
+        }
+        // TODO-HUMAN-REVIEW(https://github.com/rrnewton/reverie/pull/1410): Review waits' table.
+        // A wait, which may block, runs with the table installed, as every
+        // call does, and its lock released: waitid(P_PIDFD) finds the
+        // descriptor as the shared table has it now, though another thread
+        // opened or replaced it since this task's last call, and keeps what
+        // it found until the call ends (`guest_pidfd`).
+        if let Some(result) = self.execute_child_wait(request, memory) {
+            debug_assert!(shared_files.is_none(), "a wait holds no table lock");
+            return result;
         }
         if self.parent_death_enrolled()
             && matches!(

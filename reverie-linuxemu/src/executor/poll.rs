@@ -19,7 +19,111 @@ use crate::signal::SignalFdWaiter;
 #[derive(Clone, Debug)]
 pub(crate) enum NativePollDescription {
     EventFd(Arc<NativeEventFd>),
-    Epoll(Arc<()>),
+    Epoll(Arc<EpollIdentity>),
+}
+
+/// An epoll's open file description, which every descriptor of the epoll
+/// shares, dup and fork aliases included: it ends when the last of them is
+/// closed, as Linux frees an eventpoll with its file.
+#[derive(Debug, Default)]
+pub(crate) struct EpollIdentity {
+    /// The epoll's live descriptor entries ([`NativePollBinding`]s), one for
+    /// each descriptor of it in a table. A stale snapshot's reference to an
+    /// entry is no descriptor, so the epoll ends with its last entry's close
+    /// or table, whatever snapshots still name it.
+    live: std::sync::atomic::AtomicUsize,
+    /// Set once an `SCM_RIGHTS` message carries a descriptor of the epoll: a
+    /// receiver may then hold it past every descriptor that the epoll's
+    /// entries count, so its end no longer ends its pidfd registrations,
+    /// which last until their DEL or their pidfd's end.
+    pub(super) escaped: AtomicBool,
+    /// The pidfds registered in this epoll, each with the guest descriptor
+    /// number of its registration (`GuestPidfd::epoll_control`). Their
+    /// registrations end with the epoll, which closes the host descriptors
+    /// that stood for them (`GuestPidfd::epoll_ended`).
+    pidfd_registrations: Mutex<Vec<(std::sync::Weak<GuestPidfd>, libc::c_int)>>,
+}
+
+impl EpollIdentity {
+    /// Records the registration of guest descriptor number `fd` of `pidfd`
+    /// in this epoll, for the epoll's end to end. False if the epoll has
+    /// already ended, as a call that found its descriptor before another
+    /// thread closed it sees: the registration then ends with the call.
+    pub(super) fn register_pidfd(&self, pidfd: &Arc<GuestPidfd>, fd: libc::c_int) -> bool {
+        let mut registered = self
+            .pidfd_registrations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.live.load(Ordering::SeqCst) == 0 && !self.escaped.load(Ordering::SeqCst) {
+            return false;
+        }
+        registered.retain(|(pidfd, _)| pidfd.strong_count() != 0);
+        registered.push((Arc::downgrade(pidfd), fd));
+        true
+    }
+
+    /// Forgets the registration of guest descriptor number `fd` of `pidfd`,
+    /// which a DEL ended.
+    pub(super) fn unregister_pidfd(&self, pidfd: &GuestPidfd, fd: libc::c_int) {
+        let mut registered = self
+            .pidfd_registrations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(held) = registered.iter().position(|(registered, number)| {
+            *number == fd && std::ptr::eq(registered.as_ptr(), pidfd)
+        }) {
+            registered.swap_remove(held);
+        }
+    }
+
+    /// Ends the epoll's pidfd registrations now that its last descriptor
+    /// entry has gone, unless an `SCM_RIGHTS` message carried the epoll.
+    /// Called with no epoll domain lock held, a leaf lock that the ends,
+    /// which take pidfd locks and close host descriptors, must not run
+    /// under.
+    pub(crate) fn end(&self) {
+        if self.escaped.load(Ordering::SeqCst) {
+            return;
+        }
+        let registrations = std::mem::take(
+            &mut *self
+                .pidfd_registrations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        self.end_registrations(registrations);
+    }
+
+    fn end_registrations(&self, registrations: Vec<(std::sync::Weak<GuestPidfd>, libc::c_int)>) {
+        for (pidfd, fd) in registrations {
+            if let Some(pidfd) = pidfd.upgrade() {
+                pidfd.epoll_ended(fd, self);
+            }
+        }
+    }
+
+    /// Releases one live descriptor entry of the epoll: true if it was the
+    /// last, and so the epoll has ended.
+    fn release(&self) -> bool {
+        self.live.fetch_sub(1, Ordering::SeqCst) == 1
+    }
+}
+
+// TODO-HUMAN-REVIEW(https://github.com/rrnewton/reverie/pull/1410): Review epoll ends.
+/// The last reference ends whatever registrations remain, as when the
+/// epoll's entries went with no close, as its creation failing does.
+impl Drop for EpollIdentity {
+    fn drop(&mut self) {
+        if *self.escaped.get_mut() {
+            return;
+        }
+        let registrations = std::mem::take(
+            self.pidfd_registrations
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        self.end_registrations(registrations);
+    }
 }
 
 /// Export can hand an eventfd writer to an untracked actor. This one-way bit
@@ -58,20 +162,51 @@ pub(crate) struct NativePollBinding {
 
 impl NativePollBinding {
     fn new(description: NativePollDescription) -> Arc<Self> {
+        Self::with_live(description, true)
+    }
+
+    /// A binding that is a live descriptor entry if `live`, which an epoll
+    /// counts ([`EpollIdentity`]).
+    fn with_live(description: NativePollDescription, live: bool) -> Arc<Self> {
+        if live && let NativePollDescription::Epoll(epoll) = &description {
+            epoll.live.fetch_add(1, Ordering::SeqCst);
+        }
         Arc::new(Self {
             description,
-            live: AtomicBool::new(true),
+            live: AtomicBool::new(live),
         })
     }
 
     pub(crate) fn fork_binding(&self) -> Arc<Self> {
-        Self::new(self.description.clone())
+        Self::with_live(self.description.clone(), self.live.load(Ordering::SeqCst))
     }
 
     /// Caller holds the family's epoll domain, serializing retirement with a
-    /// zero-time wait. This token never becomes live again.
-    pub(crate) fn retire(&self) {
-        self.live.store(false, Ordering::SeqCst);
+    /// zero-time wait. This token never becomes live again. Returns the
+    /// epoll whose last live descriptor entry this was, for the caller to
+    /// end once it has released the domain lock ([`EpollIdentity::end`]).
+    #[must_use]
+    pub(crate) fn retire(&self) -> Option<Arc<EpollIdentity>> {
+        if !self.live.swap(false, Ordering::SeqCst) {
+            return None;
+        }
+        match &self.description {
+            NativePollDescription::Epoll(epoll) if epoll.release() => Some(epoll.clone()),
+            _ => None,
+        }
+    }
+}
+
+/// A live entry's binding goes without a close when its table ends, as
+/// the last task's exit ends it: its epoll loses the entry then.
+impl Drop for NativePollBinding {
+    fn drop(&mut self) {
+        if *self.live.get_mut()
+            && let NativePollDescription::Epoll(epoll) = &self.description
+            && epoll.release()
+        {
+            epoll.end();
+        }
     }
 }
 
@@ -84,7 +219,7 @@ pub(super) struct EpollRegistration {
 
 #[derive(Debug)]
 pub(super) struct EpollProof {
-    pub(super) owner: std::sync::Weak<()>,
+    pub(super) owner: std::sync::Weak<EpollIdentity>,
     pub(super) table: std::sync::Weak<NativePollTable>,
     pub(super) unsafe_history: bool,
     pub(super) registrations: std::collections::BTreeMap<i32, EpollRegistration>,
@@ -100,7 +235,7 @@ pub(crate) struct EpollDomain {
     pub(super) proofs: std::collections::BTreeMap<usize, EpollProof>,
 }
 
-pub(super) fn epoll_identity_key(identity: &Arc<()>) -> usize {
+pub(super) fn epoll_identity_key(identity: &Arc<EpollIdentity>) -> usize {
     // The record's Weak keeps this allocation from being reused until removal.
     // This private token is unrelated to a host fd or anonymous inode number.
     Arc::as_ptr(identity) as usize
@@ -854,7 +989,7 @@ pub(super) fn epoll_create1(state: &mut LoadedStaticElf, raw_flags: u64) -> i64 
     let file = unsafe { std::fs::File::from_raw_fd(host_fd) };
     let fd = insert_file_with_flags(state, file, flags & libc::EPOLL_CLOEXEC != 0, None);
     if fd >= 0 {
-        let identity = Arc::new(());
+        let identity = Arc::new(EpollIdentity::default());
         {
             let mut domain = state
                 .epoll_domain
@@ -907,12 +1042,17 @@ pub(super) fn epoll_ctl(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u
     match pidfd {
         // A registration of a pidfd for a guest process watches the pidfd's
         // shadow socket for what a pidfd can report, through a host
-        // descriptor of the shadow for the guest descriptor number, which
-        // closes with the pidfd, so the registration ends where Linux ends
-        // it (`GuestPidfd::epoll_control`).
+        // descriptor of the shadow for the guest descriptor number. That
+        // descriptor closes with the number's last registration, which ends
+        // where Linux ends it: at its DEL, or with the pidfd's or the epoll's
+        // open file description (`GuestPidfd::epoll_control`).
         Some(pidfd) => {
             event.events = pidfd_epoll_events(event.events);
-            pidfd.epoll_control(guest_target, operation, |key| {
+            let epoll = match native_poll_description(state, args[0] as libc::c_int) {
+                Some(NativePollDescription::Epoll(identity)) => Some(identity),
+                _ => None,
+            };
+            pidfd.epoll_control(guest_target, operation, epoll_fd, epoll.as_ref(), |key| {
                 host_epoll_ctl(state, args, epoll_fd, key, &mut event)
             })
         }

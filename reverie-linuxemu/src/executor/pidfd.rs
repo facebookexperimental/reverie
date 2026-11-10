@@ -36,15 +36,95 @@ pub(crate) struct GuestPidfd {
 /// The host descriptor that stands for one guest descriptor number of a
 /// pidfd in epoll registrations: Linux keys a registration by descriptor
 /// number and open file description, so each number needs a descriptor of
-/// its own. `registrations` counts those that name it: one for each
-/// successful `EPOLL_CTL_ADD` of the number, in any epoll, less one for each
-/// successful `EPOLL_CTL_DEL`. The key closes with the last of them, or with
-/// the pidfd. A registration that ends when its epoll closes still counts,
-/// so its key stays until the pidfd closes; the guest cannot tell.
+/// its own. `epolls` holds the registrations that name it, one for each
+/// epoll with one: a successful `EPOLL_CTL_ADD` of the number adds the
+/// epoll's, and its successful `EPOLL_CTL_DEL` removes it, as does the end
+/// of the epoll's open file description ([`EpollIdentity`]), as Linux frees
+/// an eventpoll's registrations with it. The key closes with the last of
+/// them, or with the pidfd.
 #[derive(Debug)]
 struct EpollKey {
     file: std::fs::File,
-    registrations: usize,
+    epolls: Vec<KeyRegistration>,
+}
+
+/// One epoll's registration of an epoll key.
+#[derive(Debug)]
+struct KeyRegistration {
+    /// The epoll's identity, whose end ends the registration. An epoll that
+    /// has none, as one received in an `SCM_RIGHTS` message has not, is
+    /// `None`: its registration lasts until its DEL or the pidfd's end, as
+    /// does one in an epoll that such a message carried.
+    identity: Option<std::sync::Weak<EpollIdentity>>,
+    /// A host descriptor of the epoll, through which the pidfd's end removes
+    /// the registration (`GuestPidfd`'s `Drop`). It goes with the
+    /// registration, so it keeps the epoll no longer than the registration
+    /// lasts.
+    epoll: std::fs::File,
+}
+
+impl EpollKey {
+    /// Where `epolls` holds the registration in the epoll whose identity is
+    /// `epoll`.
+    fn position(&self, epoll: Option<&EpollIdentity>) -> Option<usize> {
+        self.epolls
+            .iter()
+            .position(|held| match (&held.identity, epoll) {
+                (Some(held), Some(epoll)) => std::ptr::eq(held.as_ptr(), epoll),
+                (None, None) => true,
+                _ => false,
+            })
+    }
+}
+
+// TODO-HUMAN-REVIEW(https://github.com/rrnewton/reverie/pull/1410): Review pidfd ends.
+/// Removes the pidfd's epoll registrations, as Linux's `eventpoll_release`
+/// does when it releases the pidfd's open file description. The host would
+/// remove them itself when the shadow's open file description goes, but a
+/// copy of the shadow that a fork of the supervisor holds keeps that
+/// description, and the registrations with it, past the pidfd's last close.
+impl Drop for GuestPidfd {
+    fn drop(&mut self) {
+        let keys = self
+            .epoll_keys
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for key in keys.values() {
+            for epoll in key.epolls.iter().map(|held| &held.epoll) {
+                // SAFETY: both descriptors are live, and a DEL reads no
+                // event.
+                unsafe {
+                    libc::epoll_ctl(
+                        epoll.as_raw_fd(),
+                        libc::EPOLL_CTL_DEL,
+                        key.file.as_raw_fd(),
+                        std::ptr::null_mut(),
+                    )
+                };
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Makes this thread's next epoll copy fail, as a full descriptor table
+    /// would.
+    pub(super) static EPOLL_COPY_FAILS_TEST_HOOK: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// A new host descriptor of the epoll whose host descriptor is `epoll_fd`.
+fn copy_epoll(epoll_fd: RawFd) -> Option<std::fs::File> {
+    #[cfg(test)]
+    if EPOLL_COPY_FAILS_TEST_HOOK.with(|fails| fails.replace(false)) {
+        return None;
+    }
+    // SAFETY: epoll_fd is the caller's live host descriptor of the epoll;
+    // F_DUPFD_CLOEXEC returns a new one.
+    let copy = unsafe { libc::fcntl(epoll_fd, libc::F_DUPFD_CLOEXEC, libc::STDERR_FILENO + 1) };
+    // SAFETY: fcntl returned a new descriptor that nothing else owns.
+    (copy >= 0).then(|| unsafe { std::fs::File::from_raw_fd(copy) })
 }
 
 impl GuestPidfd {
@@ -58,18 +138,25 @@ impl GuestPidfd {
         self.shadow.as_raw_fd()
     }
 
-    /// `epoll_ctl` of `operation` for guest descriptor number `fd` of the
-    /// pidfd, which `control` makes on the host descriptor it is given: the
-    /// number's epoll key. An ADD makes the key if the number has none and
-    /// closes it again if the ADD fails. A MOD or DEL of a number without a
-    /// key names the shadow itself, which no registration names, so the
-    /// host answers it as Linux answers for a registration that does not
-    /// exist: ENOENT, after its other checks. A DEL that succeeds closes the
-    /// key with its last registration.
+    /// `epoll_ctl` of `operation` in the epoll with host descriptor
+    /// `epoll_fd` and identity `epoll`, if it has one, for guest descriptor
+    /// number `fd` of the pidfd, which `control` makes on the host
+    /// descriptor it is given: the number's epoll key. An ADD makes the key
+    /// if the number has none and closes it again if the ADD fails; it also
+    /// keeps a host descriptor of the epoll, for the pidfd's end. An ADD
+    /// that cannot make either fails as Linux fails an allocation, ENOMEM,
+    /// before the host sees it. A MOD or DEL of a number without a key names
+    /// the shadow itself, which no registration names, so the host answers
+    /// it as Linux answers for a registration that does not exist: ENOENT,
+    /// after its other checks. A DEL that succeeds closes the key with its
+    /// last registration. A successful ADD also tells the epoll, whose end
+    /// ends the registration ([`Self::epoll_ended`]).
     pub(super) fn epoll_control(
-        &self,
+        self: &Arc<Self>,
         fd: libc::c_int,
         operation: libc::c_int,
+        epoll_fd: RawFd,
+        epoll: Option<&Arc<EpollIdentity>>,
         control: impl FnOnce(RawFd) -> i64,
     ) -> i64 {
         let mut keys = self
@@ -90,7 +177,7 @@ impl GuestPidfd {
                     )
                 };
                 if key < 0 {
-                    return io_error(std::io::Error::last_os_error());
+                    return negative_errno(libc::ENOMEM);
                 }
                 // SAFETY: fcntl returned a new descriptor that nothing else
                 // owns.
@@ -99,22 +186,53 @@ impl GuestPidfd {
             }
             None => self.shadow.as_raw_fd(),
         };
+        // The host descriptor of the epoll that the registration keeps
+        // (`KeyRegistration::epoll`).
+        let mut epoll_copy = None;
+        if operation == libc::EPOLL_CTL_ADD {
+            match copy_epoll(epoll_fd) {
+                Some(copy) => epoll_copy = Some(copy),
+                None => return negative_errno(libc::ENOMEM),
+            }
+        }
         let result = control(key);
         match (operation, result) {
             (libc::EPOLL_CTL_ADD, 0) => {
                 keys.entry(fd)
                     .or_insert_with(|| EpollKey {
                         file: made.take().expect("an ADD without a key made one"),
-                        registrations: 0,
+                        epolls: Vec::new(),
                     })
-                    .registrations += 1;
+                    .epolls
+                    .push(KeyRegistration {
+                        identity: epoll.map(Arc::downgrade),
+                        epoll: epoll_copy.take().expect("an ADD made its epoll copy"),
+                    });
+                // An epoll whose last descriptor another thread closed since
+                // this call found it ends the registration with the call.
+                if let Some(epoll) = epoll
+                    && !epoll.register_pidfd(self, fd)
+                    && let std::collections::btree_map::Entry::Occupied(mut key) = keys.entry(fd)
+                {
+                    if let Some(held) = key.get().position(Some(epoll)) {
+                        key.get_mut().epolls.swap_remove(held);
+                    }
+                    if key.get().epolls.is_empty() {
+                        key.remove();
+                    }
+                }
             }
             (libc::EPOLL_CTL_DEL, 0) => {
                 if let std::collections::btree_map::Entry::Occupied(mut key) = keys.entry(fd) {
-                    key.get_mut().registrations -= 1;
-                    if key.get().registrations == 0 {
+                    if let Some(held) = key.get().position(epoll.map(Arc::as_ref)) {
+                        key.get_mut().epolls.swap_remove(held);
+                    }
+                    if key.get().epolls.is_empty() {
                         key.remove();
                     }
+                }
+                if let Some(epoll) = epoll {
+                    epoll.unregister_pidfd(self, fd);
                 }
             }
             _ => {}
@@ -122,9 +240,40 @@ impl GuestPidfd {
         result
     }
 
+    /// Ends the registration of guest descriptor number `fd` of the pidfd
+    /// in `epoll`, whose open file description has ended, and closes the
+    /// number's key if it was the last.
+    pub(super) fn epoll_ended(&self, fd: libc::c_int, epoll: &EpollIdentity) {
+        let _ended;
+        let mut keys = self
+            .epoll_keys
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let std::collections::btree_map::Entry::Occupied(mut key) = keys.entry(fd) {
+            if let Some(held) = key.get().position(Some(epoll)) {
+                key.get_mut().epolls.swap_remove(held);
+            }
+            if key.get().epolls.is_empty() {
+                _ended = key.remove();
+            }
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn shadow(&self) -> std::sync::Weak<std::fs::File> {
         Arc::downgrade(&self.shadow)
+    }
+
+    /// How many epoll registrations name the pidfd, each with its host
+    /// descriptor of the epoll.
+    #[cfg(test)]
+    pub(super) fn epoll_registrations(&self) -> usize {
+        self.epoll_keys
+            .lock()
+            .unwrap()
+            .values()
+            .map(|key| key.epolls.len())
+            .sum()
     }
 }
 

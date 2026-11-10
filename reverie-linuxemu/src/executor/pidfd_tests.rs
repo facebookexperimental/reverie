@@ -886,6 +886,91 @@ fn waitid_waits_for_the_child_a_pidfd_names() {
     );
 }
 
+/// A thread's waitid(P_PIDFD) finds a pidfd that another thread of its
+/// process opened since the waiter's last call, in their shared table: a
+/// nonblocking pidfd for a live child gives EAGAIN, not EBADF. Reviewer
+/// regression from https://github.com/rrnewton/reverie/pull/1410.
+#[test]
+fn waitid_of_a_pidfd_another_thread_opened_finds_it() {
+    let root = TestDir::new();
+    let memory = pidfd_test_memory();
+    let (mut parent, _child) = pidfd_test_family(&root, 2);
+    let mut sibling = parent.thread_child(9).unwrap();
+    let fd = pidfd_test_open(&mut parent, &memory, 2, libc::O_NONBLOCK as u64);
+    assert!(fd >= 0);
+    assert_eq!(
+        pidfd_test_call(
+            &mut sibling,
+            &memory,
+            libc::SYS_waitid,
+            [
+                libc::P_PIDFD as u64,
+                fd as u64,
+                PIDFD_TEST_INFO,
+                libc::WEXITED as u64,
+                0,
+                0
+            ]
+        ),
+        -(libc::EAGAIN as i64),
+        "the sibling shares the newly opened pidfd"
+    );
+}
+
+/// A thread's waitid(P_PIDFD) waits for the process that its descriptor
+/// names in the shared table now, though another thread replaced the
+/// descriptor with a pidfd for another child after the waiter's last call.
+#[test]
+fn waitid_of_a_pidfd_another_thread_replaced_waits_for_the_new_process() {
+    let root = TestDir::new();
+    let memory = pidfd_test_memory();
+    let (mut parent, _living) = pidfd_test_family(&root, 2);
+    let mut exiting = parent.fork_child(3, false, false).unwrap();
+    let mut sibling = parent.thread_child(9).unwrap();
+    let fd = pidfd_test_open(&mut parent, &memory, 2, libc::O_NONBLOCK as u64);
+    // The sibling's last call before its wait: its table has `fd`, naming
+    // the live child 2.
+    let flags = pidfd_test_call(
+        &mut sibling,
+        &memory,
+        libc::SYS_fcntl,
+        [fd as u64, libc::F_GETFL as u64, 0, 0, 0, 0],
+    );
+    assert_ne!(flags & i64::from(libc::O_NONBLOCK), 0);
+    let replacement = pidfd_test_open(&mut parent, &memory, 3, libc::O_NONBLOCK as u64);
+    assert_eq!(
+        pidfd_test_call(
+            &mut parent,
+            &memory,
+            libc::SYS_dup2,
+            [replacement as u64, fd as u64, 0, 0, 0, 0]
+        ),
+        fd
+    );
+    pidfd_test_exit(&mut parent, &mut exiting);
+    assert_eq!(
+        pidfd_test_call(
+            &mut sibling,
+            &memory,
+            libc::SYS_waitid,
+            [
+                libc::P_PIDFD as u64,
+                fd as u64,
+                PIDFD_TEST_INFO,
+                libc::WEXITED as u64,
+                0,
+                0
+            ]
+        ),
+        0
+    );
+    let info: GuestWaitidSiginfo = read_struct(&memory, PIDFD_TEST_INFO);
+    assert_eq!(
+        (info.si_signo, info.si_code, info.si_pid, info.si_status),
+        (libc::SIGCHLD, libc::CLD_EXITED, 3, 7)
+    );
+}
+
 /// The events that `epoll_wait` with a zero timeout reports for `epoll`, by
 /// registration data.
 fn pidfd_test_epoll_wait(
@@ -1562,6 +1647,541 @@ fn epoll_registrations_of_a_pidfd_last_as_linux_registrations_do() {
     assert!(pidfd_test_epoll_wait(&mut parent, &memory, second).is_empty());
 }
 
+/// The end of a pidfd removes its epoll registrations, as Linux's
+/// `eventpoll_release` does when it releases the pidfd's open file
+/// description, though a copy of its shadow is still open, as a fork of the
+/// supervisor's process holds one until it execs: the host alone would keep
+/// the registrations while the copy keeps the shadow's description, and
+/// show the reap through them.
+#[test]
+fn a_closed_pidfd_leaves_no_epoll_registration_while_a_copy_of_its_shadow_is_open() {
+    let root = TestDir::new();
+    let memory = pidfd_test_memory();
+    let (mut parent, mut child) = pidfd_test_family(&root, 2);
+    let fd = pidfd_test_open(&mut parent, &memory, 2, 0);
+    let epoll = pidfd_test_call(&mut parent, &memory, libc::SYS_epoll_create1, [0; 6]);
+    assert_eq!(
+        pidfd_test_epoll_ctl(
+            &mut parent,
+            &memory,
+            epoll,
+            libc::EPOLL_CTL_ADD,
+            fd,
+            libc::EPOLLIN as u32,
+            5
+        ),
+        0
+    );
+    let shadow = pidfd_test_record(&parent, fd).readiness_fd();
+    // SAFETY: the shadow is live; F_DUPFD_CLOEXEC returns a new descriptor.
+    let copy = unsafe { libc::fcntl(shadow, libc::F_DUPFD_CLOEXEC, libc::STDERR_FILENO + 1) };
+    assert!(copy >= 0);
+    // SAFETY: fcntl returned a new descriptor that nothing else owns.
+    let copy = unsafe { std::fs::File::from_raw_fd(copy) };
+    assert_eq!(
+        pidfd_test_call(
+            &mut parent,
+            &memory,
+            libc::SYS_close,
+            [fd as u64, 0, 0, 0, 0, 0]
+        ),
+        0
+    );
+    pidfd_test_exit(&mut parent, &mut child);
+    pidfd_test_reap(&mut parent, &memory, 2);
+    assert!(
+        pidfd_test_epoll_wait(&mut parent, &memory, epoll).is_empty(),
+        "the closed pidfd's registration is gone"
+    );
+    drop(copy);
+}
+
+/// The close of an epoll's last descriptor ends its registrations of a
+/// pidfd beside an idle thread, whose snapshot still names the epoll: they
+/// go with the epoll's open file description, not with the last reference
+/// to it, and so do their host descriptors of the epoll.
+#[test]
+fn closing_an_epoll_ends_its_pidfd_registrations_beside_an_idle_thread() {
+    let root = TestDir::new();
+    let memory = pidfd_test_memory();
+    let (mut parent, _child) = pidfd_test_family(&root, 2);
+    let fd = pidfd_test_open(&mut parent, &memory, 2, 0);
+    let link = pidfd_test_shadow_link(&parent, fd);
+    let epoll = pidfd_test_call(&mut parent, &memory, libc::SYS_epoll_create1, [0; 6]);
+    assert_eq!(
+        pidfd_test_epoll_ctl(
+            &mut parent,
+            &memory,
+            epoll,
+            libc::EPOLL_CTL_ADD,
+            fd,
+            libc::EPOLLIN as u32,
+            3
+        ),
+        0
+    );
+    let _idle_thread = parent.thread_child(9).unwrap();
+    assert_eq!(pidfd_test_socket_descriptors(&link), 2);
+    assert_eq!(pidfd_test_record(&parent, fd).epoll_registrations(), 1);
+    assert_eq!(
+        pidfd_test_call(
+            &mut parent,
+            &memory,
+            libc::SYS_close,
+            [epoll as u64, 0, 0, 0, 0, 0]
+        ),
+        0
+    );
+    assert_eq!(pidfd_test_socket_descriptors(&link), 1);
+    assert_eq!(pidfd_test_record(&parent, fd).epoll_registrations(), 0);
+}
+
+/// So does the exit of a fork whose table held the epoll's last
+/// descriptor, beside the parent's idle thread, whose snapshot still names
+/// the epoll.
+#[test]
+fn a_forks_exit_with_an_epolls_last_descriptor_ends_its_pidfd_registrations() {
+    let root = TestDir::new();
+    let memory = pidfd_test_memory();
+    let (mut parent, _child) = pidfd_test_family(&root, 2);
+    let fd = pidfd_test_open(&mut parent, &memory, 2, 0);
+    let link = pidfd_test_shadow_link(&parent, fd);
+    let epoll = pidfd_test_call(&mut parent, &memory, libc::SYS_epoll_create1, [0; 6]);
+    assert_eq!(
+        pidfd_test_epoll_ctl(
+            &mut parent,
+            &memory,
+            epoll,
+            libc::EPOLL_CTL_ADD,
+            fd,
+            libc::EPOLLIN as u32,
+            2
+        ),
+        0
+    );
+    let _idle_thread = parent.thread_child(9).unwrap();
+    let mut forked = parent.fork_child(3, false, false).unwrap();
+    assert_eq!(
+        pidfd_test_call(
+            &mut parent,
+            &memory,
+            libc::SYS_close,
+            [epoll as u64, 0, 0, 0, 0, 0]
+        ),
+        0
+    );
+    assert_eq!(
+        pidfd_test_socket_descriptors(&link),
+        2,
+        "the fork's descriptor keeps the epoll"
+    );
+    forked.release_files_on_exit();
+    assert_eq!(pidfd_test_socket_descriptors(&link), 1);
+}
+
+/// A call that found an epoll before another thread closed its last
+/// descriptor still makes its ADD of a pidfd, as Linux's `fdget` keeps the
+/// epoll for the call, but the registration ends with the epoll's open file
+/// description: no host descriptor of the shadow or the epoll stays behind.
+#[test]
+fn an_add_of_a_pidfd_to_an_epoll_another_thread_closed_meanwhile_leaves_nothing() {
+    let root = TestDir::new();
+    let memory = pidfd_test_memory();
+    let (parent, _child) = pidfd_test_family(&root, 2);
+    let parent = std::rc::Rc::new(std::cell::RefCell::new(parent));
+    let fd = pidfd_test_open(&mut parent.borrow_mut(), &memory, 2, 0);
+    let link = pidfd_test_shadow_link(&parent.borrow(), fd);
+    let epoll = pidfd_test_call(
+        &mut parent.borrow_mut(),
+        &memory,
+        libc::SYS_epoll_create1,
+        [0; 6],
+    );
+    let mut thread = parent.borrow().thread_child(9).unwrap();
+    let closer = parent.clone();
+    COPY_REACHED_TEST_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            let memory = pidfd_test_memory();
+            assert_eq!(
+                pidfd_test_call(
+                    &mut closer.borrow_mut(),
+                    &memory,
+                    libc::SYS_close,
+                    [epoll as u64, 0, 0, 0, 0, 0]
+                ),
+                0
+            );
+        }))
+    });
+    assert_eq!(
+        pidfd_test_epoll_ctl(
+            &mut thread,
+            &memory,
+            epoll,
+            libc::EPOLL_CTL_ADD,
+            fd,
+            libc::EPOLLIN as u32,
+            1
+        ),
+        0
+    );
+    assert!(
+        COPY_REACHED_TEST_HOOK.with(|hook| hook.borrow().is_none()),
+        "the close ran during the ADD"
+    );
+    assert_eq!(pidfd_test_socket_descriptors(&link), 1);
+    assert_eq!(
+        pidfd_test_record(&parent.borrow(), fd).epoll_registrations(),
+        0
+    );
+}
+
+/// Sends `fd` in an `SCM_RIGHTS` message through a new socket pair, and
+/// returns the descriptor that receiving it gives.
+fn pidfd_test_pass_right(executor: &mut ElfExecutor, memory: &GuestMemory, fd: i64) -> i64 {
+    assert_eq!(
+        pidfd_test_call(
+            executor,
+            memory,
+            libc::SYS_socketpair,
+            [
+                libc::AF_UNIX as u64,
+                libc::SOCK_STREAM as u64,
+                0,
+                PIDFD_TEST_PAIR,
+                0,
+                0
+            ],
+        ),
+        0
+    );
+    let mut pair = [0_u8; 8];
+    memory.read_raw(PIDFD_TEST_PAIR, &mut pair).unwrap();
+    let sender = i32::from_ne_bytes(pair[..4].try_into().unwrap());
+    let receiver = i32::from_ne_bytes(pair[4..].try_into().unwrap());
+    memory.write_raw(PIDFD_TEST_BYTE, b"x").unwrap();
+    let iov = libc::iovec {
+        iov_base: PIDFD_TEST_BYTE as *mut libc::c_void,
+        iov_len: 1,
+    };
+    assert_eq!(
+        write_struct(&mut ProviderMemory(memory), PIDFD_TEST_IOV, &iov),
+        0
+    );
+    let control = rights_control(&[fd as libc::c_int]);
+    // SAFETY: msghdr is plain data; a zeroed one names nothing.
+    let mut message = unsafe { std::mem::zeroed::<libc::msghdr>() };
+    message.msg_iov = PIDFD_TEST_IOV as *mut libc::iovec;
+    message.msg_iovlen = 1;
+    message.msg_control = PIDFD_TEST_CONTROL as *mut libc::c_void;
+    message.msg_controllen = control.len();
+    for (socket, number, contents) in [
+        (sender, libc::SYS_sendmsg, control.clone()),
+        (receiver, libc::SYS_recvmsg, vec![0; control.len()]),
+    ] {
+        memory.write_raw(PIDFD_TEST_CONTROL, &contents).unwrap();
+        assert_eq!(
+            write_struct(&mut ProviderMemory(memory), PIDFD_TEST_MESSAGE, &message),
+            0
+        );
+        assert_eq!(
+            pidfd_test_call(
+                executor,
+                memory,
+                number,
+                [socket as u64, PIDFD_TEST_MESSAGE, 0, 0, 0, 0]
+            ),
+            1,
+            "syscall {number}"
+        );
+    }
+    let mut received = [0_u8; 4];
+    memory
+        .read_raw(
+            PIDFD_TEST_CONTROL + std::mem::size_of::<libc::cmsghdr>() as u64,
+            &mut received,
+        )
+        .unwrap();
+    for socket in [sender, receiver] {
+        assert_eq!(
+            pidfd_test_call(
+                executor,
+                memory,
+                libc::SYS_close,
+                [socket as u64, 0, 0, 0, 0, 0]
+            ),
+            0
+        );
+    }
+    i64::from(i32::from_ne_bytes(received))
+}
+
+/// An epoll that an `SCM_RIGHTS` message carried may outlive every
+/// descriptor of it that the sender's table counts, so its registration of
+/// a pidfd outlives them too, until its DEL, as Linux's lasts while the
+/// receiver holds the epoll: the received descriptor's ADD finds it
+/// (EEXIST), its DEL removes it, and a new ADD makes one registration, not
+/// two.
+#[test]
+fn a_pidfd_registration_in_an_epoll_passed_in_scm_rights_lasts_until_its_del() {
+    let root = TestDir::new();
+    let memory = pidfd_test_memory();
+    let (mut parent, mut child) = pidfd_test_family(&root, 2);
+    let fd = pidfd_test_open(&mut parent, &memory, 2, 0);
+    let link = pidfd_test_shadow_link(&parent, fd);
+    let epoll = pidfd_test_call(&mut parent, &memory, libc::SYS_epoll_create1, [0; 6]);
+    let control = |parent: &mut ElfExecutor, epoll: i64, operation: libc::c_int, data: u64| {
+        pidfd_test_epoll_ctl(
+            parent,
+            &memory,
+            epoll,
+            operation,
+            fd,
+            libc::EPOLLIN as u32,
+            data,
+        )
+    };
+    assert_eq!(control(&mut parent, epoll, libc::EPOLL_CTL_ADD, 4), 0);
+    let received = pidfd_test_pass_right(&mut parent, &memory, epoll);
+    assert!(received >= 0);
+    assert_eq!(
+        pidfd_test_call(
+            &mut parent,
+            &memory,
+            libc::SYS_close,
+            [epoll as u64, 0, 0, 0, 0, 0]
+        ),
+        0
+    );
+    assert_eq!(
+        pidfd_test_socket_descriptors(&link),
+        2,
+        "the received epoll keeps the registration"
+    );
+    assert_eq!(
+        control(&mut parent, received, libc::EPOLL_CTL_ADD, 5),
+        negative_errno(libc::EEXIST)
+    );
+    assert_eq!(control(&mut parent, received, libc::EPOLL_CTL_DEL, 0), 0);
+    assert_eq!(control(&mut parent, received, libc::EPOLL_CTL_ADD, 5), 0);
+    pidfd_test_exit(&mut parent, &mut child);
+    assert_eq!(
+        pidfd_test_epoll_wait(&mut parent, &memory, received),
+        BTreeMap::from([(5, libc::EPOLLIN as u32)])
+    );
+}
+
+/// An `SCM_RIGHTS` message makes another descriptor of the same epoll open
+/// file description, so closing the epoll's original descriptor leaves the
+/// pidfd's registration, and its ADD/DEL identity, to the received one: its
+/// DEL removes it, a new ADD replaces it, and the exit and the reap show
+/// through the replacement alone. Reviewer regression from
+/// https://github.com/rrnewton/reverie/pull/1410.
+#[test]
+fn an_epoll_passed_in_scm_rights_keeps_its_pidfd_registration_after_its_original_closes() {
+    let root = TestDir::new();
+    let memory = pidfd_test_memory();
+    let (mut parent, mut child) = pidfd_test_family(&root, 2);
+    let pidfd = pidfd_test_open(&mut parent, &memory, 2, 0);
+    assert!(pidfd >= 0);
+    let original = pidfd_test_call(&mut parent, &memory, libc::SYS_epoll_create1, [0; 6]);
+    assert!(original >= 0);
+    assert_eq!(
+        pidfd_test_epoll_ctl(
+            &mut parent,
+            &memory,
+            original,
+            libc::EPOLL_CTL_ADD,
+            pidfd,
+            libc::EPOLLIN as u32,
+            141,
+        ),
+        0
+    );
+    assert_eq!(
+        pidfd_test_call(
+            &mut parent,
+            &memory,
+            libc::SYS_socketpair,
+            [
+                libc::AF_UNIX as u64,
+                libc::SOCK_DGRAM as u64,
+                0,
+                PIDFD_TEST_PAIR,
+                0,
+                0,
+            ],
+        ),
+        0
+    );
+    let [sender, receiver]: [libc::c_int; 2] = read_struct(&memory, PIDFD_TEST_PAIR);
+    memory.write_raw(PIDFD_TEST_BYTE, b"x").unwrap();
+    let iov = libc::iovec {
+        iov_base: PIDFD_TEST_BYTE as usize as *mut libc::c_void,
+        iov_len: 1,
+    };
+    assert_eq!(
+        write_struct(&mut ProviderMemory(&memory), PIDFD_TEST_IOV, &iov),
+        0
+    );
+    let control = rights_control(&[original as libc::c_int]);
+    assert!(control.len() <= RIGHTS_CONTROL_CAPACITY);
+    memory.write_raw(PIDFD_TEST_CONTROL, &control).unwrap();
+    // SAFETY: msghdr is plain data, and its pointer fields below name guest
+    // addresses which the executor copies before calling the host.
+    let mut message = unsafe { std::mem::zeroed::<libc::msghdr>() };
+    message.msg_iov = PIDFD_TEST_IOV as usize as *mut libc::iovec;
+    message.msg_iovlen = 1;
+    message.msg_control = PIDFD_TEST_CONTROL as usize as *mut libc::c_void;
+    message.msg_controllen = control.len();
+    assert_eq!(
+        write_struct(&mut ProviderMemory(&memory), PIDFD_TEST_MESSAGE, &message),
+        0
+    );
+    assert_eq!(
+        pidfd_test_call(
+            &mut parent,
+            &memory,
+            libc::SYS_sendmsg,
+            [sender as u64, PIDFD_TEST_MESSAGE, 0, 0, 0, 0],
+        ),
+        1,
+        "sending the epoll transfers its open file description"
+    );
+
+    memory
+        .write_raw(PIDFD_TEST_CONTROL, &[0_u8; RIGHTS_CONTROL_CAPACITY])
+        .unwrap();
+    message.msg_controllen = RIGHTS_CONTROL_CAPACITY;
+    assert_eq!(
+        write_struct(&mut ProviderMemory(&memory), PIDFD_TEST_MESSAGE, &message),
+        0
+    );
+    assert_eq!(
+        pidfd_test_call(
+            &mut parent,
+            &memory,
+            libc::SYS_recvmsg,
+            [
+                receiver as u64,
+                PIDFD_TEST_MESSAGE,
+                libc::MSG_DONTWAIT as u64,
+                0,
+                0,
+                0,
+            ],
+        ),
+        1
+    );
+    let received: libc::msghdr = read_struct(&memory, PIDFD_TEST_MESSAGE);
+    assert_eq!(received.msg_flags & libc::MSG_CTRUNC, 0);
+    let mut control = vec![0_u8; received.msg_controllen];
+    memory.read_raw(PIDFD_TEST_CONTROL, &mut control).unwrap();
+    let rights = control_rights(&control);
+    assert_eq!(rights.len(), 1);
+    let imported = i64::from(rights[0]);
+    assert_ne!(imported, original);
+    assert!(pidfd_test_epoll_wait(&mut parent, &memory, imported).is_empty());
+
+    assert_eq!(
+        pidfd_test_call(
+            &mut parent,
+            &memory,
+            libc::SYS_close,
+            [original as u64, 0, 0, 0, 0, 0],
+        ),
+        0
+    );
+    assert_eq!(
+        pidfd_test_epoll_ctl(
+            &mut parent,
+            &memory,
+            imported,
+            libc::EPOLL_CTL_DEL,
+            pidfd,
+            0,
+            0,
+        ),
+        0,
+        "the received epoll must still find the original pidfd registration"
+    );
+    assert_eq!(
+        pidfd_test_epoll_ctl(
+            &mut parent,
+            &memory,
+            imported,
+            libc::EPOLL_CTL_ADD,
+            pidfd,
+            libc::EPOLLIN as u32,
+            142,
+        ),
+        0
+    );
+    pidfd_test_exit(&mut parent, &mut child);
+    assert_eq!(
+        pidfd_test_epoll_wait(&mut parent, &memory, imported),
+        BTreeMap::from([(142, libc::EPOLLIN as u32)]),
+        "the replacement registration reports the exit, without the deleted one"
+    );
+    pidfd_test_reap(&mut parent, &memory, 2);
+    assert_eq!(
+        pidfd_test_epoll_wait(&mut parent, &memory, imported),
+        BTreeMap::from([(142, (libc::EPOLLIN | libc::EPOLLHUP) as u32)])
+    );
+    assert_eq!(
+        pidfd_test_epoll_ctl(
+            &mut parent,
+            &memory,
+            imported,
+            libc::EPOLL_CTL_DEL,
+            pidfd,
+            0,
+            0,
+        ),
+        0
+    );
+    assert!(pidfd_test_epoll_wait(&mut parent, &memory, imported).is_empty());
+}
+
+/// An ADD of a pidfd that cannot keep its host descriptor of the epoll, for
+/// the pidfd's end to remove the registration through, fails as Linux's
+/// `epoll_ctl` fails an allocation, ENOMEM, and leaves nothing behind.
+#[test]
+fn an_epoll_add_of_a_pidfd_that_cannot_keep_its_epoll_fails_with_enomem() {
+    let root = TestDir::new();
+    let memory = pidfd_test_memory();
+    let (mut parent, mut child) = pidfd_test_family(&root, 2);
+    let fd = pidfd_test_open(&mut parent, &memory, 2, 0);
+    let link = pidfd_test_shadow_link(&parent, fd);
+    let epoll = pidfd_test_call(&mut parent, &memory, libc::SYS_epoll_create1, [0; 6]);
+    let add = |parent: &mut ElfExecutor| {
+        pidfd_test_epoll_ctl(
+            parent,
+            &memory,
+            epoll,
+            libc::EPOLL_CTL_ADD,
+            fd,
+            libc::EPOLLIN as u32,
+            6,
+        )
+    };
+    EPOLL_COPY_FAILS_TEST_HOOK.with(|fails| fails.set(true));
+    assert_eq!(add(&mut parent), negative_errno(libc::ENOMEM));
+    assert_eq!(pidfd_test_socket_descriptors(&link), 1);
+    assert_eq!(pidfd_test_record(&parent, fd).epoll_registrations(), 0);
+    pidfd_test_exit(&mut parent, &mut child);
+    assert!(
+        pidfd_test_epoll_wait(&mut parent, &memory, epoll).is_empty(),
+        "the failed ADD registered nothing"
+    );
+    assert_eq!(add(&mut parent), 0);
+    assert_eq!(pidfd_test_socket_descriptors(&link), 2);
+    assert_eq!(
+        pidfd_test_epoll_wait(&mut parent, &memory, epoll),
+        BTreeMap::from([(6, libc::EPOLLIN as u32)])
+    );
+}
+
 /// Epoll controls of a pidfd that fail leave no host descriptor of its
 /// shadow behind, as Linux's leave nothing: here 32 DELs of numbers the
 /// epoll does not name. Reviewer regression from
@@ -1646,6 +2266,184 @@ fn failed_epoll_controls_of_a_pidfd_leave_no_shadow_descriptor() {
         negative_errno(libc::EINVAL)
     );
     assert_eq!(count(), before);
+}
+
+/// An epoll that closes without a DEL ends its registrations of a pidfd, as
+/// Linux frees an eventpoll's registrations with it, and with them the host
+/// descriptors that stood for the registrations' numbers: here 32 epolls,
+/// each closed before its registration's number. Reviewer regression from
+/// https://github.com/rrnewton/reverie/pull/1410.
+#[test]
+fn closed_epolls_leave_no_shadow_descriptor_of_a_pidfd() {
+    let root = TestDir::new();
+    let memory = pidfd_test_memory();
+    let (mut parent, _child) = pidfd_test_family(&root, 2);
+    let fd = pidfd_test_open(&mut parent, &memory, 2, 0);
+    assert!(fd >= 0);
+    let link = pidfd_test_shadow_link(&parent, fd);
+    assert_eq!(pidfd_test_socket_descriptors(&link), 1);
+    for alias in 100..132 {
+        assert_eq!(
+            pidfd_test_call(
+                &mut parent,
+                &memory,
+                libc::SYS_dup2,
+                [fd as u64, alias, 0, 0, 0, 0]
+            ),
+            alias as i64
+        );
+        let epoll = pidfd_test_call(&mut parent, &memory, libc::SYS_epoll_create1, [0; 6]);
+        assert!(epoll >= 0);
+        assert_eq!(
+            pidfd_test_epoll_ctl(
+                &mut parent,
+                &memory,
+                epoll,
+                libc::EPOLL_CTL_ADD,
+                alias as i64,
+                libc::EPOLLIN as u32,
+                alias
+            ),
+            0
+        );
+        for closing in [epoll as u64, alias] {
+            assert_eq!(
+                pidfd_test_call(
+                    &mut parent,
+                    &memory,
+                    libc::SYS_close,
+                    [closing, 0, 0, 0, 0, 0]
+                ),
+                0
+            );
+        }
+    }
+    assert_eq!(
+        pidfd_test_socket_descriptors(&link),
+        1,
+        "closed epolls must not leave shadow keys behind"
+    );
+}
+
+/// A registration of a pidfd lasts while any descriptor of its epoll does,
+/// a dup's or a fork's, as Linux's eventpoll lives while its file does, and
+/// ends with the last of them, though the registration's own number closed
+/// first; the end of one epoll leaves the number's registration in another.
+#[test]
+fn an_epoll_registration_of_a_pidfd_lasts_while_an_alias_of_the_epoll_does() {
+    let root = TestDir::new();
+    let memory = pidfd_test_memory();
+    let (mut parent, mut child) = pidfd_test_family(&root, 2);
+    let fd = pidfd_test_open(&mut parent, &memory, 2, 0);
+    let link = pidfd_test_shadow_link(&parent, fd);
+    let alias = pidfd_test_call(
+        &mut parent,
+        &memory,
+        libc::SYS_dup,
+        [fd as u64, 0, 0, 0, 0, 0],
+    );
+    let epoll = pidfd_test_call(&mut parent, &memory, libc::SYS_epoll_create1, [0; 6]);
+    let other = pidfd_test_call(&mut parent, &memory, libc::SYS_epoll_create1, [0; 6]);
+    let add = |parent: &mut ElfExecutor, target: i64, data: u64| {
+        assert_eq!(
+            pidfd_test_epoll_ctl(
+                parent,
+                &memory,
+                target,
+                libc::EPOLL_CTL_ADD,
+                alias,
+                libc::EPOLLIN as u32,
+                data
+            ),
+            0
+        );
+    };
+    let close = |parent: &mut ElfExecutor, closing: i64| {
+        assert_eq!(
+            pidfd_test_call(
+                parent,
+                &memory,
+                libc::SYS_close,
+                [closing as u64, 0, 0, 0, 0, 0]
+            ),
+            0
+        );
+    };
+    add(&mut parent, epoll, 7);
+    let epoll_dup = pidfd_test_call(
+        &mut parent,
+        &memory,
+        libc::SYS_dup,
+        [epoll as u64, 0, 0, 0, 0, 0],
+    );
+    close(&mut parent, alias);
+    close(&mut parent, epoll);
+    // The shadow, and the key of the closed number, which only the epoll's
+    // dup still names.
+    assert_eq!(
+        pidfd_test_socket_descriptors(&link),
+        2,
+        "the epoll's dup keeps the registration"
+    );
+    // The number again, now also in the other epoll.
+    assert_eq!(
+        pidfd_test_call(
+            &mut parent,
+            &memory,
+            libc::SYS_dup2,
+            [fd as u64, alias as u64, 0, 0, 0, 0]
+        ),
+        alias
+    );
+    add(&mut parent, other, 8);
+    let mut forked = parent.fork_child(3, false, false).unwrap();
+    pidfd_test_exit(&mut parent, &mut child);
+    let exited = libc::EPOLLIN as u32;
+    assert_eq!(
+        pidfd_test_epoll_wait(&mut parent, &memory, epoll_dup),
+        BTreeMap::from([(7, exited)])
+    );
+    close(&mut parent, epoll_dup);
+    // The fork's descriptor of the first epoll ends with its files, and the
+    // first epoll with it; the other epoll's registration remains.
+    forked.release_files_on_exit();
+    assert_eq!(pidfd_test_socket_descriptors(&link), 2);
+    assert_eq!(
+        pidfd_test_epoll_wait(&mut parent, &memory, other),
+        BTreeMap::from([(8, exited)])
+    );
+    close(&mut parent, other);
+    assert_eq!(pidfd_test_socket_descriptors(&link), 1);
+}
+
+/// The last task's exit ends its epolls' registrations of a pidfd, as
+/// Linux's `exit_files` frees the epolls, even while something else holds
+/// its table and another process holds the pidfd.
+#[test]
+fn the_last_tasks_exit_ends_its_epolls_pidfd_registrations_while_an_observer_holds_its_table() {
+    let root = TestDir::new();
+    let memory = pidfd_test_memory();
+    let (mut parent, _child) = pidfd_test_family(&root, 2);
+    let fd = pidfd_test_open(&mut parent, &memory, 2, 0);
+    let link = pidfd_test_shadow_link(&parent, fd);
+    let mut forked = parent.fork_child(3, false, false).unwrap();
+    let epoll = pidfd_test_call(&mut forked, &memory, libc::SYS_epoll_create1, [0; 6]);
+    assert_eq!(
+        pidfd_test_epoll_ctl(
+            &mut forked,
+            &memory,
+            epoll,
+            libc::EPOLL_CTL_ADD,
+            fd,
+            libc::EPOLLIN as u32,
+            0
+        ),
+        0
+    );
+    assert_eq!(pidfd_test_socket_descriptors(&link), 2);
+    let _observer = forked.file_table.clone();
+    forked.release_files_on_exit();
+    assert_eq!(pidfd_test_socket_descriptors(&link), 1);
 }
 
 /// Exec keeps a pidfd's descriptors that are not close-on-exec, and the

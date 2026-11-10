@@ -95,6 +95,17 @@ impl FileTableState {
             .collect()
     }
 
+    /// Takes the table's native poll bindings out, for the last task's exit,
+    /// as [`Self::take_pidfds`] takes its pidfd records: the caller drops
+    /// them once it has released the table, and an epoll's last binding ends
+    /// the epoll's pidfd registrations (`EpollIdentity`).
+    pub(super) fn take_native_polls(&mut self) -> Vec<Arc<NativePollBinding>> {
+        self.slots
+            .values_mut()
+            .filter_map(|slot| slot.native_poll.take())
+            .collect()
+    }
+
     /// The published entry identity for `fd` (slot-owned since slice 16).
     pub(super) fn entry_id(&self, fd: i32) -> Option<&Arc<crate::elf::FdEntry>> {
         self.slots.get(&fd).and_then(|slot| slot.entry_id.as_ref())

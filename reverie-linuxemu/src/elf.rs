@@ -1431,13 +1431,7 @@ impl LoadedStaticElf {
     /// callers retire them after both the authoritative file-table and
     /// signal-transaction guards are released.
     pub fn insert_file(&mut self, fd: i32, file: std::fs::File) -> Vec<std::fs::File> {
-        {
-            let domain = self.epoll_domain.clone();
-            let _proof = domain.lock().expect("KVM epoll provenance lock poisoned");
-            if let Some(binding) = self.native_poll_fds.remove(&fd) {
-                binding.retire();
-            }
-        }
+        self.retire_native_poll(fd);
         self.pipe_owners.remove(&fd);
         self.guest_pidfds.remove(&fd);
         let mut retired: Vec<_> = self.files.insert(fd, file).into_iter().collect();
@@ -1477,14 +1471,25 @@ impl LoadedStaticElf {
         stdin
     }
 
-    pub(crate) fn remove_file(&mut self, fd: i32) -> Option<std::fs::File> {
-        {
+    /// Retires `fd`'s native poll binding under the epoll domain lock. Once
+    /// that leaf lock is released, it ends the epoll whose last descriptor
+    /// this was and drops the binding: an epoll's end ends its pidfd
+    /// registrations, which closes host descriptors (`EpollIdentity`).
+    fn retire_native_poll(&mut self, fd: i32) {
+        let (_binding, ended) = {
             let domain = self.epoll_domain.clone();
             let _proof = domain.lock().expect("KVM epoll provenance lock poisoned");
-            if let Some(binding) = self.native_poll_fds.remove(&fd) {
-                binding.retire();
-            }
+            let binding = self.native_poll_fds.remove(&fd);
+            let ended = binding.as_ref().and_then(|binding| binding.retire());
+            (binding, ended)
+        };
+        if let Some(epoll) = ended {
+            epoll.end();
         }
+    }
+
+    pub(crate) fn remove_file(&mut self, fd: i32) -> Option<std::fs::File> {
+        self.retire_native_poll(fd);
         self.pipe_owners.remove(&fd);
         self.guest_pidfds.remove(&fd);
         let file = self.files.remove(&fd);
@@ -1645,6 +1650,12 @@ impl LoadedStaticElf {
         let regular_create_directory_policy = previous.regular_create_directory_policy;
         let host_vm_facts = previous.host_vm_facts;
         let cloexec_fds = previous.cloexec_fds;
+        // The epolls whose last descriptors were close-on-exec end, and the
+        // close-on-exec bindings drop, once the epoll domain lock, a leaf, is
+        // released: an epoll's end ends its pidfd registrations
+        // (`EpollIdentity`).
+        let mut retired_bindings = Vec::new();
+        let mut ended_epolls = Vec::new();
         let native_poll_fds = {
             let _proof = previous
                 .epoll_domain
@@ -1655,7 +1666,8 @@ impl LoadedStaticElf {
                 .into_iter()
                 .filter_map(|(fd, binding)| {
                     if cloexec_fds.contains(&fd) {
-                        binding.retire();
+                        ended_epolls.extend(binding.retire());
+                        retired_bindings.push(binding);
                         None
                     } else {
                         Some((fd, binding))
@@ -1663,6 +1675,10 @@ impl LoadedStaticElf {
                 })
                 .collect()
         };
+        for epoll in ended_epolls {
+            epoll.end();
+        }
+        drop(retired_bindings);
         let mut retired = Vec::new();
         previous
             .file_retirement

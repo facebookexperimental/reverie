@@ -1064,9 +1064,12 @@ fn mark_exported_rights(state: &LoadedStaticElf, exported: &[libc::c_int]) -> Re
                 .epoll_domain
                 .lock()
                 .expect("KVM epoll provenance lock poisoned");
-            match description {
+            match &description {
                 NativePollDescription::Epoll(identity) => {
-                    if let Some(proof) = domain.proofs.get_mut(&epoll_identity_key(&identity)) {
+                    // A receiver may hold the epoll past every descriptor
+                    // that its entries count (`EpollIdentity::escaped`).
+                    identity.escaped.store(true, Ordering::SeqCst);
+                    if let Some(proof) = domain.proofs.get_mut(&epoll_identity_key(identity)) {
                         proof.unsafe_history = true;
                     }
                 }

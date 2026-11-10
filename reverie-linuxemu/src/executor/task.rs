@@ -1851,6 +1851,7 @@ impl ElfExecutor {
         );
         let mut files = Vec::new();
         let mut pidfds = Vec::new();
+        let mut native_polls = Vec::new();
         // Elect the last task independently of transient observer Arcs. A
         // genuine CLONE_FILES sibling still owns the table, so its exit must
         // neither acquire this lock nor remove any of its descriptors.
@@ -1863,14 +1864,17 @@ impl ElfExecutor {
             files.extend(table.stdin.take().map(Owned));
             files.extend(std::mem::take(&mut table.files).into_values().map(Owned));
             pidfds = table.take_pidfds();
+            native_polls = table.take_native_polls();
         }
         // No table guard crosses service submission or descriptor destruction.
         // A separately selected/duplicated File remains a genuine foreign OFD
         // owner; an observer's table Arc alone no longer owns these files.
         drop(table);
         // Nor the pidfds' records, whose shadows close here unless another
-        // table holds them.
+        // table holds them, nor the epolls' bindings, whose last one ends
+        // the epoll's pidfd registrations.
         drop(pidfds);
+        drop(native_polls);
         files.extend(retired.into_values().map(Owned));
         files.extend(stdin.map(Owned));
         if let Some(ProcessAction::Exec {
@@ -1935,6 +1939,7 @@ impl ElfExecutor {
             .take()
             .is_some_and(|owner| Arc::into_inner(owner).is_some());
         let mut pidfds = Vec::new();
+        let mut native_polls = Vec::new();
         if last_task {
             let mut table = table.lock().unwrap_or_else(|p| p.into_inner());
             let stdin = table.stdin.take();
@@ -1943,12 +1948,15 @@ impl ElfExecutor {
                 .file_retirement
                 .retire(stdin.into_iter().chain(files.into_values()));
             pidfds = table.take_pidfds();
+            native_polls = table.take_native_polls();
         }
         drop(table);
         // The pidfds' records go with the table's descriptors, whoever else
         // holds the table; their shadows close here unless another table
-        // holds them.
+        // holds them. So do the epolls' bindings, whose last one ends the
+        // epoll's pidfd registrations.
         drop(pidfds);
+        drop(native_polls);
         let action = self.process_action.take();
         self.state
             .file_retirement
