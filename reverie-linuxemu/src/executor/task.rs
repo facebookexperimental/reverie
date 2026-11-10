@@ -1836,6 +1836,7 @@ impl ElfExecutor {
         self.state.fd_entry_ids.clear();
         self.state.native_poll_fds.clear();
         self.state.pipe_owners.clear();
+        self.state.foreign_pidfds.clear();
         self.state.poll_table_id = Default::default();
         self.state.epoll_domain = Default::default();
         let table = std::mem::replace(
@@ -1907,6 +1908,7 @@ impl ElfExecutor {
         // Snapshot retirement is not a logical close in a surviving table.
         self.state.native_poll_fds.clear();
         self.state.pipe_owners.clear();
+        self.state.foreign_pidfds.clear();
         self.state.poll_table_id = Default::default();
         self.state.epoll_domain = Default::default();
         let table = std::mem::replace(
@@ -2294,6 +2296,18 @@ impl ElfExecutor {
                         }
                     },
                     libc::P_ALL | libc::P_PGID => None,
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    libc::P_PIDFD => match pidfd_wait_target(&self.state, args[1]) {
+                        Ok((pid, _)) => Some(pid),
+                        Err(errno) => {
+                            return Some(Ok(finish_waitid(
+                                &ProviderMemory(memory),
+                                args,
+                                None,
+                                negative_errno(errno),
+                            )));
+                        }
+                    },
                     _ => {
                         return Some(Ok(finish_waitid(
                             &ProviderMemory(memory),

@@ -1934,6 +1934,7 @@ pub(super) fn fcntl(memory: &GuestMemory, state: &mut LoadedStaticElf, args: &[u
     let source_native_poll = native_poll_description(state, guest_fd);
     let source_signalfd_mask = signalfd_mask(state, guest_fd);
     let source_pipe_owner = state.pipe_owners.get(&guest_fd).cloned();
+    let source_foreign_pidfd = foreign_pidfd(state, guest_fd).cloned();
     let Some(host_fd) = host_fd(state, guest_fd) else {
         return negative_errno(libc::EBADF);
     };
@@ -1961,6 +1962,7 @@ pub(super) fn fcntl(memory: &GuestMemory, state: &mut LoadedStaticElf, args: &[u
                 signalfd_mask: source_signalfd_mask,
                 native_poll: source_native_poll,
                 pipe_owner: source_pipe_owner,
+                foreign_pidfd: source_foreign_pidfd,
             },
         ),
         libc::F_DUPFD_CLOEXEC => duplicate_fd_at_or_above(
@@ -1977,6 +1979,7 @@ pub(super) fn fcntl(memory: &GuestMemory, state: &mut LoadedStaticElf, args: &[u
                 signalfd_mask: source_signalfd_mask,
                 native_poll: source_native_poll,
                 pipe_owner: source_pipe_owner,
+                foreign_pidfd: source_foreign_pidfd,
             },
         ),
         libc::F_GETFL => match fd_status_flags(host_fd) {

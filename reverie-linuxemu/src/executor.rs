@@ -138,6 +138,7 @@ mod event_fds;
 use event_fds::*;
 mod facts;
 mod pidfd;
+pub(crate) use pidfd::ForeignPidfd;
 use pidfd::*;
 mod socket;
 use socket::*;
@@ -552,7 +553,9 @@ pub fn native_loaded_state(cwd: &std::path::Path) -> LoadedStaticElf {
         )),
         file_retirement: crate::elf::FileRetirement::default(),
         signal_refusal: None,
+        pidfd_refusal: None,
         pipe_owners: Default::default(),
+        foreign_pidfds: Default::default(),
         fd_entry_ids: std::collections::BTreeMap::new(),
         epoll_domain: Default::default(),
         poll_table_id: Default::default(),
@@ -607,6 +610,7 @@ mod tests {
     include!("executor/host_resources_tests.rs");
     include!("executor/script_line_tests.rs");
     include!("executor/pkeys_tests.rs");
+    include!("executor/pidfd_tests.rs");
     use std::collections::BTreeMap;
     use std::io::Read;
     use std::io::Seek;

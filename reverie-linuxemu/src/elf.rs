@@ -657,6 +657,16 @@ impl TaskLifecycleTable {
             .any(|task| task.tgid == tgid && task.process_generation == generation)
     }
 
+    /// The generation of the live process whose thread group id is `tgid`,
+    /// which a live task of it carries, its leader's or, once the leader has
+    /// exited, a remaining member's.
+    pub(crate) fn live_process_generation(&self, tgid: i32) -> Option<u64> {
+        self.tasks
+            .values()
+            .find(|task| task.tgid == tgid)
+            .map(|task| task.process_generation)
+    }
+
     /// Whether `process` has committed its exit: its thread group's exit
     /// (the first `exit` with `group`), or the exit of its last task. From
     /// then on none of its tasks returns to user mode, whatever their host
@@ -1306,6 +1316,11 @@ pub struct LoadedStaticElf {
     pub file_retirement: FileRetirement,
     pub(crate) pipe_owners:
         std::collections::BTreeMap<i32, std::sync::Arc<crate::executor::pipe_owner::PipeOwner>>,
+    /// The pidfds for other guest processes (`crate::executor::ForeignPidfd`).
+    /// Every alias of one, from dup or fork, shares its record; insertion and
+    /// removal drop the record of the descriptor they replace.
+    pub(crate) foreign_pidfds:
+        std::collections::BTreeMap<i32, std::sync::Arc<crate::executor::ForeignPidfd>>,
     /// Identity of each descriptor entry, independent of its filesystem object.
     /// Insertion, including a dup destination, creates a new identity. Table
     /// snapshots and fork copies retain it so unchanged host handles stay stable.
@@ -1360,6 +1375,11 @@ pub struct LoadedStaticElf {
     /// same syscall boundary, which turns it into the typed refusal
     /// `UnsupportedOperation::Signal`. Never carried across fork or exec.
     pub(crate) signal_refusal: Option<&'static str>,
+    /// Why the call just executed was refused with ENOSYS for a pidfd for
+    /// another process (`crate::executor::ForeignPidfd`), if it was. Taken at
+    /// the same syscall boundary as `signal_refusal`, as the typed refusal
+    /// `UnsupportedOperation::Pidfd`. Never carried across fork or exec.
+    pub(crate) pidfd_refusal: Option<&'static str>,
 }
 
 impl LoadedStaticElf {
@@ -1412,6 +1432,7 @@ impl LoadedStaticElf {
             }
         }
         self.pipe_owners.remove(&fd);
+        self.foreign_pidfds.remove(&fd);
         let mut retired: Vec<_> = self.files.insert(fd, file).into_iter().collect();
         if fd == libc::STDIN_FILENO {
             retired.extend(self.take_stdin());
@@ -1458,6 +1479,7 @@ impl LoadedStaticElf {
             }
         }
         self.pipe_owners.remove(&fd);
+        self.foreign_pidfds.remove(&fd);
         let file = self.files.remove(&fd);
         self.fd_entry_ids.remove(&fd);
         file
@@ -1487,6 +1509,7 @@ impl LoadedStaticElf {
             poll_table_id,
             native_poll_fds,
             pipe_owners,
+            foreign_pidfds,
             stdout_alias_fds,
             stderr_alias_fds,
             cloexec_fds,
@@ -1558,7 +1581,9 @@ impl LoadedStaticElf {
             task_lifecycle: self.task_lifecycle.clone(),
             file_retirement: FileRetirement::default(),
             signal_refusal: None,
+            pidfd_refusal: None,
             pipe_owners,
+            foreign_pidfds,
             fd_entry_ids,
             epoll_domain,
             poll_table_id,
@@ -1651,6 +1676,11 @@ impl LoadedStaticElf {
             .collect();
         let pipe_owners = previous
             .pipe_owners
+            .into_iter()
+            .filter(|(fd, _)| files.contains_key(fd))
+            .collect();
+        let foreign_pidfds = previous
+            .foreign_pidfds
             .into_iter()
             .filter(|(fd, _)| files.contains_key(fd))
             .collect();
@@ -1786,6 +1816,7 @@ impl LoadedStaticElf {
         self.file_retirement = previous.file_retirement;
         self.pipe_owner_process = previous.pipe_owner_process;
         self.pipe_owners = pipe_owners;
+        self.foreign_pidfds = foreign_pidfds;
         self.fd_entry_ids = fd_entry_ids;
         self.epoll_domain = previous.epoll_domain;
         self.poll_table_id = previous.poll_table_id;
@@ -2451,7 +2482,9 @@ fn load_executable(
         ))),
         file_retirement: FileRetirement::default(),
         signal_refusal: None,
+        pidfd_refusal: None,
         pipe_owners: Default::default(),
+        foreign_pidfds: Default::default(),
         fd_entry_ids: std::collections::BTreeMap::new(),
         epoll_domain: Default::default(),
         poll_table_id: Default::default(),

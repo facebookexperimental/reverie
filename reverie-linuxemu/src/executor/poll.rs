@@ -268,13 +268,22 @@ pub(super) fn pselect6(
         if !membership.into_iter().any(|present| present) {
             continue;
         }
-        let Some(host_fd) = host_fd(state, fd) else {
+        // A pidfd for another process shows its readiness through its shadow
+        // socket (`readiness_host_fd`).
+        let Some(host_fd) = readiness_host_fd(state, fd) else {
             return negative_errno(libc::EBADF);
         };
         captured_alias_selected |= capture_output && output_alias(state, fd).is_some();
         let signalfd = signalfd_mask(state, fd);
         let events = if signalfd.is_some() {
             if membership[0] { libc::POLLIN } else { 0 }
+        } else if foreign_pidfd(state, fd).is_some() {
+            // Only ever readable, never writable or exceptional.
+            if membership[0] {
+                FOREIGN_PIDFD_POLL_EVENTS
+            } else {
+                0
+            }
         } else {
             // Linux includes the exception mask in its poll key unconditionally.
             EXCEPT | if membership[0] { READ } else { 0 } | if membership[1] { WRITE } else { 0 }
@@ -410,18 +419,20 @@ pub(super) fn select(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[
         if !membership.into_iter().any(|present| present) {
             continue;
         }
-        let Some(host_fd) = host_fd(state, guest_fd) else {
+        let Some(host_fd) = readiness_host_fd(state, guest_fd) else {
             return negative_errno(libc::EBADF);
         };
         let signalfd = signalfd_mask(state, guest_fd);
+        // A pidfd for another process is only ever readable, as is a signalfd.
+        let read_only = signalfd.is_some() || foreign_pidfd(state, guest_fd).is_some();
         let mut events = 0;
         if membership[0] {
             events |= libc::POLLIN;
         }
-        if membership[1] && signalfd.is_none() {
+        if membership[1] && !read_only {
             events |= libc::POLLOUT;
         }
-        if membership[2] && signalfd.is_none() {
+        if membership[2] && !read_only {
             events |= libc::POLLPRI;
         }
         poll_fds.push(libc::pollfd {
@@ -651,7 +662,10 @@ fn poll_with_timeout<M: GuestMemoryAccess<Error = crate::Error>>(
             // shows the shared queue, which wakes a wait below.
             poll_fd.events &= libc::POLLIN;
         }
-        match host_fd(state, poll_fd.fd) {
+        if foreign_pidfd(state, poll_fd.fd).is_some() {
+            poll_fd.events &= FOREIGN_PIDFD_POLL_EVENTS;
+        }
+        match readiness_host_fd(state, poll_fd.fd) {
             Some(host_fd) => poll_fd.fd = host_fd,
             None => {
                 poll_fd.fd = -1;
@@ -873,8 +887,13 @@ pub(super) fn epoll_ctl(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u
     let Some(epoll_fd) = host_fd(state, args[0] as libc::c_int) else {
         return negative_errno(libc::EBADF);
     };
-    let Some(target_fd) = host_fd(state, args[2] as libc::c_int) else {
-        return negative_errno(libc::EBADF);
+    // A registration of a pidfd for another process watches the pidfd's
+    // shadow socket, through a host descriptor that closes with the pidfd, so
+    // the registration ends where Linux ends it (`epoll_host_fd`).
+    let target_fd = match epoll_host_fd(state, args[2] as libc::c_int) {
+        Ok(Some(target_fd)) => target_fd,
+        Ok(None) => return negative_errno(libc::EBADF),
+        Err(error) => return error,
     };
     let operation = args[1] as libc::c_int;
     let mut event = if operation == libc::EPOLL_CTL_DEL {
@@ -885,6 +904,9 @@ pub(super) fn epoll_ctl(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u
             Err(error) => return error,
         }
     };
+    if foreign_pidfd(state, args[2] as libc::c_int).is_some() {
+        event.events = foreign_pidfd_epoll_events(event.events);
+    }
     if matches!(operation, libc::EPOLL_CTL_ADD | libc::EPOLL_CTL_MOD)
         && signalfd_mask(state, args[2] as libc::c_int).is_some()
     {

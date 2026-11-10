@@ -930,7 +930,7 @@ pub(super) fn is_socket_timestamp_cmsg(message: ControlMessage) -> bool {
 /// releases them if the host does not queue the message.
 pub(super) fn translate_outgoing_control(
     control: &mut [u8],
-    state: &LoadedStaticElf,
+    state: &mut LoadedStaticElf,
 ) -> Result<Vec<(libc::dev_t, libc::ino_t)>, i64> {
     let mut transfers = Vec::new();
     let result = translate_outgoing_rights(control, state, &mut transfers);
@@ -943,7 +943,7 @@ pub(super) fn translate_outgoing_control(
 
 pub(super) fn translate_outgoing_rights(
     control: &mut [u8],
-    state: &LoadedStaticElf,
+    state: &mut LoadedStaticElf,
     transfers: &mut Vec<(libc::dev_t, libc::ino_t)>,
 ) -> Result<(), i64> {
     for message in control_messages(control)? {
@@ -963,6 +963,13 @@ pub(super) fn translate_outgoing_rights(
         {
             let guest_fd = read_control_fd(control, offset)?;
             let host_fd = host_fd(state, guest_fd).ok_or_else(|| negative_errno(libc::EBADF))?;
+            if foreign_pidfd(state, guest_fd).is_some() {
+                // The receiver would get the supervisor's pidfd that stands
+                // in for it, which neither names the process nor shows its
+                // readiness. Refuse before host sendmsg sends anything.
+                state.pidfd_refusal = Some(PIDFD_RIGHTS_REFUSAL);
+                return Err(negative_errno(libc::ENOSYS));
+            }
             if let Some(owner) = state.pipe_owners.get(&guest_fd) {
                 owner.before_export()?;
             }
@@ -1260,7 +1267,7 @@ pub(super) fn install_received_rights(
 // this executor arm only has to translate the guest `msghdr` — gathering the
 // iovec payload and name and mapping SCM_RIGHTS descriptors — before forwarding
 // it to the host socket.
-pub(super) fn sendmsg(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
+pub(super) fn sendmsg(memory: &GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
     let Some(host_fd) = host_fd(state, args[0] as libc::c_int) else {
         return negative_errno(libc::EBADF);
     };

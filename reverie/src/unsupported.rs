@@ -122,6 +122,11 @@ pub enum UnsupportedOperation {
     /// backend that refuses it armed nothing and kept the caller's previous
     /// parent-death signal; the refusal's diagnostic names the reason.
     ParentDeathSignal,
+    /// An operation on a pidfd for another process that the backend does not
+    /// model, such as sending the descriptor in an `SCM_RIGHTS` message. A
+    /// backend that refuses one sent nothing and changed nothing; the
+    /// refusal's diagnostic names the operation.
+    Pidfd,
 }
 
 /// A backend's refusal of an injected syscall, or of a `Guest` operation,

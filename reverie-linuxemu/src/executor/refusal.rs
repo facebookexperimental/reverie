@@ -544,6 +544,30 @@ pub(super) fn madvise_refusal_diagnostic(advice: libc::c_int) -> &'static str {
     }
 }
 
+/// Diagnostic for this backend's refusal to send a pidfd for another process
+/// in an `SCM_RIGHTS` message: the receiver would get the stand-in alone
+/// (`ForeignPidfd`), without the process it names or its readiness.
+pub(crate) const PIDFD_RIGHTS_REFUSAL: &str =
+    "KVM does not send a pidfd for another process in an SCM_RIGHTS message";
+
+/// The typed refusal, if any, that a call refused for a pidfd for another
+/// process carries: `reason` is the one the call recorded, and the call
+/// answered ENOSYS, which Linux's sendmsg never answers.
+pub(super) fn pidfd_refusal_record(
+    reason: Option<&'static str>,
+    result: i64,
+) -> Option<reverie::UnsupportedRefusal> {
+    reason
+        .filter(|_| result == negative_errno(libc::ENOSYS))
+        .map(|reason| {
+            reverie::UnsupportedRefusal::new(
+                reverie::UnsupportedOperation::Pidfd,
+                reverie::Errno::ENOSYS,
+                reason,
+            )
+        })
+}
+
 /// Diagnostic for this backend's refusal of a signalfd read that would wait,
 /// with no covered signal pending for the caller or its process.
 pub(crate) const SIGNALFD_WAITING_READ_REFUSAL: &str =

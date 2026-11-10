@@ -10,6 +10,134 @@
 
 use super::*;
 
+/// A pidfd for another guest process: the process it names, and its shadow
+/// socket (`process_signal_publication::pidfd_shadow`), which shows the
+/// pidfd's readiness. In the guest's table the descriptor itself is a pidfd
+/// for the supervisor, which the kernel answers for as for any pidfd; every
+/// alias of the descriptor, from dup or fork, shares this record.
+#[derive(Debug)]
+pub(crate) struct ForeignPidfd {
+    target: reverie::SignalProcessId,
+    shadow: Arc<std::fs::File>,
+    /// A descriptor of the shadow for each guest descriptor number an epoll
+    /// call has named the pidfd by. Linux keys an epoll
+    /// registration by descriptor number and open file description, so each
+    /// number needs a host descriptor of its own; these close with the pidfd
+    /// (`epoll_host_fd`).
+    epoll_keys: Mutex<std::collections::BTreeMap<libc::c_int, std::fs::File>>,
+}
+
+impl ForeignPidfd {
+    /// The process the pidfd names.
+    pub(crate) fn target(&self) -> reverie::SignalProcessId {
+        self.target
+    }
+
+    /// The host descriptor that poll and select watch for the pidfd.
+    pub(super) fn readiness_fd(&self) -> RawFd {
+        self.shadow.as_raw_fd()
+    }
+
+    /// The host descriptor that stands for guest descriptor number `fd` of
+    /// the pidfd in an epoll registration, made the first time it is named.
+    fn epoll_key_fd(&self, fd: libc::c_int) -> Result<RawFd, i64> {
+        let mut keys = self
+            .epoll_keys
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(key) = keys.get(&fd) {
+            return Ok(key.as_raw_fd());
+        }
+        // SAFETY: shadow owns a live descriptor; F_DUPFD_CLOEXEC returns a new
+        // one above the standard descriptors.
+        let key = unsafe {
+            libc::fcntl(
+                self.shadow.as_raw_fd(),
+                libc::F_DUPFD_CLOEXEC,
+                libc::STDERR_FILENO + 1,
+            )
+        };
+        if key < 0 {
+            return Err(io_error(std::io::Error::last_os_error()));
+        }
+        // SAFETY: fcntl returned a new descriptor that nothing else owns.
+        keys.insert(fd, unsafe { std::fs::File::from_raw_fd(key) });
+        Ok(key)
+    }
+
+    #[cfg(test)]
+    pub(super) fn shadow(&self) -> std::sync::Weak<std::fs::File> {
+        Arc::downgrade(&self.shadow)
+    }
+}
+
+/// The pidfd record of guest descriptor `fd`, if it is a pidfd for another
+/// guest process.
+pub(super) fn foreign_pidfd(
+    state: &LoadedStaticElf,
+    fd: libc::c_int,
+) -> Option<&Arc<ForeignPidfd>> {
+    state.foreign_pidfds.get(&fd)
+}
+
+/// The inode number that `stat` reports for a pidfd for `target`, another
+/// guest process. Linux gives every process one pidfs inode, which all its
+/// pidfds share, and numbers them from 2 upward as pids are made
+/// (`pidfs_add_pid`, fs/pidfs.c), so pidfds compare equal by inode number
+/// exactly when they name the same process. The stand-in's own inode is the
+/// supervisor's, the one a pidfd for the caller itself reports; this number
+/// is one per guest process instead, with the top bit set, which no pidfs
+/// inode number reaches.
+pub(super) fn foreign_pidfd_inode(target: reverie::SignalProcessId) -> u64 {
+    1 << 63 | target.generation
+}
+
+/// The host descriptor whose readiness is guest descriptor `fd`'s: the shadow
+/// of a pidfd for another process, whose own host descriptor never becomes
+/// readable while the run lasts, and otherwise the descriptor itself. A
+/// caller asks a shadow only for [`FOREIGN_PIDFD_POLL_EVENTS`].
+pub(super) fn readiness_host_fd(state: &LoadedStaticElf, fd: libc::c_int) -> Option<RawFd> {
+    let host_fd = host_fd(state, fd)?;
+    Some(foreign_pidfd(state, fd).map_or(host_fd, |pidfd| pidfd.readiness_fd()))
+}
+
+/// The host descriptor an epoll call names for guest descriptor `fd`: as
+/// [`readiness_host_fd`], with a host descriptor of the shadow for each
+/// guest descriptor number of a pidfd for another process
+/// ([`ForeignPidfd::epoll_key_fd`]). `Ok(None)` when `fd` is not open.
+pub(super) fn epoll_host_fd(
+    state: &LoadedStaticElf,
+    fd: libc::c_int,
+) -> Result<Option<RawFd>, i64> {
+    let Some(host_fd) = host_fd(state, fd) else {
+        return Ok(None);
+    };
+    match foreign_pidfd(state, fd) {
+        Some(pidfd) => pidfd.epoll_key_fd(fd).map(Some),
+        None => Ok(Some(host_fd)),
+    }
+}
+
+/// The events that poll and select ask a pidfd's shadow for: all that
+/// Linux's `pidfd_poll` reports besides `POLLHUP`, which poll reports
+/// unasked (fs/pidfs.c). The shadow is a socket, which also reports that it
+/// is writable and, once hung up, `POLLRDHUP`; a pidfd reports neither.
+pub(super) const FOREIGN_PIDFD_POLL_EVENTS: libc::c_short = libc::POLLIN | libc::POLLRDNORM;
+
+/// The events of an epoll registration of a pidfd's shadow, for a guest's
+/// registration of the pidfd with `events`: the same, without the readiness
+/// a pidfd never reports and its shadow socket does (see
+/// [`FOREIGN_PIDFD_POLL_EVENTS`]). With `EPOLLEXCLUSIVE`, Linux refuses
+/// (EINVAL) any of those but `EPOLLOUT`, so only `EPOLLOUT` is taken then,
+/// and the host refuses the rest as Linux does.
+pub(super) fn foreign_pidfd_epoll_events(events: u32) -> u32 {
+    let mut never = libc::EPOLLOUT as u32;
+    if events & libc::EPOLLEXCLUSIVE as u32 == 0 {
+        never |= (libc::EPOLLWRNORM | libc::EPOLLWRBAND | libc::EPOLLRDHUP) as u32;
+    }
+    events & !never
+}
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-235): Review self-only virtual pidfd translation.
 pub(super) fn pidfd_open(state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
@@ -17,26 +145,111 @@ pub(super) fn pidfd_open(state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
     if flags & !(libc::O_NONBLOCK as libc::c_uint) != 0 {
         return negative_errno(libc::EINVAL);
     }
-    if args[0] as libc::pid_t != state.pid {
-        return negative_errno(libc::ESRCH);
+    // Linux refuses a pid that cannot name one process before it looks the
+    // pid up (`pidfd_open`, kernel/pid.c).
+    let pid = args[0] as libc::pid_t;
+    if pid <= 0 {
+        return negative_errno(libc::EINVAL);
+    }
+    if pid != state.pid {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        return foreign_pidfd_open(state, pid, flags);
     }
 
     // The supervisor remains alive for every guest executor, so its pidfd has
     // the same readiness contract as a pidfd for the live virtual process.
-    // Cross-process pidfds remain unsupported until KVM can bind them to child
-    // lifecycle state.
-    let host_fd = unsafe {
-        libc::syscall(libc::SYS_pidfd_open, libc::getpid(), flags as libc::c_uint) as libc::c_int
+    let file = match supervisor_pidfd(flags) {
+        Ok(file) => file,
+        Err(error) => return error,
     };
-    if host_fd < 0 {
-        return io_error(std::io::Error::last_os_error());
-    }
-    // SAFETY: pidfd_open returned a new owned descriptor.
-    let file = unsafe { std::fs::File::from_raw_fd(host_fd) };
     // The pidfd is a real kernel object for the supervisor process, and its
     // metadata is the kernel's, as for a pidfd a guest receives from outside
     // the run; nothing here classifies it for later stat calls.
     insert_file_with_flags(state, file, true, None)
+}
+
+/// A new pidfd for the supervisor process, with `flags`.
+fn supervisor_pidfd(flags: libc::c_uint) -> Result<std::fs::File, i64> {
+    // SAFETY: pidfd_open takes no pointers.
+    let host_fd = unsafe {
+        libc::syscall(libc::SYS_pidfd_open, libc::getpid(), flags as libc::c_uint) as libc::c_int
+    };
+    if host_fd < 0 {
+        return Err(io_error(std::io::Error::last_os_error()));
+    }
+    // SAFETY: pidfd_open returned a new owned descriptor.
+    Ok(unsafe { std::fs::File::from_raw_fd(host_fd) })
+}
+
+/// `pidfd_open(pid, flags)` for a guest process other than the caller's:
+/// a pidfd for the supervisor stands in for it in the guest's table, and a
+/// shadow socket shows its readiness ([`ForeignPidfd`]). Like Linux, it opens
+/// one for a process that has exited and has not been reaped, which is then
+/// readable at once.
+// TODO-HUMAN-REVIEW(https://github.com/rrnewton/reverie/pull/1410): Review pidfds for other guest
+// processes, their stand-ins and their shadow sockets.
+fn foreign_pidfd_open(state: &mut LoadedStaticElf, pid: libc::pid_t, flags: libc::c_uint) -> i64 {
+    let target = match foreign_pidfd_target(state, pid) {
+        Ok(target) => target,
+        Err(errno) => return negative_errno(errno),
+    };
+    let Some(registry) = state.children.registry() else {
+        // A task outside any process family has no other process to name.
+        return negative_errno(libc::ESRCH);
+    };
+    let shadow = match registry.open_pidfd_shadow(target) {
+        Ok(shadow) => shadow,
+        Err(errno) => return negative_errno(errno),
+    };
+    let file = match supervisor_pidfd(flags) {
+        Ok(file) => file,
+        Err(error) => return error,
+    };
+    let fd = insert_file_with_flags(state, file, true, None);
+    if fd >= 0 {
+        state.foreign_pidfds.insert(
+            fd as libc::c_int,
+            Arc::new(ForeignPidfd {
+                target,
+                shadow,
+                epoll_keys: Default::default(),
+            }),
+        );
+    }
+    fd
+}
+
+/// The process `pid` names for a pidfd, as Linux's `pidfd_open` finds it
+/// (kernel/pid.c): a live process whose thread group id `pid` is, even once
+/// its leader has exited, or a process that has exited and has not been
+/// reaped. EINVAL for a live thread that leads no thread group
+/// (`pidfd_create`), ESRCH for a pid that names no process.
+fn foreign_pidfd_target(
+    state: &LoadedStaticElf,
+    pid: libc::pid_t,
+) -> Result<reverie::SignalProcessId, libc::c_int> {
+    let live = {
+        let lifecycle = state
+            .task_lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match lifecycle.get(pid) {
+            Some(task) if task.tgid != pid => return Err(libc::EINVAL),
+            Some(task) => Some(task.process_generation),
+            None => lifecycle.live_process_generation(pid),
+        }
+    };
+    if let Some(generation) = live {
+        return Ok(reverie::SignalProcessId {
+            tgid: reverie::Pid::from_raw(pid),
+            generation,
+        });
+    }
+    state
+        .children
+        .registry()
+        .and_then(|registry| registry.unreaped_exited_process(pid))
+        .ok_or(libc::ESRCH)
 }
 
 /// Classifies a carrier received in an SCM_RIGHTS message from the carrier

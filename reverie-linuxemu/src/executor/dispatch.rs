@@ -1122,6 +1122,7 @@ impl ElfExecutor {
         // leave it for the next caller's injection to report.
         self.unsupported_refusal = None;
         self.state.signal_refusal = None;
+        self.state.pidfd_refusal = None;
         // The copies this call reaches stay its own until it returns, and
         // any whose entries another thread retired meanwhile are replaced
         // then, before the guest continues (`PrivateCopies`); a replacement
@@ -1292,6 +1293,10 @@ impl ElfExecutor {
                 }
                 if let Some(refusal) =
                     signal_refusal_record(self.state.signal_refusal.take(), result)
+                {
+                    self.unsupported_refusal = Some(refusal);
+                }
+                if let Some(refusal) = pidfd_refusal_record(self.state.pidfd_refusal.take(), result)
                 {
                     self.unsupported_refusal = Some(refusal);
                 }

@@ -50,6 +50,10 @@ mod orphan_placement;
 
 #[path = "child_wait.rs"]
 pub mod child_wait;
+
+#[path = "pidfd_shadow.rs"]
+mod pidfd_shadow;
+pub(crate) use pidfd_shadow::PidfdTargetState;
 use std::sync::Condvar;
 
 pub use child_wait::ChildWaitContext;
@@ -326,6 +330,9 @@ pub struct ProcessFamilyState {
             reverie::OrphanPlacementResult,
         ),
     >,
+    // The write ends of the shadow sockets of the pidfds that name each
+    // process, kept in line with its exit and its reaping (`pidfd_shadow`).
+    pidfd_shadows: BTreeMap<ProcessKey, pidfd_shadow::PidfdShadowWriters>,
 }
 
 impl ProcessFamilyState {
@@ -592,6 +599,18 @@ impl ProcessSignalRegistry {
     /// only consume this snapshot; they cannot resample a parent's newer
     /// SIGCHLD disposition.
     pub(super) fn record_process_exit(
+        &self,
+        process: SignalProcessId,
+        status: reverie::ExitStatus,
+    ) -> ProcessFamilyExit {
+        let exit = self.record_process_exit_in_family(process, status);
+        // The exit, and the reaping of any child it leaves to an init, are
+        // recorded: the pidfds for them show it from here.
+        self.sync_pidfd_shadows();
+        exit
+    }
+
+    fn record_process_exit_in_family(
         &self,
         process: SignalProcessId,
         status: reverie::ExitStatus,

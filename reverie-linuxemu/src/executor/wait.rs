@@ -222,6 +222,47 @@ pub(super) fn finish_waitid<M: GuestMemoryAccess<Error = crate::Error>>(
     result
 }
 
+/// The child a `waitid(P_PIDFD, raw, ...)` waits for, and whether its pidfd
+/// is nonblocking, as Linux resolves the descriptor (`kernel_waitid_prepare`
+/// and `pidfd_get_pid`, kernel/exit.c and kernel/pid.c): EINVAL for a
+/// negative descriptor, EBADF for one that is not open or not a pidfd. A
+/// pidfd for another guest process names its process ([`ForeignPidfd`]),
+/// which is no child to wait for once it has been reaped (ECHILD). Any other
+/// pidfd names the caller's own process or a process outside the run, which
+/// is no child of the caller either (ECHILD); that includes a pidfd for the
+/// caller that another guest process sent it, which this executor cannot
+/// tell apart from those.
+// TODO-HUMAN-REVIEW(https://github.com/rrnewton/reverie/pull/1410): Review waitid(P_PIDFD).
+pub(super) fn pidfd_wait_target(
+    state: &LoadedStaticElf,
+    raw: u64,
+) -> Result<(i32, bool), libc::c_int> {
+    // The descriptor is the syscall's pid_t argument: Linux reads the
+    // register's low 32 bits.
+    let fd = raw as libc::c_int;
+    if fd < 0 {
+        return Err(libc::EINVAL);
+    }
+    let Some(host_fd) = host_fd(state, fd) else {
+        return Err(libc::EBADF);
+    };
+    let Some(pidfd) = foreign_pidfd(state, fd) else {
+        return Err(if fd_link_target_is(host_fd, b"anon_inode:[pidfd]") {
+            libc::ECHILD
+        } else {
+            libc::EBADF
+        });
+    };
+    let target = pidfd.target();
+    if state.children.registry().is_none_or(|registry| {
+        registry.pidfd_target_state(target) == process_signal_publication::PidfdTargetState::Reaped
+    }) {
+        return Err(libc::ECHILD);
+    }
+    let flags = fd_status_flags(host_fd).map_err(|error| -error as libc::c_int)?;
+    Ok((target.tgid.as_raw(), flags & libc::O_NONBLOCK != 0))
+}
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-227): Review serialized-child waitid ABI emulation.
 pub(super) fn waitid_result(
@@ -237,6 +278,7 @@ pub(super) fn waitid_result(
             negative_errno(libc::EINVAL),
         ));
     }
+    let mut pidfd_nonblocking = false;
     let requested = match args[0] as libc::idtype_t {
         libc::P_PID => match i32::try_from(args[1]) {
             Ok(pid) => Some(pid),
@@ -250,6 +292,21 @@ pub(super) fn waitid_result(
             }
         },
         libc::P_ALL | libc::P_PGID => None,
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        libc::P_PIDFD => match pidfd_wait_target(state, args[1]) {
+            Ok((pid, nonblocking)) => {
+                pidfd_nonblocking = nonblocking;
+                Some(pid)
+            }
+            Err(errno) => {
+                return Ok(finish_waitid(
+                    &ProviderMemory(memory),
+                    args,
+                    None,
+                    negative_errno(errno),
+                ));
+            }
+        },
         _ => {
             return Ok(finish_waitid(
                 &ProviderMemory(memory),
@@ -260,13 +317,25 @@ pub(super) fn waitid_result(
         }
     };
     preflight_wait_shared_outputs(memory, args, true)?;
+    let wnohang = args[3] as libc::c_int & libc::WNOHANG != 0;
     let selected = match state.children.select(
         requested,
         args[3] as libc::c_int & libc::WNOWAIT == 0,
-        args[3] as libc::c_int & libc::WNOHANG != 0,
+        wnohang || pidfd_nonblocking,
     )? {
         ChildWaitSelection::Ready(selected) => selected,
         ChildWaitSelection::ParentTerminated => return parent_terminated_wait(state),
+        // A nonblocking pidfd makes the wait WNOHANG, and a wait that only
+        // that made return early answers EAGAIN (`kernel_waitid`,
+        // kernel/exit.c).
+        ChildWaitSelection::Pending if pidfd_nonblocking && !wnohang => {
+            return Ok(finish_waitid(
+                &ProviderMemory(memory),
+                args,
+                None,
+                negative_errno(libc::EAGAIN),
+            ));
+        }
         ChildWaitSelection::Pending => {
             return Ok(finish_waitid(&ProviderMemory(memory), args, None, 0));
         }

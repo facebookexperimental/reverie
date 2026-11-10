@@ -20,6 +20,7 @@ pub(super) struct FdSlot {
     pub(super) entry_id: Option<Arc<crate::elf::FdEntry>>,
     pub(super) native_poll: Option<Arc<NativePollBinding>>,
     pub(super) pipe_owner: Option<Arc<pipe_owner::PipeOwner>>,
+    pub(super) foreign_pidfd: Option<Arc<ForeignPidfd>>,
     pub(super) proc_inode: Option<u64>,
     pub(super) fdinfo: Option<Arc<FdinfoDescription>>,
     pub(super) object_inode: Option<Arc<GuestFileIdentity>>,
@@ -114,6 +115,13 @@ impl FileTableState {
                     pipe_owner: state
                         .and_then(|state| state.pipe_owners.get(&fd).cloned())
                         .or_else(|| self.slots.get(&fd).and_then(|slot| slot.pipe_owner.clone())),
+                    foreign_pidfd: state
+                        .and_then(|state| state.foreign_pidfds.get(&fd).cloned())
+                        .or_else(|| {
+                            self.slots
+                                .get(&fd)
+                                .and_then(|slot| slot.foreign_pidfd.clone())
+                        }),
                     proc_inode: state
                         .and_then(|state| state.proc_files.get(&fd).copied())
                         .or_else(|| self.slots.get(&fd).and_then(|slot| slot.proc_inode)),
@@ -397,6 +405,18 @@ impl FileTableState {
                         .zip(&state.pipe_owners)
                         .all(|((fa, va), (fb, vb))| fa == *fb && Arc::ptr_eq(va, vb))
             }
+            && {
+                let slot_pidfds: Vec<_> = self
+                    .slots
+                    .iter()
+                    .filter_map(|(&fd, slot)| slot.foreign_pidfd.as_ref().map(|p| (fd, p)))
+                    .collect();
+                slot_pidfds.len() == state.foreign_pidfds.len()
+                    && slot_pidfds
+                        .into_iter()
+                        .zip(&state.foreign_pidfds)
+                        .all(|((fa, va), (fb, vb))| fa == *fb && Arc::ptr_eq(va, vb))
+            }
             && *stdout_alias_fds == state.stdout_alias_fds
             && *stderr_alias_fds == state.stderr_alias_fds
             && *cloexec_fds == state.cloexec_fds
@@ -535,6 +555,11 @@ impl FileTableState {
             .iter()
             .filter_map(|(&fd, slot)| slot.pipe_owner.clone().map(|o| (fd, o)))
             .collect();
+        state.foreign_pidfds = self
+            .slots
+            .iter()
+            .filter_map(|(&fd, slot)| slot.foreign_pidfd.clone().map(|p| (fd, p)))
+            .collect();
         state.stdout_alias_fds.clone_from(&self.stdout_alias_fds);
         state.stderr_alias_fds.clone_from(&self.stderr_alias_fds);
         state.cloexec_fds.clone_from(&self.cloexec_fds);
@@ -585,6 +610,11 @@ impl FileTableState {
             .iter()
             .filter_map(|(&fd, slot)| slot.pipe_owner.clone().map(|o| (fd, o)))
             .collect();
+        let foreign_pidfds: std::collections::BTreeMap<_, _> = self
+            .slots
+            .iter()
+            .filter_map(|(&fd, slot)| slot.foreign_pidfd.clone().map(|p| (fd, p)))
+            .collect();
         let fd_entry_ids: std::collections::BTreeMap<_, _> = self
             .slots
             .iter()
@@ -621,6 +651,7 @@ impl FileTableState {
                 poll_table_id: &self.poll_table_id,
                 native_poll_fds: &native_poll_fds,
                 pipe_owners: &pipe_owners,
+                foreign_pidfds: &foreign_pidfds,
                 stdout_alias_fds: &self.stdout_alias_fds,
                 stderr_alias_fds: &self.stderr_alias_fds,
                 cloexec_fds: &self.cloexec_fds,
@@ -641,6 +672,7 @@ struct ForkFacts<'a> {
     poll_table_id: &'a Arc<NativePollTable>,
     native_poll_fds: &'a std::collections::BTreeMap<i32, Arc<NativePollBinding>>,
     pipe_owners: &'a std::collections::BTreeMap<i32, Arc<pipe_owner::PipeOwner>>,
+    foreign_pidfds: &'a std::collections::BTreeMap<i32, Arc<ForeignPidfd>>,
     stdout_alias_fds: &'a std::collections::BTreeSet<i32>,
     stderr_alias_fds: &'a std::collections::BTreeSet<i32>,
     cloexec_fds: &'a std::collections::BTreeSet<i32>,
@@ -666,6 +698,7 @@ pub(crate) struct ForkDescriptors {
     pub(crate) poll_table_id: Arc<NativePollTable>,
     pub(crate) native_poll_fds: std::collections::BTreeMap<i32, Arc<NativePollBinding>>,
     pub(crate) pipe_owners: std::collections::BTreeMap<i32, Arc<pipe_owner::PipeOwner>>,
+    pub(crate) foreign_pidfds: std::collections::BTreeMap<i32, Arc<ForeignPidfd>>,
     pub(crate) stdout_alias_fds: std::collections::BTreeSet<i32>,
     pub(crate) stderr_alias_fds: std::collections::BTreeSet<i32>,
     pub(crate) cloexec_fds: std::collections::BTreeSet<i32>,
@@ -700,6 +733,7 @@ impl ForkDescriptors {
                 .map(|(&fd, binding)| (fd, binding.fork_binding()))
                 .collect(),
             pipe_owners: facts.pipe_owners.clone(),
+            foreign_pidfds: facts.foreign_pidfds.clone(),
             stdout_alias_fds: facts.stdout_alias_fds.clone(),
             stderr_alias_fds: facts.stderr_alias_fds.clone(),
             cloexec_fds: facts.cloexec_fds.clone(),
@@ -725,6 +759,7 @@ impl ForkDescriptors {
                 poll_table_id: &state.poll_table_id,
                 native_poll_fds: &state.native_poll_fds,
                 pipe_owners: &state.pipe_owners,
+                foreign_pidfds: &state.foreign_pidfds,
                 stdout_alias_fds: &state.stdout_alias_fds,
                 stderr_alias_fds: &state.stderr_alias_fds,
                 cloexec_fds: &state.cloexec_fds,
@@ -1992,6 +2027,7 @@ pub(super) struct DuplicateFdSource {
     pub(super) signalfd_mask: Option<Arc<KernelSigset>>,
     pub(super) native_poll: Option<NativePollDescription>,
     pub(super) pipe_owner: Option<Arc<pipe_owner::PipeOwner>>,
+    pub(super) foreign_pidfd: Option<Arc<ForeignPidfd>>,
 }
 
 /// Stops supported generic writes from reaching the eventfd that privately
@@ -2116,6 +2152,9 @@ pub(super) fn duplicate_fd_at_or_above(
     if let Some(owner) = source.pipe_owner {
         state.pipe_owners.insert(fd, owner);
     }
+    if let Some(pidfd) = source.foreign_pidfd {
+        state.foreign_pidfds.insert(fd, pidfd);
+    }
     if let Some(description) = source.native_poll {
         install_native_poll_description(state, fd, description);
     }
@@ -2174,6 +2213,7 @@ pub(super) fn duplicate_fd(
     let source_native_poll = native_poll_description(state, old_fd);
     let source_signalfd_mask = signalfd_mask(state, old_fd);
     let source_pipe_owner = state.pipe_owners.get(&old_fd).cloned();
+    let source_foreign_pidfd = foreign_pidfd(state, old_fd).cloned();
     let Some(old_host_fd) = host_fd(state, old_fd) else {
         return negative_errno(libc::EBADF);
     };
@@ -2215,6 +2255,9 @@ pub(super) fn duplicate_fd(
         if let Some(owner) = source_pipe_owner {
             state.pipe_owners.insert(new_fd, owner);
         }
+        if let Some(pidfd) = source_foreign_pidfd {
+            state.foreign_pidfds.insert(new_fd, pidfd);
+        }
         if let Some(description) = source_native_poll {
             install_native_poll_description(state, new_fd, description);
         }
@@ -2255,6 +2298,9 @@ pub(super) fn duplicate_fd(
         if new_fd >= 0 {
             if let Some(owner) = source_pipe_owner {
                 state.pipe_owners.insert(new_fd as i32, owner);
+            }
+            if let Some(pidfd) = source_foreign_pidfd {
+                state.foreign_pidfds.insert(new_fd as i32, pidfd);
             }
             if let Some(description) = source_native_poll {
                 install_native_poll_description(state, new_fd as i32, description);
