@@ -23,6 +23,19 @@
 pub mod fdinfo;
 pub mod fixed;
 pub mod mountinfo;
+pub mod task;
+
+pub use task::CommName;
+pub use task::StatFields;
+pub use task::StatusCapabilities;
+pub use task::StatusFields;
+pub use task::StatusSignals;
+pub use task::TASK_COMM_LEN;
+pub use task::render_comm;
+pub use task::render_stat;
+pub use task::render_status;
+pub use task::stat_flags;
+pub use task::stat_state;
 
 pub use fixed::FixedFile;
 pub use fixed::FixedMachine;
