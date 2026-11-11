@@ -1772,37 +1772,131 @@ fn wait_for_tracing_stop(tid: Pid) {
 #[test]
 #[cfg(not(sanitized))]
 fn resume_mark_does_not_survive_a_detach_through_another_capability() {
-    for raw in [false, true] {
-        let (root, tid, release, mut root_cleanup) = legacy_owner_guest();
-        let stopped = seized_stopped_sync(tid);
-        let generation = stopped.generation();
-        let running = stopped.resume(None).unwrap();
-        running.interrupt().unwrap();
-        wait_for_tracing_stop(tid);
-        let detached = if raw {
-            generation.assume_stopped().detach_raw(0).unwrap()
-        } else {
-            generation.assume_stopped().detach(None).unwrap()
-        };
-        let terminal = running.terminal_cleanup();
-        let reads = tracer_pid_reads();
-        let driver = running.wait_owned_on_ptracer_thread().into_driver();
-        assert_eq!(
-            tracer_pid_reads(),
-            reads + 1,
-            "a resume's mark must not skip the read after a later detach (raw: {raw})"
-        );
-        assert!(driver.inner.detached_wait.is_some());
-        assert!(
-            terminal.event.event().detach_handoff_pending(),
-            "the wait finds the task untraced and must record the handoff (raw: {raw})"
-        );
-        drop(driver);
-        drop(detached);
+    resume_mark_after_detach_case(DetachThrough::Generation);
+    resume_mark_after_detach_case(DetachThrough::GenerationRaw);
+}
+
+/// The same through a capability on an unrelated Event. Before Linux 6.9
+/// (forced here) `Stopped::new_unchecked` cannot capture a thread pidfd, so
+/// it resolves to a fresh Event that shares nothing with the resumed
+/// generation but the task. The detach is counted for the task, so the
+/// mark still lapses.
+#[test]
+#[cfg(not(sanitized))]
+fn forced_legacy_resume_mark_does_not_survive_a_detach_through_a_fresh_event() {
+    resume_mark_after_detach_case(DetachThrough::FreshEvent);
+}
+
+/// Which capability [`resume_mark_after_detach_case`] detaches through.
+#[cfg(not(sanitized))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DetachThrough {
+    /// `Stopped::detach` on a clone of the resumed generation's token.
+    Generation,
+    /// `Stopped::detach_raw` on such a clone.
+    GenerationRaw,
+    /// `Stopped::detach` on `Stopped::new_unchecked`, under forced legacy.
+    FreshEvent,
+}
+
+#[cfg(not(sanitized))]
+fn resume_mark_after_detach_case(through: DetachThrough) {
+    let (root, tid, release, mut root_cleanup) = legacy_owner_guest();
+    let _legacy = (through == DetachThrough::FreshEvent).then(|| LegacyThreadGroup::new(root));
+    let stopped = seized_stopped_sync(tid);
+    let generation = stopped.generation();
+    let running = stopped.resume(None).unwrap();
+    running.interrupt().unwrap();
+    wait_for_tracing_stop(tid);
+    let detached = match through {
+        DetachThrough::Generation => generation.assume_stopped().detach(None).unwrap(),
+        DetachThrough::GenerationRaw => generation.assume_stopped().detach_raw(0).unwrap(),
+        DetachThrough::FreshEvent => {
+            let alias = Stopped::new_unchecked(tid.into());
+            assert!(
+                !Arc::ptr_eq(alias.1.event().event(), running.1.event().event()),
+                "the unchecked capability must resolve to an unrelated Event"
+            );
+            alias.detach(None).unwrap()
+        }
+    };
+    let terminal = running.terminal_cleanup();
+    let reads = tracer_pid_reads();
+    let driver = running.wait_owned_on_ptracer_thread().into_driver();
+    assert_eq!(
+        tracer_pid_reads(),
+        reads + 1,
+        "a resume's mark must not skip the read after a later detach ({through:?})"
+    );
+    assert!(driver.inner.detached_wait.is_some());
+    assert!(
+        terminal.event.event().detach_handoff_pending(),
+        "the wait finds the task untraced and must record the handoff ({through:?})"
+    );
+    drop(driver);
+    drop(detached);
+    // How a forced-legacy generation retires is not this test's subject.
+    if through != DetachThrough::FreshEvent {
         assert!(terminal.wait(TRACEE_WAIT_TIMEOUT));
-        legacy_owner_reap_root(root, &mut root_cleanup);
-        drop(release);
     }
+    legacy_owner_reap_root(root, &mut root_cleanup);
+    drop(release);
+}
+
+/// A mark from a resume through an ownerless token does not survive its
+/// tracer's exit. Tracer thread A seizes a non-leader generically, without
+/// `PTRACE_O_EXITKILL`; a generic synchronous wait collects the stop
+/// without starting an observation worker, and A resumes it, all without
+/// capturing an owner. A exits, so the kernel detaches the task, and no
+/// detach is counted. Sibling thread B, whose process is the task's parent,
+/// then builds an explicit driver, which captures B as its owner. The wait
+/// must read TracerPid and record a note owned by B: B is alive, so the
+/// note keeps the handoff pending.
+#[test]
+#[cfg(not(sanitized))]
+fn ownerless_resume_mark_does_not_survive_tracer_exit() {
+    let (root, tid, release, mut root_cleanup) = legacy_owner_guest();
+    let running = thread::spawn(move || {
+        let running = Running::seize(tid.into(), Options::empty()).unwrap();
+        running.interrupt().unwrap();
+        let (stopped, event) = running.wait().unwrap().assume_stopped();
+        assert_eq!(event, crate::Event::Stop);
+        assert!(stopped.1.ptracer_owner.is_none());
+        stopped.resume(None).unwrap()
+    })
+    .join()
+    .unwrap();
+    assert!(running.1.ptracer_owner.is_none());
+    assert_eq!(
+        running
+            .1
+            .event()
+            .event()
+            .worker_state
+            .load(Ordering::Acquire),
+        WORKER_NOT_STARTED
+    );
+    legacy_owner_until(|| {
+        fs::read_to_string(format!("/proc/{tid}/status"))
+            .unwrap_or_default()
+            .lines()
+            .any(|line| line == "TracerPid:\t0")
+    });
+    let reads = tracer_pid_reads();
+    let driver = running.wait_owned_on_ptracer_thread().into_driver();
+    assert_eq!(
+        tracer_pid_reads(),
+        reads + 1,
+        "an ownerless resume's mark must not skip the read for a new owner"
+    );
+    assert!(driver.inner.detached_wait.is_some());
+    assert!(
+        handle_detach_handoff_pending(driver.inner.inner.as_ref().unwrap().token.event()),
+        "the new live owner's note must keep the handoff pending"
+    );
+    drop(driver);
+    legacy_owner_reap_root(root, &mut root_cleanup);
+    drop(release);
 }
 
 /// The other half: a wait built on a resume's running state, with no detach
@@ -2121,10 +2215,13 @@ async fn attached_owner_wait_after_nonleader_exec_case(force_legacy: bool) {
 /// The de_thread window: once an untraced non-leader has exec'd, it holds
 /// the resumed leader's TID (`exchange_tids`), so a TracerPid read made now
 /// returns 0. A wait built on the resume's running state only after the
-/// exec still skips the read: it records no note, exactly as the wait built
-/// before the exec in [`attached_owner_wait_resolves_after_nonleader_exec_untraces`],
-/// and retires with ECHILD in the same way. Without the skip, whether the
-/// read ran before or after `exchange_tids` was host timing.
+/// exec still skips the read, by deliberate choice: the release is treated
+/// as retirement, not as a handoff that no reattach will complete. The wait
+/// records no note, as the wait built before the exec in
+/// [`attached_owner_wait_resolves_after_nonleader_exec_untraces`] does, and
+/// retires with ECHILD in the same way: the better-defined outcome. A read
+/// here would instead record a note bound to the live owner and hold off
+/// retirement for as long as the wait lives.
 #[tokio::test(flavor = "current_thread")]
 #[cfg(not(sanitized))]
 async fn resumed_owner_wait_built_after_nonleader_exec_records_no_note() {

@@ -1300,8 +1300,20 @@ impl Stopped {
     /// the [`ResumeMark`] that lets its wait skip the detached-wait TracerPid
     /// read.
     fn into_running_resumed(self) -> Running {
+        // The owner of a ptracer-thread token is the thread that issued the
+        // request: `on_held_tid` checked it is current, and the kernel
+        // accepted the request only from the tracer. Any other token's
+        // proof records no owner.
         #[cfg(feature = "notifier")]
-        let mark = ResumeMark(Some(self.1.event().resume_mark()));
+        let mark = ResumeMark(Some(
+            self.1.event().resume_proof(
+                self.0,
+                self.1
+                    .ptracer_owner
+                    .as_ref()
+                    .filter(|_| self.1.policy == notifier::WaitPolicy::PtracerThread),
+            ),
+        ));
         #[cfg(not(feature = "notifier"))]
         let mark = ResumeMark::default();
         let mut running = self.into_running();
@@ -2340,7 +2352,7 @@ impl Stopped {
         // Before the request, whatever it returns: an errno does not
         // establish that the detach did not happen ([`ResumeMark`]).
         #[cfg(feature = "notifier")]
-        self.1.event().note_detach();
+        notifier::note_detach(self.0);
         let result = self
             .1
             .on_held_tid(|| ptrace::detach(self.0.into(), sig).map_err(nix_errno));
@@ -2352,7 +2364,7 @@ impl Stopped {
         self.flush_regs()?;
         // Before the request, as in [`Self::detach_retaining`].
         #[cfg(feature = "notifier")]
-        self.1.event().note_detach();
+        notifier::note_detach(self.0);
         self.1
             .on_held_tid(|| ptrace::detach(self.0.into(), sig).map_err(nix_errno))
             .map_err(|err| self.map_err(err))?;
@@ -2367,7 +2379,7 @@ impl Stopped {
         self.flush_regs()?;
         // Before the request, as in [`Self::detach_retaining`].
         #[cfg(feature = "notifier")]
-        self.1.event().note_detach();
+        notifier::note_detach(self.0);
         self.1
             .on_held_tid(|| ptrace_resume_raw(libc::PTRACE_DETACH, self.0, sig))
             .map_err(|err| self.map_err(err))?;
@@ -2509,22 +2521,27 @@ pub struct Running(Pid, TraceeToken, ResumeMark);
 
 /// Whether a [`Running`] came from a successful resume request on its own
 /// stop (`PTRACE_CONT`, `PTRACE_SYSCALL`, `PTRACE_SINGLESTEP` or
-/// `PTRACE_SINGLEBLOCK`; [`Stopped::into_running_resumed`]), and if so the
-/// Event that request resolved to and that Event's detach epoch then.
+/// `PTRACE_SINGLEBLOCK`; [`Stopped::into_running_resumed`]), and if so what
+/// that proves (`notifier::ResumeProof`): the resuming token's ptracer
+/// owner, the Event the request resolved to, and the task's detach epoch
+/// then.
 ///
 /// A successful resume request passed `ptrace_check_attach` for the calling
-/// thread, with the tracee in a ptrace-stop: after it, only that tracer can
-/// make the task untraced, by its own `PTRACE_DETACH` or by exiting. A wait
-/// built on such a value while the Event and its detach epoch are unchanged
-/// therefore skips the TracerPid read that looks for a detached wait
-/// (`notifier::note_detached_wait_if_untraced`). Every other producer, detach
-/// included, leaves it unset, and the read happens as before.
+/// thread, with the tracee in a ptrace-stop. After it, only that tracer can
+/// make the task untraced, by its own `PTRACE_DETACH` (counted per task,
+/// through any capability) or by exiting. A wait built on such a value and
+/// driven by that same owner, while the Event and the task's detach epoch
+/// are unchanged, therefore skips the TracerPid read that looks for a
+/// detached wait (`notifier::note_detached_wait_if_untraced`, which also
+/// states the de_thread exception). A proof from an ownerless token never
+/// holds: a sibling thread can drive a later wait after the tracer exits.
+/// Every other producer (detach, listen) leaves it unset. Those waits read
+/// as before.
 ///
 /// It carries no identity of its own: equality and hashing ignore it.
-/// Without the `notifier` feature it is never set or read.
-#[derive(Clone, Copy, Debug, Default)]
-#[cfg_attr(not(feature = "notifier"), allow(dead_code))]
-struct ResumeMark(Option<(usize, u64)>);
+/// Without the `notifier` feature it is empty.
+#[derive(Clone, Debug, Default)]
+struct ResumeMark(#[cfg(feature = "notifier")] Option<notifier::ResumeProof>);
 
 impl PartialEq for ResumeMark {
     fn eq(&self, _other: &Self) -> bool {

@@ -810,10 +810,6 @@ struct Event {
     /// [`Event::mark_echild_if_unowned`].
     detached_waits: Mutex<Vec<(u64, Option<Arc<LegacyWaitOwner>>)>>,
     detached_wait_seq: AtomicU64,
-    /// Detach requests made through any capability of this Event, counted
-    /// before each request is issued. A [`crate::ResumeMark`] records it at
-    /// its resume, and holds only while it is unchanged.
-    detach_epoch: AtomicU64,
 
     /// Monotonic activity state owned by this exact Event generation.
     worker_state: AtomicI32,
@@ -1481,7 +1477,6 @@ impl Event {
             registration_error: Mutex::new(None),
             detached_waits: Mutex::new(Vec::new()),
             detached_wait_seq: AtomicU64::new(0),
-            detach_epoch: AtomicU64::new(0),
             worker_state: AtomicI32::new(WORKER_NOT_STARTED),
             worker_done_lock: Mutex::new(()),
             worker_done_changed: Condvar::new(),
@@ -2956,30 +2951,43 @@ impl EventHandle {
         self.event().invalidate_numeric_auth();
     }
 
-    /// What a [`crate::ResumeMark`] records after a successful resume request:
-    /// the Event this handle resolves to now, by address, and its detach
-    /// epoch. The token that carries the mark keeps that Event alive, so the
-    /// address cannot be reused while the mark exists.
-    pub(super) fn resume_mark(&self) -> (usize, u64) {
-        let event = self.event();
-        (
-            Arc::as_ptr(event).addr(),
-            event.detach_epoch.load(Ordering::SeqCst),
-        )
+    /// What a [`crate::ResumeMark`] records after a successful resume request
+    /// on `pid` through this handle: the Event it resolves to now (by
+    /// address), `pid`'s detach epoch, and `owner`, the resuming tracer if
+    /// the caller knows it. The token that carries the mark keeps the Event
+    /// alive, and the proof keeps the owner alive, so neither address can be
+    /// reused while the mark exists.
+    pub(super) fn resume_proof(
+        &self,
+        pid: Pid,
+        owner: Option<&Arc<LegacyWaitOwner>>,
+    ) -> ResumeProof {
+        ResumeProof {
+            owner: owner.cloned(),
+            event: Arc::as_ptr(self.event()).addr(),
+            epoch: detach_epoch(pid).load(Ordering::SeqCst),
+        }
     }
 
-    /// Counts a detach request through this handle, before it is issued.
-    pub(super) fn note_detach(&self) {
-        self.event().detach_epoch.fetch_add(1, Ordering::SeqCst);
-    }
-
-    /// Whether `mark` still holds: this handle resolves to the same Event,
-    /// and no detach was requested through it since.
-    fn resume_mark_holds(&self, mark: crate::ResumeMark) -> bool {
-        mark.0.is_some_and(|(event, epoch)| {
-            let current = self.event();
-            Arc::as_ptr(current).addr() == event
-                && current.detach_epoch.load(Ordering::SeqCst) == epoch
+    /// Whether `proof` still holds for a wait on `pid` whose effective owner
+    /// is `owner`: this handle resolves to the same Event, no detach of any
+    /// task in `pid`'s bucket was requested since, through any capability
+    /// on any Event, and the wait is driven by the owner that resumed. A
+    /// proof that records no owner never holds: a later wait may be driven by
+    /// an owner it does not know (a sibling thread after the tracer exits,
+    /// say), so that wait reads as before.
+    fn resume_proof_holds(
+        &self,
+        pid: Pid,
+        proof: Option<&ResumeProof>,
+        owner: Option<&Arc<LegacyWaitOwner>>,
+    ) -> bool {
+        proof.is_some_and(|proof| {
+            Arc::as_ptr(self.event()).addr() == proof.event
+                && detach_epoch(pid).load(Ordering::SeqCst) == proof.epoch
+                && owner
+                    .zip(proof.owner.as_ref())
+                    .is_some_and(|(owner, resumer)| Arc::ptr_eq(owner, resumer))
         })
     }
 
@@ -7756,6 +7764,45 @@ thread_local! {
     static TRACER_PID_READS_FOR_TEST: Cell<usize> = const { Cell::new(0) };
 }
 
+/// How many detach-epoch buckets [`DETACH_EPOCHS`] has.
+const DETACH_EPOCH_BUCKETS: usize = 4096;
+
+/// Detach requests, counted per task before each request is issued, in
+/// buckets keyed by TID. A [`crate::ResumeMark`] records its task's bucket at
+/// the resume and holds only while the bucket is unchanged.
+///
+/// The count is keyed by task, not by Event. Before Linux 6.9 the public API
+/// routinely gives out capabilities for one live task on unrelated Events: a
+/// failed Native capture yields a fresh Event (`Stopped::new_unchecked`,
+/// `Wait::from_raw`, `wait_all`). A detach through any of them must cancel
+/// the mark. It is not one process-wide counter either, so that a detach of
+/// one task does not cancel every other task's marks. Two TIDs that share a
+/// bucket only cancel marks they did not need to: those waits read as
+/// before.
+static DETACH_EPOCHS: [AtomicU64; DETACH_EPOCH_BUCKETS] =
+    [const { AtomicU64::new(0) }; DETACH_EPOCH_BUCKETS];
+
+fn detach_epoch(pid: Pid) -> &'static AtomicU64 {
+    &DETACH_EPOCHS[pid.as_raw() as u32 as usize % DETACH_EPOCH_BUCKETS]
+}
+
+/// Counts a detach request for `pid`, before it is issued, whatever
+/// capability or Event the request goes through.
+pub(super) fn note_detach(pid: Pid) {
+    detach_epoch(pid).fetch_add(1, Ordering::SeqCst);
+}
+
+/// What a [`crate::ResumeMark`] proves: a successful resume request by the
+/// tracer `owner` (none when the resuming token does not identify it; see
+/// `Stopped::into_running_resumed`), resolved to the Event at address
+/// `event`, when its task's detach bucket read `epoch`.
+#[derive(Clone, Debug)]
+pub(super) struct ResumeProof {
+    owner: Option<Arc<LegacyWaitOwner>>,
+    event: usize,
+    epoch: u64,
+}
+
 /// Records a generation-bound wait created while its task is detached,
 /// returning the Event whose detached-wait list was noted (the caller
 /// holds it until drop; see [`Event::note_detached_wait`]). The caller
@@ -7770,19 +7817,29 @@ thread_local! {
 /// instead (see [`OwnedWaitFuture::new`]).
 ///
 /// A running state from a successful resume request whose
-/// [`crate::ResumeMark`] still holds is attached by construction: the request
-/// passed `ptrace_check_attach` for this tracer, and since then no detach was
-/// requested and the Event did not change. Only this tracer's exit could have
-/// made it untraced since, and a note owned by a dead tracer grants no
-/// exemption ([`Event::detach_handoff_pending`]). Such a wait records nothing
-/// and reads nothing. Every other running state reads TracerPid as before.
+/// [`crate::ResumeMark`] still holds, waited on by the owner that resumed it,
+/// skips the read and records nothing. The request passed
+/// `ptrace_check_attach` for that owner. Since then, no detach of the task
+/// was requested through any capability, and the Event did not change. So
+/// the task can have become untraced only in two ways:
+/// - its tracer, which is this wait's owner, exited. A note owned by a dead
+///   tracer grants no exemption ([`Event::detach_handoff_pending`]), so
+///   recording none changes nothing.
+/// - an untraced non-leader's exec gave it the resumed leader's TID
+///   (`de_thread` → `exchange_tids`). There the skip is a deliberate choice,
+///   not an equivalence: the release is treated as retirement (ECHILD), the
+///   outcome a wait built just before the exec already has, rather than as a
+///   handoff that no reattach will ever complete.
+///
+/// Every other running state reads TracerPid as before.
 fn note_detached_wait_if_untraced(
     running: &Running,
     affinity_owner: Option<Arc<LegacyWaitOwner>>,
 ) -> Option<(Arc<Event>, u64)> {
     let token = &running.1;
     let handle = token.event();
-    if handle.resume_mark_holds(running.2) {
+    let owner = affinity_owner.or_else(|| token.ptracer_owner.clone());
+    if handle.resume_proof_holds(running.0, running.2.0.as_ref(), owner.as_ref()) {
         return None;
     }
     let identity = handle.identity()?;
@@ -7791,7 +7848,6 @@ fn note_detached_wait_if_untraced(
     if identity.current_tracer_pid() != Ok(Pid::from_raw(0)) {
         return None;
     }
-    let owner = affinity_owner.or_else(|| token.ptracer_owner.clone());
     let event = Arc::clone(handle.event());
     let id = event.note_detached_wait(owner);
     Some((event, id))
