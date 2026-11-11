@@ -603,6 +603,22 @@ pub struct MappingFact {
     /// version bump, and the field must never be skipped when serializing.
     #[serde(default)]
     pub vm_flags: Option<u64>,
+    /// Whether `smaps` reports that the mapping may have transparent huge
+    /// pages (`THPeligible`, `thp_vma_allowable_orders` in Linux's
+    /// `include/linux/huge_mm.h`), as the kernel the backend runs on printed
+    /// it, when the list was made, for a mapping of its own of the same
+    /// open file description with the same file offset, length, protection
+    /// and sharing, at an address with the same offset within a PMD-sized
+    /// block (at the same address, for a mapping that ends below one).
+    /// `None` where the backend did not ask. It answers for the mapping
+    /// alone: whether the address space disabled transparent huge pages
+    /// (`PR_SET_THP_DISABLE`), which makes every mapping's 0, is for the
+    /// reader to apply.
+    ///
+    /// `serde(default)` lets JSON written without the field decode to
+    /// `None`, as for [`vm_flags`](Self::vm_flags).
+    #[serde(default)]
+    pub thp_eligible: Option<bool>,
 }
 
 /// `VM_READ` (`include/linux/mm.h`, Linux 7.1): `rd` in `smaps`' `VmFlags`.
@@ -684,9 +700,18 @@ impl MappingFact {
             offset,
             backing,
             vm_flags: None,
+            thp_eligible: None,
         };
         mapping.validate()?;
         Ok(mapping)
+    }
+
+    /// The mapping with [`thp_eligible`](Self::thp_eligible) `eligible`.
+    pub fn with_thp_eligible(self, eligible: bool) -> Self {
+        Self {
+            thp_eligible: Some(eligible),
+            ..self
+        }
     }
 
     /// The mapping with [`vm_flags`](Self::vm_flags) `vm_flags`, if
@@ -2540,6 +2565,20 @@ mod memory_map_tests {
             serde_json::from_str::<MappingFact>(&old).unwrap(),
             anonymous
         );
+
+        // So does `thp_eligible`, which any mapping may carry.
+        let eligible = flagged.clone().with_thp_eligible(true);
+        assert_eq!(eligible.thp_eligible, Some(true));
+        assert_eq!(eligible.validate(), Ok(()));
+        let text = serde_json::to_string(&eligible).unwrap();
+        assert!(text.contains("\"thp_eligible\":true"), "{text}");
+        assert_eq!(
+            serde_json::from_str::<MappingFact>(&text).unwrap(),
+            eligible
+        );
+        let old = text.replace(",\"thp_eligible\":true", "");
+        assert!(!old.contains("thp_eligible"), "{old}");
+        assert_eq!(serde_json::from_str::<MappingFact>(&old).unwrap(), flagged);
     }
 
     /// Facts built with the constructors print as Linux would and read back

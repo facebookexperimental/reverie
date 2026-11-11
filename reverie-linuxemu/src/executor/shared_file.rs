@@ -282,7 +282,14 @@ pub(super) fn mmap_with_shared_files(
                 "file-view extent exceeds nonnegative host off_t",
             ));
         }
-        let identity = super::mapping_list::MappedObject::file_from(file);
+        let identity = super::mapping_list::MappedObject::file_from(
+            file,
+            super::mapping_list::MapShape {
+                prot: prot as u8,
+                shared: true,
+                offset: args[5],
+            },
+        );
         let file = match file.as_fd().try_clone_to_owned() {
             Ok(file) => file,
             Err(error) => return Ok(io_error(error)),
@@ -344,10 +351,16 @@ pub(super) fn mmap_with_shared_files(
             ));
         }
         let identity = if !is_anonymous {
-            state
-                .files
-                .get(&(args[4] as libc::c_int))
-                .and_then(super::mapping_list::MappedObject::file_from)
+            state.files.get(&(args[4] as libc::c_int)).and_then(|file| {
+                super::mapping_list::MappedObject::file_from(
+                    file,
+                    super::mapping_list::MapShape {
+                        prot: prot as u8,
+                        shared: is_shared,
+                        offset: args[5],
+                    },
+                )
+            })
         } else if is_shared {
             super::mapping_list::MappedObject::shared_anonymous(
                 memory.physical_to_user(address).unwrap_or(address),

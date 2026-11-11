@@ -555,10 +555,18 @@ pub(super) fn mmap(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: 
 
     // What the mapping maps, for the list of mappings (`mapping_list`).
     let identity = if !is_anonymous {
-        state
-            .files
-            .get(&(args[4] as libc::c_int))
-            .and_then(super::mapping_list::MappedObject::file_from)
+        state.files.get(&(args[4] as libc::c_int)).and_then(|file| {
+            super::mapping_list::MappedObject::file_from(
+                file,
+                super::mapping_list::MapShape {
+                    // The protection bits were validated above, so they fit
+                    // a byte.
+                    prot: prot as u8,
+                    shared: is_shared,
+                    offset: args[5],
+                },
+            )
+        })
     } else if is_shared {
         super::mapping_list::MappedObject::shared_anonymous(
             memory.physical_to_user(address).unwrap_or(address),

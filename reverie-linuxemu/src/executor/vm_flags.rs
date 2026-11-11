@@ -12,8 +12,11 @@
 //! keeps (`DeclaredMapping::flags`, the `FLAG_*` constants of `mm`), the
 //! facts about a mapped file captured when the mapping was made
 //! ([`FileVmFacts`]), and two facts about the host kernel read once per run,
-//! before the guest's first instruction ([`HostVmFacts`]). No host state is
-//! read when a list is, or a mapping made.
+//! before the guest's first instruction ([`HostVmFacts`]). No host setting is
+//! read when a list is, or a mapping made. For a file on overlayfs, which
+//! runs the mmap hook of a layer it does not show, the host kernel is asked
+//! instead, when the mapping is made, how it maps the same open file
+//! description the same way ([`super::host_probe`]).
 //!
 //! The answer is `None`, rather than a guess, wherever one of those does not
 //! establish every bit: see [`line_vm_flags`].
@@ -251,32 +254,91 @@ pub(crate) struct FileVmFacts {
     /// `MNT_NOEXEC`; no filesystem below sets the other half of
     /// `path_noexec`, `SB_I_NOEXEC`): its mappings have no `VM_MAYEXEC`.
     pub(crate) noexec: bool,
-    /// The file is on ext2/3/4 or XFS, whose mmap hooks refuse `VM_SYNC` for
-    /// a file that is not DAX (`ext4_file_mmap_prepare`, `xfs_file_mmap`).
+    /// Linux makes no mapping of the file with `VM_SYNC`: the file is on
+    /// ext2/3/4 or XFS, whose mmap hooks refuse it for a file that is not
+    /// DAX (`ext4_file_mmap_prepare`, `xfs_file_mmap`), or on overlayfs,
+    /// whose files do not offer it (`ovl_file_operations` has no
+    /// `FOP_MMAP_SYNC`, without which `do_mmap` refuses `MAP_SYNC`).
     pub(crate) refuses_sync: bool,
 }
 
-/// `statfs` magic numbers (`include/uapi/linux/magic.h`) of the filesystems
-/// whose mmap hooks leave a regular file's `vm_flags` to the generic code
-/// when the file is not DAX: btrfs (`btrfs_file_mmap_prepare`), ext2/3/4
-/// (`ext4_file_mmap_prepare`), XFS (`xfs_file_mmap`) and tmpfs
-/// (`shmem_mmap_prepare`). Any other filesystem (hugetlbfs, whose files are
-/// regular too; overlayfs, which runs a lower filesystem's hook; FUSE and the
-/// rest) is not known to.
+/// `BTRFS_SUPER_MAGIC` (`include/uapi/linux/magic.h`).
+const BTRFS_SUPER_MAGIC: i64 = 0x9123_683e;
+/// `EXT2_SUPER_MAGIC`, which ext3 and ext4 share.
+const EXT4_SUPER_MAGIC: i64 = 0xef53;
+/// `XFS_SUPER_MAGIC`.
+const XFS_SUPER_MAGIC: i64 = 0x5846_5342;
+/// `TMPFS_MAGIC`, which memfds share.
+const TMPFS_MAGIC: i64 = 0x0102_1994;
+/// `OVERLAYFS_SUPER_MAGIC`.
+const OVERLAYFS_SUPER_MAGIC: i64 = 0x794c_7630;
+
+/// `statfs` magic numbers of the filesystems whose mmap hooks leave a
+/// regular file's `vm_flags` to the generic code when the file is not DAX:
+/// btrfs (`btrfs_file_mmap_prepare`), ext2/3/4 (`ext4_file_mmap_prepare`),
+/// XFS (`xfs_file_mmap`) and tmpfs (`shmem_mmap_prepare`). Overlayfs runs
+/// the hook of the real file of one of its layers (`ovl_mmap`), which it
+/// does not show, so its files are probed instead ([`FileVmFacts::of`]).
+/// Any other filesystem (hugetlbfs, whose files are regular too; FUSE and
+/// the rest) is not known to.
 const FLAG_NEUTRAL_FILESYSTEMS: [i64; 4] = [
-    0x9123_683e, // BTRFS_SUPER_MAGIC
-    0xef53,      // EXT2/3/4_SUPER_MAGIC
-    0x5846_5342, // XFS_SUPER_MAGIC
-    0x0102_1994, // TMPFS_MAGIC
+    BTRFS_SUPER_MAGIC,
+    EXT4_SUPER_MAGIC,
+    XFS_SUPER_MAGIC,
+    TMPFS_MAGIC,
 ];
 
+/// One mapping of a file as the guest asked for it, as far as the file's
+/// mmap hook could decide flags by it: its protection (`PROT_*` bits),
+/// whether it is shared, and its page-aligned file offset.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct MapShape {
+    pub(crate) prot: u8,
+    pub(crate) shared: bool,
+    pub(crate) offset: u64,
+}
+
+/// The `statfs` magic number of host descriptor `fd`'s filesystem.
+fn filesystem_magic(fd: libc::c_int) -> Option<i64> {
+    let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+    // SAFETY: fstatfs writes at most one statfs, read only on success.
+    if unsafe { libc::fstatfs(fd, filesystem.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: fstatfs succeeded.
+    Some(unsafe { filesystem.assume_init() }.f_type)
+}
+
+/// Whether the `THPeligible` of a mapping of `file` is asked of the host
+/// kernel when a list is taken (`super::host_probe::thp_eligible`): a file
+/// on overlayfs, whose real layer decides it, or on tmpfs, whose mount's
+/// `huge=` option and the file's size do (`shmem_allowable_huge_orders`).
+pub(crate) fn thp_eligibility_is_probed(file: &std::fs::File) -> bool {
+    matches!(
+        filesystem_magic(file.as_raw_fd()),
+        Some(OVERLAYFS_SUPER_MAGIC | TMPFS_MAGIC)
+    )
+}
+
 impl FileVmFacts {
-    /// The facts of a mapping of `file` made now, or `None` where they are
-    /// not known: a file that is not regular, one on a filesystem outside
-    /// [`FLAG_NEUTRAL_FILESYSTEMS`], a DAX file (on which ext4 and XFS add
-    /// `VM_HUGEPAGE`), or any query that fails, but `F_GET_SEALS`'s EINVAL,
-    /// which says the file takes no seals.
-    pub(crate) fn of(file: &std::fs::File) -> Option<Self> {
+    /// The facts of mappings of `file` made now with each of `shapes`, or
+    /// `None` where they are not known: a file that is not regular, one on a
+    /// filesystem outside [`FLAG_NEUTRAL_FILESYSTEMS`] but overlayfs, a DAX
+    /// file (on which ext4 and XFS add `VM_HUGEPAGE`), or any query that
+    /// fails, but `F_GET_SEALS`'s EINVAL, which says the file takes no seals.
+    ///
+    /// For a file on overlayfs, the facts are those of a file whose hook
+    /// adds no flag (an overlayfs file takes no seals, and its mount's
+    /// `noexec` is the overlay's, which `do_mmap` checks before any hook),
+    /// and each shape is probed: the host kernel maps one page of the same
+    /// open file description with that shape ([`super::host_probe::probe`]),
+    /// and the flags it prints must be exactly those these facts give such a
+    /// mapping ([`FileVmFacts::hook_adds_no_flag`]). A hook that added a
+    /// flag (a DAX layer's `VM_HUGEPAGE`), a flag this provider does not
+    /// know, or a probe that fails gives `None`, as does a file on overlayfs
+    /// with no shape to probe. What the hook adds is fixed when the mapping
+    /// is made, so later protection changes keep the answer.
+    pub(crate) fn of(file: &std::fs::File, shapes: &[MapShape]) -> Option<Self> {
         let fd = file.as_raw_fd();
         let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
         // SAFETY: fstat writes at most one stat, read only on success.
@@ -287,14 +349,9 @@ impl FileVmFacts {
         if unsafe { stat.assume_init() }.st_mode & libc::S_IFMT != libc::S_IFREG {
             return None;
         }
-        let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::zeroed();
-        // SAFETY: fstatfs writes at most one statfs, read only on success.
-        if unsafe { libc::fstatfs(fd, filesystem.as_mut_ptr()) } != 0 {
-            return None;
-        }
-        // SAFETY: fstatfs succeeded.
-        let magic = unsafe { filesystem.assume_init() }.f_type;
-        if !FLAG_NEUTRAL_FILESYSTEMS.contains(&magic) {
+        let magic = filesystem_magic(fd)?;
+        let probed = magic == OVERLAYFS_SUPER_MAGIC;
+        if !FLAG_NEUTRAL_FILESYSTEMS.contains(&magic) && !probed {
             return None;
         }
         let mut extended = std::mem::MaybeUninit::<libc::statx>::zeroed();
@@ -337,12 +394,62 @@ impl FileVmFacts {
         }
         // SAFETY: fstatvfs succeeded.
         let mount = unsafe { mount.assume_init() };
-        Some(Self {
+        let facts = Self {
             writable: matches!(status & libc::O_ACCMODE, libc::O_WRONLY | libc::O_RDWR),
             write_sealed: seals & (libc::F_SEAL_WRITE | libc::F_SEAL_FUTURE_WRITE) != 0,
             noexec: mount.f_flag & libc::ST_NOEXEC != 0,
-            refuses_sync: matches!(magic, 0xef53 | 0x5846_5342),
-        })
+            refuses_sync: matches!(
+                magic,
+                EXT4_SUPER_MAGIC | XFS_SUPER_MAGIC | OVERLAYFS_SUPER_MAGIC
+            ),
+        };
+        let neutral = !probed
+            || !shapes.is_empty()
+                && shapes
+                    .iter()
+                    .all(|shape| facts.hook_adds_no_flag(file, *shape));
+        neutral.then_some(facts)
+    }
+
+    /// Whether the host kernel gives a one-page mapping of `file` with
+    /// `shape`, made now, exactly the flags these facts give it, as for a
+    /// file whose mmap hook adds none: those of a plain mapping
+    /// (`MAP_PRIVATE` or `MAP_SHARED` alone) with that protection, which
+    /// `line_vm_flags` gives for its provider flags (`mm::new_mapping_flags`).
+    /// The flags of the probe's mapping are its own address space's too, so
+    /// any flag that space would add to every mapping (`mlockall`'s
+    /// `VM_LOCKED`, `PR_SET_MEMORY_MERGE`'s `VM_MERGEABLE`) makes them
+    /// differ, and the answer is no.
+    fn hook_adds_no_flag(&self, file: &std::fs::File, shape: MapShape) -> bool {
+        let kind = if shape.shared {
+            libc::MAP_SHARED
+        } else {
+            libc::MAP_PRIVATE
+        };
+        let provider = super::mm::new_mapping_flags(
+            kind as u64,
+            u64::from(shape.prot),
+            &HostVmFacts::UNCAPTURED,
+        );
+        let expected = line_vm_flags(
+            shape.prot,
+            provider,
+            shape.shared,
+            FlagBacking::File(Some(self)),
+            false,
+            HostVmFacts::UNCAPTURED,
+        );
+        expected.is_some()
+            && super::host_probe::probe(
+                file,
+                shape.prot,
+                shape.shared,
+                shape.offset,
+                4096,
+                super::host_probe::Placement::Lowest,
+            )
+            .and_then(|block| block.vm_flags)
+                == expected
     }
 }
 
@@ -488,34 +595,52 @@ pub(crate) fn line_vm_flags(
     Some(vm)
 }
 
+/// The name `show_smap_vma_flags` prints in `VmFlags` for each flag this
+/// provider reports (`reverie::VM_KNOWN_FLAGS`), in the order of its bit.
+pub(crate) const VM_FLAG_NAMES: [(u64, &str); 19] = [
+    (VM_READ, "rd"),
+    (VM_WRITE, "wr"),
+    (VM_EXEC, "ex"),
+    (VM_SHARED, "sh"),
+    (VM_MAYREAD, "mr"),
+    (VM_MAYWRITE, "mw"),
+    (VM_MAYEXEC, "me"),
+    (VM_MAYSHARE, "ms"),
+    (VM_GROWSDOWN, "gd"),
+    (VM_MAYBE_GUARD, "gu"),
+    (VM_LOCKED, "lo"),
+    (VM_SEQ_READ, "sr"),
+    (VM_RAND_READ, "rr"),
+    (VM_ACCOUNT, "ac"),
+    (VM_NORESERVE, "nr"),
+    (VM_SYNC, "sf"),
+    (VM_HUGEPAGE, "hg"),
+    (VM_NOHUGEPAGE, "nh"),
+    (VM_MERGEABLE, "mg"),
+];
+
+/// The flags the names of a `VmFlags` field, `names`, stand for, or `None`
+/// where one is not in [`VM_FLAG_NAMES`] (such as `sd`, `VM_SOFTDIRTY`,
+/// which this provider does not report).
+pub(crate) fn parse_vm_flags(names: &[u8]) -> Option<u64> {
+    names
+        .split(u8::is_ascii_whitespace)
+        .filter(|name| !name.is_empty())
+        .try_fold(0, |flags, name| {
+            VM_FLAG_NAMES
+                .iter()
+                .find(|(_, known)| known.as_bytes() == name)
+                .map(|(bit, _)| flags | bit)
+        })
+}
+
 /// `VmFlags` text, as `show_smap_vma_flags` prints it, for `vm`.
 #[cfg(test)]
 pub(crate) fn mnemonics(vm: Option<u64>) -> Option<String> {
-    const NAMES: [(u64, &str); 19] = [
-        (VM_READ, "rd"),
-        (VM_WRITE, "wr"),
-        (VM_EXEC, "ex"),
-        (VM_SHARED, "sh"),
-        (VM_MAYREAD, "mr"),
-        (VM_MAYWRITE, "mw"),
-        (VM_MAYEXEC, "me"),
-        (VM_MAYSHARE, "ms"),
-        (VM_GROWSDOWN, "gd"),
-        (VM_MAYBE_GUARD, "gu"),
-        (VM_LOCKED, "lo"),
-        (VM_SEQ_READ, "sr"),
-        (VM_RAND_READ, "rr"),
-        (VM_ACCOUNT, "ac"),
-        (VM_NORESERVE, "nr"),
-        (VM_SYNC, "sf"),
-        (VM_HUGEPAGE, "hg"),
-        (VM_NOHUGEPAGE, "nh"),
-        (VM_MERGEABLE, "mg"),
-    ];
     let vm = vm?;
     assert_eq!(vm & !reverie::VM_KNOWN_FLAGS, 0);
     Some(
-        NAMES
+        VM_FLAG_NAMES
             .iter()
             .filter(|(bit, _)| vm & bit != 0)
             .map(|(_, name)| *name)
@@ -812,7 +937,7 @@ mod tests {
                 std::fs::File::from_raw_fd(pipe[1]),
             )
         };
-        let memfd_facts = FileVmFacts::of(&memfd).unwrap();
+        let memfd_facts = FileVmFacts::of(&memfd, &[]).unwrap();
         assert_eq!(
             memfd_facts,
             FileVmFacts {
@@ -822,13 +947,13 @@ mod tests {
                 refuses_sync: false,
             }
         );
-        assert_eq!(FileVmFacts::of(&pipe_read), None);
+        assert_eq!(FileVmFacts::of(&pipe_read, &[]), None);
         // A regular file of a filesystem outside the list (procfs, whose
         // files are regular in fstat) has no facts.
         let proc_file = std::fs::File::open("/proc/self/status").unwrap();
-        assert_eq!(FileVmFacts::of(&proc_file), None);
+        assert_eq!(FileVmFacts::of(&proc_file, &[]), None);
         // The temporary directory's filesystem may be outside the list.
-        if let Some(facts) = FileVmFacts::of(&read_only) {
+        if let Some(facts) = FileVmFacts::of(&read_only, &[]) {
             assert!(!facts.writable && !facts.write_sealed);
         }
         std::fs::remove_dir_all(&directory).unwrap();

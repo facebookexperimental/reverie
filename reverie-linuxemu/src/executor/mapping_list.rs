@@ -63,9 +63,13 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
 use super::mm::FLAG_ACCOUNT_UNKNOWN;
+use super::mm::FLAG_HUGEPAGE;
+use super::mm::FLAG_HUGETLB;
 use super::mm::FLAG_MAYBE_GUARD;
+use super::mm::FLAG_NOHUGEPAGE;
 use super::vm_flags::FileVmFacts;
 use super::vm_flags::FlagBacking;
+pub(crate) use super::vm_flags::MapShape;
 use crate::GuestMemory;
 use crate::memory::DeclaredMapping;
 use crate::memory::MappingIdentity;
@@ -95,6 +99,9 @@ pub(crate) enum MappedObject {
         /// What decides the mapping's flags, as it was when the mapping was
         /// made (`None`: not known).
         vm_facts: Option<FileVmFacts>,
+        /// Whether a line's `THPeligible` is asked of the host kernel when
+        /// the list is taken (`vm_flags::thp_eligibility_is_probed`).
+        probe_thp: bool,
     },
     /// `MAP_SHARED | MAP_ANONYMOUS` memory, which Linux backs with a shmem
     /// file of its own named `/dev/zero (deleted)` (`shmem_zero_setup`). The
@@ -117,25 +124,27 @@ pub(crate) enum MappedObject {
 }
 
 impl MappedObject {
-    /// The identity of a mapping of `file` made now, or `None` where the
-    /// host cannot describe the file. It holds the facts that decide the
-    /// mapping's flags, read now, as Linux fixes them when it maps the file
-    /// ([`FileVmFacts::of`]).
-    pub(crate) fn file(file: &Arc<std::fs::File>) -> Option<MappingIdentity> {
+    /// The identity of mappings of `file` made now with each of `shapes`,
+    /// or `None` where the host cannot describe the file. It holds the facts
+    /// that decide the mappings' flags, read now, as Linux fixes them when it
+    /// maps the file ([`FileVmFacts::of`], which probes each shape of a file
+    /// on overlayfs).
+    pub(crate) fn file(file: &Arc<std::fs::File>, shapes: &[MapShape]) -> Option<MappingIdentity> {
         let (st_dev, raw_inode) = fstat_identity(file.as_raw_fd())?;
         let raw_device = superblock_device(file.as_raw_fd()).unwrap_or(st_dev);
         Some(MappingIdentity::new(MappedObject::File {
             file: file.clone(),
             raw_device,
             raw_inode,
-            vm_facts: FileVmFacts::of(file),
+            vm_facts: FileVmFacts::of(file, shapes),
+            probe_thp: super::vm_flags::thp_eligibility_is_probed(file),
         }))
     }
 
-    /// The identity of a mapping of the host file `file` holds, through a
-    /// descriptor of its own for the same open file description.
-    pub(crate) fn file_from(file: &std::fs::File) -> Option<MappingIdentity> {
-        Self::file(&Arc::new(file.try_clone().ok()?))
+    /// The identity of a mapping with `shape` of the host file `file` holds,
+    /// through a descriptor of its own for the same open file description.
+    pub(crate) fn file_from(file: &std::fs::File, shape: MapShape) -> Option<MappingIdentity> {
+        Self::file(&Arc::new(file.try_clone().ok()?), &[shape])
     }
 
     /// The identity of a new `MAP_SHARED | MAP_ANONYMOUS` mapping made at
@@ -398,6 +407,7 @@ enum LineBacking {
         raw_inode: u64,
         offset: u64,
         vm_facts: Option<FileVmFacts>,
+        probe_thp: bool,
     },
     SharedAnonymous {
         identity: MappingIdentity,
@@ -441,6 +451,7 @@ impl Line {
                     raw_device,
                     raw_inode,
                     vm_facts,
+                    probe_thp,
                 }),
                 Some(offset),
                 false,
@@ -450,6 +461,7 @@ impl Line {
                 raw_inode: *raw_inode,
                 offset,
                 vm_facts: *vm_facts,
+                probe_thp: *probe_thp,
             },
             (
                 Some(MappedObject::SharedAnonymous {
@@ -579,6 +591,30 @@ impl Line {
             image.read_implies_exec,
             image.host,
         );
+        // A file line's `THPeligible`, asked of the host kernel where the
+        // file's filesystem decides it by state no fact here gives, for a
+        // line whose flags are known and that no huge-page advice or
+        // `MAP_HUGETLB` reached (`host_probe::thp_eligible`).
+        let thp_eligible = match &self.backing {
+            LineBacking::File {
+                file,
+                offset,
+                probe_thp: true,
+                ..
+            } if vm_flags.is_some()
+                && self.declared.flags & (FLAG_HUGEPAGE | FLAG_NOHUGEPAGE | FLAG_HUGETLB) == 0 =>
+            {
+                super::host_probe::thp_eligible(
+                    file,
+                    self.declared.prot,
+                    self.shared,
+                    *offset,
+                    self.start,
+                    self.end,
+                )
+            }
+            _ => None,
+        };
         let (offset, backing) = match self.backing {
             LineBacking::Anonymous => {
                 // `vma_is_initial_heap`, which Linux tests before the stack.
@@ -627,7 +663,11 @@ impl Line {
             offset,
             backing,
         )?;
-        Ok(with_vm_flags(fact, vm_flags))
+        let fact = with_vm_flags(fact, vm_flags);
+        Ok(match thp_eligible {
+            Some(eligible) => fact.with_thp_eligible(eligible),
+            None => fact,
+        })
     }
 }
 

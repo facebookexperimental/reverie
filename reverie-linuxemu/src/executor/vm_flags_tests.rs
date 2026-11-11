@@ -351,7 +351,16 @@ fn removing_write_from_private_anonymous_memory_leaves_its_charge_unknown() {
         .write(true)
         .open(&path)
         .unwrap();
-    let file_facts = super::vm_flags::FileVmFacts::of(&file);
+    // The facts the mmap below captures, its shape probed where the
+    // directory is on overlayfs.
+    let file_facts = super::vm_flags::FileVmFacts::of(
+        &file,
+        &[super::vm_flags::MapShape {
+            prot: RW as u8,
+            shared: false,
+            offset: 0,
+        }],
+    );
     let fd = 77;
     executor.state.files.insert(fd, file);
     let mut owner = memory.clone();
@@ -2173,6 +2182,7 @@ fn file_mappings_whose_captured_flags_differ_or_are_not_known_report_no_merged_f
                 raw_device: *raw_device,
                 raw_inode: *raw_inode,
                 vm_facts: None,
+                probe_thp: false,
             });
         memory.describe_mapping(guest, PAGE, None, 0, Some(unknown));
         assert_eq!(
@@ -2353,5 +2363,62 @@ fn each_run_logs_its_host_facts_once_under_its_own_subscriber() {
             drive_a_run(&mut executor, &memory, &directory);
         });
         assert_eq!(events.load(Ordering::SeqCst), 1, "run {run}");
+    }
+}
+
+/// A guest's mapping of a file on overlayfs lists with the flags of a file
+/// whose hook adds none, which the host kernel's own mapping of the same
+/// shape showed when the guest made it, and with the `THPeligible` the host
+/// kernel printed for a mapping of the same shape as the list was taken. On
+/// a tmpfs layer mounted `huge=always`, which allows every order a file may
+/// have: 1 for 2 MiB at an aligned address, and 0 for four pages at an odd
+/// page, to which no such order's block is aligned; on the disk layer, whose
+/// file is not shmem, 0 under the host's settings but `always`.
+#[test]
+fn an_overlayfs_file_lists_with_its_probed_flags_and_thp_eligibility() {
+    const PMD: u64 = super::host_probe::PMD_SIZE;
+    if !super::host_probe_tests::in_namespace(
+        module_path!(),
+        "an_overlayfs_file_lists_with_its_probed_flags_and_thp_eligibility",
+    ) {
+        return;
+    }
+    let _host = inject_host_vm_facts(HOST);
+    let scratch = super::host_probe_tests::Scratch::new();
+    let overlay = super::host_probe_tests::overlay(&scratch.0, "always", 2 * PMD);
+    let directory = Directory::new();
+    let (mut executor, memory) = loaded(&directory);
+    let aligned = room(&mut executor, &memory, 2 * PMD / PAGE + 8).next_multiple_of(PMD);
+    let small = aligned + PMD + PAGE;
+    let disk = room(&mut executor, &memory, 4);
+    // The executor's own calls replace its state's descriptors with its
+    // table's, so each descriptor goes in just before its mmap.
+    for (at, pages, name) in [
+        (aligned, PMD / PAGE, "file"),
+        (small, 4, "file"),
+        (disk, 4, "disk-file"),
+    ] {
+        let file = std::fs::File::open(overlay.merged.join(name)).unwrap();
+        let fd = insert_file_with_flags(&mut executor.state, file, false, None);
+        assert!(fd >= 0);
+        let private = libc::MAP_PRIVATE as u64;
+        map_fd(&mut executor, &memory, at, pages, R, private, fd, 0);
+    }
+    let global = std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/enabled").unwrap();
+    for (at, length, eligible) in [
+        (aligned, PMD, Some(true)),
+        (small, 4 * PAGE, Some(false)),
+        (
+            disk,
+            4 * PAGE,
+            (!global.contains("[always]")).then_some(false),
+        ),
+    ] {
+        let mapped = line(&executor, &memory, at);
+        assert_eq!((mapped.start, mapped.end), (at, at + length), "{at:#x}");
+        assert_eq!(mnemonics(mapped.vm_flags), text("rd mr mw me"), "{at:#x}");
+        if eligible.is_some() {
+            assert_eq!(mapped.thp_eligible, eligible, "{at:#x}");
+        }
     }
 }

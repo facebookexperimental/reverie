@@ -2207,12 +2207,9 @@ fn load_executable(
         }
         None => (None, None),
     };
-    let image_identity = executable_file
-        .as_ref()
-        .and_then(crate::executor::mapping_list::MappedObject::file);
-    let interpreter_identity = interpreter_file
-        .as_ref()
-        .and_then(crate::executor::mapping_list::MappedObject::file);
+    let image_identity = executable_file.as_ref().and_then(|file| {
+        crate::executor::mapping_list::MappedObject::file(file, &segment_shapes(&elf))
+    });
     let interpreter = interpreter_image
         .as_deref()
         .map(|interpreter_image| -> Result<_> {
@@ -2227,6 +2224,12 @@ fn load_executable(
             Ok((interpreter, first, end - first))
         })
         .transpose()?;
+    let interpreter_identity = interpreter_file
+        .as_ref()
+        .zip(interpreter.as_ref())
+        .and_then(|(file, (interpreter, _, _))| {
+            crate::executor::mapping_list::MappedObject::file(file, &segment_shapes(interpreter))
+        });
     let brk_headroom = if interpreter.is_some() {
         INTERPRETED_BRK_HEADROOM
     } else {
@@ -3115,6 +3118,21 @@ fn load_segments_relocated(
         ));
     }
     Ok(image_end)
+}
+
+/// The shapes Linux maps `elf`'s file-backed `PT_LOAD` segments with, which
+/// decide their flags: each private, with its segment's protection, from its
+/// page-aligned file offset (`elf_map` in `fs/binfmt_elf.c`).
+fn segment_shapes(elf: &Elf<'_>) -> Vec<crate::executor::mapping_list::MapShape> {
+    elf.program_headers
+        .iter()
+        .filter(|header| header.p_type == PT_LOAD && header.p_filesz != 0)
+        .map(|header| crate::executor::mapping_list::MapShape {
+            prot: segment_prot(header.p_flags),
+            shared: false,
+            offset: header.p_offset & !(PAGE_SIZE - 1),
+        })
+        .collect()
 }
 
 /// The protection Linux maps a segment with flags `p_flags` with
