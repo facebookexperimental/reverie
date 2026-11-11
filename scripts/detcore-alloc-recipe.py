@@ -4,7 +4,13 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
-"""Derive a DETCORE_VALIDATE_TEMPLATES fixed_patch_alloc row from a real ELF.
+"""Derive a DETCORE_VALIDATE_TEMPLATES row that reads the TLS cell from a real ELF.
+
+Two roles read the INSTALLATION_DEPTH cell as a literal displacement, so a new
+cell needs a row for each (--role, default fixed_patch_alloc):
+
+- fixed_patch_alloc, the 241-byte TLS-arm allocation body, cell at [66..70];
+- fixed_tls_fn_once, the 22-byte FnOnce TLS thunk, cell at [16..20].
 
 The row's bytes, its TLS cell and its provenance are read from the ELF; the
 expected identities are read from reverie-liteinst-artifact/src/lib.rs, so
@@ -15,17 +21,17 @@ nothing in the emitted row is typed by hand:
   absent from .dynsym, in an allocated writable TLS NOBITS section, wholly
   inside the single PT_TLS segment's zero-fill extent, and overlapped by no
   other TLS identity;
-- the allocation body is the one function whose canonical name is a
-  "fixed_patch_alloc" spelling in lib.rs's role census, read through the
-  PT_LOAD segment that maps it, and its little-endian bytes [66..70] must equal
-  the cell (the binding the qualifier checks at its TLS boundary);
+- the body is the one function whose canonical name is a spelling of the role
+  in lib.rs's role census, read through the PT_LOAD segment that maps it, and
+  its little-endian bytes at the role's cell displacement must equal the cell
+  (the binding the qualifier checks at its TLS boundary);
 - the ELF's .comment must name exactly one rustc version, and --toolchain must
   carry that version as one of its words, so the provenance cannot name a
   compiler other than the one that built the image;
-- the operand and transfer structure is taken from the existing 241-byte
-  fixed_patch_alloc rows: a row matches when every byte outside its declared
-  relocation operands and the TLS displacement [66..70] is equal. The new row
-  keeps that structure with the ELF's own bytes. Structures that differ only
+- the operand and transfer structure is taken from the role's existing rows of
+  the same length: a row matches when every byte outside its declared
+  relocation operands and the cell displacement is equal. The new row keeps
+  that structure with the ELF's own bytes. Structures that differ only
   in the named callee of a GOT operand are discriminated the way
   fixed_detcore_got_discriminate does, by those differing operands;
 - whichever structure is used, EVERY one of its GOT operands must resolve,
@@ -39,24 +45,27 @@ nothing in the emitted row is typed by hand:
   __tls_get_addr's PLT entry, the panic Location data) are copied from the
   cited structure and left to the qualifier's full binding of the image.
 
---self-test (no ELF needed) checks that every 241-byte row is in the canonical
-form the generator prints; that a row without the generated-row marker is one
-of the LEGACY_ROWS, pinned by body and structure digest, each present once; and
-that every generated row agrees with its own provenance comment: the recorded
-body SHA256, the recorded INSTALLATION_DEPTH cell against the encoded read, and
-the operands and transfers of the cited masked-equal row, with the selecting
-GOT callee clause required whenever the cited digest has several structures.
-It then runs controls that must be refused: a hand-edited encoded cell (also
-with its digest re-recorded), operand displacement and recorded digest; the
-callee clause dropped with the callee rekeyed; the marker stripped, alone and
-with an edited operand; a new unmarked row; a legacy row removed; and, on a
-synthetic ELF built from each generated row, every GOT operand bound to another
-callee, and the case where the only masked-equal structure names a callee the
-ELF does not bind.
+--self-test (no ELF needed) checks, for each role, that every row of the
+role's length is in the canonical form the generator prints; that a row
+without the generated-row marker is one of the role's legacy rows
+(LEGACY_ROWS, LEGACY_FN_ONCE_ROWS), pinned by body and structure digest, each
+present once; and that every generated row agrees with its own provenance
+comment: the recorded body SHA256, the recorded INSTALLATION_DEPTH cell against
+the encoded read, and the operands and transfers of the cited masked-equal row,
+with the selecting GOT callee clause required whenever the cited digest has
+several structures. It then runs controls that must be refused: a hand-edited
+encoded cell (also with its digest re-recorded), operand displacement and
+recorded digest; the marker stripped, alone and with an edited operand; a new
+unmarked row; a legacy row removed; and, on a synthetic ELF built from each
+generated row, that the row is derived again. For a row with GOT operands it
+also refuses the callee clause dropped with the callee rekeyed, every GOT
+operand bound to another callee, and the case where the only masked-equal
+structure names a callee the ELF does not bind.
 
 Usage:
   detcore-alloc-recipe.py --self-test --lib reverie-liteinst-artifact/src/lib.rs
   detcore-alloc-recipe.py ELF --lib reverie-liteinst-artifact/src/lib.rs \
+      [--role fixed_tls_fn_once] \
       --toolchain "$(rustc -vV | head -1)" --profile liteinst-runtime \
       --features exec-native-injection --command "cargo build ..."
 
@@ -73,17 +82,27 @@ import json
 import re
 import struct
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
-ROLE = "fixed_patch_alloc"
-BODY_LEN = 241
-TLS_DISPLACEMENT = (66, 70)
 STT_FUNC, STT_TLS, STB_LOCAL = 2, 6, 0
 SHT_NOBITS, SHT_NOTE = 8, 7
 SHF_WRITE, SHF_ALLOC, SHF_EXECINSTR, SHF_TLS = 0x1, 0x2, 0x4, 0x400
 PT_LOAD, PT_NOTE, PT_TLS = 1, 4, 7
 NT_GNU_BUILD_ID = 3
 SHN_UNDEF = 0
+
+
+@dataclass(frozen=True)
+class Role:
+    """One DETCORE_VALIDATE_TEMPLATES role whose body reads the TLS cell."""
+
+    name: str
+    body_len: int
+    cell: tuple[int, int]  # the little-endian cell read's byte range in the body
+    what: str
+    synthetic_address: int
+    legacy: frozenset
 
 
 class Refusal(Exception):
@@ -242,21 +261,21 @@ def symbol_table(text: str, name: str) -> list[tuple[str, str]]:
     return re.findall(r'\(\s*"([a-z0-9_]+)",\s*"(_R[^"]+)",?\s*\)', table)
 
 
-def parse_lib(text: str):
-    role = re.search(r'^const FIXED_TLS_CELL_ROLE: &str = "([^"]+)";', text, re.M)
-    require(role is not None, "lib.rs: FIXED_TLS_CELL_ROLE not found")
+def parse_lib(text: str, role: Role):
+    tls_role = re.search(r'^const FIXED_TLS_CELL_ROLE: &str = "([^"]+)";', text, re.M)
+    require(tls_role is not None, "lib.rs: FIXED_TLS_CELL_ROLE not found")
     # Key -> every spelling lib.rs gives its function, from both role tables.
     support: dict[str, set[str]] = {}
     for table in ("FIXED_SUPPORT_ROLE_SYMBOLS", "FIXED_EMITTED_ROLE_SYMBOLS"):
         for key, spelling in symbol_table(text, table):
             support.setdefault(key, set()).add(spelling)
-    spellings = set(re.findall(r'\(\s*"' + ROLE + r'",\s*"(_R[^"]+)",\s*\)', text))
-    require(bool(spellings), f"lib.rs: no {ROLE} role spellings found")
+    spellings = set(re.findall(r'\(\s*"' + role.name + r'",\s*"(_R[^"]+)",\s*\)', text))
+    require(bool(spellings), f"lib.rs: no {role.name} role spellings found")
     start = text.index("const DETCORE_VALIDATE_TEMPLATES: &[DetcoreValidateTemplate] = &[")
     end = text.index("\n];", start)
     rows = []
     pattern = re.compile(
-        r'((?:[ \t]*//[^\n]*\n)*)[ \t]*DetcoreValidateTemplate \{\s*role: "' + ROLE + r'",\s*'
+        r'((?:[ \t]*//[^\n]*\n)*)[ \t]*DetcoreValidateTemplate \{\s*role: "' + role.name + r'",\s*'
         r'hex: "([0-9a-f]+)",\s*operands: &\[(.*?)\],\s*transfers: &\[(.*?)\],\s*\},', re.S)
     for match in pattern.finditer(text, start, end):
         operands = [(int(d), int(n), k, g == "true") for d, n, k, g in re.findall(
@@ -266,14 +285,14 @@ def parse_lib(text: str):
         rows.append({"comment": match.group(1).strip(), "hex": match.group(2),
                      "operands": operands, "transfers": transfers,
                      "line": text.count("\n", 0, match.start(2)) + 1})
-    return role.group(1), spellings, rows, support
+    return tls_role.group(1), spellings, rows, support
 
 
-def matches(body: bytes, row) -> bool:
+def matches(body: bytes, row, role: Role) -> bool:
     known = bytes.fromhex(row["hex"])
     if len(known) != len(body):
         return False
-    masked = set(range(*TLS_DISPLACEMENT))
+    masked = set(range(*role.cell))
     for displacement, nxt, _key, _got in row["operands"]:
         masked.update(range(displacement, nxt))
     return all(body[i] == known[i] for i in range(len(body)) if i not in masked)
@@ -313,6 +332,26 @@ LEGACY_ROWS = frozenset({
     ("a8ebcb1ad9b229aca79d2c5e29344b716eef9df78cf7caf015b9274d8a5ae148", _LEGACY_STRUCTURE),  # 0x148
 })
 
+# The 22-byte fixed_tls_fn_once rows that predate the generator, pinned the same
+# way as found at Reverie 820b4839. All share one structure: the TLS descriptor
+# and __tls_get_addr PLT operands, and one transfer.
+_LEGACY_FN_ONCE_STRUCTURE = "6d0bafe6c16af671244453a09eacf0a53bc63d9ec560e4dda97422fd583309a8"
+LEGACY_FN_ONCE_ROWS = frozenset({
+    ("babf65d30be4438d443c1b05efdeedaa7829f4bf13bc735f8f1d40d8e11d4bbf", _LEGACY_FN_ONCE_STRUCTURE),  # 0xa0
+    ("74b9cbe0594d3b6d59760492bc24e6ef6893ddb17efee45ffc222b502e73bc19", _LEGACY_FN_ONCE_STRUCTURE),  # 0xe0
+    ("db8ec5915319258301190b284d997db73b9c71263837328381e3f2d0204aad6c", _LEGACY_FN_ONCE_STRUCTURE),  # 0x98
+    ("31ceb9edab518b7358ba5a075392aedb542d84b6abc81f3b950bde2949d48e51", _LEGACY_FN_ONCE_STRUCTURE),  # 0xd8
+    ("371427cc22cd9daf3549e1ab38b7e3038419a688694792744860f58cd7e7564a", _LEGACY_FN_ONCE_STRUCTURE),  # 0x128
+    ("e8c91bed65db0791ea5424bcc8ceb0449e6ae65399a105a129f2fcc6fc66018e", _LEGACY_FN_ONCE_STRUCTURE),  # 0xe8
+    ("c5dfcf5de97a0cb9e9f9c4986f151c03106108472592304657548d456ca5537c", _LEGACY_FN_ONCE_STRUCTURE),  # 0x110
+    ("ae2842200f1c3de93b9716d589a3df0cbc340767c98f2a2affd89a0509c7992e", _LEGACY_FN_ONCE_STRUCTURE),  # 0x108
+    ("a350560648d73fb7dbd68c2dfbd3e4fa91c30a21e096d015c2121538678053bb", _LEGACY_FN_ONCE_STRUCTURE),  # 0x148
+})
+
+ALLOC = Role("fixed_patch_alloc", 241, (66, 70), "TLS-arm allocation body", 0x1372580, LEGACY_ROWS)
+FN_ONCE = Role("fixed_tls_fn_once", 22, (16, 20), "FnOnce TLS thunk", 0x1372a20, LEGACY_FN_ONCE_ROWS)
+ROLES = {role.name: role for role in (ALLOC, FN_ONCE)}
+
 
 def got_mismatches(elf: Elf, address: int, body: bytes, structure, support: dict[str, set[str]],
                    got: dict[int, int], only: set[int] | None = None) -> list[str]:
@@ -338,8 +377,8 @@ def got_mismatches(elf: Elf, address: int, body: bytes, structure, support: dict
     return bad
 
 
-def render(body: bytes, row) -> str:
-    lines = ["    DetcoreValidateTemplate {", f'        role: "{ROLE}",', f'        hex: "{body.hex()}",',
+def render(body: bytes, row, role: Role) -> str:
+    lines = ["    DetcoreValidateTemplate {", f'        role: "{role.name}",', f'        hex: "{body.hex()}",',
              "        operands: &["]
     for displacement, nxt, key, got in row["operands"]:
         lines += ["            DetcoreValidateOperand {", f"                displacement: {displacement},",
@@ -351,21 +390,22 @@ def render(body: bytes, row) -> str:
 
 
 def derive(data: bytes, text: str, toolchain: str, profile: str, features: str,
-           command: str) -> tuple[int, str, str]:
-    """(exit code, row text, diagnostics) for one ELF against lib.rs."""
+           command: str, role: Role, elf_name: str = "ELF") -> tuple[int, str, str]:
+    """(exit code, row text, diagnostics) for one ELF and role against lib.rs.
+    `elf_name` is how the provenance names the ELF in the generator command."""
 
     try:
         elf = Elf(data)
-        tls_role, spellings, rows, support = parse_lib(text)
+        tls_role, spellings, rows, support = parse_lib(text, role)
         _cell_name, cell, (filesz, memsz) = fixed_tls_cell(elf, tls_role)
         funcs = [s for s in elf.symbols(".symtab", ".strtab")
                  if s[3] == STT_FUNC and s[2] > 0 and canonical_rust_symbol(s[0]) in spellings]
-        require(len(funcs) == 1, f"{ROLE}: {len(funcs)} symbols carry a census spelling, expected exactly 1")
+        require(len(funcs) == 1, f"{role.name}: {len(funcs)} symbols carry a census spelling, expected exactly 1")
         name, address, size = funcs[0][0], funcs[0][1], funcs[0][2]
-        require(size == BODY_LEN, f"{ROLE} is {size} bytes, not the {BODY_LEN}-byte TLS-arm body")
+        require(size == role.body_len, f"{role.name} is {size} bytes, not the {role.body_len}-byte {role.what}")
         body = elf.read_va(address, size)
-        encoded = struct.unpack_from("<I", body, TLS_DISPLACEMENT[0])[0]
-        require(encoded == cell, f"{ROLE} reads TLS cell {encoded:#x}, but INSTALLATION_DEPTH is {cell:#x}")
+        encoded = struct.unpack_from("<I", body, role.cell[0])[0]
+        require(encoded == cell, f"{role.name} reads TLS cell {encoded:#x}, but INSTALLATION_DEPTH is {cell:#x}")
         versions = sorted({m.group(1) for c in elf.comment() for m in [re.search(r"rustc version (\S+)", c)] if m})
         require(len(versions) == 1 and versions[0] in toolchain.split(),
                 f"--toolchain {toolchain!r} does not name the ELF's rustc version {versions}")
@@ -375,7 +415,7 @@ def derive(data: bytes, text: str, toolchain: str, profile: str, features: str,
     identical = [r for r in rows if r["hex"] == body.hex()]
     if identical:
         notes.append(f"detcore-alloc-recipe: body already present verbatim at lib.rs:{identical[0]['line']}")
-    fitting = [r for r in rows if matches(body, r)]
+    fitting = [r for r in rows if matches(body, r, role)]
     structures = {structure_of(r) for r in fitting}
     got = elf.relative_got()
     callees: list[str] = []
@@ -412,14 +452,17 @@ def derive(data: bytes, text: str, toolchain: str, profile: str, features: str,
         f"    // Toolchain: {toolchain}; ELF .comment: {comment}.",
         f"    // Profile {profile}; features {features}.",
         f"    // ELF SHA256 {sha}; build-id: {build_id}.",
-        f"    // {ROLE} {name} at VA {address:#x}, {size} bytes; INSTALLATION_DEPTH LOCAL8 cell {cell:#x}"
+        f"    // {role.name} {name} at VA {address:#x}, {size} bytes; INSTALLATION_DEPTH LOCAL8 cell {cell:#x}"
         f" (PT_TLS filesz {filesz:#x}, memsz {memsz:#x}).",
         f"    // Operands and transfers: those of the masked-equal row with body SHA256"
         f" {hashlib.sha256(bytes.fromhex(pattern['hex'])).hexdigest()}"
         + (f", selected by bound GOT callee {', '.join(callees)}." if callees else "."),
         f"    // Command: {command}",
+        f"    // Generator: scripts/detcore-alloc-recipe.py {elf_name} --role {role.name}"
+        f" --lib reverie-liteinst-artifact/src/lib.rs --toolchain <Toolchain above> --profile {profile}"
+        f" --features {features} --command <Command above>",
         f"    // Complete {size}-byte body SHA256: {hashlib.sha256(body).hexdigest()}.",
-        render(body, pattern),
+        render(body, pattern, role),
     ])
     return 0, row, "\n".join(notes)
 
@@ -427,7 +470,7 @@ def derive(data: bytes, text: str, toolchain: str, profile: str, features: str,
 GENERATED_MARK = "// Generated by scripts/detcore-alloc-recipe.py"
 
 
-def provenance_violations(row, rows) -> list[str]:
+def provenance_violations(row, rows, role: Role) -> list[str]:
     """For a generated row, everything its provenance comment claims that its
     own content can be checked against: the body digest, the TLS cell its
     read encodes, and the operand/transfer structure of the cited row."""
@@ -439,7 +482,7 @@ def provenance_violations(row, rows) -> list[str]:
             or digest.group(2) != hashlib.sha256(body).hexdigest():
         bad.append("body SHA256 differs from the provenance comment")
     cell = re.search(r"INSTALLATION_DEPTH LOCAL8 cell (0x[0-9a-f]+)", comment)
-    if cell is None or body[TLS_DISPLACEMENT[0]:TLS_DISPLACEMENT[1]] != int(cell.group(1), 16).to_bytes(4, "little"):
+    if cell is None or body[role.cell[0]:role.cell[1]] != int(cell.group(1), 16).to_bytes(4, "little"):
         bad.append("encoded TLS read differs from the recorded INSTALLATION_DEPTH cell")
     cited = re.search(r"masked-equal row with body SHA256 ([0-9a-f]{64})"
                       r"(?:, selected by bound GOT callee ([a-z0-9_, ]+))?\.", comment)
@@ -448,7 +491,7 @@ def provenance_violations(row, rows) -> list[str]:
         return bad
     sources = [r for r in rows if GENERATED_MARK not in r["comment"]
                and hashlib.sha256(bytes.fromhex(r["hex"])).hexdigest() == cited.group(1)]
-    same = [r for r in sources if structure_of(r) == structure_of(row) and matches(body, r)]
+    same = [r for r in sources if structure_of(r) == structure_of(row) and matches(body, r, role)]
     structures = {structure_of(r) for r in sources}
     if not same:
         bad.append("operands/transfers are not those of the cited masked-equal row")
@@ -462,49 +505,51 @@ def provenance_violations(row, rows) -> list[str]:
     return bad
 
 
-def check_rows(text: str) -> tuple[int, list[str]]:
-    """(241-byte row count, failures) for every row of the table."""
+def check_rows(text: str, role: Role) -> tuple[int, list[str]]:
+    """(count of the role's rows of its body length, failures) for the table."""
 
-    _role, _spellings, rows, _support = parse_lib(text)
+    _tls_role, _spellings, rows, _support = parse_lib(text, role)
     lines = text.splitlines()
     failures = []
     count = 0
     legacy_seen: dict[tuple[str, str], int] = {}
     for row in rows:
         body = bytes.fromhex(row["hex"])
-        if len(body) != BODY_LEN:
+        if len(body) != role.body_len:
             continue
         count += 1
         start = row["line"] - 3
-        rendered = render(body, row).splitlines()
+        rendered = render(body, row, role).splitlines()
         if lines[start:start + len(rendered)] != rendered:
-            failures.append(f"row at lib.rs:{row['line']} is not in canonical form")
+            failures.append(f"{role.name} row at lib.rs:{row['line']} is not in canonical form")
         if GENERATED_MARK in row["comment"]:
-            failures += [f"generated row at lib.rs:{row['line']}: {v}" for v in provenance_violations(row, rows)]
+            failures += [f"generated {role.name} row at lib.rs:{row['line']}: {v}"
+                         for v in provenance_violations(row, rows, role)]
             continue
         key = (body_digest(row), structure_digest(row))
-        if key not in LEGACY_ROWS:
-            failures.append(f"row at lib.rs:{row['line']} has no generated-row provenance and is not a pinned "
-                            f"legacy row (body {key[0][:16]}, structure {key[1][:16]})")
+        if key not in role.legacy:
+            failures.append(f"{role.name} row at lib.rs:{row['line']} has no generated-row provenance and is "
+                            f"not a pinned legacy row (body {key[0][:16]}, structure {key[1][:16]})")
         legacy_seen[key] = legacy_seen.get(key, 0) + 1
-    for key in sorted(LEGACY_ROWS):
+    for key in sorted(role.legacy):
         if legacy_seen.get(key, 0) != 1:
-            failures.append(f"pinned legacy row (body {key[0][:16]}, structure {key[1][:16]}) appears "
-                            f"{legacy_seen.get(key, 0)} times, expected once")
+            failures.append(f"pinned legacy {role.name} row (body {key[0][:16]}, structure {key[1][:16]}) "
+                            f"appears {legacy_seen.get(key, 0)} times, expected once")
     return count, failures
 
 
 def synthetic_elf(body: bytes, address: int, structure, support: dict[str, set[str]],
-                  bind: dict[str, str], tls_role: str, alloc_spelling: str, rustc: str) -> bytes:
-    """A minimal ELF64 carrying `body` as fixed_patch_alloc at `address`, the
-    INSTALLATION_DEPTH cell the body reads, and for each GOT operand a unique
-    R_X86_64_RELATIVE slot naming the local function `bind[key]` (default:
-    the key itself) spells. Crate disambiguators are made non-empty."""
+                  bind: dict[str, str], tls_role: str, spelling: str, rustc: str, role: Role) -> bytes:
+    """A minimal ELF64 carrying `body` as the role's function `spelling` at
+    `address`, the INSTALLATION_DEPTH cell the body reads, and for each GOT
+    operand a unique R_X86_64_RELATIVE slot naming the local function
+    `bind[key]` (default: the key itself) spells. Crate disambiguators are made
+    non-empty."""
 
     def spelled(name: str) -> str:
         return name.replace("Cs_", "CsTest_")
 
-    cell = struct.unpack_from("<I", body, TLS_DISPLACEMENT[0])[0]
+    cell = struct.unpack_from("<I", body, role.cell[0])[0]
     strtab, symbols, relocations = bytearray(b"\0"), [], []
 
     def symbol(name: str, info: int, shndx: int, value: int, size: int) -> None:
@@ -513,7 +558,7 @@ def synthetic_elf(body: bytes, address: int, structure, support: dict[str, set[s
 
     symbols.append(bytes(24))
     symbol(spelled(tls_role), (STB_LOCAL << 4) | STT_TLS, 1, cell, 8)
-    symbol(spelled(alloc_spelling), (STB_LOCAL << 4) | STT_FUNC, 2, address, len(body))
+    symbol(spelled(spelling), (STB_LOCAL << 4) | STT_FUNC, 2, address, len(body))
     placed: dict[str, int] = {}
     for displacement, nxt, key, is_got in structure[0]:
         if not is_got:
@@ -572,12 +617,12 @@ def strip_comment(block: str) -> str:
     return "\n".join(line for line in block.split("\n") if not line.lstrip().startswith("//"))
 
 
-def rekey_last_got(block: str, row, rows) -> str:
+def rekey_last_got(block: str, row, rows, role: Role) -> str:
     """`block` with the row's last GOT operand that a same-digest twin keys
     differently given the twin's key instead (unchanged when there is none)."""
 
     twins = [r for r in rows if r is not row and GENERATED_MARK not in r["comment"]
-             and matches(bytes.fromhex(row["hex"]), r) and structure_of(r) != structure_of(row)]
+             and matches(bytes.fromhex(row["hex"]), r, role) and structure_of(r) != structure_of(row)]
     for index in sorted((i for i, op in enumerate(row["operands"]) if op[3]), reverse=True):
         for twin in twins:
             other = twin["operands"][index][2]
@@ -585,7 +630,7 @@ def rekey_last_got(block: str, row, rows) -> str:
                 operands = [op if i != index else (op[0], op[1], other, op[3])
                             for i, op in enumerate(row["operands"])]
                 body = bytes.fromhex(row["hex"])
-                return block.replace(render(body, row), render(body, {**row, "operands": operands}))
+                return block.replace(render(body, row, role), render(body, {**row, "operands": operands}, role))
     return block
 
 
@@ -597,15 +642,16 @@ def generated_block(text: str, row) -> str:
     return text[start:text.index("\n    },", at) + len("\n    },")]
 
 
-def self_test(text: str) -> int:
-    """Every 241-byte row is in canonical form; every generated row's content
-    agrees with its provenance comment; and each control below is refused."""
+def self_test_role(text: str, role: Role) -> tuple[int, int, int, list[str]]:
+    """(rows, generated rows, controls, failures) for one role: every row of the
+    role's body length is in canonical form, every generated row's content
+    agrees with its provenance comment, and each control below is refused."""
 
-    count, failures = check_rows(text)
+    count, failures = check_rows(text, role)
     for failure in failures:
         print(f"self-test: {failure}", file=sys.stderr)
-    tls_role, spellings, rows, support = parse_lib(text)
-    generated = [r for r in rows if GENERATED_MARK in r["comment"] and len(r["hex"]) == 2 * BODY_LEN]
+    tls_role, spellings, rows, support = parse_lib(text, role)
+    generated = [r for r in rows if GENERATED_MARK in r["comment"] and len(r["hex"]) == 2 * role.body_len]
     controls = 0
 
     def control(ok: bool, message: str) -> None:
@@ -617,14 +663,15 @@ def self_test(text: str) -> int:
 
     for row in generated:
         body, block = bytes.fromhex(row["hex"]), generated_block(text, row)
-        where = f"lib.rs:{row['line']}"
-        if provenance_violations(row, rows):
+        where = f"{role.name} lib.rs:{row['line']}"
+        if provenance_violations(row, rows, role):
             # Already reported; its controls would test a row that is wrong.
             continue
+        has_got = any(op[3] for op in row["operands"])
         # Hand edits the canonical-form check alone accepts; each is refused.
-        cell_at = 2 * TLS_DISPLACEMENT[0]
+        cell_at = 2 * role.cell[0]
         first = row["operands"][0]
-        moved = row["hex"][:cell_at] + f"{(body[66] + 8) & 0xff:02x}" + row["hex"][cell_at + 2:]
+        moved = row["hex"][:cell_at] + f"{(body[role.cell[0]] + 8) & 0xff:02x}" + row["hex"][cell_at + 2:]
         edits = {
             "encoded TLS cell": block.replace(row["hex"], moved),
             # The same edit with its digest re-recorded: only the recorded
@@ -634,9 +681,6 @@ def self_test(text: str) -> int:
             "operand displacement": block.replace(
                 f"displacement: {first[0]},", f"displacement: {first[0] - 1},", 1),
             "recorded body SHA256": re.sub(r"(body SHA256: )[0-9a-f]{64}", r"\g<1>" + "0" * 64, block),
-            # The selecting-callee clause dropped and the callee rekeyed to its twin's.
-            "selecting callee, clause dropped": rekey_last_got(re.sub(
-                r", selected by bound GOT callee [a-z0-9_, ]+\.", ".", block), row, rows),
             # The marker stripped: the row is then neither generated nor legacy.
             "provenance marker, stripped": strip_comment(block),
             "provenance marker, stripped with an edited operand": strip_comment(block).replace(
@@ -644,20 +688,27 @@ def self_test(text: str) -> int:
             # A hand-typed unmarked row beside it (cell moved).
             "new unmarked row": block + "\n" + strip_comment(block).replace(row["hex"], moved),
         }
+        if has_got:
+            # The selecting-callee clause dropped and the callee rekeyed to its twin's.
+            edits["selecting callee, clause dropped"] = rekey_last_got(re.sub(
+                r", selected by bound GOT callee [a-z0-9_, ]+\.", ".", block), row, rows, role)
         for label, edited in edits.items():
-            control(edited != block and bool(check_rows(text.replace(block, edited))[1]),
+            control(edited != block and bool(check_rows(text.replace(block, edited), role)[1]),
                     f"a hand-edited {label} in {where} was not refused")
         # The generator derives this row from an ELF whose GOT binds the
         # row's callees, and refuses when it binds any other callee.
-        alloc, rustc = sorted(spellings)[0], "0.0.0-selftest"
-        args = (rustc, "selftest", "selftest", "selftest")
+        spelling, rustc = sorted(spellings)[0], "0.0.0-selftest"
+        args = (rustc, "selftest", "selftest", "selftest", role)
 
         def elf_for(bind: dict[str, str]) -> bytes:
-            return synthetic_elf(body, 0x1372580, structure_of(row), support, bind, tls_role, alloc, rustc)
+            return synthetic_elf(body, role.synthetic_address, structure_of(row), support, bind,
+                                 tls_role, spelling, rustc, role)
 
         rc, emitted, notes = derive(elf_for({}), text, *args)
-        control(rc == 0 and render(body, row) in emitted,
+        control(rc == 0 and render(body, row, role) in emitted,
                 f"the synthetic ELF for {where} did not derive its row (rc {rc}: {notes})")
+        if not has_got:
+            continue
         got_keys = [op[2] for op in row["operands"] if op[3]]
         for key in got_keys:
             other = next(k for k in got_keys + sorted(support) if k != key and k in support)
@@ -666,9 +717,9 @@ def self_test(text: str) -> int:
         # The reviewed case: the only masked-equal structure names a callee the
         # ELF does not bind. Drop the generated row and rekey its source rows.
         sources = [r for r in rows if r is not row and GENERATED_MARK not in r["comment"]
-                   and structure_of(r) == structure_of(row) and matches(body, r)]
+                   and structure_of(r) == structure_of(row) and matches(body, r, role)]
         twins = {structure_of(r) for r in rows if r is not row and GENERATED_MARK not in r["comment"]
-                 and matches(body, r)} - {structure_of(row)}
+                 and matches(body, r, role)} - {structure_of(row)}
         index = next((i for i, op in enumerate(row["operands"]) if op[3]
                       and any(t[0][i][2] != op[2] for t in twins)),
                      max(i for i, op in enumerate(row["operands"]) if op[3]))
@@ -678,21 +729,29 @@ def self_test(text: str) -> int:
         rekeyed = text.replace(block + "\n", "")
         for source in sources:
             operands = [op if i != index else (op[0], op[1], wrong, op[3]) for i, op in enumerate(source["operands"])]
-            original = render(bytes.fromhex(source["hex"]), source)
-            rekeyed = rekeyed.replace(original, render(bytes.fromhex(source["hex"]), {**source, "operands": operands}), 1)
+            original = render(bytes.fromhex(source["hex"]), source, role)
+            rekeyed = rekeyed.replace(
+                original, render(bytes.fromhex(source["hex"]), {**source, "operands": operands}, role), 1)
         rc, _emitted, notes = derive(elf_for({}), rekeyed, *args)
         control(bool(sources) and rc == 3,
                 f"{where}: with {right} rekeyed to {wrong} in every source row, the lone wrong structure "
                 f"was not refused (rc {rc})")
     # Every pinned legacy row is required: dropping one is refused.
-    legacy = [r for r in rows if len(r["hex"]) == 2 * BODY_LEN and GENERATED_MARK not in r["comment"]]
+    legacy = [r for r in rows if len(r["hex"]) == 2 * role.body_len and GENERATED_MARK not in r["comment"]]
     if legacy:
-        template = render(bytes.fromhex(legacy[0]["hex"]), legacy[0]) + "\n"
-        control(text.count(template) == 1 and bool(check_rows(text.replace(template, "", 1))[1]),
-                f"dropping the legacy row at lib.rs:{legacy[0]['line']} was not refused")
-    print(f"self-test: {count} {BODY_LEN}-byte {ROLE} rows ({len(generated)} generated), "
+        template = render(bytes.fromhex(legacy[0]["hex"]), legacy[0], role) + "\n"
+        control(text.count(template) == 1 and bool(check_rows(text.replace(template, "", 1), role)[1]),
+                f"dropping the legacy {role.name} row at lib.rs:{legacy[0]['line']} was not refused")
+    print(f"self-test: {count} {role.body_len}-byte {role.name} rows ({len(generated)} generated), "
           f"{controls} controls, {len(failures)} failure(s)")
-    return 1 if failures or count == 0 else 0
+    return count, len(generated), controls, failures
+
+
+def self_test(text: str) -> int:
+    """self_test_role for every role; any failure, or a role with no rows, fails."""
+
+    results = [self_test_role(text, role) for role in ROLES.values()]
+    return 1 if any(failures or count == 0 for count, _generated, _controls, failures in results) else 0
 
 
 def main(argv: list[str]) -> int:
@@ -700,6 +759,8 @@ def main(argv: list[str]) -> int:
     parser.add_argument("elf", type=Path, nargs="?")
     parser.add_argument("--lib", type=Path, required=True)
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--role", choices=sorted(ROLES), default=ALLOC.name,
+                        help="the template role to derive (default: %(default)s)")
     parser.add_argument("--toolchain", help="`rustc -vV` first line of the building compiler")
     parser.add_argument("--profile")
     parser.add_argument("--features")
@@ -710,7 +771,7 @@ def main(argv: list[str]) -> int:
     if args.elf is None or None in (args.toolchain, args.profile, args.features, args.command):
         parser.error("ELF, --toolchain, --profile, --features and --command are required")
     rc, row, notes = derive(args.elf.read_bytes(), args.lib.read_text(), args.toolchain,
-                            args.profile, args.features, args.command)
+                            args.profile, args.features, args.command, ROLES[args.role], args.elf.name)
     if notes:
         print(notes, file=sys.stderr)
     if row:
