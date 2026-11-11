@@ -3061,6 +3061,15 @@ static int park_threads(int count) {
 /* A fork child with `count` parked threads, then a last thread that
  * execs the marker image: de_thread kills the parked threads while
  * /proc/<pid>/task is walked, so walks can come up short. */
+/* The leader's view of a fork child's status: 0 (the child's
+ * own success) becomes the leader's 7; a child thread-setup
+ * failure (14, the park_threads _exit code) passes through as
+ * 14 so it can never masquerade as a generic failure; anything
+ * else folds into 9. */
+static int leader_status(int status) {
+  return status == 0 ? 7 : status == 14 ? 14 : 9;
+}
+
 static int many_thread_exec_child_marker(const char *marker, int count) {
   exec_marker = marker;
   pid_t pid = fork();
@@ -3073,7 +3082,7 @@ static int many_thread_exec_child_marker(const char *marker, int count) {
     _exit(12);
   }
   if (pid < 0) return 9;
-  return wait_status(pid) == 0 ? 7 : 9;
+  return leader_status(wait_status(pid));
 }
 
 static int count_tasks(void) {
@@ -3098,6 +3107,15 @@ static int park_count(const char *marker, int count) {
   return tasks == count + 1 ? 7 : 9;
 }
 
+/* A fork child that exits 14 at once, standing in for a child
+ * whose thread setup failed (the park_threads _exit(14) path). */
+static int child_exit14(void) {
+  pid_t pid = fork();
+  if (pid == 0) _exit(14);
+  if (pid < 0) return 9;
+  return leader_status(wait_status(pid));
+}
+
 static void *exit_group_zero(void *unused) {
   (void)unused;
   usleep(20000);
@@ -3118,7 +3136,7 @@ static int many_thread_exit_group_nondumpable(int count) {
     for (;;) pause();
   }
   if (pid < 0) return 9;
-  return wait_status(pid) == 0 ? 7 : 9;
+  return leader_status(wait_status(pid));
 }
 
 static void *busy_then_marker(void *marker) {
@@ -3253,6 +3271,8 @@ int main(int argc, char **argv) {
     return many_thread_exec_child_marker(argv[2], atoi(argv[3]));
   if (strcmp(argv[1], "park-count") == 0 && argc == 4)
     return park_count(argv[2], atoi(argv[3]));
+  if (strcmp(argv[1], "child-exit14") == 0 && argc == 2)
+    return child_exit14();
   if (strcmp(argv[1], "many-thread-exit-group-nondumpable") == 0 && argc == 3)
     return many_thread_exit_group_nondumpable(atoi(argv[2]));
   if (strcmp(argv[1], "busy-sibling-main-exit") == 0 && argc == 3)
@@ -4804,6 +4824,27 @@ int main(int argc, char **argv) {
             String::from_utf8_lossy(&output.stderr)
         );
         assert_eq!(fs::read_to_string(&marker).unwrap().trim(), "tasks=2001");
+    }
+
+    #[test]
+    fn child_setup_failure_exit_14_surfaces_not_folded_into_9() {
+        // The many-thread modes map the fork child's status onto
+        // the leader's: success is 7, and a child thread-setup
+        // failure (exit 14, the park_threads failure code) must
+        // surface as 14, not be folded into the generic 9, so a
+        // fixture setup failure can never again masquerade as a
+        // supervisor outcome. The child-exit14 mode stands in for
+        // that failure.
+        let output = std::process::Command::new(fork_guest())
+            .arg("child-exit14")
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(14),
+            "child setup failure must surface as exit 14: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
