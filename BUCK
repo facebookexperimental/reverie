@@ -490,7 +490,11 @@ rust_library(
 
 rust_library(
     name = "reverie-procfs",
-    srcs = glob(["reverie-procfs/src/**/*.rs"]),
+    srcs = glob([
+        "reverie-procfs/src/**/*.rs",
+        # include_str! tables for the fixed procfs files.
+        "reverie-procfs/src/tables/*.txt",
+    ]),
     autocargo = {
         "cargo_toml_config": {
             "package": {
@@ -501,6 +505,7 @@ rust_library(
     },
     deps = [
         "fbsource//third-party/rust:libc",
+        "fbsource//third-party/rust:serde",
     ],
 )
 

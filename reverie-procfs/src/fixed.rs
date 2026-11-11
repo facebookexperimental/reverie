@@ -1,0 +1,941 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+//! System-wide procfs files whose contents are fixed: the files that
+//! describe the kernel and its limits, each one value from the
+//! [`FixedMachine`], and the kernel's tables (interrupts, memory zones,
+//! modules and others), rendered for the machine's CPUs and memory with
+//! every counter zero. `/proc/diskstats` is not one: its disks must be
+//! those `/sys/block` lists, which come from elsewhere. A caller renders
+//! them with no kernel open, the same on every backend and host.
+//!
+//! The tables follow the formats of Linux 7.1, where the reference
+//! machine's `uname` reports release 5.2.0; the few format changes
+//! between the two are not worth a second copy of each table. That
+//! kernel is built without NUMA, so the counters Linux compiles only
+//! under `CONFIG_NUMA` or `CONFIG_NUMA_BALANCING` (which depends on it)
+//! are in neither `/proc/vmstat` nor `/proc/zoneinfo`; a test names each
+//! one with the line of Linux's `mm/vmstat.c` that guards it.
+
+use std::path::Path;
+
+use serde::Deserialize;
+use serde::Serialize;
+
+/// The machine a guest is told it runs on, as plain caller-rendered
+/// values. Every time-derived or host-derived string (the kernel
+/// banner, version, command line, boot ID) arrives already rendered by
+/// the caller; this crate reads no clock and no host state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FixedMachine {
+    /// `/proc/version` without its newline, e.g.
+    /// `Linux version 5.2.0 #1 SMP ...`.
+    pub banner: String,
+    /// `/proc/cmdline` without its newline.
+    pub command_line: String,
+    /// The kernel release (`uname` release, `kernel/osrelease`).
+    pub release: String,
+    /// The kernel name (`uname` sysname, `kernel/ostype`).
+    pub sysname: String,
+    /// The kernel version string (`uname` version, `kernel/version`),
+    /// without its newline.
+    pub version: String,
+    /// `kernel/random/boot_id`, without its newline.
+    pub boot_id: String,
+    /// `kernel/random/entropy_avail`.
+    pub entropy_avail: u32,
+    /// `kernel/overflowuid`.
+    pub overflow_uid: u32,
+    /// `kernel/overflowgid`.
+    pub overflow_gid: u32,
+    /// `kernel/pid_max`.
+    pub pid_max: u32,
+    /// `kernel/cap_last_cap`.
+    pub cap_last_cap: u32,
+    /// `vm/overcommit_memory`.
+    pub overcommit_memory: u32,
+    /// `vm/max_map_count`.
+    pub max_map_count: u32,
+    /// `vm/mmap_min_addr`.
+    pub mmap_min_addr: u64,
+    /// `fs/file-max` (and `fs/file-nr`'s third field).
+    pub file_max: u64,
+    /// `fs/aio-max-nr`.
+    pub aio_max_nr: u64,
+    /// `fs/pipe-max-size`.
+    pub pipe_max_size: u32,
+    /// The number of CPUs the per-CPU tables render.
+    pub cpus: u32,
+    /// The memory size in bytes `/proc/meminfo` reports.
+    pub memory: u64,
+}
+
+/// A procfs file whose contents are a fact of the [`FixedMachine`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum FixedFile {
+    /// `/proc/version`: the kernel's banner.
+    Version,
+    /// `/proc/cmdline`: the kernel's command line.
+    Cmdline,
+    // Carried verbatim from reverie-kvm's removed copy of this file, which Detcore's
+    // rendering replaces (https://github.com/rrnewton/hermit/issues/4213):
+    // /proc/sys/kernel/osrelease so `sysctl -n kernel.osrelease` resolves
+    // synthetically. The value matches the KVM `uname(2)` release field
+    // ("6.0.0", see fn uname) and /proc/version above.
+    Osrelease,
+    Ostype,
+    /// `kernel/version`.
+    KernelVersion,
+    BootId,
+    EntropyAvail,
+    OverflowUid,
+    OverflowGid,
+    PidMax,
+    CapLastCap,
+    OvercommitMemory,
+    MaxMapCount,
+    MmapMinAddr,
+    /// `/proc/modules`: no modules.
+    // empty module table.
+    Modules,
+    /// `/proc/filesystems`: the filesystem types the reference kernel
+    /// registers.
+    Filesystems,
+    /// `/proc/interrupts`: the timer's and the clock's interrupt lines and the
+    /// architecture's interrupts, one column per CPU.
+    Interrupts,
+    /// `/proc/softirqs`: Linux's ten softirqs, one column per CPU.
+    Softirqs,
+    /// `/proc/swaps`: no swap areas.
+    Swaps,
+    /// `/proc/buddyinfo`: node 0's zones.
+    Buddyinfo,
+    /// `/proc/zoneinfo`: node 0's zones, a page set per CPU, without the
+    /// NUMA counters.
+    Zoneinfo,
+    /// `/proc/schedstat`: a line per CPU, no scheduling domains.
+    Schedstat,
+    /// `/proc/key-users`: root's key quota.
+    KeyUsers,
+    /// `/proc/vmstat`: the reference kernel's counters, without the NUMA
+    /// ones.
+    // Carried verbatim from reverie-kvm's removed copy of this file, which Detcore's
+    // rendering replaces (https://github.com/rrnewton/hermit/issues/4213):
+    // procps `vmstat` reads its counters synthetically instead of hitting
+    // the fail-closed real-procfs refusal. All counters are fixed at 0
+    // (memory is not virtualized under KVM), matching the zeroed
+    // /proc/stat and /proc/meminfo surfaces above.
+    Vmstat,
+    /// `/proc/cgroups`: the controllers, all on the unified hierarchy.
+    // HotSpot reads this at JVM start to detect its container
+    // (https://github.com/rrnewton/hermit/issues/3987).
+    Cgroups,
+    /// `/proc/tty/drivers`: the terminal drivers of a container's `/dev`.
+    TtyDrivers,
+    /// `/proc/meminfo`: the description's memory, all of it free.
+    // Carried verbatim from reverie-kvm's removed copy of this file, which Detcore's
+    // rendering replaces (https://github.com/rrnewton/hermit/issues/4213):
+    Meminfo,
+    /// `/proc/loadavg`: no load, one runnable task of one, and PID 1 the
+    /// last created. Detcore rendered these values from every backend's
+    /// capture already (https://github.com/rrnewton/hermit/issues/4213).
+    Loadavg,
+    /// `fs/file-nr`.
+    FileNr,
+    /// `fs/file-max`.
+    FileMax,
+    /// `fs/inode-nr`.
+    InodeNr,
+    /// `fs/inode-state`.
+    InodeState,
+    /// `fs/dentry-state`.
+    DentryState,
+    /// `fs/aio-nr`.
+    AioNr,
+    /// `fs/aio-max-nr`.
+    AioMaxNr,
+    /// `fs/pipe-max-size`.
+    // The ceiling that decides whether a guest may raise a pipe above
+    // the pinned capacity. Reported raw it is the HOST's sysctl, so a
+    // guest that reads it and acts on it branches on the machine.
+    // Reported as the pinned capacity, it agrees with what
+    // `F_SETPIPE_SZ` actually allows.
+    PipeMaxSize,
+}
+
+impl FixedFile {
+    /// Every fixed file.
+    pub const ALL: [Self; 36] = [
+        Self::Version,
+        Self::Cmdline,
+        Self::Osrelease,
+        Self::Ostype,
+        Self::KernelVersion,
+        Self::BootId,
+        Self::EntropyAvail,
+        Self::OverflowUid,
+        Self::OverflowGid,
+        Self::PidMax,
+        Self::CapLastCap,
+        Self::OvercommitMemory,
+        Self::MaxMapCount,
+        Self::MmapMinAddr,
+        Self::Modules,
+        Self::Filesystems,
+        Self::Interrupts,
+        Self::Softirqs,
+        Self::Swaps,
+        Self::Buddyinfo,
+        Self::Zoneinfo,
+        Self::Schedstat,
+        Self::KeyUsers,
+        Self::Vmstat,
+        Self::Cgroups,
+        Self::TtyDrivers,
+        Self::Meminfo,
+        Self::Loadavg,
+        Self::FileNr,
+        Self::FileMax,
+        Self::InodeNr,
+        Self::InodeState,
+        Self::DentryState,
+        Self::AioNr,
+        Self::AioMaxNr,
+        Self::PipeMaxSize,
+    ];
+
+    /// The file's path, NUL-terminated.
+    pub fn c_path(self) -> &'static std::ffi::CStr {
+        match self {
+            Self::Version => c"/proc/version",
+            Self::Cmdline => c"/proc/cmdline",
+            Self::Osrelease => c"/proc/sys/kernel/osrelease",
+            Self::Ostype => c"/proc/sys/kernel/ostype",
+            Self::KernelVersion => c"/proc/sys/kernel/version",
+            Self::BootId => c"/proc/sys/kernel/random/boot_id",
+            Self::EntropyAvail => c"/proc/sys/kernel/random/entropy_avail",
+            Self::OverflowUid => c"/proc/sys/kernel/overflowuid",
+            Self::OverflowGid => c"/proc/sys/kernel/overflowgid",
+            Self::PidMax => c"/proc/sys/kernel/pid_max",
+            Self::CapLastCap => c"/proc/sys/kernel/cap_last_cap",
+            Self::OvercommitMemory => c"/proc/sys/vm/overcommit_memory",
+            Self::MaxMapCount => c"/proc/sys/vm/max_map_count",
+            Self::MmapMinAddr => c"/proc/sys/vm/mmap_min_addr",
+            Self::Modules => c"/proc/modules",
+            Self::Filesystems => c"/proc/filesystems",
+            Self::Interrupts => c"/proc/interrupts",
+            Self::Softirqs => c"/proc/softirqs",
+            Self::Swaps => c"/proc/swaps",
+            Self::Buddyinfo => c"/proc/buddyinfo",
+            Self::Zoneinfo => c"/proc/zoneinfo",
+            Self::Schedstat => c"/proc/schedstat",
+            Self::KeyUsers => c"/proc/key-users",
+            Self::Vmstat => c"/proc/vmstat",
+            Self::Cgroups => c"/proc/cgroups",
+            Self::TtyDrivers => c"/proc/tty/drivers",
+            Self::Meminfo => c"/proc/meminfo",
+            Self::Loadavg => c"/proc/loadavg",
+            Self::FileNr => c"/proc/sys/fs/file-nr",
+            Self::FileMax => c"/proc/sys/fs/file-max",
+            Self::InodeNr => c"/proc/sys/fs/inode-nr",
+            Self::InodeState => c"/proc/sys/fs/inode-state",
+            Self::DentryState => c"/proc/sys/fs/dentry-state",
+            Self::AioNr => c"/proc/sys/fs/aio-nr",
+            Self::AioMaxNr => c"/proc/sys/fs/aio-max-nr",
+            Self::PipeMaxSize => c"/proc/sys/fs/pipe-max-size",
+        }
+    }
+
+    /// The file's path.
+    pub fn path(self) -> &'static Path {
+        Path::new(
+            self.c_path()
+                .to_str()
+                .expect("fixed procfs paths are ASCII"),
+        )
+    }
+
+    pub fn from_path(path: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|file| file.c_path().to_bytes() == path.as_bytes())
+    }
+
+    /// The permission bits Linux gives the file: read-only for the kernel's
+    /// descriptions, writable by its owner (global root) for the tunables.
+    /// Detcore refuses every write, as Linux refuses a process that is not
+    /// global root. A guest that is global root would otherwise change the
+    /// host's setting, so it is refused too: a known difference.
+    pub fn permissions(self) -> u32 {
+        match self {
+            Self::OverflowUid
+            | Self::OverflowGid
+            | Self::PidMax
+            | Self::OvercommitMemory
+            | Self::MaxMapCount
+            | Self::MmapMinAddr
+            | Self::FileMax
+            | Self::AioMaxNr
+            | Self::PipeMaxSize => 0o644,
+            _ => 0o444,
+        }
+    }
+
+    /// Whether the file is an integer sysctl (`proc_dointvec`,
+    /// `proc_doulongvec_minmax` and the `fs` counters built on it), whose
+    /// reads at a nonzero position Linux answers with end of file. The others
+    /// are strings (`proc_dostring`, `proc_do_uuid`) or `seq_file` files,
+    /// which serve the rest of their contents.
+    pub fn is_integer(self) -> bool {
+        !self.is_seq_file()
+            && !matches!(
+                self,
+                Self::Osrelease | Self::Ostype | Self::KernelVersion | Self::BootId
+            )
+    }
+
+    /// Whether the file is a `seq_file` (every file outside `/proc/sys`),
+    /// which seeks only from its start or position (`seq_lseek`), rather
+    /// than a sysctl file.
+    pub fn is_seq_file(self) -> bool {
+        !self.c_path().to_bytes().starts_with(b"/proc/sys/")
+    }
+
+    /// Whether Linux reads the file through `read_iter`, as every file here
+    /// does except `/proc/modules` and `/proc/swaps`, whose `seq_file`
+    /// operations have only `read`. A vectored read of one of those two goes
+    /// through `do_loop_readv_writev`, which refuses every `RWF_` flag but
+    /// `RWF_HIPRI` (measured on Linux 7.1).
+    pub fn has_read_iter(self) -> bool {
+        !matches!(self, Self::Modules | Self::Swaps)
+    }
+
+    /// The file's contents on `machine`.
+    pub fn contents(self, machine: &FixedMachine) -> Vec<u8> {
+        let cpus = machine.cpus;
+        let table = match self {
+            Self::Modules => Some(String::new()),
+            Self::Filesystems => Some(FILESYSTEMS.to_owned()),
+            Self::Interrupts => Some(interrupts(cpus)),
+            Self::Softirqs => Some(softirqs(cpus)),
+            Self::Swaps => Some("Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n".to_owned()),
+            Self::Buddyinfo => Some(buddyinfo()),
+            Self::Zoneinfo => Some(zoneinfo(cpus)),
+            Self::Schedstat => Some(schedstat(cpus)),
+            Self::KeyUsers => Some(KEY_USERS.to_owned()),
+            Self::Vmstat => Some(vmstat()),
+            Self::Cgroups => Some(cgroups()),
+            Self::TtyDrivers => Some(TTY_DRIVERS.to_owned()),
+            Self::Meminfo => Some(meminfo(machine.memory)),
+            Self::Loadavg => Some("0.00 0.00 0.00 1/1 1\n".to_owned()),
+            _ => None,
+        };
+        if let Some(table) = table {
+            return table.into_bytes();
+        }
+        let text = match self {
+            Self::Version => machine.banner.clone(),
+            Self::Cmdline => machine.command_line.clone(),
+            Self::Osrelease => machine.release.clone(),
+            Self::Ostype => machine.sysname.clone(),
+            Self::KernelVersion => machine.version.clone(),
+            Self::BootId => machine.boot_id.clone(),
+            Self::EntropyAvail => machine.entropy_avail.to_string(),
+            Self::OverflowUid => machine.overflow_uid.to_string(),
+            Self::OverflowGid => machine.overflow_gid.to_string(),
+            Self::PidMax => machine.pid_max.to_string(),
+            Self::CapLastCap => machine.cap_last_cap.to_string(),
+            Self::OvercommitMemory => machine.overcommit_memory.to_string(),
+            Self::MaxMapCount => machine.max_map_count.to_string(),
+            Self::MmapMinAddr => machine.mmap_min_addr.to_string(),
+            // Nothing is counted: no open files, inodes or dentries in use,
+            // no asynchronous I/O requests.
+            Self::FileNr => format!("0\t0\t{}", machine.file_max),
+            Self::FileMax => machine.file_max.to_string(),
+            Self::InodeNr => "0\t0".to_owned(),
+            Self::InodeState => "0\t0\t0\t0\t0\t0\t0".to_owned(),
+            // The fourth field is the age limit, 45 seconds.
+            Self::DentryState => "0\t0\t45\t0\t0\t0".to_owned(),
+            Self::AioNr => "0".to_owned(),
+            Self::AioMaxNr => machine.aio_max_nr.to_string(),
+            Self::PipeMaxSize => machine.pipe_max_size.to_string(),
+            _ => unreachable!("{self:?} is a table"),
+        };
+        format!("{text}\n").into_bytes()
+    }
+}
+
+/// `/proc/filesystems` of the reference kernel.
+const FILESYSTEMS: &str = include_str!("tables/filesystems.txt");
+
+/// `/proc/key-users` with root's quota alone, at Linux's root machine.
+const KEY_USERS: &str = "    0:     0 0/0 0/1000000 0/25000000\n";
+
+/// `/proc/tty/drivers` for a container's `/dev`: the console, the
+/// controlling terminal, the pseudo-terminals and the serial ports.
+const TTY_DRIVERS: &str = "\
+/dev/tty             /dev/tty        5       0 system:/dev/tty
+/dev/console         /dev/console    5       1 system:console
+/dev/ptmx            /dev/ptmx       5       2 system
+/dev/vc/0            /dev/vc/0       4       0 system:vtmaster
+serial_8250          /dev/ttyS       4 64-95 serial
+pty_slave            /dev/pts      136 0-1048575 pty:slave
+pty_master           /dev/ptm      128 0-1048575 pty:master
+unknown              /dev/tty        4 1-63 console
+";
+
+/// The interrupt lines `/proc/interrupts` lists: the timer and the real-time
+/// clock, on the I/O APIC, edge-triggered.
+const INTERRUPT_LINES: [(u32, u32, &str); 2] = [(0, 2, "timer"), (8, 8, "rtc0")];
+
+/// The interrupt numbers the machine has (Linux's `nr_irqs`), for which
+/// `/proc/stat`'s `intr` line shows a count each: the 16 legacy numbers
+/// (`NR_IRQS_LEGACY`) that every x86 kernel has, which hold every line
+/// `/proc/interrupts` lists. The host's own number depends on its CPUs and
+/// interrupt controllers.
+pub const NR_IRQS: usize = 16;
+
+/// The x86 interrupts after the lines, with their descriptions
+/// (`arch_show_interrupts`).
+const ARCH_INTERRUPTS: [(&str, &str); 15] = [
+    ("NMI", "Non-maskable interrupts"),
+    ("LOC", "Local timer interrupts"),
+    ("PMI", "Performance monitoring interrupts"),
+    ("IWI", "IRQ work interrupts"),
+    ("RES", "Rescheduling interrupts"),
+    ("CAL", "Function call interrupts"),
+    ("TLB", "TLB shootdowns"),
+    ("TRM", "Thermal event interrupt"),
+    ("THR", "Threshold APIC interrupts"),
+    ("DFR", "Deferred Error APIC interrupts"),
+    ("MCE", "Machine check exceptions"),
+    ("MCP", "Machine check polls"),
+    ("PIN", "Posted-interrupt notification event"),
+    ("NPI", "Nested posted-interrupt event"),
+    ("PIW", "Posted-interrupt wakeup event"),
+];
+
+/// `/proc/interrupts` (`show_interrupts`) in Linux 7.1's layout, with
+/// three-digit line numbers: a count per CPU, each `" %10u"`; for a line,
+/// the chip left-aligned in 14 columns, the pin right-aligned in 15, and the
+/// trigger and action.
+fn interrupts(cpus: u32) -> String {
+    let counts = || "          0".repeat(cpus as usize);
+    let mut out = " ".repeat(11);
+    for cpu in 0..cpus {
+        out += &format!("CPU{cpu:<8}");
+    }
+    out.push('\n');
+    for (line, pin, action) in INTERRUPT_LINES {
+        out += &format!(
+            "{line:>3}:{}  {:<14} {pin:>14}-{:<8}  {action}\n",
+            counts(),
+            "IO-APIC",
+            "edge"
+        );
+    }
+    for (name, description) in ARCH_INTERRUPTS {
+        out += &format!("{name:>3}:{}  {description}\n", counts());
+    }
+    out
+}
+
+/// Linux's softirqs, in `softirq_to_name` order.
+pub const SOFTIRQS: [&str; 10] = [
+    "HI", "TIMER", "NET_TX", "NET_RX", "BLOCK", "IRQ_POLL", "TASKLET", "SCHED", "HRTIMER", "RCU",
+];
+
+/// `/proc/softirqs` (`show_softirqs`).
+fn softirqs(cpus: u32) -> String {
+    let mut out = " ".repeat(20);
+    for cpu in 0..cpus {
+        out += &format!("CPU{cpu:<8}");
+    }
+    out.push('\n');
+    for name in SOFTIRQS {
+        out += &format!("{name:>12}:{}\n", "          0".repeat(cpus as usize));
+    }
+    out
+}
+
+/// `/proc/buddyinfo` (`frag_show_print`): node 0's populated zones, eleven
+/// orders each, none free.
+fn buddyinfo() -> String {
+    ["DMA", "DMA32", "Normal"]
+        .map(|zone| format!("Node 0, zone {zone:>8} {}\n", "     0 ".repeat(11)))
+        .concat()
+}
+
+/// `/proc/zoneinfo` of the reference kernel's node 0, every number zero, with
+/// a page set per CPU. Built without NUMA, the kernel prints no NUMA event
+/// counters for a zone (`zoneinfo_show_print`) and has no promotion counters
+/// among the node's.
+fn zoneinfo(cpus: u32) -> String {
+    let pagesets = (0..cpus)
+        .map(|cpu| ZONEINFO_PAGESET.replace("@CPU@", &cpu.to_string()))
+        .collect::<String>();
+    ZONEINFO.replace("@PAGESETS@\n", &pagesets)
+}
+
+/// `/proc/zoneinfo` of the reference kernel's node 0, each zone's page sets
+/// marked `@PAGESETS@`.
+const ZONEINFO: &str = include_str!("tables/zoneinfo.txt");
+
+/// One CPU's page set in `/proc/zoneinfo`, its number marked `@CPU@`.
+const ZONEINFO_PAGESET: &str = include_str!("tables/zoneinfo_pageset.txt");
+
+/// `/proc/schedstat` (`show_schedstat`), version 17: a line per CPU. One
+/// CPU has no scheduling domains.
+fn schedstat(cpus: u32) -> String {
+    let mut out = "version 17\ntimestamp 0\n".to_owned();
+    for cpu in 0..cpus {
+        out += &format!("cpu{cpu} 0 0 0 0 0 0 0 0 0\n");
+    }
+    out
+}
+
+/// `/proc/vmstat` (`vmstat_show`): the reference kernel's counters, each 0,
+/// none of them a NUMA counter, which that kernel built without NUMA does not
+/// have (`vmstat_text`).
+fn vmstat() -> String {
+    include_str!("tables/vmstat_names.txt")
+        .lines()
+        .map(|name| format!("{name} 0\n"))
+        .collect()
+}
+
+/// The controllers `/proc/cgroups` lists, as the reference kernel does.
+const CGROUP_CONTROLLERS: [&str; 10] = [
+    "cpu",
+    "cpuacct",
+    "blkio",
+    "devices",
+    "freezer",
+    "net_cls",
+    "perf_event",
+    "net_prio",
+    "hugetlb",
+    "pids",
+];
+
+/// `/proc/cgroups` (`proc_cgroupstats_show`): every controller on the
+/// unified hierarchy (hierarchy 0), enabled, in one cgroup.
+fn cgroups() -> String {
+    let mut out = "#subsys_name\thierarchy\tnum_cgroups\tenabled\n".to_owned();
+    for controller in CGROUP_CONTROLLERS {
+        out += &format!("{controller}\t0\t1\t1\n");
+    }
+    out
+}
+
+/// `/proc/meminfo` (`meminfo_proc_show`): `memory` bytes, all free, nothing
+/// cached or swapped, each value right-aligned in 8 columns after a
+/// 16-column label, as Linux prints them.
+fn meminfo(memory: u64) -> String {
+    let kb = memory / 1024;
+    [
+        ("MemTotal:", kb),
+        ("MemFree:", kb),
+        ("MemAvailable:", kb),
+        ("Buffers:", 0),
+        ("Cached:", 0),
+        ("SwapCached:", 0),
+        ("Active:", 0),
+        ("Inactive:", 0),
+        ("Shmem:", 0),
+        ("SReclaimable:", 0),
+        ("SwapTotal:", 0),
+        ("SwapFree:", 0),
+    ]
+    .map(|(label, value)| format!("{label:<16}{value:>8} kB\n"))
+    .concat()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The reference machine of the documented values below: the kernel
+    /// built at the start of 2026, 1 GB, defaults elsewhere.
+    fn machine() -> FixedMachine {
+        FixedMachine {
+            banner: "Linux version 5.2.0 #1 SMP Thu Jan 01 00:00:00 UTC 2026".to_owned(),
+            command_line: "BOOT_IMAGE=/vmlinuz-5.2.0 quiet".to_owned(),
+            release: "5.2.0".to_owned(),
+            sysname: "Linux".to_owned(),
+            version: "#1 SMP Thu Jan 01 00:00:00 UTC 2026".to_owned(),
+            boot_id: "6865726d-6974-4000-8000-000000000000".to_owned(),
+            entropy_avail: 256,
+            overflow_uid: 65534,
+            overflow_gid: 65534,
+            pid_max: 1 << 22,
+            cap_last_cap: 40,
+            overcommit_memory: 0,
+            max_map_count: 65530,
+            mmap_min_addr: 65536,
+            file_max: i64::MAX as u64,
+            aio_max_nr: 65536,
+            pipe_max_size: 8192,
+            cpus: 1,
+            memory: 1_000_000_000,
+        }
+    }
+
+    fn contents(file: FixedFile) -> String {
+        String::from_utf8(file.contents(&machine())).unwrap()
+    }
+
+    /// The table, byte for byte: changing a value is a decision, recorded
+    /// here and in `FixedMachine`.
+    #[test]
+    fn fixed_procfs_files_have_their_documented_values() {
+        let pipe_max_size = format!("{}\n", machine().pipe_max_size);
+        use FixedFile::*;
+        let expected = [
+            (
+                Version,
+                "Linux version 5.2.0 #1 SMP Thu Jan 01 00:00:00 UTC 2026\n",
+            ),
+            (Cmdline, "BOOT_IMAGE=/vmlinuz-5.2.0 quiet\n"),
+            (Osrelease, "5.2.0\n"),
+            (Ostype, "Linux\n"),
+            (KernelVersion, "#1 SMP Thu Jan 01 00:00:00 UTC 2026\n"),
+            (BootId, "6865726d-6974-4000-8000-000000000000\n"),
+            (EntropyAvail, "256\n"),
+            (OverflowUid, "65534\n"),
+            (OverflowGid, "65534\n"),
+            (PidMax, "4194304\n"),
+            (CapLastCap, "40\n"),
+            (OvercommitMemory, "0\n"),
+            (MaxMapCount, "65530\n"),
+            (MmapMinAddr, "65536\n"),
+            (Modules, ""),
+            (Swaps, "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n"),
+            (KeyUsers, "    0:     0 0/0 0/1000000 0/25000000\n"),
+            (
+                Interrupts,
+                "\x20          CPU0       \n\
+                 \x20 0:          0  IO-APIC                     2-edge      timer\n\
+                 \x20 8:          0  IO-APIC                     8-edge      rtc0\n\
+                 NMI:          0  Non-maskable interrupts\n\
+                 LOC:          0  Local timer interrupts\n\
+                 PMI:          0  Performance monitoring interrupts\n\
+                 IWI:          0  IRQ work interrupts\n\
+                 RES:          0  Rescheduling interrupts\n\
+                 CAL:          0  Function call interrupts\n\
+                 TLB:          0  TLB shootdowns\n\
+                 TRM:          0  Thermal event interrupt\n\
+                 THR:          0  Threshold APIC interrupts\n\
+                 DFR:          0  Deferred Error APIC interrupts\n\
+                 MCE:          0  Machine check exceptions\n\
+                 MCP:          0  Machine check polls\n\
+                 PIN:          0  Posted-interrupt notification event\n\
+                 NPI:          0  Nested posted-interrupt event\n\
+                 PIW:          0  Posted-interrupt wakeup event\n",
+            ),
+            (
+                Softirqs,
+                "                    CPU0       \n\
+                 \x20         HI:          0\n\
+                 \x20      TIMER:          0\n\
+                 \x20     NET_TX:          0\n\
+                 \x20     NET_RX:          0\n\
+                 \x20      BLOCK:          0\n\
+                 \x20   IRQ_POLL:          0\n\
+                 \x20    TASKLET:          0\n\
+                 \x20      SCHED:          0\n\
+                 \x20    HRTIMER:          0\n\
+                 \x20        RCU:          0\n",
+            ),
+            (
+                Buddyinfo,
+                "Node 0, zone      DMA      0      0      0      0      0      0      0      0      0      0      0 \n\
+                 Node 0, zone    DMA32      0      0      0      0      0      0      0      0      0      0      0 \n\
+                 Node 0, zone   Normal      0      0      0      0      0      0      0      0      0      0      0 \n",
+            ),
+            (
+                Schedstat,
+                "version 17\ntimestamp 0\ncpu0 0 0 0 0 0 0 0 0 0\n",
+            ),
+            (
+                Cgroups,
+                "#subsys_name\thierarchy\tnum_cgroups\tenabled\n\
+                 cpu\t0\t1\t1\ncpuacct\t0\t1\t1\nblkio\t0\t1\t1\ndevices\t0\t1\t1\n\
+                 freezer\t0\t1\t1\nnet_cls\t0\t1\t1\nperf_event\t0\t1\t1\n\
+                 net_prio\t0\t1\t1\nhugetlb\t0\t1\t1\npids\t0\t1\t1\n",
+            ),
+            (
+                Meminfo,
+                "MemTotal:         976562 kB\n\
+                 MemFree:          976562 kB\n\
+                 MemAvailable:     976562 kB\n\
+                 Buffers:               0 kB\n\
+                 Cached:                0 kB\n\
+                 SwapCached:            0 kB\n\
+                 Active:                0 kB\n\
+                 Inactive:              0 kB\n\
+                 Shmem:                 0 kB\n\
+                 SReclaimable:          0 kB\n\
+                 SwapTotal:             0 kB\n\
+                 SwapFree:              0 kB\n",
+            ),
+            (Loadavg, "0.00 0.00 0.00 1/1 1\n"),
+            (FileNr, "0\t0\t9223372036854775807\n"),
+            (FileMax, "9223372036854775807\n"),
+            (InodeNr, "0\t0\n"),
+            (InodeState, "0\t0\t0\t0\t0\t0\t0\n"),
+            (DentryState, "0\t0\t45\t0\t0\t0\n"),
+            (AioNr, "0\n"),
+            (AioMaxNr, "65536\n"),
+            // Two of the host's pages: 8192 on x86-64.
+            (PipeMaxSize, pipe_max_size.as_str()),
+        ];
+        for (file, text) in expected {
+            assert_eq!(contents(file), text, "{file:?}");
+        }
+        // The four tables too long to write out here have their own tests.
+        let long = [Filesystems, Zoneinfo, Vmstat, TtyDrivers];
+        assert_eq!(expected.len() + long.len(), FixedFile::ALL.len());
+    }
+
+    /// The long tables: well formed, every counter zero, and the same for any
+    /// host, since nothing in them is read from one.
+    #[test]
+    fn the_long_tables_are_well_formed_and_count_nothing() {
+        let filesystems = contents(FixedFile::Filesystems);
+        for line in filesystems.lines() {
+            let (flag, name) = line.split_once('\t').unwrap();
+            assert!(matches!(flag, "" | "nodev") && !name.is_empty(), "{line}");
+        }
+        for name in [
+            "\n\text4\n",
+            "\nnodev\tproc\n",
+            "\nnodev\tsysfs\n",
+            "\nnodev\ttmpfs\n",
+        ] {
+            assert!(format!("\n{filesystems}").contains(name), "{name}");
+        }
+
+        let vmstat = contents(FixedFile::Vmstat);
+        // The reference kernel's 206 counters less its 16 NUMA ones, which a
+        // kernel built without NUMA does not have
+        // (`the_tables_have_no_numa_counters`).
+        assert_eq!(vmstat.lines().count(), 190);
+        assert!(
+            vmstat
+                .lines()
+                .all(|line| line.ends_with(" 0") && line.split(' ').count() == 2)
+        );
+        assert!(vmstat.lines().any(|line| line == "nr_free_pages 0"));
+
+        let tty = contents(FixedFile::TtyDrivers);
+        assert!(
+            tty.lines()
+                .any(|line| line.starts_with("pty_slave            /dev/pts      136 "))
+        );
+        assert_eq!(tty.lines().count(), 8);
+
+        // Apart from the node and CPU numbers, every number in
+        // `/proc/zoneinfo` is 0.
+        let zoneinfo = contents(FixedFile::Zoneinfo);
+        for line in zoneinfo.lines() {
+            if line.starts_with("Node 0, zone ") || line.starts_with("    cpu: ") {
+                continue;
+            }
+            let numbers = line
+                .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .filter(|word| word.chars().all(|c| c.is_ascii_digit()) && !word.is_empty());
+            for number in numbers {
+                assert_eq!(number, "0", "{line}");
+            }
+        }
+        assert!(!zoneinfo.contains('@'), "an unexpanded marker");
+    }
+
+    /// The counters Linux 7.1 has only when built with NUMA, each with the
+    /// line of `mm/vmstat.c` that names it inside the guard leaving it out of
+    /// `vmstat_text` otherwise
+    /// (<https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/mm/vmstat.c?h=v7.1#n1210>).
+    /// `CONFIG_NUMA_BALANCING` needs `CONFIG_NUMA_MIGRATION` (init/Kconfig:1014),
+    /// which needs `CONFIG_NUMA` (mm/Kconfig:635).
+    const NUMA_ONLY_COUNTERS: [(&str, &str, u32); 16] = [
+        // `enum numa_stat_item` (mm/vmstat.c:1210-1217), which
+        // `zoneinfo_show_print` prints for each zone under the same guard
+        // (1809-1814).
+        ("numa_hit", NUMA, 1211),
+        ("numa_miss", NUMA, 1212),
+        ("numa_foreign", NUMA, 1213),
+        ("numa_interleave", NUMA, 1214),
+        ("numa_local", NUMA, 1215),
+        ("numa_other", NUMA, 1216),
+        // Node counters (1271-1275), also in zoneinfo's per-node stats.
+        ("pgpromote_success", BALANCING, 1272),
+        ("pgpromote_candidate", BALANCING, 1273),
+        ("pgpromote_candidate_nrl", BALANCING, 1274),
+        // Events (1340-1343, 1357-1363).
+        ("zone_reclaim_success", NUMA, 1341),
+        ("zone_reclaim_failed", NUMA, 1342),
+        ("numa_pte_updates", BALANCING, 1358),
+        ("numa_huge_pte_updates", BALANCING, 1359),
+        ("numa_hint_faults", BALANCING, 1360),
+        ("numa_hint_faults_local", BALANCING, 1361),
+        ("numa_pages_migrated", BALANCING, 1362),
+    ];
+    const NUMA: &str = "CONFIG_NUMA";
+    const BALANCING: &str = "CONFIG_NUMA_BALANCING";
+
+    /// Neither `/proc/vmstat` nor `/proc/zoneinfo` has a NUMA counter, and
+    /// the counters Linux prints around each guarded block, whatever its
+    /// configuration, are still next to each other.
+    #[test]
+    fn the_tables_have_no_numa_counters() {
+        let vmstat = contents(FixedFile::Vmstat);
+        let zoneinfo = contents(FixedFile::Zoneinfo);
+        for (name, guard, source_line) in NUMA_ONLY_COUNTERS {
+            let row = format!("{name} ");
+            let source = format!("{guard}, mm/vmstat.c:{source_line}");
+            assert!(
+                !vmstat.lines().any(|line| line.starts_with(&row)),
+                "/proc/vmstat has {name} ({source})"
+            );
+            assert!(
+                !zoneinfo
+                    .lines()
+                    .any(|line| line.trim_start().starts_with(&row)),
+                "/proc/zoneinfo has {name} ({source})"
+            );
+        }
+        for neighbors in [
+            "nr_unaccepted 0\nnr_inactive_anon 0\n",
+            "nr_swapcached 0\npgdemote_kswapd 0\n",
+            "pgscan_direct_throttle 0\npginodesteal 0\n",
+            "oom_kill 0\npgmigrate_success 0\n",
+        ] {
+            assert!(vmstat.contains(neighbors), "{neighbors:?}");
+        }
+        // The node's statistics, printed with the first populated zone.
+        assert_eq!(
+            zoneinfo
+                .matches("      nr_swapcached 0\n      pgdemote_kswapd 0\n")
+                .count(),
+            1
+        );
+        // Each populated zone's counters end with the last zone counter.
+        assert_eq!(
+            zoneinfo
+                .matches("      nr_unaccepted 0\n  pagesets\n")
+                .count(),
+            3
+        );
+    }
+
+    /// The tables agree with each other and with the description: a column,
+    /// line or page set per CPU, and the same populated zones.
+    #[test]
+    fn the_tables_describe_the_machine_consistently() {
+        // `/proc/stat` counts each interrupt number below NR_IRQS, which
+        // holds every line `/proc/interrupts` lists.
+        for (line, _, _) in INTERRUPT_LINES {
+            assert!((line as usize) < NR_IRQS, "{line}");
+        }
+        for cpus in [1, 2, 3] {
+            let machine = FixedMachine { cpus, ..machine() };
+            let table = |file: FixedFile| String::from_utf8(file.contents(&machine)).unwrap();
+            let columns = |text: &str| text.lines().next().unwrap().split_whitespace().count();
+            assert_eq!(columns(&table(FixedFile::Interrupts)), cpus as usize);
+            assert_eq!(columns(&table(FixedFile::Softirqs)), cpus as usize);
+            for line in table(FixedFile::Interrupts).lines().skip(1) {
+                let counts = line.split_once(": ").unwrap().1;
+                assert_eq!(
+                    counts
+                        .split_whitespace()
+                        .take_while(|word| *word == "0")
+                        .count(),
+                    cpus as usize,
+                    "{line}"
+                );
+            }
+            assert_eq!(
+                table(FixedFile::Schedstat)
+                    .lines()
+                    .filter(|line| line.starts_with("cpu"))
+                    .count(),
+                cpus as usize
+            );
+            let zoneinfo = table(FixedFile::Zoneinfo);
+            let populated = zoneinfo.matches("  pagesets\n").count();
+            assert_eq!(populated, 3);
+            assert_eq!(
+                zoneinfo.matches("    cpu: ").count(),
+                populated * cpus as usize
+            );
+        }
+        // Buddyinfo lists the zones whose page sets zoneinfo shows.
+        let zoneinfo = contents(FixedFile::Zoneinfo);
+        let populated = zoneinfo
+            .split("Node 0, zone ")
+            .filter(|zone| zone.contains("  pagesets\n"))
+            .map(|zone| zone.lines().next().unwrap().trim().to_owned())
+            .collect::<Vec<_>>();
+        let buddyinfo = contents(FixedFile::Buddyinfo)
+            .lines()
+            .map(|line| line.split_whitespace().nth(3).unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(populated, buddyinfo);
+        // The configured memory is what meminfo reports.
+        let machine = FixedMachine {
+            memory: 2 << 30,
+            ..machine()
+        };
+        let meminfo = String::from_utf8(FixedFile::Meminfo.contents(&machine)).unwrap();
+        assert!(meminfo.starts_with("MemTotal:        2097152 kB\n"));
+    }
+
+    /// `/proc/version`, `kernel/osrelease`, `kernel/ostype` and
+    /// `kernel/version` describe the kernel `uname` reports, from the same
+    /// description.
+    #[test]
+    fn procfs_agrees_with_uname() {
+        let machine = machine();
+        let version = contents(FixedFile::Version);
+        assert!(version.starts_with(&format!("{} version {} ", machine.sysname, machine.release)));
+        assert!(version.trim_end().ends_with(&machine.version));
+        assert_eq!(contents(FixedFile::Osrelease).trim_end(), machine.release);
+        assert_eq!(contents(FixedFile::Ostype).trim_end(), machine.sysname);
+        assert_eq!(
+            contents(FixedFile::KernelVersion).trim_end(),
+            machine.version
+        );
+    }
+
+    /// The integer sysctls are exactly the `/proc/sys` files whose
+    /// contents are all numbers.
+    #[test]
+    fn integer_files_are_exactly_the_integer_sysctls() {
+        for fixed in FixedFile::ALL {
+            let text = contents(fixed);
+            let integer = fixed.c_path().to_bytes().starts_with(b"/proc/sys/")
+                && text
+                    .split_whitespace()
+                    .all(|word| word.parse::<u64>().is_ok());
+            assert_eq!(fixed.is_integer(), integer, "{fixed:?}");
+        }
+    }
+
+    #[test]
+    fn fixed_procfs_files_are_found_by_path_alone() {
+        for file in FixedFile::ALL {
+            assert_eq!(
+                FixedFile::from_path(file.path().to_str().unwrap()),
+                Some(file)
+            );
+        }
+        assert_eq!(FixedFile::from_path("/proc/sys/kernel/hostname"), None);
+        assert_eq!(FixedFile::from_path("/proc/self/cmdline"), None);
+    }
+}

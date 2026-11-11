@@ -21,7 +21,13 @@
 //! names the kernel source it matches.
 
 pub mod fdinfo;
+pub mod fixed;
 pub mod mountinfo;
+
+pub use fixed::FixedFile;
+pub use fixed::FixedMachine;
+pub use fixed::NR_IRQS;
+pub use fixed::SOFTIRQS;
 
 pub use fdinfo::Fdinfo;
 pub use fdinfo::FdinfoKind;
