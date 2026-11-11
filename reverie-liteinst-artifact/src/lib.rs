@@ -17918,6 +17918,15 @@ const FIXED_DEV_TLS_CELL_GETTER_STABLE_HEX: &str =
 const FIXED_OPTIMIZED_PATCH_ALLOC_STABLE_70_HEX: &str = "41574156415453504889d34989f6ff1514980b004885c074774c8b78204d85ff746e4989c4488d3dcc950b00e84f310b004883b870000000007463498b542410498b0f498d76ff49f7de31c04889cf4801d7723e4801f772394c21f74989f84929d04901d8410f92c14981f801000002410f93c24508ca75194889c8f04d0fb1074889c1b80000000075c14889f8eb0231c04883c4085b415c415e415fc3bf010000004c89f64889da4883c4085b415c415e415fff253e9b0b00";
 const FIXED_OPTIMIZED_TLS_THUNK_STABLE_70_HEX: &str =
     "50488d3d00930b00e8832e0b00488d807000000059c3";
+// The release constructor built by stable 1.97.1 (liteinst-runtime-build
+// with the release profile) places INSTALLATION_DEPTH at TLS offset 0x30.
+// Exact bodies of that ELF: libreverie_liteinst_preload.so, sha256
+// a7944806e88c40a395cb7cda01f4240a1f885cd3ec16e8aa821062c2890f58c5,
+// build-id 13f64d0d1cb6f0b08a2356add5f414b39740f0d3, at 0x94280 (186 bytes)
+// and 0x94500 (22 bytes).
+const FIXED_OPTIMIZED_PATCH_ALLOC_STABLE_30_HEX: &str = "41574156415453504889d34989f6ff15c45e0c004885c074774c8b78204d85ff746e4989c4488d3d745c0c00e86ff80b004883b830000000007463498b542410498b0f498d76ff49f7de31c04889cf4801d7723e4801f772394c21f74989f84929d04901d8410f92c14981f801000002410f93c24508ca75194889c8f04d0fb1074889c1b80000000075c14889f8eb0231c04883c4085b415c415e415fc3bf010000004c89f64889da4883c4085b415c415e415fff257e5e0c00";
+const FIXED_OPTIMIZED_TLS_THUNK_STABLE_30_HEX: &str =
+    "50488d3d185a0c00e813f60b00488d803000000059c3";
 const FIXED_DEV_TLS_CELL_GETTER_EVENT_ARGUMENT_HEX: &str =
     "4883ec1848897c24084889742410488d3ddb4a2200e8a6d11e00488d80400000004883c418c3";
 const FIXED_DEV_TLS_CELL_GETTER_DIAGNOSTIC_EVENT_ARGUMENT_HEX: &str =
@@ -17968,6 +17977,16 @@ fn fixed_tls_cell_access_recipe(
         ),
         ("fixed_tls_fn_once", 0x70) => (
             FIXED_OPTIMIZED_TLS_THUNK_STABLE_70_HEX,
+            16,
+            &[(4, 8), (9, 13)],
+        ),
+        ("fixed_patch_alloc", 0x30) => (
+            FIXED_OPTIMIZED_PATCH_ALLOC_STABLE_30_HEX,
+            0x34,
+            &[(0x10, 0x14), (0x28, 0x2c), (0x2d, 0x31), (0xb6, 0xba)],
+        ),
+        ("fixed_tls_fn_once", 0x30) => (
+            FIXED_OPTIMIZED_TLS_THUNK_STABLE_30_HEX,
             16,
             &[(4, 8), (9, 13)],
         ),
@@ -47026,6 +47045,27 @@ mod tests {
     fn fixed_tls_cell_access_mutation_controls() {
         type TlsAccessSample<'a> = (&'a str, u64, &'a str, u64, &'a [(usize, usize, u64)]);
         let samples: &[TlsAccessSample<'_>] = &[
+            // Actual stable 1.97.1 RELEASE constructor a7944806 (build-id
+            // 13f64d0d): INSTALLATION_DEPTH at TLS offset 0x30.
+            (
+                "fixed_patch_alloc",
+                0x94280,
+                "41574156415453504889d34989f6ff15c45e0c004885c074774c8b78204d85ff746e4989c4488d3d745c0c00e86ff80b004883b830000000007463498b542410498b0f498d76ff49f7de31c04889cf4801d7723e4801f772394c21f74989f84929d04901d8410f92c14981f801000002410f93c24508ca75194889c8f04d0fb1074889c1b80000000075c14889f8eb0231c04883c4085b415c415e415fc3bf010000004c89f64889da4883c4085b415c415e415fff257e5e0c00",
+                0x30,
+                &[
+                    (16, 20, 1417560),
+                    (40, 44, 1416992),
+                    (45, 49, 1391392),
+                    (182, 186, 1417656),
+                ],
+            ),
+            (
+                "fixed_tls_fn_once",
+                0x94500,
+                "50488d3d185a0c00e813f60b00488d803000000059c3",
+                0x30,
+                &[(4, 8, 1416992), (9, 13, 1391392)],
+            ),
             // Actual DEV image a746cd77: INSTALLATION_DEPTH at TLS offset 0x80.
             (
                 "fixed_tls_cell_getter",
@@ -49802,6 +49842,40 @@ mod tests {
                     .is_err()
             );
         }
+        // The stable 1.97.1 RELEASE constructor reads INSTALLATION_DEPTH at
+        // 0x30: the same physical census finds its exact FnOnce thunk where no
+        // symbol names it, refuses it with a foreign operand, and does not
+        // take a thunk reading another cell for a 0x30 getter.
+        let mut stable30 = base.clone();
+        put(&mut stable30, 0x4020, 8, 0x30);
+        let mut cell30 = cell.clone();
+        cell30.address = 0x30;
+        let census30 = |bytes: &[u8]| {
+            direct_tls_getter_census(&Elf::parse(bytes).unwrap(), bytes, &cell30, 0x3300, 0x1800)
+        };
+        let absent30 = census30(&stable30).unwrap();
+        assert!(
+            absent30.named_getters.is_empty()
+                && absent30.recipe_getters.is_empty()
+                && absent30.getter_pointer_slots.is_empty()
+        );
+        let mut thunk30 = fixed_hex("50488d3d185a0c00e813f60b00488d803000000059c3");
+        rip(&mut thunk30, 0x1500, 4, 8, 0x3300);
+        rip(&mut thunk30, 0x1500, 9, 13, 0x1800);
+        let mut hidden30 = stable30.clone();
+        hidden30[0x1500..0x1516].copy_from_slice(&thunk30);
+        assert_eq!(census30(&hidden30).unwrap().recipe_getters, [0x1500]);
+        for (field, next, target) in [(4, 8, 0x3308), (9, 13, 0x1801)] {
+            let mut bad = hidden30.clone();
+            rip(&mut bad[0x1500..0x1516], 0x1500, field, next, target);
+            assert!(
+                census30(&bad).is_err(),
+                "stable 0x30 hidden getter wrong operand"
+            );
+        }
+        let mut other_cell = hidden30.clone();
+        other_cell[0x1500 + 16..0x1500 + 20].copy_from_slice(&0x40u32.to_le_bytes());
+        assert!(census30(&other_cell).unwrap().recipe_getters.is_empty());
         // The separate Detcore e8 route uses the SAME physical census. A
         // missing symbol is insufficient: hidden/unnamed getters outside .text
         // and raw loader pointers still invalidate an empty-getter proof.
