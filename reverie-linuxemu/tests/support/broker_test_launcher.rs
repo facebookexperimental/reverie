@@ -1,29 +1,52 @@
 // Ordinary-main launcher for the explicitly broker-routed libtest selectors.
 // This private proposal depends on the API contracts listed in API-CONTRACT.md.
 // No constructor, libtest worker or lazy backend path may assert startup authority.
+
+// The broker this launcher drives, reverie_linuxemu::native_exit_broker, is
+// compiled only on x86_64 (reverie-linuxemu is `#![cfg(target_arch =
+// "x86_64")]`, and its native exits use the x86_64 `syscall` instruction), so
+// on any other architecture the launcher only refuses. Known aarch64 gap.
+#[cfg(not(target_arch = "x86_64"))]
+fn main() {
+    eprintln!("broker test launcher: the native-exit broker exists only on x86_64");
+    std::process::exit(2);
+}
+
+#[cfg(target_arch = "x86_64")]
 use std::ffi::CString;
+#[cfg(target_arch = "x86_64")]
 use std::ffi::OsString;
+#[cfg(target_arch = "x86_64")]
 use std::os::fd::AsRawFd;
+#[cfg(target_arch = "x86_64")]
 use std::os::unix::ffi::OsStrExt;
 
+#[cfg(target_arch = "x86_64")]
 use reverie_linuxemu::native_exit_broker::BrokerOwner;
+#[cfg(target_arch = "x86_64")]
 use reverie_linuxemu::native_exit_broker::StartupAuthority;
 
+#[cfg(target_arch = "x86_64")]
 #[path = "broker_test_protocol.rs"]
 mod broker_test_protocol;
 
+#[cfg(target_arch = "x86_64")]
 #[path = "broker_native_cases.rs"]
 mod broker_native_cases;
 
+#[cfg(target_arch = "x86_64")]
 #[path = "broker_client_death_cases.rs"]
 mod broker_client_death_cases;
 
+#[cfg(target_arch = "x86_64")]
 #[path = "broker_bootstrap_cases.rs"]
 mod broker_bootstrap_cases;
 
+#[cfg(target_arch = "x86_64")]
 #[path = "broker_fatal_abort_cases.rs"]
 mod broker_fatal_abort_cases;
 
+#[cfg(target_arch = "x86_64")]
 fn main() {
     broker_client_death_cases::dispatch_client_child();
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -114,12 +137,14 @@ fn main() {
     mirror_status(status);
 }
 
+#[cfg(target_arch = "x86_64")]
 #[derive(Clone, Copy)]
 struct BrokerWaitReceipt {
     native_pid: libc::pid_t,
     raw_wait_status: i32,
 }
 
+#[cfg(target_arch = "x86_64")]
 fn print_broker_wait(receipt: BrokerWaitReceipt) {
     println!(
         "NATIVE_CASE_BROKER_WAIT native_pid={} raw_wait_status={} actual_wait=true",
@@ -127,6 +152,7 @@ fn print_broker_wait(receipt: BrokerWaitReceipt) {
     );
 }
 
+#[cfg(target_arch = "x86_64")]
 fn print_before_drain(before: &broker_native_cases::BeforeDrainRecord) {
     println!(
         "NATIVE_CASE_BEFORE_DRAIN bound_millis={} observed_micros={} completed_before_drain={} receipt_observed_after_bound={} stage_at_deadline={:?} parent_references_retired_at_deadline={} last_owner_case={}",
@@ -140,6 +166,7 @@ fn print_before_drain(before: &broker_native_cases::BeforeDrainRecord) {
     );
 }
 
+#[cfg(target_arch = "x86_64")]
 fn print_case_receipt(receipt: &broker_native_cases::CaseReceipt) {
     println!(
         "NATIVE_CASE_RECEIPT case={:?} wait_count={} sent={} outq={} notsent={} first_chunk_acknowledged={} fault_present={} before_drain_present={}",
@@ -180,6 +207,7 @@ fn print_case_receipt(receipt: &broker_native_cases::CaseReceipt) {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 fn print_case_failure(failure: &broker_native_cases::CaseFailure) {
     eprintln!(
         "NATIVE_CASE_FAILURE_DETAIL classification={} message={:?}",
@@ -208,6 +236,7 @@ fn print_case_failure(failure: &broker_native_cases::CaseFailure) {
     failure.resources.print_retained_owners();
 }
 
+#[cfg(target_arch = "x86_64")]
 fn settle_native_broker(owner: &mut BrokerOwner) -> BrokerWaitReceipt {
     match settle_broker(owner) {
         Ok(receipt) => {
@@ -223,6 +252,7 @@ fn settle_native_broker(owner: &mut BrokerOwner) -> BrokerWaitReceipt {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 fn run_native_case(mut owner: BrokerOwner, args: Vec<String>) -> i32 {
     if args.len() != 1
         || !matches!(
@@ -310,6 +340,7 @@ fn run_native_case(mut owner: BrokerOwner, args: Vec<String>) -> i32 {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 fn launch_selected(owner: &BrokerOwner) -> Result<i32, String> {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     if args.len() != 6 || args[1] != "--exact" || args[3] != "--nocapture" || args[4] != "--logfile"
@@ -487,6 +518,7 @@ fn launch_selected(owner: &BrokerOwner) -> Result<i32, String> {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 fn settle_broker(owner: &mut BrokerOwner) -> Result<BrokerWaitReceipt, String> {
     let native_pid = owner.native_pid();
     loop {
@@ -513,6 +545,7 @@ fn settle_broker(owner: &mut BrokerOwner) -> Result<BrokerWaitReceipt, String> {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 fn wait_interest(mut fd: libc::pollfd) -> Result<(), String> {
     loop {
         let result = unsafe { libc::poll(&mut fd, 1, -1) };
@@ -533,6 +566,7 @@ fn wait_interest(mut fd: libc::pollfd) -> Result<(), String> {
 // This is a terminal infrastructure failure, never an accepted guest/test result.
 // Retain owned state without unwinding until the unchanged outer30+kill2 guard
 // retires this launcher and its non-escaped children. No new private timeout.
+#[cfg(target_arch = "x86_64")]
 fn retain_for_outer_guard<T>(state: T) -> ! {
     loop {
         std::hint::black_box(&state);
@@ -542,6 +576,7 @@ fn retain_for_outer_guard<T>(state: T) -> ! {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 fn mirror_status(status: i32) -> ! {
     if libc::WIFEXITED(status) {
         std::process::exit(libc::WEXITSTATUS(status));
@@ -572,6 +607,7 @@ fn mirror_status(status: i32) -> ! {
     std::process::exit(125);
 }
 
+#[cfg(target_arch = "x86_64")]
 unsafe fn exit_raw(code: usize) -> ! {
     unsafe {
         raw(libc::SYS_exit_group, code, 0, 0, 0, 0, 0);

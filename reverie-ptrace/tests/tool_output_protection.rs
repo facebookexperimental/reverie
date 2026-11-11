@@ -14,6 +14,10 @@
 //! through its stack pointer, and an eight-byte scalar is published entirely
 //! or not at all.
 
+// x86_64 only: its guest uses x86_64 inline asm and the x86_64-only `time`
+// syscall. Known aarch64 gap.
+#![cfg(target_arch = "x86_64")]
+
 use reverie::Error;
 use reverie::Guest;
 use reverie::Stack;

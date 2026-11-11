@@ -19,7 +19,9 @@
 // unused in one binary's build is used in another's.
 #![allow(dead_code)]
 
+#[cfg(target_arch = "x86_64")]
 use std::ffi::OsStr;
+#[cfg(target_arch = "x86_64")]
 use std::os::fd::FromRawFd;
 use std::path::Path;
 use std::path::PathBuf;
@@ -31,7 +33,9 @@ pub use reverie_examples::host::BackendKind;
 pub use reverie_examples::host::Run;
 pub use reverie_examples::host::RunError;
 pub use reverie_examples::host::exit_code;
+#[cfg(target_arch = "x86_64")]
 use reverie_examples::host::guest_environment;
+#[cfg(target_arch = "x86_64")]
 use reverie_examples::host::resolve_program;
 use reverie_util::CommonToolArguments;
 
@@ -191,6 +195,23 @@ where
     })
 }
 
+// reverie-kvm is compiled only on x86_64 (`#![cfg(target_arch = "x86_64")]`:
+// its guest kernel and VM exits are x86_64), so elsewhere the KVM backend
+// refuses by name, as every backend that cannot host a run does.
+#[cfg(not(target_arch = "x86_64"))]
+async fn run_kvm<T>(
+    _args: &CommonToolArguments,
+    _config: <T::GlobalState as GlobalTool>::Config,
+) -> Result<Run<T::GlobalState>, RunError>
+where
+    T: Tool + 'static,
+{
+    Err(RunError::Refused(
+        "the KVM backend exists only on x86_64".to_string(),
+    ))
+}
+
+#[cfg(target_arch = "x86_64")]
 async fn run_kvm<T>(
     args: &CommonToolArguments,
     config: <T::GlobalState as GlobalTool>::Config,

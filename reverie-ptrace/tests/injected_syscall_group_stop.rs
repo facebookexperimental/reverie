@@ -20,6 +20,10 @@
 //! `-ERESTARTSYS` (re-executing the syscall through a restart) nor leave the
 //! guest a raw restart code.
 
+// x86_64 only: its guest issues the injected call with x86_64 inline asm,
+// reads `rax`/`orig_rax`, and exercises `fork`. Known aarch64 gap.
+#![cfg(target_arch = "x86_64")]
+
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU32;

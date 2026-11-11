@@ -12,6 +12,9 @@
 mod thread_start_guest;
 #[path = "tool_fixtures/thread_start_tail.rs"]
 mod thread_start_tail_tool;
+// The witness reads x86_64 registers by name, so it and the returning tests
+// below exist only on x86_64. Known aarch64 gap.
+#[cfg(target_arch = "x86_64")]
 #[path = "tool_fixtures/thread_start_tail_witness.rs"]
 mod thread_start_tail_witness;
 #[path = "tool_fixtures/thread_start.rs"]
@@ -89,11 +92,13 @@ fn rust_thread_start_tail_command() {
     assert!(output.stderr.is_empty());
 }
 
+#[cfg(target_arch = "x86_64")]
 struct ReturningRun {
     output: reverie::process::Output,
     rows: Vec<(reverie::Pid, thread_start_tail_witness::ReturningRecord)>,
 }
 
+#[cfg(target_arch = "x86_64")]
 fn returning_output(
     backend: &str,
     mode: u8,
@@ -133,6 +138,7 @@ fn returning_output(
     ReturningRun { output, rows }
 }
 
+#[cfg(target_arch = "x86_64")]
 fn ptrace_returning(mode: u8) -> ReturningRun {
     eprintln!("returning-injection ptrace image=/bin/true mode={mode}");
     let (output, state) = reverie_test_support::test_cmd_with_config::<
@@ -142,6 +148,7 @@ fn ptrace_returning(mode: u8) -> ReturningRun {
     returning_output("ptrace", mode, output, state)
 }
 
+#[cfg(target_arch = "x86_64")]
 fn returning_order(mode: u8) -> Vec<(u8, u8, Option<reverie::syscalls::Sysno>)> {
     use reverie::syscalls::Sysno;
     use thread_start_tail_witness::*;
@@ -181,6 +188,7 @@ fn returning_order(mode: u8) -> Vec<(u8, u8, Option<reverie::syscalls::Sysno>)> 
     order
 }
 
+#[cfg(target_arch = "x86_64")]
 fn assert_returning_byte(
     byte: thread_start_tail_witness::ByteRecord,
     frame: &thread_start_tail_witness::ReturningFrame,
@@ -196,6 +204,7 @@ fn assert_returning_byte(
     );
 }
 
+#[cfg(target_arch = "x86_64")]
 fn assert_returning_records(mode: u8, run: &ReturningRun) {
     use reverie::syscalls::Errno;
     use reverie::syscalls::Sysno;
@@ -330,12 +339,14 @@ fn assert_returning_records(mode: u8, run: &ReturningRun) {
     );
 }
 
+#[cfg(target_arch = "x86_64")]
 fn assert_returning_completion(run: &ReturningRun, stdout: &[u8]) {
     assert_eq!(run.output.status, reverie::ExitStatus::Exited(0));
     assert_eq!(run.output.stdout, stdout);
     assert!(run.output.stderr.is_empty());
 }
 
+#[cfg(target_arch = "x86_64")]
 fn full_returning_effect(run: &ReturningRun) -> bool {
     use reverie::syscalls::Sysno;
     use thread_start_tail_witness::*;
@@ -364,6 +375,7 @@ fn full_returning_effect(run: &ReturningRun) -> bool {
             })
 }
 
+#[cfg(target_arch = "x86_64")]
 fn returning_single(run: fn(u8) -> ReturningRun, mode: u8) {
     let actual = run(mode);
     assert_returning_records(mode, &actual);
@@ -371,6 +383,7 @@ fn returning_single(run: fn(u8) -> ReturningRun, mode: u8) {
     eprintln!("returning-injection mode={mode}: complete frame/result predicate accepted");
 }
 
+#[cfg(target_arch = "x86_64")]
 fn returning_sequence(run: fn(u8) -> ReturningRun, mode: u8, no_effect: u8) {
     let actual = run(mode);
     assert_returning_records(mode, &actual);
@@ -393,16 +406,19 @@ fn returning_sequence(run: fn(u8) -> ReturningRun, mode: u8, no_effect: u8) {
     );
 }
 
+#[cfg(target_arch = "x86_64")]
 #[test]
 fn ptrace_returning_startup_getpid_preserves_frame() {
     returning_single(ptrace_returning, thread_start_tail_witness::START_GETPID);
 }
 
+#[cfg(target_arch = "x86_64")]
 #[test]
 fn ptrace_returning_startup_errno_preserves_frame() {
     returning_single(ptrace_returning, thread_start_tail_witness::START_ERRNO);
 }
 
+#[cfg(target_arch = "x86_64")]
 #[test]
 fn ptrace_returning_startup_mutation_and_effect() {
     returning_sequence(
@@ -412,6 +428,7 @@ fn ptrace_returning_startup_mutation_and_effect() {
     );
 }
 
+#[cfg(target_arch = "x86_64")]
 #[test]
 fn ptrace_returning_post_exec_preserves_frame_and_effect() {
     returning_sequence(
@@ -423,6 +440,7 @@ fn ptrace_returning_post_exec_preserves_frame_and_effect() {
 
 /// The first post-exec call's register view before injection is a native ELF
 /// execve's: rax 0 and orig_rax 59.
+#[cfg(target_arch = "x86_64")]
 #[test]
 fn ptrace_post_exec_orig_rax_before_injection() {
     use thread_start_tail_witness::*;
