@@ -20,6 +20,13 @@
 //! The formatting rules follow Linux's procfs (`fs/proc/`); each helper
 //! names the kernel source it matches.
 
+pub mod mountinfo;
+
+pub use mountinfo::MOUNT_PEER_PREFIXES;
+pub use mountinfo::MountInfoRow;
+pub use mountinfo::parse_fdinfo_mount_id;
+pub use mountinfo::parse_mountinfo;
+
 /// Deterministic inode for a normalized synthetic `/proc` path (FNV-1a).
 /// Stable across runs so repeated `stat` results agree.
 pub fn path_inode(path: &[u8]) -> u64 {
