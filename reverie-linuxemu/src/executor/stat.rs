@@ -159,9 +159,11 @@ fn fstatat_impl(
     if let Some(content) = synthetic_proc_content(state, &path) {
         let normalized =
             normalize_proc_path(state, &path).expect("a synthesized /proc path always normalizes");
-        let stat = synthetic_proc_stat(
-            synthetic_proc_inode(&normalized),
+        let stat = reverie_procfs::synthetic_stat(
+            reverie_procfs::synthetic_dev(SYNTHETIC_DEV_MAJOR, SYNTHETIC_PROC_DEV_MINOR),
+            reverie_procfs::path_inode(&normalized),
             synthetic_proc_path_size(&normalized, &content),
+            PAGE_SIZE as u32,
         );
         return write_struct(&mut ProviderMemory(memory), output_address, &stat);
     }
@@ -243,7 +245,12 @@ fn fstatat_impl(
             .then(|| state.proc_files.get(&guest_dirfd).copied())
             .flatten();
         if let Some(inode) = empty_path_proc_inode {
-            sanitize_proc_stat(&mut stat, inode);
+            reverie_procfs::sanitize_synthetic_stat(
+                &mut stat,
+                reverie_procfs::synthetic_dev(SYNTHETIC_DEV_MAJOR, SYNTHETIC_PROC_DEV_MINOR),
+                inode,
+                PAGE_SIZE as u32,
+            );
         }
     }
     if executable.is_some() {
@@ -327,9 +334,12 @@ pub(super) fn statx(
         if let Some(content) = synthetic_proc_content(state, &path) {
             let normalized = normalize_proc_path(state, &path)
                 .expect("a synthesized /proc path always normalizes");
-            let stx = synthetic_proc_statx(
-                synthetic_proc_inode(&normalized),
+            let stx = reverie_procfs::synthetic_statx(
+                SYNTHETIC_DEV_MAJOR,
+                SYNTHETIC_PROC_DEV_MINOR,
+                reverie_procfs::path_inode(&normalized),
                 synthetic_proc_path_size(&normalized, &content) as u64,
+                PAGE_SIZE as u32,
             );
             return write_struct(&mut ProviderMemory(memory), args[4], &stx);
         }
@@ -348,7 +358,13 @@ pub(super) fn statx(
             }
             None => return negative_errno(libc::EBADF),
         };
-        let stx = synthetic_proc_statx(inode, size);
+        let stx = reverie_procfs::synthetic_statx(
+            SYNTHETIC_DEV_MAJOR,
+            SYNTHETIC_PROC_DEV_MINOR,
+            inode,
+            size,
+            PAGE_SIZE as u32,
+        );
         return write_struct(&mut ProviderMemory(memory), args[4], &stx);
     }
 

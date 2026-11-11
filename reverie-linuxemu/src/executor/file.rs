@@ -669,7 +669,9 @@ pub(super) fn open_guest_fd_path(
         }
         return negative_errno(libc::EEXIST);
     }
-    if source_proc_inode.is_some_and(|inode| inode == synthetic_proc_inode(b"/proc/self/status")) {
+    if source_proc_inode
+        .is_some_and(|inode| inode == reverie_procfs::path_inode(b"/proc/self/status"))
+    {
         // Its content is rendered from the opener's process cells, which an
         // O_PATH backing does not carry. Refuse rather than expose its empty
         // backing file.

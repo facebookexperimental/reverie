@@ -11,3 +11,6 @@ homepage = "https://hermetic-infra.org"
 documentation = "https://docs.rs/reverie-procfs"
 keywords = ["linux", "instrumentation", "hermit"]
 categories = ["development-tools::debugging", "os::linux-apis"]
+
+[dependencies]
+libc = "0.2.186"

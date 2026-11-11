@@ -237,15 +237,7 @@ impl ProcessProcView {
 
     fn status(&self) -> Vec<u8> {
         let mut content = b"Name:\t".to_vec();
-        // Linux renders newline and backslash as two-byte escape sequences in
-        // the `Name` field; `stat` keeps the raw bytes.
-        for byte in self.comm() {
-            match byte {
-                b'\n' => content.extend_from_slice(b"\\n"),
-                b'\\' => content.extend_from_slice(b"\\\\"),
-                _ => content.push(byte),
-            }
-        }
+        content.extend_from_slice(&reverie_procfs::escape_status_name(&self.comm()));
         content.push(b'\n');
         content.extend_from_slice(
             format!(
@@ -495,22 +487,6 @@ pub(super) const SYNTHETIC_GUEST_FD_DEV_MINOR: u32 = 0xff02;
 pub(super) const SYNTHETIC_REGULAR_PROC_PATHS: &[&[u8]] =
     &[b"/proc/self/status", b"/proc/self/maps"];
 
-pub(super) fn synthetic_dev(minor: u32) -> libc::dev_t {
-    libc::makedev(SYNTHETIC_DEV_MAJOR, minor)
-}
-
-/// Deterministic inode for a normalized synthetic /proc path (FNV-1a). Stable
-/// across runs so `--verify` sees identical `stat` results.
-pub(super) fn synthetic_proc_inode(path: &[u8]) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in path {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    // Keep clear of low, conventionally-reserved inode numbers.
-    hash | 0x1000
-}
-
 fn parse_proc_id(component: &[u8]) -> Option<i32> {
     if component.is_empty() || !component.iter().all(u8::is_ascii_digit) {
         return None;
@@ -599,7 +575,16 @@ pub(super) fn proc_self_maps_content(_state: &LoadedStaticElf) -> Vec<u8> {
     // address space, below Linux's TASK_SIZE.
     let stack_start = crate::memory::USER_ADDRESS_END - STACK_LIMIT;
     let stack_end = crate::memory::USER_STACK_TOP;
-    format!("{stack_start:012x}-{stack_end:012x} rw-p 00000000 00:00 0 [stack]\n").into_bytes()
+    reverie_procfs::format_maps_line(&reverie_procfs::MapsEntry {
+        start: stack_start,
+        end: stack_end,
+        perms: "rw-p",
+        offset: 0,
+        dev_major: 0,
+        dev_minor: 0,
+        inode: 0,
+        name: Some("[stack]"),
+    })
 }
 
 /// The size a path stat reports. Read-time files report zero, as Linux does
@@ -698,7 +683,7 @@ pub(super) fn open_synthetic_proc(
     // the proc-fd link creates a fresh O_RDONLY or O_PATH description at offset
     // zero without sharing the construction description.
     drop(file);
-    let inode = synthetic_proc_inode(normalized_path);
+    let inode = reverie_procfs::path_inode(normalized_path);
     // The snapshot class lets a receiver of this descriptor, which has no
     // `proc_files` entry, keep timestamp 0.
     let guest_fd = insert_file_with_identity(
@@ -718,62 +703,6 @@ pub(super) fn open_synthetic_proc(
         }
     }
     guest_fd
-}
-
-/// Overwrite the nondeterministic fields of a memfd `stat` with the stable
-/// synthetic identity of a /proc file, keeping the (deterministic) size.
-pub(super) fn sanitize_proc_stat(stat: &mut libc::stat, inode: u64) {
-    stat.st_dev = synthetic_dev(SYNTHETIC_PROC_DEV_MINOR);
-    stat.st_ino = inode;
-    stat.st_mode = libc::S_IFREG | 0o444;
-    stat.st_nlink = 1;
-    stat.st_uid = 0;
-    stat.st_gid = 0;
-    stat.st_rdev = 0;
-    stat.st_blksize = PAGE_SIZE as libc::blksize_t;
-    // 512-byte blocks, rounded up. A shift avoids the still-unstable
-    // int_roundings `div_ceil` on the pinned toolchain (512 == 1 << 9).
-    stat.st_blocks = (stat.st_size + 511) >> 9;
-    stat.st_atime = 0;
-    stat.st_atime_nsec = 0;
-    stat.st_mtime = 0;
-    stat.st_mtime_nsec = 0;
-    stat.st_ctime = 0;
-    stat.st_ctime_nsec = 0;
-}
-
-/// A fully synthetic `stat` for a path-addressed /proc file of `size` bytes.
-pub(super) fn synthetic_proc_stat(inode: u64, size: usize) -> libc::stat {
-    // SAFETY: libc::stat is plain-old-data; a zeroed value is valid.
-    let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
-    stat.st_size = size as libc::off_t;
-    sanitize_proc_stat(&mut stat, inode);
-    stat
-}
-
-/// A synthetic `statx` mirroring [`synthetic_proc_stat`].
-pub(super) fn synthetic_proc_statx(inode: u64, size: u64) -> libc::statx {
-    // SAFETY: libc::statx is plain-old-data; a zeroed value is valid.
-    let mut stx = unsafe { std::mem::zeroed::<libc::statx>() };
-    stx.stx_mask = libc::STATX_TYPE
-        | libc::STATX_MODE
-        | libc::STATX_NLINK
-        | libc::STATX_UID
-        | libc::STATX_GID
-        | libc::STATX_INO
-        | libc::STATX_SIZE
-        | libc::STATX_BLOCKS;
-    stx.stx_blksize = PAGE_SIZE as u32;
-    stx.stx_nlink = 1;
-    stx.stx_uid = 0;
-    stx.stx_gid = 0;
-    stx.stx_mode = (libc::S_IFREG | 0o444) as u16;
-    stx.stx_ino = inode;
-    stx.stx_size = size;
-    stx.stx_blocks = (stx.stx_size + 511) >> 9;
-    stx.stx_dev_major = SYNTHETIC_DEV_MAJOR;
-    stx.stx_dev_minor = SYNTHETIC_PROC_DEV_MINOR;
-    stx
 }
 
 // TODO-HUMAN-REVIEW(PR-92): Review deterministic guest-fd alias metadata.
@@ -812,7 +741,12 @@ pub(super) fn sanitize_guest_fd_stat(
     stat: &mut libc::stat,
 ) {
     if let Some(&inode) = state.proc_files.get(&guest_fd) {
-        sanitize_proc_stat(stat, inode);
+        reverie_procfs::sanitize_synthetic_stat(
+            stat,
+            reverie_procfs::synthetic_dev(SYNTHETIC_DEV_MAJOR, SYNTHETIC_PROC_DEV_MINOR),
+            inode,
+            PAGE_SIZE as u32,
+        );
         return;
     }
     if let Some(pidfd) = guest_pidfd(state, guest_fd) {
@@ -829,7 +763,13 @@ pub(super) fn sanitize_guest_fd_statx(
     stat: &mut libc::statx,
 ) {
     if let Some(&inode) = state.proc_files.get(&guest_fd) {
-        *stat = synthetic_proc_statx(inode, stat.stx_size);
+        *stat = reverie_procfs::synthetic_statx(
+            SYNTHETIC_DEV_MAJOR,
+            SYNTHETIC_PROC_DEV_MINOR,
+            inode,
+            stat.stx_size,
+            PAGE_SIZE as u32,
+        );
         return;
     }
     if let Some(pidfd) = guest_pidfd(state, guest_fd) {

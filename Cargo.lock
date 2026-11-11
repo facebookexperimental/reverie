@@ -1399,6 +1399,7 @@ dependencies = [
  "libc",
  "reverie-core",
  "reverie-kvm-core",
+ "reverie-procfs",
  "thiserror",
  "tracing",
 ]
@@ -1482,6 +1483,9 @@ dependencies = [
 [[package]]
 name = "reverie-procfs"
 version = "0.5.6"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "reverie-ptrace"

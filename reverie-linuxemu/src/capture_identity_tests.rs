@@ -78,7 +78,10 @@ fn captured_output_identity_matches_pipefs_and_preserves_proc_symlinks() {
         }
         let link: libc::stat = read_struct(&memory, 0x800);
         let linkx: libc::statx = read_struct(&memory, 0x1000);
-        assert_eq!(link.st_dev, synthetic_dev(SYNTHETIC_GUEST_FD_DEV_MINOR));
+        assert_eq!(
+            link.st_dev,
+            reverie_procfs::synthetic_dev(SYNTHETIC_DEV_MAJOR, SYNTHETIC_GUEST_FD_DEV_MINOR)
+        );
         assert_eq!(link.st_mode & libc::S_IFMT, libc::S_IFLNK);
         assert_eq!(
             (linkx.stx_dev_major, linkx.stx_dev_minor, linkx.stx_ino),

@@ -499,6 +499,9 @@ rust_library(
         },
         "cargo_toml_dir": "reverie-procfs",
     },
+    deps = [
+        "fbsource//third-party/rust:libc",
+    ],
 )
 
 rust_library(
@@ -608,6 +611,7 @@ rust_library(
         "fbsource//third-party/rust:tracing",
         ":reverie-kvm-core",
         ":reverie-linuxemu-terminal-read",
+        ":reverie-procfs",
     ],
 )
 
@@ -732,6 +736,7 @@ rust_library(
         "fbsource//third-party/rust:tracing",
         ":reverie-kvm-core-test-support",  # @manual name:reverie_kvm_core
         ":reverie-linuxemu-terminal-read",
+        ":reverie-procfs",
     ],
 )
 
@@ -833,6 +838,7 @@ rust_unittest(
         "fbsource//third-party/rust:tracing",
         ":reverie-kvm-core-test-support",  # @manual name:reverie_kvm_core
         ":reverie-linuxemu-terminal-read",
+        ":reverie-procfs",
     ],
 )
 
