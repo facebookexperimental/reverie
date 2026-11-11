@@ -1417,9 +1417,8 @@ rust_library(
         "ovr_config//cpu:x86_64",
         "ovr_config//os:linux",
     ],
-    test_deps = [
-        "fbsource//third-party/rust:tracing-subscriber",
-    ],
+    # Built by :reverie-liteinst-unittest below, with the system allocator.
+    unittests = False,
     deps = [
         "fbsource//third-party/rust:bincode",
         "fbsource//third-party/rust:iced-x86",
@@ -1428,6 +1427,41 @@ rust_library(
         "fbsource//third-party/rust:tempfile",
         "fbsource//third-party/rust:tokio",
         "fbsource//third-party/rust:tracing",
+        ":reverie",
+        ":reverie-inguest-liteinst",  # @manual name:reverie_inguest
+        ":reverie-rpc-transport",
+    ],
+)
+
+# The library's unit tests, linked as in the Cargo build. Under the trusted-gate
+# seccomp filter, lazy_promote's test lets only gate syscalls run, and two of
+# fbcode's defaults make others: jemalloc's background threads (a futex wake),
+# and a dev-mode shared link, whose /proc/self/maps outgrows the malloc arena
+# while it is read (an mmap).
+rust_unittest(
+    name = "reverie-liteinst-unittest",
+    srcs = glob(["reverie-liteinst/src/**/*.rs"]),
+    allocator = "malloc",
+    autocargo = {"ignore_rule": True},
+    crate = "reverie_liteinst",
+    crate_root = "reverie-liteinst/src/lib.rs",
+    link_style = "static",
+    rustc_flags = reverie_asan_feature,
+    target_compatible_with = [
+        "ovr_config//cpu:x86_64",
+        "ovr_config//os:linux",
+    ],
+    deps = [
+        "fbsource//third-party/rust:bincode",
+        "fbsource//third-party/rust:iced-x86",
+        "fbsource//third-party/rust:libc",
+        "fbsource//third-party/rust:liteinst-aarch64",
+        "fbsource//third-party/rust:liteinst-aarch64-patch",
+        "fbsource//third-party/rust:serde",
+        "fbsource//third-party/rust:tempfile",
+        "fbsource//third-party/rust:tokio",
+        "fbsource//third-party/rust:tracing",
+        "fbsource//third-party/rust:tracing-subscriber",
         ":reverie",
         ":reverie-inguest-liteinst",  # @manual name:reverie_inguest
         ":reverie-rpc-transport",
