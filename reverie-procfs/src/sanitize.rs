@@ -913,6 +913,13 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
             sanitize_diskstats(b"259 0 nvme0n1 100 2 300 4 500 6 700 8 9 10 11\n"),
             b"259 0 nvme0n1 1 0 8 0 1 0 8 0 0 0 0\n"
         );
+        // The origin's block_stat assertion, the stable_fields = 0
+        // exercise of sanitize_numeric_lines (sanitize_block_stat
+        // itself stays caller-side as a /sys transform).
+        assert_eq!(
+            sanitize_numeric_lines(b"100 2 300 4 500 6 700 8 9 10 11\n", 0),
+            b"1 0 8 0 1 0 8 0 0 0 0\n"
+        );
         assert_eq!(
             sanitize_process_io(
                 b"rchar: 100\nwchar: 200\nsyscr: 3\nsyscw: 4\nread_bytes: 5\nwrite_bytes: 6\ncancelled_write_bytes: 7\n"
@@ -1039,6 +1046,235 @@ scm_fds: 2\n"
             )
             .is_empty(),
             "an unknown fdinfo field must continue to refuse normalization"
+        );
+    }
+    /// A process's cgroup reads as a cgroup namespace rooted at it shows it:
+    /// the host's path, which names whatever launched Hermit, becomes `/` on
+    /// every line, cgroup v1 or v2 (https://github.com/rrnewton/hermit/issues/4378).
+    #[test]
+    fn a_process_cgroup_reads_as_the_root_cgroup() {
+        assert_eq!(
+            sanitize_process_cgroup(
+                b"0::/user.slice/user-1.slice/app.slice/safehermit-20261015T004318Z-183710.service\n"
+            ),
+            b"0::/\n"
+        );
+        assert_eq!(
+            sanitize_process_cgroup(
+                b"12:pids:/user.slice\n11:cpu,cpuacct:/user.slice/x\n0::/a/b\n"
+            ),
+            b"12:pids:/\n11:cpu,cpuacct:/\n0::/\n"
+        );
+        assert_eq!(
+            sanitize_process_cgroup(b"not a cgroup line"),
+            b"not a cgroup line"
+        );
+        // A directory name that is not UTF-8 is replaced too.
+        assert_eq!(
+            sanitize_process_cgroup(b"0::/user.slice/\xff\xfe.scope\n"),
+            b"0::/\n"
+        );
+    }
+
+    #[test]
+    fn arch_status_uses_logical_avx512_elapsed_time() {
+        let contents = b"AVX512_elapsed_ms:\t48\n\
+x86_Thread_features:\t\tshstk\n\
+x86_Thread_features_locked:\t\n";
+
+        assert_eq!(
+            sanitize_arch_status(contents),
+            b"AVX512_elapsed_ms:\t0\n\
+x86_Thread_features:\t\tshstk\n\
+x86_Thread_features_locked:\t\n"
+        );
+        assert_eq!(
+            sanitize_arch_status(b"AVX512_elapsed_ms:\tunknown\n"),
+            b"AVX512_elapsed_ms:\tunknown\n"
+        );
+        // A task that never used AVX-512 reads -1; it becomes 0 too.
+        assert_eq!(
+            sanitize_arch_status(b"AVX512_elapsed_ms:\t-1\n"),
+            b"AVX512_elapsed_ms:\t0\n"
+        );
+        // Any other negative value is not the kernel's format: left alone.
+        assert_eq!(
+            sanitize_arch_status(b"AVX512_elapsed_ms:\t-2\n"),
+            b"AVX512_elapsed_ms:\t-2\n"
+        );
+    }
+
+    #[test]
+    fn random_uuid_uses_deterministic_v4_bytes_or_fails_open() {
+        let kernel_uuid = b"24e63f35-232a-43e2-8799-b151e9833f45\n";
+        assert_eq!(
+            sanitize_random_uuid(kernel_uuid, [0; 16]),
+            b"00000000-0000-4000-8000-000000000000\n"
+        );
+        assert_eq!(
+            sanitize_random_uuid(kernel_uuid, [0xff; 16]),
+            b"ffffffff-ffff-4fff-bfff-ffffffffffff\n"
+        );
+
+        for malformed in [
+            b"24e63f35-232a-1e32-8799-b151e9833f45\n".as_slice(),
+            b"24e63f35-232a-4e32-c799-b151e9833f45\n",
+            b"24E63F35-232A-4E32-8799-B151E9833F45\n",
+            b"24e63f35-232a-4e32-8799-b151e9833f45",
+            b"not-a-uuid\n",
+        ] {
+            assert_eq!(sanitize_random_uuid(malformed, [0; 16]), malformed);
+        }
+    }
+
+    #[test]
+    fn self_sched_hides_host_scheduler_accounting() {
+        let contents = b"cat (3, #threads: 7)\n\
+se.exec_start : 377650149.445644\n\
+se.vruntime : 133948666.432951\n\
+se.sum_exec_runtime : 3.637972\n\
+nr_switches : 149\n\
+se.avg.load_avg : 749\n\
+uclamp.min : 128\n\
+uclamp.max : 768\n\
+effective uclamp.min : 256\n\
+effective uclamp.max : 512\n\
+policy : 0\n\
+uclamp.max : 1024\n\
+new.kernel.counter : 55\n\
+current_node=7, numa_group_id=91\n\
+numa_faults node=7 task_private=8 task_shared=9 group_private=10 group_shared=11\n";
+
+        assert_eq!(
+            sanitize_self_sched(contents),
+            b"cat (0, #threads: 1)\n\
+se.exec_start : 0.000000\n\
+se.vruntime : 0.000000\n\
+se.sum_exec_runtime : 0.000000\n\
+nr_switches : 0\n\
+se.avg.load_avg : 0\n\
+uclamp.min : 0\n\
+uclamp.max : 1024\n\
+effective uclamp.min : 0\n\
+effective uclamp.max : 1024\n\
+policy : 0\n\
+uclamp.max : 1024\n\
+new.kernel.counter : 0\n"
+        );
+    }
+
+    /// A kernel built without NUMA prints none of NUMA balancing's lines
+    /// (kernel/sched/debug.c:1239-1262 at v7.1), so they are left out, the
+    /// one `numa_faults` line per host node with them; a malformed one still
+    /// leaves the guest nothing, as any malformed line does.
+    #[test]
+    fn self_sched_leaves_out_numa_balancing() {
+        let core = "cat (3, #threads: 1)\n\
+se.exec_start : 377650149.445644\n\
+se.vruntime : 133948666.432951\n\
+se.sum_exec_runtime : 3.637972\n";
+        let numa = "mm->numa_scan_seq                            :                    4\n\
+numa_pages_migrated                          :                    5\n\
+numa_preferred_nid                           :                   -1\n\
+total_numa_faults                            :                    6\n\
+current_node=1, numa_group_id=0\n\
+numa_faults node=0 task_private=0 task_shared=0 group_private=0 group_shared=0\n\
+numa_faults node=1 task_private=7 task_shared=0 group_private=0 group_shared=0\n";
+        let expected = sanitize_self_sched(core.as_bytes());
+        assert!(expected.starts_with(b"cat (0, #threads: 1)\n"));
+        assert_eq!(
+            sanitize_self_sched(format!("{core}{numa}").as_bytes()),
+            expected
+        );
+        for malformed in [
+            "numa_preferred_nid : none\n",
+            "current_node=1\n",
+            "numa_faults node=1 task_private=x task_shared=0 group_private=0 group_shared=0\n",
+        ] {
+            assert!(
+                sanitize_self_sched(format!("{core}{malformed}").as_bytes()).is_empty(),
+                "{malformed:?}"
+            );
+        }
+    }
+
+    // With kernel.sched_schedstats=1 the kernel adds these lines, printed with
+    // "%-45s:%14Ld.%06ld" and "%-45s:%21Ld" (kernel/sched/debug.c,
+    // proc_sched_show_task); avg_atom prints -1 as 0.000001. Each value
+    // becomes zero, and the file still reaches the guest.
+    #[test]
+    fn self_sched_hides_schedstats_fields() {
+        let core = "cat (3, #threads: 1)\n\
+se.exec_start : 377650149.445644\n\
+se.vruntime : 133948666.432951\n\
+se.sum_exec_runtime : 3.637972\n";
+        let decimal = |label: &str, value: &str| format!("{label:<45}:{value:>21}\n");
+        let mut contents = core.to_owned();
+        let mut expected = "cat (0, #threads: 1)\n\
+se.exec_start : 0.000000\n\
+se.vruntime : 0.000000\n\
+se.sum_exec_runtime : 0.000000\n"
+            .to_owned();
+        for (label, value, zero) in [
+            ("sum_sleep_runtime", "1234.567890", "0.000000"),
+            ("wait_max", "2.500000", "0.000000"),
+            ("wait_count", "7", "0"),
+            ("avg_atom", "0.000001", "0.000000"),
+        ] {
+            contents.push_str(&decimal(label, value));
+            expected.push_str(&format!("{label:<45}: {zero}\n"));
+        }
+        assert_eq!(
+            String::from_utf8(sanitize_self_sched(contents.as_bytes())).unwrap(),
+            expected
+        );
+
+        // A negative or non-finite unknown field still fails closed.
+        for value in ["-1.500000", "inf"] {
+            let refused = format!("{core}{}", decimal("wait_max", value));
+            assert!(
+                sanitize_self_sched(refused.as_bytes()).is_empty(),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn self_sched_fails_closed_on_unknown_formats() {
+        let missing_core_field = b"se.exec_start : 1.0\nse.vruntime : 2.0\n";
+        assert!(sanitize_self_sched(missing_core_field).is_empty());
+
+        let invalid_counter = b"se.exec_start : NaN\n\
+se.vruntime : 2.0\n\
+se.sum_exec_runtime : 3.0\n";
+        assert!(sanitize_self_sched(invalid_counter).is_empty());
+
+        let negative_counter = b"se.exec_start : 1.0\n\
+se.vruntime : 2.0\n\
+se.sum_exec_runtime : 3.0\n\
+nr_switches : -1\n";
+        assert!(sanitize_self_sched(negative_counter).is_empty());
+    }
+
+    #[test]
+    fn smaps_rollup_hides_physical_page_accounting() {
+        let contents = b"71000000-7ffffffff000 ---p 00000000 00:00 0 [rollup]\n\
+Rss:                2216 kB\n\
+Pss:                 311 kB\n\
+Pss_File:            131 kB\n\
+Locked:                12 kB\n\
+Swap:                   8 kB\n\
+THPeligible:    0\n";
+
+        assert_eq!(
+            sanitize_smaps_rollup(contents),
+            b"71000000-7ffffffff000 ---p 00000000 00:00 0 [rollup]\n\
+Rss:\t0 kB\n\
+Pss:\t0 kB\n\
+Pss_File:\t0 kB\n\
+Locked:\t0 kB\n\
+Swap:\t0 kB\n\
+THPeligible:    0\n"
         );
     }
 }
