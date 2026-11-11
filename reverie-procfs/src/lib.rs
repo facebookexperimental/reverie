@@ -23,7 +23,10 @@
 pub mod fdinfo;
 pub mod fixed;
 pub mod mountinfo;
+pub mod sanitize;
 pub mod task;
+
+pub use sanitize::render_system_stat;
 
 pub use task::CommName;
 pub use task::StatFields;
