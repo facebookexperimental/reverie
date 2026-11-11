@@ -4783,7 +4783,8 @@ fn wait_thread_status(identity: &WorkerIdentity, event: &Event) -> Option<i32> {
 }
 
 /// Closes legacy authority only after a bounded retained check proves there
-/// is no current attachment to the same live owner. The caller holds the
+/// is no current attachment to the same live owner and no pending detach ->
+/// reattach handoff ([`LegacyAttachment::Handoff`]). The caller holds the
 /// progress mutex, so it cannot race an actual consuming producer. Publication
 /// happens only after this returns and that mutex has been dropped.
 fn close_unowned_legacy_wait(identity: &WorkerIdentity, event: &Event) -> Result<bool, Errno> {
@@ -4800,6 +4801,11 @@ enum LegacyAttachment {
     Read,
     /// Kept without reading, because another holder had the gate.
     Unread,
+    /// Kept, with the gate left open, during a detach -> reattach handoff:
+    /// the target was untraced (TracerPid 0) while a detached wait was
+    /// recorded for this same live, non-zombie generation. No attachment
+    /// was confirmed, so this does not postcheck an observation.
+    Handoff,
 }
 
 /// [`close_unowned_legacy_wait`], also reporting whether the target's
@@ -4838,6 +4844,24 @@ fn check_legacy_attachment(
                     Ok(_) | Err(Errno::ENOENT | Errno::ESRCH) => {}
                     Err(error) => return Err(error),
                 }
+            }
+            // A detach -> reattach handoff passes through TracerPid=0. While
+            // a detached wait bound to a live owner is recorded for this same
+            // live, non-zombie generation, that momentary TracerPid=0 does not
+            // close the gate: the rule of `mark_legacy_echild_if_unowned`,
+            // applied before this check commits the retirement. Unlike the
+            // native exemption (`mark_echild_if_unowned`), only an untraced
+            // target qualifies. One attached to another tracer still closes
+            // here, as before: keeping it could let this Event accept a
+            // status observed under an attachment that is not its owner's.
+            if tracer.as_raw() == 0
+                && event.detach_handoff_pending()
+                && identity.observed_process_generation() == Some(true)
+                && !identity.task_is_zombie()
+            {
+                #[cfg(test)]
+                event.detached_echild_kept.fetch_add(1, Ordering::Relaxed);
+                return Ok(LegacyAttachment::Handoff);
             }
         }
         Err(Errno::ENOENT | Errno::ESRCH) => {}
@@ -5165,6 +5189,11 @@ fn legacy_worker_thread(
                     true
                 }
                 Ok(LegacyAttachment::Unread) => false,
+                // No attachment was confirmed: the observation gets its own
+                // check below, as with an unread gate. An ECHILD observation
+                // then reaches `close_unowned_legacy_wait`, which keeps the
+                // generation for the same handoff.
+                Ok(LegacyAttachment::Handoff) => false,
                 Err(error) => {
                     progress.error = Some(error);
                     drop(progress);

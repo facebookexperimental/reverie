@@ -1530,8 +1530,26 @@ fn wait_for_detached_wait_kept(event: &Event, what: &str) {
 #[tokio::test(flavor = "current_thread")]
 #[cfg(not(sanitized))]
 async fn completed_async_driver_does_not_retain_generation() {
+    completed_async_driver_case(false).await;
+}
+
+/// The forced-procfs arm of [`completed_async_driver_does_not_retain_generation`]
+/// (https://github.com/rrnewton/reverie/issues/1477): a procfs worker, too,
+/// keeps the generation through the detach -> reattach handoff.
+#[tokio::test(flavor = "current_thread")]
+#[cfg(not(sanitized))]
+async fn forced_legacy_completed_async_driver_does_not_retain_generation() {
+    completed_async_driver_case(true).await;
+}
+
+#[cfg(not(sanitized))]
+async fn completed_async_driver_case(force_legacy: bool) {
     let (root, tid, release, mut root_cleanup) = legacy_owner_guest();
+    let _legacy = force_legacy.then(|| LegacyThreadGroup::new(root));
     let stopped = seized_stopped_sync(tid);
+    if force_legacy {
+        assert_procfs_identity(&stopped.1);
+    }
     let running = stopped.detach(None).unwrap();
     // Record the detached wait before the worker is registered, as the sync
     // counterpart does. A worker registered first can find the task
@@ -1539,17 +1557,20 @@ async fn completed_async_driver_does_not_retain_generation() {
     // (ECHILD) before the reattach.
     let mut driver = running.wait_owned_on_ptracer_thread().into_driver();
     let terminal = driver.terminal_cleanup().unwrap();
-    // The worker's first wait finds the detached task untraced: before the
-    // reattach, a native (thread-pidfd) worker must keep the generation for
-    // the recorded wait. A procfs worker does not yet keep it
-    // (https://github.com/rrnewton/reverie/issues/1477, whose fix makes this
-    // wait unconditional), so on that path the test runs as before, with
-    // every lifecycle assertion below and no added wait.
-    if terminal.has_thread_pidfd().unwrap() {
-        wait_for_detached_wait_kept(terminal.event.event(), "the detached gap");
+    if force_legacy {
+        assert_eq!(terminal.has_thread_pidfd(), Ok(false));
     }
+    // The worker's first wait finds the detached task untraced: before the
+    // reattach, it must keep the generation for the recorded wait. A procfs
+    // worker keeps it in its attachment check (`LegacyAttachment::Handoff`).
+    wait_for_detached_wait_kept(terminal.event.event(), "the detached gap");
     let reattached =
         Running::seize_on_ptracer_thread(tid.into(), legacy_thread_options()).unwrap();
+    // The kept generation's Event serves the reattachment.
+    assert!(Arc::ptr_eq(
+        reattached.1.event().event(),
+        terminal.event.event()
+    ));
     reattached.interrupt().unwrap();
     let (stopped, event) = tokio::time::timeout(
         TRACEE_WAIT_TIMEOUT,
@@ -1560,12 +1581,13 @@ async fn completed_async_driver_does_not_retain_generation() {
     .unwrap()
     .assume_stopped();
     assert_eq!(event, crate::Event::Stop);
-    // The successful poll released the handoff note exactly once; the
+    // The successful poll released the handoff note exactly once; a native
     // worker is blocked in its next waitid and cannot re-evaluate
     // retirement until the guest next changes state (true at base as
-    // well), so assert the released note directly and then finish the
-    // guest through the traced exit path with the completed driver
-    // still held.
+    // well), and a procfs worker's attachment check now reads the
+    // reattached owner. So assert the released note directly and then
+    // finish the guest through the traced exit path with the completed
+    // driver still held.
     assert!(
         !terminal.event.event().detach_handoff_pending(),
         "successful async wait must release its detached-wait note"
@@ -1667,6 +1689,89 @@ fn dead_generic_owner_retained_driver_does_not_retain_generation() {
     assert!(
         terminal.wait(TRACEE_WAIT_TIMEOUT),
         "dead generic owner's retained driver must not retain the generation"
+    );
+    drop(driver);
+    legacy_owner_reap_root(root, &mut root_cleanup);
+    drop(release);
+}
+
+/// The forced-legacy arm of [`permanent_detach_retires_native_generation`]:
+/// with no detached wait recorded, the `Procfs` worker retires.
+#[test]
+#[cfg(not(sanitized))]
+fn forced_legacy_permanent_detach_retires_generation() {
+    let (root, tid, release, mut root_cleanup) = legacy_owner_guest();
+    let _legacy = LegacyThreadGroup::new(root);
+    let stopped = seized_stopped_sync(tid);
+    assert_procfs_identity(&stopped.1);
+    let running = stopped.detach(None).unwrap();
+    let terminal = running.terminal_cleanup();
+    assert_eq!(terminal.has_thread_pidfd(), Ok(false));
+    drop(running);
+    assert!(
+        terminal.wait(TRACEE_WAIT_TIMEOUT),
+        "permanently detached legacy generation must retire"
+    );
+    legacy_owner_reap_root(root, &mut root_cleanup);
+    drop(release);
+}
+
+/// The forced-legacy arm of [`unreaped_zombie_retires_native_generation`].
+/// The detached wait is recorded, and its owner is live, but the group is
+/// then killed: no reattach can consume this generation, so the `Procfs`
+/// worker retires it, whether or not it had kept the generation for the
+/// handoff before the kill.
+#[test]
+#[cfg(not(sanitized))]
+fn forced_legacy_killed_generation_retires_with_its_wait_recorded() {
+    let (root, tid, release, mut root_cleanup) = legacy_owner_guest();
+    let _legacy = LegacyThreadGroup::new(root);
+    let stopped = seized_stopped_sync(tid);
+    assert_procfs_identity(&stopped.1);
+    let running = stopped.detach(None).unwrap();
+    let terminal = running.generation().terminal_cleanup();
+    let driver = running.wait_sync_on_ptracer_thread().into_driver();
+    assert!(terminal.event.event().detach_handoff_pending());
+    terminal.ensure_registered().unwrap();
+    assert_eq!(terminal.has_thread_pidfd(), Ok(false));
+    assert_eq!(unsafe { libc::kill(root.as_raw(), libc::SIGKILL) }, 0);
+    assert!(
+        terminal.wait(TRACEE_WAIT_TIMEOUT),
+        "killed legacy generation must retire although its wait is recorded"
+    );
+    drop(driver);
+    legacy_owner_reap_root(root, &mut root_cleanup);
+    drop(release);
+}
+
+/// The forced-legacy arm of
+/// [`dead_owner_retained_driver_does_not_retain_generation`]: the detached
+/// wait's owner thread registers the `Procfs` worker, then exits after
+/// handing its Send driver to this thread. Once the owner is dead its
+/// record grants no exemption, so the worker retires the generation, even
+/// if it had kept it for the handoff while the owner lived.
+#[test]
+#[cfg(not(sanitized))]
+fn forced_legacy_dead_owner_retained_driver_does_not_retain_generation() {
+    let (root, tid, release, mut root_cleanup) = legacy_owner_guest();
+    let (sent, received) = mpsc::channel();
+    let owner = thread::spawn(move || {
+        let _legacy = LegacyThreadGroup::new(root);
+        let stopped = seized_stopped_sync(tid);
+        assert_procfs_identity(&stopped.1);
+        let running = stopped.detach(None).unwrap();
+        let terminal = running.generation().terminal_cleanup();
+        let driver = running.wait_sync_on_ptracer_thread().into_driver();
+        assert!(terminal.event.event().detach_handoff_pending());
+        terminal.ensure_registered().unwrap();
+        assert_eq!(terminal.has_thread_pidfd(), Ok(false));
+        sent.send((terminal, driver)).unwrap();
+    });
+    let (terminal, driver) = received.recv_timeout(TRACEE_WAIT_TIMEOUT).unwrap();
+    owner.join().unwrap();
+    assert!(
+        terminal.wait(TRACEE_WAIT_TIMEOUT),
+        "dead owner's retained legacy driver must not retain the generation"
     );
     drop(driver);
     legacy_owner_reap_root(root, &mut root_cleanup);
