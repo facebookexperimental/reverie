@@ -1505,6 +1505,26 @@ fn completed_sync_driver_does_not_retain_generation() {
     drop(release);
 }
 
+/// Waits until the worker of `event` has found its task untraced during a
+/// detach -> reattach handoff and kept the generation for a pending
+/// detached wait. Fails if it retired the generation (ECHILD) instead.
+#[cfg(not(sanitized))]
+fn wait_for_detached_wait_kept(event: &Event, what: &str) {
+    let deadline = Instant::now() + TRACEE_WAIT_TIMEOUT;
+    while event.detached_echild_kept.load(Ordering::Relaxed) == 0 {
+        assert_ne!(
+            event.status.lock().terminal,
+            ECHILD_STATUS,
+            "{what}: the worker retired the generation (ECHILD) during the detach -> reattach handoff"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "{what}: the worker never found the task untraced"
+        );
+        thread::sleep(Duration::from_micros(200));
+    }
+}
+
 /// The async counterpart: a completed owned wait releases its handoff
 /// note at the successful poll, not only at Drop.
 #[tokio::test(flavor = "current_thread")]
@@ -1513,8 +1533,15 @@ async fn completed_async_driver_does_not_retain_generation() {
     let (root, tid, release, mut root_cleanup) = legacy_owner_guest();
     let stopped = seized_stopped_sync(tid);
     let running = stopped.detach(None).unwrap();
-    let terminal = running.terminal_cleanup();
+    // Record the detached wait before the worker is registered, as the sync
+    // counterpart does. A worker registered first can find the task
+    // untraced with no detached wait recorded and retire the generation
+    // (ECHILD) before the reattach.
     let mut driver = running.wait_owned_on_ptracer_thread().into_driver();
+    let terminal = driver.terminal_cleanup().unwrap();
+    // The worker's first wait finds the detached task untraced: before the
+    // reattach, it must keep the generation for the recorded wait.
+    wait_for_detached_wait_kept(terminal.event.event(), "the detached gap");
     let reattached =
         Running::seize_on_ptracer_thread(tid.into(), legacy_thread_options()).unwrap();
     reattached.interrupt().unwrap();

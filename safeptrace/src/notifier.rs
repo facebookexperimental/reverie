@@ -841,6 +841,10 @@ struct Event {
     /// [`Event::mark_echild_if_unowned`].
     detached_waits: Mutex<Vec<(u64, Option<Arc<LegacyWaitOwner>>)>>,
     detached_wait_seq: AtomicU64,
+    /// ECHILD observations of an untraced task that the worker did not
+    /// treat as retirement, because a detached wait was pending.
+    #[cfg(test)]
+    detached_echild_kept: AtomicUsize,
 
     /// Monotonic activity state owned by this exact Event generation.
     worker_state: AtomicI32,
@@ -1522,6 +1526,8 @@ impl Event {
             registration_error: Mutex::new(None),
             detached_waits: Mutex::new(Vec::new()),
             detached_wait_seq: AtomicU64::new(0),
+            #[cfg(test)]
+            detached_echild_kept: AtomicUsize::new(0),
             worker_state: AtomicI32::new(WORKER_NOT_STARTED),
             worker_done_lock: Mutex::new(()),
             worker_done_changed: Condvar::new(),
@@ -2121,6 +2127,8 @@ impl Event {
             && identity.observed_process_generation() == Some(true)
             && !identity.task_is_zombie()
         {
+            #[cfg(test)]
+            self.detached_echild_kept.fetch_add(1, Ordering::Relaxed);
             return false;
         }
         self.mark_echild();
@@ -2139,6 +2147,8 @@ impl Event {
             && identity.observed_process_generation() == Some(true)
             && !identity.task_is_zombie()
         {
+            #[cfg(test)]
+            self.detached_echild_kept.fetch_add(1, Ordering::Relaxed);
             return Ok(false);
         }
         // Attachment/lifetime proof comes from the retained target and host
