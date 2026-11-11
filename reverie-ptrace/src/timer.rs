@@ -634,8 +634,11 @@ pub enum HandleFailure {
     #[error(transparent)]
     TraceError(#[from] TraceError),
 
+    /// Boxed: [`Wait`] is large (a new child's running state rides in its
+    /// event), and this is the rare path, so the `Result`s of the stepping
+    /// calls stay small.
     #[error("Unexpected event while single stepping")]
-    Event(Wait),
+    Event(Box<Wait>),
 
     /// A single step ended at a seccomp stop: the stepped instruction entered
     /// a traced syscall. The caller dispatches it like
@@ -3708,10 +3711,10 @@ impl TimerImpl {
                 {
                     self.check_branch_run(&new_task, unit, current.rcbs(), target_rcb, None);
                     restore_breakpoints(breakpoints.regs(), &new_task);
-                    return Err(HandleFailure::Event(Wait::Stopped(
+                    return Err(HandleFailure::Event(Box::new(Wait::Stopped(
                         new_task,
                         TraceEvent::Signal(Signal::SIGTRAP),
-                    )));
+                    ))));
                 }
                 (_, Wait::Stopped(new_task, event))
                     if !matches!(event, TraceEvent::Signal(Signal::SIGTRAP)) =>
@@ -3821,13 +3824,15 @@ impl TimerImpl {
                     if matches!(event, TraceEvent::Seccomp) {
                         return Err(HandleFailure::SeccompStop(new_task));
                     }
-                    return Err(HandleFailure::Event(Wait::Stopped(new_task, event)));
+                    return Err(HandleFailure::Event(Box::new(Wait::Stopped(
+                        new_task, event,
+                    ))));
                 }
                 #[cfg(not(target_arch = "x86_64"))]
                 Wait::Stopped(new_task, TraceEvent::Seccomp) => {
                     return Err(HandleFailure::SeccompStop(new_task));
                 }
-                wait => return Err(HandleFailure::Event(wait)),
+                wait => return Err(HandleFailure::Event(Box::new(wait))),
             };
             // The step's report stop dequeued the thread's one SIGTRAP; a
             // syscall's exit stop dequeued nothing, and the syscall may have
@@ -5858,8 +5863,11 @@ mod tests {
         else {
             return;
         };
-        let Err(super::HandleFailure::Event(super::Wait::Stopped(stopped, event))) = result else {
+        let Err(super::HandleFailure::Event(wait)) = result else {
             panic!("the guest's SIGTRAP was not handed on: {result:?}");
+        };
+        let super::Wait::Stopped(stopped, event) = *wait else {
+            panic!("the guest's SIGTRAP was not handed on: {wait:?}");
         };
         assert_eq!(event, super::TraceEvent::Signal(reverie::Signal::SIGTRAP));
         assert_eq!(
@@ -6429,10 +6437,13 @@ mod tests {
                 );
                 Steps::Reached
             }
-            Err(HandleFailure::Event(Wait::Stopped(stopped, TraceEvent::Signal(_)))) => {
-                let info = stopped.getsiginfo().expect("the stop's siginfo");
-                Steps::HandedOn(info.si_signo, info.si_code)
-            }
+            Err(HandleFailure::Event(wait)) => match *wait {
+                Wait::Stopped(stopped, TraceEvent::Signal(_)) => {
+                    let info = stopped.getsiginfo().expect("the stop's siginfo");
+                    Steps::HandedOn(info.si_signo, info.si_code)
+                }
+                wait => panic!("the steps failed: {wait:?}"),
+            },
             Err(error) => panic!("the steps failed: {error:?}"),
         };
         Some((steps, inner.unnotified_overflows))

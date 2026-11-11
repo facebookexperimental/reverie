@@ -7404,6 +7404,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                 return Err(self.fail_queued_sigtrap(self.tid(), site));
             }
             Err(HandleFailure::Event(wait)) => {
+                let wait = *wait;
                 // A SIGTRAP out of the queue cannot be queued again at a stop
                 // handed to the run loop without losing the stop's own
                 // signal, and the guest must not run without it: the run
