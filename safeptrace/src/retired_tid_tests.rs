@@ -25,14 +25,57 @@ mod retired_tid {
         }
     }
 
-    fn fixture() -> (FixtureDirectory, std::ffi::CString) {
-        let nonce = std::time::SystemTime::now()
+    /// Creates a new directory under `base` named `<prefix>-<nonce>`, or
+    /// `<prefix>-<nonce>-<n>` for the first `n` that is still free. Neither
+    /// the clock nor the PID is unique here: the parallel inner instances
+    /// of these tests run in separate PID namespaces, with the same small
+    /// PID, and can read the same clock nanoseconds. The atomic
+    /// `create_dir` is what makes the directory this invocation's own.
+    fn create_unique_dir(
+        base: &std::path::Path,
+        prefix: &str,
+        nonce: u128,
+    ) -> std::io::Result<std::path::PathBuf> {
+        for attempt in 0..1024_u32 {
+            let name = match attempt {
+                0 => format!("{prefix}-{nonce}"),
+                _ => format!("{prefix}-{nonce}-{attempt}"),
+            };
+            let directory = base.join(name);
+            match fs::create_dir(&directory) {
+                Ok(()) => return Ok(directory),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Err(std::io::ErrorKind::AlreadyExists.into())
+    }
+
+    fn clock_nonce() -> u128 {
+        std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos();
-        let directory = env::temp_dir().join(format!("safeptrace-retired-{nonce}"));
-        fs::create_dir(&directory).unwrap();
-        let directory = FixtureDirectory(directory);
+            .as_nanos()
+    }
+
+    /// Two fixtures that read the same clock nanoseconds, as parallel inner
+    /// instances can, still get distinct directories of their own.
+    #[test]
+    fn fixture_directories_stay_distinct_at_the_same_nanos() {
+        let base = FixtureDirectory(
+            create_unique_dir(&env::temp_dir(), "safeptrace-retired-same-nanos", clock_nonce())
+                .unwrap(),
+        );
+        let first = create_unique_dir(&base.0, "safeptrace-retired", 7).unwrap();
+        let second = create_unique_dir(&base.0, "safeptrace-retired", 7).unwrap();
+        assert_ne!(first, second);
+        assert!(first.is_dir() && second.is_dir());
+    }
+
+    fn fixture() -> (FixtureDirectory, std::ffi::CString) {
+        let directory = FixtureDirectory(
+            create_unique_dir(&env::temp_dir(), "safeptrace-retired", clock_nonce()).unwrap(),
+        );
         let source = directory.0.join("fixture.c");
         let program = directory.0.join("fixture");
         fs::write(&source, include_bytes!("retired_tid_fixture.c")).unwrap();
