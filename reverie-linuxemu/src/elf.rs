@@ -47,6 +47,7 @@ use crate::Result;
 use crate::bootstrap::BOOT_RESERVED_END;
 use crate::bootstrap::PROGRAM_HEADERS_ADDRESS;
 use crate::bootstrap::VDSO_ADDRESS;
+use crate::executor::host_mount;
 use crate::memory::AllocationCursors;
 use crate::memory::MMAP_BASE;
 use crate::memory::MappingIdentity;
@@ -997,10 +998,11 @@ impl ToolDirectory {
     /// `EINVAL` for a relative path or a procfs directory (the executor
     /// refuses procfs whatever names it), with an `InvalidInput` error for a
     /// directory whose file system is not itself read-only, and as the
-    /// lookup or the reading of this process's mount table fails otherwise
-    /// (`ENOTDIR` for what is no directory). The file system is read-only
-    /// where the super options of the directory's mount (`statx`'s
-    /// `STATX_MNT_ID`) in `/proc/self/mountinfo` begin with `ro`.
+    /// lookup or the host's answer about the directory's mount fails
+    /// otherwise (`ENOTDIR` for what is no directory). The file system is
+    /// read-only where the superblock of the directory's mount is
+    /// (`SB_RDONLY`, which also makes the super options of the mount's line
+    /// in `mountinfo` begin with `ro`).
     /// `fstatvfs`'s `ST_RDONLY` does not tell: it is also set for a
     /// read-only mount of a writable file system, such as a read-only bind,
     /// through whose other mounts names can still be created. On a local
@@ -1083,66 +1085,20 @@ impl ToolDirectory {
     }
 }
 
-/// Whether the file system `file` is open on is itself read-only: the super
-/// options of its mount's line in this process's `/proc/self/mountinfo`
-/// begin with `ro`, which Linux writes from the superblock's read-only flag
-/// (`show_mountinfo`). The mount is the one `statx` reports for `file`
-/// (`STATX_MNT_ID`, the ID mountinfo lists). Fails where the kernel reports
-/// no mount ID or the mount is not listed exactly once.
+/// Whether the file system `file` is open on is itself read-only: the
+/// read-only flag of its mount's superblock (`SB_RDONLY`), which
+/// `statmount(2)` reports and from which Linux writes the `ro` that begins
+/// the super options of the mount's line in `mountinfo`
+/// ([`host_mount::superblock`]). Fails where the kernel reports no mount ID
+/// or the mount is in no namespace this thread sees.
 fn file_system_is_read_only(file: &std::fs::File) -> std::io::Result<bool> {
-    let mut status = std::mem::MaybeUninit::<libc::statx>::zeroed();
-    // SAFETY: the path is an empty NUL-terminated string, status is writable
-    // and file is live.
-    if unsafe {
-        libc::statx(
-            file.as_raw_fd(),
-            c"".as_ptr(),
-            libc::AT_EMPTY_PATH,
-            libc::STATX_MNT_ID,
-            status.as_mut_ptr(),
-        )
-    } != 0
-    {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: statx initialized status on success.
-    let status = unsafe { status.assume_init() };
-    if status.stx_mask & libc::STATX_MNT_ID == 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "statx reports no mount ID (STATX_MNT_ID)",
-        ));
-    }
-    let id = status.stx_mnt_id.to_string();
-    let mountinfo = std::fs::read("/proc/self/mountinfo")?;
-    let mut read_only = None;
-    for line in mountinfo.split(|byte| *byte == b'\n') {
-        let fields: Vec<&[u8]> = line.split(|byte| *byte == b' ').collect();
-        if fields[0] != id.as_bytes() {
-            continue;
-        }
-        // After the six fixed fields and the optional ones, a lone "-"
-        // precedes the file system type, the source and the super options.
-        let super_options = fields
-            .iter()
-            .skip(6)
-            .position(|field| *field == b"-")
-            .and_then(|separator| fields.get(6 + separator + 3));
-        let (Some(super_options), None) = (super_options, read_only) else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("mount {id}: a short or repeated line in /proc/self/mountinfo"),
-            ));
-        };
-        read_only =
-            Some(super_options.split(|byte| *byte == b',').next() == Some(b"ro".as_slice()));
-    }
-    read_only.ok_or_else(|| {
-        std::io::Error::new(
+    match host_mount::superblock(file.as_raw_fd())? {
+        Some(superblock) => Ok(superblock.read_only),
+        None => Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            format!("mount {id} is not in /proc/self/mountinfo"),
-        )
-    })
+            "the directory's mount is in no mount namespace this process sees",
+        )),
+    }
 }
 
 /// A task's address-space allocation state (gVisor: mm::MemoryManager
