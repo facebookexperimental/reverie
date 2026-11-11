@@ -4921,6 +4921,20 @@ fn legacy_worker_thread(
         #[cfg(test)]
         pause_retirement_for_test(&event.legacy_worker_cycle_pause);
         let mut progress = event.legacy_wait.lock();
+        // While this worker runs it is the only publisher of this Event's
+        // statuses, and the window below relies on that: from the pop until
+        // `update` returns, `consumed` is empty although a status is in
+        // flight. Nothing else can act on that window. The ptracer's
+        // `try_assist_legacy_wait` only enqueues onto `consumed`, so this
+        // worker publishes what it adds after this status. Once the worker
+        // has started, no synchronous owner can claim the wait
+        // (`claim_sync_wait` answers `Notifier`; see the invariant on
+        // `Event::exit_stop_follows_dead_exec`), so no direct kernel consume
+        // or ECHILD publication runs beside it. Retirement and promotion take
+        // effect only in this thread's later turns. A waiter that polls inside
+        // the window registered its waker first and is woken by `update`. A
+        // change that publishes from any other thread must not read an empty
+        // `consumed` as "nothing in flight".
         if let Some(status) = progress.consumed.pop_front() {
             drop(progress);
             #[cfg(test)]
