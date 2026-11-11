@@ -17,10 +17,15 @@
 //! spawning test waits for an end-of-file that comes only when it exits
 //! (<https://github.com/rrnewton/reverie/issues/1452>).
 //!
+//! A spawn that std cannot hand to `posix_spawn` (one with a `pre_exec`
+//! closure, for example) forks and then waits, before returning, until the
+//! child's exec closes a close-on-exec socket. A raw child that copies that
+//! socket blocks the spawn itself until the raw child exits.
+//!
 //! So every raw process creation in the test process holds [`SPAWN_FORK`]
 //! exclusively for the creating call, and every spawn holds it shared. No
-//! raw child can then be created while a spawn's pipes are open in this
-//! process. A child created under the exclusive hold drops its copy of the
+//! raw child can then be created while a spawn's pipes or socket are open
+//! in this process. A child created under the exclusive hold drops its copy of the
 //! guard as the call returns, so its own nested forks proceed normally.
 //!
 //! Only the lib's own unit tests (`cfg(test)`) use this; production code and

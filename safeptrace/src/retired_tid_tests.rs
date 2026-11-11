@@ -49,6 +49,7 @@ mod retired_tid {
             .arg(&source)
             .arg("-o")
             .arg(&program)
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let output = crate::test_fork::spawn(&mut compile)

@@ -162,11 +162,14 @@ fn legacy_owner_replacement_after_stop(
             set_tid_size: 1,
             ..CloneArgs::default()
         };
-        let result = crate::test_fork::exclusive(|| unsafe {
-            libc::syscall(libc::SYS_clone3, &args, mem::size_of::<CloneArgs>())
+        // Errno is read inside the guarded call, before the guard's release
+        // can make another syscall.
+        let (result, error) = crate::test_fork::exclusive(|| {
+            let result =
+                unsafe { libc::syscall(libc::SYS_clone3, &args, mem::size_of::<CloneArgs>()) };
+            (result, Errno::last())
         });
         if result == -1 {
-            let error = Errno::last();
             assert!(
                 matches!(error, Errno::EPERM | Errno::EACCES | Errno::ENOSYS),
                 "unexpected clone3 exact-reuse refusal: {error}"

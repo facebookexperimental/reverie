@@ -10087,9 +10087,7 @@ mod test {
             .stderr(Stdio::null())
             .process_group(0);
         let mut sentinel = ChildProcessGroup::new(
-            sentinel_command
-                .spawn()
-                .expect("spawn projected-PGID sentinel"),
+            crate::test_fork::spawn(&mut sentinel_command).expect("spawn projected-PGID sentinel"),
         )
         .expect("open projected-PGID sentinel pidfd");
         let projected_pgid = sentinel.process_group.to_string();
@@ -10130,8 +10128,7 @@ mod test {
         let mut old_command = Command::new("/bin/true");
         old_command.process_group(0);
         let mut old = ChildProcessGroup::new(
-            old_command
-                .spawn()
+            crate::test_fork::spawn(&mut old_command)
                 .expect("spawn old exact-cleanup group leader"),
         )
         .expect("open old exact-cleanup leader pidfd");
@@ -10151,8 +10148,7 @@ mod test {
             .stderr(Stdio::null())
             .process_group(0);
         let mut sentinel = ChildProcessGroup::new(
-            sentinel_command
-                .spawn()
+            crate::test_fork::spawn(&mut sentinel_command)
                 .expect("spawn exact-cleanup projected-PGID sentinel"),
         )
         .expect("open exact-cleanup sentinel pidfd");
@@ -15518,7 +15514,9 @@ mod test {
         // Use an exec'd child with closed stdio instead of direct fork. These
         // tests run beside exact-subprocess pipe tests, and a fork-only child
         // would inherit their write ends until cleanup, making EOF scheduling
-        // dependent under the default-parallel harness.
+        // dependent under the default-parallel harness. Its pre_exec makes
+        // std fork and wait for the exec on a close-on-exec socket, which a
+        // concurrent raw fork could also copy, so it spawns under the lock.
         let mut command = Command::new("/bin/sleep");
         command
             .arg("60")
@@ -15534,7 +15532,7 @@ mod test {
                 }
             });
         }
-        let mut child = command.spawn().expect("spawn exact-cleanup member");
+        let mut child = crate::test_fork::spawn(&mut command).expect("spawn exact-cleanup member");
         let pid = Pid::from_raw(child.id() as i32);
         let mut guard =
             ExactNewChildCleanupGuard::new(pid, EventHandle::new()).unwrap_or_else(|error| {
