@@ -1294,6 +1294,21 @@ impl Stopped {
         Running::from_token(self.0, self.1)
     }
 
+    /// [`Self::into_running`] after a successful resume request on this stop
+    /// (`PTRACE_CONT`, `PTRACE_SYSCALL`, `PTRACE_SINGLESTEP` or
+    /// `PTRACE_SINGLEBLOCK`), never after `PTRACE_DETACH`: the result carries
+    /// the [`ResumeMark`] that lets its wait skip the detached-wait TracerPid
+    /// read.
+    fn into_running_resumed(self) -> Running {
+        #[cfg(feature = "notifier")]
+        let mark = ResumeMark(Some(self.1.event().resume_mark()));
+        #[cfg(not(feature = "notifier"))]
+        let mark = ResumeMark::default();
+        let mut running = self.into_running();
+        running.2 = mark;
+        running
+    }
+
     /// Returns the generation this capability is bound to, so a caller that
     /// later rebuilds an unchecked capability for this tracee keeps the
     /// generation's TID gate instead of joining whatever task holds the TID
@@ -1648,7 +1663,7 @@ impl Stopped {
         self.1
             .on_held_tid(|| ptrace::cont(self.0.into(), sig).map_err(nix_errno))
             .map_err(|err| self.map_err(err))?;
-        Ok(self.into_running())
+        Ok(self.into_running_resumed())
     }
 
     /// Attempts to resume while retaining the original capability on error.
@@ -1670,7 +1685,7 @@ impl Stopped {
         let result = self
             .1
             .on_held_tid(|| ptrace::cont(self.0.into(), sig).map_err(nix_errno));
-        self.finish_retained_resume(result)
+        self.finish_retained_resume_resumed(result)
     }
 
     /// Resume to a syscall stop, retaining the same stopped capability on error.
@@ -1688,7 +1703,7 @@ impl Stopped {
         let result = self
             .1
             .on_held_tid(|| ptrace::syscall(self.0.into(), sig).map_err(nix_errno));
-        self.finish_retained_resume(result)
+        self.finish_retained_resume_resumed(result)
     }
 
     /// Like [`Self::syscall_retaining`], delivering a raw signal number.
@@ -1703,7 +1718,7 @@ impl Stopped {
         let result = self
             .1
             .on_held_tid(|| ptrace_resume_raw(libc::PTRACE_SYSCALL, self.0, sig));
-        self.finish_retained_resume(result)
+        self.finish_retained_resume_resumed(result)
     }
 
     /// Transfers the original capability into a retained notifier wait.
@@ -1734,8 +1749,26 @@ impl Stopped {
         self,
         result: Result<(), Errno>,
     ) -> Result<Running, (Self, Errno)> {
+        self.finish_retained_transition(result, Self::into_running)
+    }
+
+    /// [`Self::finish_retained_resume`] for a resume request, never a detach:
+    /// the running state carries the [`ResumeMark`]
+    /// ([`Self::into_running_resumed`]).
+    fn finish_retained_resume_resumed(
+        self,
+        result: Result<(), Errno>,
+    ) -> Result<Running, (Self, Errno)> {
+        self.finish_retained_transition(result, Self::into_running_resumed)
+    }
+
+    fn finish_retained_transition(
+        self,
+        result: Result<(), Errno>,
+        into_running: fn(Self) -> Running,
+    ) -> Result<Running, (Self, Errno)> {
         match result {
-            Ok(()) => Ok(self.into_running()),
+            Ok(()) => Ok(into_running(self)),
             Err(error) => {
                 if error == Errno::ESRCH {
                     // The retained value keeps its ownership role, but the
@@ -1760,7 +1793,7 @@ impl Stopped {
         self.1
             .on_held_tid(|| ptrace_resume_raw(libc::PTRACE_CONT, self.0, sig))
             .map_err(|err| self.map_err(err))?;
-        Ok(self.into_running())
+        Ok(self.into_running_resumed())
     }
 
     /// Like [`Stopped::syscall`], delivering the raw signal `sig` (see
@@ -1770,7 +1803,7 @@ impl Stopped {
         self.1
             .on_held_tid(|| ptrace_resume_raw(libc::PTRACE_SYSCALL, self.0, sig))
             .map_err(|err| self.map_err(err))?;
-        Ok(self.into_running())
+        Ok(self.into_running_resumed())
     }
 
     /// Like [`Stopped::step`], delivering the raw signal `sig` (see
@@ -1780,7 +1813,7 @@ impl Stopped {
         self.1
             .on_held_tid(|| ptrace_resume_raw(libc::PTRACE_SINGLESTEP, self.0, sig))
             .map_err(|err| self.map_err(err))?;
-        Ok(self.into_running())
+        Ok(self.into_running_resumed())
     }
 
     /// Runs the process until it next takes a branch, with
@@ -1800,7 +1833,7 @@ impl Stopped {
         self.1
             .on_held_tid(|| ptrace_resume_raw(PTRACE_SINGLEBLOCK, self.0, 0))
             .map_err(|err| self.map_err(err))?;
-        Ok(self.into_running())
+        Ok(self.into_running_resumed())
     }
 
     /// Advances the execution of the process by a single step optionally
@@ -1810,7 +1843,7 @@ impl Stopped {
         self.1
             .on_held_tid(|| ptrace::step(self.0.into(), sig).map_err(nix_errno))
             .map_err(|err| self.map_err(err))?;
-        Ok(self.into_running())
+        Ok(self.into_running_resumed())
     }
 
     /// Like `step`, but arranges for the tracee to be stopped at the next
@@ -1820,7 +1853,7 @@ impl Stopped {
         self.1
             .on_held_tid(|| ptrace::syscall(self.0.into(), sig).map_err(nix_errno))
             .map_err(|err| self.map_err(err))?;
-        Ok(self.into_running())
+        Ok(self.into_running_resumed())
     }
 
     /// Sets the syscall to be executed. Only available on `aarch64`.
@@ -2000,7 +2033,7 @@ impl Stopped {
                 ptrace_resume_raw(request, self.0, signal)
             })
             .map_err(|err| self.map_err(err))?;
-        Ok(self.into_running())
+        Ok(self.into_running_resumed())
     }
 
     /// The probe shared by [`Self::died_into_exit_stop_before_resume_with`]
@@ -2304,6 +2337,10 @@ impl Stopped {
         if let Err(errno) = self.flush_regs_retaining() {
             return Err((self, errno));
         }
+        // Before the request, whatever it returns: an errno does not
+        // establish that the detach did not happen ([`ResumeMark`]).
+        #[cfg(feature = "notifier")]
+        self.1.event().note_detach();
         let result = self
             .1
             .on_held_tid(|| ptrace::detach(self.0.into(), sig).map_err(nix_errno));
@@ -2313,6 +2350,9 @@ impl Stopped {
     /// Detaches from and then resumes the stopped tracee.
     pub fn detach<T: Into<Option<Signal>>>(self, sig: T) -> Result<Running, Error> {
         self.flush_regs()?;
+        // Before the request, as in [`Self::detach_retaining`].
+        #[cfg(feature = "notifier")]
+        self.1.event().note_detach();
         self.1
             .on_held_tid(|| ptrace::detach(self.0.into(), sig).map_err(nix_errno))
             .map_err(|err| self.map_err(err))?;
@@ -2325,6 +2365,9 @@ impl Stopped {
     /// `0` delivers nothing.
     pub fn detach_raw(self, sig: i32) -> Result<Running, Error> {
         self.flush_regs()?;
+        // Before the request, as in [`Self::detach_retaining`].
+        #[cfg(feature = "notifier")]
+        self.1.event().note_detach();
         self.1
             .on_held_tid(|| ptrace_resume_raw(libc::PTRACE_DETACH, self.0, sig))
             .map_err(|err| self.map_err(err))?;
@@ -2462,7 +2505,36 @@ pub fn try_peek_all() -> Result<Option<Running>, Errno> {
 
 /// A running child.
 #[derive(Debug, Hash, Eq, PartialEq)]
-pub struct Running(Pid, TraceeToken);
+pub struct Running(Pid, TraceeToken, ResumeMark);
+
+/// Whether a [`Running`] came from a successful resume request on its own
+/// stop (`PTRACE_CONT`, `PTRACE_SYSCALL`, `PTRACE_SINGLESTEP` or
+/// `PTRACE_SINGLEBLOCK`; [`Stopped::into_running_resumed`]), and if so the
+/// Event that request resolved to and that Event's detach epoch then.
+///
+/// A successful resume request passed `ptrace_check_attach` for the calling
+/// thread, with the tracee in a ptrace-stop: after it, only that tracer can
+/// make the task untraced, by its own `PTRACE_DETACH` or by exiting. A wait
+/// built on such a value while the Event and its detach epoch are unchanged
+/// therefore skips the TracerPid read that looks for a detached wait
+/// (`notifier::note_detached_wait_if_untraced`). Every other producer, detach
+/// included, leaves it unset, and the read happens as before.
+///
+/// It carries no identity of its own: equality and hashing ignore it.
+/// Without the `notifier` feature it is never set or read.
+#[derive(Clone, Copy, Debug, Default)]
+#[cfg_attr(not(feature = "notifier"), allow(dead_code))]
+struct ResumeMark(Option<(usize, u64)>);
+
+impl PartialEq for ResumeMark {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+impl Eq for ResumeMark {}
+impl std::hash::Hash for ResumeMark {
+    fn hash<H: std::hash::Hasher>(&self, _state: &mut H) {}
+}
 
 impl Running {
     /// Creates a new running process. This is generally the entry point for a
@@ -2501,7 +2573,7 @@ impl Running {
     }
 
     fn from_token(pid: Pid, token: TraceeToken) -> Self {
-        Self(pid, token)
+        Self(pid, token, ResumeMark::default())
     }
 
     fn from_current_or_new(pid: Pid) -> Result<Self, Errno> {

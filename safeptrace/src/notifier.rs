@@ -810,6 +810,10 @@ struct Event {
     /// [`Event::mark_echild_if_unowned`].
     detached_waits: Mutex<Vec<(u64, Option<Arc<LegacyWaitOwner>>)>>,
     detached_wait_seq: AtomicU64,
+    /// Detach requests made through any capability of this Event, counted
+    /// before each request is issued. A [`crate::ResumeMark`] records it at
+    /// its resume, and holds only while it is unchanged.
+    detach_epoch: AtomicU64,
 
     /// Monotonic activity state owned by this exact Event generation.
     worker_state: AtomicI32,
@@ -1477,6 +1481,7 @@ impl Event {
             registration_error: Mutex::new(None),
             detached_waits: Mutex::new(Vec::new()),
             detached_wait_seq: AtomicU64::new(0),
+            detach_epoch: AtomicU64::new(0),
             worker_state: AtomicI32::new(WORKER_NOT_STARTED),
             worker_done_lock: Mutex::new(()),
             worker_done_changed: Condvar::new(),
@@ -2949,6 +2954,33 @@ impl EventHandle {
 
     pub(super) fn invalidate_numeric_auth(&self) {
         self.event().invalidate_numeric_auth();
+    }
+
+    /// What a [`crate::ResumeMark`] records after a successful resume request:
+    /// the Event this handle resolves to now, by address, and its detach
+    /// epoch. The token that carries the mark keeps that Event alive, so the
+    /// address cannot be reused while the mark exists.
+    pub(super) fn resume_mark(&self) -> (usize, u64) {
+        let event = self.event();
+        (
+            Arc::as_ptr(event).addr(),
+            event.detach_epoch.load(Ordering::SeqCst),
+        )
+    }
+
+    /// Counts a detach request through this handle, before it is issued.
+    pub(super) fn note_detach(&self) {
+        self.event().detach_epoch.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Whether `mark` still holds: this handle resolves to the same Event,
+    /// and no detach was requested through it since.
+    fn resume_mark_holds(&self, mark: crate::ResumeMark) -> bool {
+        mark.0.is_some_and(|(event, epoch)| {
+            let current = self.event();
+            Arc::as_ptr(current).addr() == event
+                && current.detach_epoch.load(Ordering::SeqCst) == epoch
+        })
     }
 
     /// After a request that makes a stop likely soon (a resumption or an
@@ -7607,7 +7639,7 @@ pub struct WaitFuture {
 }
 
 impl WaitFuture {
-    pub(super) fn new(Running(pid, token): Running) -> Self {
+    pub(super) fn new(Running(pid, token, _): Running) -> Self {
         Self { pid, token }
     }
 
@@ -7717,6 +7749,13 @@ pub enum OwnedWaitError {
     Completed,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// TracerPid reads made on this thread by
+    /// [`note_detached_wait_if_untraced`].
+    static TRACER_PID_READS_FOR_TEST: Cell<usize> = const { Cell::new(0) };
+}
+
 /// Records a generation-bound wait created while its task is detached,
 /// returning the Event whose detached-wait list was noted (the caller
 /// holds it until drop; see [`Event::note_detached_wait`]). The caller
@@ -7729,12 +7768,26 @@ pub enum OwnedWaitError {
 /// A call whose token has a captured identity reads that task's retained
 /// `status`. Callers whose record could never carry an owner skip the call
 /// instead (see [`OwnedWaitFuture::new`]).
+///
+/// A running state from a successful resume request whose
+/// [`crate::ResumeMark`] still holds is attached by construction: the request
+/// passed `ptrace_check_attach` for this tracer, and since then no detach was
+/// requested and the Event did not change. Only this tracer's exit could have
+/// made it untraced since, and a note owned by a dead tracer grants no
+/// exemption ([`Event::detach_handoff_pending`]). Such a wait records nothing
+/// and reads nothing. Every other running state reads TracerPid as before.
 fn note_detached_wait_if_untraced(
-    token: &TraceeToken,
+    running: &Running,
     affinity_owner: Option<Arc<LegacyWaitOwner>>,
 ) -> Option<(Arc<Event>, u64)> {
+    let token = &running.1;
     let handle = token.event();
+    if handle.resume_mark_holds(running.2) {
+        return None;
+    }
     let identity = handle.identity()?;
+    #[cfg(test)]
+    TRACER_PID_READS_FOR_TEST.with(|reads| reads.set(reads.get() + 1));
     if identity.current_tracer_pid() != Ok(Pid::from_raw(0)) {
         return None;
     }
@@ -7782,7 +7835,7 @@ impl OwnedWaitFuture {
     /// detached-wait note.
     pub(super) fn new(running: Running) -> Self {
         let detached_wait = if running.1.ptracer_owner.is_some() {
-            note_detached_wait_if_untraced(&running.1, None)
+            note_detached_wait_if_untraced(&running, None)
         } else {
             None
         };
@@ -7796,7 +7849,7 @@ impl OwnedWaitFuture {
         running: Running,
         affinity_owner: Option<Arc<LegacyWaitOwner>>,
     ) -> Self {
-        let detached_wait = note_detached_wait_if_untraced(&running.1, affinity_owner);
+        let detached_wait = note_detached_wait_if_untraced(&running, affinity_owner);
         Self::with_detached_wait(running, detached_wait)
     }
 
@@ -8185,7 +8238,7 @@ impl PtracerSyncDriver {
             running.1.ptracer_owner.clone(),
             running.1.ptracer_wait_role,
         );
-        let detached_wait = note_detached_wait_if_untraced(&running.1, affinity.owner.clone());
+        let detached_wait = note_detached_wait_if_untraced(&running, affinity.owner.clone());
         Self {
             input: Some((running.0, running.1)),
             affinity,
