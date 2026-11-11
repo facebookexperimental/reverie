@@ -746,6 +746,18 @@ struct Event {
     /// the held period, not when a pending wakeup or probe skips the wait.
     #[cfg(test)]
     legacy_held_waits: AtomicUsize,
+    /// Notifies of `legacy_wake` that woke the worker, its only waiter.
+    #[cfg(test)]
+    legacy_notify_wakes: AtomicUsize,
+    /// Waits of the worker that a notify ended. With parking_lot's condvar
+    /// (no spurious wakeups) each counts one of `legacy_notify_wakes`.
+    #[cfg(test)]
+    legacy_worker_wakes: AtomicUsize,
+    /// `legacy_worker_wakes` when the worker last started a held wait. A held
+    /// wait that began after every delivered notify had been observed cannot
+    /// be ended by one of them.
+    #[cfg(test)]
+    legacy_held_wait_wakes: AtomicUsize,
     /// Pauses the worker once, right after it published a status.
     #[cfg(test)]
     legacy_publish_pause: Mutex<Option<BoundedTestPause>>,
@@ -1484,6 +1496,12 @@ impl Event {
             #[cfg(test)]
             legacy_held_waits: AtomicUsize::new(0),
             #[cfg(test)]
+            legacy_notify_wakes: AtomicUsize::new(0),
+            #[cfg(test)]
+            legacy_worker_wakes: AtomicUsize::new(0),
+            #[cfg(test)]
+            legacy_held_wait_wakes: AtomicUsize::new(0),
+            #[cfg(test)]
             legacy_publish_pause: Mutex::new(None),
             #[cfg(test)]
             legacy_late_turns: AtomicUsize::new(0),
@@ -1562,13 +1580,23 @@ impl Event {
     /// observes what it would have at its due time.
     fn wake_legacy_worker(&self) {
         self.count_legacy_wakeup();
-        self.legacy_wake.notify_one();
+        self.notify_legacy_worker();
+    }
+
+    /// Notifies `legacy_wake`, after the caller counted a wakeup and
+    /// released its locks. Tests count each notify that woke the worker.
+    fn notify_legacy_worker(&self) {
+        let _woke = self.legacy_wake.notify_one();
+        #[cfg(test)]
+        if _woke {
+            self.legacy_notify_wakes.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// The counting half of [`Event::wake_legacy_worker`], for a caller that
     /// holds `legacy_wait`. The worker reads the count, not the notify, under
     /// the lock it waits with, so it acts on the wakeup at its next sleep
-    /// check. The caller sends `legacy_wake.notify_one()` after it released
+    /// check. The caller sends `notify_legacy_worker()` after it released
     /// `legacy_wait`, so that the woken worker does not block on it.
     fn count_legacy_wakeup(&self) {
         let mut wakeups = self.legacy_wakeup.lock();
@@ -1585,7 +1613,7 @@ impl Event {
         let mut wakeups = self.legacy_wakeup.lock();
         wakeups.probes = wakeups.probes.wrapping_add(1);
         drop(wakeups);
-        self.legacy_wake.notify_one();
+        self.notify_legacy_worker();
     }
 
     fn hold_tid(&self) -> Option<TidHold<'_>> {
@@ -3241,7 +3269,7 @@ impl EventHandle {
         if notify {
             #[cfg(test)]
             pause_retirement_for_test(&event.legacy_assist_notify_pause);
-            event.legacy_wake.notify_one();
+            event.notify_legacy_worker();
         }
         Ok(())
     }
@@ -5219,9 +5247,17 @@ fn legacy_worker_thread(
             // skips the wait, and the turn it then takes is not a held one.
             #[cfg(test)]
             if held_timeout {
+                let observed = event.legacy_worker_wakes.load(Ordering::Relaxed);
+                event
+                    .legacy_held_wait_wakes
+                    .store(observed, Ordering::Relaxed);
                 event.legacy_held_waits.fetch_add(1, Ordering::Relaxed);
             }
-            event.legacy_wake.wait_for(&mut wakeups, timeout);
+            let _waited = event.legacy_wake.wait_for(&mut wakeups, timeout);
+            #[cfg(test)]
+            if !_waited.timed_out() {
+                event.legacy_worker_wakes.fetch_add(1, Ordering::Relaxed);
+            }
         }
         let targeted = wakeups.targeted != seen.targeted;
         let probed = wakeups.probes != seen.probes;

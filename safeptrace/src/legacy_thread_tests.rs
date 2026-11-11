@@ -1767,6 +1767,45 @@ fn wait_for_held_wait(event: &Event, before: usize, what: &str) {
     }
 }
 
+/// Waits until the legacy worker of `event` is parked in a held wait that
+/// started after `before` of them, and after it had observed every wakeup
+/// already delivered to it.
+///
+/// A count and its notify are separate steps: the notify follows once the
+/// notifier has released its locks. A notify for a count that the worker
+/// has already acted on can therefore arrive after the worker parked, and
+/// end that park with one more turn. Such a held wait is not yet quiescent.
+/// Every notify that woke the worker is counted, and so is every wait of the
+/// worker that a notify ended, one for one (only the worker waits on
+/// `legacy_wake`, and parking_lot's condvar has no spurious wakeups). A held
+/// wait that began once the worker had observed as many wakes as had been
+/// delivered cannot be ended by any of them. A worker still due a delivered
+/// wake takes that turn and parks again, so the wait ends.
+///
+/// `while_waiting` runs on each poll that does not see such a park yet.
+fn wait_for_fresh_held_wait(
+    event: &Event,
+    before: usize,
+    what: &str,
+    mut while_waiting: impl FnMut(),
+) {
+    let deadline = Instant::now() + TRACEE_WAIT_TIMEOUT;
+    loop {
+        let delivered = event.legacy_notify_wakes.load(Ordering::Relaxed);
+        if event.legacy_held_waits.load(Ordering::Relaxed) > before
+            && event.legacy_held_wait_wakes.load(Ordering::Relaxed) >= delivered
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{what}: the worker never parked held after its last delivered wakeup"
+        );
+        while_waiting();
+        thread::sleep(Duration::from_micros(200));
+    }
+}
+
 /// Resumes `stopped` to its next syscall stop and returns that stop.
 async fn next_syscall_stop(stopped: Stopped) -> Stopped {
     let (next, stop) = tokio::time::timeout(
@@ -1992,11 +2031,7 @@ async fn forced_legacy_held_worker_waits_for_a_wakeup_or_probe() {
     assert_eq!(event, crate::Event::Signal(Signal::SIGSTOP));
     let parent_running = parent.resume(None).unwrap();
 
-    let deadline = Instant::now() + TRACEE_WAIT_TIMEOUT;
-    while worker.legacy_held_waits.load(Ordering::Relaxed) == 0 {
-        assert!(Instant::now() < deadline, "the worker never held the stop");
-        thread::sleep(Duration::from_millis(1));
-    }
+    wait_for_fresh_held_wait(&worker, 0, "the consumed SIGSTOP", || {});
     let turns = || worker.legacy_worker_turns.load(Ordering::Relaxed);
     let before = turns();
     thread::sleep(Duration::from_millis(200));
@@ -2456,4 +2491,152 @@ async fn forced_legacy_skipped_held_wait_after_a_turn_count_is_not_counted() {
         return;
     }
     legacy_skipped_held_wait_is_not_counted(HeldWaitSkip::CountDuringTurn).await;
+}
+
+// The consume's notify arrives after the worker published the consumed
+// stop and parked held: the ptracer is paused between its count and its
+// notify until the worker has parked, and the woken worker is then held at
+// the start of the turn that notify gives it. That held wait is not
+// quiescent, so the check of a held worker's turns must wait for a held
+// wait that started after the late wake was observed. Once there, it takes
+// no turns.
+#[tokio::test(flavor = "current_thread")]
+#[cfg(not(sanitized))]
+async fn forced_legacy_held_turn_check_waits_out_a_late_consume_notify() {
+    if run_legacy_test_outer("forced_legacy_held_turn_check_waits_out_a_late_consume_notify") {
+        return;
+    }
+    let (root, stopped, mut root_cleanup, _force) = spawn_legacy_thread_tracee(true);
+    let root_exit = root_cleanup.exit_event_on_ptracer_thread(&stopped).unwrap();
+    let root_terminal = stopped.terminal_cleanup();
+    let (parent, crate::Event::NewChild(crate::ChildOp::Clone, child)) = tokio::time::timeout(
+        TRACEE_WAIT_TIMEOUT,
+        stopped.resume(None).unwrap().wait_owned_on_ptracer_thread(),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .assume_stopped() else {
+        panic!("missing paused pthread clone");
+    };
+    let child_tid = child.pid();
+    let mut child_cleanup = legacy_child_cleanup(&child);
+    let terminal = child.terminal_cleanup();
+    let worker = terminal.event.event().clone();
+    *worker.legacy_held_period.lock() = Some(Duration::from_secs(60));
+    let held_before = worker.legacy_held_waits.load(Ordering::Relaxed);
+    let (notify_caught, notify_release) = arm_legacy_pause(&worker.legacy_assist_notify_pause);
+    let event = worker.clone();
+    let delay = thread::spawn(move || {
+        notify_caught
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the consume never reached its notify");
+        // The ptracer counted, released `legacy_wait` and has not notified:
+        // the worker publishes the stop and parks held meanwhile.
+        let deadline = Instant::now() + Duration::from_millis(1500);
+        while event.legacy_held_waits.load(Ordering::Relaxed) <= held_before {
+            assert!(
+                Instant::now() < deadline,
+                "the worker never parked held before the late notify"
+            );
+            thread::sleep(Duration::from_micros(200));
+        }
+        // It counts under `legacy_wakeup` and releases it only once it is
+        // queued on `legacy_wake`: holding the lock here means it is parked.
+        drop(event.legacy_wakeup.lock());
+        let parked = event.legacy_worker_wakes.load(Ordering::Relaxed);
+        let (turn_caught, turn_release) = arm_legacy_pause(&event.legacy_worker_cycle_pause);
+        notify_release.send(()).unwrap();
+        turn_caught
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the late notify did not wake the parked worker");
+        assert_eq!(
+            event.legacy_worker_wakes.load(Ordering::Relaxed),
+            parked + 1,
+            "the late notify did not end the held wait"
+        );
+        turn_release
+    });
+    let (child, event) =
+        tokio::time::timeout(TRACEE_WAIT_TIMEOUT, child.wait_owned_on_ptracer_thread())
+            .await
+            .unwrap()
+            .unwrap()
+            .assume_stopped();
+    assert_eq!(event, crate::Event::Signal(Signal::SIGSTOP));
+    let mut turn_release = Some(delay.join().unwrap());
+    let parent_running = parent.resume(None).unwrap();
+
+    // The worker is woken and held before its turn. The check must not
+    // accept the held wait that the late notify ended; it lets the worker
+    // take its turn once it sees that wait is stale.
+    wait_for_fresh_held_wait(&worker, held_before, "the late notify", || {
+        if let Some(release) = turn_release.take() {
+            release.send(()).unwrap();
+        }
+    });
+    assert_eq!(
+        worker.legacy_worker_wakes.load(Ordering::Relaxed),
+        worker.legacy_held_wait_wakes.load(Ordering::Relaxed),
+        "the accepted held wait was already ended by a delivered notify"
+    );
+    drop(turn_release);
+    let turns = || worker.legacy_worker_turns.load(Ordering::Relaxed);
+    let before = turns();
+    thread::sleep(Duration::from_millis(200));
+    let held_turns = turns() - before;
+    assert_eq!(held_turns, 0, "a held worker took {held_turns} turns in 200 ms");
+
+    let exit = child_cleanup.exit_event_on_ptracer_thread(&child).unwrap();
+    // Neither a ptrace request nor a cancellation signal of this ptracer.
+    assert_eq!(unsafe { libc::kill(root.as_raw(), libc::SIGKILL) }, 0);
+    // Nothing polls `exit` until the worker has observed the exit stop on
+    // its own turns, so that a consume by the ptracer cannot stand in for
+    // the probe.
+    wait_for_legacy_hint(&worker, "the group kill");
+    drop(child);
+    let child = tokio::time::timeout(TRACEE_WAIT_TIMEOUT, exit)
+        .await
+        .unwrap()
+        .unwrap();
+    child_cleanup.mark_claimed_exit();
+    assert_eq!(
+        tokio::time::timeout(
+            TRACEE_WAIT_TIMEOUT,
+            child.resume(None).unwrap().wait_owned_on_ptracer_thread()
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .assume_exited(),
+        (
+            child_tid,
+            crate::ExitStatus::Signaled(Signal::SIGKILL, false)
+        ),
+    );
+    assert!(terminal.wait(TRACEE_WAIT_TIMEOUT));
+    child_cleanup.disarm();
+
+    let parent = tokio::time::timeout(TRACEE_WAIT_TIMEOUT, root_exit)
+        .await
+        .unwrap()
+        .unwrap();
+    root_cleanup.mark_claimed_exit();
+    drop(parent_running);
+    assert_eq!(
+        tokio::time::timeout(
+            TRACEE_WAIT_TIMEOUT,
+            parent.resume(None).unwrap().wait_owned_on_ptracer_thread()
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .assume_exited(),
+        (
+            root.into(),
+            crate::ExitStatus::Signaled(Signal::SIGKILL, false)
+        ),
+    );
+    assert!(root_terminal.wait(TRACEE_WAIT_TIMEOUT));
+    root_cleanup.disarm();
 }
