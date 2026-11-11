@@ -1,0 +1,13 @@
+[package]
+name = "reverie-procfs"
+description = "Pure Linux /proc content formatting and path classification helpers for the Reverie instrumentation framework."
+version = "0.5.6"
+authors = ["Meta Platforms"]
+edition = "2024"
+repository = "https://github.com/facebookexperimental/reverie"
+license = "BSD-2-Clause"
+readme = "README.md"
+homepage = "https://hermetic-infra.org"
+documentation = "https://docs.rs/reverie-procfs"
+keywords = ["linux", "instrumentation", "hermit"]
+categories = ["development-tools::debugging", "os::linux-apis"]

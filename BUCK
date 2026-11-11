@@ -489,6 +489,19 @@ rust_library(
 )
 
 rust_library(
+    name = "reverie-procfs",
+    srcs = glob(["reverie-procfs/src/**/*.rs"]),
+    autocargo = {
+        "cargo_toml_config": {
+            "package": {
+                "description": "Pure Linux /proc content formatting and path classification helpers for the Reverie instrumentation framework.",
+            },
+        },
+        "cargo_toml_dir": "reverie-procfs",
+    },
+)
+
+rust_library(
     name = "safeptrace",
     srcs = glob(["safeptrace/src/**/*.rs"]) + ["safeptrace/src/retired_tid_fixture.c"],
     autocargo = {
