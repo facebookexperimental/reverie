@@ -2905,15 +2905,86 @@ fn refuse_signal(refusal: &mut Option<&'static str>, reason: &'static str) -> Sy
 
 /// The size of Linux's `kernel_siginfo`: the part of a caller's `siginfo_t`
 /// that `rt_sigqueueinfo` copies in. The rest of the 128-byte record is
-/// delivered as zeros.
+/// delivered as zeros, and is read only to check that it is
+/// (`copy_siginfo_from_user`).
 pub(super) const KERNEL_SIGINFO_SIZE: usize = 48;
+
+/// Linux's `known_siginfo_layout` (kernel/signal.c:3438-3455 at v7.1.3):
+/// whether Linux knows the layout of a siginfo with `signo` and `code`, and so
+/// needs nothing of the record past its `kernel_siginfo` part. `SI_KERNEL`,
+/// the codes from `SI_DETHREAD` to `SI_USER`, and `SI_ASYNCNL` are known; a
+/// positive code is known up to the last code of its signal for the signals
+/// with codes of their own (`sig_sicodes`, lines 3422-3436, with the `NSIG*`
+/// limits of include/uapi/asm-generic/siginfo.h), and up to `NSIGPOLL` for
+/// every other signal.
+fn known_siginfo_layout(signo: libc::c_int, code: libc::c_int) -> bool {
+    const NSIGPOLL: libc::c_int = 6;
+    if code == libc::SI_KERNEL {
+        return true;
+    }
+    if code > libc::SI_USER {
+        let last = match signo {
+            libc::SIGILL => 11,
+            libc::SIGFPE => 15,
+            libc::SIGSEGV => 10,
+            libc::SIGBUS => 5,
+            libc::SIGTRAP => 6,
+            libc::SIGCHLD => 6,
+            libc::SIGSYS => 2,
+            _ => NSIGPOLL,
+        };
+        return code <= last;
+    }
+    code >= libc::SI_DETHREAD || code == libc::SI_ASYNCNL
+}
+
+/// Copies a caller's `siginfo_t` at `address` in as Linux's
+/// `copy_siginfo_from_user` does (kernel/signal.c:3512-3548 at v7.1.3): its
+/// `kernel_siginfo` part (EFAULT); then, where Linux knows no layout for the
+/// record's signal and `si_code` (`known_siginfo_layout`), the rest of the
+/// 128-byte record, which must be readable (EFAULT) and zero (E2BIG), so that
+/// delivering the record gives the caller's data back exactly
+/// (`post_copy_siginfo_from_user`). `signal` is stored over the record's
+/// `si_signo` first where the call does so (`__copy_siginfo_from_user`, for
+/// `rt_sigqueueinfo` and `rt_tgsigqueueinfo`), so the layout is judged by it;
+/// `pidfd_send_signal` passes `None`, and the record's own `si_signo` judges.
+/// The rest of the returned record is zero.
+fn copy_siginfo_from_user(
+    memory: &GuestMemory,
+    address: u64,
+    signal: Option<libc::c_int>,
+) -> Result<[u8; SIGINFO_SIZE], i64> {
+    let copied = read_guest_bytes::<KERNEL_SIGINFO_SIZE>(&ProviderMemory(memory), address)?;
+    let mut info = [0; SIGINFO_SIZE];
+    info[..KERNEL_SIGINFO_SIZE].copy_from_slice(&copied);
+    if let Some(signal) = signal {
+        info[0..4].copy_from_slice(&signal.to_ne_bytes());
+    }
+    let signo = i32::from_ne_bytes(info[0..4].try_into().expect("siginfo signo"));
+    let code = i32::from_ne_bytes(info[8..12].try_into().expect("siginfo code"));
+    if !known_siginfo_layout(signo, code) {
+        let rest = address
+            .checked_add(KERNEL_SIGINFO_SIZE as u64)
+            .ok_or_else(|| negative_errno(libc::EFAULT))?;
+        let rest = read_guest_bytes::<{ SIGINFO_SIZE - KERNEL_SIGINFO_SIZE }>(
+            &ProviderMemory(memory),
+            rest,
+        )?;
+        if rest.iter().any(|&byte| byte != 0) {
+            return Err(negative_errno(libc::E2BIG));
+        }
+    }
+    Ok(info)
+}
 
 // TODO-HUMAN-REVIEW(PR-1018): Review caller-supplied siginfo delivery.
 /// Emulates `rt_sigqueueinfo` and `rt_tgsigqueueinfo` on the `kill` and
 /// `tgkill` delivery path, carrying the caller's `siginfo_t` instead of the
 /// record those calls build. Linux's own checks come first, in its order
-/// (`kernel/signal.c`): the record is copied in (`EFAULT`) and its `si_signo`
-/// set to the signal argument; `rt_tgsigqueueinfo` needs positive ids
+/// (`kernel/signal.c`): the record is copied in (`EFAULT`) with its
+/// `si_signo` set to the signal argument, and the rest of a record whose
+/// layout Linux does not know must be readable and zero (`EFAULT`, `E2BIG`,
+/// `copy_siginfo_from_user`); `rt_tgsigqueueinfo` needs positive ids
 /// (`EINVAL`); and a caller may supply a kernel or `tkill` code
 /// (`si_code >= 0` or `SI_TKILL`) only when the id it names is its own tid
 /// (`EPERM`). Every delivery `kill_signal` refuses (real-time queues,
@@ -2931,15 +3002,11 @@ pub(super) fn sigqueueinfo(
     } else {
         (args[1], args[2])
     };
-    let copied =
-        match read_guest_bytes::<KERNEL_SIGINFO_SIZE>(&ProviderMemory(memory), info_address) {
-            Ok(copied) => copied,
-            Err(error) => return continue_with(error),
-        };
-    let mut info = [0; SIGINFO_SIZE];
-    info[..KERNEL_SIGINFO_SIZE].copy_from_slice(&copied);
     // The kernel stores the int signal argument over the caller's si_signo.
-    info[0..4].copy_from_slice(&(signal_argument as i32).to_ne_bytes());
+    let info = match copy_siginfo_from_user(memory, info_address, Some(signal_argument as i32)) {
+        Ok(info) => info,
+        Err(error) => return continue_with(error),
+    };
     let named = if thread_directed {
         let (tgid, tid) = (args[0] as libc::pid_t, args[1] as libc::pid_t);
         if tgid <= 0 || tid <= 0 {
@@ -3064,12 +3131,14 @@ fn host_pidfd(fd: RawFd) -> bool {
 ///    process in thread-group scope. A pidfd for which this executor keeps
 ///    no record (one from outside the run) is refused by name;
 /// 3. a scope flag overrides the descriptor's scope;
-/// 4. a caller's siginfo is copied in (EFAULT) and must carry the signal
-///    (EINVAL); it may carry a kernel or `tkill` code (`si_code >= 0` or
-///    `SI_TKILL`) only when the descriptor names exactly the caller's thread
-///    and the scope is not a process group (EPERM). Without one, the send
-///    builds `kill`'s siginfo in thread-group scope and `tgkill`'s in thread
-///    scope;
+/// 4. a caller's siginfo is copied in (EFAULT), with the rest of a record
+///    whose layout Linux does not know for its own `si_signo` readable
+///    (EFAULT) and zero (E2BIG) (`copy_siginfo_from_user`), and must carry
+///    the signal (EINVAL); it may carry a kernel or `tkill` code
+///    (`si_code >= 0` or `SI_TKILL`) only when the descriptor names exactly
+///    the caller's thread and the scope is not a process group (EPERM).
+///    Without one, the send builds `kill`'s siginfo in thread-group scope and
+///    `tgkill`'s in thread scope;
 /// 5. a send to a process group is refused by name;
 /// 6. then `kill_pid_info_type`'s results: ESRCH for a reaped process, and
 ///    EINVAL for an invalid signal; a process that has exited and has not
@@ -3138,13 +3207,10 @@ fn pidfd_send(
     let info = if info_address == 0 {
         None
     } else {
-        let copied =
-            match read_guest_bytes::<KERNEL_SIGINFO_SIZE>(&ProviderMemory(memory), info_address) {
-                Ok(copied) => copied,
-                Err(error) => return continue_with(error),
-            };
-        let mut info = [0; SIGINFO_SIZE];
-        info[..KERNEL_SIGINFO_SIZE].copy_from_slice(&copied);
+        let info = match copy_siginfo_from_user(memory, info_address, None) {
+            Ok(info) => info,
+            Err(error) => return continue_with(error),
+        };
         let signo = i32::from_ne_bytes(info[0..4].try_into().expect("siginfo signo"));
         if signo != signal {
             return continue_with(negative_errno(libc::EINVAL));

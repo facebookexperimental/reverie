@@ -13,10 +13,11 @@
 //! for kill and `SI_TKILL` for tgkill, each with the sender's process id.
 //! Without the request each send is refused by name. `pidfd_send_signal`
 //! reaches the caller itself and its child through their pidfds, and answers
-//! for an exited and a reaped child as Linux does. Every observable is
-//! compared with the same binary run natively, except for the self
-//! sentinels, whose spelling LinuxEmu fixes at Linux 6.17's whatever the
-//! host kernel.
+//! for an exited and a reaped child as Linux does. A siginfo the caller
+//! passes is checked as Linux checks it, including the rest of a record whose
+//! layout Linux does not know. Every observable is compared with the same
+//! binary run natively, except for the self sentinels, whose spelling
+//! LinuxEmu fixes at Linux 6.17's whatever the host kernel.
 
 use super::*;
 
@@ -301,6 +302,151 @@ fn pidfd_self_stdout() -> String {
     )
 }
 
+const SIGINFO_LAYOUT_SOURCE: &str = r#"#define _GNU_SOURCE
+#include <errno.h>
+#include <signal.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+/* sizeof(struct kernel_siginfo): the part of a siginfo_t every call copies. */
+#define COPIED 48
+#define UNREADABLE (-2)
+#define ZEROS (-1)
+
+static long page;
+static char *pages;
+static int own_pidfd;
+
+static void say(const char *text) {
+    size_t length = strlen(text);
+    if (write(STDOUT_FILENO, text, length) != (ssize_t)length) _exit(120);
+}
+
+/* A siginfo_t whose first COPIED bytes end where the first page does, so the
+ * rest of it lies in the second page: unreadable, all zeros, or zeros with a
+ * 1 at `tail` bytes past the copied part. */
+static siginfo_t *place(int signo, int code, int tail) {
+    char *start = pages + page - COPIED;
+    if (mprotect(pages + page, page, tail == UNREADABLE ? PROT_NONE : PROT_READ | PROT_WRITE))
+        _exit(121);
+    memset(start, 0, COPIED);
+    memcpy(start, &signo, sizeof signo);
+    memcpy(start + 8, &code, sizeof code);
+    if (tail != UNREADABLE) {
+        memset(pages + page, 0, page);
+        if (tail >= 0) pages[page + tail] = 1;
+    }
+    return (siginfo_t *)start;
+}
+
+/* Each sends signal 0, which only checks, and gives 0 or the negated errno. */
+static int pidfd(int signo, int code, int tail) {
+    siginfo_t *info = place(signo, code, tail);
+    return syscall(SYS_pidfd_send_signal, own_pidfd, 0, info, 0) == 0 ? 0 : -errno;
+}
+
+static int queue(int signo, int code, int tail) {
+    siginfo_t *info = place(signo, code, tail);
+    return syscall(SYS_rt_sigqueueinfo, getpid(), 0, info) == 0 ? 0 : -errno;
+}
+
+static int tgqueue(int signo, int code, int tail) {
+    siginfo_t *info = place(signo, code, tail);
+    pid_t tid = (pid_t)syscall(SYS_gettid);
+    return syscall(SYS_rt_tgsigqueueinfo, getpid(), tid, 0, info) == 0 ? 0 : -errno;
+}
+
+static void report_queue(const char *name, int (*send)(int, int, int)) {
+    char line[200];
+    int unreadable = send(0, -1000, UNREADABLE);
+    int zeros = send(0, -1000, ZEROS);
+    int first = send(0, -1000, 0);
+    int known = send(0, SI_QUEUE, UNREADABLE);
+    /* The layout is judged by the signal argument, which Linux stores over
+     * the record's si_signo: 7 is a SIGSEGV code, but no code of signal 0. */
+    int argument = send(SIGSEGV, 7, UNREADABLE);
+    snprintf(line, sizeof line, "%s: unreadable=%d zeros=%d first=%d known=%d signal_argument=%d\n",
+             name, unreadable, zeros, first, known, argument);
+    say(line);
+}
+
+int main(void) {
+    char line[200];
+    page = sysconf(_SC_PAGESIZE);
+    pages = mmap(NULL, 2 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (pages == MAP_FAILED) return 2;
+    own_pidfd = (int)syscall(SYS_pidfd_open, getpid(), 0);
+    if (own_pidfd < 0) return 3;
+
+    /* An si_code Linux knows no layout for: the rest must be readable and
+     * zero, up to the end of the 128-byte record and no further. */
+    int unreadable = pidfd(0, -1000, UNREADABLE);
+    int zeros = pidfd(0, -1000, ZEROS);
+    int first = pidfd(0, -1000, 0);
+    int last = pidfd(0, -1000, 128 - COPIED - 1);
+    int beyond = pidfd(0, -1000, 128 - COPIED);
+    snprintf(line, sizeof line, "pidfd unknown: unreadable=%d zeros=%d first=%d last=%d beyond=%d\n",
+             unreadable, zeros, first, last, beyond);
+    say(line);
+
+    /* Codes with a known layout read nothing past the copied part. */
+    int user = pidfd(0, SI_USER, UNREADABLE);
+    int user_nonzero = pidfd(0, SI_USER, 0);
+    int queued = pidfd(0, SI_QUEUE, UNREADABLE);
+    int dethread = pidfd(0, SI_DETHREAD, UNREADABLE);
+    int asyncnl = pidfd(0, SI_ASYNCNL, UNREADABLE);
+    int kernel = pidfd(0, SI_KERNEL, UNREADABLE);
+    int below = pidfd(0, SI_DETHREAD - 1, UNREADABLE);
+    snprintf(line, sizeof line,
+             "pidfd known: user=%d,%d queue=%d dethread=%d asyncnl=%d kernel=%d "
+             "below_dethread=%d\n",
+             user, user_nonzero, queued, dethread, asyncnl, kernel, below);
+    say(line);
+
+    /* A positive code is known up to its signal's last code (6 for SIGCHLD,
+     * and for a signal with no codes of its own), judged by the record's own
+     * si_signo, which then fails to match signal 0. */
+    int chld = pidfd(SIGCHLD, 6, UNREADABLE);
+    int chld_over = pidfd(SIGCHLD, 7, UNREADABLE);
+    int usr1 = pidfd(SIGUSR1, 6, UNREADABLE);
+    int usr1_over = pidfd(SIGUSR1, 7, UNREADABLE);
+    int segv = pidfd(SIGSEGV, 7, UNREADABLE);
+    snprintf(line, sizeof line, "pidfd limits: chld=%d,%d usr1=%d,%d segv=%d\n", chld, chld_over,
+             usr1, usr1_over, segv);
+    say(line);
+
+    /* The layout is checked before si_signo is compared with the signal. */
+    int unknown_mismatch = pidfd(SIGUSR1, -1000, 0);
+    int known_mismatch = pidfd(SIGUSR1, SI_QUEUE, UNREADABLE);
+    snprintf(line, sizeof line, "pidfd order: unknown=%d known=%d\n", unknown_mismatch,
+             known_mismatch);
+    say(line);
+
+    report_queue("rt_sigqueueinfo", queue);
+    report_queue("rt_tgsigqueueinfo", tgqueue);
+    return 0;
+}
+"#;
+
+/// What the siginfo layout program prints on Linux.
+fn siginfo_layout_stdout() -> String {
+    let (efault, e2big, einval) = (-libc::EFAULT, -libc::E2BIG, -libc::EINVAL);
+    format!(
+        "pidfd unknown: unreadable={efault} zeros=0 first={e2big} last={e2big} beyond=0\n\
+         pidfd known: user=0,0 queue=0 dethread=0 asyncnl=0 kernel=0 \
+         below_dethread={efault}\n\
+         pidfd limits: chld={einval},{efault} usr1={einval},{efault} segv={einval}\n\
+         pidfd order: unknown={e2big} known={einval}\n\
+         rt_sigqueueinfo: unreadable={efault} zeros=0 first={e2big} known=0 \
+         signal_argument={efault}\n\
+         rt_tgsigqueueinfo: unreadable={efault} zeros=0 first={e2big} known=0 \
+         signal_argument={efault}\n"
+    )
+}
+
 /// What the Tool reports to its global state.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 enum CrossProcessReport {
@@ -561,4 +707,35 @@ fn pidfd_send_signal_takes_the_self_sentinels_as_linux_6_17_spells_them() {
     // The backend declares the spelling its executor takes, so a Tool that
     // forwards a guest's sentinel forwards it unchanged.
     assert_eq!(*global.spellings.lock().unwrap(), ["Modern"; 3]);
+}
+
+/// A siginfo a caller passes to `pidfd_send_signal`, `rt_sigqueueinfo` or
+/// `rt_tgsigqueueinfo` with an `si_code` whose layout Linux does not know for
+/// its signal must be readable and zero past the 48 bytes Linux copies
+/// (`post_copy_siginfo_from_user`): an unreadable rest is EFAULT and a nonzero
+/// byte E2BIG, both before `pidfd_send_signal` compares `si_signo` with the
+/// signal. `pidfd_send_signal` judges the layout by the record's own
+/// `si_signo`, the other two by their signal argument.
+#[test]
+fn a_siginfo_of_unknown_layout_must_end_in_zeros_as_on_linux() {
+    if !kvm_available("a_siginfo_of_unknown_layout_must_end_in_zeros_as_on_linux") {
+        return;
+    }
+    let directory = TestDirectory::new();
+    let (executable, _) =
+        cross_process_program(&directory, "siginfo-layout", SIGINFO_LAYOUT_SOURCE);
+    let native = std::process::Command::new(&executable).output().unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout),
+        siginfo_layout_stdout(),
+        "native Linux is the oracle; stderr={}",
+        String::from_utf8_lossy(&native.stderr)
+    );
+    assert_eq!(native.status.code(), Some(0));
+
+    let (stdout, global) =
+        run_cross_process_program("siginfo-layout", SIGINFO_LAYOUT_SOURCE, false);
+    assert_eq!(stdout, siginfo_layout_stdout());
+    let refusals = global.refusals.lock().unwrap();
+    assert!(refusals.is_empty(), "{refusals:?}");
 }

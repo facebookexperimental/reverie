@@ -420,3 +420,64 @@ fn pidfd_send_signal_in_thread_scope_to_an_exited_leader_is_refused() {
         Some((libc::SI_USER, pid, 0))
     );
 }
+
+/// A siginfo whose layout Linux does not know for its own `si_signo` must be
+/// readable and zero past the part Linux copies (`copy_siginfo_from_user`):
+/// an unreadable rest is EFAULT and a nonzero byte E2BIG, both before
+/// `si_signo` is compared with the signal. A known layout reads nothing more.
+#[test]
+fn pidfd_send_signal_checks_the_rest_of_a_siginfo_of_unknown_layout() {
+    // The copied part ends where the test memory does, so the rest is unmapped.
+    const EDGE: u64 = PIDFD_TEST_MEMORY as u64 - KERNEL_SIGINFO_SIZE as u64;
+    const UNKNOWN: i32 = -1000;
+    fn at_edge(memory: &mut GuestMemory, signo: i32, code: i32) -> u64 {
+        let mut info = [0_u8; KERNEL_SIGINFO_SIZE];
+        info[0..4].copy_from_slice(&signo.to_ne_bytes());
+        info[8..12].copy_from_slice(&code.to_ne_bytes());
+        memory.write(EDGE, &info).unwrap();
+        EDGE
+    }
+    fn with_rest(memory: &mut GuestMemory, signo: i32, code: i32, rest: u8) -> u64 {
+        let info = pss_info(memory, signo, code);
+        memory
+            .write(info + KERNEL_SIGINFO_SIZE as u64, &[rest])
+            .unwrap();
+        info
+    }
+    let root = TestDir::new();
+    let mut executor = ElfExecutor::new(test_state(&root.0), false);
+    let mut memory = pidfd_test_memory();
+    let mut send = |memory: &GuestMemory, info: u64| {
+        pss_send(&mut executor, memory, PSS_SELF_THREAD_GROUP, 0, info, 0)
+    };
+
+    let info = at_edge(&mut memory, 0, UNKNOWN);
+    assert_eq!(send(&memory, info), negative_errno(libc::EFAULT));
+    let info = with_rest(&mut memory, 0, UNKNOWN, 0);
+    assert_eq!(send(&memory, info), 0);
+    let info = with_rest(&mut memory, 0, UNKNOWN, 1);
+    assert_eq!(send(&memory, info), negative_errno(libc::E2BIG));
+    // Before the signal check: a record for SIGUSR1, sent as signal 0.
+    let info = with_rest(&mut memory, libc::SIGUSR1, UNKNOWN, 1);
+    assert_eq!(send(&memory, info), negative_errno(libc::E2BIG));
+    for code in [
+        libc::SI_USER,
+        libc::SI_QUEUE,
+        libc::SI_DETHREAD,
+        libc::SI_ASYNCNL,
+        libc::SI_KERNEL,
+    ] {
+        let info = at_edge(&mut memory, 0, code);
+        assert_eq!(send(&memory, info), 0, "code {code}, rest unmapped");
+        let info = with_rest(&mut memory, 0, code, 1);
+        assert_eq!(send(&memory, info), 0, "code {code}, rest nonzero");
+    }
+    let info = at_edge(&mut memory, 0, libc::SI_DETHREAD - 1);
+    assert_eq!(send(&memory, info), negative_errno(libc::EFAULT));
+    // The record's own si_signo judges a positive code: 7 is past SIGCHLD's
+    // last code and within SIGSEGV's, whose record then fails to match.
+    let info = at_edge(&mut memory, libc::SIGCHLD, 7);
+    assert_eq!(send(&memory, info), negative_errno(libc::EFAULT));
+    let info = at_edge(&mut memory, libc::SIGSEGV, 7);
+    assert_eq!(send(&memory, info), negative_errno(libc::EINVAL));
+}
