@@ -177,7 +177,6 @@ mod tests {
 
     use nix::sys::signal::Signal;
     use nix::sys::wait::WaitPidFlag;
-    use nix::unistd;
     use nix::unistd::ForkResult;
 
     use super::*;
@@ -185,7 +184,7 @@ mod tests {
     #[cfg(feature = "notifier")]
     #[test]
     fn waitpidfd_preserves_direct_child_stop_status() {
-        let fork_result = unsafe { unistd::fork() }.expect("fork direct-child stop test");
+        let fork_result = unsafe { crate::test_fork::fork() }.expect("fork direct-child stop test");
         match fork_result {
             ForkResult::Parent { child, .. } => {
                 let raw_fd =
@@ -220,7 +219,7 @@ mod tests {
 
     #[test]
     fn waitid_w_exited_0() {
-        let fork_result = unsafe { unistd::fork() };
+        let fork_result = unsafe { crate::test_fork::fork() };
         assert!(fork_result.is_ok());
         match fork_result.unwrap() {
             ForkResult::Parent { child, .. } => {
@@ -239,7 +238,7 @@ mod tests {
 
     #[test]
     fn waitid_w_exited_1() {
-        let fork_result = unsafe { unistd::fork() };
+        let fork_result = unsafe { crate::test_fork::fork() };
         assert!(fork_result.is_ok());
         match fork_result.unwrap() {
             ForkResult::Parent { child, .. } => {
@@ -258,7 +257,7 @@ mod tests {
 
     #[test]
     fn waitid_w_killed_by_signal() {
-        let fork_result = unsafe { unistd::fork() };
+        let fork_result = unsafe { crate::test_fork::fork() };
         assert!(fork_result.is_ok());
         match fork_result.unwrap() {
             ForkResult::Parent { child, .. } => {
@@ -279,7 +278,7 @@ mod tests {
 
     #[test]
     fn waitid_w_exited_no_wait_then_wait() {
-        let fork_result = unsafe { unistd::fork() };
+        let fork_result = unsafe { crate::test_fork::fork() };
         assert!(fork_result.is_ok());
         match fork_result.unwrap() {
             ForkResult::Parent { child, .. } => {
@@ -305,7 +304,7 @@ mod tests {
 
     #[test]
     fn waitid_w_exited_then_echild() {
-        let fork_result = unsafe { unistd::fork() };
+        let fork_result = unsafe { crate::test_fork::fork() };
         assert!(fork_result.is_ok());
         match fork_result.unwrap() {
             ForkResult::Parent { child, .. } => {
@@ -328,7 +327,7 @@ mod tests {
 
     #[test]
     fn waitid_w_nohang_then_kill() {
-        let fork_result = unsafe { unistd::fork() };
+        let fork_result = unsafe { crate::test_fork::fork() };
         assert!(fork_result.is_ok());
         match fork_result.unwrap() {
             ForkResult::Parent { child, .. } => {
@@ -356,7 +355,7 @@ mod tests {
 
     #[test]
     fn waitid_w_nohang_kill_nohang_nowait_wait() {
-        let fork_result = unsafe { unistd::fork() };
+        let fork_result = unsafe { crate::test_fork::fork() };
         assert!(fork_result.is_ok());
         match fork_result.unwrap() {
             ForkResult::Parent { child, .. } => {

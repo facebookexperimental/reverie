@@ -31,6 +31,8 @@ mod memory;
 mod notifier;
 mod regs;
 mod syscall_info;
+#[cfg(test)]
+mod test_fork;
 mod waitid;
 
 use core::mem::MaybeUninit;
@@ -2898,11 +2900,11 @@ mod test {
     use nix::sys::signal;
     use nix::sys::signal::Signal;
     use nix::unistd::ForkResult;
-    use nix::unistd::fork;
     // Make sure tokio is referenced in all configurations.
     use tokio as _;
 
     use super::*;
+    use crate::test_fork::fork;
 
     // Traces a closure in a forked process. The forked process starts in a
     // stopped state so that ptrace options may be set.

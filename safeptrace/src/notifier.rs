@@ -8823,10 +8823,10 @@ mod test {
     use nix::sys::wait::WaitStatus;
     use nix::unistd::ForkResult;
     use nix::unistd::Pid;
-    use nix::unistd::fork;
 
     use super::*;
     use crate::Options;
+    use crate::test_fork::fork;
 
     /// Keep completion evidence on a separate physical line even beside
     /// C signal-handler output or libtest's unfinished progress line. One
@@ -9090,7 +9090,7 @@ mod test {
             .stderr(Stdio::piped())
             .process_group(0);
 
-        let mut group = ChildProcessGroup::new(command.spawn()?)?;
+        let mut group = ChildProcessGroup::new(crate::test_fork::spawn(&mut command)?)?;
         let mut stdout = drain_pipe(
             group
                 .child
@@ -16156,13 +16156,13 @@ mod test {
                 set_tid_size: 1,
                 ..CloneArgs::default()
             };
-            let result = unsafe {
+            let result = crate::test_fork::exclusive(|| unsafe {
                 libc::syscall(
                     libc::SYS_clone3,
                     std::ptr::from_ref(&args),
                     mem::size_of::<CloneArgs>(),
                 )
-            };
+            });
             if result == -1 {
                 return None;
             }
@@ -17828,13 +17828,13 @@ mod test {
                 set_tid_size: 1,
                 ..CloneArgs::default()
             };
-            let result = unsafe {
+            let result = crate::test_fork::exclusive(|| unsafe {
                 libc::syscall(
                     libc::SYS_clone3,
                     std::ptr::from_ref(&args),
                     mem::size_of::<CloneArgs>(),
                 )
-            };
+            });
             if result == -1 {
                 return None;
             }

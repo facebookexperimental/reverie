@@ -88,21 +88,24 @@ mod group_exit_status {
             guest();
         }
         let mut child = unsafe {
-            std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", NAME, "--test-threads=1", "--nocapture"])
-                .env(ROLE, NAME)
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                // Its own process group, so this test waits only for it.
-                .pre_exec(|| {
-                    if libc::setpgid(0, 0) == 0 && libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0) == 0 {
-                        Ok(())
-                    } else {
-                        Err(std::io::Error::last_os_error())
-                    }
-                })
-                .spawn()
-                .unwrap()
+            crate::test_fork::spawn(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", NAME, "--test-threads=1", "--nocapture"])
+                    .env(ROLE, NAME)
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    // Its own process group, so this test waits only for it.
+                    .pre_exec(|| {
+                        if libc::setpgid(0, 0) == 0
+                            && libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0) == 0
+                        {
+                            Ok(())
+                        } else {
+                            Err(std::io::Error::last_os_error())
+                        }
+                    }),
+            )
+            .unwrap()
         };
         let leader = child.id() as libc::pid_t;
         let group = leader as libc::id_t;

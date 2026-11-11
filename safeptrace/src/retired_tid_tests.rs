@@ -36,7 +36,8 @@ mod retired_tid {
         let source = directory.0.join("fixture.c");
         let program = directory.0.join("fixture");
         fs::write(&source, include_bytes!("retired_tid_fixture.c")).unwrap();
-        let output = Command::new("cc")
+        let mut compile = Command::new("cc");
+        compile
             .args([
                 "-std=gnu11",
                 "-O2",
@@ -48,7 +49,10 @@ mod retired_tid {
             .arg(&source)
             .arg("-o")
             .arg(&program)
-            .output()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = crate::test_fork::spawn(&mut compile)
+            .and_then(|child| child.wait_with_output())
             .expect("compile owned syscall fixture with the Linux build prerequisites");
         assert!(
             output.status.success(),

@@ -162,7 +162,9 @@ fn legacy_owner_replacement_after_stop(
             set_tid_size: 1,
             ..CloneArgs::default()
         };
-        let result = unsafe { libc::syscall(libc::SYS_clone3, &args, mem::size_of::<CloneArgs>()) };
+        let result = crate::test_fork::exclusive(|| unsafe {
+            libc::syscall(libc::SYS_clone3, &args, mem::size_of::<CloneArgs>())
+        });
         if result == -1 {
             let error = Errno::last();
             assert!(
