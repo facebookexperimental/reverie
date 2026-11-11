@@ -1063,6 +1063,7 @@ fn execute_basic_syscall_inner(
             return sigqueueinfo(memory, state, number, args);
         }
         _ if number == libc::SYS_pidfd_send_signal as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
             return pidfd_send_signal(memory, state, args);
         }
         _ if number == libc::SYS_close as u64 => close(state, args[0]),

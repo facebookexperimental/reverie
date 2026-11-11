@@ -3053,6 +3053,8 @@ fn host_pidfd(fd: RawFd) -> bool {
     result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EBADF)
 }
 
+// TODO-HUMAN-REVIEW(https://github.com/rrnewton/reverie/pull/1449): Review pidfd_send_signal's
+// checks, scopes and target lifetimes.
 /// Emulates `pidfd_send_signal(pidfd, sig, info, flags)`, checking in Linux's
 /// order (`pidfd_send_signal` and `do_pidfd_send_signal`, kernel/signal.c):
 /// 1. a flag other than the three scopes, or more than one scope, is EINVAL;
