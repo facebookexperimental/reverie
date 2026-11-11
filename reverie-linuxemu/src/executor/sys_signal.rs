@@ -2855,7 +2855,8 @@ impl SignalRefusal {
          the synthesized namespace init";
     pub(super) const REALTIME_OR_SIGCHLD: &'static str =
         "KVM signal delivery refused: KVM cannot send real-time signals or SIGCHLD";
-    const STOP: &'static str = "KVM signal delivery refused: KVM cannot send a stop signal";
+    pub(super) const STOP: &'static str =
+        "KVM signal delivery refused: KVM cannot send a stop signal";
     pub(super) const THREADED_PROCESS: &'static str = "KVM signal delivery refused: KVM cannot \
          choose the recipient of a process-directed signal in a process with several threads";
     const SIGKILL_SIBLING: &'static str =
@@ -3165,6 +3166,11 @@ fn send_signal(
         Ok(event) => event,
         Err(errno) => return continue_with(negative_errno(errno.into_raw())),
     };
+    // prepare_signal's queue effects come before the signal is queued,
+    // whatever its action (a default stop was refused above).
+    if let Err(error) = flush_for_own_process(state, signal) {
+        return continue_with(error);
+    }
     match queue_signal_event_locked(state, event, is_kill) {
         Ok(()) => continue_with(0),
         Err(error) => continue_with(error),
@@ -3185,7 +3191,7 @@ pub(super) fn send_thread_signal(
     if target <= 0 || tgid.is_some_and(|tgid| tgid <= 0) {
         return continue_with(negative_errno(libc::EINVAL));
     }
-    {
+    let (action, flushed) = {
         let lifecycle = state
             .task_lifecycle
             .lock()
@@ -3228,7 +3234,7 @@ pub(super) fn send_thread_signal(
             };
             target_signals
         };
-        let process_signals = state
+        let mut process_signals = state
             .process_signals
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -3238,13 +3244,6 @@ pub(super) fn send_thread_signal(
         );
         if disposition == SignalDisposition::Stop {
             return refuse_signal(refusal, SignalRefusal::STOP);
-        }
-        let mut target_signals = target_signals.lock();
-        if disposition == SignalDisposition::Ignore
-            && !target_signals.blocked.contains(signal)
-            && !target_signals.observe_ignored
-        {
-            return continue_with(0);
         }
         let event = match info {
             Some(info) => reverie::SignalEvent::new(
@@ -3261,22 +3260,139 @@ pub(super) fn send_thread_signal(
             Ok(event) => event,
             Err(errno) => return continue_with(negative_errno(errno.into_raw())),
         };
-        if let Err(errno) = target_signals
-            .pending
-            .enqueue(event, process_signals.pending_generation(signal))
-        {
-            return continue_with(negative_errno(errno.into_raw()));
-        }
-        // A signalfd's eventfd keeper shows only the shared queue. A receiver
-        // waiting in a host poll for a signalfd that covers this signal is
-        // woken here, under the lock it registered its wait with.
-        if let Some(waiter) = &target_signals.signalfd_waiter
-            && let Err(error) = waiter.wake_for(signal)
-        {
-            return continue_with(io_error(error));
-        }
+        // prepare_signal's queue effects come before the test of the
+        // signal's action.
+        let process = reverie::SignalProcessId {
+            tgid: reverie::Pid::from_raw(task.tgid),
+            generation: task.process_generation,
+        };
+        let flushed = flush_for_generation(&lifecycle, process, &mut process_signals, signal);
+        (
+            queue_thread_signal(&process_signals, &target_signals, event, disposition),
+            flushed,
+        )
+    };
+    match refresh_signalfd_keepers(state, &flushed) {
+        Ok(()) => action,
+        Err(error) => continue_with(error),
+    }
+}
+
+/// Queues `event`, a thread-directed signal whose action is `disposition`,
+/// on `target`'s own queue, where Linux's `__send_signal_locked` queues it,
+/// unless that discards it at the send: an ignored signal the thread does
+/// not block, where no Tool observes ignored signals. Wakes a wait of the
+/// thread's for a signalfd that covers the signal. The caller holds the
+/// target process's transaction and its signal lock, `process_signals`.
+fn queue_thread_signal(
+    process_signals: &crate::signal::ProcessSignalState,
+    target: &crate::signal::SharedThreadSignalState,
+    event: reverie::SignalEvent,
+    disposition: SignalDisposition,
+) -> SyscallAction {
+    let signal = event.signal();
+    let mut target = target.lock();
+    if disposition == SignalDisposition::Ignore
+        && !target.blocked.contains(signal)
+        && !target.observe_ignored
+    {
+        return continue_with(0);
+    }
+    if let Err(errno) = target
+        .pending
+        .enqueue(event, process_signals.pending_generation(signal))
+    {
+        return continue_with(negative_errno(errno.into_raw()));
+    }
+    // A signalfd's eventfd keeper shows only the shared queue. A receiver
+    // waiting in a host poll for a signalfd that covers this signal is woken
+    // here, under the lock it registered its wait with.
+    if let Some(waiter) = &target.signalfd_waiter
+        && let Err(error) = waiter.wake_for(signal)
+    {
+        return continue_with(io_error(error));
     }
     continue_with(0)
+}
+
+/// The stop signals, whose default action stops the process
+/// (`SIG_KERNEL_STOP_MASK`).
+const STOP_SIGNALS: [libc::c_int; 4] = [libc::SIGSTOP, libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU];
+
+/// Linux's `prepare_signal` queue effects of generating `signal` for
+/// `process`
+/// (<https://github.com/gregkh/linux/blob/v7.1.3/kernel/signal.c#L884-L900>):
+/// a stop signal removes SIGCONT from the process's shared queue and from
+/// each of its threads' own queues, and SIGCONT removes every stop signal
+/// from them, whatever any action is. Returns the signals it removed from
+/// the shared queue, whose signalfd keepers must be refreshed
+/// ([`refresh_signalfd_keepers`]).
+///
+/// The caller holds the process's transaction, then `lifecycle` and the
+/// process's signal state, `process_signals`; each thread's own lock is
+/// taken in turn after them.
+pub(crate) fn flush_for_generation(
+    lifecycle: &crate::elf::TaskLifecycleTable,
+    process: reverie::SignalProcessId,
+    process_signals: &mut crate::signal::ProcessSignalState,
+    signal: libc::c_int,
+) -> Vec<libc::c_int> {
+    let flushed: &[libc::c_int] = if STOP_SIGNALS.contains(&signal) {
+        &[libc::SIGCONT]
+    } else if signal == libc::SIGCONT {
+        &STOP_SIGNALS
+    } else {
+        return Vec::new();
+    };
+    let removed = flushed
+        .iter()
+        .copied()
+        .filter(|&flushed| process_signals.shared_pending.remove(flushed).is_some())
+        .collect();
+    for task in lifecycle.signal_process_tasks(process) {
+        if let Some(thread) = lifecycle.signal_target(task.tid.as_raw()) {
+            let mut thread = thread.lock();
+            for &flushed in flushed {
+                thread.pending.remove(flushed);
+            }
+        }
+    }
+    removed
+}
+
+/// [`flush_for_generation`] for a signal the caller sends to its own process,
+/// then the refresh of the signalfd keepers it changed. The caller holds its
+/// process's transaction.
+fn flush_for_own_process(state: &LoadedStaticElf, signal: libc::c_int) -> Result<(), i64> {
+    let flushed = {
+        let lifecycle = state
+            .task_lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(generation) = lifecycle.live_process_generation(state.pid) else {
+            return Ok(());
+        };
+        let process = reverie::SignalProcessId {
+            tgid: reverie::Pid::from_raw(state.pid),
+            generation,
+        };
+        let mut process_signals = state
+            .process_signals
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        flush_for_generation(&lifecycle, process, &mut process_signals, signal)
+    };
+    refresh_signalfd_keepers(state, &flushed)
+}
+
+/// Refreshes the keepers of the caller's process's signalfds that cover a
+/// signal in `changed`, which left its shared queue. The caller holds its
+/// process's transaction and none of its signal locks.
+fn refresh_signalfd_keepers(state: &LoadedStaticElf, changed: &[libc::c_int]) -> Result<(), i64> {
+    for &signal in changed {
+        refresh_signalfd_readiness_from_carriers_locked(state, Some(signal))?;
+    }
+    Ok(())
 }
 
 pub(super) fn process_dumpable(state: &LoadedStaticElf) -> bool {

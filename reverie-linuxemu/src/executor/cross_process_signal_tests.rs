@@ -215,3 +215,163 @@ fn a_threads_id_names_its_process_in_kill_and_rt_sigqueueinfo() {
     }
     drop((child_thread, child));
 }
+
+fn xsig_tgkill(executor: &mut ElfExecutor, tgid: i32, tid: i32, signal: i32) -> i64 {
+    let memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+    executor.execute(
+        &SyscallRequest::new(
+            libc::SYS_tgkill as u64,
+            [tgid as u64, tid as u64, signal as u64, 0, 0, 0],
+        ),
+        &memory,
+    )
+}
+
+/// Whether `signal` is queued in the shared queue of `executor`'s process,
+/// and in `executor`'s own queue.
+fn xsig_queued(executor: &ElfExecutor, signal: i32) -> (bool, bool) {
+    (
+        executor
+            .state
+            .process_signals
+            .lock()
+            .unwrap()
+            .shared_pending
+            .contains(signal),
+        executor
+            .state
+            .thread_signals
+            .lock()
+            .pending
+            .contains(signal),
+    )
+}
+
+/// `prepare_signal`'s queue effects for a signal a thread sends within its
+/// own process: a stop signal, here a caught SIGTSTP, removes SIGCONT from
+/// the process's shared queue and from each thread's own queue, and SIGCONT,
+/// whose default action ignores it, removes every stop signal from them. A
+/// stop signal whose action is the default is refused before any of that,
+/// so a queued SIGCONT stays.
+#[test]
+fn a_stop_signal_and_sigcont_flush_each_other_from_every_queue_of_a_process() {
+    let root = TestDir::new();
+    let mut leader = ElfExecutor::new(test_state(&root.0), false);
+    let mut sibling = leader.thread_child(2).unwrap();
+    let pid = leader.state.pid;
+    // What is queued stays queued.
+    for state in [&mut leader.state, &mut sibling.state] {
+        for signal in [libc::SIGCONT, libc::SIGTSTP, libc::SIGTTIN] {
+            test_block_signal(state, signal);
+        }
+    }
+    queue_signal_event(
+        &mut leader.state,
+        event_for_process(libc::SIGCONT, pid).unwrap(),
+        true,
+    )
+    .unwrap();
+    queue_signal_event(
+        &mut leader.state,
+        event_for_thread(libc::SIGCONT, pid, pid).unwrap(),
+        false,
+    )
+    .unwrap();
+    queue_signal_event(
+        &mut sibling.state,
+        event_for_thread(libc::SIGCONT, pid, 2).unwrap(),
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        xsig_tgkill(&mut leader, pid, 2, libc::SIGTSTP),
+        negative_errno(libc::ENOSYS)
+    );
+    assert_eq!(
+        leader.take_unsupported_refusal(),
+        xsig_refusal(SignalRefusal::STOP)
+    );
+    assert_eq!(xsig_queued(&leader, libc::SIGCONT), (true, true));
+    assert_eq!(xsig_queued(&sibling, libc::SIGCONT), (true, true));
+
+    test_install_signal_action(&leader.state, libc::SIGTSTP, custom_action(0x1000));
+    test_install_signal_action(&leader.state, libc::SIGTTIN, custom_action(0x1000));
+    assert_eq!(xsig_tgkill(&mut leader, pid, 2, libc::SIGTSTP), 0);
+    assert_eq!(xsig_queued(&leader, libc::SIGCONT), (false, false));
+    assert_eq!(xsig_queued(&sibling, libc::SIGCONT), (false, false));
+    assert_eq!(xsig_queued(&sibling, libc::SIGTSTP), (false, true));
+
+    queue_signal_event(
+        &mut leader.state,
+        event_for_process(libc::SIGTTIN, pid).unwrap(),
+        true,
+    )
+    .unwrap();
+    assert_eq!(xsig_tgkill(&mut sibling, pid, pid, libc::SIGCONT), 0);
+    assert_eq!(xsig_queued(&sibling, libc::SIGTSTP), (false, false));
+    assert_eq!(xsig_queued(&leader, libc::SIGTTIN), (false, false));
+    assert_eq!(
+        xsig_queued(&leader, libc::SIGCONT),
+        (false, true),
+        "blocked, so queued"
+    );
+}
+
+/// The same for `kill` of the sender's own process; and the keeper of a
+/// signalfd for the flushed signal stops showing it.
+#[test]
+fn sigcont_to_its_own_process_flushes_a_stop_signal_and_its_signalfd_readiness() {
+    const MASK: u64 = 0x100;
+    let root = TestDir::new();
+    let mut executor = ElfExecutor::new(test_state(&root.0), false);
+    let pid = executor.state.pid;
+    test_block_signal(&mut executor.state, libc::SIGTSTP);
+    test_install_signal_action(&executor.state, libc::SIGTSTP, custom_action(0x1000));
+    let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+    let mut mask = KernelSigset::default();
+    mask.insert(libc::SIGTSTP);
+    memory.write(MASK, &mask.to_bytes()).unwrap();
+    let fd = executor.execute(
+        &SyscallRequest::new(
+            libc::SYS_signalfd4 as u64,
+            [
+                u64::MAX,
+                MASK,
+                KERNEL_SIGSET_SIZE as u64,
+                (libc::SFD_CLOEXEC | libc::SFD_NONBLOCK) as u64,
+                0,
+                0,
+            ],
+        ),
+        &memory,
+    );
+    assert!(fd >= 0, "signalfd4: {fd}");
+    let keeper_ready = |executor: &ElfExecutor| {
+        let carrier = executor
+            .state
+            .process_signals
+            .lock()
+            .unwrap()
+            .signalfd_carriers
+            .get(&(fd as i32))
+            .expect("the signalfd's keeper")
+            .clone();
+        let mut poll = libc::pollfd {
+            fd: carrier.file().as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one initialized descriptor, and no wait.
+        assert!(unsafe { libc::poll(&mut poll, 1, 0) } >= 0);
+        poll.revents & libc::POLLIN != 0
+    };
+    assert_eq!(xsig_kill(&mut executor, pid, libc::SIGTSTP), 0);
+    assert_eq!(xsig_queued(&executor, libc::SIGTSTP), (true, false));
+    assert!(keeper_ready(&executor));
+    assert_eq!(xsig_kill(&mut executor, pid, libc::SIGCONT), 0);
+    assert_eq!(xsig_queued(&executor, libc::SIGTSTP), (false, false));
+    assert!(
+        !keeper_ready(&executor),
+        "the keeper still shows the flushed SIGTSTP"
+    );
+}
