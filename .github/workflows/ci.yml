@@ -223,7 +223,7 @@ jobs:
                 github.actor == 'rrnewton-bots' &&
                 github.triggering_actor == 'rrnewton-bots' &&
                 github.repository == 'rrnewton/reverie' &&
-                github.ref == 'refs/heads/main' &&
+                github.ref_name == github.event.repository.default_branch &&
                 github.ref_protected == true
               )
             )
