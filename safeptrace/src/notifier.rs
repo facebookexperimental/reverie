@@ -752,6 +752,24 @@ struct Event {
     /// poll period with no wakeup, published a status or first observed one.
     #[cfg(test)]
     legacy_late_turns: AtomicUsize,
+    /// Replaces [`LEGACY_POLL_PERIOD`] as the wait of a worker turn that
+    /// hinted.
+    #[cfg(test)]
+    legacy_poll_period: Mutex<Option<Duration>>,
+    /// Pauses the worker once, after a turn that hinted and before it takes
+    /// `legacy_wakeup` to wait.
+    #[cfg(test)]
+    legacy_sleep_check_pause: Mutex<Option<BoundedTestPause>>,
+    /// Signalled once by the worker while it holds `legacy_wakeup`, right
+    /// before it waits after a turn that hinted, so that a wakeup counted
+    /// after the signal is counted while it waits. The one lock taken while
+    /// holding `legacy_wakeup`, in tests only; it takes nothing itself.
+    #[cfg(test)]
+    legacy_parking_signal: Mutex<Option<mpsc::SyncSender<()>>>,
+    /// Pauses [`EventHandle::try_assist_legacy_wait`] once, after it released
+    /// `legacy_wait` and before it notifies the worker.
+    #[cfg(test)]
+    legacy_assist_notify_pause: Mutex<Option<BoundedTestPause>>,
     /// The actual host ptracer's immutable lifetime, bound only by that live
     /// thread after retained-generation attachment authentication.
     legacy_wait_owner: OnceLock<LegacyWaitOwner>,
@@ -1468,6 +1486,14 @@ impl Event {
             legacy_publish_pause: Mutex::new(None),
             #[cfg(test)]
             legacy_late_turns: AtomicUsize::new(0),
+            #[cfg(test)]
+            legacy_poll_period: Mutex::new(None),
+            #[cfg(test)]
+            legacy_sleep_check_pause: Mutex::new(None),
+            #[cfg(test)]
+            legacy_parking_signal: Mutex::new(None),
+            #[cfg(test)]
+            legacy_assist_notify_pause: Mutex::new(None),
             legacy_wait_owner: OnceLock::new(),
             native_wait_identity: OnceLock::new(),
             exit_status: AtomicI32::new(EXIT_PENDING),
@@ -1534,10 +1560,18 @@ impl Event {
     /// only moves the worker's next turn earlier; the turn checks and
     /// observes what it would have at its due time.
     fn wake_legacy_worker(&self) {
+        self.count_legacy_wakeup();
+        self.legacy_wake.notify_one();
+    }
+
+    /// The counting half of [`Event::wake_legacy_worker`], for a caller that
+    /// holds `legacy_wait`. The worker reads the count, not the notify, under
+    /// the lock it waits with, so it acts on the wakeup at its next sleep
+    /// check. The caller sends `legacy_wake.notify_one()` after it released
+    /// `legacy_wait`, so that the woken worker does not block on it.
+    fn count_legacy_wakeup(&self) {
         let mut wakeups = self.legacy_wakeup.lock();
         wakeups.targeted = wakeups.targeted.wrapping_add(1);
-        drop(wakeups);
-        self.legacy_wake.notify_one();
     }
 
     /// Runs this generation's legacy observation worker now, and lets a
@@ -3173,13 +3207,20 @@ impl EventHandle {
         if let Some(error) = progress.error {
             return Err(error);
         }
+        // A wakeup is counted here, under `legacy_wait`, so that the worker
+        // cannot publish what it pops before the count moves: its
+        // `before_publication` read includes it, as a hold must. Only the
+        // notify waits until `legacy_wait` is released below, so that the
+        // woken worker takes `legacy_wait` without first blocking on it.
+        let mut notify = false;
         let status = match try_consume_legacy_status(identity, event, Some(handle)) {
             Ok(status) => status,
             // The observation owner decides transient newborn ECHILD versus
             // exact retirement and publishes it after draining its FIFO.
             // Have it decide now: a held worker's next turn may be far off.
             Err(Errno::ECHILD) => {
-                event.wake_legacy_worker();
+                event.count_legacy_wakeup();
+                notify = true;
                 None
             }
             Err(Errno::EINTR) => None,
@@ -3192,7 +3233,14 @@ impl EventHandle {
             progress.observed = None;
             progress.error = None;
             // The worker publishes it on its next turn: run that turn now.
-            event.wake_legacy_worker();
+            event.count_legacy_wakeup();
+            notify = true;
+        }
+        drop(progress);
+        if notify {
+            #[cfg(test)]
+            pause_retirement_for_test(&event.legacy_assist_notify_pause);
+            event.legacy_wake.notify_one();
         }
         Ok(())
     }
@@ -4894,6 +4942,16 @@ fn legacy_held_period(event: &Event) -> Duration {
     LEGACY_HELD_PERIOD
 }
 
+/// [`LEGACY_POLL_PERIOD`], or a test's replacement for it.
+fn legacy_poll_period(event: &Event) -> Duration {
+    #[cfg(test)]
+    if let Some(period) = *event.legacy_poll_period.lock() {
+        return period;
+    }
+    let _ = event;
+    LEGACY_POLL_PERIOD
+}
+
 /// A Procfs worker never consumes a numeric wait. It supplies bounded hints
 /// until the live actual ptracer assists, and publishes only that caller's
 /// consumed FIFO. In particular, host ptracer exit cannot make it steal a
@@ -5134,9 +5192,13 @@ fn legacy_worker_thread(
         if held_wait {
             pause_retirement_for_test(&event.legacy_held_wait_pause);
         }
+        #[cfg(test)]
+        if wake {
+            pause_retirement_for_test(&event.legacy_sleep_check_pause);
+        }
         let mut wakeups = event.legacy_wakeup.lock();
         let timeout = if wake {
-            LEGACY_POLL_PERIOD
+            legacy_poll_period(event)
         } else if held_wait && held == Some(wakeups.targeted) {
             #[cfg(test)]
             event.legacy_held_waits.fetch_add(1, Ordering::Relaxed);
@@ -5144,6 +5206,13 @@ fn legacy_worker_thread(
         } else {
             wait
         };
+        #[cfg(test)]
+        if wake
+            && *wakeups == seen
+            && let Some(parking) = event.legacy_parking_signal.lock().take()
+        {
+            let _ = parking.try_send(());
+        }
         if *wakeups == seen {
             event.legacy_wake.wait_for(&mut wakeups, timeout);
         }
