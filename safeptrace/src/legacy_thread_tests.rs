@@ -1937,8 +1937,10 @@ async fn legacy_resume_racing_a_held_wait(late_notify_round: Option<usize>) {
             .unwrap()
             .unwrap()
             .assume_stopped();
-    // The turn a late notify gave the worker, paused at its start.
+    // The turn a late notify gave the worker, paused at its start, and the
+    // worker's count of waits a notify ended, once that notify had.
     let mut late_turn: Option<mpsc::SyncSender<()>> = None;
+    let mut late_wake: Option<usize> = None;
     for round in 0..ROUNDS {
         // At the previous read's exit stop: wait until the worker holds it
         // after every wake delivered to it, so that the pause below can only
@@ -1947,7 +1949,9 @@ async fn legacy_resume_racing_a_held_wait(late_notify_round: Option<usize>) {
         // worker until the resume below.
         wait_for_fresh_held_wait(&event, held, &format!("round {round}: read exit"), || {
             if let Some(release) = late_turn.take() {
-                release.send(()).unwrap();
+                release.send(()).unwrap_or_else(|_| {
+                    panic!("round {round}: the late turn resumed by itself before the sync released it")
+                });
             }
         });
         let (captured, capture) = mpsc::sync_channel(1);
@@ -1966,31 +1970,60 @@ async fn legacy_resume_racing_a_held_wait(late_notify_round: Option<usize>) {
             &event.legacy_held_wait_pause
         };
         *slot.lock() = Some(pause);
+        let check_capture = || {
+            if round % 2 == 1 {
+                let (status, count) = event
+                    .legacy_held_wait_paused_on
+                    .lock()
+                    .take()
+                    .unwrap_or_else(|| panic!("round {round}: the held-wait pause recorded nothing"));
+                assert!(
+                    count > armed,
+                    "round {round}: the pause captured the old stop: it held status {status:#x} \
+                     published at targeted wakeup count {count}, and the pause was armed at {armed}"
+                );
+            }
+        };
+        let mut captured_before_resume = false;
         if let Some(release) = late_turn.take() {
+            // The sync returned with the late turn still pending. If the
+            // worker parked again after the late wake, that turn resumed by
+            // itself and the schedule this test forces did not happen.
+            assert!(
+                event.legacy_held_wait_wakes.load(Ordering::Relaxed)
+                    < event.legacy_notify_wakes.load(Ordering::Relaxed),
+                "round {round}: the late turn resumed by itself (its pause's 2 s bound) before the \
+                 sync could wait it out; the forced schedule did not happen"
+            );
             // The sync accepted the held wait that the late notify ended. As
             // in the failed run, the late turn runs once the pause is armed
-            // and before the resume: let it reach the pause.
+            // and before the resume. It must take the pause before anything
+            // resumes the thread, so that only the old stop is there to take.
+            // The bound is under the turn's own pause bound (2 s), so a turn
+            // that never runs is not mistaken for one that ran.
             drop(release);
-            let deadline = Instant::now() + Duration::from_millis(1500);
-            while slot.lock().is_some() && Instant::now() < deadline {
-                thread::sleep(Duration::from_micros(200));
-            }
+            capture
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap_or_else(|_| panic!("round {round}: the late turn never reached the armed pause"));
+            check_capture();
+            captured_before_resume = true;
+        } else if let Some(late_wake) = late_wake.take() {
+            // The sync released the late turn and waited for the held wait
+            // the worker started after it.
+            let held_wait_wakes = event.legacy_held_wait_wakes.load(Ordering::Relaxed);
+            assert!(
+                held_wait_wakes >= late_wake
+                    && event.legacy_worker_wakes.load(Ordering::Relaxed) == held_wait_wakes,
+                "round {round}: the sync accepted a held wait that began before the late wake was \
+                 observed"
+            );
         }
         let entry = next_syscall_stop(child).await;
-        capture
-            .recv_timeout(TRACEE_WAIT_TIMEOUT)
-            .unwrap_or_else(|_| panic!("round {round}: the worker never reached the pause"));
-        if round % 2 == 1 {
-            let (status, count) = event
-                .legacy_held_wait_paused_on
-                .lock()
-                .take()
-                .unwrap_or_else(|| panic!("round {round}: the held-wait pause recorded nothing"));
-            assert!(
-                count > armed,
-                "round {round}: the pause captured the old stop: it held status {status:#x} \
-                 published at targeted wakeup count {count}, and the pause was armed at {armed}"
-            );
+        if !captured_before_resume {
+            capture
+                .recv_timeout(TRACEE_WAIT_TIMEOUT)
+                .unwrap_or_else(|_| panic!("round {round}: the worker never reached the pause"));
+            check_capture();
         }
         assert!(is_read_entry(&entry), "round {round}: not at the read entry");
         let running = entry.syscall(None).unwrap();
@@ -2013,6 +2046,9 @@ async fn legacy_resume_racing_a_held_wait(late_notify_round: Option<usize>) {
         assert_eq!(stop, crate::Event::Syscall);
         if let Some(late) = late {
             late_turn = Some(late.join().unwrap());
+            // The helper saw the late notify end the held wait, and the
+            // worker is held at the start of its next turn.
+            late_wake = Some(event.legacy_worker_wakes.load(Ordering::Relaxed));
         }
         child = exit;
     }
