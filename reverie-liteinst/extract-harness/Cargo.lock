@@ -134,7 +134,7 @@ dependencies = [
 
 [[package]]
 name = "reverie-inguest"
-version = "0.5.6"
+version = "0.5.7"
 dependencies = [
  "libc",
  "reverie-syscalls",
@@ -143,14 +143,14 @@ dependencies = [
 
 [[package]]
 name = "reverie-memory"
-version = "0.5.6"
+version = "0.5.7"
 dependencies = [
  "syscalls",
 ]
 
 [[package]]
 name = "reverie-syscalls"
-version = "0.5.6"
+version = "0.5.7"
 dependencies = [
  "bitflags",
  "derive_more",

@@ -4,6 +4,85 @@ Versions 0.5.1 and 0.5.3 describe selected development snapshots; 0.5.0
 describes the registry release. Backend-specific entries retain the limits
 of those execution paths.
 
+## 0.5.7
+
+Release cut for the 2026-11-11 fbsource import, taken at Reverie main. It
+summarizes the commits from the 0.5.6 cut (`f2129d99`) to this one, 88 of
+them.
+
+- reverie-procfs: a new crate of pure `/proc` helpers. LinuxEmu's path
+  classification, single-record `seq_file` positioning, synthetic `stat` and
+  `statx` metadata, and the `maps` line and `status` name formats move into
+  it, with unchanged output. It also holds strict `mountinfo` and fdinfo
+  `mnt_id` parsers, an fdinfo renderer, and the 36 fixed system-wide procfs
+  files, rendered from a caller-supplied machine description. A purity guard
+  (clippy's disallowed types and methods, and a source scan in
+  `tests/purity.rs`) keeps clocks, files, the environment, randomness,
+  threads, processes and the network out of the crate.
+- LinuxEmu signals: `pidfd_send_signal`, which answered `ENOSYS`, makes
+  Linux's checks in Linux's order; a pidfd from outside the run and
+  `PIDFD_SIGNAL_PROCESS_GROUP` are refused by name, and the KVM executor
+  declares the Linux 6.17 spelling of `PIDFD_SELF_THREAD` and
+  `PIDFD_SELF_THREAD_GROUP`, so a Tool forwards them unchanged. A Tool that
+  selects recipients can ask for signals between processes
+  (`ProcessSignalControl::enable_cross_process_signals`); such a send then
+  queues on the target as Linux's `do_send_sig_info` does, choosing and
+  waking no thread, and without the request it stays refused. `kill` and
+  `rt_sigqueueinfo` accept any live thread's id; a stop signal and
+  `SIGCONT` flush each other from a process's queues; and a caller's
+  siginfo of unknown layout must be readable (`EFAULT`) and end in zeros
+  (`E2BIG`).
+- LinuxEmu memory map: a file on overlayfs, as in podman's and docker's
+  default container root, gets its `VmFlags` from a probe mapping of the
+  same open file on the host kernel, and the new `MappingFact::thp_eligible`
+  carries the kernel's `THPeligible` for files on overlayfs and tmpfs. A
+  file `mmap` no longer reads the supervisor's whole `/proc/self/mountinfo`:
+  the superblock device comes from `statmount(2)` on Linux 6.8 and later,
+  and elsewhere from a table read again only after a mount event. Two KVM
+  runs of a git workload in a container with 886 mounts had spent 1.81 s of
+  their 6.28 s in those reads.
+- In-guest runtime on aarch64: exec-stop's capture, drain and restore of a
+  stopped entry context, and its `svc` child syscall bridge, build and pass
+  their tests natively; the exec-private features still refuse to compile
+  there. safeptrace adds aarch64 accessors for `TPIDR_EL0` and for the
+  syscall number at an exec stop.
+- In-guest launcher: the retention frame and confirmed retirement of a
+  mapped first-image launch move from Hermit into reverie-inguest
+  (`exec_stop::mapped_launch`), so other embedders can reuse them. A frame
+  retains only a spawn made with its own receipt.
+- Loader: a mapped successor decodes the coordinator endpoint stamped with
+  its packet and refuses an absent, duplicate or empty one by name;
+  `valid_mapped_input_range` checks a mapped entry's input bounds.
+- LiteInst artifact: the mapped-entry producer picks its consumer (Detcore
+  or literoot) once per source transaction, from a closed descriptor. A new
+  Cargo git binding requires every Reverie crate at the pinned revision and
+  refuses local path patches, forks, registry swaps and stale revisions.
+  Detcore's selection, link arguments and refusal texts are unchanged;
+  literoot images do not link yet.
+- Stable Rust: the LiteInst artifact qualifier accepts what rustc 1.97.1
+  builds: the native Detcore runtime, whose `INSTALLATION_DEPTH` TLS cell
+  is at 0xf8 (its allocation body and FnOnce thunk), and the release
+  LiteInst constructor (cell 0x30). Each new template is copied from the
+  real image, and no mask is widened. `scripts/detcore-alloc-recipe.py`
+  derives Detcore recipe rows from an ELF, and validation runs its
+  `--self-test`.
+- safeptrace: before Linux 6.9, a wait built right after a successful
+  resume no longer reads `TracerPid` from `/proc/<tid>/status`, so the
+  outcome after a non-leader `exec` no longer depends on host timing, and
+  the observation worker's wakeup costs about two fewer context switches
+  per non-leader stop.
+- Build: `cargo check --workspace --all-targets` passes on aarch64, except
+  for reverie-liteinst-preload, which refuses aarch64 by design. Reverie's
+  BUCK files equal fbsource's copies, and the ten generic conformance tests
+  move to `tests/BUCK` (`reverie//:generic-basics` is now
+  `reverie//tests:basics`).
+- Packaging: the `oss_cargo/` manifest copies are retired. Each crate's
+  `Cargo.toml` exists once, at its crate path.
+- Align every first-party package and internal requirement at 0.5.7. The
+  LiteInst artifact identity checks now require 0.5.7 and still reject
+  0.5.6, 0.5.5, 0.5.4, 0.5.1 and older identities. A new reviewed TLS source
+  tuple records the version-only change to the two runtime manifests.
+
 ## 0.5.6
 
 Release cut for the 2026-11-10 fbsource import, taken at Reverie main. It
