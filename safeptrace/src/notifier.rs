@@ -2953,10 +2953,10 @@ impl EventHandle {
 
     /// What a [`crate::ResumeMark`] records after a successful resume request
     /// on `pid` through this handle: the Event it resolves to now (by
-    /// address), `pid`'s detach epoch, and `owner`, the resuming tracer if
-    /// the caller knows it. The token that carries the mark keeps the Event
-    /// alive, and the proof keeps the owner alive, so neither address can be
-    /// reused while the mark exists.
+    /// address), the detach count of TID `pid`, and `owner`, the resuming
+    /// tracer if the caller knows it. The token that carries the mark keeps
+    /// the Event alive, and the proof keeps the owner alive, so neither
+    /// address can be reused while the mark exists.
     pub(super) fn resume_proof(
         &self,
         pid: Pid,
@@ -2965,14 +2965,14 @@ impl EventHandle {
         ResumeProof {
             owner: owner.cloned(),
             event: Arc::as_ptr(self.event()).addr(),
-            epoch: detach_epoch(pid).load(Ordering::SeqCst),
+            epoch: detach_epoch(pid),
         }
     }
 
     /// Whether `proof` still holds for a wait on `pid` whose effective owner
-    /// is `owner`: this handle resolves to the same Event, no detach of any
-    /// task in `pid`'s bucket was requested since, through any capability
-    /// on any Event, and the wait is driven by the owner that resumed. A
+    /// is `owner`: this handle resolves to the same Event, no detach request
+    /// naming TID `pid` was issued since, through any capability on any
+    /// Event, and the wait is driven by the owner that resumed. A
     /// proof that records no owner never holds: a later wait may be driven by
     /// an owner it does not know (a sibling thread after the tracer exits,
     /// say), so that wait reads as before.
@@ -2984,7 +2984,8 @@ impl EventHandle {
     ) -> bool {
         proof.is_some_and(|proof| {
             Arc::as_ptr(self.event()).addr() == proof.event
-                && detach_epoch(pid).load(Ordering::SeqCst) == proof.epoch
+                && proof.epoch.is_some()
+                && detach_epoch(pid) == proof.epoch
                 && owner
                     .zip(proof.owner.as_ref())
                     .is_some_and(|(owner, resumer)| Arc::ptr_eq(owner, resumer))
@@ -7764,43 +7765,87 @@ thread_local! {
     static TRACER_PID_READS_FOR_TEST: Cell<usize> = const { Cell::new(0) };
 }
 
-/// How many detach-epoch buckets [`DETACH_EPOCHS`] has.
-const DETACH_EPOCH_BUCKETS: usize = 4096;
+/// Every TID is below this: `pid_max` is at most `PID_MAX_LIMIT`, which is
+/// 2^22 on 64-bit Linux (include/linux/threads.h, kernel/pid.c
+/// `pid_max_max`).
+const DETACH_EPOCH_TID_LIMIT: usize = 1 << 22;
 
-/// Detach requests, counted per task before each request is issued, in
-/// buckets keyed by TID. A [`crate::ResumeMark`] records its task's bucket at
-/// the resume and holds only while the bucket is unchanged.
+/// TIDs per block of [`DETACH_EPOCH_BLOCKS`]: 32 KiB of counters.
+const DETACH_EPOCH_BLOCK: usize = 4096;
+
+/// How many blocks cover every TID: 1,024.
+const DETACH_EPOCH_BLOCK_COUNT: usize = DETACH_EPOCH_TID_LIMIT / DETACH_EPOCH_BLOCK;
+
+/// The detach requests issued for each exact TID, counted immediately
+/// before each request ([`note_detach`]). A [`crate::ResumeMark`] records
+/// its TID's count at the resume and holds only while it is unchanged.
 ///
-/// The count is keyed by task, not by Event. Before Linux 6.9 the public API
-/// routinely gives out capabilities for one live task on unrelated Events: a
-/// failed Native capture yields a fresh Event (`Stopped::new_unchecked`,
-/// `Wait::from_raw`, `wait_all`). A detach through any of them must cancel
-/// the mark. It is not one process-wide counter either, so that a detach of
-/// one task does not cancel every other task's marks. Two TIDs that share a
-/// bucket only cancel marks they did not need to: those waits read as
-/// before.
-static DETACH_EPOCHS: [AtomicU64; DETACH_EPOCH_BUCKETS] =
-    [const { AtomicU64::new(0) }; DETACH_EPOCH_BUCKETS];
+/// - **Keyed by the exact TID.** Not by Event: before Linux 6.9 the public
+///   API routinely gives out capabilities for one live task on unrelated
+///   Events (a failed Native capture yields a fresh Event:
+///   `Stopped::new_unchecked`, `Wait::from_raw`, `wait_all`), and a detach
+///   through any of them must cancel the mark. Not by a shared bucket or
+///   one global count either: an unrelated task's detach would cancel the
+///   mark, and the read that follows can record a live-owner note that
+///   holds off the ECHILD retirement after a non-leader exec (see
+///   [`note_detached_wait_if_untraced`]). While the marked task lives, no
+///   other task holds its TID, so only a request naming that task itself
+///   moves its count.
+/// - **Never removed or reset.** A count only grows, so it cannot return to
+///   a value a mark recorded: there is no remove-and-recreate ABA, and a
+///   wrap needs 2^64 requests for one TID. A TID reused after a reap keeps
+///   its count: a later detach of the new task cancels an old mark (which
+///   then reads as before), and without one the old mark names a reaped
+///   task, whose read finds no live untraced task either.
+/// - **Bounded.** A block is allocated by the first detach of a TID in it
+///   and kept; reads of an unallocated block see 0. At most every block:
+///   2^22 counters, 32 MiB.
+/// - **Ordering.** The count is bumped (SeqCst) before the request, a
+///   successful resume loads it (SeqCst) before it returns, and the wait
+///   loads it again (SeqCst) when it is built. A block's allocation is
+///   published through its `OnceLock` (release on set, acquire on get).
+static DETACH_EPOCH_BLOCKS: [OnceLock<Box<[AtomicU64]>>; DETACH_EPOCH_BLOCK_COUNT] =
+    [const { OnceLock::new() }; DETACH_EPOCH_BLOCK_COUNT];
 
-fn detach_epoch(pid: Pid) -> &'static AtomicU64 {
-    &DETACH_EPOCHS[pid.as_raw() as u32 as usize % DETACH_EPOCH_BUCKETS]
+/// The block and the index in it of TID `pid`'s count; `None` for a value
+/// that is not a Linux TID.
+fn detach_epoch_slot(pid: Pid) -> Option<(usize, usize)> {
+    let tid = usize::try_from(pid.as_raw())
+        .ok()
+        .filter(|tid| *tid < DETACH_EPOCH_TID_LIMIT)?;
+    Some((tid / DETACH_EPOCH_BLOCK, tid % DETACH_EPOCH_BLOCK))
 }
 
-/// Counts a detach request for `pid`, before it is issued, whatever
-/// capability or Event the request goes through.
+/// The detach requests counted so far for TID `pid`; `None`, which no proof
+/// accepts, for a value that is not a Linux TID.
+fn detach_epoch(pid: Pid) -> Option<u64> {
+    let (block, index) = detach_epoch_slot(pid)?;
+    Some(
+        DETACH_EPOCH_BLOCKS[block]
+            .get()
+            .map_or(0, |block| block[index].load(Ordering::SeqCst)),
+    )
+}
+
+/// Counts a detach request naming TID `pid`, immediately before it is
+/// issued, whatever capability or Event the request goes through.
 pub(super) fn note_detach(pid: Pid) {
-    detach_epoch(pid).fetch_add(1, Ordering::SeqCst);
+    if let Some((block, index)) = detach_epoch_slot(pid) {
+        DETACH_EPOCH_BLOCKS[block]
+            .get_or_init(|| (0..DETACH_EPOCH_BLOCK).map(|_| AtomicU64::new(0)).collect())[index]
+            .fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 /// What a [`crate::ResumeMark`] proves: a successful resume request by the
 /// tracer `owner` (none when the resuming token does not identify it; see
 /// `Stopped::into_running_resumed`), resolved to the Event at address
-/// `event`, when its task's detach bucket read `epoch`.
+/// `event`, when its TID's detach count read `epoch`.
 #[derive(Clone, Debug)]
 pub(super) struct ResumeProof {
     owner: Option<Arc<LegacyWaitOwner>>,
     event: usize,
-    epoch: u64,
+    epoch: Option<u64>,
 }
 
 /// Records a generation-bound wait created while its task is detached,

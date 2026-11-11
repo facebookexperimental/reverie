@@ -2349,24 +2349,28 @@ impl Stopped {
         if let Err(errno) = self.flush_regs_retaining() {
             return Err((self, errno));
         }
-        // Before the request, whatever it returns: an errno does not
-        // establish that the detach did not happen ([`ResumeMark`]).
-        #[cfg(feature = "notifier")]
-        notifier::note_detach(self.0);
-        let result = self
-            .1
-            .on_held_tid(|| ptrace::detach(self.0.into(), sig).map_err(nix_errno));
+        // Counted immediately before the request, once the TID gate lets it
+        // through, whatever it returns: an errno does not establish that
+        // the detach did not happen ([`ResumeMark`]). A request the gate
+        // refuses never reaches the kernel and counts nothing.
+        let result = self.1.on_held_tid(|| {
+            #[cfg(feature = "notifier")]
+            notifier::note_detach(self.0);
+            ptrace::detach(self.0.into(), sig).map_err(nix_errno)
+        });
         self.finish_retained_resume(result)
     }
 
     /// Detaches from and then resumes the stopped tracee.
     pub fn detach<T: Into<Option<Signal>>>(self, sig: T) -> Result<Running, Error> {
         self.flush_regs()?;
-        // Before the request, as in [`Self::detach_retaining`].
-        #[cfg(feature = "notifier")]
-        notifier::note_detach(self.0);
+        // Counted as in [`Self::detach_retaining`].
         self.1
-            .on_held_tid(|| ptrace::detach(self.0.into(), sig).map_err(nix_errno))
+            .on_held_tid(|| {
+                #[cfg(feature = "notifier")]
+                notifier::note_detach(self.0);
+                ptrace::detach(self.0.into(), sig).map_err(nix_errno)
+            })
             .map_err(|err| self.map_err(err))?;
         Ok(self.into_running())
     }
@@ -2377,11 +2381,13 @@ impl Stopped {
     /// `0` delivers nothing.
     pub fn detach_raw(self, sig: i32) -> Result<Running, Error> {
         self.flush_regs()?;
-        // Before the request, as in [`Self::detach_retaining`].
-        #[cfg(feature = "notifier")]
-        notifier::note_detach(self.0);
+        // Counted as in [`Self::detach_retaining`].
         self.1
-            .on_held_tid(|| ptrace_resume_raw(libc::PTRACE_DETACH, self.0, sig))
+            .on_held_tid(|| {
+                #[cfg(feature = "notifier")]
+                notifier::note_detach(self.0);
+                ptrace_resume_raw(libc::PTRACE_DETACH, self.0, sig)
+            })
             .map_err(|err| self.map_err(err))?;
         Ok(self.into_running())
     }
@@ -2523,14 +2529,14 @@ pub struct Running(Pid, TraceeToken, ResumeMark);
 /// stop (`PTRACE_CONT`, `PTRACE_SYSCALL`, `PTRACE_SINGLESTEP` or
 /// `PTRACE_SINGLEBLOCK`; [`Stopped::into_running_resumed`]), and if so what
 /// that proves (`notifier::ResumeProof`): the resuming token's ptracer
-/// owner, the Event the request resolved to, and the task's detach epoch
+/// owner, the Event the request resolved to, and the TID's detach count
 /// then.
 ///
 /// A successful resume request passed `ptrace_check_attach` for the calling
 /// thread, with the tracee in a ptrace-stop. After it, only that tracer can
-/// make the task untraced, by its own `PTRACE_DETACH` (counted per task,
-/// through any capability) or by exiting. A wait built on such a value and
-/// driven by that same owner, while the Event and the task's detach epoch
+/// make the task untraced, by its own `PTRACE_DETACH` (counted per exact
+/// TID, through any capability) or by exiting. A wait built on such a value
+/// and driven by that same owner, while the Event and the TID's detach count
 /// are unchanged, therefore skips the TracerPid read that looks for a
 /// detached wait (`notifier::note_detached_wait_if_untraced`, which also
 /// states the de_thread exception). A proof from an ownerless token never
