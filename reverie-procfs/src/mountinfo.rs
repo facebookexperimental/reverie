@@ -20,6 +20,11 @@ pub struct MountInfoRow {
     pub raw_device: u64,
     pub root: Vec<u8>,
     pub raw_peer_groups: Vec<u64>,
+    /// The superblock options verbatim (the comma-separated field after
+    /// the source, e.g. `ro,relatime`). Callers split on `,`; flags such
+    /// as `ro` versus `rw` come from here when `statmount(2)` is
+    /// unavailable.
+    pub super_options: Vec<u8>,
 }
 
 /// The optional-field prefixes that carry mount peer-group numbers.
@@ -78,6 +83,7 @@ fn parse_mountinfo_row(line: &[u8]) -> Option<MountInfoRow> {
         raw_device: libc::makedev(major, minor),
         root: fields[3].to_vec(),
         raw_peer_groups,
+        super_options: fields[separator + 3].to_vec(),
     })
 }
 
@@ -159,6 +165,10 @@ mod tests {
         assert_eq!(parsed[0].raw_parent_id, 1);
         assert_eq!(parsed[0].root, b"/");
         assert_eq!(parsed[0].raw_peer_groups, [9]);
+        assert_eq!(parsed[0].super_options, b"rw");
+        let readonly = parse_mountinfo(b"37 1 8:1 / / ro shared:9 - ext4 /dev/root ro,relatime\n")
+            .expect("valid readonly mountinfo row");
+        assert_eq!(readonly[0].super_options, b"ro,relatime");
         assert!(parse_mountinfo(b"37 1 bad / / rw - ext4 /dev/root rw\n").is_none());
         assert!(
             parse_mountinfo(b"37 1 8:1 / / rw unbindable nosymfollow - ext4 /dev/root rw\n")
