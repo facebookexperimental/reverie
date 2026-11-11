@@ -3229,10 +3229,28 @@ mod test {
     -> Result<(), Box<dyn std::error::Error>> {
         let (pid, stopped) = trace(
             || {
-                thread::spawn(|| {
-                    thread::sleep(std::time::Duration::from_secs(5));
+                // A raw pthread, not `std::thread::spawn`: see
+                // `spawn_tracee_thread`, which this test does not share
+                // because it also runs in sanitized builds.
+                extern "C" fn sleep_then_exit(_: *mut libc::c_void) -> *mut libc::c_void {
+                    let mut left = 5;
+                    while left > 0 {
+                        left = unsafe { libc::sleep(left) };
+                    }
                     unsafe { libc::_exit(0) }
-                });
+                }
+                let mut sibling = std::mem::MaybeUninit::<libc::pthread_t>::uninit();
+                let created = unsafe {
+                    libc::pthread_create(
+                        sibling.as_mut_ptr(),
+                        std::ptr::null(),
+                        sleep_then_exit,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if created != 0 {
+                    unsafe { libc::_exit(126) };
+                }
                 // End only the traced main thread. The sibling keeps the
                 // group alive, leaving a zombie group leader.
                 loop {

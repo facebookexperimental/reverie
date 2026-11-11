@@ -235,13 +235,7 @@ mod stop_observation_tests {
             ForkResult::Parent { child } => child,
             ForkResult::Child => {
                 crate::traceme_and_stop().unwrap();
-                std::thread::spawn(|| {
-                    let args = [c"/bin/true".as_ptr(), std::ptr::null()];
-                    unsafe {
-                        libc::execv(args[0], args.as_ptr());
-                        libc::_exit(127);
-                    }
-                });
+                spawn_exec_true_thread_in_fork_child();
                 loop {
                     unsafe {
                         libc::pause();

@@ -11966,19 +11966,47 @@ mod test {
         actual_nonleader_exec_owned_case(false).await;
     }
 
+    /// Starts a thread that execs `/bin/true`, in a fork child of this
+    /// multithreaded test process. The exec makes the child's leader an old
+    /// leader.
+    ///
+    /// A `std::thread` takes std's process-wide thread-info lock as it
+    /// starts and as it exits. A fork taken while another test's thread held
+    /// that lock leaves the child's copy locked with no owner, and a
+    /// `std::thread::spawn` there would block forever before running its
+    /// closure (<https://github.com/rrnewton/reverie/issues/1459>). Raw
+    /// `pthread_create` runs no std code in the new thread, as in
+    /// `spawn_legacy_threads`. The thread only calls `execv` and, if that
+    /// returns, `_exit(127)`.
+    fn spawn_exec_true_thread_in_fork_child() {
+        extern "C" fn exec_true(_: *mut libc::c_void) -> *mut libc::c_void {
+            let args = [c"/bin/true".as_ptr(), std::ptr::null()];
+            unsafe {
+                libc::execv(args[0], args.as_ptr());
+                libc::_exit(127)
+            }
+        }
+        let mut thread = std::mem::MaybeUninit::<libc::pthread_t>::uninit();
+        let created = unsafe {
+            libc::pthread_create(
+                thread.as_mut_ptr(),
+                std::ptr::null(),
+                exec_true,
+                std::ptr::null_mut(),
+            )
+        };
+        if created != 0 {
+            unsafe { libc::_exit(126) };
+        }
+    }
+
     async fn actual_nonleader_exec_owned_case(force_legacy: bool) {
         let deadline = Instant::now() + Duration::from_secs(3);
         let root = match unsafe { fork() }.unwrap() {
             ForkResult::Parent { child } => child,
             ForkResult::Child => {
                 crate::traceme_and_stop().unwrap();
-                std::thread::spawn(|| {
-                    let args = [c"/bin/true".as_ptr(), std::ptr::null()];
-                    unsafe {
-                        libc::execv(args[0], args.as_ptr());
-                        libc::_exit(127);
-                    }
-                });
+                spawn_exec_true_thread_in_fork_child();
                 loop {
                     unsafe {
                         libc::pause();
