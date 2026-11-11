@@ -53,12 +53,15 @@
 //! backend gives the guest none: no `[vdso]`, `[vvar]` or `[vsyscall]`, as
 //! Linux lists none for a kernel booted with `vdso=0` and `vsyscall=none`.
 
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
 use std::os::fd::RawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::PoisonError;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
@@ -194,13 +197,75 @@ fn fstat_identity(fd: libc::c_int) -> Option<(u64, u64)> {
     Some((stat.st_dev, stat.st_ino))
 }
 
+/// The superblock devices [`superblock_device`] has read, by the unique id of
+/// the mount each was read for (`STATX_MNT_ID_UNIQUE`, an id Linux never
+/// gives a second mount). A mount's superblock is fixed for the mount's
+/// life, so each mount's `mountinfo` line is read once rather than at every
+/// mapping of a file on it: every file `mmap` asks, and a read of the whole
+/// `mountinfo` takes milliseconds on a host with hundreds of mounts and waits
+/// behind any mount or unmount on the host.
+static SUPERBLOCK_DEVICES: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
+
 /// The device number of the superblock of host descriptor `fd`'s file, which
 /// Linux prints in `maps` (`i_sb->s_dev`) and which need not be the file's
 /// `st_dev` (btrfs gives each subvolume one of its own): the `major:minor`
-/// field of the supervisor's `mountinfo` line for the descriptor's mount.
-/// `None` where the mount is not in the supervisor's namespace (an internal
-/// one, such as a memfd's), whose files' `st_dev` is the superblock's.
+/// field of the supervisor's `mountinfo` line for the descriptor's mount,
+/// read once per mount where the host kernel names mounts uniquely
+/// ([`SUPERBLOCK_DEVICES`]). `None` where the mount is not in the
+/// supervisor's namespace (an internal one, such as a memfd's), whose files'
+/// `st_dev` is the superblock's.
 fn superblock_device(fd: libc::c_int) -> Option<u64> {
+    let mount = unique_mount_id(fd);
+    if let Some(mount) = mount
+        && let Some(device) = SUPERBLOCK_DEVICES
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&mount)
+    {
+        return Some(*device);
+    }
+    let device = superblock_device_in_mountinfo(fd)?;
+    if let Some(mount) = mount {
+        SUPERBLOCK_DEVICES
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(mount, device);
+    }
+    Some(device)
+}
+
+/// The unique id of the mount host descriptor `fd`'s file is on
+/// (`statx(2)`'s `STATX_MNT_ID_UNIQUE`), or `None` where the host kernel
+/// does not give one (before Linux 6.8).
+fn unique_mount_id(fd: libc::c_int) -> Option<u64> {
+    #[cfg(test)]
+    if NO_UNIQUE_MOUNT_ID_TEST_HOOK.with(std::cell::Cell::get) {
+        return None;
+    }
+    let mut extended = std::mem::MaybeUninit::<libc::statx>::zeroed();
+    // SAFETY: statx of the descriptor itself writes at most one statx, read
+    // only on success; the path is NUL-terminated.
+    if unsafe {
+        libc::statx(
+            fd,
+            c"".as_ptr(),
+            libc::AT_EMPTY_PATH,
+            libc::STATX_MNT_ID_UNIQUE,
+            extended.as_mut_ptr(),
+        )
+    } != 0
+    {
+        return None;
+    }
+    // SAFETY: statx succeeded.
+    let extended = unsafe { extended.assume_init() };
+    (extended.stx_mask & libc::STATX_MNT_ID_UNIQUE != 0).then_some(extended.stx_mnt_id)
+}
+
+/// [`superblock_device`] read from the supervisor's `mountinfo`.
+fn superblock_device_in_mountinfo(fd: libc::c_int) -> Option<u64> {
+    #[cfg(test)]
+    MOUNTINFO_READS.with(|reads| reads.set(reads.get() + 1));
     let fdinfo = read_small(&format!("/proc/self/fdinfo/{fd}"))?;
     let mount = fdinfo
         .lines()
@@ -246,6 +311,13 @@ fn file_name(fd: libc::c_int) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 thread_local! {
+    /// The times this thread has read `mountinfo` for a superblock device
+    /// (`superblock_device_in_mountinfo`).
+    static MOUNTINFO_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// While set, makes this thread's `unique_mount_id` find none, as on a
+    /// kernel before 6.8.
+    static NO_UNIQUE_MOUNT_ID_TEST_HOOK: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
     /// Makes this thread's next `compare_descriptions` fail its `kcmp`, as a
     /// kernel without `CONFIG_KCMP` (ENOSYS) or a policy that denies it
     /// (EPERM) would.
@@ -878,4 +950,68 @@ pub(crate) fn mark_guarded_lines(
     let low = line_holding(memory, image, start).map_or(start, |line| line.start);
     let high = line_holding(memory, image, end - page).map_or(end, |line| line.end);
     set_flags(memory, low, high, FLAG_MAYBE_GUARD);
+}
+
+#[cfg(test)]
+mod superblock_device_tests {
+    use super::*;
+
+    /// An open file of this test's own in the temporary directory, already
+    /// unlinked.
+    fn scratch_file(name: &str) -> std::fs::File {
+        let path = std::env::temp_dir().join(format!(
+            "reverie-superblock-device-{name}-{}",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"x").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        file
+    }
+
+    /// The device the cache answers is the one `mountinfo` gives, for a
+    /// file read once and for a second file on the same mount.
+    #[test]
+    fn a_cached_superblock_device_is_the_one_mountinfo_gives() {
+        let first = scratch_file("first");
+        let second = scratch_file("second");
+        let expected = superblock_device_in_mountinfo(first.as_raw_fd());
+        assert!(
+            expected.is_some(),
+            "the temporary directory's mount is listed"
+        );
+        assert_eq!(superblock_device(first.as_raw_fd()), expected);
+        assert_eq!(superblock_device(second.as_raw_fd()), expected);
+    }
+
+    /// Once a mount's device is known, a mapping of another file on it reads
+    /// no `mountinfo`: every file mmap asks for the device.
+    #[test]
+    fn a_second_file_on_a_known_mount_reads_no_mountinfo() {
+        let first = scratch_file("known");
+        assert!(
+            unique_mount_id(first.as_raw_fd()).is_some(),
+            "the host kernel names mounts uniquely (Linux 6.8 and later)"
+        );
+        superblock_device(first.as_raw_fd()).unwrap();
+        let second = scratch_file("again");
+        let before = MOUNTINFO_READS.with(std::cell::Cell::get);
+        superblock_device(second.as_raw_fd()).unwrap();
+        assert_eq!(MOUNTINFO_READS.with(std::cell::Cell::get), before);
+    }
+
+    /// Without unique mount ids nothing is kept, and each mapping reads
+    /// `mountinfo` for the same device, as before the cache.
+    #[test]
+    fn without_unique_mount_ids_each_file_reads_mountinfo() {
+        let file = scratch_file("uncached");
+        let expected = superblock_device_in_mountinfo(file.as_raw_fd());
+        NO_UNIQUE_MOUNT_ID_TEST_HOOK.with(|hook| hook.set(true));
+        let before = MOUNTINFO_READS.with(std::cell::Cell::get);
+        assert_eq!(superblock_device(file.as_raw_fd()), expected);
+        assert_eq!(superblock_device(file.as_raw_fd()), expected);
+        let reads = MOUNTINFO_READS.with(std::cell::Cell::get) - before;
+        NO_UNIQUE_MOUNT_ID_TEST_HOOK.with(|hook| hook.set(false));
+        assert_eq!(reads, 2);
+    }
 }
