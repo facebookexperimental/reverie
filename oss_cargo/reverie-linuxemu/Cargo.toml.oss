@@ -25,6 +25,7 @@ kvm-bindings = "0.14.1"
 libc = "0.2.186"
 reverie = { version = "0.5.6", path = "../reverie", package = "reverie-core" }
 reverie-kvm-core = { version = "0.5.6", path = "../reverie-kvm-core" }
+reverie-procfs = { version = "0.5.6", path = "../reverie-procfs" }
 thiserror = "2.0.18"
 tracing = "0.1.41"
 
