@@ -20,7 +20,14 @@
 //! The formatting rules follow Linux's procfs (`fs/proc/`); each helper
 //! names the kernel source it matches.
 
+pub mod fdinfo;
 pub mod mountinfo;
+
+pub use fdinfo::Fdinfo;
+pub use fdinfo::FdinfoKind;
+pub use fdinfo::FdinfoLock;
+pub use fdinfo::LockKind;
+pub use fdinfo::TimerfdLines;
 
 pub use mountinfo::MOUNT_PEER_PREFIXES;
 pub use mountinfo::MountInfoRow;
