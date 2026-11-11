@@ -185,6 +185,7 @@ fn ordinary_root_handoff_preserves_first_event_and_normal_fields() {
                     context: 0,
                     dispatch: SyscallDispatch::InstalledHook,
                     guest_pkru: None,
+                    unsupported_refusal: None,
                 };
                 unsafe { host.dispatch(&mut event) };
                 assert_eq!(event.result, 97);

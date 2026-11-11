@@ -51,10 +51,12 @@ struct Config {
     rust_exports: PathBuf,
     c_workload: PathBuf,
     oracle_sha256: BTreeMap<String, String>,
-    /// The leaf has exactly allocator-fixture; no default feature exists.
+    /// The leaf has allocator-fixture over its default liteinst enablement.
     expected_features: Vec<String>,
-    /// The standalone RV producer requires the ordinary dev profile.
-    /// H can reuse m1_artifact directly for its independent release producer.
+    /// The standalone RV producer requires the ordinary release profile:
+    /// the admitted pinned-standalone scalar cohort was qualified from
+    /// that compiler regime. H can reuse m1_artifact directly for its
+    /// independent release producer.
     profile_name: String,
     expected_cargo_profile: Value,
     deadline_seconds: u64,
@@ -82,9 +84,9 @@ fn oracle_hashes() -> BTreeMap<String, String> {
     ])
 }
 
-fn dev_profile() -> Value {
-    serde_json::json!({"opt_level":"0", "debuginfo":2, "debug_assertions":true,
-                       "overflow_checks":true, "test":false})
+fn release_profile() -> Value {
+    serde_json::json!({"opt_level":"3", "debuginfo":0, "debug_assertions":false,
+                       "overflow_checks":false, "test":false})
 }
 
 fn ci_config(generation: PathBuf) -> Result<Config> {
@@ -122,9 +124,13 @@ fn ci_config(generation: PathBuf) -> Result<Config> {
         rust_exports,
         c_workload,
         oracle_sha256: oracle_hashes(),
-        expected_features: vec!["allocator-fixture".to_owned()],
-        profile_name: "dev".to_owned(),
-        expected_cargo_profile: dev_profile(),
+        expected_features: vec![
+            "allocator-fixture".to_owned(),
+            "default".to_owned(),
+            "liteinst".to_owned(),
+        ],
+        profile_name: "release".to_owned(),
+        expected_cargo_profile: release_profile(),
         deadline_seconds: 540,
         max_command_stream_bytes: 64 << 20,
     };
@@ -346,10 +352,10 @@ fn produce(
         config.max_command_stream_bytes,
     )?;
     check(
-        config.expected_features == ["allocator-fixture"]
-            && config.profile_name == "dev"
-            && config.expected_cargo_profile == dev_profile(),
-        "RV diagnostic leaf requires independent singleton fixture features and the ordinary dev profile",
+        config.expected_features == ["allocator-fixture", "default", "liteinst"]
+            && config.profile_name == "release"
+            && config.expected_cargo_profile == release_profile(),
+        "RV diagnostic leaf requires independent fixture features and the ordinary release profile; a dev-profile body is outside this contract",
     )?;
     check(
         config.oracle_sha256 == oracle_hashes(),
@@ -455,7 +461,7 @@ fn produce(
         "--features".to_owned(),
         "allocator-fixture".to_owned(),
         "--profile".to_owned(),
-        config.profile_name.clone(),
+        "release".to_owned(),
         "--target-dir".to_owned(),
         target.to_string_lossy().into_owned(),
         "--message-format=json-render-diagnostics".to_owned(),

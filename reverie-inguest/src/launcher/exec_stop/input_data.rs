@@ -1,6 +1,10 @@
 //! Host-side copied input data. This does not construct an execution-eligible
-//! handoff: complete source-qualified code/site/binding records and the actual
-//! admitted HLIINIT1 packet still have no combined producer here.
+//! handoff: complete source-qualified code/site/binding records and a
+//! combined producer that computes the expected digests and seals an
+//! admitted handoff still do not exist here. [`build_init_packet`] only
+//! encodes caller-supplied values, and [`stamp_init_packet`] only writes
+//! host-validated packet bytes into a caller-owned blob and re-verifies
+//! table 3; neither admits, seals, maps, or releases anything.
 
 use reverie_loader::artifact::RUNTIME_WINDOW;
 use reverie_loader::artifact::TOOL_REGION;
@@ -11,6 +15,8 @@ use reverie_loader::image::PrivateRuntimeMetadata;
 use reverie_loader::image::ValidatedImage;
 use reverie_loader::musl_tls;
 
+use super::ChildOwner;
+use super::EntryContext;
 use super::InitialExecStop;
 use super::Result;
 use super::initial_inputs::CapturedInitialInputs;
@@ -443,6 +449,217 @@ fn build_data(
     })
 }
 
+/// Which birth a packet was stamped for, from the host's birth
+/// record. The packet protocol in HLSCAL01 table 3 is selected
+/// by this route, never by inspecting packet magic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InitPacketBirthKind {
+    /// First-image birth: no predecessor state deposit.
+    FirstImage,
+    /// Successor birth: a predecessor state deposit is expected.
+    Successor,
+}
+
+impl InitPacketBirthKind {
+    fn state_expected(self) -> bool {
+        matches!(self, Self::Successor)
+    }
+}
+
+/// The host's independent expectations for one packet: which
+/// birth it was stamped for and the exact digests from the
+/// registration/frozen records. Grouped under explicit field
+/// names so swapping the two digest values is visible by name
+/// at a call site; the fields remain plain `[u8; 32]` values,
+/// not distinct types.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InitPacketExpectation {
+    /// Birth kind from the host's birth record.
+    pub birth_kind: InitPacketBirthKind,
+    /// Expected SHA-256 of the exact canonical configuration bytes.
+    pub expected_config_digest: [u8; 32],
+    /// Expected SHA-256 of the exact predecessor state bytes;
+    /// all zero exactly for a first-image birth.
+    pub expected_state_digest: [u8; 32],
+}
+
+/// Host-validated contents of one HLISUC01 successor-init packet
+/// (the schema in `reverie_loader::init_packet`).
+/// Validation is syntactic plus birth-kind and digest equality;
+/// it is not admission, which stays with the coordinator-side
+/// one-use InitialImage redemption against the watched birth.
+/// The fields are private so only [`validate_init_packet`] can
+/// mint one, and the exact validated bytes are retained so a
+/// stamper can only write bytes that were validated.
+pub struct ValidatedInitPacket {
+    state_expected: bool,
+    expected_state_digest: [u8; 32],
+    redemption: Vec<u8>,
+    packet_bytes: Vec<u8>,
+}
+
+impl ValidatedInitPacket {
+    /// Whether this birth is a successor expecting a predecessor
+    /// state deposit. A clear value only says no deposit is
+    /// expected; it does not by itself prove a first-image birth,
+    /// and a successor entry must refuse it rather than
+    /// reinterpret it as an ordinary birth.
+    pub fn state_expected(&self) -> bool {
+        self.state_expected
+    }
+
+    /// Expected SHA-256 of the exact predecessor state bytes,
+    /// verbatim from the packet. All zero iff no state deposit
+    /// is expected.
+    pub fn expected_state_digest(&self) -> [u8; 32] {
+        self.expected_state_digest
+    }
+
+    /// Exact bounded redemption bytes to present for InitialImage
+    /// redemption, verbatim from the packet.
+    pub fn redemption(&self) -> &[u8] {
+        &self.redemption
+    }
+
+    /// Exact complete packet bytes that were validated, verbatim.
+    /// This is the only byte string a stamper may write for this
+    /// validation.
+    pub fn packet_bytes(&self) -> &[u8] {
+        &self.packet_bytes
+    }
+}
+
+fn init_packet_error(error: reverie_loader::init_packet::Error) -> Box<dyn std::error::Error> {
+    use reverie_loader::init_packet::Error;
+    match error {
+        Error::Format => "init_packet_format".into(),
+        Error::Version => "init_packet_version".into(),
+        Error::Reserved => "init_packet_reserved".into(),
+        Error::Flags => "init_packet_flags".into(),
+        Error::Bounds => "init_packet_bounds".into(),
+    }
+}
+
+/// Build one exact HLISUC01 packet for `expectation`. The caller
+/// computes `expected_config_digest` with
+/// `reverie_rpc_transport::initial_image::config_digest` over the
+/// final, canonical configuration bytes, and takes
+/// `expected_state_digest` only from frozen predecessor state
+/// bytes; this helper never hashes and never supplies a digest
+/// of its own.
+pub fn build_init_packet(expectation: InitPacketExpectation, redemption: &[u8]) -> Result<Vec<u8>> {
+    let flags = if expectation.birth_kind.state_expected() {
+        reverie_loader::init_packet::FLAG_STATE_EXPECTED
+    } else {
+        0
+    };
+    let mut buffer = [0u8; reverie_loader::init_packet::MAX_PACKET_LEN];
+    let written = reverie_loader::init_packet::encode_into(
+        &mut buffer,
+        flags,
+        &expectation.expected_config_digest,
+        &expectation.expected_state_digest,
+        redemption,
+    )
+    .map_err(init_packet_error)?;
+    Ok(buffer[..written].to_vec())
+}
+
+/// Host-validate one HLISUC01 packet against the host's birth
+/// record and independently expected digests (same computation
+/// contract as [`build_init_packet`]). A packet stamped for the
+/// other birth kind is refused as
+/// `init_packet_birth_kind_mismatch`; embedded digest
+/// differences are refused as
+/// `init_packet_config_digest_mismatch` or
+/// `init_packet_state_digest_mismatch`, before any preparation
+/// step may consume the packet.
+pub fn validate_init_packet(
+    packet: &[u8],
+    expectation: InitPacketExpectation,
+) -> Result<ValidatedInitPacket> {
+    let decoded = reverie_loader::init_packet::decode(packet).map_err(init_packet_error)?;
+    if decoded.state_expected() != expectation.birth_kind.state_expected() {
+        return Err("init_packet_birth_kind_mismatch".into());
+    }
+    if decoded.expected_config_digest() != expectation.expected_config_digest {
+        return Err("init_packet_config_digest_mismatch".into());
+    }
+    if decoded.expected_state_digest() != expectation.expected_state_digest {
+        return Err("init_packet_state_digest_mismatch".into());
+    }
+    Ok(ValidatedInitPacket {
+        state_expected: decoded.state_expected(),
+        expected_state_digest: decoded.expected_state_digest(),
+        redemption: decoded.redemption().to_vec(),
+        packet_bytes: packet.to_vec(),
+    })
+}
+
+fn stamp_handoff_error(error: reverie_loader::handoff::Error) -> Box<dyn std::error::Error> {
+    format!("init_packet_stamp_handoff: {error:?}").into()
+}
+
+/// Re-parse a serialized blob and require its table 3 to be
+/// exactly the validated packet bytes. A blob carrying any
+/// other bytes there is refused as `init_packet_table3_mismatch`
+/// rather than sealed or consumed. With the current
+/// `handoff::serialize`, whose table destination forces the
+/// table-3 count/stride and whose final `View::parse` refuses
+/// overlapping tables, this compare is a guard against future
+/// serializer changes rather than a mismatch reachable through
+/// [`stamp_init_packet`].
+fn verify_serialized_init_packet(
+    bytes: &[u8],
+    address: u64,
+    validated: &ValidatedInitPacket,
+) -> Result<()> {
+    let view = handoff::View::parse(bytes, address).map_err(stamp_handoff_error)?;
+    let stamped = view.table(3).map_err(stamp_handoff_error)?.bytes();
+    if stamped != validated.packet_bytes() {
+        return Err("init_packet_table3_mismatch".into());
+    }
+    Ok(())
+}
+
+/// Host-validate `candidate`, serialize the caller-owned blob in
+/// `bytes` with table 3 replaced by the exact validated packet
+/// bytes, then re-parse the blob and byte-compare table 3
+/// against those bytes. The `packet` field of `tables` is not
+/// used; `header.tables[3]` must already declare the validated
+/// packet length. Serialization and verification run on a copy
+/// of `bytes`, which is copied back only after both succeed, so
+/// every refusal from this helper leaves `bytes` unchanged.
+/// This stamps data only: it does not seal, map, admit, or
+/// release the blob.
+pub fn stamp_init_packet(
+    candidate: &[u8],
+    expectation: InitPacketExpectation,
+    header: &handoff::Header,
+    tables: handoff::TableData<'_>,
+    address: u64,
+    bytes: &mut [u8],
+) -> Result<ValidatedInitPacket> {
+    let validated = validate_init_packet(candidate, expectation)?;
+    let stamped = handoff::TableData {
+        maps: tables.maps,
+        code: tables.code,
+        sites: tables.sites,
+        packet: validated.packet_bytes(),
+        env: tables.env,
+        aux: tables.aux,
+        program_name: tables.program_name,
+        dev_null: tables.dev_null,
+        tool_init: tables.tool_init,
+    };
+    let mut stamped_bytes = bytes.to_vec();
+    handoff::serialize(header, &stamped, address, &mut stamped_bytes)
+        .map_err(stamp_handoff_error)?;
+    verify_serialized_init_packet(&stamped_bytes, address, &validated)?;
+    bytes.copy_from_slice(&stamped_bytes);
+    Ok(validated)
+}
+
 impl InitialExecStop<'_> {
     /// Assemble copied original inputs and same-image numeric geometry while
     /// borrowing the actual held stop. This returns NO complete handoff or entry
@@ -459,35 +676,58 @@ impl InitialExecStop<'_> {
         image: &ValidatedImage<'_>,
         request: &CopiedInputRequest,
     ) -> Result<CopiedInitialData> {
-        self.owner
-            ._thread
-            .as_ref()
-            .ok_or("exec_stop_missing_original_ptracer")?
-            .check_current()?;
-        if !captured.matches_stop(self) {
-            return Err("copied_input_foreign_capture".into());
-        }
-        initial_inputs::unchanged(self)?;
-        let body = (|| {
-            let page_size = captured
-                .original_aux()
-                .find(|(kind, _)| *kind == 6)
-                .map(|(_, value)| value)
-                .ok_or("copied_input_missing_original_page_size")?;
-            build_data(
-                image,
-                request,
-                page_size,
-                |private_image, base, capacity| captured.place(private_image, base, capacity),
-            )
-        })();
-        // Keep close-on-error as well: do not hide a lost original context behind
-        // a numeric refusal or replace a primary data failure with close success.
-        match (body, initial_inputs::unchanged(self)) {
-            (Ok(data), Ok(())) => Ok(data),
-            (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
-            (Err(body), Err(close)) => Err(format!("{body}; copied_input_close: {close}").into()),
-        }
+        prepare_copied_inputs_parts(
+            &self.task,
+            &self.context,
+            &self.owner,
+            captured,
+            image,
+            request,
+        )
+    }
+}
+
+/// The same copied-input assembly over stopped-image parts, for the
+/// exec supervisor's successor stops. The thread, capture-identity
+/// and unchanged-context checks are identical; the only producers
+/// are the two retained exec stops, which pair the parts by
+/// construction at a drained exec stop.
+pub(crate) fn prepare_copied_inputs_parts(
+    task: &safeptrace::Stopped,
+    context: &EntryContext,
+    owner: &ChildOwner<'_>,
+    captured: &CapturedInitialInputs,
+    image: &ValidatedImage<'_>,
+    request: &CopiedInputRequest,
+) -> Result<CopiedInitialData> {
+    owner
+        ._thread
+        .as_ref()
+        .ok_or("exec_stop_missing_original_ptracer")?
+        .check_current()?;
+    if !captured.matches_parts(task, context, owner) {
+        return Err("copied_input_foreign_capture".into());
+    }
+    initial_inputs::unchanged_parts(task, context, owner)?;
+    let body = (|| {
+        let page_size = captured
+            .original_aux()
+            .find(|(kind, _)| *kind == 6)
+            .map(|(_, value)| value)
+            .ok_or("copied_input_missing_original_page_size")?;
+        build_data(
+            image,
+            request,
+            page_size,
+            |private_image, base, capacity| captured.place(private_image, base, capacity),
+        )
+    })();
+    // Keep close-on-error as well: do not hide a lost original context behind
+    // a numeric refusal or replace a primary data failure with close success.
+    match (body, initial_inputs::unchanged_parts(task, context, owner)) {
+        (Ok(data), Ok(())) => Ok(data),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(body), Err(close)) => Err(format!("{body}; copied_input_close: {close}").into()),
     }
 }
 

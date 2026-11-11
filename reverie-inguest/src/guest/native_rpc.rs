@@ -884,6 +884,18 @@ struct BackgroundConnection {
 /// application route: only a native owner with ordinary Rust FS/TLS/allocator
 /// access may construct it. Independent owners have independent connections.
 /// No application callback may select it as a fallback for failed native I/O.
+///
+/// Fork note (W7 review): this `std::sync::Mutex` is only ever locked
+/// by the owning background thread itself (`ensure_current`), and its
+/// critical sections are socket I/O only — the owner never forks
+/// inside one. Guest forks, whose child reinitializes copied locks,
+/// exist only on the ordinary dispatch path, which native processes
+/// never run (ordinary dispatch fatals when `native_threads` is set,
+/// and the private exec domains refuse fork before any ordinary
+/// fork-child path). A followed child reusing this owner is created
+/// by the native owner's own setup, outside any exchange, and
+/// reconnects by the pid check below. The mutex therefore needs no
+/// fork-child reset.
 pub struct NativeBackgroundRpc<G: GlobalTool> {
     thread: std::thread::ThreadId,
     destination: Destination<G>,

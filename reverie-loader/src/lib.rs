@@ -47,6 +47,7 @@ pub mod artifact;
 pub mod audit;
 pub mod handoff;
 pub mod image;
+pub mod init_packet;
 pub mod manifest;
 pub mod mapped_inputs;
 pub mod musl_tls;

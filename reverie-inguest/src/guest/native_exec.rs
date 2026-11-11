@@ -116,6 +116,7 @@ impl ExecCut {
             number: self.original.number,
             args: self.original.args,
             guest_pkru: self.original.pkru,
+            unsupported_refusal: None,
             instruction_pointer: self.instruction_pointer,
             context: self.context,
             dispatch: if self.fallback {

@@ -14,10 +14,12 @@ use reverie_inguest::guest::event::InstructionEventKind;
 /// LiteInst's one registration of the continuation handlers, kept so that a
 /// retried installation reuses it while a registration by another backend is
 /// still refused.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 static REGISTRATION: OnceLock<Result<(), io::ErrorKind>> = OnceLock::new();
 
 /// Registers LiteInst's dispatch functions as the continuation's handlers
 /// (once per process) and prepares this thread's continuation.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 pub(crate) fn initialize() -> io::Result<()> {
     let region = reverie_inguest::guest::tool_region::ToolRegion::reserve()?;
     // SAFETY: this one cache always denotes these same dispatch functions.
@@ -35,10 +37,12 @@ pub(crate) fn initialize() -> io::Result<()> {
     }
 }
 
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 unsafe fn dispatch_syscall(context: *mut RegisterContext, pkru: &mut Option<u32>) {
     unsafe { crate::runtime::dispatch_fallback_context(context, pkru) };
 }
 
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 unsafe fn dispatch_instruction(context: *mut RegisterContext, kind: InstructionEventKind) {
     unsafe { reverie_inguest::guest::installed_tool::dispatch_saved_instruction(context, kind) };
 }

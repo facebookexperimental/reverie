@@ -1,6 +1,6 @@
 [package]
 name = "reverie-liteinst"
-version = "0.5.5"
+version = "0.5.6"
 authors = ["Meta Platforms"]
 edition = "2024"
 repository = "https://github.com/facebookexperimental/reverie"
@@ -60,22 +60,30 @@ path = "src/bin/lifecycle_guest.rs"
 
 [dependencies]
 bincode = { version = "2", features = ["serde"] }
-iced-x86 = { version = "1.21.0", default-features = false, features = ["std", "decoder"], optional = true }
 libc = "0.2.186"
-liteinst = { version = "0.2.0", optional = true }
-reverie = { version = "0.5.5", path = "../reverie", package = "reverie-core" }
-reverie-inguest = { version = "0.5.5", path = "../reverie-inguest", default-features = false, features = ["coordinator-rpc", "rcb-clock", "launcher"] }
-reverie-rpc-transport = { version = "0.5.5", path = "../reverie-rpc-transport" }
+liteinst-aarch64 = { version = "0.2.0", git = "https://github.com/rrnewton/liteinst2", rev = "4a6092fe5207866b35eb50c152cabcdc0bda0371" }
+liteinst-aarch64-patch = { version = "0.1.0", git = "https://github.com/rrnewton/liteinst2", rev = "4a6092fe5207866b35eb50c152cabcdc0bda0371" }
+reverie = { version = "0.5.6", path = "../reverie", package = "reverie-core" }
+reverie-inguest = { version = "0.5.6", path = "../reverie-inguest", default-features = false, features = ["coordinator-rpc", "rcb-clock", "launcher"] }
+reverie-rpc-transport = { version = "0.5.6", path = "../reverie-rpc-transport" }
 serde = { version = "1.0.219", features = ["derive"] }
 tokio = { version = "1.54.1", features = ["macros", "net", "rt", "time"] }
 tempfile = "3.27.0"
 tracing = "0.1.41"
 
+# The crates.io liteinst trampoline builder and its x86 decoder are x86-64
+# only upstream; the `liteinst` feature's site patching exists only there.
+# On other targets the feature compiles the trap-only runtime.
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+iced-x86 = { version = "1.21.0", default-features = false, features = ["std", "decoder"], optional = true }
+liteinst = { version = "0.2.0", optional = true }
+
 [dev-dependencies]
 # Cross-crate tests inspect the actual shared collector without exposing fields.
-reverie-inguest = { version = "0.5.5", path = "../reverie-inguest", default-features = false, features = ["native-exec-state-fixture"] }
+reverie-inguest = { version = "0.5.6", path = "../reverie-inguest", default-features = false, features = ["native-exec-state-fixture"] }
 goblin = "=0.10.7"
-safeptrace = { version = "0.5.5", path = "../safeptrace" }
+liteinst-aarch64-patch = { version = "0.1.0", git = "https://github.com/rrnewton/liteinst2", rev = "4a6092fe5207866b35eb50c152cabcdc0bda0371", features = ["test-support"] }
+safeptrace = { version = "0.5.6", path = "../safeptrace" }
 sha2 = "0.10.9"
 serde_json = "1"
 tokio = { version = "1.54.1", features = ["test-util"] }

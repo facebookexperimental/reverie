@@ -1,4 +1,5 @@
-//! Scalar first-image input codec. Numeric validation is not physical authority.
+//! Scalar input codec for first-image and successor generations.
+//! Numeric validation is not physical authority.
 //! This module allocates nothing, dereferences no numeric address and invokes
 //! no syscall. All integers are x86-64 little-endian, including digest words.
 //! Views borrow retained bytes; no native struct or enum is cast from bytes.
@@ -8,7 +9,8 @@ use core::num::NonZeroUsize;
 // Fixed local record construction; const evaluation creates no runtime panic.
 const WORD_STRIDE: NonZeroUsize = NonZeroUsize::new(8).unwrap();
 
-/// Wire discriminator, distinct from the ordinary HLNI packet.
+/// Wire discriminator, distinct from the tool-defined ordinary
+/// initialization packet.
 pub const MAGIC: u64 = u64::from_le_bytes(*b"HLSCAL01");
 /// Only supported wire revision. This unpublished candidate replaces the earlier
 /// unpublished117-word candidate; no deployed wire compatibility is claimed.
@@ -17,8 +19,58 @@ pub const VERSION: u64 = 1;
 pub const HEADER_WORDS: usize = 120;
 /// Fixed header length in bytes.
 pub const HEADER_BYTES: usize = HEADER_WORDS * 8;
-/// Maximum complete handoff blob (private strings included).
-pub const MAX_BYTES: usize = 1024 * 1024;
+/// Maximum table payload: sum over the nine tables of stride x the
+/// per-table count limit enforced by both parsers (`View::parse`
+/// limits and `Bootstrap::descriptor` agree):
+/// 32*64 + 16*64 + 32*128 + 1*4096 + 8*512 + 8*512 + 1*4096 + 1*10
+/// + 8*4096 = 56_330 bytes.
+const MAX_TABLE_BYTES: usize =
+    32 * 64 + 16 * 64 + 32 * 128 + 4096 + 8 * 512 + 8 * 512 + 4096 + 10 + 8 * 4096;
+/// Maximum copied string payload (argv/env bytes the env/aux words
+/// reference, retained in blob slack outside the declared tables):
+/// the kernel execve ceiling on total argv+envp string bytes,
+/// min(rlimit_stack / 4, 3/4 * _STK_LIM) with _STK_LIM = 8 MiB,
+/// whose ceiling over all rlimits is 6 MiB. (The 2 MiB figure at a
+/// default 8 MiB stack rlimit is only one instance of that rule; a
+/// producer forwarding a raised-rlimit guest's strings may
+/// legitimately reach the full 6 MiB.) The argv pointer array is
+/// not a wire table; it is covered because the kernel subtracts
+/// (max(argc, 1) + envc) pointer words from the same 6 MiB budget
+/// (fs/exec.c bprm_stack_limits), and AT_EXECFN's string is inside
+/// that budget too.
+const MAX_STRING_BYTES: usize = 6 * 1024 * 1024;
+/// Extra margin for blob-tail bytes the kernel does not charge to
+/// the string budget: AT_RANDOM (16 bytes) plus the AT_PLATFORM
+/// machine string (utsname machine field, at most 64 bytes + NUL).
+/// The remaining uncounted bytes — the argc word, the two NULL
+/// words, auxv itself (at most 448 bytes, inside table 5's
+/// 8*512 table maximum above), and interpreter-added argv pointers
+/// (at most 96 bytes) — need no separate term: tables 4, 5 and 6
+/// sit inside the copied payload, so their maxima are already
+/// counted once in MAX_TABLE_BYTES and again inside the 6 MiB
+/// string term, leaving that double count as their margin. This
+/// explicit term is therefore extra margin, not an exact accounting.
+const MAX_AUXV_PAYLOAD_BYTES: usize = 16 + 65;
+/// Maximum complete handoff blob (private strings included): fixed
+/// header + maximum tables + maximum string payload + auxv payload
+/// slack = 960 + 56_330 + 6_291_456 + 81 = 6_348_827 bytes, a sound
+/// over-estimate (the copy_plan worst case is ~6_337_063).
+/// Alignment padding is bounded (at most 14 bytes across the two
+/// 8-byte table alignments) and absorbed by that slack. Every
+/// total-length
+/// field on the wire is a u64 word, so no narrower serialized width
+/// caps below this bound. The only allocation the bound sizes is the
+/// producer's blob buffer, checked against this const before the
+/// allocation; readers borrow slices and allocate nothing, so memory
+/// cost stays one caller-owned blob of at most this size.
+///
+/// Mirror: Hermit emits this value as layout descriptor word 5,
+/// which `reverie-liteinst-artifact` checks by exact equality, so
+/// changing this const changes that descriptor word under layout
+/// VERSION 1 and pre-change runtime images are refused there. The
+/// two must move together (and the Hermit pin with them).
+pub const MAX_BYTES: usize =
+    HEADER_BYTES + MAX_TABLE_BYTES + MAX_STRING_BYTES + MAX_AUXV_PAYLOAD_BYTES;
 
 /// Host-side record shape; serialize each word explicitly with `to_le_bytes`.
 /// Never copy struct padding or transmute this structure into a guest reference.
@@ -35,7 +87,7 @@ pub struct Header {
     /// TID, control addr/size, relay addr/size, fd, PKRU, mask, TCB, handler,
     /// independent gate reference addr/size, GNU stack bytes, actual final-ELF dev-null address, two zero words.
     pub scalars: [u64; 16],
-    /// Maps, code, relay sites, HLNI packet, envp words, raw aux words,
+    /// Maps, code, relay sites, birth packet (route-selected), envp words, raw aux words,
     /// program-name bytes, dev-null bytes and exact ToolInit post-syscall PCs;
     /// offsets relative to blob start. Table8 contains sorted unique LEu64 PCs.
     pub tables: [Table; 9],
@@ -525,7 +577,7 @@ impl<'a> Bootstrap<'a> {
             operation,
         })
     }
-    /// Original packet bytes; neither HLIINIT1 admission nor ownership is proved.
+    /// Original birth-packet bytes for this route; neither admission nor ownership is proved.
     pub fn packet(self) -> Result<&'a [u8], Error> {
         self.table_bytes(3)
     }
@@ -897,7 +949,7 @@ pub struct TableData<'a> {
     pub code: &'a [Code],
     /// Numeric bootstrap syscall tuples, decoded lazily by `View::site`.
     pub sites: &'a [SiteRecord],
-    /// Exact ordinary initialization packet bytes, not an admission receipt.
+    /// Exact birth-packet bytes for this route, not an admission receipt.
     pub packet: &'a [u8],
     /// Already placed environment pointers followed by their terminating zero.
     pub env: &'a [u64],
@@ -1828,6 +1880,63 @@ mod tests {
         b.push(0);
         put(&mut b, 2, (MAX_BYTES + 1) as u64);
         assert_eq!(Bootstrap::project(&b, 0x100000).err(), Some(Error::Format));
+    }
+
+    #[test]
+    fn exact_fit_boundaries_across_all_three_checks() {
+        // Derived cap (dh-kn6yu): header + maximum tables + the 6 MiB
+        // kernel argv/env string ceiling. The pre-raise 1 MiB cap refused
+        // legitimate blobs whose only excess was copied string payload.
+        const OLD_MAX: usize = 1024 * 1024;
+        const { assert!(MAX_BYTES > OLD_MAX, "cap must exceed the old 1 MiB") };
+        // Pin the derived VALUE, not only its self-consistency: a
+        // silent change to any term must fail here by name.
+        assert_eq!(MAX_BYTES, 960 + 56_330 + 6 * 1024 * 1024 + 81);
+        assert_eq!(MAX_BYTES, 6_348_827);
+        for size in [OLD_MAX + 1, MAX_BYTES - 1, MAX_BYTES] {
+            let mut b = fixture();
+            b.resize(size, 0);
+            put(&mut b, 2, size as u64);
+            assert_eq!(
+                Bootstrap::project(&b, 0x100000).unwrap().bytes().len(),
+                size,
+                "project must accept {size}"
+            );
+            assert_eq!(
+                View::parse(&b, 0x100000).unwrap().bytes().len(),
+                size,
+                "parse must accept {size}"
+            );
+            let mut output = b.clone();
+            assert_eq!(
+                serialize_fixture(&b, 0x100000, &mut output, |_| {})
+                    .unwrap()
+                    .bytes()
+                    .len(),
+                size,
+                "serialize must accept {size}"
+            );
+        }
+        let mut b = fixture();
+        b.resize(MAX_BYTES + 1, 0);
+        put(&mut b, 2, (MAX_BYTES + 1) as u64);
+        assert_eq!(Bootstrap::project(&b, 0x100000).err(), Some(Error::Format));
+        assert_eq!(View::parse(&b, 0x100000).err(), Some(Error::Format));
+        // Sentinel-filled destination: serialize's own length check
+        // fires before any write, so a refusal here must leave every
+        // sentinel byte intact even though the trailing View::parse
+        // would also refuse. A clone of the source would not detect
+        // the write (fixture serialization is idempotent on it); the
+        // sentinel kills a mutant that widens only serialize's check.
+        let mut output = std::vec![0xa5; MAX_BYTES + 1];
+        assert_eq!(
+            serialize_fixture(&b, 0x100000, &mut output, |_| {}).err(),
+            Some(Error::Format)
+        );
+        assert!(
+            output.iter().all(|byte| *byte == 0xa5),
+            "refused serialize must not write"
+        );
     }
 
     #[test]

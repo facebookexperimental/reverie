@@ -820,6 +820,18 @@ impl MappedToolPrelude {
         }
         Ok(self)
     }
+    /// Exact original resume registers/PKRU for the mapped
+    /// successor's guarded post-exec guest.
+    pub fn successor_entry(&self) -> super::MappedSuccessorEntry {
+        // SAFETY: this prelude retains the actual captured resume
+        // registers and PKRU for this same mapped image.
+        unsafe {
+            super::MappedSuccessorEntry::from_mapped_resume(
+                self.original_registers(),
+                Some(self.original_pkru()),
+            )
+        }
+    }
     /// Same control pointer for the genuine ordinary InitialImage bridge.
     pub fn control(&self) -> NonNull<NativeControl> {
         self.input.control
@@ -828,6 +840,7 @@ impl MappedToolPrelude {
     pub fn packet(&self) -> &[u8] {
         self.input.packet
     }
+
     /// Real sole native leader, physically captured before libc startup.
     pub fn native_tid(&self) -> i32 {
         self.input.layout.owner_tid
@@ -890,5 +903,11 @@ impl MappedToolPrelude {
             .map_err(std::io::Error::from_raw_os_error)?;
         super::publish_control_slot(c)?;
         Ok(InitialImageControl::new(c as usize))
+    }
+}
+
+impl mapped_scalar::SuccessorPacketSource<'static> for MappedToolPrelude {
+    fn successor_inputs(&self) -> &ProductionMappedInputs<'static> {
+        &self.input.scalar
     }
 }

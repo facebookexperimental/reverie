@@ -163,6 +163,12 @@ pub(super) fn execute_basic_syscall_with_read_context(
         output,
         terminal_read,
     );
+    // A call where no guest result can stand for what it did ends the run in
+    // place of its result (`end_run`).
+    let action = match take_run_failure() {
+        Some(error) => SyscallAction::Failure(error),
+        None => action,
+    };
     let action = match action {
         SyscallAction::Failure(error) => {
             SyscallAction::Failure(memory.capture_shared_file_error(error))
@@ -1122,6 +1128,10 @@ impl ElfExecutor {
         // leave it for the next caller's injection to report.
         self.unsupported_refusal = None;
         self.state.signal_refusal = None;
+        self.state.pidfd_refusal = None;
+        take_receive_refused_for_descriptors();
+        take_receive_refused_for_unwritable_buffer();
+        take_run_failure();
         // The copies this call reaches stay its own until it returns, and
         // any whose entries another thread retired meanwhile are replaced
         // then, before the guest continues (`PrivateCopies`); a replacement
@@ -1131,6 +1141,14 @@ impl ElfExecutor {
             .execute_checked_dispatch(request, memory, terminal_read)
             .map_err(|error| memory.capture_shared_file_error(error));
         let ended = call.end(self.state.tid);
+        // The call has published any pidfd it opened: its table holds the
+        // record from here (`LoadedStaticElf::pidfd_holds`).
+        self.state.pidfd_holds.clear();
+        // Its publication has left each copy of an epoll entry it retired
+        // that another thread's call reached to that call, with a hold of
+        // its own, so the entries' ownership goes now, with no lock held
+        // (`LoadedStaticElf::retired_epolls`).
+        self.state.retired_epolls.clear();
         if let Some(failure) = memory.entry_gate().pending_failure() {
             return Err(failure.error());
         }
@@ -1187,9 +1205,6 @@ impl ElfExecutor {
             return Ok(negative_errno(libc::ENOSYS));
         }
         let _retirement = self.state.file_retirement.hold();
-        if let Some(result) = self.execute_child_wait(request, memory) {
-            return result;
-        }
         if let Some(result) = self.execute_accept(request, memory) {
             return result;
         }
@@ -1224,6 +1239,16 @@ impl ElfExecutor {
             self.state.file_retirement.drain_unlocked();
             #[cfg(test)]
             run_one_shot_test_hook(&TABLE_RELEASED_TEST_HOOK);
+        }
+        // TODO-HUMAN-REVIEW(https://github.com/rrnewton/reverie/pull/1410): Review waits' table.
+        // A wait, which may block, runs with the table installed, as every
+        // call does, and its lock released: waitid(P_PIDFD) finds the
+        // descriptor as the shared table has it now, though another thread
+        // opened or replaced it since this task's last call, and keeps what
+        // it found until the call ends (`guest_pidfd`).
+        if let Some(result) = self.execute_child_wait(request, memory) {
+            debug_assert!(shared_files.is_none(), "a wait holds no table lock");
+            return result;
         }
         if self.parent_death_enrolled()
             && matches!(
@@ -1286,12 +1311,19 @@ impl ElfExecutor {
                     .or_else(|| tool_decided_refusal(request, result))
                     .or_else(|| madvise_refusal(request, result))
                     .or_else(|| signalfd_refusal(&self.state, request, result))
+                    .or_else(|| pidfd_epoll_refusal(&self.state, request, result))
+                    .or_else(|| receive_descriptors_refusal(result))
+                    .or_else(|| unwritable_record_buffer_refusal(result))
                     .or_else(|| userfaultfd_refusal(request, result))
                 {
                     self.unsupported_refusal = Some(refusal);
                 }
                 if let Some(refusal) =
                     signal_refusal_record(self.state.signal_refusal.take(), result)
+                {
+                    self.unsupported_refusal = Some(refusal);
+                }
+                if let Some(refusal) = pidfd_refusal_record(self.state.pidfd_refusal.take(), result)
                 {
                     self.unsupported_refusal = Some(refusal);
                 }

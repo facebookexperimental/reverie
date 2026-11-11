@@ -6,34 +6,47 @@ use thiserror::Error;
 
 use crate::Errno;
 use crate::perf::Event;
+/// What a qualified RCB clock counts. This is the single arch-neutral
+/// definition used by PMU configuration on every target; on x86_64 the
+/// processor profile's internal metric is converted into it at the one
+/// profile boundary below.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum RcbMetric {
+    /// Every retired conditional branch, user mode only, per thread.
+    ConditionalBranchesRetiredUserV1,
+}
+
+impl RcbMetric {
+    /// The stable identifier histories store.
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::ConditionalBranchesRetiredUserV1 => "rcb:cond-retired:user:v1",
+        }
+    }
+
+    /// The metric a stored identifier names.
+    pub fn from_id(id: &str) -> Option<Self> {
+        match id {
+            "rcb:cond-retired:user:v1" => Some(Self::ConditionalBranchesRetiredUserV1),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
-pub use crate::pmu::RcbMetric;
-#[cfg(not(target_arch = "x86_64"))]
-pub use pmu_shim::RcbMetric;
+impl From<crate::pmu::RcbMetric> for RcbMetric {
+    fn from(metric: crate::pmu::RcbMetric) -> Self {
+        match metric {
+            crate::pmu::RcbMetric::ConditionalBranchesRetiredUserV1 => {
+                Self::ConditionalBranchesRetiredUserV1
+            }
+        }
+    }
+}
+
 #[cfg(not(target_arch = "x86_64"))]
 mod pmu_shim {
-    /// Interim non-x86 stand-in for the x86 PMU metric vocabulary:
-    /// no host qualifies, so RCB stays unmeasured there.
-    #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-    pub enum RcbMetric {
-        /// Every retired conditional branch, user mode only.
-        ConditionalBranchesRetiredUserV1,
-    }
-    impl RcbMetric {
-        /// The stable identifier histories store.
-        pub const fn id(self) -> &'static str {
-            match self {
-                Self::ConditionalBranchesRetiredUserV1 => "rcb:cond-retired:user:v1",
-            }
-        }
-        /// The metric a stored identifier names.
-        pub fn from_id(id: &str) -> Option<Self> {
-            match id {
-                "rcb:cond-retired:user:v1" => Some(Self::ConditionalBranchesRetiredUserV1),
-                _ => None,
-            }
-        }
-    }
+    use super::RcbMetric;
     pub struct PmuProfile;
     impl PmuProfile {
         pub fn for_family_model(_family_id: u8, _model_id: u8) -> Option<Self> {
@@ -66,6 +79,24 @@ fn pmu_profile_for_family_model(family_id: u8, model_id: u8) -> Option<crate::pm
 #[cfg(not(target_arch = "x86_64"))]
 fn pmu_profile_for_family_model(family_id: u8, model_id: u8) -> Option<pmu_shim::PmuProfile> {
     pmu_shim::PmuProfile::for_family_model(family_id, model_id)
+}
+#[cfg(target_arch = "x86_64")]
+fn pmu_profile_metric(profile: &crate::pmu::PmuProfile) -> Option<RcbMetric> {
+    profile.metric().map(RcbMetric::from)
+}
+#[cfg(not(target_arch = "x86_64"))]
+fn pmu_profile_metric(profile: &pmu_shim::PmuProfile) -> Option<RcbMetric> {
+    profile.metric()
+}
+
+/// Architecture-level PMU qualification refusal, before any x86 profile-table
+/// lookup. Only x86_64 has a qualified PMU profile source in this interim.
+fn pmu_arch_refusal() -> Option<UnqualifiedReason> {
+    if cfg!(target_arch = "x86_64") {
+        None
+    } else {
+        Some(UnqualifiedReason::UnqualifiedArchitecture)
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -529,7 +560,7 @@ impl PmuConfig {
             skid_margin_override: None,
             skid_latency_budget_ns: DEFAULT_SKID_LATENCY_BUDGET_NS,
             halve_stages: HALVE_STAGES_BY_DEFAULT,
-            metric: profile.metric(),
+            metric: profile.metric().map(RcbMetric::from),
         })
     }
 
@@ -1114,6 +1145,26 @@ mod aarch64_tests {
     }
 
     #[test]
+    fn intel_and_amd_hosts_are_refused_as_unqualified_architecture() {
+        for (vendor, family, model) in [("GenuineIntel", 0x06, 0x8F), ("AuthenticAMD", 0x1A, 0x11)]
+        {
+            assert_eq!(
+                qualify_host(vendor, family, model),
+                Err(UnqualifiedReason::UnqualifiedArchitecture),
+                "{vendor} {family:#x} {model:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_host_clock_is_refused_as_unqualified_architecture() {
+        assert_eq!(
+            resolve_host_clock(),
+            Err(UnqualifiedReason::UnqualifiedArchitecture)
+        );
+    }
+
+    #[test]
     fn the_second_stage_leaves_room_for_400_ns() {
         assert_eq!(DEFAULT_SKID_LATENCY_BUDGET_NS, 400);
         // Without any override, which would turn staging off, and with a
@@ -1229,6 +1280,9 @@ pub fn qualify_host(
     family_id: u8,
     model_id: u8,
 ) -> Result<QualifiedClock, UnqualifiedReason> {
+    if let Some(reason) = pmu_arch_refusal() {
+        return Err(reason);
+    }
     if !pmu_vendor_has_family(vendor, family_id) {
         return Err(UnqualifiedReason::VendorFamilyNotInTable {
             vendor: vendor.to_owned(),
@@ -1241,12 +1295,10 @@ pub fn qualify_host(
             model: model_id,
         },
     )?;
-    let metric = profile
-        .metric()
-        .ok_or(UnqualifiedReason::MetricNotEstablished {
-            family: family_id,
-            model: model_id,
-        })?;
+    let metric = pmu_profile_metric(&profile).ok_or(UnqualifiedReason::MetricNotEstablished {
+        family: family_id,
+        model: model_id,
+    })?;
     Ok(QualifiedClock {
         metric,
         raw_event: profile.raw_rcb_event(),
@@ -1481,6 +1533,20 @@ mod clock_state_tests {
 
     fn profile(family: u8, model: u8) -> PmuConfig {
         PmuConfig::try_from_family_model(family, model).expect("a model in the profile table")
+    }
+
+    #[test]
+    fn profile_metric_conversion_preserves_stable_ids() {
+        let source = crate::pmu::RcbMetric::ConditionalBranchesRetiredUserV1;
+        let converted = RcbMetric::from(source);
+        match source {
+            crate::pmu::RcbMetric::ConditionalBranchesRetiredUserV1 => {
+                assert_eq!(converted, RcbMetric::ConditionalBranchesRetiredUserV1);
+            }
+        }
+        assert_eq!(converted.id(), source.id());
+        assert_eq!(RcbMetric::from_id(source.id()), Some(converted));
+        assert_eq!(RcbMetric::from_id("rcb:unknown:v0"), None);
     }
 
     fn amd() -> QualifiedClock {

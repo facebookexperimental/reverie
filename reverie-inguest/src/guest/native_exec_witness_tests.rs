@@ -770,6 +770,7 @@ unsafe fn witness_syscall(context: *mut RegisterContext, pkru: &mut Option<u32>)
         context: context as usize,
         dispatch: SyscallDispatch::Fallback,
         guest_pkru: *pkru,
+        unsupported_refusal: None,
     };
     unsafe { host.dispatch(&mut event) };
     c.rax = event.result as u64;

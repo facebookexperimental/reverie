@@ -20,6 +20,7 @@ pub(super) struct FdSlot {
     pub(super) entry_id: Option<Arc<crate::elf::FdEntry>>,
     pub(super) native_poll: Option<Arc<NativePollBinding>>,
     pub(super) pipe_owner: Option<Arc<pipe_owner::PipeOwner>>,
+    pub(super) guest_pidfd: Option<Arc<GuestPidfd>>,
     pub(super) proc_inode: Option<u64>,
     pub(super) fdinfo: Option<Arc<FdinfoDescription>>,
     pub(super) object_inode: Option<Arc<GuestFileIdentity>>,
@@ -84,6 +85,27 @@ impl FileTableState {
             .and_then(|slot| slot.description.clone())
     }
 
+    /// Takes the table's pidfd records out (`GuestPidfd`), for the last
+    /// task's exit, which closes the table's descriptors whoever else holds
+    /// the table: the caller drops them once it has released the table.
+    pub(super) fn take_pidfds(&mut self) -> Vec<Arc<GuestPidfd>> {
+        self.slots
+            .values_mut()
+            .filter_map(|slot| slot.guest_pidfd.take())
+            .collect()
+    }
+
+    /// Takes the table's native poll bindings out, for the last task's exit,
+    /// as [`Self::take_pidfds`] takes its pidfd records: the caller drops
+    /// them once it has released the table, and an epoll's last binding ends
+    /// the epoll's pidfd registrations (`EpollIdentity`).
+    pub(super) fn take_native_polls(&mut self) -> Vec<Arc<NativePollBinding>> {
+        self.slots
+            .values_mut()
+            .filter_map(|slot| slot.native_poll.take())
+            .collect()
+    }
+
     /// The published entry identity for `fd` (slot-owned since slice 16).
     pub(super) fn entry_id(&self, fd: i32) -> Option<&Arc<crate::elf::FdEntry>> {
         self.slots.get(&fd).and_then(|slot| slot.entry_id.as_ref())
@@ -114,6 +136,18 @@ impl FileTableState {
                     pipe_owner: state
                         .and_then(|state| state.pipe_owners.get(&fd).cloned())
                         .or_else(|| self.slots.get(&fd).and_then(|slot| slot.pipe_owner.clone())),
+                    guest_pidfd: state
+                        .and_then(|state| {
+                            state
+                                .guest_pidfds
+                                .get(&fd)
+                                .and_then(std::sync::Weak::upgrade)
+                        })
+                        .or_else(|| {
+                            self.slots
+                                .get(&fd)
+                                .and_then(|slot| slot.guest_pidfd.clone())
+                        }),
                     proc_inode: state
                         .and_then(|state| state.proc_files.get(&fd).copied())
                         .or_else(|| self.slots.get(&fd).and_then(|slot| slot.proc_inode)),
@@ -178,6 +212,29 @@ impl FileTableState {
             .collect();
         let retired_stdin =
             (!same_stdin && self.stdin.is_some()).then(|| self.stdin_entry_id.clone());
+        // The pidfd records of the retired entries, for the calls that
+        // reached their copies to keep (`CopyLedger::retire_copy`).
+        let retired_pidfds: std::collections::BTreeMap<_, _> = retired
+            .iter()
+            .filter_map(|(fd, _)| {
+                self.slots
+                    .get(fd)
+                    .and_then(|slot| slot.guest_pidfd.clone())
+                    .map(|pidfd| (*fd, pidfd))
+            })
+            .collect();
+        // The epolls of the retired entries, for the calls that reached their
+        // copies to hold. The retiring task holds each until its call ends
+        // (`LoadedStaticElf::retired_epolls`), so none has ended yet.
+        let retired_epolls: std::collections::BTreeMap<_, _> = retired
+            .iter()
+            .filter_map(
+                |(fd, _)| match &self.slots.get(fd)?.native_poll.as_ref()?.description {
+                    NativePollDescription::Epoll(epoll) => Some((*fd, epoll.clone())),
+                    NativePollDescription::EventFd(_) => None,
+                },
+            )
+            .collect();
         // A copy that this process's descriptor limits would not let the
         // retirement replace ends the run before anything changes: the table,
         // every copy and every record stay as they were.
@@ -200,9 +257,13 @@ impl FileTableState {
             });
         }
         next.private_copies = std::mem::take(&mut self.private_copies);
-        let unreplaced = next
-            .private_copies
-            .revoke(state.tid, &retired, retired_stdin.as_ref());
+        let unreplaced = next.private_copies.revoke(
+            state.tid,
+            &retired,
+            retired_stdin.as_ref(),
+            &retired_pidfds,
+            &retired_epolls,
+        );
         next.private_copies.register(state);
         // Past the check, the guest's change is published whatever the
         // copies' fate: it has happened, as it has on Linux. A copy that still
@@ -397,6 +458,20 @@ impl FileTableState {
                         .zip(&state.pipe_owners)
                         .all(|((fa, va), (fb, vb))| fa == *fb && Arc::ptr_eq(va, vb))
             }
+            && {
+                let slot_pidfds: Vec<_> = self
+                    .slots
+                    .iter()
+                    .filter_map(|(&fd, slot)| slot.guest_pidfd.as_ref().map(|p| (fd, p)))
+                    .collect();
+                slot_pidfds.len() == state.guest_pidfds.len()
+                    && slot_pidfds
+                        .into_iter()
+                        .zip(&state.guest_pidfds)
+                        .all(|((fa, va), (fb, vb))| {
+                            fa == *fb && std::ptr::eq(Arc::as_ptr(va), vb.as_ptr())
+                        })
+            }
             && *stdout_alias_fds == state.stdout_alias_fds
             && *stderr_alias_fds == state.stderr_alias_fds
             && *cloexec_fds == state.cloexec_fds
@@ -535,6 +610,13 @@ impl FileTableState {
             .iter()
             .filter_map(|(&fd, slot)| slot.pipe_owner.clone().map(|o| (fd, o)))
             .collect();
+        // The table holds each pidfd record; the task only names it
+        // (`GuestPidfd`).
+        state.guest_pidfds = self
+            .slots
+            .iter()
+            .filter_map(|(&fd, slot)| slot.guest_pidfd.as_ref().map(|p| (fd, Arc::downgrade(p))))
+            .collect();
         state.stdout_alias_fds.clone_from(&self.stdout_alias_fds);
         state.stderr_alias_fds.clone_from(&self.stderr_alias_fds);
         state.cloexec_fds.clone_from(&self.cloexec_fds);
@@ -585,6 +667,11 @@ impl FileTableState {
             .iter()
             .filter_map(|(&fd, slot)| slot.pipe_owner.clone().map(|o| (fd, o)))
             .collect();
+        let guest_pidfds: std::collections::BTreeMap<_, _> = self
+            .slots
+            .iter()
+            .filter_map(|(&fd, slot)| slot.guest_pidfd.clone().map(|p| (fd, p)))
+            .collect();
         let fd_entry_ids: std::collections::BTreeMap<_, _> = self
             .slots
             .iter()
@@ -621,6 +708,7 @@ impl FileTableState {
                 poll_table_id: &self.poll_table_id,
                 native_poll_fds: &native_poll_fds,
                 pipe_owners: &pipe_owners,
+                guest_pidfds: &guest_pidfds,
                 stdout_alias_fds: &self.stdout_alias_fds,
                 stderr_alias_fds: &self.stderr_alias_fds,
                 cloexec_fds: &self.cloexec_fds,
@@ -641,6 +729,7 @@ struct ForkFacts<'a> {
     poll_table_id: &'a Arc<NativePollTable>,
     native_poll_fds: &'a std::collections::BTreeMap<i32, Arc<NativePollBinding>>,
     pipe_owners: &'a std::collections::BTreeMap<i32, Arc<pipe_owner::PipeOwner>>,
+    guest_pidfds: &'a std::collections::BTreeMap<i32, Arc<GuestPidfd>>,
     stdout_alias_fds: &'a std::collections::BTreeSet<i32>,
     stderr_alias_fds: &'a std::collections::BTreeSet<i32>,
     cloexec_fds: &'a std::collections::BTreeSet<i32>,
@@ -666,6 +755,7 @@ pub(crate) struct ForkDescriptors {
     pub(crate) poll_table_id: Arc<NativePollTable>,
     pub(crate) native_poll_fds: std::collections::BTreeMap<i32, Arc<NativePollBinding>>,
     pub(crate) pipe_owners: std::collections::BTreeMap<i32, Arc<pipe_owner::PipeOwner>>,
+    pub(crate) guest_pidfds: std::collections::BTreeMap<i32, Arc<GuestPidfd>>,
     pub(crate) stdout_alias_fds: std::collections::BTreeSet<i32>,
     pub(crate) stderr_alias_fds: std::collections::BTreeSet<i32>,
     pub(crate) cloexec_fds: std::collections::BTreeSet<i32>,
@@ -700,6 +790,7 @@ impl ForkDescriptors {
                 .map(|(&fd, binding)| (fd, binding.fork_binding()))
                 .collect(),
             pipe_owners: facts.pipe_owners.clone(),
+            guest_pidfds: facts.guest_pidfds.clone(),
             stdout_alias_fds: facts.stdout_alias_fds.clone(),
             stderr_alias_fds: facts.stderr_alias_fds.clone(),
             cloexec_fds: facts.cloexec_fds.clone(),
@@ -714,6 +805,11 @@ impl ForkDescriptors {
     /// `state`'s own descriptors, as of its last install, for a thread it
     /// makes: the thread installs the table they share before it runs.
     pub(crate) fn of_state(state: &LoadedStaticElf) -> std::io::Result<Self> {
+        let guest_pidfds = state
+            .guest_pidfds
+            .iter()
+            .filter_map(|(&fd, pidfd)| pidfd.upgrade().map(|pidfd| (fd, pidfd)))
+            .collect();
         Self::new(
             state.files.copies(),
             state.stdin.as_ref(),
@@ -725,6 +821,7 @@ impl ForkDescriptors {
                 poll_table_id: &state.poll_table_id,
                 native_poll_fds: &state.native_poll_fds,
                 pipe_owners: &state.pipe_owners,
+                guest_pidfds: &guest_pidfds,
                 stdout_alias_fds: &state.stdout_alias_fds,
                 stderr_alias_fds: &state.stderr_alias_fds,
                 cloexec_fds: &state.cloexec_fds,
@@ -994,7 +1091,9 @@ impl PrivateCopies {
 
     /// Deals with each copy that a task other than `publisher` holds of a
     /// retired entry (`retired`, with stdin's old identity when it changed):
-    /// leaves a reached one to its call, replaces any other
+    /// leaves a reached one to its call, with the entry's pidfd record in
+    /// `retired_pidfds` if it names one, and a hold on its epoll in
+    /// `retired_epolls` if it is one, and replaces any other
     /// ([`CopyLedger::retire_copy`]). A copy leaves its task's record only
     /// once that is done; one that could not be replaced stays, and is
     /// returned. A task whose gate is closed holds no copy and is forgotten.
@@ -1003,6 +1102,8 @@ impl PrivateCopies {
         publisher: i32,
         retired: &[(i32, Option<Arc<crate::elf::FdEntry>>)],
         retired_stdin: Option<&Arc<()>>,
+        retired_pidfds: &std::collections::BTreeMap<i32, Arc<GuestPidfd>>,
+        retired_epolls: &std::collections::BTreeMap<i32, Arc<EpollIdentity>>,
     ) -> Vec<UnreplacedCopy> {
         let mut unreplaced = Vec::new();
         if retired.is_empty() && retired_stdin.is_none() {
@@ -1027,7 +1128,7 @@ impl PrivateCopies {
                 continue;
             }
             for (fd, host) in targets {
-                match ledger.retire_copy(host) {
+                match ledger.retire_copy(host, retired_pidfds.get(&fd), retired_epolls.get(&fd)) {
                     Ok(()) => {
                         task.files.remove(&fd);
                     }
@@ -1047,7 +1148,7 @@ impl PrivateCopies {
                 }
             }
             if let Some(host) = stdin {
-                match ledger.retire_copy(host) {
+                match ledger.retire_copy(host, None, None) {
                     Ok(()) => task.stdin = None,
                     Err(failure) => {
                         if failure.replaced() {
@@ -1103,6 +1204,17 @@ struct CopyLedger {
     /// Reached copies whose entries a retirement retired: the call's end
     /// replaces them (`CallScope`).
     deferred: std::collections::BTreeSet<RawFd>,
+    /// The pidfd records of those entries that are pidfds (`GuestPidfd`):
+    /// the call keeps each, as it keeps the copy's description, until it
+    /// ends. The table held the record until the retirement, so a call that
+    /// finds a pidfd's copy finds its record, however the call and the
+    /// retirement interleave.
+    deferred_pidfds: Vec<Arc<GuestPidfd>>,
+    /// A hold on the epoll of each of those entries that is an epoll: the
+    /// call owns the epoll until it ends, as Linux's `fdget` holds the file
+    /// for the call that looked it up, so the epoll, and its pidfd
+    /// registrations, outlive its last descriptor's close until then.
+    deferred_epolls: Vec<EpollHold>,
     /// Copies a retirement replaced with the placeholder. The task treats
     /// each as closed until its next install replaces it.
     revoked: std::collections::BTreeSet<RawFd>,
@@ -1120,6 +1232,8 @@ impl Default for CopyLedger {
             in_call: false,
             reached: Default::default(),
             deferred: Default::default(),
+            deferred_pidfds: Vec::new(),
+            deferred_epolls: Vec::new(),
             revoked: Default::default(),
             foreign: Default::default(),
         }
@@ -1141,14 +1255,23 @@ impl CopyLedger {
     }
 
     /// A retirement's part for one copy: leaves a reached copy to its call,
-    /// and otherwise replaces it now. A descriptor that is no longer the
-    /// task's copy is left alone.
-    fn retire_copy(&mut self, host: RawFd) -> Result<(), ReplaceFailure> {
+    /// with `pidfd`, the record of the pidfd its entry is, if it is one, and
+    /// a hold on `epoll`, the epoll its entry is, if it is one; otherwise
+    /// replaces it now. A descriptor that is no longer the task's copy is
+    /// left alone.
+    fn retire_copy(
+        &mut self,
+        host: RawFd,
+        pidfd: Option<&Arc<GuestPidfd>>,
+        epoll: Option<&Arc<EpollIdentity>>,
+    ) -> Result<(), ReplaceFailure> {
         if self.foreign.contains(&host) {
             return Ok(());
         }
         if self.reached.contains(&host) {
             self.deferred.insert(host);
+            self.deferred_pidfds.extend(pidfd.cloned());
+            self.deferred_epolls.extend(epoll.map(EpollHold::new));
             return Ok(());
         }
         let result = replace_copy(host);
@@ -1234,10 +1357,17 @@ impl PrivateCopyGate {
     /// description: its descriptor stays open, for its owner to close, on
     /// the placeholder. A retirement after this skips the task.
     pub(crate) fn close<'a>(&self, copies: impl IntoIterator<Item = &'a std::fs::File>) {
+        // Declared before the ledger's guard, so that the pidfd records and
+        // epoll holds a call kept are dropped once the guard is released.
+        let _kept;
         let mut ledger = self.ledger();
         ledger.open = false;
         ledger.reached.clear();
         ledger.deferred.clear();
+        _kept = (
+            std::mem::take(&mut ledger.deferred_pidfds),
+            std::mem::take(&mut ledger.deferred_epolls),
+        );
         // A copy that cannot be replaced without raising the soft limit
         // keeps its description until its owner closes it, later in this
         // exit: the exit raises no limit.
@@ -1280,9 +1410,16 @@ impl CallScope {
     }
 
     fn finish(ledger: &Mutex<CopyLedger>, tid: i32) -> crate::Result<()> {
+        // Declared before the ledger's guard, so that the pidfd records and
+        // epoll holds the call kept are dropped once the guard is released.
+        let _kept;
         let mut ledger = ledger
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        _kept = (
+            std::mem::take(&mut ledger.deferred_pidfds),
+            std::mem::take(&mut ledger.deferred_epolls),
+        );
         ledger.in_call = false;
         ledger.reached.clear();
         if !ledger.open {
@@ -1351,7 +1488,8 @@ std::thread_local! {
         const { std::cell::RefCell::new(None) };
     /// Runs once on the calling thread right after a replacement raised the
     /// soft limit for a copy's `dup3`, before it puts the limit back
-    /// (`replace_copy`): where another process can change the limits.
+    /// (`replace_copy`): where another process can change the limits. A
+    /// receive's raise runs it too (`with_hard_nofile_limit`).
     pub(crate) static SOFT_LIMIT_RAISED_TEST_HOOK: OneShotTestHook =
         const { std::cell::RefCell::new(None) };
     /// When set, the next restoration of a raised soft limit on this thread
@@ -1626,8 +1764,48 @@ fn replace_copy(host: RawFd) -> Result<(), ReplaceFailure> {
     }
 }
 
+/// Runs `receive`, a host receive that cannot wait, or its count of the
+/// descriptors free for one, with this process's soft `RLIMIT_NOFILE` raised
+/// to its hard limit under [`NOFILE_LIMIT_ADJUSTMENT`], as [`replace_copy`]
+/// raises it for its one call: only where the soft limit leaves too little
+/// room for one message's rights (`host_receive_room`). The host installs
+/// every right a message carries as a descriptor of this process, and drops,
+/// unseen, those it cannot (`scm_detach_fds`), so the receive gets every right
+/// short of the hard limit; the caller gives the guest as many as the guest's
+/// own limit allows (`install_received_rights`). The soft limit is then put
+/// back as a replacement puts it back; one that cannot be put back is logged.
+pub(super) fn with_hard_nofile_limit<T>(receive: impl FnOnce() -> T) -> T {
+    let _adjustment = NOFILE_LIMIT_ADJUSTMENT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(limit) = nofile_limit().filter(|limit| limit.rlim_cur < limit.rlim_max) else {
+        return receive();
+    };
+    let raised = libc::rlimit {
+        rlim_cur: limit.rlim_max,
+        rlim_max: limit.rlim_max,
+    };
+    // SAFETY: setrlimit reads only `raised`, a soft limit equal to the hard
+    // one, which this process may always set.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } != 0 {
+        return receive();
+    }
+    #[cfg(test)]
+    run_one_shot_test_hook(&SOFT_LIMIT_RAISED_TEST_HOOK);
+    let received = receive();
+    if let Err(error) = restore_soft_limit(limit.rlim_cur, limit.rlim_max) {
+        tracing::error!(
+            "KVM could not put back its soft RLIMIT_NOFILE of {} after a receive \
+             raised it to {}: {error}",
+            limit.rlim_cur,
+            limit.rlim_max,
+        );
+    }
+    received
+}
+
 /// This process's `RLIMIT_NOFILE`, if it can be read.
-fn nofile_limit() -> Option<libc::rlimit> {
+pub(super) fn nofile_limit() -> Option<libc::rlimit> {
     let mut limit = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
@@ -1992,6 +2170,7 @@ pub(super) struct DuplicateFdSource {
     pub(super) signalfd_mask: Option<Arc<KernelSigset>>,
     pub(super) native_poll: Option<NativePollDescription>,
     pub(super) pipe_owner: Option<Arc<pipe_owner::PipeOwner>>,
+    pub(super) guest_pidfd: Option<Arc<GuestPidfd>>,
 }
 
 /// Stops supported generic writes from reaching the eventfd that privately
@@ -2116,6 +2295,9 @@ pub(super) fn duplicate_fd_at_or_above(
     if let Some(owner) = source.pipe_owner {
         state.pipe_owners.insert(fd, owner);
     }
+    if let Some(pidfd) = source.guest_pidfd {
+        state.guest_pidfds.insert(fd, Arc::downgrade(&pidfd));
+    }
     if let Some(description) = source.native_poll {
         install_native_poll_description(state, fd, description);
     }
@@ -2174,6 +2356,7 @@ pub(super) fn duplicate_fd(
     let source_native_poll = native_poll_description(state, old_fd);
     let source_signalfd_mask = signalfd_mask(state, old_fd);
     let source_pipe_owner = state.pipe_owners.get(&old_fd).cloned();
+    let source_pidfd = guest_pidfd(state, old_fd);
     let Some(old_host_fd) = host_fd(state, old_fd) else {
         return negative_errno(libc::EBADF);
     };
@@ -2215,6 +2398,9 @@ pub(super) fn duplicate_fd(
         if let Some(owner) = source_pipe_owner {
             state.pipe_owners.insert(new_fd, owner);
         }
+        if let Some(pidfd) = source_pidfd {
+            state.guest_pidfds.insert(new_fd, Arc::downgrade(&pidfd));
+        }
         if let Some(description) = source_native_poll {
             install_native_poll_description(state, new_fd, description);
         }
@@ -2255,6 +2441,11 @@ pub(super) fn duplicate_fd(
         if new_fd >= 0 {
             if let Some(owner) = source_pipe_owner {
                 state.pipe_owners.insert(new_fd as i32, owner);
+            }
+            if let Some(pidfd) = source_pidfd {
+                state
+                    .guest_pidfds
+                    .insert(new_fd as i32, Arc::downgrade(&pidfd));
             }
             if let Some(description) = source_native_poll {
                 install_native_poll_description(state, new_fd as i32, description);

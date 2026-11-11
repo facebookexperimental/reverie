@@ -1179,8 +1179,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-inguest/src/guest/sigalrm.rs",
-        55207,
-        "d31b0451697e6d475771bb6cf20ffbc6bd2ab71aa28c941172488d7125928fbc",
+        55729,
+        "85ca6bb23aca2309a91524aea5e7dab733ab0be384ed155fcc4f822d92eb1cd4",
     ),
     (
         "reverie-inguest/src/guest/signal.rs",
@@ -1189,8 +1189,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-inguest/src/guest/tool_install.rs",
-        27612,
-        "02b245a3be1cde43dfd718c3c3b27b4b702d0c22d83d2090b1ad4bf1cee56f7c",
+        28270,
+        "924a1f49294e75521f45acbc525bff24a1abdb45b0f21344d14a766a9d1986a3",
     ),
     (
         "reverie-inguest/src/signal.rs",
@@ -1199,23 +1199,23 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers/bootstrap_env_aux.rs",
-        20532,
-        "e1962e2ece55d0ca21158333047623b966fc917326dccd9fe7f6a2b99c2d7f38",
+        20652,
+        "249b94a1689d5072659145a88b56e0a180ff6a2f7dc4f083504ac71b789d7b8c",
     ),
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers/bootstrap_descriptor.rs",
-        33969,
-        "287cfbb2b93878f61067af99440541909b6376626d10e32ff0113d5375f9b4d3",
+        34089,
+        "b3ec825b4db8276d0104fd46ff837b76b4bace7a8c1bd75c0f3d80808b0e835d",
     ),
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers/bootstrap_role.rs",
-        9258,
-        "b930c898a36d6adafc8ef3d34411561a9e04bf99504ddc37c926d6add01a34c8",
+        9367,
+        "b03c9ac9c70674c94bdcd15420fcec6338d109781af39440a6b86b563633e1a5",
     ),
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers/bootstrap_site.rs",
-        17928,
-        "76249bb4eb4230a3bff4bed32586467c1c13a5ecd9be0eee0e5a7c97901c6362",
+        18037,
+        "51ebc548aec8eefa110d9be991f530d9235b412e659429ae4ecac76933c71337",
     ),
     (
         "reverie-loader/src/mapped_inputs.rs",
@@ -1224,8 +1224,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-liteinst-artifact/src/private_static/tls_sources.rs",
-        19927,
-        "d7bc03dd3fa432f406977a02d5fe58628cc656aca26d2bb921d22e69094348b6",
+        36442,
+        "6cfb112500e9cd0ae2cd5ed4401cdf99740c36f29bba48f397a412c48b9ecb6b",
     ),
     (
         "Cargo.toml",
@@ -1235,12 +1235,12 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     (
         "reverie-liteinst-artifact/Cargo.toml",
         518,
-        "d0d67686684187c810b795d4da8a7a07dba1f647b5e0c6b64084f689ba55567b",
+        "6f08075314ed920f4afe03e87a889a1841363194b111facc09dfa974c87ae761",
     ),
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers/view_site.rs",
-        52691,
-        "a2253c765e4daf6fca96879f13927213dbda4b54bb77a8600a062a57ff75864f",
+        52994,
+        "b831cb4c34929ef4b8929926429032441b5ae9f0ed379352ba579c79ce28cf2a",
     ),
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers/view_site/caller.rs",
@@ -1249,13 +1249,13 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers/view_table.rs",
-        41315,
-        "6cfc3c67d8485dff9463cff67be604f81fce9d7f92f63f93f118fc7b4a2e7ccb",
+        41618,
+        "ad4f59df6c0b4bc33e36fc385077ec990cecd3ea6a2616dc761d9a95e1c2c34d",
     ),
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers.rs",
-        240984,
-        "386d565e8ef2d80ae52a9069f7a7cda61df761601907f6594cedd47301c1b6e5",
+        246390,
+        "8c51f952f7b366b34785e434d66a8b50be37a8b2b2afc0fce1ce645e80dac5a4",
     ),
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers/package_roles.rs",
@@ -1319,13 +1319,13 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers/ordinary_gate.rs",
-        73521,
-        "93482ce58a17a14e93c0adeade3502fab3bad31f849c779e1e9bbd590582a847",
+        94622,
+        "4116af83bbd39d7e20f42276c6fb0d6ead2a49bbb6a3af952af10f721befa47a",
     ),
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers/terminal_observation.rs",
-        31604,
-        "1beca894cd78b0c3a877af1285bed1dfd288486d3978f6626359e1e0f8f0ae6c",
+        32328,
+        "e74262b7983fcbd0cf0c2b6a0a7da760a72963fdb0013ff73e212441a137b8b5",
     ),
     (
         "reverie-liteinst-artifact/tests/fixtures/ordinary_preceding_gate_page.rs",
@@ -1339,18 +1339,18 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-inguest/Cargo.toml",
-        5690,
-        "7b22069a7df3cbecaf93086ff01535b73edf2d5e2bc24ef4b0ac3155aec47dfe",
+        6166,
+        "d95f244d25c20488c4def4d251c09f4433409a4ae7b6a6c19321f1491682adbc",
     ),
     (
         "reverie-inguest/src/lib.rs",
-        11792,
-        "2d3a8d6906a102cce3627d3b42ff87a334480807b44af14beaa4e60e7eeb78d4",
+        13478,
+        "9b619884552f14046a056f68693c49fc46d065b2a084ad49ca07819a10ec27b1",
     ),
     (
         "reverie-syscalls/Cargo.toml",
         1293,
-        "b2a9b46980aebbf07ec3697f4c850deea72d152b077f2048cf8b155283da9722",
+        "736b4181652976a1283004b80a8136153aa15aed26db1b1f5414dce68c6a3811",
     ),
     (
         "reverie-syscalls/src/lib.rs",
@@ -1374,33 +1374,33 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-liteinst/Cargo.toml",
-        5964,
-        "3b823e064928a097fe80c0240b25eceac5424750733a731d0e659fd188f2eb80",
+        6685,
+        "e6300b32ee83b9aeb02cb868b8d9528459f3fc73d3bca595268534b821c2d460",
     ),
     (
         "reverie-liteinst/src/lib.rs",
-        25906,
-        "bd7b0add6501ad45754195ca458aedb3f4ac476ceda5d8abe8d5c199f57a694e",
+        35663,
+        "f90201e80854dda44cc9d76fdbf3fa45a01970baf6ff0b211a2f667c2401b50f",
     ),
     (
         "reverie-liteinst-preload/Cargo.toml",
-        982,
-        "05d2a489207cd08e5fe1f9e07f8e9519069da16953ca949d1358a65d29384fbc",
+        980,
+        "61424544ca7b38469d85ea4b3b2628fe29120996a2f5d818fef969f464d4ae49",
     ),
     (
         "reverie-liteinst-preload/src/lib.rs",
-        842,
-        "40587a60db06dc95538745208d23e7ec55a069c79ac86bfef87377df5a59fbe6",
+        1301,
+        "5d8059e7b6924429422672eda8f96c11e1163d684232a5d856f7ab4deaefea28",
     ),
     (
         "reverie-liteinst/src/patch_alloc.rs",
-        26462,
-        "799b94da011fa6d9313a296a74592fd060c12dd8543176ff4d56e7f82abb02bc",
+        26591,
+        "62646a8519771eabf5a43c6dcb351d49d0ba6b8c8bde2e5d6defeda7fd79bbd0",
     ),
     (
         "reverie-inguest/src/guest/alloc.rs",
-        37723,
-        "e1304916625b1b166ce0d32b54965c6e3623d9a004b38e77b7ed26ba653e81dc",
+        46692,
+        "05d881f55c0c89e41c86b8ff5521b13430bbbf7d2bd72a6cf430b9e2d7be118a",
     ),
     (
         "reverie-inguest/src/guest/tool_region_constructor.rs",
@@ -1424,8 +1424,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-inguest/src/guest/installed_tool.rs",
-        26031,
-        "84ba271d1e8be5e9cc665f8ce7440bf99064e84b5b9baee55e69a6e1dd5d8068",
+        35986,
+        "cc560e970e06233c2edb8e54595ddae617ca857d0969d714151134e8c86c09da",
     ),
     (
         "reverie-inguest/src/guest/mod.rs",
@@ -1434,28 +1434,28 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-inguest/src/guest/rpc.rs",
-        42116,
-        "08ecfbd1dbcd4d8ce417ee406a2579f575f1c74f8d19080cbd71fe39ecaf519f",
+        54138,
+        "e5e5c6592d505bda9a4c47bef7bba4ef266a09f5d833c6ae5a87e036f25a3984",
     ),
     (
         "reverie-inguest/src/guest/host.rs",
-        251928,
-        "16ea9adb9862d42a3cd54f08bdbd8c0cf7f59a793d0ac6fe61ff34008f102e4e",
+        406223,
+        "f31ba739d85a7671bb57d1c7f494bd6d751c296431bd5bd47a8e9d39966f32a6",
     ),
     (
         "reverie-inguest/src/guest/host_linux.rs",
-        24921,
-        "3236278ee1985a08a47c01658e20bf9c3e6569ce2ca3c3551cd59a41804e00f5",
+        25125,
+        "32716178d7f5dc17be65ebe23343b8e23706c3898f4acb9ed9501b8c4acb94ed",
     ),
     (
         "reverie-liteinst/src/tool_host.rs",
-        61723,
-        "7c3d5914e7070ddc89b72afb3ee49ecddded9f105b5fb43810c2ee070dddf3ce",
+        85210,
+        "ae03d580e6e5a6b4c313afa4673f36cc3172db690e9639fac2d216064cfa751b",
     ),
     (
         "reverie/Cargo.toml",
         2373,
-        "bf1ae47ec87ec05198764c17ddd0bc5a2988ec4511b45672b748c202ace8fc24",
+        "f07451bd4bb57c7ed5dfefadc4e84de136dce47cb0f1cd55f20b978d3df66dd1",
     ),
     (
         "reverie/src/tool_configuration.rs",
@@ -1477,11 +1477,13 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     // counter window must prove it ran throughout (time_running) before
     // any count is believed; the diagnostic counts it adds distinguish a
     // measured count from an unmeasured one instead of reporting an
-    // invented number. Size/digest cover both reviewed changes.
+    // invented number. Size/digest cover both reviewed changes, and the
+    // literoot sprint rebase's "fix interim PMU shim architecture
+    // refusals" (M1; reviewed as b8f4a6ebe, sprint commit eedaa8b6a).
     (
         "reverie/src/pmu_config.rs",
-        76782,
-        "637c6fa142ed96a215675e072f2c48152ca3fe11f18a4a0e6d8eaa4bf7124029",
+        78983,
+        "fa0e30d174f53dd047d94e9c55dba50fdc8d114586de4e9b4b706c6a954da5cc",
     ),
     (
         "reverie/src/in_guest_rcb.rs",
@@ -1536,13 +1538,13 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-rpc-transport/src/lib.rs",
-        5018,
-        "7ac7f50a9b43af71abf678026762052267ac9c003d99a49f39257455dd41c725",
+        5043,
+        "5bfc05680ef93b8ae846a4cafa96c16c4b6e3db0582064289644b20496ac800c",
     ),
     (
         "reverie-rpc-transport/src/server.rs",
-        124661,
-        "dced4ec2c6a35adf3835b8cc632d32d88bca89ffbc29d6c5073d3ec3e67815e5",
+        129298,
+        "8aca80d978e602a386f46c0331b31653b7adb7bbe0a83b097670168686754f34",
     ),
     (
         "reverie-rpc-transport/src/blocking_client.rs",
@@ -1554,11 +1556,14 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
         17031,
         "3195980ecdb940374c21fe38ccb98839798d078aed929b69edb179283b87536c",
     ),
-    // Bind the added input-ownership and facility-admission source premises.
+    // Bind the added input-ownership and facility-admission source premises,
+    // and the A6 static-executable floor (literoot sprint rebase, M1): a
+    // static program, ld.so target or `#!` interpreter is refused before
+    // spawn, and only regular files the exec loads are inspected.
     (
         "reverie-inguest/src/launcher/mod.rs",
-        94802,
-        "3e2a00f582f24652e81305e659e0960bcf6b334514b58140f886aa292de278f8",
+        144269,
+        "def24cd44c55b43e78759a1f87aac9eb227bb98b1f178b5aaa700a10249ed646",
     ),
     (
         "reverie/src/native_syscall.rs",
@@ -1977,18 +1982,18 @@ fn compiled_library_package(
         "compiled metadata source differs from full pin",
     )?;
     require(
-        p["version"] == "0.5.5",
+        p["version"] == "0.5.6",
         "compiled Reverie package version differs",
     )?;
     let id = match source {
         Some(source) => format!(
-            "{}#{name}@0.5.5",
+            "{}#{name}@0.5.6",
             source
                 .rsplit_once('#')
                 .ok_or("compiled Git source lacks revision")?
                 .0
         ),
-        None => format!("path+file://{}#0.5.5", root.join(name).display()),
+        None => format!("path+file://{}#0.5.6", root.join(name).display()),
     };
     require(
         p["id"] == id,
@@ -2081,12 +2086,12 @@ fn compiled_leaf_package(
     let expected_id = match image_kind {
         FixedImageKind::Standalone => match source {
             Some(source) => format!(
-                "{}#reverie-liteinst-preload@0.5.5",
+                "{}#reverie-liteinst-preload@0.5.6",
                 source.rsplit_once('#').unwrap().0
             ),
-            None => format!("path+file://{}#0.5.5", rv_root.join(name).display()),
+            None => format!("path+file://{}#0.5.6", rv_root.join(name).display()),
         },
-        FixedImageKind::Detcore => format!("path+file://{}#0.5.5", root.join(name).display()),
+        FixedImageKind::Detcore => format!("path+file://{}#0.5.6", root.join(name).display()),
     };
     require(
         leaf.id == expected_id,
@@ -2120,11 +2125,11 @@ fn content_package(
         "content metadata manifest differs from exact compiler spelling",
     )?;
     require(
-        raw["source"].as_str() == Some(source) && raw["version"] == "0.5.5",
+        raw["source"].as_str() == Some(source) && raw["version"] == "0.5.6",
         "content metadata source/version differs from full pin",
     )?;
     let id = format!(
-        "{}#{name}@0.5.5",
+        "{}#{name}@0.5.6",
         source
             .rsplit_once('#')
             .ok_or("content Git source lacks revision")?
@@ -2294,7 +2299,7 @@ fn content_detcore_manifest_and_lock_pin(
         selected.len() == 1
             && selected[0]["manifest_path"].as_str()
                 == root.join("detcore-liteinst/Cargo.toml").to_str()
-            && selected[0]["version"] == "0.5.5"
+            && selected[0]["version"] == "0.5.6"
             && selected[0]["source"].is_null(),
         "content Detcore leaf manifest/version/source differs",
     )?;
@@ -2346,7 +2351,7 @@ fn content_detcore_manifest_and_lock_pin(
                     .lines()
                     .filter(|line| line.starts_with("version = "))
                     .collect::<Vec<_>>()
-                    == ["version = \"0.5.5\""],
+                    == ["version = \"0.5.6\""],
             format!("content Detcore lock source/version differs: {name}"),
         )?;
     }
@@ -2365,7 +2370,7 @@ fn content_detcore_manifest_and_lock_pin(
                 .lines()
                 .filter(|line| line.starts_with("version = "))
                 .collect::<Vec<_>>()
-                == ["version = \"0.5.5\""],
+                == ["version = \"0.5.6\""],
         "content Detcore local lock entry differs",
     )
 }
@@ -3997,8 +4002,8 @@ const NO_INSTALLATION_SCOPE_POLICY: &str =
     "detcore_native_off_alloc101_reviewed_source_current_build_rx_loader_census_v1";
 const NO_INSTALLATION_SCOPE_SOURCE: (&str, u64, &str) = (
     "reverie-liteinst/src/patch_alloc.rs",
-    26462,
-    "799b94da011fa6d9313a296a74592fd060c12dd8543176ff4d56e7f82abb02bc",
+    26591,
+    "62646a8519771eabf5a43c6dcb351d49d0ba6b8c8bde2e5d6defeda7fd79bbd0",
 );
 /// The five authenticated TLS cell accessors of a no-scope image, as
 /// (accessor, cell) canonical-name pairs. Every read and write of
@@ -4071,6 +4076,16 @@ const DIRECT_TLS_CENSUS_POLICY: &str =
 // Separate from the standalone v1 contract: one observed native Detcore cohort.
 const DETCORE_DIRECT_TLS_CENSUS_POLICY: &str =
     "detcore_e8_alloc241_named_getter_pt_load22_raw_loader_pointers_v2";
+// Semantic getter-less Detcore cohort at any accepted direct-allocation offset.
+const DETCORE_DIRECT_TLS_CENSUS_POLICY_V3: &str =
+    "detcore_semantic_alloc241_named_getter_pt_load22_raw_loader_pointers_v3";
+
+fn detcore_direct_tls_offset_accepted(address: u64) -> bool {
+    matches!(
+        address,
+        0x98 | 0xa0 | 0xd8 | 0xe0 | 0xe8 | 0x100 | 0x108 | 0x110 | 0x128 | 0x148
+    )
+}
 
 /// Mandatory same-ELF Fixed selection, never a name/descriptor-only admission.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -17855,6 +17870,9 @@ const FIXED_DEV_TLS_CELL_GETTER_HEX: &str =
     "4883ec1848897c24084889742410488d3daba42100e8b6321e00488d80480000004883c418c3";
 const FIXED_DEV_TLS_CELL_GETTER_STABLE_HEX: &str =
     "4883ec1848897c24084889742410488d3df3ca1e00e8866f1b00488d80300000004883c418c3";
+const FIXED_OPTIMIZED_PATCH_ALLOC_STABLE_70_HEX: &str = "41574156415453504889d34989f6ff1514980b004885c074774c8b78204d85ff746e4989c4488d3dcc950b00e84f310b004883b870000000007463498b542410498b0f498d76ff49f7de31c04889cf4801d7723e4801f772394c21f74989f84929d04901d8410f92c14981f801000002410f93c24508ca75194889c8f04d0fb1074889c1b80000000075c14889f8eb0231c04883c4085b415c415e415fc3bf010000004c89f64889da4883c4085b415c415e415fff253e9b0b00";
+const FIXED_OPTIMIZED_TLS_THUNK_STABLE_70_HEX: &str =
+    "50488d3d00930b00e8832e0b00488d807000000059c3";
 const FIXED_DEV_TLS_CELL_GETTER_EVENT_ARGUMENT_HEX: &str =
     "4883ec1848897c24084889742410488d3ddb4a2200e8a6d11e00488d80400000004883c418c3";
 const FIXED_DEV_TLS_CELL_GETTER_DIAGNOSTIC_EVENT_ARGUMENT_HEX: &str =
@@ -17895,6 +17913,16 @@ fn fixed_tls_cell_access_recipe(
         ("fixed_tls_fn_once", 0x48) => (FIXED_OPTIMIZED_TLS_THUNK_HEX, 16, &[(4, 8), (9, 13)]),
         ("fixed_tls_fn_once", 0x88) => (
             FIXED_OPTIMIZED_TLS_THUNK_DIAGNOSTIC_HEX,
+            16,
+            &[(4, 8), (9, 13)],
+        ),
+        ("fixed_patch_alloc", 0x70) => (
+            FIXED_OPTIMIZED_PATCH_ALLOC_STABLE_70_HEX,
+            0x34,
+            &[(0x10, 0x14), (0x28, 0x2c), (0x2d, 0x31), (0xb6, 0xba)],
+        ),
+        ("fixed_tls_fn_once", 0x70) => (
+            FIXED_OPTIMIZED_TLS_THUNK_STABLE_70_HEX,
             16,
             &[(4, 8), (9, 13)],
         ),
@@ -19552,6 +19580,10 @@ fn detcore_direct_tls_source_context(
     Ok(sources)
 }
 
+// This evidence proves only that no getter function, and no loader pointer
+// to a getter, exists. It does not bind the installer's inlined enter/Drop
+// INSTALLATION_DEPTH accesses; those depth-counter writes are not getters
+// and remain outside this boundary, as they were before dh-aum5m.
 fn derive_detcore_direct_allocation_tls_evidence(
     elf: &Elf<'_>,
     bytes: &[u8],
@@ -19562,11 +19594,34 @@ fn derive_detcore_direct_allocation_tls_evidence(
     sources: Option<&VerifiedCompiledSources>,
 ) -> Result<DirectAllocationTlsEvidence> {
     let sources = detcore_direct_tls_source_context(sources)?;
+    authenticate_loader_metadata(elf, bytes)?;
+    let census = direct_tls_getter_census(elf, bytes, cell, module, plt)?;
+    mint_detcore_direct_allocation_tls_evidence(
+        bytes,
+        cell,
+        allocation_bytes,
+        census,
+        sha256(&serde_json::to_vec(sources.record()).map_err(|e| e.to_string())?),
+        sources.record().reverie_pin.clone(),
+        (elf.syms.len(), elf.dynsyms.len()),
+    )
+}
+
+fn mint_detcore_direct_allocation_tls_evidence(
+    bytes: &[u8],
+    cell: &SymbolEvidence,
+    allocation_bytes: &[u8],
+    census: DirectTlsGetterCensus,
+    compiled_sources_sha256: String,
+    reverie_pin: String,
+    symbol_counts: (usize, usize),
+) -> Result<DirectAllocationTlsEvidence> {
     // The complete existing Detcore operation closure still binds every actual
-    // operand/callee. This absence route additionally requires its exact e8
-    // whole allocation shape, not an arbitrary 241-byte function.
+    // operand/callee. This absence route additionally requires an accepted
+    // direct-allocation offset and whole allocation shape, not an arbitrary
+    // 241-byte function.
     require(
-        cell.address == 0xe8
+        detcore_direct_tls_offset_accepted(cell.address)
             && cell.size == 8
             && cell.binding == sym::STB_LOCAL
             && canonical_rust_symbol(&cell.name).as_deref() == Some(FIXED_TLS_CELL_ROLE)
@@ -19579,10 +19634,8 @@ fn derive_detcore_direct_allocation_tls_evidence(
                         template.operands.iter().map(|operand| operand.displacement),
                     )
             }),
-        "Detcore direct TLS proof lacks its exact e8 allocation recipe",
+        "Detcore direct TLS proof lacks its accepted-offset allocation recipe",
     )?;
-    authenticate_loader_metadata(elf, bytes)?;
-    let census = direct_tls_getter_census(elf, bytes, cell, module, plt)?;
     require(
         census.named_getters.is_empty()
             && census.recipe_getters.is_empty()
@@ -19590,17 +19643,15 @@ fn derive_detcore_direct_allocation_tls_evidence(
         "Detcore direct allocation TLS proof found a getter or raw loader pointer edge",
     )?;
     Ok(DirectAllocationTlsEvidence {
-        version: 2,
-        policy: DETCORE_DIRECT_TLS_CENSUS_POLICY.into(),
+        version: 3,
+        policy: DETCORE_DIRECT_TLS_CENSUS_POLICY_V3.into(),
         elf_sha256: sha256(bytes),
-        compiled_sources_sha256: sha256(
-            &serde_json::to_vec(sources.record()).map_err(|e| e.to_string())?,
-        ),
-        reverie_pin: sources.record().reverie_pin.clone(),
+        compiled_sources_sha256,
+        reverie_pin,
         allocation_sha256: sha256(allocation_bytes),
         mappings: census.mappings,
-        static_symbol_count: elf.syms.len(),
-        dynamic_symbol_count: elf.dynsyms.len(),
+        static_symbol_count: symbol_counts.0,
+        dynamic_symbol_count: symbol_counts.1,
         raw_names_sha256: census.raw_names_sha256,
         loader_writer_count: census.loader_writer_count,
         loader_writers_sha256: census.loader_writers_sha256,
@@ -19622,25 +19673,26 @@ fn validate_direct_allocation_tls_evidence_in_image(
     proof: &DirectAllocationTlsEvidence,
     image_kind: FixedImageKind,
 ) -> Result<()> {
-    let (version, policy, cell_matches, extent, call_offset) = match image_kind {
+    let (version_policy_matches, cell_matches, extent, call_offset) = match image_kind {
         FixedImageKind::Standalone => (
-            1,
-            DIRECT_TLS_CENSUS_POLICY,
+            proof.version == 1 && proof.policy == DIRECT_TLS_CENSUS_POLICY,
             matches!(tls.tls_cell.address, 0x40 | 0x80),
             186,
             0x2c,
         ),
-        FixedImageKind::Detcore => (
-            2,
-            DETCORE_DIRECT_TLS_CENSUS_POLICY,
-            tls.tls_cell.address == 0xe8
-                && tls.tls_cell.size == 8
+        FixedImageKind::Detcore => {
+            let cell_identity = tls.tls_cell.size == 8
                 && tls.tls_cell.binding == sym::STB_LOCAL
                 && canonical_rust_symbol(&tls.tls_cell.name).as_deref()
-                    == Some(FIXED_TLS_CELL_ROLE),
-            241,
-            58,
-        ),
+                    == Some(FIXED_TLS_CELL_ROLE);
+            let retained_v2 = proof.version == 2
+                && proof.policy == DETCORE_DIRECT_TLS_CENSUS_POLICY
+                && matches!(tls.tls_cell.address, 0xe8 | 0x100);
+            let semantic_v3 = proof.version == 3
+                && proof.policy == DETCORE_DIRECT_TLS_CENSUS_POLICY_V3
+                && detcore_direct_tls_offset_accepted(tls.tls_cell.address);
+            (retained_v2 || semantic_v3, cell_identity, 241, 58)
+        }
     };
     let hash =
         |s: &str, length: usize| s.len() == length && s.bytes().all(|b| b.is_ascii_hexdigit());
@@ -19649,8 +19701,7 @@ fn validate_direct_allocation_tls_evidence_in_image(
         .get("fixed_patch_alloc")
         .ok_or("direct TLS allocation role absent")?;
     require(
-        proof.version == version
-            && proof.policy == policy
+        version_policy_matches
             && [
                 proof.elf_sha256.as_str(),
                 proof.compiled_sources_sha256.as_str(),
@@ -19733,11 +19784,7 @@ fn qualify_allocator_tls_boundary_in_source_context(
         == FixedImageKind::Detcore
     {
         require(
-            allocation_bytes.len() == 241
-                && matches!(
-                    cell.address,
-                    0x98 | 0xa0 | 0xd8 | 0xe0 | 0xe8 | 0x110 | 0x128
-                ),
+            allocation_bytes.len() == 241 && detcore_direct_tls_offset_accepted(cell.address),
             format!(
                 "Detcore validate allocation/TLS shape differs: allocation length {}, cell offset {:#x}",
                 allocation_bytes.len(),
@@ -19795,7 +19842,7 @@ fn qualify_allocator_tls_boundary_in_source_context(
             });
         } else {
             require(
-                cell.address == 0xe8,
+                detcore_direct_tls_offset_accepted(cell.address),
                 "Detcore missing getter has no exact direct-allocation cohort",
             )?;
         }
@@ -20046,7 +20093,7 @@ fn qualify_allocator_tls_boundary_in_source_context(
             sources,
         )?)
     } else if image_kind == FixedImageKind::Detcore
-        && cell.address == 0xe8
+        && detcore_direct_tls_offset_accepted(cell.address)
         && allocation_bytes.len() == 241
         && !roles.contains_key("fixed_tls_fn_once")
     {
@@ -20756,14 +20803,12 @@ fn validate_existing_allocator_tls_boundary(
             && canonical_rust_symbol(&tls.tls_cell.name).as_deref() == Some(FIXED_TLS_CELL_ROLE)
             && match image_kind {
                 FixedImageKind::Standalone => {
-                    matches!(tls.tls_cell.address, 0x30 | 0x40 | 0x48 | 0x80 | 0x88)
-                }
-                FixedImageKind::Detcore => {
                     matches!(
                         tls.tls_cell.address,
-                        0x98 | 0xa0 | 0xd8 | 0xe0 | 0xe8 | 0x110 | 0x128
+                        0x30 | 0x40 | 0x48 | 0x70 | 0x80 | 0x88
                     )
                 }
+                FixedImageKind::Detcore => detcore_direct_tls_offset_accepted(tls.tls_cell.address),
             }
             && tls.tls_cell.size == 8
             && tls.tls_offset_slot
@@ -20837,7 +20882,12 @@ fn validate_existing_allocator_tls_boundary(
         (None, None, None) => {
             let extent = match (image_kind, tls.tls_cell.address) {
                 (FixedImageKind::Standalone, 0x40 | 0x80) => Some(186),
-                (FixedImageKind::Detcore, 0x98 | 0xd8 | 0xe8 | 0x110 | 0x128) => Some(241),
+                // Hand-made records use the same accepted set qualify can mint.
+                (FixedImageKind::Detcore, address)
+                    if detcore_direct_tls_offset_accepted(address) =>
+                {
+                    Some(241)
+                }
                 _ => None,
             };
             if let Some(extent) = extent {
@@ -21834,10 +21884,10 @@ const DETCORE_VALIDATE_DATA: &[DetcoreValidateDataSpec] = &[
     DetcoreValidateDataSpec {
         key: "fixed_detcore_validate_fixed_tool_span_end_data",
         location: true,
-        hex: "00000000000000005f000000000000001f01000010000000",
+        hex: "00000000000000005f000000000000002001000010000000",
         file_hex: "",
         source_context_key: Some("rv:reverie-inguest/src/guest/alloc.rs"),
-        line: 287,
+        line: 288,
         column: 16,
     },
     DetcoreValidateDataSpec {
@@ -21888,64 +21938,64 @@ const DETCORE_VALIDATE_DATA: &[DetcoreValidateDataSpec] = &[
     DetcoreValidateDataSpec {
         key: "fixed_detcore_validate_fixed_heap_allocate_537_data",
         location: true,
-        hex: "00000000000000005f00000000000000ae0000002a000000",
+        hex: "00000000000000005f00000000000000af0000002a000000",
         file_hex: "",
         source_context_key: Some("rv:reverie-inguest/src/guest/alloc.rs"),
-        line: 174,
+        line: 175,
         column: 42,
     },
     DetcoreValidateDataSpec {
         key: "fixed_detcore_validate_fixed_heap_allocate_550_data",
         location: true,
-        hex: "00000000000000005f00000000000000ae0000002a000000",
+        hex: "00000000000000005f00000000000000af0000002a000000",
         file_hex: "",
         source_context_key: Some("rv:reverie-inguest/src/guest/alloc.rs"),
-        line: 174,
+        line: 175,
         column: 42,
     },
     DetcoreValidateDataSpec {
         key: "fixed_detcore_validate_fixed_heap_allocate_571_data",
         location: true,
-        hex: "00000000000000005f000000000000009d00000022000000",
+        hex: "00000000000000005f000000000000009e00000022000000",
         file_hex: "",
         source_context_key: Some("rv:reverie-inguest/src/guest/alloc.rs"),
-        line: 157,
+        line: 158,
         column: 34,
     },
     DetcoreValidateDataSpec {
         key: "fixed_detcore_validate_fixed_heap_allocate_586_data",
         location: true,
-        hex: "00000000000000005f00000000000000c800000019000000",
+        hex: "00000000000000005f00000000000000c900000019000000",
         file_hex: "",
         source_context_key: Some("rv:reverie-inguest/src/guest/alloc.rs"),
-        line: 200,
+        line: 201,
         column: 25,
     },
     DetcoreValidateDataSpec {
         key: "fixed_detcore_validate_fixed_heap_allocate_607_data",
         location: true,
-        hex: "00000000000000005f00000000000000c800000019000000",
+        hex: "00000000000000005f00000000000000c900000019000000",
         file_hex: "",
         source_context_key: Some("rv:reverie-inguest/src/guest/alloc.rs"),
-        line: 200,
+        line: 201,
         column: 25,
     },
     DetcoreValidateDataSpec {
         key: "fixed_detcore_validate_fixed_heap_allocate_620_data",
         location: true,
-        hex: "00000000000000005f00000000000000be00000029000000",
+        hex: "00000000000000005f00000000000000bf00000029000000",
         file_hex: "",
         source_context_key: Some("rv:reverie-inguest/src/guest/alloc.rs"),
-        line: 190,
+        line: 191,
         column: 41,
     },
     DetcoreValidateDataSpec {
         key: "fixed_detcore_validate_fixed_heap_allocate_629_data",
         location: true,
-        hex: "00000000000000005f00000000000000e500000017000000",
+        hex: "00000000000000005f00000000000000e600000017000000",
         file_hex: "",
         source_context_key: Some("rv:reverie-inguest/src/guest/alloc.rs"),
-        line: 229,
+        line: 230,
         column: 23,
     },
     DetcoreValidateDataSpec {
@@ -22005,91 +22055,91 @@ const DETCORE_VALIDATE_DATA: &[DetcoreValidateDataSpec] = &[
     DetcoreValidateDataSpec {
         key: "fixed_detcore_validate_fixed_heap_deallocate_308_data",
         location: true,
-        hex: "00000000000000005f00000000000000fd00000018000000",
+        hex: "00000000000000005f00000000000000fe00000018000000",
         file_hex: "",
         source_context_key: Some("rv:reverie-inguest/src/guest/alloc.rs"),
-        line: 253,
+        line: 254,
         column: 24,
     },
     DetcoreValidateDataSpec {
         key: "fixed_detcore_validate_fixed_heap_deallocate_321_data",
         location: true,
-        hex: "00000000000000005f00000000000000fd00000018000000",
+        hex: "00000000000000005f00000000000000fe00000018000000",
         file_hex: "",
         source_context_key: Some("rv:reverie-inguest/src/guest/alloc.rs"),
-        line: 253,
+        line: 254,
         column: 24,
     },
     DetcoreValidateDataSpec {
         key: "fixed_detcore_validate_fixed_heap_deallocate_342_data",
         location: true,
-        hex: "00000000000000005f00000000000000000100000d000000",
+        hex: "00000000000000005f00000000000000010100000d000000",
         file_hex: "",
         source_context_key: Some("rv:reverie-inguest/src/guest/alloc.rs"),
-        line: 256,
+        line: 257,
         column: 13,
     },
     DetcoreValidateDataSpec {
         key: "fixed_detcore_validate_fixed_heap_deallocate_363_data",
         location: true,
-        hex: "00000000000000005f00000000000000000100000d000000",
+        hex: "00000000000000005f00000000000000010100000d000000",
         file_hex: "",
         source_context_key: Some("rv:reverie-inguest/src/guest/alloc.rs"),
-        line: 256,
+        line: 257,
         column: 13,
     },
     DetcoreValidateDataSpec {
         key: "fixed_detcore_validate_fixed_heap_deallocate_376_data",
         location: true,
-        hex: "00000000000000005f000000000000000401000011000000",
+        hex: "00000000000000005f000000000000000501000011000000",
         file_hex: "",
         source_context_key: Some("rv:reverie-inguest/src/guest/alloc.rs"),
-        line: 260,
+        line: 261,
         column: 17,
     },
     DetcoreValidateDataSpec {
         key: "fixed_detcore_validate_fixed_heap_deallocate_397_data",
         location: true,
-        hex: "00000000000000005f000000000000000401000011000000",
+        hex: "00000000000000005f000000000000000501000011000000",
         file_hex: "",
         source_context_key: Some("rv:reverie-inguest/src/guest/alloc.rs"),
-        line: 260,
+        line: 261,
         column: 17,
     },
     DetcoreValidateDataSpec {
         key: "fixed_detcore_validate_fixed_heap_deallocate_410_data",
         location: true,
-        hex: "00000000000000005f000000000000001301000043000000",
+        hex: "00000000000000005f000000000000001401000043000000",
         file_hex: "",
         source_context_key: Some("rv:reverie-inguest/src/guest/alloc.rs"),
-        line: 275,
+        line: 276,
         column: 67,
     },
     DetcoreValidateDataSpec {
         key: "fixed_detcore_validate_fixed_heap_deallocate_431_data",
         location: true,
-        hex: "00000000000000005f000000000000001301000043000000",
+        hex: "00000000000000005f000000000000001401000043000000",
         file_hex: "",
         source_context_key: Some("rv:reverie-inguest/src/guest/alloc.rs"),
-        line: 275,
+        line: 276,
         column: 67,
     },
     DetcoreValidateDataSpec {
         key: "fixed_detcore_validate_fixed_heap_deallocate_444_data",
         location: true,
-        hex: "00000000000000005f000000000000001501000040000000",
+        hex: "00000000000000005f000000000000001601000040000000",
         file_hex: "",
         source_context_key: Some("rv:reverie-inguest/src/guest/alloc.rs"),
-        line: 277,
+        line: 278,
         column: 64,
     },
     DetcoreValidateDataSpec {
         key: "fixed_detcore_validate_fixed_heap_deallocate_462_data",
         location: true,
-        hex: "00000000000000005f000000000000001501000040000000",
+        hex: "00000000000000005f000000000000001601000040000000",
         file_hex: "",
         source_context_key: Some("rv:reverie-inguest/src/guest/alloc.rs"),
-        line: 277,
+        line: 278,
         column: 64,
     },
     DetcoreValidateDataSpec {
@@ -27570,6 +27620,333 @@ const DETCORE_VALIDATE_TEMPLATES: &[DetcoreValidateTemplate] = &[
         }],
         transfers: &[(11, 0)],
     },
+    // Closed actual stable-standalone 0x114a20; complete252B SHA256e6618861767571907ee1d32eef3c4393b422acb6c1998408761f995834e3996a.
+    DetcoreValidateTemplate {
+        role: "fixed_constructor_prepare",
+        hex: "415741564154534883ec284889fb4989e648897c2408488d442408488b7c24084c89742408488b74240848c744240801000000488b5424084c8d7c24104c897c2408488b4c2408e884f3ffff85c07411b8010000004883c4285b415c415e415fc30fb64c2418b80100000084c974e64c8b6424104c89735848b8001000000060000048894424104c89642418884c2420488d1d6915050448895c2408488d442408488b7c24084c897c2408488b742408e8bb25000085c0759749c744244803000000c605301505040048895c2410488d442410488b7c2410e8732500004889c14885c0b8010000000f8467ffffff31c0807910ff0f94c0e959ffffff",
+        operands: &[
+            DetcoreValidateOperand {
+                displacement: 72,
+                next: 76,
+                key: "fixed_native_from_native",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 147,
+                next: 151,
+                key: "fixed_region",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 177,
+                next: 181,
+                key: "fixed_region_publication_set_opaque",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 196,
+                next: 201,
+                key: "fixed_initializing",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 217,
+                next: 221,
+                key: "fixed_region_publication_get_opaque",
+                got: false,
+            },
+        ],
+        transfers: &[(71, 0), (176, 2), (216, 4)],
+    },
+    // Closed actual stable-standalone 0x114c40; complete252B SHA256cc8c8a1ceaed8084eee6108427f8846b370b7b310740e8cdb509ebeb52f80c06.
+    DetcoreValidateTemplate {
+        role: "fixed_generic_prepare",
+        hex: "415741564154534883ec284889fb4989e648897c2408488d442408488b7c24084c89742408488b74240848c744240802000000488b5424084c8d7c24104c897c2408488b4c2408e864f1ffff85c07411b8010000004883c4285b415c415e415fc30fb64c2418b80100000084c974e64c8b6424104c89735848b8001000000060000048894424104c89642418884c2420488d1d4913050448895c2408488d442408488b7c24084c897c2408488b742408e89b23000085c0759749c744244803000000c605101305040048895c2410488d442410488b7c2410e8532300004889c14885c0b8010000000f8467ffffff31c0807910ff0f94c0e959ffffff",
+        operands: &[
+            DetcoreValidateOperand {
+                displacement: 72,
+                next: 76,
+                key: "fixed_native_from_native",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 147,
+                next: 151,
+                key: "fixed_region",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 177,
+                next: 181,
+                key: "fixed_region_publication_set_opaque",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 196,
+                next: 201,
+                key: "fixed_initializing",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 217,
+                next: 221,
+                key: "fixed_region_publication_get_opaque",
+                got: false,
+            },
+        ],
+        transfers: &[(71, 0), (176, 2), (216, 4)],
+    },
+    // Actual stable-built Detcore image at Reverie 2465470e (stable
+    // 1.97.1): same 241-byte fixed_patch_alloc shape as the 0x128
+    // cohort, with INSTALLATION_DEPTH at TLS cell 0x100. Whole
+    // 241 bytes, SHA256 0be4c788adc82d1f0562d9d3b6123cc17a7ff871075414fab9af5d1b339aea8d.
+    DetcoreValidateTemplate {
+        role: "fixed_patch_alloc",
+        hex: "41574156415453504889d34989f6ff15d4818a004885c0747c4989c44c8b782041f6c7070f85a50000004d85ff0f84b1000000488d3dde248a00e851c47f004883b80001000000745d498b542410498b07498d76ff49f7de31c94889c74801d772354801f772304c21f74989f84929d072504901d8410f92c14981f801000002410f93c24508ca750ef04d0fb10775ca4889f9eb0231c94889c84883c4085b415c415e415fc3bf010000004c89f64889da4883c4085b415c415e415fff2566818a00488d3da7fd8200ff15c9278a00488d155afe8200bf080000004c89feff156c2f8a00488d3d45fe8200ff1557698a00",
+        operands: &[
+            DetcoreValidateOperand {
+                displacement: 16,
+                next: 20,
+                key: "fixed_arena_backing",
+                got: true,
+            },
+            DetcoreValidateOperand {
+                displacement: 54,
+                next: 58,
+                key: "fixed_publication_tls_descriptor",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 59,
+                next: 63,
+                key: "fixed_tls_get_addr_plt",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 190,
+                next: 194,
+                key: "fixed_tool_alloc",
+                got: true,
+            },
+            DetcoreValidateOperand {
+                displacement: 197,
+                next: 201,
+                key: "fixed_detcore_validate_fixed_patch_alloc_194_data",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 203,
+                next: 207,
+                key: "fixed_heap_panic_sub_overflow",
+                got: true,
+            },
+            DetcoreValidateOperand {
+                displacement: 210,
+                next: 214,
+                key: "fixed_detcore_validate_fixed_patch_alloc_207_data",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 224,
+                next: 228,
+                key: "fixed_heap_panic_misaligned",
+                got: true,
+            },
+            DetcoreValidateOperand {
+                displacement: 231,
+                next: 235,
+                key: "fixed_detcore_validate_fixed_patch_alloc_228_data",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 237,
+                next: 241,
+                key: "fixed_panic_null_reference",
+                got: true,
+            },
+        ],
+        transfers: &[(14, 0), (58, 2), (188, 3), (201, 5), (222, 7), (235, 9)],
+    },
+    // Retained pinned normal ELF, VA 0x1289ac0, exact LOCAL8 cell 0x108.
+    // Complete 241-byte body SHA256: 35e6645a7743d95b2328662b8218da2b59094e51091a67c04a5210eca436b164.
+    DetcoreValidateTemplate {
+        role: "fixed_patch_alloc",
+        hex: "41574156415453504889d34989f6ff155c782d004885c0747c4989c44c8b782041f6c7070f85a50000004d85ff0f84b1000000488d3dbefd2c00e881c022004883b80801000000745d498b542410498b07498d76ff49f7de31c94889c74801d772354801f772304c21f74989f84929d072504901d8410f92c14981f801000002410f93c24508ca750ef04d0fb10775ca4889f9eb0231c94889c84883c4085b415c415e415fc3bf010000004c89f64889da4883c4085b415c415e415fff25ce772d00488d3d97772900ff15a1002d00488d154a782900bf080000004c89feff153c082d00488d3d35782900ff15cf492d00",
+        operands: &[
+            DetcoreValidateOperand {
+                displacement: 16,
+                next: 20,
+                key: "fixed_arena_backing",
+                got: true,
+            },
+            DetcoreValidateOperand {
+                displacement: 54,
+                next: 58,
+                key: "fixed_publication_tls_descriptor",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 59,
+                next: 63,
+                key: "fixed_tls_get_addr_plt",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 190,
+                next: 194,
+                key: "fixed_tool_alloc",
+                got: true,
+            },
+            DetcoreValidateOperand {
+                displacement: 197,
+                next: 201,
+                key: "fixed_detcore_validate_fixed_patch_alloc_194_data",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 203,
+                next: 207,
+                key: "fixed_heap_panic_sub_overflow",
+                got: true,
+            },
+            DetcoreValidateOperand {
+                displacement: 210,
+                next: 214,
+                key: "fixed_detcore_validate_fixed_patch_alloc_207_data",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 224,
+                next: 228,
+                key: "fixed_heap_panic_misaligned",
+                got: true,
+            },
+            DetcoreValidateOperand {
+                displacement: 231,
+                next: 235,
+                key: "fixed_detcore_validate_fixed_patch_alloc_228_data",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 237,
+                next: 241,
+                key: "fixed_panic_null_reference",
+                got: true,
+            },
+        ],
+        transfers: &[(14, 0), (58, 2), (188, 3), (201, 5), (222, 7), (235, 9)],
+    },
+    // Retained pinned diagnostic ELF, VA 0x128d8d0, exact LOCAL8 cell 0x148.
+    // Complete 241-byte body SHA256: a8ebcb1ad9b229aca79d2c5e29344b716eef9df78cf7caf015b9274d8a5ae148.
+    DetcoreValidateTemplate {
+        role: "fixed_patch_alloc",
+        hex: "41574156415453504889d34989f6ff157c812d004885c0747c4989c44c8b782041f6c7070f85a50000004d85ff0f84b1000000488d3d2e062d00e8b1cb22004883b84801000000745d498b542410498b07498d76ff49f7de31c94889c74801d772354801f772304c21f74989f84929d072504901d8410f92c14981f801000002410f93c24508ca750ef04d0fb10775ca4889f9eb0231c94889c84883c4085b415c415e415fc3bf010000004c89f64889da4883c4085b415c415e415fff25fe802d00488d3d47842900ff1549092d00488d156a842900bf080000004c89feff15e4102d00488d3d55842900ff15c7532d00",
+        operands: &[
+            DetcoreValidateOperand {
+                displacement: 16,
+                next: 20,
+                key: "fixed_arena_backing",
+                got: true,
+            },
+            DetcoreValidateOperand {
+                displacement: 54,
+                next: 58,
+                key: "fixed_publication_tls_descriptor",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 59,
+                next: 63,
+                key: "fixed_tls_get_addr_plt",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 190,
+                next: 194,
+                key: "fixed_tool_alloc",
+                got: true,
+            },
+            DetcoreValidateOperand {
+                displacement: 197,
+                next: 201,
+                key: "fixed_detcore_validate_fixed_patch_alloc_194_data",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 203,
+                next: 207,
+                key: "fixed_heap_panic_sub_overflow",
+                got: true,
+            },
+            DetcoreValidateOperand {
+                displacement: 210,
+                next: 214,
+                key: "fixed_detcore_validate_fixed_patch_alloc_207_data",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 224,
+                next: 228,
+                key: "fixed_heap_panic_misaligned",
+                got: true,
+            },
+            DetcoreValidateOperand {
+                displacement: 231,
+                next: 235,
+                key: "fixed_detcore_validate_fixed_patch_alloc_228_data",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 237,
+                next: 241,
+                key: "fixed_panic_null_reference",
+                got: true,
+            },
+        ],
+        transfers: &[(14, 0), (58, 2), (188, 3), (201, 5), (222, 7), (235, 9)],
+    },
+    // Retained pinned normal ELF, VA 0x1289e50, exact LOCAL8 cell 0x108.
+    // Complete 22-byte body SHA256: ae2842200f1c3de93b9716d589a3df0cbc340767c98f2a2affd89a0509c7992e.
+    DetcoreValidateTemplate {
+        role: "fixed_tls_fn_once",
+        hex: "50488d3d60fa2c00e823bd2200488d800801000059c3",
+        operands: &[
+            DetcoreValidateOperand {
+                displacement: 4,
+                next: 8,
+                key: "fixed_publication_tls_descriptor",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 9,
+                next: 13,
+                key: "fixed_tls_get_addr_plt",
+                got: false,
+            },
+        ],
+        transfers: &[(8, 1)],
+    },
+    // Retained pinned diagnostic ELF, VA 0x128dc60, exact LOCAL8 cell 0x148.
+    // Complete 22-byte body SHA256: a350560648d73fb7dbd68c2dfbd3e4fa91c30a21e096d015c2121538678053bb.
+    DetcoreValidateTemplate {
+        role: "fixed_tls_fn_once",
+        hex: "50488d3dd0022d00e853c82200488d804801000059c3",
+        operands: &[
+            DetcoreValidateOperand {
+                displacement: 4,
+                next: 8,
+                key: "fixed_publication_tls_descriptor",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 9,
+                next: 13,
+                key: "fixed_tls_get_addr_plt",
+                got: false,
+            },
+        ],
+        transfers: &[(8, 1)],
+    },
 ];
 
 // Distinct from every historical TLS-bearing241B recipe. Measured in the true
@@ -27628,6 +28005,45 @@ fn detcore_no_scope_allocation_shape(bytes: &[u8]) -> bool {
             .map(|operand| operand.displacement),
     )
 }
+// Resolves one no-scope allocation operand target. The recipe's
+// null-reference panic operand names panic_null_reference_constructed,
+// which stable core merged into panic_null_pointer_dereference (the
+// same merge the validate templates handle by GOT discrimination):
+// when only the merged entry is bound it serves as this operand's
+// target, and when both are bound the GOT slot's actual callee
+// chooses. The recipe's own GOT check still verifies whichever
+// target is chosen, and with neither bound the operand refuses by
+// its recipe name.
+fn detcore_panic_null_operand_target(
+    targets: &BTreeMap<String, u64>,
+    got: &BTreeMap<u64, u64>,
+    address: u64,
+    bytes: &[u8],
+    operand: &DetcoreValidateOperand,
+) -> Result<u64> {
+    let unbound = || format!("unbound no-scope allocation operand {}", operand.key);
+    if operand.key != "fixed_panic_null_reference" {
+        return targets.get(operand.key).copied().ok_or_else(unbound);
+    }
+    match (
+        targets.get(operand.key),
+        targets.get("fixed_heap_panic_null"),
+    ) {
+        (Some(&primary), Some(&merged)) if primary != merged => {
+            let got_chooses_merged = operand.got
+                && fixed_rip_target(address, bytes, operand.displacement, operand.next)
+                    .is_ok_and(|slot| got.get(&slot) == Some(&merged));
+            if got_chooses_merged {
+                return Ok(merged);
+            }
+            Ok(primary)
+        }
+        (Some(&primary), _) => Ok(primary),
+        (None, Some(&merged)) => Ok(merged),
+        (None, None) => Err(unbound()),
+    }
+}
+
 fn fixed_detcore_no_scope_allocation_recipe(
     address: u64,
     bytes: &[u8],
@@ -27645,9 +28061,7 @@ fn fixed_detcore_no_scope_allocation_recipe(
     let mut fields = Vec::new();
     let mut resolved = Vec::new();
     for operand in DETCORE_NO_SCOPE_ALLOC.operands {
-        let expected = *targets
-            .get(operand.key)
-            .ok_or_else(|| format!("unbound no-scope allocation operand {}", operand.key))?;
+        let expected = detcore_panic_null_operand_target(targets, got, address, bytes, operand)?;
         require(expected != 0, "null no-scope allocation typed operand")?;
         let actual = fixed_rip_target(address, bytes, operand.displacement, operand.next)?;
         if operand.got {
@@ -27939,9 +28353,7 @@ fn fixed_detcore_validate_recipe_in_scope(
         )?;
     }
     for op in t.operands {
-        let expected = *targets
-            .get(op.key)
-            .ok_or_else(|| format!("unbound exact Detcore operand {}", op.key))?;
+        let expected = detcore_panic_null_operand_target(targets, got, address, bytes, op)?;
         require(expected != 0, "null Detcore typed operand")?;
         if op.key == "fixed_region_ready" || op.key == "fixed_region_value16" {
             let base = *targets
@@ -29655,6 +30067,40 @@ const FIXED_NAKED_PINNED_STANDALONE_INCOMING: &[FixedScalarHelperIncoming] = &[
         &[("fixed_native_owner_gettid", 12, false)],
     ),
 ];
+// The pinned standalone image at add6180b retains this complete tuple,
+// but its gettid C bridge is the already-authenticated 16-byte tail form.
+// All other roles and incoming edges remain the pinned standalone ones.
+const FIXED_NAKED_PINNED_STANDALONE_GETTID_TAIL_COHORT: &[(&str, usize)] = &[
+    ("fixed_region_publication_get_opaque", 67),
+    ("fixed_region_publication_set_opaque", 80),
+    ("fixed_tool_heap_metadata", 57),
+    ("fixed_arena_backing", 58),
+    ("fixed_tool_require_owned", 59),
+    ("fixed_tool_alloc", 60),
+    ("fixed_tool_dealloc", 72),
+    ("fixed_tool_realloc", 73),
+    ("fixed_native_from_native", 78),
+    ("fixed_constructor_prepare", 88),
+    ("fixed_generic_prepare", 92),
+    ("fixed_arena_setup", 82),
+    ("fixed_native_owner_gettid", 108),
+];
+const FIXED_NAKED_PINNED_STANDALONE_GETTID_TAIL_INCOMING: &[FixedScalarHelperIncoming] = &[
+    // Reuse the eight unchanged incoming sets; only gettid's CALL+12 becomes
+    // JMP+11. The bridge still targets the same authenticated raw syscall.
+    FIXED_NAKED_PINNED_STANDALONE_INCOMING[0],
+    FIXED_NAKED_PINNED_STANDALONE_INCOMING[1],
+    FIXED_NAKED_PINNED_STANDALONE_INCOMING[2],
+    FIXED_NAKED_PINNED_STANDALONE_INCOMING[3],
+    FIXED_NAKED_PINNED_STANDALONE_INCOMING[4],
+    FIXED_NAKED_PINNED_STANDALONE_INCOMING[5],
+    FIXED_NAKED_PINNED_STANDALONE_INCOMING[6],
+    FIXED_NAKED_PINNED_STANDALONE_INCOMING[7],
+    (
+        "fixed_scalar_syscall",
+        &[("fixed_native_owner_gettid", 11, false)],
+    ),
+];
 const FIXED_NAKED_PINNED_NATIVE_COHORT: &[(&str, usize)] = &[
     ("fixed_region_publication_get_opaque", 55),
     ("fixed_region_publication_set_opaque", 81),
@@ -30066,6 +30512,92 @@ const FIXED_NAKED_STABLE_ORDINARY_INCOMING: &[FixedScalarHelperIncoming] = &[
         &[("fixed_native_owner_gettid", 12, false)],
     ),
 ];
+// The stable standalone composition reuses main's backing/metadata
+// templates (94/95, shared with the stable ordinary cohort) and the
+// pinned standalone tuple for every other role except the two 252-byte
+// prepare templates appended above (109/110). Backing/metadata
+// get_opaque calls are at caller+34, and both prepare bodies use their
+// observed caller+71/+176/+216 edges.
+const FIXED_NAKED_STABLE_STANDALONE_COHORT: &[(&str, usize)] = &[
+    ("fixed_region_publication_get_opaque", 67),
+    ("fixed_region_publication_set_opaque", 80),
+    ("fixed_tool_heap_metadata", 95),
+    ("fixed_arena_backing", 94),
+    ("fixed_tool_require_owned", 59),
+    ("fixed_tool_alloc", 60),
+    ("fixed_tool_dealloc", 72),
+    ("fixed_tool_realloc", 73),
+    ("fixed_native_from_native", 78),
+    ("fixed_constructor_prepare", 109),
+    ("fixed_generic_prepare", 110),
+    ("fixed_arena_setup", 82),
+    ("fixed_native_owner_gettid", 79),
+];
+const FIXED_NAKED_STABLE_STANDALONE_INCOMING: &[FixedScalarHelperIncoming] = &[
+    (
+        "fixed_region_publication_get_opaque",
+        &[
+            ("fixed_tool_heap_metadata", 34, false),
+            ("fixed_arena_backing", 34, false),
+            ("fixed_native_from_native", 176, false),
+            ("fixed_constructor_prepare", 216, false),
+            ("fixed_generic_prepare", 216, false),
+        ],
+    ),
+    (
+        "fixed_region_publication_set_opaque",
+        &[
+            ("fixed_constructor_prepare", 176, false),
+            ("fixed_generic_prepare", 176, false),
+        ],
+    ),
+    (
+        "fixed_tool_heap_metadata",
+        &[
+            ("fixed_tool_require_owned", 4, false),
+            ("fixed_tool_alloc", 13, false),
+            ("fixed_tool_dealloc", 4, false),
+            ("fixed_tool_realloc", 26, false),
+        ],
+    ),
+    (
+        "fixed_native_from_native",
+        &[
+            ("fixed_constructor_prepare", 71, false),
+            ("fixed_generic_prepare", 71, false),
+        ],
+    ),
+    (
+        "fixed_arena_setup",
+        &[("fixed_native_from_native", 257, false)],
+    ),
+    (
+        "fixed_native_owner_gettid",
+        &[("fixed_native_from_native", 116, false)],
+    ),
+    (
+        "fixed_arena_mprotect",
+        &[
+            ("fixed_arena_setup", 95, false),
+            ("fixed_arena_setup", 119, false),
+        ],
+    ),
+    (
+        "fixed_setup_bitmap_range",
+        &[
+            ("fixed_arena_setup", 16, false),
+            ("fixed_arena_setup", 44, false),
+            ("fixed_arena_setup", 72, false),
+            ("fixed_arena_setup", 184, false),
+            ("fixed_arena_setup", 207, false),
+            ("fixed_arena_setup", 230, false),
+        ],
+    ),
+    (
+        "fixed_scalar_syscall",
+        &[("fixed_native_owner_gettid", 12, false)],
+    ),
+];
 const FIXED_NAKED_COMPOSITIONS: &[FixedNakedComposition] = &[
     FixedNakedComposition {
         image_kind: FixedImageKind::Standalone,
@@ -30093,6 +30625,13 @@ const FIXED_NAKED_COMPOSITIONS: &[FixedNakedComposition] = &[
         native_syscalls: false,
         cohort: FIXED_NAKED_PINNED_STANDALONE_COHORT,
         incoming: FIXED_NAKED_PINNED_STANDALONE_INCOMING,
+        setup_bitmap_template: None,
+    },
+    FixedNakedComposition {
+        image_kind: FixedImageKind::Standalone,
+        native_syscalls: false,
+        cohort: FIXED_NAKED_PINNED_STANDALONE_GETTID_TAIL_COHORT,
+        incoming: FIXED_NAKED_PINNED_STANDALONE_GETTID_TAIL_INCOMING,
         setup_bitmap_template: None,
     },
     FixedNakedComposition {
@@ -30140,13 +30679,38 @@ const FIXED_NAKED_COMPOSITIONS: &[FixedNakedComposition] = &[
         incoming: FIXED_NAKED_STABLE_ORDINARY_INCOMING,
         setup_bitmap_template: Some(105),
     },
+    FixedNakedComposition {
+        image_kind: FixedImageKind::Standalone,
+        native_syscalls: false,
+        cohort: FIXED_NAKED_STABLE_STANDALONE_COHORT,
+        incoming: FIXED_NAKED_STABLE_STANDALONE_INCOMING,
+        setup_bitmap_template: None,
+    },
 ];
-const FIXED_SOURCE_OWNED_TEMPLATE_END: usize = 94;
+// Exclusive end of the source-owned appended template identities
+// (78..END). The contiguous range is a deliberate over-approximation:
+// of main's 94-108, 94-97, 102, 103, 105 and the gettid tail-jmp
+// template at 108 belong to a naked composition, while 98-101, 104,
+// 106 and 107 do not; this stack's stable-standalone prepares follow
+// at 109/110. This departs from main's END=94 and can only add
+// refusals: composition matching does not depend on END, and every
+// naked composition already requires templates 78 and 82 plus either
+// gettid template 79 or its tail successor 108 (the role-keyed
+// witness map cannot hold both for one role). Including 108 is
+// required to preserve the source-owned invariant that any one
+// appended naked identity alone proves publication is present: a
+// lone 108 fragment is routed to the naked composition check instead
+// of through the historical path. A complete tail build already also
+// carries 78 and 82, so including 108 changes no complete build. The
+// stable 0x100 alloc template at 111 (dh-r5tic) follows the same
+// rule: it can only add refusals through this over-approximation.
+const FIXED_SOURCE_OWNED_TEMPLATE_END: usize = 116;
 
 fn fixed_naked_publication_present(
     witnesses: &BTreeMap<String, AuthenticatedDetcoreOperation>,
 ) -> bool {
-    // Every appended identity belongs to this one source-owned composition,
+    // Any witness in the over-approximating source-owned range above
+    // is treated as proving a naked-owner publication is present,
     // including the same-opcode bitmap's new exact readonly-data profile.
     // A fragment cannot enter a historical cohort through an unchanged leaf.
     witnesses.values().any(|w| {
@@ -38210,6 +38774,181 @@ mod tests {
         assert_eq!(CONTENT_REVERIE_CATALOG.len(), 86);
         for (relative, old_size, old_digest) in [
             (
+                "reverie-liteinst/src/lib.rs",
+                35129,
+                "1270edf2571480add4843055dd5417b9886291c4f75d8399645f94cfc76e12ec",
+            ),
+            (
+                "reverie-inguest/src/guest/sigalrm.rs",
+                55207,
+                "d31b0451697e6d475771bb6cf20ffbc6bd2ab71aa28c941172488d7125928fbc",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers/bootstrap_env_aux.rs",
+                20532,
+                "e1962e2ece55d0ca21158333047623b966fc917326dccd9fe7f6a2b99c2d7f38",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers/bootstrap_descriptor.rs",
+                33969,
+                "287cfbb2b93878f61067af99440541909b6376626d10e32ff0113d5375f9b4d3",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers/bootstrap_role.rs",
+                9258,
+                "b930c898a36d6adafc8ef3d34411561a9e04bf99504ddc37c926d6add01a34c8",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers/bootstrap_site.rs",
+                17928,
+                "76249bb4eb4230a3bff4bed32586467c1c13a5ecd9be0eee0e5a7c97901c6362",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers/view_site.rs",
+                52691,
+                "a2253c765e4daf6fca96879f13927213dbda4b54bb77a8600a062a57ff75864f",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers/view_table.rs",
+                41315,
+                "6cfc3c67d8485dff9463cff67be604f81fce9d7f92f63f93f118fc7b4a2e7ccb",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers.rs",
+                241046,
+                "04bc1f83df130609b7e2db500adb3c7fd3a80a712021990782a3a6e9684acac7",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers/ordinary_gate.rs",
+                73521,
+                "93482ce58a17a14e93c0adeade3502fab3bad31f849c779e1e9bbd590582a847",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers/terminal_observation.rs",
+                31604,
+                "1beca894cd78b0c3a877af1285bed1dfd288486d3978f6626359e1e0f8f0ae6c",
+            ),
+            (
+                "reverie-inguest/src/launcher/mod.rs",
+                143434,
+                "bc2b4bf95a77dbdb3c11b59db85a04023fb41a347060b97e24c432ae43352b48",
+            ),
+            (
+                "reverie-inguest/src/launcher/mod.rs",
+                137761,
+                "e39f4d6e7d89c7637502816d0ca4041940fc503abd56e62af0799b9a4722b0d9",
+            ),
+            (
+                "reverie-inguest/src/guest/alloc.rs",
+                37723,
+                "e1304916625b1b166ce0d32b54965c6e3623d9a004b38e77b7ed26ba653e81dc",
+            ),
+            (
+                "reverie-inguest/src/guest/rpc.rs",
+                41754,
+                "2902cd913d98db07dd8ae8c693d2d6b69e3e8f8884dcec932d9fdc3c0dd53f6e",
+            ),
+            (
+                "reverie-inguest/src/guest/host.rs",
+                278679,
+                "440db985804a4d0811e835ed3928b5c147eac709c5955542350f9e48d208a53e",
+            ),
+            (
+                "reverie-inguest/src/guest/host_linux.rs",
+                25059,
+                "9eb8620667dff02d155300bbb35415ebbefbe32c4fc0586f9527308d921dad58",
+            ),
+            (
+                "reverie/src/pmu_config.rs",
+                76782,
+                "637c6fa142ed96a215675e072f2c48152ca3fe11f18a4a0e6d8eaa4bf7124029",
+            ),
+            (
+                "reverie-inguest/src/launcher/mod.rs",
+                94802,
+                "3e2a00f582f24652e81305e659e0960bcf6b334514b58140f886aa292de278f8",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/tls_sources.rs",
+                31145,
+                "32c2926c904342ede1c0cd0cb53734ffcf41baaef388f9ea139295c711173e67",
+            ),
+            (
+                "reverie-inguest/Cargo.toml",
+                5797,
+                "b99c37792f39a34e45cb42ab531504ba09bd0175b6547d8fcc540308d704eb9a",
+            ),
+            (
+                "reverie-liteinst/src/lib.rs",
+                25928,
+                "055b2cc3fc37fd070ebcf133dcf76c68314e80d97913870b26857cc8776b7c31",
+            ),
+            (
+                "reverie-liteinst/src/lib.rs",
+                26762,
+                "99910d58ef33187b149d5787900b5d49d68b71a76fdb68b4519e4b17a830a2a5",
+            ),
+            (
+                "reverie-liteinst/src/tool_host.rs",
+                61723,
+                "7c3d5914e7070ddc89b72afb3ee49ecddded9f105b5fb43810c2ee070dddf3ce",
+            ),
+            (
+                "reverie-inguest/src/guest/host.rs",
+                251928,
+                "16ea9adb9862d42a3cd54f08bdbd8c0cf7f59a793d0ac6fe61ff34008f102e4e",
+            ),
+            (
+                "reverie-inguest/src/guest/installed_tool.rs",
+                32266,
+                "975d69761bf762cd259cc64f2b4fcbffaea64a6df4bab8cb4513e0e27d59c6d4",
+            ),
+            (
+                "reverie-liteinst/src/tool_host.rs",
+                62210,
+                "3bef11657f7403cfe7e416c89105b1bbc4616f4d0d3654bcf43a077c21cc9af1",
+            ),
+            (
+                "reverie-inguest/src/guest/host.rs",
+                264674,
+                "8fe3ae2b738182c1a48f29a2785235d6cb19a93c17c801f4bd547b11cc6ddf02",
+            ),
+            (
+                "reverie-inguest/src/guest/installed_tool.rs",
+                32348,
+                "cf446fe11975f45f4ac7c57629d99ae57e8d868eecd55da0c76207cd978462c1",
+            ),
+            (
+                "reverie-liteinst/src/tool_host.rs",
+                76578,
+                "1d8fc42024677098d729cd45b27c5b434f1f8800981de130973303ae40dc1b45",
+            ),
+            (
+                "reverie-inguest/src/guest/host.rs",
+                259790,
+                "382707512c1af638201ec2c62f4d305b9b851d98dc54c0c8b7af78616ae77930",
+            ),
+            (
+                "reverie-inguest/src/guest/installed_tool.rs",
+                35633,
+                "9cdbb7f5f50751738041fffac5a5078e7ed765f24399699fa612b73e22ce7e00",
+            ),
+            (
+                "reverie-liteinst/src/tool_host.rs",
+                77555,
+                "273a207b2cabdcae378909a13484738ad8b96c951d9cfed08e9ec31474177a6e",
+            ),
+            (
+                "reverie-inguest/src/guest/host.rs",
+                272536,
+                "f5a07c8b8d676461499d6a8ee5e6163f7f57033f26c11d7fcec4425f4e362649",
+            ),
+            (
+                "reverie-inguest/src/guest/installed_tool.rs",
+                35715,
+                "0119bc667ad13b526a923981f8040a356c159e681c67fae4e8030e2d90da58a9",
+            ),
+            (
                 "Cargo.toml",
                 2142,
                 "b3c19cd3f242ba6185a61c596dea3b417be61543c2c83d1d4d358ee6f7fe4930",
@@ -38235,9 +38974,204 @@ mod tests {
                 "3f3a6486819a5af8212f1d6abe42cc1e1cb098ddd45f8bf137790da50ee8c392",
             ),
             (
+                "reverie-inguest/src/guest/host.rs",
+                276321,
+                "1558dc519963b376c7b0a9e69be6264817196cfe8ce7a945d1d5f531520b2a7c",
+            ),
+            (
                 "reverie/src/guest.rs",
                 81764,
                 "b8e45c8b40b0e711fdd01a4a71bbd671c4debcfd1977d44d920446067119dc3a",
+            ),
+            (
+                "reverie-inguest/src/lib.rs",
+                11792,
+                "2d3a8d6906a102cce3627d3b42ff87a334480807b44af14beaa4e60e7eeb78d4",
+            ),
+            (
+                "reverie-inguest/src/lib.rs",
+                11818,
+                "d7fe544f55cb3d3e94f4c1b571df480483a8b384a6cc0e9dfc919649fae3787c",
+            ),
+            (
+                "reverie-inguest/Cargo.toml",
+                5690,
+                "99748fa5ce04bf02949d520049f8c3f900ef9e3b611cf09a16973edf591004fe",
+            ),
+            (
+                "reverie-inguest/src/guest/tool_install.rs",
+                27612,
+                "02b245a3be1cde43dfd718c3c3b27b4b702d0c22d83d2090b1ad4bf1cee56f7c",
+            ),
+            (
+                "reverie-inguest/src/guest/host_linux.rs",
+                24921,
+                "3236278ee1985a08a47c01658e20bf9c3e6569ce2ca3c3551cd59a41804e00f5",
+            ),
+            (
+                "reverie-liteinst/Cargo.toml",
+                6419,
+                "f715014a652758f724583232e19fcfaa2146d574457c4272a6173c04ac28d8cd",
+            ),
+            (
+                "reverie-liteinst/src/lib.rs",
+                26805,
+                "058da9150afc5097c8ef24039e53bf6b4e89c1fb835faa44ab3cca1d53a1896d",
+            ),
+            (
+                "reverie-liteinst/src/patch_alloc.rs",
+                26462,
+                "799b94da011fa6d9313a296a74592fd060c12dd8543176ff4d56e7f82abb02bc",
+            ),
+            (
+                "reverie-liteinst/src/lib.rs",
+                35314,
+                "a1f8f2f5d9c2626b7e80b0e6ccfdfc6eb740d7c2092ce5583dcc66b7db245bb3",
+            ),
+            (
+                "reverie-inguest/src/lib.rs",
+                12593,
+                "8a0e8c1aa9ad1b704141aadf1e322e1ff125059d3529fa37ed296910c6510b30",
+            ),
+            (
+                "reverie-inguest/src/lib.rs",
+                12554,
+                "4654517265bc7cadceba08ed7501bc12dfdd4690370a5d3a2d4cb518a63883f5",
+            ),
+            (
+                "reverie-liteinst/src/lib.rs",
+                27188,
+                "914df22cc643e6ed968596483198833a0a0d304d0d7d0ed62ff541c74563c1b4",
+            ),
+            (
+                "reverie-liteinst-preload/src/lib.rs",
+                842,
+                "40587a60db06dc95538745208d23e7ec55a069c79ac86bfef87377df5a59fbe6",
+            ),
+            (
+                "reverie-liteinst/src/tool_host.rs",
+                77992,
+                "eb9b9481dc8ef1c7b311d6c1fe0c75efa33924d293b189e86eb98c562e44e878",
+            ),
+            (
+                "reverie-liteinst/src/tool_host.rs",
+                77827,
+                "8438f128924c1c4dcf19b72bcf98580458628c67f98b03383cde791b0f814966",
+            ),
+            (
+                "reverie-liteinst/src/tool_host.rs",
+                79634,
+                "7ba6aa50c8f4da098795b0d1f182b9aeb8f8e82efdb4b55a240e1b9a51121ae5",
+            ),
+            (
+                "reverie-rpc-transport/src/lib.rs",
+                5018,
+                "7ac7f50a9b43af71abf678026762052267ac9c003d99a49f39257455dd41c725",
+            ),
+            (
+                "reverie-rpc-transport/src/server.rs",
+                124661,
+                "dced4ec2c6a35adf3835b8cc632d32d88bca89ffbc29d6c5073d3ec3e67815e5",
+            ),
+            (
+                "reverie-liteinst/src/tool_host.rs",
+                80408,
+                "c8ea1218b4510231065591886f36d42c86035a7f9e1fd58e401e920aee535db5",
+            ),
+            (
+                "reverie-liteinst/Cargo.toml",
+                6589,
+                "c39c8a6d516187302f1e4de686c13eee2d5a4b89519af0578f7e251792113db2",
+            ),
+            (
+                "reverie-rpc-transport/src/server.rs",
+                129280,
+                "36277ed3bd85e2ee454e0a6ffebd469c9389a0a1322551dc0a3970dad1a8945d",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/tls_sources.rs",
+                19927,
+                "d7bc03dd3fa432f406977a02d5fe58628cc656aca26d2bb921d22e69094348b6",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers.rs",
+                240984,
+                "386d565e8ef2d80ae52a9069f7a7cda61df761601907f6594cedd47301c1b6e5",
+            ),
+            (
+                "reverie-inguest/src/guest/alloc.rs",
+                46676,
+                "8b594686698976c7b3c88aa5bfeaa234163b3181c1e92a10977831a01bef71b2",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers/bootstrap_env_aux.rs",
+                20586,
+                "4afada5329dc1f87a52293642fc8b5d588161f6fa8bfd13e031f9469d36ed85a",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers/bootstrap_descriptor.rs",
+                34023,
+                "b52ccee92a5a86760b2a106c431feae29cc4d58e78e6a5f91e08e9c5bf61fa6d",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers/bootstrap_role.rs",
+                9301,
+                "40ed1b5dafe32e1a52f96fb03fde75226c955d0d902a796763ad401e4b31a4d3",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers/bootstrap_site.rs",
+                17971,
+                "a6a6b9818110da6d053c9aa4edd804e9e1145e436632e9b3b2acf3439474371c",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers/view_site.rs",
+                52866,
+                "2c8a72323b5a8b8bc3b071e719d12d20183fad75d1b9d95597204bca7f04969e",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers/view_table.rs",
+                41490,
+                "0dadc3bd659870589c6b7579e79b2832103f071b5304c647b5f03030614efc76",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers.rs",
+                245432,
+                "9538dc41f8a93b9da2ef5b2960215eb5e8ae7a34ef429ad002962500b49af16c",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/tls_sources.rs",
+                34033,
+                "f4b84be4c107f164de6f4f3d51bdccc4d7d73d253d3bf10e8709d2c29a056ac7",
+            ),
+            (
+                "reverie-liteinst-artifact/Cargo.toml",
+                518,
+                "d0d67686684187c810b795d4da8a7a07dba1f647b5e0c6b64084f689ba55567b",
+            ),
+            (
+                "reverie-inguest/Cargo.toml",
+                6166,
+                "e30d39d15eb64c0ce1adb72fb92cd7a28268a4dc448d1c38690f868e979d63fb",
+            ),
+            (
+                "reverie-syscalls/Cargo.toml",
+                1293,
+                "b2a9b46980aebbf07ec3697f4c850deea72d152b077f2048cf8b155283da9722",
+            ),
+            (
+                "reverie-liteinst/Cargo.toml",
+                6685,
+                "855ce0a1b01fe45019a6dbbfa260d8c92907f935d935cd800a7873e3f0332f5c",
+            ),
+            (
+                "reverie-liteinst-preload/Cargo.toml",
+                980,
+                "47f5353ab04a0ac18348afb71cda8574189f8ee28239f1b54e86405042fc943d",
+            ),
+            (
+                "reverie/Cargo.toml",
+                2373,
+                "bf1ae47ec87ec05198764c17ddd0bc5a2988ec4511b45672b748c202ace8fc24",
             ),
         ] {
             let entries: Vec<_> = CONTENT_REVERIE_CATALOG
@@ -38445,8 +39379,8 @@ mod tests {
             };
             let raw_manifest = logical_root.join(name).join("Cargo.toml");
             let raw_target = logical_root.join(&relative_target);
-            let valid = serde_json::json!({"packages": [{"name":name, "version":"0.5.5",
-                "id":format!("{}#{name}@0.5.5", source.rsplit_once('#').unwrap().0), "source":source,
+            let valid = serde_json::json!({"packages": [{"name":name, "version":"0.5.6",
+                "id":format!("{}#{name}@0.5.6", source.rsplit_once('#').unwrap().0), "source":source,
                 "manifest_path":raw_manifest, "targets":[{"name":target, "kind":kind, "crate_types":kind, "src_path":raw_target}]}]});
             let selected = content_package(&valid, name, target, kind, &binding, &source).unwrap();
             assert_eq!(
@@ -38458,13 +39392,14 @@ mod tests {
                 ("version", serde_json::json!("0.4.0")),
                 ("version", serde_json::json!("0.5.1")),
                 ("version", serde_json::json!("0.5.4")),
+                ("version", serde_json::json!("0.5.5")),
                 (
                     "id",
                     serde_json::json!(
                         valid["packages"][0]["id"]
                             .as_str()
                             .unwrap()
-                            .replace("@0.5.5", "@0.5.1")
+                            .replace("@0.5.6", "@0.5.1")
                     ),
                 ),
                 (
@@ -38473,7 +39408,16 @@ mod tests {
                         valid["packages"][0]["id"]
                             .as_str()
                             .unwrap()
-                            .replace("@0.5.5", "@0.5.4")
+                            .replace("@0.5.6", "@0.5.4")
+                    ),
+                ),
+                (
+                    "id",
+                    serde_json::json!(
+                        valid["packages"][0]["id"]
+                            .as_str()
+                            .unwrap()
+                            .replace("@0.5.6", "@0.5.5")
                     ),
                 ),
                 ("id", serde_json::json!("wrong-package-id")),
@@ -38709,9 +39653,9 @@ mod tests {
         ]
         .into_iter()
         .map(|name| {
-            format!("[[package]]\nname = \"{name}\"\nversion = \"0.5.5\"\nsource = \"{source}\"\n")
+            format!("[[package]]\nname = \"{name}\"\nversion = \"0.5.6\"\nsource = \"{source}\"\n")
         })
-        .chain(["[[package]]\nname = \"detcore-liteinst\"\nversion = \"0.5.5\"\n".into()])
+        .chain(["[[package]]\nname = \"detcore-liteinst\"\nversion = \"0.5.6\"\n".into()])
         .collect::<String>();
         fs::write(&lock, &lock_bytes).unwrap();
         let dependencies = [
@@ -38729,8 +39673,8 @@ mod tests {
         })
         .collect::<Vec<_>>();
         let runtime = serde_json::json!({"workspace_root":root,"packages":[{
-            "name":"detcore-liteinst", "version":"0.5.5",
-            "id":format!("path+file://{}#0.5.5",root.join("detcore-liteinst").display()),
+            "name":"detcore-liteinst", "version":"0.5.6",
+            "id":format!("path+file://{}#0.5.6",root.join("detcore-liteinst").display()),
             "source":null,"manifest_path":root.join("detcore-liteinst/Cargo.toml"),
             "dependencies":dependencies,"targets":[{"name":"detcore_liteinst","kind":["cdylib"],
                 "crate_types":["cdylib"],"src_path":root.join("detcore-liteinst/src/lib.rs")}]
@@ -38830,6 +39774,7 @@ mod tests {
             ("version", serde_json::json!("0.4.1")),
             ("version", serde_json::json!("0.5.1")),
             ("version", serde_json::json!("0.5.4")),
+            ("version", serde_json::json!("0.5.5")),
             ("source", serde_json::json!(source)),
             (
                 "manifest_path",
@@ -38849,7 +39794,7 @@ mod tests {
             (
                 "id",
                 serde_json::json!(format!(
-                    "path+file://{}#0.5.5",
+                    "path+file://{}#0.5.6",
                     root.join("elsewhere/detcore-liteinst").display()
                 )),
             ),
@@ -38913,23 +39858,29 @@ mod tests {
             lock_bytes.replacen("name = \"reverie-core\"", "name = \"lookalike\"", 1),
             lock_bytes.replacen("?rev=", "?rev=wrong", 1),
             lock_bytes.replacen('#', "#wrong", 1),
-            lock_bytes.replacen("version = \"0.5.5\"", "version = \"0.4.0\"", 1),
-            lock_bytes.replacen("version = \"0.5.5\"", "version = \"0.5.1\"", 1),
-            lock_bytes.replacen("version = \"0.5.5\"", "version = \"0.5.4\"", 1),
+            lock_bytes.replacen("version = \"0.5.6\"", "version = \"0.4.0\"", 1),
+            lock_bytes.replacen("version = \"0.5.6\"", "version = \"0.5.1\"", 1),
+            lock_bytes.replacen("version = \"0.5.6\"", "version = \"0.5.4\"", 1),
+            lock_bytes.replacen("version = \"0.5.6\"", "version = \"0.5.5\"", 1),
             lock_bytes.replacen("name = \"detcore-liteinst\"", "name = \"lookalike\"", 1),
             lock_bytes.replacen(
-                "name = \"detcore-liteinst\"\nversion = \"0.5.5\"",
+                "name = \"detcore-liteinst\"\nversion = \"0.5.6\"",
                 "name = \"detcore-liteinst\"\nversion = \"0.4.1\"",
                 1,
             ),
             lock_bytes.replacen(
-                "name = \"detcore-liteinst\"\nversion = \"0.5.5\"",
+                "name = \"detcore-liteinst\"\nversion = \"0.5.6\"",
                 "name = \"detcore-liteinst\"\nversion = \"0.5.1\"",
                 1,
             ),
             lock_bytes.replacen(
-                "name = \"detcore-liteinst\"\nversion = \"0.5.5\"",
+                "name = \"detcore-liteinst\"\nversion = \"0.5.6\"",
                 "name = \"detcore-liteinst\"\nversion = \"0.5.4\"",
+                1,
+            ),
+            lock_bytes.replacen(
+                "name = \"detcore-liteinst\"\nversion = \"0.5.6\"",
+                "name = \"detcore-liteinst\"\nversion = \"0.5.5\"",
                 1,
             ),
             format!("{lock_bytes}{lock_bytes}"),
@@ -39113,7 +40064,7 @@ mod tests {
         assert!(runner.commands.is_empty());
         let source = format!("git+https://github.com/rrnewton/reverie.git?rev={pin}#{pin}");
         let git_id = |name: &str| {
-            format!("git+https://github.com/rrnewton/reverie.git?rev={pin}#{name}@0.5.5")
+            format!("git+https://github.com/rrnewton/reverie.git?rev={pin}#{name}@0.5.6")
         };
         let package = |name: &str, target: &str, kind: &[&str], git: bool, version: &str| {
             serde_json::json!({
@@ -39136,7 +40087,7 @@ mod tests {
         ] {
             for git in [false, true] {
                 let valid =
-                    serde_json::json!({"packages": [package(name, target, kind, git, "0.5.5")]});
+                    serde_json::json!({"packages": [package(name, target, kind, git, "0.5.6")]});
                 let expected_source = git.then_some(source.as_str());
                 compiled_library_package(&valid, name, target, kind, &root, expected_source)
                     .unwrap();
@@ -39154,13 +40105,14 @@ mod tests {
                     ("version", serde_json::json!("0.4.0")),
                     ("version", serde_json::json!("0.5.1")),
                     ("version", serde_json::json!("0.5.4")),
+                    ("version", serde_json::json!("0.5.5")),
                     (
                         "id",
                         serde_json::json!(
                             valid["packages"][0]["id"]
                                 .as_str()
                                 .unwrap()
-                                .replace("0.5.5", "0.5.1")
+                                .replace("0.5.6", "0.5.1")
                         ),
                     ),
                     (
@@ -39169,7 +40121,16 @@ mod tests {
                             valid["packages"][0]["id"]
                                 .as_str()
                                 .unwrap()
-                                .replace("0.5.5", "0.5.4")
+                                .replace("0.5.6", "0.5.4")
+                        ),
+                    ),
+                    (
+                        "id",
+                        serde_json::json!(
+                            valid["packages"][0]["id"]
+                                .as_str()
+                                .unwrap()
+                                .replace("0.5.6", "0.5.5")
                         ),
                     ),
                     ("id", serde_json::json!("same-name-wrong-source")),
@@ -39261,13 +40222,13 @@ mod tests {
                 FixedImageKind::Standalone,
                 "reverie-liteinst-preload",
                 "reverie_liteinst_preload",
-                "0.5.5",
+                "0.5.6",
             ),
             (
                 FixedImageKind::Detcore,
                 "detcore-liteinst",
                 "detcore_liteinst",
-                "0.5.5",
+                "0.5.6",
             ),
         ] {
             for git in [false, true] {
@@ -39281,7 +40242,7 @@ mod tests {
                             valid["packages"][0]["id"]
                                 .as_str()
                                 .unwrap()
-                                .replace("0.5.5", "0.5.1")
+                                .replace("0.5.6", "0.5.1")
                         ),
                     ),
                     (
@@ -39290,7 +40251,16 @@ mod tests {
                             valid["packages"][0]["id"]
                                 .as_str()
                                 .unwrap()
-                                .replace("0.5.5", "0.5.4")
+                                .replace("0.5.6", "0.5.4")
+                        ),
+                    ),
+                    (
+                        "id",
+                        serde_json::json!(
+                            valid["packages"][0]["id"]
+                                .as_str()
+                                .unwrap()
+                                .replace("0.5.6", "0.5.5")
                         ),
                     ),
                     ("id", serde_json::json!("wrong-leaf-id")),
@@ -45846,6 +46816,25 @@ mod tests {
                 &[(17, 21, 3671976), (22, 26, 3451968)],
             ),
             (
+                "fixed_patch_alloc",
+                675744,
+                "41574156415453504889d34989f6ff1514980b004885c074774c8b78204d85ff746e4989c4488d3dcc950b00e84f310b004883b870000000007463498b542410498b0f498d76ff49f7de31c04889cf4801d7723e4801f772394c21f74989f84929d04901d8410f92c14981f801000002410f93c24508ca75194889c8f04d0fb1074889c1b80000000075c14889f8eb0231c04883c4085b415c415e415fc3bf010000004c89f64889da4883c4085b415c415e415fff253e9b0b00",
+                112,
+                &[
+                    (16, 20, 1435592),
+                    (40, 44, 1435032),
+                    (45, 49, 1409312),
+                    (182, 186, 1436568),
+                ],
+            ),
+            (
+                "fixed_tls_fn_once",
+                676496,
+                "50488d3d00930b00e8832e0b00488d807000000059c3",
+                112,
+                &[(4, 8, 1435032), (9, 13, 1409312)],
+            ),
+            (
                 "fixed_tls_cell_getter",
                 1588208,
                 "4883ec1848897c24084889742410488d3ddb4a2200e8a6d11e00488d80400000004883c418c3",
@@ -45927,7 +46916,7 @@ mod tests {
                 );
             }
             // Even another observed offset cannot substitute for this actual cell.
-            for wrong in [0, 0x40, 0x48, 0x50, 0x80, 0x88, 0x90, u64::MAX] {
+            for wrong in [0, 0x30, 0x40, 0x48, 0x50, 0x70, 0x80, 0x88, 0x90, u64::MAX] {
                 if wrong == offset {
                     continue;
                 }
@@ -48615,6 +49604,125 @@ mod tests {
             put(&mut dynamic, 0x4418 + offset, width, value);
         }
         assert!(detcore_census(&dynamic).is_err());
+        // The same physical census at the getter-less 0x110 cohort: absent is
+        // empty, while a planted recipe getter or loader pointer is found.
+        let mut detcore110 = base.clone();
+        put(&mut detcore110, 0x4020, 8, 0x110);
+        let mut cell110 = cell.clone();
+        cell110.address = 0x110;
+        let census110 = |bytes: &[u8]| {
+            direct_tls_getter_census(&Elf::parse(bytes).unwrap(), bytes, &cell110, 0x3300, 0x1800)
+        };
+        let absent110 = census110(&detcore110).unwrap();
+        assert!(
+            absent110.named_getters.is_empty()
+                && absent110.recipe_getters.is_empty()
+                && absent110.getter_pointer_slots.is_empty()
+        );
+        let mut thunk110 = thunk.clone();
+        thunk110[16..20].copy_from_slice(&0x110u32.to_le_bytes());
+        let mut hidden110 = detcore110.clone();
+        hidden110[0x1500..0x1516].copy_from_slice(&thunk110);
+        assert_eq!(census110(&hidden110).unwrap().recipe_getters, [0x1500]);
+        let mut pointer110 = hidden110.clone();
+        for (offset, value) in [
+            (0, 0x3400),
+            (8, u64::from(reloc::R_X86_64_RELATIVE)),
+            (16, 0x1500),
+        ] {
+            put(&mut pointer110, 0x4800 + offset, 8, value);
+        }
+        assert_eq!(
+            census110(&pointer110).unwrap().getter_pointer_slots,
+            [0x3400]
+        );
+        // A novel v0 backref spelling remains an exact-spelling refusal in
+        // this slice; it must not be silently treated as the known getter.
+        let mut novel110 = hidden110.clone();
+        for (offset, width, value) in [
+            (0, 4, getter_name_offset as u64),
+            (4, 1, u64::from(sym::STT_FUNC)),
+            (6, 2, 1),
+            (8, 8, 0x1500),
+            (16, 8, 22),
+        ] {
+            put(&mut novel110, 0x4030 + offset, width, value);
+        }
+        let name_at = 0x4200 + getter_name_offset;
+        let backref = novel110[name_at..name_at + getter_name.len()]
+            .windows(3)
+            .position(|window| window == b"B1n" || window == b"B1o")
+            .expect("known getter backref");
+        novel110[name_at + backref + 2] = b'x';
+        assert!(
+            census110(&novel110).is_err(),
+            "novel-spelling named getter must refuse"
+        );
+        // Derive's source-independent mint gate must mint v3 at 0x110 from
+        // the empty census, and must refuse outside-offset or
+        // planted-getter images. This is the gate the qualify/mint sites share.
+        let alloc_template = DETCORE_VALIDATE_TEMPLATES
+            .iter()
+            .find(|template| {
+                template.role == "fixed_patch_alloc" && fixed_hex(template.hex).len() == 241
+            })
+            .unwrap();
+        let alloc_bytes = fixed_hex(alloc_template.hex);
+        let minted = mint_detcore_direct_allocation_tls_evidence(
+            &detcore110,
+            &cell110,
+            &alloc_bytes,
+            absent110,
+            "0".repeat(64),
+            "2".repeat(40),
+            (0, 0),
+        )
+        .unwrap();
+        assert_eq!(minted.version, 3);
+        assert_eq!(minted.policy, DETCORE_DIRECT_TLS_CENSUS_POLICY_V3);
+        assert!(
+            minted.named_getters.is_empty()
+                && minted.recipe_getters.is_empty()
+                && minted.getter_pointer_slots.is_empty()
+        );
+        let mut detcore118 = detcore110.clone();
+        put(&mut detcore118, 0x4020, 8, 0x118);
+        let mut cell118 = cell110.clone();
+        cell118.address = 0x118;
+        let census118 = direct_tls_getter_census(
+            &Elf::parse(&detcore118).unwrap(),
+            &detcore118,
+            &cell118,
+            0x3300,
+            0x1800,
+        )
+        .unwrap();
+        assert!(
+            mint_detcore_direct_allocation_tls_evidence(
+                &detcore118,
+                &cell118,
+                &alloc_bytes,
+                census118,
+                "0".repeat(64),
+                "2".repeat(40),
+                (0, 0),
+            )
+            .is_err(),
+            "derive must refuse an offset outside the accepted set"
+        );
+        assert!(
+            mint_detcore_direct_allocation_tls_evidence(
+                &hidden110,
+                &cell110,
+                &alloc_bytes,
+                census110(&hidden110).unwrap(),
+                "0".repeat(64),
+                "2".repeat(40),
+                (0, 0),
+            )
+            .is_err(),
+            "derive must refuse a planted recipe getter"
+        );
         // Actual mapping bytes participate in the record join even when a
         // change does not create a getter. An old census cannot be replayed.
         let mut changed = base.clone();
@@ -48786,6 +49894,61 @@ mod tests {
             .is_err(),
             "v2 cannot enter the standalone v1 validator"
         );
+        // V3 is the semantic getter-less cohort: the same retained sample at
+        // 0x110 validates only under the new version/policy pair. Retained
+        // v2 at 0x110 and v3 outside the accepted set still refuse.
+        let mut v3 = value.clone();
+        v3["tls_boundary"]["tls_cell"]["address"] = serde_json::json!(0x110);
+        v3["tls_boundary"]["direct_allocation"]["version"] = serde_json::json!(3);
+        v3["tls_boundary"]["direct_allocation"]["policy"] = serde_json::json!(
+            "detcore_semantic_alloc241_named_getter_pt_load22_raw_loader_pointers_v3"
+        );
+        let decoded_v3: AllocatorBackingEvidence = serde_json::from_value(v3.clone()).unwrap();
+        check(&decoded_v3).unwrap();
+        let mut outside = decoded_v3.clone();
+        outside.tls_boundary.existing_mut().tls_cell.address = 0x118;
+        assert!(
+            validate_direct_allocation_tls_evidence_in_image(
+                outside.tls_boundary.existing().unwrap(),
+                outside
+                    .tls_boundary
+                    .existing()
+                    .unwrap()
+                    .direct_allocation
+                    .as_ref()
+                    .unwrap(),
+                FixedImageKind::Detcore,
+            )
+            .is_err(),
+            "Detcore v3 direct validator must refuse offset outside the accepted set"
+        );
+        assert_eq!(serde_json::to_value(&decoded_v3).unwrap(), v3);
+        for (version, policy, address) in [
+            (2, DETCORE_DIRECT_TLS_CENSUS_POLICY, 0x110),
+            (
+                3,
+                "detcore_semantic_alloc241_named_getter_pt_load22_raw_loader_pointers_v3",
+                0x118,
+            ),
+            (3, DETCORE_DIRECT_TLS_CENSUS_POLICY, 0x110),
+        ] {
+            let mut bad = v3.clone();
+            bad["tls_boundary"]["tls_cell"]["address"] = serde_json::json!(address);
+            bad["tls_boundary"]["direct_allocation"]["version"] = serde_json::json!(version);
+            bad["tls_boundary"]["direct_allocation"]["policy"] = serde_json::json!(policy);
+            assert!(
+                check(&serde_json::from_value(bad).unwrap()).is_err(),
+                "Detcore direct version/policy/address {version}/{policy}/{address:#x}"
+            );
+        }
+        for field in ["named_getters", "recipe_getters", "getter_pointer_slots"] {
+            let mut bad = v3.clone();
+            bad["tls_boundary"]["direct_allocation"][field] = serde_json::json!([0x1500]);
+            assert!(
+                check(&serde_json::from_value(bad).unwrap()).is_err(),
+                "Detcore v3 direct {field}"
+            );
+        }
         // Wrong image/version, omitted/stale/forged joins, and any getter or
         // pointer edge remain refusals. No empty role map is accepted alone.
         for (field, replacement) in [
@@ -59329,6 +60492,32 @@ mod tests {
                 },
             ]
         );
+        // Stable core merged panic_null_reference_constructed into
+        // panic_null_pointer_dereference: with only the merged entry
+        // bound, the same body qualifies with the same transfers.
+        let mut stable_targets = targets.clone();
+        stable_targets.remove("fixed_panic_null_reference");
+        stable_targets.insert("fixed_heap_panic_null".into(), 0xe8cce7);
+        assert_eq!(
+            check(&bytes, &stable_targets, &got, &readonly, &context).unwrap(),
+            edges,
+            "stable merged panic entry must bind the no-scope alloc operand"
+        );
+        // With neither panic entry bound, the operand refuses by name.
+        let mut unbound_targets = stable_targets.clone();
+        unbound_targets.remove("fixed_heap_panic_null");
+        let unbound_error = check(&bytes, &unbound_targets, &got, &readonly, &context)
+            .expect_err("unbound panic operand must refuse");
+        assert!(
+            unbound_error
+                .contains("unbound no-scope allocation operand fixed_panic_null_reference"),
+            "{unbound_error}"
+        );
+        // The merged entry bound to a different address than the
+        // GOT slot holds still refuses.
+        let mut wrong_got = got.clone();
+        *wrong_got.get_mut(&0xeea2e8).unwrap() ^= 1;
+        assert!(check(&bytes, &stable_targets, &wrong_got, &readonly, &context).is_err());
         let instructions: Vec<_> = [
             (0, 2),
             (2, 1),
@@ -59579,6 +60768,268 @@ mod tests {
             AuthenticatedDetcoreOperationKind::ValidateTemplate(26)
         );
         assert_eq!(witness.scalar_storage, None);
+    }
+
+    // The stable-built Detcore image at Reverie 2465470e carries
+    // INSTALLATION_DEPTH at TLS cell 0x100 (size 8, local), with the
+    // same 241-byte fixed_patch_alloc shape as the 0x110/0x128 cohorts
+    // (sha256 0be4c788adc82d1f0562d9d3b6123cc17a7ff871075414fab9af5d1b339aea8d
+    // for the body extracted from that image, its encoded cell operand
+    // reading 0x100). At add6180b the normal and diagnostic images have
+    // direct cells 0x108 and 0x148 respectively. The ELF qualifier separately
+    // binds the allocation's encoded read to the named cell in that image;
+    // these descriptor controls retain the exact observed offset allow-list.
+    #[test]
+    fn detcore_allocator_tls_boundary_accepts_stable_cell_0x100() {
+        let boundary = |cell: u64| {
+            AllocatorTlsBoundary {
+            dependency: "existing_installation_depth_tls".into(),
+            provider_symbol: "__tls_get_addr".into(),
+            provider_version: "GLIBC_2.3".into(),
+            provider_library: "ld-linux-x86-64.so.2".into(),
+            plt_address: 0x363c40,
+            got_slot: 0x39ad18,
+            dynamic_symbol_index: 1,
+            tls_cell: SymbolEvidence {
+                name: "_RNvNCNKNvNtCsTest_16reverie_liteinst11patch_alloc18INSTALLATION_DEPTH0s_023___RUST_STD_INTERNAL_VAL".into(),
+                address: cell,
+                size: 8,
+                binding: sym::STB_LOCAL,
+                visibility: sym::STV_DEFAULT,
+            },
+            tls_module_slot: 0x39ae30,
+            tls_offset_slot: 0x39ae38,
+            callsites: vec![ConstructorTransfer {
+                instruction: 0x1000,
+                target: 0x363c40,
+                local_got_slot: None,
+            }],
+            local_key_object: None,
+            local_key_transfer: None,
+            local_key_resolution: None,
+            unisolated: true,
+            plt_sha256: "0".repeat(64),
+            function_sha256: BTreeMap::from([
+                ("fixed_patch_alloc".into(), "0".repeat(64)),
+                ("fixed_tls_fn_once".into(), "0".repeat(64)),
+            ]),
+            direct_allocation: None,
+            local_chain: BTreeMap::from([
+                (
+                    "fixed_patch_alloc".into(),
+                    SymbolEvidence {
+                        name: "fixed_patch_alloc".into(),
+                        address: 0x2000,
+                        size: 241,
+                        binding: sym::STB_LOCAL,
+                        visibility: sym::STV_DEFAULT,
+                    },
+                ),
+                (
+                    "fixed_tls_fn_once".into(),
+                    SymbolEvidence {
+                        name: "fixed_tls_fn_once".into(),
+                        address: 0x3000,
+                        size: 22,
+                        binding: sym::STB_LOCAL,
+                        visibility: sym::STV_DEFAULT,
+                    },
+                ),
+            ]),
+        }
+        };
+        for cell in [0x100, 0x108, 0x148] {
+            assert!(
+                validate_existing_allocator_tls_boundary(&boundary(cell), FixedImageKind::Detcore)
+                    .is_ok(),
+                "observed direct cell {cell:#x} must validate"
+            );
+        }
+        for cell in [0x10c, 0x140, 0x150] {
+            assert!(
+                validate_existing_allocator_tls_boundary(&boundary(cell), FixedImageKind::Detcore)
+                    .is_err(),
+                "unreviewed neighbouring cell {cell:#x} must refuse"
+            );
+        }
+    }
+
+    #[test]
+    fn detcore_allocation_refuses_in_handler_0x108_in_installation_depth_0x100_layout() {
+        // The stable 1.97.1/2465470e allocation body and 0x100/0x108
+        // INSTALLATION_DEPTH/IN_HANDLER layout were retained in 867e1510.
+        // This miniature parsed ELF is a focused symbol/section binding
+        // control, not that complete image. The unmodified body must reach
+        // the later descriptor-mapping gate; complete positive qualification
+        // remains the actual product-staging gate.
+        let allocation = fixed_hex(
+            "41574156415453504889d34989f6ff15d4818a004885c0747c4989c44c8b782041f6c7070f85a50000004d85ff0f84b1000000488d3dde248a00e851c47f004883b80001000000745d498b542410498b07498d76ff49f7de31c94889c74801d772354801f772304c21f74989f84929d072504901d8410f92c14981f801000002410f93c24508ca750ef04d0fb10775ca4889f9eb0231c94889c84883c4085b415c415e415fc3bf010000004c89f64889da4883c4085b415c415e415fff2566818a00488d3da7fd8200ff15c9278a00488d155afe8200bf080000004c89feff156c2f8a00488d3d45fe8200ff1557698a00",
+        );
+        assert_eq!(
+            sha256(&allocation),
+            "0be4c788adc82d1f0562d9d3b6123cc17a7ff871075414fab9af5d1b339aea8d"
+        );
+        assert_eq!(&allocation[66..70], &0x100_u32.to_le_bytes());
+        fn put(bytes: &mut [u8], at: usize, width: usize, value: u64) {
+            bytes[at..at + width].copy_from_slice(&value.to_le_bytes()[..width]);
+        }
+        let mut image = vec![0_u8; 0x5000];
+        image[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+        for (at, width, value) in [
+            (16, 2, 3),
+            (18, 2, 62),
+            (20, 4, 1),
+            (32, 8, 64),
+            (40, 8, 0x3000),
+            (52, 2, 64),
+            (54, 2, 56),
+            (56, 2, 3),
+            (58, 2, 64),
+            (60, 2, 5),
+        ] {
+            put(&mut image, at, width, value);
+        }
+        for (index, kind, flags, offset, address, file_size, memory_size, alignment) in [
+            (0, 1, 5, 0, 0x1000, 0x4000, 0x4000, 0x1000),
+            (1, 1, 6, 0x4000, 0x6000, 0x100, 0x110, 0x1000),
+            (2, 7, 4, 0x4000, 0x6000, 0x100, 0x110, 8),
+        ] {
+            for (delta, width, value) in [
+                (0, 4, kind),
+                (4, 4, flags),
+                (8, 8, offset),
+                (16, 8, address),
+                (24, 8, address),
+                (32, 8, file_size),
+                (40, 8, memory_size),
+                (48, 8, alignment),
+            ] {
+                put(&mut image, 64 + index * 56 + delta, width, value);
+            }
+        }
+        let mut symbols: Vec<_> = FIXED_REQUIRED_ROLES
+            .iter()
+            .enumerate()
+            .map(|(index, role)| {
+                let name = FIXED_EMITTED_ROLE_SYMBOLS
+                    .iter()
+                    .find(|(name, _)| name == role)
+                    .unwrap()
+                    .1
+                    .replace("Cs_", "CsTest_");
+                (
+                    name,
+                    sym::STT_FUNC,
+                    1,
+                    0x1800 + index as u64 * 0x100,
+                    if *role == "fixed_patch_alloc" { 241 } else { 9 },
+                )
+            })
+            .collect();
+        symbols.extend([
+            (FIXED_TLS_CELL_ROLE.replace("Cs_", "CsTest_"), sym::STT_TLS, 4, 0x100, 8),
+            ("_RNvNCNKNvNtCsTest_15reverie_inguest4trap10IN_HANDLER0s_023___RUST_STD_INTERNAL_VAL".into(), sym::STT_TLS, 4, 0x108, 1),
+        ]);
+        let mut strings = vec![0];
+        for (index, (name, kind, section, address, size)) in symbols.iter().enumerate() {
+            let row = 0x2000 + (index + 1) * 24;
+            for (delta, width, value) in [
+                (0, 4, strings.len() as u64),
+                (4, 1, u64::from(*kind)),
+                (6, 2, *section),
+                (8, 8, *address),
+                (16, 8, *size),
+            ] {
+                put(&mut image, row + delta, width, value);
+            }
+            strings.extend_from_slice(name.as_bytes());
+            strings.push(0);
+        }
+        assert!(strings.len() < 0x1000);
+        image[0x1000..0x1000 + strings.len()].copy_from_slice(&strings);
+        image[0x800..0x800 + allocation.len()].copy_from_slice(&allocation);
+        for (index, kind, flags, address, offset, size, link, entry) in [
+            (1, 1, 6, 0x1800, 0x800, 0x500, 0, 0),
+            (2, 3, 0, 0, 0x1000, strings.len() as u64, 0, 0),
+            (3, 2, 0, 0, 0x2000, 24 * (symbols.len() + 1) as u64, 2, 24),
+            (4, 8, 0x403, 0x6100, 0x4100, 0x10, 0, 0),
+        ] {
+            for (delta, width, value) in [
+                (4, 4, kind),
+                (8, 8, flags),
+                (16, 8, address),
+                (24, 8, offset),
+                (32, 8, size),
+                (40, 4, link),
+                (48, 8, 8),
+                (56, 8, entry),
+            ] {
+                put(&mut image, 0x3000 + index * 64 + delta, width, value);
+            }
+        }
+        let elf = Elf::parse(&image).unwrap();
+        let named_cell = fixed_tls_cell(&elf).unwrap();
+        assert_eq!(named_cell.address, 0x100);
+        assert_eq!(
+            canonical_rust_symbol(&named_cell.name).as_deref(),
+            Some(FIXED_TLS_CELL_ROLE)
+        );
+        let handler = elf
+            .syms
+            .iter()
+            .find(|symbol| {
+                elf.strtab
+                    .get_at(symbol.st_name)
+                    .is_some_and(|name| name.contains("IN_HANDLER"))
+            })
+            .unwrap();
+        assert_eq!(
+            (handler.st_type(), handler.st_value, handler.st_size),
+            (sym::STT_TLS, 0x108, 1)
+        );
+        let qualify = |body: &[u8]| {
+            let mut specimen = image.clone();
+            specimen[0x800..0x800 + body.len()].copy_from_slice(body);
+            let parsed = Elf::parse(&specimen).unwrap();
+            let code = BTreeMap::from([(0x1800, specimen[0x800..0x800 + body.len()].to_vec())]);
+            qualify_allocator_tls_boundary_in_source_context(
+                &parsed,
+                &specimen,
+                &code,
+                "",
+                &BTreeMap::new(),
+                FixedImageKind::Detcore,
+                None,
+            )
+            .expect_err("this focused metadata fixture omits the full TLS descriptor/provider")
+        };
+        assert_eq!(
+            qualify(&allocation),
+            "Fixed data has overlapping or absent actual page mappings",
+            "the retained 0x100 allocation must pass named-cell binding and reach the later descriptor mapping gate"
+        );
+        let mut wrong_cell = allocation.clone();
+        wrong_cell[66..70].copy_from_slice(&0x108_u32.to_le_bytes());
+        assert_eq!(
+            DETCORE_VALIDATE_TEMPLATES
+                .iter()
+                .filter(|template| {
+                    template.role == "fixed_patch_alloc"
+                        && fixed_template_shape(
+                            &wrong_cell,
+                            &fixed_hex(template.hex),
+                            template.operands.iter().map(|op| op.displacement),
+                        )
+                })
+                .count(),
+            1,
+            "the 0x108 allocation has a recognized whole shape, so name binding must reject it"
+        );
+        assert_eq!(
+            qualify(&wrong_cell),
+            "Detcore allocation reads another TLS cell",
+            "IN_HANDLER at 0x108 in the INSTALLATION_DEPTH 0x100 layout must refuse by ELF name binding"
+        );
     }
 
     // Literal extents and independently retained bindings from gate40 ELF d86724af.
@@ -61471,6 +62922,125 @@ mod tests {
                     &[(17, 21, "reverie_inguest_trusted_syscall", true)],
                 ),
             ],
+            // STABLE_STANDALONE: the pinned-standalone retained bodies
+            // for the nine unsubstituted roles are byte-identical in
+            // the stable artifact; the four substituted roles below
+            // carry their own retained stable literals and cursors
+            // (backing/metadata reuse main templates 94/95; the two
+            // prepares are templates 109/110).
+            6 => {
+                let mut samples = naked_owner_publication_samples(3);
+                for sample in &mut samples {
+                    match sample.0 {
+                        "fixed_tool_heap_metadata" => {
+                            *sample = (
+                                "fixed_tool_heap_metadata",
+                                95,
+                                "500fb605513d050484c0740431c0eb30488d05493d0504488904244889e0488b3c24e8894d00004885c074e031c9807810ff48b80030020000600000480f44c1488904244889e0488b042459c3",
+                                &[
+                                    0, 1, 8, 10, 12, 14, 16, 23, 27, 30, 34, 39, 42, 44, 46, 50,
+                                    57, 60, 64, 68, 71, 75, 76,
+                                ],
+                                &[
+                                    (4, 8, "fixed_initializing", false),
+                                    (19, 23, "fixed_region", false),
+                                    (35, 39, "fixed_region_publication_get_opaque", false),
+                                ],
+                            );
+                        }
+                        "fixed_arena_backing" => {
+                            *sample = (
+                                "fixed_arena_backing",
+                                94,
+                                "500fb605c13d050484c0740431c9eb2d488d05b93d0504488904244889e0488b3c24e8f94d000031c94885c0740f807810ff488d055f81f5ff480f45c848890c244889e0488b042459c3",
+                                &[
+                                    0, 1, 8, 10, 12, 14, 16, 23, 27, 30, 34, 39, 41, 44, 46, 50,
+                                    57, 61, 65, 68, 72, 73,
+                                ],
+                                &[
+                                    (4, 8, "fixed_initializing", false),
+                                    (19, 23, "fixed_region", false),
+                                    (35, 39, "fixed_region_publication_get_opaque", false),
+                                    (53, 57, "fixed_backing_object", false),
+                                ],
+                            );
+                        }
+                        "fixed_constructor_prepare" => {
+                            *sample = (
+                                "fixed_constructor_prepare",
+                                109,
+                                "415741564154534883ec284889fb4989e648897c2408488d442408488b7c24084c89742408488b74240848c744240801000000488b5424084c8d7c24104c897c2408488b4c2408e884f3ffff85c07411b8010000004883c4285b415c415e415fc30fb64c2418b80100000084c974e64c8b6424104c89735848b8001000000060000048894424104c89642418884c2420488d1d6915050448895c2408488d442408488b7c24084c897c2408488b742408e8bb25000085c0759749c744244803000000c605301505040048895c2410488d442410488b7c2410e8732500004889c14885c0b8010000000f8467ffffff31c0807910ff0f94c0e959ffffff",
+                                &[
+                                    0, 2, 4, 6, 7, 11, 14, 17, 22, 27, 32, 37, 42, 49, 51, 56, 61,
+                                    66, 71, 76, 78, 80, 85, 89, 90, 92, 94, 96, 97, 102, 107, 109,
+                                    111, 116, 120, 127, 130, 135, 140, 144, 151, 156, 161, 166,
+                                    171, 176, 181, 183, 185, 192, 194, 201, 206, 211, 216, 221,
+                                    224, 227, 232, 238, 240, 244, 247,
+                                ],
+                                &[
+                                    (72, 76, "fixed_native_from_native", false),
+                                    (147, 151, "fixed_region", false),
+                                    (177, 181, "fixed_region_publication_set_opaque", false),
+                                    (196, 201, "fixed_initializing", false),
+                                    (217, 221, "fixed_region_publication_get_opaque", false),
+                                ],
+                            );
+                        }
+                        "fixed_generic_prepare" => {
+                            *sample = (
+                                "fixed_generic_prepare",
+                                110,
+                                "415741564154534883ec284889fb4989e648897c2408488d442408488b7c24084c89742408488b74240848c744240802000000488b5424084c8d7c24104c897c2408488b4c2408e864f1ffff85c07411b8010000004883c4285b415c415e415fc30fb64c2418b80100000084c974e64c8b6424104c89735848b8001000000060000048894424104c89642418884c2420488d1d4913050448895c2408488d442408488b7c24084c897c2408488b742408e89b23000085c0759749c744244803000000c605101305040048895c2410488d442410488b7c2410e8532300004889c14885c0b8010000000f8467ffffff31c0807910ff0f94c0e959ffffff",
+                                &[
+                                    0, 2, 4, 6, 7, 11, 14, 17, 22, 27, 32, 37, 42, 49, 51, 56, 61,
+                                    66, 71, 76, 78, 80, 85, 89, 90, 92, 94, 96, 97, 102, 107, 109,
+                                    111, 116, 120, 127, 130, 135, 140, 144, 151, 156, 161, 166,
+                                    171, 176, 181, 183, 185, 192, 194, 201, 206, 211, 216, 221,
+                                    224, 227, 232, 238, 240, 244, 247,
+                                ],
+                                &[
+                                    (72, 76, "fixed_native_from_native", false),
+                                    (147, 151, "fixed_region", false),
+                                    (177, 181, "fixed_region_publication_set_opaque", false),
+                                    (196, 201, "fixed_initializing", false),
+                                    (217, 221, "fixed_region_publication_get_opaque", false),
+                                ],
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+                samples
+            }
+            // Pinned standalone at add6180b: the complete tuple retains the
+            // pinned bodies, with the observed tail forms for both C bridges.
+            7 => {
+                let mut samples = naked_owner_publication_samples(3);
+                for sample in &mut samples {
+                    match sample.0 {
+                        "fixed_native_owner_gettid" => {
+                            *sample = (
+                                "fixed_native_owner_gettid",
+                                108,
+                                "bfba00000031f631d231c9e910e8ffff",
+                                &[0, 5, 7, 9, 11],
+                                &[(12, 16, "fixed_scalar_syscall", false)],
+                            );
+                        }
+                        "fixed_arena_mprotect" => {
+                            *sample = (
+                                "fixed_arena_mprotect",
+                                84,
+                                "4889febf0a000000ba00000002b903000000e939f2ffff",
+                                &[0, 3, 8, 13, 18],
+                                &[(19, 23, "fixed_scalar_syscall", false)],
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+                samples
+            }
             _ => panic!("unknown naked-owner control fixture"),
         }
     }
@@ -61480,7 +63050,7 @@ mod tests {
         mutations: bool,
     ) -> DetcorePublicationControlGraph {
         let samples = naked_owner_publication_samples(case);
-        let native = [false, true, false, false, true, false][case];
+        let native = [false, true, false, false, true, false, false, false][case];
         let mut targets: BTreeMap<String, u64> = BTreeMap::from([
             ("fixed_initializing".into(), 0x600000),
             ("fixed_region".into(), 0x600008),
@@ -61722,13 +63292,21 @@ mod tests {
                         .find(|(_, _, key, _)| *key == "fixed_native_from_native")
                         .unwrap()
                         .1;
-                    let setter_test = operands
+                    let setter_next = operands
                         .iter()
                         .find(|(_, _, key, _)| *key == "fixed_region_publication_set_opaque")
                         .unwrap()
-                        .1
-                        + 7;
-                    for (at, modrm) in [(owner_test, 0xc0), (setter_test, 0xc9)] {
+                        .1;
+                    // The stable standalone prepare bodies test EAX
+                    // immediately after the setter call; the pinned
+                    // bodies first move the result to ECX and test it
+                    // seven bytes on.
+                    let (setter_test, setter_modrm) = if matches!(index, 109 | 110) {
+                        (setter_next, 0xc0)
+                    } else {
+                        (setter_next + 7, 0xc9)
+                    };
+                    for (at, modrm) in [(owner_test, 0xc0), (setter_test, setter_modrm)] {
                         let mut bad = bytes.clone();
                         assert_eq!(&bad[at..at + 2], &[0x85, modrm]);
                         bad[at] = 0x84;
@@ -61821,13 +63399,13 @@ mod tests {
             )?;
             fixed_detcore_full_result_contract(&g.witnesses, &g.transfers, &g.selected, &g.targets)
         };
-        for case in 0..6 {
-            let kind = if [true, false, false, true, false, false][case] {
+        for case in 0..8 {
+            let kind = if [true, false, false, true, false, false, true, true][case] {
                 FixedImageKind::Standalone
             } else {
                 FixedImageKind::Detcore
             };
-            let native = [false, true, false, false, true, false][case];
+            let native = [false, true, false, false, true, false, false, false][case];
             let graph = naked_owner_publication_control_graph(case, true);
             check(&graph, kind, native).unwrap();
             assert_eq!(
@@ -62007,7 +63585,7 @@ mod tests {
                     "unknown or mixed naked-owner publication whole composition"
                 );
             }
-            for other in 0..6 {
+            for other in 0..8 {
                 if other == case {
                     continue;
                 }
@@ -62032,6 +63610,33 @@ mod tests {
                     );
                 }
             }
+        }
+        // Every proper non-empty subset of the four pinned bodies in
+        // an otherwise stable standalone cohort must refuse as a mix:
+        // no composition selects a partially substituted cohort.
+        for mask in 1usize..15 {
+            let mut bad = naked_owner_publication_control_graph(6, false);
+            for (bit, (role, pinned)) in [
+                ("fixed_tool_heap_metadata", 57usize),
+                ("fixed_arena_backing", 58),
+                ("fixed_constructor_prepare", 88),
+                ("fixed_generic_prepare", 92),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if mask & (1 << bit) != 0 {
+                    bad.witnesses.get_mut(role).unwrap().kind =
+                        AuthenticatedDetcoreOperationKind::ValidateTemplate(pinned);
+                }
+            }
+            assert_eq!(
+                check(&bad, FixedImageKind::Standalone, false)
+                    .unwrap_err()
+                    .to_string(),
+                "unknown or mixed naked-owner publication whole composition",
+                "pinned-subset mask {mask:#06b} must refuse"
+            );
         }
     }
 
@@ -62297,6 +63902,171 @@ mod tests {
         }
         for role in FIXED_SCALAR_ROLES {
             assert!(fixed_scalar_recipe_role(role), "{role} lost scalar scope");
+        }
+    }
+
+    #[test]
+    fn detcore_retained_0108_and_0148_recipes_bind_exact_tls_cells() {
+        // These literal bodies and hashes were extracted from the retained
+        // normal and diagnostic ELF images, not from the production templates.
+        // Allocation controls prove unique shape and the exact named-cell gate;
+        // the getter controls additionally bind both operands and mint identity.
+        // Complete source/ELF qualification remains a product-staging gate.
+        let fixtures = [
+            // Retained new-normal ELF 03994a6bf992405ea6b8ceb8bb7922fa2ec23c48211c1e28bb1a20e46ee0142e, VA 0x1289ac0.
+            (
+                "fixed_patch_alloc",
+                0x1289ac0_u64,
+                0x108_u64,
+                66_usize,
+                241_usize,
+                "35e6645a7743d95b2328662b8218da2b59094e51091a67c04a5210eca436b164",
+                "41574156415453504889d34989f6ff155c782d004885c0747c4989c44c8b782041f6c7070f85a50000004d85ff0f84b1000000488d3dbefd2c00e881c022004883b80801000000745d498b542410498b07498d76ff49f7de31c94889c74801d772354801f772304c21f74989f84929d072504901d8410f92c14981f801000002410f93c24508ca750ef04d0fb10775ca4889f9eb0231c94889c84883c4085b415c415e415fc3bf010000004c89f64889da4883c4085b415c415e415fff25ce772d00488d3d97772900ff15a1002d00488d154a782900bf080000004c89feff153c082d00488d3d35782900ff15cf492d00",
+                0x15598b8_u64,
+                0x14b5b80_u64,
+            ),
+            // Retained new-diagnostic ELF 43f4dc48ed4e44a506658241e60d4695a0b27c6a5964a3444edee53ecccf3c8d, VA 0x128d8d0.
+            (
+                "fixed_patch_alloc",
+                0x128d8d0_u64,
+                0x148_u64,
+                66_usize,
+                241_usize,
+                "a8ebcb1ad9b229aca79d2c5e29344b716eef9df78cf7caf015b9274d8a5ae148",
+                "41574156415453504889d34989f6ff157c812d004885c0747c4989c44c8b782041f6c7070f85a50000004d85ff0f84b1000000488d3d2e062d00e8b1cb22004883b84801000000745d498b542410498b07498d76ff49f7de31c94889c74801d772354801f772304c21f74989f84929d072504901d8410f92c14981f801000002410f93c24508ca750ef04d0fb10775ca4889f9eb0231c94889c84883c4085b415c415e415fc3bf010000004c89f64889da4883c4085b415c415e415fff25fe802d00488d3d47842900ff1549092d00488d156a842900bf080000004c89feff15e4102d00488d3d55842900ff15c7532d00",
+                0x155df38_u64,
+                0x14ba4c0_u64,
+            ),
+            // Retained new-normal ELF 03994a6bf992405ea6b8ceb8bb7922fa2ec23c48211c1e28bb1a20e46ee0142e, VA 0x1289e50.
+            (
+                "fixed_tls_fn_once",
+                0x1289e50_u64,
+                0x108_u64,
+                16_usize,
+                22_usize,
+                "ae2842200f1c3de93b9716d589a3df0cbc340767c98f2a2affd89a0509c7992e",
+                "50488d3d60fa2c00e823bd2200488d800801000059c3",
+                0x15598b8_u64,
+                0x14b5b80_u64,
+            ),
+            // Retained new-diagnostic ELF 43f4dc48ed4e44a506658241e60d4695a0b27c6a5964a3444edee53ecccf3c8d, VA 0x128dc60.
+            (
+                "fixed_tls_fn_once",
+                0x128dc60_u64,
+                0x148_u64,
+                16_usize,
+                22_usize,
+                "a350560648d73fb7dbd68c2dfbd3e4fa91c30a21e096d015c2121538678053bb",
+                "50488d3dd0022d00e853c82200488d804801000059c3",
+                0x155df38_u64,
+                0x14ba4c0_u64,
+            ),
+        ];
+        let matching = |role: &str, bytes: &[u8]| -> Vec<usize> {
+            DETCORE_VALIDATE_TEMPLATES
+                .iter()
+                .enumerate()
+                .filter(|(_, template)| {
+                    template.role == role
+                        && fixed_template_shape(
+                            bytes,
+                            &fixed_hex(template.hex),
+                            template.operands.iter().map(|op| op.displacement),
+                        )
+                })
+                .map(|(index, _)| index)
+                .collect()
+        };
+        let candidates: Vec<_> = fixtures
+            .iter()
+            .map(|&(role, _, cell, tls_at, size, digest, hex, _, _)| {
+                let bytes = fixed_hex(hex);
+                assert_eq!(bytes.len(), size);
+                assert_eq!(sha256(&bytes), digest);
+                assert_eq!(
+                    u64::from(u32::from_le_bytes(
+                        bytes[tls_at..tls_at + 4].try_into().unwrap()
+                    )),
+                    cell
+                );
+                matching(role, &bytes)
+            })
+            .collect();
+        assert_eq!(
+            candidates.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![1; fixtures.len()],
+            "each independently retained allocation/getter must match exactly once"
+        );
+        for ((role, address, cell, tls_at, _, _, hex, descriptor, plt), matches) in
+            fixtures.into_iter().zip(candidates)
+        {
+            let bytes = fixed_hex(hex);
+            let template = &DETCORE_VALIDATE_TEMPLATES[matches[0]];
+            assert!(
+                template
+                    .operands
+                    .iter()
+                    .all(|op| { op.displacement + 4 <= tls_at || op.displacement >= tls_at + 4 }),
+                "the exact TLS read must never be masked for {role}"
+            );
+            let targets = BTreeMap::from([
+                ("fixed_publication_tls_descriptor".into(), descriptor),
+                ("fixed_tls_get_addr_plt".into(), plt),
+            ]);
+            let got = BTreeMap::new();
+            let readonly = BTreeMap::new();
+            let context = BTreeMap::new();
+            let bindings = || DetcoreRecipeBindings {
+                targets: &targets,
+                got: &got,
+                readonly: &readonly,
+                context: &context,
+            };
+            if role == "fixed_tls_fn_once" {
+                let identity =
+                    fixed_detcore_validate_recipe_identity(role, address, &bytes, bindings(), cell)
+                        .unwrap();
+                assert_eq!(identity.template_index, matches[0]);
+                assert_eq!(identity.edges.len(), 1);
+                assert_eq!(identity.edges[0].instruction, address + 8);
+                assert_eq!(identity.edges[0].target, plt);
+                assert_eq!(identity.edges[0].local_got_slot, None);
+            }
+            for wrong_cell in [0x100, 0x108, 0x110, 0x148, 0x10c, 0x140, 0x150] {
+                if wrong_cell == cell {
+                    continue;
+                }
+                assert_eq!(
+                    fixed_detcore_validate_recipe_identity(
+                        role,
+                        address,
+                        &bytes,
+                        bindings(),
+                        wrong_cell,
+                    )
+                    .err()
+                    .expect("a wrong named cell must not mint an identity"),
+                    "validate TLS read differs from authenticated exact LOCAL8 cell"
+                );
+            }
+            for neighbour in [0x10c_u32, 0x140, 0x150] {
+                let mut bad = bytes.clone();
+                bad[tls_at..tls_at + 4].copy_from_slice(&neighbour.to_le_bytes());
+                assert!(
+                    matching(role, &bad).is_empty(),
+                    "unreviewed {role} cell {neighbour:#x} must have no whole-body template"
+                );
+                assert!(
+                    fixed_detcore_validate_recipe_identity(
+                        role,
+                        address,
+                        &bad,
+                        bindings(),
+                        u64::from(neighbour),
+                    )
+                    .is_err()
+                );
+            }
         }
     }
 
@@ -63921,6 +65691,32 @@ mod tests {
     }
 
     #[test]
+    fn source_owned_template_end_covers_stable_prepare_identities() {
+        for index in [108, 109, 110, 112, 113, 114, 115] {
+            let mut graph = scalar_ordinary_bit_result_control_graph(false);
+            fixed_scalar_publication_syscall_mode(&graph.witnesses, FixedImageKind::Detcore, false)
+                .unwrap();
+            graph.witnesses.get_mut("fixed_arena_backing").unwrap().kind =
+                AuthenticatedDetcoreOperationKind::ValidateTemplate(index);
+            assert_eq!(
+                fixed_scalar_publication_syscall_mode(
+                    &graph.witnesses,
+                    FixedImageKind::Detcore,
+                    false,
+                )
+                .unwrap_err()
+                .to_string(),
+                "unknown or mixed naked-owner publication whole composition",
+                "lone appended naked identity {index} must prove naked publication"
+            );
+        }
+        assert_eq!(
+            FIXED_SOURCE_OWNED_TEMPLATE_END,
+            DETCORE_VALIDATE_TEMPLATES.len()
+        );
+    }
+
+    #[test]
     fn observed_scalar_ordinary_publication_families() {
         let check = |g: &DetcorePublicationControlGraph,
                      image_kind: FixedImageKind|
@@ -64885,117 +66681,158 @@ mod tests {
     }
 
     #[test]
-    fn current_alloc_locations_match_retained_host153_data() {
-        // Independent readonly samples from HOST153 native ELF
-        // 32bc62c4b30a8e1459058333328729517a5024f792fa5a0ee50289d10344fa20.
-        // These are the full 24B objects before their sole filename RELATIVE
-        // relocation. This test does not construct a VerifiedCompiledSources
-        // or replace the physical mapping/writer/call-operand checks.
-        // Only the measured length is relevant to these full Location objects.
-        // The context is explicitly synthetic, not original filename authority.
+    fn current_alloc_locations_accept_measured_objects_and_refuse_original_host153() {
+        // Current positives are the complete 24B pre-relocation objects from
+        // the qualified d81c7bb normal Detcore ELF, SHA256
+        // a8c772041420dc4e3c6cdf7131a0a237a49a6d26e7118b3237834501934bece4.
+        // Extraction decoded each heap function's RIP-relative LEA, mapped its
+        // target through PT_LOAD, and checked the sole filename RELATIVE writer.
+        // The literals below are actual ELF bytes, not generated from this table.
+        // The current filename length is 95; this context remains synthetic and
+        // cannot mint VerifiedCompiledSources or replace physical ELF checks.
         let filename = format!(
+            "/synthetic/{}/reverie-inguest/src/guest/alloc.rs",
+            "x".repeat(49)
+        )
+        .into_bytes();
+        assert_eq!(filename.len(), 95);
+        // Historical negatives are copied VERBATIM from
+        // a461e8bf71fabef52f92ffd9c7369b2bbf8f0064, which attributes them to
+        // HOST153 ELF 32bc62c4b30a8e1459058333328729517a5024f792fa5a0ee50289d10344fa20.
+        // a4174186177ccb0be44a1022aacc0a9703a7bdaa later shifted those purported
+        // retained bytes with the specs. Restore the original observations here;
+        // their own encoded coordinates, not an assumed old_line, must refuse.
+        let historical_filename = format!(
             "/synthetic/{}/reverie-inguest/src/guest/alloc.rs",
             "x".repeat(198)
         )
         .into_bytes();
-        assert_eq!(filename.len(), 244);
-        let context = BTreeMap::from([(
-            "rv:reverie-inguest/src/guest/alloc.rs".to_owned(),
-            filename.clone(),
-        )]);
-        // Exact current-source coordinate/statement checks are retained in
-        // the separate HOST153 evidence; do not add a compile-time dependency
-        // on source outside this vendorable artifact crate.
+        assert_eq!(historical_filename.len(), 244);
         let span = DETCORE_VALIDATE_DATA
             .iter()
             .find(|spec| spec.key == "fixed_detcore_validate_fixed_tool_span_end_data")
             .unwrap();
-        // This eighteenth row is source-bound only; HOST153 did not select it.
-        assert_eq!((span.line, span.column), (287, 16));
-        for (key, whole, old_line) in [
+        // This eighteenth row is source-bound only; neither ELF selects it.
+        // Its unchanged alloc.rs expression is at 288:16 after the fork refactor.
+        assert_eq!((span.line, span.column), (288, 16));
+        for (key, whole, original_host153, previous_line, legacy_stale_line) in [
             (
                 "fixed_detcore_validate_fixed_heap_allocate_537_data",
-                "0000000000000000f400000000000000ae0000002a000000",
+                "00000000000000005f00000000000000af0000002a000000",
+                "0000000000000000f400000000000000a60000002a000000",
+                174u32,
                 185u32,
             ),
             (
                 "fixed_detcore_validate_fixed_heap_allocate_550_data",
-                "0000000000000000f400000000000000ae0000002a000000",
+                "00000000000000005f00000000000000af0000002a000000",
+                "0000000000000000f400000000000000a60000002a000000",
+                174u32,
                 185u32,
             ),
             (
                 "fixed_detcore_validate_fixed_heap_allocate_571_data",
-                "0000000000000000f4000000000000009d00000022000000",
+                "00000000000000005f000000000000009e00000022000000",
+                "0000000000000000f4000000000000009500000022000000",
+                157u32,
                 168u32,
             ),
             (
                 "fixed_detcore_validate_fixed_heap_allocate_586_data",
-                "0000000000000000f400000000000000c800000019000000",
+                "00000000000000005f00000000000000c900000019000000",
+                "0000000000000000f400000000000000c000000019000000",
+                200u32,
                 211u32,
             ),
             (
                 "fixed_detcore_validate_fixed_heap_allocate_607_data",
-                "0000000000000000f400000000000000c800000019000000",
+                "00000000000000005f00000000000000c900000019000000",
+                "0000000000000000f400000000000000c000000019000000",
+                200u32,
                 211u32,
             ),
             (
                 "fixed_detcore_validate_fixed_heap_allocate_620_data",
-                "0000000000000000f400000000000000be00000029000000",
+                "00000000000000005f00000000000000bf00000029000000",
+                "0000000000000000f400000000000000b600000029000000",
+                190u32,
                 201u32,
             ),
             (
                 "fixed_detcore_validate_fixed_heap_allocate_629_data",
-                "0000000000000000f400000000000000e500000017000000",
+                "00000000000000005f00000000000000e600000017000000",
+                "0000000000000000f400000000000000dd00000017000000",
+                229u32,
                 240u32,
             ),
             (
                 "fixed_detcore_validate_fixed_heap_deallocate_308_data",
-                "0000000000000000f400000000000000fd00000018000000",
+                "00000000000000005f00000000000000fe00000018000000",
+                "0000000000000000f400000000000000f500000018000000",
+                253u32,
                 264u32,
             ),
             (
                 "fixed_detcore_validate_fixed_heap_deallocate_321_data",
-                "0000000000000000f400000000000000fd00000018000000",
+                "00000000000000005f00000000000000fe00000018000000",
+                "0000000000000000f400000000000000f500000018000000",
+                253u32,
                 264u32,
             ),
             (
                 "fixed_detcore_validate_fixed_heap_deallocate_342_data",
-                "0000000000000000f400000000000000000100000d000000",
+                "00000000000000005f00000000000000010100000d000000",
+                "0000000000000000f400000000000000f80000000d000000",
+                256u32,
                 267u32,
             ),
             (
                 "fixed_detcore_validate_fixed_heap_deallocate_363_data",
-                "0000000000000000f400000000000000000100000d000000",
+                "00000000000000005f00000000000000010100000d000000",
+                "0000000000000000f400000000000000f80000000d000000",
+                256u32,
                 267u32,
             ),
             (
                 "fixed_detcore_validate_fixed_heap_deallocate_376_data",
-                "0000000000000000f4000000000000000401000011000000",
+                "00000000000000005f000000000000000501000011000000",
+                "0000000000000000f400000000000000fc00000011000000",
+                260u32,
                 271u32,
             ),
             (
                 "fixed_detcore_validate_fixed_heap_deallocate_397_data",
-                "0000000000000000f4000000000000000401000011000000",
+                "00000000000000005f000000000000000501000011000000",
+                "0000000000000000f400000000000000fc00000011000000",
+                260u32,
                 271u32,
             ),
             (
                 "fixed_detcore_validate_fixed_heap_deallocate_410_data",
-                "0000000000000000f4000000000000001301000043000000",
+                "00000000000000005f000000000000001401000043000000",
+                "0000000000000000f4000000000000000b01000043000000",
+                275u32,
                 286u32,
             ),
             (
                 "fixed_detcore_validate_fixed_heap_deallocate_431_data",
-                "0000000000000000f4000000000000001301000043000000",
+                "00000000000000005f000000000000001401000043000000",
+                "0000000000000000f4000000000000000b01000043000000",
+                275u32,
                 286u32,
             ),
             (
                 "fixed_detcore_validate_fixed_heap_deallocate_444_data",
-                "0000000000000000f4000000000000001501000040000000",
+                "00000000000000005f000000000000001601000040000000",
+                "0000000000000000f4000000000000000d01000040000000",
+                277u32,
                 288u32,
             ),
             (
                 "fixed_detcore_validate_fixed_heap_deallocate_462_data",
-                "0000000000000000f4000000000000001501000040000000",
+                "00000000000000005f000000000000001601000040000000",
+                "0000000000000000f4000000000000000d01000040000000",
+                277u32,
                 288u32,
             ),
         ] {
@@ -65006,28 +66843,47 @@ mod tests {
             let location = fixed_hex(whole);
             assert_eq!(location.len(), 24);
             let targets = BTreeMap::from([(format!("{key}_file"), 0x3000_u64)]);
-            let check = |bytes: &[u8]| {
-                let readonly =
-                    BTreeMap::from([(0x2000_u64, bytes.to_vec()), (0x3000_u64, filename.clone())]);
+            let check = |bytes: &[u8], filename: &[u8]| {
+                let context = BTreeMap::from([(
+                    "rv:reverie-inguest/src/guest/alloc.rs".to_owned(),
+                    filename.to_vec(),
+                )]);
+                let readonly = BTreeMap::from([
+                    (0x2000_u64, bytes.to_vec()),
+                    (0x3000_u64, filename.to_vec()),
+                ]);
                 detcore_validate_readonly_recipe(spec, 0x2000, &targets, &readonly, &context)
             };
-            check(&location).unwrap_or_else(|error| panic!("HOST153 {key}: {error}"));
+            check(&location, &filename)
+                .unwrap_or_else(|error| panic!("measured current ELF positive {key}: {error}"));
             for byte in 0..location.len() {
                 let mut bad = location.clone();
                 bad[byte] ^= 1;
                 assert_eq!(
-                    check(&bad).unwrap_err(),
+                    check(&bad, &filename).unwrap_err(),
                     "complete Detcore readonly object differs",
                     "{key} Location byte {byte}"
                 );
             }
-            let mut stale = location.clone();
-            stale[16..20].copy_from_slice(&old_line.to_le_bytes());
+            let historical = fixed_hex(original_host153);
+            assert_eq!(historical.len(), 24);
+            assert_ne!(historical[16..20], location[16..20]);
+            // Use its original filename length too, so this refuses the actual
+            // historical coordinate rather than merely a 244-versus-95 mismatch.
             assert_eq!(
-                check(&stale).unwrap_err(),
+                check(&historical, &historical_filename).unwrap_err(),
                 "complete Detcore readonly object differs",
-                "{key} stale coordinate {old_line}"
+                "{key} original HOST153 coordinate"
             );
+            for old_line in [previous_line, legacy_stale_line] {
+                let mut stale = location.clone();
+                stale[16..20].copy_from_slice(&old_line.to_le_bytes());
+                assert_eq!(
+                    check(&stale, &filename).unwrap_err(),
+                    "complete Detcore readonly object differs",
+                    "{key} stale coordinate {old_line}"
+                );
+            }
         }
     }
 
@@ -65112,6 +66968,24 @@ pub mod private_static {
     pub mod selected_initializers;
 
     pub(super) mod tls_sources;
+
+    /// Test seam only: the real runtime TLS source check over one checkout
+    /// root, refusing unless it is exactly one complete reviewed tuple.
+    #[doc(hidden)]
+    pub fn tls_sources_self_check(root: &Path) -> Result<()> {
+        tls_sources::self_check(root)
+    }
+
+    /// Test seam only: the reviewed Reverie source identities the producer's
+    /// providers enforce (trap.rs gate shape, fixed_gates.rs, exec_private.rs
+    /// and the six handoff.rs consumers), each checked by its consumer's real
+    /// predicate over one checkout root. One named result per consumer. Not
+    /// covered: view_site/caller.rs's installer source identity, which no
+    /// producer calls and which does not match this tree (dh-rtkedo).
+    #[doc(hidden)]
+    pub fn factory_source_self_check(root: &Path) -> Vec<(&'static str, Result<()>)> {
+        selected_initializers::source_identity_self_check(root)
+    }
 
     const TARGET: &str = "x86_64-unknown-linux-musl";
     const LOW: u64 = 0x6000_e100_0000;
@@ -65673,13 +67547,13 @@ pub mod private_static {
                 require(rows.len() == 1, "static metadata leaf ambiguous")?;
                 let leaf = rows[0];
                 let id = format!(
-                    "path+file://{}#0.5.5",
+                    "path+file://{}#0.5.6",
                     expected.workspace.join("detcore-liteinst").display()
                 );
                 require(
                     leaf["id"] == id
                         && leaf["source"].is_null()
-                        && leaf["version"] == "0.5.5"
+                        && leaf["version"] == "0.5.6"
                         && leaf["manifest_path"].as_str() == manifest.to_str(),
                     "static leaf package identity mismatch",
                 )?;
@@ -66115,7 +67989,9 @@ pub mod private_static {
                     96,
                     1,
                     120 * 8,
-                    1024 * 1024,
+                    // Mirror of reverie_loader::handoff::MAX_BYTES
+                    // (6_348_827); Hermit emits this word from that const.
+                    6_348_827,
                 ],
             "static layout revision/header/cap differs",
         )?;
@@ -66161,8 +68037,24 @@ pub mod private_static {
                 && elf.is_64
                 && elf.little_endian
                 && elf.header.e_phentsize == 56
-                && elf.header.e_phnum > 0
-                && elf.header.e_phnum <= 64,
+                && elf.header.e_phnum > 0,
+            "static ELF type/architecture/program-header format differs",
+        )?;
+        // Lockstep with reverie_loader::image::MAX_SEGMENTS; literal only,
+        // because this source is include-by-source for Hermit consumers and
+        // must not gain a reverie-loader dependency. Count first so every
+        // over-cap PT_LOAD count refuses by this name, not by total PHDRs.
+        require(
+            elf.program_headers
+                .iter()
+                .filter(|p| p.p_type == program_header::PT_LOAD)
+                .count()
+                <= 64,
+            "static PT_LOAD count exceeds private_static 64-segment cap",
+        )?;
+        require(
+            // 64 PT_LOADs plus PT_TLS, PT_GNU_STACK and optional PT_PHDR.
+            elf.header.e_phnum <= 67,
             "static ELF type/architecture/program-header format differs",
         )?;
         require(
@@ -66191,17 +68083,16 @@ pub mod private_static {
             .filter(|p| p.p_type == program_header::PT_LOAD)
             .collect();
         require(
-            loads.len() <= 16
-                && loads.iter().all(|p| {
-                    p.p_align == 4096
-                        && p.p_offset % 4096 == 0
-                        && p.p_vaddr % 4096 == 0
-                        && p.p_vaddr >= LOW
-                        && p.p_vaddr
-                            .checked_add(p.p_memsz)
-                            .is_some_and(|end| end <= HIGH)
-                        && matches!(p.p_flags, 4..=6)
-                }),
+            loads.iter().all(|p| {
+                p.p_align == 4096
+                    && p.p_offset % 4096 == 0
+                    && p.p_vaddr % 4096 == 0
+                    && p.p_vaddr >= LOW
+                    && p.p_vaddr
+                        .checked_add(p.p_memsz)
+                        .is_some_and(|end| end <= HIGH)
+                    && matches!(p.p_flags, 4..=6)
+            }),
             "static load window/alignment/W^X differs",
         )?;
         let phbytes = u64::from(elf.header.e_phnum) * 56;
@@ -66878,7 +68769,7 @@ pub mod private_static {
                 96,
                 1,
                 960,
-                1024 * 1024,
+                6_348_827,
                 3520,
                 64,
                 4096,
@@ -67078,7 +68969,8 @@ pub mod private_static {
                 (2, 95),
                 (3, 2),
                 (4, 936),
-                (5, 1024 * 1024 + 1),
+                (5, 1024 * 1024),
+                (5, 6_348_827 + 1),
                 (6, 3519),
                 (7, 8),
                 (8, 0),
@@ -67155,6 +69047,95 @@ pub mod private_static {
                 changed[at..at + width].copy_from_slice(&value.to_le_bytes()[..width]);
                 let parsed = Elf::parse(&changed).unwrap();
                 assert!(geometry(&parsed, &changed).is_err(), "field {at}");
+            }
+        }
+        #[test]
+        fn private_static_geometry_segment_count_boundaries_hold() {
+            fn fixture(loads: usize, phdr: bool, note: bool) -> Vec<u8> {
+                let mut bytes = vec![0; 3 * 4096];
+                bytes[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+                bytes[16..18].copy_from_slice(&2u16.to_le_bytes());
+                bytes[18..20].copy_from_slice(&62u16.to_le_bytes());
+                bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
+                bytes[24..32].copy_from_slice(&(GATE + 512).to_le_bytes());
+                bytes[32..40].copy_from_slice(&64u64.to_le_bytes());
+                bytes[52..54].copy_from_slice(&64u16.to_le_bytes());
+                bytes[54..56].copy_from_slice(&56u16.to_le_bytes());
+                let phnum = loads + 2 + usize::from(phdr) + usize::from(note);
+                bytes[56..58].copy_from_slice(&u16::try_from(phnum).unwrap().to_le_bytes());
+                let mut phdrs = vec![
+                    (1u32, 4u32, 0u64, LOW, 4096u64, 4096u64, 4096u64),
+                    (1, 5, 4096, GATE, 4096, 4096, 4096),
+                    (1, 6, 8192, LOW + 8192, 4096, 4096, 4096),
+                ];
+                for index in 3..loads {
+                    phdrs.push((
+                        1,
+                        4,
+                        4096,
+                        LOW + 8192 + u64::try_from(index - 2).unwrap() * 4096,
+                        4096,
+                        4096,
+                        4096,
+                    ));
+                }
+                phdrs.push((7, 4, 8192, LOW + 8192, 16, 80, 16));
+                phdrs.push((0x6474e551, 6, 0, 0, 0, 0, 0));
+                if phdr {
+                    let phbytes = u64::try_from(phnum * 56).unwrap();
+                    phdrs.push((6, 4, 64, LOW + 64, phbytes, phbytes, 4096));
+                }
+                if note {
+                    phdrs.push((4, 0, 0, 0, 0, 0, 0));
+                }
+                for (index, (kind, flags, offset, address, file, memory, align)) in
+                    phdrs.into_iter().enumerate()
+                {
+                    let at = 64 + index * 56;
+                    bytes[at..at + 4].copy_from_slice(&kind.to_le_bytes());
+                    bytes[at + 4..at + 8].copy_from_slice(&flags.to_le_bytes());
+                    for (field, value) in [
+                        (8, offset),
+                        (16, address),
+                        (32, file),
+                        (40, memory),
+                        (48, align),
+                    ] {
+                        bytes[at + field..at + field + 8].copy_from_slice(&value.to_le_bytes());
+                    }
+                }
+                bytes
+            }
+            // Literal counts: 16 was the old cap, 64 is the loader cap.
+            // 67 total headers is 64 loads + TLS + GNU_STACK + PT_PHDR.
+            const NAMED: &str = "static PT_LOAD count exceeds private_static 64-segment cap";
+            const FORMAT: &str = "static ELF type/architecture/program-header format differs";
+            for (loads, phdr, note, refusal) in [
+                (16usize, false, false, None),
+                (17, false, false, None),
+                (64, false, false, None),
+                (64, true, false, None),
+                (65, false, false, Some(NAMED)),
+                (66, false, false, Some(NAMED)),
+                (65, true, false, Some(NAMED)),
+                (64, true, true, Some(FORMAT)),
+            ] {
+                let bytes = fixture(loads, phdr, note);
+                let parsed = Elf::parse(&bytes).unwrap();
+                let result = geometry(&parsed, &bytes);
+                if let Some(expected) = refusal {
+                    assert_eq!(
+                        result.unwrap_err(),
+                        expected,
+                        "{loads} PT_LOADs phdr={phdr} note={note}"
+                    );
+                } else {
+                    let observed = result.unwrap_or_else(|error| {
+                        panic!("{loads} PT_LOADs phdr={phdr} must pass geometry: {error}")
+                    });
+                    let phnum = loads + 2 + usize::from(phdr) + usize::from(note);
+                    assert_eq!(observed.0, (LOW + 64, u64::try_from(phnum * 56).unwrap()));
+                }
             }
         }
         #[test]
@@ -69533,8 +71514,8 @@ mod runner_cpu_budget_tests {
     #[test]
     fn wall_deadline_is_the_backstop_for_a_cpu_budgeted_command() {
         let scratch = Scratch::new("wall");
-        let mut runner =
-            Runner::new(scratch.0.join("logs"), Duration::from_secs(1), 1 << 20).unwrap();
+        let wall_budget = Duration::from_secs(1);
+        let mut runner = Runner::new(scratch.0.join("logs"), wall_budget, 1 << 20).unwrap();
         let started = Instant::now();
         let error = runner
             .run_cpu_bounded(
@@ -69551,7 +71532,20 @@ mod runner_cpu_budget_tests {
             ) && error.contains(", CPU used "),
             "{error}"
         );
-        assert!(started.elapsed() < Duration::from_secs(5), "{error}");
+        // The backstop fired at the budget (the error's command wall), and
+        // the call then returns through the product's own bounded cleanup:
+        // 1 s poll-loop cleanup deadline, 250 ms reader drain, and 1 s
+        // cgroup wait-empty. The elapsed bound is three times the sum of
+        // the budget and those bounds: each phase ends on a host wakeup,
+        // whose latency under load is the host's, not the product's, while
+        // three times that sum is still a third of the 30 s sleep the
+        // backstop had to cut short.
+        let cleanup_bounds =
+            Duration::from_secs(1) + Duration::from_millis(250) + Duration::from_secs(1);
+        assert!(
+            started.elapsed() < (wall_budget + cleanup_bounds) * 3,
+            "{error}"
+        );
         let used = runner.command_cpu.last().copied().flatten().unwrap();
         assert!(
             used < Duration::from_millis(500),

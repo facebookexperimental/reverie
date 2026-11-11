@@ -64,6 +64,14 @@ impl PipeOwner {
         }
     }
 
+    /// Whether [`Self::before_export`] would refuse this pipe's export now,
+    /// which a sender checks before it marks any right as exported.
+    pub(super) fn export_refused(&self) -> bool {
+        self.configuration
+            .lock()
+            .map_or(true, |configuration| configuration.phase == Phase::Managed)
+    }
+
     pub(super) fn before_export(&self) -> Result<(), i64> {
         let mut configuration = self
             .configuration

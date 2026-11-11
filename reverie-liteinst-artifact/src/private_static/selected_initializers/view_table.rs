@@ -38,7 +38,7 @@ use super::*;
 
 const SYMBOL: &str = "_RNvMs1_NtCs_14reverie_loader7handoffNtB5_4View5table";
 const BOOTSTRAP_SYMBOL: &str = "_RNvMs2_NtCs_14reverie_loader7handoffNtB5_4View5table";
-const SOURCE: &str = "reverie-loader/src/handoff.rs";
+pub(super) const SOURCE: &str = "reverie-loader/src/handoff.rs";
 const SOURCE_SHA: &str = "85e0f1cb9393c1ed11db4d6115f81dbce5d3f0afcfc733aa4d0cd2d6725245c7";
 // Declared whole-file source cohort: the additive numeric serializer leaves all
 // existing accessor definitions and prerequisites unchanged. Actual source-owned
@@ -68,18 +68,27 @@ const INPUT: [u8; SIZE] = [
 
 fn source_digest(digest: &str) -> Result<()> {
     require(
-        digest == SOURCE_SHA || digest == SERIALIZER_SOURCE_SHA || digest == BOOTSTRAP_SOURCE_SHA,
+        digest == SOURCE_SHA
+            || digest == SERIALIZER_SOURCE_SHA
+            || digest == BOOTSTRAP_SOURCE_SHA
+            || digest == HANDOFF_ROUTE_RULE_SOURCE_SHA
+            || digest == HANDOFF_MAX_BYTES_SOURCE_SHA,
         "View::table complete runtime source differs",
     )
 }
 // The complete retained source digest chooses one canonical role, never a union.
-fn source_symbol(digest: &str) -> Result<&'static str> {
+pub(super) fn source_symbol(digest: &str) -> Result<&'static str> {
     source_digest(digest)?;
-    Ok(if digest == BOOTSTRAP_SOURCE_SHA {
-        BOOTSTRAP_SYMBOL
-    } else {
-        SYMBOL
-    })
+    Ok(
+        if digest == BOOTSTRAP_SOURCE_SHA
+            || digest == HANDOFF_ROUTE_RULE_SOURCE_SHA
+            || digest == HANDOFF_MAX_BYTES_SOURCE_SHA
+        {
+            BOOTSTRAP_SYMBOL
+        } else {
+            SYMBOL
+        },
+    )
 }
 fn code_form(bytes: &[u8]) -> Result<()> {
     require(

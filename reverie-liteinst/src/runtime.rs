@@ -1,6 +1,6 @@
 use core::sync::atomic::AtomicBool;
 use core::sync::atomic::AtomicI32;
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 use core::sync::atomic::AtomicPtr;
 use core::sync::atomic::AtomicU8;
 use core::sync::atomic::AtomicU64;
@@ -8,74 +8,77 @@ use core::sync::atomic::Ordering;
 use std::ffi::CStr;
 use std::ffi::OsStr;
 use std::io;
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 use std::ptr;
 use std::sync::OnceLock;
 
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 use liteinst::patcher::GuardSignalAction;
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 use liteinst::patcher::GuardSignalHandler;
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 use liteinst::patcher::GuardSignalRuntime;
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 use liteinst::patcher::JumpPatchPlan;
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 use liteinst::patcher::PatchError;
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 use liteinst::patcher::prepare_live_patching_with_signal_runtime;
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 use liteinst::scanner::InstructionScanner;
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 use liteinst::scanner::ScanResult;
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 use liteinst::trampoline::ExecutableTrampoline;
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 use liteinst::trampoline::HookContext;
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 use liteinst::trampoline::HookSite;
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 use liteinst::trampoline::InstalledHook;
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 use liteinst::trampoline::TrampolineArena;
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 use liteinst::trampoline::TrampolineError;
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 use liteinst::trampoline::TrampolinePlan;
 use reverie_inguest::BuiltinTool;
 use reverie_inguest::dispatch::SyscallEvent as PreloadSyscallEvent;
 use reverie_inguest::dispatch::is_fork_like;
 use reverie_inguest::fork::ForkHook;
 use reverie_inguest::guest::context::RegisterContext;
+#[cfg(target_arch = "x86_64")]
 use reverie_inguest::lifecycle::InProcessSeccomp;
 use reverie_inguest::lifecycle::RuntimeConfig;
 use reverie_inguest::trap::raw_syscall6;
 
 use crate::COMPAT_EVENT_COOKIE_ENV;
 use crate::COMPAT_EVENT_FD_ENV;
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 use crate::interior_entry::Census;
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 use crate::interior_entry::CensusError;
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 use crate::interior_entry::ObjectImage;
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 use crate::interior_entry::Refusal;
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 use crate::interior_entry::prove;
 
 #[path = "installed_entries.rs"]
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 mod installed_entries;
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 pub(crate) use installed_entries::PreparedCallbacks;
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 pub(crate) use installed_entries::prepare as prepare_installed_callbacks;
 
-#[cfg(not(feature = "liteinst"))]
+#[cfg(not(all(feature = "liteinst", target_arch = "x86_64")))]
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 pub(crate) struct PreparedCallbacks;
 
-#[cfg(not(feature = "liteinst"))]
+#[cfg(not(all(feature = "liteinst", target_arch = "x86_64")))]
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 pub(crate) fn prepare_installed_callbacks() -> io::Result<PreparedCallbacks> {
     Ok(PreparedCallbacks)
 }
@@ -94,9 +97,13 @@ const fn const_bytes_eq(left: &[u8], right: &[u8]) -> bool {
     true
 }
 
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 const UNSET_RESULT: i64 = i64::MIN;
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 const TOOL_STRACE: u8 = 1;
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 const TOOL_COMPAT: u8 = 2;
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 const TOOL_REVERIE: u8 = 3;
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -105,19 +112,25 @@ const TOOL_REVERIE: u8 = 3;
 pub const TOOL_PASSTHROUGH: &str = "passthrough";
 /// `REVERIE_LITEINST_TOOL` value selecting the shared getpid-spoofing built-in.
 pub const TOOL_SPOOF_GETPID: &str = "spoof-getpid";
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 const EVENT_CHANNEL_IDENTITY_FAILURE_STATUS: i32 = 120;
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 const EVENT_CHANNEL_WRITE_FAILURE_STATUS: i32 = 121;
 /// Enables fail-closed, allocation-free in-guest lifecycle stage markers on stderr.
 pub const IN_GUEST_STAGE_STREAM_ENV: &str = "REVERIE_LITEINST_IN_GUEST_STAGE_STREAM";
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 const MAX_PATCH_SITES: usize = 4096;
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 const ARENA_SLOTS: usize = 128;
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 const PATCH_SNAPSHOT_BYTES: usize = 64;
-#[cfg(any(test, feature = "liteinst"))]
+#[cfg(any(test, all(feature = "liteinst", target_arch = "x86_64")))]
 const SITE_INSTALLING: u8 = 1;
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 const SITE_ACTIVE: u8 = 2;
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 const SITE_FALLBACK: u8 = 3;
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 const SITE_STALE: u8 = 4;
 /// The hook was refused, under the installation lock, after the site's bytes
 /// were re-read and found intact and before the runtime changed any page
@@ -126,57 +139,76 @@ const SITE_STALE: u8 = 4;
 /// resumes after the instruction on the original code. Only the
 /// instruction-fault path records this state; every other caller records
 /// `SITE_FALLBACK` for any refusal.
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 const SITE_UNPATCHABLE: u8 = 5;
 /// A signal-deferred exact-syscall adapter. No source jump was published;
 /// every entry must recheck its number and retained source admission.
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 const SITE_UNPUBLISHED: u8 = 6;
 
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 static TOOL_MODE: AtomicU8 = AtomicU8::new(0);
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 static EVENT_FD: AtomicI32 = AtomicI32::new(libc::STDERR_FILENO);
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 static EVENT_COOKIE: AtomicU64 = AtomicU64::new(0);
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 static EVENT_DEVICE: AtomicU64 = AtomicU64::new(0);
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 static EVENT_INODE: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 static ARENAS: OnceLock<Vec<RuntimeArena>> = OnceLock::new();
 static SITES: OnceLock<Box<[SiteSlot]>> = OnceLock::new();
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 static PAGE_SIZE: AtomicU64 = AtomicU64::new(0);
-#[cfg(any(feature = "liteinst", feature = "native-exec-state"))]
+#[cfg(any(
+    all(feature = "liteinst", target_arch = "x86_64"),
+    feature = "native-exec-state"
+))]
 static INSTALL_HELD: AtomicBool = AtomicBool::new(false);
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 static PATCH_PUBLICATION: AtomicU8 = AtomicU8::new(PatchPublication::Concurrent as u8);
-static SITE_PATCHING_ENABLED: AtomicBool = AtomicBool::new(cfg!(feature = "liteinst"));
+static SITE_PATCHING_ENABLED: AtomicBool =
+    AtomicBool::new(cfg!(all(feature = "liteinst", target_arch = "x86_64")));
 /// Set when this image's Tool installation left LiteInst's SIGTRAP guard
 /// router out ([`GuardRouter::Omit`]): from then on no site may be published,
 /// since a publication plants guard breakpoints only the router takes
 /// (`install_site_hook` refuses).
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 static GUARD_ROUTER_OMITTED: AtomicBool = AtomicBool::new(false);
 
-#[cfg(any(feature = "liteinst", all(test, feature = "exec-private-init")))]
+#[cfg(any(
+    all(feature = "liteinst", target_arch = "x86_64"),
+    all(test, feature = "exec-private-init")
+))]
 pub(crate) use reverie_inguest::guest::clock::enter_rcb_handler;
 #[cfg(feature = "exec-private-init")]
 pub(crate) use reverie_inguest::guest::clock::initialize_rcb_clock;
-#[cfg(any(feature = "liteinst", all(test, feature = "exec-private-init")))]
+#[cfg(any(
+    all(feature = "liteinst", target_arch = "x86_64"),
+    all(test, feature = "exec-private-init")
+))]
 pub(crate) use reverie_inguest::guest::clock::leave_rcb_handler;
 pub(crate) use reverie_inguest::guest::clock::read_guest_rcb_clock;
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 pub(crate) use reverie_inguest::guest::event::InstructionEventKind;
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 use reverie_inguest::guest::instruction::FaultSite;
+#[cfg(target_arch = "x86_64")]
 pub(crate) use reverie_inguest::guest::instruction::InstructionSubscriptions;
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 use reverie_inguest::guest::instruction::PatchOutcome;
 pub(crate) use reverie_inguest::guest::instruction::cpuid_interception_enabled;
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 use reverie_inguest::guest::instruction::decode_instruction;
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 use reverie_inguest::guest::instruction::deliver_default_sigsegv;
+#[cfg(target_arch = "x86_64")]
 use reverie_inguest::guest::instruction::enable_instruction_faulting;
 #[cfg(feature = "exec-private-init")]
 pub(crate) use reverie_inguest::guest::instruction::preflight_instruction_faulting;
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 use reverie_inguest::guest::instruction::set_all_instruction_native;
 use reverie_inguest::guest::patcher::Patcher;
 use reverie_inguest::guest::protect::close_range_preserving_fds;
@@ -192,31 +224,34 @@ use reverie_inguest::guest::protect::syscall_targets_event_fd;
 pub use reverie_inguest::guest::protect::tool_output_fd;
 use reverie_inguest::guest::runtime_seam::PatcherRef;
 use reverie_inguest::guest::runtime_seam::RuntimeSeam;
+#[cfg(target_arch = "x86_64")]
 use reverie_inguest::guest::runtime_seam::install_instruction_handler;
 use reverie_inguest::guest::runtime_seam::process_tool_syscall_with;
 #[cfg(feature = "exec-private-init")]
 pub(crate) use reverie_inguest::guest::signal::prepare_guest_signal_state;
 pub(crate) use reverie_inguest::guest::signal::reserved_signal_mask;
 pub(crate) use reverie_inguest::guest::signal::signal_action_supported;
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 use reverie_inguest::guest::support::IN_GUEST_STAGE_WRITE_FAILURE_STATUS;
 pub(crate) use reverie_inguest::guest::support::StackLine;
 pub(crate) use reverie_inguest::guest::support::emit_in_guest_stage;
 pub(crate) use reverie_inguest::guest::support::exit_now;
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 pub(crate) use reverie_inguest::guest::support::read_own_bytes;
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 pub(crate) use reverie_inguest::guest::support::scan_own_maps;
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 pub(crate) use reverie_inguest::guest::support::tool_callback_active;
+#[cfg(target_arch = "x86_64")]
 use reverie_inguest::guest::tool_install::PatchHost;
+#[cfg(target_arch = "x86_64")]
 use reverie_inguest::guest::trap_dispatch::InGuestDispatcher;
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 use reverie_inguest::guest::trap_dispatch::SitePatch;
 use reverie_inguest::guest::trap_dispatch::TrapPath;
 use reverie_inguest::guest::trap_dispatch::TrapSeam;
 
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 struct RuntimeArena {
     mapping_start: u64,
     mapping_end: u64,
@@ -232,7 +267,7 @@ struct RuntimeArena {
     adapter_mapping_replaced: AtomicBool,
 }
 
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 impl RuntimeArena {
     /// Returns the entry census of this arena's executable mapping, building it
     /// on first use (<https://github.com/rrnewton/reverie/issues/812>).
@@ -256,14 +291,14 @@ impl RuntimeArena {
     }
 }
 
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 const NO_OBJECT_IMAGE: CensusError =
     CensusError("the executable mapping belongs to no identifiable object");
 
 /// Whether an installation must first prove that no known control transfer
 /// enters the bytes its patch displaces.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 enum EntryProof {
     /// A `syscall` site in an object's code: the census must prove it.
     Required,
@@ -273,7 +308,7 @@ enum EntryProof {
     NotListed,
 }
 
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 struct SiteHookPolicy {
     publication: PatchPublication,
     entry_proof: EntryProof,
@@ -281,7 +316,10 @@ struct SiteHookPolicy {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[cfg(any(feature = "liteinst", all(test, feature = "exec-private-init")))]
+#[cfg(any(
+    all(feature = "liteinst", target_arch = "x86_64"),
+    all(test, feature = "exec-private-init")
+))]
 struct RuntimeMap {
     start: u64,
     end: u64,
@@ -296,10 +334,11 @@ struct RuntimeMap {
 
 struct SiteSlot {
     address: AtomicU64,
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     state: AtomicU8,
-    #[cfg(feature = "liteinst")]
+    #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
     hook: AtomicPtr<InstalledHook>,
-    #[cfg(feature = "liteinst")]
+    #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
     adapter: AtomicPtr<UnpublishedSyscall>,
     mapping_end: AtomicU64,
     trap_count: AtomicU64,
@@ -309,7 +348,7 @@ struct SiteSlot {
     /// Set, and never cleared, once this runtime first changes the site's
     /// protection to publish a patch there.
     #[cfg(any(
-        feature = "liteinst",
+        all(feature = "liteinst", target_arch = "x86_64"),
         feature = "native-exec-state",
         all(test, feature = "exec-private-init")
     ))]
@@ -319,19 +358,19 @@ struct SiteSlot {
     /// new attempt starts, which happens only after the earlier patch was
     /// proved gone (see [`earlier_patch_survives`]).
     #[cfg(any(
-        feature = "liteinst",
+        all(feature = "liteinst", target_arch = "x86_64"),
         feature = "native-exec-state",
         all(test, feature = "exec-private-init")
     ))]
     original_word: AtomicU64,
     #[cfg(any(
-        feature = "liteinst",
+        all(feature = "liteinst", target_arch = "x86_64"),
         feature = "native-exec-state",
         all(test, feature = "exec-private-init")
     ))]
     published_word: AtomicU64,
     #[cfg(any(
-        feature = "liteinst",
+        all(feature = "liteinst", target_arch = "x86_64"),
         feature = "native-exec-state",
         all(test, feature = "exec-private-init")
     ))]
@@ -339,13 +378,14 @@ struct SiteSlot {
 }
 
 impl SiteSlot {
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     fn new() -> Self {
         Self {
             address: AtomicU64::new(0),
             state: AtomicU8::new(0),
-            #[cfg(feature = "liteinst")]
+            #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
             hook: AtomicPtr::new(ptr::null_mut()),
-            #[cfg(feature = "liteinst")]
+            #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
             adapter: AtomicPtr::new(ptr::null_mut()),
             mapping_end: AtomicU64::new(0),
             trap_count: AtomicU64::new(0),
@@ -353,25 +393,25 @@ impl SiteSlot {
             instruction_len: AtomicU8::new(0),
             straddle_prefix: AtomicU8::new(0),
             #[cfg(any(
-                feature = "liteinst",
+                all(feature = "liteinst", target_arch = "x86_64"),
                 feature = "native-exec-state",
                 all(test, feature = "exec-private-init")
             ))]
             publication_attempted: AtomicBool::new(false),
             #[cfg(any(
-                feature = "liteinst",
+                all(feature = "liteinst", target_arch = "x86_64"),
                 feature = "native-exec-state",
                 all(test, feature = "exec-private-init")
             ))]
             original_word: AtomicU64::new(0),
             #[cfg(any(
-                feature = "liteinst",
+                all(feature = "liteinst", target_arch = "x86_64"),
                 feature = "native-exec-state",
                 all(test, feature = "exec-private-init")
             ))]
             published_word: AtomicU64::new(0),
             #[cfg(any(
-                feature = "liteinst",
+                all(feature = "liteinst", target_arch = "x86_64"),
                 feature = "native-exec-state",
                 all(test, feature = "exec-private-init")
             ))]
@@ -382,7 +422,7 @@ impl SiteSlot {
     // Callers: `native_exec_site_cut` (native-exec-state) and a unit test
     // gated on exec-private-init, which native-exec-state implies.
     #[cfg(all(
-        feature = "liteinst",
+        all(feature = "liteinst", target_arch = "x86_64"),
         feature = "exec-private-init",
         any(test, feature = "native-exec-state")
     ))]
@@ -392,7 +432,7 @@ impl SiteSlot {
     }
 
     #[cfg(all(
-        not(feature = "liteinst"),
+        not(all(feature = "liteinst", target_arch = "x86_64")),
         feature = "exec-private-init",
         any(test, feature = "native-exec-state")
     ))]
@@ -405,7 +445,7 @@ impl SiteSlot {
 /// Retained for process lifetime, including after mapping invalidation and
 /// across in-flight guest signal handlers. The source snapshot controls only
 /// future admission; the trampoline always returns to the live source + 2.
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 struct UnpublishedSyscall {
     trampoline: ExecutableTrampoline,
     source: Box<[u8]>,
@@ -447,6 +487,7 @@ pub fn builtin_tool_from_env_value(value: &OsStr) -> Option<BuiltinTool> {
 ///
 /// The dynamic loader must call this exactly once before application threads
 /// start; it installs process-wide, irreversible seccomp state.
+#[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn install_builtin_runtime(tool: BuiltinTool) -> io::Result<()> {
     #[cfg(feature = "fixed-syscall-gates")]
     require_fixed_gate_full_tool(false)?;
@@ -515,14 +556,15 @@ const _: () = assert!(const_bytes_eq(
 /// `None` (unset) and `1` select patching; `0` disables it. Any other value,
 /// including surrounding whitespace, is rejected, matching the strict
 /// [`PROCESS_FORK_ENV`] parse.
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 pub(crate) type StalenessBudget = liteinst::patcher::StalenessBudget;
-#[cfg(not(feature = "liteinst"))]
+#[cfg(not(all(feature = "liteinst", target_arch = "x86_64")))]
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 pub(crate) type StalenessBudget = ();
 
 pub fn site_patching_from_env_value(value: Option<&OsStr>) -> io::Result<bool> {
     match value {
-        None => Ok(cfg!(feature = "liteinst")),
+        None => Ok(cfg!(all(feature = "liteinst", target_arch = "x86_64"))),
         Some(value) if value == OsStr::new("1") => validate_site_patching(true),
         Some(value) if value == OsStr::new("0") => Ok(false),
         Some(value) => Err(io::Error::new(
@@ -546,7 +588,16 @@ pub fn site_patching_from_env_value(value: Option<&OsStr>) -> io::Result<bool> {
 /// Checks every selector, including an authenticated launcher's bootstrap.
 /// A trap-only build must never accept a request it cannot implement.
 pub(crate) fn validate_site_patching(enabled: bool) -> io::Result<bool> {
-    if enabled && !cfg!(feature = "liteinst") {
+    if enabled && !cfg!(all(feature = "liteinst", target_arch = "x86_64")) {
+        // On aarch64 the feature may be enabled; site patching itself is
+        // what does not exist there yet. Name the architecture, not the
+        // feature, so the refusal cannot be mistaken for a build mistake.
+        #[cfg(target_arch = "aarch64")]
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "site patching is not supported on aarch64",
+        ));
+        #[cfg(not(target_arch = "aarch64"))]
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "built without LiteInst; enable the `liteinst` Cargo feature to use site patching",
@@ -562,6 +613,7 @@ pub fn site_patching_enabled() -> bool {
 /// Refuses to start a runtime that does not take [`SITE_PATCHING_ENV`] when the
 /// variable holds anything but the default `1`. Reads with `getenv` so the
 /// accepted case does not allocate before the constructor window.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 fn require_site_patching(runtime: &str) -> io::Result<()> {
     // SAFETY: the loader runs constructors before application threads start,
     // so nothing mutates the environment concurrently; the name is NUL-terminated.
@@ -615,12 +667,14 @@ pub fn alt_stack_from_env_value(value: Option<&OsStr>) -> io::Result<bool> {
 ///
 /// Reads the process environment once; the parse itself is delegated to the pure
 /// [`alt_stack_from_env_value`].
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 fn runtime_config_from_env() -> io::Result<RuntimeConfig> {
     Ok(runtime_config(alt_stack_from_env_value(
         std::env::var_os(ALT_STACK_ENV).as_deref(),
     )?))
 }
 
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 fn runtime_config(use_alt_stack: bool) -> RuntimeConfig {
     // Signal phase 1: in the Tool mode every signal handler in the process is
     // the runtime's own and returns through its private restorer, so the
@@ -631,6 +685,7 @@ fn runtime_config(use_alt_stack: bool) -> RuntimeConfig {
     }
 }
 
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 pub(crate) fn initialize_from_environment() -> io::Result<()> {
     let tool_value = std::env::var_os("REVERIE_LITEINST_TOOL");
     initialize_from_selected_value(tool_value.as_deref())
@@ -639,76 +694,94 @@ pub(crate) fn initialize_from_environment() -> io::Result<()> {
 // Both acquisition paths own the selected value across initialization. The
 // actual standalone leaf reads the same raw environment vector as its native
 // activation prefix; generic embeddings retain std::env/getenv acquisition.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 pub(crate) fn initialize_from_selected_value(tool_value: Option<&OsStr>) -> io::Result<()> {
-    // The experimental artifact has only a FullTool contract. Refuse before
-    // reserving its page or changing a handler, rather than silently changing
-    // the compatibility/built-in signal-return policy.
-    #[cfg(feature = "fixed-syscall-gates")]
-    if tool_value.is_some() {
-        require_fixed_gate_full_tool(false)?;
-    }
-    // Prefer a shared reverie-inguest built-in when the selector names one, so a
-    // single env var is a superset of the LiteInst-native strace/compat modes
-    // (matches e9patch's single TOOL_ENV selecting shared built-ins).
-    if let Some(value) = tool_value
-        && let Some(tool) = builtin_tool_from_env_value(value)
+    // aarch64 (L0): any selection refuses by name before reserving a page or
+    // changing a handler; no selection stays inert. The serving tails below
+    // are not compiled on aarch64.
+    #[cfg(target_arch = "aarch64")]
     {
-        require_site_patching("built-in Tool")?;
-        // SAFETY: the loader calls this once before application threads start.
-        return unsafe { install_builtin_runtime(tool) };
-    }
-    let mode = match tool_value {
-        None => return Ok(()),
-        Some(value) if value == OsStr::new("strace") => TOOL_STRACE,
-        Some(value) if value == OsStr::new("compat") => TOOL_COMPAT,
-        Some(value) => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("unsupported REVERIE_LITEINST_TOOL value {value:?}"),
-            ));
-        }
-    };
-    require_site_patching(if mode == TOOL_COMPAT {
-        "compat"
-    } else {
-        "strace"
-    })?;
-    TOOL_MODE.store(mode, Ordering::Release);
-    let event_channel = if mode == TOOL_COMPAT {
-        compatibility_event_channel()?
-    } else {
-        None
-    };
-    let event_fd = event_channel
-        .as_ref()
-        .map_or(libc::STDERR_FILENO, |channel| channel.fd);
-    EVENT_FD.store(event_fd, Ordering::Release);
-    if let Some(channel) = event_channel {
-        EVENT_COOKIE.store(channel.cookie, Ordering::Release);
-        EVENT_DEVICE.store(channel.device, Ordering::Release);
-        EVENT_INODE.store(channel.inode, Ordering::Release);
-        // SAFETY: initialization runs before application threads start.
-        unsafe {
-            std::env::remove_var(COMPAT_EVENT_FD_ENV);
-            std::env::remove_var(COMPAT_EVENT_COOKIE_ENV);
+        match tool_value {
+            None => Ok(()),
+            Some(_) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "in-guest LiteInst runtime is not supported on aarch64",
+            )),
         }
     }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        // The experimental artifact has only a FullTool contract. Refuse before
+        // reserving its page or changing a handler, rather than silently changing
+        // the compatibility/built-in signal-return policy.
+        #[cfg(feature = "fixed-syscall-gates")]
+        if tool_value.is_some() {
+            require_fixed_gate_full_tool(false)?;
+        }
+        // Prefer a shared reverie-inguest built-in when the selector names one, so a
+        // single env var is a superset of the LiteInst-native strace/compat modes
+        // (matches e9patch's single TOOL_ENV selecting shared built-ins).
+        if let Some(value) = tool_value
+            && let Some(tool) = builtin_tool_from_env_value(value)
+        {
+            require_site_patching("built-in Tool")?;
+            // SAFETY: the loader calls this once before application threads start.
+            return unsafe { install_builtin_runtime(tool) };
+        }
+        let mode = match tool_value {
+            None => return Ok(()),
+            Some(value) if value == OsStr::new("strace") => TOOL_STRACE,
+            Some(value) if value == OsStr::new("compat") => TOOL_COMPAT,
+            Some(value) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("unsupported REVERIE_LITEINST_TOOL value {value:?}"),
+                ));
+            }
+        };
+        require_site_patching(if mode == TOOL_COMPAT {
+            "compat"
+        } else {
+            "strace"
+        })?;
+        TOOL_MODE.store(mode, Ordering::Release);
+        let event_channel = if mode == TOOL_COMPAT {
+            compatibility_event_channel()?
+        } else {
+            None
+        };
+        let event_fd = event_channel
+            .as_ref()
+            .map_or(libc::STDERR_FILENO, |channel| channel.fd);
+        EVENT_FD.store(event_fd, Ordering::Release);
+        if let Some(channel) = event_channel {
+            EVENT_COOKIE.store(channel.cookie, Ordering::Release);
+            EVENT_DEVICE.store(channel.device, Ordering::Release);
+            EVENT_INODE.store(channel.inode, Ordering::Release);
+            // SAFETY: initialization runs before application threads start.
+            unsafe {
+                std::env::remove_var(COMPAT_EVENT_FD_ENV);
+                std::env::remove_var(COMPAT_EVENT_COOKIE_ENV);
+            }
+        }
 
-    install_runtime(
-        crate::stats::GuestStatsHooks::DISABLED,
-        PatchPublication::Concurrent,
-        InstructionSubscriptions::default(),
-        &[],
-        None,
-        #[cfg(feature = "exec-private-init")]
-        None,
-    )
+        install_runtime(
+            crate::stats::GuestStatsHooks::DISABLED,
+            PatchPublication::Concurrent,
+            InstructionSubscriptions::default(),
+            &[],
+            None,
+            #[cfg(feature = "exec-private-init")]
+            None,
+        )
+    }
 }
 
 // Ordinary and legacy images retain the patcher's full preparation. The
 // authenticated no-RCB/no-patching private installer selects the trap-only
 // resource path; this selection does not confer any native image authority.
 #[derive(Clone, Copy)]
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 pub(crate) enum InstrumentationPreparation {
     Patcher,
     #[cfg(feature = "exec-private-init")]
@@ -798,6 +871,7 @@ pub(crate) fn initialize_reverie_tool(
 }
 
 /// [`IN_GUEST_STAGE_STREAM_ENV`]: absent or `0` is off, `1` is on.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 fn stage_stream_from_env() -> io::Result<bool> {
     match std::env::var_os(IN_GUEST_STAGE_STREAM_ENV).as_deref() {
         None => Ok(false),
@@ -811,6 +885,7 @@ fn stage_stream_from_env() -> io::Result<bool> {
 }
 
 /// [`PROCESS_FORK_ENV`]: absent or `1` allows process creation, `0` refuses it.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 fn process_forks_from_env() -> io::Result<bool> {
     match std::env::var_os(PROCESS_FORK_ENV).as_deref() {
         None => Ok(true),
@@ -827,6 +902,7 @@ fn process_forks_from_env() -> io::Result<bool> {
 /// ([`reverie_inguest::guest::tool_install::install_tool_with`]): its
 /// allocator check, continuation handlers, hook entries and patcher
 /// preparation, its environment selectors, and its runtime services.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 pub(crate) struct LiteinstPatchHost {
     pub(crate) publication: PatchPublication,
     #[cfg(feature = "fixed-syscall-gates")]
@@ -836,6 +912,7 @@ pub(crate) struct LiteinstPatchHost {
 /// Environment selector values validated once in preflight, before the
 /// fixed gate page is published, and reused by the later selector steps.
 #[cfg(feature = "fixed-syscall-gates")]
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 #[derive(Clone, Copy)]
 struct EnvSelectors {
     site_patching: bool,
@@ -847,6 +924,7 @@ struct EnvSelectors {
 }
 
 impl LiteinstPatchHost {
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     pub(crate) fn new(publication: PatchPublication) -> Self {
         Self {
             publication,
@@ -856,6 +934,7 @@ impl LiteinstPatchHost {
     }
 
     #[cfg(feature = "fixed-syscall-gates")]
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     fn selectors(&self) -> Option<EnvSelectors> {
         self.selectors.get().copied()
     }
@@ -866,6 +945,7 @@ impl LiteinstPatchHost {
 // same points; the only handler they install, the SIGTRAP guard router (with
 // site patching on only), uses the runtime's raw signal operations and private
 // restorer.
+#[cfg(target_arch = "x86_64")]
 unsafe impl PatchHost for LiteinstPatchHost {
     type Runtime = crate::tool_host::LiteinstRuntime;
 
@@ -898,11 +978,11 @@ unsafe impl PatchHost for LiteinstPatchHost {
                 use_alt_stack: alt_stack_from_env_value(
                     std::env::var_os(ALT_STACK_ENV).as_deref(),
                 )?,
-                #[cfg(feature = "liteinst")]
+                #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
                 straddler_staleness: crate::straddler::straddler_staleness_from_env_value(
                     std::env::var_os(crate::straddler::STRADDLER_STALENESS_TICKS_ENV).as_deref(),
                 )?,
-                #[cfg(not(feature = "liteinst"))]
+                #[cfg(not(all(feature = "liteinst", target_arch = "x86_64")))]
                 straddler_staleness: Some(()),
             };
             let _ = self.selectors.set(selectors);
@@ -1004,6 +1084,7 @@ unsafe impl PatchHost for LiteinstPatchHost {
 pub const SIGALRM_HANDLERS_ENV: &str = "REVERIE_LITEINST_SIGALRM_HANDLERS";
 
 /// Parse [`SIGALRM_HANDLERS_ENV`]: absent or `0` is off, `1` is on.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 pub fn sigalrm_handlers_from_env_value(value: Option<&OsStr>) -> io::Result<bool> {
     match value {
         None => Ok(false),
@@ -1016,6 +1097,7 @@ pub fn sigalrm_handlers_from_env_value(value: Option<&OsStr>) -> io::Result<bool
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 fn install_runtime(
     stats: crate::stats::GuestStatsHooks,
     publication: PatchPublication,
@@ -1140,6 +1222,7 @@ fn install_runtime(
 }
 
 #[cfg(feature = "fixed-syscall-gates")]
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 fn require_fixed_gate_full_tool(full_tool: bool) -> io::Result<()> {
     if full_tool {
         Ok(())
@@ -1151,6 +1234,7 @@ fn require_fixed_gate_full_tool(full_tool: bool) -> io::Result<()> {
     }
 }
 
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 struct CompatibilityEventChannel {
     fd: libc::c_int,
     cookie: u64,
@@ -1158,6 +1242,7 @@ struct CompatibilityEventChannel {
     inode: u64,
 }
 
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 fn compatibility_event_channel() -> io::Result<Option<CompatibilityEventChannel>> {
     let Some(value) = std::env::var_os(COMPAT_EVENT_FD_ENV) else {
         if std::env::var_os(COMPAT_EVENT_COOKIE_ENV).is_some() {
@@ -1272,14 +1357,20 @@ fn compatibility_event_channel() -> io::Result<Option<CompatibilityEventChannel>
     }))
 }
 
-#[cfg(any(feature = "liteinst", all(test, feature = "exec-private-init")))]
+#[cfg(any(
+    all(feature = "liteinst", target_arch = "x86_64"),
+    all(test, feature = "exec-private-init")
+))]
 fn read_runtime_maps() -> io::Result<Vec<RuntimeMap>> {
     Ok(parse_runtime_maps(&std::fs::read_to_string(
         "/proc/self/maps",
     )?))
 }
 
-#[cfg(any(feature = "liteinst", all(test, feature = "exec-private-init")))]
+#[cfg(any(
+    all(feature = "liteinst", target_arch = "x86_64"),
+    all(test, feature = "exec-private-init")
+))]
 fn parse_runtime_maps(maps: &str) -> Vec<RuntimeMap> {
     maps.lines()
         .filter_map(|line| {
@@ -1315,7 +1406,7 @@ fn parse_runtime_maps(maps: &str) -> Vec<RuntimeMap> {
 /// inode. The header is the single such mapping at file offset zero. A file
 /// that is mapped twice has two, so it gets no image, and neither does an
 /// anonymous mapping.
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 fn object_image(maps: &[RuntimeMap], text_start: u64, text_end: u64) -> Option<ObjectImage> {
     let text = maps
         .iter()
@@ -1337,7 +1428,7 @@ fn object_image(maps: &[RuntimeMap], text_start: u64, text_end: u64) -> Option<O
     Some(ObjectImage::new(header, ranges))
 }
 
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 fn discover_arena_aliases(
     before: &[RuntimeMap],
     after: &[RuntimeMap],
@@ -1381,6 +1472,7 @@ fn discover_arena_aliases(
 /// Whether [`prepare_instrumentation`] installs LiteInst2's SIGTRAP guard
 /// router.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 enum GuardRouter {
     /// Install it: the image may publish sites, whose guard breakpoints it
     /// takes.
@@ -1393,7 +1485,8 @@ enum GuardRouter {
 
 /// The base runtime has no guard router or executable patch arenas. Its
 /// shared instruction handler and SIGSYS continuation do all dispatch.
-#[cfg(not(feature = "liteinst"))]
+#[cfg(not(all(feature = "liteinst", target_arch = "x86_64")))]
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 fn prepare_instrumentation(
     preparation: InstrumentationPreparation,
     _router: GuardRouter,
@@ -1402,7 +1495,7 @@ fn prepare_instrumentation(
     prepare_instrumentation_state(preparation)
 }
 
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 fn prepare_instrumentation(
     preparation: InstrumentationPreparation,
     router: GuardRouter,
@@ -1439,7 +1532,7 @@ fn prepare_instrumentation(
 
 /// LiteInst2's guard-router signal operations, done with the runtime's raw
 /// signal syscalls and its private restorer.
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 const GUARD_SIGNAL_RUNTIME: GuardSignalRuntime = GuardSignalRuntime {
     install_blocked: install_guard_handler_blocked,
     restore_mask: restore_guard_signal_mask,
@@ -1448,20 +1541,20 @@ const GUARD_SIGNAL_RUNTIME: GuardSignalRuntime = GuardSignalRuntime {
 
 /// The calling thread's mask before [`install_guard_handler_blocked`] blocked
 /// SIGTRAP, held until [`restore_guard_signal_mask`] puts it back.
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 static GUARD_PRIOR_MASK: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 static GUARD_PRIOR_MASK_HELD: AtomicBool = AtomicBool::new(false);
 /// False also covers uninitialized/failed installation. An ignored SIGTRAP
 /// routed through a returning caught handler can interrupt timeout I/O, so
 /// only a successfully captured default profile admits the new adapter.
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 static GUARD_PRIOR_DEFAULT: AtomicBool = AtomicBool::new(false);
 
 /// Block SIGTRAP, refuse a prior custom handler, report the prior action, and
 /// install the guard router returning through the runtime's restorer; SIGTRAP
 /// stays blocked until [`restore_guard_signal_mask`].
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 unsafe fn install_guard_handler_blocked(
     signal: libc::c_int,
     handler: GuardSignalHandler,
@@ -1523,7 +1616,7 @@ unsafe fn install_guard_handler_blocked(
 }
 
 /// Put back the mask [`install_guard_handler_blocked`] held.
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 unsafe fn restore_guard_signal_mask(signal: libc::c_int) -> Result<(), i32> {
     if signal != libc::SIGTRAP || !GUARD_PRIOR_MASK_HELD.swap(false, Ordering::AcqRel) {
         return Err(libc::EINVAL);
@@ -1535,7 +1628,7 @@ unsafe fn restore_guard_signal_mask(signal: libc::c_int) -> Result<(), i32> {
 /// From the guard router's signal context: restore the prior default action
 /// and send the signal again, with raw syscalls only. It stays pending until
 /// the router returns.
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 unsafe fn restore_guard_default_action(
     signal: libc::c_int,
     previous: &GuardSignalAction,
@@ -1565,6 +1658,7 @@ pub(crate) unsafe fn prepare_private_rcb_clock(skip_pmu: bool) -> io::Result<()>
     }
 }
 
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 fn prepare_instrumentation_state(_preparation: InstrumentationPreparation) -> io::Result<()> {
     let page_size = reverie_inguest::guest::support::page_size()?;
     PAGE_SIZE.store(page_size, Ordering::Release);
@@ -1577,7 +1671,10 @@ fn prepare_instrumentation_state(_preparation: InstrumentationPreparation) -> io
         .set(sites)
         .map_err(|_| io::Error::other("LiteInst site registry initialized twice"))?;
 
-    #[cfg(all(feature = "exec-private-init", feature = "liteinst"))]
+    #[cfg(all(
+        feature = "exec-private-init",
+        all(feature = "liteinst", target_arch = "x86_64")
+    ))]
     match _preparation {
         InstrumentationPreparation::Patcher => {}
         InstrumentationPreparation::NativeTrapOnly => {
@@ -1591,18 +1688,18 @@ fn prepare_instrumentation_state(_preparation: InstrumentationPreparation) -> io
         }
     }
 
-    #[cfg(not(feature = "liteinst"))]
+    #[cfg(not(all(feature = "liteinst", target_arch = "x86_64")))]
     {
         let _ = _preparation;
         Ok(())
     }
-    #[cfg(feature = "liteinst")]
+    #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
     {
         initialize_arenas()
     }
 }
 
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 fn initialize_arenas() -> io::Result<()> {
     let maps = std::fs::read_to_string("/proc/self/maps")?;
     let objects = parse_runtime_maps(&maps);
@@ -1688,7 +1785,7 @@ fn find_site(address: u64) -> Option<&'static SiteSlot> {
     None
 }
 
-#[cfg(any(test, feature = "liteinst"))]
+#[cfg(any(test, all(feature = "liteinst", target_arch = "x86_64")))]
 fn claim_existing_site(slot: &'static SiteSlot) -> (&'static SiteSlot, bool) {
     loop {
         let state = slot.state.load(Ordering::Acquire);
@@ -1711,7 +1808,7 @@ fn claim_existing_site(slot: &'static SiteSlot) -> (&'static SiteSlot, bool) {
     }
 }
 
-#[cfg(any(test, feature = "liteinst"))]
+#[cfg(any(test, all(feature = "liteinst", target_arch = "x86_64")))]
 fn claim_site(address: u64) -> Option<(&'static SiteSlot, bool)> {
     let sites = SITES.get()?;
     let start = site_hash(address, sites.len());
@@ -1738,6 +1835,7 @@ fn claim_site(address: u64) -> Option<(&'static SiteSlot, bool)> {
     None
 }
 
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 fn mark_site_range_stale(start: u64, len: u64, replacement_end: u64) {
     let Some(end) = start.checked_add(len) else {
         return;
@@ -1762,10 +1860,11 @@ fn mark_site_range_stale(start: u64, len: u64, replacement_end: u64) {
     }
 }
 
-#[cfg(not(feature = "liteinst"))]
+#[cfg(not(all(feature = "liteinst", target_arch = "x86_64")))]
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 fn invalidate_adapter_mappings(_start: u64, _end: u64) {}
 
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 fn invalidate_adapter_mappings(start: u64, end: u64) {
     if start >= end {
         return;
@@ -1787,6 +1886,7 @@ fn invalidate_adapter_mappings(start: u64, end: u64) {
 }
 
 // TODO-HUMAN-REVIEW(PR-127): Review executable mapping-generation tracking.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 fn observe_mapping_generation(event: &SyscallEvent) {
     if event.result < 0 {
         return;
@@ -1857,6 +1957,7 @@ impl FallbackCounters {
         }
     }
 
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     fn record(&self, number: i64) {
         #[cfg(feature = "native-exec-state")]
         crate::native_exec_state::increment(&self.total, false);
@@ -2018,6 +2119,7 @@ pub(crate) fn seed_native_exec_fallback_test(value: u64) {
 ///
 /// Async-signal-safe: only relaxed atomic increments, so it is safe to call from
 /// the `SIGSYS` dispatch path. It does not change the forwarding decision.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 pub(crate) fn record_fallback_dispatch(number: i64) {
     // AUTONOMOUS-BOT-IMPLEMENTED
     FALLBACK_COUNTERS.record(number);
@@ -2067,6 +2169,7 @@ pub(crate) fn fallback_syscall_refusal_count(number: i64) -> u64 {
 /// only relaxed atomic stores plus one lock-free [`OnceLock::get`], no allocation
 /// and no locks, so it is safe to run in the child from inside the `SIGSYS`
 /// handler.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 fn reset_site_observability(sites: &[SiteSlot]) {
     for site in sites {
         site.trap_count.store(0, Ordering::Relaxed);
@@ -2074,6 +2177,7 @@ fn reset_site_observability(sites: &[SiteSlot]) {
     }
 }
 
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 pub(crate) fn reset_fallback_observability() {
     #[cfg(feature = "native-exec-state")]
     crate::native_exec_state::note_activity();
@@ -2085,6 +2189,7 @@ pub(crate) fn reset_fallback_observability() {
     }
 }
 
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 pub(crate) fn submit_process_stats(
     tid: reverie::Tid,
     stats: crate::stats::GuestStatsHooks,
@@ -2111,6 +2216,7 @@ pub(crate) fn submit_process_stats(
     stats.submit(tid, direct_hooks, sites)
 }
 
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 pub(crate) fn record_fork_child_dispatch(
     event: &SyscallEvent,
     stats: crate::stats::GuestStatsHooks,
@@ -2150,9 +2256,10 @@ pub(crate) fn record_fork_child_dispatch(
 /// fork-like syscall — but it reuses the *same* reviewed-once
 /// [`ForkHook`]/[`is_fork_like`] seam e9patch does, rather than a private
 /// fork-detection path.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 static FORK_HOOK: ForkHook = ForkHook::new(reset_fallback_observability);
 
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 fn arena_for(address: u64) -> Option<&'static RuntimeArena> {
     ARENAS.get()?.iter().find(|entry| {
         entry.mapping_start <= address
@@ -2161,7 +2268,7 @@ fn arena_for(address: u64) -> Option<&'static RuntimeArena> {
     })
 }
 
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 unsafe fn set_text_protection(address: u64, protection: i32) -> io::Result<()> {
     let page_size = PAGE_SIZE.load(Ordering::Acquire);
     if page_size == 0 {
@@ -2194,7 +2301,7 @@ unsafe fn set_text_protection(address: u64, protection: i32) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 unsafe fn set_mapping_protection(start: u64, len: u64, protection: i32) -> io::Result<()> {
     let result =
         unsafe { raw_syscall6(libc::SYS_mprotect, [start, len, protection as u64, 0, 0, 0]) };
@@ -2204,11 +2311,12 @@ unsafe fn set_mapping_protection(start: u64, len: u64, protection: i32) -> io::R
     Ok(())
 }
 
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 struct InstallGuard;
 
 #[derive(Clone, Copy)]
 #[repr(u8)]
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 pub(crate) enum PatchPublication {
     /// No other application thread can fetch the site during publication.
     Quiescent,
@@ -2216,7 +2324,7 @@ pub(crate) enum PatchPublication {
     Concurrent,
 }
 
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 fn patch_publication() -> PatchPublication {
     if PATCH_PUBLICATION.load(Ordering::Acquire) == PatchPublication::Quiescent as u8 {
         PatchPublication::Quiescent
@@ -2225,14 +2333,14 @@ fn patch_publication() -> PatchPublication {
     }
 }
 
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 impl Drop for InstallGuard {
     fn drop(&mut self) {
         INSTALL_HELD.store(false, Ordering::Release);
     }
 }
 
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 fn lock_installation() -> io::Result<InstallGuard> {
     INSTALL_HELD
         .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -2243,7 +2351,7 @@ fn lock_installation() -> io::Result<InstallGuard> {
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(liteinst-straddler-cpuid): Review the untouched-code boundary.
 /// Why [`install_site_hook`] installed no hook.
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 struct InstallFailure {
     error: io::Error,
     /// True only for a refusal that proves the site's code is the original:
@@ -2263,7 +2371,7 @@ struct InstallFailure {
     possibly_written: bool,
 }
 
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 impl InstallFailure {
     fn untouched(error: io::Error) -> Self {
         Self {
@@ -2290,7 +2398,7 @@ impl InstallFailure {
     }
 }
 
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 impl From<InstallFailure> for io::Error {
     fn from(failure: InstallFailure) -> Self {
         failure.error
@@ -2301,21 +2409,21 @@ impl From<InstallFailure> for io::Error {
 /// may have published part of a jump. The installing thread then ends the
 /// guest; a thread that finds any site marked fallback after this ends it too
 /// rather than decline (see the syscall path of `LiteinstSeam`).
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 static SITE_JUMP_POSSIBLY_WRITTEN: AtomicBool = AtomicBool::new(false);
 
 /// Whether a failed syscall-site installation must end the guest rather than
 /// decline: only when the jump may already be published. Every other failure
 /// left the bytes after the syscall as they were, so the trap's fallback
 /// continuation can still run it.
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 fn syscall_install_failure_ends_guest(failure: &InstallFailure) -> bool {
     failure.possibly_written
 }
 
 /// How a proposed patch relates to one other claimed site.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 enum NeighbourConflict {
     /// The proposed site's instruction, or the point after it, lies inside
     /// the other site's published (or possibly partly published) jump, so
@@ -2339,7 +2447,7 @@ enum NeighbourConflict {
 /// published ([`site_footprint`]); a site INSTALLING, UNPATCHABLE, STALE or
 /// FALLBACK also reserves its instruction and resume point for the
 /// continuation.
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 fn neighbour_conflict(
     address: u64,
     instruction_len: u64,
@@ -2385,7 +2493,7 @@ fn neighbour_conflict(
 /// examined: [`NeighbourConflict::InsidePublishedPatch`] dominates, because a
 /// refusal is untouched only if no published jump covers the site, whatever
 /// order the site table yields its entries in.
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 fn neighbours_conflict(
     address: u64,
     instruction_len: u64,
@@ -2417,7 +2525,7 @@ fn neighbours_conflict(
 /// liteinst guards every front-fragment byte, changed or not). Only when
 /// no byte survives is the old patch provably gone, whatever part of its
 /// window a mapping change replaced.
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 fn stale_jump_survives(words: Option<(u64, u64)>, current: Option<[u8; 8]>) -> bool {
     let (Some((original, published)), Some(current)) = (words, current) else {
         return true;
@@ -2437,7 +2545,7 @@ fn stale_jump_survives(words: Option<(u64, u64)>, current: Option<[u8; 8]>) -> b
 /// only if no publication was ever attempted, or the latest one completed and
 /// [`stale_jump_survives`] proves every byte it wrote is gone; an attempt that
 /// did not complete leaves no record and so counts as surviving.
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 fn earlier_patch_survives(
     publication_attempted: bool,
     words: Option<(u64, u64)>,
@@ -2452,14 +2560,14 @@ fn earlier_patch_survives(
 /// record and so survives; one refused before any change (a syscall the
 /// census or the cross-line budget refused) wrote nothing and keeps only
 /// its continuation reservation.
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 fn site_footprint(state: u8, survives: bool) -> bool {
     state == SITE_ACTIVE || survives
 }
 
 /// [`earlier_patch_survives`] for `slot` at `address`, reading the window
 /// without risking a fault: part or all of its mapping may be gone.
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 fn slot_patch_survives(slot: &SiteSlot, address: u64) -> bool {
     if !slot.publication_attempted.load(Ordering::Acquire) {
         return false;
@@ -2478,7 +2586,7 @@ fn slot_patch_survives(slot: &SiteSlot, address: u64) -> bool {
 /// Refuse a patch at `address` that conflicts with another claimed site.
 /// Called with the installation lock held, so no other patch is being
 /// published concurrently, and before any protection change or write.
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 fn check_neighbours(address: u64, instruction_len: u64) -> Result<(), InstallFailure> {
     let Some(sites) = SITES.get() else {
         return Ok(());
@@ -2530,12 +2638,12 @@ fn check_neighbours(address: u64, instruction_len: u64) -> Result<(), InstallFai
 /// as the kernel does for a blocked synchronous fault, instead of running a
 /// guest handler in the middle of an installation. The instruction-fault
 /// path already installs with SIGSEGV blocked.
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 struct AsyncSignalsBlocked {
     previous: u64,
 }
 
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 impl AsyncSignalsBlocked {
     fn new() -> io::Result<Self> {
         let bit = |signal: libc::c_int| 1_u64 << (signal - 1);
@@ -2563,7 +2671,7 @@ impl AsyncSignalsBlocked {
     }
 }
 
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 impl Drop for AsyncSignalsBlocked {
     fn drop(&mut self) {
         let _ = unsafe {
@@ -2582,7 +2690,7 @@ impl Drop for AsyncSignalsBlocked {
     }
 }
 
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 fn unpublished_read_write_allowed(number: i64) -> bool {
     TOOL_MODE.load(Ordering::Acquire) == TOOL_STRACE
         && GUARD_PRIOR_DEFAULT.load(Ordering::Acquire)
@@ -2593,7 +2701,7 @@ fn unpublished_read_write_allowed(number: i64) -> bool {
 /// All ordinary source admission has passed except the missing split-word
 /// calibration. Preserve the later bind validator too, without binding a
 /// source patch or changing its protection.
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 fn install_unpublished_syscall(
     address: u64,
     slot: &'static SiteSlot,
@@ -2636,7 +2744,7 @@ fn install_unpublished_syscall(
 /// Revalidate each genuine trap, including a polymorphic site's number. No
 /// copied tail is executed: the retained bytes authenticate current admission
 /// only, and a later guest handler's tail changes are seen at original + 2.
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 fn unpublished_syscall_entry(address: u64, slot: &SiteSlot, number: i64) -> Option<u64> {
     if !unpublished_read_write_allowed(number) {
         return None;
@@ -2681,7 +2789,7 @@ fn unpublished_syscall_entry(address: u64, slot: &SiteSlot, number: i64) -> Opti
     Some(adapter.trampoline.address())
 }
 
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 unsafe fn install_site_hook(
     address: u64,
     slot: &'static SiteSlot,
@@ -2929,12 +3037,13 @@ unsafe fn install_site_hook(
     Ok(())
 }
 
-#[cfg(not(feature = "liteinst"))]
+#[cfg(not(all(feature = "liteinst", target_arch = "x86_64")))]
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 fn install_vdso_sites(_sites: &[reverie::vdso::VdsoSyscallSite]) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 fn install_vdso_sites(sites: &[reverie::vdso::VdsoSyscallSite]) -> io::Result<()> {
     for site_info in sites {
         let address = site_info.address;
@@ -2990,7 +3099,7 @@ fn install_vdso_sites(sites: &[reverie::vdso::VdsoSyscallSite]) -> io::Result<()
     Ok(())
 }
 
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 fn vdso_callback(number: i64) -> io::Result<liteinst::trampoline::HookCallback> {
     let callbacks = installed_entries::selected();
     match number {
@@ -3007,7 +3116,7 @@ fn vdso_callback(number: i64) -> io::Result<liteinst::trampoline::HookCallback> 
     }
 }
 
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 fn instruction_at(address: u64) -> Option<(InstructionEventKind, &'static [u8])> {
     let arena = arena_for(address)?;
     let available = usize::try_from(arena.mapping_end.checked_sub(address)?)
@@ -3020,7 +3129,7 @@ fn instruction_at(address: u64) -> Option<(InstructionEventKind, &'static [u8])>
     decode_instruction(bytes)
 }
 
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 fn instruction_callback(kind: InstructionEventKind) -> liteinst::trampoline::HookCallback {
     let callbacks = installed_entries::selected();
     match kind {
@@ -3033,7 +3142,7 @@ fn instruction_callback(kind: InstructionEventKind) -> liteinst::trampoline::Hoo
 // LiteInst's half of the shared instruction fault handler
 // (reverie_inguest::guest::instruction): where the fault lies relative to the
 // arenas recorded at startup.
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 unsafe fn locate_instruction_fault(
     address: u64,
     info: *const libc::siginfo_t,
@@ -3079,7 +3188,7 @@ unsafe fn locate_instruction_fault(
 // The other half of LiteInst's seam: patch a subscribed instruction's site so
 // it and every later execution jump to its hook. Runs in the SIGSEGV handler,
 // outside any Tool callback.
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 unsafe fn patch_instruction_fault(
     address: u64,
     kind: InstructionEventKind,
@@ -3155,8 +3264,8 @@ unsafe fn patch_instruction_fault(
     PatchOutcome::Resume(unsafe { (*hook).trampoline().address() })
 }
 
-#[cfg(feature = "liteinst")]
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 unsafe fn installed_instruction_hook(context: *mut HookContext, kind: InstructionEventKind) {
     if let Some(context) = unsafe { context.as_ref() }
         && let Some(site) = find_site(context.instruction_pointer)
@@ -3170,22 +3279,22 @@ unsafe fn installed_instruction_hook(context: *mut HookContext, kind: Instructio
     };
 }
 
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 unsafe extern "C" fn installed_cpuid_hook(context: *mut HookContext) {
     unsafe { installed_instruction_hook(context, InstructionEventKind::Cpuid) }
 }
 
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 unsafe extern "C" fn installed_rdtsc_hook(context: *mut HookContext) {
     unsafe { installed_instruction_hook(context, InstructionEventKind::Rdtsc) }
 }
 
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 unsafe extern "C" fn installed_rdtscp_hook(context: *mut HookContext) {
     unsafe { installed_instruction_hook(context, InstructionEventKind::Rdtscp) }
 }
 
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 unsafe fn installed_syscall_hook_for(context: *mut HookContext, number: Option<i64>) {
     if let Some(context) = unsafe { context.as_ref() }
         && let Some(site) = find_site(context.instruction_pointer)
@@ -3202,7 +3311,7 @@ unsafe fn installed_syscall_hook_for(context: *mut HookContext, number: Option<i
 /// Counts one entry through a patched site's hook. An entry the Tool's own
 /// syscall or instruction made during a callback is also counted alone, so
 /// the guest's own entries can be told apart from the Tool's.
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 fn record_hook_entry(site: &SiteSlot) {
     site.hook_count.fetch_add(1, Ordering::Relaxed);
     if tool_callback_active() {
@@ -3211,6 +3320,7 @@ fn record_hook_entry(site: &SiteSlot) {
     }
 }
 
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 pub(crate) unsafe fn dispatch_fallback_context(
     context: *mut RegisterContext,
     pkru: &mut Option<u32>,
@@ -3218,6 +3328,7 @@ pub(crate) unsafe fn dispatch_fallback_context(
     unsafe { dispatch_syscall_context(context, None, SyscallDispatch::Fallback, Some(pkru)) };
 }
 
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 unsafe fn dispatch_syscall_context(
     context: *mut RegisterContext,
     number: Option<i64>,
@@ -3249,7 +3360,7 @@ unsafe fn dispatch_syscall_context(
     };
 }
 
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 unsafe extern "C" fn installed_syscall_hook(context: *mut HookContext) {
     unsafe { installed_syscall_hook_for(context, None) }
 }
@@ -3257,7 +3368,7 @@ unsafe extern "C" fn installed_syscall_hook(context: *mut HookContext) {
 /// Ordinary context after genuine SIGSYS return, with guest mask and PKRU
 /// restored. Unlike an installed Tool hook, this callback must not mark guest
 /// handlers as Tool-internal while the kernel read/write can block.
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 unsafe extern "C" fn unpublished_syscall_hook(context: *mut HookContext) {
     if context.is_null() || enter_rcb_handler().is_err() {
         unsafe { exit_now(122) };
@@ -3282,6 +3393,7 @@ unsafe extern "C" fn unpublished_syscall_hook(context: *mut HookContext) {
         // The real sigreturn restored the guest's live permissions; do not
         // open a key or borrow a saved permission value for the operation.
         guest_pkru: None,
+        unsupported_refusal: None,
     };
     // Classification is after the RCB exclusion sample. This is an unpatched
     // signal entry, never an installed-hook count.
@@ -3306,37 +3418,37 @@ unsafe extern "C" fn unpublished_syscall_hook(context: *mut HookContext) {
     }
 }
 
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 unsafe extern "C" fn installed_vdso_time_hook(context: *mut HookContext) {
     unsafe { installed_syscall_hook_for(context, Some(libc::SYS_time)) }
 }
 
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 unsafe extern "C" fn installed_vdso_clock_gettime_hook(context: *mut HookContext) {
     unsafe { installed_syscall_hook_for(context, Some(libc::SYS_clock_gettime)) }
 }
 
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 unsafe extern "C" fn installed_vdso_getcpu_hook(context: *mut HookContext) {
     unsafe { installed_syscall_hook_for(context, Some(libc::SYS_getcpu)) }
 }
 
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 unsafe extern "C" fn installed_vdso_gettimeofday_hook(context: *mut HookContext) {
     unsafe { installed_syscall_hook_for(context, Some(libc::SYS_gettimeofday)) }
 }
 
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 unsafe extern "C" fn installed_vdso_clock_getres_hook(context: *mut HookContext) {
     unsafe { installed_syscall_hook_for(context, Some(libc::SYS_clock_getres)) }
 }
 
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 unsafe extern "C" fn installed_vdso_getrandom_hook(context: *mut HookContext) {
     unsafe { installed_syscall_hook_for(context, Some(libc::SYS_getrandom)) }
 }
 
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 unsafe fn locate_syscall_site(resume_address: u64) -> Option<u64> {
     let candidates = [resume_address.checked_sub(2), Some(resume_address)];
     for address in candidates.into_iter().flatten() {
@@ -3359,6 +3471,7 @@ unsafe fn locate_syscall_site(resume_address: u64) -> Option<u64> {
 // the arena-based location of the syscall instruction, site and instruction
 // patching, mapping invalidation, and its per-syscall counters. The shared
 // runtime owns the dispatcher, the continuation and the statistics paths.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 struct LiteinstPatcher;
 
 // SAFETY: a declining answer leaves the site's code unchanged.
@@ -3370,7 +3483,7 @@ struct LiteinstPatcher;
 //   that cannot have written the jump; a failure that may have
 //   (InstallFailure::possibly_written) ends the guest instead.
 unsafe impl Patcher for LiteinstPatcher {
-    #[cfg(feature = "liteinst")]
+    #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
     unsafe fn syscall_site(&self, resume_address: u64) -> u64 {
         // SAFETY: a SIGSYS-delivered trap's arrival resume address follows code
         // that was just executing (the seam's contract); locate_syscall_site
@@ -3378,7 +3491,7 @@ unsafe impl Patcher for LiteinstPatcher {
         unsafe { locate_syscall_site(resume_address) }.unwrap_or(resume_address.saturating_sub(2))
     }
 
-    #[cfg(feature = "liteinst")]
+    #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
     unsafe fn patch_syscall_site(&self, instruction_pointer: u64, number: i64) -> SitePatch {
         if SITE_PATCHING_ENABLED.load(Ordering::Relaxed)
             && let Some((site, claimed)) = claim_site(instruction_pointer)
@@ -3466,7 +3579,7 @@ unsafe impl Patcher for LiteinstPatcher {
         SitePatch::NotPatched
     }
 
-    #[cfg(feature = "liteinst")]
+    #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
     fn fallback_path(&self, address: u64) -> crate::LiteinstDispatchPath {
         #[cfg(test)]
         ENABLED_FALLBACK_CLASSIFICATIONS.fetch_add(1, Ordering::Relaxed);
@@ -3482,7 +3595,7 @@ unsafe impl Patcher for LiteinstPatcher {
         }
     }
 
-    #[cfg(feature = "liteinst")]
+    #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
     unsafe fn locate_instruction(
         &self,
         address: u64,
@@ -3495,7 +3608,7 @@ unsafe impl Patcher for LiteinstPatcher {
         unsafe { locate_instruction_fault(address, info, context) }
     }
 
-    #[cfg(feature = "liteinst")]
+    #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
     unsafe fn patch_instruction(
         &self,
         address: u64,
@@ -3507,7 +3620,7 @@ unsafe impl Patcher for LiteinstPatcher {
         unsafe { patch_instruction_fault(address, kind, encoding) }
     }
 
-    #[cfg(feature = "liteinst")]
+    #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
     fn observe_mapping(&self, event: &SyscallEvent) {
         observe_mapping_generation(event);
     }
@@ -3522,18 +3635,22 @@ unsafe impl Patcher for LiteinstPatcher {
     }
 }
 
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 static LITEINST_PATCHER: LiteinstPatcher = LiteinstPatcher;
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 static LITEINST_PATCHER_REF: PatcherRef = PatcherRef(&LITEINST_PATCHER);
 
 /// The SIGSYS seam LiteInst installs: the shared runtime's seam over
 /// [`LiteinstPatcher`], plus what its strace/compat Tools still need until
 /// they leave the patcher library (layering step 4): the fork and wait
 /// fallbacks, and no continuation outside Tool mode.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 struct LiteinstSeam {
     runtime: RuntimeSeam,
 }
 
 impl LiteinstSeam {
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     fn new(stats: crate::stats::GuestStatsHooks) -> Self {
         Self {
             runtime: RuntimeSeam::new(&LITEINST_PATCHER, stats),
@@ -3571,6 +3688,7 @@ unsafe impl TrapSeam for LiteinstSeam {
                 context: 0,
                 dispatch: SyscallDispatch::Trap,
                 guest_pkru: event.guest_pkru(),
+                unsupported_refusal: None,
             };
             // SAFETY: process_syscall traces the event for the compatibility Tool
             // and runs its syscall natively, as the safe
@@ -3587,13 +3705,13 @@ unsafe impl TrapSeam for LiteinstSeam {
         false
     }
 
-    #[cfg(feature = "liteinst")]
+    #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
     unsafe fn syscall_site(&self, resume_address: u64) -> u64 {
         // SAFETY: the dispatcher's provenance promise is passed on unchanged.
         unsafe { self.runtime.syscall_site(resume_address) }
     }
 
-    #[cfg(feature = "liteinst")]
+    #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
     unsafe fn patch_syscall_site(&self, instruction_pointer: u64, number: i64) -> SitePatch {
         // SAFETY: the dispatcher's provenance promise is passed on unchanged.
         unsafe { self.runtime.patch_syscall_site(instruction_pointer, number) }
@@ -3619,6 +3737,7 @@ unsafe impl TrapSeam for LiteinstSeam {
 #[cfg(test)]
 static ENABLED_FALLBACK_CLASSIFICATIONS: AtomicU64 = AtomicU64::new(0);
 
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 unsafe extern "C" fn tool_trampoline(event: *mut core::ffi::c_void) {
     let event = event.cast::<SyscallEvent>();
     if event.is_null() {
@@ -3633,6 +3752,7 @@ unsafe extern "C" fn tool_trampoline(event: *mut core::ffi::c_void) {
     }
 }
 
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 unsafe fn process_syscall(event: &mut SyscallEvent) {
     let tool_mode = TOOL_MODE.load(Ordering::Relaxed);
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -3704,7 +3824,8 @@ unsafe fn process_syscall(event: &mut SyscallEvent) {
     }
 
     let compatibility_fork = TOOL_MODE.load(Ordering::Relaxed) == TOOL_COMPAT
-        && matches!(event.number, libc::SYS_clone | libc::SYS_fork);
+        && (event.number == libc::SYS_clone
+            || Some(event.number) == reverie_inguest::arch::SYS_FORK);
     if compatibility_fork {
         unsafe {
             trace_event(event, None);
@@ -3764,8 +3885,16 @@ unsafe fn process_syscall(event: &mut SyscallEvent) {
 /// `clone_args` is never read. The shared preload dispatcher refuses both for
 /// the same reason. See <https://github.com/rrnewton/reverie/issues/758>.
 ///
-/// Both are refused with `ENOTSUP` in both modes. This matches the preload
-/// dispatcher and Tool mode's nested and injected syscall guards. `ENOSYS` was
+/// Both are refused with `ENOTSUP` in both modes, on both architectures: on
+/// aarch64 there is no vfork syscall number, and a vfork arrives as
+/// `clone(CLONE_VM | CLONE_VFORK | SIGCHLD, child_stack)` (musl passes a null
+/// child stack, glibc passes the current SP), refused by the flag-keyed first
+/// arm below regardless of the stack argument. On x86-64 this matches the
+/// preload dispatcher and Tool mode's nested and injected syscall guards. On
+/// aarch64 the preload dispatcher differs: it refuses glibc's
+/// clone(0x4111, SP) only through its non-null child-stack check and admits
+/// musl's clone(0x4111, 0), because arch::is_vfork is always false there
+/// (reverie-inguest/src/dispatch.rs). `ENOSYS` was
 /// the alternative. Seccomp sandboxes conventionally deny with `ENOSYS` so that
 /// libc falls back to an older syscall (the containers-common 5.8 seccomp
 /// profile's default errno is `ENOSYS`), and glibc does retry a failed clone3
@@ -3782,8 +3911,19 @@ unsafe fn process_syscall(event: &mut SyscallEvent) {
 /// clone3 caller that falls back only on `ENOSYS` fails here; Tool mode admits
 /// that shape through the Tool host's plain-fork check
 /// (`reverie_inguest::guest::host`).
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 fn refused_process_creation(number: i64, args: [u64; 6], tool_mode: u8) -> Option<i32> {
     match number {
+        // aarch64 has no vfork number: a vfork arrives as
+        // clone(CLONE_VM | CLONE_VFORK | SIGCHLD, ..) with a null (musl) or
+        // SP (glibc) child stack. Refuse on the flag alone, never the stack
+        // argument, before the generic clone arm can mode-split the errno.
+        libc::SYS_clone
+            if reverie_inguest::arch::SYS_VFORK.is_none()
+                && args[0] & libc::CLONE_VFORK as u64 != 0 =>
+        {
+            Some(libc::ENOTSUP)
+        }
         libc::SYS_clone if !clone_is_fork_like(args[0], args[1]) => {
             Some(if tool_mode == TOOL_COMPAT {
                 libc::EPERM
@@ -3791,11 +3931,13 @@ fn refused_process_creation(number: i64, args: [u64; 6], tool_mode: u8) -> Optio
                 libc::ENOTSUP
             })
         }
-        libc::SYS_clone3 | libc::SYS_vfork => Some(libc::ENOTSUP),
+        libc::SYS_clone3 => Some(libc::ENOTSUP),
+        _ if Some(number) == reverie_inguest::arch::SYS_VFORK => Some(libc::ENOTSUP),
         _ => None,
     }
 }
 
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 fn clone_is_fork_like(flags: u64, child_stack: u64) -> bool {
     const SIGNAL_MASK: u64 = 0xff;
     let allowed_flags =
@@ -3805,6 +3947,7 @@ fn clone_is_fork_like(flags: u64, child_stack: u64) -> bool {
         && flags & !(SIGNAL_MASK | allowed_flags) == 0
 }
 
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 unsafe fn protect_compatibility_event_channel(event: &mut SyscallEvent) -> bool {
     let event_fd = EVENT_FD.load(Ordering::Acquire) as u64;
 
@@ -3829,10 +3972,12 @@ unsafe fn protect_compatibility_event_channel(event: &mut SyscallEvent) -> bool 
     true
 }
 
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 unsafe fn close_range_preserving_event_fd(event: &SyscallEvent, event_fd: u64) -> i64 {
     unsafe { close_range_preserving_fds(event, &[event_fd]) }
 }
 
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 unsafe fn compatibility_event_channel_is_intact(output_fd: libc::c_int) -> bool {
     let mut metadata: libc::stat = unsafe { core::mem::zeroed() };
     let result = unsafe {
@@ -3846,6 +3991,7 @@ unsafe fn compatibility_event_channel_is_intact(output_fd: libc::c_int) -> bool 
         && metadata.st_ino == EVENT_INODE.load(Ordering::Acquire)
 }
 
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 unsafe fn write_compatibility_event(output_fd: libc::c_int, bytes: &[u8]) {
     const MAX_BACKPRESSURE_RETRIES: usize = 20;
     const BACKPRESSURE_POLL_MILLISECONDS: u64 = 100;
@@ -3883,6 +4029,10 @@ unsafe fn write_compatibility_event(output_fd: libc::c_int, bytes: &[u8]) {
             events: libc::POLLOUT,
             revents: 0,
         };
+        // aarch64 has no poll syscall; ppoll takes a *timespec, not
+        // milliseconds, so the aarch64 arm builds one (the kernel writes the
+        // remaining time back into it). x86-64 keeps poll unchanged.
+        #[cfg(target_arch = "x86_64")]
         let _ = unsafe {
             raw_syscall6(
                 libc::SYS_poll,
@@ -3896,12 +4046,31 @@ unsafe fn write_compatibility_event(output_fd: libc::c_int, bytes: &[u8]) {
                 ],
             )
         };
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = unsafe {
+            let mut timeout = libc::timespec {
+                tv_sec: (BACKPRESSURE_POLL_MILLISECONDS / 1000) as _,
+                tv_nsec: ((BACKPRESSURE_POLL_MILLISECONDS % 1000) * 1_000_000) as libc::c_long,
+            };
+            raw_syscall6(
+                libc::SYS_ppoll,
+                [
+                    (&raw mut descriptor) as u64,
+                    1,
+                    (&raw mut timeout) as u64,
+                    0,
+                    0,
+                    0,
+                ],
+            )
+        };
     }
     unsafe {
         exit_now(EVENT_CHANNEL_WRITE_FAILURE_STATUS);
     }
 }
 
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 unsafe fn trace_event(event: &SyscallEvent, result: Option<i64>) {
     let mode = TOOL_MODE.load(Ordering::Relaxed);
     let output_fd;
@@ -3966,7 +4135,7 @@ unsafe fn trace_event(event: &SyscallEvent, result: Option<i64>) {
 /// `address` through `last` (inclusive), or `None` when that mapping is
 /// shared, `last` lies in another mapping, no line contains `address`, or the
 /// file cannot be read. Usable in signal context, like [`mapping_name_at`].
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 unsafe fn private_span_protection(address: u64, last: u64) -> Option<i32> {
     unsafe { scan_own_maps(|line| maps_line_private(line, address)) }
         .and_then(|(private, end, protection)| (private && last < end).then_some(protection))
@@ -3975,7 +4144,7 @@ unsafe fn private_span_protection(address: u64, last: u64) -> Option<i32> {
 /// Parse one `/proc/self/maps` line; when its range contains `address`,
 /// return whether its permissions mark it private (`p`, not shared `s`), the
 /// end of its range, and its protection as `PROT_*` bits.
-#[cfg(any(test, feature = "liteinst"))]
+#[cfg(any(test, all(feature = "liteinst", target_arch = "x86_64")))]
 fn maps_line_private(line: &[u8], address: u64) -> Option<(bool, u64, i32)> {
     let mut fields = line
         .split(|byte| *byte == b' ')
@@ -4002,7 +4171,7 @@ fn maps_line_private(line: &[u8], address: u64) -> Option<(bool, u64, i32)> {
         .then(|| (permissions.get(3) == Some(&b'p'), end, protection))
 }
 
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 fn emit_instruction_refusal_stage(
     stage: &[u8],
     rip_offset: u64,
@@ -4064,16 +4233,16 @@ mod tests {
     use core::sync::atomic::Ordering;
     use std::ffi::OsStr;
 
-    #[cfg(feature = "liteinst")]
+    #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
     use super::InstallFailure;
-    #[cfg(feature = "liteinst")]
+    #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
     use super::SITE_PATCHING_ENABLED;
-    #[cfg(feature = "liteinst")]
+    #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
     use super::site_patching_enabled;
-    #[cfg(feature = "liteinst")]
+    #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
     use super::syscall_install_failure_ends_guest;
 
-    #[cfg(feature = "liteinst")]
+    #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
     unsafe extern "C" fn unreachable_hook(_context: *mut liteinst::trampoline::HookContext) {
         unreachable!("a refused publication installs no hook");
     }
@@ -4084,7 +4253,7 @@ mod tests {
     // take it, and liteinst never installs one lazily. The refusal is
     // untouched (the code is the original) and the slot keeps no trace.
     #[test]
-    #[cfg(feature = "liteinst")]
+    #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
     fn site_publication_without_the_guard_router_is_refused_untouched() {
         use super::EntryProof;
         use super::GUARD_ROUTER_OMITTED;
@@ -4137,7 +4306,7 @@ mod tests {
     // change or a failed patch plan is "touched" but wrote nothing, while a
     // failure from the jump's activation onward may have.
     #[test]
-    #[cfg(feature = "liteinst")]
+    #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
     fn only_a_possibly_written_syscall_site_failure_ends_the_guest() {
         let error = || std::io::Error::other("test");
         assert!(!syscall_install_failure_ends_guest(
@@ -4452,6 +4621,7 @@ mod tests {
                         _ => SyscallDispatch::Fallback,
                     },
                     guest_pkru: None,
+                    unsupported_refusal: None,
                 };
                 // Exercise the exact production routing function. No test
                 // dispatcher, route predicate mirror or physical exec leaf.
@@ -4560,7 +4730,7 @@ mod tests {
             perf_fds().is_empty(),
             "handler accounting lazily opened a PMU"
         );
-        #[cfg(feature = "liteinst")]
+        #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
         assert!(super::ARENAS.get().unwrap().is_empty());
         assert_eq!(SITES.get().unwrap().len(), MAX_PATCH_SITES);
         let after = super::read_runtime_maps().unwrap();
@@ -4583,9 +4753,9 @@ mod tests {
     fn native_preparation_has_no_executable_arena_and_patcher_keeps_real_aliases() {
         const CHILD: &str = "REVERIE_LITEINST_PREPARATION_TEST_CHILD";
         let Some(mode) = std::env::var_os(CHILD) else {
-            #[cfg(feature = "liteinst")]
+            #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
             let modes = ["native", "patcher"];
-            #[cfg(not(feature = "liteinst"))]
+            #[cfg(not(all(feature = "liteinst", target_arch = "x86_64")))]
             let modes = ["native"];
             for mode in modes {
                 let output = std::process::Command::new(std::env::current_exe().unwrap())
@@ -4627,9 +4797,9 @@ mod tests {
             .iter()
             .filter(|map| map.executable)
             .collect::<Vec<_>>();
-        #[cfg(feature = "liteinst")]
+        #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
         let arena_count = super::ARENAS.get().unwrap().len();
-        #[cfg(not(feature = "liteinst"))]
+        #[cfg(not(all(feature = "liteinst", target_arch = "x86_64")))]
         let arena_count = 0;
         assert_eq!(SITES.get().unwrap().len(), MAX_PATCH_SITES);
         assert!(SITES.get().unwrap().iter().all(|site| {
@@ -4674,7 +4844,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "liteinst")]
+    #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
     fn site_patching_enabled_reports_the_captured_setting() {
         let previous = SITE_PATCHING_ENABLED.load(Ordering::Acquire);
         // What the installation stored is what the getter reports, whatever
@@ -4689,24 +4859,24 @@ mod tests {
     use reverie_inguest::guest::trap_dispatch::TrapSeam;
 
     use super::ALT_STACK_ENV;
-    #[cfg(feature = "liteinst")]
+    #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
     use super::AsyncSignalsBlocked;
     use super::ENABLED_FALLBACK_CLASSIFICATIONS;
     use super::FORK_HOOK;
     use super::FallbackCounters;
     use super::LiteinstSeam;
     use super::MAX_PATCH_SITES;
-    #[cfg(feature = "liteinst")]
+    #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
     use super::NeighbourConflict;
-    #[cfg(feature = "liteinst")]
+    #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
     use super::ObjectImage;
     use super::SITE_ACTIVE;
     use super::SITE_FALLBACK;
     use super::SITE_INSTALLING;
     use super::SITE_STALE;
-    #[cfg(feature = "liteinst")]
+    #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
     use super::SITE_UNPATCHABLE;
-    #[cfg(feature = "liteinst")]
+    #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
     use super::SITE_UNPUBLISHED;
     use super::SITES;
     use super::SiteSlot;
@@ -4716,26 +4886,26 @@ mod tests {
     use super::builtin_tool_from_env_value;
     use super::claim_site;
     use super::clone_is_fork_like;
-    #[cfg(feature = "liteinst")]
+    #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
     use super::earlier_patch_survives;
     use super::fallback_dispatch_count;
     use super::fallback_syscall_count;
     use super::maps_line_private;
     use super::mark_site_range_stale;
-    #[cfg(feature = "liteinst")]
+    #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
     use super::neighbour_conflict;
-    #[cfg(feature = "liteinst")]
+    #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
     use super::neighbours_conflict;
-    #[cfg(feature = "liteinst")]
+    #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
     use super::object_image;
-    #[cfg(feature = "liteinst")]
+    #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
     use super::parse_runtime_maps;
     use super::record_fallback_dispatch;
     use super::refused_process_creation;
     use super::reset_site_observability;
-    #[cfg(feature = "liteinst")]
+    #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
     use super::site_footprint;
-    #[cfg(feature = "liteinst")]
+    #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
     use super::stale_jump_survives;
 
     #[test]
@@ -4976,7 +5146,7 @@ mod tests {
     /// initialization (https://github.com/rrnewton/reverie/issues/812), so
     /// those must be exactly the readable mappings of the text mapping's file.
     #[test]
-    #[cfg(feature = "liteinst")]
+    #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
     fn object_image_records_the_readable_mappings_of_the_text_file() {
         let maps = parse_runtime_maps(concat!(
             "555555554000-555555556000 r--p 00000000 00:1f 11 /usr/bin/guest\n",
@@ -5051,15 +5221,25 @@ mod tests {
         let bookkeeping = (libc::CLONE_CHILD_CLEARTID
             | libc::CLONE_CHILD_SETTID
             | libc::CLONE_PARENT_SETTID) as u64;
+        // 0x4111: the vfork-shaped clone flags glibc and musl issue on
+        // aarch64 for vfork (CLONE_VM | CLONE_VFORK | SIGCHLD).
+        let vfork_flags = (libc::CLONE_VM | libc::CLONE_VFORK) as u64 | libc::SIGCHLD as u64;
         for mode in [super::TOOL_STRACE, super::TOOL_COMPAT] {
             let clone_errno = if mode == super::TOOL_COMPAT {
                 libc::EPERM
             } else {
                 libc::ENOTSUP
             };
+            // On aarch64 (no vfork number) the flag-keyed arm refuses
+            // vfork-shaped clones with ENOTSUP in both modes and both stack
+            // shapes; on x86-64 the same clones keep today's split errno.
+            let vfork_clone_errno = if reverie_inguest::arch::SYS_VFORK.is_none() {
+                libc::ENOTSUP
+            } else {
+                clone_errno
+            };
             for (number, args, expected) in [
                 // Refused by number, whatever the clone_args pointer and size.
-                (libc::SYS_vfork, [0; 6], Some(libc::ENOTSUP)),
                 (libc::SYS_clone3, [0; 6], Some(libc::ENOTSUP)),
                 (libc::SYS_clone3, [u64::MAX; 6], Some(libc::ENOTSUP)),
                 (
@@ -5072,7 +5252,18 @@ mod tests {
                     [libc::SIGCHLD as u64, 1, 0, 0, 0, 0],
                     Some(clone_errno),
                 ),
-                (libc::SYS_fork, [0; 6], None),
+                // musl vfork shape: clone(0x4111, 0).
+                (
+                    libc::SYS_clone,
+                    [vfork_flags, 0, 0, 0, 0, 0],
+                    Some(vfork_clone_errno),
+                ),
+                // glibc vfork shape: clone(0x4111, SP).
+                (
+                    libc::SYS_clone,
+                    [vfork_flags, 0x0000_7fff_e000, 0, 0, 0, 0],
+                    Some(vfork_clone_errno),
+                ),
                 (
                     libc::SYS_clone,
                     [libc::SIGCHLD as u64 | bookkeeping, 0, 0, 0, 0, 0],
@@ -5086,11 +5277,27 @@ mod tests {
                     "mode {mode} syscall {number} args {args:?}"
                 );
             }
+            // By-number rows, present only where the arch table has them:
+            // x86-64 SYS_vfork refuses by number, SYS_fork is admitted.
+            if let Some(vfork_nr) = reverie_inguest::arch::SYS_VFORK {
+                assert_eq!(
+                    refused_process_creation(vfork_nr, [0; 6], mode),
+                    Some(libc::ENOTSUP),
+                    "mode {mode} vfork by number"
+                );
+            }
+            if let Some(fork_nr) = reverie_inguest::arch::SYS_FORK {
+                assert_eq!(
+                    refused_process_creation(fork_nr, [0; 6], mode),
+                    None,
+                    "mode {mode} fork by number"
+                );
+            }
         }
     }
 
     #[test]
-    #[cfg(feature = "liteinst")]
+    #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
     fn neighbour_conflicts_protect_published_patches_and_continuation_sites() {
         use NeighbourConflict::CoversContinuationSite as Covers;
         use NeighbourConflict::InsidePublishedPatch as Inside;
@@ -5149,7 +5356,7 @@ mod tests {
         }
     }
     #[test]
-    #[cfg(feature = "liteinst")]
+    #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
     fn a_covering_published_patch_dominates_whatever_the_table_order() {
         use NeighbourConflict::InsidePublishedPatch as Inside;
         use NeighbourConflict::OverlapsPublishedPatch as Overlaps;
@@ -5167,7 +5374,7 @@ mod tests {
         );
     }
     #[test]
-    #[cfg(feature = "liteinst")]
+    #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
     fn a_stale_site_counts_as_published_unless_its_jump_is_provably_gone() {
         use NeighbourConflict::InsidePublishedPatch as Inside;
         let word = |bytes: [u8; 8]| u64::from_le_bytes(bytes);
@@ -5245,7 +5452,7 @@ mod tests {
         assert_eq!(maps_line_private(b"garbage", 0), None);
     }
     #[test]
-    #[cfg(feature = "liteinst")]
+    #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
     fn installation_blocks_every_blockable_signal_and_restores_the_mask() {
         let current = || {
             let mut mask = 0_u64;

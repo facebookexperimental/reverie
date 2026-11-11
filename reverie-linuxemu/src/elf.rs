@@ -355,6 +355,33 @@ pub struct GuestFileIdentityTable {
     /// keyed by their pinned backing memfd.
     pub proc_transfers:
         std::collections::BTreeMap<(libc::dev_t, libc::ino_t), crate::executor::ProcTransfer>,
+    /// Epolls that a receive can get: those sent with SCM_RIGHTS, and those
+    /// received from outside the run (`crate::executor::EpollTransfer`).
+    pub(crate) epoll_transfers: Vec<crate::executor::EpollTransfer>,
+    /// The number of the next peek window to open
+    /// (`crate::executor::PeekWindow`).
+    pub(crate) next_peek_window: u64,
+    /// The numbers of the peeks between their host receive and their lookup
+    /// of what they got (`crate::executor::PeekWindow`).
+    pub(crate) open_peek_windows: std::collections::BTreeSet<u64>,
+    /// The holds of epolls whose last right a receive took while a peek
+    /// window was open, each with the newest window open then: it goes once
+    /// no window that old or older is open.
+    pub(crate) peek_window_holds: Vec<(u64, crate::executor::EpollHold)>,
+    /// The ends of the Unix socket pairs the run made, each by its host
+    /// object, with its own identity and its peer's
+    /// (`crate::executor::sends_into_the_run`).
+    pub(crate) socket_peers: std::collections::BTreeMap<
+        (libc::dev_t, libc::ino_t),
+        (
+            std::sync::Weak<GuestFileIdentity>,
+            std::sync::Weak<GuestFileIdentity>,
+        ),
+    >,
+    /// How many sends from each socket, by its host object, rely on its
+    /// socket pair's route, between their check and their host send
+    /// (`crate::executor::RouteReliance`).
+    pub(crate) route_reliances: std::collections::BTreeMap<(libc::dev_t, libc::ino_t), usize>,
 }
 
 /// Process-tree-wide state whose lifetime follows a guest task rather than an
@@ -655,6 +682,16 @@ impl TaskLifecycleTable {
         self.tasks
             .values()
             .any(|task| task.tgid == tgid && task.process_generation == generation)
+    }
+
+    /// The generation of the live process whose thread group id is `tgid`,
+    /// which a live task of it carries, its leader's or, once the leader has
+    /// exited, a remaining member's.
+    pub(crate) fn live_process_generation(&self, tgid: i32) -> Option<u64> {
+        self.tasks
+            .values()
+            .find(|task| task.tgid == tgid)
+            .map(|task| task.process_generation)
     }
 
     /// Whether `process` has committed its exit: its thread group's exit
@@ -1306,6 +1343,18 @@ pub struct LoadedStaticElf {
     pub file_retirement: FileRetirement,
     pub(crate) pipe_owners:
         std::collections::BTreeMap<i32, std::sync::Arc<crate::executor::pipe_owner::PipeOwner>>,
+    /// The pidfds for guest processes (`crate::executor::GuestPidfd`), by
+    /// guest descriptor. Every alias of one, from dup or fork, shares its
+    /// record, which the descriptor tables that hold the pidfd hold: a task
+    /// only names it here, so that a task between calls keeps no pidfd that
+    /// its table has closed. Insertion and removal drop the name of the
+    /// descriptor they replace.
+    pub(crate) guest_pidfds:
+        std::collections::BTreeMap<i32, std::sync::Weak<crate::executor::GuestPidfd>>,
+    /// The pidfd records this task holds that no descriptor table holds yet:
+    /// one its current call opened, until the call has published it, and a
+    /// new task's, until its table holds them.
+    pub(crate) pidfd_holds: Vec<std::sync::Arc<crate::executor::GuestPidfd>>,
     /// Identity of each descriptor entry, independent of its filesystem object.
     /// Insertion, including a dup destination, creates a new identity. Table
     /// snapshots and fork copies retain it so unchanged host handles stay stable.
@@ -1314,6 +1363,11 @@ pub struct LoadedStaticElf {
     pub(crate) poll_table_id: std::sync::Arc<crate::executor::NativePollTable>,
     pub(crate) native_poll_fds:
         std::collections::BTreeMap<i32, std::sync::Arc<crate::executor::NativePollBinding>>,
+    /// The epoll entries this task's current call retired, each as a hold
+    /// on its epoll (`NativePollBinding::retire`), released when the call
+    /// ends, after its publication has left any copy of them that another
+    /// thread's call reached to that call (`CopyLedger::retire_copy`).
+    pub(crate) retired_epolls: Vec<crate::executor::EpollHold>,
     pub stdout_alias_fds: std::collections::BTreeSet<i32>,
     pub stderr_alias_fds: std::collections::BTreeSet<i32>,
     // AUTONOMOUS-BOT-IMPLEMENTED: Model guest close-on-exec state independently.
@@ -1360,6 +1414,11 @@ pub struct LoadedStaticElf {
     /// same syscall boundary, which turns it into the typed refusal
     /// `UnsupportedOperation::Signal`. Never carried across fork or exec.
     pub(crate) signal_refusal: Option<&'static str>,
+    /// Why the call just executed was refused with ENOSYS for a pidfd for a
+    /// guest process (`crate::executor::GuestPidfd`), if it was. Taken at
+    /// the same syscall boundary as `signal_refusal`, as the typed refusal
+    /// `UnsupportedOperation::Pidfd`. Never carried across fork or exec.
+    pub(crate) pidfd_refusal: Option<&'static str>,
 }
 
 impl LoadedStaticElf {
@@ -1404,14 +1463,9 @@ impl LoadedStaticElf {
     /// callers retire them after both the authoritative file-table and
     /// signal-transaction guards are released.
     pub fn insert_file(&mut self, fd: i32, file: std::fs::File) -> Vec<std::fs::File> {
-        {
-            let domain = self.epoll_domain.clone();
-            let _proof = domain.lock().expect("KVM epoll provenance lock poisoned");
-            if let Some(binding) = self.native_poll_fds.remove(&fd) {
-                binding.retire();
-            }
-        }
+        self.retire_native_poll(fd);
         self.pipe_owners.remove(&fd);
+        self.guest_pidfds.remove(&fd);
         let mut retired: Vec<_> = self.files.insert(fd, file).into_iter().collect();
         if fd == libc::STDIN_FILENO {
             retired.extend(self.take_stdin());
@@ -1449,15 +1503,26 @@ impl LoadedStaticElf {
         stdin
     }
 
-    pub(crate) fn remove_file(&mut self, fd: i32) -> Option<std::fs::File> {
-        {
+    /// Retires `fd`'s native poll binding under the epoll domain lock, and
+    /// drops the binding once that leaf lock is released. An epoll entry's
+    /// ownership goes to `retired_epolls`, for the call's end to release:
+    /// the epoll's end ends its pidfd registrations, which closes host
+    /// descriptors (`EpollIdentity`).
+    fn retire_native_poll(&mut self, fd: i32) {
+        let (_binding, retired) = {
             let domain = self.epoll_domain.clone();
             let _proof = domain.lock().expect("KVM epoll provenance lock poisoned");
-            if let Some(binding) = self.native_poll_fds.remove(&fd) {
-                binding.retire();
-            }
-        }
+            let binding = self.native_poll_fds.remove(&fd);
+            let retired = binding.as_ref().and_then(|binding| binding.retire());
+            (binding, retired)
+        };
+        self.retired_epolls.extend(retired);
+    }
+
+    pub(crate) fn remove_file(&mut self, fd: i32) -> Option<std::fs::File> {
+        self.retire_native_poll(fd);
         self.pipe_owners.remove(&fd);
+        self.guest_pidfds.remove(&fd);
         let file = self.files.remove(&fd);
         self.fd_entry_ids.remove(&fd);
         file
@@ -1487,6 +1552,7 @@ impl LoadedStaticElf {
             poll_table_id,
             native_poll_fds,
             pipe_owners,
+            guest_pidfds,
             stdout_alias_fds,
             stderr_alias_fds,
             cloexec_fds,
@@ -1498,6 +1564,11 @@ impl LoadedStaticElf {
         } = descriptors;
         let cwd_fd = self.file_retirement.stage_clone(&self.fs_context.cwd_fd)?;
         let private_copy_gate = crate::executor::PrivateCopyGate::default();
+        // The new task holds its pidfds' records until its table does.
+        let pidfd_names = guest_pidfds
+            .iter()
+            .map(|(&fd, pidfd)| (fd, std::sync::Arc::downgrade(pidfd)))
+            .collect();
         let process_signals = self
             .process_signals
             .lock()
@@ -1558,11 +1629,15 @@ impl LoadedStaticElf {
             task_lifecycle: self.task_lifecycle.clone(),
             file_retirement: FileRetirement::default(),
             signal_refusal: None,
+            pidfd_refusal: None,
             pipe_owners,
+            guest_pidfds: pidfd_names,
+            pidfd_holds: guest_pidfds.into_values().collect(),
             fd_entry_ids,
             epoll_domain,
             poll_table_id,
             native_poll_fds,
+            retired_epolls: Vec::new(),
             stdout_alias_fds,
             stderr_alias_fds,
             cloexec_fds,
@@ -1607,6 +1682,12 @@ impl LoadedStaticElf {
         let regular_create_directory_policy = previous.regular_create_directory_policy;
         let host_vm_facts = previous.host_vm_facts;
         let cloexec_fds = previous.cloexec_fds;
+        // The close-on-exec bindings drop once the epoll domain lock, a leaf,
+        // is released, and their epoll entries join the call's retired ones,
+        // which its end releases (`retired_epolls`): an epoll's end ends its
+        // pidfd registrations (`EpollIdentity`).
+        let mut retired_bindings = Vec::new();
+        let mut retired_epolls = previous.retired_epolls;
         let native_poll_fds = {
             let _proof = previous
                 .epoll_domain
@@ -1617,7 +1698,8 @@ impl LoadedStaticElf {
                 .into_iter()
                 .filter_map(|(fd, binding)| {
                     if cloexec_fds.contains(&fd) {
-                        binding.retire();
+                        retired_epolls.extend(binding.retire());
+                        retired_bindings.push(binding);
                         None
                     } else {
                         Some((fd, binding))
@@ -1625,6 +1707,8 @@ impl LoadedStaticElf {
                 })
                 .collect()
         };
+        drop(retired_bindings);
+        self.retired_epolls.extend(retired_epolls);
         let mut retired = Vec::new();
         previous
             .file_retirement
@@ -1651,6 +1735,11 @@ impl LoadedStaticElf {
             .collect();
         let pipe_owners = previous
             .pipe_owners
+            .into_iter()
+            .filter(|(fd, _)| files.contains_key(fd))
+            .collect();
+        let guest_pidfds = previous
+            .guest_pidfds
             .into_iter()
             .filter(|(fd, _)| files.contains_key(fd))
             .collect();
@@ -1786,6 +1875,7 @@ impl LoadedStaticElf {
         self.file_retirement = previous.file_retirement;
         self.pipe_owner_process = previous.pipe_owner_process;
         self.pipe_owners = pipe_owners;
+        self.guest_pidfds = guest_pidfds;
         self.fd_entry_ids = fd_entry_ids;
         self.epoll_domain = previous.epoll_domain;
         self.poll_table_id = previous.poll_table_id;
@@ -2385,6 +2475,8 @@ fn load_executable(
     // allocate the copy refuses only an image Linux would load.
     let executable_image = copy_image(image)?;
     let private_copy_gate = crate::executor::PrivateCopyGate::default();
+    // Before the guest has a descriptor, whatever it opens later.
+    crate::executor::mapping_list::comparison_probe();
     Ok(LoadedStaticElf {
         entry_point,
         stack_pointer,
@@ -2451,11 +2543,15 @@ fn load_executable(
         ))),
         file_retirement: FileRetirement::default(),
         signal_refusal: None,
+        pidfd_refusal: None,
         pipe_owners: Default::default(),
+        guest_pidfds: Default::default(),
+        pidfd_holds: Vec::new(),
         fd_entry_ids: std::collections::BTreeMap::new(),
         epoll_domain: Default::default(),
         poll_table_id: Default::default(),
         native_poll_fds: Default::default(),
+        retired_epolls: Vec::new(),
         stdout_alias_fds: std::collections::BTreeSet::new(),
         stderr_alias_fds: std::collections::BTreeSet::new(),
         cloexec_fds: std::collections::BTreeSet::new(),
@@ -2472,6 +2568,12 @@ fn load_executable(
             next_inode: 0x2100_0000,
             objects: std::collections::BTreeMap::new(),
             proc_transfers: std::collections::BTreeMap::new(),
+            epoll_transfers: Vec::new(),
+            next_peek_window: 0,
+            open_peek_windows: std::collections::BTreeSet::new(),
+            peek_window_holds: Vec::new(),
+            socket_peers: std::collections::BTreeMap::new(),
+            route_reliances: std::collections::BTreeMap::new(),
         })),
     })
 }

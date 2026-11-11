@@ -92,6 +92,39 @@ pub enum Error {
         fd: i32,
     },
 
+    /// A receive from a Unix socket whose copy of the data it received into
+    /// the guest's buffer faulted after the host's receive had taken effect:
+    /// it took the data, and any rights, off the queue, or moved the socket's
+    /// peek offset (`SO_PEEK_OFF`). The copy reached only pages it could
+    /// reach when the receive began, so another thread sharing the guest's
+    /// memory changed their mapping meanwhile. Linux faults inside its own
+    /// copy, before those effects, and this executor cannot undo them, so no
+    /// result of the call would stand for what it did. This is a terminal
+    /// backend refusal, never a Linux syscall errno.
+    #[error(
+        "unsupported KVM {operation} from a Unix socket: its buffer at {address:#x} lost access while the receive ran, after the host had taken the data"
+    )]
+    LateReceiveFault {
+        /// The receiving call, such as `recvmsg`.
+        operation: &'static str,
+        /// The first guest byte of the copy that faulted.
+        address: u64,
+    },
+
+    /// A consuming receive from a Unix datagram or seqpacket socket into a
+    /// buffer that is not all writable, whose host receive faulted where the
+    /// guest's copy does, as Linux's does, and so freed the record it took
+    /// with its rights unseen, while a right that this executor tracks was in
+    /// flight: one sent after the receive checked that none was. The record
+    /// may have carried it, and the record of a tracked right that is never
+    /// seen received stays in flight for the rest of the run, so the run ends
+    /// instead. This is a terminal backend refusal, never a Linux syscall
+    /// errno.
+    #[error(
+        "unsupported KVM receive from a Unix datagram or seqpacket socket: its copy faulted, and the record it discarded unseen may have carried a right the backend tracks"
+    )]
+    UnseenRightDiscard,
+
     /// A process-family wait observed its caller's already committed group
     /// exit. This private dispatch control must be consumed nonreturningly by
     /// Direct/Tool drivers before failure publication or any syscall result.
@@ -623,14 +656,18 @@ impl Error {
     /// faithfully, rather than failing at one. A consumer reports a run that
     /// ends this way as a refusal under its fail-closed policy, not as a
     /// failure of its own. The refusals are [`Self::PotentiallyBlockingZeroRead`],
-    /// [`Self::BlockingInotifyRead`] and [`Self::UnsupportedSharedFile`];
-    /// every other variant is a failure, [`Self::SharedFileCapability`]
-    /// among them, since it also reports the backend's internal guards.
+    /// [`Self::BlockingInotifyRead`], [`Self::LateReceiveFault`],
+    /// [`Self::UnseenRightDiscard`] and [`Self::UnsupportedSharedFile`];
+    /// every other variant is a failure,
+    /// [`Self::SharedFileCapability`] among them, since it also reports the
+    /// backend's internal guards.
     pub fn is_named_refusal(&self) -> bool {
         matches!(
             self.primary(),
             Self::PotentiallyBlockingZeroRead { .. }
                 | Self::BlockingInotifyRead { .. }
+                | Self::LateReceiveFault { .. }
+                | Self::UnseenRightDiscard
                 | Self::UnsupportedSharedFile { .. }
         )
     }

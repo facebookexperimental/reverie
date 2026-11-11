@@ -92,6 +92,18 @@ pub fn admitted() -> bool {
     ADMITTED.load(Ordering::Acquire)
 }
 
+/// Held by every unit test that changes this process's admission or
+/// depends on it, since tests share the process.
+#[cfg(test)]
+pub(crate) static ADMISSION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn lock_admission_for_test() -> std::sync::MutexGuard<'static, ()> {
+    ADMISSION_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// The process's seccomp filter count once the runtime's own filter is in
 /// place; 0 until recorded.
 static FILTER_BASELINE: AtomicU64 = AtomicU64::new(0);
@@ -1273,6 +1285,7 @@ mod tests {
 
     #[test]
     fn the_signal_argument_is_a_c_int() {
+        let _admission = lock_admission_for_test();
         set_admitted(true);
         let alias = [0x1_0000_0000 | libc::SIGALRM as u64, 0, 0, 8, 0, 0];
         assert!(decides_action(libc::SYS_rt_sigaction, alias));
@@ -1296,6 +1309,7 @@ mod tests {
 
     #[test]
     fn key_zero_rights_apply_to_the_guests_own_buffers_only() {
+        let _admission = lock_admission_for_test();
         let original = [0, 0x5000, 0x6000, 8, 0, 0];
         let rights = |pkru| GuestRights {
             pkru,

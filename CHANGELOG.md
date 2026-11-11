@@ -4,6 +4,39 @@ Versions 0.5.1 and 0.5.3 describe selected development snapshots; 0.5.0
 describes the registry release. Backend-specific entries retain the limits
 of those execution paths.
 
+## 0.5.6
+
+Release cut for the 2026-11-10 fbsource import, taken at Reverie main. It
+summarizes the commits from the 0.5.5 cut (`78d41ebd`) to this one, about 190
+of them.
+
+- In-guest runtime: a watched exec supervisor that follows fork trees, stops
+  each successor and forwards ordinary execs; static executables and malformed
+  ELF files are refused before spawn; `CLONE_THREAD` behind an off-by-default
+  capability; a Tool TLS registry at the control publication point; refused
+  fork-like calls and signal controls are recorded for the Tool to report.
+- Exec-stop producer: the new opt-in `exec-stop-producer` feature of
+  reverie-inguest qualifies a mapped first image (one syscall gate, and an
+  instruction audit of every executable page), leases the descriptors its
+  birth inherits, and fixes its placement.
+- LiteInst: mapped successor seams, lazy trap-and-patch promotion on aarch64,
+  and the runtime's refusal readers re-exported for Tools. aarch64 builds
+  compile, refuse patching by name, and run in their own validation lane.
+- Loader: decodes the successor init packet (HLISUC01) with its state digest,
+  accepts up to 64 segments, and derives its handoff size bound from the wire
+  maxima.
+- LinuxEmu: `pidfd_open` for another guest process, with Linux's readiness;
+  pidfd epolls and descriptor rights in flight stay inside the run.
+- RPC transport: a birth authority routes each stage, and a pending EOF gets a
+  terminal verdict.
+- ptrace: SIGSEGV trap repair on aarch64.
+- Packaging: each oss_cargo manifest twin equals its crate's Cargo.toml, and
+  `make check-oss-cargo-twins` keeps them equal.
+- Align every first-party package and internal requirement at 0.5.6. The
+  LiteInst artifact identity checks now require 0.5.6 and still reject 0.5.5,
+  0.5.4, 0.5.1 and older identities. A new reviewed TLS source tuple records
+  the version-only change to the two runtime manifests.
+
 ## 0.5.5
 
 Release cut for the 2026-11-09 fbsource import, taken at Reverie

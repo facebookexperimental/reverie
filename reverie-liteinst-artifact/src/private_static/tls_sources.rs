@@ -285,6 +285,234 @@ const SHARED_INPUTS_054: &[SourceRow] = &[
     ),
 ];
 
+// Reverie e39f78dd (0.5.5): manifests and crate roots only differ from
+// SHARED_INPUTS_054. abi.rs differs by one comment word; geometry and every
+// TLS export stay exact (TLS-ABI review, dh-9c8xwl).
+const SHARED_INPUTS_055: &[SourceRow] = &[
+    (
+        "reverie-inguest/Cargo.toml",
+        5690,
+        "7b22069a7df3cbecaf93086ff01535b73edf2d5e2bc24ef4b0ac3155aec47dfe",
+    ),
+    (
+        "reverie-inguest/src/lib.rs",
+        11792,
+        "2d3a8d6906a102cce3627d3b42ff87a334480807b44af14beaa4e60e7eeb78d4",
+    ),
+    (
+        "reverie-inguest/src/private_runtime/mod.rs",
+        2093,
+        "f6764939d2016bd3c9414b17b35f21f8cf7217f128135b83cfb5459aa3ae5e1e",
+    ),
+    (
+        "reverie-inguest/src/private_runtime/tls/mod.rs",
+        4853,
+        "369e35bcafda51a271720507dcf7a7c9072fb5db7486e110e14f15e4df91f0dd",
+    ),
+    (
+        "reverie-inguest/src/private_runtime/tls/abi.rs",
+        12168,
+        "b120c1f7bf2577e80264b0bab05a130d323248241ef62f101c917d4379e3e85a",
+    ),
+    (
+        "reverie-inguest/src/private_runtime/tls/layout.rs",
+        499,
+        "8fcceedb234c081b5125d95d73eaafa083fadc2d1be41698b724487ab7cfae36",
+    ),
+    (
+        "reverie-loader/Cargo.toml",
+        343,
+        "1f0a18b134d7c34f0743899572b55a3e6ff20d9d5ae7ff4bf59b497fcd2dba7c",
+    ),
+    (
+        "reverie-loader/src/lib.rs",
+        2465,
+        "a34726cf653275e7206fa7557881b530da4266994635273cfe769dbe30ae01d6",
+    ),
+    (
+        "reverie-loader/src/musl_tls.rs",
+        7478,
+        "84011bb8505fa3357908e7445b1305f54303bae32ddb9d393546da8e309ee1ea",
+    ),
+    (
+        "reverie-loader/src/mapped_inputs.rs",
+        17803,
+        "81cd7474215ff617fb1bc16b236461d4deb33697c7d559130f4bdb98b0f0e2c2",
+    ),
+];
+
+// Reverie 1fc012a2: musl_tls.rs lines 1-223 and plan() are byte-unchanged from
+// SHARED_INPUTS_055; the first-thread __init_tls path is byte-unchanged. The
+// appended per-thread TCB ABI is admitted ONLY while uncalled; the final link
+// enforces that through require_per_thread_abi_absent. Any caller needs a
+// fresh TLS-ABI and scheduling review plus an extern link audit first.
+const SHARED_INPUTS_055_THREADS: &[SourceRow] = &[
+    (
+        "reverie-inguest/Cargo.toml",
+        5797,
+        "b99c37792f39a34e45cb42ab531504ba09bd0175b6547d8fcc540308d704eb9a",
+    ),
+    (
+        "reverie-inguest/src/lib.rs",
+        13478,
+        "9b619884552f14046a056f68693c49fc46d065b2a084ad49ca07819a10ec27b1",
+    ),
+    (
+        "reverie-inguest/src/private_runtime/mod.rs",
+        2093,
+        "f6764939d2016bd3c9414b17b35f21f8cf7217f128135b83cfb5459aa3ae5e1e",
+    ),
+    (
+        "reverie-inguest/src/private_runtime/tls/mod.rs",
+        5001,
+        "ba3a02d320c26c283acde7dfc0e0273ff7b04e68b4b5daa7a4f72619758f9f98",
+    ),
+    (
+        "reverie-inguest/src/private_runtime/tls/abi.rs",
+        23446,
+        "a7d7e8e10f4883b2802f8442666c07b95ee61edafca7528add65428d9971cf4e",
+    ),
+    (
+        "reverie-inguest/src/private_runtime/tls/layout.rs",
+        743,
+        "8ee91d78869426196e2f4542dcffb2cf8be3b1372647bd407d9a28ca5b7d20c0",
+    ),
+    (
+        "reverie-loader/Cargo.toml",
+        343,
+        "1f0a18b134d7c34f0743899572b55a3e6ff20d9d5ae7ff4bf59b497fcd2dba7c",
+    ),
+    (
+        "reverie-loader/src/lib.rs",
+        2486,
+        "02aa2dae7b6eec327a0dcf68b92a66f512162d2fdd3a7f9ac89a3e8a51b1f5bf",
+    ),
+    (
+        "reverie-loader/src/musl_tls.rs",
+        17178,
+        "18ca3aec385c4dd8ec79ee5f45e8a30863e28e8a49422cf6c1ae90eb2743696d",
+    ),
+    (
+        "reverie-loader/src/mapped_inputs.rs",
+        17803,
+        "81cd7474215ff617fb1bc16b236461d4deb33697c7d559130f4bdb98b0f0e2c2",
+    ),
+];
+
+// The reverie-inguest manifest gains the off-by-default `exec-stop-producer`
+// feature and its optional sha2/iced-x86 dependencies, plus a serde_json
+// dev-dependency. Every other row is exactly SHARED_INPUTS_055_THREADS; no TLS
+// source, feature the runtime build selects, or crate root changes.
+const SHARED_INPUTS_055_PRODUCER: &[SourceRow] = &[
+    (
+        "reverie-inguest/Cargo.toml",
+        6166,
+        "e30d39d15eb64c0ce1adb72fb92cd7a28268a4dc448d1c38690f868e979d63fb",
+    ),
+    (
+        "reverie-inguest/src/lib.rs",
+        13478,
+        "9b619884552f14046a056f68693c49fc46d065b2a084ad49ca07819a10ec27b1",
+    ),
+    (
+        "reverie-inguest/src/private_runtime/mod.rs",
+        2093,
+        "f6764939d2016bd3c9414b17b35f21f8cf7217f128135b83cfb5459aa3ae5e1e",
+    ),
+    (
+        "reverie-inguest/src/private_runtime/tls/mod.rs",
+        5001,
+        "ba3a02d320c26c283acde7dfc0e0273ff7b04e68b4b5daa7a4f72619758f9f98",
+    ),
+    (
+        "reverie-inguest/src/private_runtime/tls/abi.rs",
+        23446,
+        "a7d7e8e10f4883b2802f8442666c07b95ee61edafca7528add65428d9971cf4e",
+    ),
+    (
+        "reverie-inguest/src/private_runtime/tls/layout.rs",
+        743,
+        "8ee91d78869426196e2f4542dcffb2cf8be3b1372647bd407d9a28ca5b7d20c0",
+    ),
+    (
+        "reverie-loader/Cargo.toml",
+        343,
+        "1f0a18b134d7c34f0743899572b55a3e6ff20d9d5ae7ff4bf59b497fcd2dba7c",
+    ),
+    (
+        "reverie-loader/src/lib.rs",
+        2486,
+        "02aa2dae7b6eec327a0dcf68b92a66f512162d2fdd3a7f9ac89a3e8a51b1f5bf",
+    ),
+    (
+        "reverie-loader/src/musl_tls.rs",
+        17178,
+        "18ca3aec385c4dd8ec79ee5f45e8a30863e28e8a49422cf6c1ae90eb2743696d",
+    ),
+    (
+        "reverie-loader/src/mapped_inputs.rs",
+        17803,
+        "81cd7474215ff617fb1bc16b236461d4deb33697c7d559130f4bdb98b0f0e2c2",
+    ),
+];
+
+// Reverie 0.5.6 release cut: only the package and internal dependency
+// versions in reverie-inguest/Cargo.toml and reverie-loader/Cargo.toml
+// change (rows 0, 6). Every other row is exactly SHARED_INPUTS_055_PRODUCER;
+// no TLS source, feature the runtime build selects, or crate root changes.
+const SHARED_INPUTS_056: &[SourceRow] = &[
+    (
+        "reverie-inguest/Cargo.toml",
+        6166,
+        "d95f244d25c20488c4def4d251c09f4433409a4ae7b6a6c19321f1491682adbc",
+    ),
+    (
+        "reverie-inguest/src/lib.rs",
+        13478,
+        "9b619884552f14046a056f68693c49fc46d065b2a084ad49ca07819a10ec27b1",
+    ),
+    (
+        "reverie-inguest/src/private_runtime/mod.rs",
+        2093,
+        "f6764939d2016bd3c9414b17b35f21f8cf7217f128135b83cfb5459aa3ae5e1e",
+    ),
+    (
+        "reverie-inguest/src/private_runtime/tls/mod.rs",
+        5001,
+        "ba3a02d320c26c283acde7dfc0e0273ff7b04e68b4b5daa7a4f72619758f9f98",
+    ),
+    (
+        "reverie-inguest/src/private_runtime/tls/abi.rs",
+        23446,
+        "a7d7e8e10f4883b2802f8442666c07b95ee61edafca7528add65428d9971cf4e",
+    ),
+    (
+        "reverie-inguest/src/private_runtime/tls/layout.rs",
+        743,
+        "8ee91d78869426196e2f4542dcffb2cf8be3b1372647bd407d9a28ca5b7d20c0",
+    ),
+    (
+        "reverie-loader/Cargo.toml",
+        343,
+        "79063d5d763041a53c8d37e16093d49c7a8785d5903dbcd3df8ece208c2ca305",
+    ),
+    (
+        "reverie-loader/src/lib.rs",
+        2486,
+        "02aa2dae7b6eec327a0dcf68b92a66f512162d2fdd3a7f9ac89a3e8a51b1f5bf",
+    ),
+    (
+        "reverie-loader/src/musl_tls.rs",
+        17178,
+        "18ca3aec385c4dd8ec79ee5f45e8a30863e28e8a49422cf6c1ae90eb2743696d",
+    ),
+    (
+        "reverie-loader/src/mapped_inputs.rs",
+        17803,
+        "81cd7474215ff617fb1bc16b236461d4deb33697c7d559130f4bdb98b0f0e2c2",
+    ),
+];
+
 fn classify(observed: &[(String, u64, String)]) -> Result<Variant> {
     let same = |expected: &[SourceRow]| {
         observed.len() == expected.len()
@@ -298,14 +526,68 @@ fn classify(observed: &[(String, u64, String)]) -> Result<Variant> {
         same(SHARED_INPUTS),
         same(SHARED_INPUTS_051),
         same(SHARED_INPUTS_054),
+        same(SHARED_INPUTS_055),
+        same(SHARED_INPUTS_055_THREADS),
+        same(SHARED_INPUTS_055_PRODUCER),
+        same(SHARED_INPUTS_056),
     ) {
-        (true, false, false, false, false) => Ok(Variant::LegacyInguest),
-        (false, true, false, false, false)
-        | (false, false, true, false, false)
-        | (false, false, false, true, false)
-        | (false, false, false, false, true) => Ok(Variant::SharedLoader),
+        (true, false, false, false, false, false, false, false, false) => {
+            Ok(Variant::LegacyInguest)
+        }
+        (false, true, false, false, false, false, false, false, false)
+        | (false, false, true, false, false, false, false, false, false)
+        | (false, false, false, true, false, false, false, false, false)
+        | (false, false, false, false, true, false, false, false, false)
+        | (false, false, false, false, false, true, false, false, false)
+        | (false, false, false, false, false, false, true, false, false)
+        | (false, false, false, false, false, false, false, true, false)
+        | (false, false, false, false, false, false, false, false, true) => {
+            Ok(Variant::SharedLoader)
+        }
         _ => Err("runtime TLS sources are not one complete reviewed tuple".into()),
     }
+}
+
+// Per-thread TCB ABI (reverie-inguest private_runtime/tls/abi.rs) that
+// SHARED_INPUTS_055_THREADS admits only while uncalled. A caller lands outside
+// every tuple row, so the final image must not retain any of these. Admitting a
+// caller needs a fresh TLS-ABI and scheduling review plus a final-link audit of
+// the six externs they add: __ofl_lock, __ofl_unlock, __stdin_used,
+// __stdout_used, __stderr_used and __pthread_tsd_main.
+const PER_THREAD_ABI: [&str; 4] = [
+    "build_thread_tcb",
+    "first_thread_switch",
+    "note_thread_added_locked",
+    "note_thread_add_failed_locked",
+];
+
+fn require_per_thread_abi_names_absent(names: &[&str]) -> Result<()> {
+    // Absence is meaningless without a symbol table: require the strong
+    // source-bound __init_tls that every reviewed tuple links.
+    require(
+        names.contains(&"__init_tls"),
+        "final image symbol table lacks __init_tls; per-thread TLS ABI absence is unobservable",
+    )?;
+    for function in PER_THREAD_ABI {
+        // Same path segment in v0 and legacy Rust mangling.
+        let path = format!("15private_runtime3tls3abi{}{function}", function.len());
+        if let Some(name) = names.iter().find(|name| name.contains(&path)) {
+            return Err(format!(
+                "final image retains uncalled per-thread TLS ABI {name}; \
+                 a caller needs a fresh TLS-ABI review and extern link audit"
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn require_per_thread_abi_absent(final_elf: &Elf) -> Result<()> {
+    let names = final_elf
+        .syms
+        .iter()
+        .filter_map(|symbol| final_elf.strtab.get_at(symbol.st_name))
+        .collect::<Vec<_>>();
+    require_per_thread_abi_names_absent(&names)
 }
 
 // The caller authenticates this sole Cargo root and closes its complete source
@@ -343,6 +625,25 @@ pub(super) fn bind(root: &Path, files: &mut Vec<FileIdentity>) -> Result<Variant
         files.push(file);
     }
     classify(&observed)
+}
+
+// Self-check seam: the real bind() over one checkout's own runtime TLS
+// sources. Reverie's integration test calls it on this workspace, so a source
+// edit that outruns the closed list fails here instead of in a downstream
+// private-static link. The error names every observed row.
+pub(super) fn self_check(root: &Path) -> Result<()> {
+    let mut files = Vec::new();
+    let variant = bind(root, &mut files);
+    variant.map(|_| ()).map_err(|error| {
+        let observed = files
+            .iter()
+            .map(|file| {
+                let relative = file.path.strip_prefix(root).unwrap_or(&file.path);
+                format!("\n    {} {}", relative.display(), file.sha256)
+            })
+            .collect::<String>();
+        format!("{error}; observed rows under {}:{observed}", root.display())
+    })
 }
 
 #[cfg(test)]
@@ -442,6 +743,138 @@ mod tests {
         let mut extra = expected;
         extra.push(("unreviewed.rs".into(), 1, "0".repeat(64)));
         assert!(classify(&extra).is_err());
+    }
+    fn refuse_each_missing_changed_extra_or_duplicate_row(expected: &[SourceRow]) {
+        let expected = rows(expected);
+        assert_eq!(classify(&expected).unwrap(), Variant::SharedLoader);
+        for index in 0..expected.len() {
+            let mut missing = expected.clone();
+            missing.remove(index);
+            assert!(classify(&missing).is_err(), "missing row {index}");
+            let mut changed = expected.clone();
+            changed[index].2.replace_range(..1, "x");
+            assert!(classify(&changed).is_err(), "changed digest row {index}");
+            let mut size = expected.clone();
+            size[index].1 += 1;
+            assert!(classify(&size).is_err(), "changed size row {index}");
+            let mut path = expected.clone();
+            path[index].0.push_str(".unreviewed");
+            assert!(classify(&path).is_err(), "changed path row {index}");
+        }
+        let mut duplicate = expected.clone();
+        duplicate.push(duplicate[0].clone());
+        assert!(classify(&duplicate).is_err());
+        let mut extra = expected;
+        extra.push(("unreviewed.rs".into(), 1, "0".repeat(64)));
+        assert!(classify(&extra).is_err());
+    }
+    // Exactly `changed` rows differ from the predecessor, and swapping any one
+    // of them in either direction mixes versions and refuses.
+    fn refuse_mixed_versions(current: &[SourceRow], previous: &[SourceRow], changed: &[usize]) {
+        assert_eq!(current.len(), previous.len());
+        for index in 0..current.len() {
+            assert_eq!(
+                current[index] != previous[index],
+                changed.contains(&index),
+                "row {index} change set"
+            );
+            assert_eq!(current[index].0, previous[index].0, "row {index} path");
+        }
+        for &index in changed {
+            let mut new_with_old = rows(current);
+            new_with_old[index] = rows(previous)[index].clone();
+            assert!(classify(&new_with_old).is_err(), "new with old row {index}");
+            let mut old_with_new = rows(previous);
+            old_with_new[index] = rows(current)[index].clone();
+            assert!(classify(&old_with_new).is_err(), "old with new row {index}");
+        }
+    }
+    // e39f78dd: manifests, crate roots and an abi.rs comment changed; rows
+    // 2, 3, 5, 8 (geometry) and 9 are exactly SHARED_INPUTS_054.
+    #[test]
+    fn tls_source_declarations_select_complete_055_without_mixed_versions() {
+        refuse_each_missing_changed_extra_or_duplicate_row(SHARED_INPUTS_055);
+        refuse_mixed_versions(SHARED_INPUTS_055, SHARED_INPUTS_054, &[0, 1, 4, 6, 7]);
+    }
+    // 1fc012a2: geometry row 8 changes by appended code only; plan() and
+    // musl_tls.rs lines 1-223 are byte-unchanged, which no row digest can show.
+    // Rows 2, 6 and 9 are exactly SHARED_INPUTS_055.
+    #[test]
+    fn tls_source_declarations_select_complete_055_threads_without_mixed_versions() {
+        refuse_each_missing_changed_extra_or_duplicate_row(SHARED_INPUTS_055_THREADS);
+        refuse_mixed_versions(
+            SHARED_INPUTS_055_THREADS,
+            SHARED_INPUTS_055,
+            &[0, 1, 3, 4, 5, 7, 8],
+        );
+    }
+    // The producer manifest: only row 0 (reverie-inguest/Cargo.toml) differs
+    // from SHARED_INPUTS_055_THREADS, so swapping that one row back yields the
+    // threads tuple itself rather than a mixed one.
+    #[test]
+    fn tls_source_declarations_select_complete_055_producer() {
+        refuse_each_missing_changed_extra_or_duplicate_row(SHARED_INPUTS_055_PRODUCER);
+        assert_eq!(
+            SHARED_INPUTS_055_PRODUCER.len(),
+            SHARED_INPUTS_055_THREADS.len()
+        );
+        for (index, (producer, threads)) in SHARED_INPUTS_055_PRODUCER
+            .iter()
+            .zip(SHARED_INPUTS_055_THREADS)
+            .enumerate()
+        {
+            assert_eq!(producer.0, threads.0, "row {index} path");
+            assert_eq!(producer != threads, index == 0, "row {index} change set");
+        }
+    }
+    // 0.5.6: only rows 0, 6 (the manifests) differ from SHARED_INPUTS_055_PRODUCER.
+    #[test]
+    fn tls_source_declarations_select_complete_056() {
+        refuse_each_missing_changed_extra_or_duplicate_row(SHARED_INPUTS_056);
+        refuse_mixed_versions(SHARED_INPUTS_056, SHARED_INPUTS_055_PRODUCER, &[0, 6]);
+    }
+    #[test]
+    fn tls_source_declarations_are_pairwise_distinct() {
+        let lists = [
+            LEGACY,
+            SHARED,
+            SHARED_INPUTS,
+            SHARED_INPUTS_051,
+            SHARED_INPUTS_054,
+            SHARED_INPUTS_055,
+            SHARED_INPUTS_055_THREADS,
+            SHARED_INPUTS_055_PRODUCER,
+            SHARED_INPUTS_056,
+        ];
+        for (index, first) in lists.iter().enumerate() {
+            for second in &lists[index + 1..] {
+                assert_ne!(first, second);
+            }
+        }
+    }
+    #[test]
+    fn final_image_refuses_retained_per_thread_tls_abi() {
+        let present = [
+            "__init_tls",
+            "_RNvNtNtNtCs_15reverie_inguest15private_runtime3tls3abi10___init_tls",
+        ];
+        require_per_thread_abi_names_absent(&present).unwrap();
+        assert!(require_per_thread_abi_names_absent(&["first_thread_switch"]).is_err());
+        for function in PER_THREAD_ABI {
+            let v0 = format!(
+                "_RNvNtNtNtCs_15reverie_inguest15private_runtime3tls3abi{}{function}",
+                function.len()
+            );
+            let legacy = format!(
+                "_ZN15reverie_inguest15private_runtime3tls3abi{}{function}17h0123456789abcdefE",
+                function.len()
+            );
+            for name in [v0, legacy] {
+                let refusal =
+                    require_per_thread_abi_names_absent(&["__init_tls", &name]).expect_err(&name);
+                assert!(refusal.contains("uncalled per-thread TLS ABI"), "{refusal}");
+            }
+        }
     }
     // Numeric declaration controls only, not authenticated-source positives.
     #[test]

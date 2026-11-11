@@ -11,6 +11,18 @@
 //! Backends retain interception, installation admission and runtime activation.
 //! This owner publishes the existing ToolHost and shares the saved-register
 //! entry bridge used by patched jumps and the signal continuation.
+//!
+//! Exactly one Tool may be installed per process image: a second
+//! publication is refused with [`ToolAlreadyInstalled`]. This is a stated
+//! contract, not an accidental limit (dh-o9mww). In-place replacement would
+//! have to quiesce every dispatch (no epoch or drain exists), re-install
+//! frontends armed for the old Tool's subscriptions (some state, such as
+//! seccomp, is install-once), migrate per-thread `ThreadState`s typed by the
+//! old Tool (no migration contract exists), and re-admit the guest to its
+//! coordinator under a new `CoordinatorRpc<G>` — strictly more machinery
+//! than replacing the image. The supported replacement vehicle is therefore
+//! exec: a new image whose Tool, config and state are admitted afresh
+//! through InitialImage / successor admission before its first syscall.
 
 use std::io;
 use std::sync::OnceLock;
@@ -48,6 +60,12 @@ trait ToolHandler: Send + Sync {
     unsafe fn bind_initial_image(&self, control: &InitialImageControl) -> io::Result<()>;
     #[cfg(feature = "exec-private-init")]
     fn initialize_initial_image_lifecycle(&self, control: &InitialImageControl) -> io::Result<()>;
+    #[cfg(feature = "exec-private-init")]
+    fn initialize_mapped_successor_lifecycle(
+        &self,
+        control: &InitialImageControl,
+        entry: &super::exec_private::MappedSuccessorEntry,
+    ) -> io::Result<()>;
 }
 
 impl<T: Tool + 'static, R: HostRuntime> ToolHandler for ToolHost<T, R> {
@@ -95,14 +113,54 @@ impl<T: Tool + 'static, R: HostRuntime> ToolHandler for ToolHost<T, R> {
     fn initialize_initial_image_lifecycle(&self, control: &InitialImageControl) -> io::Result<()> {
         ToolHost::initialize_initial_image_lifecycle(self, control)
     }
+
+    #[cfg(feature = "exec-private-init")]
+    fn initialize_mapped_successor_lifecycle(
+        &self,
+        control: &InitialImageControl,
+        entry: &super::exec_private::MappedSuccessorEntry,
+    ) -> io::Result<()> {
+        ToolHost::initialize_mapped_successor_lifecycle(self, control, entry)
+    }
 }
+
+/// Refusal of a second Tool installation in one process.
+///
+/// Returned, wrapped in an [`io::Error`] of kind
+/// [`io::ErrorKind::AlreadyExists`], by `publish_tool` and
+/// `publish_initial_tool` when a Tool is already installed. (A duplicate
+/// successor publication does not return this: it terminates through the
+/// native owner, exit 127, rather than dropping the rejected host.) Match
+/// it with
+/// `error.get_ref().and_then(|e| e.downcast_ref::<ToolAlreadyInstalled>())`.
+/// The first installed Tool is retained and keeps dispatching; see the
+/// module documentation for why replacement is refused by contract and why
+/// exec / successor admission is the replacement vehicle.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ToolAlreadyInstalled;
+
+impl std::fmt::Display for ToolAlreadyInstalled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "ToolAlreadyInstalled: a Reverie Tool is already installed in this \
+             process; in-place replacement is refused by contract (replace the \
+             image via exec / successor admission instead)",
+        )
+    }
+}
+
+impl std::error::Error for ToolAlreadyInstalled {}
 
 static HANDLER: OnceLock<Box<dyn ToolHandler>> = OnceLock::new();
 
-fn publish<T: Tool + 'static, R: HostRuntime>(host: ToolHost<T, R>) -> io::Result<()> {
+fn publish_handler(handler: Box<dyn ToolHandler>) -> io::Result<()> {
     HANDLER
-        .set(Box::new(host))
-        .map_err(|_| io::Error::new(io::ErrorKind::AlreadyExists, "Reverie tool installed twice"))
+        .set(handler)
+        .map_err(|_| io::Error::new(io::ErrorKind::AlreadyExists, ToolAlreadyInstalled))
+}
+
+fn publish<T: Tool + 'static, R: HostRuntime>(host: ToolHost<T, R>) -> io::Result<()> {
+    publish_handler(Box::new(host))
 }
 
 /// Publish this process's prepared ToolHost, retaining it at one stable address.
@@ -147,6 +205,70 @@ pub unsafe fn publish_initial_tool<T: Tool + 'static, R: HostRuntime>(
     // SAFETY: publication has stored the stable host; the caller establishes
     // the same genuine live client/control/fatal lineage and native context.
     unsafe { handler.bind_initial_image(control) }
+}
+
+/// Publish and restore the selected mapped successor on the one
+/// stable owner. This binds the mapped frontend control, then
+/// attaches the exact decoded root state as pending; it calls
+/// no Tool startup or post-exec callback.
+///
+/// # Safety
+/// All `publish_initial_tool` premises apply. The selected Tool
+/// and state must have been decoded from the same admitted
+/// carrier's exact delivered config/state for this mapped
+/// image. The caller retains the actual fatal owner across
+/// publication, frontend installation, selected lifecycle, and
+/// finish. A digest or typed value alone is not admission proof.
+#[cfg(feature = "exec-private-init")]
+pub unsafe fn publish_mapped_successor_tool<T: Tool + 'static, R: HostRuntime>(
+    host: ToolHost<T, R>,
+    state: T::ThreadState,
+    control: &InitialImageControl,
+    _fatal: &InitialImageAbortGuard,
+) -> io::Result<()> {
+    let host = Box::new(host);
+    let stable_host = core::ptr::from_ref(&*host);
+    if let Err(unpublished) = HANDLER.set(host) {
+        drop(unpublished);
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            ToolAlreadyInstalled,
+        ));
+    }
+    // SAFETY: successful one-time Box publication retains this allocation.
+    let host = unsafe { &*stable_host };
+    unsafe {
+        host.bind_initial_image_control(control)?;
+        host.restore_mapped_successor_state(state, control)
+    }
+}
+
+/// Run the installed mapped successor's restored-root lifecycle
+/// with the native successor's callback order: post-exec only,
+/// then publish that same state for dispatch. It calls neither
+/// `on_initial_image_attached`, `init_thread_state`, nor
+/// `handle_thread_start`. Only the callback order and
+/// published state are parity; the mapped-successor guest
+/// additionally provides guarded injection and the verified
+/// mapped resume registers/PKRU under its selected-restore
+/// permit.
+///
+/// # Safety
+/// All `initialize_initial_image_lifecycle` premises apply,
+/// and the selected state must already be attached as pending
+/// by `publish_mapped_successor_tool` for this same control and
+/// installed host. The caller retains the live fatal owner
+/// across the call; an error permanently refuses this image.
+#[cfg(feature = "exec-private-init")]
+pub unsafe fn initialize_mapped_successor_lifecycle(
+    control: &InitialImageControl,
+    _fatal: &InitialImageAbortGuard,
+    entry: &super::exec_private::MappedSuccessorEntry,
+) -> io::Result<()> {
+    let handler = HANDLER
+        .get()
+        .ok_or_else(|| io::Error::other("mapped successor Tool is not installed"))?;
+    handler.initialize_mapped_successor_lifecycle(control, entry)
 }
 
 /// Run the installed InitialImage Tool's existing eager lifecycle.
@@ -414,6 +536,7 @@ pub unsafe fn dispatch_saved_syscall(
         // Fallback supplies its owned genuine entry. Installed hooks still
         // need independent provenance; never borrow a stale signal's rights.
         guest_pkru: guest_pkru.as_ref().and_then(|value| **value),
+        unsupported_refusal: None,
     };
     if matches!(dispatch, SyscallDispatch::Fallback)
         && let Some(observe) = observe_fallback
@@ -595,5 +718,100 @@ mod tests {
         }
         assert!(libc::WIFEXITED(status));
         assert_eq!(libc::WEXITSTATUS(status), 126);
+    }
+
+    #[test]
+    fn second_install_refuses_tool_already_installed_first_keeps_dispatching() {
+        // HANDLER is process-global and install-once, so the scenario runs
+        // in a fork child that owns isolated publication state (same pattern
+        // as the missing-owner test above). The child reports via exit code:
+        // 0 = refusal typed and first handler still dispatched.
+        static DISPATCHED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        struct CountingHandler(i64);
+        impl ToolHandler for CountingHandler {
+            unsafe fn dispatch(&self, event: &mut SyscallEvent) {
+                DISPATCHED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                event.result = self.0;
+            }
+            unsafe fn dispatch_instruction(
+                &self,
+                _kind: InstructionEventKind,
+                _context: &mut RegisterContext,
+            ) {
+                unreachable!("counting handler receives no instruction events");
+            }
+            fn rpc(&self) -> &dyn std::any::Any {
+                &()
+            }
+            fn relocate_coordinator(&self, _from: libc::c_int) -> io::Result<libc::c_int> {
+                Err(io::Error::from_raw_os_error(libc::EBADF))
+            }
+            #[cfg(feature = "exec-private-successor")]
+            fn run_successor_post_exec(
+                &self,
+                _entry: &mut super::super::exec_private::ImageGuestEntry,
+                _control: &super::super::exec_private::SuccessorImageControl,
+            ) -> io::Result<()> {
+                unreachable!("counting handler runs no successor post-exec");
+            }
+            #[cfg(feature = "exec-private-init")]
+            unsafe fn bind_initial_image(
+                &self,
+                _control: &super::super::exec_private::InitialImageControl,
+            ) -> io::Result<()> {
+                unreachable!("counting handler binds no initial image");
+            }
+            #[cfg(feature = "exec-private-init")]
+            fn initialize_initial_image_lifecycle(
+                &self,
+                _control: &super::super::exec_private::InitialImageControl,
+            ) -> io::Result<()> {
+                unreachable!("counting handler runs no initial-image lifecycle");
+            }
+            #[cfg(feature = "exec-private-init")]
+            fn initialize_mapped_successor_lifecycle(
+                &self,
+                _control: &super::super::exec_private::InitialImageControl,
+                _entry: &super::super::exec_private::MappedSuccessorEntry,
+            ) -> io::Result<()> {
+                unreachable!("counting handler runs no mapped successor lifecycle");
+            }
+        }
+        assert!(HANDLER.get().is_none());
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0);
+        if child == 0 {
+            let ok = std::panic::catch_unwind(|| {
+                publish_handler(Box::new(CountingHandler(41))).unwrap();
+                // The second handler is distinguishable: it would answer 42.
+                let error = publish_handler(Box::new(CountingHandler(42))).unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+                let typed = error
+                    .get_ref()
+                    .and_then(|e| e.downcast_ref::<ToolAlreadyInstalled>());
+                assert_eq!(typed, Some(&ToolAlreadyInstalled));
+                let mut event = SyscallEvent {
+                    number: 0,
+                    args: [0; 6],
+                    instruction_pointer: 0,
+                    result: -1,
+                    context: 0,
+                    dispatch: super::super::event::SyscallDispatch::InstalledHook,
+                    guest_pkru: None,
+                    unsupported_refusal: None,
+                };
+                // SAFETY: in this fork child the counting handler is the one
+                // installed handler and the event is a plain value it only
+                // writes `result` on; no guest state is fabricated.
+                unsafe { dispatch(&mut event) };
+                assert_eq!(event.result, 41);
+                assert_eq!(DISPATCHED.load(std::sync::atomic::Ordering::SeqCst), 1);
+            });
+            unsafe { libc::_exit(if ok.is_ok() { 0 } else { 125 }) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
     }
 }

@@ -15,6 +15,8 @@ use std::io;
 #[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
 pub mod mapped_initial;
 
+pub(crate) mod tool_tls_registry;
+
 #[cfg(feature = "coordinator-rpc")]
 mod native_io;
 #[cfg(feature = "coordinator-rpc")]
@@ -661,11 +663,24 @@ unsafe fn publish_native_control(control: *mut NativeControl) -> io::Result<()> 
 
 // Same write-once physical pointer for both authenticated image origins.
 // Neither this helper nor the pointer value supplies coordinator admission.
+// This is also the one place slot 0 of the per-thread Tool TLS registry is
+// registered: the mapped musl image publishes through here directly, so
+// registering in a caller would leave its leader unregistered.
 fn publish_control_slot(control: *mut NativeControl) -> io::Result<()> {
+    // Validate the sealed leader tid before publishing anything: a tid that
+    // is not a positive kernel tid can never be the registry leader.
+    let leader_tid = i32::try_from(unsafe { (&raw const (*control).native_tid).read_volatile() })
+        .ok()
+        .filter(|tid| *tid > 0)
+        .ok_or_else(|| io::Error::other("private Tool leader slot registration failed"))?;
     reverie_inguest_private_exec_control
         .compare_exchange(0, control as usize, Ordering::Release, Ordering::Relaxed)
         .map_err(|_| io::Error::other("private Tool control published twice"))?;
-    Ok(())
+    // Registration cannot fail after the successful write-once publication
+    // above (slot 0 registers exactly once, here); both publication callers
+    // already treat an error at this point as terminal.
+    tool_tls_registry::register_leader(leader_tid)
+        .map_err(|_| io::Error::other("private Tool leader slot registration failed"))
 }
 
 /// Returned-error stage of the still-armed InitialImage refusal path.
@@ -813,7 +828,10 @@ unsafe extern "C" {
         guest_pkru: u64,
         use_pkru: u64,
     ) -> PhysicalResult;
-    #[cfg(feature = "exec-private-successor")]
+    #[cfg(any(
+        feature = "exec-private-successor",
+        all(feature = "exec-private-init", feature = "coordinator-rpc")
+    ))]
     fn reverie_inguest_private_lifecycle_call(
         number: i64,
         args: *const u64,
@@ -1250,6 +1268,20 @@ core::arch::global_asm!(r#"
     instruction_handler = sym super::instruction::instruction_sigsegv_handler,
 );
 
+#[cfg(all(test, feature = "exec-private-successor"))]
+pub(super) fn set_mapped_successor_test_entry(
+    owner: &InitialImageControl,
+    entry: &MappedSuccessorEntry,
+) {
+    let control = owner.control as *mut NativeControl;
+    unsafe {
+        (&raw mut (*control).guest_rsp).write_volatile(entry.regs.rsp);
+        (&raw mut (*control).guest_ld_entry).write_volatile(entry.regs.rip);
+        (&raw mut (*control).guest_fs).write_volatile(entry.regs.fs_base);
+        (&raw mut (*control).guest_pkru).write_volatile(entry.pkru.map(u64::from).unwrap_or(0));
+    }
+}
+
 #[cfg(test)]
 pub(super) fn lifecycle_test_owner() -> (Box<NativeControl>, InitialImageControl) {
     // Component fixture only: this does not install a signal frontend, redeem
@@ -1331,6 +1363,9 @@ pub struct InitialImageControl {
     // 0 not started, 1 permit live, 2 callbacks completed, 3 refused/abandoned.
     // Neither a returned error nor dropping a permit reopens initialization.
     lifecycle: AtomicUsize,
+    // 0 fresh-image lifecycle, 1 selected-state restore live, 2 restore
+    // completed, 3 refused/abandoned.
+    selected_restore: AtomicUsize,
 }
 impl InitialImageControl {
     fn new(control: usize) -> Self {
@@ -1340,6 +1375,7 @@ impl InitialImageControl {
             region: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
             installed_host: AtomicUsize::new(0),
             lifecycle: AtomicUsize::new(0),
+            selected_restore: AtomicUsize::new(0),
         }
     }
 
@@ -1376,6 +1412,23 @@ impl InitialImageControl {
 
     #[cfg(any(feature = "coordinator-rpc", test))]
     pub(super) fn begin_lifecycle(&self, host: usize) -> io::Result<InitialLifecyclePermit<'_>> {
+        self.begin_lifecycle_with_selected_restore(host, 0)
+    }
+
+    #[cfg(feature = "coordinator-rpc")]
+    pub(super) fn begin_mapped_successor_lifecycle(
+        &self,
+        host: usize,
+    ) -> io::Result<InitialLifecyclePermit<'_>> {
+        self.begin_lifecycle_with_selected_restore(host, 2)
+    }
+
+    #[cfg(any(feature = "coordinator-rpc", test))]
+    fn begin_lifecycle_with_selected_restore(
+        &self,
+        host: usize,
+        expected_selected_restore: usize,
+    ) -> io::Result<InitialLifecyclePermit<'_>> {
         if self
             .lifecycle
             .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
@@ -1390,11 +1443,14 @@ impl InitialImageControl {
             owner: self,
             host,
             completed: false,
+            #[cfg(feature = "coordinator-rpc")]
+            selected: expected_selected_restore == 2,
             _same_thread: core::marker::PhantomData,
         };
         if self.installation.load(Ordering::Acquire) != 2
             || host == 0
             || self.installed_host.load(Ordering::Acquire) != host
+            || self.selected_restore.load(Ordering::Acquire) != expected_selected_restore
         {
             return Err(io::Error::other(
                 "InitialImage lifecycle lacks its installed host/frontend",
@@ -1402,6 +1458,65 @@ impl InitialImageControl {
         }
         self.check_initial_thread()?;
         Ok(permit)
+    }
+
+    #[cfg(feature = "coordinator-rpc")]
+    pub(super) fn begin_mapped_successor_restore(&self, host: usize) -> io::Result<()> {
+        if self
+            .selected_restore
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            self.lifecycle.store(3, Ordering::Release);
+            return Err(io::Error::other(
+                "InitialImage selected-state restoration attempted twice",
+            ));
+        }
+        if host == 0
+            || self.installed_host.load(Ordering::Acquire) != host
+            || self.installation.load(Ordering::Acquire) != 0
+            || self.lifecycle.load(Ordering::Acquire) != 0
+        {
+            self.mapped_successor_restore_failed();
+            return Err(io::Error::other(
+                "InitialImage selected-state restoration lacks its installed host",
+            ));
+        }
+        if let Err(error) = self.check_initial_thread() {
+            self.mapped_successor_restore_failed();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "coordinator-rpc")]
+    pub(super) fn mapped_successor_restore_completed(&self) {
+        self.selected_restore.store(2, Ordering::Release);
+    }
+
+    #[cfg(feature = "coordinator-rpc")]
+    pub(super) fn verify_mapped_successor_entry(
+        &self,
+        entry: &MappedSuccessorEntry,
+    ) -> io::Result<()> {
+        let control = self.control as *const NativeControl;
+        if entry.regs.rsp != unsafe { (&raw const (*control).guest_rsp).read_volatile() }
+            || entry.regs.rip != unsafe { (&raw const (*control).guest_ld_entry).read_volatile() }
+            || entry.regs.fs_base != unsafe { (&raw const (*control).guest_fs).read_volatile() }
+            || entry.pkru.map(u64::from).unwrap_or(0)
+                != unsafe { (&raw const (*control).guest_pkru).read_volatile() }
+            || entry.regs.rsp == 0
+            || entry.regs.rip == 0
+        {
+            return Err(io::Error::other("mapped successor resume entry differs"));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "coordinator-rpc")]
+    pub(super) fn mapped_successor_restore_failed(&self) {
+        self.selected_restore.store(3, Ordering::Release);
+        self.lifecycle.store(3, Ordering::Release);
     }
 
     fn check_initial_thread(&self) -> io::Result<()> {
@@ -1511,6 +1626,7 @@ impl InitialImageControl {
             .map_err(|_| io::Error::other("private frontend installation did not complete once"))?;
         if self.installed_host.load(Ordering::Acquire) == 0
             || self.lifecycle.load(Ordering::Acquire) != 2
+            || !matches!(self.selected_restore.load(Ordering::Acquire), 0 | 2)
         {
             self.lifecycle.store(3, Ordering::Release);
             return Err(io::Error::other(
@@ -1550,11 +1666,68 @@ pub(super) struct InitialLifecyclePermit<'a> {
     owner: &'a InitialImageControl,
     host: usize,
     completed: bool,
+    #[cfg(feature = "coordinator-rpc")]
+    selected: bool,
     _same_thread: core::marker::PhantomData<*mut ()>,
 }
 
+// SAFETY: every shared mapped-injection operation revalidates the
+// actual initial thread, installed host, lifecycle phase, and
+// selected-restore state before touching the published control.
+#[cfg(feature = "coordinator-rpc")]
+unsafe impl Sync for InitialLifecyclePermit<'_> {}
+
 #[cfg(any(feature = "coordinator-rpc", test))]
 impl InitialLifecyclePermit<'_> {
+    #[cfg(feature = "coordinator-rpc")]
+    fn check_mapped_injection(&self) -> io::Result<()> {
+        if !self.selected
+            || self.completed
+            || self.owner.lifecycle.load(Ordering::Acquire) != 1
+            || self.owner.installation.load(Ordering::Acquire) != 2
+            || self.owner.installed_host.load(Ordering::Acquire) != self.host
+            || self.owner.selected_restore.load(Ordering::Acquire) != 2
+        {
+            return Err(io::Error::other(
+                "mapped successor injection permit differs",
+            ));
+        }
+        self.owner.check_initial_thread()
+    }
+
+    #[cfg(feature = "coordinator-rpc")]
+    pub(super) fn validate_mapped_injection(&self) -> io::Result<()> {
+        let result = self.check_mapped_injection();
+        if result.is_err() {
+            self.owner.lifecycle.store(3, Ordering::Release);
+        }
+        result
+    }
+
+    #[cfg(feature = "coordinator-rpc")]
+    pub(super) fn regs(&self, entry: &MappedSuccessorEntry) -> libc::user_regs_struct {
+        if self.check_mapped_injection().is_err()
+            || self.owner.verify_mapped_successor_entry(entry).is_err()
+        {
+            self.owner.terminate_lifecycle();
+        }
+        let mut regs = entry.regs;
+        regs.fs_base = unsafe {
+            (&raw const (*(self.owner.control as *const NativeControl)).guest_fs).read_volatile()
+        };
+        regs
+    }
+
+    #[cfg(feature = "coordinator-rpc")]
+    pub(super) fn pkru(&self, entry: &MappedSuccessorEntry) -> Option<u32> {
+        entry.pkru
+    }
+
+    #[cfg(feature = "coordinator-rpc")]
+    pub(super) fn terminate(&self) -> ! {
+        self.owner.terminate_lifecycle()
+    }
+
     pub(super) fn complete(mut self) -> io::Result<()> {
         if self.owner.installation.load(Ordering::Acquire) != 2
             || self.owner.installed_host.load(Ordering::Acquire) != self.host
@@ -1913,6 +2086,36 @@ pub struct ImageGuestEntry {
     regs: libc::user_regs_struct,
     pkru: Option<u32>,
 }
+/// Exact mapped-image resume registers and PKRU projected from
+/// the retained mapped prelude, with no SyscallEvent.
+#[cfg(feature = "exec-private-init")]
+#[derive(Clone, Copy)]
+pub struct MappedSuccessorEntry {
+    regs: libc::user_regs_struct,
+    pkru: Option<u32>,
+}
+#[cfg(feature = "exec-private-init")]
+impl MappedSuccessorEntry {
+    /// # Safety
+    /// Capture the actual registers and PKRU that this mapped
+    /// image's runner will use to resume its loader. Their
+    /// storage must be owned and immutable until lifecycle/finish;
+    /// no guest code may run or mutate them in between.
+    pub unsafe fn from_mapped_resume(regs: libc::user_regs_struct, pkru: Option<u32>) -> Self {
+        Self { regs, pkru }
+    }
+
+    /// Exact mapped loader-resume registers captured for this entry.
+    pub fn registers(&self) -> libc::user_regs_struct {
+        self.regs
+    }
+
+    /// Exact mapped loader-resume PKRU captured for this entry.
+    pub fn pkru(&self) -> Option<u32> {
+        self.pkru
+    }
+}
+
 #[cfg(feature = "exec-private-successor")]
 impl ImageGuestEntry {
     /// # Safety
@@ -2430,6 +2633,54 @@ pub unsafe fn physical_lifecycle_syscall(
         permit.owner.poison();
         return Err(error);
     }
+    Ok(crate::trap::NativeSyscallResult {
+        result: result.result,
+        pkru: pkru.map(|_| result.pkru as u32),
+    })
+}
+
+/// Execute only a guarded mapped lifecycle operation. The phase
+/// is bracketed 2 -> 6 -> leaf -> 2 for this one call, so Tool
+/// libc calls before and after it use the mapped relay's phase 2.
+/// This never exposes the ordinary callback leaf as a fallback.
+///
+/// # Safety
+/// The core host must apply all process/signal/mapping/descriptor
+/// guards first. Arguments/storage must survive the physical leaf;
+/// no thread creation, exec, tail/ending transition or callable
+/// guest signal delivery is admitted.
+#[cfg(all(feature = "exec-private-init", feature = "coordinator-rpc"))]
+pub(super) unsafe fn physical_mapped_lifecycle_syscall(
+    permit: &InitialLifecyclePermit<'_>,
+    number: i64,
+    args: [u64; 6],
+    pkru: Option<u32>,
+) -> io::Result<crate::trap::NativeSyscallResult> {
+    permit.validate_mapped_injection()?;
+    let control = permit.owner.control as *mut NativeControl;
+    // SAFETY: validate_mapped_injection has just required phase 2
+    // on this same initial thread and stable installed host.
+    unsafe { (&raw mut (*control).phase).write_volatile(6) };
+    let result = unsafe {
+        reverie_inguest_private_lifecycle_call(
+            number,
+            args.as_ptr(),
+            u64::from(pkru.unwrap_or(0)),
+            u64::from(pkru.is_some()),
+        )
+    };
+    // The leaf restored Tool FS and its expected phase (6). Restore
+    // phase 2 before any other Rust or libc work in this function.
+    unsafe { (&raw mut (*control).phase).write_volatile(2) };
+    unsafe {
+        if number == libc::SYS_set_tid_address && result.result > 0 {
+            (&raw mut (*control).kernel_clear_tid).write_volatile(args[0]);
+        } else if number == libc::SYS_set_robust_list && result.result == 0 {
+            (&raw mut (*control).kernel_robust_head).write_volatile(args[0]);
+            (&raw mut (*control).kernel_robust_len).write_volatile(args[1]);
+        }
+    }
+    permit.validate_mapped_injection()?;
     Ok(crate::trap::NativeSyscallResult {
         result: result.result,
         pkru: pkru.map(|_| result.pkru as u32),
@@ -3038,6 +3289,7 @@ mod successor_tests {
                         context: 0,
                         dispatch: crate::guest::event::SyscallDispatch::Trap,
                         guest_pkru: None,
+                        unsupported_refusal: None,
                     };
                     let mut observed = false;
                     unsafe {
@@ -3158,6 +3410,29 @@ mod tests {
         assert!(libc::WIFEXITED(status), "child wait status {status}");
         assert_eq!(libc::WEXITSTATUS(status), expected);
     }
+    #[cfg(feature = "coordinator-rpc")]
+    fn mapped_permit_test_owner() -> (
+        Box<NativeControl>,
+        InitialImageControl,
+        MappedSuccessorEntry,
+    ) {
+        let (mut native, owner) = lifecycle_test_owner();
+        owner.bind_lifecycle_host(1).unwrap();
+        owner.begin_mapped_successor_restore(1).unwrap();
+        owner.mapped_successor_restore_completed();
+        mark_lifecycle_test_frontend_installed(&owner);
+        let mut regs: libc::user_regs_struct = unsafe { core::mem::zeroed() };
+        regs.rsp = 0x1234_0000;
+        regs.rip = 0x5678_0000;
+        regs.fs_base = native.tool_fs;
+        native.guest_rsp = regs.rsp;
+        native.guest_ld_entry = regs.rip;
+        native.guest_fs = regs.fs_base;
+        native.guest_pkru = 0;
+        let entry = unsafe { MappedSuccessorEntry::from_mapped_resume(regs, None) };
+        (native, owner, entry)
+    }
+
     // These component controls install the actual fixed gate and reserve real
     // seqpacket FDs. They establish reporter mechanics, not native admission.
     fn refusal_socket() -> (i32, i32) {
@@ -3917,6 +4192,7 @@ mod tests {
                         context: 0,
                         dispatch: crate::guest::event::SyscallDispatch::Trap,
                         guest_pkru: None,
+                        unsupported_refusal: None,
                     };
                     let mut observed = false;
                     unsafe {
@@ -4043,6 +4319,7 @@ mod tests {
                         context: 0,
                         dispatch: crate::guest::event::SyscallDispatch::Trap,
                         guest_pkru: None,
+                        unsupported_refusal: None,
                     };
                     let mut observed = false;
                     unsafe {
@@ -4176,6 +4453,45 @@ mod tests {
     }
 
     #[test]
+    fn control_slot_publication_registers_leader_slot() {
+        isolated(
+            || {
+                // publish_control_slot is the one physical publication both
+                // authenticated origins funnel through (the GNU path via
+                // publish_native_control, the mapped musl image directly),
+                // so slot-0 registration must happen there, not in a caller
+                // the mapped path bypasses.
+                let mut control: NativeControl = unsafe { core::mem::zeroed() };
+                let tid = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
+                assert!(tid > 0);
+                control.native_tid = tid as u64;
+                assert_eq!(tool_tls_registry::TOOL_TLS_REGISTRY.leader(), None);
+                publish_control_slot(&raw mut control).unwrap();
+                assert_eq!(tool_tls_registry::TOOL_TLS_REGISTRY.leader(), Some(tid));
+                assert_eq!(
+                    tool_tls_registry::TOOL_TLS_REGISTRY.lookup_ready(tid),
+                    Some(0)
+                );
+                // A second publication still refuses and changes nothing.
+                assert!(publish_control_slot(&raw mut control).is_err());
+                assert_eq!(tool_tls_registry::TOOL_TLS_REGISTRY.leader(), Some(tid));
+            },
+            0,
+        );
+        isolated(
+            || {
+                // A sealed tid that is not a positive kernel tid refuses
+                // the publication itself: no control, no leader slot.
+                let mut control: NativeControl = unsafe { core::mem::zeroed() };
+                assert!(publish_control_slot(&raw mut control).is_err());
+                assert!(!active());
+                assert_eq!(tool_tls_registry::TOOL_TLS_REGISTRY.leader(), None);
+            },
+            0,
+        );
+    }
+
+    #[test]
     fn initial_vdso_context_requires_same_fresh_native_owner() {
         isolated(
             || {
@@ -4304,6 +4620,90 @@ mod tests {
             },
             0,
         );
+    }
+
+    #[cfg(feature = "coordinator-rpc")]
+    #[test]
+    fn mapped_injection_permit_revalidates_every_issuance_field() {
+        for mutation in 0..6 {
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0);
+            if pid == 0 {
+                let status = if std::panic::catch_unwind(|| {
+                    let (_native, owner, entry) = mapped_permit_test_owner();
+                    let mut permit = owner.begin_mapped_successor_lifecycle(1).unwrap();
+                    permit.validate_mapped_injection().unwrap();
+                    assert_eq!(permit.regs(&entry).rsp, 0x1234_0000);
+                    match mutation {
+                        0 => permit.selected = false,
+                        1 => permit.completed = true,
+                        2 => owner.lifecycle.store(2, Ordering::Release),
+                        3 => owner.installation.store(1, Ordering::Release),
+                        4 => owner.installed_host.store(2, Ordering::Release),
+                        5 => owner.selected_restore.store(1, Ordering::Release),
+                        _ => unreachable!(),
+                    }
+                    let error = permit.validate_mapped_injection().unwrap_err();
+                    assert_eq!(
+                        error.to_string(),
+                        "mapped successor injection permit differs",
+                        "permit mutation {mutation}"
+                    );
+                    assert_eq!(owner.lifecycle.load(Ordering::Acquire), 3);
+                })
+                .is_ok()
+                {
+                    0
+                } else {
+                    125
+                };
+                unsafe { libc::_exit(status) };
+            }
+            let mut status = 0;
+            assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+            assert!(libc::WIFEXITED(status));
+            assert_eq!(libc::WEXITSTATUS(status), 0, "permit mutation {mutation}");
+        }
+    }
+
+    #[cfg(feature = "coordinator-rpc")]
+    #[test]
+    fn mapped_regs_reverify_entry_after_control_mutation() {
+        for mutation in 0..4 {
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0);
+            if pid == 0 {
+                let status = if std::panic::catch_unwind(|| {
+                    let (mut native, owner, entry) = mapped_permit_test_owner();
+                    let permit = owner.begin_mapped_successor_lifecycle(1).unwrap();
+                    assert_eq!(permit.regs(&entry).rsp, 0x1234_0000);
+                    match mutation {
+                        0 => native.guest_rsp += 8,
+                        1 => native.guest_ld_entry += 8,
+                        2 => native.guest_fs += 8,
+                        3 => native.guest_pkru = 2,
+                        _ => unreachable!(),
+                    }
+                    let _ = permit.regs(&entry);
+                    panic!("mapped regs returned after entry mutation {mutation}");
+                })
+                .is_ok()
+                {
+                    0
+                } else {
+                    125
+                };
+                unsafe { libc::_exit(status) };
+            }
+            let mut status = 0;
+            assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+            assert!(libc::WIFEXITED(status));
+            assert_eq!(
+                libc::WEXITSTATUS(status),
+                127,
+                "entry mutation {mutation} must terminate at regs"
+            );
+        }
     }
 
     #[test]

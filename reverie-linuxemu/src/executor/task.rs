@@ -1290,6 +1290,8 @@ impl ElfExecutor {
         }
         let address_space = None;
         file_table = Arc::new(std::sync::Mutex::new(FileTableState::try_from_elf(&state)?));
+        // The child's table holds its pidfds' records now.
+        state.pidfd_holds.clear();
         let task_generation = {
             let mut lifecycle = state
                 .task_lifecycle
@@ -1541,6 +1543,9 @@ impl ElfExecutor {
             .lock()
             .expect("KVM file-table lock poisoned")
             .install(&mut child.state)?;
+        // The table they share holds the pidfds' records, so a thread that
+        // parks before its first call keeps no pidfd that the table closes.
+        child.state.pidfd_holds.clear();
         Ok(child)
     }
 
@@ -1835,7 +1840,10 @@ impl ElfExecutor {
         self.state.private_copy_gate.close(std::iter::empty());
         self.state.fd_entry_ids.clear();
         self.state.native_poll_fds.clear();
+        self.state.retired_epolls.clear();
         self.state.pipe_owners.clear();
+        self.state.guest_pidfds.clear();
+        self.state.pidfd_holds.clear();
         self.state.poll_table_id = Default::default();
         self.state.epoll_domain = Default::default();
         let table = std::mem::replace(
@@ -1843,6 +1851,8 @@ impl ElfExecutor {
             Arc::new(Mutex::new(FileTableState::default())),
         );
         let mut files = Vec::new();
+        let mut pidfds = Vec::new();
+        let mut native_polls = Vec::new();
         // Elect the last task independently of transient observer Arcs. A
         // genuine CLONE_FILES sibling still owns the table, so its exit must
         // neither acquire this lock nor remove any of its descriptors.
@@ -1854,11 +1864,18 @@ impl ElfExecutor {
             let mut table = table.lock().unwrap_or_else(|p| p.into_inner());
             files.extend(table.stdin.take().map(Owned));
             files.extend(std::mem::take(&mut table.files).into_values().map(Owned));
+            pidfds = table.take_pidfds();
+            native_polls = table.take_native_polls();
         }
         // No table guard crosses service submission or descriptor destruction.
         // A separately selected/duplicated File remains a genuine foreign OFD
         // owner; an observer's table Arc alone no longer owns these files.
         drop(table);
+        // Nor the pidfds' records, whose shadows close here unless another
+        // table holds them, nor the epolls' bindings, whose last one ends
+        // the epoll's pidfd registrations.
+        drop(pidfds);
+        drop(native_polls);
         files.extend(retired.into_values().map(Owned));
         files.extend(stdin.map(Owned));
         if let Some(ProcessAction::Exec {
@@ -1906,7 +1923,10 @@ impl ElfExecutor {
         self.state.fd_entry_ids.clear();
         // Snapshot retirement is not a logical close in a surviving table.
         self.state.native_poll_fds.clear();
+        self.state.retired_epolls.clear();
         self.state.pipe_owners.clear();
+        self.state.guest_pidfds.clear();
+        self.state.pidfd_holds.clear();
         self.state.poll_table_id = Default::default();
         self.state.epoll_domain = Default::default();
         let table = std::mem::replace(
@@ -1920,6 +1940,8 @@ impl ElfExecutor {
             .file_table_task_owner
             .take()
             .is_some_and(|owner| Arc::into_inner(owner).is_some());
+        let mut pidfds = Vec::new();
+        let mut native_polls = Vec::new();
         if last_task {
             let mut table = table.lock().unwrap_or_else(|p| p.into_inner());
             let stdin = table.stdin.take();
@@ -1927,8 +1949,16 @@ impl ElfExecutor {
             self.state
                 .file_retirement
                 .retire(stdin.into_iter().chain(files.into_values()));
+            pidfds = table.take_pidfds();
+            native_polls = table.take_native_polls();
         }
         drop(table);
+        // The pidfds' records go with the table's descriptors, whoever else
+        // holds the table; their shadows close here unless another table
+        // holds them. So do the epolls' bindings, whose last one ends the
+        // epoll's pidfd registrations.
+        drop(pidfds);
+        drop(native_polls);
         let action = self.process_action.take();
         self.state
             .file_retirement
@@ -2294,6 +2324,18 @@ impl ElfExecutor {
                         }
                     },
                     libc::P_ALL | libc::P_PGID => None,
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    libc::P_PIDFD => match pidfd_wait_target(&self.state, args[1]) {
+                        Ok((pid, _)) => Some(pid),
+                        Err(errno) => {
+                            return Some(Ok(finish_waitid(
+                                &ProviderMemory(memory),
+                                args,
+                                None,
+                                negative_errno(errno),
+                            )));
+                        }
+                    },
                     _ => {
                         return Some(Ok(finish_waitid(
                             &ProviderMemory(memory),
@@ -2558,6 +2600,10 @@ impl ElfExecutor {
         self.clear_child_tid = None;
         drop(_transaction);
         drop(files);
+        // The close-on-exec epoll entries the publication retired go now,
+        // with no lock held, as a call's do at its end
+        // (`LoadedStaticElf::retired_epolls`).
+        self.state.retired_epolls.clear();
         published
     }
 

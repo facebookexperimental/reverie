@@ -917,6 +917,95 @@ fn exact_counter1_tool_does_not_reenter_the_guest_allocator_on_in_guest_trap() {
     counter1_allocator_on("in-guest-trap");
 }
 
+fn thread_atexit_through_main_guest() -> PathBuf {
+    const SOURCE: &str = include_str!("fixtures/thread_atexit_through_main.c");
+    static GUEST: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    let directory = GUEST.get_or_init(|| {
+        let root = Path::new(env!("CARGO_TARGET_TMPDIR"));
+        std::fs::create_dir_all(root).unwrap();
+        let directory = tempfile::Builder::new()
+            .prefix("thread-atexit-through-main-")
+            .tempdir_in(root)
+            .unwrap();
+        let source = directory.path().join("guest.c");
+        std::fs::write(&source, SOURCE).unwrap();
+        let compiler = std::env::var_os("CC").unwrap_or_else(|| "cc".into());
+        // -rdynamic exports the guest's __cxa_thread_atexit_impl, so the
+        // runtime's reference to it binds to the guest's counting definition.
+        let output = Command::new(compiler)
+            .args(["-O2", "-Wall", "-Werror", "-rdynamic", "-o"])
+            .arg(directory.path().join("guest"))
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "guest compiler failed: {output:?}");
+        directory
+    });
+    directory.path().join("guest")
+}
+
+/// The runtime installs its Tool from the preload's constructor, before
+/// `main`, and Counter1 then handles every syscall the guest makes. A runtime
+/// thread-local whose type needs dropping, first touched in either place,
+/// registers a thread-exit destructor through libc's
+/// `__cxa_thread_atexit_impl`, and libc allocates its record from the guest's
+/// C library heap. The guest counts those registrations at `main`'s entry and
+/// again at its end; both must be zero, as natively, and the guest must have
+/// confirmed that the name resolves to its own counting definition.
+///
+/// The heap line is printed for diagnosis, not compared: this example preload
+/// allocates through the guest's C library outside dispatch by design, so its
+/// guest heap at `main` is not empty even without a registration.
+fn assert_counter1_registers_no_thread_exit_destructor(output: Output) {
+    let native = Command::new(thread_atexit_through_main_guest())
+        .output()
+        .unwrap();
+    assert!(native.status.success(), "{native:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout),
+        "heap at main: arena=0 in_use=0\n\
+         __cxa_thread_atexit_impl resolves to this program: yes\n\
+         thread-exit destructors registered before main: 0\n\
+         thread-exit destructors registered by the end of main: 0\n"
+    );
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout.lines().skip(1).collect::<Vec<_>>(),
+        [
+            "__cxa_thread_atexit_impl resolves to this program: yes",
+            "thread-exit destructors registered before main: 0",
+            "thread-exit destructors registered by the end of main: 0",
+        ],
+        "the runtime registered a thread-exit destructor: {output:?}"
+    );
+}
+
+#[test]
+fn exact_counter1_tool_registers_no_thread_exit_destructor_through_main() {
+    let guest = thread_atexit_through_main_guest();
+    assert_counter1_registers_no_thread_exit_destructor(run(
+        "counter1",
+        &[],
+        &[guest.to_str().unwrap()],
+    ));
+}
+
+#[test]
+fn exact_counter1_tool_registers_no_thread_exit_destructor_through_main_on_in_guest_trap() {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_counter1"));
+    command
+        .env(
+            STRADDLER_STALENESS_TICKS_ENV,
+            TEST_STRADDLER_STALENESS_TICKS,
+        )
+        .args(["--backend", "in-guest-trap", "--preload"])
+        .arg(preload())
+        .arg("--")
+        .arg(thread_atexit_through_main_guest());
+    assert_counter1_registers_no_thread_exit_destructor(output_with_timeout(&mut command));
+}
+
 #[test]
 fn exact_counter2_tool_reports_process_and_thread_totals() {
     let output = run("counter2", &[], &["/bin/echo", "hello"]);

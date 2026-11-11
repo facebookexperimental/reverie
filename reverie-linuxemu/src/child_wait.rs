@@ -410,6 +410,9 @@ impl ProcessSignalRegistry {
             .unwrap()
             .phase = phase;
         self.wait_changed.notify_all();
+        drop(family);
+        // An exit that was not waitable has reaped its process.
+        self.sync_pidfd_shadows();
         Ok(())
     }
 
@@ -449,6 +452,9 @@ impl ProcessSignalRegistry {
             .unwrap()
             .phase = phase;
         self.wait_changed.notify_all();
+        drop(family);
+        // An exit that was not waitable has reaped its process.
+        self.sync_pidfd_shadows();
         Ok(())
     }
 
@@ -634,11 +640,17 @@ impl ProcessSignalRegistry {
                 } else {
                     None
                 };
-                return Ok(ChildWaitSelection::Ready(SelectedChildWait {
+                let selection = ChildWaitSelection::Ready(SelectedChildWait {
                     status: snapshot.completion.status,
                     child: process_identity(child),
                     receipt,
-                }));
+                });
+                drop(family);
+                if consume {
+                    // The wait reaped the child.
+                    self.sync_pidfd_shadows();
+                }
+                return Ok(selection);
             }
             if !pending && !fenced {
                 return Ok(ChildWaitSelection::NoChild);
@@ -728,6 +740,8 @@ impl ProcessSignalRegistry {
             assert!(snapshot.completion.waitable);
             family.wait_publications.get_mut(&child).unwrap().phase = WaitPhase::Ready;
             self.wait_changed.notify_all();
+            drop(family);
+            self.sync_pidfd_shadows();
             return;
         }
         let child = SignalProcessId {
@@ -767,6 +781,8 @@ impl ProcessSignalRegistry {
                 phase: WaitPhase::Ready,
             },
         );
+        drop(family);
+        self.sync_pidfd_shadows();
     }
 }
 

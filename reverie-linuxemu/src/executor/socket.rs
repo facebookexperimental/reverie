@@ -546,20 +546,232 @@ pub(super) fn socketpair(
     let first = unsafe { std::fs::File::from_raw_fd(host_fds[0]) };
     // SAFETY: socketpair initialized both owned descriptors on success.
     let second = unsafe { std::fs::File::from_raw_fd(host_fds[1]) };
-    insert_file_pair(
+    let ends =
+        [&first, &second].map(|end| file_identity_stat(end).map(|stat| (stat.st_dev, stat.st_ino)));
+    let result = insert_file_pair(
         memory,
         state,
         args[3],
         [first, second],
         socket_type & libc::SOCK_CLOEXEC != 0,
         None,
-    )
+    );
+    if result == 0
+        && let [Some(first), Some(second)] = ends
+    {
+        record_socket_pair(state, [first, second]);
+    }
+    result
+}
+
+/// Records the two ends of a Unix socket pair the run made, by their host
+/// objects `ends`, each with its own identity and its peer's
+/// (`sends_into_the_run`), and forgets the ends that no guest holds any
+/// longer.
+fn record_socket_pair(state: &LoadedStaticElf, ends: [(libc::dev_t, libc::ino_t); 2]) {
+    let mut table = state
+        .file_identity_table
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let [Some(first), Some(second)] = ends.map(|end| {
+        table
+            .objects
+            .get(&end)
+            .and_then(GuestFileIdentityEntry::identity)
+    }) else {
+        return;
+    };
+    table
+        .socket_peers
+        .retain(|_, (own, _)| own.strong_count() != 0);
+    table
+        .socket_peers
+        .insert(ends[0], (Arc::downgrade(&first), Arc::downgrade(&second)));
+    table
+        .socket_peers
+        .insert(ends[1], (Arc::downgrade(&second), Arc::downgrade(&first)));
+}
+
+/// The host object of host descriptor `fd`, if it can be read.
+fn host_object(fd: RawFd) -> Option<(libc::dev_t, libc::ino_t)> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: stat is writable; fstat checks the descriptor.
+    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: fstat initialized stat on success.
+    let stat = unsafe { stat.assume_init() };
+    Some((stat.st_dev, stat.st_ino))
+}
+
+/// Whether a message that a socket at host object `sender` sends to its peer
+/// can reach no receiver outside the run, by `table`, the identity table,
+/// locked: the socket is one end of a Unix socket pair the run made
+/// (`record_socket_pair`), made since the last message that may leave the run
+/// carried a Unix socket (`admit_socket_export`), and not connected since
+/// (`forget_pair_before_connect`). Its peer has then never left the run,
+/// alone or in the queue of a socket that left: a guest holds it, a message
+/// in the run carries it, or it is closed, and the host refuses the send. A
+/// message on any other socket may leave the run, to a receiver that no
+/// record sees: one inherited or received from outside the run, one that
+/// connect or accept made, and an unconnected datagram socket's, as may a
+/// datagram that names its destination (`sendmsg`, whose `sender` is then
+/// `None`). The caller holds the lock across this answer and what it admits
+/// (`register_epoll_transfer`, `admit_socket_export`), and takes a reliance
+/// on the route with it (`RouteReliance`), so no export or connect comes
+/// between them and the host send.
+pub(super) fn sends_into_the_run(
+    table: &crate::elf::GuestFileIdentityTable,
+    sender: Option<(libc::dev_t, libc::ino_t)>,
+) -> bool {
+    let Some(key) = sender else {
+        return false;
+    };
+    let Some((own, _)) = table.socket_peers.get(&key) else {
+        return false;
+    };
+    // The record is this socket's, not an earlier one's at the same host
+    // object.
+    table
+        .objects
+        .get(&key)
+        .and_then(GuestFileIdentityEntry::identity)
+        .is_some_and(|identity| std::ptr::eq(Arc::as_ptr(&identity), own.as_ptr()))
+}
+
+/// A send's reliance on its socket pair's route, from the check that its
+/// message goes into the run (`sends_into_the_run`) until its host send
+/// ends, however it ends: a connect of the sending socket meanwhile, which
+/// could give it a peer outside the run, is refused
+/// (`forget_pair_before_connect`). A send takes one whether its message
+/// carries an epoll set (`register_epoll_transfer`) or only a Unix socket
+/// (`admit_socket_export`). Counted in the identity table by the socket's
+/// host object, which names its one open file description, whichever
+/// descriptor reaches it in whichever process: Linux opens no socket anew
+/// (`sock_no_open`), so every alias of one duplicates that description. The
+/// send's rights in flight keep it (`RightTransfers`), until sendmsg returns.
+pub(super) struct RouteReliance {
+    table: Arc<Mutex<crate::elf::GuestFileIdentityTable>>,
+    socket: (libc::dev_t, libc::ino_t),
+}
+
+impl RouteReliance {
+    /// Takes a reliance on the route of the socket at host object `socket`,
+    /// under `table`, the lock of `state`'s identity table, held.
+    pub(super) fn take(
+        state: &LoadedStaticElf,
+        table: &mut crate::elf::GuestFileIdentityTable,
+        socket: (libc::dev_t, libc::ino_t),
+    ) -> Self {
+        *table.route_reliances.entry(socket).or_default() += 1;
+        Self {
+            table: state.file_identity_table.clone(),
+            socket,
+        }
+    }
+}
+
+impl std::fmt::Debug for RouteReliance {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RouteReliance")
+            .field("socket", &self.socket)
+            .finish()
+    }
+}
+
+impl Drop for RouteReliance {
+    fn drop(&mut self) {
+        let mut table = self
+            .table
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let std::collections::btree_map::Entry::Occupied(mut count) =
+            table.route_reliances.entry(self.socket)
+        {
+            *count.get_mut() -= 1;
+            if *count.get() == 0 {
+                count.remove();
+            }
+        }
+    }
+}
+
+/// Before a connect of host socket `fd`, which can give a datagram socket a
+/// new peer (`unix_dgram_connect`): forgets the socket pair whose end it is,
+/// so that no message relies on the pair's route any more
+/// (`sends_into_the_run`). A send from the socket that relies on that route
+/// now (`RouteReliance`) could reach the new peer after its check, so the
+/// connect is then refused by name before any effect (`CONNECT_REFUSAL`).
+/// A stream or seqpacket socket pair's ends stay connected to each other:
+/// Linux refuses their connect.
+fn forget_pair_before_connect(state: &mut LoadedStaticElf, fd: RawFd) -> Result<(), i64> {
+    if !is_datagram_socket(fd) {
+        return Ok(());
+    }
+    let Some(key) = host_object(fd) else {
+        return Ok(());
+    };
+    let mut table = state
+        .file_identity_table
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if table.route_reliances.contains_key(&key) {
+        drop(table);
+        state.pidfd_refusal = Some(CONNECT_REFUSAL);
+        return Err(negative_errno(libc::ENOSYS));
+    }
+    if let Some((_, peer)) = table.socket_peers.remove(&key) {
+        table
+            .socket_peers
+            .retain(|_, (own, _)| !std::ptr::eq(own.as_ptr(), peer.as_ptr()));
+    }
+    Ok(())
+}
+
+/// Admits a message that a socket at host object `sender` sends with a Unix
+/// socket among its rights. A socket that leaves the run takes its queue
+/// with it. An epoll right sent in the run (`EpollTransfer`), queued there or
+/// in the queue of a socket queued there, would reach a receiver outside the
+/// run whose close no record sees. So while any epoll right is in flight, a
+/// message that may leave the run is refused by name before any effect
+/// (`SOCKET_EXPORT_REFUSAL`). Otherwise every socket pair recorded so far is
+/// forgotten (`sends_into_the_run`), since an end of one may be in the queue
+/// that leaves. A message into the run is admitted as it is.
+///
+/// The check and the forgetting are one critical section under the identity
+/// table's lock, as are an epoll right's check and its reservation
+/// (`register_epoll_transfer`). A send that reserved first is in flight here,
+/// and one that comes after finds its pair forgotten. A message into the run
+/// relies on its route until its host send ends (`route`).
+fn admit_socket_export(
+    state: &LoadedStaticElf,
+    sender: Option<(libc::dev_t, libc::ino_t)>,
+    route: &mut Option<RouteReliance>,
+) -> Result<(), OutgoingRightRefusal> {
+    let mut table = state
+        .file_identity_table
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(key) = sender
+        && sends_into_the_run(&table, sender)
+    {
+        if route.is_none() {
+            *route = Some(RouteReliance::take(state, &mut table, key));
+        }
+        return Ok(());
+    }
+    if epoll_rights_in_flight_in(&table) != 0 {
+        return Err(OutgoingRightRefusal::Pidfd(SOCKET_EXPORT_REFUSAL));
+    }
+    table.socket_peers.clear();
+    Ok(())
 }
 
 // TODO-HUMAN-REVIEW(PR-92): Review this KVM compatibility implementation.
 // TODO-HUMAN-REVIEW(PR-217): Review filesystem-backed AF_UNIX connect translation.
 // TODO-HUMAN-REVIEW(PR-349): Review host-backed AF_INET/AF_INET6 connect translation.
-pub(super) fn connect(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
+pub(super) fn connect(memory: &GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
     let Some(host_fd) = host_fd(state, args[0] as libc::c_int) else {
         return negative_errno(libc::EBADF);
     };
@@ -592,6 +804,9 @@ pub(super) fn connect(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64
             let path = path.split(|byte| *byte == 0).next().unwrap_or(path);
             if path == b"/dev/log" {
                 return 0;
+            }
+            if let Err(refused) = forget_pair_before_connect(state, host_fd) {
+                return refused;
             }
         }
         // AF_INET / AF_INET6 connect is forwarded to the host exactly like the
@@ -715,7 +930,8 @@ pub(super) fn recvfrom<M: GuestMemoryAccess<Error = crate::Error> + AddressSpace
     // decisions for the guest's buffer: a datagram or seqpacket record is
     // taken off the queue before the copy that faults, and freed (EFAULT,
     // unix_dgram_recvmsg); a stream returns what it copied before the fault;
-    // MSG_PEEK takes nothing.
+    // MSG_PEEK takes nothing. One that would free a right this backend tracks
+    // unseen is refused first (`refuse_unwritable_record_buffer`).
     let accessible = memory
         .accessible_prefix(args[1], length, Access::Write)
         .unwrap_or(0);
@@ -737,7 +953,7 @@ pub(super) fn recvfrom<M: GuestMemoryAccess<Error = crate::Error> + AddressSpace
     {
         return negative_errno(libc::EFAULT);
     }
-    let host_iov = staged_host_iovecs(std::slice::from_mut(&mut staged))[0];
+    let mut host_iov = staged_host_iovecs(std::slice::from_mut(&mut staged))[0];
 
     // SAFETY: a zeroed sockaddr_storage is valid scratch space for recvfrom.
     let mut address =
@@ -767,41 +983,67 @@ pub(super) fn recvfrom<M: GuestMemoryAccess<Error = crate::Error> + AddressSpace
         std::ptr::from_mut(&mut address_length)
     };
 
-    // SAFETY: host_iov is the staging for the guest's `length` bytes (its
-    // inaccessible suffix PROT_NONE), the optional peer address points to
-    // initialized host storage, and host_fd is guest-owned.
-    let result = unsafe {
-        libc::recvfrom(
+    // A receive from a Unix socket that asks for no control data still sees
+    // the rights it consumes, to release them (`receive_discarding_rights`).
+    let unix = is_unix_socket(host_fd);
+    let received = if unix {
+        receive_discarding_rights(
+            state,
             host_fd,
-            host_iov.iov_base,
-            host_iov.iov_len,
+            std::slice::from_mut(&mut host_iov),
             flags,
-            address_pointer,
-            length_pointer,
+            (!address_pointer.is_null()).then_some((address_pointer, length_pointer)),
+            receives_records(host_fd) && accessible < length,
         )
-    };
-    if result < 0 {
-        let error = std::io::Error::last_os_error();
-        // Linux may have copied into the accessible prefix before the fault.
-        // The staging was filled from guest memory, so publishing all of it
-        // keeps both the changed and the untouched bytes.
-        if error.raw_os_error() == Some(libc::EFAULT)
-            && accessible != 0
-            && memory
-                .write_exact(args[1], staged.accessible_slice(accessible))
-                .is_err()
-        {
-            return negative_errno(libc::EFAULT);
+    } else {
+        // SAFETY: host_iov is the staging for the guest's `length` bytes (its
+        // inaccessible suffix PROT_NONE), the optional peer address points to
+        // initialized host storage, and host_fd is guest-owned.
+        let result = unsafe {
+            libc::recvfrom(
+                host_fd,
+                host_iov.iov_base,
+                host_iov.iov_len,
+                flags,
+                address_pointer,
+                length_pointer,
+            )
+        };
+        if result < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(result as usize)
         }
-        return io_error(error);
-    }
+    };
+    let result = match received {
+        Ok(count) => count as isize,
+        Err(error) => {
+            // Linux may have copied into the accessible prefix before the fault.
+            // The staging was filled from guest memory, so publishing all of it
+            // keeps both the changed and the untouched bytes.
+            if error.raw_os_error() == Some(libc::EFAULT)
+                && accessible != 0
+                && memory
+                    .write_exact(args[1], staged.accessible_slice(accessible))
+                    .is_err()
+            {
+                return negative_errno(libc::EFAULT);
+            }
+            return io_error(error);
+        }
+    };
     let copy_length = (result as usize).min(length).min(accessible);
     if copy_length != 0
         && memory
             .write_exact(args[1], staged.accessible_slice(copy_length))
             .is_err()
     {
-        return negative_errno(libc::EFAULT);
+        // The prefix was accessible when the receive began.
+        return if unix {
+            end_run_for_late_receive_fault("recvfrom", args[1])
+        } else {
+            negative_errno(libc::EFAULT)
+        };
     }
 
     if args[4] != 0 {
@@ -926,16 +1168,52 @@ pub(super) fn is_socket_timestamp_cmsg(message: ControlMessage) -> bool {
         )
 }
 
-/// Returns the process proc transfers registered for `control`. The caller
-/// releases them if the host does not queue the message.
+/// The rights in flight that a send registered: process proc descriptions,
+/// by their pinned memfds, and epolls ([`EpollTransfer`]), with the send's
+/// reliance on its socket pair's route, if it took one ([`RouteReliance`]),
+/// which the caller keeps until its host send ends.
+#[derive(Debug, Default)]
+pub(super) struct RightTransfers {
+    proc: Vec<(libc::dev_t, libc::ino_t)>,
+    epolls: Vec<Arc<EpollIdentity>>,
+    route: Option<RouteReliance>,
+}
+
+/// Equal when they name the same rights, epolls by identity.
+#[cfg(test)]
+impl PartialEq for RightTransfers {
+    fn eq(&self, other: &Self) -> bool {
+        self.proc == other.proc
+            && self.epolls.len() == other.epolls.len()
+            && std::iter::zip(&self.epolls, &other.epolls).all(|(a, b)| Arc::ptr_eq(a, b))
+    }
+}
+
+impl RightTransfers {
+    fn is_empty(&self) -> bool {
+        self.proc.is_empty() && self.epolls.is_empty()
+    }
+
+    /// Takes the rights back, as the host queued none of them.
+    pub(super) fn release(&self, state: &LoadedStaticElf) {
+        release_proc_transfers(state, &self.proc);
+        release_epoll_transfers(state, &self.epolls);
+    }
+}
+
+/// Returns the rights in flight registered for `control`, which host socket
+/// `socket` sends to its peer, or which a message that names its own
+/// destination carries, for `socket` -1. The caller releases them if the
+/// host does not queue the message, and keeps them until its host send ends.
 pub(super) fn translate_outgoing_control(
     control: &mut [u8],
-    state: &LoadedStaticElf,
-) -> Result<Vec<(libc::dev_t, libc::ino_t)>, i64> {
-    let mut transfers = Vec::new();
-    let result = translate_outgoing_rights(control, state, &mut transfers);
+    state: &mut LoadedStaticElf,
+    socket: RawFd,
+) -> Result<RightTransfers, i64> {
+    let mut transfers = RightTransfers::default();
+    let result = translate_outgoing_rights(control, state, &mut transfers, socket);
     if let Err(error) = result {
-        release_proc_transfers(state, &transfers);
+        transfers.release(state);
         return Err(error);
     }
     Ok(transfers)
@@ -943,9 +1221,63 @@ pub(super) fn translate_outgoing_control(
 
 pub(super) fn translate_outgoing_rights(
     control: &mut [u8],
-    state: &LoadedStaticElf,
-    transfers: &mut Vec<(libc::dev_t, libc::ino_t)>,
+    state: &mut LoadedStaticElf,
+    transfers: &mut RightTransfers,
+    socket: RawFd,
 ) -> Result<(), i64> {
+    let mut exported = Vec::new();
+    match check_outgoing_rights(control, state, transfers, &mut exported, socket) {
+        // The refusal of a pidfd, or of an epoll or a Unix socket that may
+        // leave the run, marks nothing as exported, as the typed refusal
+        // promises (`UnsupportedOperation::Pidfd`); the caller releases the
+        // rights in flight registered so far (`translate_outgoing_control`).
+        Err(OutgoingRightRefusal::Pidfd(reason)) => {
+            state.pidfd_refusal = Some(reason);
+            Err(negative_errno(libc::ENOSYS))
+        }
+        // Otherwise each right that got past its own checks is marked as
+        // exported, as a send exports it; a refusal by a later right leaves
+        // those marked, conservatively.
+        Err(OutgoingRightRefusal::Errno(error)) => {
+            mark_exported_rights(state, &exported)?;
+            Err(error)
+        }
+        Ok(()) => mark_exported_rights(state, &exported),
+    }
+}
+
+/// Why an outgoing `SCM_RIGHTS` message is refused.
+enum OutgoingRightRefusal {
+    /// A right Linux refuses, or this backend refuses by errno alone.
+    Errno(i64),
+    /// A pidfd for a guest process (`PIDFD_RIGHTS_REFUSAL`), or, in a message
+    /// that may leave the run, an epoll (`EPOLL_EXPORT_REFUSAL`) or a Unix
+    /// socket while an epoll right is in flight (`SOCKET_EXPORT_REFUSAL`),
+    /// which this backend refuses by name.
+    Pidfd(&'static str),
+}
+
+impl From<i64> for OutgoingRightRefusal {
+    fn from(error: i64) -> Self {
+        Self::Errno(error)
+    }
+}
+
+/// Checks the rights of `control`, which host socket `socket` sends, in
+/// order, and puts each right's host descriptor in place of its guest
+/// descriptor. Each guest descriptor that passed its own checks goes in
+/// `exported`, for its export marks ([`mark_exported_rights`]), which wait
+/// until every right is checked. A message with a Unix socket among its
+/// rights is admitted last (`admit_socket_export`).
+fn check_outgoing_rights(
+    control: &mut [u8],
+    state: &LoadedStaticElf,
+    transfers: &mut RightTransfers,
+    exported: &mut Vec<libc::c_int>,
+    socket: RawFd,
+) -> Result<(), OutgoingRightRefusal> {
+    let sender = host_object(socket);
+    let mut carries_unix_socket = false;
     for message in control_messages(control)? {
         // SCM_RIGHTS is the only ancillary input whose payload is meaningful in
         // the guest descriptor namespace. Other control inputs (credentials,
@@ -953,43 +1285,30 @@ pub(super) fn translate_outgoing_rights(
         // virtualization rules; fail before sendmsg rather than forwarding
         // guest/host identity bytes under an accidental pass-through policy.
         if message.level != libc::SOL_SOCKET || message.kind != libc::SCM_RIGHTS {
-            return Err(negative_errno(libc::EOPNOTSUPP));
+            return Err(negative_errno(libc::EOPNOTSUPP).into());
         }
         let data_length = message.end - message.data_offset;
         if data_length == 0 || data_length % std::mem::size_of::<libc::c_int>() != 0 {
-            return Err(negative_errno(libc::EINVAL));
+            return Err(negative_errno(libc::EINVAL).into());
         }
         for offset in (message.data_offset..message.end).step_by(std::mem::size_of::<libc::c_int>())
         {
             let guest_fd = read_control_fd(control, offset)?;
             let host_fd = host_fd(state, guest_fd).ok_or_else(|| negative_errno(libc::EBADF))?;
-            if let Some(owner) = state.pipe_owners.get(&guest_fd) {
-                owner.before_export()?;
+            if state.guest_pidfds.contains_key(&guest_fd) {
+                // The receiver would get the supervisor's pidfd that stands
+                // in for it, which neither names the process nor shows its
+                // readiness. Refuse before host sendmsg sends anything.
+                return Err(OutgoingRightRefusal::Pidfd(PIDFD_RIGHTS_REFUSAL));
             }
-            if let Some(description) = native_poll_description(state, guest_fd) {
-                // Once an untracked receiver might control this description,
-                // no known alias can prove its registration set. Invalidate
-                // BEFORE host sendmsg, then release the leaf lock. Even a
-                // later malformed element/failed send keeps new syscall 441
-                // outside admission; the existing send result is unchanged.
-                let mut domain = state
-                    .epoll_domain
-                    .lock()
-                    .expect("KVM epoll provenance lock poisoned");
-                match description {
-                    NativePollDescription::Epoll(identity) => {
-                        if let Some(proof) = domain.proofs.get_mut(&epoll_identity_key(&identity)) {
-                            proof.unsafe_history = true;
-                        }
-                    }
-                    NativePollDescription::EventFd(identity) => {
-                        // A foreign writer controls readiness even when nobody
-                        // exports the epoll itself. Never infer determinism
-                        // from the native carrier merely being an eventfd.
-                        identity.escaped.store(true, Ordering::SeqCst);
-                    }
-                }
+            if state
+                .pipe_owners
+                .get(&guest_fd)
+                .is_some_and(|owner| owner.export_refused())
+            {
+                return Err(negative_errno(libc::ENOSYS).into());
             }
+            exported.push(guest_fd);
             if state
                 .fdinfo_files
                 .get(&guest_fd)
@@ -998,16 +1317,76 @@ pub(super) fn translate_outgoing_rights(
                 })
             {
                 // The receiver restores this description from the registry.
-                transfers.push(register_proc_transfer(state, guest_fd, host_fd)?);
+                transfers
+                    .proc
+                    .push(register_proc_transfer(state, guest_fd, host_fd)?);
+            } else if let Some(NativePollDescription::Epoll(epoll)) =
+                native_poll_description(state, guest_fd)
+            {
+                // The message owns the epoll while it is in flight, and the
+                // receiver's descriptor joins its identity (`EpollTransfer`).
+                // One that may leave the run is refused before host sendmsg
+                // sends anything: a receiver outside the run would hold the
+                // epoll where no record sees (`EPOLL_EXPORT_REFUSAL`). A host
+                // that cannot compare open file descriptions records no
+                // epoll, and holds none.
+                match register_epoll_transfer(state, &epoll, host_fd, sender, &mut transfers.route)?
+                {
+                    EpollRight::Recorded => transfers.epolls.push(epoll),
+                    EpollRight::Unrecorded => {}
+                    EpollRight::MayLeave => {
+                        return Err(OutgoingRightRefusal::Pidfd(EPOLL_EXPORT_REFUSAL));
+                    }
+                }
             } else if state.fdinfo_files.contains_key(&guest_fd)
                 || signalfd_mask(state, guest_fd).is_some()
             {
                 // The receiver cannot reconstruct private stream/signalfd
                 // metadata. Refuse before host sendmsg delivers any payload or
                 // descriptors.
-                return Err(negative_errno(libc::ENOSYS));
+                return Err(negative_errno(libc::ENOSYS).into());
             }
+            carries_unix_socket |= is_unix_socket(host_fd);
             write_control_fd(control, offset, host_fd)?;
+        }
+    }
+    if carries_unix_socket {
+        admit_socket_export(state, sender, &mut transfers.route)?;
+    }
+    Ok(())
+}
+
+/// Marks each of the guest descriptors `exported` as exported, before host
+/// sendmsg: a pipe's owner record, and the provenance of a native poll
+/// description.
+fn mark_exported_rights(state: &LoadedStaticElf, exported: &[libc::c_int]) -> Result<(), i64> {
+    for &guest_fd in exported {
+        if let Some(owner) = state.pipe_owners.get(&guest_fd) {
+            owner.before_export()?;
+        }
+        if let Some(description) = native_poll_description(state, guest_fd) {
+            // Once an untracked receiver might control this description,
+            // no known alias can prove its registration set. Invalidate
+            // BEFORE host sendmsg, then release the leaf lock. Even a
+            // later malformed element/failed send keeps new syscall 441
+            // outside admission; the existing send result is unchanged.
+            let mut domain = state
+                .epoll_domain
+                .lock()
+                .expect("KVM epoll provenance lock poisoned");
+            match &description {
+                NativePollDescription::Epoll(identity) => {
+                    if let Some(proof) = domain.proofs.get_mut(&epoll_identity_key(identity)) {
+                        proof.unsafe_history = true;
+                    }
+                }
+                NativePollDescription::EventFd(identity) => {
+                    // A foreign writer controls readiness even when nobody
+                    // exports the epoll itself. Never infer determinism
+                    // from the native carrier merely being an eventfd.
+                    identity.escaped.store(true, Ordering::SeqCst);
+                }
+            }
         }
     }
     Ok(())
@@ -1139,20 +1518,488 @@ pub(super) fn sanitize_received_control(control: &[u8]) -> Result<SanitizedRecei
     })
 }
 
+#[cfg(test)]
 pub(super) fn available_guest_fds_with_limit(
     state: &LoadedStaticElf,
     count: usize,
     limit: libc::c_int,
 ) -> Result<Vec<libc::c_int>, i64> {
-    let fds = (0..limit)
-        .filter(|fd| !is_open_standard(state, *fd) && !state.files.contains_key(fd))
-        .take(count)
-        .collect::<Vec<_>>();
+    let fds = available_guest_fds_up_to(state, count, limit);
     if fds.len() == count {
         Ok(fds)
     } else {
         Err(negative_errno(libc::EMFILE))
     }
+}
+
+/// The lowest free guest descriptor numbers under `limit`, at most `count`.
+pub(super) fn available_guest_fds_up_to(
+    state: &LoadedStaticElf,
+    count: usize,
+    limit: libc::c_int,
+) -> Vec<libc::c_int> {
+    (0..limit)
+        .filter(|fd| !is_open_standard(state, *fd) && !state.files.contains_key(fd))
+        .take(count)
+        .collect()
+}
+
+/// Room, past the guest's own, that a receive from a Unix socket asks the
+/// host for (`is_unix_socket`): enough for every record one message carries,
+/// the rights of one message (`SCM_MAX_FD`, 253 descriptors) among them.
+const RECEIVE_CONTROL_ROOM: usize = 4096;
+
+/// The control data a receive with room for `capacity` bytes gets, from
+/// `control`, which the host returned with room for every record: Linux puts
+/// each record where the last one ended and cuts it to the room left
+/// (`put_cmsg`), puts a pidfd only whole (`scm_pidfd_recv`), and of the
+/// rights as many as fit (`scm_detach_fds`). Returns those bytes, the host
+/// descriptors that did not fit, for the caller to release
+/// ([`release_dropped_rights`]) and close, and whether a record did not fit
+/// (MSG_CTRUNC).
+fn truncate_received_control(
+    control: &[u8],
+    capacity: usize,
+) -> Result<(Vec<u8>, Vec<std::fs::File>, bool), i64> {
+    let header = std::mem::size_of::<libc::cmsghdr>();
+    let int = std::mem::size_of::<libc::c_int>();
+    let messages = control_messages(control)?;
+    let mut bytes = Vec::with_capacity(capacity.min(control.len()));
+    let mut dropped = Vec::new();
+    let mut truncated = false;
+    let mut room = capacity;
+    for message in messages {
+        let data = &control[message.data_offset..message.end];
+        let descriptors = data
+            .chunks_exact(int)
+            .map(|chunk| libc::c_int::from_ne_bytes(chunk.try_into().expect("an int's bytes")));
+        let fd_bearing = message.level == libc::SOL_SOCKET
+            && (message.kind == libc::SCM_RIGHTS || message.kind == SCM_PIDFD);
+        // How many bytes of the record go to the guest, of how many.
+        let (kept, length) =
+            if message.level == libc::SOL_SOCKET && message.kind == libc::SCM_RIGHTS {
+                let fitting = if room > header {
+                    ((room - header) / int).min(data.len() / int)
+                } else {
+                    0
+                };
+                truncated |= fitting < data.len() / int;
+                for fd in descriptors.skip(fitting).filter(|fd| *fd >= 0) {
+                    // SAFETY: the host installed each received descriptor once.
+                    dropped.push(unsafe { std::fs::File::from_raw_fd(fd) });
+                }
+                if fitting == 0 {
+                    continue;
+                }
+                (header + fitting * int, header + fitting * int)
+            } else if fd_bearing {
+                if room < header + data.len() {
+                    truncated = true;
+                    for fd in descriptors.filter(|fd| *fd >= 0) {
+                        // SAFETY: the host installed each received descriptor once.
+                        dropped.push(unsafe { std::fs::File::from_raw_fd(fd) });
+                    }
+                    continue;
+                }
+                (header + data.len(), header + data.len())
+            } else {
+                if room < header {
+                    truncated = true;
+                    continue;
+                }
+                let length = header + data.len();
+                truncated |= room < length;
+                (length.min(room), length)
+            };
+        let start = bytes.len();
+        bytes.extend_from_slice(&control[message.offset..message.offset + header]);
+        // `cmsg_len`, the header's first field, is what the guest got.
+        bytes[start..start + std::mem::size_of::<usize>()].copy_from_slice(&kept.to_ne_bytes());
+        bytes.extend_from_slice(&data[..kept - header]);
+        // The record takes its whole space, as far as the room goes.
+        let advance = cmsg_align(length).unwrap_or(length).min(room);
+        bytes.resize(start + advance, 0);
+        room -= advance;
+    }
+    Ok((bytes, dropped, truncated))
+}
+
+/// The host descriptors that `control`, the control data of a receive, gave
+/// this process.
+fn received_descriptors(control: &[u8]) -> Vec<std::fs::File> {
+    let int = std::mem::size_of::<libc::c_int>();
+    control_messages(control)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|message| {
+            message.level == libc::SOL_SOCKET
+                && (message.kind == libc::SCM_RIGHTS || message.kind == SCM_PIDFD)
+        })
+        .flat_map(|message| {
+            control[message.data_offset..message.end]
+                .chunks_exact(int)
+                .map(|chunk| libc::c_int::from_ne_bytes(chunk.try_into().expect("an int's bytes")))
+                .collect::<Vec<_>>()
+        })
+        .filter(|fd| *fd >= 0)
+        // SAFETY: the host installed each received descriptor once.
+        .map(|fd| unsafe { std::fs::File::from_raw_fd(fd) })
+        .collect()
+}
+
+/// Whether host descriptor `fd` is a Unix socket, whose messages can carry
+/// rights (`SCM_RIGHTS`). Every receive from one asks the host for room for
+/// every right, whatever is in flight when it starts: another process can
+/// send a right this backend tracks before the host receive ends, and a
+/// receive with only the guest's room would let the host discard it unseen.
+pub(super) fn is_unix_socket(fd: RawFd) -> bool {
+    let mut domain: libc::c_int = 0;
+    let mut length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: domain and length are writable and describe each other.
+    let result = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_DOMAIN,
+            std::ptr::from_mut(&mut domain).cast(),
+            &mut length,
+        )
+    };
+    result == 0 && domain == libc::AF_UNIX
+}
+
+/// Whether host socket `fd` is a Unix datagram or seqpacket socket, whose
+/// receive takes a record, and its rights, off the queue before the copy
+/// that can fault, and frees them if it does (`__unix_dgram_recvmsg`): the
+/// host's receive into staging that faults where the guest's buffer does
+/// (`StagedIoVector::new`) frees them unseen (`refuse_unwritable_record_buffer`).
+/// A stream's receive leaves a message whose copy faults queued, with its
+/// rights (`unix_stream_read_generic`), as does a peek.
+pub(super) fn receives_records(fd: RawFd) -> bool {
+    is_unix_socket(fd) && !is_stream_socket(fd)
+}
+
+/// The most rights one message carries (`SCM_MAX_FD`).
+const SCM_MAX_FD: libc::rlim_t = 253;
+
+/// Where this process has a descriptor free for every right one message can
+/// carry, for a receive from a Unix socket: the host installs each right it
+/// gets as a descriptor of this process, and drops, unseen, those it cannot
+/// (`scm_detach_fds`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReceiveRoom {
+    /// Under the soft `RLIMIT_NOFILE`: the receive runs as it is.
+    Soft,
+    /// Only under the hard limit: the receive, which cannot wait, runs with
+    /// the soft limit raised to it (`with_hard_nofile_limit`).
+    Hard,
+    /// Under neither, or a count that cannot be made: the receive is refused
+    /// (`refuse_receive_for_descriptors`).
+    Short,
+}
+
+/// The descriptors this process has open, counted from `/proc/self/fd`,
+/// whose listing takes a descriptor of its own, if one is free.
+fn open_descriptors() -> Option<libc::rlim_t> {
+    let entries = std::fs::read_dir("/proc/self/fd").ok()?;
+    // The listing's own descriptor is among the entries.
+    Some(entries.count().saturating_sub(1) as libc::rlim_t)
+}
+
+/// The room a receive from a Unix socket has for one message's rights
+/// (`ReceiveRoom`): under the soft limit, or, for a receive that cannot wait
+/// (`raisable`), under the hard one. The soft limit is raised only when it
+/// leaves too little, to count and then to receive, so that the limit that
+/// every process this one creates meanwhile inherits stays the guest's.
+fn host_receive_room(raisable: bool) -> ReceiveRoom {
+    let fits = |limit: libc::rlim_t| {
+        open_descriptors().is_some_and(|open| open.saturating_add(SCM_MAX_FD) <= limit)
+    };
+    let Some(limit) = nofile_limit() else {
+        return ReceiveRoom::Soft;
+    };
+    if fits(limit.rlim_cur) {
+        ReceiveRoom::Soft
+    } else if raisable
+        && limit.rlim_cur < limit.rlim_max
+        && with_hard_nofile_limit(|| nofile_limit().is_some_and(|limit| fits(limit.rlim_max)))
+    {
+        ReceiveRoom::Hard
+    } else {
+        ReceiveRoom::Short
+    }
+}
+
+std::thread_local! {
+    /// Whether this thread's receive refused for want of host descriptors
+    /// (`refuse_receive_for_descriptors`), for the call's end to report.
+    static RECEIVE_REFUSED_FOR_DESCRIPTORS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Refuses a receive from a Unix socket for want of host descriptors
+/// (`host_receive_room`), before the host sees it: ENOMEM, which Linux's
+/// recvmsg answers when it cannot allocate, and which the call's end reports
+/// as the typed refusal (`receive_descriptors_refusal`).
+fn refuse_receive_for_descriptors() -> i64 {
+    RECEIVE_REFUSED_FOR_DESCRIPTORS.with(|refused| refused.set(true));
+    negative_errno(libc::ENOMEM)
+}
+
+/// Whether this thread's receive refused for want of host descriptors since
+/// the last call, which forgets it.
+pub(super) fn take_receive_refused_for_descriptors() -> bool {
+    RECEIVE_REFUSED_FOR_DESCRIPTORS.with(|refused| refused.replace(false))
+}
+
+std::thread_local! {
+    /// The failure that ends the run, which this thread's call recorded
+    /// (`end_run`), for the call's end to return in place of the call's
+    /// result (`take_run_failure`).
+    static RUN_FAILURE: std::cell::RefCell<Option<crate::Error>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Ends the run with `failure`, for a call where no guest result can stand
+/// for what it did. The call returns the failure in place of its result,
+/// which the guest never sees (`take_run_failure`). The first failure of a
+/// call stands.
+fn end_run(failure: crate::Error) {
+    RUN_FAILURE.with(|recorded| {
+        recorded.borrow_mut().get_or_insert(failure);
+    });
+}
+
+/// Ends the run, for a call that ran out of host descriptors where no guest
+/// result can stand for what it did: `diagnostic` says what
+/// (`crate::Error::HostResources`, `end_run`). The result returned here is
+/// for the caller to return meanwhile.
+pub(super) fn end_run_for_descriptors(diagnostic: String) -> i64 {
+    end_run(crate::Error::HostResources {
+        resource: reverie_kvm_core::host_limits::HostResource::Descriptors,
+        diagnostic,
+    });
+    negative_errno(libc::ENOMEM)
+}
+
+/// Ends the run for a receive from a Unix socket, made by `operation`, whose
+/// copy of the data it received into the guest's buffer, at `address`,
+/// faulted after the host's receive had taken effect: it took the data, and
+/// any rights, off the queue, or moved the socket's peek offset
+/// (`SO_PEEK_OFF`). The copy reaches only the part of the buffer that was
+/// accessible when the receive began, where the host's receive stops
+/// (`StagedIoVector`, `prepare_host_read`), so another thread sharing the
+/// guest's memory changed its mapping meanwhile. Linux faults inside its own
+/// copy, before those
+/// effects, and they cannot be undone here, so not even EFAULT stands for
+/// what the receive did (`crate::Error::LateReceiveFault`, `end_run`). The
+/// result returned here is for the caller to return meanwhile.
+///
+/// Holding the guest's mapping still through the copy instead would hold the
+/// lock of every change to its layout across a host receive that can wait
+/// for a message, which a thread that maps memory before it sends would then
+/// wait for in turn. Such a lease would need a regression on real threads
+/// for the order it allows, not one that makes the thread changing the
+/// mapping finish while the lease is held.
+pub(super) fn end_run_for_late_receive_fault(operation: &'static str, address: u64) -> i64 {
+    end_run(crate::Error::LateReceiveFault { operation, address });
+    negative_errno(libc::EFAULT)
+}
+
+/// The failure that ends the run, if this thread's call since the last one
+/// recorded one (`end_run`), which this forgets.
+pub(super) fn take_run_failure() -> Option<crate::Error> {
+    RUN_FAILURE.with(|failure| failure.borrow_mut().take())
+}
+
+/// Ends the run for a host receive from Unix socket `fd` that returned
+/// MSG_CTRUNC though it had room for every record: it could not install
+/// every right as a descriptor of this process (`scm_detach_fds`). A receive
+/// that consumed the message lost those rights, and which ones is unknown, so
+/// their records cannot be released; a peek's guest would get fewer rights
+/// than Linux gives it. The rights the receive did get, in `control`, are
+/// released and closed (`release_dropped_rights`). Returns what
+/// `end_run_for_descriptors` returns.
+fn end_run_for_lost_rights(state: &LoadedStaticElf, fd: RawFd, control: &[u8], peek: bool) -> i64 {
+    let rights = received_descriptors(control);
+    release_dropped_rights(state, &rights, peek);
+    drop(rights);
+    end_run_for_descriptors(format!(
+        "KVM receive: a host receive from a Unix socket (host descriptor {fd}) could not \
+         install every right its message carries as a descriptor of this process, with room \
+         for every record, under {}; the rights it lost are unknown, so the run ends here",
+        reverie_kvm_core::host_limits::descriptor_limit_text(),
+    ))
+}
+
+std::thread_local! {
+    /// Whether this thread's last receive was refused for a buffer that is
+    /// not all writable (`refuse_unwritable_record_buffer`), for the call's
+    /// typed refusal (`unwritable_record_buffer_refusal`).
+    static RECEIVE_REFUSED_FOR_UNWRITABLE_BUFFER: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Whether a right this backend tracks is in flight across the namespace: an
+/// epoll set (`epoll_rights_in_flight_in`) or a process proc description
+/// (`proc_rights_in_flight_in`) sent in the run, whose record only a receive
+/// that sees the right can release.
+fn tracked_rights_in_flight(state: &LoadedStaticElf) -> bool {
+    let table = state
+        .file_identity_table
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    epoll_rights_in_flight_in(&table) != 0 || proc_rights_in_flight_in(&table) != 0
+}
+
+/// Refuses, before it asks the host, a consuming receive from a Unix datagram
+/// or seqpacket socket into a buffer that is not all writable (`at_risk`)
+/// while a right this backend tracks is in flight
+/// (`tracked_rights_in_flight`). The host's receive into staging that faults
+/// where the guest's buffer does makes Linux's decisions: a copy that faults
+/// takes and frees the record, but moves no peek offset (`SO_PEEK_OFF`,
+/// `__unix_dgram_recvmsg`). It frees the record's rights unseen, though, and
+/// the record of a tracked right it freed would stay in flight for the rest
+/// of the run. So while one is in flight the receive answers ENOSYS
+/// (`UNWRITABLE_RECORD_BUFFER_REFUSAL`), and the host receives nothing: a
+/// conservative restriction, which also refuses receives that Linux
+/// completes, of a record that fits the writable part, of an empty record,
+/// or from an empty queue. A right sent after this check, which the host's
+/// receive frees unseen, ends the run instead
+/// (`end_run_for_unseen_right_discard`). A peek takes nothing, a buffer that
+/// is all writable or empty faults nothing, and with no tracked right in
+/// flight, the receive runs as Linux's does.
+pub(super) fn refuse_unwritable_record_buffer(
+    state: &LoadedStaticElf,
+    at_risk: bool,
+) -> Option<i64> {
+    (at_risk && tracked_rights_in_flight(state)).then(|| {
+        RECEIVE_REFUSED_FOR_UNWRITABLE_BUFFER.with(|refused| refused.set(true));
+        negative_errno(libc::ENOSYS)
+    })
+}
+
+/// Ends the run for a consuming receive from a Unix datagram or seqpacket
+/// socket into a buffer that is not all writable, whose host receive faulted
+/// (`at_risk`, EFAULT), freeing the record it took with its rights unseen,
+/// while a right this backend tracks is in flight: one sent after the check
+/// that found none (`refuse_unwritable_record_buffer`). The record may have
+/// carried it, and so no guest result stands for the receive
+/// (`crate::Error::UnseenRightDiscard`, `end_run`). Returns `error` for the
+/// caller to return meanwhile, or nothing if no tracked right is in flight:
+/// the fault, the host kernel's, is then Linux's.
+fn end_run_for_unseen_right_discard(
+    state: &LoadedStaticElf,
+    at_risk: bool,
+    error: &std::io::Error,
+) -> Option<std::io::Error> {
+    (at_risk && error.raw_os_error() == Some(libc::EFAULT) && tracked_rights_in_flight(state)).then(
+        || {
+            end_run(crate::Error::UnseenRightDiscard);
+            std::io::Error::from_raw_os_error(libc::EFAULT)
+        },
+    )
+}
+
+/// Whether this thread's last receive was refused for a buffer that is not
+/// all writable (`refuse_unwritable_record_buffer`), which this clears.
+pub(super) fn take_receive_refused_for_unwritable_buffer() -> bool {
+    RECEIVE_REFUSED_FOR_UNWRITABLE_BUFFER.with(|refused| refused.replace(false))
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// Runs once on the calling thread when a send has admitted the rights
+    /// it carries, relying on its socket pair's route (`RouteReliance`), and
+    /// has yet to ask the host: where another process can connect the socket
+    /// meanwhile.
+    pub(crate) static SEND_BEGUN_TEST_HOOK: OneShotTestHook =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// Runs once on the calling thread when a receive from a socket has
+    /// decided how much control room to ask for and has yet to ask the host:
+    /// where another process can send meanwhile.
+    pub(crate) static RECEIVE_BEGUN_TEST_HOOK: OneShotTestHook =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A receive on host socket `fd` into `iovecs`, with `flags` and room for the
+/// sender's address in `name`, as a read, readv, preadv2 or recvfrom makes
+/// it, which asks for no control data, but with room for every right the
+/// message carries: Linux discards them, and this backend releases those it
+/// tracks ([`release_dropped_rights`]) and closes them all. A peek's rights
+/// stay in flight. Returns the host's count, or its error. A receive that
+/// consumed the message and lost rights it could not install ends the run
+/// (`end_run_for_lost_rights`); a peek lost none, and its guest gets none. A
+/// consuming receive of a record (`receives_records`) into a buffer that is
+/// not all writable (`unwritable`) may be refused, or end the run
+/// (`refuse_unwritable_record_buffer`).
+pub(super) fn receive_discarding_rights(
+    state: &LoadedStaticElf,
+    fd: RawFd,
+    iovecs: &mut [libc::iovec],
+    flags: libc::c_int,
+    name: Option<(*mut libc::sockaddr, *mut libc::socklen_t)>,
+    unwritable: bool,
+) -> std::io::Result<usize> {
+    let peek = flags & libc::MSG_PEEK != 0;
+    let at_risk = unwritable && !peek;
+    if host_receive_room(false) == ReceiveRoom::Short {
+        return Err(std::io::Error::from_raw_os_error(
+            -refuse_receive_for_descriptors() as i32,
+        ));
+    }
+    let mut control = vec![0_u8; RECEIVE_CONTROL_ROOM];
+    let mut header = libc::msghdr {
+        msg_name: name.map_or(std::ptr::null_mut(), |(address, _)| address.cast()),
+        // SAFETY: a name's length pointer is the caller's live length.
+        msg_namelen: name.map_or(0, |(_, length)| unsafe { *length }),
+        msg_iov: iovecs.as_mut_ptr(),
+        msg_iovlen: iovecs.len(),
+        msg_control: control.as_mut_ptr().cast(),
+        msg_controllen: control.len(),
+        msg_flags: 0,
+    };
+    if let Some(refused) = refuse_unwritable_record_buffer(state, at_risk) {
+        return Err(std::io::Error::from_raw_os_error(-refused as i32));
+    }
+    #[cfg(test)]
+    run_one_shot_test_hook(&RECEIVE_BEGUN_TEST_HOOK);
+    // SAFETY: the header names the caller's live buffers, and the control
+    // buffer of its length; fd is a live socket.
+    let result = unsafe { libc::recvmsg(fd, &mut header, flags | libc::MSG_CMSG_CLOEXEC) };
+    if result < 0 {
+        let error = std::io::Error::last_os_error();
+        return Err(end_run_for_unseen_right_discard(state, at_risk, &error).unwrap_or(error));
+    }
+    if let Some((_, length)) = name {
+        // SAFETY: as above.
+        unsafe { *length = header.msg_namelen };
+    }
+    let used = header.msg_controllen.min(control.len());
+    if header.msg_flags & libc::MSG_CTRUNC != 0 && !peek {
+        let ended = end_run_for_lost_rights(state, fd, &control[..used], peek);
+        return Err(std::io::Error::from_raw_os_error(-ended as i32));
+    }
+    let rights = received_descriptors(&control[..used]);
+    release_dropped_rights(state, &rights, peek);
+    Ok(result as usize)
+}
+
+/// Takes back the rights in flight among `files`, which a receive got from
+/// the host and drops: procfs descriptions and epolls. A peek leaves them
+/// queued, so in flight.
+pub(super) fn release_dropped_rights<'a>(
+    state: &LoadedStaticElf,
+    files: impl IntoIterator<Item = &'a std::fs::File>,
+    peek: bool,
+) {
+    let files: Vec<_> = files.into_iter().collect();
+    release_dropped_proc_transfers(state, files.iter().copied(), peek);
+    release_dropped_epoll_transfers(state, files, peek);
 }
 
 fn rollback_received_rights(state: &mut LoadedStaticElf, guest_fds: &[libc::c_int]) {
@@ -1162,6 +2009,28 @@ fn rollback_received_rights(state: &mut LoadedStaticElf, guest_fds: &[libc::c_in
     }
 }
 
+/// Cuts the `SCM_RIGHTS` record of a receive's control data `control`, the
+/// last record, whose first descriptor is at byte `first`, to its first
+/// `kept` descriptors: Linux writes only the descriptors it installed, and
+/// no record for none (`scm_detach_fds`).
+fn shorten_rights_record(control: &mut Vec<u8>, first: usize, kept: usize) {
+    let header = cmsg_align(std::mem::size_of::<libc::cmsghdr>()).expect("a header's space");
+    let record = first - header;
+    if kept == 0 {
+        control.truncate(record);
+        return;
+    }
+    let length = header + kept * std::mem::size_of::<libc::c_int>();
+    control[record..record + std::mem::size_of::<usize>()].copy_from_slice(&length.to_ne_bytes());
+    control.truncate(record + cmsg_align(length).expect("a record's space"));
+}
+
+/// Installs the rights a receive got, as guest descriptors, and writes their
+/// numbers into `control`. The guest gets as many as its descriptor limit
+/// leaves room for (`guest_nofile_limit`), as Linux's receive stops at the
+/// first descriptor it cannot install; the rest are released and closed.
+/// Fewer installed than given means MSG_CTRUNC, and a record the caller cuts
+/// to the installed ones (`shorten_rights_record`).
 pub(super) fn install_received_rights(
     state: &mut LoadedStaticElf,
     control: &mut [u8],
@@ -1169,7 +2038,7 @@ pub(super) fn install_received_rights(
     close_on_exec: bool,
     peek: bool,
 ) -> Result<Vec<libc::c_int>, i64> {
-    let rights: Vec<_> = rights
+    let mut rights: Vec<_> = rights
         .into_iter()
         .map(|right| {
             (
@@ -1178,18 +2047,9 @@ pub(super) fn install_received_rights(
             )
         })
         .collect();
-    let guest_fds = match available_guest_fds_with_limit(state, rights.len(), guest_nofile_limit())
-    {
-        Ok(guest_fds) => guest_fds,
-        Err(error) => {
-            release_dropped_proc_transfers(
-                state,
-                rights.iter().map(|(_, file)| file.as_file()),
-                peek,
-            );
-            return Err(error);
-        }
-    };
+    let guest_fds = available_guest_fds_up_to(state, rights.len(), guest_nofile_limit());
+    let excess = rights.split_off(guest_fds.len().min(rights.len()));
+    release_dropped_rights(state, excess.iter().map(|(_, file)| file.as_file()), peek);
     let mut installed = Vec::with_capacity(rights.len());
     let mut pending = rights.into_iter().zip(guest_fds);
 
@@ -1207,7 +2067,26 @@ pub(super) fn install_received_rights(
             Err(error) => {
                 rollback_received_rights(state, &installed);
                 let rest: Vec<_> = pending.map(|((_, file), _)| file).collect();
-                release_dropped_proc_transfers(
+                release_dropped_rights(
+                    state,
+                    std::iter::once(&file)
+                        .chain(&rest)
+                        .map(|file| file.as_file()),
+                    peek,
+                );
+                return Err(error);
+            }
+        };
+        // An epoll joins its sender's identity, taking one of its rights in
+        // flight, whose record goes only once the new descriptor owns the
+        // epoll (`received_epoll`). One whose identity cannot be kept has
+        // ended the run, and the receive installs nothing.
+        let epoll = match received_epoll(state, file.as_file(), peek) {
+            Ok(epoll) => epoll,
+            Err(error) => {
+                rollback_received_rights(state, &installed);
+                let rest: Vec<_> = pending.map(|((_, file), _)| file).collect();
+                release_dropped_rights(
                     state,
                     std::iter::once(&file)
                         .chain(&rest)
@@ -1219,6 +2098,13 @@ pub(super) fn install_received_rights(
         };
         let retired = state.insert_file(guest_fd, file.into_file());
         state.file_retirement.retire(retired);
+        if let Some((identity, _taken)) = epoll {
+            install_native_poll_description(
+                state,
+                guest_fd,
+                NativePollDescription::Epoll(identity),
+            );
+        }
         state.fd_object_inodes.insert(guest_fd, object_inode);
         state.synthetic_proc_nofollow_fds.remove(&guest_fd);
         if let Some((description, inode, nofollow)) = transfer {
@@ -1242,7 +2128,7 @@ pub(super) fn install_received_rights(
             installed.push(guest_fd);
             rollback_received_rights(state, &installed);
             let rest: Vec<_> = pending.map(|((_, file), _)| file).collect();
-            release_dropped_proc_transfers(state, rest.iter().map(|file| file.as_file()), peek);
+            release_dropped_rights(state, rest.iter().map(|file| file.as_file()), peek);
             return Err(error);
         }
         installed.push(guest_fd);
@@ -1260,7 +2146,7 @@ pub(super) fn install_received_rights(
 // this executor arm only has to translate the guest `msghdr` — gathering the
 // iovec payload and name and mapping SCM_RIGHTS descriptors — before forwarding
 // it to the host socket.
-pub(super) fn sendmsg(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
+pub(super) fn sendmsg(memory: &GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
     let Some(host_fd) = host_fd(state, args[0] as libc::c_int) else {
         return negative_errno(libc::EBADF);
     };
@@ -1341,7 +2227,16 @@ pub(super) fn sendmsg(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64
     {
         return negative_errno(libc::EFAULT);
     }
-    let transfers = match translate_outgoing_control(&mut control, state) {
+    // A datagram socket sends a message that names a destination there, not
+    // to its peer (`unix_dgram_sendmsg`), so the socket's pair says nothing
+    // about where it goes. A seqpacket send ignores the name
+    // (`unix_seqpacket_sendmsg`), and a stream send with one fails.
+    let route = if !name.is_empty() && is_datagram_socket(host_fd) {
+        -1
+    } else {
+        host_fd
+    };
+    let transfers = match translate_outgoing_control(&mut control, state, route) {
         Ok(transfers) => transfers,
         Err(error) => return error,
     };
@@ -1368,6 +2263,8 @@ pub(super) fn sendmsg(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64
         msg_flags: 0,
     };
     let flags = args[2] as libc::c_int;
+    #[cfg(test)]
+    run_one_shot_test_hook(&SEND_BEGUN_TEST_HOOK);
     // SAFETY: payload/name/control are readable host buffers matching the
     // header's declared lengths, and host_fd belongs to the guest descriptor
     // table. The supervisor cannot safely accept a guest SIGPIPE, so KVM's
@@ -1384,11 +2281,50 @@ pub(super) fn sendmsg(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64
     if result < 0 {
         let error = std::io::Error::last_os_error();
         // A failed sendmsg queues no rights.
-        release_proc_transfers(state, &transfers);
+        transfers.release(state);
         io_error(error)
     } else {
+        // A stream socket queues the rights with the first byte it sends, so
+        // a send of no byte queues none (`unix_stream_sendmsg`).
+        if result == 0 && !transfers.is_empty() && is_stream_socket(host_fd) {
+            transfers.release(state);
+        }
         result as i64
     }
+}
+
+/// Whether host descriptor `fd` is a datagram socket.
+fn is_datagram_socket(fd: RawFd) -> bool {
+    let mut kind: libc::c_int = 0;
+    let mut length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: kind and length are writable and describe each other.
+    let result = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            std::ptr::from_mut(&mut kind).cast(),
+            &mut length,
+        )
+    };
+    result == 0 && kind == libc::SOCK_DGRAM
+}
+
+/// Whether host descriptor `fd` is a stream socket.
+fn is_stream_socket(fd: RawFd) -> bool {
+    let mut kind: libc::c_int = 0;
+    let mut length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: kind and length are writable and describe each other.
+    let result = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            std::ptr::from_mut(&mut kind).cast(),
+            &mut length,
+        )
+    };
+    result == 0 && kind == libc::SOCK_STREAM
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1473,7 +2409,20 @@ pub(super) fn recvmsg(
         return negative_errno(libc::EFAULT);
     }
     let mut name = vec![0u8; name_capacity];
-    let mut control = vec![0u8; control_capacity];
+    // A Unix socket's receive asks the host for room for every record, so
+    // that this backend sees, and releases, the rights that the guest's room
+    // drops (`truncate_received_control`), whatever is in flight now
+    // (`is_unix_socket`).
+    let full_control = is_unix_socket(host_fd);
+    let mut control = vec![
+        0u8;
+        control_capacity
+            + if full_control {
+                RECEIVE_CONTROL_ROOM
+            } else {
+                0
+            }
+    ];
     for (address, length) in [
         (message.msg_name as usize as u64, name_capacity),
         (message.msg_control as usize as u64, control_capacity),
@@ -1488,7 +2437,9 @@ pub(super) fn recvmsg(
 
     // Each segment is received into staging whose inaccessible part is
     // PROT_NONE where the guest's is, as `recvfrom` receives, so the host
-    // kernel takes and frees a record whose copy faults, as Linux does.
+    // kernel takes and frees a record whose copy faults, as Linux does. One
+    // that would free a right this backend tracks unseen is refused first
+    // (`refuse_unwritable_record_buffer`).
     let mut staged_vectors = Vec::with_capacity(guest_iovecs.len());
     for iov in &guest_iovecs {
         let guest = GuestIoVec {
@@ -1530,19 +2481,52 @@ pub(super) fn recvmsg(
         msg_flags: 0,
     };
     let flags = args[2] as libc::c_int;
+    let peek = flags & libc::MSG_PEEK != 0;
+    let room = if full_control {
+        host_receive_room(true)
+    } else {
+        ReceiveRoom::Soft
+    };
+    if room == ReceiveRoom::Short {
+        return refuse_receive_for_descriptors();
+    }
+    let at_risk = receives_records(host_fd)
+        && !peek
+        && staged_vectors
+            .iter()
+            .any(|vector| vector.accessible_length < vector.guest.length);
+    if let Some(refused) = refuse_unwritable_record_buffer(state, at_risk) {
+        return refused;
+    }
+    // A peek keeps the epolls whose last right a consuming receive takes
+    // meanwhile until it has looked up what it got (`PeekWindow`).
+    let _peek_window = (full_control && peek).then(|| PeekWindow::open(state));
+    #[cfg(test)]
+    run_one_shot_test_hook(&RECEIVE_BEGUN_TEST_HOOK);
     // Keep the VM executor cooperative: Detcore's scheduler owns blocking and
     // retries EAGAIN, while already-queued datagrams are returned immediately.
     // Always ask the host for CLOEXEC descriptors so a supervisor exec cannot
     // leak them; guest CLOEXEC state is modeled from the caller's original flag.
-    let received = unsafe {
+    // A Unix socket's receive, which cannot wait, runs under the hard
+    // descriptor limit where the soft one leaves too little room, so that it
+    // gets every right the message carries (`host_receive_room`).
+    let mut receive = || unsafe {
         libc::recvmsg(
             host_fd,
             std::ptr::from_mut(&mut host_header),
             flags | libc::MSG_DONTWAIT | libc::MSG_CMSG_CLOEXEC,
         )
     };
+    let received = if room == ReceiveRoom::Hard {
+        with_hard_nofile_limit(receive)
+    } else {
+        receive()
+    };
     if received < 0 {
         let error = std::io::Error::last_os_error();
+        if let Some(ended) = end_run_for_unseen_right_discard(state, at_risk, &error) {
+            return io_error(ended);
+        }
         // Linux may have copied into the segments' accessible prefixes, up to
         // the first fault, before reporting EFAULT; the staging was filled
         // from guest memory, so publishing those prefixes keeps both the
@@ -1569,11 +2553,25 @@ pub(super) fn recvmsg(
     }
 
     let used_control = host_header.msg_controllen.min(control.len());
+    if full_control && host_header.msg_flags & libc::MSG_CTRUNC != 0 {
+        return end_run_for_lost_rights(state, host_fd, &control[..used_control], peek);
+    }
+    let (received_control, truncated) = if full_control {
+        match truncate_received_control(&control[..used_control], control_capacity) {
+            Ok((bytes, dropped, truncated)) => {
+                release_dropped_rights(state, &dropped, flags & libc::MSG_PEEK != 0);
+                (std::borrow::Cow::Owned(bytes), truncated)
+            }
+            Err(error) => return error,
+        }
+    } else {
+        (std::borrow::Cow::Borrowed(&control[..used_control]), false)
+    };
     let SanitizedReceivedControl {
         bytes: mut control_bytes,
         rights,
         stripped_unsupported,
-    } = match sanitize_received_control(&control[..used_control]) {
+    } = match sanitize_received_control(&received_control) {
         Ok(control) => control,
         Err(error) => return error,
     };
@@ -1588,8 +2586,13 @@ pub(super) fn recvmsg(
                 .is_err()
         {
             let dropped = rights.iter().map(|right| &right.file);
-            release_dropped_proc_transfers(state, dropped, flags & libc::MSG_PEEK != 0);
-            return negative_errno(libc::EFAULT);
+            release_dropped_rights(state, dropped, flags & libc::MSG_PEEK != 0);
+            // The prefix was accessible when the receive began.
+            return if full_control {
+                end_run_for_late_receive_fault("recvmsg", vector.guest.base)
+            } else {
+                negative_errno(libc::EFAULT)
+            };
         }
         remaining -= transferred;
         if remaining == 0 {
@@ -1606,10 +2609,14 @@ pub(super) fn recvmsg(
             .is_err()
     {
         let dropped = rights.iter().map(|right| &right.file);
-        release_dropped_proc_transfers(state, dropped, flags & libc::MSG_PEEK != 0);
+        release_dropped_rights(state, dropped, flags & libc::MSG_PEEK != 0);
         return negative_errno(libc::EFAULT);
     }
 
+    let (offered, first) = (
+        rights.len(),
+        rights.first().map(|right| right.control_offset),
+    );
     let installed = match install_received_rights(
         state,
         &mut control_bytes,
@@ -1620,6 +2627,11 @@ pub(super) fn recvmsg(
         Ok(installed) => installed,
         Err(error) => return error,
     };
+    if let Some(first) = first
+        && installed.len() < offered
+    {
+        shorten_rights_record(&mut control_bytes, first, installed.len());
+    }
     if !publish_received_control(memory, message.msg_control as usize as u64, &control_bytes) {
         rollback_received_rights(state, &installed);
         return negative_errno(libc::EFAULT);
@@ -1628,7 +2640,7 @@ pub(super) fn recvmsg(
     if flags & libc::MSG_CMSG_CLOEXEC == 0 {
         message_flags &= !libc::MSG_CMSG_CLOEXEC;
     }
-    if stripped_unsupported {
+    if stripped_unsupported || truncated || installed.len() < offered {
         message_flags |= libc::MSG_CTRUNC;
     }
     if !write_back_received_header(
@@ -1819,7 +2831,18 @@ pub(super) fn recvmmsg(
         }
         let mut payload = vec![0u8; payload_length];
         let mut name = vec![0u8; name_capacity];
-        let mut control = vec![0u8; control_capacity];
+        // As for recvmsg: room for every record from a Unix socket
+        // (`truncate_received_control`).
+        let full_control = is_unix_socket(host_fd);
+        let mut control = vec![
+            0u8;
+            control_capacity
+                + if full_control {
+                    RECEIVE_CONTROL_ROOM
+                } else {
+                    0
+                }
+        ];
         if name_capacity != 0
             && memory
                 .user()
@@ -1835,7 +2858,10 @@ pub(super) fn recvmmsg(
         if control_capacity != 0
             && memory
                 .user()
-                .read(message.msg_hdr.msg_control as usize as u64, &mut control)
+                .read(
+                    message.msg_hdr.msg_control as usize as u64,
+                    &mut control[..control_capacity],
+                )
                 .is_err()
         {
             return if delivered == 0 {
@@ -1867,14 +2893,39 @@ pub(super) fn recvmmsg(
             msg_flags: 0,
         };
         let flags = args[3] as libc::c_int & !libc::MSG_WAITFORONE;
+        let room = if full_control {
+            host_receive_room(true)
+        } else {
+            ReceiveRoom::Soft
+        };
+        if room == ReceiveRoom::Short {
+            let error = refuse_receive_for_descriptors();
+            return if delivered == 0 {
+                error
+            } else {
+                take_receive_refused_for_descriptors();
+                delivered as i64
+            };
+        }
+        // As for recvmsg (`PeekWindow`).
+        let _peek_window =
+            (full_control && flags & libc::MSG_PEEK != 0).then(|| PeekWindow::open(state));
+        #[cfg(test)]
+        run_one_shot_test_hook(&RECEIVE_BEGUN_TEST_HOOK);
         // Keep the VM executor cooperative. Detcore retries EAGAIN through its
         // scheduler, while already queued datagrams are returned immediately.
-        let received = unsafe {
+        // As for recvmsg, under the hard descriptor limit where needed.
+        let mut receive = || unsafe {
             libc::recvmsg(
                 host_fd,
                 std::ptr::from_mut(&mut host_header),
                 flags | libc::MSG_DONTWAIT | libc::MSG_CMSG_CLOEXEC,
             )
+        };
+        let received = if room == ReceiveRoom::Hard {
+            with_hard_nofile_limit(receive)
+        } else {
+            receive()
         };
         if received < 0 {
             let error = io_error(std::io::Error::last_os_error());
@@ -1886,11 +2937,37 @@ pub(super) fn recvmmsg(
         }
 
         let used_control = host_header.msg_controllen.min(control.len());
+        // Whatever the messages before it delivered (`end_run_for_lost_rights`).
+        if full_control && host_header.msg_flags & libc::MSG_CTRUNC != 0 {
+            return end_run_for_lost_rights(
+                state,
+                host_fd,
+                &control[..used_control],
+                flags & libc::MSG_PEEK != 0,
+            );
+        }
+        let (received_control, truncated) = if full_control {
+            match truncate_received_control(&control[..used_control], control_capacity) {
+                Ok((bytes, dropped, truncated)) => {
+                    release_dropped_rights(state, &dropped, flags & libc::MSG_PEEK != 0);
+                    (std::borrow::Cow::Owned(bytes), truncated)
+                }
+                Err(error) => {
+                    return if delivered == 0 {
+                        error
+                    } else {
+                        delivered as i64
+                    };
+                }
+            }
+        } else {
+            (std::borrow::Cow::Borrowed(&control[..used_control]), false)
+        };
         let SanitizedReceivedControl {
             bytes: mut control_bytes,
             rights,
             stripped_unsupported,
-        } = match sanitize_received_control(&control[..used_control]) {
+        } = match sanitize_received_control(&received_control) {
             Ok(control) => control,
             Err(error) => {
                 return if delivered == 0 {
@@ -1915,7 +2992,14 @@ pub(super) fn recvmmsg(
                     .is_err()
             {
                 let dropped = rights.iter().map(|right| &right.file);
-                release_dropped_proc_transfers(state, dropped, flags & libc::MSG_PEEK != 0);
+                release_dropped_rights(state, dropped, flags & libc::MSG_PEEK != 0);
+                // The buffer was accessible when the receive began.
+                if full_control {
+                    return end_run_for_late_receive_fault(
+                        "recvmmsg",
+                        iov.iov_base as usize as u64,
+                    );
+                }
                 return if delivered == 0 {
                     negative_errno(libc::EFAULT)
                 } else {
@@ -1934,13 +3018,17 @@ pub(super) fn recvmmsg(
                 .is_err()
         {
             let dropped = rights.iter().map(|right| &right.file);
-            release_dropped_proc_transfers(state, dropped, flags & libc::MSG_PEEK != 0);
+            release_dropped_rights(state, dropped, flags & libc::MSG_PEEK != 0);
             return if delivered == 0 {
                 negative_errno(libc::EFAULT)
             } else {
                 delivered as i64
             };
         }
+        let (offered, first) = (
+            rights.len(),
+            rights.first().map(|right| right.control_offset),
+        );
         let installed = match install_received_rights(
             state,
             &mut control_bytes,
@@ -1957,6 +3045,11 @@ pub(super) fn recvmmsg(
                 };
             }
         };
+        if let Some(first) = first
+            && installed.len() < offered
+        {
+            shorten_rights_record(&mut control_bytes, first, installed.len());
+        }
         if !publish_received_control(
             memory,
             message.msg_hdr.msg_control as usize as u64,
@@ -1973,7 +3066,7 @@ pub(super) fn recvmmsg(
         if flags & libc::MSG_CMSG_CLOEXEC == 0 {
             message_flags &= !libc::MSG_CMSG_CLOEXEC;
         }
-        if stripped_unsupported {
+        if stripped_unsupported || truncated || installed.len() < offered {
             message_flags |= libc::MSG_CTRUNC;
         }
         // The entry's header fields as for recvmsg, then its msg_len, as

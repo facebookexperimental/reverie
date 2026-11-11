@@ -51,6 +51,84 @@ pub use native_leaves::NativeLeafInputs;
 pub use native_leaves::NativeLeafObservations;
 pub use native_leaves::native_leaf_implementation_sha256;
 
+// reverie-loader/src/handoff.rs at Reverie 71c29c66 (2026-11-08, "state the
+// successor table-3 route rule"). Its only change from the 85abd905 bootstrap
+// cohort is five doc comments: no item, impl order, signature or body moves,
+// so every symbol the four Bootstrap and two View consumers select is the one
+// they select for 85abd905. Each consumer accepts it exactly where it accepts
+// 85abd905, and every emitted-byte, relocation and alias check still runs.
+const HANDOFF_ROUTE_RULE_SOURCE_SHA: &str =
+    "e7c8f96840a3787ec4d05c70a14c3c7a6077feabc888ca9878064a9bd560eec4";
+// reverie-loader/src/handoff.rs after "loader: derive the handoff MAX_BYTES
+// bound from wire maxima" (dh-kn6yu). Outside `mod tests` its only change from
+// 71c29c66 is the MAX_BYTES initializer, now the sum of three new private
+// consts (MAX_TABLE_BYTES, MAX_STRING_BYTES, MAX_AUXV_PAYLOAD_BYTES) and their
+// doc comments. No impl block is added, so the Ms1_/Ms2_ impl disambiguators
+// stay; no item, impl order, signature or body of the six selected functions
+// moves, and only Bootstrap::project, View::parse and serialize read MAX_BYTES.
+// Every consumer therefore selects the symbol it selects for 71c29c66 and
+// accepts it exactly there; every emitted-byte, relocation and alias check
+// still runs.
+const HANDOFF_MAX_BYTES_SOURCE_SHA: &str =
+    "fa44be93468c2257d532fc8ad5631a541befb13af9f7e98f2771287350aaa76e";
+
+/// Test seam (see private_static::factory_source_self_check): the reviewed
+/// Reverie source identities the producer's providers enforce, each checked by
+/// its own consumer's predicate over the file that consumer reads under ROOT.
+/// view_site/caller.rs's installer identity is not covered (dh-rtkedo).
+pub(super) fn source_identity_self_check(root: &Path) -> Vec<(&'static str, Result<()>)> {
+    let observed = |relative: &str, accept: &dyn Fn(&str) -> Result<()>| {
+        let file = FileIdentity::read(&root.join(relative))?;
+        accept(&file.sha256).map_err(|e| format!("{e}: {relative} sha256 {}", file.sha256))
+    };
+    let symbol = |relative: &str, select: fn(&str) -> Result<&'static str>| {
+        observed(relative, &|digest| select(digest).map(drop))
+    };
+    vec![
+        (
+            "ordinary_gate trap.rs gate shape",
+            ordinary_gate::source_self_check(root, false),
+        ),
+        (
+            "ordinary_gate fixed_gates.rs",
+            ordinary_gate::source_self_check(root, true),
+        ),
+        (
+            "terminal_observation exec_private.rs",
+            observed(terminal_observation::PRIVATE_SOURCE_PATH, &|digest| {
+                require(
+                    terminal_observation::accepted_private_source(digest),
+                    "terminal actual source differs",
+                )
+            }),
+        ),
+        (
+            "bootstrap_descriptor handoff.rs",
+            symbol(view_table::SOURCE, bootstrap_descriptor::source_symbol),
+        ),
+        (
+            "bootstrap_env_aux handoff.rs",
+            symbol(view_table::SOURCE, bootstrap_env_aux::source_symbol),
+        ),
+        (
+            "bootstrap_role handoff.rs",
+            symbol(view_table::SOURCE, bootstrap_role::source_symbol),
+        ),
+        (
+            "bootstrap_site handoff.rs",
+            symbol(view_site::SOURCE, bootstrap_site::source_symbol),
+        ),
+        (
+            "view_site handoff.rs",
+            symbol(view_site::SOURCE, view_site::source_symbol),
+        ),
+        (
+            "view_table handoff.rs",
+            symbol(view_table::SOURCE, view_table::source_symbol),
+        ),
+    ]
+}
+
 // Private target identities produced from actual selected archive sections and
 // final map placement, including COMMON allocations; not final-name lookup.
 #[derive(Clone, Debug)]
@@ -1796,6 +1874,7 @@ fn join_from_files(
     let bytes = fs::read(&artifact.path).map_err(|e| e.to_string())?;
     let elf = Elf::parse(&bytes).map_err(|e| e.to_string())?;
     static_image_metadata(&elf, &bytes)?;
+    super::tls_sources::require_per_thread_abi_absent(&elf)?;
     for object in &objects {
         checked_object_symbol_authority(&object.elf, object.bytes)?;
     }
@@ -2152,6 +2231,44 @@ impl VerifiedStaticSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn handoff_route_rule_source_selects_the_bootstrap_cohort_symbol_in_every_consumer() {
+        const BOOTSTRAP_COHORT: &str =
+            "85abd905256f3bc5b526840cf3cd5e090238e4aa770f03d320c2ae907ee7ae75";
+        type Select = fn(&str) -> Result<&'static str>;
+        let consumers: [(&str, Select); 6] = [
+            ("bootstrap_descriptor", bootstrap_descriptor::source_symbol),
+            ("bootstrap_env_aux", bootstrap_env_aux::source_symbol),
+            ("bootstrap_role", bootstrap_role::source_symbol),
+            ("bootstrap_site", bootstrap_site::source_symbol),
+            ("view_site", view_site::source_symbol),
+            ("view_table", view_table::source_symbol),
+        ];
+        for new in [HANDOFF_ROUTE_RULE_SOURCE_SHA, HANDOFF_MAX_BYTES_SOURCE_SHA] {
+            for (name, select) in consumers {
+                assert_eq!(select(new), select(BOOTSTRAP_COHORT), "{name}");
+                assert!(select(new).is_ok(), "{name}");
+                for refused in [
+                    "0".repeat(64),
+                    new[..63].to_owned(),
+                    format!("{new}0"),
+                    new.to_ascii_uppercase(),
+                    format!("sha256:{new}"),
+                ] {
+                    assert!(select(&refused).is_err(), "{name}: {refused}");
+                }
+                for index in 0..new.len() {
+                    let mut modified = new.as_bytes().to_vec();
+                    modified[index] = if modified[index] == b'0' { b'1' } else { b'0' };
+                    assert!(
+                        select(&String::from_utf8(modified).unwrap()).is_err(),
+                        "{name}"
+                    );
+                }
+            }
+        }
+    }
     // Tiny structural ET_REL fixtures exercise the production selector only;
     // they are not source-owned archives or selected-definition proof tokens.
     fn role_selection_image(name: &str) -> Vec<u8> {

@@ -930,6 +930,11 @@ thread_local! {
     static PTRACER_ATTACHMENT_STATUS_READS: Cell<usize> = const { Cell::new(0) };
     /// Calls of `retained_proc_status` on this thread.
     static RETAINED_STATUS_READS: Cell<usize> = const { Cell::new(0) };
+    /// `status` opens on this thread by `retained_proc_snapshot`,
+    /// `retained_proc_parent`, `worker_proc_snapshot` and
+    /// `AlignedProcfs::from_root`, which `RETAINED_STATUS_READS` does not
+    /// count.
+    static OTHER_STATUS_OPENS: Cell<usize> = const { Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -2041,11 +2046,14 @@ impl Event {
         // reap an instantaneous ECHILD. That gap is explicit state, not
         // timing inference: a generation-bound wait created while the
         // task was detached records itself in `detached_waits` until it
-        // drops or completes. While such a wait exists, the same live
-        // generation is not unowned merely for being untraced at this
-        // instant. A zombie is exempt: Linux refuses ptrace attach once
-        // exit_state is set, so no reattach can ever consume it, and
-        // retirement must not wait for an unrelated parent's reap.
+        // drops or completes. Only waits that carry an owner, or an
+        // explicit driver that can bind one, record themselves; an
+        // ownerless public wait could never protect the handoff. While
+        // such a wait exists, the same live generation is not unowned
+        // merely for being untraced at this instant. A zombie is exempt:
+        // Linux refuses ptrace attach once exit_state is set, so no
+        // reattach can ever consume it, and retirement must not wait for
+        // an unrelated parent's reap.
         if self.detach_handoff_pending()
             && identity.observed_process_generation() == Some(true)
             && !identity.task_is_zombie()
@@ -3494,6 +3502,8 @@ fn retained_proc_status(directory: RawFd) -> Result<RetainedProcStatus, Errno> {
 /// tries to bind an untraced task. Host selection for a later attachment and
 /// all generic/native identity reads keep their original contract.
 fn retained_proc_parent(directory: RawFd) -> Result<Pid, Errno> {
+    #[cfg(test)]
+    OTHER_STATUS_OPENS.with(|opens| opens.set(opens.get() + 1));
     let _open = launch_window::TransientOpen::begin();
     let raw = unsafe {
         libc::openat(
@@ -3919,6 +3929,31 @@ impl ThreadHandle {
         })
         .map(|_| ())
     }
+
+    /// Process-directed delivery for every descriptor form. A native
+    /// thread pidfd names its thread group explicitly with
+    /// `PIDFD_SIGNAL_THREAD_GROUP` (the kernel would otherwise deliver
+    /// thread-directed); ordinary leader pidfds and proc directories are
+    /// already process-directed and take no flag.
+    fn send_process_signal(&self, signal: i32) -> Result<(), Errno> {
+        const PIDFD_SIGNAL_THREAD_GROUP: libc::c_uint = 1 << 1;
+        let flags = match self {
+            Self::Pidfd(_) => PIDFD_SIGNAL_THREAD_GROUP,
+            Self::LegacyLeader { .. } | Self::Procfs { .. } => 0,
+        };
+        // SAFETY: pidfd_send_signal reads only its scalar arguments; the
+        // descriptor is owned by this handle and a null siginfo is allowed.
+        Errno::result(unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.as_raw_fd(),
+                signal,
+                std::ptr::null::<libc::siginfo_t>(),
+                flags,
+            )
+        })
+        .map(|_| ())
+    }
 }
 
 /// One bounded numeric WNOWAIT observation of `pid`, with no lifetime check.
@@ -4159,6 +4194,8 @@ impl AlignedProcfs {
             return Err(Errno::EXDEV);
         }
         let root = Self { root };
+        #[cfg(test)]
+        OTHER_STATUS_OPENS.with(|opens| opens.set(opens.get() + 1));
         let raw = unsafe {
             libc::openat(
                 root.root.as_raw_fd(),
@@ -5565,6 +5602,8 @@ fn retained_proc_snapshot(directory: RawFd) -> io::Result<WorkerProcSnapshot> {
         Ok(text)
     }
     let start_time = worker_stat_start_time(&read(directory, c"stat")?)?;
+    #[cfg(test)]
+    OTHER_STATUS_OPENS.with(|opens| opens.set(opens.get() + 1));
     let status = read(directory, c"status")?;
     let snapshot = WorkerProcSnapshot {
         tgid: worker_status_pid(&status, "Tgid:")?,
@@ -5604,6 +5643,8 @@ fn worker_status_pid(status: &str, name: &str) -> std::io::Result<Pid> {
 
 fn worker_proc_snapshot(pid: Pid) -> std::io::Result<WorkerProcSnapshot> {
     let start_time = worker_process_start_time(pid)?;
+    #[cfg(test)]
+    OTHER_STATUS_OPENS.with(|opens| opens.set(opens.get() + 1));
     let status = launch_window::read_to_string(format!("/proc/{pid}/status"))?;
     let snapshot = WorkerProcSnapshot {
         tgid: worker_status_pid(&status, "Tgid:")?,
@@ -7040,6 +7081,31 @@ impl TerminalCleanup {
         self.request_cancellation_signal(libc::SIGKILL)
     }
 
+    /// Requests a process-directed SIGKILL for the whole thread group of
+    /// this already-bound generation's task.
+    ///
+    /// [`Self::request_sigkill`] through a native thread pidfd is
+    /// thread-directed. If the bound thread is an exited group leader (a
+    /// zombie whose sibling threads still run), such a signal stays in that
+    /// zombie's private pending set and kills nothing. This request is
+    /// process-directed for every descriptor form, so a live sibling takes
+    /// the fatal signal and the whole group exits. Like `request_sigkill`, it
+    /// uses the retained descriptor, never a numeric PID, and neither success
+    /// nor ESRCH acknowledges an exit.
+    pub fn request_process_sigkill(&self) -> Result<(), Errno> {
+        if let Some(error) = self.registration_error() {
+            return Err(error);
+        }
+        let identity = self
+            .event
+            .identity()
+            .ok_or_else(|| self.registration_error().unwrap_or(Errno::ENODATA))?;
+        let sent = identity.pidfd.send_process_signal(libc::SIGKILL);
+        // SIGKILL ends every stop of the group without a ptrace request.
+        self.event.stop_may_have_ended();
+        sent
+    }
+
     /// Stops this already-bound generation for fatal tree cancellation.
     /// Like `request_sigkill`, delivery is not a stopped-state acknowledgment.
     /// The caller must consume an actual owned ptrace stop before discovery.
@@ -7645,6 +7711,10 @@ pub enum OwnedWaitError {
 /// arbitrary constructing thread. A wait created while attached, or
 /// whose task is already gone, records nothing: no handoff is pending
 /// for it to protect.
+///
+/// A call whose token has a captured identity reads that task's retained
+/// `status`. Callers whose record could never carry an owner skip the call
+/// instead (see [`OwnedWaitFuture::new`]).
 fn note_detached_wait_if_untraced(
     token: &TraceeToken,
     affinity_owner: Option<Arc<LegacyWaitOwner>>,
@@ -7686,11 +7756,37 @@ pub struct OwnedWaitFuture {
     observed_death: bool,
     managed_guard: Option<PtracerThreadGuard>,
     /// Detached-wait note taken at creation while untraced, ended on drop.
+    /// Never taken for an ownerless public wait; see [`Self::new`].
     detached_wait: Option<(Arc<Event>, u64)>,
 }
 impl OwnedWaitFuture {
+    /// The public wait. An ownerless token records nothing and reads no
+    /// status: this future never binds an owner later (only a
+    /// [`PtracerWaitDriver`] binds one, when built or polled), and
+    /// [`Event::detach_handoff_pending`] discards an ownerless record
+    /// without granting an exemption. An owner-bearing token keeps the
+    /// detached-wait note.
     pub(super) fn new(running: Running) -> Self {
-        let detached_wait = note_detached_wait_if_untraced(&running.1, None);
+        let detached_wait = if running.1.ptracer_owner.is_some() {
+            note_detached_wait_if_untraced(&running.1, None)
+        } else {
+            None
+        };
+        Self::with_detached_wait(running, detached_wait)
+    }
+
+    /// The core of an explicit [`PtracerWaitDriver`]. Its affinity can
+    /// capture an owner after creation, so it notes a detached wait
+    /// whether or not the token or `affinity_owner` carries one yet.
+    fn new_for_ptracer_driver(
+        running: Running,
+        affinity_owner: Option<Arc<LegacyWaitOwner>>,
+    ) -> Self {
+        let detached_wait = note_detached_wait_if_untraced(&running.1, affinity_owner);
+        Self::with_detached_wait(running, detached_wait)
+    }
+
+    fn with_detached_wait(running: Running, detached_wait: Option<(Arc<Event>, u64)>) -> Self {
         Self {
             inner: Some(WaitFuture::new(running)),
             observed_death: false,
@@ -8242,8 +8338,7 @@ impl PtracerWaitDriver {
             running.1.ptracer_owner.clone(),
             running.1.ptracer_wait_role,
         );
-        let mut inner = OwnedWaitFuture::new(running);
-        inner.bind_detached_wait_owner(affinity.owner.clone());
+        let inner = OwnedWaitFuture::new_for_ptracer_driver(running, affinity.owner.clone());
         Self {
             inner,
             affinity,

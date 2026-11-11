@@ -61,4 +61,5 @@ reverie_keyed_oracle_sigreturn:
     syscall
     ud2
 .size reverie_keyed_oracle_sigreturn, .-reverie_keyed_oracle_sigreturn
-.section .note.GNU-stack,"",@progbits
+.pushsection .note.GNU-stack,"",@progbits
+.popsection

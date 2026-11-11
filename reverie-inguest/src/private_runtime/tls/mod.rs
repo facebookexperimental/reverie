@@ -8,6 +8,10 @@ use core::ffi::c_char;
 
 pub(crate) use abi::Failure;
 pub use abi::IndexedAux;
+pub use abi::build_thread_tcb;
+pub use abi::first_thread_switch;
+pub use abi::note_thread_add_failed_locked;
+pub use abi::note_thread_added_locked;
 
 unsafe extern "C" {
     fn __init_libc(envp: *mut *mut c_char, program_name: *mut c_char);

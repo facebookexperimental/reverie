@@ -13,6 +13,7 @@
 //! trap and hook paths implements [`HostRuntime`] for the services the host
 //! calls back into.
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io;
 use std::sync::Arc;
@@ -96,6 +97,9 @@ mod native_entry_tests;
 #[cfg(feature = "exec-private-init")]
 #[path = "image_guest.rs"]
 mod image_guest;
+#[cfg(feature = "exec-private-init")]
+#[path = "mapped_successor_image_guest.rs"]
+mod mapped_successor_image_guest;
 #[cfg(all(test, feature = "exec-native-injection"))]
 #[path = "native_exec_tests.rs"]
 mod native_exec_tests;
@@ -139,6 +143,48 @@ pub trait HostRuntime: Send + Sync + 'static {
     /// The signals the runtime keeps for itself; stripped from any set the
     /// guest blocks.
     fn reserved_signal_mask(&self) -> u64;
+    /// Whether an external exec watcher is armed for this process: a
+    /// supervisor seized over the guest that catches the kernel exec
+    /// event and re-bootstraps the successor image before its first
+    /// instruction runs (the exec-stop supervisor's watched mode).
+    ///
+    /// When this returns `true`, `execve`/`execveat` are forwarded to
+    /// the kernel instead of refused — dynamic and static images
+    /// alike. The gate applies wherever it is queried, including in
+    /// plain-fork children (runtime state is inherited; each child
+    /// is its own thread-group leader under this runtime's
+    /// single-thread model, and thread creation stays refused, so a
+    /// non-leader exec cannot arise) — but a child's leader status
+    /// does not establish its ptracer: arming asserts watcher
+    /// coverage in every process where the gate can fire. The
+    /// in-tree supervisor watches a single leader and does not
+    /// follow forks yet, so until fork-following exists arming is
+    /// sound only when the embedder watches each child itself or
+    /// the guest cannot fork. A successful exec never returns here:
+    /// this runtime image is replaced, and successor
+    /// admission/reconnection is the coordinator's business. A
+    /// failed exec returns the genuine kernel errno, untagged.
+    ///
+    /// Arming the watch asserts the watcher will in fact catch the
+    /// exec and re-bootstrap the successor (or terminate it) before
+    /// resuming it: the inherited trap filter survives exec but its
+    /// handler does not, so a successor resumed without
+    /// re-bootstrap is not viable. The default is unarmed, which
+    /// keeps the historical fail-closed refusal.
+    fn exec_watch_armed(&self) -> bool {
+        false
+    }
+
+    /// Per-thread admission checklist step (W7): verify any backend
+    /// per-thread arming for a just-created guest thread — alternate
+    /// signal stack above all — before its first Tool callback runs.
+    /// Called on the new thread itself, after its state lease exists and
+    /// before `handle_thread_start`. An error is a host invariant break
+    /// (the thread physically exists), so failure is fatal, never a
+    /// guest errno. Default: nothing per-thread to arm.
+    fn verify_thread_admission(&self, _tid: Pid) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Decide a guest signal call through the runtime's virtual SIGALRM state;
@@ -263,19 +309,35 @@ fn perform_pkey_alloc(event: &mut SyscallEvent, number: i64, args: [u64; 6]) -> 
 
 const STACK_CAPACITY: usize = 4096;
 
+/// The type of [`COMMITTED_STACKS`]. It must not need dropping: see there.
+type CommittedStacks = core::mem::ManuallyDrop<core::cell::RefCell<Vec<Box<[u8]>>>>;
+
 thread_local! {
     /// Arenas committed by this thread's in-flight dispatch. Per-thread:
     /// a sibling dispatch's scope entry/exit must never free arenas this
     /// thread committed and may still reference through stack guards.
     ///
-    /// Only ever touch this with `try_with`: dispatch also runs for the
-    /// syscalls a thread makes after libc destroyed its TLS — the
-    /// `exit_group` that follows `exit()`'s `__cxa_thread_atexit`
-    /// destructors, and the thread-exit syscall after pthread teardown —
-    /// where `.with()` panics with `AccessError` inside the nounwind
-    /// trap handler and aborts the guest.
-    static COMMITTED_STACKS: core::cell::RefCell<Vec<Box<[u8]>>> =
-        const { core::cell::RefCell::new(Vec::new()) };
+    /// Destructor-free on purpose. A thread-local whose type needs
+    /// dropping makes std register a thread-exit destructor on first
+    /// access, through libc's `__cxa_thread_atexit_impl`, which allocates
+    /// its record from the C library heap. The first access is
+    /// [`ToolHost::from_parts`], which for an in-guest runtime runs while
+    /// the preload's constructor installs the Tool, before the guest's
+    /// `main`: the guest's heap then started with libc's per-thread cache
+    /// and that record in it. Every dispatch touches the slot as well. No
+    /// destructor is needed, because [`DispatchScratchScope`] empties the
+    /// vector and releases its buffer whenever a dispatch ends, so a
+    /// thread exits holding nothing; only a thread that exits inside a
+    /// dispatch leaks what that dispatch retained, the vector's buffer
+    /// included, which freeing could not have made sound anyway.
+    ///
+    /// Without a destructor the slot is never destroyed, so the syscalls a
+    /// thread makes after libc ran its TLS destructors (the `exit_group`
+    /// after `exit()`, the thread-exit syscall after pthread teardown)
+    /// still reach it. Access stays on `try_with` regardless: `.with()`
+    /// panicking inside the nounwind trap handler would abort the guest.
+    static COMMITTED_STACKS: CommittedStacks =
+        const { core::mem::ManuallyDrop::new(core::cell::RefCell::new(Vec::new())) };
 }
 
 fn retain_committed_stack(arena: Box<[u8]>) {
@@ -286,10 +348,9 @@ fn retain_committed_stack(arena: Box<[u8]>) {
             .push(arena.take().expect("arena retained once"));
     });
     if retained.is_err() {
-        // This thread's TLS is already destroyed (exit teardown): no
-        // later dispatch on it will clear the vector. Leaking the arena
-        // is the only sound answer — freeing it here could release
-        // memory a stack guard of this final dispatch still references.
+        // Unreachable while the slot has no destructor. Leaking is the
+        // only sound answer if it ever is: freeing here could release
+        // memory a stack guard of this dispatch still references.
         std::mem::forget(arena.take().expect("arena retained once"));
     }
 }
@@ -300,9 +361,6 @@ struct DispatchScratchScope {
 
 impl DispatchScratchScope {
     fn enter() -> Self {
-        // A destroyed thread-local means this dispatch is part of exit
-        // teardown; the vector was already dropped with the TLS, so
-        // there is nothing left to clear.
         let _ = COMMITTED_STACKS.try_with(|stacks| stacks.borrow_mut().clear());
         Self {
             _allocation_scope: super::alloc::enter_dispatch(),
@@ -312,10 +370,24 @@ impl DispatchScratchScope {
 
 impl Drop for DispatchScratchScope {
     fn drop(&mut self) {
-        // A forked child inherits this thread's vector; clearing it here
+        // A forked child inherits this thread's vector; releasing it here
         // only ever touches the calling thread's own committed arenas.
-        let _ = COMMITTED_STACKS.try_with(|stacks| stacks.borrow_mut().clear());
+        // Its buffer goes too, not only its arenas: the slot has no
+        // destructor, so nothing else would free it when the thread exits.
+        let _ = COMMITTED_STACKS.try_with(|stacks| {
+            let released = core::mem::take(&mut *stacks.borrow_mut());
+            drop(released);
+        });
     }
+}
+
+thread_local! {
+    /// This thread's own live `ActiveDispatch` guards. The fork-child
+    /// reinit resets the process-wide counter to exactly this: the
+    /// surviving thread's guards are the only ones that will drop in
+    /// the child, so the counter stays balanced across the fork.
+    /// Const no-drop TLS: readable even in exit teardown.
+    static LOCAL_DISPATCHES: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
 }
 
 /// One in-flight dispatch, counted so install/initial-image flows can
@@ -326,6 +398,7 @@ struct ActiveDispatch<'a, T: Tool, R: HostRuntime> {
 
 impl<T: Tool, R: HostRuntime> Drop for ActiveDispatch<'_, T, R> {
     fn drop(&mut self) {
+        LOCAL_DISPATCHES.set(LOCAL_DISPATCHES.get() - 1);
         self.host
             .active_dispatches
             .fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
@@ -354,10 +427,27 @@ pub struct ToolHost<T: Tool, R: HostRuntime> {
     /// section, so "counter was zero" cannot race a dispatch starting.
     active_dispatches: core::sync::atomic::AtomicUsize,
     install_gate: SpinMutex<()>,
+    /// W7 thread-admission capability: when false (default), guest thread
+    /// creation refuses exactly as before W7; when true, admitted
+    /// CLONE_THREAD shapes are performed through the birth trampoline.
+    admit_threads: bool,
+    /// Runtime birth stacks by admitted thread tid (base, len), freed by
+    /// `finish_tool_exit` when that thread retires. Registered by the
+    /// child itself during admission (its tid is unknown parent-side
+    /// until the clone returns, and the record must exist before the
+    /// child can be signalled as a thread).
+    birth_stacks: SpinMutex<HashMap<i32, (usize, usize)>>,
     native_threads: Option<native_state::NativeThreads<T::ThreadState>>,
     // Prepared only by the ordinary installer, before publication. Keeping it
     // outside `states` preserves the real first-event lifecycle callbacks.
     ordinary_root_state: SpinMutex<Option<T::ThreadState>>,
+    #[cfg(feature = "exec-private-init")]
+    mapped_successor_state: SpinMutex<Option<MappedSuccessorState<T>>>,
+    /// Whether `mapped_successor_state` currently holds a state, mirrored
+    /// under its lock so ordinary dispatch can refuse without contending
+    /// for the slot lock.
+    #[cfg(feature = "exec-private-init")]
+    mapped_successor_pending: core::sync::atomic::AtomicBool,
     runtime: R,
     #[cfg(feature = "exec-private-successor")]
     prepared_exec: SpinMutex<Option<PreparedExecState<T>>>,
@@ -375,6 +465,18 @@ pub struct ToolHost<T: Tool, R: HostRuntime> {
     // installer explicitly admitted it via `admit_native_exec`.
     #[cfg(feature = "exec-native-injection")]
     native_exec_admitted: bool,
+}
+
+#[cfg(feature = "exec-private-init")]
+enum MappedSuccessorPhase {
+    Pending,
+    Failed,
+    Complete,
+}
+#[cfg(feature = "exec-private-init")]
+struct MappedSuccessorState<T: Tool> {
+    state: T::ThreadState,
+    phase: MappedSuccessorPhase,
 }
 
 #[cfg(feature = "exec-private-successor")]
@@ -403,6 +505,7 @@ impl<T: Tool, R: HostRuntime> ToolHost<T, R> {
         let _gate = self.install_gate.lock();
         self.active_dispatches
             .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+        LOCAL_DISPATCHES.set(LOCAL_DISPATCHES.get() + 1);
         ActiveDispatch { host: self }
     }
 
@@ -427,6 +530,72 @@ impl<T: Tool, R: HostRuntime> ToolHost<T, R> {
             != 0
     }
 
+    /// Reinitialize this host's synchronization state in a fork child
+    /// whose copies of the spinlocks may have been made mid-hold by
+    /// sibling threads that do not exist here (fork quiescence), and
+    /// reset the dispatch counter to this surviving thread's own live
+    /// guards. Runs at the top of `finish_fork_child`, where the child
+    /// is still single-threaded and this thread holds none of these
+    /// locks (its live guards are the dispatch counter's, which is
+    /// exactly what is preserved).
+    ///
+    /// Per-lock disposition (the force-unlock contract needs a
+    /// data-consistency argument per lock, not just dead holders):
+    /// - `install_gate` guards nothing (the counter is a separate
+    ///   atomic), `tool` and `ordinary_root_state` and `prepared_exec`
+    ///   each guard one `Option` word plus a value only ever moved
+    ///   wholesale under install-time exclusion, and the RPC
+    ///   `fork_reset` guards one pid word: force-release is sound.
+    /// - The three hash-map registries (`states` slots, RPC `by_tid`,
+    ///   `birth_stacks`) may have been copied mid-rehash: their locks
+    ///   are force-released only so the maps can be *leak-replaced*
+    ///   (`ThreadStates::reset_to`, the RPC fork reset, and below)
+    ///   without ever traversing or dropping the copied contents.
+    /// - The Tool-heap locks are not here at all: the forwarding path
+    ///   holds them across the physical fork
+    ///   (`alloc::quiesce_for_fork`), so the child inherits a
+    ///   consistent free list; per-connection locks are likewise
+    ///   never touched (see `CoordinatorRpc::reinit_after_fork`).
+    fn reinit_after_fork(&self) {
+        // SAFETY: the force-unlock contract holds here — the only
+        // surviving thread is the forking one, it holds none of these
+        // locks at this point, and no other thread exists yet in the
+        // child to hold or later drop a guard.
+        unsafe {
+            self.install_gate.force_unlock();
+            self.tool.force_unlock();
+            self.birth_stacks.force_unlock();
+            self.ordinary_root_state.force_unlock();
+            #[cfg(feature = "exec-private-successor")]
+            self.prepared_exec.force_unlock();
+            self.states.force_unlock_slots();
+            self.rpc.reinit_after_fork();
+        }
+        // Leak-replace the birth-stack registry: the copied map is
+        // forgotten without traversal (a sibling's admission insert
+        // or retire remove may have been copied mid-operation). The
+        // dead threads' birth stacks leak as unused mappings in this
+        // child only — munmapping them would require reading the
+        // copied entries — and this thread's own birth stack, if any,
+        // likewise stays mapped until process exit instead of being
+        // released at retire.
+        // Reuse the copied map's hasher: building a fresh
+        // RandomState on a thread that has never made one issues
+        // getrandom through libc, outside the trusted gate, in
+        // this post-fork context. The hasher is fixed at map
+        // construction, so cloning it reads no bucket state.
+        let copied = {
+            let mut stacks = self.birth_stacks.lock();
+            let hasher = stacks.hasher().clone();
+            core::mem::replace(&mut *stacks, HashMap::with_hasher(hasher))
+        };
+        core::mem::forget(copied);
+        self.active_dispatches.store(
+            LOCAL_DISPATCHES.get(),
+            core::sync::atomic::Ordering::Release,
+        );
+    }
+
     /// Install an already-admitted continuation's Tool state for this thread.
     ///
     /// The owner must restore every field of its `ThreadState`, including its
@@ -436,6 +605,15 @@ impl<T: Tool, R: HostRuntime> ToolHost<T, R> {
     /// dispatch currently holding the state lock, is refused without replacing
     /// anything. No production backend calls this inactive input seam.
     pub fn restore_current_thread_state(&self, state: T::ThreadState) -> io::Result<()> {
+        #[cfg(feature = "exec-private-init")]
+        if self
+            .mapped_successor_pending
+            .load(core::sync::atomic::Ordering::Acquire)
+        {
+            return Err(io::Error::other(
+                "mapped successor lifecycle state is not complete",
+            ));
+        }
         // Read the occupancy mirror, not the lock: momentary
         // contention (a writer updating the slot) must not read as a
         // pending successor and spuriously refuse a legitimate
@@ -646,8 +824,14 @@ where
             states: thread_lease::ThreadStates::new(),
             active_dispatches: core::sync::atomic::AtomicUsize::new(0),
             install_gate: SpinMutex::new(()),
+            admit_threads: false,
+            birth_stacks: SpinMutex::new(HashMap::new()),
             native_threads: None,
             ordinary_root_state: SpinMutex::new(None),
+            #[cfg(feature = "exec-private-init")]
+            mapped_successor_state: SpinMutex::new(None),
+            #[cfg(feature = "exec-private-init")]
+            mapped_successor_pending: core::sync::atomic::AtomicBool::new(false),
             runtime,
             #[cfg(feature = "exec-private-successor")]
             prepared_exec: SpinMutex::new(None),
@@ -695,6 +879,90 @@ where
     /// concurrently against the shared `Arc`.
     fn tool_process(&self) -> Option<Arc<ToolProcess<T>>> {
         self.tool.lock().clone()
+    }
+
+    /// Enable or disable guest thread admission (W7). Default off:
+    /// CLONE_THREAD creations refuse exactly as before. Set before the
+    /// host dispatches; toggling mid-run is not synchronized against
+    /// in-flight creations.
+    ///
+    /// Admission is a test-only capability for now. Known gaps that
+    /// block enabling it outside tests are tracked for the enabling
+    /// slice as minibeads dh-2414s
+    /// (<https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-2414s.md>);
+    /// each was measured or traced at the W7 respin reviews:
+    /// - Multi-threaded exit lifecycle: process exit unwraps the
+    ///   Tool slot's `Arc` (`finish_tool_exit`), which fatals (126)
+    ///   while any sibling dispatch holds a clone; a leader's plain
+    ///   `SYS_exit` is also treated as process exit.
+    /// - The signal gate's `event_identity` handling can attribute a
+    ///   sibling's signal event to the wrong thread, and the signal
+    ///   runtime still assumes one thread per process: the cached
+    ///   identity in `runtime_mask` and the per-process virtual mask
+    ///   in `sigalrm` are process-wide, not per-thread.
+    /// - The liteinst site table (`INSTALL_HELD`/`SITE_INSTALLING`
+    ///   in the liteinst runtime) is process-wide state no fork or
+    ///   thread path reinitializes.
+    /// - Reported creations across sibling threads share the one
+    ///   runtime pidfd output word (see `creation_storage`).
+    /// - `CoordinatorRpc::relocate` against a sibling connection
+    ///   that is mid-exchange answers EBUSY (by contract), which a
+    ///   guest `dup2` onto that number surfaces as a refusal Linux
+    ///   would not produce.
+    /// - `ThreadBirth` without `CLONE_SETTLS` runs the whole
+    ///   admission on the parent's TLS (the trampoline never
+    ///   changes FS): the parent's `LOCAL_DISPATCHES`,
+    ///   `DISPATCH_DEPTH`, `TOOL_CALLBACK_ACTIVE`, `IN_HANDLER`
+    ///   and `COMMITTED_STACKS` cells are written by two threads
+    ///   at once (the last is a non-atomic `RefCell`). Refusing
+    ///   no-SETTLS births by name, or giving admission
+    ///   runtime-owned TLS, is enabling-slice work.
+    /// - A birth whose thread-start callback ends the thread
+    ///   leaks its 64 KiB birth-stack mapping (and its birth
+    ///   record) until process exit or exec — measured at about
+    ///   +64 KiB virtual and +20 KiB RSS per ended birth — because
+    ///   the ending thread is still running on that stack when
+    ///   every release path runs.
+    /// - Tool-internal locks (inside the Tool, its process object
+    ///   and thread states) copied while held at a fork are not
+    ///   reinitialized; the fork child runs `new_process`,
+    ///   `init_thread_state` and `handle_thread_start` against the
+    ///   copied Tool before any contract covers them.
+    /// - The close-then-`F_GETFD` survivor check (inherited-fd
+    ///   close, runtime-fd placement, the clock counter move)
+    ///   fires falsely when a sibling reuses the descriptor number
+    ///   first: the guest's new descriptor is then recorded as
+    ///   runtime-owned, and eight such misfires fill the recorded
+    ///   set and end the process (pre-existing, measured at the
+    ///   respin head).
+    /// - In `inject`, the `ThreadBirth` and clone3 `KernelDecides`
+    ///   arms are matched before the admitted-native-exec
+    ///   `ThreadCreation` refusal, so with admission on, the admitted
+    ///   native exec route forwards a thread birth (or hands the
+    ///   kernel a clone3 it rejects) instead of refusing it by name.
+    ///   The refusal must come first. Found by code reading in the
+    ///   M1 rebase review, as is the next entry.
+    /// - `reinit_after_fork` force-releases its locks
+    ///   (`crate::sync`'s `force_unlock`) on the premise that only
+    ///   the forking thread survives, without checking that it runs
+    ///   in a genuine fork child (child pid differs from the
+    ///   parent's). With sibling threads, a call outside a fork child
+    ///   would release a lock a live thread holds. It must check
+    ///   first.
+    pub fn set_thread_admission(&mut self, enabled: bool) {
+        self.admit_threads = enabled;
+    }
+
+    /// The physical thread-birth entry for guests built by this host, or
+    /// `None` while thread admission is off.
+    fn thread_birth_ops(&self) -> Option<ThreadBirthOps>
+    where
+        T: 'static,
+    {
+        self.admit_threads.then_some(ThreadBirthOps {
+            host: core::ptr::from_ref(self) as usize,
+            forward: forward_thread_creation::<T, R>,
+        })
     }
 
     fn new_thread_state(&self, tool: &ToolProcess<T>, tid: Pid) -> T::ThreadState {
@@ -745,8 +1013,10 @@ where
 
     /// Admit the native exec/clone route for this host: the embedder
     /// opt-in, distinct from installing a driver. Until admitted, an
-    /// installed driver is never consulted for exec or clone and both
-    /// keep their typed refusals. Admission is single-shot and must
+    /// installed driver is never consulted for exec or clone; both
+    /// keep their typed refusals unless an exec watch is armed, in
+    /// which case exec forwards to the kernel and clone still keeps
+    /// its typed refusal. Admission is single-shot and must
     /// precede dispatch, under the same guards as driver installation.
     ///
     /// # Safety
@@ -928,12 +1198,17 @@ where
         // ExecComplete publication uses the same restored state. Dispatch now
         // observes an existing state and cannot repeat either startup hook.
         let completed = pending.take().expect("owned successor state");
-        self.prepared_exec_pending
-            .store(false, core::sync::atomic::Ordering::Release);
         drop(pending);
         self.states
             .publish(tid.as_raw(), completed.state)
             .map_err(|_| io::Error::other("successor thread state already exists"))?;
+        // The only clear, a Release-store after the publish above: a
+        // dispatch whose Acquire load observes it clear synchronizes-with
+        // the publish and must see the published state. A failed publish
+        // leaves it set, so a later dispatch ends the process
+        // (`refuse_if_prepared_exec_pending`) rather than run without it.
+        self.prepared_exec_pending
+            .store(false, core::sync::atomic::Ordering::Release);
         Ok(())
     }
 
@@ -952,6 +1227,162 @@ where
         control: &super::exec_private::InitialImageControl,
     ) -> io::Result<()> {
         control.bind_lifecycle_host(core::ptr::from_ref(self) as usize)
+    }
+
+    /// Attach the exact decoded selected root state as pending for a
+    /// mapped successor. This neither creates thread state nor calls
+    /// `on_initial_image_attached`, `init_thread_state`,
+    /// `handle_thread_start`, or post-exec callbacks.
+    ///
+    /// # Safety
+    /// The same installer must have decoded and validated this state
+    /// from the admitted carrier's exact delivered bytes for this
+    /// authenticated mapped image. A matching digest alone does not
+    /// prove correct Tool-state restoration.
+    #[cfg(feature = "exec-private-init")]
+    pub unsafe fn restore_mapped_successor_state(
+        &self,
+        state: T::ThreadState,
+        control: &super::exec_private::InitialImageControl,
+    ) -> io::Result<()> {
+        control.begin_mapped_successor_restore(core::ptr::from_ref(self) as usize)?;
+        let result = (|| {
+            let _allocation_scope = super::alloc::enter_dispatch();
+            if self.root_pid != raw_pid(libc::SYS_gettid)
+                || self.root_pid != raw_pid(libc::SYS_getpid)
+            {
+                return Err(io::Error::other(
+                    "mapped successor host root identity differs",
+                ));
+            }
+            let Some(_install) = self.begin_install() else {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "mapped successor state dispatch is active",
+                ));
+            };
+            let mut pending = self.mapped_successor_state.lock();
+            if !self.states.is_empty() || pending.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "mapped successor thread state already exists",
+                ));
+            }
+            *pending = Some(MappedSuccessorState {
+                state,
+                phase: MappedSuccessorPhase::Pending,
+            });
+            self.mapped_successor_pending
+                .store(true, core::sync::atomic::Ordering::Release);
+            control.mapped_successor_restore_completed();
+            Ok(())
+        })();
+        if result.is_err() {
+            control.mapped_successor_restore_failed();
+        }
+        result
+    }
+
+    /// Run the restored mapped successor's post-exec with the
+    /// same callback order as the native successor. There is no
+    /// `on_initial_image_attached`, `init_thread_state`,
+    /// thread-start, or syscall callback. Only the callback order
+    /// and published state are native parity: the mapped path
+    /// supplies its mapped-successor guest, with guarded injection
+    /// under the selected-restore permit and the verified mapped
+    /// resume registers/PKRU; stack access still terminates.
+    #[cfg(feature = "exec-private-init")]
+    pub(super) fn initialize_mapped_successor_lifecycle(
+        &self,
+        control: &super::exec_private::InitialImageControl,
+        entry: &super::exec_private::MappedSuccessorEntry,
+    ) -> io::Result<()> {
+        let permit = control.begin_mapped_successor_lifecycle(core::ptr::from_ref(self) as usize)?;
+        let _scratch_scope = DispatchScratchScope::enter();
+        let tid = raw_pid(libc::SYS_gettid);
+        if tid != self.root_pid {
+            return Err(io::Error::other(
+                "mapped successor host root identity differs",
+            ));
+        }
+        let Some(_install) = self.begin_install() else {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "mapped successor Tool callback is active",
+            ));
+        };
+        control.verify_mapped_successor_entry(entry)?;
+        let tool_arc = self
+            .tool_process()
+            .ok_or_else(|| io::Error::other("mapped successor Tool is absent"))?;
+        let tool: &ToolProcess<T> = &tool_arc;
+        let mut pending = self.mapped_successor_state.lock();
+        let restored = pending
+            .as_mut()
+            .ok_or_else(|| io::Error::other("mapped successor state is absent"))?;
+        if !self.states.is_empty() || !matches!(restored.phase, MappedSuccessorPhase::Pending) {
+            return Err(io::Error::other(
+                "mapped successor pending state binding differs",
+            ));
+        }
+        // Mark failed before invoking Tool code, including unwind.
+        restored.phase = MappedSuccessorPhase::Failed;
+        let tail = TailResult::default();
+        {
+            let mut guest = mapped_successor_image_guest::MappedSuccessorImageGuest::<T, R>::new(
+                tid,
+                &mut restored.state,
+                self,
+                &tail,
+                &permit,
+                entry,
+            );
+            #[cfg(feature = "exec-native-injection")]
+            if let Some(driver) = &self.native_exec_driver {
+                let mode = guest.signal_control_mode();
+                let actual = guest.signal_task_identity();
+                driver.bind_post_exec_state(guest.thread_state_mut(), mode, actual)?;
+            }
+            match drive_callback(tool.handle_post_exec(&mut guest), &tail) {
+                CallbackOutcome::Ready(Ok(())) => {}
+                CallbackOutcome::Ready(Err(error)) => {
+                    return Err(io::Error::from_raw_os_error(error.into_raw()));
+                }
+                CallbackOutcome::Exit { .. } | CallbackOutcome::Unsupported(_) => {
+                    return Err(io::Error::other(
+                        "mapped successor post-exec transition refused",
+                    ));
+                }
+            }
+            guest.check_refusal()?;
+        }
+        permit.complete()?;
+        restored.phase = MappedSuccessorPhase::Complete;
+        let completed = pending.take().expect("owned mapped successor state");
+        self.mapped_successor_pending
+            .store(false, core::sync::atomic::Ordering::Release);
+        drop(pending);
+        if self
+            .states
+            .try_publish(tid.as_raw(), completed.state)
+            .is_err()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "mapped successor thread state already exists",
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "exec-private-init")]
+    fn refuse_if_mapped_successor_pending(&self) {
+        if self
+            .mapped_successor_pending
+            .load(core::sync::atomic::Ordering::Acquire)
+        {
+            unsafe { super::exec_private::initialization_failed(core::ptr::null_mut()) }
+        }
     }
 
     /// Run this installed InitialImage's real thread-start and post-exec
@@ -1107,9 +1538,14 @@ where
     /// its injections must not break Rust's memory invariants for any memory
     /// they touch.
     pub unsafe fn dispatch(&self, event: &mut SyscallEvent) {
+        // The refusal identity describes this dispatch's terminal
+        // result only; never carry a reused event's stale name.
+        event.unsupported_refusal = None;
         if self.native_threads.is_some() {
             fatal(126);
         }
+        #[cfg(feature = "exec-private-init")]
+        self.refuse_if_mapped_successor_pending();
         #[cfg(feature = "exec-private-successor")]
         self.refuse_if_prepared_exec_pending();
 
@@ -1145,6 +1581,8 @@ where
             native: None,
             tail: &tail,
             cpuid_interception: self.cpuid_interception,
+            admit_threads: self.admit_threads,
+            thread_birth: self.thread_birth_ops(),
             fork_parent_state: None,
             runtime: &self.runtime,
             staged_signals: Vec::new(),
@@ -1156,10 +1594,22 @@ where
             mapping_driver: self.native_exec_driver.as_deref(),
             #[cfg(feature = "exec-native-injection")]
             native_exec_admitted: self.native_exec_admitted(),
+            #[cfg(feature = "exec-native-injection")]
+            native_exec_route_active: self.native_exec_admitted(),
             unsupported_refusal: None,
             injected_syscalls: 0,
         };
 
+        // Admission checklist (W7): a thread first seen here was either
+        // admitted at birth (lease not new) or is being seen without a
+        // birth (admission off, or a backend-created thread); verify its
+        // per-thread arming before its first callback either way.
+        if is_new
+            && self.admit_threads
+            && let Err(error) = self.runtime.verify_thread_admission(tid)
+        {
+            tool_fatal(126, &Error::from(error));
+        }
         let mut lifecycle =
             CallbackLifecycle::new(is_new, is_new && tid.as_raw() == self.root_pid.as_raw());
         if let Err(failure) = enter_tool_callbacks(tool, &mut guest, &mut lifecycle) {
@@ -1186,6 +1636,9 @@ where
             let guest_pkru = guest.event.guest_pkru;
             #[cfg(feature = "exec-native-injection")]
             if let Err(error) = guest.check_native_mapping(number, args) {
+                // Terminal unsubscribed return: no Tool callback
+                // runs, so the stored name rides on the event.
+                guest.surface_terminal_refusal();
                 guest.event.result = -i64::from(error.into_raw());
                 return;
             }
@@ -1206,11 +1659,43 @@ where
                             parent_pid: pid,
                             child_tid: raw_pid(libc::SYS_gettid),
                             child_pid: raw_pid(libc::SYS_getpid),
+                            #[cfg(feature = "exec-native-injection")]
+                            native_exec_route_active: self.native_exec_admitted(),
                         },
                     );
                 } else {
                     guest.event.result = result;
                 }
+                return;
+            } else if self.admit_threads
+                && creation_admission(number, args) == CreationAdmission::ThreadBirth
+            {
+                // Pre-callback intercept (W7 review): an admitted thread
+                // creation reaching dispatch unsubscribed must run the
+                // birth trampoline here, never the raw forward below --
+                // a plain forward would return the child into these
+                // frames on its guest stack.
+                let Some(birth) = guest.thread_birth else {
+                    guest.event.result = -i64::from(libc::EOPNOTSUPP);
+                    return;
+                };
+                // SAFETY: creation_admission classified this exact call
+                // ThreadBirth above; the event is this dispatch's live
+                // guest event with its saved context.
+                guest.event.result =
+                    unsafe { (birth.forward)(birth.host, number, args, guest.event) };
+                return;
+            } else if number == libc::SYS_clone3
+                && self.admit_threads
+                && creation_admission(number, args) == CreationAdmission::KernelDecides
+            {
+                // Deferred to the kernel — but from a checked copy,
+                // never the guest's own record pointer: the raw
+                // forward below would let a sibling flip a shape the
+                // kernel rejects into a creation that skips every
+                // fork-child step. The checked copy gets EINVAL.
+                guest.event.result =
+                    forward_clone3_kernel_decides(args, Some(&mut guest.event.guest_pkru));
                 return;
             } else if is_exit_syscall(number) {
                 drop(guest);
@@ -1248,7 +1733,21 @@ where
                     finish_ending(self, lease, (tid, pid), ending);
                 }
                 return;
-            } else if let Some(error) = injected_syscall_guard(&self.runtime, number, args) {
+            } else if matches!(number, libc::SYS_execve | libc::SYS_execveat)
+                && let Some(refusal) = guest.exec_native_priority_refusal()
+            {
+                // Unsubscribed originals never capture the installed
+                // native route; a watched exec refuses by name here
+                // instead of forwarding past it. No Tool callback
+                // runs on this route, so the name rides on the event
+                // itself for the dispatch consumer. Unwatched, the
+                // guard below keeps the historical refusal.
+                guest.event.unsupported_refusal = Some(refusal);
+                guest.event.result = -i64::from(Errno::EOPNOTSUPP.into_raw());
+                return;
+            } else if let Some(error) =
+                injected_syscall_guard(&self.runtime, number, args, self.admit_threads)
+            {
                 guest.event.result = -i64::from(error.into_raw());
                 return;
             } else if let Some(result) = super::restorer::mapping_change_result(number, args) {
@@ -1332,6 +1831,13 @@ where
         match driven {
             DrivenSyscall::Result(value) => {
                 guest.event.result = value;
+                // Deliberately no harvest of guest.unsupported_refusal
+                // here: an injection refusal the Tool received and
+                // handled (taking the tag is an optional query) is
+                // not behind this Tool-selected result. Only routes
+                // whose terminal result IS the refusal (tail and
+                // unsubscribed) write the event's refusal identity,
+                // at the refusal site itself.
                 // Signals the Tool's handler sent the guest itself that would
                 // end its process (`InGuest::inject` staged them), now that
                 // the handler has run to its end, as a tracer delivers a
@@ -1382,6 +1888,8 @@ where
                         parent_pid,
                         child_tid,
                         child_pid,
+                        #[cfg(feature = "exec-native-injection")]
+                        native_exec_route_active: self.native_exec_admitted(),
                     },
                 );
             }
@@ -1417,6 +1925,8 @@ where
         if self.native_threads.is_some() {
             fatal(126);
         }
+        #[cfg(feature = "exec-private-init")]
+        self.refuse_if_mapped_successor_pending();
         #[cfg(feature = "exec-private-successor")]
         self.refuse_if_prepared_exec_pending();
 
@@ -1441,6 +1951,7 @@ where
             context: context as *mut RegisterContext as usize,
             dispatch: SyscallDispatch::InstalledHook,
             guest_pkru: None,
+            unsupported_refusal: None,
         };
         let mut guest = InGuest::<T, R> {
             event: &mut event,
@@ -1452,6 +1963,8 @@ where
             native: None,
             tail: &tail,
             cpuid_interception: self.cpuid_interception,
+            admit_threads: self.admit_threads,
+            thread_birth: self.thread_birth_ops(),
             fork_parent_state: None,
             runtime: &self.runtime,
             staged_signals: Vec::new(),
@@ -1463,9 +1976,21 @@ where
             mapping_driver: self.native_exec_driver.as_deref(),
             #[cfg(feature = "exec-native-injection")]
             native_exec_admitted: self.native_exec_admitted(),
+            #[cfg(feature = "exec-native-injection")]
+            native_exec_route_active: self.native_exec_admitted(),
             unsupported_refusal: None,
             injected_syscalls: 0,
         };
+        // Admission checklist (W7): a thread first seen here was either
+        // admitted at birth (lease not new) or is being seen without a
+        // birth (admission off, or a backend-created thread); verify its
+        // per-thread arming before its first callback either way.
+        if is_new
+            && self.admit_threads
+            && let Err(error) = self.runtime.verify_thread_admission(tid)
+        {
+            tool_fatal(126, &Error::from(error));
+        }
         let mut lifecycle =
             CallbackLifecycle::new(is_new, is_new && tid.as_raw() == self.root_pid.as_raw());
         if let Err(failure) = enter_tool_callbacks(tool, &mut guest, &mut lifecycle) {
@@ -1566,11 +2091,20 @@ fn finish_fork_child<T: Tool + 'static, R: HostRuntime>(
         parent_pid,
         child_tid,
         child_pid,
+        #[cfg(feature = "exec-native-injection")]
+        native_exec_route_active,
     } = context;
     let rpc = &host.rpc;
     let runtime = &host.runtime;
-    runtime.fork_child_rebind();
-    runtime.emit_stage(b"fork-child-thread-start-begin");
+    // First child-side acts in this function, before the runtime
+    // rebind or any Tool callback below (the heap locks were
+    // already released by the forking thread's quiesce guard
+    // immediately at the raw fork return; signals are NOT blocked
+    // across that window — the runtime action mask is empty
+    // outside the signal-delivery gate, and the window consists of
+    // the one raw syscall, in which no handler can be admitted):
+    // flag the inherited coordinator connection and reinitialize
+    // the copied host locks.
     // This child inherited the parent's coordinator connection. Flag it before
     // any child-side callback can issue an RPC (`handle_thread_start` below is
     // the first such opportunity) so the next `send_rpc` reconnects under the
@@ -1578,10 +2112,17 @@ fn finish_fork_child<T: Tool + 'static, R: HostRuntime>(
     // hook also covers forks that never enter libc, such as a raw `SYS_fork` or
     // a raw plain `SYS_clone`.
     super::rpc::note_fork_in_child();
+    // Sibling dispatches may have held host spinlocks at the fork
+    // instant; their copies here would spin forever. Reinitialize
+    // before the first host-lock use below.
+    host.reinit_after_fork();
+    runtime.fork_child_rebind();
+    runtime.emit_stage(b"fork-child-thread-start-begin");
     // The parent lease object is this child's inherited copy of the
-    // parent's checkout: retire it (drop the inherited state, clear the
-    // parent's slot in this copy) before the registry reset below.
-    drop(parent_lease.retire());
+    // parent's checkout: abandon it (drop the inherited state without
+    // touching the copied registry map, which the reset below
+    // leak-replaces).
+    drop(parent_lease.abandon());
     let child_tool = host
         .tool_process()
         .unwrap_or_else(|| fatal(126))
@@ -1611,6 +2152,8 @@ fn finish_fork_child<T: Tool + 'static, R: HostRuntime>(
         native: None,
         tail: &child_tail,
         cpuid_interception: runtime.cpuid_interception_enabled(),
+        admit_threads: host.admit_threads,
+        thread_birth: host.thread_birth_ops(),
         fork_parent_state: None,
         runtime,
         staged_signals: Vec::new(),
@@ -1622,6 +2165,8 @@ fn finish_fork_child<T: Tool + 'static, R: HostRuntime>(
         mapping_driver: None,
         #[cfg(feature = "exec-native-injection")]
         native_exec_admitted: false,
+        #[cfg(feature = "exec-native-injection")]
+        native_exec_route_active,
         unsupported_refusal: None,
         injected_syscalls: 0,
     };
@@ -1652,6 +2197,8 @@ struct ForkChildContext {
     parent_pid: Pid,
     child_tid: Pid,
     child_pid: Pid,
+    #[cfg(feature = "exec-native-injection")]
+    native_exec_route_active: bool,
 }
 
 // TODO-HUMAN-REVIEW(PR-143): Review single-process Tool exit lifecycle.
@@ -1679,6 +2226,19 @@ fn finish_tool_exit<T: Tool + 'static, R: HostRuntime>(
     };
     if let Err(error) = on_exit {
         tool_fatal(125, &error);
+    }
+    if let Some((birth_base, birth_len)) = host.birth_stacks.lock().remove(&tid.as_raw()) {
+        // The exiting thread resumed on its guest stack long ago; its
+        // birth stack is free to release from here. (A thread whose
+        // admission itself ended it unregisters its stack first in
+        // thread_birth_admit: it is still running on that stack, so
+        // no entry is present to release here.)
+        unsafe {
+            raw_syscall6(
+                libc::SYS_munmap,
+                [birth_base as u64, birth_len as u64, 0, 0, 0, 0],
+            )
+        };
     }
     if process_exit {
         let tool = host.tool.lock().take().unwrap_or_else(|| fatal(126));
@@ -1790,8 +2350,26 @@ fn callback_result<V>(outcome: CallbackOutcome<V>) -> Result<V, Ending> {
 fn finish_ending<T: Tool + 'static, R: HostRuntime>(
     host: &ToolHost<T, R>,
     lease: thread_lease::Lease<'_, T::ThreadState>,
+    ids: (Pid, Pid),
+    ending: Ending,
+) -> ! {
+    finish_ending_releasing(host, lease, ids, ending, &mut || {})
+}
+
+/// `finish_ending` with a guard-release hook: `release` runs after
+/// `finish_tool_exit` (so the exit callbacks still run counted and
+/// inside the caller's allocation scope) and immediately before
+/// the terminal action in every arm. The birth-admission caller
+/// uses it to drop its dispatch guards, which the
+/// never-returning terminal action would otherwise leak on
+/// whichever TLS the admission ran (the parent's, without
+/// CLONE_SETTLS).
+fn finish_ending_releasing<T: Tool + 'static, R: HostRuntime>(
+    host: &ToolHost<T, R>,
+    lease: thread_lease::Lease<'_, T::ThreadState>,
     (tid, pid): (Pid, Pid),
     ending: Ending,
+    release: &mut dyn FnMut(),
 ) -> ! {
     match ending {
         Ending::Death(death) => {
@@ -1800,6 +2378,7 @@ fn finish_ending<T: Tool + 'static, R: HostRuntime>(
                 lease,
                 ToolExitContext::signal_death(tid, pid, death.status),
             );
+            release();
             die_by_pending_signal(death.signal)
         }
         Ending::Call { number, args } if is_exit_syscall(number) => {
@@ -1808,6 +2387,7 @@ fn finish_ending<T: Tool + 'static, R: HostRuntime>(
                 lease,
                 ToolExitContext::exit_syscall(tid, pid, number, args),
             );
+            release();
             let _ = unsafe { raw_syscall6(number, args) };
             fatal(126)
         }
@@ -1819,6 +2399,7 @@ fn finish_ending<T: Tool + 'static, R: HostRuntime>(
                 lease,
                 ToolExitContext::signal_death(tid, pid, SignalDeath::KILL.status),
             );
+            release();
             die_by_pending_signal(SignalDeath::KILL.signal)
         }
     };
@@ -2223,6 +2804,16 @@ struct NativeGuestView<'callback, G: GlobalTool> {
 
 /// The common Tool-facing Guest. Fields remain private: only the local host
 /// and an admitted native callback lease can construct a view.
+/// Type-erased physical thread creation for one host instantiation:
+/// performs an admitted CLONE_THREAD creation and returns in the parent
+/// only (child tid or negative errno); the child starts life in the
+/// birth path and never returns through the injecting frames.
+#[derive(Clone, Copy)]
+struct ThreadBirthOps {
+    host: usize,
+    forward: unsafe fn(usize, i64, [u64; 6], &SyscallEvent) -> i64,
+}
+
 pub struct InGuest<'a, T: Tool, R: HostRuntime> {
     event: &'a mut SyscallEvent,
     tid: Pid,
@@ -2233,6 +2824,12 @@ pub struct InGuest<'a, T: Tool, R: HostRuntime> {
     native: Option<NativeGuestView<'a, T::GlobalState>>,
     tail: &'a TailResult,
     cpuid_interception: bool,
+    /// Mirrors the host's W7 thread-admission capability for guard checks
+    /// on injected creations.
+    admit_threads: bool,
+    /// Physical thread-birth entry (host pointer + monomorphized
+    /// forward), present only where a dispatch installed it.
+    thread_birth: Option<ThreadBirthOps>,
     fork_parent_state: Option<T::ThreadState>,
     runtime: &'a R,
     /// Signals sent to the caller itself that would end its process, held
@@ -2251,6 +2848,13 @@ pub struct InGuest<'a, T: Tool, R: HostRuntime> {
     /// dispatch (embedder opt-in; see `ToolHost::admit_native_exec`).
     #[cfg(feature = "exec-native-injection")]
     native_exec_admitted: bool,
+    /// Whether the host's native exec route is admitted, including in
+    /// views that cannot capture it themselves (lifecycle callbacks,
+    /// unsubscribed originals, tail calls, fork-child and native-entry
+    /// views). Those routes use this to refuse a watched exec by name
+    /// instead of forwarding past the admitted native authority.
+    #[cfg(feature = "exec-native-injection")]
+    native_exec_route_active: bool,
     /// The typed refusal of the last injection, if the backend refused it
     /// ([`reverie::Guest::take_unsupported_refusal`]).
     unsupported_refusal: Option<reverie::UnsupportedRefusal>,
@@ -2276,6 +2880,76 @@ impl<T: Tool, R: HostRuntime> InGuest<'_, T, R> {
             guest_filter: guest_filter_admitted(),
             guest_signal_mode: super::sigalrm::admitted(),
             fork_state: self.fork_parent_state.is_some(),
+        }
+    }
+
+    /// Whether a watched exec would forward past admitted native
+    /// authority from this view: the host's native route is admitted
+    /// but this dispatch never captured it (lifecycle callbacks and
+    /// unsubscribed originals capture nothing; the subscribed handler
+    /// captures before the Tool runs). Forwarding there would bypass
+    /// the admitted route's priority, so those routes refuse by name
+    /// instead.
+    fn exec_native_route_unreachable(&self) -> bool {
+        #[cfg(feature = "exec-native-injection")]
+        {
+            self.native_exec_route_active && self.exec.is_none()
+        }
+        #[cfg(not(feature = "exec-native-injection"))]
+        {
+            false
+        }
+    }
+
+    /// The named refusal for a watched exec on a route that cannot
+    /// consult the admitted native exec route, or `None` when the
+    /// exec may proceed (unwatched handling is the caller's existing
+    /// refusal; no admitted route — whether no driver is installed
+    /// or it is installed but unadmitted — or a captured route
+    /// forwards through the ordinary paths).
+    fn exec_native_priority_refusal(&self) -> Option<reverie::UnsupportedRefusal> {
+        if self.runtime.exec_watch_armed() && self.exec_native_route_unreachable() {
+            Some(reverie::UnsupportedRefusal::new(
+                reverie::UnsupportedOperation::NativeExec,
+                Errno::EOPNOTSUPP,
+                "watched exec cannot forward from a dispatch route that did not capture \
+                 the admitted native exec route",
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// The named refusal for a watched tail-injected exec while the
+    /// native route is admitted: a tail call has no native cut of
+    /// its own (the capture belongs to the original dispatch and is
+    /// single-attempt), so it refuses by name in every capture state
+    /// rather than forwarding past — or re-spending — the admitted
+    /// route.
+    fn exec_tail_native_refusal(&self) -> Option<reverie::UnsupportedRefusal> {
+        #[cfg(feature = "exec-native-injection")]
+        if self.runtime.exec_watch_armed() && self.native_exec_route_active {
+            return Some(reverie::UnsupportedRefusal::new(
+                reverie::UnsupportedOperation::NativeExec,
+                Errno::EOPNOTSUPP,
+                "tail-injected exec has no native cut of its own and cannot bypass \
+                 the admitted native exec route",
+            ));
+        }
+        None
+    }
+
+    /// Move this view's stored refusal onto the outward event.
+    /// Only for terminal routes whose result IS that refusal and
+    /// where no live Tool callback remains to take it from the
+    /// view (tail and unsubscribed mapping refusals; the exec
+    /// routes write the event directly at their refusal sites).
+    /// Never call this for a refusal a Tool received and handled
+    /// en route to its own selected result.
+    #[cfg(feature = "exec-native-injection")]
+    fn surface_terminal_refusal(&mut self) {
+        if self.event.unsupported_refusal.is_none() {
+            self.event.unsupported_refusal = self.unsupported_refusal.take();
         }
     }
 
@@ -2524,11 +3198,15 @@ fn is_plain_fork(number: i64, args: [u64; 6]) -> bool {
         && args[0] & !(SIGNAL_MASK | allowed_flags) == 0
 }
 
-fn clone3_is_plain_fork(address: u64, size: u64) -> bool {
+/// Read up to the first 88 bytes (eleven words) of a guest
+/// `struct clone_args`, or `None` when the record is absent, short, or
+/// unreadable. Fields past the guest's stated size read as zero, as the
+/// kernel's own zero-extension presents them.
+fn read_clone3_fields(address: u64, size: u64) -> Option<[u64; 11]> {
     const CLONE_ARGS_SIZE_VER0: usize = 64;
     const CLONE_ARGS_SIZE_VER2: usize = 88;
     if address == 0 || size < CLONE_ARGS_SIZE_VER0 as u64 {
-        return false;
+        return None;
     }
     let mut fields = [0_u64; CLONE_ARGS_SIZE_VER2 / core::mem::size_of::<u64>()];
     let read_len = usize::try_from(size)
@@ -2556,11 +3234,114 @@ fn clone3_is_plain_fork(address: u64, size: u64) -> bool {
             ],
         )
     };
-    if read != read_len as i64 {
-        return false;
-    }
+    (read == read_len as i64).then_some(fields)
+}
 
-    clone_args_are_plain_fork(&fields)
+fn clone3_is_plain_fork(address: u64, size: u64) -> bool {
+    read_clone3_fields(address, size).is_some_and(|fields| clone_args_are_plain_fork(&fields))
+}
+
+/// How one guest creation call is admitted when thread admission is on
+/// (see [`ToolHost::set_thread_admission`]). With admission off, every
+/// shape but [`CreationAdmission::PlainFork`] is refused exactly as
+/// before W7.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CreationAdmission {
+    /// The existing plain-fork subset.
+    PlainFork,
+    /// A `CLONE_THREAD` creation the runtime can track: performed
+    /// through the thread-birth trampoline so the new thread's first
+    /// runtime act is its admission checklist, never shared frames.
+    ThreadBirth,
+    /// `CLONE_THREAD` is set but the shape cannot create a thread on
+    /// Linux — missing `CLONE_SIGHAND`, missing `CLONE_VM`, a clone3
+    /// stack/stack_size pair with exactly one zero, or a clone3 exit
+    /// signal on a thread: forward it and let the kernel produce its
+    /// own `EINVAL`; no child can result. Every other
+    /// kernel-accepted thread shape (no `CLONE_FS`/`CLONE_FILES`, or
+    /// a zero stack, which returns the child on the parent's stack)
+    /// is `ThreadBirth` or a named refusal, never this.
+    KernelDecides,
+    /// Shapes the runtime cannot track (namespaces, set_tid, cgroup,
+    /// pidfd outputs, shared-VM processes, unknown flag bits).
+    Unsupported,
+}
+
+/// The clone flag bits a thread creation may carry besides the required
+/// sharing set. Anything outside this allowlist — namespace creation,
+/// pidfd outputs, ptrace, parent-sibling creation, future bits — is
+/// [`CreationAdmission::Unsupported`].
+const THREAD_ALLOWED_FLAGS: u64 = (libc::CLONE_VM
+    | libc::CLONE_FS
+    | libc::CLONE_FILES
+    | libc::CLONE_SIGHAND
+    | libc::CLONE_THREAD
+    | libc::CLONE_SYSVSEM
+    | libc::CLONE_SETTLS
+    | libc::CLONE_PARENT_SETTID
+    | libc::CLONE_CHILD_SETTID
+    | libc::CLONE_CHILD_CLEARTID) as u64;
+
+/// Pure flag half of thread admission (table-tested). Linux requires
+/// only THREAD ⇒ SIGHAND ⇒ VM: a shape carrying those three creates
+/// a real thread whether or not it shares fs/files, and a zero stack
+/// likewise creates one (returning on the parent's stack). Only the
+/// shapes Linux itself rejects with `EINVAL` may defer to it.
+fn thread_flags_admission(flags: u64) -> CreationAdmission {
+    if flags & libc::CLONE_THREAD as u64 == 0 {
+        return CreationAdmission::Unsupported;
+    }
+    if flags & !THREAD_ALLOWED_FLAGS != 0 {
+        return CreationAdmission::Unsupported;
+    }
+    if flags & libc::CLONE_SIGHAND as u64 == 0 || flags & libc::CLONE_VM as u64 == 0 {
+        return CreationAdmission::KernelDecides;
+    }
+    CreationAdmission::ThreadBirth
+}
+
+/// `clone_args` half of thread admission: set_tid/cgroup outputs stay
+/// unsupported (no runtime path tracks chosen-TID or cgroup births);
+/// the thread shapes Linux itself rejects (exit signal, half-given
+/// stack) defer to its `EINVAL`; everything else defers to
+/// [`thread_flags_admission`]. Fields are the eleven ver2 words
+/// (flags, pidfd, child_tid, parent_tid, exit_signal, stack,
+/// stack_size, tls, set_tid, set_tid_size, cgroup).
+fn clone_args_thread_admission(fields: &[u64; 11]) -> CreationAdmission {
+    if fields[8] != 0 || fields[9] != 0 || fields[10] != 0 {
+        return CreationAdmission::Unsupported;
+    }
+    if fields[0] & libc::CLONE_THREAD as u64 != 0 {
+        // Kernel-rejected thread shapes keep Linux's own EINVAL:
+        // an exit signal on a thread, or exactly one of the stack
+        // pair zero.
+        if fields[4] != 0 || (fields[5] == 0) != (fields[6] == 0) {
+            return CreationAdmission::KernelDecides;
+        }
+    } else if fields[4] != 0 {
+        return CreationAdmission::Unsupported;
+    }
+    thread_flags_admission(fields[0])
+}
+
+/// Classify one creation call for admission. Plain fork keeps its exact
+/// existing meaning; thread shapes are recognized only for the caller to
+/// admit under the thread-admission capability.
+fn creation_admission(number: i64, args: [u64; 6]) -> CreationAdmission {
+    if is_plain_fork(number, args) {
+        return CreationAdmission::PlainFork;
+    }
+    const SIGNAL_MASK: u64 = 0xff;
+    if number == libc::SYS_clone {
+        return thread_flags_admission(args[0] & !SIGNAL_MASK);
+    }
+    if number == libc::SYS_clone3 {
+        return match read_clone3_fields(args[0], args[1]) {
+            Some(fields) => clone_args_thread_admission(&fields),
+            None => CreationAdmission::Unsupported,
+        };
+    }
+    CreationAdmission::Unsupported
 }
 
 /// Whether `struct clone_args` fields (at least its first 88 bytes, as
@@ -2716,6 +3497,15 @@ pub enum CreationHookError {
 /// creation report or the filter refusal; a Tool that registers a hook must
 /// not install a filter or create a process through those paths, and a
 /// built-in-tool process must not register one.
+///
+/// Registration must happen while the process is still
+/// single-threaded (before thread admission can create a second
+/// thread): the hook cell is a plain `OnceLock` read without
+/// synchronization on the creation path, so a fork or thread
+/// creation racing registration can observe either state, and a
+/// child forked mid-registration can inherit a cell that never
+/// completes. The installer already registers before the guest
+/// runs; this names the requirement.
 ///
 /// With a hook registered,
 /// the runtime performs every process creation as `clone3` with a
@@ -3221,12 +4011,21 @@ fn reported_creation(
             unreachable!();
         }
     };
-    let physical = unsafe {
-        crate::trap::raw_syscall6_with_result(
-            libc::SYS_clone3,
-            [record.as_ptr() as u64, size as u64, 0, 0, 0, 0],
-            permissions,
-        )
+    // Fork quiescence for the Tool heaps: hold their locks across the
+    // physical fork so the child copies consistent free lists. No
+    // allocation happens between the acquire and the drop in either
+    // process (the raw gate below only issues the syscall).
+    let physical = {
+        let quiesce = super::alloc::quiesce_for_fork();
+        let physical = unsafe {
+            crate::trap::raw_syscall6_with_result(
+                libc::SYS_clone3,
+                [record.as_ptr() as u64, size as u64, 0, 0, 0, 0],
+                permissions,
+            )
+        };
+        drop(quiesce);
+        physical
     };
     if let Some(output) = guest_pkru {
         *output = physical.pkru;
@@ -3283,11 +4082,396 @@ fn reported_creation(
     result
 }
 
+/// Runtime-owned stack a newborn guest thread runs its admission on
+/// before resuming on its guest stack. Bounded by the coordinator
+/// connection cap in practice (one live birth stack per admitted
+/// thread); freed by `finish_tool_exit` when the thread retires.
+const BIRTH_STACK_BYTES: usize = 64 * 1024;
+
+/// Birth record handed across the physical clone: the trap context
+/// (whose first fields the trampoline reads) plus what admission needs.
+#[repr(C)]
+struct ThreadBirth<T: Tool, R: HostRuntime> {
+    trap: crate::trap::ThreadBirthContext,
+    host: *const ToolHost<T, R>,
+    number: i64,
+    args: [u64; 6],
+    birth_stack: (usize, usize),
+}
+
+// SAFETY: the record crosses into the child by shared memory (the clone
+// shares the address space); the parent neither reads nor writes it after
+// a successful clone, and the child owns it from birth (it drops the Box
+// it was allocated in). The host pointer is the process-singleton host
+// the birth was dispatched from.
+unsafe impl<T: Tool, R: HostRuntime> Send for ThreadBirth<T, R> {}
+
+/// Perform one admitted `CLONE_THREAD` creation physically and return in
+/// the parent only. The child starts in [`thread_birth_admit`] on a
+/// runtime birth stack and resumes as guest code from its clone return;
+/// it never returns through the injecting frames it shares memory with.
+///
+/// # Safety
+/// `host` must be the live `ToolHost<T, R>` this pointer was taken from,
+/// and `event` the dispatch's event for the clone call.
+unsafe fn forward_thread_creation<T: Tool + 'static, R: HostRuntime>(
+    host: usize,
+    number: i64,
+    args: [u64; 6],
+    event: &SyscallEvent,
+) -> i64 {
+    let host = unsafe { &*(host as *const ToolHost<T, R>) };
+    if event.context == 0
+        || event
+            .guest_pkru
+            .is_some_and(|_| crate::trap::pkru_present())
+    {
+        // No saved guest context to resume a child from, or a PKRU guest
+        // whose permissions the plain trusted-gate trampoline cannot
+        // honor: the typed refusal the guard would have produced.
+        return -i64::from(libc::EOPNOTSUPP);
+    }
+    // SAFETY: event.context names this dispatch's RegisterContext.
+    let saved = unsafe { core::ptr::read(event.context as *const RegisterContext) };
+    let mut guest_regs = [0_u64; 22];
+    // SAFETY: RegisterContext is a 176-byte repr(C) register block; the
+    // trap context's guest array has its asserted layout.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            &raw const saved as *const u8,
+            guest_regs.as_mut_ptr().cast::<u8>(),
+            core::mem::size_of::<RegisterContext>(),
+        );
+    }
+    guest_regs[16] = 0; // rax: the child's clone return value
+    guest_regs[0] = match event.dispatch {
+        SyscallDispatch::Trap => event.instruction_pointer,
+        _ => event.instruction_pointer + 2,
+    };
+    // A guest clone3 record lives in guest memory: copy it, re-check
+    // the copy's admission, and perform the physical clone from the
+    // copy — the same check/use gap as the plain-fork path, where a
+    // sibling rewriting the record between classification and the
+    // kernel's read could turn the admitted thread shape into a
+    // shared-VM process the birth admission would then run in.
+    let mut record = [0_u64; CLONE_ARGS_SIZE_LIMIT / 8];
+    let physical_args = if number == libc::SYS_clone3 {
+        let size = match copy_guest_clone_args(args[0], args[1], event.guest_pkru, &mut record) {
+            Ok(size) => size,
+            Err(Unperformed::Failed(errno)) => return -i64::from(errno),
+            Err(Unperformed::Refused(_)) => return -i64::from(libc::EOPNOTSUPP),
+        };
+        let fields: [u64; 11] = record[..11].try_into().expect("eleven copied words");
+        if clone_args_thread_admission(&fields) != CreationAdmission::ThreadBirth {
+            return -i64::from(libc::EOPNOTSUPP);
+        }
+        // Stack 0 keeps the saved guest stack pointer: Linux returns
+        // a stack-less thread on the parent's own stack pointer
+        // (the very same stack, VM being shared), and the trampoline
+        // switches off it before any stack access in either shape.
+        if fields[5] != 0 {
+            guest_regs[1] = fields[5].saturating_add(fields[6]);
+        }
+        [record.as_ptr() as u64, size as u64, 0, 0, 0, 0]
+    } else {
+        if args[1] != 0 {
+            guest_regs[1] = args[1];
+        }
+        args
+    };
+    // SAFETY: anonymous private mapping owned by this birth until the
+    // child registers it for retire-time release.
+    let birth_base = unsafe {
+        raw_syscall6(
+            libc::SYS_mmap,
+            [
+                0,
+                BIRTH_STACK_BYTES as u64,
+                (libc::PROT_READ | libc::PROT_WRITE) as u64,
+                (libc::MAP_PRIVATE | libc::MAP_ANONYMOUS) as u64,
+                u64::MAX,
+                0,
+            ],
+        )
+    };
+    if (-4095..0).contains(&birth_base) {
+        return birth_base;
+    }
+    let birth_base = birth_base as usize;
+    let mut birth = Box::new(ThreadBirth {
+        trap: crate::trap::ThreadBirthContext {
+            birth_stack_top: (birth_base + BIRTH_STACK_BYTES) as u64 & !15,
+            birth: thread_birth_entry::<T, R>,
+            opaque: [0; 4],
+            guest: guest_regs,
+            guest_pkru: u64::from(event.guest_pkru.unwrap_or(0)),
+            has_pkru: u64::from(event.guest_pkru.is_some()),
+        },
+        host,
+        number,
+        args,
+        birth_stack: (birth_base, BIRTH_STACK_BYTES),
+    });
+    let result = unsafe {
+        crate::trap::thread_clone(number, physical_args, core::ptr::addr_of_mut!(birth.trap))
+    };
+    if result < 0 {
+        // No child: reclaim the stack and record on the parent side.
+        unsafe {
+            raw_syscall6(
+                libc::SYS_munmap,
+                [birth_base as u64, BIRTH_STACK_BYTES as u64, 0, 0, 0, 0],
+            );
+        }
+        drop(birth);
+        return result;
+    }
+    // The child owns the record and the birth stack from here.
+    core::mem::forget(birth);
+    result
+}
+
+/// Trampoline target (monomorphized per host): unpack and admit.
+unsafe extern "C" fn thread_birth_entry<T: Tool + 'static, R: HostRuntime>(
+    context: *mut crate::trap::ThreadBirthContext,
+) -> ! {
+    // SAFETY: the trampoline was handed the address of the `trap` field,
+    // the first field of ThreadBirth (repr(C) on both), boxed by
+    // forward_thread_creation and not yet touched by the parent since.
+    let birth = unsafe { Box::from_raw(context as *mut ThreadBirth<T, R>) };
+    unsafe { thread_birth_admit(birth) }
+}
+
+/// Admission checklist for a newborn guest thread, on its birth stack:
+/// state lease, backend per-thread arming, thread-start callbacks, then
+/// resume as guest code at its clone return. Never returns.
+unsafe fn thread_birth_admit<T: Tool + 'static, R: HostRuntime>(
+    birth: Box<ThreadBirth<T, R>>,
+) -> ! {
+    // The bare allocation scope dispatch uses, NOT
+    // DispatchScratchScope: without an allocation scope, on
+    // GuestAllocator/ScopedToolAllocator hosts the newborn's
+    // registry inserts below would take glibc malloc under the
+    // birth_stacks/slots locks — a lock-order inversion against
+    // glibc fork's arena prepare on a sibling's fork. The scratch
+    // scope would additionally clear COMMITTED_STACKS, which must
+    // never happen here: without CLONE_SETTLS this admission runs
+    // on the parent's TLS, so clearing would free arenas the
+    // parent's live dispatch still references. The scope is
+    // dropped explicitly before the never-returning resume below,
+    // so DISPATCH_DEPTH is also restored on whichever TLS this is.
+    let allocation_scope = super::alloc::enter_dispatch();
+    let host = unsafe { &*birth.host };
+    let tid = raw_pid(libc::SYS_gettid);
+    let pid = raw_pid(libc::SYS_getpid);
+    // Register the birth stack for retire-time release before anything
+    // can observe this thread as admitted.
+    host.birth_stacks
+        .lock()
+        .insert(tid.as_raw(), birth.birth_stack);
+    // One admission checklist order everywhere (trait doc): state lease,
+    // then per-thread arming verification, then thread-start callbacks.
+    // The per-thread coordinator connection opens lazily at this
+    // thread's first RPC (slice 2), between lease and first callback use.
+    let tool = host.tool_process().unwrap_or_else(|| fatal(126));
+    let _active = host.begin_dispatch();
+    let mut lease = host
+        .states
+        .checkout(tid.as_raw(), || host.new_thread_state(&tool, tid))
+        .unwrap_or_else(|| fatal(126));
+    if let Err(error) = host.runtime.verify_thread_admission(tid) {
+        tool_fatal(126, &Error::from(error));
+    }
+    if !lease.is_new() {
+        // A birth whose state already exists is a host invariant break:
+        // this thread was just created by this very clone.
+        fatal(126);
+    }
+    let mut event = SyscallEvent {
+        number: birth.number,
+        args: birth.args,
+        instruction_pointer: birth.trap.guest[0],
+        result: 0,
+        context: core::ptr::addr_of!(birth.trap.guest) as usize,
+        dispatch: SyscallDispatch::Trap,
+        guest_pkru: (birth.trap.has_pkru != 0).then_some(birth.trap.guest_pkru as u32),
+        unsupported_refusal: None,
+    };
+    let tail = TailResult::default();
+    let mut guest = InGuest::<T, R> {
+        event: &mut event,
+        tid,
+        pid,
+        ppid: Some(raw_pid(libc::SYS_getppid)),
+        state: lease.state_mut(),
+        rpc: &host.rpc,
+        native: None,
+        tail: &tail,
+        cpuid_interception: host.cpuid_interception,
+        admit_threads: host.admit_threads,
+        thread_birth: host.thread_birth_ops(),
+        fork_parent_state: None,
+        runtime: &host.runtime,
+        staged_signals: Vec::new(),
+        staged_signal_delivery: false,
+        in_syscall_handler: false,
+        #[cfg(feature = "exec-native-injection")]
+        exec: None,
+        #[cfg(feature = "exec-native-injection")]
+        mapping_driver: None,
+        #[cfg(feature = "exec-native-injection")]
+        native_exec_admitted: host.native_exec_admitted(),
+        #[cfg(feature = "exec-native-injection")]
+        native_exec_route_active: host.native_exec_admitted(),
+        unsupported_refusal: None,
+        injected_syscalls: 0,
+    };
+    let mut lifecycle = CallbackLifecycle::new(true, false);
+    match enter_tool_callbacks(&tool, &mut guest, &mut lifecycle) {
+        Ok(()) => {}
+        Err(EntryFailure::Tool(error)) => {
+            drop(guest);
+            tool_fatal(124, &error);
+        }
+        Err(EntryFailure::Ending(ending)) => {
+            drop(guest);
+            drop(tool);
+            // This thread still runs on its birth stack: unregister
+            // it so finish_tool_exit cannot munmap the stack in use
+            // (the mapping is deliberately leaked until process
+            // exit or exec). Both dispatch guards stay live across
+            // finish_tool_exit — the exit callbacks must run
+            // counted and inside the allocation scope, exactly as
+            // on every other dispatch path — and are released by
+            // the hook immediately before the terminal action,
+            // restoring the counters/depth this admission raised
+            // on whichever TLS it ran (the parent's, without
+            // SETTLS).
+            host.birth_stacks.lock().remove(&tid.as_raw());
+            let mut guards = Some((_active, allocation_scope));
+            finish_ending_releasing(host, lease, (tid, pid), ending, &mut || {
+                drop(guards.take());
+            });
+        }
+    }
+    drop(guest);
+    drop(lease);
+    drop(tool);
+    drop(_active);
+    // resume_guest_context never returns, so no guard drop would
+    // run after it: release the allocation scope explicitly here,
+    // restoring DISPATCH_DEPTH on whichever thread's TLS this
+    // admission ran (the parent's, without CLONE_SETTLS).
+    drop(allocation_scope);
+    // The context outlives the box on the birth stack copy below; read
+    // the registers out before freeing the record.
+    // SAFETY: the box is uniquely owned here and dropped right after.
+    let trap_context = unsafe { core::ptr::read(&birth.trap) };
+    drop(birth);
+    // SAFETY: built by forward_thread_creation from the clone event's
+    // saved registers with rax=0 and the guest stack from its arguments.
+    unsafe { crate::trap::resume_guest_context(&trap_context) }
+}
+
+/// Copy a guest clone3 record into `record`, verify the *copy* is a
+/// [`CreationAdmission::KernelDecides`] shape, and return the
+/// forwarding arguments that name the copy. Every clone3 a ToolHost
+/// path actually forwards — plain fork, thread birth, and the
+/// deferred KernelDecides shapes on dispatch, inject and
+/// tail_inject — goes from a checked runtime-owned copy, and any
+/// clone3 that reaches the generic forward instead is refused by
+/// `injected_syscall_guard`: no ToolHost forward ever hands the
+/// kernel the guest's own pointer, so a sibling rewriting the
+/// record between classification and the kernel's read cannot
+/// turn a shape classified as kernel-rejected into a real thread
+/// or a shared-memory child that skips the fork-child lifecycle.
+/// A copy that no
+/// longer classifies KernelDecides, or one the runtime cannot read
+/// as Linux would, ends the process exactly like a refused
+/// reported creation; a copy Linux's own reading would fail
+/// returns that failure as `Err(-errno)`.
+fn checked_kernel_decides_clone3(
+    args: [u64; 6],
+    permissions: Option<u32>,
+    record: &mut [u64; CLONE_ARGS_SIZE_LIMIT / 8],
+) -> Result<[u64; 6], i64> {
+    let size = match copy_guest_clone_args(args[0], args[1], permissions, record) {
+        Ok(size) => size,
+        Err(Unperformed::Failed(errno)) => return Err(-i64::from(errno)),
+        Err(Unperformed::Refused(_)) => end_process(),
+    };
+    let fields: [u64; 11] = record[..11].try_into().expect("eleven copied words");
+    if clone_args_thread_admission(&fields) != CreationAdmission::KernelDecides {
+        end_process();
+    }
+    Ok([record.as_ptr() as u64, size as u64, 0, 0, 0, 0])
+}
+
+/// Forward one KernelDecides clone3 on the dispatch path, with the
+/// guest's rights: the checked copy receives the kernel's own
+/// EINVAL, so no child can result and no heap quiesce is owed. The
+/// copy carries key 0 and the kernel reads it under the guest's
+/// protection keys, so key denial ends the process as in
+/// `forward_plain_fork`.
+fn forward_clone3_kernel_decides(args: [u64; 6], guest_pkru: Option<&mut Option<u32>>) -> i64 {
+    let permissions = guest_pkru.as_ref().and_then(|value| **value);
+    if guest_keys_deny_runtime_memory(permissions) {
+        end_process();
+    }
+    let mut record = [0_u64; CLONE_ARGS_SIZE_LIMIT / 8];
+    let copy_args = match checked_kernel_decides_clone3(args, permissions, &mut record) {
+        Ok(copy_args) => copy_args,
+        Err(result) => return result,
+    };
+    let physical =
+        unsafe { crate::trap::raw_syscall6_with_result(libc::SYS_clone3, copy_args, permissions) };
+    if let Some(output) = guest_pkru {
+        *output = physical.pkru;
+    }
+    physical.result
+}
+
 fn forward_plain_fork(number: i64, args: [u64; 6], guest_pkru: Option<&mut Option<u32>>) -> i64 {
     let result = if let Some(hook) = CREATION_HOOK.get().copied() {
         reported_creation(hook, number, args, guest_pkru)
     } else {
         let permissions = guest_pkru.as_ref().and_then(|value| **value);
+        // A guest clone3 record lives in guest memory: copy it,
+        // re-check the copy, and forward the copy. Forwarding the
+        // guest's own pointer after checking it would let a sibling
+        // thread rewrite the flags (to CLONE_VM|CLONE_VFORK, say)
+        // between the check and the kernel's read, producing a child
+        // that shares the parent's memory — in which the fork-child
+        // reinit would then rewrite the parent's live locks and
+        // counters. The hook path already copies via
+        // `clone3_record_for`; this is the same copy without the
+        // pidfd output. A copy that is no longer a plain fork, or
+        // one the runtime cannot read as Linux would, ends the
+        // process exactly like a refused reported creation: the
+        // guest racing its own arguments gets no other answer.
+        let mut record = [0_u64; CLONE_ARGS_SIZE_LIMIT / 8];
+        let (number, args) = if number == libc::SYS_clone3 {
+            // The runtime's copy carries key 0 and the kernel reads
+            // it under the guest's protection keys (see
+            // `reported_creation`'s ProtectionKeyDenied refusal).
+            if guest_keys_deny_runtime_memory(permissions) {
+                end_process();
+            }
+            match copy_guest_clone_args(args[0], args[1], permissions, &mut record) {
+                Ok(size) if clone_args_are_plain_fork(&record) => {
+                    (number, [record.as_ptr() as u64, size as u64, 0, 0, 0, 0])
+                }
+                Ok(_) => end_process(),
+                Err(Unperformed::Failed(errno)) => return -i64::from(errno),
+                Err(Unperformed::Refused(_)) => end_process(),
+            }
+        } else {
+            (number, args)
+        };
+        // Fork quiescence for the Tool heaps, as in
+        // `reported_creation`: hold their locks across the physical
+        // fork, with no allocation in the window, and release them
+        // immediately on return in both processes.
         let physical = if Some(number) == crate::arch::SYS_VFORK {
             // A real vfork child would run the instrumentation callback on the
             // parent's shared stack. Use a COW fork and preserve vfork's parent
@@ -3296,9 +4480,17 @@ fn forward_plain_fork(number: i64, args: [u64; 6], guest_pkru: Option<&mut Optio
             // reachable where the table has fork (vfork is a clone shape on
             // aarch64 and never takes this branch).
             let fork_nr = crate::arch::SYS_FORK.expect("vfork exists only beside fork");
-            unsafe { crate::trap::raw_syscall6_with_result(fork_nr, [0; 6], permissions) }
+            let quiesce = super::alloc::quiesce_for_fork();
+            let physical =
+                unsafe { crate::trap::raw_syscall6_with_result(fork_nr, [0; 6], permissions) };
+            drop(quiesce);
+            physical
         } else {
-            unsafe { crate::trap::raw_syscall6_with_result(number, args, permissions) }
+            let quiesce = super::alloc::quiesce_for_fork();
+            let physical =
+                unsafe { crate::trap::raw_syscall6_with_result(number, args, permissions) };
+            drop(quiesce);
+            physical
         };
         if let Some(output) = guest_pkru {
             *output = physical.pkru;
@@ -3338,6 +4530,7 @@ fn injected_syscall_guard(
     runtime: &impl HostRuntime,
     number: i64,
     args: [u64; 6],
+    admit_threads: bool,
 ) -> Option<Errno> {
     // Every forwarded guest call passes here, so this is where a guest's own
     // seccomp filter is noticed or refused.
@@ -3365,12 +4558,34 @@ fn injected_syscall_guard(
     // not an errno that would corrupt libc's saved break.
     let unsupported_process =
         // AUTONOMOUS-BOT-IMPLEMENTED
-        ((number == libc::SYS_clone
-            || number == libc::SYS_clone3
-            || Some(number) == crate::arch::SYS_VFORK)
-            && !is_plain_fork(number, args))
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        || matches!(number, libc::SYS_execve | libc::SYS_execveat);
+        // Any clone3 reaching this guard is refused outright: every
+        // legitimate clone3 on a ToolHost path is intercepted and
+        // forwarded from a checked runtime copy before the guard is
+        // consulted (plain fork, thread birth, KernelDecides), so a
+        // clone3 here could only have arrived by falling through
+        // those intercepts — where forwarding the guest's own
+        // record pointer would reopen the classification/read race
+        // those copies close. This also covers admission-off, where
+        // the same fall-through existed before W7. Legacy clone and
+        // vfork carry register values only and keep the taxonomy
+        // match below.
+        number == libc::SYS_clone3
+        || ((number == libc::SYS_clone || Some(number) == crate::arch::SYS_VFORK)
+            && match creation_admission(number, args) {
+                CreationAdmission::PlainFork => false,
+                // Admitted thread shapes are performed by the caller's
+                // birth path, never by plain forwarding; with admission
+                // off they refuse here exactly as before W7.
+                CreationAdmission::ThreadBirth | CreationAdmission::KernelDecides => {
+                    !admit_threads
+                }
+                CreationAdmission::Unsupported => true,
+            })
+        // With an armed exec watch the exec forwards to the kernel
+        // and the watcher re-bootstraps the successor; without one
+        // it stays refused (see HostRuntime::exec_watch_armed).
+        || (matches!(number, libc::SYS_execve | libc::SYS_execveat)
+            && !runtime.exec_watch_armed());
     let protected_signal =
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-133): Review fail-closed guest signal-handler policy.
@@ -3477,6 +4692,98 @@ fn stripped_signal_mask(
     } else {
         Err(Errno::new(-copied as i32))
     }
+}
+
+/// Outcome of the one shared lifecycle injection guard chain.
+/// `Refused` still requires the guest to record its sticky
+/// first refusal before returning the carried result.
+#[cfg(any(feature = "exec-private-successor", feature = "exec-private-init"))]
+pub(super) enum GuardedLifecycleInjection {
+    /// Run the route's physical lifecycle leaf with these exact
+    /// arguments; `mask`, when present, must outlive that call so
+    /// the caller can point `args[1]` at it.
+    Physical {
+        /// Guard-adjusted syscall arguments.
+        args: [u64; 6],
+        /// Stripped signal mask storage, when the call needs one.
+        mask: Option<u64>,
+    },
+    /// Do not run any physical call; return this precomputed
+    /// result after recording the caller's sticky refusal.
+    Refused(core::result::Result<i64, Errno>),
+}
+
+/// The one deny/mapping/signal/descriptor guard chain shared by
+/// native and mapped successor lifecycle injection.
+#[cfg(any(feature = "exec-private-successor", feature = "exec-private-init"))]
+pub(super) fn guard_lifecycle_injection(
+    runtime: &impl HostRuntime,
+    number: i64,
+    mut args: [u64; 6],
+    mapping_allowed: impl FnOnce() -> bool,
+) -> GuardedLifecycleInjection {
+    // Lifecycle may not create/replace/terminate an image, admit an extra
+    // filter/namespace, stage delivery, or activate keys/guest handlers.
+    if matches!(
+        number,
+        libc::SYS_clone
+            | libc::SYS_clone3
+            | libc::SYS_fork
+            | libc::SYS_vfork
+            | libc::SYS_execve
+            | libc::SYS_execveat
+            | libc::SYS_exit
+            | libc::SYS_exit_group
+            | libc::SYS_rt_sigreturn
+            | libc::SYS_rseq
+            | libc::SYS_seccomp
+            | libc::SYS_unshare
+            | libc::SYS_setns
+            | libc::SYS_mount
+            | libc::SYS_umount2
+            | libc::SYS_chroot
+            | libc::SYS_pivot_root
+            | libc::SYS_pkey_alloc
+            | libc::SYS_pkey_free
+            | libc::SYS_pkey_mprotect
+            | libc::SYS_kill
+            | libc::SYS_tkill
+            | libc::SYS_tgkill
+            | libc::SYS_rt_sigqueueinfo
+            | libc::SYS_rt_tgsigqueueinfo
+    ) || (number == libc::SYS_prctl && args[0] == libc::PR_SET_SECCOMP as u64)
+        || (number == libc::SYS_arch_prctl && args[0] == 0x1001)
+    {
+        return GuardedLifecycleInjection::Refused(Err(Errno::EOPNOTSUPP));
+    }
+    if !mapping_allowed() {
+        return GuardedLifecycleInjection::Refused(Err(Errno::EOPNOTSUPP));
+    }
+    if let Some(error) = injected_syscall_guard(runtime, number, args, false) {
+        return GuardedLifecycleInjection::Refused(Err(error));
+    }
+    if let Some(result) = super::restorer::mapping_change_result(number, args) {
+        return GuardedLifecycleInjection::Refused(
+            Errno::from_ret(result as usize).map(|value| value as i64),
+        );
+    }
+    if let Some(result) =
+        unsafe { super::protect::protect_forwarded_descriptor_change(number, args) }
+    {
+        return GuardedLifecycleInjection::Refused(
+            Errno::from_ret(result as usize).map(|value| value as i64),
+        );
+    }
+    let mask = match stripped_signal_mask(runtime, number, args) {
+        Ok(mask) => mask,
+        Err(error) => return GuardedLifecycleInjection::Refused(Err(error)),
+    };
+    if mask.is_some() {
+        // The caller points args[1] at the returned mask storage
+        // immediately before its physical call.
+        args[1] = 0;
+    }
+    GuardedLifecycleInjection::Physical { args, mask }
 }
 
 /// The guest memory a Tool callback reaches through [`Guest::memory`]: this
@@ -3918,6 +5225,40 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
             return Errno::from_ret(result as usize).map(|value| value as i64);
         }
 
+        if self.admit_threads
+            && creation_admission(number, raw_args) == CreationAdmission::ThreadBirth
+        {
+            let Some(birth) = self.thread_birth else {
+                return Err(Errno::EOPNOTSUPP);
+            };
+            // SAFETY: creation_admission just classified this exact call
+            // as an admissible thread shape, and the event is this
+            // dispatch's live guest event with its saved context.
+            let result = unsafe { (birth.forward)(birth.host, number, raw_args, self.event) };
+            return Errno::from_ret(result as usize).map(|value| value as i64);
+        }
+
+        // With admission on, a KernelDecides shape is one Linux itself
+        // rejects: it is forwarded so the guest sees the kernel's
+        // EINVAL, exactly as on dispatch and tail_inject — clone3
+        // from a checked copy below, legacy clone (register values
+        // only, nothing to race) by the ordinary forward. Every
+        // other creation here is the typed refusal.
+        let kernel_decides = self.admit_threads
+            && creation_admission(number, raw_args) == CreationAdmission::KernelDecides;
+        if kernel_decides && number == libc::SYS_clone3 {
+            let mut record = [0_u64; CLONE_ARGS_SIZE_LIMIT / 8];
+            let result =
+                match checked_kernel_decides_clone3(raw_args, self.event.guest_pkru, &mut record) {
+                    Ok(copy_args) => {
+                        // SAFETY: the copy was classified KernelDecides
+                        // above; the kernel reads only the checked copy.
+                        unsafe { host_linux::forward(self.tid, number, copy_args) }
+                    }
+                    Err(result) => result,
+                };
+            return Errno::from_ret(result as usize).map(|value| value as i64);
+        }
         #[cfg(feature = "exec-native-injection")]
         if (matches!(number, libc::SYS_clone | libc::SYS_clone3)
             || Some(number) == crate::arch::SYS_VFORK)
@@ -3939,9 +5280,10 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
             return Err(Errno::EOPNOTSUPP);
         }
         // AUTONOMOUS-BOT-IMPLEMENTED
-        if number == libc::SYS_clone
-            || number == libc::SYS_clone3
-            || Some(number) == crate::arch::SYS_VFORK
+        if !kernel_decides
+            && (number == libc::SYS_clone
+                || number == libc::SYS_clone3
+                || Some(number) == crate::arch::SYS_VFORK)
         {
             // A typed refusal, so the Tool can tell this from a clone that
             // Linux failed: the in-guest runtime runs one thread of the guest
@@ -3994,21 +5336,39 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
             }
         }
         if matches!(number, libc::SYS_execve | libc::SYS_execveat) {
-            // A typed refusal, so the Tool can tell this from an exec that
-            // Linux failed: without an installed native exec route the
-            // in-guest runtime has no way to replace the process image.
-            self.unsupported_refusal = Some(reverie::UnsupportedRefusal::new(
-                reverie::UnsupportedOperation::Exec,
-                Errno::EOPNOTSUPP,
-                "the in-guest backend cannot replace the process image: execve and execveat \
+            // Admitted native authority first: on a route that never
+            // captured it (lifecycle callbacks run before capture), a
+            // watched exec refuses by name here instead of forwarding
+            // past the admitted route.
+            if let Some(refusal) = self.exec_native_priority_refusal() {
+                self.unsupported_refusal = Some(refusal);
+                return Err(Errno::EOPNOTSUPP);
+            }
+            if !self.runtime.exec_watch_armed() {
+                // A typed refusal, so the Tool can tell this from an exec
+                // that Linux failed: without an admitted native exec
+                // route or an armed exec watch the in-guest runtime has
+                // no way to replace the process image. With a watch
+                // armed (and no unreachable native route), execution
+                // falls through to the ordinary forward below: success
+                // never returns (the watcher re-bootstraps the
+                // successor), and failure returns the genuine kernel
+                // errno untagged.
+                self.unsupported_refusal = Some(reverie::UnsupportedRefusal::new(
+                    reverie::UnsupportedOperation::Exec,
+                    Errno::EOPNOTSUPP,
+                    "the in-guest backend cannot replace the process image: execve and execveat \
                  are not forwarded",
-            ));
-            return Err(Errno::EOPNOTSUPP);
+                ));
+                return Err(Errno::EOPNOTSUPP);
+            }
         }
         #[cfg(feature = "exec-native-injection")]
         self.check_native_mapping(number, raw_args)?;
         self.refuse_filter_while_staging(number, raw_args);
-        if let Some(error) = injected_syscall_guard(self.runtime, number, raw_args) {
+        if let Some(error) =
+            injected_syscall_guard(self.runtime, number, raw_args, self.admit_threads)
+        {
             return Err(error);
         }
         if let Some(result) = super::restorer::mapping_change_result(number, raw_args) {
@@ -4158,6 +5518,9 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
         let number = number.id() as i64;
         #[cfg(feature = "exec-native-injection")]
         if let Err(error) = self.check_native_mapping(number, args) {
+            // Terminal tail return: the parked Tool can never take
+            // the stored tag, so it rides on the event.
+            self.surface_terminal_refusal();
             self.tail.set_result(-i64::from(error.into_raw()));
             return std::future::pending().await;
         }
@@ -4200,7 +5563,55 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
             } else {
                 self.tail.set_result(result);
             }
-        } else if let Some(error) = injected_syscall_guard(self.runtime, number, args) {
+        } else if matches!(number, libc::SYS_execve | libc::SYS_execveat)
+            && let Some(refusal) = self.exec_tail_native_refusal()
+        {
+            // A tail call has no native cut of its own; with the
+            // native route admitted it refuses by name in every
+            // capture state rather than forwarding past (or
+            // re-spending) the admitted route. The name rides on the event, whose
+            // terminal result this refusal is; the parked Tool
+            // continuation can never take it from the guest view.
+            // Unwatched, the guard below refuses.
+            self.event.unsupported_refusal = Some(refusal);
+            self.tail
+                .set_result(-i64::from(Errno::EOPNOTSUPP.into_raw()));
+        } else if self.admit_threads
+            && creation_admission(number, args) == CreationAdmission::ThreadBirth
+        {
+            // Tail-injected admitted creations run the same birth
+            // trampoline as every other admitted path (W7 review);
+            // the plain forward below must never execute one raw.
+            match self.thread_birth {
+                Some(birth) => {
+                    // SAFETY: classified ThreadBirth just above; the
+                    // event is this dispatch's live guest event.
+                    let result = unsafe { (birth.forward)(birth.host, number, args, self.event) };
+                    self.tail.set_result(result);
+                }
+                None => self.tail.set_result(-i64::from(libc::EOPNOTSUPP)),
+            }
+        } else if number == libc::SYS_clone3
+            && self.admit_threads
+            && creation_admission(number, args) == CreationAdmission::KernelDecides
+        {
+            // Deferred to the kernel from a checked copy, as on
+            // dispatch and inject: the plain forward below must
+            // never hand the kernel the guest's own record pointer.
+            let mut record = [0_u64; CLONE_ARGS_SIZE_LIMIT / 8];
+            let result =
+                match checked_kernel_decides_clone3(args, self.event.guest_pkru, &mut record) {
+                    Ok(copy_args) => {
+                        // SAFETY: the copy was classified KernelDecides
+                        // above; the kernel reads only the checked copy.
+                        unsafe { host_linux::forward(self.tid, number, copy_args) }
+                    }
+                    Err(result) => result,
+                };
+            self.tail.set_result(result);
+        } else if let Some(error) =
+            injected_syscall_guard(self.runtime, number, args, self.admit_threads)
+        {
             self.tail.set_result(-i64::from(error.into_raw()));
         } else if let Some(result) = super::restorer::mapping_change_result(number, args) {
             self.tail.set_result(result);
@@ -4488,6 +5899,17 @@ mod process_owner_tests {
     /// When set, the getpid handler rendezvouses on this barrier, so two
     /// dispatches must be inside the Tool at once for either to proceed.
     static RENDEZVOUS: Mutex<Option<std::sync::Arc<std::sync::Barrier>>> = Mutex::new(None);
+    /// When set, Probe's thread-start ends the newborn thread.
+    static END_ON_START: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    /// Dispatch depth the Probe's on_exit_thread observed.
+    static EXIT_SEEN_DEPTH: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(usize::MAX);
+    /// The ToolHost address whose dispatch counter on_exit_thread
+    /// samples (the ending-birth test installs it before the birth).
+    static EXIT_HOST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    /// Whether on_exit_thread observed the host dispatch-active.
+    static EXIT_SEEN_ACTIVE: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
 
     struct Remote;
     impl Default for Remote {
@@ -4573,6 +5995,34 @@ mod process_owner_tests {
             assert_eq!(guest.pid().as_raw(), self.pid);
             assert_eq!(guest.tid().as_raw(), guest.thread_state().tid);
             EVENTS.lock().unwrap().push(("start", guest.tid().as_raw()));
+            if END_ON_START.load(std::sync::atomic::Ordering::Acquire) {
+                // End this thread from its own start callback: the
+                // injected exit stages the ending the birth path
+                // must finish still on the birth stack.
+                let _ = guest.inject(reverie::syscalls::Exit::default()).await;
+            }
+            Ok(())
+        }
+        async fn on_exit_thread<G: GlobalRPC<Remote>>(
+            &self,
+            _tid: reverie::Tid,
+            _global_state: &G,
+            _thread_state: State,
+            _exit_status: reverie::ExitStatus,
+        ) -> Result<(), Error> {
+            EXIT_SEEN_DEPTH.store(
+                super::super::alloc::dispatch_depth_for_test(),
+                std::sync::atomic::Ordering::Release,
+            );
+            let host_addr = EXIT_HOST.load(std::sync::atomic::Ordering::Acquire);
+            if host_addr != 0 {
+                // SAFETY: the ending-birth test installs its live
+                // host's address for exactly this read and clears
+                // it before the host drops.
+                let host = unsafe { &*(host_addr as *const ToolHost<Probe, Runtime>) };
+                EXIT_SEEN_ACTIVE
+                    .store(host.dispatch_active(), std::sync::atomic::Ordering::Release);
+            }
             Ok(())
         }
         async fn handle_syscall_event<G: Guest<Self>>(
@@ -4702,6 +6152,7 @@ mod process_owner_tests {
             context: 0,
             dispatch: SyscallDispatch::InstalledHook,
             guest_pkru: None,
+            unsupported_refusal: None,
         }
     }
 
@@ -4729,6 +6180,639 @@ mod process_owner_tests {
                 written, byte,
                 "a completed tail must never be forwarded again"
             );
+        }
+    }
+
+    /// The thread-admission taxonomy: every creation shape lands in
+    /// exactly one class, with plain fork's meaning unchanged. The
+    /// classes track Linux's own rules (THREAD ⇒ SIGHAND ⇒ VM): every
+    /// shape the kernel would turn into a real thread is ThreadBirth
+    /// or a named refusal, and only shapes the kernel itself rejects
+    /// defer to its EINVAL.
+    #[test]
+    fn creation_admission_taxonomy() {
+        const REQUIRED: u64 = (libc::CLONE_VM
+            | libc::CLONE_FS
+            | libc::CLONE_FILES
+            | libc::CLONE_SIGHAND
+            | libc::CLONE_THREAD) as u64;
+        assert_eq!(
+            thread_flags_admission(REQUIRED),
+            CreationAdmission::ThreadBirth
+        );
+        assert_eq!(
+            thread_flags_admission(REQUIRED | libc::CLONE_SETTLS as u64),
+            CreationAdmission::ThreadBirth
+        );
+        // No FS/FILES sharing: still a real thread on Linux.
+        assert_eq!(
+            thread_flags_admission(
+                (libc::CLONE_VM | libc::CLONE_SIGHAND | libc::CLONE_THREAD) as u64
+            ),
+            CreationAdmission::ThreadBirth
+        );
+        assert_eq!(
+            thread_flags_admission(REQUIRED & !(libc::CLONE_VM as u64)),
+            CreationAdmission::KernelDecides
+        );
+        assert_eq!(
+            thread_flags_admission(REQUIRED & !(libc::CLONE_SIGHAND as u64)),
+            CreationAdmission::KernelDecides
+        );
+        assert_eq!(
+            thread_flags_admission(REQUIRED | libc::CLONE_NEWNS as u64),
+            CreationAdmission::Unsupported
+        );
+        assert_eq!(
+            thread_flags_admission(REQUIRED | libc::CLONE_PIDFD as u64),
+            CreationAdmission::Unsupported
+        );
+        assert_eq!(
+            thread_flags_admission(libc::CLONE_VM as u64),
+            CreationAdmission::Unsupported,
+            "shared-VM process without CLONE_THREAD stays unsupported"
+        );
+        // clone_args: set_tid / cgroup stay unsupported; an exit
+        // signal or a half-given stack on a thread defers to the
+        // kernel's EINVAL; no stack at all is a real thread.
+        let mut fields = [0_u64; 11];
+        fields[0] = REQUIRED;
+        fields[5] = 0x1000;
+        fields[6] = 0x8000;
+        assert_eq!(
+            clone_args_thread_admission(&fields),
+            CreationAdmission::ThreadBirth
+        );
+        fields[5] = 0;
+        fields[6] = 0;
+        assert_eq!(
+            clone_args_thread_admission(&fields),
+            CreationAdmission::ThreadBirth,
+            "stack-less clone3 thread returns on the parent's stack"
+        );
+        fields[6] = 0x8000;
+        assert_eq!(
+            clone_args_thread_admission(&fields),
+            CreationAdmission::KernelDecides,
+            "stack_size without stack is the kernel's EINVAL"
+        );
+        fields[5] = 0x1000;
+        fields[6] = 0;
+        assert_eq!(
+            clone_args_thread_admission(&fields),
+            CreationAdmission::KernelDecides,
+            "stack without stack_size is the kernel's EINVAL"
+        );
+        fields[6] = 0x8000;
+        fields[8] = 1;
+        assert_eq!(
+            clone_args_thread_admission(&fields),
+            CreationAdmission::Unsupported
+        );
+        fields[8] = 0;
+        fields[4] = libc::SIGCHLD as u64;
+        assert_eq!(
+            clone_args_thread_admission(&fields),
+            CreationAdmission::KernelDecides,
+            "a thread exit signal is the kernel's EINVAL"
+        );
+    }
+
+    // The born thread's whole guest program: write its own tid to the
+    // pointer in rdi, then exit. It runs on the guest stack the birth
+    // resume installs, after admission has already run on the birth
+    // stack, and must touch nothing else (no Rust runtime, no TLS).
+    // x86_64 only, like the birth trampoline it exercises.
+    #[cfg(target_arch = "x86_64")]
+    core::arch::global_asm!(
+        r#"
+        .text
+        .p2align 4
+        .global w7_birth_stub
+        .hidden w7_birth_stub
+        .type w7_birth_stub,@function
+    w7_birth_stub:
+        endbr64
+        mov rax, 186
+        syscall
+        mov [rdi], rax
+        mov rax, 60
+        xor edi, edi
+        syscall
+        ud2
+        .size w7_birth_stub, .-w7_birth_stub
+    "#
+    );
+
+    /// Raw clone syscall for tail-inject tests (typed Clone needs the
+    /// nix sched type this crate does not depend on in tests).
+    #[cfg(target_arch = "x86_64")]
+    #[derive(Copy, Clone)]
+    struct RawClone([u64; 6]);
+
+    #[cfg(target_arch = "x86_64")]
+    impl reverie::syscalls::Displayable for RawClone {
+        fn fmt<M: reverie::syscalls::MemoryAccess>(
+            &self,
+            _memory: &M,
+            _outputs: bool,
+            f: &mut core::fmt::Formatter,
+        ) -> core::fmt::Result {
+            write!(f, "clone({:#x}, {:#x})", self.0[0], self.0[1])
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    impl reverie::syscalls::SyscallInfo for RawClone {
+        type Return = Result<i64, Errno>;
+
+        fn name(&self) -> &'static str {
+            "clone"
+        }
+
+        fn number(&self) -> reverie::syscalls::Sysno {
+            reverie::syscalls::Sysno::clone
+        }
+
+        fn into_parts(self) -> (reverie::syscalls::Sysno, reverie::syscalls::SyscallArgs) {
+            (
+                reverie::syscalls::Sysno::clone,
+                reverie::syscalls::SyscallArgs::new(
+                    self.0[0] as usize,
+                    self.0[1] as usize,
+                    self.0[2] as usize,
+                    self.0[3] as usize,
+                    self.0[4] as usize,
+                    self.0[5] as usize,
+                ),
+            )
+        }
+    }
+
+    /// A default-Tool tail_inject of an admitted thread creation runs
+    /// the same birth trampoline (and checklist) as dispatch and inject
+    /// (W7 review): the tail result is the child tid, the child was
+    /// admitted (thread-start observed), and its stub ran.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn tail_injected_thread_creation_runs_birth_checklist() {
+        let _test = TEST_LOCK.lock().unwrap();
+        let (mut host, _peer) = host(false, false);
+        host.set_thread_admission(true);
+        static TAIL_SEEN: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+        TAIL_SEEN.store(0, core::sync::atomic::Ordering::Release);
+        EVENTS.lock().unwrap().clear();
+        let guest_stack_len = 64 * 1024usize;
+        let guest_stack = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                guest_stack_len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(guest_stack, libc::MAP_FAILED);
+        let stack_top = guest_stack as u64 + guest_stack_len as u64;
+        unsafe extern "C" {
+            fn w7_birth_stub();
+        }
+        let mut saved = RegisterContext::default();
+        saved.rdi = core::ptr::addr_of!(TAIL_SEEN) as u64;
+        let root_tid = raw_pid(libc::SYS_gettid);
+        let pid = raw_pid(libc::SYS_getpid);
+        let mut event = SyscallEvent {
+            number: libc::SYS_getpid,
+            args: [0; 6],
+            instruction_pointer: w7_birth_stub as *const () as usize as u64,
+            result: 0,
+            context: &raw const saved as usize,
+            dispatch: SyscallDispatch::Trap,
+            guest_pkru: None,
+            unsupported_refusal: None,
+        };
+        let tail = TailResult::default();
+        let mut state = State {
+            pid: pid.as_raw(),
+            tid: root_tid.as_raw(),
+            attempts: 0,
+        };
+        let mut guest = InGuest::<Probe, Runtime> {
+            event: &mut event,
+            tid: root_tid,
+            pid,
+            ppid: None,
+            state: &mut state,
+            rpc: &host.rpc,
+            native: None,
+            tail: &tail,
+            cpuid_interception: false,
+            admit_threads: true,
+            thread_birth: host.thread_birth_ops(),
+            fork_parent_state: None,
+            runtime: &host.runtime,
+            staged_signals: Vec::new(),
+            staged_signal_delivery: false,
+            in_syscall_handler: true,
+            #[cfg(feature = "exec-native-injection")]
+            exec: None,
+            #[cfg(feature = "exec-native-injection")]
+            mapping_driver: None,
+            #[cfg(feature = "exec-native-injection")]
+            native_exec_admitted: host.native_exec_admitted(),
+            #[cfg(feature = "exec-native-injection")]
+            native_exec_route_active: host.native_exec_admitted(),
+            unsupported_refusal: None,
+            injected_syscalls: 0,
+        };
+        let flags = (libc::CLONE_VM
+            | libc::CLONE_FS
+            | libc::CLONE_FILES
+            | libc::CLONE_SIGHAND
+            | libc::CLONE_THREAD
+            | libc::CLONE_SYSVSEM) as u64;
+        let call = RawClone([flags, stack_top, 0, 0, 0, 0]);
+        let mut tail_future = core::pin::pin!(guest.tail_inject(call));
+        // tail_inject parks once it has stored the result.
+        let waker = std::task::Waker::noop();
+        let mut context = std::task::Context::from_waker(waker);
+        assert!(matches!(
+            tail_future.as_mut().poll(&mut context),
+            core::task::Poll::Pending
+        ));
+        let result = match crate::tool_host::drive_syscall(
+            std::future::pending::<Result<i64, Error>>(),
+            &tail,
+        ) {
+            crate::tool_host::SyscallOutcome::Return(result) => {
+                result.expect("tail thread creation failed")
+            }
+            _ => panic!("tail_inject did not park a result"),
+        };
+        assert!(result > 0, "child tid {result}");
+        let child_tid = result as i32;
+        let mut seen = 0;
+        for _ in 0..500 {
+            seen = TAIL_SEEN.load(core::sync::atomic::Ordering::Acquire);
+            if seen != 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(seen, i64::from(child_tid), "born thread ran its guest stub");
+        assert!(
+            EVENTS
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(name, _)| *name == "start"),
+            "birth checklist ran thread-start for the tail-injected creation"
+        );
+        assert!(host.states.contains(child_tid));
+        unsafe { libc::munmap(guest_stack, guest_stack_len) };
+    }
+
+    /// Physical thread birth end to end: a real clone through the birth
+    /// trampoline. The child is admitted (lease + thread-start) on its
+    /// birth stack, then resumes at the stub above on its guest stack,
+    /// records its tid, and exits — all inside this test process.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn physical_thread_birth_admits_and_resumes() {
+        let _test = TEST_LOCK.lock().unwrap();
+        let (mut host, _peer) = host(false, false);
+        host.set_thread_admission(true);
+        static SEEN: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+        SEEN.store(0, core::sync::atomic::Ordering::Release);
+        EVENTS.lock().unwrap().clear();
+        // Guest stack for the child (its clone stack argument).
+        let guest_stack_len = 64 * 1024usize;
+        let guest_stack = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                guest_stack_len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(guest_stack, libc::MAP_FAILED);
+        let stack_top = guest_stack as u64 + guest_stack_len as u64;
+        unsafe extern "C" {
+            fn w7_birth_stub();
+        }
+        let mut saved = RegisterContext::default();
+        saved.rdi = core::ptr::addr_of!(SEEN) as u64;
+        let flags = (libc::CLONE_VM
+            | libc::CLONE_FS
+            | libc::CLONE_FILES
+            | libc::CLONE_SIGHAND
+            | libc::CLONE_THREAD
+            | libc::CLONE_SYSVSEM) as u64;
+        let args = [flags, stack_top, 0, 0, 0, 0];
+        assert_eq!(
+            creation_admission(libc::SYS_clone, args),
+            CreationAdmission::ThreadBirth
+        );
+        let event = SyscallEvent {
+            number: libc::SYS_clone,
+            args,
+            instruction_pointer: w7_birth_stub as *const () as usize as u64,
+            result: 0,
+            context: &raw const saved as usize,
+            dispatch: SyscallDispatch::Trap,
+            guest_pkru: None,
+            unsupported_refusal: None,
+        };
+        // This shape has no CLONE_SETTLS, so the newborn's admission
+        // runs on THIS thread's TLS: it must leave the parent's
+        // dispatch depth and committed arenas exactly as they were
+        // (a leaked birth scope once raised the depth and cleared
+        // the arenas here).
+        retain_committed_stack(vec![0_u8; 64].into_boxed_slice());
+        let parent_depth = super::super::alloc::dispatch_depth_for_test();
+        let parent_committed = COMMITTED_STACKS.with(|stacks| stacks.borrow().len());
+        // SAFETY: host/event as constructed above; the child resumes at
+        // the stub with SEEN's address in rdi and exits by raw syscall.
+        let child_tid = unsafe {
+            forward_thread_creation::<Probe, Runtime>(
+                core::ptr::from_ref(&host) as usize,
+                libc::SYS_clone,
+                args,
+                &event,
+            )
+        };
+        assert!(child_tid > 0, "clone failed with {child_tid}");
+        // The child writes its own tid before exiting; poll briefly.
+        let mut seen = 0;
+        for _ in 0..500 {
+            seen = SEEN.load(core::sync::atomic::Ordering::Acquire);
+            if seen != 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(seen, child_tid, "born thread ran its guest stub");
+        assert_eq!(
+            super::super::alloc::dispatch_depth_for_test(),
+            parent_depth,
+            "birth admission on the parent's TLS must restore its depth"
+        );
+        assert_eq!(
+            COMMITTED_STACKS.with(|stacks| stacks.borrow().len()),
+            parent_committed,
+            "birth admission must not clear the parent's committed arenas"
+        );
+        // Admission ran on the child: a lease exists for its tid and the
+        // birth stack is registered for retire-time release.
+        assert!(host.states.contains(child_tid as i32));
+        assert!(host.birth_stacks.lock().contains_key(&(child_tid as i32)));
+        assert!(
+            EVENTS
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(name, _)| *name == "start"),
+            "thread_start callback ran for the born thread"
+        );
+        unsafe { libc::munmap(guest_stack, guest_stack_len) };
+    }
+
+    /// A birth whose own thread-start callback ends the thread:
+    /// the Ending path finishes still standing on the birth stack.
+    /// The parent must observe: the process survives, the exit
+    /// callback ran counted and in scope (depth > 0,
+    /// dispatch_active), the counters are back at baseline after
+    /// the newborn is gone, the parent's committed arenas are
+    /// untouched, and no birth-stack entry remains (the mapping
+    /// itself is deliberately leaked — unmapping the stack in use
+    /// is the SIGSEGV this guards against). Runs no-SETTLS first
+    /// (admission on the parent's TLS), then with CLONE_SETTLS
+    /// onto a copied FS page.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn birth_ending_on_start_restores_parent_dispatch_state() {
+        let _test = TEST_LOCK.lock().unwrap();
+        for settls in [false, true] {
+            let (mut host, _peer) = host(false, false);
+            host.set_thread_admission(true);
+            static END_SEEN: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+            END_SEEN.store(0, core::sync::atomic::Ordering::Release);
+            EVENTS.lock().unwrap().clear();
+            EXIT_SEEN_DEPTH.store(usize::MAX, std::sync::atomic::Ordering::Release);
+            EXIT_SEEN_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
+            EXIT_HOST.store(
+                core::ptr::from_ref(&host) as usize,
+                std::sync::atomic::Ordering::Release,
+            );
+            END_ON_START.store(true, std::sync::atomic::Ordering::Release);
+            let guest_stack_len = 64 * 1024usize;
+            let guest_stack = unsafe {
+                libc::mmap(
+                    core::ptr::null_mut(),
+                    guest_stack_len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            assert_ne!(guest_stack, libc::MAP_FAILED);
+            let stack_top = guest_stack as u64 + guest_stack_len as u64;
+            // For SETTLS: a private FS page copied from the
+            // parent's, with its self-pointer retargeted. The DTV
+            // still aliases the parent's module blocks (only the
+            // depth/active invariants are under test, and those
+            // read the cells either way).
+            let tls_page = if settls {
+                // x86_64 TLS variant II: variables live BELOW the
+                // FS base (the TCB head), so copy the block on
+                // both sides of a retargeted self-pointer.
+                let span = 64 * 1024usize;
+                let tls = unsafe {
+                    libc::mmap(
+                        core::ptr::null_mut(),
+                        span * 2,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                        -1,
+                        0,
+                    )
+                };
+                assert_ne!(tls, libc::MAP_FAILED);
+                let mut fs_base: u64 = 0;
+                // SAFETY: ARCH_GET_FS writes the FS base to fs_base.
+                let got = unsafe {
+                    libc::syscall(libc::SYS_arch_prctl, 0x1003_i64, &mut fs_base as *mut u64)
+                };
+                assert_eq!(got, 0, "ARCH_GET_FS failed");
+                // Clip both sides to the mappings that actually
+                // contain them: the thread-stack mapping ends only
+                // ~2.5 KiB above fs_base, so copying a full span
+                // upward reads into the next mapping (or a guard
+                // page) and segfaults beside sibling tests.
+                let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+                let clip = |addr: u64, want: usize, upward: bool| -> usize {
+                    for line in maps.lines() {
+                        let mut parts = line.split(['-', ' ']);
+                        let Ok(start) = u64::from_str_radix(parts.next().unwrap_or(""), 16) else {
+                            continue;
+                        };
+                        let Ok(end) = u64::from_str_radix(parts.next().unwrap_or(""), 16) else {
+                            continue;
+                        };
+                        if upward && addr >= start && addr < end {
+                            return want.min((end - addr) as usize);
+                        }
+                        if !upward && addr > start && addr <= end {
+                            return want.min((addr - start) as usize);
+                        }
+                    }
+                    0
+                };
+                let below = clip(fs_base, span, false);
+                assert!(below > 0, "FS mapping not found below fs_base");
+                let above = clip(fs_base, span, true);
+                assert!(above > 0, "FS mapping not found above fs_base");
+                // SAFETY: both sides are clipped to their mappings;
+                // the copy is this test's private span, placed so
+                // the new base sits at the same offsets.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        (fs_base as *const u8).sub(below),
+                        (tls as *mut u8).add(span - below),
+                        below + above,
+                    );
+                    let new_base = (tls as u64) + span as u64;
+                    (new_base as *mut u64).write(new_base);
+                    new_base
+                }
+            } else {
+                0
+            };
+            retain_committed_stack(vec![0_u8; 64].into_boxed_slice());
+            let parent_depth = super::super::alloc::dispatch_depth_for_test();
+            let parent_committed = COMMITTED_STACKS.with(|stacks| stacks.borrow().len());
+            unsafe extern "C" {
+                fn w7_birth_stub();
+            }
+            let mut saved = RegisterContext::default();
+            saved.rdi = core::ptr::addr_of!(END_SEEN) as u64;
+            let mut flags = (libc::CLONE_VM
+                | libc::CLONE_FS
+                | libc::CLONE_FILES
+                | libc::CLONE_SIGHAND
+                | libc::CLONE_THREAD
+                | libc::CLONE_SYSVSEM) as u64;
+            if settls {
+                flags |= libc::CLONE_SETTLS as u64;
+            }
+            let args = [flags, stack_top, 0, 0, tls_page, 0];
+            assert_eq!(
+                creation_admission(libc::SYS_clone, args),
+                CreationAdmission::ThreadBirth
+            );
+            let event = SyscallEvent {
+                number: libc::SYS_clone,
+                args,
+                instruction_pointer: w7_birth_stub as *const () as usize as u64,
+                result: 0,
+                context: &raw const saved as usize,
+                dispatch: SyscallDispatch::Trap,
+                guest_pkru: None,
+                unsupported_refusal: None,
+            };
+            // SAFETY: host/event as constructed; the newborn's
+            // start callback ends it before any guest resume.
+            let child_tid = unsafe {
+                forward_thread_creation::<Probe, Runtime>(
+                    core::ptr::from_ref(&host) as usize,
+                    libc::SYS_clone,
+                    args,
+                    &event,
+                )
+            };
+            assert!(child_tid > 0, "clone failed with {child_tid}");
+            // The newborn ends itself during admission; poll until
+            // its state slot and birth-stack entry are gone.
+            let child_tid = child_tid as i32;
+            let mut finished = false;
+            for _ in 0..500 {
+                if !host.states.contains(child_tid)
+                    && !host.birth_stacks.lock().contains_key(&child_tid)
+                    && EXIT_SEEN_DEPTH.load(std::sync::atomic::Ordering::Acquire) != usize::MAX
+                {
+                    finished = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            END_ON_START.store(false, std::sync::atomic::Ordering::Release);
+            if !finished {
+                // The newborn may still reach the host through
+                // its guard drops (inline fields included, which
+                // forget alone would leave in this unwound
+                // frame); leak it on the heap rather than turn
+                // this failure into a suite-wide SIGSEGV.
+                let _ = Box::leak(Box::new(host));
+                panic!("ending birth did not finish (settls={settls})");
+            }
+            // The poll above can complete as soon as on_exit_thread
+            // ran — before the newborn released its guards and
+            // exited. Wait for the thread to really be gone
+            // before asserting baselines, unmapping its live TLS
+            // copy, or dropping the host its guard drops write to.
+            let mypid = raw_pid(libc::SYS_getpid);
+            let mut exited = false;
+            for _ in 0..500 {
+                // SAFETY: signal 0 only probes existence.
+                let probe = unsafe {
+                    libc::syscall(
+                        libc::SYS_tgkill,
+                        mypid.as_raw() as i64,
+                        child_tid as i64,
+                        0_i64,
+                    )
+                };
+                if probe == -1
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                {
+                    exited = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            if !exited {
+                let _ = Box::leak(Box::new(host));
+                panic!("ending newborn thread did not exit");
+            }
+            EXIT_HOST.store(0, std::sync::atomic::Ordering::Release);
+            assert!(
+                EXIT_SEEN_DEPTH.load(std::sync::atomic::Ordering::Acquire) > 0,
+                "on_exit_thread must run inside the allocation scope"
+            );
+            assert!(
+                EXIT_SEEN_ACTIVE.load(std::sync::atomic::Ordering::Acquire),
+                "on_exit_thread must run counted as an active dispatch"
+            );
+            assert_eq!(
+                super::super::alloc::dispatch_depth_for_test(),
+                parent_depth,
+                "parent dispatch depth changed by the ending birth"
+            );
+            assert_eq!(
+                COMMITTED_STACKS.with(|stacks| stacks.borrow().len()),
+                parent_committed,
+                "parent committed arenas changed by the ending birth"
+            );
+            assert!(!host.dispatch_active());
+            unsafe { libc::munmap(guest_stack, guest_stack_len) };
+            if settls {
+                // SAFETY: the copied TLS span's base is 64 KiB in.
+                unsafe { libc::munmap((tls_page as *mut libc::c_void).sub(64 * 1024), 128 * 1024) };
+            }
         }
     }
 
@@ -5120,6 +7204,8 @@ mod process_owner_tests {
                 parent_pid: Pid::from_raw(parent_pid),
                 child_tid: Pid::from_raw(child_tid),
                 child_pid: Pid::from_raw(child_pid),
+                #[cfg(feature = "exec-native-injection")]
+                native_exec_route_active: false,
             },
         );
         assert_eq!(call.result, 0);
@@ -5147,6 +7233,1098 @@ mod process_owner_tests {
             Some(child_pid)
         );
         assert!(!host.states.contains(parent_tid));
+    }
+
+    /// Wiring witness for fork quiescence: `finish_fork_child` must
+    /// complete in a child whose copies of every host lock were made
+    /// mid-hold by sibling threads that do not exist here, with a
+    /// dispatch counter including those siblings' guards. Leaked
+    /// guards stand in for the dead holders; deleting the host
+    /// reinit call deadlocks the exec'd child (deadline below),
+    /// and deleting the nested RPC reinit fails the registry-lock
+    /// assertions after the call.
+    #[test]
+    fn fork_child_reinit_recovers_copied_locked_host() {
+        use std::os::unix::process::CommandExt;
+        const MODE: &str = "REVERIE_FORK_REINIT_TEST";
+        const TEST: &str =
+            "guest::host::process_owner_tests::fork_child_reinit_recovers_copied_locked_host";
+        if std::env::var_os(MODE).is_none() {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+                .env(MODE, "child")
+                .process_group(0)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break status;
+                }
+                if std::time::Instant::now() >= deadline {
+                    assert_eq!(
+                        unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) },
+                        0
+                    );
+                    child.wait().unwrap();
+                    panic!("fork reinit test exceeded ten seconds (a copied lock deadlocked)");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
+            let output = child.wait_with_output().unwrap();
+            assert!(status.success(), "{status}; {output:?}");
+            assert!(
+                String::from_utf8(output.stdout)
+                    .unwrap()
+                    .lines()
+                    .any(|line| line == format!("test {TEST} ... ok")),
+                "expected exactly one completed child test"
+            );
+            return;
+        }
+        let (host, _peer) = host(false, false);
+        EVENTS.lock().unwrap().clear();
+        let child_pid = raw_pid(libc::SYS_getpid).as_raw();
+        let child_tid = raw_pid(libc::SYS_gettid).as_raw();
+        let parent_pid = raw_pid(libc::SYS_getppid).as_raw();
+        // A sibling's tid which is not this thread's: the parent
+        // lease's identity in the copied registry.
+        let parent_tid = child_tid + 100_000;
+        assert!(
+            host.states
+                .try_publish(
+                    parent_tid,
+                    State {
+                        pid: parent_pid,
+                        tid: parent_tid,
+                        attempts: 0,
+                    },
+                )
+                .is_ok()
+        );
+        let parent_lease = host
+            .states
+            .checkout_existing(parent_tid)
+            .expect("parent state just published");
+        let snapshot = State {
+            pid: parent_pid,
+            tid: parent_tid,
+            attempts: 0,
+        };
+        // Sibling stand-ins: every host/registry lock held by a
+        // thread that no longer exists, plus three sibling dispatches
+        // counted in the process-wide counter.
+        core::mem::forget(host.install_gate.lock());
+        core::mem::forget(host.tool.lock());
+        core::mem::forget(host.birth_stacks.lock());
+        core::mem::forget(host.ordinary_root_state.lock());
+        #[cfg(feature = "exec-private-successor")]
+        core::mem::forget(host.prepared_exec.lock());
+        host.states.forget_lock_guard_for_test();
+        host.rpc.forget_lock_guards_for_test();
+        host.active_dispatches
+            .fetch_add(3, core::sync::atomic::Ordering::AcqRel);
+        assert!(host.install_gate.try_lock().is_none());
+        assert!(host.tool.try_lock().is_none());
+        assert!(host.dispatch_active());
+        let mut call = event(crate::arch::SYS_FORK.unwrap_or(libc::SYS_clone), [0; 6]);
+        finish_fork_child(
+            &host,
+            parent_lease,
+            &mut call,
+            snapshot,
+            ForkChildContext {
+                parent_tid: Pid::from_raw(parent_tid),
+                parent_pid: Pid::from_raw(parent_pid),
+                child_tid: Pid::from_raw(child_tid),
+                child_pid: Pid::from_raw(child_pid),
+                #[cfg(feature = "exec-native-injection")]
+                native_exec_route_active: false,
+            },
+        );
+        assert_eq!(call.result, 0);
+        assert!(
+            !host.dispatch_active(),
+            "sibling dispatch counts must be reset away"
+        );
+        assert!(host.install_gate.try_lock().is_some());
+        assert!(host.tool.try_lock().is_some());
+        assert!(host.birth_stacks.try_lock().is_some());
+        assert!(host.ordinary_root_state.try_lock().is_some());
+        #[cfg(feature = "exec-private-successor")]
+        assert!(host.prepared_exec.try_lock().is_some());
+        assert!(
+            host.rpc.registry_locks_free_for_test(),
+            "RPC registry locks leaked above must be free after reinit"
+        );
+        assert!(host.states.contains(child_tid));
+        assert!(!host.states.contains(parent_tid));
+        assert!(
+            EVENTS
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(name, tid)| *name == "start" && *tid == child_tid),
+            "thread-start ran in the recovered child"
+        );
+    }
+
+    /// Real-wiring heap witness: a sibling thread holds the Tool
+    /// heap lock directly (not through the quiesce under test)
+    /// while the main thread performs a REAL plain fork through
+    /// `forward_plain_fork` and runs `finish_fork_child` in the
+    /// child, which then allocates from the Tool heap. The sibling
+    /// holds past the forker's entry and then keeps re-acquiring
+    /// the lock, so a fork taken without the quiesce — or one
+    /// whose quiesce is released before the raw syscall — copies
+    /// a held heap lock and the child hangs; the pipe deadline
+    /// fails the test. Replacing the quiesce calls with `()` must
+    /// therefore kill this test. Legs run fork, COW-vfork, and
+    /// fork again with `CREATION_HOOK` set directly in this
+    /// exec'd child (reported_creation itself never checks for an
+    /// installed filter; only set_physical_creation_hook does),
+    /// covering all three quiesce sites.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn fork_heap_quiesce_through_real_forward() {
+        use std::os::unix::process::CommandExt;
+        const MODE: &str = "REVERIE_FORK_HEAP_QUIESCE_TEST";
+        const TEST: &str =
+            "guest::host::process_owner_tests::fork_heap_quiesce_through_real_forward";
+        if std::env::var_os(MODE).is_none() {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+                .env(MODE, "child")
+                .process_group(0)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break status;
+                }
+                if std::time::Instant::now() >= deadline {
+                    assert_eq!(
+                        unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) },
+                        0
+                    );
+                    child.wait().unwrap();
+                    panic!("heap quiesce wiring test exceeded twenty seconds");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
+            let output = child.wait_with_output().unwrap();
+            assert!(status.success(), "{status}; {output:?}");
+            assert!(
+                String::from_utf8(output.stdout)
+                    .unwrap()
+                    .lines()
+                    .any(|line| line == format!("test {TEST} ... ok")),
+                "expected exactly one completed child test"
+            );
+            return;
+        }
+        use core::sync::atomic::AtomicBool;
+        use core::sync::atomic::Ordering;
+        static HOOK_CREATED: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        fn counting_creation_hook(creation: PhysicalCreation) -> io::Result<()> {
+            if matches!(creation, PhysicalCreation::Created { .. }) {
+                HOOK_CREATED.fetch_add(1, Ordering::AcqRel);
+            }
+            Ok(())
+        }
+        for (number, use_hook) in [
+            (
+                crate::arch::SYS_FORK.expect("x86_64 gate keeps fork beside vfork"),
+                false,
+            ),
+            (
+                crate::arch::SYS_VFORK.expect("x86_64 gate keeps vfork beside fork"),
+                false,
+            ),
+            (
+                crate::arch::SYS_FORK.expect("x86_64 gate keeps fork beside vfork"),
+                true,
+            ),
+        ] {
+            if use_hook {
+                // Direct set, exec'd-child only: reported_creation
+                // reads the cell; only the registration API checks
+                // for an installed runtime filter.
+                let _ = CREATION_HOOK.set(counting_creation_hook);
+            }
+            let (host, _peer) = host(false, false);
+            EVENTS.lock().unwrap().clear();
+            let parent_pid = raw_pid(libc::SYS_getppid).as_raw();
+            let parent_tid = raw_pid(libc::SYS_gettid).as_raw() + 100_000;
+            assert!(
+                host.states
+                    .try_publish(
+                        parent_tid,
+                        State {
+                            pid: parent_pid,
+                            tid: parent_tid,
+                            attempts: 0,
+                        },
+                    )
+                    .is_ok()
+            );
+            let parent_lease = host
+                .states
+                .checkout_existing(parent_tid)
+                .expect("parent state just published");
+            let snapshot = State {
+                pid: parent_pid,
+                tid: parent_tid,
+                attempts: 0,
+            };
+            let mut pipe_fds = [-1; 2];
+            // SAFETY: pipe2 writes two descriptors into the array.
+            assert_eq!(unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), 0) }, 0);
+            let held = std::sync::Arc::new(AtomicBool::new(false));
+            let entered = std::sync::Arc::new(AtomicBool::new(false));
+            let stop = std::sync::Arc::new(AtomicBool::new(false));
+            let sibling = {
+                let held = std::sync::Arc::clone(&held);
+                let entered = std::sync::Arc::clone(&entered);
+                let stop = std::sync::Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    // Hold the heap lock directly, not through the
+                    // quiesce under test.
+                    let guard = super::super::alloc::hold_tool_heap_lock_for_test();
+                    held.store(true, Ordering::Release);
+                    while !entered.load(Ordering::Acquire) {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    // Hold well past the forker's syscall entry: a
+                    // fork taken inside this window without the
+                    // quiesce copies the held heap lock.
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    drop(guard);
+                    // Then keep re-acquiring: a quiesce released
+                    // before the raw syscall (instead of after it)
+                    // lets this churn win the lock back in the gap,
+                    // and the fork copies it held again.
+                    while !stop.load(Ordering::Acquire) {
+                        let guard = super::super::alloc::hold_tool_heap_lock_for_test();
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                        drop(guard);
+                        std::thread::yield_now();
+                    }
+                })
+            };
+            while !held.load(Ordering::Acquire) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let mut call = event(number, [0; 6]);
+            entered.store(true, Ordering::Release);
+            let result = forward_plain_fork(number, [0; 6], None);
+            if result == 0 {
+                // Fork child: the sibling and its held guard do not
+                // exist here. Run the real child finish, then prove
+                // the Tool heap allocates.
+                // SAFETY: closing this child's copy of the read end.
+                unsafe { libc::close(pipe_fds[0]) };
+                let child_pid = raw_pid(libc::SYS_getpid);
+                let child_tid = raw_pid(libc::SYS_gettid);
+                finish_fork_child(
+                    &host,
+                    parent_lease,
+                    &mut call,
+                    snapshot,
+                    ForkChildContext {
+                        parent_tid: Pid::from_raw(parent_tid),
+                        parent_pid: Pid::from_raw(parent_pid),
+                        child_tid,
+                        child_pid,
+                        #[cfg(feature = "exec-native-injection")]
+                        native_exec_route_active: false,
+                    },
+                );
+                let ok = {
+                    use core::alloc::GlobalAlloc;
+                    let _scope = super::super::alloc::enter_dispatch();
+                    let layout = core::alloc::Layout::from_size_align(512, 64).unwrap();
+                    // SAFETY: layout is valid for this allocator.
+                    let pointer = unsafe { super::super::alloc::GuestAllocator.alloc(layout) };
+                    if pointer.is_null() {
+                        false
+                    } else {
+                        // SAFETY: pointer covers layout.size bytes.
+                        unsafe { pointer.write_bytes(0xa5, layout.size()) };
+                        // SAFETY: pointer is live with layout.
+                        unsafe { super::super::alloc::GuestAllocator.dealloc(pointer, layout) };
+                        true
+                    }
+                };
+                let byte = [u8::from(ok)];
+                // SAFETY: write end is open in this child.
+                unsafe {
+                    libc::write(pipe_fds[1], byte.as_ptr().cast(), 1);
+                }
+                // SAFETY: _exit avoids inherited atexit state.
+                unsafe { libc::_exit(if ok { 0 } else { 71 }) };
+            }
+            assert!(result > 0, "forward_plain_fork failed with {result}");
+            // SAFETY: closing the parent's write end so the read
+            // side sees EOF when the child exits.
+            unsafe { libc::close(pipe_fds[1]) };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+            let mut byte = [0_u8; 1];
+            let read = loop {
+                let mut poll = libc::pollfd {
+                    fd: pipe_fds[0],
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: one pollfd for this test's pipe read end.
+                let ready = unsafe { libc::poll(&mut poll, 1, 100) };
+                if ready > 0 {
+                    // SAFETY: reading the one status byte.
+                    break unsafe { libc::read(pipe_fds[0], byte.as_mut_ptr().cast(), 1) };
+                }
+                if std::time::Instant::now() >= deadline {
+                    // SAFETY: killing this test's direct child.
+                    unsafe { libc::kill(result as libc::pid_t, libc::SIGKILL) };
+                    break -1;
+                }
+            };
+            let mut status = 0;
+            // SAFETY: `result` is this test's direct child pid.
+            assert_eq!(
+                unsafe { libc::waitpid(result as libc::pid_t, &mut status, 0) },
+                result as libc::pid_t
+            );
+            // SAFETY: closing the parent's read end.
+            unsafe { libc::close(pipe_fds[0]) };
+            drop(parent_lease);
+            stop.store(true, Ordering::Release);
+            sibling.join().unwrap();
+            if use_hook {
+                assert!(
+                    HOOK_CREATED.load(Ordering::Acquire) >= 1,
+                    "the hooked leg must have reported its creation"
+                );
+            }
+            assert_eq!(read, 1, "child hung before its Tool-heap allocation");
+            assert_eq!(byte, [1]);
+            assert!(
+                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                "fork child failed with status {status:#x}"
+            );
+        }
+    }
+
+    /// Raw clone3 syscall for the flip test's tail injections.
+    #[cfg(target_arch = "x86_64")]
+    #[derive(Copy, Clone)]
+    struct RawClone3([u64; 2]);
+
+    #[cfg(target_arch = "x86_64")]
+    impl reverie::syscalls::Displayable for RawClone3 {
+        fn fmt<M: reverie::syscalls::MemoryAccess>(
+            &self,
+            _memory: &M,
+            _outputs: bool,
+            f: &mut core::fmt::Formatter,
+        ) -> core::fmt::Result {
+            write!(f, "clone3({:#x}, {:#x})", self.0[0], self.0[1])
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    impl reverie::syscalls::SyscallInfo for RawClone3 {
+        type Return = Result<i64, Errno>;
+
+        fn name(&self) -> &'static str {
+            "clone3"
+        }
+
+        fn number(&self) -> reverie::syscalls::Sysno {
+            reverie::syscalls::Sysno::clone3
+        }
+
+        fn into_parts(self) -> (reverie::syscalls::Sysno, reverie::syscalls::SyscallArgs) {
+            (
+                reverie::syscalls::Sysno::clone3,
+                reverie::syscalls::SyscallArgs::new(
+                    self.0[0] as usize,
+                    self.0[1] as usize,
+                    0,
+                    0,
+                    0,
+                    0,
+                ),
+            )
+        }
+    }
+
+    /// Flip regression: a sibling thread rewrites a shared clone3
+    /// record between shapes while creations are classified and
+    /// forwarded in a loop, in separately exec'd phases:
+    /// dispatch flips plain-fork vs KernelDecides, tail_inject
+    /// flips KernelDecides vs plain-fork vs Unsupported vs the
+    /// stack-less full-sharing birth shape, and a births phase
+    /// holds that birth shape steady. Outcomes
+    /// accumulate on a memfd-shared page across the 40 exec'd runs
+    /// of each phase (guard refusals, kernel EINVALs, reset fork
+    /// children, admitted births, raw children): each phase must
+    /// show a minimum number of real outcomes, so a run that ends
+    /// with the classification-mismatch refusal (bare 125) at
+    /// iteration 0 does not count as coverage, and raw children
+    /// must stay zero. Per-phase exec modes keep a dispatch-phase
+    /// 125 from ending the tail phase unrun. Exec'd throughout so
+    /// a regression's raw child cannot take the suite with it.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn clone3_flip_never_creates_unreset_child() {
+        use std::os::unix::process::CommandExt;
+        const MODE: &str = "REVERIE_CLONE3_FLIP_TEST";
+        const COUNT_FD: &str = "REVERIE_CLONE3_FLIP_COUNT_FD";
+        const TEST: &str =
+            "guest::host::process_owner_tests::clone3_flip_never_creates_unreset_child";
+        // Counter page layout (u64 slots): 0 raw children,
+        // 1 guard/typed refusals (EOPNOTSUPP), 2 kernel EINVAL,
+        // 3 reset fork children, 4 admitted births.
+        const MIN_OUTCOMES_PER_PHASE: u64 = 200;
+        let mode = std::env::var(MODE).ok();
+        if mode.is_none() {
+            // The counter page lives in a memfd so every exec'd run
+            // of the three phases accumulates into the same counts.
+            let counter_fd = unsafe { libc::memfd_create(c"clone3-flip-counts".as_ptr(), 0) };
+            assert!(counter_fd >= 0, "memfd_create failed");
+            assert_eq!(unsafe { libc::ftruncate(counter_fd, 4096) }, 0);
+            let counter_page = unsafe {
+                libc::mmap(
+                    core::ptr::null_mut(),
+                    4096,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    counter_fd,
+                    0,
+                )
+            };
+            assert_ne!(counter_page, libc::MAP_FAILED);
+            let counts = |slot: usize| {
+                // SAFETY: the counter page is this test's memfd.
+                let word: &core::sync::atomic::AtomicU64 = unsafe {
+                    core::sync::atomic::AtomicU64::from_ptr(
+                        (counter_page as *mut u8).add(slot * 8).cast(),
+                    )
+                };
+                word.load(core::sync::atomic::Ordering::Acquire)
+            };
+            for phase in ["dispatch", "tail", "births"] {
+                let before: u64 = (1..5).map(&counts).sum();
+                let refusals_before = counts(1);
+                let einval_before = counts(2);
+                let resets_before = counts(3);
+                let births_before = counts(4);
+                for run in 0..40 {
+                    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                        .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+                        .env(MODE, phase)
+                        .env(COUNT_FD, counter_fd.to_string())
+                        .process_group(0)
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::piped())
+                        .spawn()
+                        .unwrap();
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                    let status = loop {
+                        if let Some(status) = child.try_wait().unwrap() {
+                            break status;
+                        }
+                        if std::time::Instant::now() >= deadline {
+                            assert_eq!(
+                                unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) },
+                                0
+                            );
+                            child.wait().unwrap();
+                            panic!("clone3 flip test exceeded thirty seconds");
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    };
+                    let output = child.wait_with_output().unwrap();
+                    if status.success() {
+                        assert!(
+                            String::from_utf8(output.stdout)
+                                .unwrap()
+                                .lines()
+                                .any(|line| line == format!("test {TEST} ... ok")),
+                            "phase {phase} run {run}: expected one completed child test"
+                        );
+                    } else {
+                        assert_eq!(
+                            status.code(),
+                            Some(125),
+                            "phase {phase} run {run}: unsafe flip outcome {status}; {output:?}"
+                        );
+                    }
+                }
+                if std::env::var_os("FLIP_DEBUG").is_some() {
+                    eprintln!(
+                        "phase {phase}: raw={} eopnotsupp={} einval={} reset={} births={}",
+                        counts(0),
+                        counts(1),
+                        counts(2),
+                        counts(3),
+                        counts(4)
+                    );
+                }
+                let outcomes: u64 = (1..5).map(&counts).sum::<u64>() - before;
+                // The tail phase holds shapes for 300 us (its
+                // raw-forward window is the classify-to-kernel-read
+                // gap, which needs tight flips to hit), so most of
+                // its runs end in the 125 mismatch refusal after
+                // only a few counted outcomes. Floor 100 is from
+                // measurement at e021968d: tail minimum 229 and
+                // mean ~350-430 outcomes per 40 runs over 497 head
+                // runs, so 100 stays well clear of the observed
+                // minimum without pretending to the dispatch
+                // phase's counts. Do not raise it towards 200 at
+                // this stimulus: 229 is only ~15% above 200.
+                let minimum = if phase == "tail" {
+                    100
+                } else {
+                    MIN_OUTCOMES_PER_PHASE
+                };
+                assert!(
+                    outcomes >= minimum,
+                    "phase {phase} produced only {outcomes} counted outcomes in 40 runs"
+                );
+                // The KernelDecides branch itself must have run
+                // on both forwarding paths: deleting either branch
+                // (guard-only refusals) leaves its kernel-EINVAL
+                // slot empty. Dispatch head minimum measured at
+                // e021968d was 2514 over 497 runs, so 20 is a
+                // wide-margin floor there too.
+                if phase != "births" {
+                    let einvals = counts(2) - einval_before;
+                    assert!(
+                        einvals >= 20,
+                        "phase {phase} produced only {einvals} kernel EINVAL outcomes"
+                    );
+                } else {
+                    // Births-phase exactness: with the shape
+                    // pre-written steady, every one of the 1000
+                    // iterations admits a birth and nothing else
+                    // is counted, so the bar is exact equality —
+                    // a partial refusal at any rate (even 49%)
+                    // misses it. Load cannot turn a correct birth
+                    // into a refusal: a slow newborn fails the
+                    // per-iteration seen==result assert instead.
+                    let births = counts(4) - births_before;
+                    let refusals = counts(1) - refusals_before;
+                    let einvals_b = counts(2) - einval_before;
+                    let resets = counts(3) - resets_before;
+                    assert_eq!(
+                        births, 1000,
+                        "births phase admitted only {births} of 1000 steady-shape births"
+                    );
+                    assert_eq!(
+                        (refusals, einvals_b, resets),
+                        (0, 0, 0),
+                        "births phase counted non-birth outcomes"
+                    );
+                }
+            }
+            // The stack-less full-sharing shape is a birth only
+            // under the Linux-shaped taxonomy. Two mutants die
+            // differently here: the refusal variant (stack-less
+            // ThreadBirth turned into Unsupported) leaves this
+            // slot empty and fails the births-phase floor above,
+            // while the restored pre-Linux rule defers the shape to the
+            // kernel as KernelDecides, forwarding it into a raw
+            // thread on the parent's stack — which the tail
+            // phase's raw-child accounting and status asserts
+            // kill first, never reaching this floor. Asserted
+            // across the tail + dedicated births phases:
+            // births are Poisson-rare under the mixed flip load
+            // alone, so the births phase holds the FULL shape
+            // steady to make the stimulus deterministic.
+            assert!(
+                counts(4) >= 1,
+                "no stack-less birth admitted across the tail and births phases"
+            );
+            assert_eq!(
+                counts(0),
+                0,
+                "raw (unreset/unadmitted) children were created"
+            );
+            unsafe {
+                libc::munmap(counter_page, 4096);
+                libc::close(counter_fd);
+            }
+            return;
+        }
+        let phase = mode.unwrap();
+        use core::sync::atomic::AtomicBool;
+        use core::sync::atomic::AtomicU64;
+        use core::sync::atomic::Ordering;
+        let counter_fd: i32 = std::env::var(COUNT_FD).unwrap().parse().unwrap();
+        let counter_page = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                4096,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                counter_fd,
+                0,
+            )
+        };
+        assert_ne!(counter_page, libc::MAP_FAILED);
+        let count = |slot: usize| {
+            // SAFETY: the counter page is the parent's memfd.
+            let word: &AtomicU64 =
+                unsafe { AtomicU64::from_ptr((counter_page as *mut u8).add(slot * 8).cast()) };
+            word.fetch_add(1, Ordering::AcqRel);
+        };
+        // One shared page: the clone3 record at 0, a set_tid array
+        // word at 1024.
+        let page = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                4096,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(page, libc::MAP_FAILED);
+        let record = page as *mut u64;
+        fn write_shape(record: *mut u64, flags: u64, exit_signal: u64, set_tid: u64) {
+            let words = [flags, 0, 0, 0, exit_signal, 0, 0, 0, set_tid, 0, 0];
+            for (index, word) in words.iter().enumerate() {
+                // SAFETY: the record fits the shared page.
+                unsafe { record.add(index).write_volatile(*word) };
+            }
+        }
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let mypid = raw_pid(libc::SYS_getpid).as_raw();
+        let mytid = raw_pid(libc::SYS_gettid).as_raw();
+        let count_result = |result: i64| {
+            if result == -i64::from(libc::EINVAL) {
+                count(2);
+            } else if result == -i64::from(Errno::EOPNOTSUPP.into_raw()) {
+                count(1);
+            }
+        };
+
+        if phase == "dispatch" {
+            let (mut host, _peer) = host(false, false);
+            host.set_thread_admission(true);
+            let flipper = {
+                let stop = std::sync::Arc::clone(&stop);
+                let record_addr = record as usize;
+                std::thread::spawn(move || {
+                    let record = record_addr as *mut u64;
+                    while !stop.load(Ordering::Acquire) {
+                        // Duty cycle with edge bursts: shapes stay
+                        // put for 5 ms (most iterations
+                        // classify and copy one stable shape and
+                        // count an outcome), and each transition
+                        // flip-flops back-to-back ~200 times so the
+                        // classify-to-kernel-read window is hit at
+                        // the edges, not only by luck.
+                        write_shape(record, 0, libc::SIGCHLD as u64, 0);
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        for _ in 0..200 {
+                            write_shape(record, (libc::CLONE_THREAD | libc::CLONE_VM) as u64, 0, 0);
+                            write_shape(record, 0, libc::SIGCHLD as u64, 0);
+                        }
+                        write_shape(record, (libc::CLONE_THREAD | libc::CLONE_VM) as u64, 0, 0);
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        for _ in 0..200 {
+                            write_shape(record, 0, libc::SIGCHLD as u64, 0);
+                            write_shape(record, (libc::CLONE_THREAD | libc::CLONE_VM) as u64, 0, 0);
+                        }
+                    }
+                })
+            };
+            for _ in 0..600 {
+                let mut call = event(libc::SYS_clone3, [record as u64, 88, 0, 0, 0, 0]);
+                // SAFETY: no guest pointers but the shared record,
+                // which every forward path must copy before use.
+                unsafe { host.dispatch(&mut call) };
+                if raw_pid(libc::SYS_getpid).as_raw() != mypid {
+                    // A fork child: reset (thread-start recorded
+                    // for this tid) or raw (counted, exit nonzero).
+                    let me = raw_pid(libc::SYS_gettid).as_raw();
+                    let reset = EVENTS
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|(name, tid)| *name == "start" && *tid == me);
+                    if !reset {
+                        count(0);
+                    }
+                    // SAFETY: _exit avoids inherited atexit state.
+                    unsafe { libc::_exit(if reset { 0 } else { 73 }) };
+                }
+                if call.result > 0 {
+                    count(3);
+                    let mut status = 0;
+                    // SAFETY: reaping this test's direct child.
+                    assert_eq!(
+                        unsafe { libc::waitpid(call.result as libc::pid_t, &mut status, 0) },
+                        call.result as libc::pid_t
+                    );
+                    assert!(
+                        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                        "fork child without a reset: status {status:#x}"
+                    );
+                } else {
+                    count_result(call.result);
+                    assert!(
+                        [
+                            -i64::from(libc::EINVAL),
+                            -i64::from(Errno::EOPNOTSUPP.into_raw())
+                        ]
+                        .contains(&call.result),
+                        "unexpected clone3 result {}",
+                        call.result
+                    );
+                }
+            }
+            stop.store(true, Ordering::Release);
+            flipper.join().unwrap();
+            return;
+        }
+
+        // Tail phase: KernelDecides <-> plain <-> FULL (birth)
+        // <-> Unsupported rotation.
+        // Births phase: the same body, but the flipper holds the
+        // stack-less full-sharing shape steady so admitted births
+        // are deterministic rather than Poisson-rare under load.
+        assert!(phase == "tail" || phase == "births");
+        let phase_is_births = phase == "births";
+        {
+            let (mut host, _peer) = host(false, false);
+            host.set_thread_admission(true);
+            static FLIP_SEEN: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+            unsafe extern "C" {
+                fn w7_birth_stub();
+            }
+            let set_tid_word = (page as u64) + 1024;
+            if phase_is_births {
+                // Pre-write the steady shape BEFORE spawning the
+                // flipper, so no iteration can read the zeroed
+                // record (an all-zero record classifies
+                // Unsupported and the early iterations would count
+                // as refusals, not births).
+                const FULL_ONLY: u64 = (libc::CLONE_THREAD
+                    | libc::CLONE_VM
+                    | libc::CLONE_FS
+                    | libc::CLONE_FILES
+                    | libc::CLONE_SIGHAND) as u64;
+                write_shape(record, FULL_ONLY, 0, 0);
+            }
+            let flipper = {
+                let stop = std::sync::Arc::clone(&stop);
+                let record_addr = record as usize;
+                std::thread::spawn(move || {
+                    let record = record_addr as *mut u64;
+                    if phase_is_births {
+                        const FULL_ONLY: u64 = (libc::CLONE_THREAD
+                            | libc::CLONE_VM
+                            | libc::CLONE_FS
+                            | libc::CLONE_FILES
+                            | libc::CLONE_SIGHAND)
+                            as u64;
+                        write_shape(record, FULL_ONLY, 0, 0);
+                        while !stop.load(Ordering::Acquire) {
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                        return;
+                    }
+                    while !stop.load(Ordering::Acquire) {
+                        // 300 us duty cycle with edge bursts,
+                        // as in the dispatch phase: shapes stay put
+                        // long enough for the multi-read copy walk
+                        // to usually see one shape (so runs
+                        // accumulate counted outcomes), and each
+                        // transition flip-flops back-to-back ~200
+                        // times so the classify-to-kernel-read
+                        // window is hit at the edges. Rotation
+                        // KD -> plain -> FULL -> set_tid -> plain:
+                        // plain directly follows KernelDecides, so a
+                        // forward that reads the record after a
+                        // KernelDecides classification can create a
+                        // real fork child, not only EINVAL shapes.
+                        const KD: u64 = (libc::CLONE_THREAD | libc::CLONE_VM) as u64;
+                        const PLAIN: u64 = 0;
+                        const UNSUP: u64 =
+                            (libc::CLONE_THREAD | libc::CLONE_VM | libc::CLONE_SIGHAND) as u64;
+                        const FULL: u64 = (libc::CLONE_THREAD
+                            | libc::CLONE_VM
+                            | libc::CLONE_FS
+                            | libc::CLONE_FILES
+                            | libc::CLONE_SIGHAND) as u64;
+                        const SHAPES: [(u64, u64, u64); 5] = [
+                            (KD, 0, 0),
+                            (PLAIN, libc::SIGCHLD as u64, 0),
+                            (FULL, 0, 0),
+                            (UNSUP, 0, 1024),
+                            (PLAIN, libc::SIGCHLD as u64, 0),
+                        ];
+                        for index in 0..SHAPES.len() {
+                            let (shape, exit, set_tid) = SHAPES[index];
+                            let set_tid = if set_tid == 1024 {
+                                set_tid_word
+                            } else {
+                                set_tid
+                            };
+                            write_shape(record, shape, exit, set_tid);
+                            std::thread::sleep(std::time::Duration::from_micros(300));
+                            // Burst across this edge into the next
+                            // shape, ending on it.
+                            let (next, next_exit, next_tid) = SHAPES[(index + 1) % SHAPES.len()];
+                            let next_tid = if next_tid == 1024 {
+                                set_tid_word
+                            } else {
+                                next_tid
+                            };
+                            for _ in 0..200 {
+                                write_shape(record, next, next_exit, next_tid);
+                                write_shape(record, shape, exit, set_tid);
+                            }
+                            write_shape(record, next, next_exit, next_tid);
+                        }
+                    }
+                })
+            };
+            // The births phase is deterministic per iteration,
+            // so a short loop gives the same floor evidence
+            // without 400 real thread births per run.
+            for iteration in 0..if phase_is_births { 25 } else { 400 } {
+                FLIP_SEEN.store(0, Ordering::Release);
+                // A correctly routed plain fork surfaces as the
+                // ForkChild outcome and its child runs the real
+                // finish below (counted as reset only once
+                // thread-start is recorded); prepare its lease.
+                let parent_pid = raw_pid(libc::SYS_getppid).as_raw();
+                let parent_tid = mytid + 200_000 + iteration;
+                assert!(
+                    host.states
+                        .try_publish(
+                            parent_tid,
+                            State {
+                                pid: parent_pid,
+                                tid: parent_tid,
+                                attempts: 0,
+                            },
+                        )
+                        .is_ok()
+                );
+                let parent_lease = host
+                    .states
+                    .checkout_existing(parent_tid)
+                    .expect("parent state just published");
+                let snapshot = State {
+                    pid: parent_pid,
+                    tid: parent_tid,
+                    attempts: 0,
+                };
+                let mut saved = RegisterContext::default();
+                saved.rdi = core::ptr::addr_of!(FLIP_SEEN) as u64;
+                let root_tid = raw_pid(libc::SYS_gettid);
+                let pid = raw_pid(libc::SYS_getpid);
+                let mut event = SyscallEvent {
+                    number: libc::SYS_getpid,
+                    args: [0; 6],
+                    instruction_pointer: w7_birth_stub as *const () as usize as u64,
+                    result: 0,
+                    context: &raw const saved as usize,
+                    dispatch: SyscallDispatch::Trap,
+                    guest_pkru: None,
+                    unsupported_refusal: None,
+                };
+                let tail = TailResult::default();
+                let mut state = State {
+                    pid: pid.as_raw(),
+                    tid: root_tid.as_raw(),
+                    attempts: 0,
+                };
+                let mut guest = InGuest::<Probe, Runtime> {
+                    event: &mut event,
+                    tid: root_tid,
+                    pid,
+                    ppid: None,
+                    state: &mut state,
+                    rpc: &host.rpc,
+                    native: None,
+                    tail: &tail,
+                    cpuid_interception: false,
+                    admit_threads: true,
+                    thread_birth: host.thread_birth_ops(),
+                    fork_parent_state: None,
+                    runtime: &host.runtime,
+                    staged_signals: Vec::new(),
+                    staged_signal_delivery: false,
+                    in_syscall_handler: true,
+                    #[cfg(feature = "exec-native-injection")]
+                    exec: None,
+                    #[cfg(feature = "exec-native-injection")]
+                    mapping_driver: None,
+                    #[cfg(feature = "exec-native-injection")]
+                    native_exec_admitted: host.native_exec_admitted(),
+                    #[cfg(feature = "exec-native-injection")]
+                    native_exec_route_active: host.native_exec_admitted(),
+                    unsupported_refusal: None,
+                    injected_syscalls: 0,
+                };
+                let call = RawClone3([record as u64, 88]);
+                // Boxed so the fork child can drop the future (and
+                // its guest borrow) before running finish_fork_child.
+                let mut tail_future = Box::pin(guest.tail_inject(call));
+                let waker = std::task::Waker::noop();
+                let mut context = std::task::Context::from_waker(waker);
+                assert!(matches!(
+                    tail_future.as_mut().poll(&mut context),
+                    core::task::Poll::Pending
+                ));
+                // A raw thread created from the guest pointer would
+                // resume these very frames on a tid that is not the
+                // test thread's (a fork child keeps its leader tid
+                // equal to its new pid, handled after the drive).
+                if raw_pid(libc::SYS_gettid).as_raw() != mytid
+                    && raw_pid(libc::SYS_getpid).as_raw() == mypid
+                {
+                    count(0);
+                    // SAFETY: end the wedged subprocess loudly.
+                    unsafe { libc::_exit(73) };
+                }
+                let outcome = crate::tool_host::drive_syscall(
+                    std::future::pending::<Result<i64, Error>>(),
+                    &tail,
+                );
+                if raw_pid(libc::SYS_getpid).as_raw() != mypid {
+                    // Fork child. The correctly routed plain fork
+                    // parked a ForkChild outcome: run the real
+                    // finish (thread-start recorded) and leave as a
+                    // reset child. A raw fall-through child instead
+                    // surfaces as a plain Return here.
+                    let reset = match outcome {
+                        crate::tool_host::SyscallOutcome::ForkChild {
+                            parent_tid: ft,
+                            parent_pid: fp,
+                            child_tid,
+                            child_pid,
+                        } => {
+                            drop(tail_future);
+                            drop(guest);
+                            finish_fork_child(
+                                &host,
+                                parent_lease,
+                                &mut event,
+                                snapshot,
+                                ForkChildContext {
+                                    parent_tid: ft,
+                                    parent_pid: fp,
+                                    child_tid,
+                                    child_pid,
+                                    #[cfg(feature = "exec-native-injection")]
+                                    native_exec_route_active: false,
+                                },
+                            );
+                            let me = raw_pid(libc::SYS_gettid).as_raw();
+                            EVENTS
+                                .lock()
+                                .unwrap()
+                                .iter()
+                                .any(|(name, tid)| *name == "start" && *tid == me)
+                        }
+                        _ => false,
+                    };
+                    if !reset {
+                        count(0);
+                    }
+                    // SAFETY: _exit avoids inherited atexit state.
+                    unsafe { libc::_exit(if reset { 0 } else { 73 }) };
+                }
+                drop(parent_lease);
+                match outcome {
+                    crate::tool_host::SyscallOutcome::Return(result) => {
+                        let result = result.expect("tail clone3 failed");
+                        if result > 0 {
+                            // Two admitted shapes can return a tid:
+                            // a plain-fork child (reaped below) or
+                            // an admitted birth (stub writes seen).
+                            let mut status = 0;
+                            // Poll briefly: a fork child exits as
+                            // soon as its poll returns, but the reap
+                            // can still race its _exit. A born thread
+                            // is not a child process, so waitpid keeps
+                            // returning 0 for it (ECHILD only once the
+                            // tid is meaningless as a pid; either way
+                            // the probe distinguishes the two).
+                            let mut waited = 0;
+                            for _ in 0..200 {
+                                // SAFETY: WNOHANG probe for a fork child.
+                                waited = unsafe {
+                                    libc::waitpid(result as libc::pid_t, &mut status, libc::WNOHANG)
+                                };
+                                if waited != 0 {
+                                    break;
+                                }
+                                if FLIP_SEEN.load(Ordering::Acquire) != 0 {
+                                    break;
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(5));
+                            }
+                            if waited == result as libc::pid_t {
+                                assert!(
+                                    libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                                    "tail fork child failed: status {status:#x}"
+                                );
+                                count(3);
+                            } else {
+                                let mut seen = 0;
+                                for _ in 0..200 {
+                                    seen = FLIP_SEEN.load(Ordering::Acquire);
+                                    if seen != 0 {
+                                        break;
+                                    }
+                                    std::thread::sleep(std::time::Duration::from_millis(5));
+                                }
+                                assert_eq!(
+                                    seen, result,
+                                    "created thread {result} was not admitted through birth"
+                                );
+                                count(4);
+                            }
+                        } else {
+                            count_result(result);
+                            assert!(
+                                [
+                                    -i64::from(libc::EINVAL),
+                                    -i64::from(Errno::EOPNOTSUPP.into_raw())
+                                ]
+                                .contains(&result),
+                                "unexpected tail clone3 result {result}"
+                            );
+                        }
+                    }
+                    crate::tool_host::SyscallOutcome::ForkChild { .. } => {
+                        // In the parent this outcome is unreachable
+                        // (the fork returns in the child only); if it
+                        // is ever observed here the loop above has
+                        // already left via _exit in the child.
+                        panic!("ForkChild observed in the tail parent");
+                    }
+                    _ => panic!("tail_inject did not park a result"),
+                }
+            }
+            stop.store(true, Ordering::Release);
+            flipper.join().unwrap();
+        }
     }
 }
 
@@ -5233,6 +8411,7 @@ mod tests {
             context: 0,
             dispatch: SyscallDispatch::InstalledHook,
             guest_pkru: None,
+            unsupported_refusal: None,
         };
         let tail = TailResult::default();
         let mut state = ();
@@ -5247,6 +8426,8 @@ mod tests {
             native: None,
             tail: &tail,
             cpuid_interception: false,
+            admit_threads: false,
+            thread_birth: None,
             fork_parent_state: None,
             runtime: &ToolSyscallRuntime,
             staged_signals: Vec::new(),
@@ -5258,6 +8439,8 @@ mod tests {
             mapping_driver: None,
             #[cfg(feature = "exec-native-injection")]
             native_exec_admitted: false,
+            #[cfg(feature = "exec-native-injection")]
+            native_exec_route_active: false,
             unsupported_refusal: None,
             injected_syscalls: 0,
         };
@@ -5375,6 +8558,7 @@ mod tests {
             context: 0,
             dispatch: SyscallDispatch::InstalledHook,
             guest_pkru: None,
+            unsupported_refusal: None,
         };
         let tail = TailResult::default();
         let mut state = ();
@@ -5389,6 +8573,8 @@ mod tests {
             native: None,
             tail: &tail,
             cpuid_interception: false,
+            admit_threads: false,
+            thread_birth: None,
             fork_parent_state: None,
             runtime: &ToolSyscallRuntime,
             staged_signals: Vec::new(),
@@ -5400,6 +8586,8 @@ mod tests {
             mapping_driver: None,
             #[cfg(feature = "exec-native-injection")]
             native_exec_admitted: false,
+            #[cfg(feature = "exec-native-injection")]
+            native_exec_route_active: false,
             unsupported_refusal: None,
             injected_syscalls: 0,
         };
@@ -5918,6 +9106,130 @@ mod tests {
             }
         }
 
+        /// TailStartRuntime with an armed exec watch.
+        struct WatchedRuntime;
+        impl HostRuntime for WatchedRuntime {
+            fn fork_child_rebind(&self) {
+                TailStartRuntime.fork_child_rebind()
+            }
+            fn emit_stage(&self, stage: &[u8]) {
+                TailStartRuntime.emit_stage(stage)
+            }
+            fn fork_child_reset(&self, event: &SyscallEvent) {
+                TailStartRuntime.fork_child_reset(event)
+            }
+            fn cpuid_interception_enabled(&self) -> bool {
+                TailStartRuntime.cpuid_interception_enabled()
+            }
+            fn exit_process_stats(&self, tid: Pid) -> io::Result<()> {
+                TailStartRuntime.exit_process_stats(tid)
+            }
+            fn read_clock(&self) -> io::Result<u64> {
+                TailStartRuntime.read_clock()
+            }
+            fn signal_action_supported(&self, number: i64, args: [u64; 6]) -> bool {
+                TailStartRuntime.signal_action_supported(number, args)
+            }
+            fn reserved_signal_mask(&self) -> u64 {
+                TailStartRuntime.reserved_signal_mask()
+            }
+            fn exec_watch_armed(&self) -> bool {
+                true
+            }
+        }
+
+        /// The guard is the backstop of the clone3 copy discipline:
+        /// every legitimate clone3 is intercepted and forwarded from
+        /// a checked copy before the guard, so ANY clone3 reaching
+        /// it — plain fork, thread birth, KernelDecides, or
+        /// unsupported, admission on or off — refuses here instead
+        /// of falling through to a raw guest-pointer forward.
+        #[test]
+        fn guard_refuses_every_clone3_shape() {
+            const REQUIRED: u64 = (libc::CLONE_VM
+                | libc::CLONE_FS
+                | libc::CLONE_FILES
+                | libc::CLONE_SIGHAND
+                | libc::CLONE_THREAD) as u64;
+            let args = |fields: &[u64; 11]| [fields.as_ptr() as u64, 88, 0, 0, 0, 0];
+            for admit in [false, true] {
+                // Plain fork.
+                let mut fields = [0_u64; 11];
+                fields[4] = libc::SIGCHLD as u64;
+                assert_eq!(
+                    injected_syscall_guard(
+                        &TailStartRuntime,
+                        libc::SYS_clone3,
+                        args(&fields),
+                        admit
+                    ),
+                    Some(Errno::EOPNOTSUPP),
+                    "plain-fork clone3 must never reach the generic forward (admit={admit})"
+                );
+                // Thread birth.
+                fields = [0; 11];
+                fields[0] = REQUIRED;
+                fields[5] = 0x1000;
+                fields[6] = 0x8000;
+                assert_eq!(
+                    injected_syscall_guard(
+                        &TailStartRuntime,
+                        libc::SYS_clone3,
+                        args(&fields),
+                        admit
+                    ),
+                    Some(Errno::EOPNOTSUPP)
+                );
+                // KernelDecides (missing SIGHAND).
+                fields[0] = (libc::CLONE_VM | libc::CLONE_THREAD) as u64;
+                assert_eq!(
+                    injected_syscall_guard(
+                        &TailStartRuntime,
+                        libc::SYS_clone3,
+                        args(&fields),
+                        admit
+                    ),
+                    Some(Errno::EOPNOTSUPP)
+                );
+                // Unsupported (set_tid).
+                fields[0] = REQUIRED;
+                fields[8] = 1;
+                assert_eq!(
+                    injected_syscall_guard(
+                        &TailStartRuntime,
+                        libc::SYS_clone3,
+                        args(&fields),
+                        admit
+                    ),
+                    Some(Errno::EOPNOTSUPP)
+                );
+            }
+        }
+
+        #[test]
+        fn exec_guard_refuses_unwatched_and_forwards_watched() {
+            for number in [libc::SYS_execve, libc::SYS_execveat] {
+                assert_eq!(
+                    injected_syscall_guard(&TailStartRuntime, number, [0; 6], false),
+                    Some(Errno::EOPNOTSUPP)
+                );
+                assert_eq!(
+                    injected_syscall_guard(&WatchedRuntime, number, [0; 6], false),
+                    None
+                );
+            }
+            // The watch scopes to exec only: a thread-creating clone
+            // (non-null child stack via clone3) stays refused.
+            assert_eq!(
+                injected_syscall_guard(&WatchedRuntime, libc::SYS_clone3, [0; 6], false),
+                Some(Errno::EOPNOTSUPP)
+            );
+            assert_eq!(
+                injected_syscall_guard(&WatchedRuntime, libc::SYS_getpid, [0; 6], false),
+                None
+            );
+        }
+
         static EVENTS: AtomicUsize = AtomicUsize::new(0);
         fn observe(tid: Pid, number: Sysno) {
             assert!(tid.as_raw() > 0);
@@ -5961,9 +9273,13 @@ mod tests {
             // a bypass of injected_syscall_guard. The scope-refusal child still
             // fails earlier at the actual outside-handler check.
             assert!(
-                injected_syscall_guard(&TailStartRuntime, libc::SYS_exit_group, [0; 6]).is_none()
+                injected_syscall_guard(&TailStartRuntime, libc::SYS_exit_group, [0; 6], false)
+                    .is_none()
             );
-            assert!(injected_syscall_guard(&TailStartRuntime, libc::SYS_getpid, [0; 6]).is_none());
+            assert!(
+                injected_syscall_guard(&TailStartRuntime, libc::SYS_getpid, [0; 6], false)
+                    .is_none()
+            );
             reverie::set_tail_start_forwarder(observe).unwrap();
             let (client, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
             let config = reverie_rpc_transport::codec::encode(&()).unwrap();
@@ -5988,6 +9304,7 @@ mod tests {
                 context: 0,
                 dispatch: SyscallDispatch::InstalledHook,
                 guest_pkru: None,
+                unsupported_refusal: None,
             };
             let tail = TailResult::default();
             let mut state = ();
@@ -6001,6 +9318,8 @@ mod tests {
                 native: None,
                 tail: &tail,
                 cpuid_interception: false,
+                admit_threads: false,
+                thread_birth: None,
                 fork_parent_state: None,
                 runtime: &TailStartRuntime,
                 staged_signals: Vec::new(),
@@ -6012,6 +9331,8 @@ mod tests {
                 mapping_driver: None,
                 #[cfg(feature = "exec-native-injection")]
                 native_exec_admitted: false,
+                #[cfg(feature = "exec-native-injection")]
+                native_exec_route_active: false,
                 unsupported_refusal: None,
                 injected_syscalls: 0,
             };
@@ -6041,18 +9362,47 @@ mod tests {
         }
     }
 
+    fn needs_drop_of<T: 'static>(_: &'static std::thread::LocalKey<T>) -> bool {
+        core::mem::needs_drop::<T>()
+    }
+
+    /// `ToolHost::from_parts` touches `COMMITTED_STACKS`, and for an
+    /// in-guest runtime it runs while the preload's constructor installs
+    /// the Tool, before the guest's `main`. std registers a thread-exit
+    /// destructor for a thread-local exactly when its type needs dropping,
+    /// through libc's `__cxa_thread_atexit_impl`, which allocates from the
+    /// C library heap: the guest's heap then reached `main` holding libc's
+    /// per-thread cache and that record (704 bytes with glibc 2.34).
+    #[test]
+    fn committed_stacks_registers_no_thread_exit_destructor() {
+        assert!(!needs_drop_of(&COMMITTED_STACKS));
+    }
+
+    /// With no destructor, ending a dispatch is the only thing that frees
+    /// the vector's buffer: a thread exits holding whatever the last
+    /// dispatch scope left behind.
+    #[test]
+    fn dispatch_scratch_scope_releases_the_committed_stack_buffer() {
+        let capacity = || COMMITTED_STACKS.with(|stacks| stacks.borrow().capacity());
+        let scope = DispatchScratchScope::enter();
+        retain_committed_stack(vec![0; STACK_CAPACITY].into_boxed_slice());
+        assert_ne!(capacity(), 0);
+        drop(scope);
+        assert_eq!(capacity(), 0);
+    }
+
     /// Regression for the W7 TLS-teardown abort: a guest thread's last
     /// syscalls dispatch after libc destroyed that thread's TLS
     /// (`exit_group` after `exit()` ran the main thread's
     /// `__cxa_thread_atexit` destructors, the thread-exit syscall after
     /// pthread teardown on a worker), and every dispatch enters
     /// [`DispatchScratchScope`]. Its `COMMITTED_STACKS` access must
-    /// survive a destroyed thread-local instead of panicking in the
-    /// nounwind trap handler. The probe TLS below is touched before
-    /// `COMMITTED_STACKS` on each thread, so its destructor runs after
-    /// `COMMITTED_STACKS` is destroyed and re-enters the scope exactly
-    /// like that late dispatch. Subprocess-isolated: the failure this
-    /// guards against is a process abort, not a catchable panic.
+    /// survive libc's TLS teardown instead of panicking in the nounwind
+    /// trap handler. The probe TLS below is touched before
+    /// `COMMITTED_STACKS` on each thread, so its destructor runs during
+    /// that teardown and re-enters the scope exactly like that late
+    /// dispatch. Subprocess-isolated: the failure this guards against is
+    /// a process abort, not a catchable panic.
     #[test]
     fn dispatch_scratch_scope_survives_tls_teardown_at_exit() {
         use std::io::Write;
@@ -6084,9 +9434,9 @@ mod tests {
         }
 
         let states = std::sync::Arc::new(super::thread_lease::ThreadStates::<u32>::new());
-        // Worker-thread teardown: at pthread exit COMMITTED_STACKS is
-        // destroyed before the probe destructor re-enters the scope,
-        // while the thread holds a live lease.
+        // Worker-thread teardown: the probe destructor re-enters the
+        // scope during pthread exit's TLS teardown, while the thread
+        // holds a live lease.
         let worker_states = std::sync::Arc::clone(&states);
         std::thread::spawn(move || {
             REENTER_ON_TEARDOWN.with(|_| {});

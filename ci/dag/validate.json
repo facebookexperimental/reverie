@@ -30,6 +30,30 @@
       "jobs_flag": ""
     },
     {
+      "group": "check",
+      "job": "oss_cargo_twins",
+      "desc": "oss_cargo manifest twins",
+      "description": "Runs scripts/check-oss-cargo-twins.sh: its self-test, then the check that every oss_cargo/<crate>/Cargo.toml.oss has the bytes and mode of <crate>/Cargo.toml.",
+      "labels": [
+        "full"
+      ],
+      "cmd": "./scripts/check-oss-cargo-twins.sh --self-test && ./scripts/check-oss-cargo-twins.sh",
+      "deps": [],
+      "env": {},
+      "timeout": 120,
+      "cpu_timeout": 30,
+      "priority": 60,
+      "hint": {
+        "resources": {},
+        "est_duration_s": 1,
+        "rss_baseline_bytes": 100000000,
+        "hard_mem_max_bytes": 1000000000,
+        "classification": "cpu-bound",
+        "preferred_inner_jobs": 1
+      },
+      "jobs_flag": ""
+    },
+    {
       "group": "lint",
       "job": "rustfmt",
       "desc": "Rustfmt",
@@ -108,28 +132,85 @@
       "jobs_env": "CARGO_BUILD_JOBS"
     },
     {
-      "group": "fixtures",
-      "job": "liteinst",
-      "desc": "LiteInst allocator fixtures (disabled: dh-hkdh0)",
-      "description": "DISABLED (dh-hkdh0), mirroring validate.sh: the allocator-fixtures producer is red at base (fixed_arena_backing needs the held ordinary-dev publication cohort, reverie 1125). Waived to parity-with-main by coordinator ruling C. Re-enable by replacing this command with the producer invocation (scripts/build-liteinst-test-runtime.rs --for-ci) writing its fixture.env under target/validate/; test nodes already depend on this node, and it runs concurrently with build.test_binaries.",
+      "group": "build",
+      "job": "ptrace_aarch64",
+      "desc": "AArch64 check: reverie-ptrace",
+      "description": "Compile only the reverie-ptrace library for aarch64-unknown-linux-gnu. Host validation exercises the package for the host architecture, so this separate package-scoped check catches target_arch conditional-compilation errors in library code. It intentionally does not compile test targets.",
       "labels": [
         "full"
       ],
-      "cmd": "echo 'SKIP (dh-hkdh0): allocator producer disabled until held reverie 1125 cohort lands'",
+      "cmd": "cargo check --locked -p reverie-ptrace --lib --target aarch64-unknown-linux-gnu",
+      "deps": [],
+      "env": {
+        "PKG_CONFIG_ALLOW_CROSS": "1"
+      },
+      "timeout": 600,
+      "cpu_timeout": 300,
+      "priority": 80,
+      "hint": {
+        "resources": {
+          "cargo-build": 1
+        },
+        "est_duration_s": 60,
+        "rss_baseline_bytes": 8000000000,
+        "hard_mem_max_bytes": 16000000000,
+        "classification": "cpu-bound",
+        "preferred_inner_jobs": 8
+      },
+      "jobs_flag": "",
+      "jobs_env": "CARGO_BUILD_JOBS"
+    },
+    {
+      "group": "build",
+      "job": "liteinst_aarch64_l0",
+      "desc": "LiteInst aarch64 L0 gates",
+      "description": "Runs scripts/check-liteinst-aarch64-l0.py (G2-G6): exact liteinst alias and lazy_promote reference checks; gnu check and musl build for every L0 feature set; named exec-private compile refusals; aarch64 clippy; and pinned qemu-aarch64 lib runs. Verified host tooling is devbig030 (declared gnu/musl std targets, rust-lld, /opt/fb-qemu-user/bin/qemu-aarch64). The script fails rather than skips when any prerequisite is missing. Its qemu leg runs the aarch64 lib tests serialized (--test-threads 1, required under qemu-user) and is intentionally not counted by libtest-counts; a counted test.* node can come later. G7 native preload/lazy_promote evidence is intentionally metal-only and is not in this DAG step.",
+      "labels": [
+        "full"
+      ],
+      "cmd": "./scripts/check-liteinst-aarch64-l0.py",
       "deps": [],
       "env": {},
-      "timeout": 60,
-      "cpu_timeout": 10,
+      "timeout": 1800,
+      "cpu_timeout": 3600,
+      "priority": 80,
+      "hint": {
+        "resources": {
+          "cargo-build": 1
+        },
+        "est_duration_s": 150,
+        "rss_baseline_bytes": 2000000000,
+        "hard_mem_max_bytes": 8000000000,
+        "classification": "cpu-bound",
+        "preferred_inner_jobs": 8
+      },
+      "jobs_flag": "",
+      "jobs_env": "CARGO_BUILD_JOBS"
+    },
+    {
+      "group": "fixtures",
+      "job": "liteinst",
+      "desc": "LiteInst allocator fixtures",
+      "description": "Runs the standalone allocator-fixture producer, which explicitly builds the leaf with --profile release and refuses a dev-profile body as outside the contract. It writes fixture.env under target/validate/liteinst-fixtures/bundle for the LiteInst A test node; test nodes already depend on this node, and it runs concurrently with build.test_binaries.",
+      "labels": [
+        "full"
+      ],
+      "cmd": "rm -rf target/validate/liteinst-fixtures && mkdir -p target/validate && ./scripts/build-liteinst-test-runtime.rs --for-ci \"$PWD/target/validate/liteinst-fixtures\"",
+      "deps": [],
+      "env": {},
+      "timeout": 600,
+      "cpu_timeout": 600,
       "priority": 80,
       "hint": {
         "resources": {},
-        "est_duration_s": 1,
-        "rss_baseline_bytes": 1000000000,
+        "est_duration_s": 45,
+        "rss_baseline_bytes": 4000000000,
         "hard_mem_max_bytes": 16000000000,
-        "classification": "light",
-        "preferred_inner_jobs": 1
+        "classification": "cpu-bound",
+        "preferred_inner_jobs": 16
       },
-      "jobs_flag": ""
+      "jobs_flag": "",
+      "jobs_env": "CARGO_BUILD_JOBS"
     },
     {
       "group": "test",
@@ -139,7 +220,7 @@
       "labels": [
         "full"
       ],
-      "cmd": "./scripts/libtest-counts.rs run-nextest target/validate/counts-test-liteinst_a.json -- cargo nextest run --binaries-metadata target/validate/binaries-metadata.json -E \"(package(reverie-liteinst) & (binary(=strace) | binary(=generic_bootstrap) | binary(=standalone_constructor) | binary(=tool_tls) | binary(=fixed_arena) | binary(=reverie_liteinst) | binary(=reverie-liteinst-trap-count-guest) | binary(=reverie-liteinst-strace) | binary(=reverie-liteinst-spoof-guest) | binary(=reverie-liteinst-rpc-tool-guest) | binary(=reverie-liteinst-lifecycle-guest))) & $REVERIE_NEXTEST_SKIP_FILTER\"",
+      "cmd": "source target/validate/liteinst-fixtures/bundle/fixture.env && ./scripts/libtest-counts.rs run-nextest target/validate/counts-test-liteinst_a.json -- cargo nextest run --binaries-metadata target/validate/binaries-metadata.json -E \"(package(reverie-liteinst) & (binary(=strace) | binary(=generic_bootstrap) | binary(=standalone_constructor) | binary(=tool_tls) | binary(=fixed_arena) | binary(=reverie_liteinst) | binary(=reverie-liteinst-trap-count-guest) | binary(=reverie-liteinst-strace) | binary(=reverie-liteinst-spoof-guest) | binary(=reverie-liteinst-rpc-tool-guest) | binary(=reverie-liteinst-lifecycle-guest))) & $REVERIE_NEXTEST_SKIP_FILTER\"",
       "deps": [
         "build.test_binaries",
         "fixtures.liteinst"
@@ -439,15 +520,15 @@
       "group": "test",
       "job": "doc",
       "desc": "Documentation tests",
-      "description": "Counted doctests via the serial libtest runner (nextest does not run doctests): cargo test --workspace --doc with per-test CPU caps.",
+      "description": "Counted doctests via the serial libtest runner (nextest does not run doctests): cargo test --workspace --doc --features \"$STABLE_FEATURES\" with per-test CPU caps. The stable set (scripts/stable-features.sh, as in validate.sh's serial test step) is required: doctests of feature-gated modules, such as the reverie-inguest exec-stop producer's ArmedClaim borrow guard (a compile_fail doctest), are not compiled without it.",
       "labels": [
         "full"
       ],
-      "cmd": "./scripts/libtest-counts.rs run target/validate/counts-doc.json -- cargo test --workspace --doc",
+      "cmd": "source scripts/stable-features.sh && ./scripts/libtest-counts.rs run target/validate/counts-doc.json -- cargo test --workspace --doc --features \"$STABLE_FEATURES\"",
       "deps": [],
       "env": {},
       "timeout": 600,
-      "cpu_timeout": 300,
+      "cpu_timeout": 600,
       "priority": 40,
       "hint": {
         "resources": {

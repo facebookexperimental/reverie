@@ -464,6 +464,9 @@ impl ProcessSignalRegistry {
         }
         self.wait_changed.notify_all();
         drop(family);
+        // A zombie an init adopted, or one whose new parent cannot wait, is
+        // reaped.
+        self.sync_pidfd_shadows();
 
         // Linux's `reparent_leader` announces each zombie to its new parent
         // with the child's own `SIGCHLD` siginfo; a SIG_IGN reaper generates

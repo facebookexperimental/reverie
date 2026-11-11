@@ -83,6 +83,7 @@ unsafe fn continued_exec(context: *mut RegisterContext, pkru: &mut Option<u32>) 
         context: context as usize,
         dispatch: SyscallDispatch::Fallback,
         guest_pkru: *pkru,
+        unsupported_refusal: None,
     };
     assert_eq!(event.number, EXPECTED_NUMBER.load(Ordering::Relaxed));
     assert_eq!(event.args, *EXPECTED_ARGS.lock().unwrap());

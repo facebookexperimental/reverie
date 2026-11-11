@@ -302,7 +302,7 @@ fn qualify_runtime() -> Result<QualifiedRuntime, String> {
             return Err("leaf path needs unsupported Cargo URL escaping".into());
         }
         let package = artifact::PackageIdentity {
-            id: format!("path+file://{leaf_text}#0.5.5"),
+            id: format!("path+file://{leaf_text}#0.5.6"),
             name: "reverie-liteinst-preload".into(),
             manifest: artifact::real_file(&leaf.join("Cargo.toml"))?,
             source: None,
@@ -311,10 +311,14 @@ fn qualify_runtime() -> Result<QualifiedRuntime, String> {
             crate_types: vec!["cdylib".into()],
             target_source: artifact::real_file(&leaf.join("src/lib.rs"))?,
         };
-        let features = vec!["allocator-fixture".to_owned()];
+        let features = vec![
+            "allocator-fixture".to_owned(),
+            "default".to_owned(),
+            "liteinst".to_owned(),
+        ];
         let profile = serde_json::json!({
-            "opt_level": "0", "debuginfo": 2, "debug_assertions": true,
-            "overflow_checks": true, "test": false,
+            "opt_level": "3", "debuginfo": 0, "debug_assertions": false,
+            "overflow_checks": false, "test": false,
         });
         let oracle_sha256 = BTreeMap::from([
             ("rust_exports".to_owned(), RUST_ORACLE_SHA256.to_owned()),
@@ -342,7 +346,7 @@ fn qualify_runtime() -> Result<QualifiedRuntime, String> {
                     compiled_sources: Some(compiled_sources),
                     package: &package,
                     features: &features,
-                    profile_name: "dev",
+                    profile_name: "release",
                     profile: &profile,
                     initializer: artifact::STANDALONE_ROOT,
                     source_head: &source.head,

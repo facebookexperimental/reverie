@@ -63,6 +63,7 @@ fn event(number: i64, args: [u64; 6]) -> SyscallEvent {
         context: 0,
         dispatch: SyscallDispatch::Fallback,
         guest_pkru: None,
+        unsupported_refusal: None,
     }
 }
 

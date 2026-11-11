@@ -1,0 +1,1376 @@
+{
+  "schema_version": 1,
+  "base_commit": "f9ed30e8c6481e8e386ec4a470b2a64e8a7647ef",
+  "rust_toolchain": {
+    "channel": "1.97.1",
+    "targets": [
+      "aarch64-unknown-linux-gnu",
+      "aarch64-unknown-linux-musl"
+    ]
+  },
+  "qemu": {
+    "path": "/opt/fb-qemu-user/bin/qemu-aarch64",
+    "cpu": "cortex-a72",
+    "target": "aarch64-unknown-linux-musl",
+    "linker": "rust-lld",
+    "page_size": 4096
+  },
+  "native": {
+    "host": "devbig015",
+    "page_size": 65536,
+    "target": "aarch64-unknown-linux-musl",
+    "linker": "rust-lld",
+    "counts_status": "pinned"
+  },
+  "x86_64_reference": {
+    "listed": 2680,
+    "ignored": 2,
+    "deduplicated_listed": 993,
+    "deduplicated_ignored": 2
+  },
+  "scope": "LiteInst packages only (reverie-liteinst, reverie-liteinst-artifact, reverie-liteinst-preload); reverie-inguest has separate test coverage and is not counted here.",
+  "packages": [
+    {
+      "name": "reverie-liteinst",
+      "profile": {
+        "name": "l1c-non-private",
+        "cargo_args": [
+          "--no-default-features",
+          "--features",
+          "liteinst,allocator-fixture,fixed-syscall-gates,rpc-io-fixture,preload-constructor"
+        ]
+      },
+      "targets": [
+        {
+          "name": "reverie_liteinst",
+          "kind": [
+            "rlib"
+          ],
+          "required_features": [],
+          "x86_64": {
+            "listed": 81,
+            "ignored": 0
+          },
+          "disposition": "qemu",
+          "x86_only_tests": [
+            "interior_entry::tests::a_branch_from_another_function_refuses_the_site",
+            "interior_entry::tests::a_branch_into_the_displaced_bytes_refuses_the_site",
+            "interior_entry::tests::a_code_pointer_in_data_refuses_the_site",
+            "interior_entry::tests::a_function_without_interior_entries_proves_the_site",
+            "interior_entry::tests::a_landing_pad_in_the_displaced_bytes_refuses_the_site",
+            "interior_entry::tests::a_last_instruction_crossing_the_function_end_makes_it_opaque",
+            "interior_entry::tests::a_rip_relative_lea_of_the_displaced_bytes_refuses_the_site",
+            "interior_entry::tests::a_site_outside_every_function_is_refused",
+            "interior_entry::tests::a_window_may_cross_into_padding_but_not_into_code",
+            "interior_entry::tests::an_entry_at_the_displaced_end_is_allowed",
+            "interior_entry::tests::an_indirect_jump_makes_the_function_opaque",
+            "interior_entry::tests::object_overlap_includes_metadata_but_not_gaps_or_empty_ranges",
+            "interior_entry::tests::overlapping_functions_are_opaque",
+            "interior_entry::tests::the_census_of_this_process_libc_agrees_with_a_decode_of_posix_madvise",
+            "interior_entry::tests::the_displaced_end_matches_liteinst",
+            "liteinst_census::tests::census_decoders_agree_across_4_gib",
+            "liteinst_census::tests::copy_start_keeps_the_copy_off_the_byte_before_4_gib",
+            "liteinst_census::tests::decode_copy_decodes_from_a_buffer_across_4_gib",
+            "liteinst_census::tests::decode_each_decodes_what_one_decoder_does_across_4_gib",
+            "liteinst_census::tests::decode_each_stops_at_break",
+            "liteinst_census::tests::one_decoder_panics_on_an_instruction_ending_at_4_gib",
+            "runtime::installed_entries::tests::actual_owned_callback_entries_have_only_native_transfers",
+            "runtime::installed_entries::tests::full_tool_preparation_publishes_every_callback_route",
+            "runtime::tests::a_covering_published_patch_dominates_whatever_the_table_order",
+            "runtime::tests::a_stale_site_counts_as_published_unless_its_jump_is_provably_gone",
+            "runtime::tests::installation_blocks_every_blockable_signal_and_restores_the_mask",
+            "runtime::tests::neighbour_conflicts_protect_published_patches_and_continuation_sites",
+            "runtime::tests::object_image_records_the_readable_mappings_of_the_text_file",
+            "runtime::tests::only_a_possibly_written_syscall_site_failure_ends_the_guest",
+            "runtime::tests::site_patching_enabled_reports_the_captured_setting",
+            "runtime::tests::site_publication_without_the_guard_router_is_refused_untouched",
+            "straddler::tests::calibrated_staleness_enables_every_split_offset",
+            "straddler::tests::single_line_publication_does_not_need_a_staleness_delay",
+            "straddler::tests::staleness_parser_accepts_only_nonzero_decimal_ticks",
+            "straddler::tests::unset_staleness_disables_guarded_publication",
+            "tests::site_patching_parser_defaults_on_and_rejects_other_values",
+            "tests::site_patching_setter_round_trips_through_the_parser"
+          ],
+          "aarch64_only_tests": [
+            "lazy_promote::tests::bti_guard_survives_a_store_cycle",
+            "lazy_promote::tests::custody_site_blocks_all_new_work_until_settled",
+            "lazy_promote::tests::drain_pending_consumes_s5a_table",
+            "lazy_promote::tests::flipped_site_island_is_denylisted_in_s5a_table",
+            "lazy_promote::tests::proc_mem_pwrite_failure_completes_to_unpatched",
+            "lazy_promote::tests::promote_one_flips_svc_and_call_result_is_unchanged",
+            "lazy_promote::tests::refused_attempt_releases_island_range_slot",
+            "lazy_promote::tests::restore_failure_is_custody_then_completes",
+            "lazy_promote::tests::resume_shortfall_is_custody_then_completes",
+            "lazy_promote::tests::retry_requalifies_under_second_lease",
+            "lazy_promote::tests::toctou_guest_change_inside_acquire_refuses",
+            "tests::aarch64_c_entry_refuses_selected_tool_as_subprocess",
+            "tests::aarch64_install_surfaces_refuse_by_name",
+            "tests::trap_only_build_defaults_off_and_refuses_explicit_patching"
+          ],
+          "aarch64": {
+            "listed": 58,
+            "passed": 55,
+            "failed": 3,
+            "ignored": 0,
+            "tests": [
+              "allocator_backing::tests::unknown_allocator_contracts_refuse",
+              "lazy_promote::tests::admit_accepts_aligned_windowable_contained",
+              "lazy_promote::tests::admit_refuses_misaligned",
+              "lazy_promote::tests::admit_refuses_non_windowable",
+              "lazy_promote::tests::admit_refuses_outside_span",
+              "lazy_promote::tests::admit_refuses_runtime_gate_text",
+              "lazy_promote::tests::bti_guard_survives_a_store_cycle",
+              "lazy_promote::tests::classify_rejects_post_store_error_with_unpatched_state",
+              "lazy_promote::tests::classify_separates_pre_store_from_custody",
+              "lazy_promote::tests::custody_site_blocks_all_new_work_until_settled",
+              "lazy_promote::tests::deferred_batch_survives_custody_block",
+              "lazy_promote::tests::deferred_replay_requeues_current_candidate_at_front",
+              "lazy_promote::tests::drain_pending_consumes_s5a_table",
+              "lazy_promote::tests::drain_promotes_in_order_and_retains_refusals",
+              "lazy_promote::tests::drop_leaks_unsettled_custody_fail_closed",
+              "lazy_promote::tests::empty_resume_is_a_shortfall",
+              "lazy_promote::tests::flipped_site_island_is_denylisted_in_s5a_table",
+              "lazy_promote::tests::global_custody_blocks_other_promoters",
+              "lazy_promote::tests::mask_failure_does_no_work_and_is_reported",
+              "lazy_promote::tests::mprotect_store_windows_restores_exact_protection",
+              "lazy_promote::tests::proc_mem_pwrite_failure_completes_to_unpatched",
+              "lazy_promote::tests::proc_mem_store_changes_word_in_rx_text",
+              "lazy_promote::tests::promote_one_flips_svc_and_call_result_is_unchanged",
+              "lazy_promote::tests::refused_attempt_releases_island_range_slot",
+              "lazy_promote::tests::restore_failure_is_custody_then_completes",
+              "lazy_promote::tests::resume_shortfall_is_custody_then_completes",
+              "lazy_promote::tests::retry_requalifies_under_second_lease",
+              "lazy_promote::tests::settled_unpatched_site_leaves_custody_and_ranges",
+              "lazy_promote::tests::stores_run_under_the_real_seccomp_filter",
+              "lazy_promote::tests::toctou_guest_change_inside_acquire_refuses",
+              "patch_alloc::tests::dispatch_allocations_go_to_the_tool_heap",
+              "patch_alloc::tests::installation_allocations_stay_in_the_installation_heap",
+              "patch_alloc::tests::installation_takes_precedence_over_dispatch",
+              "patch_alloc::tests::other_allocations_go_to_the_system_allocator",
+              "patch_alloc::tests::patch_heap_is_largest_page_aligned_and_anonymous",
+              "patch_alloc::tests::private_allocations_keep_their_owner_across_scope_changes",
+              "patch_alloc::tests::private_exhaustion_has_no_system_fallback",
+              "runtime::tests::alt_stack_defaults_to_the_shared_default_when_unset",
+              "runtime::tests::alt_stack_env_is_distinct_from_the_other_selectors",
+              "runtime::tests::alt_stack_parses_truthy_and_falsy_spellings",
+              "runtime::tests::alt_stack_rejects_unknown_values",
+              "runtime::tests::builtin_tool_selector_maps_shared_values_only",
+              "runtime::tests::clone_accepts_only_fork_like_flags",
+              "runtime::tests::disabled_dispatch_does_not_classify_fallback_sites",
+              "runtime::tests::fallback_counter_reset_zeroes_total_and_per_number_counts",
+              "runtime::tests::fixed_gate_artifact_refuses_non_fulltool_before_publication",
+              "runtime::tests::fork_child_reset_zeroes_per_site_counts_but_preserves_patch_state",
+              "runtime::tests::fork_hook_runs_the_observability_reset",
+              "runtime::tests::maps_line_private_reads_the_sharing_flag_of_the_containing_mapping",
+              "runtime::tests::out_of_range_syscall_numbers_count_in_the_total_only",
+              "runtime::tests::recording_a_fallback_bumps_total_and_the_matching_syscall",
+              "runtime::tests::reused_address_claims_a_new_site_generation",
+              "runtime::tests::strace_and_compat_refuse_vfork_and_clone3_by_number",
+              "tests::aarch64_c_entry_refuses_selected_tool_as_subprocess",
+              "tests::aarch64_install_surfaces_refuse_by_name",
+              "tests::alt_stack_setter_round_trips_through_the_parser",
+              "tests::generated_preload_leaves_precede_a_stale_canonical_artifact",
+              "tests::trap_only_build_defaults_off_and_refuses_explicit_patching"
+            ],
+            "failed_tests": [
+              "lazy_promote::tests::proc_mem_store_changes_word_in_rx_text",
+              "lazy_promote::tests::retry_requalifies_under_second_lease",
+              "lazy_promote::tests::stores_run_under_the_real_seccomp_filter"
+            ]
+          },
+          "native": {
+            "listed": 58,
+            "passed": 57,
+            "failed": 1,
+            "ignored": 0,
+            "failed_tests": [
+              "lazy_promote::tests::stores_run_under_the_real_seccomp_filter"
+            ]
+          }
+        },
+        {
+          "name": "reverie-liteinst-allocator-host-control",
+          "kind": [
+            "bin"
+          ],
+          "required_features": [
+            "allocator-fixture"
+          ],
+          "x86_64": {
+            "listed": 0,
+            "ignored": 0
+          },
+          "disposition": "qemu",
+          "x86_only_tests": [],
+          "aarch64_only_tests": [],
+          "aarch64": {
+            "listed": 0,
+            "passed": 0,
+            "failed": 0,
+            "ignored": 0,
+            "tests": [],
+            "failed_tests": []
+          },
+          "native": {
+            "listed": 0,
+            "passed": 0,
+            "failed": 0,
+            "ignored": 0,
+            "failed_tests": []
+          }
+        },
+        {
+          "name": "reverie-liteinst-allocator-install-control",
+          "kind": [
+            "bin"
+          ],
+          "required_features": [
+            "allocator-fixture"
+          ],
+          "x86_64": {
+            "listed": 0,
+            "ignored": 0
+          },
+          "disposition": "qemu",
+          "x86_only_tests": [],
+          "aarch64_only_tests": [],
+          "aarch64": {
+            "listed": 0,
+            "passed": 0,
+            "failed": 0,
+            "ignored": 0,
+            "tests": [],
+            "failed_tests": []
+          },
+          "native": {
+            "listed": 0,
+            "passed": 0,
+            "failed": 0,
+            "ignored": 0,
+            "failed_tests": []
+          }
+        },
+        {
+          "name": "reverie-liteinst-allocator-private-control",
+          "kind": [
+            "bin"
+          ],
+          "required_features": [
+            "allocator-fixture"
+          ],
+          "x86_64": {
+            "listed": 0,
+            "ignored": 0
+          },
+          "disposition": "qemu",
+          "x86_only_tests": [],
+          "aarch64_only_tests": [],
+          "aarch64": {
+            "listed": 0,
+            "passed": 0,
+            "failed": 0,
+            "ignored": 0,
+            "tests": [],
+            "failed_tests": []
+          },
+          "native": {
+            "listed": 0,
+            "passed": 0,
+            "failed": 0,
+            "ignored": 0,
+            "failed_tests": []
+          }
+        },
+        {
+          "name": "reverie-liteinst-exec-guest",
+          "kind": [
+            "bin"
+          ],
+          "required_features": [],
+          "x86_64": {
+            "listed": 0,
+            "ignored": 0
+          },
+          "disposition": "qemu",
+          "x86_only_tests": [],
+          "aarch64_only_tests": [],
+          "aarch64": {
+            "listed": 0,
+            "passed": 0,
+            "failed": 0,
+            "ignored": 0,
+            "tests": [],
+            "failed_tests": []
+          },
+          "native": {
+            "listed": 0,
+            "passed": 0,
+            "failed": 0,
+            "ignored": 0,
+            "failed_tests": []
+          }
+        },
+        {
+          "name": "reverie-liteinst-fork-guest",
+          "kind": [
+            "bin"
+          ],
+          "required_features": [],
+          "x86_64": {
+            "listed": 0,
+            "ignored": 0
+          },
+          "disposition": "qemu",
+          "x86_only_tests": [],
+          "aarch64_only_tests": [],
+          "aarch64": {
+            "listed": 0,
+            "passed": 0,
+            "failed": 0,
+            "ignored": 0,
+            "tests": [],
+            "failed_tests": []
+          },
+          "native": {
+            "listed": 0,
+            "passed": 0,
+            "failed": 0,
+            "ignored": 0,
+            "failed_tests": []
+          }
+        },
+        {
+          "name": "reverie-liteinst-grouped-admission-spike",
+          "kind": [
+            "bin"
+          ],
+          "required_features": [],
+          "x86_64": {
+            "listed": 0,
+            "ignored": 0
+          },
+          "disposition": "qemu",
+          "x86_only_tests": [],
+          "aarch64_only_tests": [],
+          "aarch64": {
+            "listed": 0,
+            "passed": 0,
+            "failed": 0,
+            "ignored": 0,
+            "tests": [],
+            "failed_tests": []
+          },
+          "native": {
+            "listed": 0,
+            "passed": 0,
+            "failed": 0,
+            "ignored": 0,
+            "failed_tests": []
+          }
+        },
+        {
+          "name": "reverie-liteinst-lifecycle-guest",
+          "kind": [
+            "bin"
+          ],
+          "required_features": [],
+          "x86_64": {
+            "listed": 0,
+            "ignored": 0
+          },
+          "disposition": "qemu",
+          "x86_only_tests": [],
+          "aarch64_only_tests": [],
+          "aarch64": {
+            "listed": 0,
+            "passed": 0,
+            "failed": 0,
+            "ignored": 0,
+            "tests": [],
+            "failed_tests": []
+          },
+          "native": {
+            "listed": 0,
+            "passed": 0,
+            "failed": 0,
+            "ignored": 0,
+            "failed_tests": []
+          }
+        },
+        {
+          "name": "reverie-liteinst-rpc-tool-guest",
+          "kind": [
+            "bin"
+          ],
+          "required_features": [],
+          "x86_64": {
+            "listed": 0,
+            "ignored": 0
+          },
+          "disposition": "qemu",
+          "x86_only_tests": [],
+          "aarch64_only_tests": [],
+          "aarch64": {
+            "listed": 0,
+            "passed": 0,
+            "failed": 0,
+            "ignored": 0,
+            "tests": [],
+            "failed_tests": []
+          },
+          "native": {
+            "listed": 0,
+            "passed": 0,
+            "failed": 0,
+            "ignored": 0,
+            "failed_tests": []
+          }
+        },
+        {
+          "name": "reverie-liteinst-spoof-guest",
+          "kind": [
+            "bin"
+          ],
+          "required_features": [],
+          "x86_64": {
+            "listed": 0,
+            "ignored": 0
+          },
+          "disposition": "qemu",
+          "x86_only_tests": [],
+          "aarch64_only_tests": [],
+          "aarch64": {
+            "listed": 0,
+            "passed": 0,
+            "failed": 0,
+            "ignored": 0,
+            "tests": [],
+            "failed_tests": []
+          },
+          "native": {
+            "listed": 0,
+            "passed": 0,
+            "failed": 0,
+            "ignored": 0,
+            "failed_tests": []
+          }
+        },
+        {
+          "name": "reverie-liteinst-strace",
+          "kind": [
+            "bin"
+          ],
+          "required_features": [],
+          "x86_64": {
+            "listed": 0,
+            "ignored": 0
+          },
+          "disposition": "qemu",
+          "x86_only_tests": [],
+          "aarch64_only_tests": [],
+          "aarch64": {
+            "listed": 0,
+            "passed": 0,
+            "failed": 0,
+            "ignored": 0,
+            "tests": [],
+            "failed_tests": []
+          },
+          "native": {
+            "listed": 0,
+            "passed": 0,
+            "failed": 0,
+            "ignored": 0,
+            "failed_tests": []
+          }
+        },
+        {
+          "name": "reverie-liteinst-trap-count-guest",
+          "kind": [
+            "bin"
+          ],
+          "required_features": [],
+          "x86_64": {
+            "listed": 0,
+            "ignored": 0
+          },
+          "disposition": "qemu",
+          "x86_only_tests": [],
+          "aarch64_only_tests": [],
+          "aarch64": {
+            "listed": 0,
+            "passed": 0,
+            "failed": 0,
+            "ignored": 0,
+            "tests": [],
+            "failed_tests": []
+          },
+          "native": {
+            "listed": 0,
+            "passed": 0,
+            "failed": 0,
+            "ignored": 0,
+            "failed_tests": []
+          }
+        },
+        {
+          "name": "allocator_contract",
+          "kind": [
+            "test"
+          ],
+          "required_features": [
+            "allocator-fixture"
+          ],
+          "x86_64": {
+            "listed": 247,
+            "ignored": 0
+          },
+          "disposition": "compile-blocked",
+          "reason": "aarch64-musl compile-blocked at f9ed30e8 by the statfs f_type comparison in the shared artifact test support",
+          "compile_signatures": [
+            "filesystem.f_type == CGROUP2_SUPER_MAGIC"
+          ],
+          "aarch64": {
+            "listed": 0,
+            "passed": 0,
+            "failed": 0,
+            "ignored": 0,
+            "tests": [],
+            "failed_tests": []
+          }
+        },
+        {
+          "name": "concurrent_patching",
+          "kind": [
+            "test"
+          ],
+          "required_features": [
+            "liteinst"
+          ],
+          "x86_64": {
+            "listed": 1,
+            "ignored": 0
+          },
+          "disposition": "qemu",
+          "x86_only_tests": [
+            "threaded_clients_keep_guarded_wordpatch_publication"
+          ],
+          "aarch64_only_tests": [],
+          "aarch64": {
+            "listed": 0,
+            "passed": 0,
+            "failed": 0,
+            "ignored": 0,
+            "tests": [],
+            "failed_tests": []
+          },
+          "native": {
+            "listed": 0,
+            "passed": 0,
+            "failed": 0,
+            "ignored": 0,
+            "failed_tests": []
+          }
+        },
+        {
+          "name": "fixed_arena",
+          "kind": [
+            "test"
+          ],
+          "required_features": [
+            "allocator-fixture"
+          ],
+          "x86_64": {
+            "listed": 242,
+            "ignored": 0
+          },
+          "disposition": "compile-blocked",
+          "reason": "aarch64-musl compile-blocked at f9ed30e8 by the statfs f_type comparison in the shared artifact test support",
+          "compile_signatures": [
+            "filesystem.f_type == CGROUP2_SUPER_MAGIC"
+          ],
+          "aarch64": {
+            "listed": 0,
+            "passed": 0,
+            "failed": 0,
+            "ignored": 0,
+            "tests": [],
+            "failed_tests": []
+          }
+        },
+        {
+          "name": "fixed_gates",
+          "kind": [
+            "test"
+          ],
+          "required_features": [
+            "fixed-syscall-gates"
+          ],
+          "x86_64": {
+            "listed": 5,
+            "ignored": 0
+          },
+          "disposition": "qemu",
+          "x86_only_tests": [],
+          "aarch64_only_tests": [],
+          "aarch64": {
+            "listed": 5,
+            "passed": 0,
+            "failed": 5,
+            "ignored": 0,
+            "tests": [
+              "failed_installation_after_publication_terminates_through_fixed_gate",
+              "failed_published_installation_exits_even_with_saturated_stderr",
+              "fixed_gate_installation_refuses_collisions_and_inherited_filters",
+              "full_tool_uses_fixed_gates_and_protects_them_across_fork",
+              "preflight_refusal_never_connects"
+            ],
+            "failed_tests": [
+              "failed_installation_after_publication_terminates_through_fixed_gate",
+              "failed_published_installation_exits_even_with_saturated_stderr",
+              "fixed_gate_installation_refuses_collisions_and_inherited_filters",
+              "full_tool_uses_fixed_gates_and_protects_them_across_fork",
+              "preflight_refusal_never_connects"
+            ]
+          },
+          "native": {
+            "listed": 5,
+            "passed": 0,
+            "failed": 5,
+            "ignored": 0,
+            "failed_tests": [
+              "failed_installation_after_publication_terminates_through_fixed_gate",
+              "failed_published_installation_exits_even_with_saturated_stderr",
+              "fixed_gate_installation_refuses_collisions_and_inherited_filters",
+              "full_tool_uses_fixed_gates_and_protects_them_across_fork",
+              "preflight_refusal_never_connects"
+            ]
+          }
+        },
+        {
+          "name": "generic_bootstrap",
+          "kind": [
+            "test"
+          ],
+          "required_features": [
+            "allocator-fixture"
+          ],
+          "x86_64": {
+            "listed": 248,
+            "ignored": 1
+          },
+          "disposition": "compile-blocked",
+          "reason": "aarch64-musl compile-blocked at f9ed30e8 by the statfs f_type comparison in the shared artifact test support",
+          "compile_signatures": [
+            "filesystem.f_type == CGROUP2_SUPER_MAGIC"
+          ],
+          "aarch64": {
+            "listed": 0,
+            "passed": 0,
+            "failed": 0,
+            "ignored": 0,
+            "tests": [],
+            "failed_tests": []
+          }
+        },
+        {
+          "name": "grouped_admission",
+          "kind": [
+            "test"
+          ],
+          "required_features": [],
+          "x86_64": {
+            "listed": 5,
+            "ignored": 0
+          },
+          "disposition": "qemu",
+          "x86_only_tests": [],
+          "aarch64_only_tests": [],
+          "aarch64": {
+            "listed": 5,
+            "passed": 0,
+            "failed": 5,
+            "ignored": 0,
+            "tests": [
+              "fresh_certificate_readmits_the_new_generation",
+              "one_fault_admits_the_whole_group",
+              "racing_first_faults_admit_exactly_once",
+              "stale_certificate_refuses_after_revocation",
+              "uncertified_interior_entry_refuses"
+            ],
+            "failed_tests": [
+              "fresh_certificate_readmits_the_new_generation",
+              "one_fault_admits_the_whole_group",
+              "racing_first_faults_admit_exactly_once",
+              "stale_certificate_refuses_after_revocation",
+              "uncertified_interior_entry_refuses"
+            ]
+          },
+          "native": {
+            "listed": 5,
+            "passed": 0,
+            "failed": 5,
+            "ignored": 0,
+            "failed_tests": [
+              "fresh_certificate_readmits_the_new_generation",
+              "one_fault_admits_the_whole_group",
+              "racing_first_faults_admit_exactly_once",
+              "stale_certificate_refuses_after_revocation",
+              "uncertified_interior_entry_refuses"
+            ]
+          }
+        },
+        {
+          "name": "lifecycle",
+          "kind": [
+            "test"
+          ],
+          "required_features": [],
+          "x86_64": {
+            "listed": 59,
+            "ignored": 0
+          },
+          "disposition": "qemu",
+          "x86_only_tests": [],
+          "aarch64_only_tests": [],
+          "aarch64": {
+            "listed": 59,
+            "passed": 1,
+            "failed": 58,
+            "ignored": 0,
+            "tests": [
+              "a_backend_failure_ends_the_run_while_a_process_is_parked",
+              "a_changing_clone3_record_is_not_read_for_an_outside_handler_refusal",
+              "a_close_range_over_runtime_descriptors_reaches_the_tool",
+              "a_creation_hook_excludes_guest_seccomp_filters",
+              "a_creation_hook_receives_each_childs_birth_identity",
+              "a_creation_the_runtime_cannot_perform_faithfully_is_refused",
+              "a_failing_creation_hook_ends_the_creating_process",
+              "a_filter_install_during_staging_or_delivery_is_refused_before_installation",
+              "a_process_that_ends_itself_with_a_signal_reports_it_and_its_exit_first",
+              "a_reserved_tool_output_fd_is_protected_from_the_guest",
+              "a_sigalrm_whose_handler_its_signal_callback_installed_is_refused_by_name",
+              "a_signal_from_a_thread_start_callback_is_delivered_before_post_exec",
+              "an_admitted_guest_filter_keeps_denied_self_kill_errno_and_survival",
+              "an_admitted_permissive_filter_keeps_self_death_without_exit_callbacks",
+              "backend_trait_output_capture_reports_bytes_status_and_stats",
+              "bootstrap_run_with_inherited_stdio_reports_typed_instrumentation_stats",
+              "bootstrap_run_with_output_reports_typed_instrumentation_stats",
+              "bootstrap_status_run_keeps_caller_stdio_and_reports_stats",
+              "connection_admission_sees_each_guest_process_before_it_is_served",
+              "fallback_fork_reports_both_process_dispatch_paths",
+              "hooked_fork_counts_the_inherited_hook_entry_once",
+              "in_guest_run_reports_typed_instrumentation_stats",
+              "in_guest_runs_disable_address_space_randomization",
+              "in_guest_timer_requests_fail_closed_with_enosys",
+              "in_guest_tool_refuses_an_unsupported_site_patching_value",
+              "installed_shared_and_liteinst_accessors_retain_the_real_tool_and_rpc_owner",
+              "mapping_routes::published_owner_guards_nested_raw_mseal_and_reports_kernel_support",
+              "mapping_routes::published_owner_mapping_guard_uses_rewritten_final_arguments",
+              "mapping_routes::published_owner_survives_injected_fulltool_mapping_changes",
+              "mapping_routes::published_owner_survives_nested_hook_mapping_changes",
+              "mapping_routes::published_owner_survives_nested_sigsys_mapping_changes",
+              "mapping_routes::published_owner_survives_tail_injected_fulltool_mapping_changes",
+              "mapping_routes::published_owner_survives_unsubscribed_fulltool_mapping_changes",
+              "one_physical_exit_per_process_on_signal_and_normal_exits",
+              "pkey_alloc_installed_pre_effect_refusal_forward",
+              "pkey_alloc_installed_pre_effect_refusal_inject",
+              "pkey_alloc_installed_pre_effect_refusal_tail",
+              "pkey_alloc_instruction_without_owned_pkru_refuses_before_effect",
+              "pkey_alloc_owned_event_composes_rewrites_errors_and_scalar_override",
+              "pkey_permission_effects_forward_fallback",
+              "pkey_permission_effects_inject_fallback",
+              "pkey_permission_effects_native_control",
+              "pkey_permission_effects_tail_fallback",
+              "refused_guest_connection_fails_the_run",
+              "replacing_a_signal_with_a_virtual_sigalrm_is_refused_by_name",
+              "rpc_io::guest_memory_copies_in_an_actual_callback_do_not_reenter_sigsys",
+              "rpc_io::installed_liteinst_accessor_outside_callback_is_terminal_without_wire_or_handler",
+              "rpc_io::installed_shared_accessor_outside_callback_is_terminal_without_wire_or_handler",
+              "rpc_io::ordinary_rpc_adapter_uses_private_gate_only_in_an_actual_callback",
+              "rpc_io::tool_syscall_in_an_actual_callback_uses_the_private_gate",
+              "site_patching_off_runs_every_call_through_the_in_guest_fallback",
+              "supervisor_keeps_patchable_syscalls_in_guest",
+              "supervisor_observes_and_reaps_signaled_descendant",
+              "supervisor_preserves_root_status_and_drains_outliving_child",
+              "supervisor_restarts_read_without_leaking_private_errno",
+              "supervisor_restarts_wait4_without_leaking_private_errno",
+              "synchronous_tool_code_inside_a_callback_reaches_the_global_state",
+              "tool_syscall_through_a_patched_site_is_a_nested_hook_entry",
+              "whole_fixed_install_duplicate_is_terminal_after_actual_first_owner_observations"
+            ],
+            "failed_tests": [
+              "a_backend_failure_ends_the_run_while_a_process_is_parked",
+              "a_changing_clone3_record_is_not_read_for_an_outside_handler_refusal",
+              "a_close_range_over_runtime_descriptors_reaches_the_tool",
+              "a_creation_hook_excludes_guest_seccomp_filters",
+              "a_creation_hook_receives_each_childs_birth_identity",
+              "a_creation_the_runtime_cannot_perform_faithfully_is_refused",
+              "a_failing_creation_hook_ends_the_creating_process",
+              "a_filter_install_during_staging_or_delivery_is_refused_before_installation",
+              "a_process_that_ends_itself_with_a_signal_reports_it_and_its_exit_first",
+              "a_reserved_tool_output_fd_is_protected_from_the_guest",
+              "a_sigalrm_whose_handler_its_signal_callback_installed_is_refused_by_name",
+              "a_signal_from_a_thread_start_callback_is_delivered_before_post_exec",
+              "an_admitted_guest_filter_keeps_denied_self_kill_errno_and_survival",
+              "an_admitted_permissive_filter_keeps_self_death_without_exit_callbacks",
+              "backend_trait_output_capture_reports_bytes_status_and_stats",
+              "bootstrap_run_with_inherited_stdio_reports_typed_instrumentation_stats",
+              "bootstrap_run_with_output_reports_typed_instrumentation_stats",
+              "bootstrap_status_run_keeps_caller_stdio_and_reports_stats",
+              "connection_admission_sees_each_guest_process_before_it_is_served",
+              "fallback_fork_reports_both_process_dispatch_paths",
+              "hooked_fork_counts_the_inherited_hook_entry_once",
+              "in_guest_run_reports_typed_instrumentation_stats",
+              "in_guest_runs_disable_address_space_randomization",
+              "in_guest_timer_requests_fail_closed_with_enosys",
+              "in_guest_tool_refuses_an_unsupported_site_patching_value",
+              "installed_shared_and_liteinst_accessors_retain_the_real_tool_and_rpc_owner",
+              "mapping_routes::published_owner_guards_nested_raw_mseal_and_reports_kernel_support",
+              "mapping_routes::published_owner_mapping_guard_uses_rewritten_final_arguments",
+              "mapping_routes::published_owner_survives_injected_fulltool_mapping_changes",
+              "mapping_routes::published_owner_survives_nested_hook_mapping_changes",
+              "mapping_routes::published_owner_survives_nested_sigsys_mapping_changes",
+              "mapping_routes::published_owner_survives_tail_injected_fulltool_mapping_changes",
+              "mapping_routes::published_owner_survives_unsubscribed_fulltool_mapping_changes",
+              "one_physical_exit_per_process_on_signal_and_normal_exits",
+              "pkey_alloc_installed_pre_effect_refusal_forward",
+              "pkey_alloc_installed_pre_effect_refusal_inject",
+              "pkey_alloc_installed_pre_effect_refusal_tail",
+              "pkey_alloc_instruction_without_owned_pkru_refuses_before_effect",
+              "pkey_alloc_owned_event_composes_rewrites_errors_and_scalar_override",
+              "pkey_permission_effects_forward_fallback",
+              "pkey_permission_effects_inject_fallback",
+              "pkey_permission_effects_native_control",
+              "pkey_permission_effects_tail_fallback",
+              "replacing_a_signal_with_a_virtual_sigalrm_is_refused_by_name",
+              "rpc_io::guest_memory_copies_in_an_actual_callback_do_not_reenter_sigsys",
+              "rpc_io::installed_liteinst_accessor_outside_callback_is_terminal_without_wire_or_handler",
+              "rpc_io::installed_shared_accessor_outside_callback_is_terminal_without_wire_or_handler",
+              "rpc_io::ordinary_rpc_adapter_uses_private_gate_only_in_an_actual_callback",
+              "rpc_io::tool_syscall_in_an_actual_callback_uses_the_private_gate",
+              "site_patching_off_runs_every_call_through_the_in_guest_fallback",
+              "supervisor_keeps_patchable_syscalls_in_guest",
+              "supervisor_observes_and_reaps_signaled_descendant",
+              "supervisor_preserves_root_status_and_drains_outliving_child",
+              "supervisor_restarts_read_without_leaking_private_errno",
+              "supervisor_restarts_wait4_without_leaking_private_errno",
+              "synchronous_tool_code_inside_a_callback_reaches_the_global_state",
+              "tool_syscall_through_a_patched_site_is_a_nested_hook_entry",
+              "whole_fixed_install_duplicate_is_terminal_after_actual_first_owner_observations"
+            ]
+          },
+          "native": {
+            "listed": 59,
+            "passed": 1,
+            "failed": 58,
+            "ignored": 0,
+            "failed_tests": [
+              "a_backend_failure_ends_the_run_while_a_process_is_parked",
+              "a_changing_clone3_record_is_not_read_for_an_outside_handler_refusal",
+              "a_close_range_over_runtime_descriptors_reaches_the_tool",
+              "a_creation_hook_excludes_guest_seccomp_filters",
+              "a_creation_hook_receives_each_childs_birth_identity",
+              "a_creation_the_runtime_cannot_perform_faithfully_is_refused",
+              "a_failing_creation_hook_ends_the_creating_process",
+              "a_filter_install_during_staging_or_delivery_is_refused_before_installation",
+              "a_process_that_ends_itself_with_a_signal_reports_it_and_its_exit_first",
+              "a_reserved_tool_output_fd_is_protected_from_the_guest",
+              "a_sigalrm_whose_handler_its_signal_callback_installed_is_refused_by_name",
+              "a_signal_from_a_thread_start_callback_is_delivered_before_post_exec",
+              "an_admitted_guest_filter_keeps_denied_self_kill_errno_and_survival",
+              "an_admitted_permissive_filter_keeps_self_death_without_exit_callbacks",
+              "backend_trait_output_capture_reports_bytes_status_and_stats",
+              "bootstrap_run_with_inherited_stdio_reports_typed_instrumentation_stats",
+              "bootstrap_run_with_output_reports_typed_instrumentation_stats",
+              "bootstrap_status_run_keeps_caller_stdio_and_reports_stats",
+              "connection_admission_sees_each_guest_process_before_it_is_served",
+              "fallback_fork_reports_both_process_dispatch_paths",
+              "hooked_fork_counts_the_inherited_hook_entry_once",
+              "in_guest_run_reports_typed_instrumentation_stats",
+              "in_guest_runs_disable_address_space_randomization",
+              "in_guest_timer_requests_fail_closed_with_enosys",
+              "in_guest_tool_refuses_an_unsupported_site_patching_value",
+              "installed_shared_and_liteinst_accessors_retain_the_real_tool_and_rpc_owner",
+              "mapping_routes::published_owner_guards_nested_raw_mseal_and_reports_kernel_support",
+              "mapping_routes::published_owner_mapping_guard_uses_rewritten_final_arguments",
+              "mapping_routes::published_owner_survives_injected_fulltool_mapping_changes",
+              "mapping_routes::published_owner_survives_nested_hook_mapping_changes",
+              "mapping_routes::published_owner_survives_nested_sigsys_mapping_changes",
+              "mapping_routes::published_owner_survives_tail_injected_fulltool_mapping_changes",
+              "mapping_routes::published_owner_survives_unsubscribed_fulltool_mapping_changes",
+              "one_physical_exit_per_process_on_signal_and_normal_exits",
+              "pkey_alloc_installed_pre_effect_refusal_forward",
+              "pkey_alloc_installed_pre_effect_refusal_inject",
+              "pkey_alloc_installed_pre_effect_refusal_tail",
+              "pkey_alloc_instruction_without_owned_pkru_refuses_before_effect",
+              "pkey_alloc_owned_event_composes_rewrites_errors_and_scalar_override",
+              "pkey_permission_effects_forward_fallback",
+              "pkey_permission_effects_inject_fallback",
+              "pkey_permission_effects_native_control",
+              "pkey_permission_effects_tail_fallback",
+              "replacing_a_signal_with_a_virtual_sigalrm_is_refused_by_name",
+              "rpc_io::guest_memory_copies_in_an_actual_callback_do_not_reenter_sigsys",
+              "rpc_io::installed_liteinst_accessor_outside_callback_is_terminal_without_wire_or_handler",
+              "rpc_io::installed_shared_accessor_outside_callback_is_terminal_without_wire_or_handler",
+              "rpc_io::ordinary_rpc_adapter_uses_private_gate_only_in_an_actual_callback",
+              "rpc_io::tool_syscall_in_an_actual_callback_uses_the_private_gate",
+              "site_patching_off_runs_every_call_through_the_in_guest_fallback",
+              "supervisor_keeps_patchable_syscalls_in_guest",
+              "supervisor_observes_and_reaps_signaled_descendant",
+              "supervisor_preserves_root_status_and_drains_outliving_child",
+              "supervisor_restarts_read_without_leaking_private_errno",
+              "supervisor_restarts_wait4_without_leaking_private_errno",
+              "synchronous_tool_code_inside_a_callback_reaches_the_global_state",
+              "tool_syscall_through_a_patched_site_is_a_nested_hook_entry",
+              "whole_fixed_install_duplicate_is_terminal_after_actual_first_owner_observations"
+            ]
+          }
+        },
+        {
+          "name": "mapping_integrity",
+          "kind": [
+            "test"
+          ],
+          "required_features": [
+            "allocator-fixture"
+          ],
+          "x86_64": {
+            "listed": 243,
+            "ignored": 0
+          },
+          "disposition": "compile-blocked",
+          "reason": "aarch64-musl compile-blocked at f9ed30e8 by the statfs f_type comparison in the shared artifact test support",
+          "compile_signatures": [
+            "filesystem.f_type == CGROUP2_SUPER_MAGIC"
+          ],
+          "aarch64": {
+            "listed": 0,
+            "passed": 0,
+            "failed": 0,
+            "ignored": 0,
+            "tests": [],
+            "failed_tests": []
+          }
+        },
+        {
+          "name": "native_unpublished",
+          "kind": [
+            "test"
+          ],
+          "required_features": [],
+          "x86_64": {
+            "listed": 261,
+            "ignored": 1
+          },
+          "disposition": "compile-blocked",
+          "reason": "aarch64-musl compile-blocked at f9ed30e8 by the statfs f_type comparison in the shared artifact test support",
+          "compile_signatures": [
+            "filesystem.f_type == CGROUP2_SUPER_MAGIC"
+          ],
+          "aarch64": {
+            "listed": 0,
+            "passed": 0,
+            "failed": 0,
+            "ignored": 0,
+            "tests": [],
+            "failed_tests": []
+          }
+        },
+        {
+          "name": "nop_window",
+          "kind": [
+            "test"
+          ],
+          "required_features": [
+            "liteinst"
+          ],
+          "x86_64": {
+            "listed": 1,
+            "ignored": 0
+          },
+          "disposition": "qemu",
+          "x86_only_tests": [
+            "replace_first_over_nop_windows_executes_and_resumes"
+          ],
+          "aarch64_only_tests": [],
+          "aarch64": {
+            "listed": 0,
+            "passed": 0,
+            "failed": 0,
+            "ignored": 0,
+            "tests": [],
+            "failed_tests": []
+          },
+          "native": {
+            "listed": 0,
+            "passed": 0,
+            "failed": 0,
+            "ignored": 0,
+            "failed_tests": []
+          }
+        },
+        {
+          "name": "private_prepare",
+          "kind": [
+            "test"
+          ],
+          "required_features": [
+            "exec-private-init"
+          ],
+          "x86_64": {
+            "listed": 1,
+            "ignored": 0
+          },
+          "disposition": "compile-refused-feature",
+          "reason": "exec-private-init is named compile-refused on aarch64; verified by the runner negative probe, not by the L1c profile build.",
+          "compile_signatures": [
+            "reverie-inguest exec-private features are not supported on aarch64 (exec_private is x86-64 only)"
+          ],
+          "x86_only_tests": [
+            "private_prepare_ordering_is_serialized"
+          ],
+          "aarch64": {
+            "listed": 0,
+            "passed": 0,
+            "failed": 0,
+            "ignored": 0,
+            "tests": [],
+            "failed_tests": []
+          }
+        },
+        {
+          "name": "region_stacks",
+          "kind": [
+            "test"
+          ],
+          "required_features": [
+            "allocator-fixture"
+          ],
+          "x86_64": {
+            "listed": 246,
+            "ignored": 0
+          },
+          "disposition": "compile-blocked",
+          "reason": "aarch64-musl compile-blocked at f9ed30e8 by the statfs f_type comparison in the shared artifact test support",
+          "compile_signatures": [
+            "filesystem.f_type == CGROUP2_SUPER_MAGIC"
+          ],
+          "aarch64": {
+            "listed": 0,
+            "passed": 0,
+            "failed": 0,
+            "ignored": 0,
+            "tests": [],
+            "failed_tests": []
+          }
+        },
+        {
+          "name": "rpc_tool",
+          "kind": [
+            "test"
+          ],
+          "required_features": [],
+          "x86_64": {
+            "listed": 35,
+            "ignored": 0
+          },
+          "disposition": "qemu",
+          "x86_only_tests": [
+            "fallback_assembly_blocks_restore_text_section"
+          ],
+          "aarch64_only_tests": [],
+          "aarch64": {
+            "listed": 34,
+            "passed": 2,
+            "failed": 32,
+            "ignored": 0,
+            "tests": [
+              "a_refused_site_resuming_into_a_shared_mapping_runs_through_the_continuation",
+              "a_shared_alias_is_not_patched_under_a_private_continuation_site",
+              "a_shared_executable_mapping_is_never_patched",
+              "a_stale_syscall_fallback_site_keeps_its_continuation_reservation",
+              "an_anonymous_syscall_site_stays_on_the_fallback_path",
+              "an_instruction_at_a_fallback_syscalls_resume_point_is_still_patched",
+              "cross_line_instruction_site_reaches_the_tool_through_the_continuation",
+              "deferred_sigalrm_preserves_full_event_at_completion_and_before_syscall",
+              "dlopen_constructor_cpuid_reaches_the_tool_through_the_continuation",
+              "dlopen_system_libcrypto_initializer_reaches_the_tool",
+              "fallback_refusal_is_counted_separately_from_tool_errors",
+              "fallback_uses_owned_frames_after_guest_stack_revocation",
+              "fork_child_accounts_for_fallback_and_installed_dispatch",
+              "installed_hook_reentry_bypasses_tool_with_shared_coordinator_rpc",
+              "late_code_instructions_reach_the_tool_through_the_continuation",
+              "ordinary_tool_memory_and_scratch_work_with_protected_guest_state",
+              "patched_declined_and_unpatched_sites_give_one_tool_the_same_results",
+              "public_installers_admit_the_typed_role_before_new_and_start",
+              "reclaiming_a_site_whose_jump_partly_survives_fails_closed",
+              "signal_gate_caches_the_event_identity_only_under_the_gate",
+              "signal_gate_mask_calls_returns_and_fork_match_native",
+              "signal_gate_refuses_a_tools_masked_call_whatever_the_guests_keys",
+              "signal_gate_refuses_only_forwards_that_install_a_mask",
+              "signal_gate_resume_mask_is_the_saved_mask_or_the_prepared_handlers",
+              "signal_gate_sigsys_action_carries_the_runtime_mask",
+              "site_patching_off_emulates_in_arena_instructions_through_the_continuation",
+              "site_patching_off_fork_child_binds_its_clock_and_exits",
+              "timeout_capture_drains_both_8192_byte_pipes_while_child_runs",
+              "timeout_capture_preserves_prefixes_and_reaps_child_and_coordinator_on_unwind",
+              "undecodable_late_code_fault_ends_the_guest_by_sigsegv",
+              "unpatchable_syscall_dispatches_tool_after_signal_return",
+              "unpatchable_syscall_preserves_protection_keys",
+              "unpatchable_syscall_preserves_protection_keys_without_alt_stack",
+              "unpatchable_syscall_preserves_xstate_with_native_controls"
+            ],
+            "failed_tests": [
+              "a_refused_site_resuming_into_a_shared_mapping_runs_through_the_continuation",
+              "a_shared_alias_is_not_patched_under_a_private_continuation_site",
+              "a_shared_executable_mapping_is_never_patched",
+              "a_stale_syscall_fallback_site_keeps_its_continuation_reservation",
+              "an_anonymous_syscall_site_stays_on_the_fallback_path",
+              "an_instruction_at_a_fallback_syscalls_resume_point_is_still_patched",
+              "cross_line_instruction_site_reaches_the_tool_through_the_continuation",
+              "deferred_sigalrm_preserves_full_event_at_completion_and_before_syscall",
+              "dlopen_constructor_cpuid_reaches_the_tool_through_the_continuation",
+              "dlopen_system_libcrypto_initializer_reaches_the_tool",
+              "fallback_refusal_is_counted_separately_from_tool_errors",
+              "fallback_uses_owned_frames_after_guest_stack_revocation",
+              "fork_child_accounts_for_fallback_and_installed_dispatch",
+              "installed_hook_reentry_bypasses_tool_with_shared_coordinator_rpc",
+              "late_code_instructions_reach_the_tool_through_the_continuation",
+              "ordinary_tool_memory_and_scratch_work_with_protected_guest_state",
+              "patched_declined_and_unpatched_sites_give_one_tool_the_same_results",
+              "public_installers_admit_the_typed_role_before_new_and_start",
+              "reclaiming_a_site_whose_jump_partly_survives_fails_closed",
+              "signal_gate_caches_the_event_identity_only_under_the_gate",
+              "signal_gate_mask_calls_returns_and_fork_match_native",
+              "signal_gate_refuses_a_tools_masked_call_whatever_the_guests_keys",
+              "signal_gate_refuses_only_forwards_that_install_a_mask",
+              "signal_gate_resume_mask_is_the_saved_mask_or_the_prepared_handlers",
+              "signal_gate_sigsys_action_carries_the_runtime_mask",
+              "site_patching_off_emulates_in_arena_instructions_through_the_continuation",
+              "site_patching_off_fork_child_binds_its_clock_and_exits",
+              "undecodable_late_code_fault_ends_the_guest_by_sigsegv",
+              "unpatchable_syscall_dispatches_tool_after_signal_return",
+              "unpatchable_syscall_preserves_protection_keys",
+              "unpatchable_syscall_preserves_protection_keys_without_alt_stack",
+              "unpatchable_syscall_preserves_xstate_with_native_controls"
+            ]
+          },
+          "native": {
+            "listed": 34,
+            "passed": 1,
+            "failed": 33,
+            "ignored": 0,
+            "failed_tests": [
+              "a_refused_site_resuming_into_a_shared_mapping_runs_through_the_continuation",
+              "a_shared_alias_is_not_patched_under_a_private_continuation_site",
+              "a_shared_executable_mapping_is_never_patched",
+              "a_stale_syscall_fallback_site_keeps_its_continuation_reservation",
+              "an_anonymous_syscall_site_stays_on_the_fallback_path",
+              "an_instruction_at_a_fallback_syscalls_resume_point_is_still_patched",
+              "cross_line_instruction_site_reaches_the_tool_through_the_continuation",
+              "deferred_sigalrm_preserves_full_event_at_completion_and_before_syscall",
+              "dlopen_constructor_cpuid_reaches_the_tool_through_the_continuation",
+              "dlopen_system_libcrypto_initializer_reaches_the_tool",
+              "fallback_refusal_is_counted_separately_from_tool_errors",
+              "fallback_uses_owned_frames_after_guest_stack_revocation",
+              "fork_child_accounts_for_fallback_and_installed_dispatch",
+              "installed_hook_reentry_bypasses_tool_with_shared_coordinator_rpc",
+              "late_code_instructions_reach_the_tool_through_the_continuation",
+              "ordinary_tool_memory_and_scratch_work_with_protected_guest_state",
+              "patched_declined_and_unpatched_sites_give_one_tool_the_same_results",
+              "public_installers_admit_the_typed_role_before_new_and_start",
+              "reclaiming_a_site_whose_jump_partly_survives_fails_closed",
+              "signal_gate_caches_the_event_identity_only_under_the_gate",
+              "signal_gate_mask_calls_returns_and_fork_match_native",
+              "signal_gate_refuses_a_tools_masked_call_whatever_the_guests_keys",
+              "signal_gate_refuses_only_forwards_that_install_a_mask",
+              "signal_gate_resume_mask_is_the_saved_mask_or_the_prepared_handlers",
+              "signal_gate_sigsys_action_carries_the_runtime_mask",
+              "site_patching_off_emulates_in_arena_instructions_through_the_continuation",
+              "site_patching_off_fork_child_binds_its_clock_and_exits",
+              "timeout_capture_drains_both_8192_byte_pipes_while_child_runs",
+              "undecodable_late_code_fault_ends_the_guest_by_sigsegv",
+              "unpatchable_syscall_dispatches_tool_after_signal_return",
+              "unpatchable_syscall_preserves_protection_keys",
+              "unpatchable_syscall_preserves_protection_keys_without_alt_stack",
+              "unpatchable_syscall_preserves_xstate_with_native_controls"
+            ]
+          }
+        },
+        {
+          "name": "standalone_constructor",
+          "kind": [
+            "test"
+          ],
+          "required_features": [
+            "allocator-fixture"
+          ],
+          "x86_64": {
+            "listed": 246,
+            "ignored": 0
+          },
+          "disposition": "compile-blocked",
+          "reason": "aarch64-musl compile-blocked at f9ed30e8 by the statfs f_type comparison in the shared artifact test support",
+          "compile_signatures": [
+            "filesystem.f_type == CGROUP2_SUPER_MAGIC"
+          ],
+          "aarch64": {
+            "listed": 0,
+            "passed": 0,
+            "failed": 0,
+            "ignored": 0,
+            "tests": [],
+            "failed_tests": []
+          }
+        },
+        {
+          "name": "strace",
+          "kind": [
+            "test"
+          ],
+          "required_features": [],
+          "x86_64": {
+            "listed": 261,
+            "ignored": 0
+          },
+          "disposition": "compile-blocked",
+          "reason": "aarch64-musl compile-blocked at f9ed30e8 by x86 syscall-number spellings and the shared statfs f_type comparison",
+          "compile_signatures": [
+            "filesystem.f_type == CGROUP2_SUPER_MAGIC",
+            "cannot find value `SYS_fork` in crate `libc`",
+            "cannot find value `SYS_vfork` in crate `libc`"
+          ],
+          "aarch64": {
+            "listed": 0,
+            "passed": 0,
+            "failed": 0,
+            "ignored": 0,
+            "tests": [],
+            "failed_tests": []
+          }
+        },
+        {
+          "name": "tool_tls",
+          "kind": [
+            "test"
+          ],
+          "required_features": [
+            "allocator-fixture"
+          ],
+          "x86_64": {
+            "listed": 246,
+            "ignored": 0
+          },
+          "disposition": "compile-blocked",
+          "reason": "aarch64-musl compile-blocked at f9ed30e8 by the statfs f_type comparison in the shared artifact test support",
+          "compile_signatures": [
+            "filesystem.f_type == CGROUP2_SUPER_MAGIC"
+          ],
+          "aarch64": {
+            "listed": 0,
+            "passed": 0,
+            "failed": 0,
+            "ignored": 0,
+            "tests": [],
+            "failed_tests": []
+          }
+        }
+      ]
+    },
+    {
+      "name": "reverie-liteinst-artifact",
+      "profile": {
+        "name": "default",
+        "cargo_args": []
+      },
+      "targets": [
+        {
+          "name": "reverie_liteinst_artifact",
+          "kind": [
+            "lib"
+          ],
+          "required_features": [],
+          "disposition": "compile-blocked",
+          "reason": "aarch64-musl compile-blocked at f9ed30e8 by the statfs f_type comparison in reverie-liteinst-artifact tests",
+          "compile_signatures": [
+            "filesystem.f_type == CGROUP2_SUPER_MAGIC"
+          ],
+          "x86_64": {
+            "listed": 241,
+            "ignored": 0
+          },
+          "aarch64": {
+            "listed": 0,
+            "passed": 0,
+            "failed": 0,
+            "ignored": 0,
+            "tests": [],
+            "failed_tests": []
+          }
+        }
+      ]
+    },
+    {
+      "name": "reverie-liteinst-preload",
+      "profile": {
+        "name": "default",
+        "cargo_args": []
+      },
+      "negative_probe": {
+        "target": "aarch64-unknown-linux-gnu",
+        "cargo_args": []
+      },
+      "targets": [
+        {
+          "name": "reverie_liteinst_preload",
+          "kind": [
+            "cdylib"
+          ],
+          "required_features": [],
+          "disposition": "compile-refused-package",
+          "reason": "reverie-liteinst-preload has no aarch64 native bootstrap at f9ed30e8; verified by the runner negative probe on aarch64-unknown-linux-gnu.",
+          "compile_signatures": [
+            "reverie-liteinst-preload is not supported on aarch64 (no aarch64 native bootstrap)"
+          ],
+          "x86_64": {
+            "listed": 10,
+            "ignored": 0
+          },
+          "aarch64": {
+            "listed": 0,
+            "passed": 0,
+            "failed": 0,
+            "ignored": 0,
+            "tests": [],
+            "failed_tests": []
+          }
+        },
+        {
+          "name": "glibc_compat",
+          "kind": [
+            "test"
+          ],
+          "required_features": [],
+          "disposition": "compile-refused-package",
+          "reason": "reverie-liteinst-preload has no aarch64 native bootstrap at f9ed30e8; verified by the runner negative probe on aarch64-unknown-linux-gnu.",
+          "compile_signatures": [
+            "reverie-liteinst-preload is not supported on aarch64 (no aarch64 native bootstrap)"
+          ],
+          "x86_64": {
+            "listed": 1,
+            "ignored": 0
+          },
+          "aarch64": {
+            "listed": 0,
+            "passed": 0,
+            "failed": 0,
+            "ignored": 0,
+            "tests": [],
+            "failed_tests": []
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -185,7 +185,7 @@ const RPC_FAIL: u64 = 8;
 /// Tags a process's exit-time count of its Tool callbacks.
 const RPC_CALLBACK_COUNT: u64 = 1 << 32;
 /// The lifecycle observations the fixture Tool sends (`lifecycle_event` in
-/// `src/bin/lifecycle_guest.rs`: tag in the top byte, id in bits 16 to 47,
+/// `src/bin/real_bodies/lifecycle_guest.rs`: tag in the top byte, id in bits 16 to 47,
 /// value in the low 16 bits), and the physical exits an admission observes,
 /// each numbered from [`OBSERVATION_SEQUENCE`] when it is recorded, so the
 /// two sources merge into one ordered stream.

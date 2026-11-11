@@ -5,13 +5,13 @@
 use std::io;
 use std::path::Path;
 
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 use liteinst::trampoline::HookContext;
 #[cfg(feature = "exec-private-init")]
 use reverie::GlobalRPC;
 use reverie::Pid;
 use reverie::Tool;
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 use reverie_inguest::guest::context::RegisterContext;
 use reverie_inguest::guest::host::HostRuntime;
 #[cfg(feature = "exec-private-init")]
@@ -27,9 +27,24 @@ use crate::rpc::CoordinatorRpc;
 use crate::runtime;
 use crate::runtime::SyscallEvent;
 
+/// Named aarch64 refusal for the serving entry points below (L0 of the
+/// aarch64 LiteInst port): the serving tails are not compiled on aarch64,
+/// and each public installer refuses here before touching any
+/// process-global state. One signature exists per installer on both
+/// architectures (the refusal is a cfg arm inside the single fn item), so
+/// signature drift between serving and refusing shapes is impossible by
+/// construction. L1 flips surfaces to real trap serving one by one.
+#[cfg(not(target_arch = "x86_64"))]
+pub(crate) fn aarch64_unsupported(surface: &'static str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!("{surface}: in-guest LiteInst runtime is not supported on aarch64"),
+    )
+}
+
 // Patched trampolines save HookContext; the shared entry reads RegisterContext.
 // The shared fallback continuation already owns RegisterContext.
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 const _: () = {
     use core::mem::align_of;
     use core::mem::offset_of;
@@ -60,17 +75,25 @@ const _: () = {
 };
 
 /// LiteInst's services for the in-guest Tool host.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 pub(crate) struct LiteinstRuntime {
     stats: crate::stats::GuestStatsHooks,
+    /// Armed external exec watch (see `HostRuntime::exec_watch_armed`).
+    /// No in-tree liteinst launcher seizes guests under a supervisor
+    /// yet, so every current construction sets this `false`; the
+    /// seized-launcher composition will set it at construction.
+    exec_watch: bool,
     #[cfg(feature = "exec-private-init")]
     no_rcb: bool,
 }
 
 impl LiteinstRuntime {
     /// The services of an ordinary installation.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     pub(crate) fn new(stats: crate::stats::GuestStatsHooks) -> Self {
         Self {
             stats,
+            exec_watch: false,
             #[cfg(feature = "exec-private-init")]
             no_rcb: false,
         }
@@ -122,6 +145,10 @@ impl HostRuntime for LiteinstRuntime {
     fn reserved_signal_mask(&self) -> u64 {
         runtime::reserved_signal_mask()
     }
+
+    fn exec_watch_armed(&self) -> bool {
+        self.exec_watch
+    }
 }
 
 // TODO-HUMAN-REVIEW(PR-127): Review generic in-guest Tool hosting.
@@ -146,6 +173,12 @@ pub unsafe fn install_tool<T>(coordinator: impl AsRef<Path>) -> io::Result<()>
 where
     T: Tool + 'static,
 {
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = &coordinator;
+        Err(aarch64_unsupported("install_tool"))
+    }
+    #[cfg(target_arch = "x86_64")]
     unsafe {
         reverie_inguest::guest::tool_install::install_tool_with::<T, _>(
             coordinator.as_ref(),
@@ -173,6 +206,12 @@ pub unsafe fn install_tool_quiescent<T>(coordinator: impl AsRef<Path>) -> io::Re
 where
     T: Tool + 'static,
 {
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = &coordinator;
+        Err(aarch64_unsupported("install_tool_quiescent"))
+    }
+    #[cfg(target_arch = "x86_64")]
     unsafe {
         reverie_inguest::guest::tool_install::install_tool_with::<T, _>(
             coordinator.as_ref(),
@@ -198,6 +237,12 @@ pub unsafe fn install_tool_from_bootstrap<T>(coordinator: impl AsRef<Path>) -> i
 where
     T: Tool + 'static,
 {
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = &coordinator;
+        Err(aarch64_unsupported("install_tool_from_bootstrap"))
+    }
+    #[cfg(target_arch = "x86_64")]
     unsafe {
         reverie_inguest::guest::tool_install::install_tool_with::<T, _>(
             coordinator.as_ref(),
@@ -228,8 +273,17 @@ where
     T: Tool + 'static,
     R: HostRuntime,
 {
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = &coordinator;
+        let _ = &project;
+        Err(aarch64_unsupported(
+            "install_tool_from_bootstrap_with_runtime",
+        ))
+    }
     // SAFETY: the caller retains the original installation and service
     // projection obligations. No private image owner is created here.
+    #[cfg(target_arch = "x86_64")]
     unsafe {
         reverie_inguest::guest::tool_install::install_tool_with_runtime::<T, _, R, _>(
             coordinator.as_ref(),
@@ -273,9 +327,10 @@ impl PrivateImageControl<'_> {
 #[cfg(feature = "exec-private-init")]
 enum ImageInstall<'a, T: Tool> {
     Initial(
-        reverie_rpc_transport::InitialImageClient<T::GlobalState, GuestRpcStream>,
+        reverie_rpc_transport::BlockingRpcClient<T::GlobalState, GuestRpcStream>,
         &'a reverie_inguest::guest::exec_private::InitialImageControl,
         &'a reverie_inguest::guest::exec_private::InitialImageAbortGuard,
+        Option<(T, T::ThreadState)>,
     ),
     #[cfg(feature = "exec-native-injection")]
     Successor {
@@ -290,12 +345,18 @@ enum ImageInstall<'a, T: Tool> {
 /// Parse the straddler selector from the runner's environ block
 /// directly: no getenv interposition and no allocation unless the
 /// parse constructs its error.
-#[cfg(all(feature = "exec-private-init", not(feature = "liteinst")))]
+#[cfg(all(
+    feature = "exec-private-init",
+    not(all(feature = "liteinst", target_arch = "x86_64"))
+))]
 fn validated_straddler_staleness() -> io::Result<Option<crate::runtime::StalenessBudget>> {
     Ok(Some(()))
 }
 
-#[cfg(all(feature = "exec-private-init", feature = "liteinst"))]
+#[cfg(all(
+    feature = "exec-private-init",
+    all(feature = "liteinst", target_arch = "x86_64")
+))]
 fn validated_straddler_staleness() -> io::Result<Option<crate::runtime::StalenessBudget>> {
     use std::os::unix::ffi::OsStrExt;
     let value = reverie_inguest::guest::support::environment_value(
@@ -337,8 +398,9 @@ pub struct PreparedInitialImage<T: Tool> {
     // Fields drop in declaration order: abandon before any generic Config or
     // client destructor can run, allocate, block, or panic.
     fatal: reverie_inguest::guest::exec_private::InitialImageAbortGuard,
-    client: reverie_rpc_transport::InitialImageClient<T::GlobalState, GuestRpcStream>,
+    client: reverie_rpc_transport::BlockingRpcClient<T::GlobalState, GuestRpcStream>,
     control: reverie_inguest::guest::exec_private::InitialImageControl,
+    selected: Option<(T, T::ThreadState)>,
     straddler_staleness: Option<Option<crate::runtime::StalenessBudget>>,
 }
 
@@ -356,6 +418,162 @@ impl InstalledInitialImage {
     /// native runner's existing handover, not an independent Guest entry.
     pub fn finish(self) -> io::Result<()> {
         self.fatal.finish(&self.control)
+    }
+}
+
+/// Verified digests supplied by whichever already-admitted
+/// carrier delivered the selected state. This seam does not
+/// construct or name that carrier's scalar-5 client.
+///
+/// The fields are private: outside this module, the digests
+/// can only be copied from a `VerifiedSuccessorState` via
+/// the `From` conversion below; code inside this module can
+/// still build them by struct literal.
+#[cfg(feature = "loader-private-runtime")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MappedSuccessorVerifiedDigests {
+    /// SHA-256 of the exact delivered opaque state bytes.
+    state: [u8; 32],
+    /// SHA-256 of the exact one-use ticket/redemption bytes.
+    ticket: [u8; 32],
+}
+
+#[cfg(feature = "loader-private-runtime")]
+impl MappedSuccessorVerifiedDigests {
+    /// SHA-256 of the exact delivered opaque state bytes.
+    pub fn state(&self) -> [u8; 32] {
+        self.state
+    }
+
+    /// SHA-256 of the exact one-use ticket/redemption bytes.
+    pub fn ticket(&self) -> [u8; 32] {
+        self.ticket
+    }
+}
+
+#[cfg(feature = "loader-private-runtime")]
+impl From<&reverie_rpc_transport::successor::VerifiedSuccessorState>
+    for MappedSuccessorVerifiedDigests
+{
+    fn from(verified: &reverie_rpc_transport::successor::VerifiedSuccessorState) -> Self {
+        Self {
+            state: verified.expected().state,
+            ticket: verified.ticket_digest(),
+        }
+    }
+}
+
+#[cfg(all(feature = "loader-private-runtime", any(test, target_env = "musl")))]
+fn mapped_successor_binding_digests<C: serde::Serialize>(
+    config: &C,
+    redemption: &[u8],
+) -> io::Result<([u8; 32], [u8; 32])> {
+    let config_bytes = reverie_rpc_transport::codec::encode(config)
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    Ok((
+        reverie_rpc_transport::initial_image::config_digest(&config_bytes),
+        reverie_rpc_transport::initial_image::config_digest(redemption),
+    ))
+}
+
+#[cfg(all(feature = "loader-private-runtime", any(test, target_env = "musl")))]
+fn check_mapped_successor_binding(
+    client_config_digest: [u8; 32],
+    packet_config_digest: [u8; 32],
+    packet_state_digest: [u8; 32],
+    packet_ticket_digest: [u8; 32],
+    verified: &MappedSuccessorVerifiedDigests,
+) -> io::Result<()> {
+    if client_config_digest != packet_config_digest {
+        return Err(io::Error::other(
+            "mapped successor packet config digest mismatch",
+        ));
+    }
+    if verified.state != packet_state_digest {
+        return Err(io::Error::other(
+            "mapped successor packet state digest mismatch",
+        ));
+    }
+    if packet_ticket_digest != verified.ticket {
+        return Err(io::Error::other(
+            "mapped successor packet ticket digest mismatch",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "loader-private-runtime", any(test, target_env = "musl")))]
+fn publish_after_mapped_successor_binding<P>(
+    client_config_digest: [u8; 32],
+    packet_config_digest: [u8; 32],
+    packet_state_digest: [u8; 32],
+    packet_ticket_digest: [u8; 32],
+    verified: &MappedSuccessorVerifiedDigests,
+    publish: impl FnOnce() -> io::Result<P>,
+) -> io::Result<P> {
+    check_mapped_successor_binding(
+        client_config_digest,
+        packet_config_digest,
+        packet_state_digest,
+        packet_ticket_digest,
+        verified,
+    )?;
+    publish()
+}
+
+#[cfg(feature = "exec-private-init")]
+fn route_selected_initial_publication<H, S>(
+    host: H,
+    selected: Option<S>,
+    mapped_successor: impl FnOnce(H, S) -> io::Result<()>,
+    initial: impl FnOnce(H) -> io::Result<()>,
+) -> io::Result<()> {
+    match selected {
+        Some(state) => mapped_successor(host, state),
+        None => initial(host),
+    }
+}
+
+/// Already-admitted mapped successor inputs for selected
+/// construction. The live RPC client is the common blocking
+/// client transferred from whichever carrier the caller used;
+/// this preparation constructs neither carrier client.
+#[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+pub struct MappedSuccessorPreparation<T: Tool> {
+    /// Same live connection transferred from the admitted client.
+    pub client: reverie_rpc_transport::BlockingRpcClient<T::GlobalState, GuestRpcStream>,
+    /// Captured/adopted mapped prelude for this exact launch.
+    pub mapped: reverie_inguest::guest::exec_private::mapped_initial::MappedToolPrelude,
+    /// Tool decoded from the delivered selected state.
+    pub tool: T,
+    /// Root thread state decoded from that same selected state.
+    pub state: T::ThreadState,
+    /// Independent delivered-state and ticket digests to bind
+    /// against the successor packet before publication.
+    pub verified: MappedSuccessorVerifiedDigests,
+}
+
+/// Mapped successor prepared for selected Tool installation.
+#[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+pub struct PreparedMappedSuccessorImage<T: Tool> {
+    initial: PreparedInitialImage<T>,
+    entry: reverie_inguest::guest::exec_private::MappedSuccessorEntry,
+}
+
+/// Installed mapped successor retaining fatal ownership through
+/// its restored-root lifecycle and frontend finish.
+#[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+pub struct InstalledMappedSuccessorImage {
+    initial: InstalledInitialImage,
+    entry: reverie_inguest::guest::exec_private::MappedSuccessorEntry,
+}
+
+#[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+impl InstalledMappedSuccessorImage {
+    /// Complete frontend/lifecycle checks exactly once through
+    /// the retained mapped initial-image owner.
+    pub fn finish(self) -> io::Result<()> {
+        self.initial.finish()
     }
 }
 
@@ -411,9 +629,10 @@ unsafe fn prepare_tool_initial_image_with_budget<T: Tool>(
     let control =
         unsafe { reverie_inguest::guest::exec_private::publish_authenticated_control(native)? };
     Ok(PreparedInitialImage {
-        client,
+        client: client.into_client(),
         control,
         fatal,
+        selected: None,
         straddler_staleness,
     })
 }
@@ -466,10 +685,128 @@ unsafe fn prepare_tool_mapped_initial_image_with_budget<T: Tool>(
     let control = unsafe { mapped.publish_authenticated()? };
     Ok(PreparedInitialImage {
         fatal,
-        client,
+        client: client.into_client(),
         control,
+        selected: None,
         straddler_staleness,
     })
+}
+
+/// Bind and prepare a mapped successor before the one
+/// authenticated mapped publication. The successor packet is
+/// decoded through the prelude's shared trait delegate and all
+/// three packet/client digests must match before
+/// `publish_authenticated` runs.
+///
+/// # Safety
+/// Every `prepare_tool_mapped_initial_image_validated`
+/// obligation applies to the transferred live client and mapped
+/// prelude, regardless of which carrier constructed that client
+/// before this call. `tool` and `state` must be the exact pair
+/// decoded from the delivered bytes whose SHA-256 and ticket
+/// digest are in `verified`; matching digests alone do not prove
+/// that decode. Obtain `straddler` before constructing or
+/// redeeming any admitted owner. No guest code may have run.
+///
+/// Every `Err` from this function that returns before the
+/// fatal guard is armed can be named; the caller must still
+/// treat it as terminal. It must not resume guest code or
+/// reuse the consumed preparation after one.
+#[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+pub unsafe fn prepare_tool_mapped_successor_image_validated<T: Tool>(
+    straddler: ValidatedStraddlerStaleness,
+    preparation: MappedSuccessorPreparation<T>,
+) -> io::Result<PreparedMappedSuccessorImage<T>> {
+    use reverie_inguest::guest::exec_private::mapped_initial::mapped_scalar::SuccessorPacketSource as _;
+
+    let MappedSuccessorPreparation {
+        client,
+        mapped,
+        tool,
+        state,
+        verified,
+    } = preparation;
+    let entry = mapped.successor_entry();
+    let packet = mapped
+        .successor_init_packet()
+        .map_err(|error| io::Error::other(error.name()))?;
+    let packet_config_digest = packet.expected_config_digest();
+    let packet_state_digest = packet.expected_state_digest();
+    let (client_config_digest, packet_ticket_digest) =
+        mapped_successor_binding_digests(client.config(), packet.redemption())?;
+    let mut initial = publish_after_mapped_successor_binding(
+        client_config_digest,
+        packet_config_digest,
+        packet_state_digest,
+        packet_ticket_digest,
+        &verified,
+        || {
+            let fatal =
+                unsafe { reverie_inguest::guest::exec_private::InitialImageAbortGuard::arm() };
+            // SAFETY: packet/client binding above and the caller's
+            // mapped-prelude publication obligations apply.
+            let control = unsafe { mapped.publish_authenticated()? };
+            Ok(PreparedInitialImage {
+                fatal,
+                client,
+                control,
+                selected: None,
+                straddler_staleness: Some(straddler.budget),
+            })
+        },
+    )?;
+    initial.selected = Some((tool, state));
+    Ok(PreparedMappedSuccessorImage { initial, entry })
+}
+
+/// Install the selected mapped successor Tool/state using the
+/// same transferred live client and authenticated mapped
+/// control. The caller must run
+/// [`initialize_mapped_successor_lifecycle`], complete its
+/// existing setup, then consume the installed owner's `finish`
+/// before the runner can resume the guest.
+///
+/// # Safety
+/// Every `install_tool_initial_image` obligation applies. The
+/// selected Tool/state in `prepared` must be the exact pair
+/// bound to its successor packet by
+/// `prepare_tool_mapped_successor_image_validated`.
+#[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+pub unsafe fn install_tool_mapped_successor_image<T>(
+    coordinator: impl AsRef<Path>,
+    prepared: PreparedMappedSuccessorImage<T>,
+) -> io::Result<InstalledMappedSuccessorImage>
+where
+    T: Tool + 'static,
+{
+    Ok(InstalledMappedSuccessorImage {
+        initial: unsafe { install_prepared_initial_image(coordinator, prepared.initial)? },
+        entry: prepared.entry,
+    })
+}
+
+/// Run the installed mapped successor's restored-root lifecycle
+/// with the native successor's callback order: the native
+/// driver bind when present, post-exec only, then publish that
+/// same state. It calls neither `on_initial_image_attached`,
+/// `init_thread_state`, nor `handle_thread_start`. Only the
+/// callback order and published state are parity; the mapped
+/// lifecycle guest provides guarded injection and the verified
+/// mapped resume registers/PKRU under its selected-restore
+/// permit.
+#[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+pub fn initialize_mapped_successor_lifecycle(
+    image: &InstalledMappedSuccessorImage,
+) -> io::Result<()> {
+    // SAFETY: the wrapper retains the same private affine
+    // installed owner and its live fatal guard.
+    unsafe {
+        installed_tool::initialize_mapped_successor_lifecycle(
+            &image.initial.control,
+            &image.initial.fatal,
+            &image.entry,
+        )
+    }
 }
 
 /// Install the actual Tool using the same authenticated client and native owner.
@@ -488,10 +825,22 @@ pub unsafe fn install_tool_initial_image<T>(
 where
     T: Tool + 'static,
 {
+    unsafe { install_prepared_initial_image(coordinator, prepared) }
+}
+
+#[cfg(feature = "exec-private-init")]
+unsafe fn install_prepared_initial_image<T>(
+    coordinator: impl AsRef<Path>,
+    prepared: PreparedInitialImage<T>,
+) -> io::Result<InstalledInitialImage>
+where
+    T: Tool + 'static,
+{
     let PreparedInitialImage {
         client,
         control,
         fatal,
+        selected,
         straddler_staleness,
     } = prepared;
     unsafe {
@@ -499,7 +848,7 @@ where
             coordinator.as_ref(),
             false,
             runtime::PatchPublication::Quiescent,
-            Some(ImageInstall::Initial(client, &control, &fatal)),
+            Some(ImageInstall::Initial(client, &control, &fatal, selected)),
             #[cfg(feature = "exec-native-injection")]
             None,
             true,
@@ -794,7 +1143,8 @@ pub unsafe fn install_tool_successor_image<T: Tool + 'static>(
 
 /// Install an authenticated initial image with its concrete native exec driver
 /// before the first dispatch, without admitting the native exec/clone route:
-/// exec and thread creation keep their typed refusals. Ordinary
+/// exec keeps its typed refusal unless an exec watch is armed, and
+/// thread creation keeps its typed refusal. Ordinary
 /// InitialImage installation is unchanged.
 ///
 /// # Safety
@@ -861,6 +1211,7 @@ unsafe fn install_tool_initial_image_with_native_exec_admission<T: Tool + 'stati
         fatal,
         client,
         control,
+        selected,
         straddler_staleness,
     } = prepared;
     let _private_allocations = reverie_inguest::guest::alloc::enter_dispatch();
@@ -870,7 +1221,7 @@ unsafe fn install_tool_initial_image_with_native_exec_admission<T: Tool + 'stati
             coordinator.as_ref(),
             false,
             runtime::PatchPublication::Quiescent,
-            Some(ImageInstall::Initial(client, &control, &fatal)),
+            Some(ImageInstall::Initial(client, &control, &fatal, selected)),
             Some((driver, admit_native_exec)),
             true,
             straddler_staleness,
@@ -1181,23 +1532,31 @@ where
         }
     }
     install_try!(crate::syscall_fallback::initialize());
-    #[cfg(feature = "exec-native-injection")]
+    #[cfg(feature = "exec-private-init")]
     let mut restored_tool = None;
+    #[cfg(feature = "exec-private-init")]
+    let mut selected_initial_state = None;
     #[cfg(feature = "exec-native-injection")]
     let mut restored_state = None;
     #[cfg(feature = "exec-native-injection")]
     let mut runtime_restore: Option<Box<dyn FnOnce() -> io::Result<()> + '_>> = None;
     #[cfg(feature = "exec-private-init")]
     let (rpc, initial_control, initial_fatal) = match initial {
-        Some(ImageInstall::Initial(client, control, fatal)) => (
-            install_try!(CoordinatorRpc::<T::GlobalState>::from_live_client(
-                coordinator,
-                client.into_client(),
-                runtime::replace_coordinator_fd,
-            )),
-            Some(PrivateImageControl::Initial(control)),
-            Some(fatal),
-        ),
+        Some(ImageInstall::Initial(client, control, fatal, selected)) => {
+            if let Some((tool, state)) = selected {
+                restored_tool = Some(tool);
+                selected_initial_state = Some(state);
+            }
+            (
+                install_try!(CoordinatorRpc::<T::GlobalState>::from_live_client(
+                    coordinator,
+                    client,
+                    runtime::replace_coordinator_fd,
+                )),
+                Some(PrivateImageControl::Initial(control)),
+                Some(fatal),
+            )
+        }
         #[cfg(feature = "exec-native-injection")]
         Some(ImageInstall::Successor {
             client,
@@ -1340,12 +1699,12 @@ where
         // SAFETY: legacy tool installation runs before application-created threads.
         unsafe { std::env::remove_var(crate::backend::COORDINATOR_ENV) };
     }
-    #[cfg(feature = "exec-native-injection")]
+    #[cfg(feature = "exec-private-init")]
     let tool = match restored_tool {
         Some(tool) => tool,
         None => T::new(pid, rpc.config()),
     };
-    #[cfg(not(feature = "exec-native-injection"))]
+    #[cfg(not(feature = "exec-private-init"))]
     let tool = T::new(pid, rpc.config());
     let host = ToolHost::<T, LiteinstRuntime>::new(
         tool,
@@ -1355,6 +1714,7 @@ where
         instruction_subscriptions.cpuid,
         LiteinstRuntime {
             stats,
+            exec_watch: false,
             #[cfg(feature = "exec-private-init")]
             no_rcb: skip_pmu,
         },
@@ -1388,7 +1748,14 @@ where
                 let fatal = install_try!(initial_fatal.ok_or_else(|| io::Error::other(
                     "InitialImage installer lacks its fatal owner"
                 )));
-                install_try!(installed_tool::publish_initial_tool(host, control, fatal));
+                install_try!(route_selected_initial_publication(
+                    host,
+                    selected_initial_state.take(),
+                    |host, state| installed_tool::publish_mapped_successor_tool(
+                        host, state, control, fatal
+                    ),
+                    |host| installed_tool::publish_initial_tool(host, control, fatal),
+                ));
             }
             #[cfg(feature = "exec-native-injection")]
             Some(PrivateImageControl::Successor(control)) => {
@@ -1463,3 +1830,291 @@ impl Drop for FixedGateInstallation {
 }
 
 pub use installed_tool::blocking_global_rpc;
+
+#[cfg(all(test, feature = "loader-private-runtime"))]
+mod mapped_successor_binding_tests {
+    use super::*;
+
+    fn binding() -> (u64, [u8; 32], [u8; 32], MappedSuccessorVerifiedDigests) {
+        let config = 901_u64;
+        let config_bytes = reverie_rpc_transport::codec::encode(&config).unwrap();
+        let packet_config = reverie_rpc_transport::initial_image::config_digest(&config_bytes);
+        let packet_state = [0x33; 32];
+        let verified = MappedSuccessorVerifiedDigests {
+            state: packet_state,
+            ticket: reverie_rpc_transport::initial_image::config_digest(b"birth-nonce"),
+        };
+        (config, packet_config, packet_state, verified)
+    }
+
+    #[test]
+    fn mapped_successor_binding_requires_all_three_digests() {
+        let (config, packet_config, packet_state, verified) = binding();
+        let (client_config_digest, packet_ticket) =
+            mapped_successor_binding_digests(&config, b"birth-nonce").unwrap();
+        assert_eq!(client_config_digest, packet_config);
+        assert_eq!(packet_ticket, verified.ticket);
+        let (wrong_config_digest, _) =
+            mapped_successor_binding_digests(&902_u64, b"birth-nonce").unwrap();
+        check_mapped_successor_binding(
+            client_config_digest,
+            packet_config,
+            packet_state,
+            packet_ticket,
+            &verified,
+        )
+        .unwrap();
+
+        let error = check_mapped_successor_binding(
+            wrong_config_digest,
+            packet_config,
+            packet_state,
+            packet_ticket,
+            &verified,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "mapped successor packet config digest mismatch"
+        );
+
+        let error = check_mapped_successor_binding(
+            client_config_digest,
+            packet_config,
+            packet_state,
+            packet_ticket,
+            &MappedSuccessorVerifiedDigests {
+                state: [0x44; 32],
+                ..verified
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "mapped successor packet state digest mismatch"
+        );
+
+        let (_, wrong_ticket_digest) =
+            mapped_successor_binding_digests(&config, b"wrong-nonce").unwrap();
+        let error = check_mapped_successor_binding(
+            client_config_digest,
+            packet_config,
+            packet_state,
+            wrong_ticket_digest,
+            &verified,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "mapped successor packet ticket digest mismatch"
+        );
+
+        // A zeroed verified ticket never binds, even against the
+        // genuine packet ticket digest.
+        let error = check_mapped_successor_binding(
+            client_config_digest,
+            packet_config,
+            packet_state,
+            packet_ticket,
+            &MappedSuccessorVerifiedDigests {
+                ticket: [0; 32],
+                ..verified
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "mapped successor packet ticket digest mismatch"
+        );
+    }
+
+    #[derive(Default)]
+    struct FidelityGlobal;
+
+    #[reverie::global_tool]
+    impl reverie::GlobalTool for FidelityGlobal {
+        type Request = ();
+        type Response = ();
+        type Config = u64;
+
+        async fn receive_rpc(&self, _from: reverie::Pid, _message: ()) {
+            panic!("fidelity fixture performs no RPC");
+        }
+    }
+
+    #[test]
+    fn mapped_digests_from_verified_state_are_faithful() {
+        use reverie_rpc_transport::BlockingRpcClient;
+        use reverie_rpc_transport::initial_image::config_digest;
+        use reverie_rpc_transport::successor::ExpectedSuccessor;
+        use reverie_rpc_transport::successor::SuccessorRequest;
+        use std::io::Read;
+        use std::io::Write;
+        use std::os::unix::net::UnixStream;
+
+        let config = reverie_rpc_transport::codec::encode(&73_u64).unwrap();
+        let state_bytes: &[u8] = b"selected-state-bytes";
+        let expected = ExpectedSuccessor {
+            config: config_digest(&config),
+            state: config_digest(state_bytes),
+        };
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        peer.set_write_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        let peer_config = config.clone();
+        let peer_thread = std::thread::spawn(move || {
+            let mut header = [0_u8; 4];
+            peer.read_exact(&mut header).unwrap();
+            let mut request = vec![0_u8; u32::from_be_bytes(header) as usize];
+            peer.read_exact(&mut request).unwrap();
+            let mut ack = Vec::from(*b"RVSUCCAK");
+            ack.extend_from_slice(&1_u16.to_be_bytes());
+            ack.extend_from_slice(&expected.config);
+            ack.extend_from_slice(&expected.state);
+            ack.extend_from_slice(&config_digest(b"birth-nonce"));
+            for payload in [&ack, &peer_config, &state_bytes.to_vec()] {
+                peer.write_all(&(payload.len() as u32).to_be_bytes())
+                    .unwrap();
+                peer.write_all(payload).unwrap();
+            }
+            peer.flush().unwrap();
+        });
+        let client =
+            BlockingRpcClient::<FidelityGlobal, UnixStream>::successor_from_connected_stream(
+                stream,
+                reverie::Tid::from_raw(17),
+                SuccessorRequest {
+                    ticket: b"birth-nonce",
+                    expected,
+                },
+            )
+            .unwrap();
+        peer_thread.join().unwrap();
+        let digests = MappedSuccessorVerifiedDigests::from(client.state());
+        assert_eq!(digests.state(), client.state().expected().state);
+        assert_eq!(digests.ticket(), client.state().ticket_digest());
+        assert_eq!(digests.ticket(), config_digest(b"birth-nonce"));
+        assert_ne!(digests.ticket(), [0; 32]);
+    }
+
+    #[test]
+    fn mapped_successor_publication_waits_for_binding() {
+        let (config, packet_config, packet_state, verified) = binding();
+        let (client_config_digest, packet_ticket) =
+            mapped_successor_binding_digests(&config, b"birth-nonce").unwrap();
+        let (wrong_config_digest, _) =
+            mapped_successor_binding_digests(&902_u64, b"birth-nonce").unwrap();
+        let published = std::cell::Cell::new(false);
+        let error = publish_after_mapped_successor_binding(
+            wrong_config_digest,
+            packet_config,
+            packet_state,
+            packet_ticket,
+            &verified,
+            || {
+                published.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "mapped successor packet config digest mismatch"
+        );
+        assert!(!published.get());
+
+        let error = publish_after_mapped_successor_binding(
+            client_config_digest,
+            packet_config,
+            packet_state,
+            packet_ticket,
+            &MappedSuccessorVerifiedDigests {
+                state: [0x44; 32],
+                ..verified
+            },
+            || {
+                published.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "mapped successor packet state digest mismatch"
+        );
+        assert!(!published.get());
+
+        let (_, wrong_ticket_digest) =
+            mapped_successor_binding_digests(&config, b"wrong-nonce").unwrap();
+        let error = publish_after_mapped_successor_binding(
+            client_config_digest,
+            packet_config,
+            packet_state,
+            wrong_ticket_digest,
+            &verified,
+            || {
+                published.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "mapped successor packet ticket digest mismatch"
+        );
+        assert!(!published.get());
+
+        publish_after_mapped_successor_binding(
+            client_config_digest,
+            packet_config,
+            packet_state,
+            packet_ticket,
+            &verified,
+            || {
+                published.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(published.get());
+    }
+
+    #[test]
+    fn selected_initial_publication_routes_only_selected_state_to_mapped() {
+        let route = std::cell::Cell::new("");
+        route_selected_initial_publication(
+            "host",
+            Some(7_u64),
+            |host, state| {
+                assert_eq!(host, "host");
+                assert_eq!(state, 7);
+                route.set("mapped");
+                Ok(())
+            },
+            |_host| {
+                route.set("initial");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(route.get(), "mapped");
+
+        route_selected_initial_publication(
+            "host",
+            None,
+            |_host, _state: u64| {
+                route.set("mapped");
+                Ok(())
+            },
+            |host| {
+                assert_eq!(host, "host");
+                route.set("initial");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(route.get(), "initial");
+    }
+}

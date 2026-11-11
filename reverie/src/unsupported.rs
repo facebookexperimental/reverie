@@ -47,6 +47,10 @@ pub enum UnsupportedOperation {
     ProcessGroups,
     /// `execve` or `execveat` on a backend that cannot replace the process
     /// image at all. No replacement image ran; the caller runs on unchanged.
+    /// A backend running under an external exec watcher (a supervisor that
+    /// catches the kernel exec event and re-bootstraps the successor)
+    /// forwards the exec instead and records no refusal: this name covers
+    /// only the unwatched configuration.
     Exec,
     /// A scheduling, priority or I/O-priority call (`setpriority`,
     /// `getpriority`, the `sched_set*` and `sched_get*` calls that name a
@@ -118,6 +122,27 @@ pub enum UnsupportedOperation {
     /// backend that refuses it armed nothing and kept the caller's previous
     /// parent-death signal; the refusal's diagnostic names the reason.
     ParentDeathSignal,
+    /// An operation on a pidfd that the backend does not model, such as
+    /// sending a pidfd for a process of the run in an `SCM_RIGHTS` message,
+    /// or adding one to an epoll set where the backend cannot tell open file
+    /// descriptions apart, or to an epoll set that came from outside the run,
+    /// where a process the backend cannot see may hold it. It also names the
+    /// refusal of an epoll set, whose pidfd registrations the backend keeps,
+    /// in an `SCM_RIGHTS` message that may leave the run, where the backend
+    /// could not follow its lifetime, and of a Unix socket in such a message
+    /// while an epoll set sent in the run may be queued in it. A backend that
+    /// refuses one changed nothing; the refusal's diagnostic names the
+    /// operation.
+    Pidfd,
+    /// A receive that takes a record from a Unix datagram or seqpacket socket
+    /// into a buffer that is not all writable, on a backend that must see
+    /// every right such a receive takes, and whose own receive, like Linux's,
+    /// would free the record with its rights unseen where the copy faults.
+    /// The refusal is conservative: it also covers receives that Linux
+    /// completes, such as of a record that fits the writable part, and the
+    /// refusal's diagnostic names when the backend makes it. A backend that
+    /// refuses one received nothing.
+    UnwritableRecordBuffer,
 }
 
 /// A backend's refusal of an injected syscall, or of a `Guest` operation,

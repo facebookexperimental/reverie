@@ -552,6 +552,7 @@ mod tests {
             context: 0,
             dispatch: SyscallDispatch::InstalledHook,
             guest_pkru: None,
+            unsupported_refusal: None,
         };
         let tail = TailResult::default();
         let mut state = ();
@@ -566,6 +567,8 @@ mod tests {
             native: None,
             tail: &tail,
             cpuid_interception: false,
+            admit_threads: false,
+            thread_birth: None,
             fork_parent_state: None,
             runtime: &ForwardRuntime,
             staged_signals: Vec::new(),
@@ -577,6 +580,8 @@ mod tests {
             mapping_driver: None,
             #[cfg(feature = "exec-native-injection")]
             native_exec_admitted: false,
+            #[cfg(feature = "exec-native-injection")]
+            native_exec_route_active: false,
             unsupported_refusal: None,
             injected_syscalls: 0,
         };

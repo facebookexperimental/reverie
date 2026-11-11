@@ -164,6 +164,8 @@ where
                 }),
                 tail: &tail,
                 cpuid_interception: services.facts().cpuid_interception,
+                admit_threads: self.admit_threads,
+                thread_birth: None,
                 fork_parent_state: None,
                 runtime: &self.runtime,
                 staged_signals: Vec::new(),
@@ -175,6 +177,9 @@ where
                 mapping_driver: None,
                 #[cfg(feature = "exec-native-injection")]
                 native_exec_admitted: false,
+                #[cfg(feature = "exec-native-injection")]
+                native_exec_route_active: self.native_exec_admitted
+                    && self.native_exec_driver.is_some(),
                 unsupported_refusal: None,
                 injected_syscalls: 0,
             };

@@ -988,6 +988,42 @@ pub(super) fn host_read(memory: &mut GuestMemory, fd: RawFd, address: u64, lengt
     finish_host_read(memory, address, &bytes, count)
 }
 
+/// [`host_read`] for a guest's read of host descriptor `fd`, which may be a
+/// socket if `socket`. A Unix socket's read receives the rights of the
+/// message it consumes, which Linux discards, to release them
+/// (`receive_discarding_rights`), whatever is in flight when it starts: a
+/// read can wait for a message that another process sends meanwhile
+/// (`is_unix_socket`).
+fn guest_host_read(
+    memory: &mut GuestMemory,
+    state: &LoadedStaticElf,
+    fd: RawFd,
+    address: u64,
+    length: usize,
+    socket: bool,
+) -> i64 {
+    if !(socket && is_unix_socket(fd)) {
+        return host_read(memory, fd, address, length);
+    }
+    let mut bytes = match prepare_host_read(&ProviderMemory(memory), address, length) {
+        Ok(bytes) => bytes,
+        Err(error) => return error,
+    };
+    let mut iov = libc::iovec {
+        iov_base: bytes.as_mut_ptr().cast(),
+        iov_len: bytes.len(),
+    };
+    match receive_discarding_rights(state, fd, std::slice::from_mut(&mut iov), 0, None, false) {
+        Ok(0) => 0,
+        // The bytes were accessible when the read began (`prepare_host_read`).
+        Ok(count) => match memory.user().write(address, &bytes[..count]) {
+            Ok(()) => count as i64,
+            Err(_) => end_run_for_late_receive_fault("read", address),
+        },
+        Err(error) => io_error(error),
+    }
+}
+
 fn finish_host_read(memory: &mut GuestMemory, address: u64, bytes: &[u8], count: isize) -> i64 {
     let count = count as usize;
     if count == 0 {
@@ -1101,7 +1137,14 @@ pub(super) fn read(
         if !range_is_valid(&ProviderMemory(memory), args[1], args[2]) {
             return Ok(negative_errno(libc::EFAULT));
         }
-        return Ok(host_read(memory, stdin.as_raw_fd(), args[1], length));
+        return Ok(guest_host_read(
+            memory,
+            state,
+            stdin.as_raw_fd(),
+            args[1],
+            length,
+            true,
+        ));
     }
     let Some(file) = state.files.get(&fd) else {
         return Ok(negative_errno(libc::EBADF));
@@ -1181,7 +1224,14 @@ pub(super) fn read(
         Ok(false) => {}
         Err(error) => return Ok(error),
     }
-    Ok(host_read(memory, host_fd, args[1], length))
+    Ok(guest_host_read(
+        memory,
+        state,
+        host_fd,
+        args[1],
+        length,
+        mode & libc::S_IFMT == libc::S_IFSOCK,
+    ))
 }
 
 pub(super) fn pread64<M: GuestMemoryAccess<Error = crate::Error> + AddressSpace>(
@@ -1738,11 +1788,48 @@ fn invoke_vectored_write_reporting(
 }
 
 fn invoke_vectored_read(
+    state: &LoadedStaticElf,
     number: libc::c_long,
     host_fd: RawFd,
     host_iovecs: &mut [libc::iovec],
     args: &[u64; 6],
+    socket: bool,
+    unwritable: bool,
 ) -> i64 {
+    // As for read: a readv of a Unix socket, or a preadv2 at its current
+    // position, receives the rights it consumes (`guest_host_read`). Linux
+    // returns 0 for a read of no byte before it reaches the socket
+    // (`sock_read_iter`), and refuses RWF_ATOMIC and RWF_DONTCACHE for a
+    // socket before reading (`kiocb_set_rw_flags`); the host call below gives
+    // both.
+    let flags = if number == libc::SYS_preadv2 {
+        args[5] as libc::c_int
+    } else {
+        0
+    };
+    if (number == libc::SYS_readv || number == libc::SYS_preadv2 && args[3] as i64 == -1)
+        && host_iovecs.iter().any(|vector| vector.iov_len != 0)
+        && flags & (libc::RWF_ATOMIC | libc::RWF_DONTCACHE) == 0
+        && socket
+        && is_unix_socket(host_fd)
+    {
+        let receive = if flags & libc::RWF_NOWAIT != 0 {
+            libc::MSG_DONTWAIT
+        } else {
+            0
+        };
+        return match receive_discarding_rights(
+            state,
+            host_fd,
+            host_iovecs,
+            receive,
+            None,
+            unwritable,
+        ) {
+            Ok(count) => count as i64,
+            Err(error) => io_error(error),
+        };
+    }
     // SAFETY: every host iovec points into a live writable buffer for its
     // declared length, and host_fd belongs to the translated guest descriptor.
     let result = unsafe {
@@ -2006,13 +2093,17 @@ fn staged_vectored_transfer<M: GuestMemoryAccess<Error = crate::Error> + Address
     args: &[u64; 6],
     reading: bool,
 ) -> i64 {
-    let inotify = if reading {
-        match host_fd_is_inotify(host_fd) {
-            Ok(inotify) => inotify,
+    let (inotify, socket) = if reading {
+        let mode = match fd_mode(host_fd) {
+            Ok(mode) => mode,
+            Err(error) => return error,
+        };
+        match host_fd_mode_is_inotify(host_fd, mode) {
+            Ok(inotify) => (inotify, mode & libc::S_IFMT == libc::S_IFSOCK),
             Err(error) => return error,
         }
     } else {
-        false
+        (false, false)
     };
     let staging_alignment = direct_io_memory_alignment(host_fd);
 
@@ -2067,7 +2158,22 @@ fn staged_vectored_transfer<M: GuestMemoryAccess<Error = crate::Error> + Address
     } else {
         None
     };
-    let result = invoke_vectored_read(number, host_fd, &mut host_iovecs, args);
+    // A receive from a Unix datagram or seqpacket socket into a buffer that
+    // is not all writable may be refused (`refuse_unwritable_record_buffer`).
+    let unwritable = socket
+        && receives_records(host_fd)
+        && staged_vectors
+            .iter()
+            .any(|vector| vector.accessible_length < vector.guest.length);
+    let result = invoke_vectored_read(
+        state,
+        number,
+        host_fd,
+        &mut host_iovecs,
+        args,
+        socket,
+        unwritable,
+    );
     if result >= 0 {
         let mut remaining = result as usize;
         for vector in &staged_vectors {
@@ -2078,7 +2184,20 @@ fn staged_vectored_transfer<M: GuestMemoryAccess<Error = crate::Error> + Address
                     .write_exact(vector.guest.base, vector.accessible_slice(copied))
                     .is_err()
             {
-                return negative_errno(libc::EFAULT);
+                // The prefix was accessible when the read began; a read of a
+                // Unix socket has received (`invoke_vectored_read`).
+                return if socket && is_unix_socket(host_fd) {
+                    end_run_for_late_receive_fault(
+                        if number == libc::SYS_readv {
+                            "readv"
+                        } else {
+                            "preadv2"
+                        },
+                        vector.guest.base,
+                    )
+                } else {
+                    negative_errno(libc::EFAULT)
+                };
             }
             remaining -= transferred;
             if remaining == 0 {

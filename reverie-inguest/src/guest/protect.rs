@@ -29,9 +29,12 @@ use std::io;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicI32;
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
+use crate::arch::SYS_FORK;
+use crate::arch::SYS_VFORK;
 use crate::dispatch::is_fork_like;
 use crate::guest::event::SyscallEvent;
 use crate::guest::signal::signal_action_supported;
@@ -390,7 +393,7 @@ pub(crate) fn replace_recorded_fd(old: libc::c_int, new: libc::c_int) -> io::Res
 /// ends the process with the tool-RPC failure exit (rpc_fatal) -- the
 /// 65th simultaneous guest thread is refused at its first RPC, never
 /// silently unprotected.
-const COORDINATOR_CONN_CAPACITY: usize = 64;
+pub(crate) const COORDINATOR_CONN_CAPACITY: usize = 64;
 
 /// The per-thread coordinator connection descriptors (-1 is a free slot).
 /// Plain descriptors, not pid-packed: connections are process-scoped (any
@@ -433,6 +436,23 @@ pub fn unregister_coordinator_conn_fd(fd: libc::c_int) {
     for slot in &COORDINATOR_CONN_FDS {
         let _ = slot.compare_exchange(fd, -1, Ordering::AcqRel, Ordering::Acquire);
     }
+}
+
+/// Takes every recorded per-thread connection descriptor out of the
+/// registry (fork child: the entries are copies of the parent threads'
+/// connections, which the child closes without ever consulting the
+/// RPC layer's copied connection map). Returns how many were written
+/// to `out`.
+pub fn take_coordinator_conn_fds(out: &mut [libc::c_int; COORDINATOR_CONN_CAPACITY]) -> usize {
+    let mut count = 0;
+    for slot in &COORDINATOR_CONN_FDS {
+        let fd = slot.swap(-1, Ordering::AcqRel);
+        if fd >= 0 {
+            out[count] = fd;
+            count += 1;
+        }
+    }
+    count
 }
 
 /// Rebinds the per-thread coordinator connection record after a move
@@ -705,16 +725,99 @@ fn record_refused_signal_control(event: &SyscallEvent) {
     }
 }
 
+/// The kinds of fork-like call [`protect_runtime_control`] refused since the
+/// last [`take_refused_process_creations`], one `REFUSED_*` bit per kind.
+static REFUSED_PROCESS_CREATIONS: AtomicU32 = AtomicU32::new(0);
+const REFUSED_CLONE_THREAD: u32 = 1 << 0;
+const REFUSED_CLONE_PROCESS: u32 = 1 << 1;
+const REFUSED_CLONE3: u32 = 1 << 2;
+const REFUSED_FORK: u32 = 1 << 3;
+const REFUSED_VFORK: u32 = 1 << 4;
+
+/// The SET of fork-like call kinds [`protect_runtime_control`] refused with
+/// `ENOTSUP` because process forks are not allowed; the Tool never sees these
+/// calls. It records which of five kinds were refused, not how many times or
+/// in what order: repeats of a kind between two takes merge into one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RefusedProcessCreations {
+    /// A `clone` whose flags held `CLONE_THREAD` (a thread). Of `clone`'s
+    /// flags only that bit is kept.
+    pub clone_thread: bool,
+    /// A `clone` whose flags did not hold `CLONE_THREAD` (a process, as a C
+    /// library's `fork` issues it), whatever its other flags.
+    pub clone_process: bool,
+    /// A `clone3`, thread or process: clone3 flags not read (they live in
+    /// guest memory).
+    pub clone3: bool,
+    /// A `fork`.
+    pub fork: bool,
+    /// A `vfork`.
+    pub vfork: bool,
+}
+
+impl RefusedProcessCreations {
+    /// Whether nothing was refused.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// Takes the set of fork-like call kinds refused in this process since the
+/// last take, so that a Tool can report them; taking clears the set, so each
+/// kind is reported once per take. A forked child starts with its parent's
+/// set. Nothing calls this yet; a Tool that reports refusals is its first
+/// caller.
+pub fn take_refused_process_creations() -> RefusedProcessCreations {
+    // A caller may ask often; almost always nothing was refused.
+    if REFUSED_PROCESS_CREATIONS.load(Ordering::Acquire) == 0 {
+        return RefusedProcessCreations::default();
+    }
+    let bits = REFUSED_PROCESS_CREATIONS.swap(0, Ordering::AcqRel);
+    RefusedProcessCreations {
+        clone_thread: bits & REFUSED_CLONE_THREAD != 0,
+        clone_process: bits & REFUSED_CLONE_PROCESS != 0,
+        clone3: bits & REFUSED_CLONE3 != 0,
+        fork: bits & REFUSED_FORK != 0,
+        vfork: bits & REFUSED_VFORK != 0,
+    }
+}
+
+/// Adds the kind of the fork-like call `event` asked for to the refused set.
+fn record_refused_process_creation(event: &SyscallEvent) {
+    let bit = if event.number == libc::SYS_clone {
+        // Linux reads clone's flags as an unsigned long; CLONE_THREAD is in
+        // the low word on every architecture.
+        if event.args[0] & libc::CLONE_THREAD as u64 != 0 {
+            REFUSED_CLONE_THREAD
+        } else {
+            REFUSED_CLONE_PROCESS
+        }
+    } else if event.number == libc::SYS_clone3 {
+        REFUSED_CLONE3
+    } else if Some(event.number) == SYS_FORK {
+        REFUSED_FORK
+    } else if Some(event.number) == SYS_VFORK {
+        REFUSED_VFORK
+    } else {
+        return;
+    };
+    REFUSED_PROCESS_CREATIONS.fetch_or(bit, Ordering::AcqRel);
+}
+
 // TODO-HUMAN-REVIEW(PR-127): Review process-global preload safety guards.
 /// Refuses a guest syscall that would take control from the runtime: a
 /// fork-like call when process forks are not allowed (`ENOTSUP`), and a
 /// signal action [`signal_action_supported`] refuses or an alternate signal
 /// stack (`EPERM`). Returns whether `event` was refused, with its result set.
-/// A refused signal control is recorded for the Tool to report
-/// ([`take_refused_signal_controls`]).
+/// Each refusal is recorded for the Tool to report
+/// ([`take_refused_process_creations`], [`take_refused_signal_controls`]).
 pub fn protect_runtime_control(event: &mut SyscallEvent) -> bool {
-    let unsupported_process =
-        is_fork_like(event.number) && !PROCESS_FORKS_ALLOWED.load(Ordering::Acquire);
+    refuse_runtime_control(event, PROCESS_FORKS_ALLOWED.load(Ordering::Acquire))
+}
+
+/// [`protect_runtime_control`] with the fork setting given.
+fn refuse_runtime_control(event: &mut SyscallEvent, process_forks_allowed: bool) -> bool {
+    let unsupported_process = is_fork_like(event.number) && !process_forks_allowed;
     let protected_signal =
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-133): Review fail-closed guest signal-handler policy.
@@ -724,6 +827,7 @@ pub fn protect_runtime_control(event: &mut SyscallEvent) -> bool {
         || (event.number == libc::SYS_sigaltstack && event.args[0] != 0);
 
     if unsupported_process {
+        record_refused_process_creation(event);
         event.result = -i64::from(libc::ENOTSUP);
     } else if protected_signal {
         record_refused_signal_control(event);
@@ -1264,6 +1368,16 @@ pub(crate) mod tests {
         numbers
     }
 
+    /// Held by the tests here that take the signal-control record and
+    /// assert on what it holds, so that one does not take another's.
+    static SIGNAL_RECORD_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_signal_record() -> std::sync::MutexGuard<'static, ()> {
+        SIGNAL_RECORD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     pub(crate) fn event(number: i64, args: [u64; 6]) -> SyscallEvent {
         SyscallEvent {
             number,
@@ -1273,6 +1387,7 @@ pub(crate) mod tests {
             context: 0,
             dispatch: SyscallDispatch::Trap,
             guest_pkru: None,
+            unsupported_refusal: None,
         }
     }
 
@@ -2295,6 +2410,7 @@ pub(crate) mod tests {
     /// alternate-stack query are not refused and not recorded.
     #[test]
     fn refused_signal_controls_are_recorded_for_the_tool_once() {
+        let _record = lock_signal_record();
         // A struct sigaction whose handler is an address, read from this
         // process's own memory as the runtime reads the guest's.
         let handler: [u64; 4] = [0x4000, 0, 0, 0];
@@ -2354,6 +2470,134 @@ pub(crate) mod tests {
         );
     }
 
+    /// Where handlers are not admitted (always so for a private initial
+    /// image), a new SIGALRM handler is refused like any other signal's and
+    /// recorded as signal 14, and the refusal leaves SIGALRM handlers off:
+    /// not admitted and no handler installed.
+    #[test]
+    fn a_refused_sigalrm_handler_leaves_sigalrm_handlers_off() {
+        let _admission = crate::guest::sigalrm::lock_admission_for_test();
+        let _record = lock_signal_record();
+        crate::guest::sigalrm::set_admitted(false);
+        let _ = take_refused_signal_controls();
+        let handler: [u64; 4] = [0x4000, 0, 0, 0];
+        let mut install = event(
+            libc::SYS_rt_sigaction,
+            [libc::SIGALRM as u64, handler.as_ptr() as u64, 0, 8, 0, 0],
+        );
+        assert!(protect_runtime_control(&mut install));
+        assert_eq!(install.result, -i64::from(libc::EPERM));
+        assert!(!crate::guest::sigalrm::admitted());
+        assert!(!crate::guest::sigalrm::handled());
+        assert_eq!(
+            take_refused_signal_controls(),
+            RefusedSignalControls {
+                actions: 1 << (libc::SIGALRM - 1),
+                alternate_stack: false,
+            }
+        );
+    }
+
+    /// Each fork-like call refused alone records exactly its one kind, and
+    /// is taken once. A `clone` is a thread only by `CLONE_THREAD`: a process
+    /// clone carrying every other thread flag is still a process, with or
+    /// without `CLONE_VFORK` and an exit signal, and so is glibc's `fork()`.
+    /// With forks allowed nothing is refused or recorded. Several kinds
+    /// before one take merge into one set.
+    #[test]
+    fn refused_process_creations_are_recorded_for_the_tool_once() {
+        let _ = take_refused_process_creations();
+        let none = RefusedProcessCreations::default();
+        let thread = (libc::CLONE_VM
+            | libc::CLONE_FS
+            | libc::CLONE_FILES
+            | libc::CLONE_SIGHAND
+            | libc::CLONE_THREAD) as u64;
+        let process = (libc::CLONE_VM
+            | libc::CLONE_FS
+            | libc::CLONE_FILES
+            | libc::CLONE_SIGHAND
+            | libc::CLONE_VFORK) as u64
+            | libc::SIGCHLD as u64;
+        // Exit signal 0 and no CLONE_VFORK: only CLONE_THREAD separates it
+        // from the thread case.
+        let process_no_signal =
+            (libc::CLONE_VM | libc::CLONE_FS | libc::CLONE_FILES | libc::CLONE_SIGHAND) as u64;
+        // glibc's fork().
+        let glibc_fork =
+            (libc::CLONE_CHILD_CLEARTID | libc::CLONE_CHILD_SETTID) as u64 | libc::SIGCHLD as u64;
+        let clone = |flags: u64| [flags, 0, 0, 0, 0, 0];
+        let clone_process = RefusedProcessCreations {
+            clone_process: true,
+            ..none
+        };
+        let mut cases = vec![
+            (
+                libc::SYS_clone,
+                clone(thread),
+                RefusedProcessCreations {
+                    clone_thread: true,
+                    ..none
+                },
+            ),
+            (libc::SYS_clone, clone(process), clone_process),
+            (libc::SYS_clone, clone(process_no_signal), clone_process),
+            (libc::SYS_clone, clone(glibc_fork), clone_process),
+            (
+                // clone3(args, size): a null args pointer with the size of a
+                // current `struct clone_args`; the flags are not read.
+                libc::SYS_clone3,
+                [0, 88, 0, 0, 0, 0],
+                RefusedProcessCreations {
+                    clone3: true,
+                    ..none
+                },
+            ),
+        ];
+        cases.extend(
+            SYS_FORK.map(|fork| (fork, [0; 6], RefusedProcessCreations { fork: true, ..none })),
+        );
+        cases.extend(SYS_VFORK.map(|vfork| {
+            (
+                vfork,
+                [0; 6],
+                RefusedProcessCreations {
+                    vfork: true,
+                    ..none
+                },
+            )
+        }));
+        for &(number, args, expected) in &cases {
+            let mut allowed = event(number, args);
+            assert!(!refuse_runtime_control(&mut allowed, true), "{number}");
+            assert_eq!(take_refused_process_creations(), none, "{number} allowed");
+            let mut refused = event(number, args);
+            assert!(refuse_runtime_control(&mut refused, false), "{number}");
+            assert_eq!(refused.result, -i64::from(libc::ENOTSUP), "{number}");
+            assert_eq!(take_refused_process_creations(), expected, "{number}");
+            assert_eq!(
+                take_refused_process_creations(),
+                none,
+                "{number} taken once"
+            );
+        }
+        // Every kind before one take: one merged set, a repeat adding nothing.
+        for &(number, args, _) in cases.iter().chain(cases.iter()) {
+            let mut refused = event(number, args);
+            assert!(refuse_runtime_control(&mut refused, false), "{number}");
+        }
+        assert_eq!(
+            take_refused_process_creations(),
+            RefusedProcessCreations {
+                clone_thread: true,
+                clone_process: true,
+                clone3: true,
+                fork: SYS_FORK.is_some(),
+                vfork: SYS_VFORK.is_some(),
+            }
+        );
+    }
+
     /// The Tool's own signal controls are refused on their own path, before
     /// `protect_runtime_control`, and are not the guest's: nothing is
     /// recorded for them. Routes through `guest::trap_dispatch`, which is
@@ -2361,6 +2605,7 @@ pub(crate) mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn the_tools_own_signal_controls_are_not_recorded() {
+        let _record = lock_signal_record();
         let handler: [u64; 4] = [0x4000, 0, 0, 0];
         let stack = [0u64; 3];
         let _ = take_refused_signal_controls();
@@ -2412,6 +2657,7 @@ mod mapped_input_lease_tests {
                 context: 0,
                 dispatch: SyscallDispatch::Trap,
                 guest_pkru: None,
+                unsupported_refusal: None,
             };
             // Every case is numerically refused before any physical operation.
             assert!(unsafe { protect_tool_init_descriptors(&mut event, Some(fd)) });

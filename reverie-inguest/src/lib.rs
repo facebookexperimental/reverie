@@ -57,8 +57,28 @@
 )))]
 compile_error!("reverie-inguest requires Linux x86-64 or aarch64");
 
+// Named aarch64 refusal for the exec-private feature family: guest
+// exec_private is x86-64 only. This boundary is the one stated exception to
+// the aarch64 LiteInst port's F(1) confinement (arch cfgs live in
+// reverie-liteinst backend modules): the refusal must live here because
+// reverie-inguest compiles before every consumer, so a consumer-side
+// message would never print.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(
+        feature = "exec-private-init",
+        feature = "loader-private-runtime",
+        feature = "exec-private-successor",
+        feature = "exec-native-injection"
+    )
+))]
+compile_error!(
+    "reverie-inguest exec-private features are not supported on aarch64 (exec_private is x86-64 only)"
+);
+
 pub mod arch;
 pub mod bootstrap;
+pub mod bootstrap_recipe;
 pub mod dispatch;
 pub mod fmt;
 pub mod fork;
@@ -299,6 +319,25 @@ pub unsafe extern "C" fn reverie_inguest_initialize() {
 #[used]
 #[unsafe(link_section = ".init_array")]
 static REVERIE_INGUEST_INIT: unsafe extern "C" fn() = reverie_inguest_initialize;
+
+/// Serializes the long-window forked-child holders (the five
+/// `before_seize`-sleep supervisor tests and every
+/// `native_exec_tests::isolated` fork) with the prepared-stdio
+/// tests in one libtest process. Such a child inherits every open
+/// parent pipe writer, so a concurrent stdio test can otherwise
+/// miss POLLHUP until that child execs or exits. Gated to the
+/// test subsets that fork (`exec-stop` or
+/// `exec-native-injection`) so it is not dead code in other
+/// test builds.
+#[cfg(all(test, any(feature = "exec-stop", feature = "exec-native-injection")))]
+static FORKED_CHILD_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(all(test, any(feature = "exec-stop", feature = "exec-native-injection")))]
+pub(crate) fn forked_child_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    FORKED_CHILD_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 #[cfg(test)]
 mod tests {

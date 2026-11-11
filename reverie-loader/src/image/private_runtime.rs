@@ -48,7 +48,8 @@ pub struct PrivateRuntimeMetadata {
 pub enum PrivateRuntimeMetadataError {
     /// A previously validated ELF field or range could not be read.
     Image(ImageError),
-    /// The private handoff admits at most 64 program headers, without truncation.
+    /// The private handoff admits at most 67 program headers (64 PT_LOADs
+    /// plus PT_TLS, PT_GNU_STACK and optional PT_PHDR), without truncation.
     ProgramHeaderCount,
     /// Program headers lack one complete initialized read-only mapping.
     ProgramHeadersNotReadOnly,
@@ -81,7 +82,8 @@ impl ValidatedImage<'_> {
         let bytes = self.0.bytes;
         let offset = read_u64(bytes, 32)?;
         let count = read_u16(bytes, 56)?;
-        if count == 0 || count > 64 {
+        // 64 PT_LOADs plus PT_TLS, PT_GNU_STACK and optional PT_PHDR.
+        if count == 0 || count > 67 {
             return Err(Error::ProgramHeaderCount);
         }
         let length = u64::from(count) * PHDR_SIZE as u64;
@@ -276,6 +278,56 @@ mod tests {
         assert_eq!(
             inspect(&b),
             Err(PrivateRuntimeMetadataError::StackDescriptor)
+        );
+    }
+    #[test]
+    fn program_header_count_boundaries_hold() {
+        fn fixture(loads: usize, phdr: bool, note: bool) -> Vec<u8> {
+            let mut phdrs = vec![
+                (1, 4, 0, BASE, 4096, 4096),
+                (1, 5, 4096, BASE + 4096, 4096, 4096),
+                (1, 6, 8192, BASE + 8192, 512, 4096),
+            ];
+            for index in 3..loads {
+                phdrs.push((
+                    1,
+                    4,
+                    4096,
+                    BASE + 8192 + u64::try_from(index - 2).unwrap() * 4096,
+                    4096,
+                    4096,
+                ));
+            }
+            phdrs.push((7, 4, 8192, BASE + 8192, 16, 80));
+            phdrs.push((0x6474_e551, 6, 0, 0, 0, 8 * 1024 * 1024));
+            if phdr {
+                let count = u64::try_from(phdrs.len() + 1).unwrap() * 56;
+                phdrs.push((6, 4, 64, BASE + 64, count, count));
+            }
+            if note {
+                phdrs.push((4, 0, 0, 0, 0, 0));
+            }
+            let mut bytes = build(BASE + 4096, &phdrs, &[0x90; 4608]);
+            field(&mut bytes, loads, 48, 16);
+            bytes
+        }
+        fn inspect_wide(
+            bytes: &[u8],
+        ) -> Result<PrivateRuntimeMetadata, PrivateRuntimeMetadataError> {
+            Image::parse(bytes)?
+                .validate(&Policy {
+                    window: BASE..BASE + 0x100000,
+                    allow_tls: true,
+                })?
+                .private_runtime_metadata()
+        }
+        // Literal derived envelope: 64 PT_LOAD + PT_TLS + PT_GNU_STACK +
+        // optional PT_PHDR = 67 program headers.
+        let accepted = inspect_wide(&fixture(64, true, false)).unwrap();
+        assert_eq!(accepted.program_header_count, 67);
+        assert_eq!(
+            inspect_wide(&fixture(64, true, true)),
+            Err(PrivateRuntimeMetadataError::ProgramHeaderCount)
         );
     }
     #[test]

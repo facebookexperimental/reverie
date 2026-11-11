@@ -2,14 +2,19 @@
 
 use std::env;
 use std::ffi::OsStr;
+#[cfg(target_arch = "x86_64")]
 use std::ffi::OsString;
 use std::io;
+#[cfg(target_arch = "x86_64")]
 use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
 use std::process::Command;
 
-#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
-compile_error!("reverie-liteinst requires Linux x86-64");
+#[cfg(not(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+)))]
+compile_error!("reverie-liteinst requires Linux x86-64 or aarch64");
 
 mod allocator_backing;
 
@@ -29,9 +34,11 @@ pub mod fixed_arena_fixture;
 pub mod generic_fixture;
 #[cfg(feature = "exec-private-init")]
 mod initial_image_stats;
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 mod interior_entry;
-#[cfg(feature = "liteinst")]
+#[cfg(any(target_arch = "aarch64", test))]
+pub mod lazy_promote;
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 mod liteinst_census;
 #[cfg(feature = "native-exec-state")]
 pub mod native_exec_state;
@@ -86,7 +93,21 @@ pub use reverie_inguest::guest::host::PhysicalCreation;
 pub use reverie_inguest::guest::host::PhysicalCreationHook;
 pub use reverie_inguest::guest::host::RefusedChild;
 pub use reverie_inguest::guest::host::set_physical_creation_hook;
+/// The runtime's records of guest calls it refused before any Tool ran (a
+/// signal handler or alternate stack; a fork-like call while process forks
+/// are not allowed). A take returns what was refused in this process since
+/// the last take and clears it.
+pub use reverie_inguest::guest::protect::RefusedProcessCreations;
+pub use reverie_inguest::guest::protect::RefusedSignalControls;
+pub use reverie_inguest::guest::protect::take_refused_process_creations;
+pub use reverie_inguest::guest::protect::take_refused_signal_controls;
 /// Native fixed-stack entry used by the owned standalone leaf.
+///
+/// x86-64 only: on aarch64 this name is not exported (compile-time API
+/// narrowing, recorded in the L0 hand-off) because the inguest entry it
+/// names has no aarch64 body; exporting it would publish a path straight
+/// to `brk #0`.
+#[cfg(target_arch = "x86_64")]
 #[doc(hidden)]
 pub use reverie_inguest::guest::tool_region::constructor_entry;
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -108,7 +129,7 @@ pub use runtime::site_patching_enabled;
 pub use runtime::site_patching_from_env_value;
 pub use runtime::tool_output_fd;
 pub use straddler::STRADDLER_STALENESS_TICKS_ENV;
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 pub use straddler::straddler_staleness_from_env_value;
 #[cfg(feature = "exec-private-init")]
 pub use tool_host::InstalledInitialImage;
@@ -134,14 +155,26 @@ pub use tool_host::install_tool_from_bootstrap_with_runtime;
 pub fn preflight_tool_allocator() -> std::io::Result<()> {
     patch_alloc::preflight_allocator()
 }
+#[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+pub use tool_host::InstalledMappedSuccessorImage;
+#[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+pub use tool_host::MappedSuccessorPreparation;
+#[cfg(feature = "loader-private-runtime")]
+pub use tool_host::MappedSuccessorVerifiedDigests;
+#[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+pub use tool_host::PreparedMappedSuccessorImage;
 #[cfg(feature = "exec-private-init")]
 pub use tool_host::ValidatedStraddlerStaleness;
+#[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+pub use tool_host::initialize_mapped_successor_lifecycle;
 #[cfg(feature = "exec-private-init")]
 pub use tool_host::install_tool_initial_image;
 #[cfg(feature = "exec-native-injection")]
 pub use tool_host::install_tool_initial_image_with_admitted_native_exec;
 #[cfg(feature = "exec-native-injection")]
 pub use tool_host::install_tool_initial_image_with_native_exec;
+#[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+pub use tool_host::install_tool_mapped_successor_image;
 pub use tool_host::install_tool_quiescent;
 #[cfg(feature = "exec-native-injection")]
 pub use tool_host::install_tool_successor_image;
@@ -153,6 +186,8 @@ pub use tool_host::prepare_tool_initial_image_validated;
 pub use tool_host::prepare_tool_mapped_initial_image;
 #[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
 pub use tool_host::prepare_tool_mapped_initial_image_validated;
+#[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+pub use tool_host::prepare_tool_mapped_successor_image_validated;
 #[cfg(feature = "exec-native-injection")]
 pub use tool_host::prepare_tool_successor_image;
 #[cfg(feature = "exec-native-injection")]
@@ -329,6 +364,10 @@ pub fn set_guest_site_patching(command: &mut Command, enabled: bool) {
 /// refused before runtime activation. This explicit call first reserves a fixed
 /// guarded scalar stack, even when its environment getter selects no Tool. Such
 /// a call returns with that reservation retained and without runtime activation.
+/// aarch64 contract change (L0): the aarch64 body reserves nothing — with no
+/// Tool selected it returns without any reservation, and with a Tool selected
+/// it refuses (see `refuse_aarch64_c_entry_if_selected`); the scalar stack is
+/// an x86-64-only contract until the aarch64 native bootstrap exists.
 /// A repeated call, or an already-owned/colliding region, refuses before a
 /// second getter/body invocation. The selector-absent standalone constructor
 /// remains a separate inert path and does not call this entry.
@@ -338,6 +377,7 @@ pub fn set_guest_site_patching(command: &mut Command, enabled: bool) {
 /// Call once during trusted single-threaded startup, with clear DF and no
 /// active runtime filter. Repeated calls refuse before reading the selector
 /// or installing another runtime.
+#[cfg(target_arch = "x86_64")]
 #[unsafe(naked)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn reverie_liteinst_initialize() {
@@ -350,8 +390,54 @@ pub unsafe extern "C" fn reverie_liteinst_initialize() {
     );
 }
 
+/// Allocation-free aarch64 refusal for the C constructor entries.
+///
+/// Runs before `enter_dispatch` and `preflight_allocator`: the fixed tool
+/// allocator returns null before its arenas are published, and publication
+/// happens only in the native bootstrap, which has no aarch64 body, so any
+/// allocation on this path (including `io::Error` construction and
+/// `eprintln!`) would abort instead of refusing. Reads the selector with
+/// inguest's allocation-free environment scan, writes one fixed line naming
+/// aarch64 to stderr, and exits 127. With no Tool selected it returns and the
+/// entries stay inert.
+///
+/// # Safety
+///
+/// Same startup contract as the entries that call it: trusted
+/// single-threaded startup before application threads and filters.
+#[cfg(target_arch = "aarch64")]
+unsafe fn refuse_aarch64_c_entry_if_selected() {
+    if reverie_inguest::guest::support::environment_value(b"REVERIE_LITEINST_TOOL").is_some() {
+        const MESSAGE: &[u8] =
+            b"reverie-liteinst initialization failed: in-guest LiteInst runtime is not supported on aarch64\n";
+        // SAFETY: fd 2 write of a fixed byte string, then process exit; no
+        // allocation and no other state is touched on this path.
+        unsafe {
+            let _ = libc::write(2, MESSAGE.as_ptr() as *const libc::c_void, MESSAGE.len());
+            libc::_exit(127);
+        }
+    }
+}
+
+/// aarch64 body of [`reverie_liteinst_initialize`]: inert with no Tool
+/// selected, allocation-free named refusal (exit 127) with one selected.
+///
+/// # Safety
+///
+/// Same contract as the x86-64 entry: call once during trusted
+/// single-threaded startup, with clear DF and no active runtime filter.
+#[cfg(target_arch = "aarch64")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn reverie_liteinst_initialize() {
+    // SAFETY: same trusted single-threaded startup contract as the x86-64
+    // entry; the helper only scans the environment and, when a Tool is
+    // selected, writes one fixed line and exits.
+    unsafe { refuse_aarch64_c_entry_if_selected() }
+}
+
 // Distinct local Rust body: the existing dispatch/preflight/getter order stays
 // intact, and only the native entry may supply this body to its fresh bootstrap.
+#[cfg(target_arch = "x86_64")]
 #[unsafe(no_mangle)]
 #[inline(never)]
 unsafe extern "C" fn reverie_liteinst_generic_body() {
@@ -361,6 +447,7 @@ unsafe extern "C" fn reverie_liteinst_generic_body() {
     );
 }
 
+#[cfg(target_arch = "x86_64")]
 core::arch::global_asm!(".hidden reverie_liteinst_generic_body");
 
 /// Establish an ordinary region owner for the explicit-entry refusal control.
@@ -393,25 +480,38 @@ pub extern "C" fn m4_generic_ordinary_owner_setup() -> i32 {
 #[inline(never)]
 #[unsafe(export_name = "reverie_liteinst_standalone_initialize")]
 pub unsafe extern "C" fn initialize_standalone() {
-    let _scope = reverie_inguest::guest::alloc::enter_dispatch();
-    let result = patch_alloc::preflight_allocator().and_then(|()| {
-        let selected = reverie_inguest::guest::support::environment_value(b"REVERIE_LITEINST_TOOL")
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "REVERIE_LITEINST_TOOL disappeared during standalone initialization",
-                )
-            })?;
-        let selected = OsString::from_vec(selected.to_vec());
-        runtime::initialize_from_selected_value(Some(&selected))
-    });
-    initialization_or_exit(result);
+    // aarch64: refuse before enter_dispatch/preflight (allocation would
+    // abort pre-publication); with no selector the entry stays inert.
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: same authenticated constructor-body contract as below; the
+        // helper only scans the environment and exits when a Tool is selected.
+        unsafe { refuse_aarch64_c_entry_if_selected() }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _scope = reverie_inguest::guest::alloc::enter_dispatch();
+        let result = patch_alloc::preflight_allocator().and_then(|()| {
+            let selected =
+                reverie_inguest::guest::support::environment_value(b"REVERIE_LITEINST_TOOL")
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "REVERIE_LITEINST_TOOL disappeared during standalone initialization",
+                        )
+                    })?;
+            let selected = OsString::from_vec(selected.to_vec());
+            runtime::initialize_from_selected_value(Some(&selected))
+        });
+        initialization_or_exit(result);
+    }
 }
 
 // The actual leaf cannot be redirected through another object's initializer.
 // This does not change the separately exported generic initializer.
 core::arch::global_asm!(".hidden reverie_liteinst_standalone_initialize");
 
+#[cfg(target_arch = "x86_64")]
 fn initialization_or_exit(result: io::Result<()>) {
     if let Err(error) = result {
         eprintln!("reverie-liteinst initialization failed: {error}");
@@ -547,7 +647,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "liteinst")]
+    #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
     #[test]
     fn site_patching_setter_round_trips_through_the_parser() {
         for enabled in [true, false] {
@@ -567,7 +667,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "liteinst")]
+    #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
     #[test]
     fn site_patching_parser_defaults_on_and_rejects_other_values() {
         assert!(site_patching_from_env_value(None).unwrap());
@@ -581,7 +681,7 @@ mod tests {
             );
         }
     }
-    #[cfg(not(feature = "liteinst"))]
+    #[cfg(not(all(feature = "liteinst", target_arch = "x86_64")))]
     #[test]
     fn trap_only_build_defaults_off_and_refuses_explicit_patching() {
         assert!(!site_patching_from_env_value(None).unwrap());
@@ -595,12 +695,123 @@ mod tests {
             .unwrap();
         let error = site_patching_from_env_value(Some(requested)).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        #[cfg(target_arch = "aarch64")]
+        assert!(error.to_string().contains("not supported on aarch64"));
+        #[cfg(not(target_arch = "aarch64"))]
         assert!(error.to_string().contains("built without LiteInst"));
         for rejected in ["", " 0", "0 ", "off", "false", "2", "yes"] {
             let error = site_patching_from_env_value(Some(OsStr::new(rejected)))
                 .expect_err("invalid selectors must still be rejected");
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         }
+    }
+
+    // L0 refusal surface (Decision F(2)): every aarch64 install/selector
+    // entry refuses by name before touching process-global state. Runs
+    // under qemu-aarch64 (G6) and on metal; never compiled on x86-64.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn aarch64_install_surfaces_refuse_by_name() {
+        fn assert_refusal(surface: &str, error: std::io::Error) {
+            assert_eq!(error.kind(), std::io::ErrorKind::Unsupported, "{surface}");
+            assert!(
+                error.to_string().contains("not supported on aarch64"),
+                "{surface}: {error}"
+            );
+            assert!(error.to_string().contains(surface), "{surface}: {error}");
+        }
+        // SAFETY: on aarch64 every surface refuses before installing any
+        // process-global state (that is exactly what is asserted here).
+        assert_refusal(
+            "install_tool",
+            unsafe { crate::install_tool::<()>("/nonexistent-coordinator") }.unwrap_err(),
+        );
+        assert_refusal(
+            "install_tool_quiescent",
+            unsafe { crate::install_tool_quiescent::<()>("/nonexistent-coordinator") }.unwrap_err(),
+        );
+        assert_refusal(
+            "install_tool_from_bootstrap",
+            unsafe { crate::install_tool_from_bootstrap::<()>("/nonexistent-coordinator") }
+                .unwrap_err(),
+        );
+        assert_refusal(
+            "install_tool_from_bootstrap_with_runtime",
+            unsafe {
+                crate::install_tool_from_bootstrap_with_runtime::<(), _>(
+                    "/nonexistent-coordinator",
+                    |_services| {
+                        crate::tool_host::LiteinstRuntime::new(
+                            crate::stats::GuestStatsHooks::DISABLED,
+                        )
+                    },
+                )
+            }
+            .unwrap_err(),
+        );
+        // The selector path: selected refuses naming aarch64, unselected is Ok.
+        let error =
+            crate::runtime::initialize_from_selected_value(Some(OsStr::new("strace"))).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        assert!(error.to_string().contains("not supported on aarch64"));
+        crate::runtime::initialize_from_selected_value(None).unwrap();
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn aarch64_c_entry_refuses_selected_tool_as_subprocess() {
+        const CHILD: &str = "REVERIE_LITEINST_AARCH64_C_ENTRY_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            // Child: SIGSYS disposition and patching state must be untouched
+            // by an inert (unselected) call; a selected call never returns.
+            let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+            assert_eq!(
+                unsafe { libc::sigaction(libc::SIGSYS, std::ptr::null(), &mut action) },
+                0
+            );
+            let handler_before = action.sa_sigaction;
+            // SAFETY: isolated child process; the aarch64 body only scans
+            // the environment and exits when a Tool is selected.
+            unsafe { crate::reverie_liteinst_initialize() }
+            let mut after: libc::sigaction = unsafe { std::mem::zeroed() };
+            assert_eq!(
+                unsafe { libc::sigaction(libc::SIGSYS, std::ptr::null(), &mut after) },
+                0
+            );
+            assert_eq!(after.sa_sigaction, handler_before);
+            return;
+        }
+        let exe = std::env::current_exe().unwrap();
+        let args = [
+            "--exact",
+            "tests::aarch64_c_entry_refuses_selected_tool_as_subprocess",
+            "--nocapture",
+            "--test-threads=1",
+        ];
+        let selected = Command::new(&exe)
+            .args(args)
+            .env(CHILD, "1")
+            .env("REVERIE_LITEINST_TOOL", "strace")
+            .output()
+            .unwrap();
+        assert_eq!(selected.status.code(), Some(127), "{selected:?}");
+        assert!(
+            String::from_utf8_lossy(&selected.stderr).contains("aarch64"),
+            "{selected:?}"
+        );
+        let unselected = Command::new(&exe)
+            .args(args)
+            .env(CHILD, "1")
+            .env_remove("REVERIE_LITEINST_TOOL")
+            .output()
+            .unwrap();
+        assert!(unselected.status.success(), "{unselected:?}");
+        assert!(
+            String::from_utf8(unselected.stdout)
+                .unwrap()
+                .contains("1 passed"),
+            "the exact C-entry child must execute"
+        );
     }
 }
 

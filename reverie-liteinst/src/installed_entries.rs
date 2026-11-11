@@ -16,9 +16,9 @@ use core::sync::atomic::AtomicPtr;
 use core::sync::atomic::Ordering;
 use std::io;
 
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 use liteinst::trampoline::HookCallback;
-#[cfg(feature = "liteinst")]
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 use liteinst::trampoline::HookContext;
 pub(crate) use reverie_inguest::guest::installed_stack::PreparedCallbacks;
 

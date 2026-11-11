@@ -6,7 +6,7 @@ use crate::launcher::exec_stop::trace;
 
 const NATIVE_BYTES: [u8; 9] = [0xf3, 0x0f, 0x1e, 0xfa, 0x0f, 0x05, 0x41, 0xff, 0xe4];
 
-impl PreparedMapping<'_> {
+impl<'fd> PreparedMapping<'fd> {
     /// Restore registrations/context, detach once and await the original child.
     /// This borrows the complete outer owner; cancellation retains every stop,
     /// returned event and wait driver in it. It does not create a Ready value.
@@ -69,6 +69,58 @@ impl PreparedMapping<'_> {
         self.restore_guest_for_release(operation_deadline).await?;
         self.detach_restored_guest(operation_deadline, live_deadline)
             .await
+    }
+
+    /// Restore registrations/context and detach once, returning the
+    /// retained owner for the caller's own terminal wait. This is
+    /// the release half of [`Self::handover_and_wait`]: same restore
+    /// and detach sequence, but guest execution is not awaited here.
+    ///
+    /// The consumed `ready` token must have been minted by this
+    /// mapping's ToolInitialization observation; it is rechecked
+    /// against the retained initialized stop and the token's child
+    /// identity before any physical change. A mismatch returns the
+    /// mapping unspent (only `entry.failed` remains unset, exactly
+    /// as a refused handover precondition).
+    ///
+    /// # Safety
+    /// The complete contract of [`Self::handover_and_wait`] applies,
+    /// with the wait obligation transferred to the returned
+    /// [`ReleasedPreparedMapping`]: the original synchronous ptracer
+    /// root retains it and every borrowed resource outside all
+    /// futures, polls its wait and the EXISTING RPC/services
+    /// concurrently on the original OS thread, and requires real
+    /// same-generation terminal confirmation (via wait or confirmed
+    /// cancellation) before releasing any of them. Dropping the
+    /// released owner is only bounded best-effort cleanup, not a
+    /// reap proof.
+    pub async unsafe fn release_after_ready(
+        mut self,
+        ready: VerifiedReady,
+        operation_deadline: Instant,
+    ) -> std::result::Result<ReleasedPreparedMapping<'fd>, Box<ReleaseFailure<'fd>>> {
+        if !ready_token_matches(
+            &ready,
+            self.owner.generation.pid(),
+            self.entry.initialized_stop,
+        ) {
+            return Err(Box::new(ReleaseFailure::new(
+                "mapped_ready_token_mismatch".into(),
+                self,
+            )));
+        }
+        let result = async {
+            self.restore_guest_for_release(operation_deadline).await?;
+            self.detach_after_restore(operation_deadline)
+        }
+        .await;
+        match result {
+            Ok(()) => Ok(ReleasedPreparedMapping { mapping: self }),
+            Err(error) => {
+                self.entry.failed = true;
+                Err(Box::new(ReleaseFailure::new(error, self)))
+            }
+        }
     }
 
     // Shared real restoration only. The observational successor retains the
@@ -248,6 +300,12 @@ impl PreparedMapping<'_> {
         deadline: Instant,
         live_deadline: Option<Instant>,
     ) -> Result<ExitStatus> {
+        self.detach_after_restore(deadline)?;
+        self.wait_detached_terminal_with_deadline(live_deadline)
+            .await
+    }
+
+    fn detach_after_restore(&mut self, deadline: Instant) -> Result<()> {
         self.entry_thread()?;
         if Instant::now() >= deadline {
             return Err("mapped_handover_deadline_before_detach".into());
@@ -258,11 +316,22 @@ impl PreparedMapping<'_> {
                 // Driver stored synchronously BEFORE any cancellable await.
                 self.entry.wait = Some(running.wait_owned_on_ptracer_thread().into_driver());
                 self.entry.event = None;
+                Ok(())
             }
             Err((task, error)) => {
                 self.task = Some(task);
-                return Err(error.into());
+                Err(error.into())
             }
+        }
+    }
+
+    async fn wait_detached_terminal_with_deadline(
+        &mut self,
+        live_deadline: Option<Instant>,
+    ) -> Result<ExitStatus> {
+        if let Some(status) = self.entry.terminal {
+            self.owner.record_detached_terminal(status);
+            return Ok(status);
         }
         self.handover_wait_next_with_deadline(live_deadline).await?;
         match self.entry.terminal {
@@ -342,22 +411,44 @@ impl PreparedMapping<'_> {
             "mapped_handover_wait_deadline",
         )
         .await?;
-        match waited {
-            Wait::Stopped(task, event) => {
-                self.task = Some(task);
-                self.entry.event = Some(event); // retain NewChild before refusal
-                self.entry.wait = None;
-            }
-            Wait::Exited(pid, status) => {
-                self.entry.terminal = Some(status);
-                self.entry.wait = None;
-                if pid != self.owner.generation.pid() {
-                    return Err("mapped_handover_foreign_terminal".into());
-                }
-            }
+        self.entry.wait = None;
+        if let Some((task, event)) = apply_handover_wait(
+            &mut self.entry.terminal,
+            waited,
+            self.owner.generation.pid(),
+        )? {
+            self.task = Some(task);
+            self.entry.event = Some(event); // retain NewChild before refusal
         }
         self.entry_thread()?;
         Ok(())
+    }
+}
+
+impl<'fd> ReleasedPreparedMapping<'fd> {
+    /// Await the detached guest's actual terminal exit on the
+    /// original ptracer thread. `None` removes only the detached
+    /// execution deadline. An unexpected post-detach stop is an
+    /// error retaining this owner for cancellation; it is never
+    /// acknowledged as reaped.
+    pub async fn wait(&mut self, live_deadline: Option<Instant>) -> Result<ExitStatus> {
+        self.mapping
+            .wait_detached_terminal_with_deadline(live_deadline)
+            .await
+    }
+
+    /// Cleanup observations, including the retained owner's terminal proof.
+    pub fn cleanup(&self) -> super::super::CleanupState {
+        self.mapping.cleanup()
+    }
+
+    /// Request bounded kill/wait of the detached guest. Unconfirmed
+    /// retirement returns this complete released owner.
+    pub fn cancel(self) -> std::result::Result<super::super::CancelledPreparation, Box<Self>> {
+        match self.mapping.cancel() {
+            Ok(cancelled) => Ok(cancelled),
+            Err(mapping) => Err(Box::new(Self { mapping: *mapping })),
+        }
     }
 }
 
@@ -379,6 +470,48 @@ pub(super) async fn wait_retained_driver(
             .map_err(|_| timeout_error)??,
         None => wait.await?,
     })
+}
+
+/// Apply one handover wait result: a stopped task is returned for
+/// retention, and an exited status is stored only if it names this
+/// generation. The generation is the caller's retained owner pid,
+/// never the waited status's own pid.
+pub(super) fn apply_handover_wait(
+    slot: &mut Option<ExitStatus>,
+    waited: Wait,
+    generation: safeptrace::Pid,
+) -> Result<Option<(safeptrace::Stopped, safeptrace::Event)>> {
+    match waited {
+        Wait::Stopped(task, event) => Ok(Some((task, event))),
+        Wait::Exited(pid, status) => {
+            store_same_generation_terminal(
+                slot,
+                pid,
+                generation,
+                status,
+                "mapped_handover_foreign_terminal",
+            )?;
+            Ok(None)
+        }
+    }
+}
+
+/// Store a terminal status only when it names this retained
+/// generation. A foreign terminal is refused by name and the
+/// slot stays empty, so a retried wait can never record it as
+/// this child's confirmed reap.
+pub(super) fn store_same_generation_terminal(
+    slot: &mut Option<ExitStatus>,
+    pid: safeptrace::Pid,
+    generation: safeptrace::Pid,
+    status: ExitStatus,
+    foreign_error: &'static str,
+) -> Result<()> {
+    if pid != generation {
+        return Err(foreign_error.into());
+    }
+    *slot = Some(status);
+    Ok(())
 }
 
 fn restoration_facts(control: &[u8; 384], original_mask: u64, reserved: u64) -> bool {
@@ -420,6 +553,62 @@ mod tests {
             assert!(!restoration_facts(&changed, mask, reserved), "field {i}");
         }
         assert!(!restoration_facts(&c, mask, 0));
+    }
+    #[test]
+    fn foreign_terminal_is_never_stored_for_a_retried_wait() {
+        let generation = safeptrace::Pid::from_raw(4242);
+        let mut slot = None;
+        let error = store_same_generation_terminal(
+            &mut slot,
+            safeptrace::Pid::from_raw(4243),
+            generation,
+            ExitStatus::Exited(0),
+            "mapped_handover_foreign_terminal",
+        )
+        .expect_err("foreign terminal must refuse");
+        assert!(
+            error
+                .to_string()
+                .contains("mapped_handover_foreign_terminal"),
+            "unexpected foreign-terminal refusal: {error}"
+        );
+        assert_eq!(slot, None, "foreign status must not reach the retry slot");
+        store_same_generation_terminal(
+            &mut slot,
+            generation,
+            generation,
+            ExitStatus::Exited(7),
+            "mapped_handover_foreign_terminal",
+        )
+        .unwrap();
+        assert_eq!(slot, Some(ExitStatus::Exited(7)));
+    }
+    #[test]
+    fn handover_wait_foreign_terminal_is_refused_at_the_call_site() {
+        let generation = safeptrace::Pid::from_raw(4242);
+        let foreign = safeptrace::Pid::from_raw(4243);
+        let mut slot = None;
+        let error = apply_handover_wait(
+            &mut slot,
+            Wait::Exited(foreign, ExitStatus::Exited(0)),
+            generation,
+        )
+        .expect_err("foreign handover terminal must refuse");
+        assert!(
+            error
+                .to_string()
+                .contains("mapped_handover_foreign_terminal"),
+            "unexpected foreign-terminal refusal: {error}"
+        );
+        assert_eq!(slot, None, "foreign status must not reach the retry slot");
+        let stopped = apply_handover_wait(
+            &mut slot,
+            Wait::Exited(generation, ExitStatus::Exited(7)),
+            generation,
+        )
+        .unwrap();
+        assert!(stopped.is_none());
+        assert_eq!(slot, Some(ExitStatus::Exited(7)));
     }
     // A real direct child held by its stdin pipe, with exactly one retained
     // safeptrace driver. std::process never waits after that driver is created.

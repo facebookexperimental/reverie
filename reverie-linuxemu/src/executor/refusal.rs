@@ -544,6 +544,157 @@ pub(super) fn madvise_refusal_diagnostic(advice: libc::c_int) -> &'static str {
     }
 }
 
+/// Diagnostic for this backend's refusal to send a pidfd for a guest process
+/// in an `SCM_RIGHTS` message: the receiver would get the stand-in alone, a
+/// pidfd for the supervisor (`GuestPidfd`), without the process it names or
+/// its readiness.
+pub(crate) const PIDFD_RIGHTS_REFUSAL: &str =
+    "KVM does not send a pidfd for a guest process in an SCM_RIGHTS message";
+
+/// Diagnostic for this backend's refusal to send an epoll set in an
+/// `SCM_RIGHTS` message that may leave the run (`sends_into_the_run`): a
+/// receiver outside the run would hold the epoll where this backend cannot
+/// see, so the backend could neither keep the epoll, and the pidfd
+/// registrations it keeps in it, while that receiver holds it, nor let it end
+/// when Linux would.
+pub(crate) const EPOLL_EXPORT_REFUSAL: &str = "KVM does not send an epoll set in an SCM_RIGHTS \
+     message on a socket that may carry it out of the run";
+
+/// Diagnostic for this backend's refusal to send a Unix socket in an
+/// `SCM_RIGHTS` message that may leave the run while an epoll right sent in
+/// the run is in flight (`admit_socket_export`): the socket takes its queue
+/// with it, and an epoll queued there, or in the queue of a socket queued
+/// there, would reach a receiver outside the run, where the backend could
+/// neither keep the epoll while that receiver holds it nor let it end when
+/// Linux would.
+pub(crate) const SOCKET_EXPORT_REFUSAL: &str = "KVM does not send a Unix socket in an \
+     SCM_RIGHTS message on a socket that may carry it out of the run while an epoll set sent in \
+     the run is in flight";
+
+/// Diagnostic for this backend's refusal to connect a datagram socket that
+/// is an end of a socket pair the run made while a send from it relies on
+/// the pair's route (`forget_pair_before_connect`): the connect could give
+/// the socket a peer outside the run between that send's check and its
+/// host send, and an epoll set or a Unix socket the send carries would
+/// leave the run unseen.
+pub(crate) const CONNECT_REFUSAL: &str = "KVM does not connect an end of a socket pair while a \
+     send from it that carries an epoll set or a Unix socket into the run is in progress";
+
+/// Diagnostic for this backend's refusal to add a pidfd for a guest process
+/// to an epoll set where open file descriptions cannot be compared: a
+/// descriptor of the epoll passed in an `SCM_RIGHTS` message could not join
+/// its registrations (`descriptions_comparable`).
+pub(crate) const PIDFD_EPOLL_REFUSAL: &str = "KVM does not add a pidfd for a guest process to an \
+     epoll set on a host where neither kcmp nor F_DUPFD_QUERY compares open file descriptions";
+
+/// Diagnostic for this backend's refusal to add a pidfd for a guest process
+/// to an epoll set that came from outside the run
+/// (`EpollIdentity::from_outside`): a process outside the run can hold the
+/// epoll past its last descriptor in the run, where the backend cannot see,
+/// so the registration could neither last while that process holds the
+/// epoll nor end when it lets go.
+pub(crate) const PIDFD_IMPORTED_EPOLL_REFUSAL: &str = "KVM does not add a pidfd for a guest \
+     process to an epoll set that came from outside the run";
+
+/// The typed refusal, if any, that an `epoll_ctl` result carries for a pidfd
+/// for a guest process. Linux's epoll_ctl never fails with ENOSYS, so an
+/// ENOSYS answer to an EPOLL_CTL_ADD of such a pidfd is this backend's own
+/// refusal (`epoll_ctl`): of an epoll that came from outside the run where
+/// open file descriptions can be compared, and of every epoll where they
+/// cannot. Every other result carries none.
+pub(super) fn pidfd_epoll_refusal(
+    state: &LoadedStaticElf,
+    request: &SyscallRequest,
+    result: i64,
+) -> Option<reverie::UnsupportedRefusal> {
+    let args = request.args();
+    (result == negative_errno(libc::ENOSYS)
+        && request.number() == libc::SYS_epoll_ctl as u64
+        && args[1] as libc::c_int == libc::EPOLL_CTL_ADD
+        && guest_pidfd(state, args[2] as libc::c_int).is_some())
+    .then(|| {
+        let imported = super::mapping_list::descriptions_comparable()
+            && matches!(
+                native_poll_description(state, args[0] as libc::c_int),
+                Some(NativePollDescription::Epoll(epoll)) if epoll.came_from_outside()
+            );
+        reverie::UnsupportedRefusal::new(
+            reverie::UnsupportedOperation::Pidfd,
+            reverie::Errno::ENOSYS,
+            if imported {
+                PIDFD_IMPORTED_EPOLL_REFUSAL
+            } else {
+                PIDFD_EPOLL_REFUSAL
+            },
+        )
+    })
+}
+
+/// Diagnostic for this backend's refusal of a receive from a Unix socket
+/// with fewer than `SCM_MAX_FD` descriptors free under the descriptor limit
+/// it receives with: the host would drop, unseen, the rights it could not
+/// install (`host_receive_room`).
+pub(crate) const RECEIVE_DESCRIPTORS_REFUSAL: &str = "KVM does not receive from a Unix socket \
+     with fewer than 253 descriptors free under its RLIMIT_NOFILE: the host would drop, unseen, \
+     the rights it could not install";
+
+/// The typed refusal, if any, of the receive this call made: one that
+/// refused for want of host descriptors answered ENOMEM and said so
+/// (`refuse_receive_for_descriptors`); every other result carries none.
+pub(super) fn receive_descriptors_refusal(result: i64) -> Option<reverie::UnsupportedRefusal> {
+    (take_receive_refused_for_descriptors() && result == negative_errno(libc::ENOMEM)).then(|| {
+        reverie::UnsupportedRefusal::new(
+            reverie::UnsupportedOperation::HostResources,
+            reverie::Errno::ENOMEM,
+            RECEIVE_DESCRIPTORS_REFUSAL,
+        )
+    })
+}
+
+/// Diagnostic for this backend's refusal of a consuming receive from a Unix
+/// datagram or seqpacket socket into a buffer that is not all writable while
+/// a right it tracks is in flight (`refuse_unwritable_record_buffer`).
+pub(crate) const UNWRITABLE_RECORD_BUFFER_REFUSAL: &str = "KVM does not take a record from a \
+     Unix datagram or seqpacket socket into a buffer that is not all writable while an epoll \
+     set or a process proc description sent in the run is in flight: a faulting copy would \
+     discard the record's rights unseen. This conservative restriction also refuses receives \
+     that Linux completes, of a record that fits the writable part, of an empty record, or \
+     from an empty queue";
+
+/// The typed refusal, if any, of the receive this call made: one refused
+/// for a buffer that is not all writable, while a right this backend tracks
+/// was in flight, answered ENOSYS and said so
+/// (`refuse_unwritable_record_buffer`); every other result carries none.
+pub(super) fn unwritable_record_buffer_refusal(result: i64) -> Option<reverie::UnsupportedRefusal> {
+    (take_receive_refused_for_unwritable_buffer() && result == negative_errno(libc::ENOSYS)).then(
+        || {
+            reverie::UnsupportedRefusal::new(
+                reverie::UnsupportedOperation::UnwritableRecordBuffer,
+                reverie::Errno::ENOSYS,
+                UNWRITABLE_RECORD_BUFFER_REFUSAL,
+            )
+        },
+    )
+}
+
+/// The typed refusal, if any, that a call refused for a pidfd for a guest
+/// process carries: `reason` is the one the call recorded, and the call
+/// answered ENOSYS, which Linux's sendmsg and connect never answer.
+pub(super) fn pidfd_refusal_record(
+    reason: Option<&'static str>,
+    result: i64,
+) -> Option<reverie::UnsupportedRefusal> {
+    reason
+        .filter(|_| result == negative_errno(libc::ENOSYS))
+        .map(|reason| {
+            reverie::UnsupportedRefusal::new(
+                reverie::UnsupportedOperation::Pidfd,
+                reverie::Errno::ENOSYS,
+                reason,
+            )
+        })
+}
+
 /// Diagnostic for this backend's refusal of a signalfd read that would wait,
 /// with no covered signal pending for the caller or its process.
 pub(crate) const SIGNALFD_WAITING_READ_REFUSAL: &str =

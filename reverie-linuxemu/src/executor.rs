@@ -138,6 +138,7 @@ mod event_fds;
 use event_fds::*;
 mod facts;
 mod pidfd;
+pub(crate) use pidfd::GuestPidfd;
 use pidfd::*;
 mod socket;
 use socket::*;
@@ -486,6 +487,8 @@ const fn negative_errno(errno: libc::c_int) -> i64 {
 #[cfg(any(test, feature = "test-support", feature = "native-test-support"))]
 pub fn native_loaded_state(cwd: &std::path::Path) -> LoadedStaticElf {
     let private_copy_gate = PrivateCopyGate::default();
+    // As a loaded guest's (`load_static_elf`).
+    mapping_list::comparison_probe();
     LoadedStaticElf {
         entry_point: 0,
         stack_pointer: 0,
@@ -552,11 +555,15 @@ pub fn native_loaded_state(cwd: &std::path::Path) -> LoadedStaticElf {
         )),
         file_retirement: crate::elf::FileRetirement::default(),
         signal_refusal: None,
+        pidfd_refusal: None,
         pipe_owners: Default::default(),
+        guest_pidfds: Default::default(),
+        pidfd_holds: Vec::new(),
         fd_entry_ids: std::collections::BTreeMap::new(),
         epoll_domain: Default::default(),
         poll_table_id: Default::default(),
         native_poll_fds: Default::default(),
+        retired_epolls: Vec::new(),
         stdout_alias_fds: std::collections::BTreeSet::new(),
         stderr_alias_fds: std::collections::BTreeSet::new(),
         cloexec_fds: std::collections::BTreeSet::new(),
@@ -574,6 +581,12 @@ pub fn native_loaded_state(cwd: &std::path::Path) -> LoadedStaticElf {
             next_inode: 0x2100_0000,
             objects: std::collections::BTreeMap::new(),
             proc_transfers: std::collections::BTreeMap::new(),
+            epoll_transfers: Vec::new(),
+            next_peek_window: 0,
+            open_peek_windows: std::collections::BTreeSet::new(),
+            peek_window_holds: Vec::new(),
+            socket_peers: std::collections::BTreeMap::new(),
+            route_reliances: std::collections::BTreeMap::new(),
         })),
     }
 }
@@ -607,6 +620,7 @@ mod tests {
     include!("executor/host_resources_tests.rs");
     include!("executor/script_line_tests.rs");
     include!("executor/pkeys_tests.rs");
+    include!("executor/pidfd_tests.rs");
     use std::collections::BTreeMap;
     use std::io::Read;
     use std::io::Seek;
@@ -25047,9 +25061,20 @@ mod tests {
             [pid as u64, 0, 0, 0, 0, 0],
         );
         assert!(pidfd >= 0, "pidfd_open failed: {pidfd}");
-        // The guest sees the pidfd's own device and inode, as Linux reports
-        // them; no number is allocated here for it.
+        // The guest sees the stand-in's device and its process's inode, the
+        // one every pidfd for the process reports, whoever opened it
+        // (`pidfd_inode`).
         let pidfd_guest = pidfd as libc::c_int;
+        let process = reverie::SignalProcessId {
+            tgid: reverie::Pid::from_raw(pid),
+            generation: state
+                .task_lifecycle
+                .lock()
+                .unwrap()
+                .get(pid)
+                .unwrap()
+                .process_generation,
+        };
         let mut kernel = std::mem::MaybeUninit::<libc::stat>::zeroed();
         // SAFETY: kernel is writable and the pidfd's host descriptor is live.
         assert_eq!(
@@ -25070,8 +25095,8 @@ mod tests {
         let stat: libc::stat = read_struct(&memory, 0x1000);
         assert_eq!(
             (stat.st_dev, stat.st_ino),
-            (kernel.st_dev, kernel.st_ino),
-            "self pidfd reports the pidfd's device and inode"
+            (kernel.st_dev, pidfd_inode(process)),
+            "self pidfd reports the pidfd's device and its process's inode"
         );
         assert_descriptor_through_dup_and_fork(
             &mut memory,
@@ -25298,10 +25323,11 @@ mod tests {
         }
     }
 
-    /// Every pidfd is a real host object and keeps its host timestamps: one
-    /// the backend made for the supervisor process, including when one guest
-    /// socket passes it to another, and one for another host process received
-    /// from outside the run alike.
+    /// Every pidfd is a real host object and keeps its host timestamps: the
+    /// stand-in the backend made for a guest process, the caller's own
+    /// included, and one for another host process received from outside the
+    /// run alike. A guest socket refuses to pass the stand-in, which would
+    /// name the supervisor (`GuestPidfd`).
     #[test]
     fn host_metadata_timestamps_keep_host_times_for_pidfds() {
         let root = TestDir::new();
@@ -25317,21 +25343,18 @@ mod tests {
             [pid as u64, 0, 0, 0, 0, 0],
         );
         assert!(own >= 0, "pidfd_open failed: {own}");
-        let [sender, receiver] = guest_datagram_pair(&mut memory, &mut state);
-        assert_eq!(
-            send_guest_rights(&mut memory, &mut state, sender, &[own as libc::c_int]),
-            1
-        );
-        let (result, _, passed) =
-            receive_guest_rights(&mut memory, &mut state, receiver, RIGHTS_CONTROL_CAPACITY);
-        assert_eq!(result, 1);
-        assert_eq!(passed.len(), 1);
         assert_descriptor_timestamps(
             &mut memory,
             &mut state,
-            passed[0],
+            own as libc::c_int,
             None,
-            "the backend's pidfd passed between guest sockets",
+            "the backend's pidfd for the caller",
+        );
+        let [sender, _receiver] = guest_datagram_pair(&mut memory, &mut state);
+        assert_eq!(
+            send_guest_rights(&mut memory, &mut state, sender, &[own as libc::c_int]),
+            negative_errno(libc::ENOSYS),
+            "a guest socket refuses to pass a pidfd for a guest process"
         );
 
         // The test runner's parent is a live host process outside the run.

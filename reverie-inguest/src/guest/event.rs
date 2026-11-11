@@ -50,7 +50,27 @@ pub struct SyscallEvent {
     pub dispatch: SyscallDispatch,
     /// The guest's PKRU value to run the call under, when it is not the runtime's.
     pub guest_pkru: Option<u32>,
+    /// The typed backend refusal behind `result`, when the terminal
+    /// result IS that refusal and no live Tool callback remained to
+    /// consume it through `Guest::take_unsupported_refusal`
+    /// (tail-injected and unsubscribed routes write it at the
+    /// refusal site). An injection refusal a Tool received and
+    /// handled en route to its own selected result is never
+    /// attributed here. The dispatch consumer reads the name here;
+    /// without this field those routes would surface only the bare
+    /// errno, indistinguishable from a kernel failure.
+    pub unsupported_refusal: Option<UnsupportedRefusal>,
 }
+
+/// The refusal identity carried on an event. Only the Tool-host
+/// builds (the features that link `reverie`) can produce one; in
+/// the remaining configurations the field is uninhabited and
+/// always `None`.
+#[cfg(any(feature = "coordinator-rpc", feature = "rcb-clock"))]
+pub type UnsupportedRefusal = reverie::UnsupportedRefusal;
+/// See the `UnsupportedRefusal` alias above.
+#[cfg(not(any(feature = "coordinator-rpc", feature = "rcb-clock")))]
+pub type UnsupportedRefusal = core::convert::Infallible;
 
 impl SyscallEvent {
     /// Forward only this guest operation. Runtime-private syscall buffers must

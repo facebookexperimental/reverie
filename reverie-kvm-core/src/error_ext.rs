@@ -290,6 +290,11 @@ mod tests {
         for refusal in [
             Error::PotentiallyBlockingZeroRead { fd: 3 },
             Error::BlockingInotifyRead { fd: 4 },
+            Error::LateReceiveFault {
+                operation: "recvmsg",
+                address: 0x1000,
+            },
+            Error::UnseenRightDiscard,
             Error::UnsupportedSharedFile {
                 operation: "mmap",
                 reason: "hugetlbfs file views need huge page placement, length and reservation",
