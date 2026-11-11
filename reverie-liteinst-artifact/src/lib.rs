@@ -27999,6 +27999,7 @@ const DETCORE_VALIDATE_TEMPLATES: &[DetcoreValidateTemplate] = &[
     // fixed_patch_alloc _RNvXs3_NtCsc48ZNeIyhXL_16reverie_liteinst11patch_allocNtB5_26FixedPrivatePatchAllocatorNtNtNtCs4NRVxsYgnAr_4core5alloc6global11GlobalAlloc5alloc at VA 0x1372580, 241 bytes; INSTALLATION_DEPTH LOCAL8 cell 0xf8 (PT_TLS filesz 0xf8, memsz 0x220).
     // Operands and transfers: those of the masked-equal row with body SHA256 425180fc2fadd76cf2a9fdb77d09695db03acfedb4fc9e4c6cbafc1b45a3a6f6, selected by bound GOT callee fixed_heap_panic_null.
     // Command: cargo build --locked --offline --manifest-path <Hermit>/Cargo.toml -p detcore-liteinst --lib --no-default-features --features exec-native-injection --profile liteinst-runtime --target-dir <producer OUT_DIR>/native-runtime-target (nested in build.hermit_native_exec_compile_in_pinned_root at hermit 3d9eca25fcf7f3a212d0be15b110943cfd962196)
+    // Generator: scripts/detcore-alloc-recipe.py libdetcore_liteinst.so --role fixed_patch_alloc --lib reverie-liteinst-artifact/src/lib.rs --toolchain <Toolchain above> --profile liteinst-runtime --features exec-native-injection --command <Command above>
     // Complete 241-byte body SHA256: 2d28fc7bbbed87cb8e42405566bead6a55dc04bc49a01c7b0334a7b68186a06e.
     DetcoreValidateTemplate {
         role: "fixed_patch_alloc",
@@ -66340,9 +66341,10 @@ mod tests {
     #[test]
     fn source_owned_template_end_covers_stable_prepare_identities() {
         // 111 and 116 are the stable 0x100 and generated stable native 0xf8
-        // fixed_patch_alloc templates; as appended identities they too must
+        // fixed_patch_alloc templates, and 117 the generated 0xf8
+        // fixed_tls_fn_once template; as appended identities they too must
         // route a lone witness to the naked-composition check.
-        for index in [108, 109, 110, 111, 112, 113, 114, 115, 116] {
+        for index in [108, 109, 110, 111, 112, 113, 114, 115, 116, 117] {
             let mut graph = scalar_ordinary_bit_result_control_graph(false);
             fixed_scalar_publication_syscall_mode(&graph.witnesses, FixedImageKind::Detcore, false)
                 .unwrap();
