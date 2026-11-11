@@ -8,6 +8,8 @@
 
 //! Signal syscalls and per-task signal delivery state (gVisor: pkg/sentry/syscalls/linux/sys_signal.go, pkg/sentry/kernel/task_signals.go).
 
+use super::process_signal_publication::SignalDestination;
+use super::process_signal_publication::UnsentSignal;
 use super::*;
 
 #[cfg(test)]
@@ -2824,8 +2826,12 @@ pub enum SignalDisposition {
 /// the Tool hook to observe them, then discarded at that return boundary; an
 /// unchanged fatal default disposition terminates with the conventional
 /// `128 + signo` status. Stopped-state scheduling, queued real-time siginfo,
-/// and cross-process delivery remain unsupported. Same-process thread-directed
-/// signals use the named receiver's private queue and return boundary.
+/// and cross-process delivery remain unsupported, except that a Tool that
+/// selects recipients may ask for a signal to one other process or one of its
+/// threads (`ProcessSignalControl::enable_cross_process_signals`): it is
+/// queued on that process's shared queue or the thread's own, and a thread the
+/// Tool permits takes it. Same-process thread-directed signals use the named
+/// receiver's private queue and return boundary.
 // TODO-HUMAN-REVIEW(#95): Review self-signal termination and the default-disposition table.
 pub(super) fn kill_signal(
     state: &mut LoadedStaticElf,
@@ -2861,6 +2867,10 @@ impl SignalRefusal {
          choose the recipient of a process-directed signal in a process with several threads";
     const SIGKILL_SIBLING: &'static str =
         "KVM signal delivery refused: KVM cannot send SIGKILL to a sibling thread";
+    pub(super) const SIGKILL_OTHER_PROCESS: &'static str =
+        "KVM signal delivery refused: KVM cannot send SIGKILL to another process";
+    pub(super) const TARGET_CHANGED: &'static str = "KVM signal delivery refused: the target \
+         exited or ran exec while KVM sent the signal";
     const SIBLING_UNAVAILABLE: &'static str = "KVM signal delivery refused: KVM cannot reach \
          the target thread's signal state";
     const EXIT_STATUS: &'static str = "KVM signal delivery refused: KVM cannot represent this \
@@ -2899,8 +2909,9 @@ pub(super) const KERNEL_SIGINFO_SIZE: usize = 48;
 /// set to the signal argument; `rt_tgsigqueueinfo` needs positive ids
 /// (`EINVAL`); and a caller may supply a kernel or `tkill` code
 /// (`si_code >= 0` or `SI_TKILL`) only when the id it names is its own tid
-/// (`EPERM`). Every delivery `kill_signal` refuses (another process,
-/// real-time queues, `SIGCHLD`, stop signals) stays refused.
+/// (`EPERM`). Every delivery `kill_signal` refuses (real-time queues,
+/// `SIGCHLD`, stop signals, and another process unless the Tool asked for it)
+/// stays refused.
 pub(super) fn sigqueueinfo(
     memory: &GuestMemory,
     state: &mut LoadedStaticElf,
@@ -2965,7 +2976,7 @@ fn send_signal(
     refusal: &mut Option<&'static str>,
 ) -> SyscallAction {
     let transaction = state.signal_transaction.clone();
-    let _transaction = transaction.lock().unwrap_or_else(|p| p.into_inner());
+    let held = transaction.lock().unwrap_or_else(|p| p.into_inner());
     let is_kill = number == libc::SYS_kill as u64;
     let is_tgkill = number == libc::SYS_tgkill as u64;
 
@@ -2993,7 +3004,9 @@ fn send_signal(
     }
 
     if !is_kill {
-        return send_thread_signal(state, tgid, target, signal, info, refusal);
+        let decided = decide_thread_signal(state, tgid, target, signal, info, refusal);
+        drop(held);
+        return finish_send(decided, refusal);
     }
 
     let targets_self = {
@@ -3003,10 +3016,16 @@ fn send_signal(
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let processes: Vec<(i32, i32)> = lifecycle.processes().collect();
-            // kill_pid_info_type finds a positive id as any live task's and
-            // signals that task's thread group, so a thread's id that is not
-            // its process's names its process.
-            let named_process = lifecycle.get(target).map(|task| task.tgid);
+            // A live process's id, even once its leader has exited, or a live
+            // thread's id: kill_pid_info_type finds a positive id as any live
+            // task's and signals that task's thread group, so a thread's id
+            // that is not its process's names its process.
+            let named_process = processes
+                .iter()
+                .any(|(tgid, _)| *tgid == target)
+                .then_some(target)
+                .or_else(|| lifecycle.get(target).map(|task| task.tgid))
+                .and_then(|tgid| Some((tgid, lifecycle.live_process_generation(tgid)?)));
             (
                 processes,
                 lifecycle.synthesizes_namespace_init(),
@@ -3080,22 +3099,27 @@ fn send_signal(
                     refuse_signal(refusal, SignalRefusal::INIT)
                 };
             }
-            // A live process's id, even once its leader has exited, or a
-            // live thread's id, which names that thread's process.
-            _ => match processes
-                .iter()
-                .any(|(tgid, _)| *tgid == target)
-                .then_some(target)
-                .or(named_process)
-            {
+            _ => match named_process {
                 None => return continue_with(negative_errno(libc::ESRCH)),
-                Some(tgid) if tgid == state.pid => true,
-                Some(_) => {
-                    return if signal == 0 {
-                        continue_with(0)
-                    } else {
-                        refuse_signal(refusal, SignalRefusal::OTHER_PROCESS)
+                Some((tgid, _)) if tgid == state.pid => true,
+                Some(_) if signal == 0 => return continue_with(0),
+                Some(_) if !cross_process_signals(state) => {
+                    return refuse_signal(refusal, SignalRefusal::OTHER_PROCESS);
+                }
+                Some((tgid, generation)) => {
+                    let process = reverie::SignalProcessId {
+                        tgid: reverie::Pid::from_raw(tgid),
+                        generation,
                     };
+                    let decided = decide_other_process_signal(
+                        state,
+                        SignalDestination::Process(process),
+                        signal,
+                        info,
+                        refusal,
+                    );
+                    drop(held);
+                    return finish_send(decided, refusal);
                 }
             },
         }
@@ -3177,9 +3201,97 @@ fn send_signal(
     }
 }
 
-/// A thread-directed signal is published into the named receiver's one private
-/// queue. The lifecycle lock binds publication to the live task incarnation;
-/// process dispositions and the receiver mask are then inspected in that order.
+/// A send decided under the sender's transaction ([`finish_send`]).
+enum DecidedSend {
+    /// The call's result: a send within the sender's process, done under the
+    /// sender's transaction, or a refusal.
+    Done(SyscallAction),
+    /// A signal to another process, to queue under the target's transaction
+    /// once the sender's is released.
+    OtherProcess {
+        registry: Arc<ProcessSignalRegistry>,
+        destination: SignalDestination,
+        event: reverie::SignalEvent,
+    },
+}
+
+impl From<SyscallAction> for DecidedSend {
+    fn from(action: SyscallAction) -> Self {
+        Self::Done(action)
+    }
+}
+
+/// Completes a send decided under the sender's transaction, which the caller
+/// has released: a signal to another process is queued under the target's
+/// (`ProcessSignalRegistry::send_to_other_process`).
+fn finish_send(decided: DecidedSend, refusal: &mut Option<&'static str>) -> SyscallAction {
+    match decided {
+        DecidedSend::Done(action) => action,
+        DecidedSend::OtherProcess {
+            registry,
+            destination,
+            event,
+        } => match registry.send_to_other_process(destination, event) {
+            Ok(()) => continue_with(0),
+            Err(UnsentSignal::TargetChanged) => {
+                refuse_signal(refusal, SignalRefusal::TARGET_CHANGED)
+            }
+            Err(UnsentSignal::DefaultStop) => refuse_signal(refusal, SignalRefusal::STOP),
+            Err(UnsentSignal::Errno(errno)) => continue_with(negative_errno(errno.into_raw())),
+        },
+    }
+}
+
+/// A signal to another process, which the Tool asked for: the refusals that
+/// need none of the target's locks, then the event to queue at
+/// `destination`. Its siginfo is the caller's (`info`), or the one Linux's
+/// `prepare_kill_siginfo` builds: `SI_USER` for the process, `SI_TKILL` for
+/// one of its threads, with the sender's thread group id and real uid 0, the
+/// guest credential model's fixed uid.
+fn decide_other_process_signal(
+    state: &LoadedStaticElf,
+    destination: SignalDestination,
+    signal: libc::c_int,
+    info: Option<[u8; SIGINFO_SIZE]>,
+    refusal: &mut Option<&'static str>,
+) -> DecidedSend {
+    if signal > 31 || signal == libc::SIGCHLD {
+        return refuse_signal(refusal, SignalRefusal::REALTIME_OR_SIGCHLD).into();
+    }
+    if signal == libc::SIGKILL {
+        return refuse_signal(refusal, SignalRefusal::SIGKILL_OTHER_PROCESS).into();
+    }
+    let (target, code) = match destination {
+        SignalDestination::Process(process) => (
+            reverie::SignalTarget::Process { pid: process.tgid },
+            libc::SI_USER,
+        ),
+        SignalDestination::Thread(task) => (
+            reverie::SignalTarget::Thread {
+                pid: task.process.tgid,
+                tid: task.tid,
+            },
+            libc::SI_TKILL,
+        ),
+    };
+    let info = info.unwrap_or_else(|| crate::signal::signal_info_user(signal, state.pid, 0, code));
+    let event = match reverie::SignalEvent::new(signal, info, target) {
+        Ok(event) => event,
+        Err(errno) => return continue_with(negative_errno(errno.into_raw())).into(),
+    };
+    let Some(registry) = state.children.registry() else {
+        return refuse_signal(refusal, SignalRefusal::OTHER_PROCESS).into();
+    };
+    DecidedSend::OtherProcess {
+        registry,
+        destination,
+        event,
+    }
+}
+
+/// [`decide_thread_signal`] and [`finish_send`], for a caller that holds no
+/// transaction.
+#[cfg(test)]
 pub(super) fn send_thread_signal(
     state: &LoadedStaticElf,
     tgid: Option<libc::pid_t>,
@@ -3188,8 +3300,24 @@ pub(super) fn send_thread_signal(
     info: Option<[u8; SIGINFO_SIZE]>,
     refusal: &mut Option<&'static str>,
 ) -> SyscallAction {
+    let decided = decide_thread_signal(state, tgid, target, signal, info, refusal);
+    finish_send(decided, refusal)
+}
+
+/// A thread-directed signal is published into the named receiver's one private
+/// queue. The lifecycle lock binds publication to the live task incarnation;
+/// process dispositions and the receiver mask are then inspected in that order.
+/// A receiver in another process is left for [`finish_send`].
+fn decide_thread_signal(
+    state: &LoadedStaticElf,
+    tgid: Option<libc::pid_t>,
+    target: libc::pid_t,
+    signal: libc::c_int,
+    info: Option<[u8; SIGINFO_SIZE]>,
+    refusal: &mut Option<&'static str>,
+) -> DecidedSend {
     if target <= 0 || tgid.is_some_and(|tgid| tgid <= 0) {
-        return continue_with(negative_errno(libc::EINVAL));
+        return continue_with(negative_errno(libc::EINVAL)).into();
     }
     let (action, flushed) = {
         let lifecycle = state
@@ -3201,36 +3329,55 @@ pub(super) fn send_thread_signal(
                 0
             } else {
                 negative_errno(libc::ESRCH)
-            });
+            })
+            .into();
         }
         let Some(task) = lifecycle.get(target) else {
-            return continue_with(negative_errno(libc::ESRCH));
+            return continue_with(negative_errno(libc::ESRCH)).into();
         };
         if tgid.is_some_and(|tgid| tgid != task.tgid) {
-            return continue_with(negative_errno(libc::ESRCH));
+            return continue_with(negative_errno(libc::ESRCH)).into();
         }
         if task.tgid != state.pid {
-            return refuse_signal(refusal, SignalRefusal::OTHER_PROCESS);
+            if !cross_process_signals(state) {
+                return refuse_signal(refusal, SignalRefusal::OTHER_PROCESS).into();
+            }
+            let task = reverie::SignalTaskIdentity {
+                process: reverie::SignalProcessId {
+                    tgid: reverie::Pid::from_raw(task.tgid),
+                    generation: task.process_generation,
+                },
+                tid: reverie::Pid::from_raw(target),
+                task_generation: task.generation,
+            };
+            return decide_other_process_signal(
+                state,
+                SignalDestination::Thread(task),
+                signal,
+                info,
+                refusal,
+            );
         }
         if signal > 31 || signal == libc::SIGCHLD {
-            return refuse_signal(refusal, SignalRefusal::REALTIME_OR_SIGCHLD);
+            return refuse_signal(refusal, SignalRefusal::REALTIME_OR_SIGCHLD).into();
         }
         if signal == libc::SIGKILL {
             // A sibling may be parked outside any return boundary. Queuing
             // SIGKILL there would falsely promise actual group cancellation.
             if target != state.tid {
-                return refuse_signal(refusal, SignalRefusal::SIGKILL_SIBLING);
+                return refuse_signal(refusal, SignalRefusal::SIGKILL_SIBLING).into();
             }
             return terminating_signal_status(signal, task.dumpable)
                 .map(SyscallAction::Exit)
-                .unwrap_or_else(|| refuse_signal(refusal, SignalRefusal::EXIT_STATUS));
+                .unwrap_or_else(|| refuse_signal(refusal, SignalRefusal::EXIT_STATUS))
+                .into();
         }
         let target_signals = if target == state.tid {
             // Loader-level self-signal callers need no borrowed sibling handle.
             state.thread_signals.clone()
         } else {
             let Some(target_signals) = lifecycle.signal_target(target) else {
-                return refuse_signal(refusal, SignalRefusal::SIBLING_UNAVAILABLE);
+                return refuse_signal(refusal, SignalRefusal::SIBLING_UNAVAILABLE).into();
             };
             target_signals
         };
@@ -3243,7 +3390,7 @@ pub(super) fn send_thread_signal(
             signal,
         );
         if disposition == SignalDisposition::Stop {
-            return refuse_signal(refusal, SignalRefusal::STOP);
+            return refuse_signal(refusal, SignalRefusal::STOP).into();
         }
         let event = match info {
             Some(info) => reverie::SignalEvent::new(
@@ -3258,7 +3405,7 @@ pub(super) fn send_thread_signal(
         };
         let event = match event {
             Ok(event) => event,
-            Err(errno) => return continue_with(negative_errno(errno.into_raw())),
+            Err(errno) => return continue_with(negative_errno(errno.into_raw())).into(),
         };
         // prepare_signal's queue effects come before the test of the
         // signal's action.
@@ -3273,8 +3420,8 @@ pub(super) fn send_thread_signal(
         )
     };
     match refresh_signalfd_keepers(state, &flushed) {
-        Ok(()) => action,
-        Err(error) => continue_with(error),
+        Ok(()) => action.into(),
+        Err(error) => continue_with(error).into(),
     }
 }
 
@@ -3319,6 +3466,19 @@ fn queue_thread_signal(
 /// (`SIG_KERNEL_STOP_MASK`).
 const STOP_SIGNALS: [libc::c_int; 4] = [libc::SIGSTOP, libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU];
 
+/// The signals generating `signal` removes from its process's queues
+/// ([`flush_for_generation`]): SIGCONT for a stop signal, the stop signals for
+/// SIGCONT, and none for any other.
+pub(crate) fn flushed_by(signal: libc::c_int) -> &'static [libc::c_int] {
+    if STOP_SIGNALS.contains(&signal) {
+        &[libc::SIGCONT]
+    } else if signal == libc::SIGCONT {
+        &STOP_SIGNALS
+    } else {
+        &[]
+    }
+}
+
 /// Linux's `prepare_signal` queue effects of generating `signal` for
 /// `process`
 /// (<https://github.com/gregkh/linux/blob/v7.1.3/kernel/signal.c#L884-L900>):
@@ -3337,13 +3497,10 @@ pub(crate) fn flush_for_generation(
     process_signals: &mut crate::signal::ProcessSignalState,
     signal: libc::c_int,
 ) -> Vec<libc::c_int> {
-    let flushed: &[libc::c_int] = if STOP_SIGNALS.contains(&signal) {
-        &[libc::SIGCONT]
-    } else if signal == libc::SIGCONT {
-        &STOP_SIGNALS
-    } else {
+    let flushed = flushed_by(signal);
+    if flushed.is_empty() {
         return Vec::new();
-    };
+    }
     let removed = flushed
         .iter()
         .copied()

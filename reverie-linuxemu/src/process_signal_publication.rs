@@ -48,6 +48,11 @@ mod parent_death_publication;
 #[path = "orphan_placement.rs"]
 mod orphan_placement;
 
+#[path = "cross_process_send.rs"]
+mod cross_process_send;
+pub(crate) use cross_process_send::SignalDestination;
+pub(crate) use cross_process_send::UnsentSignal;
+
 #[path = "child_wait.rs"]
 pub mod child_wait;
 
