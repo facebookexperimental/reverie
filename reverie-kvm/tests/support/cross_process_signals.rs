@@ -14,7 +14,9 @@
 //! Without the request each send is refused by name. `pidfd_send_signal`
 //! reaches the caller itself and its child through their pidfds, and answers
 //! for an exited and a reaped child as Linux does. Every observable is
-//! compared with the same binary run natively.
+//! compared with the same binary run natively, except for the self
+//! sentinels, whose spelling LinuxEmu fixes at Linux 6.17's whatever the
+//! host kernel.
 
 use super::*;
 
@@ -230,13 +232,92 @@ fn pidfd_stdout() -> String {
     )
 }
 
+const PIDFD_SELF_SOURCE: &str = r#"#define _GNU_SOURCE
+#include <errno.h>
+#include <signal.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+static volatile sig_atomic_t taken;
+static volatile int number, code, sender;
+
+static void handler(int signal, siginfo_t *info, void *context) {
+    (void)context;
+    number = signal;
+    code = info->si_code;
+    sender = info->si_pid;
+    taken++;
+}
+
+static void say(const char *text) {
+    size_t length = strlen(text);
+    if (write(STDOUT_FILENO, text, length) != (ssize_t)length) _exit(120);
+}
+
+/* 0, or the negated errno of a failed pidfd_send_signal. */
+static int send_through(int pidfd, int signal) {
+    return syscall(SYS_pidfd_send_signal, pidfd, signal, NULL, 0) == 0 ? 0 : -errno;
+}
+
+static void report(const char *name, int sent) {
+    char line[160];
+    snprintf(line, sizeof line, "%s: send=%d taken=%d signal=%d code=%d from_self=%d\n", name,
+             sent, (int)taken, number, code, sender == getpid());
+    say(line);
+}
+
+int main(void) {
+    struct sigaction action;
+    memset(&action, 0, sizeof action);
+    action.sa_sigaction = handler;
+    action.sa_flags = SA_SIGINFO;
+    sigemptyset(&action.sa_mask);
+    if (sigaction(SIGUSR1, &action, NULL) || sigaction(SIGUSR2, &action, NULL)) return 2;
+    /* PIDFD_SELF_THREAD and PIDFD_SELF_THREAD_GROUP as Linux 6.17 spells them,
+     * then the thread group sentinel as Linux 6.15 and 6.16 spell it. */
+    report("thread", send_through(-10000, SIGUSR1));
+    report("group", send_through(-10001, SIGUSR2));
+    report("legacy group", send_through(-20000, SIGUSR1));
+    return 0;
+}
+"#;
+
+/// What the self-sentinel program prints on Linux 6.17 and later, and under
+/// LinuxEmu on any host.
+fn pidfd_self_stdout() -> String {
+    format!(
+        "thread: send=0 taken=1 signal={} code={} from_self=1\n\
+         group: send=0 taken=2 signal={} code={} from_self=1\n\
+         legacy group: send={} taken=2 signal={} code={} from_self=1\n",
+        libc::SIGUSR1,
+        libc::SI_TKILL,
+        libc::SIGUSR2,
+        libc::SI_USER,
+        -libc::EBADF,
+        libc::SIGUSR2,
+        libc::SI_USER,
+    )
+}
+
+/// What the Tool reports to its global state.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+enum CrossProcessReport {
+    /// A refusal of the guest's send, as `operation: diagnostic`.
+    Refusal(String),
+    /// The pidfd self-sentinel spelling the guest declared at a
+    /// `pidfd_send_signal`, as its `Debug` text.
+    Spelling(String),
+}
+
 const OTHER_PROCESS_REFUSAL: &str =
     "Signal: KVM signal delivery refused: KVM cannot deliver a signal to another process";
 
 /// Grants a delivery permit at every signal boundary, as a scheduler does for
 /// its running task, and asks for cross-process signals when configured to.
-/// It records the receipts that settle its permits and the refusals of the
-/// guest's sends.
+/// It records the receipts that settle its permits, the refusals of the
+/// guest's sends, and the pidfd self-sentinel spelling the backend declares.
 #[derive(Debug, Default)]
 struct CrossProcessGlobal {
     ask: bool,
@@ -244,11 +325,12 @@ struct CrossProcessGlobal {
     sequence: AtomicU64,
     receipts: Mutex<Vec<reverie::SignalBoundaryReceipt>>,
     refusals: Mutex<Vec<String>>,
+    spellings: Mutex<Vec<String>>,
 }
 
 #[reverie::global_tool]
 impl GlobalTool for CrossProcessGlobal {
-    type Request = String;
+    type Request = CrossProcessReport;
     type Response = ();
     type Config = bool;
 
@@ -259,8 +341,11 @@ impl GlobalTool for CrossProcessGlobal {
         }
     }
 
-    async fn receive_rpc(&self, _: Pid, refusal: String) {
-        self.refusals.lock().unwrap().push(refusal);
+    async fn receive_rpc(&self, _: Pid, report: CrossProcessReport) {
+        match report {
+            CrossProcessReport::Refusal(refusal) => self.refusals.lock().unwrap().push(refusal),
+            CrossProcessReport::Spelling(spelling) => self.spellings.lock().unwrap().push(spelling),
+        }
     }
 
     fn install_backend_signal_control(
@@ -315,11 +400,14 @@ impl Tool for CrossProcessTool {
             syscall.number(),
             Sysno::kill | Sysno::tgkill | Sysno::pidfd_send_signal
         ) {
+            if syscall.number() == Sysno::pidfd_send_signal {
+                let spelling = format!("{:?}", guest.pidfd_self_spelling());
+                guest.send_rpc(CrossProcessReport::Spelling(spelling)).await;
+            }
             let sent = guest.inject(syscall).await;
             if let Some(refusal) = guest.take_unsupported_refusal() {
-                guest
-                    .send_rpc(format!("{:?}: {}", refusal.operation, refusal.diagnostic))
-                    .await;
+                let refusal = format!("{:?}: {}", refusal.operation, refusal.diagnostic);
+                guest.send_rpc(CrossProcessReport::Refusal(refusal)).await;
             }
             return Ok(sent?);
         }
@@ -459,4 +547,18 @@ fn pidfd_send_signal_reaches_the_caller_and_its_child_as_on_linux() {
         .map(|receipt| receipt.permit.task.tid == Pid::from_raw(1))
         .collect::<Vec<_>>();
     assert_eq!(caught, [true, false], "receipts: {receipts:?}");
+}
+
+#[test]
+fn pidfd_send_signal_takes_the_self_sentinels_as_linux_6_17_spells_them() {
+    if !kvm_available("pidfd_send_signal_takes_the_self_sentinels_as_linux_6_17_spells_them") {
+        return;
+    }
+    let (stdout, global) = run_cross_process_program("pidfd-self", PIDFD_SELF_SOURCE, false);
+    assert_eq!(stdout, pidfd_self_stdout());
+    let refusals = global.refusals.lock().unwrap();
+    assert!(refusals.is_empty(), "{refusals:?}");
+    // The backend declares the spelling its executor takes, so a Tool that
+    // forwards a guest's sentinel forwards it unchanged.
+    assert_eq!(*global.spellings.lock().unwrap(), ["Modern"; 3]);
 }
