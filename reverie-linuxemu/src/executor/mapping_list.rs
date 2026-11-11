@@ -956,17 +956,22 @@ pub(crate) fn mark_guarded_lines(
 mod superblock_device_tests {
     use super::*;
 
-    /// An open file of this test's own in the temporary directory, already
-    /// unlinked.
-    fn scratch_file(name: &str) -> std::fs::File {
-        let path = std::env::temp_dir().join(format!(
+    /// An open file of this test's own in `directory`, already unlinked.
+    fn scratch_file_in(directory: &std::path::Path, name: &str) -> std::io::Result<std::fs::File> {
+        let path = directory.join(format!(
             "reverie-superblock-device-{name}-{}",
             std::process::id()
         ));
-        std::fs::write(&path, b"x").unwrap();
-        let file = std::fs::File::open(&path).unwrap();
-        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"x")?;
+        let file = std::fs::File::open(&path);
+        std::fs::remove_file(&path)?;
         file
+    }
+
+    /// An open file of this test's own in the temporary directory, already
+    /// unlinked.
+    fn scratch_file(name: &str) -> std::fs::File {
+        scratch_file_in(&std::env::temp_dir(), name).unwrap()
     }
 
     /// The device the cache answers is the one `mountinfo` gives, for a
@@ -985,19 +990,53 @@ mod superblock_device_tests {
     }
 
     /// Once a mount's device is known, a mapping of another file on it reads
-    /// no `mountinfo`: every file mmap asks for the device.
+    /// no `mountinfo`: every file mmap asks for the device. A kernel before
+    /// 6.8 names no mount uniquely, so nothing is kept and there is nothing
+    /// to check here; `without_unique_mount_ids_each_file_reads_mountinfo`
+    /// covers that path on any kernel.
     #[test]
     fn a_second_file_on_a_known_mount_reads_no_mountinfo() {
         let first = scratch_file("known");
-        assert!(
-            unique_mount_id(first.as_raw_fd()).is_some(),
-            "the host kernel names mounts uniquely (Linux 6.8 and later)"
-        );
+        if unique_mount_id(first.as_raw_fd()).is_none() {
+            eprintln!("skipped: this kernel names no mount uniquely (before Linux 6.8)");
+            return;
+        }
         superblock_device(first.as_raw_fd()).unwrap();
         let second = scratch_file("again");
         let before = MOUNTINFO_READS.with(std::cell::Cell::get);
         superblock_device(second.as_raw_fd()).unwrap();
         assert_eq!(MOUNTINFO_READS.with(std::cell::Cell::get), before);
+    }
+
+    /// Files on different mounts keep their own devices, each the one its
+    /// mount's `mountinfo` line gives, however their lookups interleave:
+    /// the temporary directory's mount, procfs, and `/dev/shm` where a file
+    /// can be made there. The temporary directory and procfs are two mounts
+    /// with two superblocks, so a cache that answered one device for both
+    /// would fail.
+    #[test]
+    fn files_on_different_mounts_keep_their_own_devices() {
+        let mut files = vec![
+            scratch_file("interleaved"),
+            std::fs::File::open("/proc/self/status").unwrap(),
+        ];
+        if let Ok(shm) = scratch_file_in(std::path::Path::new("/dev/shm"), "interleaved") {
+            files.push(shm);
+        }
+        let expected: Vec<Option<u64>> = files
+            .iter()
+            .map(|file| superblock_device_in_mountinfo(file.as_raw_fd()))
+            .collect();
+        assert!(
+            expected[0].is_some() && expected[1].is_some(),
+            "the temporary directory's mount and procfs are listed: {expected:?}"
+        );
+        assert_ne!(expected[0], expected[1]);
+        for _ in 0..2 {
+            for (file, expected) in files.iter().zip(&expected) {
+                assert_eq!(superblock_device(file.as_raw_fd()), *expected);
+            }
+        }
     }
 
     /// Without unique mount ids nothing is kept, and each mapping reads
