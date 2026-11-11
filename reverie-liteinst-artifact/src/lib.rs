@@ -66090,7 +66090,10 @@ mod tests {
 
     #[test]
     fn source_owned_template_end_covers_stable_prepare_identities() {
-        for index in [108, 109, 110, 112, 113, 114, 115] {
+        // 111 and 116 are the stable 0x100 and generated stable native 0xf8
+        // fixed_patch_alloc templates; as appended identities they too must
+        // route a lone witness to the naked-composition check.
+        for index in [108, 109, 110, 111, 112, 113, 114, 115, 116] {
             let mut graph = scalar_ordinary_bit_result_control_graph(false);
             fixed_scalar_publication_syscall_mode(&graph.witnesses, FixedImageKind::Detcore, false)
                 .unwrap();
