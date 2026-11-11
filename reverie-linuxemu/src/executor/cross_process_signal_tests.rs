@@ -804,3 +804,33 @@ fn a_childs_exit_interleaved_with_its_parents_send_neither_deadlocks_nor_loses_t
         }
     }
 }
+
+/// With the request, a signal through the id of another process's thread
+/// that does not lead it waits in that process's shared queue, as
+/// `kill_pid_info_type` signals the task's thread group, for `kill` and
+/// `rt_sigqueueinfo` alike. The siginfo `kill` builds names the sender's
+/// thread group, also when a thread that does not lead its process sends.
+#[test]
+fn a_signal_through_another_processs_thread_id_waits_in_its_shared_queue() {
+    let root = TestDir::new();
+    let (mut parent, child, _run) = xsig_parent_and_child(&root, true);
+    let (pid, child_pid) = (parent.state.pid, child.state.pid);
+    let thread = child.thread_child(child_pid + 1).unwrap();
+    let tid = thread.state.tid;
+    let mut sibling = parent.thread_child(child_pid + 2).unwrap();
+    assert_eq!(xsig_kill(&mut sibling, tid, libc::SIGUSR1), 0);
+    assert_eq!(sibling.take_unsupported_refusal(), None);
+    assert_eq!(xsig_rt_sigqueueinfo(&mut parent, tid, libc::SIGUSR2, 5), 0);
+    assert_eq!(parent.take_unsupported_refusal(), None);
+    for signal in [libc::SIGUSR1, libc::SIGUSR2] {
+        assert_eq!(xsig_queued(&thread, signal), (true, false), "{signal}");
+    }
+    assert_eq!(
+        pss_take(&child, libc::SIGUSR1, true),
+        Some((libc::SI_USER, pid, 0))
+    );
+    assert_eq!(
+        pss_take(&child, libc::SIGUSR2, true),
+        Some((libc::SI_QUEUE, 0, 0))
+    );
+}

@@ -481,3 +481,93 @@ fn pidfd_send_signal_checks_the_rest_of_a_siginfo_of_unknown_layout() {
     let info = at_edge(&mut memory, libc::SIGSEGV, 7);
     assert_eq!(send(&memory, info), negative_errno(libc::EINVAL));
 }
+
+/// A caller's siginfo goes through a pidfd to another process as it is, in
+/// thread-group and in thread scope, as `rt_sigqueueinfo` and
+/// `rt_tgsigqueueinfo` carry one: no `kill` or `tgkill` siginfo replaces it.
+#[test]
+fn pidfd_send_signal_carries_a_callers_siginfo_to_another_process() {
+    let root = TestDir::new();
+    let (mut parent, child, _run) = xsig_parent_and_child(&root, true);
+    let mut memory = pidfd_test_memory();
+    let child_pid = child.state.pid;
+    let pidfd = pidfd_test_open(&mut parent, &memory, i64::from(child_pid), 0);
+    assert!(pidfd >= 0);
+    let info = pss_info(&mut memory, libc::SIGUSR1, libc::SI_QUEUE);
+    for flags in [0, libc::PIDFD_SIGNAL_THREAD] {
+        assert_eq!(
+            pss_send(&mut parent, &memory, pidfd, libc::SIGUSR1, info, flags),
+            0,
+            "flags {flags:#x}"
+        );
+        assert_eq!(parent.take_unsupported_refusal(), None);
+        assert_eq!(
+            pss_take(&child, libc::SIGUSR1, flags == 0),
+            Some((libc::SI_QUEUE, 0, 0)),
+            "flags {flags:#x}"
+        );
+    }
+}
+
+/// A `/proc/<pid>` directory descriptor names a process to Linux's
+/// `pidfd_send_signal` (`tgid_pidfd_to_pid`), but not one this executor keeps
+/// a record of: the send is refused by name, signal 0 included, as one
+/// through a pidfd from outside the run is.
+#[test]
+fn pidfd_send_signal_through_a_proc_directory_is_refused_by_name() {
+    const PROC: i32 = 62;
+    let root = TestDir::new();
+    let mut state = test_state(&root.0);
+    let directory = std::fs::File::open("/proc/self").unwrap();
+    assert!(state.insert_file(PROC, directory).is_empty());
+    let mut executor = ElfExecutor::new(state, false);
+    let memory = pidfd_test_memory();
+    for signal in [0, libc::SIGUSR1] {
+        assert_eq!(
+            pss_send(&mut executor, &memory, i64::from(PROC), signal, 0, 0),
+            negative_errno(libc::ENOSYS),
+            "signal {signal}"
+        );
+        assert_eq!(
+            executor.take_unsupported_refusal(),
+            xsig_refusal(SignalRefusal::PIDFD_WITHOUT_RECORD)
+        );
+    }
+    assert_eq!(xsig_queued(&executor, libc::SIGUSR1), (false, false));
+}
+
+/// A task outside any process family keeps no record of its own process's
+/// life, so the pidfd `pidfd_open` gives it for itself is the supervisor's
+/// stand-in alone (`guest_pidfd_open`), and a send through it is refused by
+/// name.
+#[test]
+fn pidfd_send_signal_through_a_pidfd_without_a_record_is_refused_by_name() {
+    let root = TestDir::new();
+    let mut state = test_state(&root.0);
+    state.children = ChildWaitContext::default();
+    let mut memory = pidfd_test_memory();
+    let pid = state.pid as u64;
+    let pidfd = syscall_result(
+        &mut memory,
+        &mut state,
+        libc::SYS_pidfd_open,
+        [pid, 0, 0, 0, 0, 0],
+    );
+    assert!(pidfd >= 0, "pidfd_open: {pidfd}");
+    for signal in [0, libc::SIGUSR1] {
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_pidfd_send_signal,
+                [pidfd as u64, signal as u64, 0, 0, 0, 0],
+            ),
+            negative_errno(libc::ENOSYS),
+            "signal {signal}"
+        );
+        assert_eq!(
+            state.signal_refusal.take(),
+            Some(SignalRefusal::PIDFD_WITHOUT_RECORD)
+        );
+    }
+}
