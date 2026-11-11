@@ -2856,14 +2856,24 @@ impl SignalRefusal {
     pub(super) const REALTIME_OR_SIGCHLD: &'static str =
         "KVM signal delivery refused: KVM cannot send real-time signals or SIGCHLD";
     const STOP: &'static str = "KVM signal delivery refused: KVM cannot send a stop signal";
-    const THREADED_PROCESS: &'static str = "KVM signal delivery refused: KVM cannot choose the \
-         recipient of a process-directed signal in a process with several threads";
+    pub(super) const THREADED_PROCESS: &'static str = "KVM signal delivery refused: KVM cannot \
+         choose the recipient of a process-directed signal in a process with several threads";
     const SIGKILL_SIBLING: &'static str =
         "KVM signal delivery refused: KVM cannot send SIGKILL to a sibling thread";
     const SIBLING_UNAVAILABLE: &'static str = "KVM signal delivery refused: KVM cannot reach \
          the target thread's signal state";
     const EXIT_STATUS: &'static str = "KVM signal delivery refused: KVM cannot represent this \
          signal's terminating status";
+}
+
+/// Whether the Tool selects the thread that takes a signal a guest sends to
+/// another process, or to its own process while that has another thread
+/// (`ProcessSignalRegistry::cross_process_signals`).
+fn cross_process_signals(state: &LoadedStaticElf) -> bool {
+    state
+        .children
+        .registry()
+        .is_some_and(|registry| registry.cross_process_signals())
 }
 
 /// Refuses a signal delivery with ENOSYS, recording why. Linux's signal
@@ -3106,9 +3116,11 @@ fn send_signal(
     // A process-directed signal has no preselected recipient. With more than
     // one live thread, letting whichever host vCPU reaches a boundary first
     // take the shared event would make delivery depend on host scheduling.
-    // Hermit's later deterministic scheduler will own that selection; this
-    // foundation fails visibly until then.
+    // A Tool that asked for signals to other processes selects that thread
+    // (`cross_process_signals`): only a thread it permits takes the event, at
+    // its own boundary. Without one, this fails visibly.
     if is_kill
+        && !cross_process_signals(state)
         && state
             .task_lifecycle
             .lock()

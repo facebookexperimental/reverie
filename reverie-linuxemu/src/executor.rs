@@ -624,6 +624,7 @@ mod tests {
     include!("executor/script_line_tests.rs");
     include!("executor/pkeys_tests.rs");
     include!("executor/pidfd_tests.rs");
+    include!("executor/cross_process_signal_tests.rs");
     use std::collections::BTreeMap;
     use std::io::Read;
     use std::io::Seek;

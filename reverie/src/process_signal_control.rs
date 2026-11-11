@@ -492,6 +492,38 @@ pub trait ProcessSignalControl: Debug + Send + Sync {
         ProcessSignalPublicationResult::RejectedBeforeCommit(Errno::ENOSYS)
     }
 
+    /// Opt into a guest's signals to other processes before starting any
+    /// guest task.
+    ///
+    /// A backend that keeps its own signal queues refuses, by default, a
+    /// guest `kill`, `tkill`, `tgkill`, `rt_sigqueueinfo` or
+    /// `rt_tgsigqueueinfo` that names another process, and a process-directed
+    /// signal to the guest's own process while that process has another
+    /// thread. Either needs a thread other than the sender to take the
+    /// signal, and only a Tool that selects recipients can order that.
+    ///
+    /// After this call, in [`BackendSignalControlMode::ToolControlled`]
+    /// mode, the backend performs such a send as Linux's `do_send_sig_info`
+    /// does, but chooses no thread and wakes none: it queues the signal on
+    /// the target process's shared queue, or on the named thread's own
+    /// queue, keeping a standard signal's first siginfo. A thread of the
+    /// target takes it at a boundary the Tool authorizes
+    /// ([`Self::reserve_delivery`]) or in a parked observation.
+    ///
+    /// The Tool, which forwards the guest's call, decides which sends to
+    /// forward, and orders each one against the target's exit and exec, as
+    /// it orders the publications here. The backend refuses by name, before
+    /// any effect, a send that the target's exit or exec overlapped, and may
+    /// keep refusing by name a send it cannot perform.
+    ///
+    /// `EBUSY` once installation has closed. In
+    /// [`BackendSignalControlMode::Unchanged`] mode the call has no effect.
+    /// Backends that keep no signal queues of their own keep the default
+    /// `ENOSYS`.
+    fn enable_cross_process_signals(&self) -> Result<(), Errno> {
+        Err(Errno::ENOSYS)
+    }
+
     /// Eligible live recipients for one pending signal, in ascending numeric
     /// TID order. The caller intersects these with its causally admitted task
     /// generations.
