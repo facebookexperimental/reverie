@@ -1717,10 +1717,9 @@ fn forced_legacy_permanent_detach_retires_generation() {
 }
 
 /// The forced-legacy arm of [`unreaped_zombie_retires_native_generation`].
-/// The detached wait is recorded, and its owner is live, but the group is
-/// then killed: no reattach can consume this generation, so the `Procfs`
-/// worker retires it, whether or not it had kept the generation for the
-/// handoff before the kill.
+/// The `Procfs` worker first keeps the generation for the recorded wait,
+/// whose owner is live. Then the group is killed: no reattach can consume
+/// the generation any more, so the keep must end and the worker retire it.
 #[test]
 #[cfg(not(sanitized))]
 fn forced_legacy_killed_generation_retires_with_its_wait_recorded() {
@@ -1734,10 +1733,47 @@ fn forced_legacy_killed_generation_retires_with_its_wait_recorded() {
     assert!(terminal.event.event().detach_handoff_pending());
     terminal.ensure_registered().unwrap();
     assert_eq!(terminal.has_thread_pidfd(), Ok(false));
+    wait_for_detached_wait_kept(terminal.event.event(), "before the kill");
     assert_eq!(unsafe { libc::kill(root.as_raw(), libc::SIGKILL) }, 0);
     assert!(
         terminal.wait(TRACEE_WAIT_TIMEOUT),
         "killed legacy generation must retire although its wait is recorded"
+    );
+    drop(driver);
+    legacy_owner_reap_root(root, &mut root_cleanup);
+    drop(release);
+}
+
+/// A procfs read error during the handoff, such as EMFILE, shows neither a
+/// live generation nor its exit, and the keep needs a positive answer. So
+/// the `Procfs` worker retires the generation, as the native rule
+/// (`mark_echild_if_unowned`) does on the same error.
+#[test]
+#[cfg(not(sanitized))]
+fn forced_legacy_procfs_error_during_the_handoff_does_not_keep_the_generation() {
+    let (root, tid, release, mut root_cleanup) = legacy_owner_guest();
+    let _legacy = LegacyThreadGroup::new(root);
+    let stopped = seized_stopped_sync(tid);
+    assert_procfs_identity(&stopped.1);
+    let running = stopped.detach(None).unwrap();
+    let driver = running.wait_owned_on_ptracer_thread().into_driver();
+    // The worker's first attachment check reads this error as its
+    // generation answer.
+    PROCFS_OBSERVATION_ERRORS
+        .lock()
+        .insert(tid.into(), Errno::EMFILE);
+    let terminal = driver.terminal_cleanup().unwrap();
+    assert_eq!(terminal.has_thread_pidfd(), Ok(false));
+    assert!(terminal.event.event().detach_handoff_pending());
+    assert!(
+        terminal.wait(TRACEE_WAIT_TIMEOUT),
+        "a procfs read error during the handoff must not keep the generation"
+    );
+    assert!(
+        !PROCFS_OBSERVATION_ERRORS
+            .lock()
+            .contains_key(&tid.into()),
+        "the injected procfs error was not read"
     );
     drop(driver);
     legacy_owner_reap_root(root, &mut root_cleanup);
