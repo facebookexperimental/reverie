@@ -2269,3 +2269,191 @@ async fn forced_legacy_consume_counts_its_wakeup_before_the_notify() {
     }
     legacy_consume_wakes_the_worker(ConsumeWakeup::BetweenDropAndNotify).await;
 }
+
+#[cfg(not(sanitized))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HeldWaitSkip {
+    /// A probe is pending when the worker decides to wait as a held worker.
+    PendingProbe,
+    /// The ptracer's consume counted its wakeup during the worker's turn,
+    /// after the worker had last read the counts.
+    CountDuringTurn,
+}
+
+/// A held worker whose wakeup counts changed since it last read them does
+/// not wait: it takes another turn first. That skipped wait is not a held
+/// wait and must not be counted as one. The worker is paused at its first
+/// held-wait decision after the published SIGSTOP, with the wakeup pending,
+/// and again at its next one: no held wait may have been counted by then.
+/// It then parks, and a parked held worker takes no turns.
+#[cfg(not(sanitized))]
+async fn legacy_skipped_held_wait_is_not_counted(case: HeldWaitSkip) {
+    let (root, stopped, mut root_cleanup, _force) = spawn_legacy_thread_tracee(true);
+    let root_exit = root_cleanup.exit_event_on_ptracer_thread(&stopped).unwrap();
+    let root_terminal = stopped.terminal_cleanup();
+    let (parent, crate::Event::NewChild(crate::ChildOp::Clone, child)) = tokio::time::timeout(
+        TRACEE_WAIT_TIMEOUT,
+        stopped.resume(None).unwrap().wait_owned_on_ptracer_thread(),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .assume_stopped() else {
+        panic!("missing paused pthread clone");
+    };
+    let child_tid = child.pid();
+    let mut child_cleanup = legacy_child_cleanup(&child);
+    let terminal = child.terminal_cleanup();
+    let worker = terminal.event.event().clone();
+    *worker.legacy_held_period.lock() = Some(Duration::from_secs(60));
+    // Taken by the first held-wait decision: one after the publication of
+    // the SIGSTOP consumed below, since no stop is held before it.
+    let (first_caught, first_release) = arm_legacy_pause(&worker.legacy_held_wait_pause);
+    let counted = match case {
+        HeldWaitSkip::PendingProbe => None,
+        HeldWaitSkip::CountDuringTurn => {
+            // Hold the worker at the start of a turn, after it read the
+            // counts and before it takes `legacy_wait`, while the consume
+            // below counts its wakeup.
+            wait_for_legacy_hint(&worker, "the SIGSTOP");
+            let (turn_caught, turn_release) = arm_legacy_pause(&worker.legacy_worker_cycle_pause);
+            turn_caught
+                .recv_timeout(Duration::from_secs(2))
+                .expect("the worker never started another turn");
+            let before = worker.legacy_wakeup.lock().targeted;
+            let event = worker.clone();
+            Some(thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_millis(1500);
+                while event.legacy_wakeup.lock().targeted == before {
+                    assert!(
+                        Instant::now() < deadline,
+                        "the consume never counted its wakeup"
+                    );
+                    thread::sleep(Duration::from_micros(200));
+                }
+                turn_release.send(()).unwrap();
+            }))
+        }
+    };
+    let (child, event) =
+        tokio::time::timeout(TRACEE_WAIT_TIMEOUT, child.wait_owned_on_ptracer_thread())
+            .await
+            .unwrap()
+            .unwrap()
+            .assume_stopped();
+    assert_eq!(event, crate::Event::Signal(Signal::SIGSTOP));
+    if let Some(counted) = counted {
+        counted.join().unwrap();
+    }
+    let parent_running = parent.resume(None).unwrap();
+    first_caught
+        .recv_timeout(Duration::from_secs(2))
+        .expect("the worker never decided to hold the SIGSTOP");
+    let held_before = worker.legacy_held_waits.load(Ordering::Relaxed);
+    if case == HeldWaitSkip::PendingProbe {
+        worker.probe_legacy_worker();
+    }
+    // Armed while the worker is paused, so its next held-wait decision
+    // takes it.
+    let (second_caught, second_release) = arm_legacy_pause(&worker.legacy_held_wait_pause);
+    let turns = || worker.legacy_worker_turns.load(Ordering::Relaxed);
+    let turns_before = turns();
+    first_release.send(()).unwrap();
+    second_caught
+        .recv_timeout(Duration::from_secs(2))
+        .expect("the worker never decided to hold the SIGSTOP again");
+    assert_eq!(
+        worker.legacy_held_waits.load(Ordering::Relaxed),
+        held_before,
+        "{case:?}: a held wait was counted although the pending wakeup skipped it"
+    );
+    assert!(
+        turns() > turns_before,
+        "{case:?}: the pending wakeup did not give the worker another turn"
+    );
+    second_release.send(()).unwrap();
+    wait_for_held_wait(&worker, held_before, "the SIGSTOP");
+    let before = turns();
+    thread::sleep(Duration::from_millis(200));
+    let held_turns = turns() - before;
+    assert_eq!(held_turns, 0, "a held worker took {held_turns} turns in 200 ms");
+
+    let exit = child_cleanup.exit_event_on_ptracer_thread(&child).unwrap();
+    // Neither a ptrace request nor a cancellation signal of this ptracer.
+    assert_eq!(unsafe { libc::kill(root.as_raw(), libc::SIGKILL) }, 0);
+    // Nothing polls `exit` until the worker has observed the exit stop on
+    // its own turns, so that a consume by the ptracer cannot stand in for
+    // the probe.
+    wait_for_legacy_hint(&worker, "the group kill");
+    drop(child);
+    let child = tokio::time::timeout(TRACEE_WAIT_TIMEOUT, exit)
+        .await
+        .unwrap()
+        .unwrap();
+    child_cleanup.mark_claimed_exit();
+    assert_eq!(
+        tokio::time::timeout(
+            TRACEE_WAIT_TIMEOUT,
+            child.resume(None).unwrap().wait_owned_on_ptracer_thread()
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .assume_exited(),
+        (
+            child_tid,
+            crate::ExitStatus::Signaled(Signal::SIGKILL, false)
+        ),
+    );
+    assert!(terminal.wait(TRACEE_WAIT_TIMEOUT));
+    child_cleanup.disarm();
+
+    let parent = tokio::time::timeout(TRACEE_WAIT_TIMEOUT, root_exit)
+        .await
+        .unwrap()
+        .unwrap();
+    root_cleanup.mark_claimed_exit();
+    drop(parent_running);
+    assert_eq!(
+        tokio::time::timeout(
+            TRACEE_WAIT_TIMEOUT,
+            parent.resume(None).unwrap().wait_owned_on_ptracer_thread()
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .assume_exited(),
+        (
+            root.into(),
+            crate::ExitStatus::Signaled(Signal::SIGKILL, false)
+        ),
+    );
+    assert!(root_terminal.wait(TRACEE_WAIT_TIMEOUT));
+    root_cleanup.disarm();
+}
+
+// The worker decides to hold the published SIGSTOP while a probe is
+// pending. It polls for the probe instead of waiting, and only the wait it
+// parks in afterwards counts as a held wait.
+#[tokio::test(flavor = "current_thread")]
+#[cfg(not(sanitized))]
+async fn forced_legacy_skipped_held_wait_after_a_probe_is_not_counted() {
+    if run_legacy_test_outer("forced_legacy_skipped_held_wait_after_a_probe_is_not_counted") {
+        return;
+    }
+    legacy_skipped_held_wait_is_not_counted(HeldWaitSkip::PendingProbe).await;
+}
+
+// The ptracer's consume of the SIGSTOP counts its wakeup during the
+// worker's turn, after the worker last read the counts. The worker
+// publishes and holds the stop, but its first held-wait decision sees that
+// count as new and takes one more turn. That turn does not follow a held
+// wait.
+#[tokio::test(flavor = "current_thread")]
+#[cfg(not(sanitized))]
+async fn forced_legacy_skipped_held_wait_after_a_turn_count_is_not_counted() {
+    if run_legacy_test_outer("forced_legacy_skipped_held_wait_after_a_turn_count_is_not_counted") {
+        return;
+    }
+    legacy_skipped_held_wait_is_not_counted(HeldWaitSkip::CountDuringTurn).await;
+}

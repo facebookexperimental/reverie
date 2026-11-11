@@ -742,7 +742,8 @@ struct Event {
     /// and before it takes `legacy_wakeup` to do so.
     #[cfg(test)]
     legacy_held_wait_pause: Mutex<Option<BoundedTestPause>>,
-    /// Waits the worker started as a held worker.
+    /// Waits the worker started as a held worker: counted as it parks for
+    /// the held period, not when a pending wakeup or probe skips the wait.
     #[cfg(test)]
     legacy_held_waits: AtomicUsize,
     /// Pauses the worker once, right after it published a status.
@@ -5197,11 +5198,10 @@ fn legacy_worker_thread(
             pause_retirement_for_test(&event.legacy_sleep_check_pause);
         }
         let mut wakeups = event.legacy_wakeup.lock();
+        let held_timeout = held_wait && held == Some(wakeups.targeted);
         let timeout = if wake {
             legacy_poll_period(event)
-        } else if held_wait && held == Some(wakeups.targeted) {
-            #[cfg(test)]
-            event.legacy_held_waits.fetch_add(1, Ordering::Relaxed);
+        } else if held_timeout {
             held_period
         } else {
             wait
@@ -5214,6 +5214,13 @@ fn legacy_worker_thread(
             let _ = parking.try_send(());
         }
         if *wakeups == seen {
+            // A held wait starts only here. A wakeup this worker has not
+            // acted on yet (a probe, or a count that landed during its turn)
+            // skips the wait, and the turn it then takes is not a held one.
+            #[cfg(test)]
+            if held_timeout {
+                event.legacy_held_waits.fetch_add(1, Ordering::Relaxed);
+            }
             event.legacy_wake.wait_for(&mut wakeups, timeout);
         }
         let targeted = wakeups.targeted != seen.targeted;
