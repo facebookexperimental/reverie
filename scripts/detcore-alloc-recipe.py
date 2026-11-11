@@ -34,17 +34,25 @@ nothing in the emitted row is typed by hand:
   (FIXED_SUPPORT_ROLE_SYMBOLS or FIXED_EMITTED_ROLE_SYMBOLS). This holds also
   when a single structure fits. No match, more than one structure left, or a
   GOT operand bound to another callee is a refusal (exit 3): such a body needs
-  a reviewed operand derivation, not a guess.
+  a reviewed operand derivation, not a guess. Only GOT operands are checked
+  against the ELF: the RIP-relative data and PLT operands (the TLS descriptor,
+  __tls_get_addr's PLT entry, the panic Location data) are copied from the
+  cited structure and left to the qualifier's full binding of the image.
 
 --self-test (no ELF needed) checks that every 241-byte row is in the canonical
-form the generator prints, and that every generated row agrees with its own
-provenance comment: the recorded body SHA256, the recorded INSTALLATION_DEPTH
-cell against the encoded read, and the operands and transfers of the cited
-masked-equal row (and the cited selecting GOT callee). It then runs controls
-that must be refused: a hand-edited encoded cell, operand displacement and
-recorded digest; and, on a synthetic ELF built from each generated row, every
-GOT operand bound to another callee, and the case where the only masked-equal
-structure names a callee the ELF does not bind.
+form the generator prints; that a row without the generated-row marker is one
+of the LEGACY_ROWS, pinned by body and structure digest, each present once; and
+that every generated row agrees with its own provenance comment: the recorded
+body SHA256, the recorded INSTALLATION_DEPTH cell against the encoded read, and
+the operands and transfers of the cited masked-equal row, with the selecting
+GOT callee clause required whenever the cited digest has several structures.
+It then runs controls that must be refused: a hand-edited encoded cell (also
+with its digest re-recorded), operand displacement and recorded digest; the
+callee clause dropped with the callee rekeyed; the marker stripped, alone and
+with an edited operand; a new unmarked row; a legacy row removed; and, on a
+synthetic ELF built from each generated row, every GOT operand bound to another
+callee, and the case where the only masked-equal structure names a callee the
+ELF does not bind.
 
 Usage:
   detcore-alloc-recipe.py --self-test --lib reverie-liteinst-artifact/src/lib.rs
@@ -61,6 +69,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import re
 import struct
 import sys
@@ -274,6 +283,37 @@ def structure_of(row):
     return (tuple(row["operands"]), tuple(row["transfers"]))
 
 
+def body_digest(row) -> str:
+    return hashlib.sha256(bytes.fromhex(row["hex"])).hexdigest()
+
+
+def structure_digest(row) -> str:
+    return hashlib.sha256(json.dumps([row["operands"], row["transfers"]]).encode()).hexdigest()
+
+
+# The 241-byte rows that predate the generator, each pinned by (body SHA256,
+# structure digest) as found at Reverie 9c370385. A row without the
+# generated-row marker must be one of these, and each must be present once;
+# bead dh-a9s8n7 retires entries here with the rows. Recompute with
+# body_digest/structure_digest over that commit's DETCORE_VALIDATE_TEMPLATES.
+_LEGACY_STRUCTURE = "fc26e816f9e9b896e06b50fce6f2eac3346797e2878131771e6ffb6b620d252e"
+LEGACY_ROWS = frozenset({
+    ("ba73e30af1a804ff1e8d572f78173f3f7dbbe07a135d6abf36f880deffe0703d", _LEGACY_STRUCTURE),  # 0xa0
+    ("52121dcd837dd3d03c208a65175fe075551f785b1cdfc84c2f723ea93d52956a", _LEGACY_STRUCTURE),  # 0xe0
+    ("e3640a6c2bf6ab14c37132bad5079062b04f8ee1f33edb8bad1788051d9291bb", _LEGACY_STRUCTURE),  # 0x98
+    ("425180fc2fadd76cf2a9fdb77d09695db03acfedb4fc9e4c6cbafc1b45a3a6f6", _LEGACY_STRUCTURE),  # 0xd8
+    ("ab3dfbbc1ef307c33a2e7cab465a25a5e041f0d92afe6c05163ea787a11a086b", _LEGACY_STRUCTURE),  # 0x128
+    ("ed294f96690817e14de44ca377c77f990b3fe830310934f911963a7b6c5aa104", _LEGACY_STRUCTURE),  # 0xe8
+    # 0xd8, stable-core twin: the null-panic GOT operand is fixed_heap_panic_null.
+    ("425180fc2fadd76cf2a9fdb77d09695db03acfedb4fc9e4c6cbafc1b45a3a6f6",
+     "66404afe9a90c8c787c3a3a87c37addc55cb28f92864168b10e522c914671c81"),
+    ("a3115032ef86e35a3d6945ca24716fd9995f894a7ceb950796c760878ab7881c", _LEGACY_STRUCTURE),  # 0x110
+    ("0be4c788adc82d1f0562d9d3b6123cc17a7ff871075414fab9af5d1b339aea8d", _LEGACY_STRUCTURE),  # 0x100
+    ("35e6645a7743d95b2328662b8218da2b59094e51091a67c04a5210eca436b164", _LEGACY_STRUCTURE),  # 0x108
+    ("a8ebcb1ad9b229aca79d2c5e29344b716eef9df78cf7caf015b9274d8a5ae148", _LEGACY_STRUCTURE),  # 0x148
+})
+
+
 def got_mismatches(elf: Elf, address: int, body: bytes, structure, support: dict[str, set[str]],
                    got: dict[int, int], only: set[int] | None = None) -> list[str]:
     """Every GOT operand of `structure` (or only those indexed by `only`) whose
@@ -409,10 +449,12 @@ def provenance_violations(row, rows) -> list[str]:
     sources = [r for r in rows if GENERATED_MARK not in r["comment"]
                and hashlib.sha256(bytes.fromhex(r["hex"])).hexdigest() == cited.group(1)]
     same = [r for r in sources if structure_of(r) == structure_of(row) and matches(body, r)]
+    structures = {structure_of(r) for r in sources}
     if not same:
         bad.append("operands/transfers are not those of the cited masked-equal row")
+    elif len(structures) > 1 and not cited.group(2):
+        bad.append("the cited digest has several structures but no selecting GOT callee is recorded")
     elif cited.group(2):
-        structures = {structure_of(r) for r in sources}
         differing = sorted({i for i in range(len(row["operands"]))
                             if len({s[0][i][2] for s in structures}) > 1})
         if [row["operands"][i][2] for i in differing] != [k.strip() for k in cited.group(2).split(",")]:
@@ -427,6 +469,7 @@ def check_rows(text: str) -> tuple[int, list[str]]:
     lines = text.splitlines()
     failures = []
     count = 0
+    legacy_seen: dict[tuple[str, str], int] = {}
     for row in rows:
         body = bytes.fromhex(row["hex"])
         if len(body) != BODY_LEN:
@@ -438,6 +481,16 @@ def check_rows(text: str) -> tuple[int, list[str]]:
             failures.append(f"row at lib.rs:{row['line']} is not in canonical form")
         if GENERATED_MARK in row["comment"]:
             failures += [f"generated row at lib.rs:{row['line']}: {v}" for v in provenance_violations(row, rows)]
+            continue
+        key = (body_digest(row), structure_digest(row))
+        if key not in LEGACY_ROWS:
+            failures.append(f"row at lib.rs:{row['line']} has no generated-row provenance and is not a pinned "
+                            f"legacy row (body {key[0][:16]}, structure {key[1][:16]})")
+        legacy_seen[key] = legacy_seen.get(key, 0) + 1
+    for key in sorted(LEGACY_ROWS):
+        if legacy_seen.get(key, 0) != 1:
+            failures.append(f"pinned legacy row (body {key[0][:16]}, structure {key[1][:16]}) appears "
+                            f"{legacy_seen.get(key, 0)} times, expected once")
     return count, failures
 
 
@@ -513,6 +566,29 @@ def synthetic_elf(body: bytes, address: int, structure, support: dict[str, set[s
     return bytes(image)
 
 
+def strip_comment(block: str) -> str:
+    """A generated row's block without its provenance comment lines."""
+
+    return "\n".join(line for line in block.split("\n") if not line.lstrip().startswith("//"))
+
+
+def rekey_last_got(block: str, row, rows) -> str:
+    """`block` with the row's last GOT operand that a same-digest twin keys
+    differently given the twin's key instead (unchanged when there is none)."""
+
+    twins = [r for r in rows if r is not row and GENERATED_MARK not in r["comment"]
+             and matches(bytes.fromhex(row["hex"]), r) and structure_of(r) != structure_of(row)]
+    for index in sorted((i for i, op in enumerate(row["operands"]) if op[3]), reverse=True):
+        for twin in twins:
+            other = twin["operands"][index][2]
+            if other != row["operands"][index][2]:
+                operands = [op if i != index else (op[0], op[1], other, op[3])
+                            for i, op in enumerate(row["operands"])]
+                body = bytes.fromhex(row["hex"])
+                return block.replace(render(body, row), render(body, {**row, "operands": operands}))
+    return block
+
+
 def generated_block(text: str, row) -> str:
     """The generated row's provenance comment plus its template, as in lib.rs."""
 
@@ -549,7 +625,7 @@ def self_test(text: str) -> int:
         cell_at = 2 * TLS_DISPLACEMENT[0]
         first = row["operands"][0]
         moved = row["hex"][:cell_at] + f"{(body[66] + 8) & 0xff:02x}" + row["hex"][cell_at + 2:]
-        for label, edited in {
+        edits = {
             "encoded TLS cell": block.replace(row["hex"], moved),
             # The same edit with its digest re-recorded: only the recorded
             # cell can refuse it.
@@ -558,7 +634,17 @@ def self_test(text: str) -> int:
             "operand displacement": block.replace(
                 f"displacement: {first[0]},", f"displacement: {first[0] - 1},", 1),
             "recorded body SHA256": re.sub(r"(body SHA256: )[0-9a-f]{64}", r"\g<1>" + "0" * 64, block),
-        }.items():
+            # The selecting-callee clause dropped and the callee rekeyed to its twin's.
+            "selecting callee, clause dropped": rekey_last_got(re.sub(
+                r", selected by bound GOT callee [a-z0-9_, ]+\.", ".", block), row, rows),
+            # The marker stripped: the row is then neither generated nor legacy.
+            "provenance marker, stripped": strip_comment(block),
+            "provenance marker, stripped with an edited operand": strip_comment(block).replace(
+                f"displacement: {first[0]},", f"displacement: {first[0] - 1},", 1),
+            # A hand-typed unmarked row beside it (cell moved).
+            "new unmarked row": block + "\n" + strip_comment(block).replace(row["hex"], moved),
+        }
+        for label, edited in edits.items():
             control(edited != block and bool(check_rows(text.replace(block, edited))[1]),
                     f"a hand-edited {label} in {where} was not refused")
         # The generator derives this row from an ELF whose GOT binds the
@@ -598,6 +684,12 @@ def self_test(text: str) -> int:
         control(bool(sources) and rc == 3,
                 f"{where}: with {right} rekeyed to {wrong} in every source row, the lone wrong structure "
                 f"was not refused (rc {rc})")
+    # Every pinned legacy row is required: dropping one is refused.
+    legacy = [r for r in rows if len(r["hex"]) == 2 * BODY_LEN and GENERATED_MARK not in r["comment"]]
+    if legacy:
+        template = render(bytes.fromhex(legacy[0]["hex"]), legacy[0]) + "\n"
+        control(text.count(template) == 1 and bool(check_rows(text.replace(template, "", 1))[1]),
+                f"dropping the legacy row at lib.rs:{legacy[0]['line']} was not refused")
     print(f"self-test: {count} {BODY_LEN}-byte {ROLE} rows ({len(generated)} generated), "
           f"{controls} controls, {len(failures)} failure(s)")
     return 1 if failures or count == 0 else 0
