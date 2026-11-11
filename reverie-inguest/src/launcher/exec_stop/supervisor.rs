@@ -4754,7 +4754,7 @@ int main(int argc, char **argv) {
     fn sibling_exec_check_uses_the_host_execve_number() {
         // The Exec classification must key on the host's execve
         // numbers, not another architecture's: 59 is execve only on
-        // x86_64, and semtimedop on aarch64.
+        // x86_64; on aarch64 it is pipe2 (semtimedop is 192 there).
         assert!(super::is_exec_entry(
             libc::SYS_execve,
             super::EntryAbi::Native
@@ -4767,6 +4767,21 @@ int main(int argc, char **argv) {
             libc::SYS_read,
             super::EntryAbi::Native
         ));
+        // Literal pins, independent of libc's table, so a binding
+        // regression cannot silently re-key the classification.
+        #[cfg(target_arch = "aarch64")]
+        {
+            // Compile-checked only here: this arm is type-checked by
+            // the aarch64 cargo check, not natively executed.
+            assert!(super::is_exec_entry(221, super::EntryAbi::Native));
+            assert!(super::is_exec_entry(281, super::EntryAbi::Native));
+            assert!(!super::is_exec_entry(59, super::EntryAbi::Native));
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert!(super::is_exec_entry(59, super::EntryAbi::Native));
+            assert!(super::is_exec_entry(322, super::EntryAbi::Native));
+        }
     }
 
     #[test]
