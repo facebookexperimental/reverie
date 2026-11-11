@@ -2336,13 +2336,13 @@ async fn forced_legacy_resumed_owner_wait_after_nonleader_exec_ignores_another_t
 #[cfg(not(sanitized))]
 const COLLIDING_TID_OFFSET: i32 = 4096;
 
+/// Runs one colliding-task test in a fresh user and PID namespace.
+///
 /// Unlike the other PID-namespace tests, which pass when the namespace or
-/// clone3(set_tid) is refused, the two colliding-task tests then fail,
-/// unless this variable is set to accept that explicitly: they must not pass
-/// without running.
-#[cfg(not(sanitized))]
-const ACCEPT_UNAVAILABLE_COLLIDING_TASK: &str = "SAFEPTRACE_ACCEPT_UNAVAILABLE_COLLIDING_TASK";
-
+/// clone3(set_tid) is refused, these two then fail, always, naming the test
+/// and the refused facility: they are the only check that another task's
+/// detach cannot cancel the resumed leader's mark, so they must not pass
+/// without running. There is no opt-out.
 #[cfg(not(sanitized))]
 async fn another_tasks_detach_case(name: &str, force_legacy: bool) {
     const INNER: &str = "SAFEPTRACE_ANOTHER_TASKS_DETACH_INNER";
@@ -2355,14 +2355,10 @@ async fn another_tasks_detach_case(name: &str, force_legacy: bool) {
         );
         match classify_exact_reuse_output(output.as_ref(), MARKER, UNAVAILABLE).unwrap() {
             ExactReuseOutcome::Exercised => emit_completion_marker(MARKER),
-            ExactReuseOutcome::Unavailable => {
-                assert!(
-                    env::var_os(ACCEPT_UNAVAILABLE_COLLIDING_TASK).is_some(),
-                    "{name} did not run: this host refused the user and PID namespace or \
-                     clone3(set_tid). Set {ACCEPT_UNAVAILABLE_COLLIDING_TASK}=1 to accept that"
-                );
-                println!("{UNAVAILABLE}");
-            }
+            ExactReuseOutcome::Unavailable => panic!(
+                "{name} FAILED: it did not run, because {}. It has no opt-out",
+                colliding_task_refusal(output.as_ref(), UNAVAILABLE)
+            ),
         }
         return;
     }
@@ -2371,6 +2367,25 @@ async fn another_tasks_detach_case(name: &str, force_legacy: bool) {
     } else {
         println!("{UNAVAILABLE}");
     }
+}
+
+/// Which facility an unavailable colliding-task run was refused, as
+/// classified by `classify_exact_reuse_output`.
+#[cfg(not(sanitized))]
+fn colliding_task_refusal(output: Option<&Output>, unavailable: &str) -> String {
+    let Some(output) = output else {
+        return "`unshare` is not installed, so no user and PID namespace could be created"
+            .to_owned();
+    };
+    if String::from_utf8_lossy(&output.stdout).contains(unavailable) {
+        return "clone3(set_tid) was refused inside the user and PID namespace".to_owned();
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let denial = stderr
+        .lines()
+        .find(|line| line.starts_with("unshare: "))
+        .unwrap_or("no unshare error line");
+    format!("the user and PID namespace was refused ({denial})")
 }
 
 /// A child of this thread at exactly TID `requested`, stopped by
