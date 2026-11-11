@@ -1485,6 +1485,7 @@ name = "reverie-procfs"
 version = "0.5.6"
 dependencies = [
  "libc",
+ "syn 2.0.119",
 ]
 
 [[package]]

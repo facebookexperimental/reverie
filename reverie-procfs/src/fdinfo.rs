@@ -411,6 +411,29 @@ mod tests {
         );
     }
 
+    /// An unknown lock class and a mandatory lock, bytes a future
+    /// caller's mapping depends on: `Unknown` ignores `mandatory`,
+    /// `start` and `end` (`0 EOF`), as Detcore's previously unreachable
+    /// wildcard arm did; `mandatory` prints `MANDATORY` in place of
+    /// `ADVISORY` for record locks only.
+    #[test]
+    fn prints_unknown_and_mandatory_lock_lines() {
+        let mut mandatory = lock(LockKind::Posix, false, 3, 0, None);
+        mandatory.mandatory = true;
+        let fdinfo = Fdinfo {
+            locks: vec![lock(LockKind::Unknown, true, 9, 50, Some(60)), mandatory],
+            ..plain(0, 2, 1, 1234)
+        };
+        let text = rendered(&fdinfo);
+        assert_eq!(
+            text.lines().skip(4).take(2).collect::<Vec<_>>(),
+            [
+                "lock:\t1: UNKNOWN UNKNOWN  WRITE 9 00:2a:1234 0 EOF",
+                "lock:\t2: POSIX  MANDATORY READ 3 00:2a:1234 0 EOF",
+            ]
+        );
+    }
+
     /// A device whose major is wider than two hex digits, as Linux
     /// prints `%02x`: no truncation, no padding beyond two.
     #[test]

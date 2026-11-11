@@ -14,3 +14,6 @@ categories = ["development-tools::debugging", "os::linux-apis"]
 
 [dependencies]
 libc = "0.2.186"
+
+[dev-dependencies]
+syn = { version = "2", features = ["full", "visit"] }

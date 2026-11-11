@@ -28,6 +28,7 @@ pub use fdinfo::FdinfoKind;
 pub use fdinfo::FdinfoLock;
 pub use fdinfo::LockKind;
 pub use fdinfo::TimerfdLines;
+pub use fdinfo::render as render_fdinfo;
 
 pub use mountinfo::MOUNT_PEER_PREFIXES;
 pub use mountinfo::MountInfoRow;
