@@ -515,7 +515,7 @@
       "labels": [
         "full"
       ],
-      "cmd": "./scripts/libtest-counts.rs run-nextest target/validate/counts-test-core.json -- cargo nextest run --binaries-metadata target/validate/binaries-metadata.json -E \"(package(safeptrace) | package(reverie-core) | package(reverie-rpc-transport) | package(reverie-process) | package(reverie-loader) | package(reverie-test-support) | package(reverie-syscalls) | package(reverie-memory) | package(reverie-util) | package(nostd-print) | package(reverie-linux-provider) | package(reverie-rpc) | package(riptrace-rpc)) & $REVERIE_NEXTEST_SKIP_FILTER\"",
+      "cmd": "./scripts/libtest-counts.rs run-nextest target/validate/counts-test-core.json -- cargo nextest run --binaries-metadata target/validate/binaries-metadata.json -E \"(package(safeptrace) | package(reverie-core) | package(reverie-rpc-transport) | package(reverie-process) | package(reverie-procfs) | package(reverie-loader) | package(reverie-test-support) | package(reverie-syscalls) | package(reverie-memory) | package(reverie-util) | package(nostd-print) | package(reverie-linux-provider) | package(reverie-rpc) | package(riptrace-rpc)) & $REVERIE_NEXTEST_SKIP_FILTER\"",
       "deps": [
         "build.test_binaries",
         "fixtures.liteinst"

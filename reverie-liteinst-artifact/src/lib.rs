@@ -1229,8 +1229,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "Cargo.toml",
-        684,
-        "44fa1e4c6cae8a913517e223840ed1afe5309f30c179deb903bed42fd8b71233",
+        706,
+        "c16e991c5e8ba091ada2475358a4f5e4fc17c5b8aa9f82d7877ec3a7cac3d50b",
     ),
     (
         "reverie-liteinst-artifact/Cargo.toml",
