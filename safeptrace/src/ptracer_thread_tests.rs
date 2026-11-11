@@ -2416,9 +2416,13 @@ fn traced_child_at(requested: Pid) -> Option<Stopped> {
         set_tid_size: 1,
         ..CloneArgs::default()
     };
-    let result = unsafe { libc::syscall(libc::SYS_clone3, &args, mem::size_of::<CloneArgs>()) };
+    // Under the spawn/fork lock, like every raw creation in the lib tests;
+    // errno is read inside it, before the guard's release.
+    let (result, error) = crate::test_fork::exclusive(|| {
+        let result = unsafe { libc::syscall(libc::SYS_clone3, &args, mem::size_of::<CloneArgs>()) };
+        (result, Errno::last())
+    });
     if result == -1 {
-        let error = Errno::last();
         assert!(
             matches!(error, Errno::EPERM | Errno::EACCES | Errno::ENOSYS),
             "unexpected clone3(set_tid) refusal: {error}"
