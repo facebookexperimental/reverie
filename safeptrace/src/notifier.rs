@@ -222,8 +222,16 @@ struct BoundedTestPause {
 
 #[cfg(test)]
 fn pause_retirement_for_test(slot: &Mutex<Option<BoundedTestPause>>) {
+    pause_for_test_noting(slot, || {});
+}
+
+/// Like [`pause_retirement_for_test`], and runs `note` once it took the
+/// pause, before it reports the capture.
+#[cfg(test)]
+fn pause_for_test_noting(slot: &Mutex<Option<BoundedTestPause>>, note: impl FnOnce()) {
     let pause = slot.lock().take();
     if let Some(pause) = pause {
+        note();
         let _ = pause.captured.send(());
         let _ = pause.resume.recv_timeout(Duration::from_secs(2));
     }
@@ -742,11 +750,19 @@ struct Event {
     /// and before it takes `legacy_wakeup` to do so.
     #[cfg(test)]
     legacy_held_wait_pause: Mutex<Option<BoundedTestPause>>,
+    /// What the worker held when it took `legacy_held_wait_pause`: the status
+    /// it published last, and the targeted wakeup count it read before that
+    /// publication. Syscall entry and exit stops share one status; the count
+    /// tells them apart, since the request that ended the earlier stop
+    /// counted.
+    #[cfg(test)]
+    legacy_held_wait_paused_on: Mutex<Option<(i32, u64)>>,
     /// Waits the worker started as a held worker: counted as it parks for
     /// the held period, not when a pending wakeup or probe skips the wait.
     #[cfg(test)]
     legacy_held_waits: AtomicUsize,
-    /// Notifies of `legacy_wake` that woke the worker, its only waiter.
+    /// Notifies of `legacy_wake` that woke the worker, its only waiter,
+    /// counted by [`Event::notify_legacy_worker`] once the notify returned.
     #[cfg(test)]
     legacy_notify_wakes: AtomicUsize,
     /// Waits of the worker that a notify ended. With parking_lot's condvar
@@ -1498,6 +1514,8 @@ impl Event {
             #[cfg(test)]
             legacy_held_wait_pause: Mutex::new(None),
             #[cfg(test)]
+            legacy_held_wait_paused_on: Mutex::new(None),
+            #[cfg(test)]
             legacy_held_waits: AtomicUsize::new(0),
             #[cfg(test)]
             legacy_notify_wakes: AtomicUsize::new(0),
@@ -1591,6 +1609,21 @@ impl Event {
 
     /// Notifies `legacy_wake`, after the caller counted a wakeup and
     /// released its locks. Tests count each notify that woke the worker.
+    ///
+    /// Every notify of `legacy_wake` must go through here. Tests decide that
+    /// a held wait is quiescent by comparing `legacy_notify_wakes` with the
+    /// worker's own count of the waits a notify ended (see
+    /// `wait_for_fresh_held_wait` in the legacy thread tests); a direct
+    /// `legacy_wake.notify_one()` would wake the worker uncounted, and that
+    /// check would accept a held wait the uncounted wake ends.
+    ///
+    /// The count moves only after `notify_one` returns, so a notifier that
+    /// has counted its wakeup but not yet returned from here has a wake in
+    /// flight that the comparison cannot see. A test may rely on it only once
+    /// every notifier of this Event has returned from here and no other can
+    /// start. Even then the two counts match one for one only at rest: from
+    /// a notify that wakes the worker until the worker has returned from its
+    /// wait and this function from its count, either may run ahead.
     fn notify_legacy_worker(&self) {
         let _woke = self.legacy_wake.notify_one();
         #[cfg(test)]
@@ -5077,6 +5110,9 @@ fn legacy_worker_thread(
     // While the ptracer holds the tracee in a stop this worker published:
     // the targeted wakeup count read just before that publication.
     let mut held: Option<u64> = None;
+    // The status of that publication, for `legacy_held_wait_paused_on`.
+    #[cfg(test)]
+    let mut held_status = 0;
     // While a probed held worker polls: until when.
     let mut probing_until: Option<Instant> = None;
     loop {
@@ -5128,6 +5164,10 @@ fn legacy_worker_thread(
                 break;
             }
             held = libc::WIFSTOPPED(status).then_some(before_publication);
+            #[cfg(test)]
+            {
+                held_status = status;
+            }
             probing_until = None;
             wait = LEGACY_FIRST_WAIT;
             continue;
@@ -5258,7 +5298,9 @@ fn legacy_worker_thread(
         let held_period = legacy_held_period(event);
         #[cfg(test)]
         if held_wait {
-            pause_retirement_for_test(&event.legacy_held_wait_pause);
+            pause_for_test_noting(&event.legacy_held_wait_pause, || {
+                *event.legacy_held_wait_paused_on.lock() = held.map(|count| (held_status, count));
+            });
         }
         #[cfg(test)]
         if wake {

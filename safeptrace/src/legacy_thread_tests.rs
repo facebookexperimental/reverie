@@ -1782,6 +1782,10 @@ fn wait_for_held_wait(event: &Event, before: usize, what: &str) {
 /// delivered cannot be ended by any of them. A worker still due a delivered
 /// wake takes that turn and parks again, so the wait ends.
 ///
+/// Every notifier of `event` must have returned from
+/// [`Event::notify_legacy_worker`] before the call, and no other may start
+/// during it: a notify still in flight is not counted yet (see there).
+///
 /// `while_waiting` runs on each poll that does not see such a park yet.
 fn wait_for_fresh_held_wait(
     event: &Event,
@@ -1841,6 +1845,34 @@ async fn forced_legacy_resume_racing_a_held_wait_is_not_lost() {
     if run_legacy_test_outer("forced_legacy_resume_racing_a_held_wait_is_not_lost") {
         return;
     }
+    legacy_resume_racing_a_held_wait(None).await;
+}
+
+// The order of a failed run of the test above, forced. The consume of a read
+// exit notified the worker only after the worker had published that stop
+// and parked held, and the next round's sync accepted that park. The late
+// wake then gave the worker a turn on the old stop once the round had armed
+// its held-wait pause, so the pause took the old stop, not the read entry.
+// Here the consume before round 1, an odd round, notifies late: its notify
+// waits until the worker parked held, and the woken worker is held at the
+// start of the turn the notify gives it. The round's sync must wait that
+// turn out.
+#[tokio::test(flavor = "current_thread")]
+#[cfg(not(sanitized))]
+async fn forced_legacy_resume_racing_a_held_wait_waits_out_a_late_consume_notify() {
+    if run_legacy_test_outer(
+        "forced_legacy_resume_racing_a_held_wait_waits_out_a_late_consume_notify",
+    ) {
+        return;
+    }
+    legacy_resume_racing_a_held_wait(Some(1)).await;
+}
+
+/// The body of `forced_legacy_resume_racing_a_held_wait_is_not_lost`. With
+/// `late_notify_round`, an odd round, the consume of the read exit before
+/// that round notifies late ([`notify_after_held_park`]).
+#[cfg(not(sanitized))]
+async fn legacy_resume_racing_a_held_wait(late_notify_round: Option<usize>) {
     const ROUNDS: usize = 10;
     let [read_end, write_end] = legacy_pipe();
     let modes: &'static [usize] = Box::leak(Box::new([1000 + read_end.as_raw_fd() as usize]));
@@ -1905,33 +1937,73 @@ async fn forced_legacy_resume_racing_a_held_wait_is_not_lost() {
             .unwrap()
             .unwrap()
             .assume_stopped();
+    // The turn a late notify gave the worker, paused at its start.
+    let mut late_turn: Option<mpsc::SyncSender<()>> = None;
     for round in 0..ROUNDS {
-        // At the previous read's exit stop: wait until the worker holds it,
-        // so that the pause below can only take the next stop.
-        wait_for_held_wait(&event, held, &format!("round {round}: read exit"));
+        // At the previous read's exit stop: wait until the worker holds it
+        // after every wake delivered to it, so that the pause below can only
+        // take the next stop. The wait that returned that stop ran the
+        // consume's notify on this thread, and nothing else notifies the
+        // worker until the resume below.
+        wait_for_fresh_held_wait(&event, held, &format!("round {round}: read exit"), || {
+            if let Some(release) = late_turn.take() {
+                release.send(()).unwrap();
+            }
+        });
         let (captured, capture) = mpsc::sync_channel(1);
         let (release, released) = mpsc::sync_channel(1);
         let pause = BoundedTestPause {
             captured,
             resume: released,
         };
-        if round % 2 == 0 {
-            *event.legacy_publish_pause.lock() = Some(pause);
+        // The resume below counts a wakeup before the next publication can
+        // read the count, so only a stop published earlier has a count up to
+        // this one.
+        let armed = event.legacy_wakeup.lock().targeted;
+        let slot = if round % 2 == 0 {
+            &event.legacy_publish_pause
         } else {
-            *event.legacy_held_wait_pause.lock() = Some(pause);
+            &event.legacy_held_wait_pause
+        };
+        *slot.lock() = Some(pause);
+        if let Some(release) = late_turn.take() {
+            // The sync accepted the held wait that the late notify ended. As
+            // in the failed run, the late turn runs once the pause is armed
+            // and before the resume: let it reach the pause.
+            drop(release);
+            let deadline = Instant::now() + Duration::from_millis(1500);
+            while slot.lock().is_some() && Instant::now() < deadline {
+                thread::sleep(Duration::from_micros(200));
+            }
         }
         let entry = next_syscall_stop(child).await;
         capture
             .recv_timeout(TRACEE_WAIT_TIMEOUT)
             .unwrap_or_else(|_| panic!("round {round}: the worker never reached the pause"));
+        if round % 2 == 1 {
+            let (status, count) = event
+                .legacy_held_wait_paused_on
+                .lock()
+                .take()
+                .unwrap_or_else(|| panic!("round {round}: the held-wait pause recorded nothing"));
+            assert!(
+                count > armed,
+                "round {round}: the pause captured the old stop: it held status {status:#x} \
+                 published at targeted wakeup count {count}, and the pause was armed at {armed}"
+            );
+        }
         assert!(is_read_entry(&entry), "round {round}: not at the read entry");
         let running = entry.syscall(None).unwrap();
-        release.send(()).unwrap();
+        release
+            .send(())
+            .unwrap_or_else(|_| panic!("round {round}: the pause had already resumed by itself"));
         thread::sleep(Duration::from_millis(20));
         assert!(event.legacy_wait.lock().observed.is_none());
         write_byte();
         wait_for_legacy_hint(&event, &format!("round {round}: read exit"));
         held = event.legacy_held_waits.load(Ordering::Relaxed);
+        let late = (late_notify_round == Some(round + 1))
+            .then(|| notify_after_held_park(&event, held));
         let (exit, stop) =
             tokio::time::timeout(TRACEE_WAIT_TIMEOUT, running.wait_owned_on_ptracer_thread())
                 .await
@@ -1939,6 +2011,9 @@ async fn forced_legacy_resume_racing_a_held_wait_is_not_lost() {
                 .unwrap()
                 .assume_stopped();
         assert_eq!(stop, crate::Event::Syscall);
+        if let Some(late) = late {
+            late_turn = Some(late.join().unwrap());
+        }
         child = exit;
     }
 
@@ -2102,6 +2177,51 @@ fn arm_legacy_pause(
     let (release, resume) = mpsc::sync_channel(1);
     *slot.lock() = Some(BoundedTestPause { captured, resume });
     (capture, release)
+}
+
+/// Holds the notify of the ptracer's next consume (in
+/// `try_assist_legacy_wait`) for the worker of `event` until that worker has
+/// published the consumed stop and parked held after `held_before` held
+/// waits, then lets the notify go with the worker's next turn paused at its
+/// start. The thread returns the sender that releases that turn; dropping
+/// it also does.
+#[cfg(not(sanitized))]
+fn notify_after_held_park(
+    event: &Arc<Event>,
+    held_before: usize,
+) -> thread::JoinHandle<mpsc::SyncSender<()>> {
+    let (notify_caught, notify_release) = arm_legacy_pause(&event.legacy_assist_notify_pause);
+    let event = event.clone();
+    thread::spawn(move || {
+        notify_caught
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the consume never reached its notify");
+        // The ptracer counted, released `legacy_wait` and has not notified:
+        // the worker publishes the stop and parks held meanwhile.
+        let deadline = Instant::now() + Duration::from_millis(1500);
+        while event.legacy_held_waits.load(Ordering::Relaxed) <= held_before {
+            assert!(
+                Instant::now() < deadline,
+                "the worker never parked held before the late notify"
+            );
+            thread::sleep(Duration::from_micros(200));
+        }
+        // It counts under `legacy_wakeup` and releases it only once it is
+        // queued on `legacy_wake`: holding the lock here means it is parked.
+        drop(event.legacy_wakeup.lock());
+        let parked = event.legacy_worker_wakes.load(Ordering::Relaxed);
+        let (turn_caught, turn_release) = arm_legacy_pause(&event.legacy_worker_cycle_pause);
+        notify_release.send(()).unwrap();
+        turn_caught
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the late notify did not wake the parked worker");
+        assert_eq!(
+            event.legacy_worker_wakes.load(Ordering::Relaxed),
+            parked + 1,
+            "the late notify did not end the held wait"
+        );
+        turn_release
+    })
 }
 
 #[cfg(not(sanitized))]
@@ -2525,38 +2645,7 @@ async fn forced_legacy_held_turn_check_waits_out_a_late_consume_notify() {
     let worker = terminal.event.event().clone();
     *worker.legacy_held_period.lock() = Some(Duration::from_secs(60));
     let held_before = worker.legacy_held_waits.load(Ordering::Relaxed);
-    let (notify_caught, notify_release) = arm_legacy_pause(&worker.legacy_assist_notify_pause);
-    let event = worker.clone();
-    let delay = thread::spawn(move || {
-        notify_caught
-            .recv_timeout(Duration::from_secs(2))
-            .expect("the consume never reached its notify");
-        // The ptracer counted, released `legacy_wait` and has not notified:
-        // the worker publishes the stop and parks held meanwhile.
-        let deadline = Instant::now() + Duration::from_millis(1500);
-        while event.legacy_held_waits.load(Ordering::Relaxed) <= held_before {
-            assert!(
-                Instant::now() < deadline,
-                "the worker never parked held before the late notify"
-            );
-            thread::sleep(Duration::from_micros(200));
-        }
-        // It counts under `legacy_wakeup` and releases it only once it is
-        // queued on `legacy_wake`: holding the lock here means it is parked.
-        drop(event.legacy_wakeup.lock());
-        let parked = event.legacy_worker_wakes.load(Ordering::Relaxed);
-        let (turn_caught, turn_release) = arm_legacy_pause(&event.legacy_worker_cycle_pause);
-        notify_release.send(()).unwrap();
-        turn_caught
-            .recv_timeout(Duration::from_secs(2))
-            .expect("the late notify did not wake the parked worker");
-        assert_eq!(
-            event.legacy_worker_wakes.load(Ordering::Relaxed),
-            parked + 1,
-            "the late notify did not end the held wait"
-        );
-        turn_release
-    });
+    let delay = notify_after_held_park(&worker, held_before);
     let (child, event) =
         tokio::time::timeout(TRACEE_WAIT_TIMEOUT, child.wait_owned_on_ptracer_thread())
             .await
