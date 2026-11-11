@@ -54,6 +54,30 @@
       "jobs_flag": ""
     },
     {
+      "group": "check",
+      "job": "detcore_alloc_recipe_self_test",
+      "desc": "Detcore allocation recipe generator round trip",
+      "description": "Runs scripts/detcore-alloc-recipe.py --self-test: every 241-byte fixed_patch_alloc row in reverie-liteinst-artifact/src/lib.rs must re-render from the generator's own parse to its exact text, so a row edited by hand away from the generator's output fails here. Reads lib.rs only; no ELF and no build.",
+      "labels": [
+        "full"
+      ],
+      "cmd": "python3 -I -B scripts/detcore-alloc-recipe.py --self-test --lib reverie-liteinst-artifact/src/lib.rs",
+      "deps": [],
+      "env": {},
+      "timeout": 120,
+      "cpu_timeout": 30,
+      "priority": 60,
+      "hint": {
+        "resources": {},
+        "est_duration_s": 1,
+        "rss_baseline_bytes": 100000000,
+        "hard_mem_max_bytes": 512000000,
+        "classification": "cpu-bound",
+        "preferred_inner_jobs": 1
+      },
+      "jobs_flag": ""
+    },
+    {
       "group": "lint",
       "job": "rustfmt",
       "desc": "Rustfmt",
