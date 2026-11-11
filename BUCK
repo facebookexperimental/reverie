@@ -1,6 +1,7 @@
 load(
     "@fbcode//hermetic_infra/reverie/fb-only:defs.bzl",
     "DOWNSTREAM_TEST_VISIBILITY",
+    "REVERIE_SOURCE_ROOT",
     "downstream_source_exports",
     "excluded_paths_test",
     "gated_test",
@@ -788,7 +789,9 @@ rust_unittest(
     crate = "reverie_linuxemu",
     crate_root = "reverie-linuxemu/src/lib.rs",
     env = {
-        "CARGO_MANIFEST_DIR": "hermetic_infra/reverie/reverie-linuxemu",
+        # Relative to the directory the test runs in: this tree's
+        # reverie-linuxemu, wherever fb-only/defs.bzl says Reverie's sources are.
+        "CARGO_MANIFEST_DIR": REVERIE_SOURCE_ROOT + "/reverie-linuxemu",
         "CARGO_PKG_NAME": "reverie-linuxemu",
     },
     labels = run_gated_only(),
@@ -803,7 +806,7 @@ rust_unittest(
     # compile-time CARGO_MANIFEST_DIR. rustc_action applies --env-set after
     # canonicalizing path environment, so a remote compile keeps it relative,
     # as the run-time value is.
-    rustc_flags = ["--env-set=CARGO_MANIFEST_DIR=hermetic_infra/reverie/reverie-linuxemu"],
+    rustc_flags = ["--env-set=CARGO_MANIFEST_DIR=" + REVERIE_SOURCE_ROOT + "/reverie-linuxemu"],
     target_compatible_with = [
         "ovr_config//cpu:x86_64",
         "ovr_config//os:linux",
