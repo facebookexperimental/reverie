@@ -61,6 +61,21 @@ use reverie_ptrace::testing::test_fn;
 use serde::Deserialize;
 use serde::Serialize;
 
+/// Prints a guest's result line to its stdout descriptor and flushes it.
+/// These guests run as forked `test_fn` closures, and libtest's output
+/// capture, inherited across the fork, would take a guest's `println!`
+/// unless the run passes `--nocapture`: the parent would then read an empty
+/// stdout (see `reverie_ptrace::spawn_fn_with_config`). The bytes written are
+/// the ones `println!` writes.
+macro_rules! guest_println {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let mut out = std::io::stdout().lock();
+        writeln!(out, $($arg)*).expect("write the guest's stdout");
+        out.flush().expect("flush the guest's stdout");
+    }};
+}
+
 /// The guest dups its pipe's write end here; a zero-length write to this
 /// descriptor is the marker the tool replaces with a one-byte write.
 const PROBE_FD: i32 = 900;
@@ -954,7 +969,7 @@ fn guest() {
     );
     outcome.bytes += drain(read_fd);
     let others: Vec<String> = outcome.other_returns.iter().map(i64::to_string).collect();
-    println!(
+    guest_println!(
         "{} {} {} {}",
         outcome.markers,
         outcome.returned_one,
@@ -1113,7 +1128,7 @@ fn injected_syscall_completed_before_signal_delivery_keeps_its_result() {
             0usize,
         );
         let calls = SIGSYS_HANDLER_CALLS.load(Ordering::Relaxed);
-        println!("{ret} {calls}");
+        guest_println!("{ret} {calls}");
     })
     .expect("run sigqueue guest");
     assert_eq!(
@@ -1243,7 +1258,7 @@ fn injected_syscall_completed_before_two_signal_deliveries_delivers_both() {
             &set as *const libc::sigset_t,
             0usize,
         );
-        println!(
+        guest_println!(
             "{ret} {} {}",
             SIGSYS_HANDLER_CALLS.load(Ordering::Relaxed),
             SIGSEGV_HANDLER_CALLS.load(Ordering::Relaxed)
@@ -1313,7 +1328,7 @@ fn signal_pending_before_injected_syscall_interrupts_it() {
             0usize,
         );
         let errno = *libc::__errno_location();
-        println!(
+        guest_println!(
             "{ret} {errno} {}",
             SIGUSR1_HANDLER_CALLS.load(Ordering::Relaxed)
         );
@@ -1378,7 +1393,7 @@ fn a_held_sigchld_the_tool_drops_never_reaches_the_guest() {
             0usize,
         );
         let errno = *libc::__errno_location();
-        println!(
+        guest_println!(
             "{ret} {errno} {} {}",
             SIGCHLD_HANDLER_CALLS.load(Ordering::Relaxed),
             SIGURG_HANDLER_CALLS.load(Ordering::Relaxed),
@@ -1462,7 +1477,7 @@ fn a_reporting_tool_reads_and_replaces_a_signals_siginfo() {
                 }
             })
             .collect();
-        println!("{}", shown.join(" "));
+        guest_println!("{}", shown.join(" "));
     })
     .expect("run siginfo-replacing guest");
     assert_eq!(
@@ -1554,7 +1569,7 @@ fn a_refused_siginfo_replacement_is_reported_to_the_tool() {
                     }
                 })
                 .collect();
-            println!("{}", shown.join(" "));
+            guest_println!("{}", shown.join(" "));
         },
     );
     assert_eq!(
@@ -1611,7 +1626,7 @@ fn a_siginfo_replacement_does_not_bind_a_different_resumed_signal() {
         );
         let usr1 = SIGUSR1_SIGINFO.lock().unwrap().len();
         let usr2 = SIGUSR2_SI_CODES.lock().unwrap().clone();
-        println!("{usr1} {usr2:?}");
+        guest_println!("{usr1} {usr2:?}");
     })
     .expect("run siginfo-redirecting guest");
     assert_eq!(
@@ -1669,7 +1684,7 @@ fn a_held_guest_sigstkflt_is_shown_to_the_filter() {
             0usize,
         );
         let errno = *libc::__errno_location();
-        println!(
+        guest_println!(
             "{ret} {errno} {} {}",
             SIGSTKFLT_HANDLER_CALLS.load(Ordering::Relaxed),
             SIGURG_HANDLER_CALLS.load(Ordering::Relaxed),
@@ -1731,7 +1746,7 @@ fn injected_mask_swapping_syscall_keeps_the_saved_mask() {
             ),
             0
         );
-        println!(
+        guest_println!(
             "{ret} {errno} {} {}",
             SIGSYS_HANDLER_CALLS.load(Ordering::Relaxed),
             libc::sigismember(&current, libc::SIGSYS)
@@ -1822,7 +1837,7 @@ fn guest_blocked_signal_dequeued_after_injected_syscall_stays_blocked() {
             &unblock as *const libc::sigset_t,
             0usize,
         );
-        println!(
+        guest_println!(
             "{ret} {} {} {}",
             SIGBUS_HANDLER_CALLS.load(Ordering::Relaxed),
             SIGSEGV_HANDLER_CALLS.load(Ordering::Relaxed),
@@ -1892,7 +1907,7 @@ fn injected_mask_swapping_syscall_requeues_a_signal_its_mask_blocks() {
             0usize,
         );
         let errno = *libc::__errno_location();
-        println!(
+        guest_println!(
             "{ret} {errno} {} {} {} {}",
             SIGSYS_HANDLER_CALLS.load(Ordering::Relaxed),
             SIGBUS_HANDLER_CALLS.load(Ordering::Relaxed),
@@ -1966,7 +1981,7 @@ fn requeued_signals_interrupt_the_next_injected_syscall() {
             0usize,
         );
         let errno = *libc::__errno_location();
-        println!(
+        guest_println!(
             "{ret} {errno} {} {}",
             SIGSYS_HANDLER_CALLS.load(Ordering::Relaxed),
             SIGSEGV_HANDLER_CALLS.load(Ordering::Relaxed)
@@ -2040,7 +2055,7 @@ fn injected_mask_swapping_syscall_holds_the_first_of_two_unblocked_signals() {
             0usize,
         );
         let errno = *libc::__errno_location();
-        println!(
+        guest_println!(
             "{ret} {errno} {} {} {} {}",
             SIGSYS_HANDLER_CALLS.load(Ordering::Relaxed),
             SIGSEGV_HANDLER_CALLS.load(Ordering::Relaxed),
@@ -2113,7 +2128,7 @@ fn injection_after_a_held_signal_discards_the_stale_step_trap() {
             &mut args as *mut PpollArgs,
             0usize,
         );
-        println!(
+        guest_println!(
             "{} {} {} {}",
             ret == libc::getpid() as i64,
             SIGSYS_HANDLER_CALLS.load(Ordering::Relaxed),
@@ -2249,7 +2264,7 @@ fn signal_hook_injecting_after_a_held_signal_keeps_the_guest_result() {
         let blocked = is_blocked(libc::SIGSYS);
         let pending = is_pending(libc::SIGSYS);
         unblock(libc::SIGSYS);
-        println!(
+        guest_println!(
             "{ret} {errno} {calls} {blocked} {pending} {} {}",
             SIGSYS_HANDLER_CALLS.load(Ordering::Relaxed),
             libc::getpid()
@@ -2322,7 +2337,7 @@ fn signal_hook_injecting_after_a_held_signal_delivers_it_as_without_the_injectio
             let blocked = is_blocked(libc::SIGSYS);
             let pending = is_pending(libc::SIGSYS);
             unblock(libc::SIGSYS);
-            println!(
+            guest_println!(
                 "{ret} {calls} {blocked} {pending} {} {}",
                 SIGSYS_HANDLER_CALLS.load(Ordering::Relaxed),
                 libc::getpid()
@@ -2410,7 +2425,7 @@ fn signal_hook_injecting_at_a_delivery_stop_requeues_its_signal() {
         let blocked = is_blocked(libc::SIGSYS);
         let pending = is_pending(libc::SIGSYS);
         unblock(libc::SIGSYS);
-        println!(
+        guest_println!(
             "{ret} {errno} {calls} {blocked} {pending} {} {}",
             SIGSYS_HANDLER_CALLS.load(Ordering::Relaxed),
             libc::getpid()
@@ -2477,7 +2492,7 @@ fn held_default_action_stop_signal_is_reported_once() {
             &set as *const libc::sigset_t,
             0usize,
         );
-        println!("{ret} {}", libc::getpid());
+        guest_println!("{ret} {}", libc::getpid());
     })
     .expect("run held stop-signal guest");
     assert_eq!(
@@ -2540,7 +2555,7 @@ fn held_stop_signal_passed_unreported_is_reported_at_its_group_stop() {
                 &set as *const libc::sigset_t,
                 0usize,
             );
-            println!("{ret} {}", libc::getpid());
+            guest_println!("{ret} {}", libc::getpid());
         },
         "held stop signal passed unreported",
     );
@@ -2592,7 +2607,7 @@ fn held_sigstop_is_not_reported() {
             &mut sent as *mut i32,
             0usize,
         );
-        println!("{ret} {}", libc::getpid());
+        guest_println!("{ret} {}", libc::getpid());
     })
     .expect("run held-SIGSTOP guest");
     assert_eq!(
@@ -2637,7 +2652,7 @@ fn held_sigstop_is_shown_to_the_filter() {
             &mut sent as *mut i32,
             0usize,
         );
-        println!("{ret} {}", libc::getpid());
+        guest_println!("{ret} {}", libc::getpid());
     })
     .expect("run filtered held-SIGSTOP guest");
     assert_eq!(
@@ -2668,7 +2683,7 @@ fn default_action_stop_signal_is_reported_once() {
     let (output, log) = test_fn::<ReplaceMarker, _>(|| unsafe {
         assert_eq!(libc::setpgid(0, 0), 0);
         assert_eq!(libc::raise(libc::SIGTSTP), 0);
-        println!("resumed");
+        guest_println!("resumed");
     })
     .expect("run stop-signal guest");
     assert_eq!(
@@ -2723,7 +2738,7 @@ fn held_signal_is_reported_at_a_delivery_stop_with_syscall_stop_siginfo() {
             &mut args as *mut UnblockThenTrapArgs,
             0usize,
         );
-        println!("{ret} {}", SIGUSR1_HANDLER_CALLS.load(Ordering::Relaxed));
+        guest_println!("{ret} {}", SIGUSR1_HANDLER_CALLS.load(Ordering::Relaxed));
     })
     .expect("run syscall-stop siginfo guest");
     assert_eq!(
@@ -2844,7 +2859,7 @@ unsafe fn trap_getppid() {
 /// Prints the last trapped syscall's return value and what the handler saw.
 #[cfg(target_arch = "x86_64")]
 fn print_seccomp_trap(ret: i64) {
-    println!(
+    guest_println!(
         "{ret} {} {} {} {}",
         SECCOMP_TRAPS.load(Ordering::Relaxed),
         SECCOMP_CODE.load(Ordering::Relaxed),
@@ -3033,7 +3048,7 @@ fn consumed_requeue_then_resend_is_reported(consume: Consume, resend: Resend) {
         let first = requeue_then_consume(consume);
         resend_sigbus(resend);
         unblock(libc::SIGBUS);
-        println!("{first} {}", SIGBUS_HANDLER_CALLS.load(Ordering::Relaxed));
+        guest_println!("{first} {}", SIGBUS_HANDLER_CALLS.load(Ordering::Relaxed));
     })
     .expect("run consumed-requeue guest");
     assert_eq!(
@@ -3111,7 +3126,7 @@ fn consumed_requeue_then_held(resend: Resend) {
             0usize,
         );
         let errno = *libc::__errno_location();
-        println!(
+        guest_println!(
             "{first} {ret} {errno} {} {}",
             SIGBUS_HANDLER_CALLS.load(Ordering::Relaxed),
             is_pending(libc::SIGBUS),
@@ -3334,7 +3349,7 @@ fn requeued_signal_survives_a_nonleader_exec() {
     let (output, log) = test_fn::<ReplaceMarker, _>(|| unsafe {
         SIGSEGV_HANDLER_CALLS.store(0, Ordering::Relaxed);
         install_counter(libc::SIGSEGV, count_sigsegv);
-        println!("{}", libc::getpid());
+        guest_println!("{}", libc::getpid());
         let mut thread: libc::pthread_t = 0;
         assert_eq!(
             libc::pthread_create(&mut thread, std::ptr::null(), worker, std::ptr::null_mut()),
@@ -3412,7 +3427,7 @@ fn held_signal_is_reported_after_a_fork_injection() {
         let calls = SIGUSR1_HANDLER_CALLS.load(Ordering::Relaxed);
         let mut status = 0;
         let child = libc::waitpid(-1, &mut status, 0);
-        println!("{ret} {calls} {child} {status}");
+        guest_println!("{ret} {calls} {child} {status}");
     })
     .expect("run held-fork guest");
     assert_eq!(
@@ -3575,7 +3590,7 @@ unsafe fn print_fork_hook_outcome(ret: libc::c_long, errno: libc::c_int) {
         unblock(libc::SIGSYS);
         let mut status = 0;
         let child = libc::waitpid(-1, &mut status, 0);
-        println!(
+        guest_println!(
             "{ret} {errno} {calls} {blocked} {pending} {} {child}",
             SIGSYS_HANDLER_CALLS.load(Ordering::Relaxed),
         );
@@ -3770,7 +3785,7 @@ fn held_signal_is_delivered_after_a_signal_hook_vfork() {
         let calls = SIGUSR1_HANDLER_CALLS.load(Ordering::Relaxed);
         let mut status = 0;
         let child = libc::waitpid(-1, &mut status, 0);
-        println!("{ret} {calls} {child} {status}");
+        guest_println!("{ret} {calls} {child} {status}");
     })
     .expect("run held-vfork guest");
     check_vfork_hook_outcome(
@@ -3804,7 +3819,7 @@ fn signal_is_delivered_after_a_signal_hook_vfork_at_its_delivery_stop() {
         let calls = SIGUSR1_HANDLER_CALLS.load(Ordering::Relaxed);
         let mut status = 0;
         let child = libc::waitpid(-1, &mut status, 0);
-        println!("{ret} {calls} {child} {status}");
+        guest_println!("{ret} {calls} {child} {status}");
     })
     .expect("run delivery-stop vfork guest");
     // Main leaks the hook's vfork result into tgkill's; see
@@ -3835,7 +3850,7 @@ fn exec_from_a_signal_hook_ends_the_callback() {
             0usize,
         );
         use std::io::Write;
-        println!("{}", libc::getpid());
+        guest_println!("{}", libc::getpid());
         std::io::stdout().flush().unwrap();
         libc::kill(libc::getpid(), libc::SIGUSR2);
         // Reached only if the hook did not execute the program.
@@ -3892,7 +3907,7 @@ fn exec_from_a_held_signal_hook_ends_the_callback() {
                 0usize,
             );
             use std::io::Write;
-            println!("{}", libc::getpid());
+            guest_println!("{}", libc::getpid());
             std::io::stdout().flush().unwrap();
             let set = block(&[libc::SIGUSR2]);
             assert_eq!(libc::kill(libc::getpid(), libc::SIGUSR2), 0);
@@ -3963,7 +3978,7 @@ fn held_signal_is_not_delivered_after_its_hook_executes_a_program() {
                 0usize,
             );
             use std::io::Write;
-            println!("{}", libc::getpid());
+            guest_println!("{}", libc::getpid());
             std::io::stdout().flush().unwrap();
             let set = block(&[libc::SIGUSR2]);
             assert_eq!(libc::kill(libc::getpid(), libc::SIGUSR2), 0);
@@ -4157,7 +4172,7 @@ unsafe fn print_recorded_unblocking_to(
         let blocked = is_blocked(signal);
         let pending = is_pending(signal);
         unblock_returning(signal, unblocked);
-        println!(
+        guest_println!(
             "{ret} {errno} {calls} {} {} {} {blocked} {pending} {} {}",
             RECORDED_CODE.load(Ordering::Relaxed),
             RECORDED_PID.load(Ordering::Relaxed),
@@ -4465,7 +4480,7 @@ fn always_injecting_hook_requeues_an_ignored_signal() {
             8usize,
         );
         let errno = *libc::__errno_location();
-        println!(
+        guest_println!(
             "{ret} {errno} {} {} {}",
             is_blocked(libc::SIGUSR1),
             is_pending(libc::SIGUSR1),
@@ -4742,7 +4757,7 @@ extern "C" fn record_frame_masks(
 /// Prints the masks `record_frame_masks` recorded, on a line of their own:
 /// the handler's, then the frame's two.
 fn print_frame_masks() {
-    println!(
+    guest_println!(
         "{:#x} {:#x} {:#x}",
         RUN_MASK.load(Ordering::Relaxed),
         FRAME_SIGMASK.load(Ordering::Relaxed),
@@ -4861,7 +4876,7 @@ fn signal_held_by_a_hook_injection_at_a_delivery_stop_misses_the_syscall() {
             8usize,
         );
         let errno = *libc::__errno_location();
-        println!("{}", is_pending(libc::SIGUSR1));
+        guest_println!("{}", is_pending(libc::SIGUSR1));
         // Main leaks the hook's getpid into the unblock's result; see
         // https://github.com/rrnewton/reverie/issues/892. A fix flips this to 0.
         print_recorded_unblocking_to(ret, errno, libc::SIGUSR2, libc::getpid() as libc::c_long);
@@ -6191,7 +6206,7 @@ fn trap_before_getppid_guest(tstp: bool) -> impl FnOnce() + Send + 'static {
             0usize,
         );
         print_seccomp_trap(ret);
-        println!("{}", SIGTSTP_HANDLER_CALLS.load(Ordering::Relaxed));
+        guest_println!("{}", SIGTSTP_HANDLER_CALLS.load(Ordering::Relaxed));
     }
 }
 
@@ -6287,7 +6302,7 @@ fn a_sent_sigtrap_that_stops_an_injection_reaches_the_guest() {
             install_counter(libc::SIGTRAP, count_held_trap);
             let ret = libc::syscall(libc::SYS_write, GETPPID_FD, std::ptr::null::<u8>(), 0usize);
             let errno = *libc::__errno_location();
-            println!(
+            guest_println!(
                 "{ret} {errno} {}",
                 HELD_TRAP_HANDLER_CALLS.load(Ordering::Relaxed)
             );
@@ -7219,7 +7234,7 @@ fn guest_inherits_no_held_seccomp_status() {
                 if let Ok(target) = std::fs::read_link(entry.path()) {
                     let target = target.to_string_lossy().into_owned();
                     if target.starts_with("/proc/") && target.ends_with("/status") {
-                        println!("{} {target}", entry.file_name().to_string_lossy());
+                        guest_println!("{} {target}", entry.file_name().to_string_lossy());
                     }
                 }
             }
@@ -7273,7 +7288,7 @@ fn vfork_hook_guest_injecting_in_its_handler() -> impl FnOnce() + Send + 'static
         let calls = SIGUSR1_HANDLER_CALLS.load(Ordering::Relaxed);
         let mut status = 0;
         let child = libc::waitpid(-1, &mut status, 0);
-        println!("{ret} {calls} {child} {status}");
+        guest_println!("{ret} {calls} {child} {status}");
     }
 }
 
@@ -7820,13 +7835,13 @@ fn rdtsc_after_a_requeued_ignored_signal_is_emulated() {
             out("rcx") _,
             out("r11") _,
         );
-        println!(
+        guest_println!(
             "{} {} {}",
             is_blocked(libc::SIGUSR1),
             is_pending(libc::SIGUSR1),
             (high << 32 | low) != 0
         );
-        println!("{}", libc::getpid());
+        guest_println!("{}", libc::getpid());
     })
     .expect("run discarded-signal RDTSC guest");
     let stdout = check_exited(&output, "rdtsc-after-discard", &log);
@@ -7876,7 +7891,7 @@ fn signal_hook_mask_after_a_requeue_is_set_at_the_unblock() {
         queue_value_to_self(libc::SIGUSR1, libc::SI_QUEUE);
         let ret = ppoll_with_empty_mask();
         let errno = *libc::__errno_location();
-        println!("{:#x}", current_mask());
+        guest_println!("{:#x}", current_mask());
         print_recorded(ret, errno, libc::SIGUSR1);
     })
     .expect("run forced-SIGSEGV mask-setting hook guest");
@@ -7940,7 +7955,7 @@ fn replacement_hook_does_not_run_for_a_requeued_signal() {
         queue_value_to_self(libc::SIGUSR1, libc::SI_QUEUE);
         let ret = ppoll_with_empty_mask();
         let errno = *libc::__errno_location();
-        println!("{tracer}");
+        guest_println!("{tracer}");
         print_frame_masks();
         print_recorded(ret, errno, libc::SIGUSR2);
     })
@@ -8001,7 +8016,7 @@ fn inject_then_replace_hook_does_not_run_for_a_requeued_signal() {
         let ret = ppoll_with_empty_mask();
         let errno = *libc::__errno_location();
         let runs = RECORDED_CALLS.load(Ordering::Relaxed);
-        println!("{runs}");
+        guest_println!("{runs}");
         print_recorded(ret, errno, libc::SIGUSR2);
     })
     .expect("run forced-SIGSEGV inject-then-replace hook guest");
@@ -8060,7 +8075,7 @@ fn exec_hook_does_not_run_for_a_requeued_signal() {
         );
         block(&[libc::SIGUSR1]);
         use std::io::Write;
-        println!("{}", libc::getpid());
+        guest_println!("{}", libc::getpid());
         std::io::stdout().flush().unwrap();
         queue_value_to_self(libc::SIGUSR1, libc::SI_QUEUE);
         ppoll_with_empty_mask();
@@ -8291,7 +8306,7 @@ fn fault_after_a_discarded_signal_runs_under_the_saved_mask() {
         install_counter(libc::SIGSEGV, count_sigsegv);
         block(&[libc::SIGUSR1, libc::SIGSEGV]);
         use std::io::Write;
-        println!("{}", libc::getpid());
+        guest_println!("{}", libc::getpid());
         std::io::stdout().flush().unwrap();
         queue_value_to_self(libc::SIGUSR1, libc::SI_QUEUE);
         let epfd = libc::epoll_create1(0);
@@ -8468,7 +8483,7 @@ fn trapped_syscall_after_a_discarded_signal_runs_under_the_saved_mask() {
             out("r11") _,
         );
         print_frame_masks();
-        println!(
+        guest_println!(
             "{} {}",
             RECORDED_CALLS.load(Ordering::Relaxed),
             libc::getpid()
@@ -8811,7 +8826,7 @@ fn held_signal_hook_ending_with_a_tail_injection_delivers_the_signal() {
                 0usize,
             );
             let errno = *libc::__errno_location();
-            println!(
+            guest_println!(
                 "{ret} {errno} {}",
                 SIGUSR1_HANDLER_CALLS.load(Ordering::Relaxed)
             );
@@ -9168,7 +9183,7 @@ fn a_dropped_held_signal_does_not_hide_a_later_one() {
                 &SIGUSR1_SET as *const u64,
                 0usize,
             );
-            println!(
+            guest_println!(
                 "{dropped} {} {}",
                 is_pending(libc::SIGUSR1),
                 is_blocked(libc::SIGUSR1)
@@ -9282,7 +9297,7 @@ fn a_signal_dropped_while_a_skipped_syscall_steps_does_not_hide_a_later_one() {
                 0usize,
             );
             let errno = *libc::__errno_location();
-            println!(
+            guest_println!(
                 "{} {} | {} {} {} | {ret} {errno} {} {}",
                 requeued.0,
                 requeued.1,
@@ -9533,7 +9548,7 @@ fn a_reported_signal_delivered_at_its_own_stop_lends_no_count() {
                 0usize,
             );
             let errno = *libc::__errno_location();
-            println!("{unblocked} {after_pq}");
+            guest_println!("{unblocked} {after_pq}");
             print_recorded(ret, errno, libc::SIGUSR1);
         },
         "reported signal delivered at its own stop",
@@ -9614,7 +9629,7 @@ fn dropping_an_unreported_held_signal_keeps_a_reported_instances_count() {
             let blocked = is_blocked(libc::SIGUSR1);
             libc::syscall(libc::SYS_write, GETPPID_FD, std::ptr::null::<u8>(), 0usize);
             let pending = is_pending(libc::SIGUSR1);
-            println!("{blocked} {pending}");
+            guest_println!("{blocked} {pending}");
             let ret = libc::syscall(
                 libc::SYS_write,
                 UNBLOCK_THEN_GETPID_FD,
@@ -9711,7 +9726,7 @@ fn a_reported_signal_kept_by_a_fallback_is_not_reported_again() {
                 &SIGUSR1_SET as *const u64,
                 0usize,
             );
-            println!(
+            guest_println!(
                 "{first} {} {} {}",
                 RECORDED_CALLS.load(Ordering::Relaxed),
                 is_pending(libc::SIGUSR1),
@@ -9876,7 +9891,7 @@ fn a_reported_signal_the_backend_suppresses_lends_no_count() {
                 0usize,
             );
             let errno = *libc::__errno_location();
-            println!("{pending} {counted} {} {}", after.0, after.1);
+            guest_println!("{pending} {counted} {} {}", after.0, after.1);
             print_recorded(ret, errno, libc::SIGSEGV);
         },
         "reported signal the backend suppresses",
@@ -10057,7 +10072,7 @@ fn a_reported_group_stop_keeps_a_reported_instances_count() {
                 0usize,
             );
             let ppid = libc::syscall(libc::SYS_write, GETPPID_FD, std::ptr::null::<u8>(), 0usize);
-            println!(
+            guest_println!(
                 "{} {}",
                 ppid == libc::getppid() as libc::c_long,
                 is_blocked(libc::SIGTSTP)
@@ -10767,8 +10782,8 @@ fn check_restart_block_replaced_by_a_hook_injection(end: RestartBlockEnd) {
             let errno = *libc::__errno_location();
             let elapsed = start.elapsed().as_millis();
             let calls = SIGALRM_HANDLER_CALLS.load(Ordering::Relaxed);
-            println!("{ret} {errno} {calls} {elapsed} {}", libc::getpid());
-            println!("{}", SIGALRM_HANDLER_CALLS.load(Ordering::Relaxed));
+            guest_println!("{ret} {errno} {calls} {elapsed} {}", libc::getpid());
+            guest_println!("{}", SIGALRM_HANDLER_CALLS.load(Ordering::Relaxed));
         },
         "restart block replaced by a hook injection",
     );
@@ -10978,7 +10993,7 @@ fn held_signal_is_not_reported_while_the_guest_restarts_through_its_restart_bloc
                 &args as *const TimedSleepArgs,
                 0usize,
             );
-            println!("{ret} {}", start.elapsed().as_millis());
+            guest_println!("{ret} {}", start.elapsed().as_millis());
         },
         "held signal while the guest restarts through its restart block",
     );
@@ -11099,7 +11114,7 @@ fn blocked_verdict_after_the_tool_restores_its_registers_restarts_the_read() {
             helper.join().expect("join the helper thread");
             let mut unread: libc::c_int = 0;
             assert_eq!(libc::ioctl(fds[0], libc::FIONREAD, &mut unread), 0);
-            println!(
+            guest_println!(
                 "{ret} {errno} {} {unread} {} {} {}",
                 byte as char,
                 SIGUSR1_HANDLER_CALLS.load(Ordering::Relaxed),
@@ -11240,7 +11255,7 @@ fn sigtrap_sent_before_a_held_signal_hook_injection_is_discarded_and_the_injecti
                 0usize,
             );
             let errno = *libc::__errno_location();
-            println!(
+            guest_println!(
                 "{ret} {errno} {} {}",
                 SIGUSR1_HANDLER_CALLS.load(Ordering::Relaxed),
                 libc::getpid()
@@ -11550,7 +11565,7 @@ fn restart_block_verdict_raced_by_a_disposition_change_never_leaves_a_bare_eintr
                         0
                     };
                     let usr2 = SECOND_HANDLER_CALLS.load(Ordering::SeqCst) - before;
-                    println!("{ret} {errno} {usr2}");
+                    guest_println!("{ret} {errno} {usr2}");
                 })
                 .join()
                 .expect("join a worker");
