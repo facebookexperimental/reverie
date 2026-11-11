@@ -496,10 +496,10 @@ pub trait ProcessSignalControl: Debug + Send + Sync {
     /// guest task.
     ///
     /// A backend that keeps its own signal queues refuses, by default, a
-    /// guest `kill`, `tkill`, `tgkill`, `rt_sigqueueinfo` or
-    /// `rt_tgsigqueueinfo` that names another process, and a process-directed
-    /// signal to the guest's own process while that process has another
-    /// thread. Either needs a thread other than the sender to take the
+    /// guest `kill`, `tkill`, `tgkill`, `rt_sigqueueinfo`,
+    /// `rt_tgsigqueueinfo` or `pidfd_send_signal` that names another
+    /// process, and a process-directed signal to the guest's own process
+    /// while that process has another thread. Either needs a thread other than the sender to take the
     /// signal, and only a Tool that selects recipients can order that.
     ///
     /// After this call, in [`BackendSignalControlMode::ToolControlled`]

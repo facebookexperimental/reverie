@@ -8,6 +8,7 @@
 
 //! Signal syscalls and per-task signal delivery state (gVisor: pkg/sentry/syscalls/linux/sys_signal.go, pkg/sentry/kernel/task_signals.go).
 
+use super::process_signal_publication::PidfdTargetState;
 use super::process_signal_publication::SignalDestination;
 use super::process_signal_publication::UnsentSignal;
 use super::*;
@@ -2845,9 +2846,9 @@ pub(super) fn kill_signal(
 }
 
 /// Why this backend refused a signal delivery (`kill`, `tkill`, `tgkill`,
-/// `rt_sigqueueinfo`, `rt_tgsigqueueinfo`). Each is the diagnostic of the
-/// typed refusal `UnsupportedOperation::Signal`; the refused call queued
-/// nothing and changed no signal state.
+/// `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, `pidfd_send_signal`). Each is the
+/// diagnostic of the typed refusal `UnsupportedOperation::Signal`; the refused
+/// call queued nothing and changed no signal state.
 pub(super) struct SignalRefusal;
 
 impl SignalRefusal {
@@ -2875,6 +2876,12 @@ impl SignalRefusal {
          the target thread's signal state";
     const EXIT_STATUS: &'static str = "KVM signal delivery refused: KVM cannot represent this \
          signal's terminating status";
+    pub(super) const PIDFD_WITHOUT_RECORD: &'static str = "KVM signal delivery refused: KVM \
+         keeps no record of the process this pidfd names";
+    pub(super) const PIDFD_PROCESS_GROUP: &'static str = "KVM signal delivery refused: KVM \
+         cannot send a signal to a process group through a pidfd";
+    pub(super) const EXITED_LEADER: &'static str = "KVM signal delivery refused: KVM cannot \
+         send a signal to a thread group leader that has exited";
 }
 
 /// Whether the Tool selects the thread that takes a signal a guest sends to
@@ -2964,6 +2971,274 @@ pub(super) fn sigqueueinfo(
     let action = send_signal(state, number, &args, Some(info), &mut refusal);
     state.signal_refusal = refusal;
     action
+}
+
+/// The descriptor that names the caller's own thread to `pidfd_send_signal`
+/// (`PIDFD_SELF_THREAD`, include/uapi/linux/fcntl.h).
+const PIDFD_SELF_THREAD: libc::c_int = -10000;
+/// The descriptor that names the caller's own thread group
+/// (`PIDFD_SELF_THREAD_GROUP`).
+const PIDFD_SELF_THREAD_GROUP: libc::c_int = -10001;
+/// The scope flags of `pidfd_send_signal`, of which a call may give one.
+const PIDFD_SEND_SIGNAL_FLAGS: libc::c_uint =
+    libc::PIDFD_SIGNAL_THREAD | libc::PIDFD_SIGNAL_THREAD_GROUP | libc::PIDFD_SIGNAL_PROCESS_GROUP;
+
+/// What a descriptor names to `pidfd_send_signal`: Linux's pid object, which
+/// the call's scope then reads as a thread or a thread group.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PidfdNamed {
+    /// The caller's own thread (`PIDFD_SELF_THREAD`).
+    CallersThread,
+    /// A process, by its thread group id, which is its leader's id: the
+    /// caller's own (`PIDFD_SELF_THREAD_GROUP`), or the one a pidfd names.
+    Process(reverie::SignalProcessId),
+}
+
+/// Which tasks a `pidfd_send_signal` signals (Linux's `pid_type`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PidfdScope {
+    /// The named thread (`PIDTYPE_PID`).
+    Thread,
+    /// The named thread's thread group (`PIDTYPE_TGID`).
+    ThreadGroup,
+    /// The named thread's process group (`PIDTYPE_PGID`).
+    ProcessGroup,
+}
+
+/// What `kill_pid_info_type` finds for a `pidfd_send_signal`.
+enum PidfdTarget {
+    /// No task: the process has been reaped (ESRCH).
+    Reaped,
+    /// The process has exited and has not been reaped. Its leader's task
+    /// remains, and the send drops the signal (`prepare_signal` during a
+    /// group's exit).
+    Exited,
+    /// The named thread, its process's leader, has exited while another
+    /// thread of the process lives.
+    ExitedLeader,
+    /// The caller's own process, or a thread of it (`Some` tid in thread
+    /// scope).
+    Own(Option<libc::pid_t>),
+    /// Another process, or one of its threads.
+    Other(SignalDestination),
+}
+
+/// The caller's own process, which its live task names.
+fn own_process(
+    lifecycle: &crate::elf::TaskLifecycleTable,
+    state: &LoadedStaticElf,
+) -> Option<reverie::SignalProcessId> {
+    let task = lifecycle.get(state.tid)?;
+    Some(reverie::SignalProcessId {
+        tgid: reverie::Pid::from_raw(task.tgid),
+        generation: task.process_generation,
+    })
+}
+
+/// Whether host descriptor `fd` is a pidfd, or anything else the host's
+/// `pidfd_send_signal` takes as one (a `/proc/<pid>` directory). The host
+/// answers signal 0, which sends nothing, with EBADF for anything else.
+fn host_pidfd(fd: RawFd) -> bool {
+    // SAFETY: signal 0 sends nothing, and the call reads no siginfo when the
+    // pointer is null.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            fd,
+            0,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EBADF)
+}
+
+/// Emulates `pidfd_send_signal(pidfd, sig, info, flags)`, checking in Linux's
+/// order (`pidfd_send_signal` and `do_pidfd_send_signal`, kernel/signal.c):
+/// 1. a flag other than the three scopes, or more than one scope, is EINVAL;
+/// 2. `PIDFD_SELF_THREAD` names the caller's thread, in thread scope, and
+///    `PIDFD_SELF_THREAD_GROUP` its thread group, in thread-group scope. Any
+///    other descriptor must be open and a pidfd (EBADF), and names its
+///    process in thread-group scope. A pidfd for which this executor keeps
+///    no record (one from outside the run) is refused by name;
+/// 3. a scope flag overrides the descriptor's scope;
+/// 4. a caller's siginfo is copied in (EFAULT) and must carry the signal
+///    (EINVAL); it may carry a kernel or `tkill` code (`si_code >= 0` or
+///    `SI_TKILL`) only when the descriptor names exactly the caller's thread
+///    and the scope is not a process group (EPERM). Without one, the send
+///    builds `kill`'s siginfo in thread-group scope and `tgkill`'s in thread
+///    scope;
+/// 5. a send to a process group is refused by name;
+/// 6. then `kill_pid_info_type`'s results: ESRCH for a reaped process, and
+///    EINVAL for an invalid signal; a process that has exited and has not
+///    been reaped drops the signal and answers 0. A live target takes the
+///    send `kill` (thread-group scope) or `tgkill` (thread scope) makes, with
+///    its refusals, signal 0 included.
+pub(super) fn pidfd_send_signal(
+    memory: &GuestMemory,
+    state: &mut LoadedStaticElf,
+    args: &[u64; 6],
+) -> SyscallAction {
+    let mut refusal = None;
+    let action = pidfd_send(memory, state, args, &mut refusal);
+    state.signal_refusal = refusal;
+    action
+}
+
+fn pidfd_send(
+    memory: &GuestMemory,
+    state: &mut LoadedStaticElf,
+    args: &[u64; 6],
+    refusal: &mut Option<&'static str>,
+) -> SyscallAction {
+    // The kernel reads the descriptor and the signal as int and the flags as
+    // unsigned int.
+    let (pidfd, signal, info_address, flags) = (
+        args[0] as libc::c_int,
+        args[1] as libc::c_int,
+        args[2],
+        args[3] as libc::c_uint,
+    );
+    if flags & !PIDFD_SEND_SIGNAL_FLAGS != 0 || flags.count_ones() > 1 {
+        return continue_with(negative_errno(libc::EINVAL));
+    }
+    let own = {
+        let lifecycle = state
+            .task_lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        own_process(&lifecycle, state)
+    };
+    let (named, scope) = match pidfd {
+        PIDFD_SELF_THREAD => (PidfdNamed::CallersThread, PidfdScope::Thread),
+        PIDFD_SELF_THREAD_GROUP => match own {
+            Some(own) => (PidfdNamed::Process(own), PidfdScope::ThreadGroup),
+            None => return continue_with(negative_errno(libc::ESRCH)),
+        },
+        fd => match guest_pidfd(state, fd) {
+            Some(pidfd) => (PidfdNamed::Process(pidfd.target()), PidfdScope::ThreadGroup),
+            None => {
+                return match host_fd(state, fd) {
+                    Some(host) if host_pidfd(host) => {
+                        refuse_signal(refusal, SignalRefusal::PIDFD_WITHOUT_RECORD)
+                    }
+                    _ => continue_with(negative_errno(libc::EBADF)),
+                };
+            }
+        },
+    };
+    let scope = match flags {
+        libc::PIDFD_SIGNAL_THREAD => PidfdScope::Thread,
+        libc::PIDFD_SIGNAL_THREAD_GROUP => PidfdScope::ThreadGroup,
+        libc::PIDFD_SIGNAL_PROCESS_GROUP => PidfdScope::ProcessGroup,
+        _ => scope,
+    };
+    let info = if info_address == 0 {
+        None
+    } else {
+        let copied =
+            match read_guest_bytes::<KERNEL_SIGINFO_SIZE>(&ProviderMemory(memory), info_address) {
+                Ok(copied) => copied,
+                Err(error) => return continue_with(error),
+            };
+        let mut info = [0; SIGINFO_SIZE];
+        info[..KERNEL_SIGINFO_SIZE].copy_from_slice(&copied);
+        let signo = i32::from_ne_bytes(info[0..4].try_into().expect("siginfo signo"));
+        if signo != signal {
+            return continue_with(negative_errno(libc::EINVAL));
+        }
+        let callers_thread = match named {
+            PidfdNamed::CallersThread => true,
+            PidfdNamed::Process(process) => own == Some(process) && state.tid == state.pid,
+        };
+        let code = i32::from_ne_bytes(info[8..12].try_into().expect("siginfo code"));
+        if (!callers_thread || scope == PidfdScope::ProcessGroup)
+            && (code >= 0 || code == libc::SI_TKILL)
+        {
+            return continue_with(negative_errno(libc::EPERM));
+        }
+        Some(info)
+    };
+    if scope == PidfdScope::ProcessGroup {
+        return refuse_signal(refusal, SignalRefusal::PIDFD_PROCESS_GROUP);
+    }
+
+    let transaction = state.signal_transaction.clone();
+    let held = transaction.lock().unwrap_or_else(|p| p.into_inner());
+    let target = {
+        let lifecycle = state
+            .task_lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match (named, scope) {
+            (PidfdNamed::CallersThread, PidfdScope::Thread) => PidfdTarget::Own(Some(state.tid)),
+            (PidfdNamed::CallersThread, _) => PidfdTarget::Own(None),
+            (PidfdNamed::Process(process), scope) => {
+                let tgid = process.tgid.as_raw();
+                // The leader's task, in thread scope, if it lives.
+                let leader = lifecycle.get(tgid).filter(|task| {
+                    task.tgid == tgid && task.process_generation == process.generation
+                });
+                if !lifecycle.contains_process(tgid, process.generation) {
+                    // The pidfd's process: exited, and maybe reaped. A
+                    // process that has exited and not been reaped keeps its
+                    // pid, which pidfd_open takes, until its last task's exit
+                    // is recorded and after.
+                    let reaped = state.children.registry().is_none_or(|registry| {
+                        registry.pidfd_target_state(process) == PidfdTargetState::Reaped
+                    });
+                    if reaped {
+                        PidfdTarget::Reaped
+                    } else {
+                        PidfdTarget::Exited
+                    }
+                } else if scope == PidfdScope::Thread && leader.is_none() {
+                    PidfdTarget::ExitedLeader
+                } else if own == Some(process) {
+                    PidfdTarget::Own((scope == PidfdScope::Thread).then_some(tgid))
+                } else if let Some(leader) = leader.filter(|_| scope == PidfdScope::Thread) {
+                    PidfdTarget::Other(SignalDestination::Thread(reverie::SignalTaskIdentity {
+                        process,
+                        tid: process.tgid,
+                        task_generation: leader.generation,
+                    }))
+                } else {
+                    PidfdTarget::Other(SignalDestination::Process(process))
+                }
+            }
+        }
+    };
+    match target {
+        PidfdTarget::Reaped => continue_with(negative_errno(libc::ESRCH)),
+        // check_kill_permission refuses an invalid signal once a task is found.
+        _ if !(0..=64).contains(&signal) => continue_with(negative_errno(libc::EINVAL)),
+        PidfdTarget::Exited => continue_with(0),
+        PidfdTarget::ExitedLeader if signal == 0 => continue_with(0),
+        PidfdTarget::ExitedLeader => refuse_signal(refusal, SignalRefusal::EXITED_LEADER),
+        PidfdTarget::Own(thread) => {
+            drop(held);
+            let (number, args) = match thread {
+                None => (
+                    libc::SYS_kill,
+                    [state.pid as u64, signal as u64, 0, 0, 0, 0],
+                ),
+                Some(tid) => (
+                    libc::SYS_tgkill,
+                    [state.pid as u64, tid as u64, signal as u64, 0, 0, 0],
+                ),
+            };
+            send_signal(state, number as u64, &args, info, refusal)
+        }
+        PidfdTarget::Other(_) if signal == 0 => continue_with(0),
+        PidfdTarget::Other(_) if !cross_process_signals(state) => {
+            refuse_signal(refusal, SignalRefusal::OTHER_PROCESS)
+        }
+        PidfdTarget::Other(destination) => {
+            let decided = decide_other_process_signal(state, destination, signal, info, refusal);
+            drop(held);
+            finish_send(decided, refusal)
+        }
+    }
 }
 
 /// `kill_signal`, delivering `info` when given instead of the record `kill`

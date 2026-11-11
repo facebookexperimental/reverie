@@ -416,12 +416,21 @@ This does not interrupt an arbitrary running vCPU or wake a receiver blocked
 in a host syscall, futex, child wait, or other unsupported wait. Enqueuing a
 signal does not supply a deterministic scheduler notification or qualify
 Hermit's parked-I/O interruption capability. Self-targeted `kill` remains
-supported, but process-directed delivery with live siblings, cross-process
-nonzero sends and multi-process fanout remain explicitly unsupported. The
-backend does not use host scheduling to choose a recipient. Signal-zero
-identity probes do not imply delivery support. Sibling `SIGKILL`, stopped-state
-transitions, realtime signals, `SIGCHLD`/`SIGPIPE` production and general timer
-production remain refused or unimplemented. `rt_sigtimedwait` can consume an
+supported. Process-directed delivery with live siblings, and nonzero sends to
+another process of the run, need a Tool that selects recipients
+(`BackendSignalControlMode::ToolControlled`) and asks for them before
+installation (`ProcessSignalControl::enable_cross_process_signals`). The send
+then queues the signal on the target's shared queue or named thread's queue,
+as Linux's `do_send_sig_info` does, but chooses and wakes no thread: a thread
+takes it at a boundary the Tool permits. Without that request these sends
+stay refused by name, and `SIGKILL` to another process and multi-process
+fanout remain refused. `pidfd_send_signal` takes `PIDFD_SELF_THREAD`,
+`PIDFD_SELF_THREAD_GROUP`, or a pidfd this backend opened for a process of
+the run; a pidfd from outside the run, and `PIDFD_SIGNAL_PROCESS_GROUP`, are
+refused by name. The backend does not use host scheduling to choose a
+recipient. Signal-zero identity probes do not imply delivery support. Sibling
+`SIGKILL`, stopped-state transitions, realtime signals, `SIGCHLD`/`SIGPIPE`
+production and general timer production remain refused or unimplemented. `rt_sigtimedwait` can consume an
 already pending virtual event; it does not implement a timed blocking wait.
 
 `Guest::queue_child_exit_signal` is a separate receiver operation for a
