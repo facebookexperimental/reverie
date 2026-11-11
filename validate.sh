@@ -80,6 +80,27 @@ validation_slot_name() {
     esac
 }
 
+# The landing branch is the branch reviewed Reverie changes land on; the GitHub
+# default branch names it. REVERIE_LANDING_BRANCH from the environment wins
+# when set; otherwise the tracked ci/landing-branches.env names it. A missing
+# or malformed setting refuses instead of guessing a branch.
+landing_branch() {
+    local file=$ROOT_DIR/ci/landing-branches.env
+    local branch=
+
+    if [[ -v REVERIE_LANDING_BRANCH ]]; then
+        branch=$REVERIE_LANDING_BRANCH
+    elif [[ -r $file ]]; then
+        branch=$(sed -n 's/^REVERIE_LANDING_BRANCH=//p' "$file")
+    fi
+    if [[ -z $branch ]] || ! git check-ref-format "refs/heads/$branch"; then
+        printf 'validate.sh: no valid REVERIE_LANDING_BRANCH in the environment or in %s\n' \
+            "$file" >&2
+        return 1
+    fi
+    printf '%s\n' "$branch"
+}
+
 LABEL_PR=1
 [[ ${VALIDATE_LABEL_PR:-1} == 0 ]] && LABEL_PR=0
 PR_NUMBER=${PR_NUMBER:-}
@@ -105,6 +126,9 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+VALIDATION_LANDING_BRANCH=$(landing_branch) || exit 2
+readonly VALIDATION_LANDING_BRANCH
 
 LOG_FILE=${VALIDATE_LOG_FILE:-}
 if [[ -z $LOG_FILE ]]; then
@@ -136,9 +160,11 @@ VALIDATION_COMMIT=$(git rev-parse HEAD 2>/dev/null || printf unknown)
 VALIDATION_GIT_DEPTH=$(git rev-list --count HEAD 2>/dev/null || printf 0)
 VALIDATION_GIT_AHEAD=0
 VALIDATION_GIT_BEHIND=0
-if git rev-parse --verify --quiet refs/remotes/origin/main >/dev/null; then
+VALIDATION_LANDING_REF=refs/remotes/origin/$VALIDATION_LANDING_BRANCH
+if git rev-parse --verify --quiet "$VALIDATION_LANDING_REF" >/dev/null; then
     read -r VALIDATION_GIT_BEHIND VALIDATION_GIT_AHEAD < <(
-        git rev-list --left-right --count origin/main...HEAD 2>/dev/null || printf '0 0\n'
+        git rev-list --left-right --count "$VALIDATION_LANDING_REF...HEAD" 2>/dev/null ||
+            printf '0 0\n'
     )
 fi
 if [[ -n $(git status --porcelain 2>/dev/null || printf '') ]]; then
@@ -161,7 +187,7 @@ readonly VALIDATION_STARTED_AT VALIDATION_STARTED_EPOCH VALIDATION_HOST
 readonly DEV_HERMIT_PARENT VALIDATION_SLOT VALIDATION_LEDGER_TOOL
 readonly VALIDATION_COMMIT VALIDATION_GIT_DEPTH VALIDATION_GIT_AHEAD
 readonly VALIDATION_GIT_BEHIND VALIDATION_TREE_DIRTY VALIDATION_COMMIT_ANCHORED
-readonly VALIDATION_CACHE_STATE VALIDATION_CPU_TIMES_FILE
+readonly VALIDATION_CACHE_STATE VALIDATION_CPU_TIMES_FILE VALIDATION_LANDING_REF
 VALIDATION_TEST_COUNTS_DIR=$(mktemp -d "${TMPDIR:-/tmp}/reverie-test-counts.XXXXXX")
 readonly VALIDATION_TEST_COUNTS_DIR
 readonly LIBTEST_COUNTS_TOOL="$ROOT_DIR/scripts/libtest-counts.rs"

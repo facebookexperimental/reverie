@@ -43,12 +43,14 @@ jobs:
     steps:
       - name: Re-dispatch the gate for a completed PR CI run
         env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           set -euo pipefail
+          : "${DEFAULT_BRANCH:?the event names no repository default branch}"
 
           case "$HEAD_BRANCH" in
             gh-readonly-queue/*)
@@ -59,7 +61,7 @@ jobs:
 
           owner="${REPO%%/*}"
           matches="$(
-            gh api "repos/${REPO}/pulls?state=open&base=main&head=${owner}:${HEAD_BRANCH}&per_page=10" |
+            gh api "repos/${REPO}/pulls?state=open&base=${DEFAULT_BRANCH}&head=${owner}:${HEAD_BRANCH}&per_page=10" |
               jq -c --arg sha "$HEAD_SHA" 'map({number, current: (.head.sha == $sha)})'
           )"
 
@@ -113,6 +115,7 @@ jobs:
     steps:
       - name: Require the registered v2 gate definition
         env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           EXPECTED_GATE_BLOB: ${{ vars.REVERIE_MERGE_GATE_V2_BLOB }}
           GATE_PATH: .github/workflows/merge-gate.yml
           GH_TOKEN: ${{ github.token }}
@@ -120,6 +123,12 @@ jobs:
           SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
+          # The trusted checkout below names the default branch; an empty
+          # value would make it check out the run's own ref instead.
+          if [ -z "$DEFAULT_BRANCH" ]; then
+            echo "::error::The event names no repository default branch; refusing to pick a trusted ref."
+            exit 1
+          fi
           if [ -z "$EXPECTED_GATE_BLOB" ]; then
             echo "::error::REVERIE_MERGE_GATE_V2_BLOB is not configured; refusing an unbound gate result."
             exit 1
@@ -128,14 +137,14 @@ jobs:
             gh api "repos/${REPO}/contents/${GATE_PATH}?ref=${SHA}" --jq .sha
           )"
           if [ "$actual_blob" != "$EXPECTED_GATE_BLOB" ]; then
-            echo "::error::Gate definition mismatch: run used ${actual_blob}, registered v2 is ${EXPECTED_GATE_BLOB}. Rebase onto current main; a branch-owned gate cannot authorize itself."
+            echo "::error::Gate definition mismatch: run used ${actual_blob}, registered v2 is ${EXPECTED_GATE_BLOB}. Rebase onto current ${DEFAULT_BRANCH}; a branch-owned gate cannot authorize itself."
             exit 1
           fi
           echo "Gate definition is registered v2 blob ${actual_blob}."
       - name: Check out trusted gate policy
         uses: actions/checkout@v4
         with:
-          ref: main
+          ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
       - name: Check out canonical CI authority
         uses: actions/checkout@v4
@@ -147,6 +156,7 @@ jobs:
       - name: Require PASSED CI or re-dispatch NO_RESULT
         env:
           BASE_REF: ${{ github.event.merge_group.base_ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           EVENT_NAME: ${{ github.event_name }}
           EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha || inputs.head_sha }}
           GATE_RUN_ID: ${{ github.run_id }}
@@ -244,8 +254,8 @@ jobs:
               echo "::error::Gate run SHA $SHA does not match requested PR head ${EXPECTED_HEAD_SHA:-missing}."
               exit 1
             fi
-            pull_requests="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" | jq -c --arg sha "$EXPECTED_HEAD_SHA" '
-              [select(.base.ref == "main" and .state == "open" and .head.sha == $sha) | {
+            pull_requests="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" | jq -c --arg sha "$EXPECTED_HEAD_SHA" --arg base "$DEFAULT_BRANCH" '
+              [select(.base.ref == $base and .state == "open" and .head.sha == $sha) | {
                 number,
                 head: {sha: .head.sha, ref: .head.ref, repo: .head.repo.full_name}
               }]
@@ -293,7 +303,7 @@ jobs:
           fi
 
           if [ "$(jq 'length' <<< "$pull_requests")" -eq 0 ]; then
-            echo "::error::No main-branch pull request is associated with $SHA."
+            echo "::error::No pull request into the default branch (${DEFAULT_BRANCH}) is associated with $SHA."
             exit 1
           fi
 
