@@ -57,7 +57,7 @@
       "group": "check",
       "job": "detcore_alloc_recipe_self_test",
       "desc": "Detcore allocation recipe generator round trip",
-      "description": "Runs scripts/detcore-alloc-recipe.py --self-test: every 241-byte fixed_patch_alloc row in reverie-liteinst-artifact/src/lib.rs must re-render from the generator's own parse to its exact text, so a row edited by hand away from the generator's output fails here. Reads lib.rs only; no ELF and no build.",
+      "description": "Runs scripts/detcore-alloc-recipe.py --self-test on reverie-liteinst-artifact/src/lib.rs, no ELF and no build. Every 241-byte fixed_patch_alloc row must be in the generator's canonical form, and every row generated from a real ELF must agree with its own provenance comment: the recorded body SHA256, the recorded INSTALLATION_DEPTH cell against the encoded TLS read, and the operands and transfers of the cited masked-equal row. Controls that must be refused: a hand-edited encoded cell, operand displacement or recorded digest, and, on a synthetic ELF built from each generated row, any GOT operand bound to another callee, including when it is the only masked-equal structure. It does not re-derive a row from its original image; that comparison is the review's.",
       "labels": [
         "full"
       ],
