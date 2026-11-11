@@ -19636,10 +19636,22 @@ mod tests {
             ),
             negative_errno(libc::ENOENT)
         );
-        assert_eq!(guest_fd_path(&state, b"/proc/self/fd/3"), Some(3));
-        assert_eq!(guest_fd_path(&state, b"/proc/thread-self/fd/3"), Some(3));
-        assert_eq!(guest_fd_path(&state, b"/proc/1/fd/3"), Some(3));
-        assert_eq!(guest_fd_path(&state, b"/dev/fd/not-a-fd"), None);
+        assert_eq!(
+            reverie_procfs::parse_fd_path(b"/proc/self/fd/3", state.pid),
+            Some(3)
+        );
+        assert_eq!(
+            reverie_procfs::parse_fd_path(b"/proc/thread-self/fd/3", state.pid),
+            Some(3)
+        );
+        assert_eq!(
+            reverie_procfs::parse_fd_path(b"/proc/1/fd/3", state.pid),
+            Some(3)
+        );
+        assert_eq!(
+            reverie_procfs::parse_fd_path(b"/dev/fd/not-a-fd", state.pid),
+            None
+        );
     }
 
     /// readlink of `path`, a procfs link of the guest's own that a Tool

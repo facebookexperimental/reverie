@@ -163,6 +163,197 @@ pub fn escape_status_name(comm: &[u8]) -> Vec<u8> {
     escaped
 }
 
+/// Rewrite a `/proc/<pid>` path naming `own_pid` to the canonical
+/// `/proc/self` form, so both spellings resolve identically. Returns
+/// `None` for a path outside `/proc`.
+pub fn normalize_self_path(path: &[u8], own_pid: i32) -> Option<Vec<u8>> {
+    if path != b"/proc" && !path.starts_with(b"/proc/") {
+        return None;
+    }
+    let pid = format!("/proc/{own_pid}").into_bytes();
+    if path == pid.as_slice() {
+        return Some(b"/proc/self".to_vec());
+    }
+    let mut pid_dir = pid;
+    pid_dir.push(b'/');
+    if let Some(rest) = path.strip_prefix(pid_dir.as_slice()) {
+        let mut normalized = b"/proc/self/".to_vec();
+        normalized.extend_from_slice(rest);
+        return Some(normalized);
+    }
+    Some(path.to_vec())
+}
+
+/// Parse a decimal `/proc` id component (pid, tid, or fd number):
+/// nonempty, ASCII digits only, no overflow.
+pub fn parse_id(component: &[u8]) -> Option<i32> {
+    if component.is_empty() || !component.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    component.iter().try_fold(0_i32, |value, digit| {
+        value.checked_mul(10)?.checked_add(i32::from(*digit - b'0'))
+    })
+}
+
+/// The descriptor number a guest fd-link path names: `/dev/fd/<n>`,
+/// `/proc/self/fd/<n>`, `/proc/thread-self/fd/<n>`, or the own-pid
+/// spelling `/proc/<own_pid>/fd/<n>` (decimal only).
+pub fn parse_fd_path(path: &[u8], own_pid: i32) -> Option<i32> {
+    let numeric_prefix = format!("/proc/{own_pid}/fd/").into_bytes();
+    let suffix = path
+        .strip_prefix(b"/dev/fd/")
+        .or_else(|| path.strip_prefix(b"/proc/self/fd/"))
+        .or_else(|| path.strip_prefix(b"/proc/thread-self/fd/"))
+        .or_else(|| path.strip_prefix(numeric_prefix.as_slice()))?;
+    parse_id(suffix)
+}
+
+/// Classify a procfs executable-link spelling against `live`, the
+/// caller's "thread is live in the current process" predicate.
+/// `Some(false)` is a syntactically valid guest proc link naming a task
+/// outside the current process; callers must refuse it rather than
+/// accidentally opening the supervisor's procfs.
+pub fn classify_exe_path(path: &[u8], live: &impl Fn(i32) -> bool) -> Option<bool> {
+    if path == b"/proc/self/exe" || path == b"/proc/thread-self/exe" {
+        return Some(true);
+    }
+    let components = path
+        .strip_prefix(b"/proc/")?
+        .split(|byte| *byte == b'/')
+        .collect::<Vec<_>>();
+    match components.as_slice() {
+        [task, b"exe"] => parse_id(task).map(live),
+        [b"self", b"task", task, b"exe"] => parse_id(task).map(live),
+        [group, b"task", task, b"exe"] => {
+            let group = parse_id(group)?;
+            let task = parse_id(task)?;
+            Some(live(group) && live(task))
+        }
+        _ => None,
+    }
+}
+
+/// Linux single-record `seq_file` state (`fs/seq_file.c`: `seq_read`,
+/// `seq_lseek`). `read_pos` belongs to the sequence iterator; `file_pos`
+/// is the open file description's shared offset. A pread changes the
+/// former without changing the latter. Content comes from the caller's
+/// `observe` callback, re-rendered whenever the sequence (re)starts, and
+/// leaves through the caller's `copy` callback. Errors are negative
+/// `errno` values as `i64`.
+#[derive(Debug, Default)]
+pub struct SingleRecordSeq {
+    file_pos: u64,
+    read_pos: u64,
+    buffer: Vec<u8>,
+    from: usize,
+    end: bool,
+}
+
+impl SingleRecordSeq {
+    fn reset(&mut self) {
+        self.buffer.clear();
+        self.from = 0;
+        self.end = false;
+    }
+
+    fn traverse(
+        &mut self,
+        offset: u64,
+        observe: &mut impl FnMut() -> Result<Vec<u8>, i64>,
+    ) -> Result<(), i64> {
+        self.reset();
+        if offset != 0 {
+            self.buffer = observe()?;
+            self.from = offset.min(self.buffer.len() as u64) as usize;
+            self.end = true;
+        }
+        Ok(())
+    }
+
+    /// One `read` (or `pread` when `positioned_offset` is set) of at most
+    /// `count` bytes. Returns the byte count or a negative errno.
+    pub fn read(
+        &mut self,
+        positioned_offset: Option<u64>,
+        count: usize,
+        mut observe: impl FnMut() -> Result<Vec<u8>, i64>,
+        mut copy: impl FnMut(&[u8]) -> Result<usize, i64>,
+    ) -> i64 {
+        let offset = positioned_offset.unwrap_or(self.file_pos);
+        if offset > i64::MAX as u64 {
+            return -i64::from(libc::EINVAL);
+        }
+        if count == 0 {
+            return 0;
+        }
+        if offset == 0 {
+            self.reset();
+        }
+        if offset != self.read_pos {
+            if let Err(error) = self.traverse(offset, &mut observe) {
+                self.read_pos = 0;
+                self.reset();
+                return error;
+            }
+            self.read_pos = offset;
+        }
+        if self.from == self.buffer.len() && !self.end {
+            match observe() {
+                Ok(bytes) => self.buffer = bytes,
+                Err(error) => return error,
+            }
+            self.from = 0;
+            self.end = true;
+        }
+        let available = (self.buffer.len() - self.from).min(count);
+        if available == 0 {
+            return 0;
+        }
+        let copied = match copy(&self.buffer[self.from..self.from + available]) {
+            Ok(0) => return -i64::from(libc::EFAULT),
+            Ok(copied) => copied,
+            Err(error) => return error,
+        };
+        assert!(copied <= available, "seq copy exceeded the offered bytes");
+        self.from += copied;
+        self.read_pos += copied as u64;
+        if positioned_offset.is_none() {
+            self.file_pos = self.read_pos;
+        }
+        copied as i64
+    }
+
+    /// One `lseek`. Only `SEEK_SET` and `SEEK_CUR` are admitted, as for
+    /// Linux's single-record seq files. Returns the new offset or a
+    /// negative errno.
+    pub fn seek(
+        &mut self,
+        offset: i64,
+        whence: libc::c_int,
+        mut observe: impl FnMut() -> Result<Vec<u8>, i64>,
+    ) -> i64 {
+        let offset = match whence {
+            libc::SEEK_SET => Some(offset),
+            libc::SEEK_CUR => (self.file_pos as i64).checked_add(offset),
+            _ => None,
+        };
+        let Some(offset) = offset.filter(|offset| *offset >= 0) else {
+            return -i64::from(libc::EINVAL);
+        };
+        if offset as u64 != self.read_pos {
+            if let Err(error) = self.traverse(offset as u64, &mut observe) {
+                self.file_pos = 0;
+                self.read_pos = 0;
+                self.reset();
+                return error;
+            }
+            self.read_pos = offset as u64;
+        }
+        self.file_pos = offset as u64;
+        offset
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,5 +440,123 @@ mod tests {
         assert_eq!(escape_status_name(b"a\nb"), b"a\\nb");
         assert_eq!(escape_status_name(b"a\\b"), b"a\\\\b");
         assert_eq!(escape_status_name(b""), b"");
+    }
+
+    #[test]
+    fn normalize_self_path_spellings() {
+        assert_eq!(
+            normalize_self_path(b"/proc/7", 7),
+            Some(b"/proc/self".to_vec())
+        );
+        assert_eq!(
+            normalize_self_path(b"/proc/7/status", 7),
+            Some(b"/proc/self/status".to_vec())
+        );
+        assert_eq!(
+            normalize_self_path(b"/proc/8/status", 7),
+            Some(b"/proc/8/status".to_vec())
+        );
+        assert_eq!(normalize_self_path(b"/proc", 7), Some(b"/proc".to_vec()));
+        assert_eq!(normalize_self_path(b"/etc/passwd", 7), None);
+    }
+
+    #[test]
+    fn parse_id_and_fd_path() {
+        assert_eq!(parse_id(b"0"), Some(0));
+        assert_eq!(parse_id(b"42"), Some(42));
+        assert_eq!(parse_id(b""), None);
+        assert_eq!(parse_id(b"4x"), None);
+        assert_eq!(parse_id(b"99999999999999999999"), None);
+        assert_eq!(parse_fd_path(b"/proc/self/fd/3", 1), Some(3));
+        assert_eq!(parse_fd_path(b"/proc/thread-self/fd/3", 1), Some(3));
+        assert_eq!(parse_fd_path(b"/proc/1/fd/3", 1), Some(3));
+        assert_eq!(parse_fd_path(b"/proc/2/fd/3", 1), None);
+        assert_eq!(parse_fd_path(b"/dev/fd/3", 1), Some(3));
+        assert_eq!(parse_fd_path(b"/dev/fd/not-a-fd", 1), None);
+        assert_eq!(parse_fd_path(b"/proc/self/fd/", 1), None);
+    }
+
+    #[test]
+    fn classify_exe_path_spellings() {
+        let live = |tid: i32| tid == 5;
+        assert_eq!(classify_exe_path(b"/proc/self/exe", &live), Some(true));
+        assert_eq!(
+            classify_exe_path(b"/proc/thread-self/exe", &live),
+            Some(true)
+        );
+        assert_eq!(classify_exe_path(b"/proc/5/exe", &live), Some(true));
+        assert_eq!(classify_exe_path(b"/proc/6/exe", &live), Some(false));
+        assert_eq!(
+            classify_exe_path(b"/proc/self/task/5/exe", &live),
+            Some(true)
+        );
+        assert_eq!(classify_exe_path(b"/proc/5/task/5/exe", &live), Some(true));
+        assert_eq!(classify_exe_path(b"/proc/5/task/6/exe", &live), Some(false));
+        assert_eq!(classify_exe_path(b"/proc/self/status", &live), None);
+        assert_eq!(classify_exe_path(b"/etc/exe", &live), None);
+    }
+
+    fn collect(seq: &mut SingleRecordSeq, positioned: Option<u64>, count: usize) -> (i64, Vec<u8>) {
+        let mut out = Vec::new();
+        let result = seq.read(
+            positioned,
+            count,
+            || Ok(b"hello".to_vec()),
+            |bytes| {
+                out.extend_from_slice(bytes);
+                Ok(bytes.len())
+            },
+        );
+        (result, out)
+    }
+
+    #[test]
+    fn seq_read_chunks_and_rereads_from_zero() {
+        let mut seq = SingleRecordSeq::default();
+        assert_eq!(collect(&mut seq, None, 2), (2, b"he".to_vec()));
+        assert_eq!(collect(&mut seq, None, 2), (2, b"ll".to_vec()));
+        assert_eq!(collect(&mut seq, None, 2), (1, b"o".to_vec()));
+        assert_eq!(collect(&mut seq, None, 2), (0, Vec::new()));
+        assert_eq!(collect(&mut seq, Some(0), 5), (5, b"hello".to_vec()));
+    }
+
+    #[test]
+    fn seq_pread_moves_sequence_not_file_position() {
+        let mut seq = SingleRecordSeq::default();
+        assert_eq!(collect(&mut seq, Some(1), 2), (2, b"el".to_vec()));
+        // The plain read position is still 0, and offset 0 restarts.
+        assert_eq!(collect(&mut seq, None, 2), (2, b"he".to_vec()));
+        assert_eq!(collect(&mut seq, None, 0), (0, Vec::new()));
+        assert_eq!(
+            collect(&mut seq, Some(u64::MAX), 1).0,
+            -i64::from(libc::EINVAL)
+        );
+    }
+
+    #[test]
+    fn seq_seek_set_cur_and_refusals() {
+        let mut seq = SingleRecordSeq::default();
+        let observe = || Ok(b"hello".to_vec());
+        assert_eq!(seq.seek(2, libc::SEEK_SET, observe), 2);
+        assert_eq!(collect(&mut seq, None, 2), (2, b"ll".to_vec()));
+        assert_eq!(seq.seek(-1, libc::SEEK_CUR, observe), 3);
+        assert_eq!(
+            seq.seek(0, libc::SEEK_END, observe),
+            -i64::from(libc::EINVAL)
+        );
+        assert_eq!(
+            seq.seek(-1, libc::SEEK_SET, observe),
+            -i64::from(libc::EINVAL)
+        );
+    }
+
+    #[test]
+    fn seq_copy_fault_and_observe_error() {
+        let mut seq = SingleRecordSeq::default();
+        let zero_copy = seq.read(None, 2, || Ok(b"hello".to_vec()), |_| Ok(0));
+        assert_eq!(zero_copy, -i64::from(libc::EFAULT));
+        let mut seq = SingleRecordSeq::default();
+        let failed = seq.read(None, 2, || Err(-7), |bytes| Ok(bytes.len()));
+        assert_eq!(failed, -7);
     }
 }

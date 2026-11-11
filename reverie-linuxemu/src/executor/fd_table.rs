@@ -53,7 +53,7 @@ pub struct FileTableState {
 pub struct FdinfoDescription {
     pub(super) source: SeqProcSource,
     pub(super) nofollow_status: bool,
-    pub(super) sequence: Mutex<crate::fdinfo::FdinfoSequence>,
+    pub(super) sequence: Mutex<reverie_procfs::SingleRecordSeq>,
 }
 
 /// A `/proc/<pid>/stat` or `status` description carried by SCM_RIGHTS. The host

@@ -157,8 +157,8 @@ fn fstatat_impl(
     // synthetic_proc_content returns None for an empty path, so no explicit
     // AT_EMPTY_PATH guard is needed here.
     if let Some(content) = synthetic_proc_content(state, &path) {
-        let normalized =
-            normalize_proc_path(state, &path).expect("a synthesized /proc path always normalizes");
+        let normalized = reverie_procfs::normalize_self_path(&path, state.pid)
+            .expect("a synthesized /proc path always normalizes");
         let stat = reverie_procfs::synthetic_stat(
             reverie_procfs::synthetic_dev(SYNTHETIC_DEV_MAJOR, SYNTHETIC_PROC_DEV_MINOR),
             reverie_procfs::path_inode(&normalized),
@@ -192,7 +192,7 @@ fn fstatat_impl(
         );
     }
     let executable = if flags & libc::AT_SYMLINK_NOFOLLOW == 0 {
-        match guest_proc_exe_path(state, &path) {
+        match reverie_procfs::classify_exe_path(&path, &|tid| live_thread_in_process(state, tid)) {
             Some(true) => match state.executable_file.as_ref() {
                 Some(file) => Some(file.as_raw_fd()),
                 None => return negative_errno(libc::ENOENT),
@@ -332,7 +332,7 @@ pub(super) fn statx(
     // Path-addressed synthetic /proc file: synthesize deterministic metadata.
     if !path.is_empty() {
         if let Some(content) = synthetic_proc_content(state, &path) {
-            let normalized = normalize_proc_path(state, &path)
+            let normalized = reverie_procfs::normalize_self_path(&path, state.pid)
                 .expect("a synthesized /proc path always normalizes");
             let stx = reverie_procfs::synthetic_statx(
                 SYNTHETIC_DEV_MAJOR,

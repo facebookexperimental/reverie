@@ -487,16 +487,7 @@ pub(super) const SYNTHETIC_GUEST_FD_DEV_MINOR: u32 = 0xff02;
 pub(super) const SYNTHETIC_REGULAR_PROC_PATHS: &[&[u8]] =
     &[b"/proc/self/status", b"/proc/self/maps"];
 
-fn parse_proc_id(component: &[u8]) -> Option<i32> {
-    if component.is_empty() || !component.iter().all(u8::is_ascii_digit) {
-        return None;
-    }
-    component.iter().try_fold(0_i32, |value, digit| {
-        value.checked_mul(10)?.checked_add(i32::from(*digit - b'0'))
-    })
-}
-
-fn live_thread_in_process(state: &LoadedStaticElf, tid: i32) -> bool {
+pub(super) fn live_thread_in_process(state: &LoadedStaticElf, tid: i32) -> bool {
     state
         .task_lifecycle
         .lock()
@@ -505,55 +496,10 @@ fn live_thread_in_process(state: &LoadedStaticElf, tid: i32) -> bool {
         .is_some_and(|task| task.tgid == state.pid)
 }
 
-/// Classify a procfs executable-link spelling. `Some(false)` is a syntactically
-/// valid guest proc link naming a task outside the current process; callers
-/// must refuse it rather than accidentally opening the supervisor's procfs.
-pub(super) fn guest_proc_exe_path(state: &LoadedStaticElf, path: &[u8]) -> Option<bool> {
-    if path == b"/proc/self/exe" || path == b"/proc/thread-self/exe" {
-        return Some(true);
-    }
-    let components = path
-        .strip_prefix(b"/proc/")?
-        .split(|byte| *byte == b'/')
-        .collect::<Vec<_>>();
-    match components.as_slice() {
-        [task, b"exe"] => parse_proc_id(task).map(|tid| live_thread_in_process(state, tid)),
-        [b"self", b"task", task, b"exe"] => {
-            parse_proc_id(task).map(|tid| live_thread_in_process(state, tid))
-        }
-        [group, b"task", task, b"exe"] => {
-            let group = parse_proc_id(group)?;
-            let task = parse_proc_id(task)?;
-            Some(live_thread_in_process(state, group) && live_thread_in_process(state, task))
-        }
-        _ => None,
-    }
-}
-
-/// Rewrite a `/proc/<pid>` path (for this guest's own pid) to the canonical
-/// `/proc/self` form so both spellings resolve to the same synthetic content.
-pub(super) fn normalize_proc_path(state: &LoadedStaticElf, path: &[u8]) -> Option<Vec<u8>> {
-    if path != b"/proc" && !path.starts_with(b"/proc/") {
-        return None;
-    }
-    let pid = format!("/proc/{}", state.pid).into_bytes();
-    if path == pid.as_slice() {
-        return Some(b"/proc/self".to_vec());
-    }
-    let mut pid_dir = pid;
-    pid_dir.push(b'/');
-    if let Some(rest) = path.strip_prefix(pid_dir.as_slice()) {
-        let mut normalized = b"/proc/self/".to_vec();
-        normalized.extend_from_slice(rest);
-        return Some(normalized);
-    }
-    Some(path.to_vec())
-}
-
 /// Synthesize deterministic content for a recognized /proc path, or `None` when
 /// the path is not part of the supported surface.
 pub(super) fn synthetic_proc_content(state: &LoadedStaticElf, path: &[u8]) -> Option<Vec<u8>> {
-    let normalized = normalize_proc_path(state, path)?;
+    let normalized = reverie_procfs::normalize_self_path(path, state.pid)?;
     let content = match normalized.as_slice() {
         b"/proc/self/status" => proc_self_status_content(state),
         b"/proc/self/maps" => proc_self_maps_content(state),

@@ -653,7 +653,10 @@ impl ElfExecutor {
         })?;
         let alias = read_c_string(&ProviderMemory(memory), path_address, 4096)
             .map_err(|_| Self::parent_death_exec_error("enrolled exec alias is not readable"))?;
-        if guest_proc_exe_path(&self.state, &alias) != Some(true) {
+        if reverie_procfs::classify_exe_path(&alias, &|tid| {
+            live_thread_in_process(&self.state, tid)
+        }) != Some(true)
+        {
             return Err(Self::parent_death_exec_error(
                 "enrolled exec requires retained current-image authority",
             ));
