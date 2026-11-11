@@ -2996,13 +2996,21 @@ fn send_signal(
     }
 
     let targets_self = {
-        let (processes, synthesized_init) = {
+        let (processes, synthesized_init, named_process) = {
             let lifecycle = state
                 .task_lifecycle
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let processes: Vec<(i32, i32)> = lifecycle.processes().collect();
-            (processes, lifecycle.synthesizes_namespace_init())
+            // kill_pid_info_type finds a positive id as any live task's and
+            // signals that task's thread group, so a thread's id that is not
+            // its process's names its process.
+            let named_process = lifecycle.get(target).map(|task| task.tgid);
+            (
+                processes,
+                lifecycle.synthesizes_namespace_init(),
+                named_process,
+            )
         };
         match target {
             // Process groups are distinct from thread groups. A fork inherits
@@ -3071,16 +3079,24 @@ fn send_signal(
                     refuse_signal(refusal, SignalRefusal::INIT)
                 };
             }
-            _ if !processes.iter().any(|(tgid, _)| *tgid == target) => {
-                return continue_with(negative_errno(libc::ESRCH));
-            }
-            _ => {
-                return if signal == 0 {
-                    continue_with(0)
-                } else {
-                    refuse_signal(refusal, SignalRefusal::OTHER_PROCESS)
-                };
-            }
+            // A live process's id, even once its leader has exited, or a
+            // live thread's id, which names that thread's process.
+            _ => match processes
+                .iter()
+                .any(|(tgid, _)| *tgid == target)
+                .then_some(target)
+                .or(named_process)
+            {
+                None => return continue_with(negative_errno(libc::ESRCH)),
+                Some(tgid) if tgid == state.pid => true,
+                Some(_) => {
+                    return if signal == 0 {
+                        continue_with(0)
+                    } else {
+                        refuse_signal(refusal, SignalRefusal::OTHER_PROCESS)
+                    };
+                }
+            },
         }
     };
     if !targets_self {

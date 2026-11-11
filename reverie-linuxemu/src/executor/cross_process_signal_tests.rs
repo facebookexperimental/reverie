@@ -157,3 +157,61 @@ fn a_threaded_processs_signal_to_itself_waits_for_the_thread_the_tool_permits() 
             .unwrap();
     }
 }
+
+/// `kill` and `rt_sigqueueinfo` find a positive id as any live task's and
+/// signal that task's process (`kill_pid_info_type`), so a thread's id that
+/// is not its process's names its process: a liveness probe answers 0, and a
+/// signal goes to the process, here to the refusals a process gets.
+#[test]
+fn a_threads_id_names_its_process_in_kill_and_rt_sigqueueinfo() {
+    const INFO: u64 = 0x100;
+    let root = TestDir::new();
+    let mut leader = ElfExecutor::new(test_state(&root.0), false);
+    let mut sibling = leader.thread_child(2).unwrap();
+    let child = leader.fork_child(3, false, false).unwrap();
+    let child_thread = child.thread_child(4).unwrap();
+    let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+    let mut info = [0_u8; 128];
+    info[8..12].copy_from_slice(&libc::SI_QUEUE.to_ne_bytes());
+    memory.write(INFO, &info).unwrap();
+    let sigqueueinfo = |executor: &mut ElfExecutor, pid: i32, signal: i32| {
+        executor.execute(
+            &SyscallRequest::new(
+                libc::SYS_rt_sigqueueinfo as u64,
+                [pid as u64, signal as u64, INFO, 0, 0, 0],
+            ),
+            &memory,
+        )
+    };
+    // The sender's own id, from a thread that does not lead its process; a
+    // sibling's; another process's thread's; and an id no task has.
+    assert_eq!(xsig_kill(&mut sibling, 2, 0), 0);
+    assert_eq!(xsig_kill(&mut leader, 2, 0), 0);
+    assert_eq!(xsig_kill(&mut leader, 4, 0), 0);
+    assert_eq!(sigqueueinfo(&mut leader, 4, 0), 0);
+    assert_eq!(xsig_kill(&mut leader, 5, 0), negative_errno(libc::ESRCH));
+    assert_eq!(leader.take_unsupported_refusal(), None);
+    // A signal through a thread's id is its process's: the sender's own
+    // process has another thread, and the child is another process.
+    assert_eq!(
+        xsig_kill(&mut sibling, 2, libc::SIGUSR1),
+        negative_errno(libc::ENOSYS)
+    );
+    assert_eq!(
+        sibling.take_unsupported_refusal(),
+        xsig_refusal(SignalRefusal::THREADED_PROCESS)
+    );
+    for queued in [false, true] {
+        let result = if queued {
+            sigqueueinfo(&mut leader, 4, libc::SIGUSR1)
+        } else {
+            xsig_kill(&mut leader, 4, libc::SIGUSR1)
+        };
+        assert_eq!(result, negative_errno(libc::ENOSYS));
+        assert_eq!(
+            leader.take_unsupported_refusal(),
+            xsig_refusal(SignalRefusal::OTHER_PROCESS)
+        );
+    }
+    drop((child_thread, child));
+}
