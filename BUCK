@@ -895,7 +895,7 @@ rust_library(
 
 # The deprecated re-export of reverie::provider, kept for one release
 # (reverie-linux-provider/src/lib.rs). Its Cargo manifest is the open-source
-# one (oss_cargo), not autocargo's.
+# one, reverie-linux-provider/Cargo.toml, not autocargo's.
 rust_library(
     name = "reverie-linux-provider",
     srcs = glob(["reverie-linux-provider/src/**/*.rs"]),
