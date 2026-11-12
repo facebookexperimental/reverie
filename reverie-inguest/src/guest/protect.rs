@@ -312,10 +312,14 @@ pub fn place_runtime_fd(fd: libc::c_int) -> io::Result<libc::c_int> {
 /// and the remaining callers here are tests. A caller outside this repository
 /// that ignores the error from `CoordinatorRpc::connect` or `install_tool*`
 /// could resume the guest with that number open and unrecorded. That also
-/// needs a filter installed before the placement that refuses `rt_sigprocmask`
-/// or `F_GETFD` and then fakes or refuses the close, and installation with
-/// fixed syscall gates refuses an inherited filter before it connects
-/// (guest/tool_install.rs:277-282).
+/// needs a filter installed before the placement that makes the placement fail
+/// and then fakes or refuses the cleanup close. The placement fails there only
+/// under a filter: one that refuses `rt_sigprocmask` or `F_GETFD`, or one that
+/// fakes the close of the old number after the move while the record is full
+/// (`RECORDED_FD_CAPACITY` numbers), so [`record_if_open`] fails with
+/// `OutOfMemory`. Installation with fixed syscall gates refuses an inherited
+/// filter before it connects (guest/tool_install.rs:277-282); a direct caller
+/// of `CoordinatorRpc::connect` gets no such check.
 ///
 /// After a move `fd` was already closed; this call never attempts a second
 /// close of that number, because another thread may have reopened it. A filter
@@ -1805,42 +1809,106 @@ pub(crate) mod tests {
         Fake,
         /// The close fails with EIO without running.
         Refuse,
+        /// The close is never answered, so the supervisor's deadline expires.
+        Hold,
     }
+
+    /// A forked child that is killed and reaped if this is dropped before
+    /// [`OwnedChild::try_reap`] has reaped it, so a supervisor that fails or
+    /// panics leaves no process behind. SIGKILL ends a child even with every
+    /// signal blocked and while a seccomp notification holds one of its calls.
+    struct OwnedChild(libc::pid_t);
+
+    impl OwnedChild {
+        /// The child's wait status once it has exited, or `None` while it runs.
+        fn try_reap(&mut self) -> Option<i32> {
+            let mut status = 0;
+            let reaped = unsafe { libc::waitpid(self.0, &mut status, libc::WNOHANG) };
+            if reaped == self.0 {
+                self.0 = -1;
+                return Some(status);
+            }
+            assert_eq!(reaped, 0, "waitpid: {}", io::Error::last_os_error());
+            None
+        }
+    }
+
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            if self.0 > 0 {
+                unsafe {
+                    libc::kill(self.0, libc::SIGKILL);
+                    libc::waitpid(self.0, core::ptr::null_mut(), 0);
+                }
+            }
+        }
+    }
+
+    /// The last child [`closes_held_within`] forked in this process.
+    static SUPERVISED_CHILD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
     /// Runs `guest` in a forked process under a filter that holds its every
     /// `close` of `numbers[0]` or `numbers[1]` for this process (a seccomp
     /// user notification), answers each with the matching `answers` entry,
     /// requires `guest` to finish without panicking, and returns how many
-    /// closes of each number it made.
+    /// closes of each number it made. Fails after 20 seconds.
     fn closes_held(
         numbers: [libc::c_int; 2],
         answers: [CloseAnswer; 2],
         guest: impl FnOnce(),
     ) -> [usize; 2] {
+        closes_held_within(numbers, answers, std::time::Duration::from_secs(20), guest)
+    }
+
+    /// [`closes_held`], failing once `limit` has passed, handshake included.
+    /// The child is killed and reaped on every failure ([`OwnedChild`]).
+    fn closes_held_within(
+        numbers: [libc::c_int; 2],
+        answers: [CloseAnswer; 2],
+        limit: std::time::Duration,
+        guest: impl FnOnce(),
+    ) -> [usize; 2] {
+        let deadline = std::time::Instant::now() + limit;
+        let remaining_ms = || {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(!left.is_zero(), "the guest never finished");
+            left.as_millis().clamp(1, 50) as libc::c_int
+        };
         let mut pipe = [-1; 2];
         assert_eq!(
             unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
             0
         );
-        let child = unsafe { libc::fork() };
-        assert!(child >= 0);
-        if child == 0 {
-            unsafe { libc::alarm(60) };
+        let forked = unsafe { libc::fork() };
+        assert!(forked >= 0);
+        if forked == 0 {
+            unsafe { libc::close(pipe[0]) };
             let listener = notify_on_close(numbers);
             let written = unsafe { libc::write(pipe[1], (&raw const listener).cast(), 4) };
             if listener < 0 || written != 4 {
                 unsafe { libc::_exit(124) };
             }
+            unsafe { libc::close(pipe[1]) };
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(guest));
             unsafe { libc::_exit(if result.is_ok() { 0 } else { 125 }) };
         }
+        let mut child = OwnedChild(forked);
+        SUPERVISED_CHILD.store(forked, Ordering::SeqCst);
+        unsafe { libc::close(pipe[1]) };
+        // The handshake: the child's listener number, or end of file if the
+        // child ended before sending it.
+        let mut ready = libc::pollfd {
+            fd: pipe[0],
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        while unsafe { libc::poll(&mut ready, 1, remaining_ms()) } <= 0 {}
         let mut remote_listener = -1_i32;
-        assert_eq!(
-            unsafe { libc::read(pipe[0], (&raw mut remote_listener).cast(), 4) },
-            4
-        );
+        let read = unsafe { libc::read(pipe[0], (&raw mut remote_listener).cast(), 4) };
+        unsafe { libc::close(pipe[0]) };
+        assert_eq!(read, 4, "the child ended before its handshake");
         assert!(remote_listener >= 0, "listener: {remote_listener}");
-        let pidfd = unsafe { raw_syscall6(libc::SYS_pidfd_open, [child as u64, 0, 0, 0, 0, 0]) };
+        let pidfd = unsafe { raw_syscall6(libc::SYS_pidfd_open, [forked as u64, 0, 0, 0, 0, 0]) };
         assert!(pidfd >= 0, "pidfd_open: {pidfd}");
         let listener = unsafe {
             raw_syscall6(
@@ -1848,25 +1916,19 @@ pub(crate) mod tests {
                 [pidfd as u64, remote_listener as u64, 0, 0, 0, 0],
             )
         };
+        unsafe { libc::close(pidfd as libc::c_int) };
         assert!(listener >= 0, "pidfd_getfd: {listener}");
         let mut closes = [0; 2];
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         let status = loop {
-            let mut status = 0;
-            let reaped = unsafe { libc::waitpid(child, &mut status, libc::WNOHANG) };
-            if reaped == child {
+            if let Some(status) = child.try_reap() {
                 break status;
             }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the guest never finished"
-            );
             let mut ready = libc::pollfd {
                 fd: listener as i32,
                 events: libc::POLLIN,
                 revents: 0,
             };
-            if unsafe { libc::poll(&mut ready, 1, 50) } <= 0 {
+            if unsafe { libc::poll(&mut ready, 1, remaining_ms()) } <= 0 {
                 continue;
             }
             let mut notification: libc::seccomp_notif = unsafe { core::mem::zeroed() };
@@ -1890,6 +1952,7 @@ pub(crate) mod tests {
                 CloseAnswer::Run => (0, libc::SECCOMP_USER_NOTIF_FLAG_CONTINUE as u32),
                 CloseAnswer::Fake => (0, 0),
                 CloseAnswer::Refuse => (-libc::EIO, 0),
+                CloseAnswer::Hold => continue,
             };
             let response = libc::seccomp_notif_resp {
                 id: notification.id,
@@ -1897,8 +1960,16 @@ pub(crate) mod tests {
                 error,
                 flags,
             };
-            unsafe { libc::ioctl(listener as i32, libc::SECCOMP_IOCTL_NOTIF_SEND, &response) };
+            let sent =
+                unsafe { libc::ioctl(listener as i32, libc::SECCOMP_IOCTL_NOTIF_SEND, &response) };
+            assert_eq!(
+                sent,
+                0,
+                "notification reply: {}",
+                io::Error::last_os_error()
+            );
         };
+        unsafe { libc::close(listener as libc::c_int) };
         assert!(
             libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
             "guest status {status:#x}"
@@ -1970,7 +2041,9 @@ pub(crate) mod tests {
     /// descriptor stays open and is not recorded, the placement returns its
     /// own error, and nothing else is closed.
     fn a_failed_cleanup_close_of_the_unmoved_descriptor(answer: CloseAnswer) {
-        in_child(|| {
+        // The spare number is above RUNTIME_FD_MIN, which a soft limit of
+        // 1024 would not admit.
+        in_child_with_soft_nofile(2048, || {
             let fd = open_eventfd();
             let spare = next_runtime_number(fd);
             let closes = closes_held([fd, spare], [answer, CloseAnswer::Run], || {
@@ -1992,6 +2065,40 @@ pub(crate) mod tests {
     #[test]
     fn a_refused_cleanup_close_is_attempted_once_and_records_nothing() {
         a_failed_cleanup_close_of_the_unmoved_descriptor(CloseAnswer::Refuse);
+    }
+
+    /// A supervisor that fails (here its deadline expires while the guest's
+    /// close is still held, with every signal blocked) kills and reaps its
+    /// child instead of leaving it behind.
+    #[test]
+    fn a_failing_close_supervisor_kills_and_reaps_its_child() {
+        in_child(|| {
+            let fd = open_eventfd();
+            let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                closes_held_within(
+                    [fd, fd],
+                    [CloseAnswer::Hold; 2],
+                    std::time::Duration::from_millis(500),
+                    || {
+                        let _blocked = block_all_signals().unwrap();
+                        unsafe { raw_syscall6(libc::SYS_close, [fd as u64, 0, 0, 0, 0, 0]) };
+                    },
+                )
+            }));
+            assert!(failed.is_err(), "the held close never timed out");
+            let child = SUPERVISED_CHILD.load(Ordering::SeqCst);
+            assert!(child > 0);
+            assert_eq!(
+                unsafe { libc::waitpid(child, core::ptr::null_mut(), libc::WNOHANG) },
+                -1
+            );
+            assert_eq!(
+                io::Error::last_os_error().raw_os_error(),
+                Some(libc::ECHILD)
+            );
+            assert_eq!(unsafe { libc::kill(child, 0) }, -1);
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+        });
     }
 
     /// After a move and a record that fails, the placement attempts one close
