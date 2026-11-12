@@ -25,7 +25,8 @@ the raw size and sha256 of every source file listed in
 
 - Any change to one of those files, comments included (the pins are raw size
   and sha256), must update its pinned tuple in the same change and run
-  `cargo test -p reverie-liteinst-artifact` at the exact head before landing.
+  `cargo test -p reverie-liteinst-artifact` at the exact head before
+  submitting.
 - Update every occurrence of the old sha256, not only the catalog row. Some
   files are pinned again elsewhere in `reverie-liteinst-artifact/src/`, for
   example in `private_static/tls_sources.rs`,
@@ -38,6 +39,7 @@ the raw size and sha256 of every source file listed in
   refuses the old content.
 - Run that test in a git checkout of the head: some of its tests run
   `git rev-parse HEAD`, so a copy without `.git` fails them.
-- A landing that runs only the tests for what a change touches does not run
-  this test for a pinned file in another crate. Two merge-queue ejections came
-  from exactly that: one for a code change and one for a comment-only change.
+- The tests for what a change touches include this one for every pinned file
+  it changes, even a file in another crate whose own tests do not run it. Two
+  merge-queue ejections came from missing exactly that: one for a code change
+  and one for a comment-only change.
