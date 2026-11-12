@@ -2336,7 +2336,7 @@ impl VerifiedStaticSource {
             let inventory = bind(&input.musl_source_authority.join("inventory.json"))?;
             require(
                 inventory.sha256
-                    == "6aeea4469c8ba49c4c475a6694972e6a1ef3974954c9f986f99d7d1bce926275",
+                    == "3beab05d07515e2005d1ee59b66327a4c5de385be4ba689f180d9cc470c62bf1",
                 "initializer native source authority inventory differs",
             )?;
             let native_sources: Value =

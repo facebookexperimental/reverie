@@ -1255,7 +1255,7 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers.rs",
         284108,
-        "60d0c9dc14d99ada7ce79b0b04baa7a786712e0429d9203d8d346f835ffa1e9b",
+        "5be23875aab66314ad90190601c4827a7c50201b5106448cb149d30390f59acc",
     ),
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers/package_roles.rs",
@@ -71892,7 +71892,7 @@ pub mod private_machine_diagnostic {
             )?;
             let inventory = bind(
                 &inputs.source_authority.join("inventory.json"),
-                Some("6aeea4469c8ba49c4c475a6694972e6a1ef3974954c9f986f99d7d1bce926275"),
+                Some("3beab05d07515e2005d1ee59b66327a4c5de385be4ba689f180d9cc470c62bf1"),
                 128 * 1024,
             )?;
             let rows: Value =
