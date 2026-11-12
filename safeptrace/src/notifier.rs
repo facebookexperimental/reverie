@@ -6411,10 +6411,17 @@ impl Notifier {
         }
     }
 
+    /// The registered handle of `pid`'s current generation, captured under
+    /// `policy`: a Native capture of a thread without a thread pidfd is
+    /// refused, and reports that refusal on stderr.
     #[cfg(test)]
-    fn current_registered(&self, pid: Pid) -> Result<Option<EventHandle>, Errno> {
+    fn current_registered(
+        &self,
+        pid: Pid,
+        policy: WaitPolicy,
+    ) -> Result<Option<EventHandle>, Errno> {
         loop {
-            let current = match self.capture_identity(pid) {
+            let current = match self.capture_identity_for_policy(pid, policy) {
                 Ok(current) => current,
                 Err(Errno::ENOENT | Errno::ESRCH) => return Ok(None),
                 Err(error) => return Err(error),
@@ -9874,8 +9881,15 @@ mod test {
             terminal: &TerminalCleanup,
             signal_sent: &mut bool,
         ) -> io::Result<CleanupWaitOwner> {
+            // Capture under the policy of the generation this guard holds,
+            // as its owner would: Native for a thread pidfd, the explicit
+            // ptracer-thread policy otherwise.
+            let policy = match terminal.event.identity().map(|identity| &identity.pidfd) {
+                Some(ThreadHandle::Pidfd(_)) | None => WaitPolicy::Native,
+                Some(_) => WaitPolicy::PtracerThread,
+            };
             let authoritative =
-                match NOTIFIER.current_registered(pid.into()) {
+                match NOTIFIER.current_registered(pid.into(), policy) {
                     Ok(Some(authoritative)) => Some(authoritative),
                     Ok(None) | Err(_) => NOTIFIER
                         .registered_sync_handle(pid.into(), pidfd)
@@ -10016,6 +10030,24 @@ mod test {
             }
         }
 
+        /// Waits up to `timeout` for `terminal`'s generation to retire. Its
+        /// worker runs, but a procfs worker publishes only the statuses its
+        /// ptracer consumes, which the shared handle alone never does (see
+        /// [`TerminalCleanup::wait`]). This guard runs on the tracee's
+        /// ptracer, so for such a generation it waits through the
+        /// ptracer-thread facade, which consumes for the worker. A refusal
+        /// there leaves the shared wait, as for any other generation.
+        fn notifier_retired(terminal: &TerminalCleanup, timeout: Duration) -> bool {
+            let procfs = terminal
+                .event
+                .identity()
+                .is_some_and(|identity| matches!(identity.pidfd, ThreadHandle::Procfs { .. }));
+            if procfs && let Ok(retired) = terminal.on_ptracer_thread().wait(timeout) {
+                return retired;
+            }
+            terminal.wait(timeout)
+        }
+
         fn cleanup_with_notifier(
             pid: Pid,
             pidfd: &ThreadHandle,
@@ -10028,7 +10060,7 @@ mod test {
                     Ok(()) => *signal_sent = true,
                     Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {
                         *signal_sent = true;
-                        if terminal.wait(TRACEE_WAIT_TIMEOUT) {
+                        if Self::notifier_retired(terminal, TRACEE_WAIT_TIMEOUT) {
                             return Ok(());
                         }
                         return Err(io::Error::new(
@@ -10053,7 +10085,7 @@ mod test {
             let deadline = Instant::now() + TRACEE_WAIT_TIMEOUT;
             let mut exit_stop_resumed = false;
             loop {
-                if terminal.wait(Duration::ZERO) {
+                if Self::notifier_retired(terminal, Duration::ZERO) {
                     return Ok(());
                 }
                 if terminal.exit_stop_observed() && !exit_stop_resumed {

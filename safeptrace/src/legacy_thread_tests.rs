@@ -43,6 +43,17 @@ fn run_legacy_test_outer(name: &str) -> bool {
 
 #[cfg(not(sanitized))]
 fn run_legacy_test_outer_with_outcome(name: &str, marker: Option<&str>) -> bool {
+    run_legacy_test_outer_checked(name, marker, |_| {})
+}
+
+/// [`run_legacy_test_outer_with_outcome`], and `check` then inspects the
+/// inner run.
+#[cfg(not(sanitized))]
+fn run_legacy_test_outer_checked(
+    name: &str,
+    marker: Option<&str>,
+    check: impl FnOnce(&BoundedSubprocess),
+) -> bool {
     const INNER: &str = "SAFEPTRACE_LEGACY_THREAD_INNER";
     if env::var(INNER).as_deref() == Ok(name) {
         return false;
@@ -71,6 +82,7 @@ fn run_legacy_test_outer_with_outcome(name: &str, marker: Option<&str>) -> bool 
         );
         emit_completion_marker(marker);
     }
+    check(&result);
     true
 }
 
@@ -2102,6 +2114,83 @@ async fn legacy_resume_racing_a_held_wait(late_notify_round: Option<usize>) {
     );
     assert!(root_terminal.wait(TRACEE_WAIT_TIMEOUT));
     root_cleanup.disarm();
+}
+
+// A failing forced-procfs test unwinds through its armed cleanup guards,
+// and they must tear the group down promptly. The non-leader's guard kills
+// it, and the thread stops at its exit stop. A procfs worker publishes only
+// what its ptracer consumes, so a guard that only observed would never see
+// that stop, never resume it, and wait out its 2 s bound; the leader's guard
+// then waits out its own, since the group cannot finish exiting. The guard
+// runs on the ptracer and drives the generation from there instead. The
+// guards' lookup of the registered generation must also capture as the
+// generation's owner does, not with the native policy, whose refusal on a
+// thread without a thread pidfd goes to stderr: the outer run requires the
+// inner stderr to omit it.
+#[tokio::test(flavor = "current_thread")]
+#[cfg(not(sanitized))]
+async fn forced_legacy_cleanup_guards_reap_a_held_nonleader_on_unwind() {
+    if run_legacy_test_outer_checked(
+        "forced_legacy_cleanup_guards_reap_a_held_nonleader_on_unwind",
+        None,
+        |result| {
+            assert!(
+                !result
+                    .output
+                    .stderr
+                    .windows(NATIVE_THREAD_PIDFD_REQUIREMENT.len())
+                    .any(|window| window == NATIVE_THREAD_PIDFD_REQUIREMENT),
+                "a cleanup guard opened a native thread pidfd for a procfs generation: {result:?}"
+            )
+        },
+    ) {
+        return;
+    }
+    let reached = Arc::new(Mutex::new(None));
+    let record = Arc::clone(&reached);
+    let unwind = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async move {
+        let (root, stopped, _root_cleanup, _force) = spawn_legacy_thread_tracee(true);
+        let (parent, crate::Event::NewChild(crate::ChildOp::Clone, child)) =
+            tokio::time::timeout(
+                TRACEE_WAIT_TIMEOUT,
+                stopped.resume(None).unwrap().wait_owned_on_ptracer_thread(),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .assume_stopped()
+        else {
+            panic!("missing paused pthread clone");
+        };
+        let _child_cleanup = legacy_child_cleanup(&child);
+        *child.terminal_cleanup().event.event().legacy_held_period.lock() =
+            Some(Duration::from_secs(60));
+        let (_child, sigstop) =
+            tokio::time::timeout(TRACEE_WAIT_TIMEOUT, child.wait_owned_on_ptracer_thread())
+                .await
+                .unwrap()
+                .unwrap()
+                .assume_stopped();
+        assert_eq!(sigstop, crate::Event::Signal(Signal::SIGSTOP));
+        let _parent_running = parent.resume(None).unwrap();
+        *record.lock() = Some((root, Instant::now()));
+        panic!("a failure with both cleanup guards armed");
+    }))
+    .await;
+    assert!(unwind.is_err());
+    let (root, panicked) = reached
+        .lock()
+        .take()
+        .expect("the fixture failed before its deliberate panic");
+    let unwound = panicked.elapsed();
+    assert!(
+        unwound < Duration::from_secs(1),
+        "the armed cleanup guards took {unwound:?} to unwind"
+    );
+    assert!(
+        !std::path::Path::new(&format!("/proc/{root}")).exists(),
+        "the cleanup guards left the leader {root}"
+    );
 }
 
 // While the ptracer holds a legacy non-leader in a stop, its worker waits
