@@ -977,7 +977,7 @@ const LITEROOT: MappedConsumerSource = MappedConsumerSource {
     entry_source_relative: "preload/src/mapped_entry.rs",
     // SHA-256 of `preload/src/mapped_entry.rs` at the reviewed
     // literoot head for this stack. Update only with that file.
-    accepted_entry_sources: &["b089e8f53e6285c21f411c1dce77741f0c9e081285914b55ef171eaa30d53559"],
+    accepted_entry_sources: &["13c86e80c0ab927508422539f4d81c93b9af24d45e545464d7d2c9210177a9d0"],
     binding: WorkspaceBinding::CargoGitRev,
     package_name: "literoot-preload",
     package_version: "0.0.1",

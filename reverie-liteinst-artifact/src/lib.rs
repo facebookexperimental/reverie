@@ -1255,7 +1255,7 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers.rs",
         283885,
-        "ad6a646f91964e31d11df15ab716ef6cd542de4b0632e51098078220b3bd662a",
+        "18b3558ebb0f2e42beed1de31921eb471000e15f680ce2c56e9d1a2ca5f62bb3",
     ),
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers/package_roles.rs",
@@ -38987,6 +38987,11 @@ mod tests {
                 "reverie-liteinst-artifact/src/private_static/selected_initializers/view_table.rs",
                 41315,
                 "6cfc3c67d8485dff9463cff67be604f81fce9d7f92f63f93f118fc7b4a2e7ccb",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers.rs",
+                283885,
+                "ad6a646f91964e31d11df15ab716ef6cd542de4b0632e51098078220b3bd662a",
             ),
             (
                 "reverie-liteinst-artifact/src/private_static/selected_initializers.rs",
