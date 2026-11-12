@@ -1812,7 +1812,8 @@ pub(crate) mod tests {
         Fake,
         /// The close fails with EIO without running.
         Refuse,
-        /// The close is never answered, so the supervisor's deadline expires.
+        /// The close is never answered: the supervisor gives up
+        /// [`HOLD_EXPIRY`] after receiving it.
         Hold,
     }
 
@@ -1847,37 +1848,40 @@ pub(crate) mod tests {
         }
     }
 
-    /// The last child [`closes_held_within`] forked in this process.
+    /// The last child [`closes_held`] forked in this process.
     static SUPERVISED_CHILD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
-    /// How many closes the last [`closes_held_within`] call in this process
-    /// received from its child, answered or not.
+    /// How many closes the last [`closes_held`] call in this process received
+    /// from its child, answered or not.
     static SUPERVISED_CLOSES: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(0);
+
+    /// How long [`closes_held`] lets its child work, handshake included,
+    /// before it fails the test. Generous: it is a bound on real work under
+    /// load, which takes milliseconds when the host is idle.
+    const WORK_LIMIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+    /// How long [`closes_held`] keeps a [`CloseAnswer::Hold`] close held
+    /// before it gives up. Its timer starts only when the close has been
+    /// received, so a slow fork or handshake cannot make it fire early.
+    const HOLD_EXPIRY: std::time::Duration = std::time::Duration::from_millis(300);
 
     /// Runs `guest` in a forked process under a filter that holds its every
     /// `close` of `numbers[0]` or `numbers[1]` for this process (a seccomp
     /// user notification), answers each with the matching `answers` entry,
     /// requires `guest` to finish without panicking, and returns how many
-    /// closes of each number it made. Fails after 20 seconds.
+    /// closes of each number it made. Fails once [`WORK_LIMIT`] has passed,
+    /// handshake included, or [`HOLD_EXPIRY`] after a [`CloseAnswer::Hold`]
+    /// close arrives. The child is killed and reaped on every failure
+    /// ([`OwnedChild`]).
     fn closes_held(
         numbers: [libc::c_int; 2],
         answers: [CloseAnswer; 2],
         guest: impl FnOnce(),
     ) -> [usize; 2] {
-        closes_held_within(numbers, answers, std::time::Duration::from_secs(20), guest)
-    }
-
-    /// [`closes_held`], failing once `limit` has passed, handshake included.
-    /// The child is killed and reaped on every failure ([`OwnedChild`]).
-    fn closes_held_within(
-        numbers: [libc::c_int; 2],
-        answers: [CloseAnswer; 2],
-        limit: std::time::Duration,
-        guest: impl FnOnce(),
-    ) -> [usize; 2] {
-        let deadline = std::time::Instant::now() + limit;
-        let remaining_ms = || {
+        let start = std::time::Instant::now();
+        let mut deadline = start + WORK_LIMIT;
+        let remaining_ms = |deadline: std::time::Instant| {
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             assert!(!left.is_zero(), "the guest never finished");
             left.as_millis().clamp(1, 50) as libc::c_int
@@ -1915,12 +1919,15 @@ pub(crate) mod tests {
             events: libc::POLLIN,
             revents: 0,
         };
-        while unsafe { libc::poll(&mut ready, 1, remaining_ms()) } <= 0 {}
+        while unsafe { libc::poll(&mut ready, 1, remaining_ms(deadline)) } <= 0 {}
         let mut remote_listener = -1_i32;
         let read = unsafe { libc::read(pipe[0], (&raw mut remote_listener).cast(), 4) };
         unsafe { libc::close(pipe[0]) };
         assert_eq!(read, 4, "the child ended before its handshake");
         assert!(remote_listener >= 0, "listener: {remote_listener}");
+        // Seen only with --nocapture: the handshake time the limits are sized
+        // against.
+        eprintln!("closes_held: handshake after {:?}", start.elapsed());
         let pidfd = unsafe { raw_syscall6(libc::SYS_pidfd_open, [forked as u64, 0, 0, 0, 0, 0]) };
         assert!(pidfd >= 0, "pidfd_open: {pidfd}");
         let listener = unsafe {
@@ -1941,7 +1948,7 @@ pub(crate) mod tests {
                 events: libc::POLLIN,
                 revents: 0,
             };
-            if unsafe { libc::poll(&mut ready, 1, remaining_ms()) } <= 0 {
+            if unsafe { libc::poll(&mut ready, 1, remaining_ms(deadline)) } <= 0 {
                 continue;
             }
             let mut notification: libc::seccomp_notif = unsafe { core::mem::zeroed() };
@@ -1966,7 +1973,11 @@ pub(crate) mod tests {
                 CloseAnswer::Run => (0, libc::SECCOMP_USER_NOTIF_FLAG_CONTINUE as u32),
                 CloseAnswer::Fake => (0, 0),
                 CloseAnswer::Refuse => (-libc::EIO, 0),
-                CloseAnswer::Hold => continue,
+                CloseAnswer::Hold => {
+                    eprintln!("closes_held: close held after {:?}", start.elapsed());
+                    deadline = deadline.min(std::time::Instant::now() + HOLD_EXPIRY);
+                    continue;
+                }
             };
             let response = libc::seccomp_notif_resp {
                 id: notification.id,
@@ -2081,27 +2092,21 @@ pub(crate) mod tests {
         a_failed_cleanup_close_of_the_unmoved_descriptor(CloseAnswer::Refuse);
     }
 
-    /// A supervisor that fails (here its deadline expires while the guest's
-    /// close is still held, with every signal blocked) kills and reaps its
-    /// child instead of leaving it behind.
+    /// A supervisor that fails (here it gives up on a close it holds, with
+    /// every signal blocked in the guest) kills and reaps its child instead of
+    /// leaving it behind.
     #[test]
     fn a_failing_close_supervisor_kills_and_reaps_its_child() {
         in_child(|| {
             let fd = open_eventfd();
             let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                closes_held_within(
-                    [fd, fd],
-                    [CloseAnswer::Hold; 2],
-                    std::time::Duration::from_secs(2),
-                    || {
-                        let _blocked = block_all_signals().unwrap();
-                        unsafe { raw_syscall6(libc::SYS_close, [fd as u64, 0, 0, 0, 0, 0]) };
-                    },
-                )
+                closes_held([fd, fd], [CloseAnswer::Hold; 2], || {
+                    let _blocked = block_all_signals().unwrap();
+                    unsafe { raw_syscall6(libc::SYS_close, [fd as u64, 0, 0, 0, 0, 0]) };
+                })
             }));
             assert!(failed.is_err(), "the held close never timed out");
-            // The deadline expired while the close was held, not earlier (for
-            // example during the handshake).
+            // The supervisor gave up on the held close, not on slow setup.
             assert_eq!(SUPERVISED_CLOSES.load(Ordering::SeqCst), 1);
             let child = SUPERVISED_CHILD.load(Ordering::SeqCst);
             assert!(child > 0);
