@@ -1115,22 +1115,75 @@ mod tests {
         );
     }
 
+    const ET_EXEC: u16 = 2;
+    const ET_DYN: u16 = 3;
+
+    /// The ELF `e_type` of `image`, read straight from its header and not
+    /// through goblin: the magic at bytes 0..4, the byte order at byte 5
+    /// (`EI_DATA`), and `e_type` as the 16-bit field at bytes 16..18.
+    fn header_e_type(image: &[u8]) -> u16 {
+        assert!(image.len() >= 18, "image too short for an ELF header");
+        assert_eq!(&image[..4], b"\x7fELF", "not an ELF image");
+        let field = [image[16], image[17]];
+        match image[5] {
+            1 => u16::from_le_bytes(field),
+            2 => u16::from_be_bytes(field),
+            other => panic!("unknown ELF byte order {other}"),
+        }
+    }
+
+    /// Writes `e_type` into `image`'s header in the image's byte order.
+    fn set_header_e_type(image: &mut [u8], e_type: u16) {
+        let field = match image[5] {
+            1 => e_type.to_le_bytes(),
+            _ => e_type.to_be_bytes(),
+        };
+        image[16..18].copy_from_slice(&field);
+    }
+
+    /// `shape` is the proved shape of a dynamically linked executable whose
+    /// header says `e_type`: PIE exactly when that is ET_DYN.
+    fn assert_executable_shape(shape: &CodeShape, e_type: u16, what: &str) {
+        assert!(shape.dynamic, "{what} is dynamically linked: {shape:?}");
+        assert!(
+            e_type == ET_EXEC || e_type == ET_DYN,
+            "{what}: e_type {e_type} is neither ET_EXEC nor ET_DYN"
+        );
+        assert_eq!(
+            shape.pie,
+            e_type == ET_DYN,
+            "{what}: PIE must match the header's e_type {e_type}: {shape:?}"
+        );
+        assert!(!shape.jit_indicators, "{what}: {shape:?}");
+    }
+
     /// Positive ELF coverage over a deterministic fixture that always
     /// exists in a test run: this very test binary. An always-Unknown
     /// `probe_code_shape_file` mutant fails here (it survived the old
     /// /bin/true test, which returned successfully on Unknown).
+    ///
+    /// Whether the binary is PIE depends on the build: Cargo links a PIE
+    /// (ET_DYN), and fbcode's Buck `rust_unittest` links a non-PIE
+    /// (ET_EXEC) dynamic executable. So the probe's answer is checked
+    /// against the binary's own header, and again on a copy whose header
+    /// says the other kind. Either build then covers both answers.
     #[test]
     fn code_shape_proves_a_real_dynamic_image() {
         let exe = std::env::current_exe().expect("test binary path");
         let Knowledge::Proved(shape) = probe_code_shape_file(&exe) else {
             panic!("own test binary must parse as a proved ELF shape");
         };
-        assert!(
-            shape.dynamic,
-            "test binary is dynamically linked: {shape:?}"
-        );
-        assert!(shape.pie, "test binary is PIE: {shape:?}");
-        assert!(!shape.jit_indicators, "{shape:?}");
+        let mut image = std::fs::read(&exe).expect("read own test binary");
+        let e_type = header_e_type(&image);
+        assert_executable_shape(&shape, e_type, "test binary");
+
+        let other = if e_type == ET_DYN { ET_EXEC } else { ET_DYN };
+        set_header_e_type(&mut image, other);
+        assert_eq!(header_e_type(&image), other);
+        let Knowledge::Proved(shape) = probe_code_shape(&image) else {
+            panic!("the e_type-switched copy must parse as a proved ELF shape");
+        };
+        assert_executable_shape(&shape, other, "e_type-switched copy");
     }
 
     /// Scripted [`TrialChild`] for custody tests: replays wait replies
