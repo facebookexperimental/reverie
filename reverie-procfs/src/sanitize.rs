@@ -927,11 +927,11 @@ pub fn sanitize_smaps_rollup(contents: &[u8]) -> Vec<u8> {
 /// read different bytes, and Go, which reads this file at every process start
 /// to size GOMAXPROCS from its cgroup's `cpu.max`, then took different
 /// branches, ran for different virtual times and wrote different timestamps
-/// into its build cache (https://github.com/rrnewton/hermit/issues/4378).
+/// into its build cache (<https://github.com/rrnewton/hermit/issues/4378>).
 /// With the path `/`, Go reads `/sys/fs/cgroup/cpu.max` instead: absent on a
 /// host's real root cgroup, but the launcher's quota at the root of a private
 /// cgroup namespace (a container), so launchers with different quotas can
-/// still differ (https://github.com/rrnewton/hermit/issues/4388).
+/// still differ (<https://github.com/rrnewton/hermit/issues/4388>).
 ///
 /// Split on bytes: a cgroup directory name may hold any byte but `/` and NUL,
 /// and a name that is not UTF-8 must not pass through.
