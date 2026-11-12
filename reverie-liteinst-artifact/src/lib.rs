@@ -1224,8 +1224,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-liteinst-artifact/src/private_static/tls_sources.rs",
-        38792,
-        "ff08286667d4989abfeba6c8eaba336318de2f11dfa3eb789892f6499b3691fc",
+        41407,
+        "241f357852442b9246bac9fa6a317d95044daa4cfd74700871ad3c9248384620",
     ),
     (
         "Cargo.toml",
@@ -1254,8 +1254,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers.rs",
-        283885,
-        "18b3558ebb0f2e42beed1de31921eb471000e15f680ce2c56e9d1a2ca5f62bb3",
+        284108,
+        "60d0c9dc14d99ada7ce79b0b04baa7a786712e0429d9203d8d346f835ffa1e9b",
     ),
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers/package_roles.rs",
@@ -1339,8 +1339,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-inguest/Cargo.toml",
-        6166,
-        "1cca57bb80f07e02e47977ea2f639475084a7e6838caa140b8445e6d358f0488",
+        6495,
+        "2ee5115d633d33984ebfae0d5debd0278596536e8866587a25b68f26940b63e0",
     ),
     (
         "reverie-inguest/src/lib.rs",
@@ -38943,6 +38943,21 @@ mod tests {
         // Keep the fixed catalog authoritative and reject their prior tuples.
         assert_eq!(CONTENT_REVERIE_CATALOG.len(), 86);
         for (relative, old_size, old_digest) in [
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers.rs",
+                283885,
+                "18b3558ebb0f2e42beed1de31921eb471000e15f680ce2c56e9d1a2ca5f62bb3",
+            ),
+            (
+                "reverie-inguest/Cargo.toml",
+                6166,
+                "1cca57bb80f07e02e47977ea2f639475084a7e6838caa140b8445e6d358f0488",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/tls_sources.rs",
+                38792,
+                "ff08286667d4989abfeba6c8eaba336318de2f11dfa3eb789892f6499b3691fc",
+            ),
             (
                 "reverie-inguest/src/guest/rpc.rs",
                 54138,

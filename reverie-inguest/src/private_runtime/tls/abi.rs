@@ -268,6 +268,10 @@ pub unsafe fn install_before_libc(
 }
 
 /// Strong replacement for the archive's weak __init_tls, not __init_libc.
+/// It is exported under that name only with the `private-libc-exports`
+/// feature, which only a private image's own build enables. Without it this
+/// function keeps its Rust name, and musl's own weak __init_tls serves an
+/// ordinary program.
 /// # Safety
 /// Called exactly once by retained private __init_libc, after successful unsafe
 /// install_before_libc; aux points to its readable indexed [usize;38] stack array.
@@ -275,7 +279,7 @@ pub unsafe fn install_before_libc(
 /// never touches this state. All installer obligations remain in force.
 /// The final ELF must resolve exactly this strong symbol and the intended private
 /// __libc/__copy_tls/__init_tp; their archive weak/hidden bindings need link audit.
-#[unsafe(no_mangle)]
+#[cfg_attr(feature = "private-libc-exports", unsafe(no_mangle))]
 pub unsafe extern "C" fn __init_tls(aux: *mut usize) {
     // Reject missing, incomplete or repeated installation before touching the
     // MaybeUninit. A successful acquire sees the completed release publication.

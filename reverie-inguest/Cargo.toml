@@ -47,6 +47,11 @@ exec-private-init = ["fixed-syscall-gates"]
 # GNU builds, including all-features, retain the legacy fixed gate ABI.
 # This selects coordinates only; it does not admit or initialize an image.
 loader-private-runtime = ["exec-private-init", "dep:reverie-loader"]
+# Export the private runtime's C allocator (malloc and its aliases) and its
+# strong __init_tls under their libc names; effective only with
+# target_env=musl. Only a private image's own build may enable this: an
+# ordinary musl program that links these exports dies before main.
+private-libc-exports = ["loader-private-runtime"]
 # Host producer of a mapped first image's qualified runtime image, birth
 # descriptor leases and fixed placement. Holds no stop, admission or Ready.
 exec-stop-producer = ["exec-stop", "loader-private-runtime", "dep:sha2", "dep:iced-x86"]

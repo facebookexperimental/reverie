@@ -3,6 +3,11 @@
 //! Each C call must execute under this image's genuine initialized private FS
 //! after the sole bootstrap leader publishes TLS. No guest/host allocator is a
 //! valid source for a nonnull pointer. This module confers no image ownership.
+//!
+//! The C names (malloc and its aliases) are exported only with the
+//! `private-libc-exports` feature, which only a private image's own build
+//! enables. Without it these functions keep Rust names and nothing calls them,
+//! so an ordinary musl program that links this crate keeps musl's allocator.
 #![cfg(all(
     target_os = "linux",
     target_arch = "x86_64",
@@ -10,6 +15,7 @@
     feature = "loader-private-runtime",
 ))]
 #![forbid(unsafe_op_in_unsafe_fn)]
+#![cfg_attr(not(feature = "private-libc-exports"), allow(dead_code))]
 
 use core::alloc::GlobalAlloc;
 use core::alloc::Layout;
@@ -239,7 +245,7 @@ macro_rules! allocation_alias {
         /// Allocate C bytes from the existing Fixed owner.
         /// # Safety
         /// The caller must satisfy this module's private TLS/startup contract.
-        #[unsafe(no_mangle)]
+        #[cfg_attr(feature = "private-libc-exports", unsafe(no_mangle))]
         pub unsafe extern "C" fn $name(size: usize) -> *mut c_void {
             allocate(size, MIN_ALIGNMENT)
         }
@@ -252,7 +258,7 @@ macro_rules! calloc_alias {
         /// Checked, zeroed C allocation from the existing Fixed owner.
         /// # Safety
         /// The caller must satisfy this module's private TLS/startup contract.
-        #[unsafe(no_mangle)]
+        #[cfg_attr(feature = "private-libc-exports", unsafe(no_mangle))]
         pub unsafe extern "C" fn $name(count: usize, size: usize) -> *mut c_void {
             zero_allocate(count, size)
         }
@@ -266,7 +272,7 @@ macro_rules! free_alias {
         /// # Safety
         /// Nonnull pointer is live from this adapter, not a Rust allocation or
         /// another libc. All module private TLS/startup requirements apply.
-        #[unsafe(no_mangle)]
+        #[cfg_attr(feature = "private-libc-exports", unsafe(no_mangle))]
         pub unsafe extern "C" fn $name(pointer: *mut c_void) {
             // SAFETY: forwarded caller requirements.
             unsafe { release(pointer) }
@@ -281,7 +287,7 @@ macro_rules! realloc_alias {
         /// # Safety
         /// Nonnull pointer is a live allocation from this adapter. All module
         /// private TLS/startup requirements apply.
-        #[unsafe(no_mangle)]
+        #[cfg_attr(feature = "private-libc-exports", unsafe(no_mangle))]
         pub unsafe extern "C" fn $name(pointer: *mut c_void, size: usize) -> *mut c_void {
             // SAFETY: forwarded caller requirements.
             unsafe { resize(pointer, size) }
@@ -293,7 +299,7 @@ realloc_alias!(realloc, __libc_realloc);
 /// Checked array resize; leaves the original live on multiplication overflow.
 /// # Safety
 /// Same pointer and private TLS requirements as realloc.
-#[unsafe(no_mangle)]
+#[cfg_attr(feature = "private-libc-exports", unsafe(no_mangle))]
 pub unsafe extern "C" fn reallocarray(
     pointer: *mut c_void,
     count: usize,
@@ -311,7 +317,7 @@ pub unsafe extern "C" fn reallocarray(
 /// Aligned C allocation with musl's retained validation semantics.
 /// # Safety
 /// All module private TLS/startup requirements apply.
-#[unsafe(no_mangle)]
+#[cfg_attr(feature = "private-libc-exports", unsafe(no_mangle))]
 pub unsafe extern "C" fn aligned_alloc(alignment: usize, size: usize) -> *mut c_void {
     aligned(alignment, size)
 }
@@ -319,7 +325,7 @@ pub unsafe extern "C" fn aligned_alloc(alignment: usize, size: usize) -> *mut c_
 /// Legacy aligned allocation; same owner and validation as aligned_alloc.
 /// # Safety
 /// All module private TLS/startup requirements apply.
-#[unsafe(no_mangle)]
+#[cfg_attr(feature = "private-libc-exports", unsafe(no_mangle))]
 pub unsafe extern "C" fn memalign(alignment: usize, size: usize) -> *mut c_void {
     aligned(alignment, size)
 }
@@ -328,7 +334,7 @@ pub unsafe extern "C" fn memalign(alignment: usize, size: usize) -> *mut c_void 
 /// # Safety
 /// All module private TLS/startup requirements apply; final image's page-size
 /// authority must be exactly 4096 (the same required TLS/image geometry).
-#[unsafe(no_mangle)]
+#[cfg_attr(feature = "private-libc-exports", unsafe(no_mangle))]
 pub unsafe extern "C" fn valloc(size: usize) -> *mut c_void {
     aligned(4096, size)
 }
@@ -336,7 +342,7 @@ pub unsafe extern "C" fn valloc(size: usize) -> *mut c_void {
 /// POSIX aligned allocation; the result pointer is untouched on failure.
 /// # Safety
 /// `result` is writable, and all module private TLS/startup requirements apply.
-#[unsafe(no_mangle)]
+#[cfg_attr(feature = "private-libc-exports", unsafe(no_mangle))]
 pub unsafe extern "C" fn posix_memalign(
     result: *mut *mut c_void,
     alignment: usize,
@@ -359,7 +365,7 @@ pub unsafe extern "C" fn posix_memalign(
 /// Requested payload size; no mallocng metadata is ever decoded.
 /// # Safety
 /// Nonnull pointer is a live allocation from this adapter; module TLS contract.
-#[unsafe(no_mangle)]
+#[cfg_attr(feature = "private-libc-exports", unsafe(no_mangle))]
 pub unsafe extern "C" fn malloc_usable_size(pointer: *mut c_void) -> usize {
     if pointer.is_null() {
         return 0;
@@ -371,7 +377,7 @@ pub unsafe extern "C" fn malloc_usable_size(pointer: *mut c_void) -> usize {
 /// Conservative all-zero hint for retained musl calloc: always clear payload.
 /// # Safety
 /// The caller obeys the musl helper ABI; this implementation accesses no pointee.
-#[unsafe(no_mangle)]
+#[cfg_attr(feature = "private-libc-exports", unsafe(no_mangle))]
 pub unsafe extern "C" fn __malloc_allzerop(_pointer: *mut c_void) -> c_int {
     0
 }

@@ -989,7 +989,10 @@ const LITEROOT: MappedConsumerSource = MappedConsumerSource {
     // repository-root workspace does not contain literoot-preload.
     root_manifest_relative: "preload/Cargo.toml",
     root_lock_relative: "preload/Cargo.lock",
-    features: &["mapped-successor"],
+    // The image-only feature: `mapped-successor` plus Reverie's
+    // `private-libc-exports`. literoot's own musl tests build with
+    // `mapped-successor` alone, so they never link the private libc exports.
+    features: &["mapped-successor-image"],
 };
 
 #[cfg(test)]
@@ -3241,7 +3244,7 @@ mod tests {
         assert_eq!(literoot.lib_rs_relative(), "preload/src/lib.rs");
         assert_eq!(literoot.root_manifest_relative(), "preload/Cargo.toml");
         assert_eq!(literoot.root_lock_relative(), "preload/Cargo.lock");
-        assert_eq!(literoot.features(), ["mapped-successor"]);
+        assert_eq!(literoot.features(), ["mapped-successor-image"]);
         // cargo metadata 1.97.1 names a leaf whose directory differs
         // from its package name with `#<name>@<version>`.
         assert_eq!(
