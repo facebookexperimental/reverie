@@ -16,20 +16,28 @@ names, feature flags and environment variables.
   including the strace and counter example tools. The backends are ptrace,
   KVM, DBT, LiteInst and in-guest.
 
-**Rebind catalogued sources in the same change.** The LiteInst artifact pins
+**Rebind pinned sources in the same change.** The LiteInst artifact pins
 the raw size and sha256 of every source file listed in
 `reverie-liteinst-artifact`'s `CONTENT_REVERIE_CATALOG`
-(`reverie-liteinst-artifact/src/lib.rs`).
+(`reverie-liteinst-artifact/src/lib.rs`). That file also pins
+`reverie-inguest/src/trap/fixed_gates.rs` the same way, in
+`CONTENT_DETCORE_FIXED_GATE`, outside the catalog.
 
-- Any change to a file listed in reverie-liteinst-artifact's
-  CONTENT_REVERIE_CATALOG, comments included (the catalog pins raw size and
-  sha256), must update that file's catalog row in the same change and run
+- Any change to one of those files, comments included (the pins are raw size
+  and sha256), must update its pinned tuple in the same change and run
   `cargo test -p reverie-liteinst-artifact` at the exact head before landing.
-- Add the replaced tuple to that test module's list of rejected prior tuples,
-  as earlier row updates did, so that a build from the older content fails.
+- Update every occurrence of the old sha256, not only the catalog row. Some
+  files are pinned again elsewhere in `reverie-liteinst-artifact/src/`, for
+  example in `private_static/tls_sources.rs`,
+  `private_static/selected_initializers/native_leaves.rs` and `lib.rs`'s
+  `NO_INSTALLATION_SCOPE_SOURCE`. Grep that directory for the old sha256 to
+  find them all.
+- When a catalog row changes, add the replaced tuple to the test module's
+  list of rejected prior tuples (after the `CONTENT_REVERIE_CATALOG.len()`
+  assertion), as earlier row updates did. The test then proves the catalog
+  refuses the old content.
 - Run that test in a git checkout of the head: some of its tests run
   `git rev-parse HEAD`, so a copy without `.git` fails them.
-- A soft-green landing runs only the tests for what a change touches, and a
-  catalogued file's own tests do not include this one. Two merge-queue
-  ejections came from exactly that: one for a code change and one for a
-  comment-only change.
+- A landing that runs only the tests for what a change touches does not run
+  this test for a pinned file in another crate. Two merge-queue ejections came
+  from exactly that: one for a code change and one for a comment-only change.
