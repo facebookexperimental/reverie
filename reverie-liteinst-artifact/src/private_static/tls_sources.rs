@@ -629,6 +629,62 @@ const SHARED_INPUTS_057_EXPORTS: &[SourceRow] = &[
     ),
 ];
 
+// abi.rs: in `__init_tls` an unnecessary `unsafe` block around `addr_of_mut!`
+// and a null comparison become `&raw mut __libc` and `.is_null()` (row 4).
+// Every other row is exactly SHARED_INPUTS_057_EXPORTS.
+const SHARED_INPUTS_057_LINTS: &[SourceRow] = &[
+    (
+        "reverie-inguest/Cargo.toml",
+        6495,
+        "2ee5115d633d33984ebfae0d5debd0278596536e8866587a25b68f26940b63e0",
+    ),
+    (
+        "reverie-inguest/src/lib.rs",
+        13478,
+        "9b619884552f14046a056f68693c49fc46d065b2a084ad49ca07819a10ec27b1",
+    ),
+    (
+        "reverie-inguest/src/private_runtime/mod.rs",
+        2093,
+        "f6764939d2016bd3c9414b17b35f21f8cf7217f128135b83cfb5459aa3ae5e1e",
+    ),
+    (
+        "reverie-inguest/src/private_runtime/tls/mod.rs",
+        5001,
+        "ba3a02d320c26c283acde7dfc0e0273ff7b04e68b4b5daa7a4f72619758f9f98",
+    ),
+    (
+        "reverie-inguest/src/private_runtime/tls/abi.rs",
+        23707,
+        "216dd2050bec7f6611bfa51b9de9e308bf1e23d2831b46b2da9a8901a226dbaf",
+    ),
+    (
+        "reverie-inguest/src/private_runtime/tls/layout.rs",
+        743,
+        "8ee91d78869426196e2f4542dcffb2cf8be3b1372647bd407d9a28ca5b7d20c0",
+    ),
+    (
+        "reverie-loader/Cargo.toml",
+        343,
+        "7b659fdf29bcea1534e8b5239d3bd0beb5d49a9e0c66381a854129e148226e4f",
+    ),
+    (
+        "reverie-loader/src/lib.rs",
+        2486,
+        "02aa2dae7b6eec327a0dcf68b92a66f512162d2fdd3a7f9ac89a3e8a51b1f5bf",
+    ),
+    (
+        "reverie-loader/src/musl_tls.rs",
+        17178,
+        "18ca3aec385c4dd8ec79ee5f45e8a30863e28e8a49422cf6c1ae90eb2743696d",
+    ),
+    (
+        "reverie-loader/src/mapped_inputs.rs",
+        17803,
+        "81cd7474215ff617fb1bc16b236461d4deb33697c7d559130f4bdb98b0f0e2c2",
+    ),
+];
+
 fn classify(observed: &[(String, u64, String)]) -> Result<Variant> {
     let same = |expected: &[SourceRow]| {
         observed.len() == expected.len()
@@ -648,20 +704,22 @@ fn classify(observed: &[(String, u64, String)]) -> Result<Variant> {
         same(SHARED_INPUTS_056),
         same(SHARED_INPUTS_057),
         same(SHARED_INPUTS_057_EXPORTS),
+        same(SHARED_INPUTS_057_LINTS),
     ) {
-        (true, false, false, false, false, false, false, false, false, false, false) => {
+        (true, false, false, false, false, false, false, false, false, false, false, false) => {
             Ok(Variant::LegacyInguest)
         }
-        (false, true, false, false, false, false, false, false, false, false, false)
-        | (false, false, true, false, false, false, false, false, false, false, false)
-        | (false, false, false, true, false, false, false, false, false, false, false)
-        | (false, false, false, false, true, false, false, false, false, false, false)
-        | (false, false, false, false, false, true, false, false, false, false, false)
-        | (false, false, false, false, false, false, true, false, false, false, false)
-        | (false, false, false, false, false, false, false, true, false, false, false)
-        | (false, false, false, false, false, false, false, false, true, false, false)
-        | (false, false, false, false, false, false, false, false, false, true, false)
-        | (false, false, false, false, false, false, false, false, false, false, true) => {
+        (false, true, false, false, false, false, false, false, false, false, false, false)
+        | (false, false, true, false, false, false, false, false, false, false, false, false)
+        | (false, false, false, true, false, false, false, false, false, false, false, false)
+        | (false, false, false, false, true, false, false, false, false, false, false, false)
+        | (false, false, false, false, false, true, false, false, false, false, false, false)
+        | (false, false, false, false, false, false, true, false, false, false, false, false)
+        | (false, false, false, false, false, false, false, true, false, false, false, false)
+        | (false, false, false, false, false, false, false, false, true, false, false, false)
+        | (false, false, false, false, false, false, false, false, false, true, false, false)
+        | (false, false, false, false, false, false, false, false, false, false, true, false)
+        | (false, false, false, false, false, false, false, false, false, false, false, true) => {
             Ok(Variant::SharedLoader)
         }
         _ => Err("runtime TLS sources are not one complete reviewed tuple".into()),
@@ -966,6 +1024,27 @@ mod tests {
         refuse_each_missing_changed_extra_or_duplicate_row(SHARED_INPUTS_057_EXPORTS);
         refuse_mixed_versions(SHARED_INPUTS_057_EXPORTS, SHARED_INPUTS_057, &[0, 4]);
     }
+    // The musl lint fixes: only row 4 (abi.rs) differs from
+    // SHARED_INPUTS_057_EXPORTS, so swapping that one row back yields the
+    // exports tuple itself rather than a mixed one. Against SHARED_INPUTS_057
+    // rows 0 and 4 differ, and each swap mixes versions and refuses.
+    #[test]
+    fn tls_source_declarations_select_complete_057_lints() {
+        refuse_each_missing_changed_extra_or_duplicate_row(SHARED_INPUTS_057_LINTS);
+        assert_eq!(
+            SHARED_INPUTS_057_LINTS.len(),
+            SHARED_INPUTS_057_EXPORTS.len()
+        );
+        for (index, (lints, exports)) in SHARED_INPUTS_057_LINTS
+            .iter()
+            .zip(SHARED_INPUTS_057_EXPORTS)
+            .enumerate()
+        {
+            assert_eq!(lints.0, exports.0, "row {index} path");
+            assert_eq!(lints != exports, index == 4, "row {index} change set");
+        }
+        refuse_mixed_versions(SHARED_INPUTS_057_LINTS, SHARED_INPUTS_057, &[0, 4]);
+    }
     #[test]
     fn tls_source_declarations_are_pairwise_distinct() {
         let lists = [
@@ -980,6 +1059,7 @@ mod tests {
             SHARED_INPUTS_056,
             SHARED_INPUTS_057,
             SHARED_INPUTS_057_EXPORTS,
+            SHARED_INPUTS_057_LINTS,
         ];
         for (index, first) in lists.iter().enumerate() {
             for second in &lists[index + 1..] {

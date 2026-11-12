@@ -275,7 +275,7 @@ fn pause_after_check(checks: u32) {
         return;
     }
     let mut request = libc::timespec {
-        tv_sec: WAIT_SLEEP.as_secs() as libc::time_t,
+        tv_sec: WAIT_SLEEP.as_secs() as i64,
         tv_nsec: WAIT_SLEEP.subsec_nanos() as libc::c_long,
     };
     for _ in 0..=MAX_SLEEP_RESUMES {

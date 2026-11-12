@@ -2083,7 +2083,7 @@ typed_syscall! {
 #[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     pub struct Time {
-        tloc: Option<AddrMut<libc::time_t>>,
+        tloc: Option<AddrMut<i64>>,
     }
 }
 

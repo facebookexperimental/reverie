@@ -306,11 +306,11 @@ pub unsafe extern "C" fn __init_tls(aux: *mut usize) {
         die(Failure::AuxMismatch)
     }
     // SAFETY: exact resolved private object address, not guest libc interposition.
-    let libc = unsafe { ptr::addr_of_mut!(__libc) };
+    let libc = &raw mut __libc;
     // SAFETY: source-bound private libc and sole-leader access. Preserve auxv,
     // hwcap/sysinfo/env/security/locale fields initialized or used by __init_libc.
     if unsafe {
-        ptr::read(&raw const (*libc).tls_head) != ptr::null_mut()
+        !ptr::read(&raw const (*libc).tls_head).is_null()
             || ptr::read(&raw const (*libc).tls_cnt) != 0
             || ptr::read(&raw const (*libc).tls_size) != 0
             || ptr::read(&raw const (*libc).tls_align) != 0

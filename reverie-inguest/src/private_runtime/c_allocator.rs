@@ -155,7 +155,7 @@ unsafe fn header(pointer: *mut c_void) -> Header {
     let Some(first) = address.checked_sub(size_of::<Header>()) else {
         die(INVALID_ALLOCATION);
     };
-    if address % MIN_ALIGNMENT != 0
+    if !address.is_multiple_of(MIN_ALIGNMENT)
         || !fixed_tool_heap_contains(pointer.cast())
         || !fixed_tool_heap_contains(first as *const u8)
         || !fixed_tool_heap_contains((address - 1) as *const u8)

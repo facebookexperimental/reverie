@@ -1149,8 +1149,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     // Bind the signal-mask gate and every changed native-source premise of it.
     (
         "reverie-inguest/src/guest/continuation.rs",
-        46467,
-        "08309a0f057ecd3f4ce8f3c5dbf066ca6a9d5b7e66d143104df1ce014b196896",
+        46450,
+        "a25e871591adb957ed150a3b2007b31bc671f9d330e6a861fdab391b3df5ed25",
     ),
     (
         "reverie-inguest/src/guest/instruction.rs",
@@ -1224,8 +1224,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-liteinst-artifact/src/private_static/tls_sources.rs",
-        41407,
-        "241f357852442b9246bac9fa6a317d95044daa4cfd74700871ad3c9248384620",
+        44390,
+        "bb1e19542aa5db52a9d7338892dc7b122a9d6a136ff594c3018041077f563e95",
     ),
     (
         "Cargo.toml",
@@ -38943,6 +38943,16 @@ mod tests {
         // Keep the fixed catalog authoritative and reject their prior tuples.
         assert_eq!(CONTENT_REVERIE_CATALOG.len(), 86);
         for (relative, old_size, old_digest) in [
+            (
+                "reverie-inguest/src/guest/continuation.rs",
+                46467,
+                "08309a0f057ecd3f4ce8f3c5dbf066ca6a9d5b7e66d143104df1ce014b196896",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/tls_sources.rs",
+                41407,
+                "241f357852442b9246bac9fa6a317d95044daa4cfd74700871ad3c9248384620",
+            ),
             (
                 "reverie-inguest/src/guest/rpc.rs",
                 54589,

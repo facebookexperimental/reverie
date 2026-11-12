@@ -160,7 +160,7 @@ pub unsafe extern "C" fn bootstrap_sigsys(signal: i32, info: *mut c_void, contex
     }
     // SAFETY: release publication guarantees initialized live fixed State role;
     // only the atomic is borrowed until the reentrancy guard succeeds.
-    let busy = unsafe { &*(&raw const (*raw).busy) };
+    let busy = unsafe { &(*raw).busy };
     if busy
         .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
         .is_err()
@@ -566,7 +566,7 @@ unsafe fn validate_aux(captured: &CapturedMappedInitial, args: &LibcInputs) -> b
     check(
         args.env_aux_words > 0
             && args.env_aux_words <= 512
-            && (args.envp as usize) % core::mem::align_of::<usize>() == 0
+            && (args.envp as usize).is_multiple_of(core::mem::align_of::<usize>())
             && handoff.covers(args.envp as usize, args.env_aux_words * 8),
     );
     let base = args.envp.cast::<usize>();
@@ -685,7 +685,7 @@ impl CapturedMappedInitial {
         let c = input.control.as_ptr();
         check(
             INSTALLED.load(Ordering::Acquire).is_null()
-                && slot as usize % core::mem::align_of::<RelayStorage>() == 0
+                && (slot as usize).is_multiple_of(core::mem::align_of::<RelayStorage>())
                 && state_extent.covers(slot as usize, core::mem::size_of::<RelayStorage>())
                 && !overlaps(
                     slot as usize,
@@ -924,7 +924,7 @@ pub(super) unsafe fn validate_after_libc(
     }
     // SAFETY: installer release-published initialized same-generation storage;
     // borrow only its atomic before obtaining the existing exclusion.
-    let busy = unsafe { &*(&raw const (*raw).busy) };
+    let busy = unsafe { &(*raw).busy };
     if busy
         .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
         .is_err()
@@ -1224,13 +1224,11 @@ pub(in crate::guest::exec_private) mod callback {
         // differs: keep actual Tool FS, do not call event.forward/Guest FS.
         unsafe {
             crate::guest::trap_dispatch::forward_nested_tool_syscall_with(event, observe, |event| {
-                let result = unsafe {
-                    crate::trap::raw_syscall6_with_result(
-                        event.number,
-                        event.args,
-                        event.guest_pkru,
-                    )
-                };
+                let result = crate::trap::raw_syscall6_with_result(
+                    event.number,
+                    event.args,
+                    event.guest_pkru,
+                );
                 event.result = result.result;
                 event.guest_pkru = result.pkru;
             })

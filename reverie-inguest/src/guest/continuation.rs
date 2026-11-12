@@ -456,7 +456,7 @@ pub(super) fn mapped_callback_facts(
     // SAFETY: disjoint immutable stack metadata and saved mask; no context
     // reference is formed while Tool holds its unique mutable register block.
     unsafe {
-        let lease = (&*(&raw const (*pointer).stack)).region.as_ref()?;
+        let lease = (*pointer).stack.region.as_ref()?;
         if !lease.belongs_to(region) || saved_rsp < lease.base() || saved_rsp >= lease.top() {
             return None;
         }
