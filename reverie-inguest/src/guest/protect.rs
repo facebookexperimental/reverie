@@ -265,10 +265,10 @@ pub fn block_all_signals() -> io::Result<crate::guest::support::SignalInstallGua
 /// When `fd` stays open after its close (a seccomp filter the guest installed
 /// can report success without running it), the runtime records that number
 /// too ([`record_runtime_fd`]), so both are protected and reported. When the
-/// record is full that fails, and so does this: the moved number is closed,
-/// the old one stays open (the filter keeps it so), and the caller must not
-/// let the guest run on. Signals stay blocked throughout
-/// ([`block_all_signals`]).
+/// record is full that fails, and so does this: the moved number is released
+/// ([`place_runtime_fd_and`]), the old one stays open (the filter keeps it so),
+/// and the caller must not let the guest run on. Signals stay blocked
+/// throughout ([`block_all_signals`]).
 ///
 /// The returned number is not protected until the caller records it, and a
 /// signal held during the placement is delivered as this returns; use
@@ -283,34 +283,63 @@ pub fn place_runtime_fd(fd: libc::c_int) -> io::Result<libc::c_int> {
 /// [`place_runtime_fd`], then `record(placed)` before signals are unblocked,
 /// so a handler of a signal held during the placement already finds the
 /// number protected. `record` runs inside the window and follows
-/// [`block_all_signals`]'s rule.
+/// [`block_all_signals`]'s rule. When `record` returns `Err` it must leave
+/// nothing recorded for `placed`, because this call then releases that
+/// number: a record that published it would name a closed descriptor.
 ///
-/// On `Err`, nothing derived from `fd` stays open that this call still holds:
-/// it closes `fd` when the descriptor was not moved (signals could not be
-/// blocked, or no number was free), and the moved number when it was, before
-/// signals are unblocked. A caller that handed over its only descriptor
-/// (`into_raw_fd`) therefore has nothing to clean up. After a move `fd` was
-/// already closed; this call never closes that number again, because another
-/// thread may have reopened it. A filter that faked that close keeps it open,
-/// and [`record_if_open`] has then recorded it or failed this call.
+/// On `Err`, the call releases the number derived from `fd` that it still
+/// holds: `fd` when the descriptor was not moved (signals could not be
+/// blocked, or no number was free), the moved number when it was. Releasing
+/// closes the number, before signals are unblocked where they were blocked. If
+/// a filter refuses that close, or fakes it (the number is still open after
+/// it), the number is recorded as the runtime's instead ([`record_runtime_fd`],
+/// [`record_if_open`]), as the old number after a move already is, so no
+/// number this call held is left open and unrecorded. If even that fails (the
+/// record is full, or the kernel will not say whether the number is open), the
+/// call returns that failure in place of its own, and, as for
+/// [`record_if_open`], the caller must not let the guest run on. Otherwise a
+/// caller that handed over its only descriptor (`into_raw_fd`) has nothing to
+/// clean up.
+///
+/// After a move `fd` was already closed; this call never closes that number
+/// again, because another thread may have reopened it. A filter that faked
+/// that close keeps it open, and [`record_if_open`] has then recorded it or
+/// failed this call. When signals could not be blocked, the check after a
+/// close that reported success runs with signals unblocked, so a handler that
+/// opened a descriptor at that number in between would have it recorded; that
+/// needs a filter that refuses `rt_sigprocmask` in the first place.
 pub fn place_runtime_fd_and(
     fd: libc::c_int,
     record: impl FnOnce(libc::c_int) -> io::Result<()>,
 ) -> io::Result<libc::c_int> {
-    let close = |number: libc::c_int| unsafe {
-        raw_syscall6(libc::SYS_close, [number as u64, 0, 0, 0, 0, 0]);
+    // Closes `number`, which this call still owns. A refused close leaves it
+    // open and still this call's, so it is recorded; a close that reported
+    // success (or EINTR, after which Linux has released the number) is
+    // checked, because a filter can fake it.
+    let release = |number: libc::c_int| -> io::Result<()> {
+        let closed = unsafe { raw_syscall6(libc::SYS_close, [number as u64, 0, 0, 0, 0, 0]) };
+        if closed < 0 && closed != -i64::from(libc::EINTR) {
+            return record_runtime_fd(number);
+        }
+        record_if_open(number)
     };
-    let _blocked = block_all_signals().inspect_err(|_| close(fd))?;
+    // The error to return after releasing `number`: the original one, or the
+    // release's own failure, which the caller must treat as record_if_open's.
+    let fail = |error: io::Error, number: libc::c_int| match release(number) {
+        Ok(()) => error,
+        Err(release_error) => release_error,
+    };
+    let _blocked = block_all_signals().map_err(|error| fail(error, fd))?;
     let moved = dup_into_runtime_range(fd);
     let placed = if moved < 0 {
         fd
     } else {
         let moved = moved as libc::c_int;
-        close(fd);
-        record_if_open(fd).inspect_err(|_| close(moved))?;
+        unsafe { raw_syscall6(libc::SYS_close, [fd as u64, 0, 0, 0, 0, 0]) };
+        record_if_open(fd).map_err(|error| fail(error, moved))?;
         moved
     };
-    record(placed).inspect_err(|_| close(placed))?;
+    record(placed).map_err(|error| fail(error, placed))?;
     Ok(placed)
 }
 
@@ -1746,6 +1775,118 @@ pub(crate) mod tests {
             let refused = place_runtime_fd(fd).unwrap_err();
             assert_eq!(refused.raw_os_error(), Some(libc::EPERM));
             assert!(!is_open(fd));
+        });
+    }
+
+    /// Blocks `rt_sigprocmask(SIG_BLOCK)` so that a placement cannot start.
+    fn refuse_signal_blocking() {
+        install_filter(
+            libc::SYS_rt_sigprocmask,
+            0,
+            libc::SIG_BLOCK as u32,
+            libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
+        );
+    }
+
+    /// Makes `close(fd)` fail with `EPERM` without running.
+    fn refuse_close_of(fd: libc::c_int) {
+        install_filter(
+            libc::SYS_close,
+            0,
+            fd as u32,
+            libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
+        );
+    }
+
+    /// The number a move will take: the lowest free one from RUNTIME_FD_MIN.
+    fn next_runtime_number(fd: libc::c_int) -> libc::c_int {
+        let next = dup_at_least(fd, RUNTIME_FD_MIN) as libc::c_int;
+        assert!(next >= RUNTIME_FD_MIN);
+        unsafe { libc::close(next) };
+        next
+    }
+
+    /// A cleanup close a filter fakes leaves the descriptor open, so it is
+    /// recorded as the runtime's rather than left open and unrecorded.
+    #[test]
+    fn a_faked_cleanup_close_records_the_descriptor() {
+        in_child(|| {
+            let fd = open_eventfd();
+            refuse_signal_blocking();
+            suppress_close_of(fd);
+            let refused = place_runtime_fd(fd).unwrap_err();
+            assert_eq!(refused.raw_os_error(), Some(libc::EPERM));
+            assert!(is_open(fd));
+            assert!(is_runtime_owned_fd(fd));
+        });
+    }
+
+    /// A cleanup close a filter refuses leaves the descriptor open and still
+    /// the placement's, so it is recorded as the runtime's.
+    #[test]
+    fn a_refused_cleanup_close_records_the_descriptor() {
+        in_child(|| {
+            let fd = open_eventfd();
+            refuse_signal_blocking();
+            refuse_close_of(fd);
+            let refused = place_runtime_fd(fd).unwrap_err();
+            assert_eq!(refused.raw_os_error(), Some(libc::EPERM));
+            assert!(is_open(fd));
+            assert!(is_runtime_owned_fd(fd));
+        });
+    }
+
+    /// The same for the moved number, after a record that fails: a faked
+    /// cleanup close leaves it open and recorded.
+    #[test]
+    fn a_faked_cleanup_close_of_the_moved_number_records_it() {
+        in_child_with_soft_nofile(2048, || {
+            let fd = open_eventfd();
+            let moved = next_runtime_number(fd);
+            suppress_close_of(moved);
+            place_runtime_fd_and(fd, |placed| {
+                assert_eq!(placed, moved);
+                Err(io::Error::other("refused by the test"))
+            })
+            .unwrap_err();
+            assert!(is_open(moved));
+            assert!(is_runtime_owned_fd(moved));
+            assert!(!is_open(fd));
+        });
+    }
+
+    /// And a refused cleanup close of the moved number records it too.
+    #[test]
+    fn a_refused_cleanup_close_of_the_moved_number_records_it() {
+        in_child_with_soft_nofile(2048, || {
+            let fd = open_eventfd();
+            let moved = next_runtime_number(fd);
+            refuse_close_of(moved);
+            place_runtime_fd_and(fd, |placed| {
+                assert_eq!(placed, moved);
+                Err(io::Error::other("refused by the test"))
+            })
+            .unwrap_err();
+            assert!(is_open(moved));
+            assert!(is_runtime_owned_fd(moved));
+        });
+    }
+
+    /// When a cleanup close is refused and the record is full, the descriptor
+    /// can be neither closed nor recorded; the placement returns that failure
+    /// (`OutOfMemory`) instead of its own, so the caller stops.
+    #[test]
+    fn a_cleanup_that_can_neither_close_nor_record_returns_that_failure() {
+        in_child(|| {
+            for _ in 0..RECORDED_FD_CAPACITY {
+                record_runtime_fd(open_eventfd()).unwrap();
+            }
+            let fd = open_eventfd();
+            refuse_signal_blocking();
+            refuse_close_of(fd);
+            let refused = place_runtime_fd(fd).unwrap_err();
+            assert_eq!(refused.kind(), io::ErrorKind::OutOfMemory);
+            assert!(is_open(fd));
         });
     }
 
