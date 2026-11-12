@@ -1564,6 +1564,7 @@ async fn forced_legacy_nonleader_steps_are_not_paced_by_the_poll_period() {
 /// Counts this thread's retained status reads during each legacy consuming
 /// attempt until `done`, asserting that no attempt reads more than once, and
 /// returns how many attempts read.
+#[cfg(not(sanitized))]
 fn legacy_attempt_reads(terminal: &TerminalCleanup, done: impl Fn() -> bool) -> usize {
     let deadline = Instant::now() + TRACEE_WAIT_TIMEOUT;
     let mut attempts_that_read = 0;
@@ -1749,6 +1750,7 @@ async fn forced_legacy_waits_read_target_status_once_per_attempt_or_period() {
 
 /// Waits until the legacy worker of `event` hints at a status that nothing
 /// has consumed yet, which only its own turns can do.
+#[cfg(not(sanitized))]
 fn wait_for_legacy_hint(event: &Event, what: &str) {
     let deadline = Instant::now() + Duration::from_secs(2);
     while event.legacy_wait.lock().observed.is_none() {
@@ -1759,6 +1761,7 @@ fn wait_for_legacy_hint(event: &Event, what: &str) {
 
 /// Waits until the legacy worker of `event` has started a held wait after
 /// `before` of them.
+#[cfg(not(sanitized))]
 fn wait_for_held_wait(event: &Event, before: usize, what: &str) {
     let deadline = Instant::now() + TRACEE_WAIT_TIMEOUT;
     while event.legacy_held_waits.load(Ordering::Relaxed) <= before {
@@ -1768,6 +1771,7 @@ fn wait_for_held_wait(event: &Event, before: usize, what: &str) {
 }
 
 /// Resumes `stopped` to its next syscall stop and returns that stop.
+#[cfg(not(sanitized))]
 async fn next_syscall_stop(stopped: Stopped) -> Stopped {
     let (next, stop) = tokio::time::timeout(
         TRACEE_WAIT_TIMEOUT,
