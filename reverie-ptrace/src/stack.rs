@@ -188,8 +188,11 @@ impl MemoryAccess for GuestStack {
 ///
 /// # Safety
 ///
-/// `T` must have no padding: every byte of `value` is read, and padding
-/// bytes are not initialized.
+/// Every byte of `value`'s representation must be initialized and readable
+/// as a `u8`, since every byte is read. Having no padding is not enough:
+/// `MaybeUninit` storage, for example, has none but may be uninitialized.
+/// The safe `push` and `reserve` above accept any `T` and so do not
+/// guarantee this yet; see <https://github.com/rrnewton/reverie/issues/1492>.
 #[inline]
 pub unsafe fn transmute_u64s<T: Sized>(value: T) -> Vec<u64> {
     // SAFETY: `value` is a live local of `size_of::<T>()` bytes, initialized
@@ -500,9 +503,11 @@ mod tests {
     /// whose length is a whole number of words plus a tail, and one with a
     /// single word and a longer tail. A `T` whose alignment is below a
     /// word's gives its bytes no more, and a word read in place from them is
-    /// misaligned: debug builds abort on it ("ptr::read requires that the
-    /// pointer argument is aligned and non-null"), while optimized builds
-    /// drop the check. The bytes after each run are nonzero, so the zeros
+    /// misaligned. A standard library built with debug assertions aborts on
+    /// that read ("ptr::read requires that the pointer argument is aligned
+    /// and non-null"). Rustup's is built without them, so natively this
+    /// test checks only the values; Miri reports the misaligned read on any
+    /// toolchain. The bytes after each run are nonzero, so the zeros
     /// required past its end also show that nothing past it was read.
     #[test]
     fn u64s_from_bytes_packs_a_misaligned_run() {
