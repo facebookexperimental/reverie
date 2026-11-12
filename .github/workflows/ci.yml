@@ -14,8 +14,13 @@ name: Rust
 # drifted. It is hosted, uses no secrets, and is best-effort signal only:
 # local validation (`validate.sh`, which hard-fails on a producer refusal)
 # and its ledger remain the gate; no GitHub check is a required status check.
+# Every push to main also runs the hosted jobs (owner, 2026-11-12), for
+# post-merge signal on the exported main tip. The self-hosted `hardware` job
+# keeps its earlier triggers and never runs for a push.
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
 
@@ -214,7 +219,6 @@ jobs:
       ${{
         vars.REVERIE_SELF_HOSTED == 'true' &&
         (
-          github.event_name == 'push' ||
           (
             github.event_name == 'workflow_dispatch' &&
             (
