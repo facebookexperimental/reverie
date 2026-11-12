@@ -9022,6 +9022,10 @@ impl TerminalCleanup {
 
 #[cfg(test)]
 mod test {
+    #![allow(
+        unexpected_cfgs,
+        reason = "`fbcode_build` is supplied by the internal Buck build"
+    )]
     include!("adaptive_api_tests.rs");
     include!("managed_native_tests.rs");
     include!("exit_probe_tests.rs");
