@@ -2484,6 +2484,10 @@ async fn forced_legacy_resumed_owner_wait_built_after_nonleader_exec_records_no_
 /// detach must not cancel the leader's mark: the wait still makes no read,
 /// records no note and retires with ECHILD. It runs in a fresh PID
 /// namespace, where clone3 can choose the other task's TID.
+#[cfg_attr(
+    fbcode_build,
+    ignore = "fbsource-disabled: sandcastle-env: needs mount(2) of /proc in a fresh user and PID namespace"
+)]
 #[tokio::test(flavor = "current_thread")]
 #[cfg(not(sanitized))]
 async fn resumed_owner_wait_after_nonleader_exec_ignores_another_tasks_detach() {
@@ -2496,6 +2500,10 @@ async fn resumed_owner_wait_after_nonleader_exec_ignores_another_tasks_detach() 
 
 /// The forced-legacy arm of
 /// [`resumed_owner_wait_after_nonleader_exec_ignores_another_tasks_detach`].
+#[cfg_attr(
+    fbcode_build,
+    ignore = "fbsource-disabled: sandcastle-env: needs mount(2) of /proc in a fresh user and PID namespace"
+)]
 #[tokio::test(flavor = "current_thread")]
 #[cfg(not(sanitized))]
 async fn forced_legacy_resumed_owner_wait_after_nonleader_exec_ignores_another_tasks_detach() {
