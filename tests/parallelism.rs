@@ -138,13 +138,13 @@ impl Tool for TestTool2 {
     }
 }
 
-/// Exit status of `kill_blocked_child` when its thread did not reach the
-/// marker within the bound.
+/// Exit status of `kill_blocked_child` when its thread did not set its flag,
+/// on the line before the marker, within the bound.
 #[cfg(not(sanitized))]
 const MARKER_NEVER_REACHED: i32 = 3;
 
-/// Exit status of `kill_blocked_child` when its thread reached the marker but
-/// was not seen stopped in it within the bound.
+/// Exit status of `kill_blocked_child` when its thread set its flag but was not
+/// seen in a ptrace stop within the bound.
 #[cfg(not(sanitized))]
 const MARKER_NEVER_STOPPED: i32 = 4;
 
@@ -206,9 +206,10 @@ fn kill_blocked_child() {
     // Wait for the thread to start up.
     shared.barrier.wait();
 
-    // Wait until the thread is stopped in the marker's handler, so the
-    // exit_group below has a pending handler to cancel. The process's only
-    // other thread is the one created above.
+    // Wait until the thread has set its flag, on the line before the marker,
+    // and then until it is in a ptrace stop (state 't'). The process's only
+    // other thread is the one created above. Neither wait shows that the
+    // tracer has polled the marker's handler; see `test_kill_blocked_child`.
     wait_for(MARKER_NEVER_REACHED, || {
         shared.at_marker.load(Ordering::Acquire)
     });
@@ -239,10 +240,17 @@ fn kill_blocked_child() {
 
 /// Test where handle_syscall_event blocks a child thread forever. The
 /// expectation is that calling `exit_group` will cancel the
-/// `handle_syscall_event` future. The guest calls `exit_group` only once the
-/// thread is stopped in that handler, so a pass is never vacuous; exit status
-/// `MARKER_NEVER_REACHED` or `MARKER_NEVER_STOPPED` means the thread did not
-/// get there within 10 s.
+/// `handle_syscall_event` future.
+///
+/// After the barrier, the guest calls `exit_group` only once it has seen two
+/// things: the thread's flag, set on the line before the marker syscall, and
+/// the thread in a ptrace stop (state `t` in `/proc/self/task/<tid>/stat`).
+/// Exit status `MARKER_NEVER_REACHED` or `MARKER_NEVER_STOPPED` means the
+/// first or the second was not seen within 10 s. These waits rule out an
+/// exit before the thread has set its flag and entered a ptrace stop. They do
+/// not show which stop the thread is in, or that the tracer has already polled the marker's handler
+/// into its `pending()`, so a pass does not by itself prove that a pending
+/// handler was cancelled.
 #[cfg(not(sanitized))]
 #[test]
 pub fn test_kill_blocked_child() {
@@ -382,11 +390,12 @@ pub fn blocking_gettid_stops_a_thread_before_its_closure() {
 
 /// The control for the test above: under the same tool, a thread made with
 /// raw pthread_create runs its closure, because neither its start routine nor
-/// the C library's thread start makes a gettid. Both tests block every gettid
-/// and differ in how the thread is made, so the test above stops at a gettid
-/// that std's thread start makes. Raw pthread_create also keeps this control
-/// clear of std's `thread_info` lock, which another harness thread can hold
-/// at fork time in this fork of the multithreaded test harness
+/// the C library's thread start makes a gettid. Both tests block every gettid.
+/// They differ in how the thread is made, and so in how it reports (an atomic
+/// flag here, a channel above). That points to the gettid in std's thread
+/// start as what stops the thread above. Raw pthread_create also keeps this
+/// control clear of std's `thread_info` lock, which another harness thread can
+/// hold at fork time in this fork of the multithreaded test harness
 /// (https://github.com/rrnewton/reverie/issues/1459).
 #[cfg(not(sanitized))]
 #[test]
