@@ -106,7 +106,12 @@ pub fn delay_childprint_test() {
     assert_eq!(output.stdout[101] as char, 'a');
 }
 
-// A test tool that blocks a handler indefinitely.
+// A test tool that blocks a handler indefinitely. Its marker is getppid, not
+// gettid: Rust's standard library makes a gettid syscall while it starts a
+// thread, before the thread's closure runs (to record the thread's id for its
+// stack-overflow report), so blocking gettid would stop the thread before it
+// reaches the code under test, as
+// `blocking_gettid_stops_a_thread_before_its_closure` shows.
 #[derive(Debug, Default)]
 struct TestTool2 {}
 
@@ -120,7 +125,7 @@ impl Tool for TestTool2 {
         guest: &mut T,
         call: Syscall,
     ) -> Result<i64, Error> {
-        if let Syscall::Gettid(_) = call {
+        if let Syscall::Getppid(_) = call {
             // Delay forever. When the main thread is killed, this future should
             // get canceled.
             futures::future::pending::<()>().await;
@@ -141,7 +146,7 @@ fn kill_blocked_child() {
         let barrier = barrier.clone();
         std::thread::spawn(move || {
             barrier.wait();
-            unsafe { libc::syscall(libc::SYS_gettid, 0) };
+            unsafe { libc::syscall(libc::SYS_getppid) };
         })
     };
 
@@ -165,6 +170,90 @@ pub fn test_kill_blocked_child() {
     use reverie_ptrace::testing::test_fn;
 
     let (output, _state) = test_fn::<TestTool2, _>(kill_blocked_child).unwrap();
+    reverie_ptrace::testing::print_tracee_output(&output);
+    assert_eq!(output.status, ExitStatus::Exited(0));
+}
+
+// A test tool that blocks every gettid, as `TestTool2` once did.
+#[derive(Debug, Default)]
+struct BlockGettid {}
+
+#[reverie::tool]
+impl Tool for BlockGettid {
+    type GlobalState = ();
+    type ThreadState = ();
+
+    async fn handle_syscall_event<T: Guest<Self>>(
+        &self,
+        guest: &mut T,
+        call: Syscall,
+    ) -> Result<i64, Error> {
+        if let Syscall::Gettid(_) = call {
+            futures::future::pending::<()>().await;
+        }
+
+        guest.tail_inject(call).await
+    }
+}
+
+/// Exit status of `spawn_and_wait_for_the_closure` when the spawned thread's
+/// closure did not run within its bound.
+#[cfg(not(sanitized))]
+const CLOSURE_NEVER_RAN: i32 = 42;
+
+/// Spawns a thread whose closure only reports that it ran, waits up to 2 s for
+/// that report, and exits the group with 0 if it came and
+/// `CLOSURE_NEVER_RAN` if it did not.
+#[cfg(not(sanitized))]
+fn spawn_and_wait_for_the_closure() {
+    use std::sync::mpsc::RecvTimeoutError;
+    use std::time::Duration;
+
+    let (ran, report) = std::sync::mpsc::channel();
+    let _handle = std::thread::spawn(move || {
+        let _ = ran.send(());
+    });
+    let status = match report.recv_timeout(Duration::from_secs(2)) {
+        Ok(()) => 0,
+        Err(RecvTimeoutError::Timeout) => CLOSURE_NEVER_RAN,
+        Err(RecvTimeoutError::Disconnected) => 1,
+    };
+    unsafe { libc::syscall(libc::SYS_exit_group, status) };
+
+    unreachable!()
+}
+
+/// Why `TestTool2` does not use gettid as its marker. With every gettid
+/// blocked, a spawned thread stops at the gettid its standard library makes
+/// while starting it, so its closure never runs; the exit_group after the 2 s
+/// bound then ends that blocked thread.
+///
+/// This depends on the standard library. In Rust 1.97.1, the pinned
+/// toolchain, a spawned thread's start calls `stack_overflow::make_handler`,
+/// which calls `set_current_info`, which makes the gettid syscall, whenever
+/// std has installed its SIGSEGV handler. If a later std stops making that
+/// call, this test fails, and that loud failure is the intended signal:
+/// `TestTool2`'s choice of marker should then be looked at again.
+#[cfg(not(sanitized))]
+#[test]
+pub fn blocking_gettid_stops_a_thread_before_its_closure() {
+    use reverie::ExitStatus;
+    use reverie_ptrace::testing::test_fn;
+
+    let (output, _state) = test_fn::<BlockGettid, _>(spawn_and_wait_for_the_closure).unwrap();
+    reverie_ptrace::testing::print_tracee_output(&output);
+    assert_eq!(output.status, ExitStatus::Exited(CLOSURE_NEVER_RAN));
+}
+
+/// The control for the test above: with getppid blocked instead, the same
+/// closure runs.
+#[cfg(not(sanitized))]
+#[test]
+pub fn blocking_getppid_lets_a_thread_run_its_closure() {
+    use reverie::ExitStatus;
+    use reverie_ptrace::testing::test_fn;
+
+    let (output, _state) = test_fn::<TestTool2, _>(spawn_and_wait_for_the_closure).unwrap();
     reverie_ptrace::testing::print_tracee_output(&output);
     assert_eq!(output.status, ExitStatus::Exited(0));
 }
