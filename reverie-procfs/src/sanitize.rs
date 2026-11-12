@@ -2624,4 +2624,24 @@ periodic IRQ frequency\t: 0\n\
             assert_eq!(sanitize_netlink_sockets(malformed), malformed);
         }
     }
+    #[test]
+    fn numa_maps_hides_host_page_accounting() {
+        let contents = b"71000000 default heap anon=1 dirty=1 active=0 N12=1 kernelpagesize_kB=4\n\
+7ffff7c00000 default file=/usr/lib64/libc.so.6 mapped=41 mapmax=443 N0=41 swapcache=2 writeback=3 kernelpagesize_kB=4\n";
+
+        assert_eq!(
+            sanitize_numa_maps(contents),
+            b"71000000 default heap kernelpagesize_kB=4\n\
+7ffff7c00000 default file=/usr/lib64/libc.so.6 kernelpagesize_kB=4\n"
+        );
+    }
+
+    #[test]
+    fn numa_maps_leaves_unknown_formats_untouched() {
+        let invalid_address = b"address default anon=1\n";
+        assert_eq!(sanitize_numa_maps(invalid_address), invalid_address);
+
+        let invalid_counter = b"71000000 default active=recent N0=1\n";
+        assert_eq!(sanitize_numa_maps(invalid_counter), invalid_counter);
+    }
 }
