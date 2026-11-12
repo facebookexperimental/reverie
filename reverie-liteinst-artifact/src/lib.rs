@@ -1255,7 +1255,7 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers.rs",
         284108,
-        "5be23875aab66314ad90190601c4827a7c50201b5106448cb149d30390f59acc",
+        "e681ba4a4d55fc841dc4107b1665d3c03edde4f5ff2daf4b4f0ac51885bed582",
     ),
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers/package_roles.rs",

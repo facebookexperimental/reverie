@@ -944,7 +944,7 @@ const DETCORE: MappedConsumerSource = MappedConsumerSource {
         reverie_gitlink_relative: "reverie",
     },
     package_name: "detcore-liteinst",
-    package_version: "0.5.6",
+    package_version: "0.5.7",
     lib_target: "detcore_liteinst",
     manifest_relative: "detcore-liteinst/Cargo.toml",
     lib_rs_relative: "detcore-liteinst/src/lib.rs",
@@ -2984,7 +2984,7 @@ mod tests {
             ]
         );
         assert_eq!(detcore.package_name, "detcore-liteinst");
-        assert_eq!(detcore.package_version, "0.5.6");
+        assert_eq!(detcore.package_version, "0.5.7");
         assert_eq!(detcore.lib_target, "detcore_liteinst");
         assert_eq!(detcore.manifest_relative, "detcore-liteinst/Cargo.toml");
         assert_eq!(detcore.lib_rs_relative, "detcore-liteinst/src/lib.rs");
@@ -3008,7 +3008,7 @@ mod tests {
         // against, not a re-derivation of its format.
         assert_eq!(
             super::super::leaf_package_id(Path::new("/ws"), detcore).unwrap(),
-            "path+file:///ws/detcore-liteinst#0.5.6"
+            "path+file:///ws/detcore-liteinst#0.5.7"
         );
         // The pre-0.5.5 Detcore leaf id is not what production builds.
         assert_ne!(
