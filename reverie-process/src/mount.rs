@@ -72,6 +72,10 @@ pub struct Bind {
     /// The target of the bind mount. This does not need to exist and can be
     /// created when performing the bind mount.
     pub target: CString,
+
+    /// Whether the bind is mounted read-only (the `:ro` suffix in the
+    /// `source:target:ro` spelling; `:rw` and no suffix are writable).
+    pub readonly: bool,
 }
 
 /// `util::to_cstring` panics on an interior NUL. Every mount path, source,
@@ -697,7 +701,14 @@ impl Bind {
         Self {
             source: src,
             target: tgt,
+            readonly: false,
         }
+    }
+
+    /// Marks this bind read-only.
+    pub fn readonly(mut self) -> Self {
+        self.readonly = true;
+        self
     }
 }
 
@@ -709,7 +720,12 @@ impl From<Bind> for Mount {
             source: Some(b.source),
             target: b.target,
             fstype: None,
-            flags: MountFlags::MS_BIND,
+            flags: MountFlags::MS_BIND
+                | if b.readonly {
+                    MountFlags::MS_RDONLY
+                } else {
+                    MountFlags::empty()
+                },
             data: None,
             touch_target: false,
             allow_readonly_fallback: false,
@@ -725,10 +741,24 @@ impl From<Bind> for Mount {
 
 impl From<&str> for Bind {
     fn from(s: &str) -> Self {
+        // Docker's `-v` option suffix: `source:target:ro` is read-only,
+        // `:rw` is the writable default spelled out. The suffix is taken
+        // from the right and only when a source:target split precedes it,
+        // so a bare path never loses its tail. Any other suffix stays part
+        // of the target, exactly as before this spelling existed.
+        let (s, readonly) = match s
+            .strip_suffix(":ro")
+            .map(|rest| (rest, true))
+            .or_else(|| s.strip_suffix(":rw").map(|rest| (rest, false)))
+        {
+            Some((rest, readonly)) if rest.contains(':') => (rest, readonly),
+            _ => (s, false),
+        };
         if let Some((source, target)) = s.split_once(':') {
             Self {
                 source: checked_cstring(source).0,
                 target: checked_cstring(target).0,
+                readonly,
             }
         } else {
             // A Rust `&str` may contain an interior NUL, so this path panicked
@@ -736,7 +766,11 @@ impl From<&str> for Bind {
             // converts into refuses with EINVAL.
             let source = checked_cstring(s).0;
             let target = source.clone();
-            Self { source, target }
+            Self {
+                source,
+                target,
+                readonly,
+            }
         }
     }
 }
@@ -747,6 +781,7 @@ impl FromStr for Bind {
     /// Parses bind mounts of the following forms:
     ///  1. "path/to/source"
     ///  2. "path/to/source:path/to/dest"
+    ///  3. "path/to/source:path/to/dest:ro" (":rw" spells the default)
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(Self::from(s))
     }
@@ -1030,6 +1065,36 @@ mod tests {
         assert_eq!(
             Mount::from(Bind::from("source:target")),
             Mount::bind("source", "target")
+        );
+    }
+
+    #[test]
+    fn parse_bind_readonly_suffix() {
+        assert_eq!(
+            Bind::from("source:target:ro"),
+            Bind::new("source", "target").readonly(),
+            "a trailing :ro is the read-only option, not part of the target"
+        );
+        assert_eq!(
+            Bind::from("source:target:rw"),
+            Bind::new("source", "target"),
+            "a trailing :rw spells the writable default"
+        );
+        assert_eq!(
+            Bind::from("/path:ro"),
+            Bind::new("/path", "ro"),
+            "a suffix is an option only after a source:target split"
+        );
+        assert_eq!(
+            Bind::from("source:target:shared"),
+            Bind::new("source", "target:shared"),
+            "an unrecognized suffix stays part of the target, as before"
+        );
+
+        assert_eq!(
+            Mount::from(Bind::from("source:target:ro")),
+            Mount::bind("source", "target").readonly(),
+            "a read-only bind converts to a read-only bind mount"
         );
     }
 }
