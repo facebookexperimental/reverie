@@ -263,12 +263,12 @@ pub fn block_all_signals() -> io::Result<crate::guest::support::SignalInstallGua
 /// there, and only the guest's own numbering differs.
 ///
 /// When `fd` stays open after its close (a seccomp filter the guest installed
-/// can report success without running it), the runtime records that number
-/// too ([`record_runtime_fd`]), so both are protected and reported. When the
-/// record is full that fails, and so does this: one close of the moved number
-/// is attempted ([`place_runtime_fd_and`]), the old one stays open (the filter
-/// keeps it so), and the caller must not let the guest run on. Signals stay
-/// blocked throughout ([`block_all_signals`]).
+/// can report success without running it, or refuse it), the runtime records
+/// that number too ([`record_runtime_fd`]), so both are protected and
+/// reported. When the record is full that fails, and so does this: one close
+/// of the moved number is attempted ([`place_runtime_fd_and`]), the old one
+/// stays open (the filter keeps it so), and the caller must not let the guest
+/// run on. Signals stay blocked throughout ([`block_all_signals`]).
 ///
 /// The returned number is not protected until the caller records it, and a
 /// signal held during the placement is delivered as this returns; use
@@ -303,28 +303,31 @@ pub fn place_runtime_fd(fd: libc::c_int) -> io::Result<libc::c_int> {
 /// (`into_raw_fd`) has nothing to clean up.
 ///
 /// No caller in this repository lets the guest run on. The coordinator
-/// connection's per-thread and fork-child placements (guest/rpc.rs:659 and
-/// :828) exit through `rpc_fatal` (:979). `CoordinatorRpc::connect` (:525)
-/// returns the error (:535) to installation (guest/tool_install.rs:288), which
+/// connection's per-thread and fork-child placements (guest/rpc.rs:663 and
+/// :832) exit through `rpc_fatal` (:983). `CoordinatorRpc::connect` (:529)
+/// returns the error (:539) to installation (guest/tool_install.rs:296), which
 /// returns it from the public `install_tool_with` family and from
-/// reverie-liteinst's `install_tool` family (tool_host.rs:183, :216, :247,
-/// :288); the example preload exits on it (reverie-examples/src/lib.rs:286),
+/// reverie-liteinst's `install_tool` family (tool_host.rs:186, :222, :256,
+/// :300); the example preload exits on it (reverie-examples/src/lib.rs:286),
 /// and the remaining callers here are tests. A caller outside this repository
 /// that ignores the error from `CoordinatorRpc::connect` or `install_tool*`
-/// could resume the guest with that number open and unrecorded. That also
-/// needs a filter installed before the placement that makes the placement fail
-/// and then fakes or refuses the cleanup close. The placement fails there only
-/// under a filter: one that refuses `rt_sigprocmask` or `F_GETFD`, or one that
-/// fakes the close of the old number after the move while the record is full
-/// (`RECORDED_FD_CAPACITY` numbers), so [`record_if_open`] fails with
-/// `OutOfMemory`. Installation with fixed syscall gates refuses an inherited
-/// filter before it connects (guest/tool_install.rs:277-282); a direct caller
-/// of `CoordinatorRpc::connect` gets no such check.
+/// could resume the guest with that number open and unrecorded. That needs a
+/// filter installed before the placement that fakes or refuses the cleanup
+/// close; without one, that close releases the number. Examples of how the
+/// placement fails on that path, not a complete list: a filter refuses
+/// `rt_sigprocmask` or `F_GETFD`; or a filter fakes or refuses the close of the
+/// old number after the move while the record is full (`RECORDED_FD_CAPACITY`
+/// numbers), so [`record_if_open`] fails with `OutOfMemory`. With no filter at
+/// all, another thread can open a descriptor at the old number between the
+/// move's close and that check, and a full record fails the placement the same
+/// way. Installation with fixed syscall gates refuses an inherited filter
+/// before it connects (guest/tool_install.rs:285-290); a direct caller of
+/// `CoordinatorRpc::connect` gets no such check.
 ///
 /// After a move `fd` was already closed; this call never attempts a second
 /// close of that number, because another thread may have reopened it. A filter
-/// that faked that close keeps it open, and [`record_if_open`] has then
-/// recorded it or failed this call.
+/// that faked or refused that close keeps it open, and [`record_if_open`] has
+/// then recorded it or failed this call.
 pub fn place_runtime_fd_and(
     fd: libc::c_int,
     record: impl FnOnce(libc::c_int) -> io::Result<()>,
@@ -1847,6 +1850,11 @@ pub(crate) mod tests {
     /// The last child [`closes_held_within`] forked in this process.
     static SUPERVISED_CHILD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
+    /// How many closes the last [`closes_held_within`] call in this process
+    /// received from its child, answered or not.
+    static SUPERVISED_CLOSES: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
     /// Runs `guest` in a forked process under a filter that holds its every
     /// `close` of `numbers[0]` or `numbers[1]` for this process (a seccomp
     /// user notification), answers each with the matching `answers` entry,
@@ -1882,6 +1890,10 @@ pub(crate) mod tests {
         let forked = unsafe { libc::fork() };
         assert!(forked >= 0);
         if forked == 0 {
+            // A backstop for a supervisor that dies without unwinding, which
+            // its guard cannot cover; a child with every signal blocked relies
+            // on the guard alone.
+            unsafe { libc::alarm(60) };
             unsafe { libc::close(pipe[0]) };
             let listener = notify_on_close(numbers);
             let written = unsafe { libc::write(pipe[1], (&raw const listener).cast(), 4) };
@@ -1894,6 +1906,7 @@ pub(crate) mod tests {
         }
         let mut child = OwnedChild(forked);
         SUPERVISED_CHILD.store(forked, Ordering::SeqCst);
+        SUPERVISED_CLOSES.store(0, Ordering::SeqCst);
         unsafe { libc::close(pipe[1]) };
         // The handshake: the child's listener number, or end of file if the
         // child ended before sending it.
@@ -1943,6 +1956,7 @@ pub(crate) mod tests {
                 continue;
             }
             assert_eq!(notification.data.nr, libc::SYS_close as i32);
+            SUPERVISED_CLOSES.fetch_add(1, Ordering::SeqCst);
             let which = numbers
                 .iter()
                 .position(|&number| notification.data.args[0] == number as u64)
@@ -2078,7 +2092,7 @@ pub(crate) mod tests {
                 closes_held_within(
                     [fd, fd],
                     [CloseAnswer::Hold; 2],
-                    std::time::Duration::from_millis(500),
+                    std::time::Duration::from_secs(2),
                     || {
                         let _blocked = block_all_signals().unwrap();
                         unsafe { raw_syscall6(libc::SYS_close, [fd as u64, 0, 0, 0, 0, 0]) };
@@ -2086,6 +2100,9 @@ pub(crate) mod tests {
                 )
             }));
             assert!(failed.is_err(), "the held close never timed out");
+            // The deadline expired while the close was held, not earlier (for
+            // example during the handshake).
+            assert_eq!(SUPERVISED_CLOSES.load(Ordering::SeqCst), 1);
             let child = SUPERVISED_CHILD.load(Ordering::SeqCst);
             assert!(child > 0);
             assert_eq!(

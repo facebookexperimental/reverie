@@ -1189,8 +1189,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-inguest/src/guest/tool_install.rs",
-        28270,
-        "924a1f49294e75521f45acbc525bff24a1abdb45b0f21344d14a766a9d1986a3",
+        28887,
+        "fccf7936590e1458419a344c44e0986b390bdeb4a9b0b9c32fb386721bfe3ab5",
     ),
     (
         "reverie-inguest/src/signal.rs",
@@ -1434,8 +1434,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-inguest/src/guest/rpc.rs",
-        54589,
-        "e4cc7de2fc760fb1056fcce67b46c4751f5d96d32e4be062d04d158cd4e1d904",
+        54818,
+        "efeb70d95dfdad205ff00a0d885741d28917efbb7b6908750c51d275454af2de",
     ),
     (
         "reverie-inguest/src/guest/host.rs",
@@ -1449,8 +1449,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-liteinst/src/tool_host.rs",
-        85210,
-        "ae03d580e6e5a6b4c313afa4673f36cc3172db690e9639fac2d216064cfa751b",
+        85990,
+        "a6115c160ec28cd2959509c96ab2e64606c8ab26317066d0afbdb5cdd96999d9",
     ),
     (
         "reverie/Cargo.toml",
@@ -38943,6 +38943,21 @@ mod tests {
         // Keep the fixed catalog authoritative and reject their prior tuples.
         assert_eq!(CONTENT_REVERIE_CATALOG.len(), 86);
         for (relative, old_size, old_digest) in [
+            (
+                "reverie-inguest/src/guest/rpc.rs",
+                54589,
+                "e4cc7de2fc760fb1056fcce67b46c4751f5d96d32e4be062d04d158cd4e1d904",
+            ),
+            (
+                "reverie-inguest/src/guest/tool_install.rs",
+                28270,
+                "924a1f49294e75521f45acbc525bff24a1abdb45b0f21344d14a766a9d1986a3",
+            ),
+            (
+                "reverie-liteinst/src/tool_host.rs",
+                85210,
+                "ae03d580e6e5a6b4c313afa4673f36cc3172db690e9639fac2d216064cfa751b",
+            ),
             (
                 "reverie-liteinst-artifact/src/private_static/selected_initializers.rs",
                 283885,

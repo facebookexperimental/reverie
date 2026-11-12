@@ -168,6 +168,9 @@ impl HostRuntime for LiteinstRuntime {
 /// # Safety
 ///
 /// Installs process-global signal, seccomp, allocator, and instrumentation state.
+/// On `Err` the caller must not resume the guest: a failed coordinator
+/// connection can leave a descriptor open and unrecorded
+/// ([`reverie_inguest::guest::protect::place_runtime_fd_and`]).
 // TODO-HUMAN-REVIEW(PR-133): Review fail-closed preinstalled signal-handler boundary.
 pub unsafe fn install_tool<T>(coordinator: impl AsRef<Path>) -> io::Result<()>
 where
@@ -202,6 +205,9 @@ where
 ///
 /// In addition to [`install_tool`]'s requirements, the caller asserts that no
 /// other application thread can execute while a syscall site is installed.
+/// On `Err` the caller must not resume the guest: a failed coordinator
+/// connection can leave a descriptor open and unrecorded
+/// ([`reverie_inguest::guest::protect::place_runtime_fd_and`]).
 pub unsafe fn install_tool_quiescent<T>(coordinator: impl AsRef<Path>) -> io::Result<()>
 where
     T: Tool + 'static,
@@ -233,6 +239,9 @@ where
 /// # Safety
 ///
 /// Installs process-global signal, seccomp, allocator, and instrumentation state.
+/// On `Err` the caller must not resume the guest: a failed coordinator
+/// connection can leave a descriptor open and unrecorded
+/// ([`reverie_inguest::guest::protect::place_runtime_fd_and`]).
 pub unsafe fn install_tool_from_bootstrap<T>(coordinator: impl AsRef<Path>) -> io::Result<()>
 where
     T: Tool + 'static,
@@ -265,6 +274,9 @@ where
 /// [`reverie_inguest::guest::tool_install::install_tool_with_runtime`]
 /// preconditions apply. `project` must preserve every supplied service and
 /// retain it for the installed host's lifetime.
+/// On `Err` the caller must not resume the guest: a failed coordinator
+/// connection can leave a descriptor open and unrecorded
+/// ([`reverie_inguest::guest::protect::place_runtime_fd_and`]).
 pub unsafe fn install_tool_from_bootstrap_with_runtime<T, R>(
     coordinator: impl AsRef<Path>,
     project: impl FnOnce(Box<dyn HostRuntime>) -> R,

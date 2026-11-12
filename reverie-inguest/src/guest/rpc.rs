@@ -522,6 +522,10 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
     /// Connect before installing seccomp and decode the coordinator config.
     /// `on_reconnect` runs when a forked child reconnects; see
     /// [`ReconnectHook`].
+    ///
+    /// On `Err` the caller must not resume the guest: a failed placement can
+    /// leave the connection's descriptor open and unrecorded
+    /// ([`place_runtime_fd_and`](crate::guest::protect::place_runtime_fd_and)).
     pub fn connect(path: impl AsRef<Path>, on_reconnect: ReconnectHook) -> io::Result<Self> {
         // Path connect is the socket transport by definition; a mapped
         // selection here is a named mismatch, never a silent fallback.

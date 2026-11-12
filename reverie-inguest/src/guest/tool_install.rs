@@ -148,7 +148,9 @@ pub unsafe trait PatchHost {
 ///
 /// Installs process-global signal, seccomp and instrumentation state. Call
 /// once, before application threads start and before any seccomp filter is
-/// active.
+/// active. On `Err` the caller must not resume the guest: a failed coordinator
+/// connection can leave a descriptor open and unrecorded
+/// ([`place_runtime_fd_and`](crate::guest::protect::place_runtime_fd_and)).
 pub unsafe fn install_tool_with<T, H>(
     coordinator: &Path,
     remove_coordinator_environment: bool,
@@ -184,6 +186,9 @@ where
 /// actual runtime services and their image lifetime, including fork rebinding,
 /// signal control, clock and statistics behavior. Rust objects supplied here
 /// remain within one linked build; this is not a dynamic-library ABI.
+/// On `Err` the caller must not resume the guest: a failed coordinator
+/// connection can leave a descriptor open and unrecorded
+/// ([`place_runtime_fd_and`](crate::guest::protect::place_runtime_fd_and)).
 pub unsafe fn install_tool_with_runtime<T, H, R, F>(
     coordinator: &Path,
     remove_coordinator_environment: bool,
@@ -229,6 +234,9 @@ pub type OrdinaryRootInitializer<T> = fn(
 /// All [`install_tool_with_runtime`] preconditions apply. The caller owns the
 /// initializer's payload/schema/config/image checks and may change only its
 /// declared state fields. This does not authorize private phase callbacks.
+/// On `Err` the caller must not resume the guest: a failed coordinator
+/// connection can leave a descriptor open and unrecorded
+/// ([`place_runtime_fd_and`](crate::guest::protect::place_runtime_fd_and)).
 pub unsafe fn install_tool_with_runtime_and_root_initializer<T, H, R, F>(
     coordinator: &Path,
     remove_coordinator_environment: bool,
