@@ -952,8 +952,14 @@ fn connect_ordinary<G: GlobalTool>(
     // onto its number moves it first (CoordinatorRpc::relocate). A
     // placement that cannot record a surviving old number fails the connection
     // rather than leave that number reachable.
-    // Authenticated initial-image callers keep their own high descriptor
-    // helper and separate descriptor contract.
+    // literoot's initial image and its successor connect place their
+    // connection with place_runtime_fd_and on these same numbers, but accept
+    // only the top band (1025 and up, or 1016 to 1023 under a soft
+    // RLIMIT_NOFILE of 1024) and refuse a lower number by name. They leave
+    // recording to install's single reserve_coordinator_fd (reverie-liteinst
+    // tool_host.rs, install_tool_initial_image), which no guest code or
+    // handler precedes. Other authenticated initial-image callers, if any,
+    // keep their own helper and descriptor contract.
     let connected = UnixStream::connect(path)?;
     let placed = crate::guest::protect::place_runtime_fd_and(connected.into_raw_fd(), record)?;
     // SAFETY: `placed` is the connected socket's only descriptor, owned here.
