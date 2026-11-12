@@ -265,8 +265,9 @@ pub fn block_all_signals() -> io::Result<crate::guest::support::SignalInstallGua
 /// When `fd` stays open after its close (a seccomp filter the guest installed
 /// can report success without running it), the runtime records that number
 /// too ([`record_runtime_fd`]), so both are protected and reported. When the
-/// record is full that fails, and so does this, with both numbers still open;
-/// the caller must not let the guest run on. Signals stay blocked throughout
+/// record is full that fails, and so does this: the moved number is closed,
+/// the old one stays open (the filter keeps it so), and the caller must not
+/// let the guest run on. Signals stay blocked throughout
 /// ([`block_all_signals`]).
 ///
 /// The returned number is not protected until the caller records it, and a
@@ -282,22 +283,34 @@ pub fn place_runtime_fd(fd: libc::c_int) -> io::Result<libc::c_int> {
 /// [`place_runtime_fd`], then `record(placed)` before signals are unblocked,
 /// so a handler of a signal held during the placement already finds the
 /// number protected. `record` runs inside the window and follows
-/// [`block_all_signals`]'s rule; its error is returned with the number still
-/// open.
+/// [`block_all_signals`]'s rule.
+///
+/// On `Err`, nothing derived from `fd` stays open that this call still holds:
+/// it closes `fd` when the descriptor was not moved (signals could not be
+/// blocked, or no number was free), and the moved number when it was, before
+/// signals are unblocked. A caller that handed over its only descriptor
+/// (`into_raw_fd`) therefore has nothing to clean up. After a move `fd` was
+/// already closed; this call never closes that number again, because another
+/// thread may have reopened it. A filter that faked that close keeps it open,
+/// and [`record_if_open`] has then recorded it or failed this call.
 pub fn place_runtime_fd_and(
     fd: libc::c_int,
     record: impl FnOnce(libc::c_int) -> io::Result<()>,
 ) -> io::Result<libc::c_int> {
-    let _blocked = block_all_signals()?;
+    let close = |number: libc::c_int| unsafe {
+        raw_syscall6(libc::SYS_close, [number as u64, 0, 0, 0, 0, 0]);
+    };
+    let _blocked = block_all_signals().inspect_err(|_| close(fd))?;
     let moved = dup_into_runtime_range(fd);
     let placed = if moved < 0 {
         fd
     } else {
-        unsafe { raw_syscall6(libc::SYS_close, [fd as u64, 0, 0, 0, 0, 0]) };
-        record_if_open(fd)?;
-        moved as libc::c_int
+        let moved = moved as libc::c_int;
+        close(fd);
+        record_if_open(fd).inspect_err(|_| close(moved))?;
+        moved
     };
-    record(placed)?;
+    record(placed).inspect_err(|_| close(placed))?;
     Ok(placed)
 }
 
@@ -1681,6 +1694,61 @@ pub(crate) mod tests {
         });
     }
 
+    /// A record that fails after a move leaves nothing open: the moved number
+    /// is closed, and the old one was closed by the move.
+    #[test]
+    fn a_failed_record_closes_the_moved_number() {
+        in_child_with_soft_nofile(2048, || {
+            let fd = open_eventfd();
+            let mut seen = -1;
+            let refused = place_runtime_fd_and(fd, |placed| {
+                seen = placed;
+                Err(io::Error::other("refused by the test"))
+            })
+            .unwrap_err();
+            assert_eq!(refused.kind(), io::ErrorKind::Other);
+            assert!(seen >= RUNTIME_FD_MIN, "placed at {seen}");
+            assert!(!is_open(seen));
+            assert!(!is_open(fd));
+        });
+    }
+
+    /// A record that fails when the descriptor kept its number (the table is
+    /// full) closes that number.
+    #[test]
+    fn a_failed_record_closes_a_descriptor_that_kept_its_number() {
+        in_child_with_soft_nofile(1024, || {
+            let fd = open_eventfd();
+            fill_from(fd, 0);
+            let mut seen = -1;
+            place_runtime_fd_and(fd, |placed| {
+                seen = placed;
+                Err(io::Error::other("refused by the test"))
+            })
+            .unwrap_err();
+            assert_eq!(seen, fd);
+            assert!(!is_open(fd));
+        });
+    }
+
+    /// A placement that cannot block signals does not start, and closes the
+    /// descriptor it was given.
+    #[test]
+    fn a_placement_that_cannot_block_signals_closes_the_descriptor() {
+        in_child(|| {
+            let fd = open_eventfd();
+            install_filter(
+                libc::SYS_rt_sigprocmask,
+                0,
+                libc::SIG_BLOCK as u32,
+                libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
+            );
+            let refused = place_runtime_fd(fd).unwrap_err();
+            assert_eq!(refused.raw_os_error(), Some(libc::EPERM));
+            assert!(!is_open(fd));
+        });
+    }
+
     /// A soft limit so low that the band would reach below 3 starts it at 3,
     /// and nothing lower follows.
     #[test]
@@ -2124,6 +2192,10 @@ pub(crate) mod tests {
     fn a_placement_fails_when_the_kernel_will_not_say_whether_the_old_number_is_open() {
         in_child_with_soft_nofile(2048, || {
             let fd = open_eventfd();
+            // The number the move takes: the lowest free one from RUNTIME_FD_MIN.
+            let moved = dup_at_least(fd, RUNTIME_FD_MIN) as libc::c_int;
+            assert!(moved >= RUNTIME_FD_MIN);
+            unsafe { libc::close(moved) };
             install_filter(
                 libc::SYS_fcntl,
                 1,
@@ -2133,6 +2205,9 @@ pub(crate) mod tests {
             let refused = place_runtime_fd(fd).unwrap_err();
             assert_eq!(refused.raw_os_error(), Some(libc::EPERM));
             assert!(!is_runtime_owned_fd(fd));
+            // The failed placement closed the moved number (F_GETFL, because
+            // the filter refuses F_GETFD).
+            assert!(unsafe { libc::fcntl(moved, libc::F_GETFL) } < 0);
         });
     }
 
