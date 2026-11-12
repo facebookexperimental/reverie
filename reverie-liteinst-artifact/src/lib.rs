@@ -1259,8 +1259,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers/package_roles.rs",
-        81209,
-        "82295cbdd884e81b92cfba699f068ab068a1ac761fef5f7e9498f653699f8515",
+        83186,
+        "b568a674b69e960aa26a3287bbd0803518aeb9d6fd529f4f8095ed1a2cea2fde",
     ),
     (
         "reverie-liteinst-artifact/tests/fixtures/package_roles_fallback_member.rs",
@@ -69201,9 +69201,11 @@ pub mod private_static {
             .collect();
         require(
             loads.iter().all(|p| {
-                p.p_align == 4096
+                (4096..=65536).contains(&p.p_align)
+                    && p.p_align.is_power_of_two()
                     && p.p_offset % 4096 == 0
                     && p.p_vaddr % 4096 == 0
+                    && p.p_vaddr % p.p_align == p.p_offset % p.p_align
                     && p.p_vaddr >= LOW
                     && p.p_vaddr
                         .checked_add(p.p_memsz)
@@ -70633,6 +70635,35 @@ pub mod private_static {
                 changed[at..at + width].copy_from_slice(&value.to_le_bytes()[..width]);
                 let parsed = Elf::parse(&changed).unwrap();
                 assert!(geometry(&parsed, &changed).is_err(), "field {at}");
+            }
+        }
+        #[test]
+        fn private_static_geometry_accepts_64k_aligned_rw_and_refuses_bad_align() {
+            fn with_rw_align(align: u64, vaddr_shift: u64) -> Vec<u8> {
+                let mut bytes = elf_fixture();
+                bytes.resize(0x1_4000 + 0x1000, 0);
+                let rw = 64 + 2 * 56;
+                let tls = 64 + 3 * 56;
+                for (at, value) in [
+                    (rw + 8, 0x1_3000u64),
+                    (rw + 16, LOW + 0x1_3000 + vaddr_shift),
+                    (rw + 48, align),
+                    (tls + 8, 0x1_3000),
+                    (tls + 16, LOW + 0x1_3000 + vaddr_shift),
+                ] {
+                    bytes[at..at + 8].copy_from_slice(&value.to_le_bytes());
+                }
+                bytes
+            }
+            // Real produced RW header shape: align 0x10000 with
+            // vaddr/offset residues 0x3000 (offset 0x1573000 and
+            // vaddr 0x6000e2573000 in the shake-out ELF).
+            let bytes = with_rw_align(0x10000, 0);
+            geometry(&Elf::parse(&bytes).unwrap(), &bytes).unwrap();
+            for (align, shift) in [(131072, 0), (12288, 0), (0x10000, 4096)] {
+                let changed = with_rw_align(align, shift);
+                let parsed = Elf::parse(&changed).unwrap();
+                assert!(geometry(&parsed, &changed).is_err(), "align {align}");
             }
         }
         #[test]
