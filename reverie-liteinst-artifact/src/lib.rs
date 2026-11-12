@@ -1434,8 +1434,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-inguest/src/guest/rpc.rs",
-        54138,
-        "e5e5c6592d505bda9a4c47bef7bba4ef266a09f5d833c6ae5a87e036f25a3984",
+        54589,
+        "e4cc7de2fc760fb1056fcce67b46c4751f5d96d32e4be062d04d158cd4e1d904",
     ),
     (
         "reverie-inguest/src/guest/host.rs",
@@ -38943,6 +38943,11 @@ mod tests {
         // Keep the fixed catalog authoritative and reject their prior tuples.
         assert_eq!(CONTENT_REVERIE_CATALOG.len(), 86);
         for (relative, old_size, old_digest) in [
+            (
+                "reverie-inguest/src/guest/rpc.rs",
+                54138,
+                "e5e5c6592d505bda9a4c47bef7bba4ef266a09f5d833c6ae5a87e036f25a3984",
+            ),
             (
                 "reverie-liteinst/src/lib.rs",
                 35129,
