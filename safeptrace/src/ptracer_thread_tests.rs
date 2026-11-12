@@ -1640,6 +1640,356 @@ fn dead_generic_owner_retained_driver_does_not_retain_generation() {
     drop(release);
 }
 
+/// TracerPid reads made so far on this thread by the detached-wait check
+/// (`note_detached_wait_if_untraced`).
+#[cfg(not(sanitized))]
+fn tracer_pid_reads() -> usize {
+    TRACER_PID_READS_FOR_TEST.with(Cell::get)
+}
+
+/// Resumes a seized, stopped member and interrupts it again, so that the
+/// generation has seen a resume (whose running state carries a
+/// `ResumeMark`) before the caller detaches.
+#[cfg(not(sanitized))]
+fn resumed_and_stopped_again(stopped: Stopped) -> Stopped {
+    let running = stopped.resume(None).unwrap();
+    running.interrupt().unwrap();
+    let (stopped, event) = running
+        .wait_sync_on_ptracer_thread()
+        .wait()
+        .unwrap()
+        .assume_stopped();
+    assert_eq!(event, crate::Event::Stop);
+    stopped
+}
+
+/// A wait built on the running state of a detach still reads TracerPid and
+/// records its detached-wait note after the generation has been resumed
+/// before: a detach never yields a `ResumeMark`. Covers the explicit
+/// synchronous and asynchronous drivers, which bind the live owner the
+/// handoff needs, and the generic wait, whose note is ownerless.
+#[test]
+#[cfg(not(sanitized))]
+fn detached_waits_after_a_resume_still_record_the_handoff() {
+    for driver in ["sync", "async", "generic"] {
+        let (root, tid, release, mut root_cleanup) = legacy_owner_guest();
+        let stopped = resumed_and_stopped_again(seized_stopped_sync(tid));
+        let running = stopped.detach(None).unwrap();
+        let terminal = running.terminal_cleanup();
+        let reads = tracer_pid_reads();
+        // Each wait drops at the end of its arm, which ends its note.
+        let noted = match driver {
+            "sync" => running
+                .wait_sync_on_ptracer_thread()
+                .into_driver()
+                .detached_wait
+                .is_some(),
+            "async" => running
+                .wait_owned_on_ptracer_thread()
+                .into_driver()
+                .inner
+                .detached_wait
+                .is_some(),
+            _ => running.wait_owned().detached_wait.is_some(),
+        };
+        assert_eq!(
+            tracer_pid_reads(),
+            reads + 1,
+            "a wait on a detach's running state must read TracerPid ({driver})"
+        );
+        assert!(
+            noted,
+            "a wait created after a detach must record its note ({driver})"
+        );
+        assert!(
+            terminal.wait(TRACEE_WAIT_TIMEOUT),
+            "the generation retires once the detached wait is dropped ({driver})"
+        );
+        legacy_owner_reap_root(root, &mut root_cleanup);
+        drop(release);
+    }
+}
+
+/// The explicit drivers' notes are bound to the live owner, so the Event
+/// reports the handoff pending while they are held. This takes the
+/// retaining detach, as reverie-inguest's mapped handover does.
+#[test]
+#[cfg(not(sanitized))]
+fn owned_detached_wait_after_a_resume_keeps_the_handoff_pending() {
+    let (root, tid, release, mut root_cleanup) = legacy_owner_guest();
+    let stopped = resumed_and_stopped_again(seized_stopped_sync(tid));
+    let running = stopped
+        .detach_retaining(None)
+        .map_err(|(_, error)| error)
+        .unwrap();
+    let terminal = running.terminal_cleanup();
+    let reads = tracer_pid_reads();
+    let driver = running.wait_owned_on_ptracer_thread().into_driver();
+    assert_eq!(
+        tracer_pid_reads(),
+        reads + 1,
+        "a wait on a retaining detach's running state must read TracerPid"
+    );
+    assert!(driver.inner.detached_wait.is_some());
+    assert!(
+        terminal.event.event().detach_handoff_pending(),
+        "a held explicit wait created after a detach keeps the handoff pending"
+    );
+    drop(driver);
+    assert!(terminal.wait(TRACEE_WAIT_TIMEOUT));
+    legacy_owner_reap_root(root, &mut root_cleanup);
+    drop(release);
+}
+
+/// Waits until `tid` is in a ptrace stop (`/proc/<tid>/stat` state `t`),
+/// without consuming its report.
+#[cfg(not(sanitized))]
+fn wait_for_tracing_stop(tid: Pid) {
+    let deadline = Instant::now() + TRACEE_WAIT_TIMEOUT;
+    loop {
+        let stat = fs::read_to_string(format!("/proc/{tid}/stat")).unwrap();
+        let state = stat
+            .rsplit_once(')')
+            .and_then(|(_, rest)| rest.split_whitespace().next())
+            .unwrap();
+        if state == "t" {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{tid} reached no ptrace stop (state {state})"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// A resume's mark does not survive a detach made through another
+/// capability of the same generation before the wait is built: the detach
+/// epoch moved, so the wait reads TracerPid, finds the task untraced and
+/// records the handoff. Covers both `Stopped::detach` and
+/// `Stopped::detach_raw` (reverie-inguest's fork-child teardown), each of
+/// which counts its detach before the request.
+#[test]
+#[cfg(not(sanitized))]
+fn resume_mark_does_not_survive_a_detach_through_another_capability() {
+    resume_mark_after_detach_case(DetachThrough::Generation);
+    resume_mark_after_detach_case(DetachThrough::GenerationRaw);
+}
+
+/// The same through a capability on an unrelated Event. Before Linux 6.9
+/// (forced here) `Stopped::new_unchecked` cannot capture a thread pidfd, so
+/// it resolves to a fresh Event that shares nothing with the resumed
+/// generation but the task. The detach is counted for the task, so the
+/// mark still lapses.
+#[test]
+#[cfg(not(sanitized))]
+fn forced_legacy_resume_mark_does_not_survive_a_detach_through_a_fresh_event() {
+    resume_mark_after_detach_case(DetachThrough::FreshEvent);
+}
+
+/// Which capability [`resume_mark_after_detach_case`] detaches through.
+#[cfg(not(sanitized))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DetachThrough {
+    /// `Stopped::detach` on a clone of the resumed generation's token.
+    Generation,
+    /// `Stopped::detach_raw` on such a clone.
+    GenerationRaw,
+    /// `Stopped::detach` on `Stopped::new_unchecked`, under forced legacy.
+    FreshEvent,
+}
+
+#[cfg(not(sanitized))]
+fn resume_mark_after_detach_case(through: DetachThrough) {
+    let (root, tid, release, mut root_cleanup) = legacy_owner_guest();
+    let _legacy = (through == DetachThrough::FreshEvent).then(|| LegacyThreadGroup::new(root));
+    let stopped = seized_stopped_sync(tid);
+    let generation = stopped.generation();
+    let running = stopped.resume(None).unwrap();
+    running.interrupt().unwrap();
+    wait_for_tracing_stop(tid);
+    let detached = match through {
+        DetachThrough::Generation => generation.assume_stopped().detach(None).unwrap(),
+        DetachThrough::GenerationRaw => generation.assume_stopped().detach_raw(0).unwrap(),
+        DetachThrough::FreshEvent => {
+            let alias = Stopped::new_unchecked(tid.into());
+            assert!(
+                !Arc::ptr_eq(alias.1.event().event(), running.1.event().event()),
+                "the unchecked capability must resolve to an unrelated Event"
+            );
+            alias.detach(None).unwrap()
+        }
+    };
+    let terminal = running.terminal_cleanup();
+    let reads = tracer_pid_reads();
+    let driver = running.wait_owned_on_ptracer_thread().into_driver();
+    assert_eq!(
+        tracer_pid_reads(),
+        reads + 1,
+        "a resume's mark must not skip the read after a later detach ({through:?})"
+    );
+    assert!(driver.inner.detached_wait.is_some());
+    assert!(
+        terminal.event.event().detach_handoff_pending(),
+        "the wait finds the task untraced and must record the handoff ({through:?})"
+    );
+    drop(driver);
+    drop(detached);
+    assert!(
+        terminal.wait(TRACEE_WAIT_TIMEOUT),
+        "the generation retires once the detached wait is dropped ({through:?})"
+    );
+    legacy_owner_reap_root(root, &mut root_cleanup);
+    drop(release);
+}
+
+/// A mark from a resume through an ownerless token does not survive its
+/// tracer's exit. Tracer thread A seizes a non-leader generically, without
+/// `PTRACE_O_EXITKILL`; a generic synchronous wait collects the stop
+/// without starting an observation worker, and A resumes it, all without
+/// capturing an owner. A exits, so the kernel detaches the task, and no
+/// detach is counted. Sibling thread B, whose process is the task's parent,
+/// then builds an explicit driver, which captures B as its owner. The wait
+/// must read TracerPid and record a note owned by B: B is alive, so the
+/// note keeps the handoff pending.
+#[test]
+#[cfg(not(sanitized))]
+fn ownerless_resume_mark_does_not_survive_tracer_exit() {
+    let (root, tid, release, mut root_cleanup) = legacy_owner_guest();
+    let running = thread::spawn(move || {
+        let running = Running::seize(tid.into(), Options::empty()).unwrap();
+        running.interrupt().unwrap();
+        let (stopped, event) = running.wait().unwrap().assume_stopped();
+        assert_eq!(event, crate::Event::Stop);
+        assert!(stopped.1.ptracer_owner.is_none());
+        stopped.resume(None).unwrap()
+    })
+    .join()
+    .unwrap();
+    assert!(running.1.ptracer_owner.is_none());
+    assert_eq!(
+        running
+            .1
+            .event()
+            .event()
+            .worker_state
+            .load(Ordering::Acquire),
+        WORKER_NOT_STARTED
+    );
+    legacy_owner_until(|| {
+        fs::read_to_string(format!("/proc/{tid}/status"))
+            .unwrap_or_default()
+            .lines()
+            .any(|line| line == "TracerPid:\t0")
+    });
+    let reads = tracer_pid_reads();
+    let driver = running.wait_owned_on_ptracer_thread().into_driver();
+    assert_eq!(
+        tracer_pid_reads(),
+        reads + 1,
+        "an ownerless resume's mark must not skip the read for a new owner"
+    );
+    assert!(driver.inner.detached_wait.is_some());
+    assert!(
+        handle_detach_handoff_pending(driver.inner.inner.as_ref().unwrap().token.event()),
+        "the new live owner's note must keep the handoff pending"
+    );
+    drop(driver);
+    legacy_owner_reap_root(root, &mut root_cleanup);
+    drop(release);
+}
+
+/// The other half: a wait built on a resume's running state, with no detach
+/// since, makes no TracerPid read (the per-step cost of
+/// https://github.com/rrnewton/reverie/issues/1439), on the synchronous and
+/// the asynchronous waits. The member is detached before the cleanup kill,
+/// so that no exit stop holds it.
+///
+/// It runs alone in its own process, as do the other tests that require no
+/// read (`zero_read_test_runs_alone`): a mark is cancelled only by a detach
+/// request naming the marked TID, and there no other test can issue one.
+#[tokio::test(flavor = "current_thread")]
+#[cfg(not(sanitized))]
+async fn resumed_waits_skip_the_tracer_pid_read() {
+    if zero_read_test_runs_alone("resumed_waits_skip_the_tracer_pid_read") {
+        return;
+    }
+    let (root, tid, release, mut root_cleanup) = legacy_owner_guest();
+    let stopped = seized_stopped_sync(tid);
+    let reads = tracer_pid_reads();
+    // The synchronous wait on a resume's running state.
+    let stopped = resumed_and_stopped_again(stopped);
+    // The asynchronous driver on another resume's.
+    let running = stopped.resume(None).unwrap();
+    running.interrupt().unwrap();
+    let mut driver = running.wait_owned_on_ptracer_thread().into_driver();
+    assert!(driver.inner.detached_wait.is_none());
+    let (stopped, event) = tokio::time::timeout(
+        TRACEE_WAIT_TIMEOUT,
+        futures::future::poll_fn(|cx| driver.poll_on_ptracer_thread(cx)),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .assume_stopped();
+    assert_eq!(event, crate::Event::Stop);
+    assert_eq!(
+        tracer_pid_reads(),
+        reads,
+        "waits on a resume's running state must not read TracerPid"
+    );
+    drop(driver);
+    drop(stopped.detach(None).unwrap());
+    legacy_owner_reap_root(root, &mut root_cleanup);
+    drop(release);
+    emit_completion_marker(ZERO_READ_ALONE_MARKER);
+}
+
+/// Detach counts are kept per exact TID: a detach moves the count of the TID
+/// it names only, not another TID in the same block nor the TID 4,096 above,
+/// and a value that is not a Linux TID has no count. The TIDs are near the
+/// top of the range; the test runs alone, so no other test's detach of a
+/// task that happens to hold one of them can move a count in between.
+#[test]
+#[cfg(not(sanitized))]
+fn detach_counts_are_exact_per_tid() {
+    if zero_read_test_runs_alone("detach_counts_are_exact_per_tid") {
+        return;
+    }
+    let tid = super::Pid::from_raw((DETACH_EPOCH_TID_LIMIT - 1 - DETACH_EPOCH_BLOCK) as i32);
+    let same_block = super::Pid::from_raw(tid.as_raw() - 1);
+    let next_block = super::Pid::from_raw(tid.as_raw() + DETACH_EPOCH_BLOCK as i32);
+    let before = [tid, same_block, next_block].map(detach_epoch);
+    assert!(before.iter().all(Option::is_some));
+    note_detach(tid);
+    assert_eq!(detach_epoch(tid), before[0].map(|count| count + 1));
+    assert_eq!(detach_epoch(same_block), before[1]);
+    assert_eq!(detach_epoch(next_block), before[2]);
+    for not_a_tid in [-1, 0x7fff_ffff, DETACH_EPOCH_TID_LIMIT as i32] {
+        let not_a_tid = super::Pid::from_raw(not_a_tid);
+        assert_eq!(detach_epoch(not_a_tid), None);
+        note_detach(not_a_tid);
+        assert_eq!(detach_epoch(not_a_tid), None);
+    }
+    emit_completion_marker(ZERO_READ_ALONE_MARKER);
+}
+
+/// Printed by a zero-read test's inner run once its body passed.
+#[cfg(not(sanitized))]
+const ZERO_READ_ALONE_MARKER: &str = "ACTUAL_ZERO_READ_TEST_RAN_ALONE";
+
+/// Runs the named test, which requires that a resume's mark holds (no
+/// TracerPid read), alone in its own process; returns true in the outer run
+/// and false in that inner run, which executes the body. The lib's tests
+/// otherwise run in parallel in one process. A mark is cancelled only by a
+/// detach request naming the marked TID ([`note_detach`]), and while the
+/// tracee lives, only a capability left from an earlier task with the same
+/// TID could name it. In its own process no other test can hold one.
+#[cfg(not(sanitized))]
+fn zero_read_test_runs_alone(name: &str) -> bool {
+    run_legacy_test_outer_with_outcome(name, Some(ZERO_READ_ALONE_MARKER))
+}
+
 /// Status opens on this thread through every retained status reader.
 #[cfg(not(sanitized))]
 fn status_opens_on_this_thread() -> usize {
@@ -1913,6 +2263,260 @@ async fn attached_owner_wait_after_nonleader_exec_case(force_legacy: bool) {
     drop(driver);
     assert_eq!(unsafe { libc::kill(leader.as_raw(), libc::SIGKILL) }, 0);
     legacy_owner_reap_root(intermediate, &mut intermediate_cleanup);
+}
+
+/// The de_thread window: once an untraced non-leader has exec'd, it holds
+/// the resumed leader's TID (`exchange_tids`), so a TracerPid read made now
+/// returns 0. A wait built on the resume's running state only after the
+/// exec still skips the read, by deliberate choice: the release is treated
+/// as retirement, not as a handoff that no reattach will complete. The wait
+/// records no note, as the wait built before the exec in
+/// [`attached_owner_wait_resolves_after_nonleader_exec_untraces`] does, and
+/// retires with ECHILD in the same way: the better-defined outcome. A read
+/// here would instead record a note bound to the live owner and hold off
+/// retirement for as long as the wait lives.
+#[tokio::test(flavor = "current_thread")]
+#[cfg(not(sanitized))]
+async fn resumed_owner_wait_built_after_nonleader_exec_records_no_note() {
+    const NAME: &str = "resumed_owner_wait_built_after_nonleader_exec_records_no_note";
+    if zero_read_test_runs_alone(NAME) {
+        return;
+    }
+    assert!(resumed_owner_wait_after_nonleader_exec_case(false, false).await);
+    emit_completion_marker(ZERO_READ_ALONE_MARKER);
+}
+
+/// The forced-legacy arm of
+/// [`resumed_owner_wait_built_after_nonleader_exec_records_no_note`]: the
+/// seized leader has a `LegacyLeader` identity, as on a kernel without
+/// thread pidfds.
+#[tokio::test(flavor = "current_thread")]
+#[cfg(not(sanitized))]
+async fn forced_legacy_resumed_owner_wait_built_after_nonleader_exec_records_no_note() {
+    const NAME: &str =
+        "forced_legacy_resumed_owner_wait_built_after_nonleader_exec_records_no_note";
+    if zero_read_test_runs_alone(NAME) {
+        return;
+    }
+    assert!(resumed_owner_wait_after_nonleader_exec_case(true, false).await);
+    emit_completion_marker(ZERO_READ_ALONE_MARKER);
+}
+
+/// The colliding-task variant of
+/// [`resumed_owner_wait_built_after_nonleader_exec_records_no_note`].
+/// Between the exec and the wait build, the tracer detaches another task it
+/// holds stopped, whose TID is the leader's plus 4,096: unrelated to the
+/// leader, but sharing its slot in a table indexed by TID modulo 4,096. That
+/// detach must not cancel the leader's mark: the wait still makes no read,
+/// records no note and retires with ECHILD. It runs in a fresh PID
+/// namespace, where clone3 can choose the other task's TID.
+#[tokio::test(flavor = "current_thread")]
+#[cfg(not(sanitized))]
+async fn resumed_owner_wait_after_nonleader_exec_ignores_another_tasks_detach() {
+    another_tasks_detach_case(
+        "resumed_owner_wait_after_nonleader_exec_ignores_another_tasks_detach",
+        false,
+    )
+    .await;
+}
+
+/// The forced-legacy arm of
+/// [`resumed_owner_wait_after_nonleader_exec_ignores_another_tasks_detach`].
+#[tokio::test(flavor = "current_thread")]
+#[cfg(not(sanitized))]
+async fn forced_legacy_resumed_owner_wait_after_nonleader_exec_ignores_another_tasks_detach() {
+    another_tasks_detach_case(
+        "forced_legacy_resumed_owner_wait_after_nonleader_exec_ignores_another_tasks_detach",
+        true,
+    )
+    .await;
+}
+
+/// How far above the leader's TID the colliding task's TID is.
+#[cfg(not(sanitized))]
+const COLLIDING_TID_OFFSET: i32 = 4096;
+
+/// Runs one colliding-task test in a fresh user and PID namespace.
+///
+/// Unlike the other PID-namespace tests, which pass when the namespace or
+/// clone3(set_tid) is refused, these two then fail, always, naming the test
+/// and the refused facility: they are the only check that another task's
+/// detach cannot cancel the resumed leader's mark, so they must not pass
+/// without running. There is no opt-out.
+#[cfg(not(sanitized))]
+async fn another_tasks_detach_case(name: &str, force_legacy: bool) {
+    const INNER: &str = "SAFEPTRACE_ANOTHER_TASKS_DETACH_INNER";
+    const MARKER: &str = "ACTUAL_ANOTHER_TASKS_DETACH_EXERCISED";
+    const UNAVAILABLE: &str = "ANOTHER_TASKS_DETACH_UNAVAILABLE";
+    if env::var_os(INNER).is_none() {
+        let output = run_exact_in_pid_namespace_bounded(
+            &format!("notifier::test::{name}"),
+            &[(INNER, "1")],
+        );
+        match classify_exact_reuse_output(output.as_ref(), MARKER, UNAVAILABLE).unwrap() {
+            ExactReuseOutcome::Exercised => emit_completion_marker(MARKER),
+            ExactReuseOutcome::Unavailable => panic!(
+                "{name} FAILED: it did not run, because {}. It has no opt-out",
+                colliding_task_refusal(output.as_ref(), UNAVAILABLE)
+            ),
+        }
+        return;
+    }
+    if resumed_owner_wait_after_nonleader_exec_case(force_legacy, true).await {
+        emit_completion_marker(MARKER);
+    } else {
+        println!("{UNAVAILABLE}");
+    }
+}
+
+/// Which facility an unavailable colliding-task run was refused, as
+/// classified by `classify_exact_reuse_output`.
+#[cfg(not(sanitized))]
+fn colliding_task_refusal(output: Option<&Output>, unavailable: &str) -> String {
+    let Some(output) = output else {
+        return "`unshare` is not installed, so no user and PID namespace could be created"
+            .to_owned();
+    };
+    if String::from_utf8_lossy(&output.stdout).contains(unavailable) {
+        return "clone3(set_tid) was refused inside the user and PID namespace".to_owned();
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let denial = stderr
+        .lines()
+        .find(|line| line.starts_with("unshare: "))
+        .unwrap_or("no unshare error line");
+    format!("the user and PID namespace was refused ({denial})")
+}
+
+/// A child of this thread at exactly TID `requested`, stopped by
+/// PTRACE_TRACEME and SIGSTOP and held through an explicit capability; once
+/// resumed it exits 42. `None` when clone3(set_tid) is refused, as it is
+/// outside a PID namespace this process owns.
+#[cfg(not(sanitized))]
+fn traced_child_at(requested: Pid) -> Option<Stopped> {
+    #[repr(C)]
+    #[derive(Default)]
+    struct CloneArgs {
+        flags: u64,
+        pidfd: u64,
+        child_tid: u64,
+        parent_tid: u64,
+        exit_signal: u64,
+        stack: u64,
+        stack_size: u64,
+        tls: u64,
+        set_tid: u64,
+        set_tid_size: u64,
+        cgroup: u64,
+    }
+    let mut tid = requested.as_raw();
+    let args = CloneArgs {
+        exit_signal: libc::SIGCHLD as u64,
+        set_tid: std::ptr::from_mut(&mut tid) as u64,
+        set_tid_size: 1,
+        ..CloneArgs::default()
+    };
+    // Under the spawn/fork lock, like every raw creation in the lib tests;
+    // errno is read inside it, before the guard's release.
+    let (result, error) = crate::test_fork::exclusive(|| {
+        let result = unsafe { libc::syscall(libc::SYS_clone3, &args, mem::size_of::<CloneArgs>()) };
+        (result, Errno::last())
+    });
+    if result == -1 {
+        assert!(
+            matches!(error, Errno::EPERM | Errno::EACCES | Errno::ENOSYS),
+            "unexpected clone3(set_tid) refusal: {error}"
+        );
+        return None;
+    }
+    if result == 0 {
+        crate::traceme_and_stop().unwrap();
+        unsafe { libc::_exit(42) };
+    }
+    let child = Pid::from_raw(result as i32);
+    assert_eq!(child, requested, "clone3 did not create the requested TID");
+    Some(
+        stopped_tracee_bounded(child, |pid| {
+            Stopped::new_unchecked_on_ptracer_thread(pid).unwrap()
+        })
+        .unwrap(),
+    )
+}
+
+/// T5's body. With `colliding`, the tracer also holds a stopped task at the
+/// leader's TID plus [`COLLIDING_TID_OFFSET`] and detaches it between the
+/// exec and the wait build. Returns false, having done nothing else, when
+/// that task cannot be created.
+#[cfg(not(sanitized))]
+async fn resumed_owner_wait_after_nonleader_exec_case(force_legacy: bool, colliding: bool) -> bool {
+    let (intermediate, mut intermediate_cleanup, leader, execute) = grandchild_exec_guest();
+    let other = if colliding {
+        let Some(other) = traced_child_at(Pid::from_raw(leader.as_raw() + COLLIDING_TID_OFFSET))
+        else {
+            assert_eq!(unsafe { libc::kill(leader.as_raw(), libc::SIGKILL) }, 0);
+            legacy_owner_reap_root(intermediate, &mut intermediate_cleanup);
+            return false;
+        };
+        Some(other)
+    } else {
+        None
+    };
+    let _legacy = force_legacy.then(|| LegacyThreadGroup::new(leader));
+    let running =
+        Running::seize_on_ptracer_thread(leader.into(), Options::PTRACE_O_EXITKILL).unwrap();
+    running.interrupt().unwrap();
+    let (stopped, event) = running
+        .wait_sync_on_ptracer_thread()
+        .wait()
+        .unwrap()
+        .assume_stopped();
+    assert_eq!(event, crate::Event::Stop);
+    assert!(stopped.1.ptracer_owner.is_some());
+    let running = stopped.resume(None).unwrap();
+    assert_eq!(
+        unsafe { libc::write(execute.as_raw_fd(), b"x".as_ptr().cast(), 1) },
+        1
+    );
+    legacy_owner_until(|| {
+        let status = fs::read_to_string(format!("/proc/{leader}/status")).unwrap_or_default();
+        status.lines().any(|line| line == "Name:\tsleep")
+            && status.lines().any(|line| line == "TracerPid:\t0")
+    });
+    // The other task's detach, by the same tracer, before the wait exists.
+    let other = other.map(|other| {
+        let pid = other.pid();
+        drop(other.detach(None).unwrap());
+        pid
+    });
+    // Built only now, when a TracerPid read would return 0.
+    let reads = tracer_pid_reads();
+    let mut driver = running.wait_owned_on_ptracer_thread().into_driver();
+    assert_eq!(
+        tracer_pid_reads(),
+        reads,
+        "a wait on the resume's running state must not read TracerPid after the exec"
+    );
+    assert!(
+        driver.inner.detached_wait.is_none(),
+        "a wait on the resume's running state must record no note after the exec"
+    );
+    let result = tokio::time::timeout(
+        TRACEE_WAIT_TIMEOUT,
+        futures::future::poll_fn(|cx| driver.poll_on_ptracer_thread(cx)),
+    )
+    .await;
+    assert!(
+        matches!(result, Ok(Err(OwnedWaitError::Errno(Errno::ECHILD)))),
+        "a wait built after the exec did not retire with ECHILD: {result:?}"
+    );
+    drop(driver);
+    assert_eq!(unsafe { libc::kill(leader.as_raw(), libc::SIGKILL) }, 0);
+    legacy_owner_reap_root(intermediate, &mut intermediate_cleanup);
+    if let Some(other) = other {
+        let status = waitpid_status_bounded(other.into(), 0, TRACEE_WAIT_TIMEOUT).unwrap();
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 42);
+    }
+    true
 }
 
 #[cfg(not(sanitized))]

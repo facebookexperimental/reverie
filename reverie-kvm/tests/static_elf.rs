@@ -18583,6 +18583,9 @@ mod process_alarm_signals;
 #[path = "support/parked_signals.rs"]
 mod parked_signals;
 
+#[path = "support/cross_process_signals.rs"]
+mod cross_process_signals;
+
 #[path = "support/captured_write_signals.rs"]
 mod captured_write_signals;
 

@@ -23,6 +23,7 @@ pub struct XState(pub(crate) Vec<u8>);
 
 /// Floating point registers.
 #[cfg(target_arch = "aarch64")]
+#[repr(C)]
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
 #[allow(missing_docs)]
 pub struct FpRegs {

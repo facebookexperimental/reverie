@@ -6,6 +6,7 @@
 | `reverie-ptrace` + `safeptrace` | the reference backend | [Backends](backends.md) |
 | `reverie-syscalls` | typed syscall wrappers + pretty-printing | [Typed syscalls](typed-syscalls.md) |
 | `reverie-process`, `reverie-memory`, `reverie-util` | commands, guest memory, shared utilities | throughout |
+| `reverie-procfs` | pure `/proc` content formatting and path classification helpers | throughout |
 | `reverie-inguest` | shared in-guest runtime: seccomp trap, dispatcher, trusted gate | [Mechanisms](mechanisms.md) |
 | `reverie-liteinst` (+ `-artifact`, `-preload`) | in-guest LiteInst patching backend + preload hosting | [Backends](backends.md) |
 | `reverie-loader` | image validation, gate audit, init stages | [Loaders](loaders.md) |

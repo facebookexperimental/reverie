@@ -551,7 +551,7 @@ pub(super) fn carrier_seals(file: &std::fs::File) -> CarrierSealProbe {
 pub(super) fn synthetic_guest_fd_symlink_stat(guest_fd: libc::c_int) -> libc::stat {
     // SAFETY: libc::stat is plain-old-data; a zeroed value is valid.
     let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
-    stat.st_dev = synthetic_dev(SYNTHETIC_GUEST_FD_DEV_MINOR);
+    stat.st_dev = reverie_procfs::synthetic_dev(SYNTHETIC_DEV_MAJOR, SYNTHETIC_GUEST_FD_DEV_MINOR);
     stat.st_ino = synthetic_guest_fd_inode(guest_fd, true);
     stat.st_mode = libc::S_IFLNK | 0o777;
     stat.st_nlink = 1;

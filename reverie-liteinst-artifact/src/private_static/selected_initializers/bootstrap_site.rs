@@ -61,7 +61,8 @@ pub(super) fn source_symbol(digest: &str) -> Result<&'static str> {
     require(
         digest == SOURCE_SHA
             || digest == HANDOFF_ROUTE_RULE_SOURCE_SHA
-            || digest == HANDOFF_MAX_BYTES_SOURCE_SHA,
+            || digest == HANDOFF_MAX_BYTES_SOURCE_SHA
+            || digest == HANDOFF_ENTRY_PREDICATE_SOURCE_SHA,
         "Bootstrap::site complete runtime source differs",
     )?;
     Ok(SYMBOL)

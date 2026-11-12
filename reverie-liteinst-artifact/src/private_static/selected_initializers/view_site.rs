@@ -88,7 +88,8 @@ fn source_digest(digest: &str) -> Result<()> {
             || digest == SERIALIZER_SOURCE_SHA
             || digest == BOOTSTRAP_SOURCE_SHA
             || digest == HANDOFF_ROUTE_RULE_SOURCE_SHA
-            || digest == HANDOFF_MAX_BYTES_SOURCE_SHA,
+            || digest == HANDOFF_MAX_BYTES_SOURCE_SHA
+            || digest == HANDOFF_ENTRY_PREDICATE_SOURCE_SHA,
         "View::site complete runtime source differs",
     )
 }
@@ -99,6 +100,7 @@ pub(super) fn source_symbol(digest: &str) -> Result<&'static str> {
         if digest == BOOTSTRAP_SOURCE_SHA
             || digest == HANDOFF_ROUTE_RULE_SOURCE_SHA
             || digest == HANDOFF_MAX_BYTES_SOURCE_SHA
+            || digest == HANDOFF_ENTRY_PREDICATE_SOURCE_SHA
         {
             BOOTSTRAP_SYMBOL
         } else {

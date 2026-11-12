@@ -1,15 +1,8 @@
 //! Finite mapped-entry terminal/observer observations, never entry admission.
 use super::*;
 
-const ENTRY_SOURCE: &str = "bc140aaea9d598480cdabddd070ca4bc853ebfa0d7525789c85063988fa91f42";
-// The bounded-bootstrap entry keeps the same terminal and observer source
-// bodies. Admission of this complete source still requires every actual root,
-// owner, body, relocation and local-control check below to pass anew.
-const BOOTSTRAP_ENTRY_SOURCE: &str =
-    "34e21f21a41f2346889c242c869bc32c74821c625dd5b9cf9bd2181ca2d8d40e";
-
-fn accepted_entry_source(digest: &str) -> bool {
-    digest == ENTRY_SOURCE || digest == BOOTSTRAP_ENTRY_SOURCE
+fn accepted_entry_source(consumer: &MappedConsumerSource, digest: &str) -> bool {
+    consumer.accepted_entry_sources.contains(&digest)
 }
 
 pub(super) const PRIVATE_SOURCE_PATH: &str = "reverie-inguest/src/guest/exec_private.rs";
@@ -32,8 +25,6 @@ pub(super) fn accepted_private_source(digest: &str) -> bool {
         || digest == SUCCESSOR_PRIVATE_SOURCE
 }
 
-const OBSERVED_LABEL: &str = "detcore_liteinst_mapped_entry_observed_int3";
-
 /// Callback-scoped static observations only. No execution/Ready conversion.
 #[derive(Debug, Serialize)]
 pub struct MappedTerminalObservation {
@@ -45,6 +36,27 @@ pub struct MappedTerminalObservation {
     // These are persistent open obligations, not successful qualification.
     remaining: Vec<String>,
     scope: &'static str,
+    // Not serialized, so the exported evidence keeps its fields.
+    #[serde(skip)]
+    generation: GenerationKind,
+    #[serde(skip)]
+    entry: u64,
+}
+
+impl MappedTerminalObservation {
+    /// The generation this observation qualified.
+    pub fn generation(&self) -> GenerationKind {
+        self.generation
+    }
+
+    /// `(entry, observed INT3)` for that generation, read from the
+    /// final ELF in this same source transaction: the joined root's
+    /// address and its observer label's address. This is the producer
+    /// half of the supervisor's per-generation entry coordinates. It is
+    /// data only and grants no entry or Ready authority.
+    pub fn entry_coordinates(&self) -> (u64, u64) {
+        (self.entry, self.observer_int3)
+    }
 }
 
 fn body<'a>(elf: &Elf<'_>, bytes: &'a [u8], role: &RelocatedDefinition) -> Result<&'a [u8]> {
@@ -171,7 +183,13 @@ fn aliases(
                 && s.st_type() != sym::STT_SECTION
         })
         .collect::<Vec<_>>();
-    let is_observer = matches!(role, InitializerRole::MappedObserver);
+    // Only an observer carries a label: its generation's, through
+    // the one generation lookup (an absent generation refuses).
+    let observed_label = match role {
+        InitializerRole::MappedObserver(mapped) => Some(mapped.symbols()?.observed_label),
+        _ => None,
+    };
+    let is_observer = observed_label.is_some();
     require(
         found.len() == if is_observer { 2 } else { 1 },
         "terminal alias set differs",
@@ -187,15 +205,12 @@ fn aliases(
                 "terminal owner alias differs",
             )?;
         } else {
-            require(
-                is_observer && name == OBSERVED_LABEL,
-                "extra terminal alias",
-            )?;
+            require(observed_label == Some(name), "extra terminal alias")?;
             observer_label(s, address, input)?;
         }
     }
     // Another section/alias must not impersonate the owner or the trap label.
-    for name in std::iter::once(owner_name).chain(is_observer.then_some(OBSERVED_LABEL)) {
+    for name in std::iter::once(owner_name).chain(observed_label) {
         require(
             elf.syms
                 .iter()
@@ -229,8 +244,13 @@ fn joined_role(
     elf: &Elf<'_>,
     bytes: &[u8],
 ) -> Result<RelocatedDefinition> {
-    let (selected, actual_name) =
-        select_role_named(&role, objects, map, runtime, role.terminal_path().is_some())?;
+    let (selected, actual_name) = select_role_named(
+        &role,
+        objects,
+        map,
+        runtime,
+        role.terminal_path()?.is_some(),
+    )?;
     let proof =
         join_selected_initializer_named(role, &actual_name, map, selected, objects, elf, bytes)?;
     aliases(
@@ -329,6 +349,38 @@ impl VerifiedStaticSource {
         runner: &mut Runner,
         callback: impl FnOnce(&super::MappedTerminalObservation, &mut Runner) -> Result<T>,
     ) -> Result<T> {
+        self.with_mapped_terminal_observation_for(
+            GenerationKind::First,
+            archive,
+            definitions,
+            objdump,
+            runner,
+            callback,
+        )
+    }
+
+    /// Generation-scoped form: qualifies one present
+    /// generation's root/terminal/observer bodies under the
+    /// consumer this source transaction selected. There is no
+    /// consumer parameter; a generation that consumer does not
+    /// carry refuses by name before any join.
+    pub fn with_mapped_terminal_observation_for<T>(
+        &self,
+        generation: GenerationKind,
+        archive: &StaticArchive,
+        definitions: &SelectedInitializerDefinitions,
+        objdump: &FileIdentity,
+        runner: &mut Runner,
+        callback: impl FnOnce(&super::MappedTerminalObservation, &mut Runner) -> Result<T>,
+    ) -> Result<T> {
+        let mapped = MappedRole {
+            consumer: self.consumer,
+            generation,
+        };
+        if let Err(error) = mapped.symbols() {
+            return close_result(Err(error), self.guard.close(runner));
+        }
+        let consumer = self.consumer.source();
         let admission = self.require_archive_owner(archive).and_then(|_| {
             require(
                 Arc::ptr_eq(&self.archive_owner, &definitions.source_owner.0)
@@ -355,7 +407,7 @@ impl VerifiedStaticSource {
                     "terminal objdump differs",
                 )?;
                 for (relative, cargo) in [
-                    ("detcore-liteinst/src/exec_initial/mapped_entry.rs", false),
+                    (consumer.entry_source_relative, false),
                     (PRIVATE_SOURCE_PATH, true),
                 ] {
                     let roots = self
@@ -374,7 +426,7 @@ impl VerifiedStaticSource {
                         if cargo {
                             accepted_private_source(&file.sha256)
                         } else {
-                            accepted_entry_source(&file.sha256)
+                            accepted_entry_source(consumer, &file.sha256)
                         },
                         "terminal actual source differs",
                     )?;
@@ -413,11 +465,11 @@ impl VerifiedStaticSource {
                 let map =
                     fs::read_to_string(&definitions.core.map.path).map_err(|e| e.to_string())?;
                 let roles = [
-                    InitializerRole::MappedRoot,
-                    InitializerRole::MappedTerminal,
+                    InitializerRole::MappedRoot(mapped),
+                    InitializerRole::MappedTerminal(mapped),
                     InitializerRole::InitializationFailed,
                     InitializerRole::InitialTerminal,
-                    InitializerRole::MappedObserver,
+                    InitializerRole::MappedObserver(mapped),
                 ];
                 let joined = roles
                     .into_iter()
@@ -426,10 +478,21 @@ impl VerifiedStaticSource {
                 let [root, mapped, failed, terminal, observed] = joined.as_slice() else {
                     return Err("terminal internal role count".into());
                 };
-                require(
-                    elf.entry == root.address,
-                    "terminal root is not actual e_entry",
-                )?;
+                // The ELF header names the first-image entry for
+                // every consumer; a successor observation's root
+                // is joined by its exact symbol instead and must
+                // not be the header entry. The first-image text is
+                // the Detcore-only producer's, unchanged.
+                match generation {
+                    GenerationKind::First => require(
+                        elf.entry == root.address,
+                        "terminal root is not actual e_entry",
+                    )?,
+                    GenerationKind::Successor => require(
+                        elf.entry != root.address,
+                        "terminal successor root is actual e_entry",
+                    )?,
+                }
                 wrappers(&elf, &data, mapped, failed, terminal)?;
                 // Existing complete-page/source/member/map proof, not ordinary44's
                 // syscall ABI. The fixed native entry is page+124 in that exact page.
@@ -616,6 +679,8 @@ impl VerifiedStaticSource {
                         "PRE_FS_CLOSURE_AND_ENTRY_ADMISSION_NOT_PROVEN".into(),
                     ],
                     scope: "FINITE_TERMINAL_OBSERVER_STATIC_OBSERVATIONS_ONLY",
+                    generation,
+                    entry: root.address,
                 };
                 let result = callback(&observation, runner);
                 close_result(result, observation.disassembly.verify())
@@ -716,6 +781,18 @@ mod tests {
         assert!(observer_label(good, 0x4000, true).is_err());
     }
     #[test]
+    fn entry_sources_are_accepted_only_for_their_own_consumer() {
+        let literoot = MappedConsumer::Literoot.source();
+        for digest in literoot.accepted_entry_sources {
+            assert!(accepted_entry_source(literoot, digest));
+            assert!(!accepted_entry_source(&DETCORE, digest));
+        }
+        for digest in DETCORE.accepted_entry_sources {
+            assert!(!accepted_entry_source(literoot, digest));
+        }
+    }
+
+    #[test]
     fn actual_noreturn_call_cut_refuses_another_branch_into_ud2() {
         let i = |address, bytes| EncodedConstructorInstruction { address, bytes };
         let valid = vec![
@@ -738,8 +815,8 @@ mod tests {
 
     #[test]
     fn mapped_terminal_entry_sources_remain_exact_closed_declarations() {
-        for digest in [ENTRY_SOURCE, BOOTSTRAP_ENTRY_SOURCE] {
-            assert!(accepted_entry_source(digest));
+        for digest in DETCORE.accepted_entry_sources {
+            assert!(accepted_entry_source(&DETCORE, digest));
             for refused in [
                 "0".repeat(64),
                 digest[..63].to_owned(),
@@ -747,17 +824,18 @@ mod tests {
                 digest.to_ascii_uppercase(),
                 format!("sha256:{digest}"),
             ] {
-                assert!(!accepted_entry_source(&refused));
+                assert!(!accepted_entry_source(&DETCORE, &refused));
             }
             for index in 0..digest.len() {
                 let mut modified = digest.as_bytes().to_vec();
                 modified[index] = if modified[index] == b'0' { b'1' } else { b'0' };
                 assert!(!accepted_entry_source(
+                    &DETCORE,
                     &String::from_utf8(modified).unwrap()
                 ));
             }
         }
-        assert!(!accepted_entry_source(PRIVATE_SOURCE));
+        assert!(!accepted_entry_source(&DETCORE, PRIVATE_SOURCE));
     }
     #[test]
     fn terminal_private_sources_remain_exact_closed_declarations() {
@@ -784,10 +862,13 @@ mod tests {
                 ));
             }
         }
-        for digest in [ENTRY_SOURCE, BOOTSTRAP_ENTRY_SOURCE] {
+        for digest in DETCORE.accepted_entry_sources {
             assert!(!accepted_private_source(digest));
         }
-        assert!(!accepted_entry_source(MAPPED_CALLBACK_PRIVATE_SOURCE));
-        assert!(!accepted_entry_source(SUCCESSOR_PRIVATE_SOURCE));
+        assert!(!accepted_entry_source(
+            &DETCORE,
+            MAPPED_CALLBACK_PRIVATE_SOURCE
+        ));
+        assert!(!accepted_entry_source(&DETCORE, SUCCESSOR_PRIVATE_SOURCE));
     }
 }

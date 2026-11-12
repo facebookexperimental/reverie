@@ -53,19 +53,27 @@
 //! backend gives the guest none: no `[vdso]`, `[vvar]` or `[vsyscall]`, as
 //! Linux lists none for a kernel booted with `vdso=0` and `vsyscall=none`.
 
-use std::io::Read;
+use std::collections::BTreeMap;
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
 use std::os::fd::RawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::PoisonError;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
+use super::host_mount;
+use super::host_mount::MountId;
 use super::mm::FLAG_ACCOUNT_UNKNOWN;
+use super::mm::FLAG_HUGEPAGE;
+use super::mm::FLAG_HUGETLB;
 use super::mm::FLAG_MAYBE_GUARD;
+use super::mm::FLAG_NOHUGEPAGE;
 use super::vm_flags::FileVmFacts;
 use super::vm_flags::FlagBacking;
+pub(crate) use super::vm_flags::MapShape;
 use crate::GuestMemory;
 use crate::memory::DeclaredMapping;
 use crate::memory::MappingIdentity;
@@ -95,6 +103,9 @@ pub(crate) enum MappedObject {
         /// What decides the mapping's flags, as it was when the mapping was
         /// made (`None`: not known).
         vm_facts: Option<FileVmFacts>,
+        /// Whether a line's `THPeligible` is asked of the host kernel when
+        /// the list is taken (`vm_flags::thp_eligibility_is_probed`).
+        probe_thp: bool,
     },
     /// `MAP_SHARED | MAP_ANONYMOUS` memory, which Linux backs with a shmem
     /// file of its own named `/dev/zero (deleted)` (`shmem_zero_setup`). The
@@ -117,25 +128,27 @@ pub(crate) enum MappedObject {
 }
 
 impl MappedObject {
-    /// The identity of a mapping of `file` made now, or `None` where the
-    /// host cannot describe the file. It holds the facts that decide the
-    /// mapping's flags, read now, as Linux fixes them when it maps the file
-    /// ([`FileVmFacts::of`]).
-    pub(crate) fn file(file: &Arc<std::fs::File>) -> Option<MappingIdentity> {
+    /// The identity of mappings of `file` made now with each of `shapes`,
+    /// or `None` where the host cannot describe the file. It holds the facts
+    /// that decide the mappings' flags, read now, as Linux fixes them when it
+    /// maps the file ([`FileVmFacts::of`], which probes each shape of a file
+    /// on overlayfs).
+    pub(crate) fn file(file: &Arc<std::fs::File>, shapes: &[MapShape]) -> Option<MappingIdentity> {
         let (st_dev, raw_inode) = fstat_identity(file.as_raw_fd())?;
         let raw_device = superblock_device(file.as_raw_fd()).unwrap_or(st_dev);
         Some(MappingIdentity::new(MappedObject::File {
             file: file.clone(),
             raw_device,
             raw_inode,
-            vm_facts: FileVmFacts::of(file),
+            vm_facts: FileVmFacts::of(file, shapes),
+            probe_thp: super::vm_flags::thp_eligibility_is_probed(file),
         }))
     }
 
-    /// The identity of a mapping of the host file `file` holds, through a
-    /// descriptor of its own for the same open file description.
-    pub(crate) fn file_from(file: &std::fs::File) -> Option<MappingIdentity> {
-        Self::file(&Arc::new(file.try_clone().ok()?))
+    /// The identity of a mapping with `shape` of the host file `file` holds,
+    /// through a descriptor of its own for the same open file description.
+    pub(crate) fn file_from(file: &std::fs::File, shape: MapShape) -> Option<MappingIdentity> {
+        Self::file(&Arc::new(file.try_clone().ok()?), &[shape])
     }
 
     /// The identity of a new `MAP_SHARED | MAP_ANONYMOUS` mapping made at
@@ -185,37 +198,39 @@ fn fstat_identity(fd: libc::c_int) -> Option<(u64, u64)> {
     Some((stat.st_dev, stat.st_ino))
 }
 
+/// The superblock devices [`superblock_device`] has found, by the unique id
+/// of the mount each was found for (`STATX_MNT_ID_UNIQUE`, an id Linux never
+/// gives a second mount). A mount's superblock is fixed for the mount's
+/// life, so each mount is asked about once rather than at every mapping of a
+/// file on it: every file `mmap` asks.
+static SUPERBLOCK_DEVICES: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
+
 /// The device number of the superblock of host descriptor `fd`'s file, which
 /// Linux prints in `maps` (`i_sb->s_dev`) and which need not be the file's
-/// `st_dev` (btrfs gives each subvolume one of its own): the `major:minor`
-/// field of the supervisor's `mountinfo` line for the descriptor's mount.
-/// `None` where the mount is not in the supervisor's namespace (an internal
-/// one, such as a memfd's), whose files' `st_dev` is the superblock's.
+/// `st_dev` (btrfs gives each subvolume one of its own), as
+/// [`host_mount::superblock_device`] finds it, once per mount where the host
+/// kernel names mounts uniquely ([`SUPERBLOCK_DEVICES`]). `None` where the
+/// mount is in no namespace the supervisor sees (an internal one, such as a
+/// memfd's), whose files' `st_dev` is the superblock's, or where the host
+/// cannot tell.
 fn superblock_device(fd: libc::c_int) -> Option<u64> {
-    let fdinfo = read_small(&format!("/proc/self/fdinfo/{fd}"))?;
-    let mount = fdinfo
-        .lines()
-        .find_map(|line| line.strip_prefix("mnt_id:"))?
-        .trim()
-        .to_owned();
-    let mountinfo = read_small("/proc/self/mountinfo")?;
-    let device = mountinfo.lines().find_map(|line| {
-        let mut fields = line.split(' ');
-        (fields.next()? == mount).then(|| fields.nth(1))?
-    })?;
-    let (major, minor) = device.split_once(':')?;
-    Some(libc::makedev(major.parse().ok()?, minor.parse().ok()?))
-}
-
-/// The text of a small procfs file of the supervisor's own.
-fn read_small(path: &str) -> Option<String> {
-    let mut text = String::new();
-    std::fs::File::open(path)
-        .ok()?
-        .take(16 * 1024 * 1024)
-        .read_to_string(&mut text)
-        .ok()?;
-    Some(text)
+    let mount = host_mount::mount_id(fd).ok()?;
+    if let MountId::Unique(id) = mount
+        && let Some(device) = SUPERBLOCK_DEVICES
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&id)
+    {
+        return Some(*device);
+    }
+    let device = host_mount::superblock_device(fd, mount).ok()??;
+    if let MountId::Unique(id) = mount {
+        SUPERBLOCK_DEVICES
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id, device);
+    }
+    Some(device)
 }
 
 /// The name `maps` prints for the file host descriptor `fd` holds: the
@@ -398,6 +413,7 @@ enum LineBacking {
         raw_inode: u64,
         offset: u64,
         vm_facts: Option<FileVmFacts>,
+        probe_thp: bool,
     },
     SharedAnonymous {
         identity: MappingIdentity,
@@ -441,6 +457,7 @@ impl Line {
                     raw_device,
                     raw_inode,
                     vm_facts,
+                    probe_thp,
                 }),
                 Some(offset),
                 false,
@@ -450,6 +467,7 @@ impl Line {
                 raw_inode: *raw_inode,
                 offset,
                 vm_facts: *vm_facts,
+                probe_thp: *probe_thp,
             },
             (
                 Some(MappedObject::SharedAnonymous {
@@ -579,6 +597,30 @@ impl Line {
             image.read_implies_exec,
             image.host,
         );
+        // A file line's `THPeligible`, asked of the host kernel where the
+        // file's filesystem decides it by state no fact here gives, for a
+        // line whose flags are known and that no huge-page advice or
+        // `MAP_HUGETLB` reached (`host_probe::thp_eligible`).
+        let thp_eligible = match &self.backing {
+            LineBacking::File {
+                file,
+                offset,
+                probe_thp: true,
+                ..
+            } if vm_flags.is_some()
+                && self.declared.flags & (FLAG_HUGEPAGE | FLAG_NOHUGEPAGE | FLAG_HUGETLB) == 0 =>
+            {
+                super::host_probe::thp_eligible(
+                    file,
+                    self.declared.prot,
+                    self.shared,
+                    *offset,
+                    self.start,
+                    self.end,
+                )
+            }
+            _ => None,
+        };
         let (offset, backing) = match self.backing {
             LineBacking::Anonymous => {
                 // `vma_is_initial_heap`, which Linux tests before the stack.
@@ -627,7 +669,11 @@ impl Line {
             offset,
             backing,
         )?;
-        Ok(with_vm_flags(fact, vm_flags))
+        let fact = with_vm_flags(fact, vm_flags);
+        Ok(match thp_eligible {
+            Some(eligible) => fact.with_thp_eligible(eligible),
+            None => fact,
+        })
     }
 }
 
@@ -838,4 +884,130 @@ pub(crate) fn mark_guarded_lines(
     let low = line_holding(memory, image, start).map_or(start, |line| line.start);
     let high = line_holding(memory, image, end - page).map_or(end, |line| line.end);
     set_flags(memory, low, high, FLAG_MAYBE_GUARD);
+}
+
+#[cfg(test)]
+mod superblock_device_tests {
+    use super::*;
+
+    /// An open file of this test's own in `directory`, already unlinked.
+    fn scratch_file_in(directory: &std::path::Path, name: &str) -> std::io::Result<std::fs::File> {
+        let path = directory.join(format!(
+            "reverie-superblock-device-{name}-{}",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"x")?;
+        let file = std::fs::File::open(&path);
+        std::fs::remove_file(&path)?;
+        file
+    }
+
+    /// An open file of this test's own in the temporary directory, already
+    /// unlinked.
+    fn scratch_file(name: &str) -> std::fs::File {
+        scratch_file_in(&std::env::temp_dir(), name).unwrap()
+    }
+
+    /// The device of `fd`'s mount as its line in `mountinfo` gives it,
+    /// with `statmount(2)` kept out of the answer.
+    fn device_in_mountinfo(fd: libc::c_int) -> Option<u64> {
+        host_mount::NO_STATMOUNT_TEST_HOOK.with(|hook| hook.set(true));
+        let found = host_mount::superblock(fd);
+        host_mount::NO_STATMOUNT_TEST_HOOK.with(|hook| hook.set(false));
+        found.unwrap().map(|superblock| superblock.device)
+    }
+
+    /// The device the cache answers is the one `mountinfo` gives, for a
+    /// file asked about once and for a second file on the same mount.
+    #[test]
+    fn a_cached_superblock_device_is_the_one_mountinfo_gives() {
+        let first = scratch_file("first");
+        let second = scratch_file("second");
+        let expected = device_in_mountinfo(first.as_raw_fd());
+        assert!(
+            expected.is_some(),
+            "the temporary directory's mount is listed"
+        );
+        assert_eq!(superblock_device(first.as_raw_fd()), expected);
+        assert_eq!(superblock_device(second.as_raw_fd()), expected);
+    }
+
+    /// Where the host kernel names mounts uniquely (Linux 6.8 and later),
+    /// a mapping reads no `mountinfo`: `statmount(2)` answers the first
+    /// file on a mount, and the cache every later one, with no further
+    /// `statmount`. A kernel before 6.8 names no mount uniquely, so there is
+    /// nothing to check here; `without_unique_mount_ids_a_kept_table_answers`
+    /// covers that path on any kernel.
+    #[test]
+    fn files_on_a_uniquely_named_mount_read_no_mountinfo() {
+        let first = scratch_file("statmount");
+        if !matches!(
+            host_mount::mount_id(first.as_raw_fd()),
+            Ok(MountId::Unique(_))
+        ) {
+            eprintln!("skipped: this kernel names no mount uniquely (before Linux 6.8)");
+            return;
+        }
+        let reads = host_mount::MOUNTINFO_READS.with(std::cell::Cell::get);
+        superblock_device(first.as_raw_fd()).unwrap();
+        let second = scratch_file("cached");
+        let statmounts = host_mount::STATMOUNT_CALLS.with(std::cell::Cell::get);
+        superblock_device(second.as_raw_fd()).unwrap();
+        assert_eq!(
+            host_mount::STATMOUNT_CALLS.with(std::cell::Cell::get),
+            statmounts,
+            "the second file on the mount is answered from the cache"
+        );
+        assert_eq!(
+            host_mount::MOUNTINFO_READS.with(std::cell::Cell::get),
+            reads
+        );
+    }
+
+    /// Files on different mounts keep their own devices, each the one its
+    /// mount's `mountinfo` line gives, however their lookups interleave:
+    /// the temporary directory's mount, procfs, and `/dev/shm` where a file
+    /// can be made there. The temporary directory and procfs are two mounts
+    /// with two superblocks, so a cache that answered one device for both
+    /// would fail.
+    #[test]
+    fn files_on_different_mounts_keep_their_own_devices() {
+        let mut files = vec![
+            scratch_file("interleaved"),
+            std::fs::File::open("/proc/self/status").unwrap(),
+        ];
+        if let Ok(shm) = scratch_file_in(std::path::Path::new("/dev/shm"), "interleaved") {
+            files.push(shm);
+        }
+        let expected: Vec<Option<u64>> = files
+            .iter()
+            .map(|file| device_in_mountinfo(file.as_raw_fd()))
+            .collect();
+        assert!(
+            expected[0].is_some() && expected[1].is_some(),
+            "the temporary directory's mount and procfs are listed: {expected:?}"
+        );
+        assert_ne!(expected[0], expected[1]);
+        for _ in 0..2 {
+            for (file, expected) in files.iter().zip(&expected) {
+                assert_eq!(superblock_device(file.as_raw_fd()), *expected);
+            }
+        }
+    }
+
+    /// Without unique mount ids nothing is cached, and each mapping asks
+    /// again; the answer comes from the table kept from one read of
+    /// `mountinfo`, which is read again only after a mount event.
+    #[test]
+    fn without_unique_mount_ids_a_kept_table_answers() {
+        let file = scratch_file("uncached");
+        let expected = device_in_mountinfo(file.as_raw_fd());
+        host_mount::NO_UNIQUE_MOUNT_ID_TEST_HOOK.with(|hook| hook.set(true));
+        let answers = [
+            superblock_device(file.as_raw_fd()),
+            superblock_device(file.as_raw_fd()),
+        ];
+        host_mount::NO_UNIQUE_MOUNT_ID_TEST_HOOK.with(|hook| hook.set(false));
+        assert_eq!(answers, [expected, expected]);
+    }
 }

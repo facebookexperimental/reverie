@@ -108,6 +108,7 @@ use process_signal_publication::ProcessSignalRegistry;
 #[path = "executor/shared_file.rs"]
 mod shared_file;
 use shared_file::mmap_with_shared_files;
+pub(crate) mod host_mount;
 pub(crate) mod mapping_list;
 
 mod refusal;
@@ -152,6 +153,9 @@ mod xattr;
 use xattr::*;
 mod mm;
 pub(crate) use mm::*;
+mod host_probe;
+#[cfg(test)]
+mod host_probe_tests;
 mod pkeys;
 pub(crate) mod vm_flags;
 #[cfg(test)]
@@ -621,6 +625,8 @@ mod tests {
     include!("executor/script_line_tests.rs");
     include!("executor/pkeys_tests.rs");
     include!("executor/pidfd_tests.rs");
+    include!("executor/cross_process_signal_tests.rs");
+    include!("executor/pidfd_send_signal_tests.rs");
     use std::collections::BTreeMap;
     use std::io::Read;
     use std::io::Seek;
@@ -4218,7 +4224,7 @@ mod tests {
         );
         state
             .proc_files
-            .insert(3, synthetic_proc_inode(b"/proc/self/maps"));
+            .insert(3, reverie_procfs::path_inode(b"/proc/self/maps"));
         let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
         write_c_string(&mut memory, PATH, "/proc/self/fd/3");
 
@@ -4901,8 +4907,8 @@ mod tests {
             assert_eq!(
                 (stat.st_dev, stat.st_ino),
                 (
-                    synthetic_dev(SYNTHETIC_PROC_DEV_MINOR),
-                    synthetic_proc_inode(b"/proc/self/maps")
+                    reverie_procfs::synthetic_dev(SYNTHETIC_DEV_MAJOR, SYNTHETIC_PROC_DEV_MINOR),
+                    reverie_procfs::path_inode(b"/proc/self/maps")
                 )
             );
             assert_eq!(stat.st_mode, libc::S_IFREG | 0o444);
@@ -5094,8 +5100,11 @@ mod tests {
         );
         let stat: libc::stat = read_struct(&memory, stat_address);
         assert_eq!(stat.st_mode, libc::S_IFREG | 0o444);
-        assert_eq!(stat.st_ino, synthetic_proc_inode(b"/proc/self/maps"));
-        assert_eq!(stat.st_dev, synthetic_dev(SYNTHETIC_PROC_DEV_MINOR));
+        assert_eq!(stat.st_ino, reverie_procfs::path_inode(b"/proc/self/maps"));
+        assert_eq!(
+            stat.st_dev,
+            reverie_procfs::synthetic_dev(SYNTHETIC_DEV_MAJOR, SYNTHETIC_PROC_DEV_MINOR)
+        );
         assert_eq!(stat.st_size, SELF_MAPS_CONTENT.len() as libc::off_t);
         assert_eq!(stat.st_uid, 0);
         assert_eq!(stat.st_mtime, 0);
@@ -19628,10 +19637,22 @@ mod tests {
             ),
             negative_errno(libc::ENOENT)
         );
-        assert_eq!(guest_fd_path(&state, b"/proc/self/fd/3"), Some(3));
-        assert_eq!(guest_fd_path(&state, b"/proc/thread-self/fd/3"), Some(3));
-        assert_eq!(guest_fd_path(&state, b"/proc/1/fd/3"), Some(3));
-        assert_eq!(guest_fd_path(&state, b"/dev/fd/not-a-fd"), None);
+        assert_eq!(
+            reverie_procfs::parse_fd_path(b"/proc/self/fd/3", state.pid),
+            Some(3)
+        );
+        assert_eq!(
+            reverie_procfs::parse_fd_path(b"/proc/thread-self/fd/3", state.pid),
+            Some(3)
+        );
+        assert_eq!(
+            reverie_procfs::parse_fd_path(b"/proc/1/fd/3", state.pid),
+            Some(3)
+        );
+        assert_eq!(
+            reverie_procfs::parse_fd_path(b"/dev/fd/not-a-fd", state.pid),
+            None
+        );
     }
 
     /// readlink of `path`, a procfs link of the guest's own that a Tool
@@ -29577,6 +29598,83 @@ mod tests {
             -i64::from(libc::EPIPE),
         );
         assert!(read_info(&mut memory, &mut state).is_none());
+    }
+
+    /// rt_sigqueueinfo and rt_tgsigqueueinfo copy the caller's siginfo as
+    /// Linux's `__copy_siginfo_from_user` does: the signal argument, stored
+    /// over si_signo, judges the record's layout, and the rest of a record
+    /// whose layout Linux does not know must be readable (EFAULT) and zero
+    /// (E2BIG), which is checked before the ids are.
+    #[test]
+    fn sigqueueinfo_checks_the_rest_of_a_siginfo_of_unknown_layout() {
+        const SENT: u64 = 0x200;
+        // The copied part ends where the memory does, so the rest is unmapped.
+        const EDGE: u64 = PAGE_SIZE - KERNEL_SIGINFO_SIZE as u64;
+        const UNKNOWN: i32 = -1000;
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        let (pid, tid) = (state.pid as u64, state.tid as u64);
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        let place = |memory: &mut GuestMemory, signo: i32, code: i32, rest: Option<u8>| {
+            let mut info = [0_u8; SIGINFO_SIZE];
+            info[0..4].copy_from_slice(&signo.to_ne_bytes());
+            info[8..12].copy_from_slice(&code.to_ne_bytes());
+            match rest {
+                Some(rest) => {
+                    info[KERNEL_SIGINFO_SIZE] = rest;
+                    memory.write(SENT, &info).unwrap();
+                    SENT
+                }
+                None => {
+                    memory.write(EDGE, &info[..KERNEL_SIGINFO_SIZE]).unwrap();
+                    EDGE
+                }
+            }
+        };
+        for (number, ids) in [
+            (libc::SYS_rt_sigqueueinfo, [pid, 0]),
+            (libc::SYS_rt_tgsigqueueinfo, [pid, tid]),
+        ] {
+            // Signal 0, which only checks.
+            let mut send = |memory: &mut GuestMemory, ids: [u64; 2], info: u64| {
+                let args = if number == libc::SYS_rt_sigqueueinfo {
+                    [ids[0], 0, info, 0, 0, 0]
+                } else {
+                    [ids[0], ids[1], 0, info, 0, 0]
+                };
+                syscall_result(memory, &mut state, number, args)
+            };
+            let info = place(&mut memory, 0, UNKNOWN, None);
+            assert_eq!(
+                send(&mut memory, ids, info),
+                -i64::from(libc::EFAULT),
+                "{number}"
+            );
+            let info = place(&mut memory, 0, UNKNOWN, Some(0));
+            assert_eq!(send(&mut memory, ids, info), 0, "{number}");
+            let info = place(&mut memory, 0, UNKNOWN, Some(1));
+            assert_eq!(
+                send(&mut memory, ids, info),
+                -i64::from(libc::E2BIG),
+                "{number}"
+            );
+            let info = place(&mut memory, 0, libc::SI_QUEUE, None);
+            assert_eq!(send(&mut memory, ids, info), 0, "{number}");
+            // 7 is a SIGSEGV code but no code of signal 0, the argument.
+            let info = place(&mut memory, libc::SIGSEGV, 7, None);
+            assert_eq!(
+                send(&mut memory, ids, info),
+                -i64::from(libc::EFAULT),
+                "{number}"
+            );
+            // Before the ids: no process 0, no thread group 0.
+            let info = place(&mut memory, 0, UNKNOWN, Some(1));
+            assert_eq!(
+                send(&mut memory, [0, tid], info),
+                -i64::from(libc::E2BIG),
+                "{number}"
+            );
+        }
     }
 
     /// rt_sigqueueinfo and rt_tgsigqueueinfo queue the caller's siginfo

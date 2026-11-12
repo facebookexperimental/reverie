@@ -286,7 +286,7 @@ pub fn run_native(program: &Path, args: &[OsString]) -> anyhow::Result<Report> {
                 let regs = ptrace::getregs(pid)?;
                 match entered.remove(&tid) {
                     None => {
-                        let sysno = regs.orig_rax as i64;
+                        let sysno = entry_syscall_number(&regs);
                         if sysno == libc::SYS_exit || sysno == libc::SYS_exit_group {
                             events.push((tid, sysno, Outcome::NoReturn));
                         } else {
@@ -294,7 +294,7 @@ pub fn run_native(program: &Path, args: &[OsString]) -> anyhow::Result<Report> {
                         }
                     }
                     Some(sysno) => {
-                        let value = regs.rax as i64;
+                        let value = exit_syscall_value(&regs);
                         let outcome = if (-4095..0).contains(&value) {
                             Outcome::Errno(-value as i32)
                         } else {
@@ -346,4 +346,30 @@ pub fn run_native(program: &Path, args: &[OsString]) -> anyhow::Result<Report> {
         })
         .collect();
     Ok(report(exit_code, events))
+}
+
+/// The call's number, read at its syscall-entry stop.
+#[cfg(target_arch = "x86_64")]
+fn entry_syscall_number(regs: &libc::user_regs_struct) -> i64 {
+    regs.orig_rax as i64
+}
+
+/// The call's number, read at its syscall-entry stop: aarch64 passes it in
+/// `x8`, which the entry stop leaves unchanged.
+#[cfg(target_arch = "aarch64")]
+fn entry_syscall_number(regs: &libc::user_regs_struct) -> i64 {
+    regs.regs[8] as i64
+}
+
+/// The call's result, read at its syscall-exit stop.
+#[cfg(target_arch = "x86_64")]
+fn exit_syscall_value(regs: &libc::user_regs_struct) -> i64 {
+    regs.rax as i64
+}
+
+/// The call's result, read at its syscall-exit stop: aarch64 returns it in
+/// `x0`.
+#[cfg(target_arch = "aarch64")]
+fn exit_syscall_value(regs: &libc::user_regs_struct) -> i64 {
+    regs.regs[0] as i64
 }

@@ -44,7 +44,6 @@ pub mod core_dump;
 pub mod credentials;
 pub mod elf;
 pub mod executor;
-pub mod fdinfo;
 pub mod native_exit_broker;
 pub mod provider;
 pub mod signal;

@@ -1,8 +1,8 @@
 name: Guide
 
-# Builds the mdBook guide in guide/ and, on main, deploys it to GitHub
-# Pages. Kept separate from ci.yml: hosted runners only, no secrets,
-# no self-hosted hardware.
+# Builds the mdBook guide in guide/ and, on the repository's default
+# branch (the landing branch), deploys it to GitHub Pages. Kept separate
+# from ci.yml: hosted runners only, no secrets, no self-hosted hardware.
 #
 # Deployment is a NO-OP until GitHub Pages is enabled for this repo
 # (Settings -> Pages -> Source: "GitHub Actions", a repo-admin/owner
@@ -10,16 +10,22 @@ name: Guide
 # build job runs whenever ci.yml's PR gating admits the run (draft and
 # hermit-bot3 PRs are skipped, matching base policy); upload/deploy are
 # skipped while unenabled, so this workflow can merge before Pages
-# exists. On push to main with the variable unset, the build job runs
-# green and upload/deploy are SKIPPED: nothing is published and no repo
-# setting is touched (deploy-pages never executes, and it cannot
-# enable Pages itself).
+# exists. On push to the default branch with the variable unset, the
+# build job runs green and upload/deploy are SKIPPED: nothing is published
+# and no repo setting is touched (deploy-pages never executes, and it
+# cannot enable Pages itself).
+#
+# Expressions are not allowed in on.push.branches, so the push trigger
+# lists both the current landing branch name (main) and the planned one
+# (integration). Every job acts on a push only when the pushed branch is
+# the repository's default branch; a push to any other listed branch
+# builds and deploys nothing.
 
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
   push:
-    branches: [main]
+    branches: [main, integration]
 
 permissions:
   contents: read
@@ -31,7 +37,9 @@ concurrency:
 jobs:
   build:
     name: Build guide
-    if: github.event_name != 'pull_request' || (github.event.pull_request.user.login != 'hermit-bot3' && !github.event.pull_request.draft)
+    if: >-
+      (github.event_name != 'pull_request' || (github.event.pull_request.user.login != 'hermit-bot3' && !github.event.pull_request.draft)) &&
+      (github.event_name != 'push' || github.ref_name == github.event.repository.default_branch)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
@@ -85,7 +93,7 @@ jobs:
           source scripts/stable-features.sh
           cargo doc --workspace --features "${STABLE_FEATURES}" --no-deps
       - name: Upload Pages artifact
-        if: vars.PAGES_ENABLED == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: vars.PAGES_ENABLED == 'true' && github.event_name == 'push' && github.ref_name == github.event.repository.default_branch
         uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
         with:
           path: guide/book
@@ -97,7 +105,7 @@ jobs:
       group: guide-deploy-${{ github.ref }}
       cancel-in-progress: false
     needs: build
-    if: vars.PAGES_ENABLED == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: vars.PAGES_ENABLED == 'true' && github.event_name == 'push' && github.ref_name == github.event.repository.default_branch
     permissions:
       pages: write
       id-token: write

@@ -157,11 +157,13 @@ fn fstatat_impl(
     // synthetic_proc_content returns None for an empty path, so no explicit
     // AT_EMPTY_PATH guard is needed here.
     if let Some(content) = synthetic_proc_content(state, &path) {
-        let normalized =
-            normalize_proc_path(state, &path).expect("a synthesized /proc path always normalizes");
-        let stat = synthetic_proc_stat(
-            synthetic_proc_inode(&normalized),
+        let normalized = reverie_procfs::normalize_self_path(&path, state.pid)
+            .expect("a synthesized /proc path always normalizes");
+        let stat = reverie_procfs::synthetic_stat(
+            reverie_procfs::synthetic_dev(SYNTHETIC_DEV_MAJOR, SYNTHETIC_PROC_DEV_MINOR),
+            reverie_procfs::path_inode(&normalized),
             synthetic_proc_path_size(&normalized, &content),
+            PAGE_SIZE as u32,
         );
         return write_struct(&mut ProviderMemory(memory), output_address, &stat);
     }
@@ -190,7 +192,7 @@ fn fstatat_impl(
         );
     }
     let executable = if flags & libc::AT_SYMLINK_NOFOLLOW == 0 {
-        match guest_proc_exe_path(state, &path) {
+        match reverie_procfs::classify_exe_path(&path, &|tid| live_thread_in_process(state, tid)) {
             Some(true) => match state.executable_file.as_ref() {
                 Some(file) => Some(file.as_raw_fd()),
                 None => return negative_errno(libc::ENOENT),
@@ -243,7 +245,12 @@ fn fstatat_impl(
             .then(|| state.proc_files.get(&guest_dirfd).copied())
             .flatten();
         if let Some(inode) = empty_path_proc_inode {
-            sanitize_proc_stat(&mut stat, inode);
+            reverie_procfs::sanitize_synthetic_stat(
+                &mut stat,
+                reverie_procfs::synthetic_dev(SYNTHETIC_DEV_MAJOR, SYNTHETIC_PROC_DEV_MINOR),
+                inode,
+                PAGE_SIZE as u32,
+            );
         }
     }
     if executable.is_some() {
@@ -325,11 +332,14 @@ pub(super) fn statx(
     // Path-addressed synthetic /proc file: synthesize deterministic metadata.
     if !path.is_empty() {
         if let Some(content) = synthetic_proc_content(state, &path) {
-            let normalized = normalize_proc_path(state, &path)
+            let normalized = reverie_procfs::normalize_self_path(&path, state.pid)
                 .expect("a synthesized /proc path always normalizes");
-            let stx = synthetic_proc_statx(
-                synthetic_proc_inode(&normalized),
+            let stx = reverie_procfs::synthetic_statx(
+                SYNTHETIC_DEV_MAJOR,
+                SYNTHETIC_PROC_DEV_MINOR,
+                reverie_procfs::path_inode(&normalized),
                 synthetic_proc_path_size(&normalized, &content) as u64,
+                PAGE_SIZE as u32,
             );
             return write_struct(&mut ProviderMemory(memory), args[4], &stx);
         }
@@ -348,7 +358,13 @@ pub(super) fn statx(
             }
             None => return negative_errno(libc::EBADF),
         };
-        let stx = synthetic_proc_statx(inode, size);
+        let stx = reverie_procfs::synthetic_statx(
+            SYNTHETIC_DEV_MAJOR,
+            SYNTHETIC_PROC_DEV_MINOR,
+            inode,
+            size,
+            PAGE_SIZE as u32,
+        );
         return write_struct(&mut ProviderMemory(memory), args[4], &stx);
     }
 

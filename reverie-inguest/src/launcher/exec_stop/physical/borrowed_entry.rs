@@ -33,13 +33,66 @@ mod startup_auxv;
 /// Unauthenticated coordinates for a bootstrap-only unsafe operation.
 /// Safe construction does not qualify source, code, admission or entry.
 /// These are data, never a Ready token or a substitute for the live source owner.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BootstrapEntryCoordinates {
     /// Actual qualified private C entry, with arguments (handoff pointer, length).
     pub entry: u64,
     /// Actual source-qualified INT3 instruction, not its post-RIP.
     /// Recognizing this trap supplies only a stopped observation in this draft.
     pub terminal_int3: u64,
+}
+
+/// First-image and successor entry coordinates for one mapped
+/// private image, as one pair. Choosing a member of this pair goes
+/// only through the typed stop accessors on `BridgeInitialStop` /
+/// `BridgeIssuedStop` (the constructor is test-only and, like the
+/// member getters, private to the exec-stop module); there is no
+/// boolean selector to flip and no packet inspection in that choice. The claim
+/// covers values taken from this pair only: `RuntimeEntrySpec` has
+/// public fields, so a caller can still build a runtime entry from
+/// any coordinates without going through it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EntryCoordinates {
+    first: BootstrapEntryCoordinates,
+    successor: BootstrapEntryCoordinates,
+}
+
+impl EntryCoordinates {
+    /// Build the pair from `(entry, observed_int3)` for the first
+    /// image and for the successor. Data only, like
+    /// [`BootstrapEntryCoordinates`]: nothing here proves the numbers
+    /// were read from a producer-qualified ELF. The producer exposes
+    /// them as `MappedTerminalObservation::entry_coordinates`; carrying
+    /// that value here is the slice-4 host harness's job, and until it
+    /// does, musearch gate 2 (coordinate provenance) is outstanding.
+    /// Until then the constructor is test-only and private to the
+    /// exec-stop module: no production caller can build a pair.
+    #[cfg(test)]
+    pub(in crate::launcher::exec_stop) fn from_unqualified_addresses(
+        first: (u64, u64),
+        successor: (u64, u64),
+    ) -> Self {
+        Self {
+            first: BootstrapEntryCoordinates {
+                entry: first.0,
+                terminal_int3: first.1,
+            },
+            successor: BootstrapEntryCoordinates {
+                entry: successor.0,
+                terminal_int3: successor.1,
+            },
+        }
+    }
+
+    /// First-image entry coordinates.
+    pub(in crate::launcher::exec_stop) fn first(&self) -> BootstrapEntryCoordinates {
+        self.first
+    }
+
+    /// Successor entry coordinates.
+    pub(in crate::launcher::exec_stop) fn successor(&self) -> BootstrapEntryCoordinates {
+        self.successor
+    }
 }
 
 /// Interim runtime-entry specification for ToolInitialization:
@@ -876,7 +929,7 @@ fn sigsys_identity(info: &[u8; 128], rip: u64, number: u64) -> bool {
         && i32_at(info, 24) >= 0
         && i32_at(info, 24) as u64 == number
 }
-fn terminal(info: &[u8; 128], rip: u64, int3: u64) -> bool {
+pub(in crate::launcher::exec_stop) fn terminal(info: &[u8; 128], rip: u64, int3: u64) -> bool {
     i32_at(info, 0) == libc::SIGTRAP
         && i32_at(info, 4) == 0
         && i32_at(info, 8) == 128

@@ -2056,3 +2056,216 @@ async fn forced_legacy_held_worker_waits_for_a_wakeup_or_probe() {
     assert!(root_terminal.wait(TRACEE_WAIT_TIMEOUT));
     root_cleanup.disarm();
 }
+
+/// Arms `slot` and returns the receiver of its capture signal and the sender
+/// that releases it. Dropping the sender also releases it.
+#[cfg(not(sanitized))]
+fn arm_legacy_pause(
+    slot: &Mutex<Option<BoundedTestPause>>,
+) -> (mpsc::Receiver<()>, mpsc::SyncSender<()>) {
+    let (captured, capture) = mpsc::sync_channel(1);
+    let (release, resume) = mpsc::sync_channel(1);
+    *slot.lock() = Some(BoundedTestPause { captured, resume });
+    (capture, release)
+}
+
+#[cfg(not(sanitized))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConsumeWakeup {
+    /// The worker is parked when the ptracer consumes.
+    Parked,
+    /// The worker reaches its sleep check after the ptracer released
+    /// `legacy_wait` and before it notifies.
+    BetweenDropAndNotify,
+}
+
+/// The ptracer consumes a stop that the legacy worker hinted, while the
+/// worker would otherwise sleep for 60 s, and the wait must resolve within
+/// 2 s: the consume's wakeup is not lost. Afterwards the worker holds the
+/// published stop, because the wakeup was counted before the publication.
+#[cfg(not(sanitized))]
+async fn legacy_consume_wakes_the_worker(case: ConsumeWakeup) {
+    let (root, stopped, mut root_cleanup, _force) = spawn_legacy_thread_tracee(true);
+    let root_exit = root_cleanup.exit_event_on_ptracer_thread(&stopped).unwrap();
+    let root_terminal = stopped.terminal_cleanup();
+    let (parent, crate::Event::NewChild(crate::ChildOp::Clone, child)) = tokio::time::timeout(
+        TRACEE_WAIT_TIMEOUT,
+        stopped.resume(None).unwrap().wait_owned_on_ptracer_thread(),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .assume_stopped() else {
+        panic!("missing paused pthread clone");
+    };
+    let child_tid = child.pid();
+    let mut child_cleanup = legacy_child_cleanup(&child);
+    let terminal = child.terminal_cleanup();
+    let worker = terminal.event.event().clone();
+    let (child, event) =
+        tokio::time::timeout(TRACEE_WAIT_TIMEOUT, child.wait_owned_on_ptracer_thread())
+            .await
+            .unwrap()
+            .unwrap()
+            .assume_stopped();
+    assert_eq!(event, crate::Event::Signal(Signal::SIGSTOP));
+    let parent_running = parent.resume(None).unwrap();
+    let running = child.resume(None).unwrap();
+    // The resume counted a wakeup that ends the hold on the SIGSTOP, so no
+    // held wait starts after this read until the next publication.
+    let held_before = worker.legacy_held_waits.load(Ordering::Relaxed);
+
+    // From the hint of the next stop, only a wakeup ends the worker's sleep
+    // within the test's bounds.
+    *worker.legacy_poll_period.lock() = Some(Duration::from_secs(60));
+    let deliver = || {
+        // SAFETY: tgkill takes integer arguments and touches no memory.
+        let sent = unsafe {
+            libc::syscall(
+                libc::SYS_tgkill,
+                root.as_raw(),
+                child_tid.as_raw(),
+                libc::SIGUSR2,
+            )
+        };
+        assert_eq!(sent, 0);
+    };
+    let coordinator = match case {
+        ConsumeWakeup::Parked => {
+            let (parked, parking) = mpsc::sync_channel(1);
+            *worker.legacy_parking_signal.lock() = Some(parked);
+            deliver();
+            // Sent while the worker holds `legacy_wakeup` with no new count,
+            // right before it waits: the consume counts only after it parked.
+            parking
+                .recv_timeout(Duration::from_secs(2))
+                .expect("the worker never parked after hinting the stop");
+            None
+        }
+        ConsumeWakeup::BetweenDropAndNotify => {
+            let (worker_caught, worker_release) =
+                arm_legacy_pause(&worker.legacy_sleep_check_pause);
+            deliver();
+            worker_caught
+                .recv_timeout(Duration::from_secs(2))
+                .expect("the worker never hinted the stop");
+            // Armed while the worker is paused, so its next publication is
+            // the stop the ptracer consumes below.
+            let (published, publish_release) = arm_legacy_pause(&worker.legacy_publish_pause);
+            let (tracer_caught, tracer_release) =
+                arm_legacy_pause(&worker.legacy_assist_notify_pause);
+            Some(thread::spawn(move || {
+                tracer_caught
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("the consume never reached its notify");
+                // Released first, the worker reaches its sleep check while
+                // the ptracer has not notified. The 1.5 s window ends before
+                // either pause resumes by itself (2 s).
+                worker_release.send(()).unwrap();
+                let before_notify = published.recv_timeout(Duration::from_millis(1500)).is_ok();
+                if before_notify {
+                    publish_release.send(()).unwrap();
+                }
+                tracer_release.send(()).unwrap();
+                if !before_notify {
+                    let _ = published.recv_timeout(Duration::from_secs(2));
+                    let _ = publish_release.send(());
+                }
+                before_notify
+            }))
+        }
+    };
+    // Its first poll consumes the stop through `try_assist_legacy_wait`.
+    let (child, event) = tokio::time::timeout(
+        Duration::from_secs(2),
+        running.wait_owned_on_ptracer_thread(),
+    )
+    .await
+    .expect("lost wakeup: the consumed stop was not published within 2 s")
+    .unwrap()
+    .assume_stopped();
+    assert_eq!(event, crate::Event::Signal(Signal::SIGUSR2));
+    if let Some(coordinator) = coordinator {
+        assert!(
+            coordinator.join().unwrap(),
+            "the worker did not publish before the consume notified: \
+             its sleep check did not see the consume's wakeup count"
+        );
+    }
+    *worker.legacy_poll_period.lock() = None;
+    wait_for_held_wait(&worker, held_before, "the consumed stop");
+
+    let exit = child_cleanup.exit_event_on_ptracer_thread(&child).unwrap();
+    assert_eq!(unsafe { libc::kill(root.as_raw(), libc::SIGKILL) }, 0);
+    wait_for_legacy_hint(&worker, "the group kill");
+    drop(child);
+    let child = tokio::time::timeout(TRACEE_WAIT_TIMEOUT, exit)
+        .await
+        .unwrap()
+        .unwrap();
+    child_cleanup.mark_claimed_exit();
+    assert_eq!(
+        tokio::time::timeout(
+            TRACEE_WAIT_TIMEOUT,
+            child.resume(None).unwrap().wait_owned_on_ptracer_thread()
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .assume_exited(),
+        (
+            child_tid,
+            crate::ExitStatus::Signaled(Signal::SIGKILL, false)
+        ),
+    );
+    assert!(terminal.wait(TRACEE_WAIT_TIMEOUT));
+    child_cleanup.disarm();
+
+    let parent = tokio::time::timeout(TRACEE_WAIT_TIMEOUT, root_exit)
+        .await
+        .unwrap()
+        .unwrap();
+    root_cleanup.mark_claimed_exit();
+    drop(parent_running);
+    assert_eq!(
+        tokio::time::timeout(
+            TRACEE_WAIT_TIMEOUT,
+            parent.resume(None).unwrap().wait_owned_on_ptracer_thread()
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .assume_exited(),
+        (
+            root.into(),
+            crate::ExitStatus::Signaled(Signal::SIGKILL, false)
+        ),
+    );
+    assert!(root_terminal.wait(TRACEE_WAIT_TIMEOUT));
+    root_cleanup.disarm();
+}
+
+// T1: the worker is parked, sleeping for 60 s after hinting a stop, when
+// the ptracer consumes that stop. The consume counts a wakeup and notifies
+// after it released `legacy_wait`; the notify must reach the parked worker.
+#[tokio::test(flavor = "current_thread")]
+#[cfg(not(sanitized))]
+async fn forced_legacy_consume_wakes_a_parked_worker() {
+    if run_legacy_test_outer("forced_legacy_consume_wakes_a_parked_worker") {
+        return;
+    }
+    legacy_consume_wakes_the_worker(ConsumeWakeup::Parked).await;
+}
+
+// T2: the worker reaches its sleep check between the consume's release of
+// `legacy_wait` and its notify. The wakeup was counted under `legacy_wait`,
+// so the worker sees it without the notify and publishes the stop at once,
+// before the notify; it then holds that stop.
+#[tokio::test(flavor = "current_thread")]
+#[cfg(not(sanitized))]
+async fn forced_legacy_consume_counts_its_wakeup_before_the_notify() {
+    if run_legacy_test_outer("forced_legacy_consume_counts_its_wakeup_before_the_notify") {
+        return;
+    }
+    legacy_consume_wakes_the_worker(ConsumeWakeup::BetweenDropAndNotify).await;
+}

@@ -301,13 +301,13 @@ mod test {
     use nix::sys::wait::WaitStatus;
     use nix::sys::wait::waitpid;
     use nix::unistd::ForkResult;
-    use nix::unistd::fork;
     use quickcheck::QuickCheck;
     use quickcheck_macros::quickcheck;
     use reverie_memory::RemoteIoVec;
     use reverie_process::Pid;
 
     use super::*;
+    use crate::test_fork::fork;
 
     fn remote(address: usize, length: usize) -> RemoteIoVec {
         RemoteIoVec::new(AddrMut::from_raw(address).unwrap(), length).unwrap()

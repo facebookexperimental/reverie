@@ -2745,6 +2745,7 @@ mod tests {
 
     const FORK_GUEST_C: &str = r#"
 #define _DEFAULT_SOURCE 1
+#include <dirent.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
@@ -3045,7 +3046,13 @@ static int park_threads(int count) {
   pthread_attr_t attr;
   pthread_t thread;
   if (pthread_attr_init(&attr) != 0) return -1;
-  if (pthread_attr_setstacksize(&attr, 65536) != 0) return -1;
+  /* 65536 is below the thread-stack minimum on aarch64 (128 KiB), where
+   * setstacksize fails EINVAL and no thread is created; use the larger
+   * of the two so the parked threads exist on both architectures. */
+  long min_stack = sysconf(_SC_THREAD_STACK_MIN);
+  size_t stack_size = 65536;
+  if (min_stack > (long)stack_size) stack_size = (size_t)min_stack;
+  if (pthread_attr_setstacksize(&attr, stack_size) != 0) return -1;
   for (int i = 0; i < count; i++)
     if (pthread_create(&thread, &attr, park_forever, NULL) != 0) return -1;
   return 0;
@@ -3054,6 +3061,15 @@ static int park_threads(int count) {
 /* A fork child with `count` parked threads, then a last thread that
  * execs the marker image: de_thread kills the parked threads while
  * /proc/<pid>/task is walked, so walks can come up short. */
+/* The leader's view of a fork child's status: 0 (the child's
+ * own success) becomes the leader's 7; a child thread-setup
+ * failure (14, the park_threads _exit code) passes through as
+ * 14 so it can never masquerade as a generic failure; anything
+ * else folds into 9. */
+static int leader_status(int status) {
+  return status == 0 ? 7 : status == 14 ? 14 : 9;
+}
+
 static int many_thread_exec_child_marker(const char *marker, int count) {
   exec_marker = marker;
   pid_t pid = fork();
@@ -3066,7 +3082,38 @@ static int many_thread_exec_child_marker(const char *marker, int count) {
     _exit(12);
   }
   if (pid < 0) return 9;
-  return wait_status(pid) == 0 ? 7 : 9;
+  return leader_status(wait_status(pid));
+}
+
+static int count_tasks(void) {
+  DIR *dir = opendir("/proc/self/task");
+  if (!dir) return -1;
+  int count = 0;
+  struct dirent *entry;
+  while ((entry = readdir(dir)) != NULL)
+    if (entry->d_name[0] >= '0' && entry->d_name[0] <= '9') count++;
+  closedir(dir);
+  return count;
+}
+
+/* Park `count` threads, prove they exist by counting
+ * /proc/self/task, and record the count in the marker. */
+static int park_count(const char *marker, int count) {
+  if (park_threads(count) != 0) return 14;
+  int tasks = count_tasks();
+  char text[32];
+  snprintf(text, sizeof(text), "tasks=%d\n", tasks);
+  if (write_text(marker, text) != 0) return 10;
+  return tasks == count + 1 ? 7 : 9;
+}
+
+/* A fork child that exits 14 at once, standing in for a child
+ * whose thread setup failed (the park_threads _exit(14) path). */
+static int child_exit14(void) {
+  pid_t pid = fork();
+  if (pid == 0) _exit(14);
+  if (pid < 0) return 9;
+  return leader_status(wait_status(pid));
 }
 
 static void *exit_group_zero(void *unused) {
@@ -3089,7 +3136,7 @@ static int many_thread_exit_group_nondumpable(int count) {
     for (;;) pause();
   }
   if (pid < 0) return 9;
-  return wait_status(pid) == 0 ? 7 : 9;
+  return leader_status(wait_status(pid));
 }
 
 static void *busy_then_marker(void *marker) {
@@ -3222,6 +3269,10 @@ int main(int argc, char **argv) {
 #endif
   if (strcmp(argv[1], "many-thread-exec-child-marker") == 0 && argc == 4)
     return many_thread_exec_child_marker(argv[2], atoi(argv[3]));
+  if (strcmp(argv[1], "park-count") == 0 && argc == 4)
+    return park_count(argv[2], atoi(argv[3]));
+  if (strcmp(argv[1], "child-exit14") == 0 && argc == 2)
+    return child_exit14();
   if (strcmp(argv[1], "many-thread-exit-group-nondumpable") == 0 && argc == 3)
     return many_thread_exit_group_nondumpable(atoi(argv[2]));
   if (strcmp(argv[1], "busy-sibling-main-exit") == 0 && argc == 3)
@@ -4657,7 +4708,14 @@ int main(int argc, char **argv) {
         );
         // Dying: SIGKILL pending, PF_SIGNALED or PF_EXITING; this wins
         // over an exec number.
-        let in_execve = b"59 0x0 0x0 0x0 0x0 0x0 0x0 0x7ffd0000 0x100";
+        // The host's execve number (59 on x86_64, 221 on aarch64): a
+        // literal 59 is a different syscall on aarch64 and never Exec.
+        let in_execve: &'static [u8] = format!(
+            "{} 0x0 0x0 0x0 0x0 0x0 0x0 0x7ffd0000 0x100",
+            libc::SYS_execve
+        )
+        .leak()
+        .as_bytes();
         assert_eq!(
             examine(&[
                 ("status", STATUS_SIGKILL),
@@ -4710,6 +4768,83 @@ int main(int argc, char **argv) {
         assert_eq!(with(b"running", None), Live);
         assert_eq!(with(blocked, None), Live);
         assert_eq!(examine(&live), Gone, "no syscall file");
+    }
+
+    #[test]
+    fn sibling_exec_check_uses_the_host_execve_number() {
+        // The Exec classification must key on the host's execve
+        // numbers, not another architecture's: 59 is execve only on
+        // x86_64; on aarch64 it is pipe2 (semtimedop is 192 there).
+        assert!(super::is_exec_entry(
+            libc::SYS_execve,
+            super::EntryAbi::Native
+        ));
+        assert!(super::is_exec_entry(
+            libc::SYS_execveat,
+            super::EntryAbi::Native
+        ));
+        assert!(!super::is_exec_entry(
+            libc::SYS_read,
+            super::EntryAbi::Native
+        ));
+        // Literal pins, independent of libc's table, so a binding
+        // regression cannot silently re-key the classification.
+        #[cfg(target_arch = "aarch64")]
+        {
+            // Compile-checked only here: this arm is type-checked by
+            // the aarch64 cargo check, not natively executed.
+            assert!(super::is_exec_entry(221, super::EntryAbi::Native));
+            assert!(super::is_exec_entry(281, super::EntryAbi::Native));
+            assert!(!super::is_exec_entry(59, super::EntryAbi::Native));
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert!(super::is_exec_entry(59, super::EntryAbi::Native));
+            assert!(super::is_exec_entry(322, super::EntryAbi::Native));
+        }
+    }
+
+    #[test]
+    fn parked_threads_really_exist() {
+        // The many-thread fixtures are only meaningful if the 2000
+        // parked threads were actually created (on aarch64 a 64 KiB
+        // stack request used to fail EINVAL and create none). The
+        // guest counts /proc/self/task and records it in the marker.
+        let marker = supervisor_test_file("park-count.marker");
+        let output = std::process::Command::new(fork_guest())
+            .arg("park-count")
+            .arg(&marker)
+            .arg("2000")
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(7),
+            "park-count guest failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(fs::read_to_string(&marker).unwrap().trim(), "tasks=2001");
+    }
+
+    #[test]
+    fn child_setup_failure_exit_14_surfaces_not_folded_into_9() {
+        // The many-thread modes map the fork child's status onto
+        // the leader's: success is 7, and a child thread-setup
+        // failure (exit 14, the park_threads failure code) must
+        // surface as 14, not be folded into the generic 9, so a
+        // fixture setup failure can never again masquerade as a
+        // supervisor outcome. The child-exit14 mode stands in for
+        // that failure.
+        let output = std::process::Command::new(fork_guest())
+            .arg("child-exit14")
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(14),
+            "child setup failure must surface as exit 14: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
@@ -4873,7 +5008,10 @@ int main(int argc, char **argv) {
                     execs += 1;
                     assert_eq!(stop.pid(), watched_pid);
                     assert_eq!(stop.former_tid(), watched_pid);
-                    assert_eq!(stop.entry().regs().rip, stop.boundary().exit_regs.rip);
+                    assert_eq!(
+                        super::super::arch::instruction_pointer(stop.entry().regs()),
+                        super::super::arch::instruction_pointer(&stop.boundary().exit_regs)
+                    );
                     watched = stop
                         .rearm_and_resume(|task, _entry, _boundary| Ok(task))
                         .unwrap();
@@ -4922,7 +5060,7 @@ int main(int argc, char **argv) {
                     watched = stop
                         .rearm_and_resume(|task, _entry, _boundary| {
                             let mut regs = task.getregs()?;
-                            regs.rip = 0x4141_4141;
+                            super::super::arch::set_instruction_pointer(&mut regs, 0x4141_4141);
                             task.setregs(&regs)?;
                             Ok(task)
                         })

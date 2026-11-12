@@ -467,14 +467,17 @@ unsafe fn clone_on_new_stack(args: &[u64; 11], context: &ChildContext) -> i64 {
     result
 }
 
+// The child, which clone3 starts with this thread's registers but x0 = 0,
+// finds its context in x21 (LLVM reserves x19 as an operand: it may be the
+// base pointer).
 #[cfg(target_arch = "aarch64")]
 unsafe fn clone_on_new_stack(args: &[u64; 11], context: &ChildContext) -> i64 {
     let result: i64;
     unsafe {
         std::arch::asm!(
-            "svc #0", "cbnz x0, 2f", "mov x0, x19", "blr x20", "brk #0", "2:",
+            "svc #0", "cbnz x0, 2f", "mov x0, x21", "blr x20", "brk #0", "2:",
             in("x8") libc::SYS_clone3, inlateout("x0") args.as_ptr() => result,
-            inlateout("x1") 88usize => _, in("x19") context as *const ChildContext,
+            inlateout("x1") 88usize => _, in("x21") context as *const ChildContext,
             in("x20") child_on_new_stack as unsafe extern "C" fn(*const ChildContext) -> !,
             lateout("x30") _,
         );

@@ -201,7 +201,7 @@ pub(super) fn resolve_guest_exec_image(
     envp: &[String],
     refusal: &mut Option<reverie::UnsupportedRefusal>,
 ) -> Result<ResolvedExecutable, i64> {
-    match guest_proc_exe_path(state, &path) {
+    match reverie_procfs::classify_exe_path(&path, &|tid| live_thread_in_process(state, tid)) {
         Some(true) => {
             let file = state
                 .executable_file

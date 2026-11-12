@@ -1723,11 +1723,13 @@ where
         self.process_context.terminal_injection_refusal(request)
     }
 
-    /// The static-ELF executor answers every syscall itself and implements no
-    /// `pidfd_send_signal`: a call naming either sentinel would get its
-    /// unsupported-syscall fallback. It declares that, and nothing is probed.
+    /// The static-ELF executor answers every syscall itself. Its
+    /// `pidfd_send_signal` takes the self sentinels as Linux 6.17 and later
+    /// spell them (`PIDFD_SELF_THREAD` -10000, `PIDFD_SELF_THREAD_GROUP`
+    /// -10001), whatever the host kernel. It declares that, and nothing is
+    /// probed.
     fn pidfd_self_spelling(&self) -> reverie::PidfdSelfSpelling {
-        reverie::PidfdSelfSpelling::Unsupported
+        reverie::PidfdSelfSpelling::Modern
     }
 
     fn has_cpuid_interception(&self) -> bool {

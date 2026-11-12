@@ -71,7 +71,7 @@ impl ManagedWakerFork {
         {
             return;
         }
-        let child = unsafe { libc::fork() };
+        let child = unsafe { crate::test_fork::libc_fork() };
         assert!(child >= 0);
         if child == 0 {
             // Return through the actual waker operation and the SDK poll in
@@ -510,7 +510,7 @@ fn managed_native_reservation_preserves_front_on_foreign_refusal() {
         .unwrap()
         .unwrap();
     let status = reservation.inner.as_ref().unwrap().status;
-    let forked = unsafe { libc::fork() };
+    let forked = unsafe { crate::test_fork::libc_fork() };
     assert!(forked >= 0);
     if forked == 0 {
         assert!(matches!(

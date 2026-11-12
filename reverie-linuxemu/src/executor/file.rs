@@ -139,7 +139,7 @@ pub(super) fn truncate(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u6
         Err(error) => return read_c_string_errno(error),
     };
     let held_file;
-    let target_fd = if let Some(guest_fd) = guest_fd_path(state, &path) {
+    let target_fd = if let Some(guest_fd) = reverie_procfs::parse_fd_path(&path, state.pid) {
         if state.proc_files.contains_key(&guest_fd) {
             return negative_errno(libc::EACCES);
         }
@@ -373,8 +373,8 @@ fn open_file(
                 return negative_errno(libc::EINVAL);
             }
         }
-        let normalized =
-            normalize_proc_path(state, path).expect("a synthesized /proc path always normalizes");
+        let normalized = reverie_procfs::normalize_self_path(path, state.pid)
+            .expect("a synthesized /proc path always normalizes");
         if let Some(file) = ProcessProcFile::from_normalized_path(&normalized) {
             if !path_only {
                 return open_process_proc(state, &normalized, file, flags, close_on_exec);
@@ -400,7 +400,7 @@ fn open_file(
         );
     }
     let guest_cloexec = close_on_exec;
-    if let Some(guest_fd) = guest_fd_path(state, path) {
+    if let Some(guest_fd) = reverie_procfs::parse_fd_path(path, state.pid) {
         return open_guest_fd_path(state, guest_fd, flags, guest_cloexec);
     }
     let guest_path = path;
@@ -566,21 +566,6 @@ fn finish_open_file(
 // TODO-HUMAN-REVIEW(PR-92): Review this KVM compatibility implementation.
 // TODO-HUMAN-REVIEW(PR-114): Review /proc/thread-self/fd guest descriptor resolution.
 // TODO-HUMAN-REVIEW(PR-136): Review numeric guest-pid descriptor aliases.
-pub(super) fn guest_fd_path(state: &LoadedStaticElf, path: &[u8]) -> Option<libc::c_int> {
-    let numeric_prefix = format!("/proc/{}/fd/", state.pid).into_bytes();
-    let suffix = path
-        .strip_prefix(b"/dev/fd/")
-        .or_else(|| path.strip_prefix(b"/proc/self/fd/"))
-        .or_else(|| path.strip_prefix(b"/proc/thread-self/fd/"))
-        .or_else(|| path.strip_prefix(numeric_prefix.as_slice()))?;
-    if suffix.is_empty() || !suffix.iter().all(u8::is_ascii_digit) {
-        return None;
-    }
-    suffix.iter().try_fold(0_i32, |value, digit| {
-        value.checked_mul(10)?.checked_add(i32::from(*digit - b'0'))
-    })
-}
-
 // TODO-HUMAN-REVIEW(PR-92): Review guest-fd metadata translation.
 #[derive(Clone, Copy)]
 pub(super) struct GuestFdMetadata {
@@ -594,7 +579,7 @@ pub(super) fn guest_fd_metadata(
     path: &[u8],
     no_follow: bool,
 ) -> Result<Option<GuestFdMetadata>, i64> {
-    let Some(guest_fd) = guest_fd_path(state, path) else {
+    let Some(guest_fd) = reverie_procfs::parse_fd_path(path, state.pid) else {
         return Ok(None);
     };
     let Some(host_fd) = host_fd(state, guest_fd) else {
@@ -669,7 +654,9 @@ pub(super) fn open_guest_fd_path(
         }
         return negative_errno(libc::EEXIST);
     }
-    if source_proc_inode.is_some_and(|inode| inode == synthetic_proc_inode(b"/proc/self/status")) {
+    if source_proc_inode
+        .is_some_and(|inode| inode == reverie_procfs::path_inode(b"/proc/self/status"))
+    {
         // Its content is rendered from the opener's process cells, which an
         // O_PATH backing does not carry. Refuse rather than expose its empty
         // backing file.
@@ -2395,8 +2382,8 @@ pub(super) fn readlinkat(
 // `link_path` fact names any process's image now, and a Tool renders
 // another process's links (package K item 2b slice 2b-4 of
 // https://github.com/rrnewton/hermit/issues/4564). Following `/proc/self/exe`
-// (stat, and exec of the retained image, `guest_proc_exe_path`) is not a
-// readlink and stays.
+// (stat, and exec of the retained image, via
+// `reverie_procfs::classify_exe_path`) is not a readlink and stays.
 pub(super) fn readlink_at_impl(
     memory: &mut GuestMemory,
     state: &LoadedStaticElf,

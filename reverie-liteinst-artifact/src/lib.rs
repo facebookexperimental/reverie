@@ -1199,23 +1199,23 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers/bootstrap_env_aux.rs",
-        20652,
-        "249b94a1689d5072659145a88b56e0a180ff6a2f7dc4f083504ac71b789d7b8c",
+        20712,
+        "f29f4ce995093779f8af596e9dd0fba76f60f73da9e46230a4f2c38fef40b9a1",
     ),
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers/bootstrap_descriptor.rs",
-        34089,
-        "b3ec825b4db8276d0104fd46ff837b76b4bace7a8c1bd75c0f3d80808b0e835d",
+        34149,
+        "74c4491bab5e935d555d9306718dfbb01597c4771d9ba7454b813232570f3a89",
     ),
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers/bootstrap_role.rs",
-        9367,
-        "b03c9ac9c70674c94bdcd15420fcec6338d109781af39440a6b86b563633e1a5",
+        9427,
+        "c9203a45dde54743969d6ff79ef5d53138738e894cf613ae650e3f4f6339099e",
     ),
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers/bootstrap_site.rs",
-        18037,
-        "51ebc548aec8eefa110d9be991f530d9235b412e659429ae4ecac76933c71337",
+        18097,
+        "32d4f8bc715befaeea69c124f54b14f5e396e9eac6188fce0a04c88d3c8d80bc",
     ),
     (
         "reverie-loader/src/mapped_inputs.rs",
@@ -1224,23 +1224,23 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-liteinst-artifact/src/private_static/tls_sources.rs",
-        36442,
-        "6cfb112500e9cd0ae2cd5ed4401cdf99740c36f29bba48f397a412c48b9ecb6b",
+        38792,
+        "ff08286667d4989abfeba6c8eaba336318de2f11dfa3eb789892f6499b3691fc",
     ),
     (
         "Cargo.toml",
-        684,
-        "44fa1e4c6cae8a913517e223840ed1afe5309f30c179deb903bed42fd8b71233",
+        706,
+        "c16e991c5e8ba091ada2475358a4f5e4fc17c5b8aa9f82d7877ec3a7cac3d50b",
     ),
     (
         "reverie-liteinst-artifact/Cargo.toml",
         518,
-        "6f08075314ed920f4afe03e87a889a1841363194b111facc09dfa974c87ae761",
+        "e9cd4eac53fb454640e75e640e93957298db66ecdbba7302c0ed79ef71a3e9fb",
     ),
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers/view_site.rs",
-        52994,
-        "b831cb4c34929ef4b8929926429032441b5ae9f0ed379352ba579c79ce28cf2a",
+        53114,
+        "7a7ed42c8051003e24f342c8e47ccc328cafb91f43e833c20b7edc8d4949ea23",
     ),
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers/view_site/caller.rs",
@@ -1249,18 +1249,18 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers/view_table.rs",
-        41618,
-        "ad4f59df6c0b4bc33e36fc385077ec990cecd3ea6a2616dc761d9a95e1c2c34d",
+        41738,
+        "58a79bacbba2daa0f7a26bc147555e4cb95a24fd7c69d7ae62e67905387e5c44",
     ),
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers.rs",
-        246390,
-        "8c51f952f7b366b34785e434d66a8b50be37a8b2b2afc0fce1ce645e80dac5a4",
+        283885,
+        "ad6a646f91964e31d11df15ab716ef6cd542de4b0632e51098078220b3bd662a",
     ),
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers/package_roles.rs",
-        81170,
-        "148d46702286ef359c7613c490083877d4bbc134972b2ae509760b2bb51bb55e",
+        81209,
+        "82295cbdd884e81b92cfba699f068ab068a1ac761fef5f7e9498f653699f8515",
     ),
     (
         "reverie-liteinst-artifact/tests/fixtures/package_roles_fallback_member.rs",
@@ -1319,13 +1319,13 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers/ordinary_gate.rs",
-        94622,
-        "4116af83bbd39d7e20f42276c6fb0d6ead2a49bbb6a3af952af10f721befa47a",
+        95051,
+        "7a6d9adbdab1f17c2c458986cff499e61fe8c0a38b3a58885054d98b7fdc60b9",
     ),
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers/terminal_observation.rs",
-        32328,
-        "e74262b7983fcbd0cf0c2b6a0a7da760a72963fdb0013ff73e212441a137b8b5",
+        35240,
+        "3bcced9c84ed853d04ed5d99931a74a983a9597c1555ad66cea91dbcf9889090",
     ),
     (
         "reverie-liteinst-artifact/tests/fixtures/ordinary_preceding_gate_page.rs",
@@ -1340,7 +1340,7 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     (
         "reverie-inguest/Cargo.toml",
         6166,
-        "d95f244d25c20488c4def4d251c09f4433409a4ae7b6a6c19321f1491682adbc",
+        "1cca57bb80f07e02e47977ea2f639475084a7e6838caa140b8445e6d358f0488",
     ),
     (
         "reverie-inguest/src/lib.rs",
@@ -1350,7 +1350,7 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     (
         "reverie-syscalls/Cargo.toml",
         1293,
-        "736b4181652976a1283004b80a8136153aa15aed26db1b1f5414dce68c6a3811",
+        "f1ce8b0305c6a6f488a7f4dbebc1360f06274faf6d2825a7bdb854dc717dc71d",
     ),
     (
         "reverie-syscalls/src/lib.rs",
@@ -1375,7 +1375,7 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     (
         "reverie-liteinst/Cargo.toml",
         6685,
-        "e6300b32ee83b9aeb02cb868b8d9528459f3fc73d3bca595268534b821c2d460",
+        "74ccbbbf72f7921dfad0e0adafddf414be8ab5d5f6ea2a8a2f15d842d65db9f6",
     ),
     (
         "reverie-liteinst/src/lib.rs",
@@ -1385,7 +1385,7 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     (
         "reverie-liteinst-preload/Cargo.toml",
         980,
-        "61424544ca7b38469d85ea4b3b2628fe29120996a2f5d818fef969f464d4ae49",
+        "4853e2f273fa7a60306bc5aea84987325778b923d64219c7bbf8b57098b62f1d",
     ),
     (
         "reverie-liteinst-preload/src/lib.rs",
@@ -1455,7 +1455,7 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     (
         "reverie/Cargo.toml",
         2373,
-        "f07451bd4bb57c7ed5dfefadc4e84de136dce47cb0f1cd55f20b978d3df66dd1",
+        "632b995fb8060c8cd780b0a819440cbb9a94cb124125d6d3c08b7d67d646805e",
     ),
     (
         "reverie/src/tool_configuration.rs",
@@ -1982,18 +1982,18 @@ fn compiled_library_package(
         "compiled metadata source differs from full pin",
     )?;
     require(
-        p["version"] == "0.5.6",
+        p["version"] == "0.5.7",
         "compiled Reverie package version differs",
     )?;
     let id = match source {
         Some(source) => format!(
-            "{}#{name}@0.5.6",
+            "{}#{name}@0.5.7",
             source
                 .rsplit_once('#')
                 .ok_or("compiled Git source lacks revision")?
                 .0
         ),
-        None => format!("path+file://{}#0.5.6", root.join(name).display()),
+        None => format!("path+file://{}#0.5.7", root.join(name).display()),
     };
     require(
         p["id"] == id,
@@ -2086,12 +2086,12 @@ fn compiled_leaf_package(
     let expected_id = match image_kind {
         FixedImageKind::Standalone => match source {
             Some(source) => format!(
-                "{}#reverie-liteinst-preload@0.5.6",
+                "{}#reverie-liteinst-preload@0.5.7",
                 source.rsplit_once('#').unwrap().0
             ),
-            None => format!("path+file://{}#0.5.6", rv_root.join(name).display()),
+            None => format!("path+file://{}#0.5.7", rv_root.join(name).display()),
         },
-        FixedImageKind::Detcore => format!("path+file://{}#0.5.6", root.join(name).display()),
+        FixedImageKind::Detcore => format!("path+file://{}#0.5.7", root.join(name).display()),
     };
     require(
         leaf.id == expected_id,
@@ -2125,11 +2125,11 @@ fn content_package(
         "content metadata manifest differs from exact compiler spelling",
     )?;
     require(
-        raw["source"].as_str() == Some(source) && raw["version"] == "0.5.6",
+        raw["source"].as_str() == Some(source) && raw["version"] == "0.5.7",
         "content metadata source/version differs from full pin",
     )?;
     let id = format!(
-        "{}#{name}@0.5.6",
+        "{}#{name}@0.5.7",
         source
             .rsplit_once('#')
             .ok_or("content Git source lacks revision")?
@@ -2299,7 +2299,7 @@ fn content_detcore_manifest_and_lock_pin(
         selected.len() == 1
             && selected[0]["manifest_path"].as_str()
                 == root.join("detcore-liteinst/Cargo.toml").to_str()
-            && selected[0]["version"] == "0.5.6"
+            && selected[0]["version"] == "0.5.7"
             && selected[0]["source"].is_null(),
         "content Detcore leaf manifest/version/source differs",
     )?;
@@ -2351,7 +2351,7 @@ fn content_detcore_manifest_and_lock_pin(
                     .lines()
                     .filter(|line| line.starts_with("version = "))
                     .collect::<Vec<_>>()
-                    == ["version = \"0.5.6\""],
+                    == ["version = \"0.5.7\""],
             format!("content Detcore lock source/version differs: {name}"),
         )?;
     }
@@ -2370,7 +2370,7 @@ fn content_detcore_manifest_and_lock_pin(
                 .lines()
                 .filter(|line| line.starts_with("version = "))
                 .collect::<Vec<_>>()
-                == ["version = \"0.5.6\""],
+                == ["version = \"0.5.7\""],
         "content Detcore local lock entry differs",
     )
 }
@@ -4080,10 +4080,55 @@ const DETCORE_DIRECT_TLS_CENSUS_POLICY: &str =
 const DETCORE_DIRECT_TLS_CENSUS_POLICY_V3: &str =
     "detcore_semantic_alloc241_named_getter_pt_load22_raw_loader_pointers_v3";
 
+// Every accepted INSTALLATION_DEPTH cell names its source. This list is not a
+// range: each entry is a cell observed in a real image, whose 241-byte
+// fixed_patch_alloc read is also bound to the named symbol by the ELF
+// qualifier. Entries without a recorded compiler predate the qualifier's
+// move into this crate (ed29a09d) and are kept as found there.
 fn detcore_direct_tls_offset_accepted(address: u64) -> bool {
     matches!(
         address,
-        0x98 | 0xa0 | 0xd8 | 0xe0 | 0xe8 | 0x100 | 0x108 | 0x110 | 0x128 | 0x148
+        // "Actual event" normal TLS body, SHA256 e3640a6c...; compiler not
+        // recorded.
+        0x98
+        // freshfc4b normal image, fixed_patch_alloc at 0x6f3340, body SHA256
+        // ba73e30a...; compiler not recorded.
+        | 0xa0
+        // "Actual event" diagnostic TLS body, SHA256 425180fc..., and its
+        // stable-core twin whose null-panic GOT operand binds
+        // panic_null_pointer_dereference; compiler not recorded.
+        | 0xd8
+        // freshfc4b diagnostic image, fixed_patch_alloc at 0x6f8910, body
+        // SHA256 52121dcd...; compiler not recorded.
+        | 0xe0
+        // Integrated Hermit ca1ae727 / Reverie 5b9df546 gate40 cohort,
+        // fixed_patch_alloc at 0x986bf0, body SHA256 ed294f96....
+        | 0xe8
+        // Stable 1.97.1 Detcore image at Reverie 2465470e, LOCAL8 cell 0x100,
+        // body SHA256 0be4c788... (867e1510).
+        | 0x100
+        // Pinned nightly normal image at add6180b: COMMITTED_STACKS 40 -> 32
+        // bytes shrinks PT_TLS filesz 0x110 -> 0x108; fixed_patch_alloc at
+        // 0x1289ac0, body SHA256 35e6645a... (b2791afb).
+        | 0x108
+        // Nightly normal image before add6180b, PT_TLS filesz 0x110, the cell
+        // b2791afb derives 0x108 from.
+        | 0x110
+        // Hermit main 2cd56771 cohort, fixed_patch_alloc at 0x7c3550, body
+        // SHA256 ab3dfbbc...; compiler not recorded.
+        | 0x128
+        // Pinned nightly diagnostic image at add6180b: 0x108 plus the 64-byte
+        // stack marker before it; fixed_patch_alloc at 0x128d8d0, body SHA256
+        // a8ebcb1a... (b2791afb).
+        | 0x148
+        // Stable rustc 1.97.1 (8bab26f4f 2026-07-14) native-exec runtime from
+        // build.hermit_native_exec_compile_in_pinned_root (detcore-liteinst,
+        // features exec-native-injection, profile liteinst-runtime) at Reverie
+        // 9c370385: LOCAL8 cell 0xf8, PT_TLS filesz 0xf8 memsz 0x220; ELF SHA256
+        // 05903e134c10a4042b6ee4c771e73730db850fcf811267c7a8dedaf83f1b6449, no
+        // NT_GNU_BUILD_ID note; fixed_patch_alloc at 0x1372580, body SHA256
+        // 2d28fc7b.... Its recipe row is scripts/detcore-alloc-recipe.py output.
+        | 0xf8
     )
 }
 
@@ -17873,6 +17918,15 @@ const FIXED_DEV_TLS_CELL_GETTER_STABLE_HEX: &str =
 const FIXED_OPTIMIZED_PATCH_ALLOC_STABLE_70_HEX: &str = "41574156415453504889d34989f6ff1514980b004885c074774c8b78204d85ff746e4989c4488d3dcc950b00e84f310b004883b870000000007463498b542410498b0f498d76ff49f7de31c04889cf4801d7723e4801f772394c21f74989f84929d04901d8410f92c14981f801000002410f93c24508ca75194889c8f04d0fb1074889c1b80000000075c14889f8eb0231c04883c4085b415c415e415fc3bf010000004c89f64889da4883c4085b415c415e415fff253e9b0b00";
 const FIXED_OPTIMIZED_TLS_THUNK_STABLE_70_HEX: &str =
     "50488d3d00930b00e8832e0b00488d807000000059c3";
+// The release constructor built by stable 1.97.1 (liteinst-runtime-build
+// with the release profile) places INSTALLATION_DEPTH at TLS offset 0x30.
+// Exact bodies of that ELF: libreverie_liteinst_preload.so, sha256
+// a7944806e88c40a395cb7cda01f4240a1f885cd3ec16e8aa821062c2890f58c5,
+// build-id 13f64d0d1cb6f0b08a2356add5f414b39740f0d3, at 0x94280 (186 bytes)
+// and 0x94500 (22 bytes).
+const FIXED_OPTIMIZED_PATCH_ALLOC_STABLE_30_HEX: &str = "41574156415453504889d34989f6ff15c45e0c004885c074774c8b78204d85ff746e4989c4488d3d745c0c00e86ff80b004883b830000000007463498b542410498b0f498d76ff49f7de31c04889cf4801d7723e4801f772394c21f74989f84929d04901d8410f92c14981f801000002410f93c24508ca75194889c8f04d0fb1074889c1b80000000075c14889f8eb0231c04883c4085b415c415e415fc3bf010000004c89f64889da4883c4085b415c415e415fff257e5e0c00";
+const FIXED_OPTIMIZED_TLS_THUNK_STABLE_30_HEX: &str =
+    "50488d3d185a0c00e813f60b00488d803000000059c3";
 const FIXED_DEV_TLS_CELL_GETTER_EVENT_ARGUMENT_HEX: &str =
     "4883ec1848897c24084889742410488d3ddb4a2200e8a6d11e00488d80400000004883c418c3";
 const FIXED_DEV_TLS_CELL_GETTER_DIAGNOSTIC_EVENT_ARGUMENT_HEX: &str =
@@ -17923,6 +17977,16 @@ fn fixed_tls_cell_access_recipe(
         ),
         ("fixed_tls_fn_once", 0x70) => (
             FIXED_OPTIMIZED_TLS_THUNK_STABLE_70_HEX,
+            16,
+            &[(4, 8), (9, 13)],
+        ),
+        ("fixed_patch_alloc", 0x30) => (
+            FIXED_OPTIMIZED_PATCH_ALLOC_STABLE_30_HEX,
+            0x34,
+            &[(0x10, 0x14), (0x28, 0x2c), (0x2d, 0x31), (0xb6, 0xba)],
+        ),
+        ("fixed_tls_fn_once", 0x30) => (
+            FIXED_OPTIMIZED_TLS_THUNK_STABLE_30_HEX,
             16,
             &[(4, 8), (9, 13)],
         ),
@@ -27947,6 +28011,110 @@ const DETCORE_VALIDATE_TEMPLATES: &[DetcoreValidateTemplate] = &[
         ],
         transfers: &[(8, 1)],
     },
+    // Generated by scripts/detcore-alloc-recipe.py from a real ELF; compare, never hand-edit.
+    // Toolchain: rustc 1.97.1 (8bab26f4f 2026-07-14), rust-toolchain.toml channel 1.97.1, pinned image localhost/hermit-hermetic-validate@sha256:8cc3da4d4aad5a5322ab6358bfb805c4f3662db1ce5cab217289547cb3f5752f; ELF .comment: rustc version 1.97.1 (8bab26f4f 2026-07-14).
+    // Profile liteinst-runtime; features exec-native-injection.
+    // ELF SHA256 05903e134c10a4042b6ee4c771e73730db850fcf811267c7a8dedaf83f1b6449; build-id: none (no NT_GNU_BUILD_ID note).
+    // fixed_patch_alloc _RNvXs3_NtCsc48ZNeIyhXL_16reverie_liteinst11patch_allocNtB5_26FixedPrivatePatchAllocatorNtNtNtCs4NRVxsYgnAr_4core5alloc6global11GlobalAlloc5alloc at VA 0x1372580, 241 bytes; INSTALLATION_DEPTH LOCAL8 cell 0xf8 (PT_TLS filesz 0xf8, memsz 0x220).
+    // Operands and transfers: those of the masked-equal row with body SHA256 425180fc2fadd76cf2a9fdb77d09695db03acfedb4fc9e4c6cbafc1b45a3a6f6, selected by bound GOT callee fixed_heap_panic_null.
+    // Command: cargo build --locked --offline --manifest-path <Hermit>/Cargo.toml -p detcore-liteinst --lib --no-default-features --features exec-native-injection --profile liteinst-runtime --target-dir <producer OUT_DIR>/native-runtime-target (nested in build.hermit_native_exec_compile_in_pinned_root at hermit 3d9eca25fcf7f3a212d0be15b110943cfd962196)
+    // Generator: scripts/detcore-alloc-recipe.py libdetcore_liteinst.so --role fixed_patch_alloc --lib reverie-liteinst-artifact/src/lib.rs --toolchain <Toolchain above> --profile liteinst-runtime --features exec-native-injection --command <Command above>
+    // Complete 241-byte body SHA256: 2d28fc7bbbed87cb8e42405566bead6a55dc04bc49a01c7b0334a7b68186a06e.
+    DetcoreValidateTemplate {
+        role: "fixed_patch_alloc",
+        hex: "41574156415453504889d34989f6ff154cc38b004885c0747c4989c44c8b782041f6c7070f85a50000004d85ff0f84b1000000488d3d96658b00e831f180004883b8f800000000745d498b542410498b07498d76ff49f7de31c94889c74801d772354801f772304c21f74989f84929d072504901d8410f92c14981f801000002410f93c24508ca750ef04d0fb10775ca4889f9eb0231c94889c84883c4085b415c415e415fc3bf010000004c89f64889da4883c4085b415c415e415fff25bec28b00488d3d5f2d8400ff1599688b00488d159a2d8400bf080000004c89feff151c708b00488d3d852d8400ff1547a58b00",
+        operands: &[
+            DetcoreValidateOperand {
+                displacement: 16,
+                next: 20,
+                key: "fixed_arena_backing",
+                got: true,
+            },
+            DetcoreValidateOperand {
+                displacement: 54,
+                next: 58,
+                key: "fixed_publication_tls_descriptor",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 59,
+                next: 63,
+                key: "fixed_tls_get_addr_plt",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 190,
+                next: 194,
+                key: "fixed_tool_alloc",
+                got: true,
+            },
+            DetcoreValidateOperand {
+                displacement: 197,
+                next: 201,
+                key: "fixed_detcore_validate_fixed_patch_alloc_194_data",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 203,
+                next: 207,
+                key: "fixed_heap_panic_sub_overflow",
+                got: true,
+            },
+            DetcoreValidateOperand {
+                displacement: 210,
+                next: 214,
+                key: "fixed_detcore_validate_fixed_patch_alloc_207_data",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 224,
+                next: 228,
+                key: "fixed_heap_panic_misaligned",
+                got: true,
+            },
+            DetcoreValidateOperand {
+                displacement: 231,
+                next: 235,
+                key: "fixed_detcore_validate_fixed_patch_alloc_228_data",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 237,
+                next: 241,
+                key: "fixed_heap_panic_null",
+                got: true,
+            },
+        ],
+        transfers: &[(14, 0), (58, 2), (188, 3), (201, 5), (222, 7), (235, 9)],
+    },
+    // Generated by scripts/detcore-alloc-recipe.py from a real ELF; compare, never hand-edit.
+    // Toolchain: rustc 1.97.1 (8bab26f4f 2026-07-14), rust-toolchain.toml channel 1.97.1, pinned image localhost/hermit-hermetic-validate@sha256:8cc3da4d4aad5a5322ab6358bfb805c4f3662db1ce5cab217289547cb3f5752f; ELF .comment: rustc version 1.97.1 (8bab26f4f 2026-07-14).
+    // Profile liteinst-runtime; features exec-native-injection.
+    // ELF SHA256 05903e134c10a4042b6ee4c771e73730db850fcf811267c7a8dedaf83f1b6449; build-id: none (no NT_GNU_BUILD_ID note).
+    // fixed_tls_fn_once _RNvYNCNKNvNtCsc48ZNeIyhXL_16reverie_liteinst11patch_alloc18INSTALLATION_DEPTH0s_0INtNtNtCs4NRVxsYgnAr_4core3ops8function6FnOnceTINtNtB1o_6option6OptionQIB23_INtNtB1o_4cell4CelljEEEEE9call_onceBa_.llvm.10949202350413072693 at VA 0x1372a20, 22 bytes; INSTALLATION_DEPTH LOCAL8 cell 0xf8 (PT_TLS filesz 0xf8, memsz 0x220).
+    // Operands and transfers: those of the masked-equal row with body SHA256 babf65d30be4438d443c1b05efdeedaa7829f4bf13bc735f8f1d40d8e11d4bbf.
+    // Command: cargo build --locked --offline --manifest-path <Hermit>/Cargo.toml -p detcore-liteinst --lib --no-default-features --features exec-native-injection --profile liteinst-runtime --target-dir <producer OUT_DIR>/native-runtime-target (nested in build.hermit_native_exec_compile_in_pinned_root at hermit 3d9eca25fcf7f3a212d0be15b110943cfd962196)
+    // Generator: scripts/detcore-alloc-recipe.py libdetcore_liteinst.so --role fixed_tls_fn_once --lib reverie-liteinst-artifact/src/lib.rs --toolchain <Toolchain above> --profile liteinst-runtime --features exec-native-injection --command <Command above>
+    // Complete 22-byte body SHA256: 64f7e580acad5b8eb71c7f487b62f78a07c8be22cdeee6ea72dae9be7f396e33.
+    DetcoreValidateTemplate {
+        role: "fixed_tls_fn_once",
+        hex: "50488d3d28618b00e8c3ec8000488d80f800000059c3",
+        operands: &[
+            DetcoreValidateOperand {
+                displacement: 4,
+                next: 8,
+                key: "fixed_publication_tls_descriptor",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 9,
+                next: 13,
+                key: "fixed_tls_get_addr_plt",
+                got: false,
+            },
+        ],
+        transfers: &[(8, 1)],
+    },
 ];
 
 // Distinct from every historical TLS-bearing241B recipe. Measured in the true
@@ -30703,8 +30871,10 @@ const FIXED_NAKED_COMPOSITIONS: &[FixedNakedComposition] = &[
 // of through the historical path. A complete tail build already also
 // carries 78 and 82, so including 108 changes no complete build. The
 // stable 0x100 alloc template at 111 (dh-r5tic) follows the same
-// rule: it can only add refusals through this over-approximation.
-const FIXED_SOURCE_OWNED_TEMPLATE_END: usize = 116;
+// rule: it can only add refusals through this over-approximation. So
+// does the generated stable native 0xf8 alloc template at 116, and its
+// generated 0xf8 FnOnce template at 117.
+const FIXED_SOURCE_OWNED_TEMPLATE_END: usize = 118;
 
 fn fixed_naked_publication_present(
     witnesses: &BTreeMap<String, AuthenticatedDetcoreOperation>,
@@ -39173,6 +39343,161 @@ mod tests {
                 2373,
                 "bf1ae47ec87ec05198764c17ddd0bc5a2988ec4511b45672b748c202ace8fc24",
             ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers/bootstrap_env_aux.rs",
+                20652,
+                "249b94a1689d5072659145a88b56e0a180ff6a2f7dc4f083504ac71b789d7b8c",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers/bootstrap_descriptor.rs",
+                34089,
+                "b3ec825b4db8276d0104fd46ff837b76b4bace7a8c1bd75c0f3d80808b0e835d",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers/bootstrap_role.rs",
+                9367,
+                "b03c9ac9c70674c94bdcd15420fcec6338d109781af39440a6b86b563633e1a5",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers/bootstrap_site.rs",
+                18037,
+                "51ebc548aec8eefa110d9be991f530d9235b412e659429ae4ecac76933c71337",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers/view_site.rs",
+                52994,
+                "b831cb4c34929ef4b8929926429032441b5ae9f0ed379352ba579c79ce28cf2a",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers/view_table.rs",
+                41618,
+                "ad4f59df6c0b4bc33e36fc385077ec990cecd3ea6a2616dc761d9a95e1c2c34d",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers.rs",
+                246390,
+                "8c51f952f7b366b34785e434d66a8b50be37a8b2b2afc0fce1ce645e80dac5a4",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers/package_roles.rs",
+                81170,
+                "148d46702286ef359c7613c490083877d4bbc134972b2ae509760b2bb51bb55e",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers/ordinary_gate.rs",
+                94622,
+                "4116af83bbd39d7e20f42276c6fb0d6ead2a49bbb6a3af952af10f721befa47a",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers/terminal_observation.rs",
+                32328,
+                "e74262b7983fcbd0cf0c2b6a0a7da760a72963fdb0013ff73e212441a137b8b5",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers.rs",
+                256236,
+                "55d6b83c3677725e1eaf0d176102f0330fa21e888bc2b341931cc676c683304b",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers/package_roles.rs",
+                81441,
+                "7a0119b202fe9a3d3927b56b098fac9a94afc1b878306a3a1971c1bcf46d8ef0",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers/terminal_observation.rs",
+                34191,
+                "5f75e628016105e7b568887028a48d3207c49774597383372497761234375a9f",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers.rs",
+                256897,
+                "9275ffb2e91ddb8014703c140e8d535e893a223d98956e6bb094216ba87f16ac",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers.rs",
+                258234,
+                "20632624870e19d837a736b953e8568edb06d32940ffdb0b9fd01c852854d9dc",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers.rs",
+                258479,
+                "d1269a128256dc032c11e700161c16036b6d5efd056c31b271e9db102a3eb59f",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers/terminal_observation.rs",
+                34210,
+                "6aa6b7a657ee90916e83419c45fa4b0babe880d0c13e2d65156772fe0def007b",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers.rs",
+                267610,
+                "44c0ba69c928703147b47c2d49ce9ef73b6aecaf4715b0ac6e74f671b56cf7b5",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers.rs",
+                267845,
+                "24674cf10a0539f1f32b1030578fd8a2af77fec990e6057c485217aad677c41d",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers.rs",
+                277476,
+                "2c82000b92c29eecfa72a501f6a35e5310422ad236379e217e65ed6226e94e1c",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers.rs",
+                277538,
+                "3a836162342d56c99c0a35233e1b6af3fb9280b4683b1450b53740a7989f6a2b",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers/ordinary_gate.rs",
+                73950,
+                "862a9a319a17fe3df3adbd95abd4b763ec3a8163c47903b7522a41f8431989d9",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers/terminal_observation.rs",
+                34506,
+                "596c98875c763dac3e54a00b4bf95a61a72e04333cd785814f2290c3d26690c2",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers.rs",
+                282882,
+                "98b7c1bf429b162db40d80b0ea6f165dcd4fd3d6540b3642198ee040d9a87702",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/tls_sources.rs",
+                36442,
+                "6cfb112500e9cd0ae2cd5ed4401cdf99740c36f29bba48f397a412c48b9ecb6b",
+            ),
+            (
+                "reverie-liteinst-artifact/Cargo.toml",
+                518,
+                "6f08075314ed920f4afe03e87a889a1841363194b111facc09dfa974c87ae761",
+            ),
+            (
+                "reverie-inguest/Cargo.toml",
+                6166,
+                "d95f244d25c20488c4def4d251c09f4433409a4ae7b6a6c19321f1491682adbc",
+            ),
+            (
+                "reverie-syscalls/Cargo.toml",
+                1293,
+                "736b4181652976a1283004b80a8136153aa15aed26db1b1f5414dce68c6a3811",
+            ),
+            (
+                "reverie-liteinst/Cargo.toml",
+                6685,
+                "e6300b32ee83b9aeb02cb868b8d9528459f3fc73d3bca595268534b821c2d460",
+            ),
+            (
+                "reverie-liteinst-preload/Cargo.toml",
+                980,
+                "61424544ca7b38469d85ea4b3b2628fe29120996a2f5d818fef969f464d4ae49",
+            ),
+            (
+                "reverie/Cargo.toml",
+                2373,
+                "f07451bd4bb57c7ed5dfefadc4e84de136dce47cb0f1cd55f20b978d3df66dd1",
+            ),
         ] {
             let entries: Vec<_> = CONTENT_REVERIE_CATALOG
                 .iter()
@@ -39379,8 +39704,8 @@ mod tests {
             };
             let raw_manifest = logical_root.join(name).join("Cargo.toml");
             let raw_target = logical_root.join(&relative_target);
-            let valid = serde_json::json!({"packages": [{"name":name, "version":"0.5.6",
-                "id":format!("{}#{name}@0.5.6", source.rsplit_once('#').unwrap().0), "source":source,
+            let valid = serde_json::json!({"packages": [{"name":name, "version":"0.5.7",
+                "id":format!("{}#{name}@0.5.7", source.rsplit_once('#').unwrap().0), "source":source,
                 "manifest_path":raw_manifest, "targets":[{"name":target, "kind":kind, "crate_types":kind, "src_path":raw_target}]}]});
             let selected = content_package(&valid, name, target, kind, &binding, &source).unwrap();
             assert_eq!(
@@ -39393,13 +39718,14 @@ mod tests {
                 ("version", serde_json::json!("0.5.1")),
                 ("version", serde_json::json!("0.5.4")),
                 ("version", serde_json::json!("0.5.5")),
+                ("version", serde_json::json!("0.5.6")),
                 (
                     "id",
                     serde_json::json!(
                         valid["packages"][0]["id"]
                             .as_str()
                             .unwrap()
-                            .replace("@0.5.6", "@0.5.1")
+                            .replace("@0.5.7", "@0.5.1")
                     ),
                 ),
                 (
@@ -39408,7 +39734,7 @@ mod tests {
                         valid["packages"][0]["id"]
                             .as_str()
                             .unwrap()
-                            .replace("@0.5.6", "@0.5.4")
+                            .replace("@0.5.7", "@0.5.4")
                     ),
                 ),
                 (
@@ -39417,7 +39743,16 @@ mod tests {
                         valid["packages"][0]["id"]
                             .as_str()
                             .unwrap()
-                            .replace("@0.5.6", "@0.5.5")
+                            .replace("@0.5.7", "@0.5.5")
+                    ),
+                ),
+                (
+                    "id",
+                    serde_json::json!(
+                        valid["packages"][0]["id"]
+                            .as_str()
+                            .unwrap()
+                            .replace("@0.5.7", "@0.5.6")
                     ),
                 ),
                 ("id", serde_json::json!("wrong-package-id")),
@@ -39653,9 +39988,9 @@ mod tests {
         ]
         .into_iter()
         .map(|name| {
-            format!("[[package]]\nname = \"{name}\"\nversion = \"0.5.6\"\nsource = \"{source}\"\n")
+            format!("[[package]]\nname = \"{name}\"\nversion = \"0.5.7\"\nsource = \"{source}\"\n")
         })
-        .chain(["[[package]]\nname = \"detcore-liteinst\"\nversion = \"0.5.6\"\n".into()])
+        .chain(["[[package]]\nname = \"detcore-liteinst\"\nversion = \"0.5.7\"\n".into()])
         .collect::<String>();
         fs::write(&lock, &lock_bytes).unwrap();
         let dependencies = [
@@ -39673,8 +40008,8 @@ mod tests {
         })
         .collect::<Vec<_>>();
         let runtime = serde_json::json!({"workspace_root":root,"packages":[{
-            "name":"detcore-liteinst", "version":"0.5.6",
-            "id":format!("path+file://{}#0.5.6",root.join("detcore-liteinst").display()),
+            "name":"detcore-liteinst", "version":"0.5.7",
+            "id":format!("path+file://{}#0.5.7",root.join("detcore-liteinst").display()),
             "source":null,"manifest_path":root.join("detcore-liteinst/Cargo.toml"),
             "dependencies":dependencies,"targets":[{"name":"detcore_liteinst","kind":["cdylib"],
                 "crate_types":["cdylib"],"src_path":root.join("detcore-liteinst/src/lib.rs")}]
@@ -39775,6 +40110,7 @@ mod tests {
             ("version", serde_json::json!("0.5.1")),
             ("version", serde_json::json!("0.5.4")),
             ("version", serde_json::json!("0.5.5")),
+            ("version", serde_json::json!("0.5.6")),
             ("source", serde_json::json!(source)),
             (
                 "manifest_path",
@@ -39794,7 +40130,7 @@ mod tests {
             (
                 "id",
                 serde_json::json!(format!(
-                    "path+file://{}#0.5.6",
+                    "path+file://{}#0.5.7",
                     root.join("elsewhere/detcore-liteinst").display()
                 )),
             ),
@@ -39858,29 +40194,35 @@ mod tests {
             lock_bytes.replacen("name = \"reverie-core\"", "name = \"lookalike\"", 1),
             lock_bytes.replacen("?rev=", "?rev=wrong", 1),
             lock_bytes.replacen('#', "#wrong", 1),
-            lock_bytes.replacen("version = \"0.5.6\"", "version = \"0.4.0\"", 1),
-            lock_bytes.replacen("version = \"0.5.6\"", "version = \"0.5.1\"", 1),
-            lock_bytes.replacen("version = \"0.5.6\"", "version = \"0.5.4\"", 1),
-            lock_bytes.replacen("version = \"0.5.6\"", "version = \"0.5.5\"", 1),
+            lock_bytes.replacen("version = \"0.5.7\"", "version = \"0.4.0\"", 1),
+            lock_bytes.replacen("version = \"0.5.7\"", "version = \"0.5.1\"", 1),
+            lock_bytes.replacen("version = \"0.5.7\"", "version = \"0.5.4\"", 1),
+            lock_bytes.replacen("version = \"0.5.7\"", "version = \"0.5.5\"", 1),
+            lock_bytes.replacen("version = \"0.5.7\"", "version = \"0.5.6\"", 1),
             lock_bytes.replacen("name = \"detcore-liteinst\"", "name = \"lookalike\"", 1),
             lock_bytes.replacen(
-                "name = \"detcore-liteinst\"\nversion = \"0.5.6\"",
+                "name = \"detcore-liteinst\"\nversion = \"0.5.7\"",
                 "name = \"detcore-liteinst\"\nversion = \"0.4.1\"",
                 1,
             ),
             lock_bytes.replacen(
-                "name = \"detcore-liteinst\"\nversion = \"0.5.6\"",
+                "name = \"detcore-liteinst\"\nversion = \"0.5.7\"",
                 "name = \"detcore-liteinst\"\nversion = \"0.5.1\"",
                 1,
             ),
             lock_bytes.replacen(
-                "name = \"detcore-liteinst\"\nversion = \"0.5.6\"",
+                "name = \"detcore-liteinst\"\nversion = \"0.5.7\"",
                 "name = \"detcore-liteinst\"\nversion = \"0.5.4\"",
                 1,
             ),
             lock_bytes.replacen(
-                "name = \"detcore-liteinst\"\nversion = \"0.5.6\"",
+                "name = \"detcore-liteinst\"\nversion = \"0.5.7\"",
                 "name = \"detcore-liteinst\"\nversion = \"0.5.5\"",
+                1,
+            ),
+            lock_bytes.replacen(
+                "name = \"detcore-liteinst\"\nversion = \"0.5.7\"",
+                "name = \"detcore-liteinst\"\nversion = \"0.5.6\"",
                 1,
             ),
             format!("{lock_bytes}{lock_bytes}"),
@@ -40064,7 +40406,7 @@ mod tests {
         assert!(runner.commands.is_empty());
         let source = format!("git+https://github.com/rrnewton/reverie.git?rev={pin}#{pin}");
         let git_id = |name: &str| {
-            format!("git+https://github.com/rrnewton/reverie.git?rev={pin}#{name}@0.5.6")
+            format!("git+https://github.com/rrnewton/reverie.git?rev={pin}#{name}@0.5.7")
         };
         let package = |name: &str, target: &str, kind: &[&str], git: bool, version: &str| {
             serde_json::json!({
@@ -40087,7 +40429,7 @@ mod tests {
         ] {
             for git in [false, true] {
                 let valid =
-                    serde_json::json!({"packages": [package(name, target, kind, git, "0.5.6")]});
+                    serde_json::json!({"packages": [package(name, target, kind, git, "0.5.7")]});
                 let expected_source = git.then_some(source.as_str());
                 compiled_library_package(&valid, name, target, kind, &root, expected_source)
                     .unwrap();
@@ -40106,13 +40448,14 @@ mod tests {
                     ("version", serde_json::json!("0.5.1")),
                     ("version", serde_json::json!("0.5.4")),
                     ("version", serde_json::json!("0.5.5")),
+                    ("version", serde_json::json!("0.5.6")),
                     (
                         "id",
                         serde_json::json!(
                             valid["packages"][0]["id"]
                                 .as_str()
                                 .unwrap()
-                                .replace("0.5.6", "0.5.1")
+                                .replace("0.5.7", "0.5.1")
                         ),
                     ),
                     (
@@ -40121,7 +40464,7 @@ mod tests {
                             valid["packages"][0]["id"]
                                 .as_str()
                                 .unwrap()
-                                .replace("0.5.6", "0.5.4")
+                                .replace("0.5.7", "0.5.4")
                         ),
                     ),
                     (
@@ -40130,7 +40473,16 @@ mod tests {
                             valid["packages"][0]["id"]
                                 .as_str()
                                 .unwrap()
-                                .replace("0.5.6", "0.5.5")
+                                .replace("0.5.7", "0.5.5")
+                        ),
+                    ),
+                    (
+                        "id",
+                        serde_json::json!(
+                            valid["packages"][0]["id"]
+                                .as_str()
+                                .unwrap()
+                                .replace("0.5.7", "0.5.6")
                         ),
                     ),
                     ("id", serde_json::json!("same-name-wrong-source")),
@@ -40222,13 +40574,13 @@ mod tests {
                 FixedImageKind::Standalone,
                 "reverie-liteinst-preload",
                 "reverie_liteinst_preload",
-                "0.5.6",
+                "0.5.7",
             ),
             (
                 FixedImageKind::Detcore,
                 "detcore-liteinst",
                 "detcore_liteinst",
-                "0.5.6",
+                "0.5.7",
             ),
         ] {
             for git in [false, true] {
@@ -40242,7 +40594,7 @@ mod tests {
                             valid["packages"][0]["id"]
                                 .as_str()
                                 .unwrap()
-                                .replace("0.5.6", "0.5.1")
+                                .replace("0.5.7", "0.5.1")
                         ),
                     ),
                     (
@@ -40251,7 +40603,7 @@ mod tests {
                             valid["packages"][0]["id"]
                                 .as_str()
                                 .unwrap()
-                                .replace("0.5.6", "0.5.4")
+                                .replace("0.5.7", "0.5.4")
                         ),
                     ),
                     (
@@ -40260,7 +40612,16 @@ mod tests {
                             valid["packages"][0]["id"]
                                 .as_str()
                                 .unwrap()
-                                .replace("0.5.6", "0.5.5")
+                                .replace("0.5.7", "0.5.5")
+                        ),
+                    ),
+                    (
+                        "id",
+                        serde_json::json!(
+                            valid["packages"][0]["id"]
+                                .as_str()
+                                .unwrap()
+                                .replace("0.5.7", "0.5.6")
                         ),
                     ),
                     ("id", serde_json::json!("wrong-leaf-id")),
@@ -46755,6 +47116,27 @@ mod tests {
     fn fixed_tls_cell_access_mutation_controls() {
         type TlsAccessSample<'a> = (&'a str, u64, &'a str, u64, &'a [(usize, usize, u64)]);
         let samples: &[TlsAccessSample<'_>] = &[
+            // Actual stable 1.97.1 RELEASE constructor a7944806 (build-id
+            // 13f64d0d): INSTALLATION_DEPTH at TLS offset 0x30.
+            (
+                "fixed_patch_alloc",
+                0x94280,
+                "41574156415453504889d34989f6ff15c45e0c004885c074774c8b78204d85ff746e4989c4488d3d745c0c00e86ff80b004883b830000000007463498b542410498b0f498d76ff49f7de31c04889cf4801d7723e4801f772394c21f74989f84929d04901d8410f92c14981f801000002410f93c24508ca75194889c8f04d0fb1074889c1b80000000075c14889f8eb0231c04883c4085b415c415e415fc3bf010000004c89f64889da4883c4085b415c415e415fff257e5e0c00",
+                0x30,
+                &[
+                    (16, 20, 1417560),
+                    (40, 44, 1416992),
+                    (45, 49, 1391392),
+                    (182, 186, 1417656),
+                ],
+            ),
+            (
+                "fixed_tls_fn_once",
+                0x94500,
+                "50488d3d185a0c00e813f60b00488d803000000059c3",
+                0x30,
+                &[(4, 8, 1416992), (9, 13, 1391392)],
+            ),
             // Actual DEV image a746cd77: INSTALLATION_DEPTH at TLS offset 0x80.
             (
                 "fixed_tls_cell_getter",
@@ -49531,6 +49913,40 @@ mod tests {
                     .is_err()
             );
         }
+        // The stable 1.97.1 RELEASE constructor reads INSTALLATION_DEPTH at
+        // 0x30: the same physical census finds its exact FnOnce thunk where no
+        // symbol names it, refuses it with a foreign operand, and does not
+        // take a thunk reading another cell for a 0x30 getter.
+        let mut stable30 = base.clone();
+        put(&mut stable30, 0x4020, 8, 0x30);
+        let mut cell30 = cell.clone();
+        cell30.address = 0x30;
+        let census30 = |bytes: &[u8]| {
+            direct_tls_getter_census(&Elf::parse(bytes).unwrap(), bytes, &cell30, 0x3300, 0x1800)
+        };
+        let absent30 = census30(&stable30).unwrap();
+        assert!(
+            absent30.named_getters.is_empty()
+                && absent30.recipe_getters.is_empty()
+                && absent30.getter_pointer_slots.is_empty()
+        );
+        let mut thunk30 = fixed_hex("50488d3d185a0c00e813f60b00488d803000000059c3");
+        rip(&mut thunk30, 0x1500, 4, 8, 0x3300);
+        rip(&mut thunk30, 0x1500, 9, 13, 0x1800);
+        let mut hidden30 = stable30.clone();
+        hidden30[0x1500..0x1516].copy_from_slice(&thunk30);
+        assert_eq!(census30(&hidden30).unwrap().recipe_getters, [0x1500]);
+        for (field, next, target) in [(4, 8, 0x3308), (9, 13, 0x1801)] {
+            let mut bad = hidden30.clone();
+            rip(&mut bad[0x1500..0x1516], 0x1500, field, next, target);
+            assert!(
+                census30(&bad).is_err(),
+                "stable 0x30 hidden getter wrong operand"
+            );
+        }
+        let mut other_cell = hidden30.clone();
+        other_cell[0x1500 + 16..0x1500 + 20].copy_from_slice(&0x40u32.to_le_bytes());
+        assert!(census30(&other_cell).unwrap().recipe_getters.is_empty());
         // The separate Detcore e8 route uses the SAME physical census. A
         // missing symbol is insufficient: hidden/unnamed getters outside .text
         // and raw loader pointers still invalidate an empty-getter proof.
@@ -60779,10 +61195,10 @@ mod tests {
     // direct cells 0x108 and 0x148 respectively. The ELF qualifier separately
     // binds the allocation's encoded read to the named cell in that image;
     // these descriptor controls retain the exact observed offset allow-list.
-    #[test]
-    fn detcore_allocator_tls_boundary_accepts_stable_cell_0x100() {
-        let boundary = |cell: u64| {
-            AllocatorTlsBoundary {
+    /// The descriptor-level boundary of the 0x100 control, with only the
+    /// INSTALLATION_DEPTH cell varied.
+    fn detcore_allocator_tls_boundary_fixture(cell: u64) -> AllocatorTlsBoundary {
+        AllocatorTlsBoundary {
             dependency: "existing_installation_depth_tls".into(),
             provider_symbol: "__tls_get_addr".into(),
             provider_version: "GLIBC_2.3".into(),
@@ -60837,7 +61253,11 @@ mod tests {
                 ),
             ]),
         }
-        };
+    }
+
+    #[test]
+    fn detcore_allocator_tls_boundary_accepts_stable_cell_0x100() {
+        let boundary = detcore_allocator_tls_boundary_fixture;
         for cell in [0x100, 0x108, 0x148] {
             assert!(
                 validate_existing_allocator_tls_boundary(&boundary(cell), FixedImageKind::Detcore)
@@ -60854,25 +61274,46 @@ mod tests {
         }
     }
 
-    #[test]
-    fn detcore_allocation_refuses_in_handler_0x108_in_installation_depth_0x100_layout() {
-        // The stable 1.97.1/2465470e allocation body and 0x100/0x108
-        // INSTALLATION_DEPTH/IN_HANDLER layout were retained in 867e1510.
-        // This miniature parsed ELF is a focused symbol/section binding
-        // control, not that complete image. The unmodified body must reach
-        // the later descriptor-mapping gate; complete positive qualification
-        // remains the actual product-staging gate.
-        let allocation = fixed_hex(
-            "41574156415453504889d34989f6ff15d4818a004885c0747c4989c44c8b782041f6c7070f85a50000004d85ff0f84b1000000488d3dde248a00e851c47f004883b80001000000745d498b542410498b07498d76ff49f7de31c94889c74801d772354801f772304c21f74989f84929d072504901d8410f92c14981f801000002410f93c24508ca750ef04d0fb10775ca4889f9eb0231c94889c84883c4085b415c415e415fc3bf010000004c89f64889da4883c4085b415c415e415fff2566818a00488d3da7fd8200ff15c9278a00488d155afe8200bf080000004c89feff156c2f8a00488d3d45fe8200ff1557698a00",
-        );
-        assert_eq!(
-            sha256(&allocation),
-            "0be4c788adc82d1f0562d9d3b6123cc17a7ff871075414fab9af5d1b339aea8d"
-        );
-        assert_eq!(&allocation[66..70], &0x100_u32.to_le_bytes());
-        fn put(bytes: &mut [u8], at: usize, width: usize, value: u64) {
-            bytes[at..at + width].copy_from_slice(&value.to_le_bytes()[..width]);
-        }
+    fn detcore_tls_put(bytes: &mut [u8], at: usize, width: usize, value: u64) {
+        bytes[at..at + width].copy_from_slice(&value.to_le_bytes()[..width]);
+    }
+
+    /// A miniature parsed ELF binding one 241-byte fixed_patch_alloc body to a
+    /// named INSTALLATION_DEPTH cell at `depth_cell`, beside one neighbouring
+    /// TLS symbol `(name, offset, size)`. PT_TLS and its writable PT_LOAD have
+    /// `file_size` initialized bytes of `memory_size`; .tbss holds the rest.
+    /// A focused symbol/section binding control, not a complete image.
+    fn detcore_tls_binding_image(
+        allocation: &[u8],
+        depth_cell: u64,
+        neighbour: (&str, u64, u64),
+        file_size: u64,
+        memory_size: u64,
+    ) -> Vec<u8> {
+        detcore_tls_binding_image_with_thunk(
+            allocation,
+            None,
+            depth_cell,
+            neighbour,
+            file_size,
+            memory_size,
+        )
+    }
+
+    /// Where detcore_tls_binding_image_with_thunk places the 22-byte
+    /// fixed_tls_fn_once thunk: inside .text, after the required roles.
+    const DETCORE_TLS_THUNK_ADDRESS: u64 = 0x1c80;
+
+    /// detcore_tls_binding_image, plus a fixed_tls_fn_once symbol for `thunk`
+    /// at DETCORE_TLS_THUNK_ADDRESS when one is given.
+    fn detcore_tls_binding_image_with_thunk(
+        allocation: &[u8],
+        thunk: Option<&[u8]>,
+        depth_cell: u64,
+        neighbour: (&str, u64, u64),
+        file_size: u64,
+        memory_size: u64,
+    ) -> Vec<u8> {
         let mut image = vec![0_u8; 0x5000];
         image[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
         for (at, width, value) in [
@@ -60887,12 +61328,12 @@ mod tests {
             (58, 2, 64),
             (60, 2, 5),
         ] {
-            put(&mut image, at, width, value);
+            detcore_tls_put(&mut image, at, width, value);
         }
-        for (index, kind, flags, offset, address, file_size, memory_size, alignment) in [
+        for (index, kind, flags, offset, address, segment_file, segment_memory, alignment) in [
             (0, 1, 5, 0, 0x1000, 0x4000, 0x4000, 0x1000),
-            (1, 1, 6, 0x4000, 0x6000, 0x100, 0x110, 0x1000),
-            (2, 7, 4, 0x4000, 0x6000, 0x100, 0x110, 8),
+            (1, 1, 6, 0x4000, 0x6000, file_size, memory_size, 0x1000),
+            (2, 7, 4, 0x4000, 0x6000, file_size, memory_size, 8),
         ] {
             for (delta, width, value) in [
                 (0, 4, kind),
@@ -60900,11 +61341,11 @@ mod tests {
                 (8, 8, offset),
                 (16, 8, address),
                 (24, 8, address),
-                (32, 8, file_size),
-                (40, 8, memory_size),
+                (32, 8, segment_file),
+                (40, 8, segment_memory),
                 (48, 8, alignment),
             ] {
-                put(&mut image, 64 + index * 56 + delta, width, value);
+                detcore_tls_put(&mut image, 64 + index * 56 + delta, width, value);
             }
         }
         let mut symbols: Vec<_> = FIXED_REQUIRED_ROLES
@@ -60926,9 +61367,36 @@ mod tests {
                 )
             })
             .collect();
+        if let Some(thunk) = thunk {
+            let name = FIXED_EMITTED_ROLE_SYMBOLS
+                .iter()
+                .find(|(name, _)| *name == "fixed_tls_fn_once")
+                .unwrap()
+                .1
+                .replace("Cs_", "CsTest_");
+            symbols.push((
+                name,
+                sym::STT_FUNC,
+                1,
+                DETCORE_TLS_THUNK_ADDRESS,
+                thunk.len() as u64,
+            ));
+        }
         symbols.extend([
-            (FIXED_TLS_CELL_ROLE.replace("Cs_", "CsTest_"), sym::STT_TLS, 4, 0x100, 8),
-            ("_RNvNCNKNvNtCsTest_15reverie_inguest4trap10IN_HANDLER0s_023___RUST_STD_INTERNAL_VAL".into(), sym::STT_TLS, 4, 0x108, 1),
+            (
+                FIXED_TLS_CELL_ROLE.replace("Cs_", "CsTest_"),
+                sym::STT_TLS,
+                4,
+                depth_cell,
+                8,
+            ),
+            (
+                neighbour.0.to_string(),
+                sym::STT_TLS,
+                4,
+                neighbour.1,
+                neighbour.2,
+            ),
         ]);
         let mut strings = vec![0];
         for (index, (name, kind, section, address, size)) in symbols.iter().enumerate() {
@@ -60940,19 +61408,32 @@ mod tests {
                 (8, 8, *address),
                 (16, 8, *size),
             ] {
-                put(&mut image, row + delta, width, value);
+                detcore_tls_put(&mut image, row + delta, width, value);
             }
             strings.extend_from_slice(name.as_bytes());
             strings.push(0);
         }
         assert!(strings.len() < 0x1000);
         image[0x1000..0x1000 + strings.len()].copy_from_slice(&strings);
-        image[0x800..0x800 + allocation.len()].copy_from_slice(&allocation);
+        image[0x800..0x800 + allocation.len()].copy_from_slice(allocation);
+        if let Some(thunk) = thunk {
+            let at = (DETCORE_TLS_THUNK_ADDRESS - 0x1000) as usize;
+            image[at..at + thunk.len()].copy_from_slice(thunk);
+        }
         for (index, kind, flags, address, offset, size, link, entry) in [
             (1, 1, 6, 0x1800, 0x800, 0x500, 0, 0),
             (2, 3, 0, 0, 0x1000, strings.len() as u64, 0, 0),
             (3, 2, 0, 0, 0x2000, 24 * (symbols.len() + 1) as u64, 2, 24),
-            (4, 8, 0x403, 0x6100, 0x4100, 0x10, 0, 0),
+            (
+                4,
+                8,
+                0x403,
+                0x6000 + file_size,
+                0x4000 + file_size,
+                memory_size - file_size,
+                0,
+                0,
+            ),
         ] {
             for (delta, width, value) in [
                 (4, 4, kind),
@@ -60964,9 +61445,74 @@ mod tests {
                 (48, 8, 8),
                 (56, 8, entry),
             ] {
-                put(&mut image, 0x3000 + index * 64 + delta, width, value);
+                detcore_tls_put(&mut image, 0x3000 + index * 64 + delta, width, value);
             }
         }
+        image
+    }
+
+    /// The allocator-boundary refusal for `body` placed in `image`. The
+    /// miniature image omits the TLS descriptor/provider, so a body that
+    /// passes named-cell binding stops at the later page-mapping gate.
+    fn qualify_detcore_tls_binding(image: &[u8], body: &[u8]) -> String {
+        qualify_detcore_tls_binding_with_thunk(image, body, None)
+    }
+
+    /// qualify_detcore_tls_binding, with `thunk` placed as the image's
+    /// fixed_tls_fn_once bytes when one is given.
+    fn qualify_detcore_tls_binding_with_thunk(
+        image: &[u8],
+        body: &[u8],
+        thunk: Option<&[u8]>,
+    ) -> String {
+        let mut specimen = image.to_vec();
+        specimen[0x800..0x800 + body.len()].copy_from_slice(body);
+        let mut code = BTreeMap::from([(0x1800, body.to_vec())]);
+        if let Some(thunk) = thunk {
+            let at = (DETCORE_TLS_THUNK_ADDRESS - 0x1000) as usize;
+            specimen[at..at + thunk.len()].copy_from_slice(thunk);
+            code.insert(DETCORE_TLS_THUNK_ADDRESS, thunk.to_vec());
+        }
+        let parsed = Elf::parse(&specimen).unwrap();
+        qualify_allocator_tls_boundary_in_source_context(
+            &parsed,
+            &specimen,
+            &code,
+            "",
+            &BTreeMap::new(),
+            FixedImageKind::Detcore,
+            None,
+        )
+        .expect_err("this focused metadata fixture omits the full TLS descriptor/provider")
+    }
+
+    #[test]
+    fn detcore_allocation_refuses_in_handler_0x108_in_installation_depth_0x100_layout() {
+        // The stable 1.97.1/2465470e allocation body and 0x100/0x108
+        // INSTALLATION_DEPTH/IN_HANDLER layout were retained in 867e1510.
+        // This miniature parsed ELF is a focused symbol/section binding
+        // control, not that complete image. The unmodified body must reach
+        // the later descriptor-mapping gate; complete positive qualification
+        // remains the actual product-staging gate.
+        let allocation = fixed_hex(
+            "41574156415453504889d34989f6ff15d4818a004885c0747c4989c44c8b782041f6c7070f85a50000004d85ff0f84b1000000488d3dde248a00e851c47f004883b80001000000745d498b542410498b07498d76ff49f7de31c94889c74801d772354801f772304c21f74989f84929d072504901d8410f92c14981f801000002410f93c24508ca750ef04d0fb10775ca4889f9eb0231c94889c84883c4085b415c415e415fc3bf010000004c89f64889da4883c4085b415c415e415fff2566818a00488d3da7fd8200ff15c9278a00488d155afe8200bf080000004c89feff156c2f8a00488d3d45fe8200ff1557698a00",
+        );
+        assert_eq!(
+            sha256(&allocation),
+            "0be4c788adc82d1f0562d9d3b6123cc17a7ff871075414fab9af5d1b339aea8d"
+        );
+        assert_eq!(&allocation[66..70], &0x100_u32.to_le_bytes());
+        let image = detcore_tls_binding_image(
+            &allocation,
+            0x100,
+            (
+                "_RNvNCNKNvNtCsTest_15reverie_inguest4trap10IN_HANDLER0s_023___RUST_STD_INTERNAL_VAL",
+                0x108,
+                1,
+            ),
+            0x100,
+            0x110,
+        );
         let elf = Elf::parse(&image).unwrap();
         let named_cell = fixed_tls_cell(&elf).unwrap();
         assert_eq!(named_cell.address, 0x100);
@@ -60987,22 +61533,7 @@ mod tests {
             (handler.st_type(), handler.st_value, handler.st_size),
             (sym::STT_TLS, 0x108, 1)
         );
-        let qualify = |body: &[u8]| {
-            let mut specimen = image.clone();
-            specimen[0x800..0x800 + body.len()].copy_from_slice(body);
-            let parsed = Elf::parse(&specimen).unwrap();
-            let code = BTreeMap::from([(0x1800, specimen[0x800..0x800 + body.len()].to_vec())]);
-            qualify_allocator_tls_boundary_in_source_context(
-                &parsed,
-                &specimen,
-                &code,
-                "",
-                &BTreeMap::new(),
-                FixedImageKind::Detcore,
-                None,
-            )
-            .expect_err("this focused metadata fixture omits the full TLS descriptor/provider")
-        };
+        let qualify = |body: &[u8]| qualify_detcore_tls_binding(&image, body);
         assert_eq!(
             qualify(&allocation),
             "Fixed data has overlapping or absent actual page mappings",
@@ -61029,6 +61560,268 @@ mod tests {
             qualify(&wrong_cell),
             "Detcore allocation reads another TLS cell",
             "IN_HANDLER at 0x108 in the INSTALLATION_DEPTH 0x100 layout must refuse by ELF name binding"
+        );
+    }
+
+    /// The one 241-byte fixed_patch_alloc template whose encoded read (bytes
+    /// 63..70: `48 83 b8 <cell: u32 LE>`) names `cell`, found by identity,
+    /// never by table position.
+    fn fixed_patch_alloc_template_reading(cell: u32) -> Vec<u8> {
+        let bodies: Vec<Vec<u8>> = DETCORE_VALIDATE_TEMPLATES
+            .iter()
+            .filter(|template| template.role == "fixed_patch_alloc")
+            .map(|template| fixed_hex(template.hex))
+            .filter(|body| {
+                body.len() == 241
+                    && body[63..66] == [0x48, 0x83, 0xb8]
+                    && u32::from_le_bytes(body[66..70].try_into().unwrap()) == cell
+            })
+            .collect();
+        assert_eq!(
+            bodies.len(),
+            1,
+            "exactly one fixed_patch_alloc template reads cell {cell:#x}"
+        );
+        bodies.into_iter().next().unwrap()
+    }
+
+    // The stable rustc 1.97.1 native-exec runtime carries INSTALLATION_DEPTH at
+    // TLS cell 0xf8 (PT_TLS filesz 0xf8, memsz 0x220; ELF SHA256
+    // 05903e134c10a4042b6ee4c771e73730db850fcf811267c7a8dedaf83f1b6449). Its
+    // fixed_patch_alloc template is scripts/detcore-alloc-recipe.py output
+    // for that image, and its provenance comment carries this body digest.
+    #[test]
+    fn detcore_patch_alloc_0xf8_template_is_the_generated_stable_native_body() {
+        let body = fixed_patch_alloc_template_reading(0xf8);
+        assert_eq!(
+            sha256(&body),
+            "2d28fc7bbbed87cb8e42405566bead6a55dc04bc49a01c7b0334a7b68186a06e"
+        );
+        assert_eq!(&body[66..70], &0xf8_u32.to_le_bytes());
+    }
+
+    // 0xf8 joins the observed allow-list; every earlier observed cell stays
+    // accepted, and unreviewed cells beside 0xf8 still refuse.
+    #[test]
+    fn detcore_allocator_tls_boundary_accepts_stable_native_cell_0xf8() {
+        let boundary = detcore_allocator_tls_boundary_fixture;
+        for cell in [
+            0xf8, 0x98, 0xa0, 0xd8, 0xe0, 0xe8, 0x100, 0x108, 0x110, 0x128, 0x148,
+        ] {
+            assert!(
+                validate_existing_allocator_tls_boundary(&boundary(cell), FixedImageKind::Detcore)
+                    .is_ok(),
+                "observed direct cell {cell:#x} must validate"
+            );
+        }
+        for cell in [0xf0, 0xf4, 0xf9, 0xfc, 0x90, 0x150] {
+            assert!(
+                validate_existing_allocator_tls_boundary(&boundary(cell), FixedImageKind::Detcore)
+                    .is_err(),
+                "unreviewed cell {cell:#x} must refuse"
+            );
+        }
+    }
+
+    // The named cell and the encoded read must agree at 0xf8 in the actual
+    // stable native layout, where continuation::OWNER (8 bytes) follows at
+    // 0x100. Either side moving to another allow-listed cell refuses.
+    #[test]
+    fn detcore_allocation_binds_its_0xf8_read_to_installation_depth() {
+        let allocation = fixed_patch_alloc_template_reading(0xf8);
+        let owner = (
+            "_RNvNCNKNvNtNtCsTest_15reverie_inguest5guest12continuation5OWNER0s_023___RUST_STD_INTERNAL_VAL",
+            0x100,
+            8,
+        );
+        let image = detcore_tls_binding_image(&allocation, 0xf8, owner, 0xf8, 0x220);
+        let elf = Elf::parse(&image).unwrap();
+        assert_eq!(fixed_tls_cell(&elf).unwrap().address, 0xf8);
+        assert_eq!(
+            qualify_detcore_tls_binding(&image, &allocation),
+            "Fixed data has overlapping or absent actual page mappings",
+            "the generated 0xf8 allocation must pass named-cell binding and reach the later descriptor mapping gate"
+        );
+        let mut reads_owner = allocation.clone();
+        reads_owner[66..70].copy_from_slice(&0x100_u32.to_le_bytes());
+        assert_eq!(
+            qualify_detcore_tls_binding(&image, &reads_owner),
+            "Detcore allocation reads another TLS cell",
+            "a 0xf8-layout allocation reading 0x100 must refuse by ELF name binding"
+        );
+        let moved = detcore_tls_binding_image(&allocation, 0x100, (owner.0, 0xf8, 8), 0xf8, 0x220);
+        assert_eq!(
+            fixed_tls_cell(&Elf::parse(&moved).unwrap())
+                .unwrap()
+                .address,
+            0x100
+        );
+        assert_eq!(
+            qualify_detcore_tls_binding(&moved, &allocation),
+            "Detcore allocation reads another TLS cell",
+            "INSTALLATION_DEPTH at 0x100 must refuse an allocation that reads 0xf8"
+        );
+    }
+
+    /// The one 22-byte fixed_tls_fn_once template whose encoded read (bytes
+    /// 13..20: `48 8d 80 <cell: u32 LE>`) names `cell`, found by identity,
+    /// never by table position.
+    fn fixed_tls_fn_once_template_reading(cell: u32) -> Vec<u8> {
+        let bodies: Vec<Vec<u8>> = DETCORE_VALIDATE_TEMPLATES
+            .iter()
+            .filter(|template| template.role == "fixed_tls_fn_once")
+            .map(|template| fixed_hex(template.hex))
+            .filter(|body| {
+                body.len() == 22
+                    && body[13..16] == [0x48, 0x8d, 0x80]
+                    && u32::from_le_bytes(body[16..20].try_into().unwrap()) == cell
+            })
+            .collect();
+        assert_eq!(
+            bodies.len(),
+            1,
+            "exactly one fixed_tls_fn_once template reads cell {cell:#x}"
+        );
+        bodies.into_iter().next().unwrap()
+    }
+
+    /// `thunk` re-pointed, as it would be at DETCORE_TLS_THUNK_ADDRESS, at the
+    /// TLS descriptor and __tls_get_addr PLT entry that `allocation` (at
+    /// 0x1800) uses, so the qualifier's whole-recipe binding can hold.
+    fn detcore_tls_thunk_for(allocation: &[u8], thunk: &[u8]) -> Vec<u8> {
+        let target = |at: usize, next: u64| {
+            (0x1800 + next).wrapping_add_signed(i64::from(i32::from_le_bytes(
+                allocation[at..at + 4].try_into().unwrap(),
+            )))
+        };
+        let (module, plt) = (target(54, 58), target(59, 63));
+        let mut thunk = thunk.to_vec();
+        for (at, next, goal) in [(4, 8, module), (9, 13, plt)] {
+            let displacement =
+                i32::try_from(goal as i64 - (DETCORE_TLS_THUNK_ADDRESS + next) as i64).unwrap();
+            thunk[at..at + 4].copy_from_slice(&displacement.to_le_bytes());
+        }
+        thunk
+    }
+
+    // The same stable native runtime's FnOnce TLS thunk reads 0xf8 as a
+    // literal too, so 0xf8 needs this second row. It is
+    // scripts/detcore-alloc-recipe.py --role fixed_tls_fn_once output for
+    // that image, and its provenance comment carries this body digest.
+    #[test]
+    fn detcore_tls_fn_once_0xf8_template_is_the_generated_stable_native_body() {
+        let thunk = fixed_tls_fn_once_template_reading(0xf8);
+        assert_eq!(
+            sha256(&thunk),
+            "64f7e580acad5b8eb71c7f487b62f78a07c8be22cdeee6ea72dae9be7f396e33"
+        );
+        assert_eq!(&thunk[16..20], &0xf8_u32.to_le_bytes());
+    }
+
+    // With both 0xf8 rows the allocation and the FnOnce thunk pass named-cell
+    // binding and reach the later descriptor-mapping gate. A thunk reading
+    // continuation::OWNER at 0x100 instead refuses by ELF name binding.
+    #[test]
+    fn detcore_tls_fn_once_binds_its_0xf8_read_to_installation_depth() {
+        let allocation = fixed_patch_alloc_template_reading(0xf8);
+        let thunk = detcore_tls_thunk_for(&allocation, &fixed_tls_fn_once_template_reading(0xf8));
+        let owner = (
+            "_RNvNCNKNvNtNtCsTest_15reverie_inguest5guest12continuation5OWNER0s_023___RUST_STD_INTERNAL_VAL",
+            0x100,
+            8,
+        );
+        let image = detcore_tls_binding_image_with_thunk(
+            &allocation,
+            Some(&thunk),
+            0xf8,
+            owner,
+            0xf8,
+            0x220,
+        );
+        assert_eq!(
+            qualify_detcore_tls_binding_with_thunk(&image, &allocation, Some(&thunk)),
+            "Fixed data has overlapping or absent actual page mappings",
+            "the generated 0xf8 allocation and FnOnce thunk must pass named-cell binding and reach the later descriptor mapping gate"
+        );
+        let mut reads_owner = thunk.clone();
+        reads_owner[16..20].copy_from_slice(&0x100_u32.to_le_bytes());
+        assert_eq!(
+            qualify_detcore_tls_binding_with_thunk(&image, &allocation, Some(&reads_owner)),
+            "Detcore FnOnce reads another TLS cell",
+            "a 0xf8-layout FnOnce thunk reading 0x100 must refuse by ELF name binding"
+        );
+    }
+
+    // A cell with an allocation row but no FnOnce row refuses the thunk: the
+    // shape the stable native build met at 0xf8 before its second row. 0x100
+    // is such a cell (see FN_ONCE_ROW_PENDING below).
+    #[test]
+    fn detcore_tls_fn_once_at_a_cell_without_its_row_refuses() {
+        let allocation = fixed_patch_alloc_template_reading(0x100);
+        let mut thunk =
+            detcore_tls_thunk_for(&allocation, &fixed_tls_fn_once_template_reading(0xf8));
+        thunk[16..20].copy_from_slice(&0x100_u32.to_le_bytes());
+        let in_handler = (
+            "_RNvNCNKNvNtCsTest_15reverie_inguest4trap10IN_HANDLER0s_023___RUST_STD_INTERNAL_VAL",
+            0x108,
+            1,
+        );
+        let image = detcore_tls_binding_image_with_thunk(
+            &allocation,
+            Some(&thunk),
+            0x100,
+            in_handler,
+            0x100,
+            0x110,
+        );
+        assert_eq!(
+            qualify_detcore_tls_binding_with_thunk(&image, &allocation, Some(&thunk)),
+            "Detcore FnOnce unrecognized full template",
+            "a FnOnce thunk at a cell no fixed_tls_fn_once row reads must refuse"
+        );
+    }
+
+    /// Allow-listed cells with an allocation row but no FnOnce row: 867e1510
+    /// added 0x100 from its allocation body alone, and no 0x100 image's FnOnce
+    /// thunk has been retained to generate that row from. A 0x100 image with
+    /// that thunk refuses until one is.
+    const FN_ONCE_ROW_PENDING: &[u64] = &[0x100];
+
+    // Both cell-reading roles carry every accepted cell, so a new cell cannot
+    // land with only one of its rows (0xf8 did, and refused at the second).
+    #[test]
+    fn every_accepted_tls_cell_has_its_alloc_and_fn_once_rows() {
+        let reads = |role: &str, len: usize, at: usize, cell: u64| {
+            DETCORE_VALIDATE_TEMPLATES
+                .iter()
+                .filter(|template| template.role == role)
+                .map(|template| fixed_hex(template.hex))
+                .filter(|body| {
+                    body.len() == len
+                        && u64::from(u32::from_le_bytes(body[at..at + 4].try_into().unwrap()))
+                            == cell
+                })
+                .count()
+        };
+        let accepted: Vec<u64> = (0..0x1000)
+            .filter(|cell| detcore_direct_tls_offset_accepted(*cell))
+            .collect();
+        assert!(accepted.contains(&0xf8) && accepted.len() >= 11);
+        let mut missing_fn_once = Vec::new();
+        for &cell in &accepted {
+            assert!(
+                reads("fixed_patch_alloc", 241, 66, cell) >= 1,
+                "accepted cell {cell:#x} has no fixed_patch_alloc row"
+            );
+            match reads("fixed_tls_fn_once", 22, 16, cell) {
+                0 => missing_fn_once.push(cell),
+                1 => {}
+                n => panic!("accepted cell {cell:#x} has {n} fixed_tls_fn_once rows"),
+            }
+        }
+        assert_eq!(
+            missing_fn_once, FN_ONCE_ROW_PENDING,
+            "the accepted cells without a fixed_tls_fn_once row must be exactly the pending list"
         );
     }
 
@@ -65692,7 +66485,11 @@ mod tests {
 
     #[test]
     fn source_owned_template_end_covers_stable_prepare_identities() {
-        for index in [108, 109, 110, 112, 113, 114, 115] {
+        // 111 and 116 are the stable 0x100 and generated stable native 0xf8
+        // fixed_patch_alloc templates, and 117 the generated 0xf8
+        // fixed_tls_fn_once template; as appended identities they too must
+        // route a lone witness to the naked-composition check.
+        for index in [108, 109, 110, 111, 112, 113, 114, 115, 116, 117] {
             let mut graph = scalar_ordinary_bit_result_control_graph(false);
             fixed_scalar_publication_syscall_mode(&graph.witnesses, FixedImageKind::Detcore, false)
                 .unwrap();
@@ -66991,13 +67788,14 @@ pub mod private_static {
     const LOW: u64 = 0x6000_e100_0000;
     const HIGH: u64 = 0x6000_ff00_0000;
     const GATE: u64 = LOW + 4096;
-    const ENTRY: &str = "detcore_liteinst_mapped_entry";
-    const LAYOUT: &str = "detcore_liteinst_mapped_layout";
-    const FEATURES: [&str; 3] = [
-        "exec-native-injection",
-        "exec-private-init",
-        "loader-private-runtime",
-    ];
+    #[cfg(test)]
+    const LAYOUT: &str = selected_initializers::MappedConsumer::Detcore
+        .source()
+        .layout();
+    #[cfg(test)]
+    const FEATURES: &[&str] = selected_initializers::MappedConsumer::Detcore
+        .source()
+        .features();
 
     /// Independently selected exact Git/compiler inputs, never receipt JSON.
     pub struct SourceExpectation<'a> {
@@ -67392,13 +68190,225 @@ pub mod private_static {
         guard: Guard,
         cargo: FileIdentity,
         target_dir: PathBuf,
+        // The one consumer this transaction selected. The link, joins,
+        // final-artifact checks, diagnostics and terminal observation
+        // all read it here; none of them selects again.
+        consumer: selected_initializers::MappedConsumer,
         metadata_sha256: String,
         archive_owner: Arc<ArchiveSourceOwner>,
     }
+    /// Target-dir rule by workspace binding kind. Hermit keeps
+    /// the sole canonical H/target rule; CargoGitRev requires a
+    /// canonical explicit target (already checked by caller)
+    /// with no workspace/target equality demand.
+    fn target_dir_accepted(
+        binding: selected_initializers::WorkspaceBinding,
+        workspace: &Path,
+        target_dir: &Path,
+    ) -> bool {
+        match binding {
+            selected_initializers::WorkspaceBinding::HermitGitlink { .. } => {
+                target_dir == workspace.join("target")
+            }
+            selected_initializers::WorkspaceBinding::CargoGitRev => target_dir.is_absolute(),
+        }
+    }
+
+    /// The Hermit refusal text is unchanged from the Detcore-only
+    /// producer; only CargoGitRev names its own rule.
+    fn target_dir_refusal(binding: selected_initializers::WorkspaceBinding) -> &'static str {
+        match binding {
+            selected_initializers::WorkspaceBinding::HermitGitlink { .. } => {
+                "static producer requires canonical sole H/target"
+            }
+            selected_initializers::WorkspaceBinding::CargoGitRev => {
+                "static producer requires canonical explicit target"
+            }
+        }
+    }
+
+    /// The git source string CargoGitRev expects for the pinned
+    /// Reverie rev. Cargo keeps the URL spelling the manifest uses:
+    /// literoot's manifests and locks say
+    /// `git+https://github.com/rrnewton/reverie?rev=...` while Hermit's
+    /// Cargo.lock says `...reverie.git?rev=...`. This is literoot's
+    /// spelling; any other spelling refuses. Both CargoGitRev checks
+    /// (root lock and metadata source equality) build their expected
+    /// string here so they cannot drift.
+    fn cargo_git_source(pin: &str) -> String {
+        format!("git+https://github.com/rrnewton/reverie?rev={pin}#{pin}")
+    }
+
+    /// The package id cargo (1.97.1, measured) reports for the path
+    /// leaf: the manifest directory URL, then `#<version>` when the
+    /// directory name is the package name, else `#<name>@<version>`
+    /// (`path+file:///ws/detcore-liteinst#0.5.5`,
+    /// `path+file:///ws/preload#literoot-preload@0.0.1`). The leaf
+    /// identity check compares metadata against exactly this.
+    fn leaf_package_id(
+        workspace: &Path,
+        consumer: &selected_initializers::MappedConsumerSource,
+    ) -> Result<String> {
+        let manifest = workspace.join(consumer.manifest_relative());
+        let directory = manifest.parent().ok_or("static leaf manifest parent")?;
+        let (name, version) = (consumer.package_name(), consumer.package_version());
+        let fragment = if directory.file_name().and_then(|n| n.to_str()) == Some(name) {
+            version.to_owned()
+        } else {
+            format!("{name}@{version}")
+        };
+        Ok(format!("path+file://{}#{fragment}", directory.display()))
+    }
+
+    /// Binds the resolved Reverie crates to the pin and returns the
+    /// manifest path of each bound package. For both kinds each bound
+    /// package must appear once with the exact pinned git source; this
+    /// equality, not the lock text, is what binds the compiled Reverie
+    /// crates. The Hermit kind keeps exactly these pre-generalization
+    /// checks; its gitlink root and ls-tree pin guard the checkout.
+    ///
+    /// CargoGitRev has no gitlink root that would guard another tree,
+    /// so it also requires:
+    /// - the leaf to be the only source-less package. A `[patch]` or
+    ///   path override to a local tree yields a source-less package
+    ///   whether or not that tree is also declared a workspace member;
+    ///   literoot's real resolve has exactly one (literoot-preload).
+    /// - every Reverie-internal dependency edge to resolve to the
+    ///   pinned source. An edge is internal when its declaring package
+    ///   (a pinned Reverie package or the leaf) names the pinned source
+    ///   for it in `dependencies[].source`: with the `#<rev>` fragment
+    ///   inside the checkout, without it in the leaf's own manifest.
+    ///   `resolve.nodes` gives the package it actually resolved to. A
+    ///   `[patch]` to a fork, another URL spelling, a registry or a local
+    ///   path changes that resolved package's source and refuses here.
+    /// - no crate that the pinned source carries to appear a second time
+    ///   at another source (for example a direct leaf dependency on
+    ///   reverie-syscalls at another rev, coord7 lens A2 case V5).
+    /// - every `reverie-*` package to be at the pinned source, including
+    ///   one the leaf declares directly at a fork or a stale rev that no
+    ///   pinned crate reaches (coord7 round-2 cases E3 and E5).
+    ///
+    /// Accepted residual (coord7 design ruling on 1982bdb7): a crate the
+    /// resolve carries only at a non-pinned source, declared there by the
+    /// leaf, outside the `reverie-*` name rule, is not recognized as
+    /// Reverie code. None exists at literoot 74c241de, whose leaf declares
+    /// only pinned Reverie crates plus libc and serde from crates.io.
+    fn bound_reverie_manifests<'m>(
+        metadata: &'m Value,
+        binding: selected_initializers::WorkspaceBinding,
+        pin: &str,
+        leaf_id: &str,
+    ) -> Result<Vec<(&'static str, &'m str)>> {
+        let packages = metadata["packages"]
+            .as_array()
+            .ok_or("static metadata lacks packages")?;
+        let source = match binding {
+            selected_initializers::WorkspaceBinding::CargoGitRev => cargo_git_source(pin),
+            selected_initializers::WorkspaceBinding::HermitGitlink { .. } => {
+                format!("git+https://github.com/rrnewton/reverie.git?rev={pin}#{pin}")
+            }
+        };
+        let mut bound = Vec::new();
+        for name in ["reverie-inguest", "reverie-liteinst", "reverie-loader"] {
+            let rows: Vec<_> = packages.iter().filter(|p| p["name"] == name).collect();
+            require(
+                rows.len() == 1 && rows[0]["source"].as_str() == Some(source.as_str()),
+                "static metadata R source/uniqueness mismatch",
+            )?;
+            let manifest = rows[0]["manifest_path"]
+                .as_str()
+                .ok_or("static R manifest absent")?;
+            bound.push((name, manifest));
+        }
+        if binding == selected_initializers::WorkspaceBinding::CargoGitRev {
+            require(
+                packages
+                    .iter()
+                    .filter(|p| p["source"].is_null())
+                    .map(|p| p["id"].as_str())
+                    .eq([Some(leaf_id)]),
+                "static CargoGitRev resolve has a source-less package other than the leaf (local patch refused)",
+            )?;
+            let nodes = metadata["resolve"]["nodes"]
+                .as_array()
+                .ok_or("static metadata lacks resolve nodes")?;
+            for parent in packages.iter().filter(|p| {
+                p["source"].as_str() == Some(source.as_str()) || p["id"].as_str() == Some(leaf_id)
+            }) {
+                let internal: Vec<_> = parent["dependencies"]
+                    .as_array()
+                    .ok_or("static metadata package lacks dependencies")?
+                    .iter()
+                    .filter(|d| {
+                        // Cargo prints the `#<rev>` fragment only for
+                        // dependencies declared inside the git checkout;
+                        // the leaf's own declarations read `?rev=<rev>`.
+                        d["source"].as_str().is_some_and(|declared| {
+                            declared == source || Some(declared) == source.split('#').next()
+                        })
+                    })
+                    .map(|d| &d["name"])
+                    .collect();
+                let node = nodes
+                    .iter()
+                    .find(|n| n["id"] == parent["id"])
+                    .ok_or("static metadata package lacks resolve node")?;
+                for edge in node["deps"]
+                    .as_array()
+                    .ok_or("static resolve node lacks deps")?
+                {
+                    let resolved = packages
+                        .iter()
+                        .find(|p| p["id"] == edge["pkg"])
+                        .ok_or("static resolve edge names no package")?;
+                    require(
+                        !internal.contains(&&resolved["name"])
+                            || resolved["source"].as_str() == Some(source.as_str()),
+                        "static CargoGitRev Reverie dependency resolves outside the pinned source",
+                    )?;
+                }
+            }
+            let pinned: Vec<_> = packages
+                .iter()
+                .filter(|p| p["source"].as_str() == Some(source.as_str()))
+                .map(|p| &p["name"])
+                .collect();
+            require(
+                packages.iter().all(|p| {
+                    p["source"].as_str() == Some(source.as_str()) || !pinned.contains(&&p["name"])
+                }),
+                "static CargoGitRev resolve carries a second copy of a pinned Reverie crate",
+            )?;
+            require(
+                packages.iter().all(|p| {
+                    p["source"].as_str() == Some(source.as_str())
+                        || !p["name"]
+                            .as_str()
+                            .is_some_and(|n| n.starts_with("reverie-"))
+                }),
+                "static CargoGitRev resolve has a reverie-* package outside the pinned source",
+            )?;
+        }
+        Ok(bound)
+    }
+
+    /// The root lockfile names the exact pinned Reverie git source at
+    /// least once. This is an early refusal only (one matching line
+    /// satisfies it); `bound_reverie_manifests` is what binds the
+    /// compiled Reverie crates.
+    fn cargo_git_rev_lock_accepts(lock_text: &str, pin: &str) -> bool {
+        lock_text.contains(&format!("source = \"{}\"", cargo_git_source(pin)))
+    }
+
     impl VerifiedStaticSource {
         /// Metadata observation only; equal digests do not establish ownership.
         pub fn metadata_sha256(&self) -> &str {
             &self.metadata_sha256
+        }
+
+        /// The mapped consumer selected when this transaction resolved.
+        pub fn mapped_consumer(&self) -> selected_initializers::MappedConsumer {
+            self.consumer
         }
 
         fn require_archive_owner(&self, archive: &StaticArchive) -> Result<()> {
@@ -67413,6 +68423,24 @@ pub mod private_static {
         /// path, including failure. The body cannot take ownership of this
         /// context or use it to construct a DSO source authority.
         pub fn with_resolved<T>(
+            expected: &SourceExpectation<'_>,
+            runner: &mut Runner,
+            body: impl FnOnce(&Self, &mut Runner) -> Result<T>,
+        ) -> Result<T> {
+            Self::with_resolved_for(
+                selected_initializers::MappedConsumer::Detcore,
+                expected,
+                runner,
+                body,
+            )
+        }
+
+        /// Consumer-selected form. The workspace binding kind
+        /// in the closed descriptor decides how the Reverie
+        /// source is bound; every other identity check reads
+        /// the same descriptor, never per-site literals.
+        pub fn with_resolved_for<T>(
+            selected: selected_initializers::MappedConsumer,
             expected: &SourceExpectation<'_>,
             runner: &mut Runner,
             body: impl FnOnce(&Self, &mut Runner) -> Result<T>,
@@ -67444,13 +68472,26 @@ pub mod private_static {
                     format!("static compiler override forbidden: {key}"),
                 )?;
             }
+            // Package identity comes from the selected closed
+            // consumer descriptor, not per-site literals.
+            let consumer = selected.source();
             require(
                 expected.target_dir.is_absolute()
                     && fs::canonicalize(expected.target_dir).map_err(|e| e.to_string())?
                         == expected.target_dir
-                    && expected.target_dir == expected.workspace.join("target"),
-                "static producer requires canonical sole H/target",
+                    && target_dir_accepted(
+                        consumer.binding(),
+                        expected.workspace,
+                        expected.target_dir,
+                    ),
+                target_dir_refusal(consumer.binding()),
             )?;
+            let gitlink = match consumer.binding() {
+                selected_initializers::WorkspaceBinding::HermitGitlink {
+                    reverie_gitlink_relative,
+                } => Some(reverie_gitlink_relative),
+                selected_initializers::WorkspaceBinding::CargoGitRev => None,
+            };
             let mut guard = Guard {
                 roots: Vec::new(),
                 files: vec![cargo.clone(), rustc],
@@ -67458,26 +68499,34 @@ pub mod private_static {
             };
             let result = (|| {
                 guard.root(expected.workspace, expected.workspace_head, runner)?;
-                guard.root(
-                    &expected.workspace.join("reverie"),
-                    expected.reverie_pin,
-                    runner,
-                )?;
-                let link = runner.text(
-                    "git",
-                    &["--no-replace-objects", "ls-tree", "HEAD", "--", "reverie"],
-                    expected.workspace,
-                )?;
-                require(
-                    link == format!("160000 commit {}\treverie\n", expected.reverie_pin),
-                    "static H gitlink mismatch",
-                )?;
-                for relative in [
-                    "Cargo.toml",
-                    "Cargo.lock",
-                    "detcore-liteinst/Cargo.toml",
-                    "detcore-liteinst/src/lib.rs",
-                ] {
+                if let Some(gitlink) = gitlink {
+                    guard.root(
+                        &expected.workspace.join(gitlink),
+                        expected.reverie_pin,
+                        runner,
+                    )?;
+                    let link = runner.text(
+                        "git",
+                        &["--no-replace-objects", "ls-tree", "HEAD", "--", gitlink],
+                        expected.workspace,
+                    )?;
+                    require(
+                        link == format!("160000 commit {}\t{gitlink}\n", expected.reverie_pin),
+                        "static H gitlink mismatch",
+                    )?;
+                }
+                let relatives = [
+                    consumer.root_manifest_relative(),
+                    consumer.root_lock_relative(),
+                    consumer.manifest_relative(),
+                    consumer.lib_rs_relative(),
+                ];
+                for (index, &relative) in relatives.iter().enumerate() {
+                    // A leaf that is its own workspace root (literoot's
+                    // preload) names one manifest twice; guard it once.
+                    if relatives[..index].contains(&relative) {
+                        continue;
+                    }
                     guard.files.push(compiled_blob_file(
                         expected.workspace,
                         expected.workspace_head,
@@ -67485,7 +68534,19 @@ pub mod private_static {
                         runner,
                     )?);
                 }
-                let manifest = expected.workspace.join("detcore-liteinst/Cargo.toml");
+                if matches!(
+                    consumer.binding(),
+                    selected_initializers::WorkspaceBinding::CargoGitRev
+                ) {
+                    let lock =
+                        fs::read_to_string(expected.workspace.join(consumer.root_lock_relative()))
+                            .map_err(|e| e.to_string())?;
+                    require(
+                        cargo_git_rev_lock_accepts(&lock, expected.reverie_pin),
+                        "static CargoGitRev lock does not name the exact Reverie rev (local patch refused)",
+                    )?;
+                }
+                let manifest = expected.workspace.join(consumer.manifest_relative());
                 let output = runner.run(
                     cargo.path.to_str().ok_or("non-UTF8 cargo")?,
                     &[
@@ -67498,7 +68559,7 @@ pub mod private_static {
                         "--filter-platform".into(),
                         TARGET.into(),
                         "--features".into(),
-                        FEATURES.join(","),
+                        consumer.features().join(","),
                     ],
                     expected.workspace,
                 )?;
@@ -67507,21 +68568,14 @@ pub mod private_static {
                     .as_array()
                     .ok_or("static metadata lacks packages")?;
                 let mut roots = Vec::new();
-                let source = format!(
-                    "git+https://github.com/rrnewton/reverie.git?rev={0}#{0}",
-                    expected.reverie_pin
-                );
-                for name in ["reverie-inguest", "reverie-liteinst", "reverie-loader"] {
-                    let rows: Vec<_> = packages.iter().filter(|p| p["name"] == name).collect();
-                    require(
-                        rows.len() == 1 && rows[0]["source"].as_str() == Some(source.as_str()),
-                        "static metadata R source/uniqueness mismatch",
-                    )?;
-                    let p = real_file(Path::new(
-                        rows[0]["manifest_path"]
-                            .as_str()
-                            .ok_or("static R manifest absent")?,
-                    ))?;
+                let id = leaf_package_id(expected.workspace, consumer)?;
+                for (name, manifest) in bound_reverie_manifests(
+                    &metadata,
+                    consumer.binding(),
+                    expected.reverie_pin,
+                    &id,
+                )? {
+                    let p = real_file(Path::new(manifest))?;
                     let root = p
                         .parent()
                         .and_then(Path::parent)
@@ -67542,18 +68596,14 @@ pub mod private_static {
                 guard.cache_root(&roots[0], expected.reverie_pin, runner)?;
                 let rows: Vec<_> = packages
                     .iter()
-                    .filter(|p| p["name"] == "detcore-liteinst")
+                    .filter(|p| p["name"] == consumer.package_name())
                     .collect();
                 require(rows.len() == 1, "static metadata leaf ambiguous")?;
                 let leaf = rows[0];
-                let id = format!(
-                    "path+file://{}#0.5.6",
-                    expected.workspace.join("detcore-liteinst").display()
-                );
                 require(
                     leaf["id"] == id
                         && leaf["source"].is_null()
-                        && leaf["version"] == "0.5.6"
+                        && leaf["version"] == consumer.package_version()
                         && leaf["manifest_path"].as_str() == manifest.to_str(),
                     "static leaf package identity mismatch",
                 )?;
@@ -67562,17 +68612,14 @@ pub mod private_static {
                     .ok_or("static leaf targets absent")?;
                 let lib: Vec<_> = targets
                     .iter()
-                    .filter(|t| t["name"] == "detcore_liteinst")
+                    .filter(|t| t["name"] == consumer.lib_target())
                     .collect();
                 require(
                     lib.len() == 1
                         && strings(&lib[0]["kind"])? == ["cdylib"]
                         && strings(&lib[0]["crate_types"])? == ["cdylib"]
                         && lib[0]["src_path"].as_str()
-                            == expected
-                                .workspace
-                                .join("detcore-liteinst/src/lib.rs")
-                                .to_str(),
+                            == expected.workspace.join(consumer.lib_rs_relative()).to_str(),
                     "static explicit Cargo override requires actual cdylib metadata target",
                 )?;
                 let mut target = lib[0].clone();
@@ -67582,13 +68629,13 @@ pub mod private_static {
                 target["crate_types"] = serde_json::json!(["staticlib"]);
                 let package = PackageIdentity {
                     id,
-                    name: "detcore-liteinst".into(),
-                    manifest,
+                    name: consumer.package_name().into(),
+                    manifest: manifest.clone(),
                     source: None,
-                    target: "detcore_liteinst".into(),
+                    target: consumer.lib_target().into(),
                     kind: vec!["staticlib".into()],
                     crate_types: vec!["staticlib".into()],
-                    target_source: expected.workspace.join("detcore-liteinst/src/lib.rs"),
+                    target_source: expected.workspace.join(consumer.lib_rs_relative()),
                 };
                 Ok((
                     package,
@@ -67612,6 +68659,7 @@ pub mod private_static {
                 guard,
                 cargo,
                 target_dir: expected.target_dir.to_owned(),
+                consumer: selected,
                 archive_owner: Arc::new(ArchiveSourceOwner { _reserved: 0 }),
             };
             let result = body(&context, runner);
@@ -67643,7 +68691,7 @@ pub mod private_static {
                         "--profile".into(),
                         "liteinst-runtime".into(),
                         "--features".into(),
-                        FEATURES.join(","),
+                        self.consumer.source().features().join(","),
                         "--crate-type".into(),
                         "staticlib".into(),
                         "--message-format=json-render-diagnostics".into(),
@@ -67660,9 +68708,12 @@ pub mod private_static {
                     &self.package,
                     &self.target,
                     &self.build_targets,
-                    &self.target_dir,
-                    &self.metadata_sha256,
-                    &self.archive_owner,
+                    ArchiveSelectionExpectation {
+                        target_dir: &self.target_dir,
+                        metadata_sha256: &self.metadata_sha256,
+                        expected_features: self.consumer.source().features(),
+                        archive_owner: &self.archive_owner,
+                    },
                 )
             })();
             close_result(result, self.guard.close(runner))
@@ -67696,15 +68747,26 @@ pub mod private_static {
             &self.cargo_messages_sha256
         }
     }
+    struct ArchiveSelectionExpectation<'a> {
+        target_dir: &'a Path,
+        metadata_sha256: &'a str,
+        expected_features: &'a [&'a str],
+        archive_owner: &'a Arc<ArchiveSourceOwner>,
+    }
+
     fn select_archive(
         output: &[u8],
         package: &PackageIdentity,
         target: &Value,
         build_targets: &[Value],
-        target_dir: &Path,
-        metadata_sha256: &str,
-        archive_owner: &Arc<ArchiveSourceOwner>,
+        expectation: ArchiveSelectionExpectation<'_>,
     ) -> Result<StaticArchive> {
+        let ArchiveSelectionExpectation {
+            target_dir,
+            metadata_sha256,
+            expected_features,
+            archive_owner,
+        } = expectation;
         let target_dir = fs::canonicalize(target_dir).map_err(|e| e.to_string())?;
         let mut finished = Vec::new();
         let mut roots = Vec::new();
@@ -67728,7 +68790,7 @@ pub mod private_static {
                 "static package/manifest disagreement",
             )?;
             require(
-                strings(&row["features"])? == FEATURES
+                strings(&row["features"])? == expected_features
                     && row["profile"]["test"] == false
                     && row["executable"].is_null(),
                 "static feature/test/executable mismatch",
@@ -67773,11 +68835,12 @@ pub mod private_static {
             retained.push(file);
         }
         let files = strings(&roots[0]["filenames"])?;
+        let expected_archive_name = format!("lib{}.a", package.target);
         require(
             files.len() == 1
                 && Path::new(&files[0])
                     .file_name()
-                    .is_some_and(|s| s == "libdetcore_liteinst.a"),
+                    .is_some_and(|s| s.to_str() == Some(expected_archive_name.as_str())),
             "static archive output ambiguous",
         )?;
         let file = FileIdentity::read(Path::new(&files[0]))?;
@@ -67912,8 +68975,12 @@ pub mod private_static {
     }
     // Only the target-produced #[used] layout has SHF_GNU_RETAIN. This is an
     // exact role-specific contract, not a mask applied to arbitrary objects.
-    fn layout_object<'a>(elf: &Elf<'_>, bytes: &'a [u8]) -> Result<(sym::Sym, &'a [u8])> {
-        object_with_section_flags(elf, bytes, LAYOUT, 96, 4, 0x200002)
+    fn layout_object<'a>(
+        elf: &Elf<'_>,
+        bytes: &'a [u8],
+        layout: &str,
+    ) -> Result<(sym::Sym, &'a [u8])> {
+        object_with_section_flags(elf, bytes, layout, 96, 4, 0x200002)
     }
     fn object_with_section_flags<'a>(
         elf: &Elf<'_>,
@@ -68232,7 +69299,7 @@ pub mod private_static {
                     (
                         "entry",
                         &self.workspace,
-                        "detcore-liteinst/src/exec_initial/mapped_entry.rs",
+                        self.consumer.source().entry_source_relative(),
                     ),
                     (
                         "exec_private",
@@ -68297,7 +69364,10 @@ pub mod private_static {
                 files.push(geometry.clone());
                 sources.insert("tls_layout", geometry);
                 super::private_machine_diagnostic::startup_census::inspect(
-                    tls_variant,
+                    super::private_machine_diagnostic::startup_census::CensusSelectors {
+                        tls_variant,
+                        entry: self.consumer.source().first_entry()?,
+                    },
                     &archive.file,
                     artifact,
                     link_map,
@@ -68332,9 +69402,11 @@ pub mod private_static {
             objdump: &FileIdentity,
             runner: &mut Runner,
         ) -> Result<super::private_machine_diagnostic::EntryTransferDiagnostic> {
-            let result = super::private_machine_diagnostic::inspect_entry_transfers_with_memcpy(
-                inputs, artifact, objdump, runner,
-            );
+            let result = self.consumer.source().first_entry().and_then(|entry| {
+                super::private_machine_diagnostic::inspect_entry_transfers_with_memcpy(
+                    entry, inputs, artifact, objdump, runner,
+                )
+            });
             close_result(result, self.guard.close(runner))
         }
         /// Inspect current bytes and close source/archive/file identities even
@@ -68444,14 +69516,16 @@ pub mod private_static {
                     Some(observation) => geometry_impl(&elf, &bytes, Some(observation))?,
                     None => geometry(&elf, &bytes)?,
                 };
-                let entry = strong_function(&elf, &bytes, ENTRY)?;
+                let consumer = self.consumer.source();
+                let entry_name = consumer.first_entry()?;
+                let entry = strong_function(&elf, &bytes, entry_name)?;
                 require(
                     elf.entry == entry.st_value,
                     "static ELF entry differs from genuine mapped entry",
                 )?;
                 let mut strong_symbols = BTreeMap::new();
                 for name in [
-                    ENTRY,
+                    entry_name,
                     "__init_tls",
                     "malloc",
                     "__libc_malloc",
@@ -68535,7 +69609,7 @@ pub mod private_static {
                 )?;
                 // Equality + the ABI interval is observation, not qualification
                 // of both pages' remaining bytes against reviewed instructions.
-                let (_, descriptor) = layout_object(&elf, &bytes)?;
+                let (_, descriptor) = layout_object(&elf, &bytes, consumer.layout())?;
                 let layout = layout_words(descriptor)?;
                 Ok(StaticImageInspection {
                     artifact: artifact.clone(),
@@ -68571,6 +69645,468 @@ pub mod private_static {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn workspace_binding_rules_are_kind_specific() {
+            let workspace = Path::new("/ws");
+            let hermit = selected_initializers::WorkspaceBinding::HermitGitlink {
+                reverie_gitlink_relative: "reverie",
+            };
+            let cargo = selected_initializers::WorkspaceBinding::CargoGitRev;
+            assert!(target_dir_accepted(
+                hermit,
+                workspace,
+                &workspace.join("target")
+            ));
+            assert!(!target_dir_accepted(
+                hermit,
+                workspace,
+                Path::new("/elsewhere/target")
+            ));
+            assert!(target_dir_accepted(
+                cargo,
+                workspace,
+                Path::new("/elsewhere/target")
+            ));
+            assert!(!target_dir_accepted(
+                cargo,
+                workspace,
+                Path::new("relative/target")
+            ));
+            // Detcore keeps the pre-generalization refusal text.
+            assert_eq!(
+                target_dir_refusal(hermit),
+                "static producer requires canonical sole H/target"
+            );
+            assert_eq!(
+                target_dir_refusal(cargo),
+                "static producer requires canonical explicit target"
+            );
+
+            // Verbatim reverie-core entry from literoot 74c241de
+            // preload/Cargo.lock lines 811-814 (the preload workspace's
+            // own lock), so the control cannot self-mirror the
+            // implementation's format string.
+            let pin = "02973cdcfcadd21190fda864dfa9eb1b3e6ed1c1";
+            let exact = "[[package]]\nname = \"reverie-core\"\nversion = \"0.5.4\"\nsource = \"git+https://github.com/rrnewton/reverie?rev=02973cdcfcadd21190fda864dfa9eb1b3e6ed1c1#02973cdcfcadd21190fda864dfa9eb1b3e6ed1c1\"\n".to_owned();
+            let dot_git = exact.replace("rrnewton/reverie?", "rrnewton/reverie.git?");
+            assert!(!cargo_git_rev_lock_accepts(&dot_git, pin));
+            assert!(cargo_git_rev_lock_accepts(&exact, pin));
+            assert!(!cargo_git_rev_lock_accepts(
+                "[[package]]\nname = \"reverie-core\"\n",
+                pin
+            ));
+            let wrong = exact.replace(pin, "ffffffffffffffffffffffffffffffffffffffff");
+            assert!(!cargo_git_rev_lock_accepts(&wrong, pin));
+            let patched = "[[package]]\nname = \"reverie-core\"\nversion = \"0.5.4\"\n";
+            assert!(!cargo_git_rev_lock_accepts(patched, pin));
+        }
+
+        #[test]
+        fn reverie_resolve_binding_refuses_other_revs_and_local_patches() {
+            let pin = "02973cdcfcadd21190fda864dfa9eb1b3e6ed1c1";
+            let other = "ffffffffffffffffffffffffffffffffffffffff";
+            let hermit = selected_initializers::WorkspaceBinding::HermitGitlink {
+                reverie_gitlink_relative: "reverie",
+            };
+            let cargo = selected_initializers::WorkspaceBinding::CargoGitRev;
+            let canonical =
+                |rev: &str| format!("git+https://github.com/rrnewton/reverie?rev={rev}#{rev}");
+            let dot_git =
+                |rev: &str| format!("git+https://github.com/rrnewton/reverie.git?rev={rev}#{rev}");
+            let leaf = "path+file:///ws/preload#literoot-preload@0.0.1";
+            let crates_io = "registry+https://github.com/rust-lang/crates.io-index";
+            // Field shapes copied from `cargo metadata --offline
+            // --format-version=1 --features mapped-successor
+            // --filter-platform x86_64-unknown-linux-musl` (cargo 1.97.1)
+            // over literoot 74c241de preload/: a git package's id swaps
+            // the source's `#<sha>` for `#<name>@<version>`; a registry
+            // id is `<registry>#<name>@<version>`; a local path package
+            // has a null source and a `path+file` id; checkout manifests
+            // sit under one `<checkout>/<rev7>/` root; a dependency
+            // declared inside the checkout carries `?rev=<rev>#<rev>` in
+            // `dependencies[].source`, while the leaf's own Reverie
+            // dependencies read `?rev=<rev>` (no fragment);
+            // `resolve.nodes[].deps[].pkg` names the package each edge
+            // resolved to.
+            let id_of = |name: &str, source: Option<&str>| match source {
+                Some(source) => format!("{}#{name}@0.5.4", source.split('#').next().unwrap()),
+                None => format!("path+file:///home/u/reverie/{name}#0.5.4"),
+            };
+            let checkout = "/home/u/.cargo/git/checkouts/reverie-2fc770f7a9c80803/02973cd";
+            // (package, its declared Reverie-internal dependencies).
+            // reverie-rpc-transport is declared only by the leaf;
+            // safeptrace is internal but not named `reverie-*`.
+            let graph: [(&str, &[&str]); 8] = [
+                (
+                    "literoot-preload",
+                    &["reverie-core", "reverie-liteinst", "reverie-rpc-transport"],
+                ),
+                ("reverie-core", &[]),
+                (
+                    "reverie-inguest",
+                    &[
+                        "reverie-core",
+                        "reverie-loader",
+                        "reverie-syscalls",
+                        "safeptrace",
+                    ],
+                ),
+                ("reverie-liteinst", &["reverie-inguest", "reverie-loader"]),
+                ("reverie-loader", &[]),
+                ("reverie-syscalls", &[]),
+                ("reverie-rpc-transport", &[]),
+                ("safeptrace", &[]),
+            ];
+            // `swaps` replaces where a named crate resolves (its source);
+            // `None` is a local path package.
+            let metadata = |spelling: &dyn Fn(&str) -> String, swaps: &[(&str, Option<String>)]| {
+                let pinned = spelling(pin);
+                let source_of = |name: &str| -> Option<String> {
+                    if name == "literoot-preload" {
+                        return None;
+                    }
+                    swaps
+                        .iter()
+                        .find(|(swapped, _)| *swapped == name)
+                        .map_or(Some(pinned.clone()), |(_, source)| source.clone())
+                };
+                let id_for = |name: &str| match name {
+                    "literoot-preload" => leaf.to_owned(),
+                    _ => id_of(name, source_of(name).as_deref()),
+                };
+                let mut packages = vec![serde_json::json!({
+                    "name": "libc",
+                    "id": format!("{crates_io}#libc@0.2.186"),
+                    "source": crates_io,
+                    "dependencies": [],
+                })];
+                let mut nodes = vec![serde_json::json!({
+                    "id": format!("{crates_io}#libc@0.2.186"),
+                    "deps": [],
+                })];
+                for (name, internal) in graph {
+                    let declared = match name {
+                        "literoot-preload" => pinned.split('#').next().unwrap(),
+                        _ => pinned.as_str(),
+                    };
+                    let mut dependencies: Vec<_> = internal
+                        .iter()
+                        .map(|dep| serde_json::json!({"name": dep, "source": declared}))
+                        .collect();
+                    dependencies.push(serde_json::json!({"name": "libc", "source": crates_io}));
+                    let mut deps: Vec<_> = internal
+                        .iter()
+                        .map(|dep| serde_json::json!({"name": dep.replace('-', "_"), "pkg": id_for(dep)}))
+                        .collect();
+                    deps.push(serde_json::json!({"name": "libc", "pkg": format!("{crates_io}#libc@0.2.186")}));
+                    let manifest = match source_of(name) {
+                        _ if name == "literoot-preload" => "/ws/preload/Cargo.toml".to_owned(),
+                        Some(_) => format!("{checkout}/{name}/Cargo.toml"),
+                        None => format!("/home/u/reverie/{name}/Cargo.toml"),
+                    };
+                    packages.push(serde_json::json!({
+                        "name": name,
+                        "id": id_for(name),
+                        "source": source_of(name),
+                        "manifest_path": manifest,
+                        "dependencies": dependencies,
+                    }));
+                    nodes.push(serde_json::json!({"id": id_for(name), "deps": deps}));
+                }
+                serde_json::json!({
+                    "packages": packages,
+                    "workspace_members": [leaf],
+                    "resolve": {"nodes": nodes},
+                })
+            };
+            let exact = metadata(&canonical, &[]);
+            let bound = bound_reverie_manifests(&exact, cargo, pin, leaf).unwrap();
+            assert_eq!(
+                bound,
+                ["reverie-inguest", "reverie-liteinst", "reverie-loader"]
+                    .map(|name| (name, format!("{checkout}/{name}/Cargo.toml")))
+                    .iter()
+                    .map(|(name, manifest)| (*name, manifest.as_str()))
+                    .collect::<Vec<_>>()
+            );
+            // Each kind binds its own spelling of the exact rev. The
+            // bound-package equality is checked first, so this refusal
+            // text comes from it and not from the CargoGitRev checks.
+            let mismatch = "static metadata R source/uniqueness mismatch";
+            assert_eq!(
+                bound_reverie_manifests(&exact, hermit, pin, leaf)
+                    .err()
+                    .unwrap(),
+                mismatch
+            );
+            let hermit_exact = metadata(&dot_git, &[]);
+            assert_eq!(
+                bound_reverie_manifests(&hermit_exact, hermit, pin, leaf)
+                    .unwrap()
+                    .len(),
+                3
+            );
+            assert_eq!(
+                bound_reverie_manifests(&hermit_exact, cargo, pin, leaf)
+                    .err()
+                    .unwrap(),
+                mismatch
+            );
+            for binding in [hermit, cargo] {
+                for metadata in [&exact, &hermit_exact] {
+                    assert_eq!(
+                        bound_reverie_manifests(metadata, binding, other, leaf)
+                            .err()
+                            .unwrap(),
+                        mismatch
+                    );
+                }
+            }
+            let mut duplicate = exact.clone();
+            let again = duplicate["packages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["name"] == "reverie-inguest")
+                .unwrap()
+                .clone();
+            duplicate["packages"].as_array_mut().unwrap().push(again);
+            assert_eq!(
+                bound_reverie_manifests(&duplicate, cargo, pin, leaf)
+                    .err()
+                    .unwrap(),
+                mismatch
+            );
+            // A local path patch refuses whether or not the patched tree
+            // is also declared a workspace member (cargo then lists it in
+            // workspace_members; coord7 lens A2 measured that resolve).
+            let local = metadata(&canonical, &[("reverie-syscalls", None)]);
+            let only_leaf = "static CargoGitRev resolve has a source-less package other than the leaf (local patch refused)";
+            assert_eq!(
+                bound_reverie_manifests(&local, cargo, pin, leaf)
+                    .err()
+                    .unwrap(),
+                only_leaf
+            );
+            let mut member_declared = local.clone();
+            member_declared["workspace_members"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!(id_of("reverie-syscalls", None)));
+            assert_eq!(
+                bound_reverie_manifests(&member_declared, cargo, pin, leaf)
+                    .err()
+                    .unwrap(),
+                only_leaf
+            );
+            // The leaf itself must be that one source-less package.
+            assert_eq!(
+                bound_reverie_manifests(&exact, cargo, pin, "path+file:///ws/other#x@0.0.1")
+                    .err()
+                    .unwrap(),
+                only_leaf
+            );
+            // Patches cargo accepts for an unbound internal crate (a
+            // fork, another spelling of the repository, a registry, a
+            // stale rev). reverie-syscalls and safeptrace are reached from
+            // a pinned crate (`#<rev>` declarations); reverie-rpc-transport
+            // only from the leaf (`?rev=<rev>` declaration), which swapped
+            // to a fork is coord7's round-2 case E1. The edge rule runs
+            // before the `reverie-*` rule, so this text pins the edge rule
+            // even for the `reverie-*` names.
+            let outside =
+                "static CargoGitRev Reverie dependency resolves outside the pinned source";
+            for crate_name in ["reverie-syscalls", "safeptrace", "reverie-rpc-transport"] {
+                for swapped in [
+                    format!("git+https://github.com/fork/reverie?rev={other}#{other}"),
+                    format!("git+ssh://git@github.com/rrnewton/reverie?rev={pin}#{pin}"),
+                    format!("git+https://github.com/RRNewton/reverie?rev={pin}#{pin}"),
+                    dot_git(pin),
+                    canonical(other),
+                    crates_io.to_owned(),
+                ] {
+                    let patched = metadata(&canonical, &[(crate_name, Some(swapped.clone()))]);
+                    assert_eq!(
+                        bound_reverie_manifests(&patched, cargo, pin, leaf)
+                            .err()
+                            .unwrap(),
+                        outside,
+                        "{crate_name} -> {swapped}"
+                    );
+                }
+            }
+            // Verbatim entries from the captured `cargo metadata` of
+            // literoot 74c241de preload/ (cargo 1.97.1, pin 02973cdc): the
+            // leaf's declaration of reverie-rpc-transport (no fragment),
+            // reverie-inguest's declaration of reverie-syscalls (with
+            // fragment) and both resolve edges.
+            const LEAF_DECLARES: &str = r#"{"name": "reverie-rpc-transport", "source": "git+https://github.com/rrnewton/reverie?rev=02973cdcfcadd21190fda864dfa9eb1b3e6ed1c1", "req": "*", "kind": null, "rename": null, "optional": true, "uses_default_features": true, "features": [], "target": null, "registry": null}"#;
+            const CHECKOUT_DECLARES: &str = r#"{"name": "reverie-syscalls", "source": "git+https://github.com/rrnewton/reverie?rev=02973cdcfcadd21190fda864dfa9eb1b3e6ed1c1#02973cdcfcadd21190fda864dfa9eb1b3e6ed1c1", "req": "^0.5.4", "kind": null, "rename": null, "optional": false, "uses_default_features": true, "features": [], "target": null, "registry": null}"#;
+            const LEAF_EDGE: &str = r#"{"name": "reverie_rpc_transport", "pkg": "git+https://github.com/rrnewton/reverie?rev=02973cdcfcadd21190fda864dfa9eb1b3e6ed1c1#reverie-rpc-transport@0.5.4", "dep_kinds": [{"kind": null, "target": null}]}"#;
+            const CHECKOUT_EDGE: &str = r#"{"name": "reverie_syscalls", "pkg": "git+https://github.com/rrnewton/reverie?rev=02973cdcfcadd21190fda864dfa9eb1b3e6ed1c1#reverie-syscalls@0.5.4", "dep_kinds": [{"kind": null, "target": null}]}"#;
+            let real = |text: &str| serde_json::from_str::<Value>(text).unwrap();
+            // Swap in the verbatim objects; each edge keeps the package
+            // the fixture resolved it to, so swaps still apply.
+            let with_real = |mut metadata: Value| {
+                let parent_id = |name: &str| id_of(name, Some(&canonical(pin)));
+                for (parent, dep, declares, edge) in [
+                    (
+                        leaf.to_owned(),
+                        "reverie-rpc-transport",
+                        LEAF_DECLARES,
+                        LEAF_EDGE,
+                    ),
+                    (
+                        parent_id("reverie-inguest"),
+                        "reverie-syscalls",
+                        CHECKOUT_DECLARES,
+                        CHECKOUT_EDGE,
+                    ),
+                ] {
+                    for package in metadata["packages"].as_array_mut().unwrap() {
+                        if package["id"] == parent.as_str() {
+                            for declared in package["dependencies"].as_array_mut().unwrap() {
+                                if declared["name"] == dep {
+                                    *declared = real(declares);
+                                }
+                            }
+                        }
+                    }
+                    for node in metadata["resolve"]["nodes"].as_array_mut().unwrap() {
+                        if node["id"] == parent.as_str() {
+                            for resolved in node["deps"].as_array_mut().unwrap() {
+                                if resolved["name"] == real(edge)["name"] {
+                                    let pkg = resolved["pkg"].clone();
+                                    *resolved = real(edge);
+                                    resolved["pkg"] = pkg;
+                                }
+                            }
+                        }
+                    }
+                }
+                metadata
+            };
+            // The fixture already produces cargo's shapes: its source
+            // strings and edge targets equal the verbatim ones.
+            let leaf_row = exact["packages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["id"] == leaf)
+                .unwrap();
+            let fixture_declared = leaf_row["dependencies"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|d| d["name"] == "reverie-rpc-transport")
+                .unwrap();
+            assert_eq!(fixture_declared["source"], real(LEAF_DECLARES)["source"]);
+            let leaf_node = exact["resolve"]["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|n| n["id"] == leaf)
+                .unwrap();
+            assert!(
+                leaf_node["deps"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|e| e["name"] == real(LEAF_EDGE)["name"]
+                        && e["pkg"] == real(LEAF_EDGE)["pkg"])
+            );
+            let real_exact = with_real(exact.clone());
+            assert_eq!(
+                bound_reverie_manifests(&real_exact, cargo, pin, leaf)
+                    .unwrap()
+                    .len(),
+                3
+            );
+            for crate_name in ["reverie-rpc-transport", "reverie-syscalls"] {
+                let fork = format!("git+https://github.com/fork/reverie?rev={other}#{other}");
+                let patched = with_real(metadata(&canonical, &[(crate_name, Some(fork))]));
+                assert_eq!(
+                    bound_reverie_manifests(&patched, cargo, pin, leaf)
+                        .err()
+                        .unwrap(),
+                    outside,
+                    "verbatim declarations, {crate_name} -> fork"
+                );
+            }
+            // The leaf declares `name` directly, at `resolved` (a git
+            // source with its `#<rev>`), optionally under a rename; its
+            // declaration reads `?rev=<rev>` as cargo prints it.
+            let leaf_declares = |name: &str, rename: Option<&str>, resolved: &str| {
+                let mut metadata = exact.clone();
+                let id = id_of(name, Some(resolved));
+                let declared = resolved.split('#').next().unwrap();
+                metadata["packages"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(serde_json::json!({
+                        "name": name,
+                        "id": id,
+                        "source": resolved,
+                        "manifest_path": format!("/home/u/.cargo/git/checkouts/other/fffffff/{name}/Cargo.toml"),
+                        "dependencies": [],
+                    }));
+                for package in metadata["packages"].as_array_mut().unwrap() {
+                    if package["id"] == leaf {
+                        package["dependencies"]
+                            .as_array_mut()
+                            .unwrap()
+                            .push(serde_json::json!({
+                                "name": name, "rename": rename, "source": declared,
+                            }));
+                    }
+                }
+                let extern_name = rename.map_or(name.replace('-', "_"), str::to_owned);
+                for node in metadata["resolve"]["nodes"].as_array_mut().unwrap() {
+                    if node["id"] == leaf {
+                        node["deps"]
+                            .as_array_mut()
+                            .unwrap()
+                            .push(serde_json::json!({"name": extern_name, "pkg": id}));
+                    }
+                }
+                metadata["resolve"]["nodes"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(serde_json::json!({"id": id, "deps": []}));
+                metadata
+            };
+            // A second copy of a pinned crate at another rev, declared by
+            // the leaf under a rename (lens A2 case V5).
+            let second_copy = leaf_declares("reverie-syscalls", Some("rsys2"), &canonical(other));
+            assert_eq!(
+                bound_reverie_manifests(&second_copy, cargo, pin, leaf)
+                    .err()
+                    .unwrap(),
+                "static CargoGitRev resolve carries a second copy of a pinned Reverie crate"
+            );
+            // A `reverie-*` crate no pinned crate reaches, declared by the
+            // leaf at a stale rev (E5) or at a fork (E3).
+            let not_pinned =
+                "static CargoGitRev resolve has a reverie-* package outside the pinned source";
+            for resolved in [
+                canonical(other),
+                format!("git+https://github.com/fork/reverie?rev={other}#{other}"),
+            ] {
+                let direct = leaf_declares("reverie-extra", None, &resolved);
+                assert_eq!(
+                    bound_reverie_manifests(&direct, cargo, pin, leaf)
+                        .err()
+                        .unwrap(),
+                    not_pinned,
+                    "{resolved}"
+                );
+            }
+            let mut no_resolve = exact.clone();
+            no_resolve["resolve"] = Value::Null;
+            assert!(bound_reverie_manifests(&no_resolve, cargo, pin, leaf).is_err());
+        }
+
         struct CacheFixture {
             base: PathBuf,
             root: PathBuf,
@@ -68859,10 +70395,10 @@ pub mod private_static {
             let (_, payload) =
                 object(&elf, &bytes, "reverie_inguest_fixed_gate_template", 4096, 4).unwrap();
             assert_eq!(payload, &[0x5a; 4096]);
-            assert!(layout_object(&elf, &bytes).is_err());
+            assert!(layout_object(&elf, &bytes, LAYOUT).is_err());
             let bytes = reference_object_fixture(LAYOUT, 96, 0x200002);
             let elf = Elf::parse(&bytes).unwrap();
-            let (_, payload) = layout_object(&elf, &bytes).unwrap();
+            let (_, payload) = layout_object(&elf, &bytes, LAYOUT).unwrap();
             assert_eq!(payload, &[0x5a; 96]);
             // The ordinary object path remains strict even for the same name.
             assert!(object(&elf, &bytes, LAYOUT, 96, 4).is_err());
@@ -68888,7 +70424,7 @@ pub mod private_static {
                 );
                 let bytes = reference_object_fixture(LAYOUT, 96, 0x200002 | extra);
                 assert!(
-                    layout_object(&Elf::parse(&bytes).unwrap(), &bytes).is_err(),
+                    layout_object(&Elf::parse(&bytes).unwrap(), &bytes, LAYOUT).is_err(),
                     "layout flags {extra:#x}"
                 );
             }
@@ -68905,7 +70441,7 @@ pub mod private_static {
                 .is_err()
             );
             let bytes = reference_object_fixture(LAYOUT, 96, 2);
-            assert!(layout_object(&Elf::parse(&bytes).unwrap(), &bytes).is_err());
+            assert!(layout_object(&Elf::parse(&bytes).unwrap(), &bytes, LAYOUT).is_err());
         }
         #[test]
         fn private_static_retained_layout_keeps_type_size_load_and_coordinate_checks() {
@@ -68925,7 +70461,7 @@ pub mod private_static {
                 let mut bytes = original.clone();
                 bytes[at..at + width].copy_from_slice(&value.to_le_bytes()[..width]);
                 assert!(
-                    layout_object(&Elf::parse(&bytes).unwrap(), &bytes).is_err(),
+                    layout_object(&Elf::parse(&bytes).unwrap(), &bytes, LAYOUT).is_err(),
                     "field {at}"
                 );
             }
@@ -69164,9 +70700,12 @@ pub mod private_static {
                         &package,
                         &serde_json::json!({}),
                         &[],
-                        Path::new("/"),
-                        "not-authority",
-                        &Arc::new(ArchiveSourceOwner { _reserved: 0 })
+                        ArchiveSelectionExpectation {
+                            target_dir: Path::new("/"),
+                            metadata_sha256: "not-authority",
+                            expected_features: FEATURES,
+                            archive_owner: &Arc::new(ArchiveSourceOwner { _reserved: 0 }),
+                        },
                     )
                     .is_err()
                 );
@@ -69353,6 +70892,8 @@ pub mod private_machine_diagnostic {
             Role {
                 name: "entry",
                 source: Some("entry"),
+                // Recorded V9 selector only; `inspect` selects the
+                // entry its source transaction's consumer names.
                 symbol: "detcore_liteinst_mapped_entry",
                 asynchronous: false,
             },
@@ -69654,10 +71195,17 @@ pub mod private_machine_diagnostic {
             Ok(bytes)
         }
 
+        /// What the source transaction selects for the census: the TLS
+        /// source variant and the first entry of its mapped consumer.
+        pub(in super::super) struct CensusSelectors {
+            pub(in super::super) tls_variant: super::super::private_static::tls_sources::Variant,
+            pub(in super::super) entry: &'static str,
+        }
+
         // Only the source factory calls this. All output is diagnostic data, including
         // a successfully collected body. No variant can satisfy an executable API.
         pub(in super::super) fn inspect(
-            tls_variant: super::super::private_static::tls_sources::Variant,
+            selectors: CensusSelectors,
             archive: &FileIdentity,
             artifact: &FileIdentity,
             link_map: &FileIdentity,
@@ -69665,6 +71213,7 @@ pub mod private_machine_diagnostic {
             sources: BTreeMap<&'static str, FileIdentity>,
             runner: &mut Runner,
         ) -> Result<PrivateStartupCensus> {
+            let CensusSelectors { tls_variant, entry } = selectors;
             let mut files = vec![
                 archive.clone(),
                 artifact.clone(),
@@ -69708,12 +71257,12 @@ pub mod private_machine_diagnostic {
                 for role in ROLES.iter().chain(project) {
                     let selected_selector = selector(cohort, role);
                     let source = selected_selector.map_or(role.source, |(_, source)| source);
-                    let expected_symbol = selected_selector.map(|(symbol, _)| {
-                        if role.name == "tls_geometry" {
-                            tls_variant.geometry_symbol()
-                        } else {
-                            symbol
-                        }
+                    let expected_symbol = selected_selector.map(|(symbol, _)| match role.name {
+                        "tls_geometry" => tls_variant.geometry_symbol(),
+                        // The source transaction's consumer, not the
+                        // recorded Detcore selector below.
+                        "entry" => entry,
+                        _ => symbol,
                     });
                     let matches = elf
                         .syms
@@ -70427,8 +71976,6 @@ pub mod private_machine_diagnostic {
         }
     }
 
-    const ENTRY: &str = "detcore_liteinst_mapped_entry";
-
     /// Immutable observations only. Even a complete root transfer census leaves
     /// every callee's semantics and pre-TLS closure explicitly unproved.
     #[derive(Debug, Serialize)]
@@ -70621,22 +72168,29 @@ pub mod private_machine_diagnostic {
     /// No returned value can be converted to an existing admission capability.
     /// An unsupported transfer is retained as diagnostic refusal; NOT_PROVEN
     /// remains unconditional even when all root transfers have known addresses.
+    ///
+    /// Outside a source transaction the caller names the closed mapped
+    /// consumer whose first entry roots the census; this is that call's
+    /// one selection.
     pub fn inspect_entry_transfers(
+        consumer: private_static::selected_initializers::MappedConsumer,
         artifact: &FileIdentity,
         objdump: &FileIdentity,
         runner: &mut Runner,
     ) -> Result<EntryTransferDiagnostic> {
-        inspect_entry_transfers_impl(artifact, objdump, runner, None, None)
+        let entry = consumer.source().first_entry()?;
+        inspect_entry_transfers_impl(entry, artifact, objdump, runner, None, None)
     }
 
     pub(super) fn inspect_entry_transfers_with_memcpy(
+        entry: &str,
         inputs: &NativeMemcpyInputs<'_>,
         artifact: &FileIdentity,
         objdump: &FileIdentity,
         runner: &mut Runner,
     ) -> Result<EntryTransferDiagnostic> {
         with_native_memcpy(inputs, artifact, |role| {
-            inspect_entry_transfers_impl(artifact, objdump, runner, Some(role), None)
+            inspect_entry_transfers_impl(entry, artifact, objdump, runner, Some(role), None)
         })
     }
 
@@ -70646,7 +72200,14 @@ pub mod private_machine_diagnostic {
         objdump: &FileIdentity,
         runner: &mut Runner,
     ) -> Result<EntryTransferDiagnostic> {
-        inspect_entry_transfers_impl(artifact, objdump, runner, None, Some(role))
+        inspect_entry_transfers_impl(
+            role.mapped_entry(),
+            artifact,
+            objdump,
+            runner,
+            None,
+            Some(role),
+        )
     }
 
     pub(crate) fn inspect_entry_transfers_with_ordinary_and_memcpy(
@@ -70657,11 +72218,19 @@ pub mod private_machine_diagnostic {
         runner: &mut Runner,
     ) -> Result<EntryTransferDiagnostic> {
         with_native_memcpy(inputs, artifact, |native| {
-            inspect_entry_transfers_impl(artifact, objdump, runner, Some(native), Some(ordinary))
+            inspect_entry_transfers_impl(
+                ordinary.mapped_entry(),
+                artifact,
+                objdump,
+                runner,
+                Some(native),
+                Some(ordinary),
+            )
         })
     }
 
     fn inspect_entry_transfers_impl(
+        entry: &str,
         artifact: &FileIdentity,
         objdump: &FileIdentity,
         runner: &mut Runner,
@@ -70683,7 +72252,7 @@ pub mod private_machine_diagnostic {
             let roots: Vec<_> = elf
                 .syms
                 .iter()
-                .filter(|s| elf.strtab.get_at(s.st_name) == Some(ENTRY))
+                .filter(|s| elf.strtab.get_at(s.st_name) == Some(entry))
                 .collect();
             require(roots.len() == 1, "mapped root absent/ambiguous")?;
             let root = roots[0];
@@ -70783,7 +72352,7 @@ pub mod private_machine_diagnostic {
                 artifact: artifact.clone(),
                 objdump_tool: objdump.clone(),
                 disassembly,
-                root: symbol_evidence(ENTRY, &root),
+                root: symbol_evidence(entry, &root),
                 complete_root_bytes: usize::try_from(root.st_size)
                     .map_err(|_| "root byte count exceeds usize")?,
                 complete_root_instructions: instructions.len(),

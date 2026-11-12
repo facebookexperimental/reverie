@@ -634,8 +634,11 @@ pub enum HandleFailure {
     #[error(transparent)]
     TraceError(#[from] TraceError),
 
+    /// Boxed: [`Wait`] is large (a new child's running state rides in its
+    /// event), and this is the rare path, so the `Result`s of the stepping
+    /// calls stay small.
     #[error("Unexpected event while single stepping")]
-    Event(Wait),
+    Event(Box<Wait>),
 
     /// A single step ended at a seccomp stop: the stepped instruction entered
     /// a traced syscall. The caller dispatches it like
@@ -3708,10 +3711,10 @@ impl TimerImpl {
                 {
                     self.check_branch_run(&new_task, unit, current.rcbs(), target_rcb, None);
                     restore_breakpoints(breakpoints.regs(), &new_task);
-                    return Err(HandleFailure::Event(Wait::Stopped(
+                    return Err(HandleFailure::Event(Box::new(Wait::Stopped(
                         new_task,
                         TraceEvent::Signal(Signal::SIGTRAP),
-                    )));
+                    ))));
                 }
                 (_, Wait::Stopped(new_task, event))
                     if !matches!(event, TraceEvent::Signal(Signal::SIGTRAP)) =>
@@ -3821,13 +3824,15 @@ impl TimerImpl {
                     if matches!(event, TraceEvent::Seccomp) {
                         return Err(HandleFailure::SeccompStop(new_task));
                     }
-                    return Err(HandleFailure::Event(Wait::Stopped(new_task, event)));
+                    return Err(HandleFailure::Event(Box::new(Wait::Stopped(
+                        new_task, event,
+                    ))));
                 }
                 #[cfg(not(target_arch = "x86_64"))]
                 Wait::Stopped(new_task, TraceEvent::Seccomp) => {
                     return Err(HandleFailure::SeccompStop(new_task));
                 }
-                wait => return Err(HandleFailure::Event(wait)),
+                wait => return Err(HandleFailure::Event(Box::new(wait))),
             };
             // The step's report stop dequeued the thread's one SIGTRAP; a
             // syscall's exit stop dequeued nothing, and the syscall may have
@@ -5858,8 +5863,11 @@ mod tests {
         else {
             return;
         };
-        let Err(super::HandleFailure::Event(super::Wait::Stopped(stopped, event))) = result else {
+        let Err(super::HandleFailure::Event(wait)) = result else {
             panic!("the guest's SIGTRAP was not handed on: {result:?}");
+        };
+        let super::Wait::Stopped(stopped, event) = *wait else {
+            panic!("the guest's SIGTRAP was not handed on: {wait:?}");
         };
         assert_eq!(event, super::TraceEvent::Signal(reverie::Signal::SIGTRAP));
         assert_eq!(
@@ -6429,10 +6437,13 @@ mod tests {
                 );
                 Steps::Reached
             }
-            Err(HandleFailure::Event(Wait::Stopped(stopped, TraceEvent::Signal(_)))) => {
-                let info = stopped.getsiginfo().expect("the stop's siginfo");
-                Steps::HandedOn(info.si_signo, info.si_code)
-            }
+            Err(HandleFailure::Event(wait)) => match *wait {
+                Wait::Stopped(stopped, TraceEvent::Signal(_)) => {
+                    let info = stopped.getsiginfo().expect("the stop's siginfo");
+                    Steps::HandedOn(info.si_signo, info.si_code)
+                }
+                wait => panic!("the steps failed: {wait:?}"),
+            },
             Err(error) => panic!("the steps failed: {error:?}"),
         };
         Some((steps, inner.unnotified_overflows))
@@ -7281,6 +7292,9 @@ mod tests {
     // re-arms the rest of the event in place, as the notification's own stop
     // would, rather than handing the event on to be delivered from far
     // short of its target; a whole programming's is handed on as before.
+    // Uses x86_64-only timer scaffolding (`BranchThread`,
+    // `disregard_stop_before_period`, `retire`). Known aarch64 gap.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn a_lost_halved_notification_rearms_the_rest_at_a_disregarded_stop() {
         use reverie::Pid;
@@ -7889,6 +7903,9 @@ mod tests {
     // before any step (`TimerImpl::rearm_short_of_target`, which `deliver`
     // calls first): the same target and instruction offset, and the new
     // programming's overflow point recorded for a later overshoot record.
+    // Uses x86_64-only timer scaffolding (`BranchThread`,
+    // `disregard_stop_before_period`, `retire`). Known aarch64 gap.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn a_halved_notification_rearms_before_any_step_keeping_the_offset() {
         use reverie::Pid;
@@ -7962,6 +7979,9 @@ mod tests {
     // and so single step the whole first stage margin. Farther out that path
     // requests the same event, its instruction offset included, so this is
     // where the two differ.
+    // Uses x86_64-only timer scaffolding (`BranchThread`,
+    // `disregard_stop_before_period`, `retire`). Known aarch64 gap.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn a_halved_notification_at_the_margin_arms_the_second_stage() {
         use reverie::Pid;
@@ -8026,6 +8046,9 @@ mod tests {
     // the counter's next overflow, a period later, still comes no later than
     // the whole notification would have, so no overshoot follows. One that it
     // absorbs of the last, whole programming comes short of the target too.
+    // Uses x86_64-only timer scaffolding (`BranchThread`,
+    // `disregard_stop_before_period`, `retire`). Known aarch64 gap.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn a_halved_notification_rearms_the_rest_and_survives_one_absorbed_overflow() {
         use reverie::Pid;
@@ -8153,6 +8176,9 @@ mod tests {
     // guest is a thread of this process blocked in a read between steps, so
     // its counters hold still whenever they are read, and every clock here
     // is exact.
+    // Uses x86_64-only timer scaffolding (`BranchThread`,
+    // `disregard_stop_before_period`, `retire`). Known aarch64 gap.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn a_kept_event_keeps_the_overflow_point_its_request_programmed() {
         use reverie::Pid;

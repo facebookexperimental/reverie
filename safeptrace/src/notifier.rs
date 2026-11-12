@@ -752,6 +752,24 @@ struct Event {
     /// poll period with no wakeup, published a status or first observed one.
     #[cfg(test)]
     legacy_late_turns: AtomicUsize,
+    /// Replaces [`LEGACY_POLL_PERIOD`] as the wait of a worker turn that
+    /// hinted.
+    #[cfg(test)]
+    legacy_poll_period: Mutex<Option<Duration>>,
+    /// Pauses the worker once, after a turn that hinted and before it takes
+    /// `legacy_wakeup` to wait.
+    #[cfg(test)]
+    legacy_sleep_check_pause: Mutex<Option<BoundedTestPause>>,
+    /// Signalled once by the worker while it holds `legacy_wakeup`, right
+    /// before it waits after a turn that hinted, so that a wakeup counted
+    /// after the signal is counted while it waits. The one lock taken while
+    /// holding `legacy_wakeup`, in tests only; it takes nothing itself.
+    #[cfg(test)]
+    legacy_parking_signal: Mutex<Option<mpsc::SyncSender<()>>>,
+    /// Pauses [`EventHandle::try_assist_legacy_wait`] once, after it released
+    /// `legacy_wait` and before it notifies the worker.
+    #[cfg(test)]
+    legacy_assist_notify_pause: Mutex<Option<BoundedTestPause>>,
     /// The actual host ptracer's immutable lifetime, bound only by that live
     /// thread after retained-generation attachment authentication.
     legacy_wait_owner: OnceLock<LegacyWaitOwner>,
@@ -1468,6 +1486,14 @@ impl Event {
             legacy_publish_pause: Mutex::new(None),
             #[cfg(test)]
             legacy_late_turns: AtomicUsize::new(0),
+            #[cfg(test)]
+            legacy_poll_period: Mutex::new(None),
+            #[cfg(test)]
+            legacy_sleep_check_pause: Mutex::new(None),
+            #[cfg(test)]
+            legacy_parking_signal: Mutex::new(None),
+            #[cfg(test)]
+            legacy_assist_notify_pause: Mutex::new(None),
             legacy_wait_owner: OnceLock::new(),
             native_wait_identity: OnceLock::new(),
             exit_status: AtomicI32::new(EXIT_PENDING),
@@ -1534,10 +1560,18 @@ impl Event {
     /// only moves the worker's next turn earlier; the turn checks and
     /// observes what it would have at its due time.
     fn wake_legacy_worker(&self) {
+        self.count_legacy_wakeup();
+        self.legacy_wake.notify_one();
+    }
+
+    /// The counting half of [`Event::wake_legacy_worker`], for a caller that
+    /// holds `legacy_wait`. The worker reads the count, not the notify, under
+    /// the lock it waits with, so it acts on the wakeup at its next sleep
+    /// check. The caller sends `legacy_wake.notify_one()` after it released
+    /// `legacy_wait`, so that the woken worker does not block on it.
+    fn count_legacy_wakeup(&self) {
         let mut wakeups = self.legacy_wakeup.lock();
         wakeups.targeted = wakeups.targeted.wrapping_add(1);
-        drop(wakeups);
-        self.legacy_wake.notify_one();
     }
 
     /// Runs this generation's legacy observation worker now, and lets a
@@ -2951,6 +2985,47 @@ impl EventHandle {
         self.event().invalidate_numeric_auth();
     }
 
+    /// What a [`crate::ResumeMark`] records after a successful resume request
+    /// on `pid` through this handle: the Event it resolves to now (by
+    /// address), the detach count of TID `pid`, and `owner`, the resuming
+    /// tracer if the caller knows it. The token that carries the mark keeps
+    /// the Event alive, and the proof keeps the owner alive, so neither
+    /// address can be reused while the mark exists.
+    pub(super) fn resume_proof(
+        &self,
+        pid: Pid,
+        owner: Option<&Arc<LegacyWaitOwner>>,
+    ) -> ResumeProof {
+        ResumeProof {
+            owner: owner.cloned(),
+            event: Arc::as_ptr(self.event()).addr(),
+            epoch: detach_epoch(pid),
+        }
+    }
+
+    /// Whether `proof` still holds for a wait on `pid` whose effective owner
+    /// is `owner`: this handle resolves to the same Event, no detach request
+    /// naming TID `pid` was issued since, through any capability on any
+    /// Event, and the wait is driven by the owner that resumed. A
+    /// proof that records no owner never holds: a later wait may be driven by
+    /// an owner it does not know (a sibling thread after the tracer exits,
+    /// say), so that wait reads as before.
+    fn resume_proof_holds(
+        &self,
+        pid: Pid,
+        proof: Option<&ResumeProof>,
+        owner: Option<&Arc<LegacyWaitOwner>>,
+    ) -> bool {
+        proof.is_some_and(|proof| {
+            Arc::as_ptr(self.event()).addr() == proof.event
+                && proof.epoch.is_some()
+                && detach_epoch(pid) == proof.epoch
+                && owner
+                    .zip(proof.owner.as_ref())
+                    .is_some_and(|(owner, resumer)| Arc::ptr_eq(owner, resumer))
+        })
+    }
+
     /// After a request that makes a stop likely soon (a resumption or an
     /// interrupt): a legacy (Procfs) generation's observation worker polls
     /// for it from the shortest wait up ([`Event::wake_legacy_worker`]).
@@ -3132,13 +3207,20 @@ impl EventHandle {
         if let Some(error) = progress.error {
             return Err(error);
         }
+        // A wakeup is counted here, under `legacy_wait`, so that the worker
+        // cannot publish what it pops before the count moves: its
+        // `before_publication` read includes it, as a hold must. Only the
+        // notify waits until `legacy_wait` is released below, so that the
+        // woken worker takes `legacy_wait` without first blocking on it.
+        let mut notify = false;
         let status = match try_consume_legacy_status(identity, event, Some(handle)) {
             Ok(status) => status,
             // The observation owner decides transient newborn ECHILD versus
             // exact retirement and publishes it after draining its FIFO.
             // Have it decide now: a held worker's next turn may be far off.
             Err(Errno::ECHILD) => {
-                event.wake_legacy_worker();
+                event.count_legacy_wakeup();
+                notify = true;
                 None
             }
             Err(Errno::EINTR) => None,
@@ -3151,7 +3233,14 @@ impl EventHandle {
             progress.observed = None;
             progress.error = None;
             // The worker publishes it on its next turn: run that turn now.
-            event.wake_legacy_worker();
+            event.count_legacy_wakeup();
+            notify = true;
+        }
+        drop(progress);
+        if notify {
+            #[cfg(test)]
+            pause_retirement_for_test(&event.legacy_assist_notify_pause);
+            event.legacy_wake.notify_one();
         }
         Ok(())
     }
@@ -4853,6 +4942,16 @@ fn legacy_held_period(event: &Event) -> Duration {
     LEGACY_HELD_PERIOD
 }
 
+/// [`LEGACY_POLL_PERIOD`], or a test's replacement for it.
+fn legacy_poll_period(event: &Event) -> Duration {
+    #[cfg(test)]
+    if let Some(period) = *event.legacy_poll_period.lock() {
+        return period;
+    }
+    let _ = event;
+    LEGACY_POLL_PERIOD
+}
+
 /// A Procfs worker never consumes a numeric wait. It supplies bounded hints
 /// until the live actual ptracer assists, and publishes only that caller's
 /// consumed FIFO. In particular, host ptracer exit cannot make it steal a
@@ -4921,6 +5020,20 @@ fn legacy_worker_thread(
         #[cfg(test)]
         pause_retirement_for_test(&event.legacy_worker_cycle_pause);
         let mut progress = event.legacy_wait.lock();
+        // While this worker runs it is the only publisher of this Event's
+        // statuses, and the window below relies on that: from the pop until
+        // `update` returns, `consumed` is empty although a status is in
+        // flight. Nothing else can act on that window. The ptracer's
+        // `try_assist_legacy_wait` only enqueues onto `consumed`, so this
+        // worker publishes what it adds after this status. Once the worker
+        // has started, no synchronous owner can claim the wait
+        // (`claim_sync_wait` answers `Notifier`; see the invariant on
+        // `Event::exit_stop_follows_dead_exec`), so no direct kernel consume
+        // or ECHILD publication runs beside it. Retirement and promotion take
+        // effect only in this thread's later turns. A waiter that polls inside
+        // the window registered its waker first and is woken by `update`. A
+        // change that publishes from any other thread must not read an empty
+        // `consumed` as "nothing in flight".
         if let Some(status) = progress.consumed.pop_front() {
             drop(progress);
             #[cfg(test)]
@@ -5079,9 +5192,13 @@ fn legacy_worker_thread(
         if held_wait {
             pause_retirement_for_test(&event.legacy_held_wait_pause);
         }
+        #[cfg(test)]
+        if wake {
+            pause_retirement_for_test(&event.legacy_sleep_check_pause);
+        }
         let mut wakeups = event.legacy_wakeup.lock();
         let timeout = if wake {
-            LEGACY_POLL_PERIOD
+            legacy_poll_period(event)
         } else if held_wait && held == Some(wakeups.targeted) {
             #[cfg(test)]
             event.legacy_held_waits.fetch_add(1, Ordering::Relaxed);
@@ -5089,6 +5206,13 @@ fn legacy_worker_thread(
         } else {
             wait
         };
+        #[cfg(test)]
+        if wake
+            && *wakeups == seen
+            && let Some(parking) = event.legacy_parking_signal.lock().take()
+        {
+            let _ = parking.try_send(());
+        }
         if *wakeups == seen {
             event.legacy_wake.wait_for(&mut wakeups, timeout);
         }
@@ -7593,7 +7717,7 @@ pub struct WaitFuture {
 }
 
 impl WaitFuture {
-    pub(super) fn new(Running(pid, token): Running) -> Self {
+    pub(super) fn new(Running(pid, token, _): Running) -> Self {
         Self { pid, token }
     }
 
@@ -7703,6 +7827,96 @@ pub enum OwnedWaitError {
     Completed,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// TracerPid reads made on this thread by
+    /// [`note_detached_wait_if_untraced`].
+    static TRACER_PID_READS_FOR_TEST: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Every TID is below this: `pid_max` is at most `PID_MAX_LIMIT`, which is
+/// 2^22 on 64-bit Linux (include/linux/threads.h, kernel/pid.c
+/// `pid_max_max`).
+const DETACH_EPOCH_TID_LIMIT: usize = 1 << 22;
+
+/// TIDs per block of [`DETACH_EPOCH_BLOCKS`]: 32 KiB of counters.
+const DETACH_EPOCH_BLOCK: usize = 4096;
+
+/// How many blocks cover every TID: 1,024.
+const DETACH_EPOCH_BLOCK_COUNT: usize = DETACH_EPOCH_TID_LIMIT / DETACH_EPOCH_BLOCK;
+
+/// The detach requests issued for each exact TID, counted immediately
+/// before each request ([`note_detach`]). A [`crate::ResumeMark`] records
+/// its TID's count at the resume and holds only while it is unchanged.
+///
+/// - **Keyed by the exact TID.** Not by Event: before Linux 6.9 the public
+///   API routinely gives out capabilities for one live task on unrelated
+///   Events (a failed Native capture yields a fresh Event:
+///   `Stopped::new_unchecked`, `Wait::from_raw`, `wait_all`), and a detach
+///   through any of them must cancel the mark. Not by a shared bucket or
+///   one global count either: an unrelated task's detach would cancel the
+///   mark, and the read that follows can record a live-owner note that
+///   holds off the ECHILD retirement after a non-leader exec (see
+///   [`note_detached_wait_if_untraced`]). While the marked task lives, no
+///   other task holds its TID, so only a request naming that task itself
+///   moves its count.
+/// - **Never removed or reset.** A count only grows, so it cannot return to
+///   a value a mark recorded: there is no remove-and-recreate ABA, and a
+///   wrap needs 2^64 requests for one TID. A TID reused after a reap keeps
+///   its count: a later detach of the new task cancels an old mark (which
+///   then reads as before), and without one the old mark names a reaped
+///   task, whose read finds no live untraced task either.
+/// - **Bounded.** A block is allocated by the first detach of a TID in it
+///   and kept; reads of an unallocated block see 0. At most every block:
+///   2^22 counters, 32 MiB.
+/// - **Ordering.** The count is bumped (SeqCst) before the request, a
+///   successful resume loads it (SeqCst) before it returns, and the wait
+///   loads it again (SeqCst) when it is built. A block's allocation is
+///   published through its `OnceLock` (release on set, acquire on get).
+static DETACH_EPOCH_BLOCKS: [OnceLock<Box<[AtomicU64]>>; DETACH_EPOCH_BLOCK_COUNT] =
+    [const { OnceLock::new() }; DETACH_EPOCH_BLOCK_COUNT];
+
+/// The block and the index in it of TID `pid`'s count; `None` for a value
+/// that is not a Linux TID.
+fn detach_epoch_slot(pid: Pid) -> Option<(usize, usize)> {
+    let tid = usize::try_from(pid.as_raw())
+        .ok()
+        .filter(|tid| *tid < DETACH_EPOCH_TID_LIMIT)?;
+    Some((tid / DETACH_EPOCH_BLOCK, tid % DETACH_EPOCH_BLOCK))
+}
+
+/// The detach requests counted so far for TID `pid`; `None`, which no proof
+/// accepts, for a value that is not a Linux TID.
+fn detach_epoch(pid: Pid) -> Option<u64> {
+    let (block, index) = detach_epoch_slot(pid)?;
+    Some(
+        DETACH_EPOCH_BLOCKS[block]
+            .get()
+            .map_or(0, |block| block[index].load(Ordering::SeqCst)),
+    )
+}
+
+/// Counts a detach request naming TID `pid`, immediately before it is
+/// issued, whatever capability or Event the request goes through.
+pub(super) fn note_detach(pid: Pid) {
+    if let Some((block, index)) = detach_epoch_slot(pid) {
+        DETACH_EPOCH_BLOCKS[block]
+            .get_or_init(|| (0..DETACH_EPOCH_BLOCK).map(|_| AtomicU64::new(0)).collect())[index]
+            .fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// What a [`crate::ResumeMark`] proves: a successful resume request by the
+/// tracer `owner` (none when the resuming token does not identify it; see
+/// `Stopped::into_running_resumed`), resolved to the Event at address
+/// `event`, when its TID's detach count read `epoch`.
+#[derive(Clone, Debug)]
+pub(super) struct ResumeProof {
+    owner: Option<Arc<LegacyWaitOwner>>,
+    event: usize,
+    epoch: Option<u64>,
+}
+
 /// Records a generation-bound wait created while its task is detached,
 /// returning the Event whose detached-wait list was noted (the caller
 /// holds it until drop; see [`Event::note_detached_wait`]). The caller
@@ -7715,16 +7929,39 @@ pub enum OwnedWaitError {
 /// A call whose token has a captured identity reads that task's retained
 /// `status`. Callers whose record could never carry an owner skip the call
 /// instead (see [`OwnedWaitFuture::new`]).
+///
+/// A running state from a successful resume request whose
+/// [`crate::ResumeMark`] still holds, waited on by the owner that resumed it,
+/// skips the read and records nothing. The request passed
+/// `ptrace_check_attach` for that owner. Since then, no detach of the task
+/// was requested through any capability, and the Event did not change. So
+/// the task can have become untraced only in two ways:
+/// - its tracer, which is this wait's owner, exited. A note owned by a dead
+///   tracer grants no exemption ([`Event::detach_handoff_pending`]), so
+///   recording none changes nothing.
+/// - an untraced non-leader's exec gave it the resumed leader's TID
+///   (`de_thread` → `exchange_tids`). There the skip is a deliberate choice,
+///   not an equivalence: the release is treated as retirement (ECHILD), the
+///   outcome a wait built just before the exec already has, rather than as a
+///   handoff that no reattach will ever complete.
+///
+/// Every other running state reads TracerPid as before.
 fn note_detached_wait_if_untraced(
-    token: &TraceeToken,
+    running: &Running,
     affinity_owner: Option<Arc<LegacyWaitOwner>>,
 ) -> Option<(Arc<Event>, u64)> {
+    let token = &running.1;
     let handle = token.event();
+    let owner = affinity_owner.or_else(|| token.ptracer_owner.clone());
+    if handle.resume_proof_holds(running.0, running.2.0.as_ref(), owner.as_ref()) {
+        return None;
+    }
     let identity = handle.identity()?;
+    #[cfg(test)]
+    TRACER_PID_READS_FOR_TEST.with(|reads| reads.set(reads.get() + 1));
     if identity.current_tracer_pid() != Ok(Pid::from_raw(0)) {
         return None;
     }
-    let owner = affinity_owner.or_else(|| token.ptracer_owner.clone());
     let event = Arc::clone(handle.event());
     let id = event.note_detached_wait(owner);
     Some((event, id))
@@ -7768,7 +8005,7 @@ impl OwnedWaitFuture {
     /// detached-wait note.
     pub(super) fn new(running: Running) -> Self {
         let detached_wait = if running.1.ptracer_owner.is_some() {
-            note_detached_wait_if_untraced(&running.1, None)
+            note_detached_wait_if_untraced(&running, None)
         } else {
             None
         };
@@ -7782,7 +8019,7 @@ impl OwnedWaitFuture {
         running: Running,
         affinity_owner: Option<Arc<LegacyWaitOwner>>,
     ) -> Self {
-        let detached_wait = note_detached_wait_if_untraced(&running.1, affinity_owner);
+        let detached_wait = note_detached_wait_if_untraced(&running, affinity_owner);
         Self::with_detached_wait(running, detached_wait)
     }
 
@@ -8171,7 +8408,7 @@ impl PtracerSyncDriver {
             running.1.ptracer_owner.clone(),
             running.1.ptracer_wait_role,
         );
-        let detached_wait = note_detached_wait_if_untraced(&running.1, affinity.owner.clone());
+        let detached_wait = note_detached_wait_if_untraced(&running, affinity.owner.clone());
         Self {
             input: Some((running.0, running.1)),
             affinity,
@@ -8823,10 +9060,10 @@ mod test {
     use nix::sys::wait::WaitStatus;
     use nix::unistd::ForkResult;
     use nix::unistd::Pid;
-    use nix::unistd::fork;
 
     use super::*;
     use crate::Options;
+    use crate::test_fork::fork;
 
     /// Keep completion evidence on a separate physical line even beside
     /// C signal-handler output or libtest's unfinished progress line. One
@@ -9090,7 +9327,7 @@ mod test {
             .stderr(Stdio::piped())
             .process_group(0);
 
-        let mut group = ChildProcessGroup::new(command.spawn()?)?;
+        let mut group = ChildProcessGroup::new(crate::test_fork::spawn(&mut command)?)?;
         let mut stdout = drain_pipe(
             group
                 .child
@@ -10087,9 +10324,7 @@ mod test {
             .stderr(Stdio::null())
             .process_group(0);
         let mut sentinel = ChildProcessGroup::new(
-            sentinel_command
-                .spawn()
-                .expect("spawn projected-PGID sentinel"),
+            crate::test_fork::spawn(&mut sentinel_command).expect("spawn projected-PGID sentinel"),
         )
         .expect("open projected-PGID sentinel pidfd");
         let projected_pgid = sentinel.process_group.to_string();
@@ -10130,8 +10365,7 @@ mod test {
         let mut old_command = Command::new("/bin/true");
         old_command.process_group(0);
         let mut old = ChildProcessGroup::new(
-            old_command
-                .spawn()
+            crate::test_fork::spawn(&mut old_command)
                 .expect("spawn old exact-cleanup group leader"),
         )
         .expect("open old exact-cleanup leader pidfd");
@@ -10151,8 +10385,7 @@ mod test {
             .stderr(Stdio::null())
             .process_group(0);
         let mut sentinel = ChildProcessGroup::new(
-            sentinel_command
-                .spawn()
+            crate::test_fork::spawn(&mut sentinel_command)
                 .expect("spawn exact-cleanup projected-PGID sentinel"),
         )
         .expect("open exact-cleanup sentinel pidfd");
@@ -15518,7 +15751,9 @@ mod test {
         // Use an exec'd child with closed stdio instead of direct fork. These
         // tests run beside exact-subprocess pipe tests, and a fork-only child
         // would inherit their write ends until cleanup, making EOF scheduling
-        // dependent under the default-parallel harness.
+        // dependent under the default-parallel harness. Its pre_exec makes
+        // std fork and wait for the exec on a close-on-exec socket, which a
+        // concurrent raw fork could also copy, so it spawns under the lock.
         let mut command = Command::new("/bin/sleep");
         command
             .arg("60")
@@ -15534,7 +15769,7 @@ mod test {
                 }
             });
         }
-        let mut child = command.spawn().expect("spawn exact-cleanup member");
+        let mut child = crate::test_fork::spawn(&mut command).expect("spawn exact-cleanup member");
         let pid = Pid::from_raw(child.id() as i32);
         let mut guard =
             ExactNewChildCleanupGuard::new(pid, EventHandle::new()).unwrap_or_else(|error| {
@@ -16156,13 +16391,13 @@ mod test {
                 set_tid_size: 1,
                 ..CloneArgs::default()
             };
-            let result = unsafe {
+            let result = crate::test_fork::exclusive(|| unsafe {
                 libc::syscall(
                     libc::SYS_clone3,
                     std::ptr::from_ref(&args),
                     mem::size_of::<CloneArgs>(),
                 )
-            };
+            });
             if result == -1 {
                 return None;
             }
@@ -17828,13 +18063,13 @@ mod test {
                 set_tid_size: 1,
                 ..CloneArgs::default()
             };
-            let result = unsafe {
+            let result = crate::test_fork::exclusive(|| unsafe {
                 libc::syscall(
                     libc::SYS_clone3,
                     std::ptr::from_ref(&args),
                     mem::size_of::<CloneArgs>(),
                 )
-            };
+            });
             if result == -1 {
                 return None;
             }

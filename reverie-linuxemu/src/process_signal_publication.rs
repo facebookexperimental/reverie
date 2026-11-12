@@ -48,6 +48,11 @@ mod parent_death_publication;
 #[path = "orphan_placement.rs"]
 mod orphan_placement;
 
+#[path = "cross_process_send.rs"]
+mod cross_process_send;
+pub(crate) use cross_process_send::SignalDestination;
+pub(crate) use cross_process_send::UnsentSignal;
+
 #[path = "child_wait.rs"]
 pub mod child_wait;
 
@@ -440,6 +445,11 @@ pub struct ProcessSignalRegistry {
     controlled: AtomicBool,
     parent_death_adopted: AtomicBool,
     orphan_placement_adopted: AtomicBool,
+    // A Tool's request for guest signals to other processes
+    // (`ProcessSignalControl::enable_cross_process_signals`), and whether it
+    // took effect, fixed at installation: only in `ToolControlled` mode.
+    cross_process_signals_adopted: AtomicBool,
+    cross_process_signals: AtomicBool,
     parent_death_installation_closed: AtomicBool,
     parent_death_results: Mutex<BTreeMap<u64, parent_death_publication::BatchResult>>,
     parent_death_error: Mutex<Option<Errno>>,
@@ -1484,6 +1494,12 @@ impl ProcessSignalRegistry {
             .unwrap_or_else(|p| p.into_inner())
             .orphan_placement =
             self.controlled() && self.orphan_placement_adopted.load(Ordering::Acquire);
+        // So is the choice of the thread that takes a signal a guest sends to
+        // another process.
+        self.cross_process_signals.store(
+            self.controlled() && self.cross_process_signals_adopted.load(Ordering::Acquire),
+            Ordering::Release,
+        );
         let processes = self
             .processes
             .lock()
@@ -1502,6 +1518,26 @@ impl ProcessSignalRegistry {
 
     pub(super) fn controlled(&self) -> bool {
         self.controlled.load(Ordering::Acquire)
+    }
+
+    /// [`reverie::ProcessSignalControl::enable_cross_process_signals`].
+    fn enable_cross_process_signals(&self) -> Result<(), Errno> {
+        if self
+            .parent_death_installation_closed
+            .load(Ordering::Acquire)
+        {
+            return Err(Errno::EBUSY);
+        }
+        self.cross_process_signals_adopted
+            .store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Whether a Tool that selects recipients asked for a guest's signals to
+    /// other processes (`enable_cross_process_signals`), as fixed at
+    /// installation. The send paths queue those signals only then.
+    pub(crate) fn cross_process_signals(&self) -> bool {
+        self.cross_process_signals.load(Ordering::Acquire)
     }
 
     pub(super) fn permit(
@@ -1757,6 +1793,13 @@ impl reverie::ProcessSignalControl for ProcessSignalControl {
         event: SignalEvent,
     ) -> reverie::ProcessSignalPublicationResult {
         public_process_outcome(self.publish_active_parent_death_signal(process, event))
+    }
+
+    fn enable_cross_process_signals(&self) -> Result<(), Errno> {
+        self.0
+            .upgrade()
+            .ok_or(Errno::ESRCH)?
+            .enable_cross_process_signals()
     }
 
     fn signal_recipients(

@@ -18,6 +18,7 @@ members = [
     "reverie-loader",
     "reverie-memory",
     "reverie-process",
+    "reverie-procfs",
     "reverie-ptrace",
     "reverie-rpc-transport",
     "reverie-syscalls",

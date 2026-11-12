@@ -657,6 +657,9 @@ fn compatibility_fork_reports_clone_only_from_parent() {
     assert_compatibility_fork_event(&[], libc::SYS_clone);
 }
 
+// aarch64 has no fork or vfork syscall (only clone and clone3), so this case
+// exists only on x86_64. Known aarch64 gap.
+#[cfg(target_arch = "x86_64")]
 #[test]
 fn compatibility_raw_fork_reports_once_before_child() {
     assert_compatibility_fork_event(&["--raw-fork"], libc::SYS_fork);
@@ -684,6 +687,8 @@ fn unsafe_clone_is_rejected_in_compatibility_and_strace_modes() {
 /// milliseconds. A regression that forwards one of the probed calls can leave
 /// the guest, or a task it created, running forever; the test must then fail
 /// rather than hang.
+// Only the x86_64-only raw vfork/clone3 case below uses it.
+#[cfg(target_arch = "x86_64")]
 const PROCESS_CREATION_PROBE_LIMIT: Duration = Duration::from_secs(30);
 
 // https://github.com/rrnewton/reverie/issues/758: a raw vfork that
@@ -700,6 +705,9 @@ const PROCESS_CREATION_PROBE_LIMIT: Duration = Duration::from_secs(30);
 // run, so those two reach the refusal through the first SIGSYS trap. The trace
 // counts separate a refusal in process_syscall from the SIGSYS handler's
 // untraced fallback, which returns the same errno.
+// aarch64 has no fork or vfork syscall (only clone and clone3), so this case
+// exists only on x86_64. Known aarch64 gap.
+#[cfg(target_arch = "x86_64")]
 #[test]
 fn raw_vfork_and_clone3_are_refused_in_compatibility_and_strace_modes() {
     let guest = env!("CARGO_BIN_EXE_reverie-liteinst-fork-guest");

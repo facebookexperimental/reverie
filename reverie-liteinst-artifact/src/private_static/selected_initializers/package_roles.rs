@@ -218,7 +218,7 @@ pub(super) fn validate_native_input(role: InitializerRole, object: &ObjectInput<
     native_input_form(role, object)
 }
 fn native_input_form(role: InitializerRole, object: &ObjectInput<'_>) -> Result<()> {
-    let (_, symbol) = named(&object.elf, role.symbol())?;
+    let (_, symbol) = named(&object.elf, role.symbol()?)?;
     let (index, size, name, expected) = match role {
         InitializerRole::PackageLibc => (7, 413, ".text.__init_libc", LIBC_RELOCS),
         InitializerRole::PackageTp => (4, 107, ".text.__init_tp", TP_RELOCS),
@@ -932,7 +932,7 @@ fn role_body(
     } else {
         join_selected_initializer(role, map, owner, objects, elf, bytes)?
     };
-    let (_, symbol) = named(elf, role.symbol())?;
+    let (_, symbol) = named(elf, role.symbol()?)?;
     let finals = emitted_rows(elf, bytes, symbol.st_shndx, joined.address, joined.bytes)?;
     let source = relocation_rows(owner, joined.section_index, joined.bytes)?;
     require(
@@ -1031,7 +1031,7 @@ fn role_body(
         BTreeMap::new()
     };
     Ok(RoleBody {
-        symbol: role.symbol(),
+        symbol: role.symbol()?,
         member_name: owner.member_name.into(),
         member_ordinal: owner.ordinal,
         member_header: owner.header_offset,
@@ -1327,7 +1327,7 @@ mod tests {
                     .unwrap_err()
                     .contains("physical member")
             );
-            let (_, s) = named(&obj.elf, role.symbol()).unwrap();
+            let (_, s) = named(&obj.elf, role.symbol().unwrap()).unwrap();
             let at = obj.elf.section_headers[s.st_shndx].sh_offset as usize;
             for n in [0, s.st_size as usize / 2, s.st_size as usize - 1] {
                 let mut bad = raw.to_vec();
@@ -1343,7 +1343,7 @@ mod tests {
             (TP, InitializerRole::PackageTp),
         ] {
             let obj = object(raw, role);
-            let (_, s) = named(&obj.elf, role.symbol()).unwrap();
+            let (_, s) = named(&obj.elf, role.symbol().unwrap()).unwrap();
             let rel = obj
                 .elf
                 .section_headers
@@ -1520,7 +1520,7 @@ mod tests {
         raw: &[u8],
     ) -> (Vec<u8>, Vec<u8>, Vec<InputRelocation>, Vec<FinalRelocation>) {
         let obj = object(raw, role);
-        let (_, s) = named(&obj.elf, role.symbol()).unwrap();
+        let (_, s) = named(&obj.elf, role.symbol().unwrap()).unwrap();
         let input = section_file_bytes(&obj.elf.section_headers[s.st_shndx], raw).unwrap()
             [..s.st_size as usize]
             .to_vec();
@@ -1692,7 +1692,7 @@ mod tests {
             (2, InitializerRole::MuslSsp, 0x403000),
         ] {
             let owner = &objects[which];
-            let (_, symbol) = named(&owner.elf, role.symbol()).unwrap();
+            let (_, symbol) = named(&owner.elf, role.symbol().unwrap()).unwrap();
             let mut body =
                 section_file_bytes(&owner.elf.section_headers[symbol.st_shndx], owner.bytes)
                     .unwrap()
