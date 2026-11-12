@@ -183,33 +183,35 @@ impl MemoryAccess for GuestStack {
     }
 }
 
+/// The bytes of `value` as native-endian 64-bit words, the last one
+/// zero-filled past `size_of::<T>()`.
+///
+/// # Safety
+///
+/// `T` must have no padding: every byte of `value` is read, and padding
+/// bytes are not initialized.
 #[inline]
 pub unsafe fn transmute_u64s<T: Sized>(value: T) -> Vec<u64> {
-    unsafe {
-        let value_ptr = &value as *const T as *const u8;
-        let size = core::mem::size_of::<T>();
-        let mut result: Vec<u64> = Vec::new();
+    // SAFETY: `value` is a live local of `size_of::<T>()` bytes, initialized
+    // as the caller promises. A byte view needs no alignment; `T`'s may be
+    // below a word's, so its bytes are not read as words in place.
+    let bytes = unsafe {
+        core::slice::from_raw_parts((&raw const value).cast::<u8>(), core::mem::size_of::<T>())
+    };
+    u64s_from_bytes(bytes)
+}
 
-        let mut k = 0;
-        let mut n = size;
-
-        // use copy_nonloverlapping?
-        while n >= 8 {
-            let ptr: *const u64 = value_ptr.offset(k).cast();
-            result.push(ptr.read());
-            n -= 8;
-            k += 8;
-        }
-
-        if n != 0 {
-            let mut val: u64 = 0;
-            let src = value_ptr.offset(k);
-            let dst = &mut val as *mut u64 as *mut u8;
-            core::ptr::copy_nonoverlapping(src, dst, n);
-            result.push(val);
-        }
-        result
-    }
+/// Packs `bytes` into native-endian 64-bit words, zero-filling the last.
+/// `bytes` may start at any address.
+fn u64s_from_bytes(bytes: &[u8]) -> Vec<u64> {
+    bytes
+        .chunks(core::mem::size_of::<u64>())
+        .map(|chunk| {
+            let mut word = [0u8; core::mem::size_of::<u64>()];
+            word[..chunk.len()].copy_from_slice(chunk);
+            u64::from_ne_bytes(word)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -492,5 +494,48 @@ mod tests {
         };
 
         assert_eq!(unsafe { transmute_u64s(tp) }, vec![0x12, 0x3456789a]);
+    }
+
+    /// The words of byte runs that do not start on a word boundary: one
+    /// whose length is a whole number of words plus a tail, and one with a
+    /// single word and a longer tail. A `T` whose alignment is below a
+    /// word's gives its bytes no more, and a word read in place from them is
+    /// misaligned: debug builds abort on it ("ptr::read requires that the
+    /// pointer argument is aligned and non-null"), while optimized builds
+    /// drop the check. The bytes after each run are nonzero, so the zeros
+    /// required past its end also show that nothing past it was read.
+    #[test]
+    fn u64s_from_bytes_packs_a_misaligned_run() {
+        #[repr(C, align(8))]
+        struct WordAligned([u8; 24]);
+        let mut buffer = WordAligned([0; 24]);
+        for (index, byte) in buffer.0.iter_mut().enumerate() {
+            *byte = index as u8;
+        }
+        let word = u64::from_ne_bytes;
+        let cases: [(usize, Vec<u64>); 2] = [
+            (
+                20,
+                vec![
+                    word([1, 2, 3, 4, 5, 6, 7, 8]),
+                    word([9, 10, 11, 12, 13, 14, 15, 16]),
+                    word([17, 18, 19, 20, 0, 0, 0, 0]),
+                ],
+            ),
+            (
+                13,
+                vec![
+                    word([1, 2, 3, 4, 5, 6, 7, 8]),
+                    word([9, 10, 11, 12, 13, 0, 0, 0]),
+                ],
+            ),
+        ];
+        for (len, expected) in cases {
+            // Offset 1 of a word-aligned buffer is never word-aligned,
+            // whatever the stack layout.
+            let bytes = &buffer.0[1..1 + len];
+            assert_eq!(bytes.as_ptr().addr() % core::mem::align_of::<u64>(), 1);
+            assert_eq!(u64s_from_bytes(bytes), expected, "{len} bytes at offset 1");
+        }
     }
 }
