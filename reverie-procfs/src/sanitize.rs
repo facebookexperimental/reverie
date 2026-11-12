@@ -65,6 +65,316 @@ fn replace_sockstat_field(fields: &mut [String], name: &str, value: &str) {
     *field_value = value.to_owned();
 }
 
+/// One row of `/proc/locks`, split into fields:
+///     `SEQ: [->] CLASS MODE RW PID MAJOR:MINOR:INODE START END`
+#[derive(Clone)]
+struct LockLine {
+    sequence: String,
+    waiter: bool,
+    fields: Vec<String>,
+    owner_index: usize,
+    object_index: usize,
+}
+
+/// `line` as a `/proc/locks` row, or `None` when it is not one. The owner is
+/// a signed integer and the object has three `:`-separated parts.
+fn parse_lock_line(line: &str) -> Option<LockLine> {
+    let fields = line
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let waiter = fields.get(1).is_some_and(|field| field == "->");
+    let details = usize::from(waiter) + 1;
+    let owner_index = details + 3;
+    let object_index = details + 4;
+    let sequence = fields
+        .first()
+        .and_then(|field| field.strip_suffix(':'))
+        .filter(|field| !field.is_empty() && field.bytes().all(|byte| byte.is_ascii_digit()))?
+        .to_owned();
+    if fields.len() != details + 7
+        || fields[owner_index].parse::<i64>().is_err()
+        || fields[object_index].split(':').count() != 3
+    {
+        return None;
+    }
+    Some(LockLine {
+        sequence,
+        waiter,
+        fields,
+        owner_index,
+        object_index,
+    })
+}
+
+use std::collections::BTreeMap;
+
+/// `block`, one CPU's block of `/proc/cpuinfo`, with the fields that differ
+/// from CPU to CPU of a machine of single-core sockets set for CPU `cpu`, and
+/// its frequency set to the virtual 1 GHz.
+fn cpuinfo_block_for(block: &[u8], cpu: u32) -> Vec<u8> {
+    let replacement = |key: &[u8]| -> Option<String> {
+        Some(match key {
+            b"processor" => format!("processor\t: {cpu}"),
+            b"cpu MHz" => "cpu MHz\t\t: 1000.000".to_owned(),
+            b"physical id" => format!("physical id\t: {cpu}"),
+            b"siblings" => "siblings\t: 1".to_owned(),
+            b"core id" => "core id\t\t: 0".to_owned(),
+            b"cpu cores" => "cpu cores\t: 1".to_owned(),
+            b"apicid" => format!("apicid\t\t: {cpu}"),
+            b"initial apicid" => format!("initial apicid\t: {cpu}"),
+            _ => return None,
+        })
+    };
+    let mut normalized = Vec::with_capacity(block.len());
+    for line in block.split_inclusive(|byte| *byte == b'\n') {
+        let has_newline = line.last() == Some(&b'\n');
+        let body = line.strip_suffix(b"\n").unwrap_or(line);
+        let key = body
+            .split(|byte| *byte == b':')
+            .next()
+            .unwrap_or_default()
+            .trim_ascii_end();
+        match replacement(key) {
+            Some(replaced) => normalized.extend_from_slice(replaced.as_bytes()),
+            None => normalized.extend_from_slice(body),
+        }
+        if has_newline {
+            normalized.push(b'\n');
+        }
+    }
+    normalized
+}
+
+fn unix_socket_fields(line: &str) -> Option<(Vec<&str>, &str)> {
+    const FIELD_COUNT: usize = 7;
+
+    let mut fields = Vec::with_capacity(FIELD_COUNT);
+    let mut remainder = line;
+    while fields.len() < FIELD_COUNT {
+        remainder = remainder.trim_start_matches(|character: char| character.is_ascii_whitespace());
+        if remainder.is_empty() {
+            return None;
+        }
+        let end = remainder
+            .find(|character: char| character.is_ascii_whitespace())
+            .unwrap_or(remainder.len());
+        fields.push(&remainder[..end]);
+        remainder = &remainder[end..];
+    }
+
+    Some((
+        fields,
+        remainder.trim_start_matches(|character: char| character.is_ascii_whitespace()),
+    ))
+}
+
+fn is_fixed_lower_hex(field: &str, width: usize) -> bool {
+    field.len() == width
+        && field
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Rewrite the device and inode of one mapping header from the caller-supplied
+/// table, preserving every other byte of the line and the COLUMN its pathname
+/// starts in.
+///
+/// A raw pair absent from the table is left ALONE rather than guessed at: the
+/// table is built from this same snapshot, so a miss means the pair was not
+/// determinizable (an anonymous mapping), and inventing a value here is the
+/// precise failure this design exists to avoid.
+///
+/// ⚠️ PRESERVE THE COLUMN, NOT THE PADDING BYTES. This used to copy the raw
+/// whitespace run after the inode verbatim, which silently republished the
+/// HOST inode's digit count as line length. The kernel pads the pathname to a
+/// fixed column (`seq_setwidth(m, 25 + sizeof(void *) * 6)`, measured at column
+/// 73 on x86_64), so that run is `73 - len(host_inode_digits)` characters long.
+/// Substituting a short determinized inode into it therefore left a line whose
+/// every VISIBLE field was deterministic and whose LENGTH was not.
+///
+/// Measured 2026-08-26 at hermit `d741307158`: for a LiteInst guest, whose
+/// `/memfd:liteinst2-trampoline` mappings take inodes from a host-global
+/// counter, `cat /proc/self/maps` under `--backend liteinst --strict` produced
+/// TWO distinct outputs in 20 runs (14x one, 6x the other) differing in nothing
+/// but one space on each memfd line -- the runs where the host counter had
+/// crossed a power of ten. With `--detlog-io-buffers` hashing `read()` payloads
+/// that is a hard `--verify` divergence, and `/usr/bin/tail -n 2 <fixture>`
+/// under LiteInst failed 10 of 20 verified runs on it.
+///
+/// Padding to the column the RAW line used keeps this in step with the kernel
+/// rather than hard-coding 73, and that column does not depend on the inode.
+fn rewrite_mapping_header(line: &str, table: &BTreeMap<(u64, u64), (u64, u64)>) -> String {
+    let Some(raw) = mapping_header_identity(line) else {
+        return line.to_string();
+    };
+    let Some((det_dev, det_inode)) = table.get(&raw).copied() else {
+        return line.to_string();
+    };
+    let mut out = String::with_capacity(line.len());
+    let mut remaining = line;
+    // Copy the first three fields (range, perms, offset) verbatim, whitespace
+    // included, then substitute the fourth and fifth.
+    for _ in 0..3 {
+        let field_end = match remaining.find(char::is_whitespace) {
+            Some(index) => index,
+            None => return line.to_string(),
+        };
+        let gap_end = remaining[field_end..]
+            .find(|c: char| !c.is_whitespace())
+            .map_or(remaining.len(), |offset| field_end + offset);
+        out.push_str(&remaining[..gap_end]);
+        remaining = &remaining[gap_end..];
+    }
+    let dev_end = match remaining.find(char::is_whitespace) {
+        Some(index) => index,
+        None => return line.to_string(),
+    };
+    let dev_gap = remaining[dev_end..]
+        .find(|c: char| !c.is_whitespace())
+        .map_or(remaining.len(), |offset| dev_end + offset);
+    out.push_str(&format!(
+        "{:02x}:{:02x}",
+        libc::major(det_dev),
+        libc::minor(det_dev)
+    ));
+    out.push_str(&remaining[dev_end..dev_gap]);
+    remaining = &remaining[dev_gap..];
+    let inode_end = remaining
+        .find(char::is_whitespace)
+        .unwrap_or(remaining.len());
+    let tail = &remaining[inode_end..];
+    let pad_len = tail
+        .find(|c: char| !c.is_whitespace())
+        .unwrap_or(tail.len());
+    // Column the pathname starts in on the raw line. `line.len() - remaining.len()`
+    // is how much of the line has already been consumed by the first four fields.
+    let name_column = (line.len() - remaining.len()) + inode_end + pad_len;
+    out.push_str(&det_inode.to_string());
+    let name = &tail[pad_len..];
+    if name.is_empty() {
+        // No pathname, so there is no column to preserve and nothing to pad to.
+        // Trailing whitespace here would be pure host-inode-width leakage.
+        return out;
+    }
+    // A determinized inode can in principle be WIDER than the raw one, which
+    // leaves no room to pad. One space is what the kernel's `seq_pad` emits in
+    // that same situation.
+    if out.len() < name_column {
+        out.extend(std::iter::repeat_n(' ', name_column - out.len()));
+    } else {
+        out.push(' ');
+    }
+    out.push_str(name);
+    out
+}
+
+/// Parse the DEVICE and INODE from a `maps`/`smaps` mapping header line.
+///
+/// Layout: `addr-addr perms offset MAJ:MIN INODE [pathname]`, with the device
+/// in hex `major:minor` and the inode in decimal. Returns `None` for anything
+/// that is not a backed mapping -- anonymous mappings carry `00:00 0`, and
+/// there is nothing to determinize about a file that does not exist.
+pub(crate) fn mapping_header_identity(line: &str) -> Option<(u64, u64)> {
+    let mut fields = line.split_whitespace();
+    let _range = fields.next()?;
+    let _perms = fields.next()?;
+    let _offset = fields.next()?;
+    let (major, minor) = fields.next()?.split_once(':')?;
+    let major = u32::from_str_radix(major, 16).ok()?;
+    let minor = u32::from_str_radix(minor, 16).ok()?;
+    let inode: u64 = fields.next()?.parse().ok()?;
+    if inode == 0 {
+        return None;
+    }
+    Some((libc::makedev(major, minor), inode))
+}
+
+fn is_decimal(field: &str) -> bool {
+    !field.is_empty()
+        && field.bytes().all(|byte| byte.is_ascii_digit())
+        && field.parse::<u64>().is_ok()
+}
+
+fn is_lower_hex(field: &str, width: usize) -> bool {
+    field.len() == width
+        && field
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn parse_decimal(field: &str) -> Option<u64> {
+    if field.is_empty() || !field.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    field.parse().ok()
+}
+
+fn parse_lower_hex(field: &str) -> Option<u64> {
+    u64::from_str_radix(field, 16).ok()
+}
+
+fn is_smaps_integer_value(value: &str) -> bool {
+    let mut fields = value.split_whitespace();
+    matches!(
+        (fields.next(), fields.next()),
+        (Some(number), None) if number.parse::<u64>().is_ok()
+    )
+}
+
+fn numa_page_accounting_value(field: &str) -> Option<&str> {
+    let (name, value) = field.split_once('=')?;
+    let fixed_counter = matches!(
+        name,
+        "active" | "anon" | "dirty" | "mapped" | "mapmax" | "swapcache" | "writeback"
+    );
+    let node_counter = name
+        .strip_prefix('N')
+        .is_some_and(|node| !node.is_empty() && node.bytes().all(|byte| byte.is_ascii_digit()));
+    (fixed_counter || node_counter).then_some(value)
+}
+
+fn is_smaps_mapping_header(line: &str) -> bool {
+    let mut fields = line.split_whitespace();
+    let Some((start, end)) = fields.next().and_then(|range| range.split_once('-')) else {
+        return false;
+    };
+    let (Ok(start), Ok(end)) = (u64::from_str_radix(start, 16), u64::from_str_radix(end, 16))
+    else {
+        return false;
+    };
+    let Some(permissions) = fields.next() else {
+        return false;
+    };
+    let permissions = permissions.as_bytes();
+    let valid_permissions = permissions.len() == 4
+        && matches!(permissions[0], b'r' | b'-')
+        && matches!(permissions[1], b'w' | b'-')
+        && matches!(permissions[2], b'x' | b'-')
+        && matches!(permissions[3], b'p' | b's');
+    let valid_offset = fields
+        .next()
+        .is_some_and(|offset| u64::from_str_radix(offset, 16).is_ok());
+    let valid_device = fields.next().is_some_and(|device| {
+        device.split_once(':').is_some_and(|(major, minor)| {
+            u64::from_str_radix(major, 16).is_ok() && u64::from_str_radix(minor, 16).is_ok()
+        })
+    });
+    let valid_inode = fields
+        .next()
+        .is_some_and(|inode| inode.parse::<u64>().is_ok());
+
+    start < end && valid_permissions && valid_offset && valid_device && valid_inode
+}
+
+fn is_smaps_kilobyte_value(value: &str) -> bool {
+    let mut fields = value.split_whitespace();
+    matches!(
+        (fields.next(), fields.next(), fields.next()),
+        (Some(number), Some("kB"), None) if number.parse::<u64>().is_ok()
+    )
+}
+
 pub fn sanitize_numeric_lines(contents: &[u8], stable_fields: usize) -> Vec<u8> {
     let mut normalized = Vec::with_capacity(contents.len());
     for line in contents.split_inclusive(|byte| *byte == b'\n') {
@@ -828,6 +1138,531 @@ pub fn sanitize_random_uuid(contents: &[u8], mut random: [u8; 16]) -> Vec<u8> {
     .into_bytes()
 }
 
+/// Reports `/proc/cpuinfo` for the virtual CPUs, `cpus` of them, the ones
+/// `sched_getaffinity` returns, where CPUID is the host's. The kernel prints
+/// one block per online CPU, separated by blank lines; the first block is
+/// kept, once per virtual CPU, so the processor count no longer follows the
+/// host's. Each block's topology fields describe CPU N of a machine of
+/// single-core sockets: a one-core, one-thread package numbered N, whose
+/// APIC ID is N; its frequency is the virtual 1 GHz.
+pub fn sanitize_cpuinfo(contents: &[u8], cpus: u32) -> Vec<u8> {
+    let mut first_block = Vec::with_capacity(contents.len());
+    let mut seen_processor = false;
+    for line in contents.split_inclusive(|byte| *byte == b'\n') {
+        if line.starts_with(b"processor") {
+            if seen_processor {
+                // The second CPU's block: the blank line that ended the first
+                // one has already been copied, as the kernel's file ends.
+                break;
+            }
+            seen_processor = true;
+        }
+        first_block.extend_from_slice(line);
+    }
+    (0..cpus)
+        .flat_map(|cpu| cpuinfo_block_for(&first_block, cpu))
+        .collect()
+}
+
+pub fn sanitize_unix_sockets(contents: &[u8]) -> Vec<u8> {
+    const HEADER: [&str; 8] = [
+        "Num", "RefCount", "Protocol", "Flags", "Type", "St", "Inode", "Path",
+    ];
+    const ZERO_NUM: &str = "0000000000000000:";
+
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+    let Some(body) = text.strip_suffix('\n') else {
+        return contents.to_vec();
+    };
+    let mut lines = body.split('\n');
+    let Some(header) = lines.next() else {
+        return contents.to_vec();
+    };
+    if !header.split_whitespace().eq(HEADER) {
+        return contents.to_vec();
+    }
+
+    let mut rows = Vec::new();
+    for line in lines {
+        let Some((mut fields, path)) = unix_socket_fields(line) else {
+            return contents.to_vec();
+        };
+        let Some(num) = fields[0].strip_suffix(':') else {
+            return contents.to_vec();
+        };
+        if !is_fixed_lower_hex(num, 16)
+            || !is_fixed_lower_hex(fields[1], 8)
+            || !is_fixed_lower_hex(fields[2], 8)
+            || !is_fixed_lower_hex(fields[3], 8)
+            || !is_fixed_lower_hex(fields[4], 4)
+            || !is_fixed_lower_hex(fields[5], 2)
+            || !is_decimal(fields[6])
+        {
+            return contents.to_vec();
+        }
+
+        fields[0] = ZERO_NUM;
+        fields[6] = "0";
+        let mut row = fields.join(" ");
+        if !path.is_empty() {
+            row.push(' ');
+            row.push_str(path);
+        }
+        rows.push(row);
+    }
+    rows.sort_unstable();
+
+    let mut normalized = String::with_capacity(text.len());
+    normalized.push_str(header);
+    normalized.push('\n');
+    for row in rows {
+        normalized.push_str(&row);
+        normalized.push('\n');
+    }
+    normalized.into_bytes()
+}
+
+pub fn sanitize_netlink_sockets(contents: &[u8]) -> Vec<u8> {
+    const HEADER: [&str; 10] = [
+        "sk", "Eth", "Pid", "Groups", "Rmem", "Wmem", "Dump", "Locks", "Drops", "Inode",
+    ];
+    const ZERO_POINTER: &str = "0000000000000000";
+
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+    let Some(body) = text.strip_suffix('\n') else {
+        return contents.to_vec();
+    };
+    let mut lines = body.split('\n');
+    let Some(header) = lines.next() else {
+        return contents.to_vec();
+    };
+    if !header.split_whitespace().eq(HEADER) {
+        return contents.to_vec();
+    }
+
+    let mut rows = Vec::new();
+    for line in lines {
+        let mut fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.len() != HEADER.len()
+            || !is_lower_hex(fields[0], 16)
+            || !is_lower_hex(fields[3], 8)
+        {
+            return contents.to_vec();
+        }
+
+        let Some(key) = [
+            parse_decimal(fields[1]),
+            parse_decimal(fields[2]),
+            parse_lower_hex(fields[3]),
+            parse_decimal(fields[4]),
+            parse_decimal(fields[5]),
+            parse_decimal(fields[6]),
+            parse_decimal(fields[7]),
+            parse_decimal(fields[8]),
+        ]
+        .into_iter()
+        .collect::<Option<Vec<_>>>() else {
+            return contents.to_vec();
+        };
+        if parse_decimal(fields[9]).is_none() {
+            return contents.to_vec();
+        }
+
+        fields[0] = ZERO_POINTER;
+        fields[9] = "0";
+        rows.push((key, fields.join(" ")));
+    }
+    rows.sort_unstable();
+
+    let mut normalized = String::with_capacity(text.len());
+    normalized.push_str(header);
+    normalized.push('\n');
+    for (_, row) in rows {
+        normalized.push_str(&row);
+        normalized.push('\n');
+    }
+    normalized.into_bytes()
+}
+
+/// Zero the host-assigned identities in `/proc/net/tcp{,6}` and
+/// `/proc/net/udp{,6}`.
+///
+/// Two columns carry host state and both differ on every run. Measured under
+/// `hermit run --strict`, two runs of a guest binding two listeners:
+///
+/// ```text
+/// run 1  ... 0 3066787052 1 0000000042a27170 100 ...
+/// run 2  ... 0 3071433840 1 000000005b1c887b 100 ...
+/// ```
+///
+/// `inode` is a host-global counter and `pointer` is the kernel socket address.
+/// This mirrors `sanitize_netlink_sockets`, which zeroes the same two kinds of
+/// field, and it is the text half of the `AF_INET`/`AF_INET6` work in
+/// the caller's sock_diag view: the binary and text views of this table agreed before
+/// (both leaking) and must still agree after.
+///
+/// Zero is in range for `inode` rather than a substitute chosen here. The
+/// kernel emits it itself for sockets with no owning file -- on the host that
+/// developed this, `/proc/net/tcp` carried 176 rows of which 12 had inode 0,
+/// all in state 06 (`TCP_TIME_WAIT`).
+///
+/// Row ORDER also varies and is canonicalized here, which zeroing alone does
+/// not fix. Measured after the two columns above were already zeroed, six runs
+/// of the same guest binding ports 8000 and 8001: port 8000 appeared in row 0
+/// on four runs and in row 1 on the other two. The kernel walks a hash table,
+/// so the order depends on host-side bucket state. Rows are therefore sorted on
+/// their content with `sl` excluded, and `sl` is then renumbered to match --
+/// sorting without renumbering would leave a positional index contradicting its
+/// own position.
+///
+/// Fail-open on any unexpected shape, like the other sanitizers.
+pub fn sanitize_inet_sockets(contents: &[u8]) -> Vec<u8> {
+    /// `inode`, counting from zero.
+    const INODE_FIELD: usize = 9;
+    /// The kernel socket pointer, printed `%pK` as 16 lower-hex digits.
+    const POINTER_FIELD: usize = 11;
+    /// `udp`/`udp6` rows are 13 fields, `tcp`/`tcp6` 17. Both put the two
+    /// host-state columns at the same index, so only the shorter is required.
+    const MIN_FIELDS: usize = 13;
+    const ZERO_POINTER: &str = "0000000000000000";
+
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+    let Some(body) = text.strip_suffix('\n') else {
+        return contents.to_vec();
+    };
+    let mut lines = body.split('\n');
+    let Some(header) = lines.next() else {
+        return contents.to_vec();
+    };
+    // The four files have four different headers, so this checks the shape
+    // rather than an exact string: first column `sl`, and an `inode` column.
+    let header_fields = header.split_whitespace().collect::<Vec<_>>();
+    if header_fields.first() != Some(&"sl") || !header_fields.contains(&"inode") {
+        return contents.to_vec();
+    }
+
+    let mut rows = Vec::new();
+    for line in lines {
+        let mut fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.len() < MIN_FIELDS {
+            return contents.to_vec();
+        }
+        if parse_decimal(fields[INODE_FIELD]).is_none() || !is_lower_hex(fields[POINTER_FIELD], 16)
+        {
+            return contents.to_vec();
+        }
+        fields[INODE_FIELD] = "0";
+        fields[POINTER_FIELD] = ZERO_POINTER;
+        // Sort on everything but the index, then reassign the index, so the
+        // ordering key cannot be perturbed by the very column it decides.
+        rows.push(fields[1..].join(" "));
+    }
+    rows.sort_unstable();
+
+    let mut normalized = String::with_capacity(text.len());
+    normalized.push_str(header);
+    normalized.push('\n');
+    for (index, row) in rows.iter().enumerate() {
+        normalized.push_str(&format!("{index}: {row}\n"));
+    }
+    normalized.into_bytes()
+}
+
+pub fn sanitize_numa_maps(contents: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+    let mut normalized = Vec::with_capacity(contents.len());
+    let mut row_count = 0;
+
+    for line in text.split_inclusive('\n') {
+        let has_newline = line.ends_with('\n');
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        let fields = body.split_whitespace().collect::<Vec<_>>();
+        if fields.len() < 2 || u64::from_str_radix(fields[0], 16).is_err() {
+            return contents.to_vec();
+        }
+
+        let mut kept = Vec::with_capacity(fields.len());
+        for field in fields {
+            if let Some(value) = numa_page_accounting_value(field) {
+                if value.parse::<u64>().is_err() {
+                    return contents.to_vec();
+                }
+            } else {
+                kept.push(field);
+            }
+        }
+        normalized.extend_from_slice(kept.join(" ").as_bytes());
+        if has_newline {
+            normalized.push(b'\n');
+        }
+        row_count += 1;
+    }
+
+    if row_count == 0 {
+        contents.to_vec()
+    } else {
+        normalized
+    }
+}
+
+pub fn sanitize_smaps(contents: &[u8], table: &BTreeMap<(u64, u64), (u64, u64)>) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+    let mut normalized = Vec::with_capacity(contents.len());
+    let mut mapping_count = 0;
+    let mut accounting_count = 0;
+
+    for line in text.split_inclusive('\n') {
+        let has_newline = line.ends_with('\n');
+        let body = line.strip_suffix('\n').unwrap_or(line);
+
+        if is_smaps_mapping_header(body) {
+            mapping_count += 1;
+            // Was passed through verbatim, which left smaps carrying the same
+            // raw device and inode as maps while appearing sanitized.
+            normalized.extend_from_slice(rewrite_mapping_header(body, table).as_bytes());
+        } else {
+            if mapping_count == 0 {
+                return contents.to_vec();
+            }
+            let Some((label, value)) = body.split_once(':') else {
+                return contents.to_vec();
+            };
+
+            if SMAPS_ACCOUNTING_FIELDS.contains(&label) {
+                if !is_smaps_kilobyte_value(value) {
+                    return contents.to_vec();
+                }
+                normalized.extend_from_slice(label.as_bytes());
+                normalized.extend_from_slice(b":\t0 kB");
+                accounting_count += 1;
+            } else {
+                let valid_static_field = match label {
+                    "Size" | "KernelPageSize" | "MMUPageSize" => is_smaps_kilobyte_value(value),
+                    "THPeligible" | "ProtectionKey" => is_smaps_integer_value(value),
+                    "VmFlags" => value
+                        .split_whitespace()
+                        .all(|flag| flag.bytes().all(|byte| byte.is_ascii_alphanumeric())),
+                    _ => false,
+                };
+                if !valid_static_field {
+                    return contents.to_vec();
+                }
+                normalized.extend_from_slice(body.as_bytes());
+            }
+        }
+
+        if has_newline {
+            normalized.push(b'\n');
+        }
+    }
+
+    if mapping_count == 0 || accounting_count == 0 {
+        contents.to_vec()
+    } else {
+        normalized
+    }
+}
+
+/// `/proc/*/maps`: rewrite only the device and inode columns.
+pub fn sanitize_maps(contents: &[u8], table: &BTreeMap<(u64, u64), (u64, u64)>) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+    let mut out = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        let has_newline = line.ends_with('\n');
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        out.push_str(&rewrite_mapping_header(body, table));
+        if has_newline {
+            out.push('\n');
+        }
+    }
+    out.into_bytes()
+}
+
+pub fn sanitize_rtc(contents: &[u8], rtc_time: &str, rtc_date: &str) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+
+    let mut normalized = Vec::with_capacity(contents.len());
+    for line in text.split_inclusive('\n') {
+        let has_newline = line.ends_with('\n');
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        let replacement = body.split_once(':').and_then(|(key, _)| {
+            let value = match key.trim() {
+                "rtc_time" => rtc_time,
+                "rtc_date" => rtc_date,
+                "alrm_time" => "00:00:00",
+                "alrm_date" => rtc_date,
+                "alarm_IRQ"
+                | "alrm_pending"
+                | "update IRQ enabled"
+                | "periodic IRQ enabled"
+                | "periodic_IRQ"
+                | "update_IRQ" => "no",
+                "periodic IRQ frequency" | "max user IRQ frequency" | "periodic_freq" => "0",
+                _ => return None,
+            };
+            Some(format!("{key}: {value}"))
+        });
+        if let Some(replacement) = replacement {
+            normalized.extend_from_slice(replacement.as_bytes());
+        } else {
+            normalized.extend_from_slice(body.as_bytes());
+        }
+        if has_newline {
+            normalized.push(b'\n');
+        }
+    }
+    normalized
+}
+
+//
+// `/proc/locks` rows have the shape
+//     `SEQ: [->] CLASS MODE RW PID MAJOR:MINOR:INODE START END`
+// where the leading `SEQ:` is a kernel-global lock counter, `PID` is the owner
+// task, and `MAJOR:MINOR:INODE` identifies the backing object. All three are
+// host-specific and vary run-to-run, and the kernel emits rows in an internal
+// order. A granted lock and the blocked waiters queued behind it share one
+// `SEQ`, and a waiter row is marked with `->`.
+//
+// Rather than collapse every identity to a single constant, derive dense IDs
+// from stable lock semantics. Equal raw values remain equal, distinct objects
+// stay distinct, holder/waiter groups stay adjacent, and raw ID renumbering or
+// row reordering does not change the resulting snapshot. An unknown format
+// fails the complete snapshot closed instead of leaking any raw identities.
+//
+// The rows reaching this function are the guest's own: the caller has already
+// dropped every other process's rows (`locks::keep_lock_rows`), so a lock
+// outside the container neither adds a row nor shifts the numbering of the
+// guest's rows.
+pub fn sanitize_locks(contents: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return Vec::new();
+    };
+    if text.is_empty() {
+        return Vec::new();
+    }
+
+    let mut rows: Vec<LockLine> = Vec::new();
+    for line in text.lines() {
+        let Some(row) = parse_lock_line(line) else {
+            return Vec::new();
+        };
+        rows.push(row);
+    }
+
+    let mut object_signatures: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for row in &rows {
+        let mut signature = row.fields.clone();
+        signature[0] = if row.waiter { "waiter" } else { "holder" }.to_owned();
+        signature[row.owner_index] = "owner".to_owned();
+        signature[row.object_index] = "object".to_owned();
+        object_signatures
+            .entry(row.fields[row.object_index].clone())
+            .or_default()
+            .push(signature.join(" "));
+    }
+    let mut objects = object_signatures.into_iter().collect::<Vec<_>>();
+    for (_, signatures) in &mut objects {
+        signatures.sort_unstable();
+    }
+    objects.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
+    let object_ids = objects
+        .into_iter()
+        .enumerate()
+        .map(|(index, (object, _))| (object, index + 1))
+        .collect::<BTreeMap<_, _>>();
+    for row in &mut rows {
+        let object_id = object_ids[&row.fields[row.object_index]];
+        row.fields[row.object_index] = format!("00:00:{object_id}");
+    }
+
+    let mut owner_signatures: BTreeMap<i64, Vec<String>> = BTreeMap::new();
+    for row in &rows {
+        let owner = row.fields[row.owner_index]
+            .parse::<i64>()
+            .expect("owner was validated above");
+        if owner == -1 {
+            continue;
+        }
+        let mut signature = row.fields.clone();
+        signature[0] = if row.waiter { "waiter" } else { "holder" }.to_owned();
+        signature[row.owner_index] = "owner".to_owned();
+        owner_signatures
+            .entry(owner)
+            .or_default()
+            .push(signature.join(" "));
+    }
+    let mut owners = owner_signatures.into_iter().collect::<Vec<_>>();
+    for (_, signatures) in &mut owners {
+        signatures.sort_unstable();
+    }
+    owners.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
+    let owner_ids = owners
+        .into_iter()
+        .enumerate()
+        .map(|(index, (owner, _))| (owner, index + 1))
+        .collect::<BTreeMap<_, _>>();
+    for row in &mut rows {
+        let owner = row.fields[row.owner_index]
+            .parse::<i64>()
+            .expect("owner was validated above");
+        if owner != -1 {
+            row.fields[row.owner_index] = owner_ids[&owner].to_string();
+        }
+    }
+
+    let mut groups: BTreeMap<String, Vec<LockLine>> = BTreeMap::new();
+    for row in rows {
+        groups.entry(row.sequence.clone()).or_default().push(row);
+    }
+    let mut groups = groups.into_values().collect::<Vec<_>>();
+    for rows in &mut groups {
+        rows.sort_by(|left, right| {
+            left.waiter
+                .cmp(&right.waiter)
+                .then_with(|| left.fields.cmp(&right.fields))
+        });
+    }
+    groups.sort_by_key(|rows| {
+        rows.iter()
+            .map(|row| {
+                let mut fields = row.fields.clone();
+                fields[0] = "sequence:".to_owned();
+                fields.join(" ")
+            })
+            .collect::<Vec<_>>()
+    });
+
+    let normalized_rows = groups
+        .into_iter()
+        .enumerate()
+        .flat_map(|(sequence, rows)| {
+            rows.into_iter().map(move |mut row| {
+                row.fields[0] = format!("{}:", sequence + 1);
+                row.fields.join(" ")
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut normalized = normalized_rows.join("\n").into_bytes();
+    if text.ends_with('\n') {
+        normalized.push(b'\n');
+    }
+    normalized
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1276,5 +2111,517 @@ Locked:\t0 kB\n\
 Swap:\t0 kB\n\
 THPeligible:    0\n"
         );
+    }
+    #[test]
+    fn maps_rewrites_both_the_device_and_the_inode() {
+        let raw =
+            b"7f0000000000-7f0000001000 r-xp 00000000 08:02 1234567 /lib/libc.so.6\n" as &[u8];
+        let table = BTreeMap::from([(
+            (libc::makedev(0x08, 0x02), 1_234_567u64),
+            (libc::makedev(0x00, 0x2a), 99u64),
+        )]);
+        let out = String::from_utf8(sanitize_maps(raw, &table)).unwrap();
+        assert!(out.contains(" 00:2a 99 "), "both columns rewritten: {out}");
+        assert!(!out.contains("08:02"), "raw device must not survive: {out}");
+        assert!(
+            !out.contains("1234567"),
+            "raw inode must not survive: {out}"
+        );
+        assert!(
+            out.ends_with("/lib/libc.so.6\n"),
+            "pathname preserved: {out}"
+        );
+    }
+
+    #[test]
+    fn maps_padding_does_not_republish_the_host_inode_width() {
+        // Everything up to and including the space before the inode.
+        const HEAD: &str = "70f80000-71000000 r-xs 00000000 00:06 ";
+        const NAME: &str = "/memfd:liteinst2-trampoline (deleted)";
+        // `seq_setwidth(m, 25 + sizeof(void *) * 6)` in the kernel's
+        // `show_map_vma`; measured at 73 on x86_64.
+        const PATHNAME_COLUMN: usize = 73;
+
+        let kernel_line = |inode: u64| {
+            let prefix = format!("{HEAD}{inode}");
+            let pad = PATHNAME_COLUMN - prefix.len();
+            format!("{prefix}{}{NAME}\n", " ".repeat(pad))
+        };
+        let table = |inode: u64| {
+            BTreeMap::from([(
+                (libc::makedev(0x00, 0x06), inode),
+                (libc::makedev(0x00, 0x06), 8u64),
+            )])
+        };
+
+        let four_digit = sanitize_maps(kernel_line(9_999).as_bytes(), &table(9_999));
+        let five_digit = sanitize_maps(kernel_line(10_000).as_bytes(), &table(10_000));
+        assert_eq!(
+            String::from_utf8(four_digit.clone()).unwrap(),
+            String::from_utf8(five_digit).unwrap(),
+            "the host inode's digit count must not survive as line length",
+        );
+
+        // And the surviving line is still a well-formed maps line: same
+        // pathname, at the column the kernel put it in.
+        let out = String::from_utf8(four_digit).unwrap();
+        let body = out.strip_suffix('\n').unwrap();
+        assert_eq!(
+            body.find('/'),
+            Some(PATHNAME_COLUMN),
+            "pathname column preserved: {out:?}",
+        );
+        assert!(body.ends_with(NAME), "pathname preserved: {out:?}");
+        // Read the inode COLUMN rather than substring-searching the line: the
+        // address range `70f80000-71000000` itself contains "10000", so a
+        // `contains` check here passes for the wrong reason on one input and
+        // fails for the wrong reason on the other.
+        assert_eq!(
+            body.split_whitespace().nth(4),
+            Some("8"),
+            "raw inode must not survive in the inode column: {out:?}",
+        );
+    }
+
+    #[test]
+    fn maps_leaves_anonymous_mappings_alone() {
+        let raw = b"7ffd00000000-7ffd00021000 rw-p 00000000 00:00 0 [stack]\n" as &[u8];
+        assert_eq!(
+            mapping_header_identity(std::str::from_utf8(raw).unwrap().trim_end()),
+            None
+        );
+        assert_eq!(sanitize_maps(raw, &BTreeMap::new()), raw.to_vec());
+    }
+
+    #[test]
+    fn maps_never_invents_an_identity_for_an_untabled_mapping() {
+        let raw =
+            b"7f0000000000-7f0000001000 r-xp 00000000 08:02 1234567 /lib/libc.so.6\n" as &[u8];
+        assert_eq!(sanitize_maps(raw, &BTreeMap::new()), raw.to_vec());
+    }
+
+    #[test]
+    fn smaps_header_is_rewritten_like_maps() {
+        let raw = b"7f0000000000-7f0000001000 r-xp 00000000 08:02 1234567 /lib/libc.so.6\n\
+Size:                  4 kB\n\
+Rss:                   4 kB\n" as &[u8];
+        let table = BTreeMap::from([(
+            (libc::makedev(0x08, 0x02), 1_234_567u64),
+            (libc::makedev(0x00, 0x2a), 99u64),
+        )]);
+        let out = String::from_utf8(sanitize_smaps(raw, &table)).unwrap();
+        assert!(out.contains(" 00:2a 99 "), "smaps header rewritten: {out}");
+        assert!(
+            !out.contains("1234567"),
+            "raw inode must not survive smaps: {out}"
+        );
+    }
+
+    #[test]
+    fn cpuinfo_normalizes_frequency() {
+        let input = b"processor\t: 0\ncpu MHz\t\t: 2994.183\ncache size\t: 1024 KB\n";
+        assert_eq!(
+            sanitize_cpuinfo(input, 1),
+            b"processor\t: 0\ncpu MHz\t\t: 1000.000\ncache size\t: 1024 KB\n"
+        );
+    }
+
+    #[test]
+    fn cpuinfo_reports_one_virtual_cpu() {
+        let block = |n: u32| {
+            format!(
+                "processor\t: {n}\nmodel name\t: Example CPU\ncpu MHz\t\t: 2994.183\n\
+                 physical id\t: 1\nsiblings\t: 8\ncore id\t\t: {n}\ncpu cores\t: 4\n\
+                 apicid\t\t: {n}\ninitial apicid\t: {n}\nflags\t\t: fpu sse2\n\n"
+            )
+        };
+        let host = format!("{}{}{}", block(0), block(1), block(2));
+        let virtual_block = |n: u32| {
+            format!(
+                "processor\t: {n}\nmodel name\t: Example CPU\ncpu MHz\t\t: 1000.000\n\
+                 physical id\t: {n}\nsiblings\t: 1\ncore id\t\t: 0\ncpu cores\t: 1\n\
+                 apicid\t\t: {n}\ninitial apicid\t: {n}\nflags\t\t: fpu sse2\n\n"
+            )
+        };
+        assert_eq!(
+            String::from_utf8(sanitize_cpuinfo(host.as_bytes(), 1)).unwrap(),
+            virtual_block(0)
+        );
+        // A single-CPU host's file is already the virtual shape.
+        assert_eq!(
+            sanitize_cpuinfo(b"processor\t: 0\ncpu cores\t: 1\n\n", 1),
+            b"processor\t: 0\ncpu cores\t: 1\n\n"
+        );
+        // Under --virtual-cpus, the first block once per virtual CPU, each a
+        // single-core socket of its own: more CPUs than the host shows too.
+        assert_eq!(
+            String::from_utf8(sanitize_cpuinfo(host.as_bytes(), 4)).unwrap(),
+            (0..4).map(virtual_block).collect::<String>()
+        );
+    }
+
+    #[test]
+    fn smaps_hides_host_memory_accounting_but_preserves_mapping_metadata() {
+        let contents = b"71000000-71001000 r-xp 00000000 00:00 0\n\
+Size:                  4 kB\n\
+KernelPageSize:        4 kB\n\
+MMUPageSize:           4 kB\n\
+Rss:                   4 kB\n\
+Pss:                   3 kB\n\
+Shared_Clean:          4 kB\n\
+Private_Dirty:         0 kB\n\
+THPeligible:           0\n\
+ProtectionKey:         0\n\
+VmFlags: rd ex mr mw me ac\n";
+
+        assert_eq!(
+            sanitize_smaps(contents, &BTreeMap::new()),
+            b"71000000-71001000 r-xp 00000000 00:00 0\n\
+Size:                  4 kB\n\
+KernelPageSize:        4 kB\n\
+MMUPageSize:           4 kB\n\
+Rss:\t0 kB\n\
+Pss:\t0 kB\n\
+Shared_Clean:\t0 kB\n\
+Private_Dirty:\t0 kB\n\
+THPeligible:           0\n\
+ProtectionKey:         0\n\
+VmFlags: rd ex mr mw me ac\n"
+        );
+    }
+
+    #[test]
+    fn smaps_hides_page_cache_dirty_state() {
+        let dirty = b"00400000-00401000 r--p 00000000 00:2a 99 /guest\n\
+Size:                  4 kB\n\
+Rss:                   4 kB\n\
+Private_Dirty:         4 kB\n\
+VmFlags: rd mr mw me\n";
+        let clean = b"00400000-00401000 r--p 00000000 00:2a 99 /guest\n\
+Size:                  4 kB\n\
+Rss:                   4 kB\n\
+Private_Dirty:         0 kB\n\
+VmFlags: rd mr mw me\n";
+
+        let expected = b"00400000-00401000 r--p 00000000 00:2a 99 /guest\n\
+Size:                  4 kB\n\
+Rss:\t0 kB\n\
+Private_Dirty:\t0 kB\n\
+VmFlags: rd mr mw me\n";
+        assert_eq!(sanitize_smaps(dirty, &BTreeMap::new()), expected);
+        assert_eq!(sanitize_smaps(clean, &BTreeMap::new()), expected);
+        assert_eq!(
+            sanitize_smaps_rollup(b"Private_Dirty:        12 kB\n"),
+            b"Private_Dirty:\t0 kB\n"
+        );
+    }
+
+    /// Every host page-accounting field, in the order this kernel prints them.
+    /// Deliberately a separate literal rather than `SMAPS_ACCOUNTING_FIELDS`, so
+    /// dropping a field from the sanitizer's list fails here.
+    const KERNEL_SMAPS_ACCOUNTING_LABELS: &[&str] = &[
+        "Rss",
+        "Pss",
+        "Pss_Dirty",
+        "Pss_Anon",
+        "Pss_File",
+        "Pss_Shmem",
+        "Shared_Clean",
+        "Shared_Dirty",
+        "Private_Clean",
+        "Private_Dirty",
+        "Referenced",
+        "Anonymous",
+        "KSM",
+        "LazyFree",
+        "AnonHugePages",
+        "ShmemPmdMapped",
+        "FilePmdMapped",
+        "Shared_Hugetlb",
+        "Private_Hugetlb",
+        "Swap",
+        "SwapPss",
+        "Locked",
+    ];
+
+    #[test]
+    fn smaps_hides_every_host_page_accounting_field() {
+        let block = |seed: u64| {
+            let mut block = String::from(
+                "00400000-00600000 rw-p 00000000 00:00 0\nSize:               2048 kB\n",
+            );
+            for (index, label) in KERNEL_SMAPS_ACCOUNTING_LABELS.iter().enumerate() {
+                let value = seed * (index as u64 + 1);
+                block.push_str(&format!("{:<16}{value:>8} kB\n", format!("{label}:")));
+            }
+            block.push_str("THPeligible:    1\nVmFlags: rd wr mr mw me ac\n");
+            block
+        };
+        let idle = block(0);
+        let busy = block(4);
+        let mut expected =
+            String::from("00400000-00600000 rw-p 00000000 00:00 0\nSize:               2048 kB\n");
+        for label in KERNEL_SMAPS_ACCOUNTING_LABELS {
+            expected.push_str(&format!("{label}:\t0 kB\n"));
+        }
+        expected.push_str("THPeligible:    1\nVmFlags: rd wr mr mw me ac\n");
+
+        for input in [&idle, &busy] {
+            let smaps = sanitize_smaps(input.as_bytes(), &BTreeMap::new());
+            assert_eq!(String::from_utf8(smaps).unwrap(), expected);
+        }
+
+        let rollup = |block: &str| {
+            let block = block.replace("00400000-00600000 rw-p", "00400000-7ffffffff000 ---p");
+            let body: String = block
+                .lines()
+                .filter(|line| {
+                    !line.starts_with("Size:")
+                        && !line.starts_with("THPeligible:")
+                        && !line.starts_with("VmFlags:")
+                })
+                .map(|line| format!("{line}\n"))
+                .collect();
+            String::from_utf8(sanitize_smaps_rollup(body.as_bytes())).unwrap()
+        };
+        let idle_rollup = rollup(&idle);
+        assert_eq!(idle_rollup, rollup(&busy));
+        for label in KERNEL_SMAPS_ACCOUNTING_LABELS {
+            assert!(
+                idle_rollup.contains(&format!("\n{label}:\t0 kB\n")),
+                "rollup left {label} unsanitized: {idle_rollup}"
+            );
+        }
+    }
+
+    #[test]
+    fn smaps_leaves_unknown_or_malformed_formats_untouched() {
+        let invalid_counter = b"71000000-71001000 r-xp 00000000 00:00 0\nPss: many kB\n";
+        assert_eq!(
+            sanitize_smaps(invalid_counter, &BTreeMap::new()),
+            invalid_counter
+        );
+
+        let unknown_field = b"71000000-71001000 r-xp 00000000 00:00 0\nMystery: 1 kB\n";
+        assert_eq!(
+            sanitize_smaps(unknown_field, &BTreeMap::new()),
+            unknown_field
+        );
+
+        let invalid_header = b"not-a-range r-xp 00000000 00:00 0\nPss: 3 kB\n";
+        assert_eq!(
+            sanitize_smaps(invalid_header, &BTreeMap::new()),
+            invalid_header
+        );
+    }
+
+    #[test]
+    fn rtc_uses_the_virtual_clock_and_hides_alarm_state() {
+        let contents = b"rtc_time\t: 10:07:42\n\
+rtc_date\t: 2026-07-27\n\
+alrm_time\t: 00:50:12\n\
+alrm_date\t: 2026-07-28\n\
+alarm_IRQ\t: yes\n\
+periodic IRQ enabled\t: yes\n\
+periodic IRQ frequency\t: 1024\n\
+24hr\t\t: yes\n";
+
+        assert_eq!(
+            sanitize_rtc(contents, "23:59:59", "2000-12-31"),
+            b"rtc_time\t: 23:59:59\n\
+rtc_date\t: 2000-12-31\n\
+alrm_time\t: 00:00:00\n\
+alrm_date\t: 2000-12-31\n\
+alarm_IRQ\t: no\n\
+periodic IRQ enabled\t: no\n\
+periodic IRQ frequency\t: 0\n\
+24hr\t\t: yes\n"
+        );
+    }
+
+    #[test]
+    fn locks_virtualize_identities_but_preserve_equivalences() {
+        // A holder (seq 74) with a waiter blocked behind it on the same object,
+        // a second lock by the same owner (PID 480) on a *different* object,
+        // and a third lock by a different owner on the *first* object.
+        let contents = b"74: POSIX  ADVISORY  WRITE 480 08:02:1111 0 EOF\n\
+74: -> POSIX  ADVISORY  WRITE 481 08:02:1111 0 EOF\n\
+9: OFDLCK ADVISORY  WRITE 480 08:02:2222 0 EOF\n\
+21: FLOCK ADVISORY  WRITE 999 08:02:1111 0 EOF\n";
+
+        let out = String::from_utf8(sanitize_locks(contents)).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+
+        // No host-specific sequence, PID, or device:inode magnitude survives.
+        assert!(!out.contains("74"), "raw sequence leaked: {out}");
+        assert!(!out.contains("480") && !out.contains("481") && !out.contains("999"));
+        assert!(!out.contains("1111") && !out.contains("2222"));
+
+        // The holder and its `->` waiter keep a shared virtual sequence and stay
+        // adjacent (grouping preserved rather than scattered by a global sort).
+        let holder = lines
+            .iter()
+            .position(|l| l.contains("POSIX") && !l.contains("->"));
+        let waiter = lines.iter().position(|l| l.contains("->"));
+        let (holder, waiter) = (holder.unwrap(), waiter.unwrap());
+        assert_eq!(waiter, holder + 1, "waiter must immediately follow holder");
+        let seq_of = |l: &str| l.split(':').next().unwrap().to_owned();
+        assert_eq!(seq_of(lines[holder]), seq_of(lines[waiter]));
+
+        // The two locks on object 08:02:1111 (holder + FLOCK) share one virtual
+        // object id; the lock on 08:02:2222 keeps a *distinct* one.
+        let obj_of = |l: &str| l.split_whitespace().nth_back(2).unwrap().to_owned();
+        let flock = lines.iter().find(|l| l.contains("FLOCK")).unwrap();
+        let ofd = lines.iter().find(|l| l.contains("OFDLCK")).unwrap();
+        assert_eq!(
+            obj_of(lines[holder]),
+            obj_of(flock),
+            "same object must match"
+        );
+        assert_ne!(
+            obj_of(lines[holder]),
+            obj_of(ofd),
+            "distinct objects must differ"
+        );
+
+        // Same raw owner (PID 480) on two different objects keeps one virtual
+        // owner; the other owners stay distinct.
+        let pid_of = |l: &str| l.split_whitespace().nth_back(3).unwrap().to_owned();
+        assert_eq!(pid_of(lines[holder]), pid_of(ofd), "same owner must match");
+        assert_ne!(pid_of(lines[holder]), pid_of(lines[waiter]));
+        assert_ne!(pid_of(lines[holder]), pid_of(flock));
+
+        let renumbered_and_reordered = b"800: FLOCK ADVISORY WRITE 9000 00:fe:9001 0 EOF\n\
+700: OFDLCK ADVISORY WRITE 8000 00:fe:9002 0 EOF\n\
+900: -> POSIX ADVISORY WRITE 7000 00:fe:9001 0 EOF\n\
+900: POSIX ADVISORY WRITE 8000 00:fe:9001 0 EOF\n";
+        assert_eq!(
+            sanitize_locks(contents),
+            sanitize_locks(renumbered_and_reordered),
+            "raw ID renumbering and row order changed the virtual graph"
+        );
+
+        // Fail closed, not open: one unclassifiable row suppresses the entire
+        // snapshot instead of mixing a sentinel with partially trusted data.
+        assert!(sanitize_locks(b"malformed row\n").is_empty());
+        assert!(
+            sanitize_locks(b"74: POSIX ADVISORY WRITE 480 08:02:1111 0 EOF\nmalformed\n")
+                .is_empty()
+        );
+        assert!(sanitize_locks(&[0xff, 0xfe]).is_empty());
+        assert!(sanitize_locks(b"").is_empty());
+    }
+
+    #[test]
+    fn unix_sockets_hide_kernel_identities_and_sort_semantic_rows() {
+        let contents = b"Num RefCount Protocol Flags Type St Inode Path\n\
+00000000fedcba98: 00000003 00000000 00010000 0002 01 12346 /run/socket two\n\
+000000001234abcd: 00000002 00000000 00000000 0001 03 12345\n";
+
+        assert_eq!(
+            sanitize_unix_sockets(contents),
+            b"Num RefCount Protocol Flags Type St Inode Path\n\
+0000000000000000: 00000002 00000000 00000000 0001 03 0\n\
+0000000000000000: 00000003 00000000 00010000 0002 01 0 /run/socket two\n"
+        );
+    }
+
+    #[test]
+    fn unix_sockets_fail_open_on_unknown_schemas() {
+        for malformed in [
+            b"".as_slice(),
+            b"Num RefCount Protocol Flags Type St Inode Path",
+            b"Num RefCount Protocol Flags Type St Inode Path Extra\n",
+            b"Num RefCount Protocol Flags Type St Inode Path\n1234: 00000003 00000000 00000000 0001 03 12345\n",
+            b"Num RefCount Protocol Flags Type St Inode Path\n000000001234abcd: 0000000G 00000000 00000000 0001 03 12345\n",
+            b"Num RefCount Protocol Flags Type St Inode Path\n000000001234abcd: 00000003 00000000 00000000 0001 03 inode\n",
+            b"Num RefCount Protocol Flags Type St Inode Path\n000000001234abcd: 00000003 00000000 00000000 0001 03 18446744073709551616\n",
+            b"Num RefCount Protocol Flags Type St Inode Path\n000000001234abcd: 00000003 00000000 00000000 0001\n",
+        ] {
+            assert_eq!(sanitize_unix_sockets(malformed), malformed);
+        }
+    }
+
+    #[test]
+    fn netlink_sockets_hide_kernel_identities_and_sort_semantic_rows() {
+        let contents = b"sk Eth Pid Groups Rmem Wmem Dump Locks Drops Inode\n\
+00000000fedcba98 10 20 00000002 3 4 5 6 7 12346\n\
+000000001234abcd 4 10 00000001 0 0 0 2 0 12345\n";
+
+        assert_eq!(
+            sanitize_netlink_sockets(contents),
+            b"sk Eth Pid Groups Rmem Wmem Dump Locks Drops Inode\n\
+0000000000000000 4 10 00000001 0 0 0 2 0 0\n\
+0000000000000000 10 20 00000002 3 4 5 6 7 0\n"
+        );
+    }
+
+    #[test]
+    fn inet_sockets_zero_both_host_identities_and_canonicalize_row_order() {
+        // Two rows deliberately given in the order the kernel happened to
+        // produce on one run; a later run produced them the other way round.
+        let contents = b"  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n   0: 0100007F:8001 00000000:0000 0A 00000000:00000000 00:00000000 00000000 0 0 3066787053 1 00000000703938cf 100 0 0 10 0\n   1: 0100007F:8000 00000000:0000 0A 00000000:00000000 00:00000000 00000000 0 0 3066787052 1 0000000042a27170 100 0 0 10 0\n"
+            .as_slice();
+        // Same rows, opposite order, different host inodes and pointers: a
+        // second run of the same guest. Both must normalize to one answer.
+        let swapped = b"  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n   0: 0100007F:8000 00000000:0000 0A 00000000:00000000 00:00000000 00000000 0 0 3071433840 1 000000005b1c887b 100 0 0 10 0\n   1: 0100007F:8001 00000000:0000 0A 00000000:00000000 00:00000000 00000000 0 0 3071433841 1 00000000ab7b588a 100 0 0 10 0\n"
+            .as_slice();
+
+        let first = sanitize_inet_sockets(contents);
+        assert_eq!(
+            first,
+            sanitize_inet_sockets(swapped),
+            "two runs differing only in host identity and row order must agree"
+        );
+
+        let text = String::from_utf8(first).unwrap();
+        for row in text.lines().skip(1) {
+            let fields = row.split_whitespace().collect::<Vec<_>>();
+            assert_eq!(fields[9], "0", "inode must be zeroed: {row}");
+            assert_eq!(
+                fields[11], "0000000000000000",
+                "pointer must be zeroed: {row}"
+            );
+        }
+        // `sl` is renumbered to match the sorted order, not left contradicting it.
+        let indices = text
+            .lines()
+            .skip(1)
+            .map(|row| row.split_whitespace().next().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(indices, vec!["0:", "1:"]);
+        // And sorted on content: port 8000 sorts before 8001.
+        assert!(text.lines().nth(1).unwrap().contains(":8000"));
+    }
+
+    #[test]
+    fn inet_sockets_fail_open_on_unknown_schemas() {
+        for malformed in [
+            b"".as_slice(),
+            // No trailing newline.
+            b"  sl  local_address rem_address st inode",
+            // Header is not this table.
+            b"sk Eth Pid Groups Rmem Wmem Dump Locks Drops Inode\n",
+            // Too few columns for the two host-state fields to exist.
+            b"  sl  local_address inode\n   0: 0100007F:8000 12345\n",
+            // Inode column not decimal.
+            b"  sl  a b c d e f g h inode j pointer\n   0: 1 2 3 4 5 6 7 8 zero 1 0000000042a27170\n",
+        ] {
+            assert_eq!(sanitize_inet_sockets(malformed), malformed);
+        }
+    }
+
+    #[test]
+    fn netlink_sockets_fail_open_on_unknown_schemas() {
+        for malformed in [
+            b"".as_slice(),
+            b"sk Eth Pid Groups Rmem Wmem Dump Locks Drops Inode",
+            b"sk Eth Pid Groups Rmem Wmem Dump Locks Drops Inode Extra\n",
+            b"sk Eth Pid Groups Rmem Wmem Dump Locks Drops Inode\n1234 4 10 00000001 0 0 0 2 0 12345\n",
+            b"sk Eth Pid Groups Rmem Wmem Dump Locks Drops Inode\n000000001234abcd 4 10 00000001 0 0 0 2 zero 12345\n",
+            b"sk Eth Pid Groups Rmem Wmem Dump Locks Drops Inode\n000000001234abcd 4 10 00000001 0 0 0 2 0 12345 extra\n",
+        ] {
+            assert_eq!(sanitize_netlink_sockets(malformed), malformed);
+        }
     }
 }
