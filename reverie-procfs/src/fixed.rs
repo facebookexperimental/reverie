@@ -143,7 +143,7 @@ pub enum FixedFile {
     Meminfo,
     /// `/proc/loadavg`: no load, one runnable task of one, and PID 1 the
     /// last created. Detcore rendered these values from every backend's
-    /// capture already (https://github.com/rrnewton/hermit/issues/4213).
+    /// capture already (<https://github.com/rrnewton/hermit/issues/4213>).
     Loadavg,
     /// `fs/file-nr`.
     FileNr,

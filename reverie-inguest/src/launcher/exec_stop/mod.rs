@@ -44,7 +44,6 @@ pub mod birth_bridge;
 pub mod inject;
 #[cfg(all(feature = "loader-private-runtime", not(feature = "stage1a-probe")))]
 mod inject;
-/// Retention and retirement for a mapped first-image launch.
 #[cfg(feature = "loader-private-runtime")]
 pub mod mapped_launch;
 #[cfg(any(feature = "stage1a-probe", feature = "loader-private-runtime"))]
