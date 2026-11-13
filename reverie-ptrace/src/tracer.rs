@@ -333,6 +333,18 @@ impl ManagedWaitDriver {
         }
     }
 
+    /// Blocks until this wait's status can be returned, for at most
+    /// `timeout`, without reserving or consuming it, so the next
+    /// [`Self::poll_on_ptracer_thread`] finds it (see safeptrace's
+    /// `block_until_ready`). `None`: no wait was made.
+    fn block_until_ready(&self, timeout: Duration) -> Option<bool> {
+        match self {
+            Self::Native { inner, .. } => inner.block_until_ready(timeout),
+            Self::Explicit { inner, .. } => inner.block_until_ready(timeout),
+            Self::Refused { .. } => None,
+        }
+    }
+
     fn into_zombie_after_observed_death(self) -> Result<safeptrace::Zombie, Box<Self>> {
         match self {
             Self::Native { inner, controller } => inner
@@ -496,6 +508,17 @@ impl ManagedPendingStatusReservation<'_> {
         }
     }
 }
+
+/// How long the first poll of a bounded step's wait blocks for its status
+/// ([`PtracerWaitOwner::wait_running_bounded`]) before it falls back to
+/// returning `Pending` to the runtime. A bounded step stops within
+/// microseconds; the bound only keeps the runtime live if that ever fails.
+pub(crate) const BOUNDED_STEP_WAIT: Duration = Duration::from_millis(100);
+
+/// Bounded step waits whose status did not arrive within
+/// [`BOUNDED_STEP_WAIT`].
+pub(crate) static BOUNDED_STEP_WAITS_TIMED_OUT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// Ordinary cancellation retains the same event/stop authority as the running
 /// task. Mode selection inspects that original descriptor, never a new PID.
@@ -736,6 +759,16 @@ impl PtracerWaitOwner {
         self: &Arc<Self>,
         driver: ManagedWaitDriver,
     ) -> BoxFuture<'static, Result<Wait, TraceError>> {
+        self.wait_driver_with(driver, None)
+    }
+
+    /// [`Self::wait_driver`], whose first poll first blocks for at most
+    /// `bound` until the status is there, if `bound` is set.
+    fn wait_driver_with(
+        self: &Arc<Self>,
+        driver: ManagedWaitDriver,
+        mut bound: Option<Duration>,
+    ) -> BoxFuture<'static, Result<Wait, TraceError>> {
         assert!(
             driver.generation().is_some(),
             "unfinished wait has its original generation"
@@ -747,6 +780,12 @@ impl PtracerWaitOwner {
             let result = {
                 let mut retained = slot.lock().unwrap();
                 let driver = retained.as_mut().expect("wait is polled before transfer");
+                if let Some(timeout) = bound.take()
+                    && driver.block_until_ready(timeout) == Some(false)
+                {
+                    BOUNDED_STEP_WAITS_TIMED_OUT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tracing::debug!(?timeout, "bounded step wait timed out");
+                }
                 match driver.poll_on_ptracer_thread(cx) {
                     std::task::Poll::Pending => return std::task::Poll::Pending,
                     std::task::Poll::Ready(Ok(wait)) => {
@@ -790,6 +829,19 @@ impl PtracerWaitOwner {
         running: Running,
     ) -> BoxFuture<'static, Result<Wait, TraceError>> {
         self.wait_driver(self.running_driver(running))
+    }
+
+    /// [`Self::wait_running`] for a step whose stop is bounded: its first poll
+    /// first blocks for at most [`BOUNDED_STEP_WAIT`] until the status is
+    /// there ([`ManagedWaitDriver::block_until_ready`]), instead of returning
+    /// `Pending` to the runtime and being woken. Everything else is
+    /// [`Self::wait_running`]'s: the slot, the poll, its reservation and
+    /// commit, and its errors.
+    pub(crate) fn wait_running_bounded(
+        self: &Arc<Self>,
+        running: Running,
+    ) -> BoxFuture<'static, Result<Wait, TraceError>> {
+        self.wait_driver_with(self.running_driver(running), Some(BOUNDED_STEP_WAIT))
     }
 
     pub(crate) fn reap_zombie(
@@ -945,6 +997,18 @@ pub(crate) trait WaitOnPtracer {
         self,
         owner: &Arc<PtracerWaitOwner>,
     ) -> BoxFuture<'static, Result<Wait, TraceError>>;
+
+    /// [`Self::next_state_with_owner`] for a step whose next stop is bounded
+    /// (see [`PtracerWaitOwner::wait_running_bounded`]).
+    fn next_state_with_owner_bounded(
+        self,
+        owner: &Arc<PtracerWaitOwner>,
+    ) -> BoxFuture<'static, Result<Wait, TraceError>>
+    where
+        Self: Sized,
+    {
+        self.next_state_with_owner(owner)
+    }
 }
 
 impl WaitOnPtracer for Running {
@@ -953,6 +1017,13 @@ impl WaitOnPtracer for Running {
         owner: &Arc<PtracerWaitOwner>,
     ) -> BoxFuture<'static, Result<Wait, TraceError>> {
         owner.wait_running(self)
+    }
+
+    fn next_state_with_owner_bounded(
+        self,
+        owner: &Arc<PtracerWaitOwner>,
+    ) -> BoxFuture<'static, Result<Wait, TraceError>> {
+        owner.wait_running_bounded(self)
     }
 }
 
@@ -4678,6 +4749,7 @@ mod plain_guest_regression_tests;
 #[cfg(test)]
 mod tests {
     include!("tracer/adaptive_wait_tests.rs");
+    include!("tracer/bounded_step_wait_tests.rs");
     include!("tracer/legacy_group_stop_tests.rs");
     include!("tracer/fatal_callback_tests.rs");
     include!("tracer/fatal_vfork_tests.rs");

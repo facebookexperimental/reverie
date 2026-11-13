@@ -2603,6 +2603,72 @@ impl Event {
         }
     }
 
+    /// Blocks the calling thread until this Event's FIFO holds a status or a
+    /// terminal status is set, for at most `timeout`, without taking either:
+    /// the predicate of [`Self::wait_status_reservation_sync`]'s descriptor
+    /// branch, waited on the same `status_changed` condvar, but with no
+    /// reservation, no consumption, no wait-owner transition and no waker
+    /// registration. A caller then polls its wait as before, and that poll
+    /// reserves, decodes and commits exactly as it would have.
+    ///
+    /// It waits only while the running notifier worker owns this Event's
+    /// wait and no cleanup claim is pending: the lock-free predicate of
+    /// [`Self::claim_notifier_wait`]'s fast path, under which every status
+    /// reaches the FIFO through [`Self::update`], which notifies
+    /// `status_changed`. Otherwise it returns `None` at once and the caller's
+    /// poll decides, as before.
+    ///
+    /// An Event's first `PTRACE_EVENT_EXIT` stop does not enter the FIFO:
+    /// [`Self::publish_exit_stop`] moves `exit_status` off `EXIT_PENDING` for
+    /// the exit-epoch poll instead. That also ends the wait, so the caller's
+    /// poll runs at once, as it would have, rather than after `timeout`.
+    ///
+    /// `Some(true)`: a status, a terminal status or an exit stop is there
+    /// (after an exit stop alone, the caller's poll may still be `Pending`, as
+    /// before). `Some(false)`: the timeout passed without any of them.
+    fn block_until_status(&self, timeout: Duration) -> Option<bool> {
+        if self.cleanup_cancel_requested.load(Ordering::Acquire)
+            || self.cleanup_claim_waiters.load(Ordering::Acquire) != 0
+            || self.wait_owner.load(Ordering::Acquire) != WAIT_OWNER_NOTIFIER
+            || self.worker_state.load(Ordering::Acquire) != WORKER_RUNNING
+        {
+            return None;
+        }
+        // An exit stop (or ECHILD) is already published: nothing to wait for.
+        if self.exit_status.load(Ordering::Acquire) != EXIT_PENDING {
+            return Some(true);
+        }
+        let deadline = Instant::now() + timeout;
+        let mut state = self.status.lock();
+        loop {
+            // Checked under the status lock, so no exit stop is missed:
+            // `publish_exit_stop` stores EXIT_STOPPED (its `exit_status`
+            // compare_exchange) before it takes this lock to record
+            // `before_exit`, and before its `status_changed.notify_all()`. This
+            // check therefore either sees the store, or this thread is already
+            // waiting when that notify_all runs. When an exit stop is queued
+            // into the FIFO instead (`queue_exit_stop_after_exit`), the push
+            // happens under this lock and is followed by the same notify_all.
+            if !state.pending.is_empty()
+                || state.terminal != INVALID_STATUS
+                || self.exit_status.load(Ordering::Acquire) != EXIT_PENDING
+            {
+                return Some(true);
+            }
+            if self
+                .status_changed
+                .wait_until(&mut state, deadline)
+                .timed_out()
+            {
+                return Some(
+                    !state.pending.is_empty()
+                        || state.terminal != INVALID_STATUS
+                        || self.exit_status.load(Ordering::Acquire) != EXIT_PENDING,
+                );
+            }
+        }
+    }
+
     fn try_status_reservation_sync(&self) -> Option<Result<StatusReservation<'_>, Errno>> {
         let state = self.status.lock();
         if let Some(status) = state.pending.front().copied() {
@@ -8214,6 +8280,20 @@ impl OwnedWaitFuture {
         }
     }
 
+    /// Blocks until this wait's Event has a status to return, for at most
+    /// `timeout`, without reserving or consuming it (see
+    /// [`Event::block_until_status`]), so that the next poll finds it. A
+    /// Procfs (legacy non-leader) wait, whose status the ptracer thread
+    /// consumes itself, returns `None` at once, as does a completed wait.
+    pub fn block_until_ready(&self, timeout: Duration) -> Option<bool> {
+        let inner = self.inner.as_ref()?;
+        let handle = inner.token.event().resolved_handle();
+        if handle.uses_procfs_wait() {
+            return None;
+        }
+        handle.event().block_until_status(timeout)
+    }
+
     /// Polls the Native wait for one retained execution-controller host.
     ///
     /// The first admitted call retains this same guard, and every poll checks
@@ -8725,6 +8805,11 @@ impl PtracerWaitDriver {
             affinity,
             observed_death: false,
         }
+    }
+
+    /// [`OwnedWaitFuture::block_until_ready`] for this driver's wait.
+    pub fn block_until_ready(&self, timeout: Duration) -> Option<bool> {
+        self.inner.block_until_ready(timeout)
     }
 
     /// Polls on the original, still-live host ptracer OS thread.
@@ -10670,6 +10755,137 @@ mod test {
                 Signal::SIGTRAP,
                 libc::PTRACE_EVENT_EXIT
             ))
+        );
+    }
+
+    /// An Event whose wait the running notifier worker owns, as
+    /// `claim_notifier_wait`'s fast path requires, without a worker thread.
+    fn notifier_owned_event() -> Event {
+        let event = Event::new();
+        event
+            .wait_owner
+            .store(WAIT_OWNER_NOTIFIER, Ordering::Release);
+        event.worker_state.store(WORKER_RUNNING, Ordering::Release);
+        event
+    }
+
+    #[test]
+    fn block_until_status_refuses_an_event_the_worker_does_not_own() {
+        let event = Event::new();
+        event.update((libc::SIGTRAP << 8) | 0x7f);
+        // Not owned by a running worker: no wait, whatever is queued.
+        assert_eq!(event.block_until_status(Duration::from_secs(5)), None);
+        let event = notifier_owned_event();
+        event.cleanup_claim_waiters.fetch_add(1, Ordering::AcqRel);
+        assert_eq!(event.block_until_status(Duration::from_secs(5)), None);
+        let event = notifier_owned_event();
+        event
+            .cleanup_cancel_requested
+            .store(true, Ordering::Release);
+        assert_eq!(event.block_until_status(Duration::from_secs(5)), None);
+    }
+
+    #[test]
+    fn block_until_status_returns_at_once_for_a_queued_stop_without_taking_it() {
+        let event = notifier_owned_event();
+        let stop = (libc::SIGTRAP << 8) | 0x7f;
+        event.update(stop);
+        assert_eq!(event.block_until_status(Duration::from_secs(5)), Some(true));
+        // Read only: the stop is still at the front of the FIFO.
+        assert_eq!(event.status.lock().pending.front().copied(), Some(stop));
+        assert_eq!(
+            event.wait_owner.load(Ordering::Acquire),
+            WAIT_OWNER_NOTIFIER
+        );
+    }
+
+    #[test]
+    fn block_until_status_returns_for_an_exit_stop_and_a_terminal_status() {
+        let event = notifier_owned_event();
+        event.update(PTRACE_EVENT_EXIT_STOP);
+        assert_eq!(event.block_until_status(Duration::from_secs(5)), Some(true));
+        let event = notifier_owned_event();
+        event.update(42 << 8);
+        assert_eq!(event.block_until_status(Duration::from_secs(5)), Some(true));
+    }
+
+    #[test]
+    fn block_until_status_times_out_on_an_empty_fifo() {
+        let event = notifier_owned_event();
+        let start = Instant::now();
+        assert_eq!(
+            event.block_until_status(Duration::from_millis(20)),
+            Some(false)
+        );
+        assert!(start.elapsed() >= Duration::from_millis(20));
+    }
+
+    #[test]
+    fn block_until_status_wakes_on_a_later_update() {
+        let event = Arc::new(notifier_owned_event());
+        let publisher = {
+            let event = Arc::clone(&event);
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(20));
+                event.update((libc::SIGTRAP << 8) | 0x7f);
+            })
+        };
+        let start = Instant::now();
+        assert_eq!(
+            event.block_until_status(Duration::from_secs(10)),
+            Some(true)
+        );
+        assert!(start.elapsed() < Duration::from_secs(10));
+        publisher.join().unwrap();
+    }
+
+    #[test]
+    fn block_until_status_wakes_when_an_exit_stop_is_published_during_the_wait() {
+        let event = Arc::new(notifier_owned_event());
+        let publisher = {
+            let event = Arc::clone(&event);
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(20));
+                event.update(PTRACE_EVENT_EXIT_STOP);
+            })
+        };
+        let start = Instant::now();
+        assert_eq!(
+            event.block_until_status(Duration::from_secs(10)),
+            Some(true)
+        );
+        // Woken by the publication, well before the bound.
+        assert!(start.elapsed() < Duration::from_secs(5));
+        publisher.join().unwrap();
+        // The first exit stop is published to the exit-epoch poll, not the
+        // FIFO, and the wait took nothing.
+        assert!(event.status.lock().pending.is_empty());
+        assert_eq!(event.exit_status.load(Ordering::Acquire), EXIT_STOPPED);
+        assert_eq!(
+            event.exit_capability.load(Ordering::Acquire),
+            EXIT_CAP_AVAILABLE
+        );
+    }
+
+    #[test]
+    fn block_until_status_returns_at_entry_after_a_published_exit_stop() {
+        let event = notifier_owned_event();
+        event.update(PTRACE_EVENT_EXIT_STOP);
+        let start = Instant::now();
+        assert_eq!(
+            event.block_until_status(Duration::from_secs(10)),
+            Some(true)
+        );
+        assert!(start.elapsed() < Duration::from_secs(5));
+        // Read only: the capability is still unclaimed for the exit-epoch poll.
+        assert!(event.status.lock().pending.is_empty());
+        assert_eq!(
+            event.exit_capability.load(Ordering::Acquire),
+            EXIT_CAP_AVAILABLE
+        );
+        assert_eq!(
+            event.wait_owner.load(Ordering::Acquire),
+            WAIT_OWNER_NOTIFIER
         );
     }
 

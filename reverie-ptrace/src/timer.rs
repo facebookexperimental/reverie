@@ -3563,7 +3563,21 @@ impl TimerImpl {
             )?;
             #[cfg(target_arch = "aarch64")]
             breakpoints.resumed();
-            let mut wait = running.next_state_with_owner(waits).await?;
+            // A block or instruction step stops within its unit, so its wait
+            // can block for the stop instead of yielding to the runtime
+            // (`PtracerWaitOwner::wait_running_bounded`). Every other unit
+            // keeps the plain wait.
+            let bounded = match unit {
+                StepUnit::Instruction => true,
+                #[cfg(target_arch = "x86_64")]
+                StepUnit::Block => true,
+                _ => false,
+            };
+            let mut wait = if bounded {
+                running.next_state_with_owner_bounded(waits).await?
+            } else {
+                running.next_state_with_owner(waits).await?
+            };
             #[cfg(target_arch = "aarch64")]
             note_stop(&mut breakpoints, &wait);
             // A step run as a syscall (`StepUnit::Syscall`, or one the caller
