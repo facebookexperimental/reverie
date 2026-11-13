@@ -22,6 +22,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
 use super::host_probe::PMD_SIZE;
+use super::host_probe::Placement;
 use super::vm_flags::FileVmFacts;
 use super::vm_flags::MapShape;
 
@@ -338,4 +339,77 @@ fn thp_eligibility_of_an_overlayfs_file_follows_its_layer() {
         eligible(&overlay_never.merged, "file", aligned),
         Some(false)
     );
+}
+
+/// A probe needs no particular address of this process to be free. With the
+/// lowest page a mapping may have taken, and the lowest PMD-aligned block
+/// above it and the page after (the place a non-PIE executable linked at
+/// lld's default base, 0x200000, takes), a one-page probe, probes at two
+/// offsets within a PMD block, and the `THPeligible` probe of a 2 MiB
+/// mapping all read their own blocks. It runs in a child process of this
+/// test binary ([`in_namespace`]), so the addresses it takes touch no other
+/// test.
+#[test]
+fn a_probe_needs_no_low_address_free() {
+    if !in_namespace(module_path!(), "a_probe_needs_no_low_address_free") {
+        return;
+    }
+    let lowest = std::fs::read_to_string("/proc/sys/vm/mmap_min_addr")
+        .unwrap()
+        .trim()
+        .parse::<u64>()
+        .unwrap()
+        .max(1)
+        .next_multiple_of(PAGE);
+    for (address, length) in [
+        (lowest, PAGE),
+        (lowest.next_multiple_of(PMD_SIZE), PMD_SIZE + PAGE),
+    ] {
+        // SAFETY: MAP_FIXED_NOREPLACE never replaces a mapping; what it
+        // maps stays until this child process exits.
+        let taken = unsafe {
+            libc::syscall(
+                libc::SYS_mmap,
+                address as *mut libc::c_void,
+                length as usize,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED_NOREPLACE,
+                -1,
+                0,
+            )
+        };
+        // Taken here, or already (EEXIST), as by a non-PIE image.
+        assert!(
+            taken == address as libc::c_long
+                || std::io::Error::last_os_error().raw_os_error() == Some(libc::EEXIST),
+            "{address:#x}: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    let file = {
+        // SAFETY: a new memfd this test owns.
+        let fd = unsafe { libc::memfd_create(c"host-probe".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(fd >= 0);
+        // SAFETY: memfd_create returned a new descriptor.
+        unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fd) }
+    };
+    file.set_len(4 * PMD_SIZE).unwrap();
+    let page = super::host_probe::probe(&file, R, false, 0, PAGE, Placement::Anywhere);
+    assert!(
+        page.is_some_and(|block| block.vm_flags.is_some()),
+        "{page:?}"
+    );
+    for residue in [0, PAGE] {
+        let block = super::host_probe::probe(
+            &file,
+            RW,
+            true,
+            PMD_SIZE,
+            PMD_SIZE,
+            Placement::Residue(residue),
+        );
+        assert!(block.is_some(), "Residue({residue:#x})");
+    }
+    let start = 0x7f00_0000_0000;
+    assert!(super::host_probe::thp_eligible(&file, R, false, 0, start, start + PMD_SIZE).is_some());
 }

@@ -446,7 +446,7 @@ impl FileVmFacts {
                 shape.shared,
                 shape.offset,
                 4096,
-                super::host_probe::Placement::Lowest,
+                super::host_probe::Placement::Anywhere,
             )
             .and_then(|block| block.vm_flags)
                 == expected
