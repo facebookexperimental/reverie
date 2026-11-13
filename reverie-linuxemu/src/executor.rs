@@ -620,6 +620,7 @@ mod tests {
     include!("executor/shared_file_tests.rs");
     include!("executor/read_zero_cancel_tests.rs");
     include!("executor/descriptor_generic_tests.rs");
+    include!("executor/fd_subpath_tests.rs");
     include!("executor/tool_directory_tests.rs");
     include!("executor/host_resources_tests.rs");
     include!("executor/script_line_tests.rs");
@@ -36866,6 +36867,10 @@ mod tests {
             PROTECTED,
             &format!("/proc/self/fd/{}", protected_file.as_raw_fd()),
         );
+        // The descriptor number names only a supervisor descriptor: the
+        // guest must not observe it at all. Natively an unheld
+        // /proc/self/fd/<n> answers ENOENT; the previous EACCES came from
+        // forwarding the literal spelling to the supervisor's own procfs.
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -36873,7 +36878,7 @@ mod tests {
                 libc::SYS_fchmodat2,
                 [libc::AT_FDCWD as u64, PROTECTED, 0o777, 0, 0, 0],
             ),
-            negative_errno(libc::EACCES)
+            negative_errno(libc::ENOENT)
         );
         assert_eq!(std::fs::metadata(protected).unwrap().mode() & 0o7777, 0o600);
     }

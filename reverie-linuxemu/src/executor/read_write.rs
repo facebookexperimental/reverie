@@ -156,7 +156,9 @@ pub(super) struct ResolvedExecutable {
 /// cannot allocate) is answered ENOMEM, with `refusal` recording the typed
 /// refusal that names it, so that the exec is refused by name rather than
 /// answered with an errno Linux would give for the guest's own reasons. Every
-/// other failure is the errno Linux gives the guest.
+/// other failure is the errno Linux gives the guest, except an exact fd-link
+/// spelling of a descriptor the guest holds, which Linux would follow and run:
+/// that is refused with ELOOP, below.
 pub(super) fn read_executable_file(
     state: &LoadedStaticElf,
     path: &std::path::Path,
@@ -164,6 +166,19 @@ pub(super) fn read_executable_file(
 ) -> Result<ResolvedExecutable, i64> {
     use std::io::Read;
     const OPENING: &str = "opening the new program";
+    // This executor opens an exec path without following magic links, so an
+    // exact fd-link spelling of a descriptor the guest holds is refused with
+    // the errno Linux gives a magic link it will not follow, ELOOP
+    // (fs/namei.c nd_jump_link under LOOKUP_NO_MAGICLINKS). A descriptor the
+    // guest does not hold continues to open_metadata_path, which answers
+    // ENOENT, as Linux does for an fd that is not open (fs/proc/fd.c
+    // proc_lookupfd_common).
+    if let Some(reverie_procfs::FdLinkPath::Exact(guest_fd)) =
+        reverie_procfs::parse_fd_link(path.as_os_str().as_bytes(), state.pid, state.tid)
+        && host_fd(state, guest_fd).is_some()
+    {
+        return Err(negative_errno(libc::ELOOP));
+    }
     let pinned = open_metadata_path(state, libc::AT_FDCWD, path.as_os_str().as_bytes(), false)
         .map_err(|errno| exec_step_errno(errno, OPENING, refusal))?;
     let mut file = std::fs::File::open(format!("/proc/self/fd/{}", pinned.as_raw_fd()))
