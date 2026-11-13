@@ -780,6 +780,7 @@ mod tests {
             crate::guest::native_exec::arm_test_issue();
         }
         unsafe { host.dispatch(&mut event) };
+        assert!(event.unsupported_refusal.is_none());
         let results = returned.lock().unwrap();
         assert_eq!(results.len(), 1, "results: {results:?}");
         let (errno, refusal) = &results[0];

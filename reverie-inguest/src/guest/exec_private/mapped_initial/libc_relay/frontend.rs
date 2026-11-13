@@ -211,7 +211,7 @@ pub(in crate::guest::exec_private) unsafe fn install_if_mapped(
         lo: lease.base(),
         hi: lease.top(),
     };
-    let busy = unsafe { &*(&raw const (*raw).busy) };
+    let busy = unsafe { &(*raw).busy };
     if busy
         .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
         .is_err()
@@ -390,7 +390,7 @@ pub(in crate::guest::exec_private) unsafe fn retire_if_mapped(
     if raw.is_null() {
         return;
     }
-    let busy = unsafe { &*(&raw const (*raw).busy) };
+    let busy = unsafe { &(*raw).busy };
     if busy
         .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
         .is_err()

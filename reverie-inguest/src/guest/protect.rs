@@ -263,11 +263,12 @@ pub fn block_all_signals() -> io::Result<crate::guest::support::SignalInstallGua
 /// there, and only the guest's own numbering differs.
 ///
 /// When `fd` stays open after its close (a seccomp filter the guest installed
-/// can report success without running it), the runtime records that number
-/// too ([`record_runtime_fd`]), so both are protected and reported. When the
-/// record is full that fails, and so does this, with both numbers still open;
-/// the caller must not let the guest run on. Signals stay blocked throughout
-/// ([`block_all_signals`]).
+/// can report success without running it, or refuse it), the runtime records
+/// that number too ([`record_runtime_fd`]), so both are protected and
+/// reported. When the record is full that fails, and so does this: one close
+/// of the moved number is attempted ([`place_runtime_fd_and`]), the old one
+/// stays open (the filter keeps it so), and the caller must not let the guest
+/// run on. Signals stay blocked throughout ([`block_all_signals`]).
 ///
 /// The returned number is not protected until the caller records it, and a
 /// signal held during the placement is delivered as this returns; use
@@ -282,22 +283,70 @@ pub fn place_runtime_fd(fd: libc::c_int) -> io::Result<libc::c_int> {
 /// [`place_runtime_fd`], then `record(placed)` before signals are unblocked,
 /// so a handler of a signal held during the placement already finds the
 /// number protected. `record` runs inside the window and follows
-/// [`block_all_signals`]'s rule; its error is returned with the number still
-/// open.
+/// [`block_all_signals`]'s rule. When `record` returns `Err` it must leave
+/// nothing recorded for `placed`, because this call then closes that number:
+/// a record that published it would name a closed descriptor. `record` must
+/// not close `placed` either; this call still owns it.
+///
+/// On `Err`, this call has attempted one close of the number derived from `fd`
+/// that it still held, and returns the original error: of `fd` when the
+/// descriptor was not moved (signals could not be blocked, or no number was
+/// free), of the moved number when it was. Where signals were blocked, that
+/// close runs before they are unblocked. Nothing queries, records or closes
+/// the number afterwards, because once that close has run, another thread can
+/// open a descriptor that takes the number. Linux releases the number even
+/// when the close reports an I/O error or `EINTR`, so its result cannot say
+/// whether that happened. So a seccomp filter that fakes that close (reports
+/// success without running it) or refuses it leaves the number open and
+/// unrecorded, and the caller must not let the guest run on after an `Err`.
+/// Without such a filter, a caller that handed over its only descriptor
+/// (`into_raw_fd`) has nothing to clean up.
+///
+/// No caller in this repository lets the guest run on. The coordinator
+/// connection's per-thread and fork-child placements (guest/rpc.rs:663 and
+/// :832) exit through `rpc_fatal` (:983). `CoordinatorRpc::connect` (:529)
+/// returns the error (:539) to installation (guest/tool_install.rs:296), which
+/// returns it from the public `install_tool_with` family and from
+/// reverie-liteinst's `install_tool` family (tool_host.rs:186, :222, :256,
+/// :300); the example preload exits on it (reverie-examples/src/lib.rs:286),
+/// and the remaining callers here are tests. A caller outside this repository
+/// that ignores the error from `CoordinatorRpc::connect` or `install_tool*`
+/// could resume the guest with that number open and unrecorded. That needs a
+/// filter installed before the placement that fakes or refuses the cleanup
+/// close; without one, that close releases the number. Examples of how the
+/// placement fails on that path, not a complete list: a filter refuses
+/// `rt_sigprocmask` or `F_GETFD`; or a filter fakes or refuses the close of the
+/// old number after the move while the record is full (`RECORDED_FD_CAPACITY`
+/// numbers), so [`record_if_open`] fails with `OutOfMemory`. With no filter at
+/// all, another thread can open a descriptor at the old number between the
+/// move's close and that check, and a full record fails the placement the same
+/// way. Installation with fixed syscall gates refuses an inherited filter
+/// before it connects (guest/tool_install.rs:285-290); a direct caller of
+/// `CoordinatorRpc::connect` gets no such check.
+///
+/// After a move `fd` was already closed; this call never attempts a second
+/// close of that number, because another thread may have reopened it. A filter
+/// that faked or refused that close keeps it open, and [`record_if_open`] has
+/// then recorded it or failed this call.
 pub fn place_runtime_fd_and(
     fd: libc::c_int,
     record: impl FnOnce(libc::c_int) -> io::Result<()>,
 ) -> io::Result<libc::c_int> {
-    let _blocked = block_all_signals()?;
+    // The one close attempt of a number this call still owns.
+    let close = |number: libc::c_int| unsafe {
+        raw_syscall6(libc::SYS_close, [number as u64, 0, 0, 0, 0, 0]);
+    };
+    let _blocked = block_all_signals().inspect_err(|_| close(fd))?;
     let moved = dup_into_runtime_range(fd);
     let placed = if moved < 0 {
         fd
     } else {
-        unsafe { raw_syscall6(libc::SYS_close, [fd as u64, 0, 0, 0, 0, 0]) };
-        record_if_open(fd)?;
-        moved as libc::c_int
+        let moved = moved as libc::c_int;
+        close(fd);
+        record_if_open(fd).inspect_err(|_| close(moved))?;
+        moved
     };
-    record(placed)?;
+    record(placed).inspect_err(|_| close(placed))?;
     Ok(placed)
 }
 
@@ -1681,6 +1730,434 @@ pub(crate) mod tests {
         });
     }
 
+    /// A record that fails after a move leaves nothing open: the moved number
+    /// is closed, and the old one was closed by the move.
+    #[test]
+    fn a_failed_record_closes_the_moved_number() {
+        in_child_with_soft_nofile(2048, || {
+            let fd = open_eventfd();
+            let mut seen = -1;
+            let refused = place_runtime_fd_and(fd, |placed| {
+                seen = placed;
+                Err(io::Error::other("refused by the test"))
+            })
+            .unwrap_err();
+            assert_eq!(refused.kind(), io::ErrorKind::Other);
+            assert!(seen >= RUNTIME_FD_MIN, "placed at {seen}");
+            assert!(!is_open(seen));
+            assert!(!is_open(fd));
+        });
+    }
+
+    /// A record that fails when the descriptor kept its number (the table is
+    /// full) closes that number.
+    #[test]
+    fn a_failed_record_closes_a_descriptor_that_kept_its_number() {
+        in_child_with_soft_nofile(1024, || {
+            let fd = open_eventfd();
+            fill_from(fd, 0);
+            let mut seen = -1;
+            place_runtime_fd_and(fd, |placed| {
+                seen = placed;
+                Err(io::Error::other("refused by the test"))
+            })
+            .unwrap_err();
+            assert_eq!(seen, fd);
+            assert!(!is_open(fd));
+        });
+    }
+
+    /// A placement that cannot block signals does not start, and closes the
+    /// descriptor it was given.
+    #[test]
+    fn a_placement_that_cannot_block_signals_closes_the_descriptor() {
+        in_child(|| {
+            let fd = open_eventfd();
+            install_filter(
+                libc::SYS_rt_sigprocmask,
+                0,
+                libc::SIG_BLOCK as u32,
+                libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
+            );
+            let refused = place_runtime_fd(fd).unwrap_err();
+            assert_eq!(refused.raw_os_error(), Some(libc::EPERM));
+            assert!(!is_open(fd));
+        });
+    }
+
+    /// Blocks `rt_sigprocmask(SIG_BLOCK)` so that a placement cannot start.
+    fn refuse_signal_blocking() {
+        install_filter(
+            libc::SYS_rt_sigprocmask,
+            0,
+            libc::SIG_BLOCK as u32,
+            libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
+        );
+    }
+
+    /// The number a move will take: the lowest free one from RUNTIME_FD_MIN.
+    fn next_runtime_number(fd: libc::c_int) -> libc::c_int {
+        let next = dup_at_least(fd, RUNTIME_FD_MIN) as libc::c_int;
+        assert!(next >= RUNTIME_FD_MIN);
+        unsafe { libc::close(next) };
+        next
+    }
+
+    /// How a supervisor answers a `close` it holds.
+    #[derive(Clone, Copy)]
+    enum CloseAnswer {
+        /// The close runs.
+        Run,
+        /// The close reports success without running, as a filter can fake it.
+        Fake,
+        /// The close fails with EIO without running.
+        Refuse,
+        /// The close is never answered: the supervisor gives up
+        /// [`HOLD_EXPIRY`] after receiving it.
+        Hold,
+    }
+
+    /// A forked child that is killed and reaped if this is dropped before
+    /// [`OwnedChild::try_reap`] has reaped it, so a supervisor that fails or
+    /// panics leaves no process behind. SIGKILL ends a child even with every
+    /// signal blocked and while a seccomp notification holds one of its calls.
+    struct OwnedChild(libc::pid_t);
+
+    impl OwnedChild {
+        /// The child's wait status once it has exited, or `None` while it runs.
+        fn try_reap(&mut self) -> Option<i32> {
+            let mut status = 0;
+            let reaped = unsafe { libc::waitpid(self.0, &mut status, libc::WNOHANG) };
+            if reaped == self.0 {
+                self.0 = -1;
+                return Some(status);
+            }
+            assert_eq!(reaped, 0, "waitpid: {}", io::Error::last_os_error());
+            None
+        }
+    }
+
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            if self.0 > 0 {
+                unsafe {
+                    libc::kill(self.0, libc::SIGKILL);
+                    libc::waitpid(self.0, core::ptr::null_mut(), 0);
+                }
+            }
+        }
+    }
+
+    /// The last child [`closes_held`] forked in this process.
+    static SUPERVISED_CHILD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+    /// How many closes the last [`closes_held`] call in this process received
+    /// from its child, answered or not.
+    static SUPERVISED_CLOSES: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    /// How long [`closes_held`] lets its child work, handshake included,
+    /// before it fails the test. Generous: it is a bound on real work under
+    /// load, which takes milliseconds when the host is idle.
+    const WORK_LIMIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+    /// How long [`closes_held`] keeps a [`CloseAnswer::Hold`] close held
+    /// before it gives up. Its timer starts only when the close has been
+    /// received, so a slow fork or handshake cannot make it fire early.
+    const HOLD_EXPIRY: std::time::Duration = std::time::Duration::from_millis(300);
+
+    /// Runs `guest` in a forked process under a filter that holds its every
+    /// `close` of `numbers[0]` or `numbers[1]` for this process (a seccomp
+    /// user notification), answers each with the matching `answers` entry,
+    /// requires `guest` to finish without panicking, and returns how many
+    /// closes of each number it made. Fails once [`WORK_LIMIT`] has passed,
+    /// handshake included, or [`HOLD_EXPIRY`] after a [`CloseAnswer::Hold`]
+    /// close arrives. The child is killed and reaped on every failure
+    /// ([`OwnedChild`]).
+    fn closes_held(
+        numbers: [libc::c_int; 2],
+        answers: [CloseAnswer; 2],
+        guest: impl FnOnce(),
+    ) -> [usize; 2] {
+        let start = std::time::Instant::now();
+        let mut deadline = start + WORK_LIMIT;
+        let remaining_ms = |deadline: std::time::Instant| {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(!left.is_zero(), "the guest never finished");
+            left.as_millis().clamp(1, 50) as libc::c_int
+        };
+        let mut pipe = [-1; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        let forked = unsafe { libc::fork() };
+        assert!(forked >= 0);
+        if forked == 0 {
+            // A backstop for a supervisor that dies without unwinding, which
+            // its guard cannot cover; a child with every signal blocked relies
+            // on the guard alone.
+            unsafe { libc::alarm(60) };
+            unsafe { libc::close(pipe[0]) };
+            let listener = notify_on_close(numbers);
+            let written = unsafe { libc::write(pipe[1], (&raw const listener).cast(), 4) };
+            if listener < 0 || written != 4 {
+                unsafe { libc::_exit(124) };
+            }
+            unsafe { libc::close(pipe[1]) };
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(guest));
+            unsafe { libc::_exit(if result.is_ok() { 0 } else { 125 }) };
+        }
+        let mut child = OwnedChild(forked);
+        SUPERVISED_CHILD.store(forked, Ordering::SeqCst);
+        SUPERVISED_CLOSES.store(0, Ordering::SeqCst);
+        unsafe { libc::close(pipe[1]) };
+        // The handshake: the child's listener number, or end of file if the
+        // child ended before sending it.
+        let mut ready = libc::pollfd {
+            fd: pipe[0],
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        while unsafe { libc::poll(&mut ready, 1, remaining_ms(deadline)) } <= 0 {}
+        let mut remote_listener = -1_i32;
+        let read = unsafe { libc::read(pipe[0], (&raw mut remote_listener).cast(), 4) };
+        unsafe { libc::close(pipe[0]) };
+        assert_eq!(read, 4, "the child ended before its handshake");
+        assert!(remote_listener >= 0, "listener: {remote_listener}");
+        // Seen only with --nocapture: the handshake time the limits are sized
+        // against.
+        eprintln!("closes_held: handshake after {:?}", start.elapsed());
+        let pidfd = unsafe { raw_syscall6(libc::SYS_pidfd_open, [forked as u64, 0, 0, 0, 0, 0]) };
+        assert!(pidfd >= 0, "pidfd_open: {pidfd}");
+        let listener = unsafe {
+            raw_syscall6(
+                libc::SYS_pidfd_getfd,
+                [pidfd as u64, remote_listener as u64, 0, 0, 0, 0],
+            )
+        };
+        unsafe { libc::close(pidfd as libc::c_int) };
+        assert!(listener >= 0, "pidfd_getfd: {listener}");
+        let mut closes = [0; 2];
+        let status = loop {
+            if let Some(status) = child.try_reap() {
+                break status;
+            }
+            let mut ready = libc::pollfd {
+                fd: listener as i32,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            if unsafe { libc::poll(&mut ready, 1, remaining_ms(deadline)) } <= 0 {
+                continue;
+            }
+            let mut notification: libc::seccomp_notif = unsafe { core::mem::zeroed() };
+            if unsafe {
+                libc::ioctl(
+                    listener as i32,
+                    libc::SECCOMP_IOCTL_NOTIF_RECV,
+                    &mut notification,
+                )
+            } != 0
+            {
+                continue;
+            }
+            assert_eq!(notification.data.nr, libc::SYS_close as i32);
+            SUPERVISED_CLOSES.fetch_add(1, Ordering::SeqCst);
+            let which = numbers
+                .iter()
+                .position(|&number| notification.data.args[0] == number as u64)
+                .expect("the filter holds only these numbers");
+            closes[which] += 1;
+            let (error, flags) = match answers[which] {
+                CloseAnswer::Run => (0, libc::SECCOMP_USER_NOTIF_FLAG_CONTINUE as u32),
+                CloseAnswer::Fake => (0, 0),
+                CloseAnswer::Refuse => (-libc::EIO, 0),
+                CloseAnswer::Hold => {
+                    eprintln!("closes_held: close held after {:?}", start.elapsed());
+                    deadline = deadline.min(std::time::Instant::now() + HOLD_EXPIRY);
+                    continue;
+                }
+            };
+            let response = libc::seccomp_notif_resp {
+                id: notification.id,
+                val: 0,
+                error,
+                flags,
+            };
+            let sent =
+                unsafe { libc::ioctl(listener as i32, libc::SECCOMP_IOCTL_NOTIF_SEND, &response) };
+            assert_eq!(
+                sent,
+                0,
+                "notification reply: {}",
+                io::Error::last_os_error()
+            );
+        };
+        unsafe { libc::close(listener as libc::c_int) };
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "guest status {status:#x}"
+        );
+        closes
+    }
+
+    /// Installs a seccomp filter that holds `close(numbers[0])` and
+    /// `close(numbers[1])` for a supervisor (`SECCOMP_RET_USER_NOTIF`) and
+    /// returns the listener, or a negative errno.
+    fn notify_on_close(numbers: [libc::c_int; 2]) -> i32 {
+        let load = |offset: u32| libc::sock_filter {
+            code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
+            jt: 0,
+            jf: 0,
+            k: offset,
+        };
+        let jump_if = |value: u32, if_equal: u8, if_not: u8| libc::sock_filter {
+            code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+            jt: if_equal,
+            jf: if_not,
+            k: value,
+        };
+        let ret = |action: u32| libc::sock_filter {
+            code: (libc::BPF_RET | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 0,
+            k: action,
+        };
+        let mut instructions = [
+            load(0),
+            jump_if(libc::SYS_close as u32, 0, 4),
+            load(16),
+            jump_if(numbers[0] as u32, 1, 0),
+            jump_if(numbers[1] as u32, 0, 1),
+            ret(libc::SECCOMP_RET_USER_NOTIF),
+            ret(libc::SECCOMP_RET_ALLOW),
+        ];
+        let program = libc::sock_fprog {
+            len: instructions.len() as u16,
+            filter: instructions.as_mut_ptr(),
+        };
+        let no_new_privileges = unsafe {
+            raw_syscall6(
+                libc::SYS_prctl,
+                [libc::PR_SET_NO_NEW_PRIVS as u64, 1, 0, 0, 0, 0],
+            )
+        };
+        if no_new_privileges != 0 {
+            return no_new_privileges as i32;
+        }
+        unsafe {
+            raw_syscall6(
+                libc::SYS_seccomp,
+                [
+                    libc::SECCOMP_SET_MODE_FILTER as u64,
+                    libc::SECCOMP_FILTER_FLAG_NEW_LISTENER,
+                    (&raw const program) as u64,
+                    0,
+                    0,
+                    0,
+                ],
+            ) as i32
+        }
+    }
+
+    /// A placement that cannot block signals attempts one close of the
+    /// descriptor it was given. When a filter fakes or refuses that close, the
+    /// descriptor stays open and is not recorded, the placement returns its
+    /// own error, and nothing else is closed.
+    fn a_failed_cleanup_close_of_the_unmoved_descriptor(answer: CloseAnswer) {
+        // The spare number is above RUNTIME_FD_MIN, which a soft limit of
+        // 1024 would not admit.
+        in_child_with_soft_nofile(2048, || {
+            let fd = open_eventfd();
+            let spare = next_runtime_number(fd);
+            let closes = closes_held([fd, spare], [answer, CloseAnswer::Run], || {
+                refuse_signal_blocking();
+                let refused = place_runtime_fd(fd).unwrap_err();
+                assert_eq!(refused.raw_os_error(), Some(libc::EPERM));
+                assert!(is_open(fd));
+                assert!(!is_runtime_owned_fd(fd));
+            });
+            assert_eq!(closes, [1, 0]);
+        });
+    }
+
+    #[test]
+    fn a_faked_cleanup_close_is_attempted_once_and_records_nothing() {
+        a_failed_cleanup_close_of_the_unmoved_descriptor(CloseAnswer::Fake);
+    }
+
+    #[test]
+    fn a_refused_cleanup_close_is_attempted_once_and_records_nothing() {
+        a_failed_cleanup_close_of_the_unmoved_descriptor(CloseAnswer::Refuse);
+    }
+
+    /// A supervisor that fails (here it gives up on a close it holds, with
+    /// every signal blocked in the guest) kills and reaps its child instead of
+    /// leaving it behind.
+    #[test]
+    fn a_failing_close_supervisor_kills_and_reaps_its_child() {
+        in_child(|| {
+            let fd = open_eventfd();
+            let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                closes_held([fd, fd], [CloseAnswer::Hold; 2], || {
+                    let _blocked = block_all_signals().unwrap();
+                    unsafe { raw_syscall6(libc::SYS_close, [fd as u64, 0, 0, 0, 0, 0]) };
+                })
+            }));
+            assert!(failed.is_err(), "the held close never timed out");
+            // The supervisor gave up on the held close, not on slow setup.
+            assert_eq!(SUPERVISED_CLOSES.load(Ordering::SeqCst), 1);
+            let child = SUPERVISED_CHILD.load(Ordering::SeqCst);
+            assert!(child > 0);
+            assert_eq!(
+                unsafe { libc::waitpid(child, core::ptr::null_mut(), libc::WNOHANG) },
+                -1
+            );
+            assert_eq!(
+                io::Error::last_os_error().raw_os_error(),
+                Some(libc::ECHILD)
+            );
+            assert_eq!(unsafe { libc::kill(child, 0) }, -1);
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+        });
+    }
+
+    /// After a move and a record that fails, the placement attempts one close
+    /// of the moved number and never closes the old number again. When a
+    /// filter fakes or refuses the moved number's close, it stays open and is
+    /// not recorded, and the record's error is returned.
+    fn a_failed_cleanup_close_of_the_moved_number(answer: CloseAnswer) {
+        in_child_with_soft_nofile(2048, || {
+            let fd = open_eventfd();
+            let moved = next_runtime_number(fd);
+            let closes = closes_held([fd, moved], [CloseAnswer::Run, answer], || {
+                let refused = place_runtime_fd_and(fd, |placed| {
+                    assert_eq!(placed, moved);
+                    Err(io::Error::other("refused by the test"))
+                })
+                .unwrap_err();
+                assert_eq!(refused.kind(), io::ErrorKind::Other);
+                assert_eq!(refused.to_string(), "refused by the test");
+                assert!(is_open(moved));
+                assert!(!is_runtime_owned_fd(moved));
+                assert!(!is_open(fd));
+                assert!(!is_runtime_owned_fd(fd));
+            });
+            assert_eq!(closes, [1, 1]);
+        });
+    }
+
+    #[test]
+    fn a_faked_cleanup_close_of_the_moved_number_is_attempted_once_and_records_nothing() {
+        a_failed_cleanup_close_of_the_moved_number(CloseAnswer::Fake);
+    }
+
+    #[test]
+    fn a_refused_cleanup_close_of_the_moved_number_is_attempted_once_and_records_nothing() {
+        a_failed_cleanup_close_of_the_moved_number(CloseAnswer::Refuse);
+    }
+
     /// A soft limit so low that the band would reach below 3 starts it at 3,
     /// and nothing lower follows.
     #[test]
@@ -2124,6 +2601,10 @@ pub(crate) mod tests {
     fn a_placement_fails_when_the_kernel_will_not_say_whether_the_old_number_is_open() {
         in_child_with_soft_nofile(2048, || {
             let fd = open_eventfd();
+            // The number the move takes: the lowest free one from RUNTIME_FD_MIN.
+            let moved = dup_at_least(fd, RUNTIME_FD_MIN) as libc::c_int;
+            assert!(moved >= RUNTIME_FD_MIN);
+            unsafe { libc::close(moved) };
             install_filter(
                 libc::SYS_fcntl,
                 1,
@@ -2133,6 +2614,9 @@ pub(crate) mod tests {
             let refused = place_runtime_fd(fd).unwrap_err();
             assert_eq!(refused.raw_os_error(), Some(libc::EPERM));
             assert!(!is_runtime_owned_fd(fd));
+            // The failed placement closed the moved number (F_GETFL, because
+            // the filter refuses F_GETFD).
+            assert!(unsafe { libc::fcntl(moved, libc::F_GETFL) } < 0);
         });
     }
 

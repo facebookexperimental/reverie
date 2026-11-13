@@ -582,7 +582,11 @@ fn fallback_target(
     let rust = name
         .strip_prefix(prefix)
         .ok_or("package fallback target section kind differs")?;
-    let expected = format!("_RNvNtNtCs_15reverie_inguest5guest12continuation{suffix}");
+    let expected = if offset == 6 {
+        format!("_RNvNtNtNtCs_15reverie_inguest5guest3isa6x86_64{suffix}")
+    } else {
+        format!("_RNvNtNtCs_15reverie_inguest5guest12continuation{suffix}")
+    };
     require(
         !rust.contains(".llvm.")
             && canonical_rust_symbol(rust).as_deref() == Some(expected.as_str()),
@@ -1967,22 +1971,35 @@ mod tests {
         }
         (result, map)
     }
-    fn fallback_image() -> (Vec<u8>, String) {
-        fallback_image_from(FALLBACK)
+    fn fallback_with_post_merge_isa_mxcsr_path() -> Vec<u8> {
+        const OLD: &[u8] =
+            b"_RNvNtNtCsga9NZm0hUzd_15reverie_inguest5guest12continuation14CALLBACK_MXCSR";
+        const NEW: &[u8] =
+            b"_RNvNtNtNtCsga9NZm0hUzd_15reverie_inguest5guest3isa6x86_6414CALLBACK_MXCSR";
+        assert!(NEW.len() < OLD.len());
+        let positions: Vec<_> = (0..FALLBACK.len() - OLD.len())
+            .filter(|&at| FALLBACK[at..].starts_with(OLD))
+            .collect();
+        assert_eq!(positions.len(), 1);
+        let mut raw = FALLBACK.to_vec();
+        let at = positions[0];
+        raw[at..at + NEW.len()].copy_from_slice(NEW);
+        raw[at + NEW.len()] = 0;
+        raw
     }
 
     // Synthetic ELF DATA for the exact isolated-function geometry. Preserve
     // the historical fixture and its negative controls; this is no source or
     // compiler provenance claim. The same three body relocations and their
     // actual operand sections are retained for the production join parser.
-    fn isolated_fallback_data() -> Vec<u8> {
-        let owner = object(FALLBACK, InitializerRole::PackageFallback);
+    fn isolated_fallback_data_from(source: &[u8]) -> Vec<u8> {
+        let owner = object(source, InitializerRole::PackageFallback);
         let (_, symbol) = named(&owner.elf, "fallback_entry").unwrap();
         let elf = &owner.elf;
         let shoff = elf.header.e_shoff as usize;
         let strings_index = elf.header.e_shstrndx as usize;
-        let strings = section_file_bytes(&elf.section_headers[strings_index], FALLBACK).unwrap();
-        let mut raw = FALLBACK.to_vec();
+        let strings = section_file_bytes(&elf.section_headers[strings_index], source).unwrap();
+        let mut raw = source.to_vec();
         let strings_at = raw.len();
         raw.extend_from_slice(strings);
         raw.extend_from_slice(FALLBACK_SECTION.as_bytes());
@@ -2037,8 +2054,8 @@ mod tests {
         let rel_at = raw.len();
         for i in 0..rel.sh_size as usize / 24 {
             let at = rel.sh_offset as usize + i * 24;
-            if u64::from_le_bytes(FALLBACK[at..at + 8].try_into().unwrap()) < 48 {
-                raw.extend_from_slice(&FALLBACK[at..at + 24]);
+            if u64::from_le_bytes(source[at..at + 8].try_into().unwrap()) < 48 {
+                raw.extend_from_slice(&source[at..at + 24]);
             }
         }
         assert_eq!(raw.len() - rel_at, 72);
@@ -2049,7 +2066,9 @@ mod tests {
 
     #[test]
     fn package_roles_isolated_fallback_owns_the_complete_function_and_three_operands() {
-        let data = isolated_fallback_data();
+        // Isolate the post-merge ISA MXCSR operand shape; geometry and the
+        // negative controls below operate on that same isolated object.
+        let data = isolated_fallback_data_from(&fallback_with_post_merge_isa_mxcsr_path());
         let owner = object(&data, InitializerRole::PackageFallback);
         let symbol = fallback_input(&owner).unwrap();
         assert_eq!(owner.elf.section_headers[symbol.st_shndx].sh_size, 48);
@@ -2096,17 +2115,16 @@ mod tests {
         // neighboring contribution or by otherwise correct relocation bytes.
         put(&mut bad, 0x8000 + 5 * 24 + 8, 8, 0x401001);
         let bad_elf = Elf::parse(&bad).unwrap();
-        assert!(
-            join_fallback(&owner, std::slice::from_ref(&owner), &map, &bad_elf, &bad)
-                .unwrap_err()
-                .contains("extra aliases")
-        );
+        let bad_error =
+            join_fallback(&owner, std::slice::from_ref(&owner), &map, &bad_elf, &bad).unwrap_err();
+        assert!(bad_error.contains("extra aliases"), "{bad_error}");
     }
     #[test]
     fn package_roles_fallback_joins_actual_48b_and_all_three_source_operands() {
-        let (raw, map) = fallback_image();
+        let data = fallback_with_post_merge_isa_mxcsr_path();
+        let (raw, map) = fallback_image_from(&data);
         let elf = Elf::parse(&raw).unwrap();
-        let objects = [object(FALLBACK, InitializerRole::PackageFallback)];
+        let objects = [object(&data, InitializerRole::PackageFallback)];
         let joined = join_fallback(&objects[0], &objects, &map, &elf, &raw).unwrap();
         assert_eq!((joined.bytes, joined.relocation_fields), (48, 3));
         let observed = role_body(
@@ -2142,6 +2160,26 @@ mod tests {
             let bad_elf = Elf::parse(&bad).unwrap();
             assert!(join_fallback(&objects[0], &objects, &map, &bad_elf, &bad).is_err());
         }
+    }
+    #[test]
+    fn package_roles_fallback_refuses_pre_move_continuation_mxcsr_path() {
+        let (raw, map) = fallback_image_from(FALLBACK);
+        let elf = Elf::parse(&raw).unwrap();
+        let objects = [object(FALLBACK, InitializerRole::PackageFallback)];
+        let error = join_fallback(&objects[0], &objects, &map, &elf, &raw).unwrap_err();
+        assert!(
+            error.contains("package fallback exact source operand path differs"),
+            "{error}"
+        );
+    }
+    #[test]
+    fn package_roles_fallback_accepts_post_merge_isa_mxcsr_path() {
+        let data = fallback_with_post_merge_isa_mxcsr_path();
+        let (raw, map) = fallback_image_from(&data);
+        let elf = Elf::parse(&raw).unwrap();
+        let objects = [object(&data, InitializerRole::PackageFallback)];
+        let joined = join_fallback(&objects[0], &objects, &map, &elf, &raw).unwrap();
+        assert_eq!((joined.bytes, joined.relocation_fields), (48, 3));
     }
     #[test]
     fn package_roles_fallback_exact_subextent_never_weakens_whole_section_join() {

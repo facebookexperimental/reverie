@@ -1168,8 +1168,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     // Bind the signal-mask gate and every changed native-source premise of it.
     (
         "reverie-inguest/src/guest/continuation.rs",
-        46467,
-        "08309a0f057ecd3f4ce8f3c5dbf066ca6a9d5b7e66d143104df1ce014b196896",
+        46450,
+        "a25e871591adb957ed150a3b2007b31bc671f9d330e6a861fdab391b3df5ed25",
     ),
     (
         "reverie-inguest/src/guest/instruction.rs",
@@ -1208,8 +1208,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-inguest/src/guest/tool_install.rs",
-        28270,
-        "924a1f49294e75521f45acbc525bff24a1abdb45b0f21344d14a766a9d1986a3",
+        28887,
+        "fccf7936590e1458419a344c44e0986b390bdeb4a9b0b9c32fb386721bfe3ab5",
     ),
     (
         "reverie-inguest/src/signal.rs",
@@ -1243,8 +1243,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-liteinst-artifact/src/private_static/tls_sources.rs",
-        38792,
-        "ff08286667d4989abfeba6c8eaba336318de2f11dfa3eb789892f6499b3691fc",
+        44390,
+        "bb1e19542aa5db52a9d7338892dc7b122a9d6a136ff594c3018041077f563e95",
     ),
     (
         "Cargo.toml",
@@ -1273,13 +1273,13 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers.rs",
-        283885,
-        "ad6a646f91964e31d11df15ab716ef6cd542de4b0632e51098078220b3bd662a",
+        284108,
+        "e681ba4a4d55fc841dc4107b1665d3c03edde4f5ff2daf4b4f0ac51885bed582",
     ),
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers/package_roles.rs",
-        81209,
-        "82295cbdd884e81b92cfba699f068ab068a1ac761fef5f7e9498f653699f8515",
+        83186,
+        "b568a674b69e960aa26a3287bbd0803518aeb9d6fd529f4f8095ed1a2cea2fde",
     ),
     (
         "reverie-liteinst-artifact/tests/fixtures/package_roles_fallback_member.rs",
@@ -1358,8 +1358,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-inguest/Cargo.toml",
-        6166,
-        "1cca57bb80f07e02e47977ea2f639475084a7e6838caa140b8445e6d358f0488",
+        6495,
+        "2ee5115d633d33984ebfae0d5debd0278596536e8866587a25b68f26940b63e0",
     ),
     (
         "reverie-inguest/src/lib.rs",
@@ -1453,8 +1453,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-inguest/src/guest/rpc.rs",
-        54138,
-        "e5e5c6592d505bda9a4c47bef7bba4ef266a09f5d833c6ae5a87e036f25a3984",
+        54818,
+        "efeb70d95dfdad205ff00a0d885741d28917efbb7b6908750c51d275454af2de",
     ),
     (
         "reverie-inguest/src/guest/host.rs",
@@ -1468,8 +1468,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-liteinst/src/tool_host.rs",
-        85210,
-        "ae03d580e6e5a6b4c313afa4673f36cc3172db690e9639fac2d216064cfa751b",
+        85990,
+        "a6115c160ec28cd2959509c96ab2e64606c8ab26317066d0afbdb5cdd96999d9",
     ),
     (
         "reverie/Cargo.toml",
@@ -38963,6 +38963,51 @@ mod tests {
         assert_eq!(CONTENT_REVERIE_CATALOG.len(), 86);
         for (relative, old_size, old_digest) in [
             (
+                "reverie-inguest/src/guest/continuation.rs",
+                46467,
+                "08309a0f057ecd3f4ce8f3c5dbf066ca6a9d5b7e66d143104df1ce014b196896",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/tls_sources.rs",
+                41407,
+                "241f357852442b9246bac9fa6a317d95044daa4cfd74700871ad3c9248384620",
+            ),
+            (
+                "reverie-inguest/src/guest/rpc.rs",
+                54589,
+                "e4cc7de2fc760fb1056fcce67b46c4751f5d96d32e4be062d04d158cd4e1d904",
+            ),
+            (
+                "reverie-inguest/src/guest/tool_install.rs",
+                28270,
+                "924a1f49294e75521f45acbc525bff24a1abdb45b0f21344d14a766a9d1986a3",
+            ),
+            (
+                "reverie-liteinst/src/tool_host.rs",
+                85210,
+                "ae03d580e6e5a6b4c313afa4673f36cc3172db690e9639fac2d216064cfa751b",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers.rs",
+                283885,
+                "18b3558ebb0f2e42beed1de31921eb471000e15f680ce2c56e9d1a2ca5f62bb3",
+            ),
+            (
+                "reverie-inguest/Cargo.toml",
+                6166,
+                "1cca57bb80f07e02e47977ea2f639475084a7e6838caa140b8445e6d358f0488",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/tls_sources.rs",
+                38792,
+                "ff08286667d4989abfeba6c8eaba336318de2f11dfa3eb789892f6499b3691fc",
+            ),
+            (
+                "reverie-inguest/src/guest/rpc.rs",
+                54138,
+                "e5e5c6592d505bda9a4c47bef7bba4ef266a09f5d833c6ae5a87e036f25a3984",
+            ),
+            (
                 "reverie-liteinst/src/lib.rs",
                 35129,
                 "1270edf2571480add4843055dd5417b9886291c4f75d8399645f94cfc76e12ec",
@@ -39001,6 +39046,11 @@ mod tests {
                 "reverie-liteinst-artifact/src/private_static/selected_initializers/view_table.rs",
                 41315,
                 "6cfc3c67d8485dff9463cff67be604f81fce9d7f92f63f93f118fc7b4a2e7ccb",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers.rs",
+                283885,
+                "ad6a646f91964e31d11df15ab716ef6cd542de4b0632e51098078220b3bd662a",
             ),
             (
                 "reverie-liteinst-artifact/src/private_static/selected_initializers.rs",
@@ -69170,9 +69220,11 @@ pub mod private_static {
             .collect();
         require(
             loads.iter().all(|p| {
-                p.p_align == 4096
+                (4096..=65536).contains(&p.p_align)
+                    && p.p_align.is_power_of_two()
                     && p.p_offset % 4096 == 0
                     && p.p_vaddr % 4096 == 0
+                    && p.p_vaddr % p.p_align == p.p_offset % p.p_align
                     && p.p_vaddr >= LOW
                     && p.p_vaddr
                         .checked_add(p.p_memsz)
@@ -70605,6 +70657,35 @@ pub mod private_static {
             }
         }
         #[test]
+        fn private_static_geometry_accepts_64k_aligned_rw_and_refuses_bad_align() {
+            fn with_rw_align(align: u64, vaddr_shift: u64) -> Vec<u8> {
+                let mut bytes = elf_fixture();
+                bytes.resize(0x1_4000 + 0x1000, 0);
+                let rw = 64 + 2 * 56;
+                let tls = 64 + 3 * 56;
+                for (at, value) in [
+                    (rw + 8, 0x1_3000u64),
+                    (rw + 16, LOW + 0x1_3000 + vaddr_shift),
+                    (rw + 48, align),
+                    (tls + 8, 0x1_3000),
+                    (tls + 16, LOW + 0x1_3000 + vaddr_shift),
+                ] {
+                    bytes[at..at + 8].copy_from_slice(&value.to_le_bytes());
+                }
+                bytes
+            }
+            // Real produced RW header shape: align 0x10000 with
+            // vaddr/offset residues 0x3000 (offset 0x1573000 and
+            // vaddr 0x6000e2573000 in the shake-out ELF).
+            let bytes = with_rw_align(0x10000, 0);
+            geometry(&Elf::parse(&bytes).unwrap(), &bytes).unwrap();
+            for (align, shift) in [(131072, 0), (12288, 0), (0x10000, 4096)] {
+                let changed = with_rw_align(align, shift);
+                let parsed = Elf::parse(&changed).unwrap();
+                assert!(geometry(&parsed, &changed).is_err(), "align {align}");
+            }
+        }
+        #[test]
         fn private_static_geometry_segment_count_boundaries_hold() {
             fn fixture(loads: usize, phdr: bool, note: bool) -> Vec<u8> {
                 let mut bytes = vec![0; 3 * 4096];
@@ -71871,7 +71952,7 @@ pub mod private_machine_diagnostic {
             )?;
             let inventory = bind(
                 &inputs.source_authority.join("inventory.json"),
-                Some("6aeea4469c8ba49c4c475a6694972e6a1ef3974954c9f986f99d7d1bce926275"),
+                Some("3beab05d07515e2005d1ee59b66327a4c5de385be4ba689f180d9cc470c62bf1"),
                 128 * 1024,
             )?;
             let rows: Value =

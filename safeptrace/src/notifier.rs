@@ -222,8 +222,16 @@ struct BoundedTestPause {
 
 #[cfg(test)]
 fn pause_retirement_for_test(slot: &Mutex<Option<BoundedTestPause>>) {
+    pause_for_test_noting(slot, || {});
+}
+
+/// Like [`pause_retirement_for_test`], and runs `note` once it took the
+/// pause, before it reports the capture.
+#[cfg(test)]
+fn pause_for_test_noting(slot: &Mutex<Option<BoundedTestPause>>, note: impl FnOnce()) {
     let pause = slot.lock().take();
     if let Some(pause) = pause {
+        note();
         let _ = pause.captured.send(());
         let _ = pause.resume.recv_timeout(Duration::from_secs(2));
     }
@@ -742,9 +750,30 @@ struct Event {
     /// and before it takes `legacy_wakeup` to do so.
     #[cfg(test)]
     legacy_held_wait_pause: Mutex<Option<BoundedTestPause>>,
-    /// Waits the worker started as a held worker.
+    /// What the worker held when it took `legacy_held_wait_pause`: the status
+    /// it published last, and the targeted wakeup count it read before that
+    /// publication. Syscall entry and exit stops share one status; the count
+    /// tells them apart, since the request that ended the earlier stop
+    /// counted.
+    #[cfg(test)]
+    legacy_held_wait_paused_on: Mutex<Option<(i32, u64)>>,
+    /// Waits the worker started as a held worker: counted as it parks for
+    /// the held period, not when a pending wakeup or probe skips the wait.
     #[cfg(test)]
     legacy_held_waits: AtomicUsize,
+    /// Notifies of `legacy_wake` that woke the worker, its only waiter,
+    /// counted by [`Event::notify_legacy_worker`] once the notify returned.
+    #[cfg(test)]
+    legacy_notify_wakes: AtomicUsize,
+    /// Waits of the worker that a notify ended. With parking_lot's condvar
+    /// (no spurious wakeups) each counts one of `legacy_notify_wakes`.
+    #[cfg(test)]
+    legacy_worker_wakes: AtomicUsize,
+    /// `legacy_worker_wakes` when the worker last started a held wait. A held
+    /// wait that began after every delivered notify had been observed cannot
+    /// be ended by one of them.
+    #[cfg(test)]
+    legacy_held_wait_wakes: AtomicUsize,
     /// Pauses the worker once, right after it published a status.
     #[cfg(test)]
     legacy_publish_pause: Mutex<Option<BoundedTestPause>>,
@@ -828,6 +857,10 @@ struct Event {
     /// [`Event::mark_echild_if_unowned`].
     detached_waits: Mutex<Vec<(u64, Option<Arc<LegacyWaitOwner>>)>>,
     detached_wait_seq: AtomicU64,
+    /// ECHILD observations of an untraced task that the worker did not
+    /// treat as retirement, because a detached wait was pending.
+    #[cfg(test)]
+    detached_echild_kept: AtomicUsize,
 
     /// Monotonic activity state owned by this exact Event generation.
     worker_state: AtomicI32,
@@ -1481,7 +1514,15 @@ impl Event {
             #[cfg(test)]
             legacy_held_wait_pause: Mutex::new(None),
             #[cfg(test)]
+            legacy_held_wait_paused_on: Mutex::new(None),
+            #[cfg(test)]
             legacy_held_waits: AtomicUsize::new(0),
+            #[cfg(test)]
+            legacy_notify_wakes: AtomicUsize::new(0),
+            #[cfg(test)]
+            legacy_worker_wakes: AtomicUsize::new(0),
+            #[cfg(test)]
+            legacy_held_wait_wakes: AtomicUsize::new(0),
             #[cfg(test)]
             legacy_publish_pause: Mutex::new(None),
             #[cfg(test)]
@@ -1503,6 +1544,8 @@ impl Event {
             registration_error: Mutex::new(None),
             detached_waits: Mutex::new(Vec::new()),
             detached_wait_seq: AtomicU64::new(0),
+            #[cfg(test)]
+            detached_echild_kept: AtomicUsize::new(0),
             worker_state: AtomicI32::new(WORKER_NOT_STARTED),
             worker_done_lock: Mutex::new(()),
             worker_done_changed: Condvar::new(),
@@ -1561,13 +1604,38 @@ impl Event {
     /// observes what it would have at its due time.
     fn wake_legacy_worker(&self) {
         self.count_legacy_wakeup();
-        self.legacy_wake.notify_one();
+        self.notify_legacy_worker();
+    }
+
+    /// Notifies `legacy_wake`, after the caller counted a wakeup and
+    /// released its locks. Tests count each notify that woke the worker.
+    ///
+    /// Every notify of `legacy_wake` must go through here. Tests decide that
+    /// a held wait is quiescent by comparing `legacy_notify_wakes` with the
+    /// worker's own count of the waits a notify ended (see
+    /// `wait_for_fresh_held_wait` in the legacy thread tests); a direct
+    /// `legacy_wake.notify_one()` would wake the worker uncounted, and that
+    /// check would accept a held wait the uncounted wake ends.
+    ///
+    /// The count moves only after `notify_one` returns, so a notifier that
+    /// has counted its wakeup but not yet returned from here has a wake in
+    /// flight that the comparison cannot see. A test may rely on it only once
+    /// every notifier of this Event has returned from here and no other can
+    /// start. Even then the two counts match one for one only at rest: from
+    /// a notify that wakes the worker until the worker has returned from its
+    /// wait and this function from its count, either may run ahead.
+    fn notify_legacy_worker(&self) {
+        let _woke = self.legacy_wake.notify_one();
+        #[cfg(test)]
+        if _woke {
+            self.legacy_notify_wakes.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// The counting half of [`Event::wake_legacy_worker`], for a caller that
     /// holds `legacy_wait`. The worker reads the count, not the notify, under
     /// the lock it waits with, so it acts on the wakeup at its next sleep
-    /// check. The caller sends `legacy_wake.notify_one()` after it released
+    /// check. The caller sends `notify_legacy_worker()` after it released
     /// `legacy_wait`, so that the woken worker does not block on it.
     fn count_legacy_wakeup(&self) {
         let mut wakeups = self.legacy_wakeup.lock();
@@ -1584,7 +1652,7 @@ impl Event {
         let mut wakeups = self.legacy_wakeup.lock();
         wakeups.probes = wakeups.probes.wrapping_add(1);
         drop(wakeups);
-        self.legacy_wake.notify_one();
+        self.notify_legacy_worker();
     }
 
     fn hold_tid(&self) -> Option<TidHold<'_>> {
@@ -2092,6 +2160,8 @@ impl Event {
             && identity.observed_process_generation() == Some(true)
             && !identity.task_is_zombie()
         {
+            #[cfg(test)]
+            self.detached_echild_kept.fetch_add(1, Ordering::Relaxed);
             return false;
         }
         self.mark_echild();
@@ -2110,6 +2180,8 @@ impl Event {
             && identity.observed_process_generation() == Some(true)
             && !identity.task_is_zombie()
         {
+            #[cfg(test)]
+            self.detached_echild_kept.fetch_add(1, Ordering::Relaxed);
             return Ok(false);
         }
         // Attachment/lifetime proof comes from the retained target and host
@@ -3240,7 +3312,7 @@ impl EventHandle {
         if notify {
             #[cfg(test)]
             pause_retirement_for_test(&event.legacy_assist_notify_pause);
-            event.legacy_wake.notify_one();
+            event.notify_legacy_worker();
         }
         Ok(())
     }
@@ -4744,7 +4816,8 @@ fn wait_thread_status(identity: &WorkerIdentity, event: &Event) -> Option<i32> {
 }
 
 /// Closes legacy authority only after a bounded retained check proves there
-/// is no current attachment to the same live owner. The caller holds the
+/// is no current attachment to the same live owner and no pending detach ->
+/// reattach handoff ([`LegacyAttachment::Handoff`]). The caller holds the
 /// progress mutex, so it cannot race an actual consuming producer. Publication
 /// happens only after this returns and that mutex has been dropped.
 fn close_unowned_legacy_wait(identity: &WorkerIdentity, event: &Event) -> Result<bool, Errno> {
@@ -4761,6 +4834,11 @@ enum LegacyAttachment {
     Read,
     /// Kept without reading, because another holder had the gate.
     Unread,
+    /// Kept, with the gate left open, during a detach -> reattach handoff:
+    /// the target was untraced (TracerPid 0) while a detached wait was
+    /// recorded for this same live, non-zombie generation. No attachment
+    /// was confirmed, so this does not postcheck an observation.
+    Handoff,
 }
 
 /// [`close_unowned_legacy_wait`], also reporting whether the target's
@@ -4799,6 +4877,24 @@ fn check_legacy_attachment(
                     Ok(_) | Err(Errno::ENOENT | Errno::ESRCH) => {}
                     Err(error) => return Err(error),
                 }
+            }
+            // A detach -> reattach handoff passes through TracerPid=0. While
+            // a detached wait bound to a live owner is recorded for this same
+            // live, non-zombie generation, that momentary TracerPid=0 does not
+            // close the gate: the rule of `mark_legacy_echild_if_unowned`,
+            // applied before this check commits the retirement. Unlike the
+            // native exemption (`mark_echild_if_unowned`), only an untraced
+            // target qualifies. One attached to another tracer still closes
+            // here, as before: keeping it could let this Event accept a
+            // status observed under an attachment that is not its owner's.
+            if tracer.as_raw() == 0
+                && event.detach_handoff_pending()
+                && identity.observed_process_generation() == Some(true)
+                && !identity.task_is_zombie()
+            {
+                #[cfg(test)]
+                event.detached_echild_kept.fetch_add(1, Ordering::Relaxed);
+                return Ok(LegacyAttachment::Handoff);
             }
         }
         Err(Errno::ENOENT | Errno::ESRCH) => {}
@@ -5014,6 +5110,9 @@ fn legacy_worker_thread(
     // While the ptracer holds the tracee in a stop this worker published:
     // the targeted wakeup count read just before that publication.
     let mut held: Option<u64> = None;
+    // The status of that publication, for `legacy_held_wait_paused_on`.
+    #[cfg(test)]
+    let mut held_status = 0;
     // While a probed held worker polls: until when.
     let mut probing_until: Option<Instant> = None;
     loop {
@@ -5065,6 +5164,10 @@ fn legacy_worker_thread(
                 break;
             }
             held = libc::WIFSTOPPED(status).then_some(before_publication);
+            #[cfg(test)]
+            {
+                held_status = status;
+            }
             probing_until = None;
             wait = LEGACY_FIRST_WAIT;
             continue;
@@ -5126,6 +5229,11 @@ fn legacy_worker_thread(
                     true
                 }
                 Ok(LegacyAttachment::Unread) => false,
+                // No attachment was confirmed: the observation gets its own
+                // check below, as with an unread gate. An ECHILD observation
+                // then reaches `close_unowned_legacy_wait`, which keeps the
+                // generation for the same handoff.
+                Ok(LegacyAttachment::Handoff) => false,
                 Err(error) => {
                     progress.error = Some(error);
                     drop(progress);
@@ -5190,18 +5298,19 @@ fn legacy_worker_thread(
         let held_period = legacy_held_period(event);
         #[cfg(test)]
         if held_wait {
-            pause_retirement_for_test(&event.legacy_held_wait_pause);
+            pause_for_test_noting(&event.legacy_held_wait_pause, || {
+                *event.legacy_held_wait_paused_on.lock() = held.map(|count| (held_status, count));
+            });
         }
         #[cfg(test)]
         if wake {
             pause_retirement_for_test(&event.legacy_sleep_check_pause);
         }
         let mut wakeups = event.legacy_wakeup.lock();
+        let held_timeout = held_wait && held == Some(wakeups.targeted);
         let timeout = if wake {
             legacy_poll_period(event)
-        } else if held_wait && held == Some(wakeups.targeted) {
-            #[cfg(test)]
-            event.legacy_held_waits.fetch_add(1, Ordering::Relaxed);
+        } else if held_timeout {
             held_period
         } else {
             wait
@@ -5214,7 +5323,22 @@ fn legacy_worker_thread(
             let _ = parking.try_send(());
         }
         if *wakeups == seen {
-            event.legacy_wake.wait_for(&mut wakeups, timeout);
+            // A held wait starts only here. A wakeup this worker has not
+            // acted on yet (a probe, or a count that landed during its turn)
+            // skips the wait, and the turn it then takes is not a held one.
+            #[cfg(test)]
+            if held_timeout {
+                let observed = event.legacy_worker_wakes.load(Ordering::Relaxed);
+                event
+                    .legacy_held_wait_wakes
+                    .store(observed, Ordering::Relaxed);
+                event.legacy_held_waits.fetch_add(1, Ordering::Relaxed);
+            }
+            let _waited = event.legacy_wake.wait_for(&mut wakeups, timeout);
+            #[cfg(test)]
+            if !_waited.timed_out() {
+                event.legacy_worker_wakes.fetch_add(1, Ordering::Relaxed);
+            }
         }
         let targeted = wakeups.targeted != seen.targeted;
         let probed = wakeups.probes != seen.probes;
@@ -6287,10 +6411,17 @@ impl Notifier {
         }
     }
 
+    /// The registered handle of `pid`'s current generation, captured under
+    /// `policy`: a Native capture of a thread without a thread pidfd is
+    /// refused, and reports that refusal on stderr.
     #[cfg(test)]
-    fn current_registered(&self, pid: Pid) -> Result<Option<EventHandle>, Errno> {
+    fn current_registered(
+        &self,
+        pid: Pid,
+        policy: WaitPolicy,
+    ) -> Result<Option<EventHandle>, Errno> {
         loop {
-            let current = match self.capture_identity(pid) {
+            let current = match self.capture_identity_for_policy(pid, policy) {
                 Ok(current) => current,
                 Err(Errno::ENOENT | Errno::ESRCH) => return Ok(None),
                 Err(error) => return Err(error),
@@ -9750,8 +9881,15 @@ mod test {
             terminal: &TerminalCleanup,
             signal_sent: &mut bool,
         ) -> io::Result<CleanupWaitOwner> {
+            // Capture under the policy of the generation this guard holds,
+            // as its owner would: Native for a thread pidfd, the explicit
+            // ptracer-thread policy otherwise.
+            let policy = match terminal.event.identity().map(|identity| &identity.pidfd) {
+                Some(ThreadHandle::Pidfd(_)) | None => WaitPolicy::Native,
+                Some(_) => WaitPolicy::PtracerThread,
+            };
             let authoritative =
-                match NOTIFIER.current_registered(pid.into()) {
+                match NOTIFIER.current_registered(pid.into(), policy) {
                     Ok(Some(authoritative)) => Some(authoritative),
                     Ok(None) | Err(_) => NOTIFIER
                         .registered_sync_handle(pid.into(), pidfd)
@@ -9892,6 +10030,24 @@ mod test {
             }
         }
 
+        /// Waits up to `timeout` for `terminal`'s generation to retire. Its
+        /// worker runs, but a procfs worker publishes only the statuses its
+        /// ptracer consumes, which the shared handle alone never does (see
+        /// [`TerminalCleanup::wait`]). This guard runs on the tracee's
+        /// ptracer, so for such a generation it waits through the
+        /// ptracer-thread facade, which consumes for the worker. A refusal
+        /// there leaves the shared wait, as for any other generation.
+        fn notifier_retired(terminal: &TerminalCleanup, timeout: Duration) -> bool {
+            let procfs = terminal
+                .event
+                .identity()
+                .is_some_and(|identity| matches!(identity.pidfd, ThreadHandle::Procfs { .. }));
+            if procfs && let Ok(retired) = terminal.on_ptracer_thread().wait(timeout) {
+                return retired;
+            }
+            terminal.wait(timeout)
+        }
+
         fn cleanup_with_notifier(
             pid: Pid,
             pidfd: &ThreadHandle,
@@ -9904,7 +10060,7 @@ mod test {
                     Ok(()) => *signal_sent = true,
                     Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {
                         *signal_sent = true;
-                        if terminal.wait(TRACEE_WAIT_TIMEOUT) {
+                        if Self::notifier_retired(terminal, TRACEE_WAIT_TIMEOUT) {
                             return Ok(());
                         }
                         return Err(io::Error::new(
@@ -9929,7 +10085,7 @@ mod test {
             let deadline = Instant::now() + TRACEE_WAIT_TIMEOUT;
             let mut exit_stop_resumed = false;
             loop {
-                if terminal.wait(Duration::ZERO) {
+                if Self::notifier_retired(terminal, Duration::ZERO) {
                     return Ok(());
                 }
                 if terminal.exit_stop_observed() && !exit_stop_resumed {
@@ -11970,19 +12126,47 @@ mod test {
         actual_nonleader_exec_owned_case(false).await;
     }
 
+    /// Starts a thread that execs `/bin/true`, in a fork child of this
+    /// multithreaded test process. The exec makes the child's leader an old
+    /// leader.
+    ///
+    /// A `std::thread` takes std's process-wide thread-info lock as it
+    /// starts and as it exits. A fork taken while another test's thread held
+    /// that lock leaves the child's copy locked with no owner, and a
+    /// `std::thread::spawn` there would block forever before running its
+    /// closure (<https://github.com/rrnewton/reverie/issues/1459>). Raw
+    /// `pthread_create` runs no std code in the new thread, as in
+    /// `spawn_legacy_threads`. The thread only calls `execv` and, if that
+    /// returns, `_exit(127)`.
+    fn spawn_exec_true_thread_in_fork_child() {
+        extern "C" fn exec_true(_: *mut libc::c_void) -> *mut libc::c_void {
+            let args = [c"/bin/true".as_ptr(), std::ptr::null()];
+            unsafe {
+                libc::execv(args[0], args.as_ptr());
+                libc::_exit(127)
+            }
+        }
+        let mut thread = std::mem::MaybeUninit::<libc::pthread_t>::uninit();
+        let created = unsafe {
+            libc::pthread_create(
+                thread.as_mut_ptr(),
+                std::ptr::null(),
+                exec_true,
+                std::ptr::null_mut(),
+            )
+        };
+        if created != 0 {
+            unsafe { libc::_exit(126) };
+        }
+    }
+
     async fn actual_nonleader_exec_owned_case(force_legacy: bool) {
         let deadline = Instant::now() + Duration::from_secs(3);
         let root = match unsafe { fork() }.unwrap() {
             ForkResult::Parent { child } => child,
             ForkResult::Child => {
                 crate::traceme_and_stop().unwrap();
-                std::thread::spawn(|| {
-                    let args = [c"/bin/true".as_ptr(), std::ptr::null()];
-                    unsafe {
-                        libc::execv(args[0], args.as_ptr());
-                        libc::_exit(127);
-                    }
-                });
+                spawn_exec_true_thread_in_fork_child();
                 loop {
                     unsafe {
                         libc::pause();

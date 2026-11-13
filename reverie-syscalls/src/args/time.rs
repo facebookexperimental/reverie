@@ -15,8 +15,8 @@ use serde::Serialize;
 #[derive(Serialize, Deserialize, Copy, Clone, Eq, PartialEq, Debug, Hash)]
 #[repr(C)]
 pub struct Timespec {
-    /// Seconds
-    pub tv_sec: libc::time_t,
+    /// Seconds; `i64` because libc deprecates `time_t` on musl (time64).
+    pub tv_sec: i64,
     /// Nanoseconds
     pub tv_nsec: libc::c_long,
 }
@@ -93,8 +93,8 @@ impl std::fmt::Display for Timespec {
 #[repr(C)]
 #[allow(missing_docs)]
 pub struct Timeval {
-    pub tv_sec: libc::time_t,
-    pub tv_usec: libc::suseconds_t,
+    pub tv_sec: i64,
+    pub tv_usec: i64,
 }
 
 impl std::fmt::Display for Timeval {

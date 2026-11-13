@@ -91,7 +91,7 @@ pub(in super::super) unsafe fn enable(owner: &MappedToolPrelude) -> Result<(), i
     if raw.is_null() {
         return Err(libc::EINVAL);
     }
-    let busy = unsafe { &*(&raw const (*raw).busy) };
+    let busy = unsafe { &(*raw).busy };
     if busy
         .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
         .is_err()
@@ -225,7 +225,7 @@ pub(in super::super) unsafe fn retire_input(owner: &MappedToolPrelude) -> Result
     if raw.is_null() {
         return Err(libc::EINVAL);
     }
-    let busy = unsafe { &*(&raw const (*raw).busy) };
+    let busy = unsafe { &(*raw).busy };
     if busy
         .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
         .is_err()

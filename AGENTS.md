@@ -15,3 +15,31 @@ names, feature flags and environment variables.
 - Every backend must pass Reverie's own generic tests without Hermit,
   including the strace and counter example tools. The backends are ptrace,
   KVM, DBT, LiteInst and in-guest.
+
+**Rebind pinned sources in the same change.** The LiteInst artifact pins
+the raw size and sha256 of every source file listed in
+`reverie-liteinst-artifact`'s `CONTENT_REVERIE_CATALOG`
+(`reverie-liteinst-artifact/src/lib.rs`). That file also pins
+`reverie-inguest/src/trap/fixed_gates.rs` the same way, in
+`CONTENT_DETCORE_FIXED_GATE`, outside the catalog.
+
+- Any change to one of those files, comments included (the pins are raw size
+  and sha256), must update its pinned tuple in the same change and run
+  `cargo test -p reverie-liteinst-artifact` at the exact head before
+  submitting.
+- Update every occurrence of the old sha256, not only the catalog row. Some
+  files are pinned again elsewhere in `reverie-liteinst-artifact/src/`, for
+  example in `private_static/tls_sources.rs`,
+  `private_static/selected_initializers/native_leaves.rs` and `lib.rs`'s
+  `NO_INSTALLATION_SCOPE_SOURCE`. Grep that directory for the old sha256 to
+  find them all.
+- When a catalog row changes, add the replaced tuple to the test module's
+  list of rejected prior tuples (after the `CONTENT_REVERIE_CATALOG.len()`
+  assertion), as earlier row updates did. The test then proves the catalog
+  refuses the old content.
+- Run that test in a git checkout of the head: some of its tests run
+  `git rev-parse HEAD`, so a copy without `.git` fails them.
+- The tests for what a change touches include this one for every pinned file
+  it changes, even a file in another crate whose own tests do not run it. Two
+  merge-queue ejections came from missing exactly that: one for a code change
+  and one for a comment-only change.

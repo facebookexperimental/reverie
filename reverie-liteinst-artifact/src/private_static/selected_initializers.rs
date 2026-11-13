@@ -944,7 +944,7 @@ const DETCORE: MappedConsumerSource = MappedConsumerSource {
         reverie_gitlink_relative: "reverie",
     },
     package_name: "detcore-liteinst",
-    package_version: "0.5.6",
+    package_version: "0.5.7",
     lib_target: "detcore_liteinst",
     manifest_relative: "detcore-liteinst/Cargo.toml",
     lib_rs_relative: "detcore-liteinst/src/lib.rs",
@@ -977,7 +977,7 @@ const LITEROOT: MappedConsumerSource = MappedConsumerSource {
     entry_source_relative: "preload/src/mapped_entry.rs",
     // SHA-256 of `preload/src/mapped_entry.rs` at the reviewed
     // literoot head for this stack. Update only with that file.
-    accepted_entry_sources: &["b089e8f53e6285c21f411c1dce77741f0c9e081285914b55ef171eaa30d53559"],
+    accepted_entry_sources: &["13c86e80c0ab927508422539f4d81c93b9af24d45e545464d7d2c9210177a9d0"],
     binding: WorkspaceBinding::CargoGitRev,
     package_name: "literoot-preload",
     package_version: "0.0.1",
@@ -989,7 +989,10 @@ const LITEROOT: MappedConsumerSource = MappedConsumerSource {
     // repository-root workspace does not contain literoot-preload.
     root_manifest_relative: "preload/Cargo.toml",
     root_lock_relative: "preload/Cargo.lock",
-    features: &["mapped-successor"],
+    // The image-only feature: `mapped-successor` plus Reverie's
+    // `private-libc-exports`. literoot's own musl tests build with
+    // `mapped-successor` alone, so they never link the private libc exports.
+    features: &["mapped-successor-image"],
 };
 
 #[cfg(test)]
@@ -2333,7 +2336,7 @@ impl VerifiedStaticSource {
             let inventory = bind(&input.musl_source_authority.join("inventory.json"))?;
             require(
                 inventory.sha256
-                    == "6aeea4469c8ba49c4c475a6694972e6a1ef3974954c9f986f99d7d1bce926275",
+                    == "3beab05d07515e2005d1ee59b66327a4c5de385be4ba689f180d9cc470c62bf1",
                 "initializer native source authority inventory differs",
             )?;
             let native_sources: Value =
@@ -2981,7 +2984,7 @@ mod tests {
             ]
         );
         assert_eq!(detcore.package_name, "detcore-liteinst");
-        assert_eq!(detcore.package_version, "0.5.6");
+        assert_eq!(detcore.package_version, "0.5.7");
         assert_eq!(detcore.lib_target, "detcore_liteinst");
         assert_eq!(detcore.manifest_relative, "detcore-liteinst/Cargo.toml");
         assert_eq!(detcore.lib_rs_relative, "detcore-liteinst/src/lib.rs");
@@ -3005,7 +3008,7 @@ mod tests {
         // against, not a re-derivation of its format.
         assert_eq!(
             super::super::leaf_package_id(Path::new("/ws"), detcore).unwrap(),
-            "path+file:///ws/detcore-liteinst#0.5.6"
+            "path+file:///ws/detcore-liteinst#0.5.7"
         );
         // The pre-0.5.5 Detcore leaf id is not what production builds.
         assert_ne!(
@@ -3241,7 +3244,7 @@ mod tests {
         assert_eq!(literoot.lib_rs_relative(), "preload/src/lib.rs");
         assert_eq!(literoot.root_manifest_relative(), "preload/Cargo.toml");
         assert_eq!(literoot.root_lock_relative(), "preload/Cargo.lock");
-        assert_eq!(literoot.features(), ["mapped-successor"]);
+        assert_eq!(literoot.features(), ["mapped-successor-image"]);
         // cargo metadata 1.97.1 names a leaf whose directory differs
         // from its package name with `#<name>@<version>`.
         assert_eq!(

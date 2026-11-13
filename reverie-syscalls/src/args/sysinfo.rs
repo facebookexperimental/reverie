@@ -156,8 +156,12 @@ impl From<libc::sysinfo> for SysInfo {
         // The remaining fields are c_ulong, which is u64 on every target this
         // crate builds for; if that ever stops holding, this stops compiling
         // rather than silently truncating.
+        #[cfg(target_env = "musl")]
+        let uptime = sys_info.uptime;
+        #[cfg(not(target_env = "musl"))]
+        let uptime = sys_info.uptime as u64;
         SysInfo {
-            uptime: sys_info.uptime as u64,
+            uptime,
             loads_1: sys_info.loads[0],
             loads_5: sys_info.loads[1],
             loads_15: sys_info.loads[2],
