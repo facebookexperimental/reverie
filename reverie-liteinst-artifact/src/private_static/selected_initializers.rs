@@ -775,6 +775,8 @@ pub struct MappedGenerationSymbols {
     // modules deep, literoot's one.
     terminal_path: &'static str,
     observer_path: &'static str,
+    entry_source_relative: &'static str,
+    accepted_entry_sources: &'static [&'static str],
 }
 
 impl MappedGenerationSymbols {
@@ -785,6 +787,14 @@ impl MappedGenerationSymbols {
     /// Observed INT3 asm label for this generation.
     pub fn observed_label(&self) -> &'static str {
         self.observed_label
+    }
+    /// Workspace-relative source for this generation's entry and observer.
+    pub const fn entry_source_relative(&self) -> &'static str {
+        self.entry_source_relative
+    }
+    /// Exact reviewed digests for this generation's source path.
+    pub const fn accepted_entry_sources(&self) -> &'static [&'static str] {
+        self.accepted_entry_sources
     }
 }
 
@@ -811,8 +821,6 @@ pub struct MappedConsumerSource {
     member_prefix: &'static str,
     first: Option<MappedGenerationSymbols>,
     successor: Option<MappedGenerationSymbols>,
-    entry_source_relative: &'static str,
-    accepted_entry_sources: &'static [&'static str],
     binding: WorkspaceBinding,
     package_name: &'static str,
     package_version: &'static str,
@@ -821,6 +829,7 @@ pub struct MappedConsumerSource {
     lib_rs_relative: &'static str,
     root_manifest_relative: &'static str,
     root_lock_relative: &'static str,
+    requested_features: &'static [&'static str],
     features: &'static [&'static str],
 }
 
@@ -857,14 +866,6 @@ impl MappedConsumerSource {
         self.generation(generation)
             .ok_or_else(|| GENERATION_ABSENT.into())
     }
-    /// Accepted sha256 digests of the consumer entry source.
-    pub fn accepted_entry_sources(&self) -> &'static [&'static str] {
-        self.accepted_entry_sources
-    }
-    /// Consumer entry source path, workspace-relative.
-    pub const fn entry_source_relative(&self) -> &'static str {
-        self.entry_source_relative
-    }
     /// Workspace binding kind for the source transaction.
     pub const fn binding(&self) -> WorkspaceBinding {
         self.binding
@@ -897,7 +898,11 @@ impl MappedConsumerSource {
     pub const fn root_lock_relative(&self) -> &'static str {
         self.root_lock_relative
     }
-    /// Exact Cargo feature set for the archive build.
+    /// Feature seeds requested identically for Cargo metadata and rustc.
+    pub const fn requested_features(&self) -> &'static [&'static str] {
+        self.requested_features
+    }
+    /// Exact activated Cargo feature closure in the compiler-artifact row.
     pub const fn features(&self) -> &'static [&'static str] {
         self.features
     }
@@ -909,14 +914,19 @@ impl MappedConsumerSource {
 pub enum MappedConsumer {
     /// Hermit Detcore mapped first image (native successor route).
     Detcore,
-    /// Literoot mapped successor (its first image is not written yet).
+    /// Literoot mapped first and successor images in one archive.
     Literoot,
     /// Test-only consumer carrying both generations under fixture
-    /// names, so two-generation selection, retention and observer
-    /// distinctness stay exercised while no production consumer
-    /// has both. It names no real crate and exists only in tests.
+    /// names for consumer-isolation controls. It names no real crate
+    /// and exists only in tests.
     #[cfg(test)]
     TwoGenerationFixture,
+    /// Test-only consumer without a first generation, so the
+    /// first-absent refusal keeps a control now that every reviewed
+    /// consumer carries a first image. It names no real crate and
+    /// exists only in tests.
+    #[cfg(test)]
+    FirstAbsentFixture,
 }
 
 const DETCORE: MappedConsumerSource = MappedConsumerSource {
@@ -933,13 +943,13 @@ const DETCORE: MappedConsumerSource = MappedConsumerSource {
         ),
         terminal_path: "_RNvNtNtCs_16detcore_liteinst12exec_initial12mapped_entry8terminal",
         observer_path: "_RNvNtNtCs_16detcore_liteinst12exec_initial12mapped_entry26observe_initializer_return",
+        entry_source_relative: "detcore-liteinst/src/exec_initial/mapped_entry.rs",
+        accepted_entry_sources: &[
+            "bc140aaea9d598480cdabddd070ca4bc853ebfa0d7525789c85063988fa91f42",
+            "34e21f21a41f2346889c242c869bc32c74821c625dd5b9cf9bd2181ca2d8d40e",
+        ],
     }),
     successor: None,
-    entry_source_relative: "detcore-liteinst/src/exec_initial/mapped_entry.rs",
-    accepted_entry_sources: &[
-        "bc140aaea9d598480cdabddd070ca4bc853ebfa0d7525789c85063988fa91f42",
-        "34e21f21a41f2346889c242c869bc32c74821c625dd5b9cf9bd2181ca2d8d40e",
-    ],
     binding: WorkspaceBinding::HermitGitlink {
         reverie_gitlink_relative: "reverie",
     },
@@ -950,6 +960,11 @@ const DETCORE: MappedConsumerSource = MappedConsumerSource {
     lib_rs_relative: "detcore-liteinst/src/lib.rs",
     root_manifest_relative: "Cargo.toml",
     root_lock_relative: "Cargo.lock",
+    requested_features: &[
+        "exec-native-injection",
+        "exec-private-init",
+        "loader-private-runtime",
+    ],
     features: &[
         "exec-native-injection",
         "exec-private-init",
@@ -960,12 +975,18 @@ const DETCORE: MappedConsumerSource = MappedConsumerSource {
 const LITEROOT: MappedConsumerSource = MappedConsumerSource {
     layout: "literoot_mapped_layout",
     member_prefix: "literoot_preload-",
-    // The first-image entry, observer and label belong to the
-    // dh-tc7os first-image work item and do not exist yet. Until
-    // they do, the first generation refuses by name: the image
-    // cannot link (the ELF header entry is the first entry), and
-    // no literoot observer body is shared between two labels.
-    first: None,
+    first: Some(MappedGenerationSymbols {
+        entry: "literoot_mapped_initial_entry",
+        observed_label: "literoot_mapped_initial_entry_observed_int3",
+        terminal_exact: None,
+        observer_exact: None,
+        terminal_path: "_RNvNtCs_16literoot_preload20mapped_initial_entry8terminal",
+        observer_path: "_RNvNtCs_16literoot_preload20mapped_initial_entry26observe_initializer_return",
+        entry_source_relative: "preload/src/mapped_initial_entry.rs",
+        accepted_entry_sources: &[
+            "96cbfe6ae8cac1f5410486c0ccbbebc08191712326fc2dd63ef03381c64a7e25",
+        ],
+    }),
     successor: Some(MappedGenerationSymbols {
         entry: "literoot_mapped_successor_entry",
         observed_label: "literoot_mapped_successor_entry_observed_int3",
@@ -973,11 +994,11 @@ const LITEROOT: MappedConsumerSource = MappedConsumerSource {
         observer_exact: None,
         terminal_path: "_RNvNtCs_16literoot_preload12mapped_entry8terminal",
         observer_path: "_RNvNtCs_16literoot_preload12mapped_entry26observe_initializer_return",
+        entry_source_relative: "preload/src/mapped_entry.rs",
+        accepted_entry_sources: &[
+            "13c86e80c0ab927508422539f4d81c93b9af24d45e545464d7d2c9210177a9d0",
+        ],
     }),
-    entry_source_relative: "preload/src/mapped_entry.rs",
-    // SHA-256 of `preload/src/mapped_entry.rs` at the reviewed
-    // literoot head for this stack. Update only with that file.
-    accepted_entry_sources: &["13c86e80c0ab927508422539f4d81c93b9af24d45e545464d7d2c9210177a9d0"],
     binding: WorkspaceBinding::CargoGitRev,
     package_name: "literoot-preload",
     package_version: "0.0.1",
@@ -989,10 +1010,15 @@ const LITEROOT: MappedConsumerSource = MappedConsumerSource {
     // repository-root workspace does not contain literoot-preload.
     root_manifest_relative: "preload/Cargo.toml",
     root_lock_relative: "preload/Cargo.lock",
-    // The image-only feature: `mapped-successor` plus Reverie's
-    // `private-libc-exports`. literoot's own musl tests build with
-    // `mapped-successor` alone, so they never link the private libc exports.
-    features: &["mapped-successor-image"],
+    requested_features: &["mapped-successor-image"],
+    features: &[
+        "default",
+        "exec-stage",
+        "liteinst",
+        "mapped-successor",
+        "mapped-successor-image",
+        "successor",
+    ],
 };
 
 #[cfg(test)]
@@ -1006,6 +1032,8 @@ const TWO_GENERATION_FIXTURE: MappedConsumerSource = MappedConsumerSource {
         observer_exact: None,
         terminal_path: "_RNvNtCs_15fixture_preload12mapped_first8terminal",
         observer_path: "_RNvNtCs_15fixture_preload12mapped_first26observe_initializer_return",
+        entry_source_relative: "fixture/src/mapped_first.rs",
+        accepted_entry_sources: &[],
     }),
     successor: Some(MappedGenerationSymbols {
         entry: "fixture_mapped_successor_entry",
@@ -1014,9 +1042,9 @@ const TWO_GENERATION_FIXTURE: MappedConsumerSource = MappedConsumerSource {
         observer_exact: None,
         terminal_path: "_RNvNtCs_15fixture_preload16mapped_successor8terminal",
         observer_path: "_RNvNtCs_15fixture_preload16mapped_successor26observe_initializer_return",
+        entry_source_relative: "fixture/src/mapped_successor.rs",
+        accepted_entry_sources: &[],
     }),
-    entry_source_relative: "fixture/src/mapped_entry.rs",
-    accepted_entry_sources: &[],
     binding: WorkspaceBinding::CargoGitRev,
     package_name: "fixture-preload",
     package_version: "0.0.0",
@@ -1025,7 +1053,14 @@ const TWO_GENERATION_FIXTURE: MappedConsumerSource = MappedConsumerSource {
     lib_rs_relative: "fixture/src/lib.rs",
     root_manifest_relative: "fixture/Cargo.toml",
     root_lock_relative: "fixture/Cargo.lock",
+    requested_features: &[],
     features: &[],
+};
+
+#[cfg(test)]
+const FIRST_ABSENT_FIXTURE: MappedConsumerSource = MappedConsumerSource {
+    first: None,
+    ..LITEROOT
 };
 
 impl MappedConsumer {
@@ -1036,6 +1071,8 @@ impl MappedConsumer {
             Self::Literoot => &LITEROOT,
             #[cfg(test)]
             Self::TwoGenerationFixture => &TWO_GENERATION_FIXTURE,
+            #[cfg(test)]
+            Self::FirstAbsentFixture => &FIRST_ABSENT_FIXTURE,
         }
     }
 }
@@ -2973,11 +3010,11 @@ mod tests {
             "_RNvNtNtCs_16detcore_liteinst12exec_initial12mapped_entry26observe_initializer_return"
         );
         assert_eq!(
-            detcore.entry_source_relative(),
+            first.entry_source_relative(),
             "detcore-liteinst/src/exec_initial/mapped_entry.rs"
         );
         assert_eq!(
-            detcore.accepted_entry_sources(),
+            first.accepted_entry_sources(),
             [
                 "bc140aaea9d598480cdabddd070ca4bc853ebfa0d7525789c85063988fa91f42",
                 "34e21f21a41f2346889c242c869bc32c74821c625dd5b9cf9bd2181ca2d8d40e",
@@ -3082,16 +3119,21 @@ mod tests {
         // Literoot's entry digest is not Detcore's, and the
         // reverse; each consumer reads only its own list.
         assert_ne!(
-            literoot.accepted_entry_sources(),
-            DETCORE.accepted_entry_sources()
+            literoot
+                .generation_symbols(GenerationKind::Successor)
+                .unwrap()
+                .accepted_entry_sources(),
+            DETCORE
+                .generation_symbols(GenerationKind::First)
+                .unwrap()
+                .accepted_entry_sources()
         );
     }
 
     #[test]
     fn two_generation_descriptor_retains_both_entries_and_selects_each_generation() {
-        // No production consumer carries both generations yet
-        // (literoot's first image belongs to dh-tc7os), so these
-        // assertions run on the test-only fixture descriptor.
+        // The existing synthetic descriptor remains an independent
+        // control for consumer isolation and generation selection.
         let fixture = MappedConsumer::TwoGenerationFixture.source();
         assert_eq!(
             entry_undefined_args(fixture).unwrap(),
@@ -3140,7 +3182,10 @@ mod tests {
             for (production, refusal) in [
                 (DETCORE_FIRST, "selected strong definition absent/duplicate"),
                 (DETCORE_SUCCESSOR, GENERATION_ABSENT),
-                (LITEROOT_FIRST, GENERATION_ABSENT),
+                (
+                    LITEROOT_FIRST,
+                    "selected strong definition absent/duplicate",
+                ),
                 (
                     LITEROOT_SUCCESSOR,
                     "selected strong definition absent/duplicate",
@@ -3231,10 +3276,7 @@ mod tests {
 
     #[test]
     fn literoot_descriptor_names_the_standalone_preload_workspace() {
-        // literoot 74c241de: preload/Cargo.toml declares package
-        // literoot-preload 0.0.1, lib literoot_preload, feature
-        // mapped-successor and an empty `[workspace]`; the lock is
-        // preload/Cargo.lock.
+        // The preload package is a standalone workspace with its own lock.
         let literoot = MappedConsumer::Literoot.source();
         assert_eq!(literoot.binding(), WorkspaceBinding::CargoGitRev);
         assert_eq!(literoot.package_name(), "literoot-preload");
@@ -3244,7 +3286,18 @@ mod tests {
         assert_eq!(literoot.lib_rs_relative(), "preload/src/lib.rs");
         assert_eq!(literoot.root_manifest_relative(), "preload/Cargo.toml");
         assert_eq!(literoot.root_lock_relative(), "preload/Cargo.lock");
-        assert_eq!(literoot.features(), ["mapped-successor-image"]);
+        assert_eq!(literoot.requested_features(), ["mapped-successor-image"]);
+        assert_eq!(
+            literoot.features(),
+            [
+                "default",
+                "exec-stage",
+                "liteinst",
+                "mapped-successor",
+                "mapped-successor-image",
+                "successor",
+            ]
+        );
         // cargo metadata 1.97.1 names a leaf whose directory differs
         // from its package name with `#<name>@<version>`.
         assert_eq!(
@@ -3254,35 +3307,209 @@ mod tests {
     }
 
     #[test]
-    fn literoot_first_generation_is_absent_and_refuses_by_name() {
-        // dh-tc7os has not written literoot's first-image entry.
-        // Neither the link nor selection substitutes the successor.
+    fn literoot_first_generation_selects_roles_and_retains_both_entries() {
         let literoot = MappedConsumer::Literoot.source();
-        assert!(literoot.generation(GenerationKind::First).is_none());
-        assert_eq!(literoot.first_entry().err().unwrap(), GENERATION_ABSENT);
         assert_eq!(
-            entry_undefined_args(literoot).err().unwrap(),
+            literoot.first_entry().expect("reviewed first generation"),
+            "literoot_mapped_initial_entry"
+        );
+        assert_eq!(
+            entry_undefined_args(literoot).unwrap(),
+            [
+                "--undefined=literoot_mapped_initial_entry",
+                "--undefined=literoot_mapped_successor_entry",
+            ]
+        );
+        assert_eq!(
+            elf_entry_arg(literoot).unwrap(),
+            "--entry=literoot_mapped_initial_entry"
+        );
+        let runtime = Path::new("/runtime.a");
+        let member = "literoot_preload-mapped.o";
+        let absent = "initializer selected strong definition absent/duplicate";
+        for (mapped, other, name) in [
+            (
+                LITEROOT_FIRST,
+                LITEROOT_SUCCESSOR,
+                "literoot_mapped_initial_entry",
+            ),
+            (
+                LITEROOT_SUCCESSOR,
+                LITEROOT_FIRST,
+                "literoot_mapped_successor_entry",
+            ),
+        ] {
+            let role = InitializerRole::MappedRoot(mapped);
+            assert_eq!(role.symbol().unwrap(), name);
+            let mut bytes = role_selection_image(name);
+            bytes[189] = sym::STV_PROTECTED;
+            let map = role_selection_row(runtime, member);
+            let objects = [role_selection_object(&bytes, runtime, member)];
+            assert_eq!(
+                select_role(&role, &objects, &map, runtime)
+                    .unwrap()
+                    .member_name,
+                member
+            );
+            assert_eq!(
+                select_role(&InitializerRole::MappedRoot(other), &objects, &map, runtime)
+                    .err()
+                    .unwrap(),
+                absent
+            );
+            assert_eq!(
+                select_role(&role, &objects, "", runtime).err().unwrap(),
+                absent
+            );
+            let duplicate_member = "literoot_preload-again.o";
+            let duplicates = [
+                role_selection_object(&bytes, runtime, member),
+                role_selection_object(&bytes, runtime, duplicate_member),
+            ];
+            let duplicate_map = map.clone() + &role_selection_row(runtime, duplicate_member);
+            assert_eq!(
+                select_role(&role, &duplicates, &duplicate_map, runtime)
+                    .err()
+                    .unwrap(),
+                absent
+            );
+            for (path, owner) in [
+                (runtime, "another_preload-mapped.o"),
+                (Path::new("/another.a"), member),
+            ] {
+                let wrong = [role_selection_object(&bytes, path, owner)];
+                let map = role_selection_row(path, owner);
+                assert_eq!(
+                    select_role(&role, &wrong, &map, runtime).err().unwrap(),
+                    "initializer strong definition has wrong physical source owner"
+                );
+            }
+            for visibility in [sym::STV_DEFAULT, sym::STV_HIDDEN] {
+                let mut wrong = bytes.clone();
+                wrong[189] = visibility;
+                let objects = [role_selection_object(&wrong, runtime, member)];
+                assert_eq!(
+                    select_role(&role, &objects, &map, runtime).err().unwrap(),
+                    absent
+                );
+            }
+        }
+        assert_eq!(
+            DETCORE.first_entry().unwrap(),
+            "detcore_liteinst_mapped_entry"
+        );
+        assert_eq!(
+            DETCORE
+                .generation_symbols(GenerationKind::Successor)
+                .err()
+                .unwrap(),
             GENERATION_ABSENT
         );
-        assert_eq!(elf_entry_arg(literoot).err().unwrap(), GENERATION_ABSENT);
+    }
+
+    #[test]
+    fn literoot_generations_discover_separate_terminal_and_observer_bodies() {
+        let source = MappedConsumer::Literoot.source();
+        source
+            .generation_symbols(GenerationKind::First)
+            .expect("production first generation");
+        source
+            .generation_symbols(GenerationKind::Successor)
+            .unwrap();
+        assert!(!generations_share_an_observer(source));
         let runtime = Path::new("/runtime.a");
-        let mut bytes = role_selection_image("literoot_mapped_successor_entry");
-        bytes[189] = sym::STV_PROTECTED;
-        let map = role_selection_row(runtime, "literoot_preload-mapped.o");
-        let objects = [role_selection_object(
-            &bytes,
-            runtime,
-            "literoot_preload-mapped.o",
-        )];
-        for role in [
-            InitializerRole::MappedRoot(LITEROOT_FIRST),
-            InitializerRole::MappedTerminal(LITEROOT_FIRST),
-            InitializerRole::MappedObserver(LITEROOT_FIRST),
+        let member = "literoot_preload-mapped.o";
+        for (mapped, other, module) in [
+            (LITEROOT_FIRST, LITEROOT_SUCCESSOR, "20mapped_initial_entry"),
+            (LITEROOT_SUCCESSOR, LITEROOT_FIRST, "12mapped_entry"),
         ] {
-            assert_eq!(
-                select_role(&role, &objects, &map, runtime).err().unwrap(),
-                GENERATION_ABSENT
-            );
+            for (kind, leaf) in [
+                (
+                    InitializerRole::MappedTerminal as fn(MappedRole) -> InitializerRole,
+                    "8terminal",
+                ),
+                (
+                    InitializerRole::MappedObserver,
+                    "26observe_initializer_return",
+                ),
+            ] {
+                let role = kind(mapped);
+                let name = format!("_RNvNtCsA9z_16literoot_preload{module}{leaf}");
+                assert!(role.terminal_name(&name), "{name}");
+                assert!(!kind(other).terminal_name(&name));
+                assert!(!role.terminal_name(&name.replacen("_RNvNtCs", "_RNvNtNtCs", 1)));
+                let bytes = terminal_selection_image(&name, role);
+                let objects = [role_selection_object(&bytes, runtime, member)];
+                let map = role_selection_row(runtime, member);
+                let (found, actual) =
+                    select_role_named(&role, &objects, &map, runtime, true).unwrap();
+                assert_eq!(actual, name);
+                assert_eq!(found.member_name, member);
+                assert_eq!(
+                    select_role(&role, &objects, &map, runtime).err().unwrap(),
+                    "mapped exact body name undeclared for selected consumer"
+                );
+                for (candidate, rows) in [(kind(other), map.as_str()), (role, "")] {
+                    assert_eq!(
+                        select_role_named(&candidate, &objects, rows, runtime, true)
+                            .err()
+                            .unwrap(),
+                        "initializer selected strong definition absent/duplicate"
+                    );
+                }
+                let again = "literoot_preload-again.o";
+                let duplicates = [
+                    role_selection_object(&bytes, runtime, member),
+                    role_selection_object(&bytes, runtime, again),
+                ];
+                assert_eq!(
+                    select_role_named(
+                        &role,
+                        &duplicates,
+                        &(map.clone() + &role_selection_row(runtime, again)),
+                        runtime,
+                        true
+                    )
+                    .err()
+                    .unwrap(),
+                    "initializer selected strong definition absent/duplicate"
+                );
+                let wrong = [role_selection_object(
+                    &bytes,
+                    runtime,
+                    "another_preload-body.o",
+                )];
+                assert_eq!(
+                    select_role_named(
+                        &role,
+                        &wrong,
+                        &role_selection_row(runtime, "another_preload-body.o"),
+                        runtime,
+                        true
+                    )
+                    .err()
+                    .unwrap(),
+                    "initializer strong definition has wrong physical source owner"
+                );
+            }
+        }
+        let first = source.first.unwrap();
+        let successor = source.successor.unwrap();
+        assert_ne!(first.terminal_path, successor.terminal_path);
+        for collided in [
+            MappedGenerationSymbols {
+                observer_path: first.observer_path,
+                ..successor
+            },
+            MappedGenerationSymbols {
+                observed_label: first.observed_label,
+                ..successor
+            },
+        ] {
+            assert!(generations_share_an_observer(&MappedConsumerSource {
+                successor: Some(collided),
+                ..*source
+            }));
         }
     }
 
@@ -3441,6 +3668,40 @@ mod tests {
                 GENERATION_ABSENT
             );
         }
+    }
+
+    #[test]
+    fn first_absent_consumer_refuses_entry_and_first_roles_by_name() {
+        let consumer = MappedConsumer::FirstAbsentFixture.source();
+        assert!(consumer.generation(GenerationKind::First).is_none());
+        assert_eq!(consumer.first_entry().err().unwrap(), GENERATION_ABSENT);
+        // The link arguments refuse instead of naming an empty entry.
+        assert_eq!(
+            entry_undefined_args(consumer).err().unwrap(),
+            GENERATION_ABSENT
+        );
+        assert_eq!(elf_entry_arg(consumer).err().unwrap(), GENERATION_ABSENT);
+        let first = MappedRole {
+            consumer: MappedConsumer::FirstAbsentFixture,
+            generation: GenerationKind::First,
+        };
+        for role in [
+            InitializerRole::MappedRoot(first),
+            InitializerRole::MappedTerminal(first),
+            InitializerRole::MappedObserver(first),
+        ] {
+            assert_eq!(role.symbol().err().unwrap(), GENERATION_ABSENT);
+            assert!(!role.terminal_name(""));
+        }
+        // Not vacuous: the same consumer's successor still resolves.
+        let successor = MappedRole {
+            consumer: MappedConsumer::FirstAbsentFixture,
+            generation: GenerationKind::Successor,
+        };
+        assert_eq!(
+            InitializerRole::MappedRoot(successor).symbol().unwrap(),
+            "literoot_mapped_successor_entry"
+        );
     }
 
     fn binding_definition() -> RelocatedDefinition {

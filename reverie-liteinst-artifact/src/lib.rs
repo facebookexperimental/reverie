@@ -1273,8 +1273,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 88] = [
     ),
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers.rs",
-        284108,
-        "e681ba4a4d55fc841dc4107b1665d3c03edde4f5ff2daf4b4f0ac51885bed582",
+        293891,
+        "6c6b1aeef3813be229e541f4aba807c9f6e27f799c2d02067c8ef26760cfe89b",
     ),
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers/package_roles.rs",
@@ -1353,8 +1353,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 88] = [
     ),
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers/terminal_observation.rs",
-        35240,
-        "3bcced9c84ed853d04ed5d99931a74a983a9597c1555ad66cea91dbcf9889090",
+        41076,
+        "21839c56aaee95a3c2c83dfaa22ae579265fd0a35624863b0b04e8e1ac34dbbc",
     ),
     (
         "reverie-liteinst-artifact/tests/fixtures/ordinary_preceding_gate_page.rs",
@@ -39045,6 +39045,26 @@ mod tests {
             80301,
             "89ae1888619a96b89c1adbcd6703b55c78af093de55f6a2e362af152c4fff321",
         ),
+        (
+            "reverie-liteinst-artifact/src/private_static/selected_initializers.rs",
+            291996,
+            "69d477708a5132b937a26aa6952584e6c94cdd4ab9d2a5e29aa2b2f1f22d5ff5",
+        ),
+        (
+            "reverie-liteinst-artifact/src/private_static/selected_initializers/terminal_observation.rs",
+            41035,
+            "ba95d4b7c18bb76f86943fb5499019bb07696fc7fbbdefa03f9c3903856507dc",
+        ),
+        (
+            "reverie-liteinst-artifact/src/private_static/selected_initializers.rs",
+            293891,
+            "6c6b1aeef3813be229e541f4aba807c9f6e27f799c2d02067c8ef26760cfe89b",
+        ),
+        (
+            "reverie-liteinst-artifact/src/private_static/selected_initializers/terminal_observation.rs",
+            41076,
+            "21839c56aaee95a3c2c83dfaa22ae579265fd0a35624863b0b04e8e1ac34dbbc",
+        ),
     ];
 
     /// Seals over prefixes of `CONTENT_REVERIE_CATALOG_BINDINGS`: (rows covered,
@@ -39054,10 +39074,20 @@ mod tests {
     /// hiding it means editing existing seal lines. This is tamper-evident within
     /// one revision; scripts/check-catalog-bindings-append-only.rs compares a change
     /// with its merge-base, which is the independent check.
-    const CONTENT_REVERIE_CATALOG_BINDING_SEALS: &[(usize, &str)] = &[(
-        89,
-        "2f07e10f1e2338d112d2483587cc5f4cc34a8762477765d8482f6a91c7524c63",
-    )];
+    const CONTENT_REVERIE_CATALOG_BINDING_SEALS: &[(usize, &str)] = &[
+        (
+            89,
+            "2f07e10f1e2338d112d2483587cc5f4cc34a8762477765d8482f6a91c7524c63",
+        ),
+        (
+            91,
+            "ed4eb18573d968dc9fc3af0ed114657506c3c0594a401e441a23ad739cb4a411",
+        ),
+        (
+            93,
+            "7f545874ce3166c5f9f52e1b7c4d12f8c37b24a7f2e3ac38ff697b37aa6ad242",
+        ),
+    ];
 
     /// The canonical bytes a binding seal covers: one `path\tsize\tdigest\n` line
     /// per binding, in order.
@@ -39612,6 +39642,26 @@ mod tests {
         // Keep the fixed catalog authoritative and reject their prior tuples.
         assert_eq!(CONTENT_REVERIE_CATALOG.len(), 88);
         let rejected_prior = [
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers.rs",
+                291996,
+                "69d477708a5132b937a26aa6952584e6c94cdd4ab9d2a5e29aa2b2f1f22d5ff5",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers/terminal_observation.rs",
+                41035,
+                "ba95d4b7c18bb76f86943fb5499019bb07696fc7fbbdefa03f9c3903856507dc",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers.rs",
+                284108,
+                "e681ba4a4d55fc841dc4107b1665d3c03edde4f5ff2daf4b4f0ac51885bed582",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers/terminal_observation.rs",
+                35240,
+                "3bcced9c84ed853d04ed5d99931a74a983a9597c1555ad66cea91dbcf9889090",
+            ),
             (
                 "reverie-inguest/src/guest/continuation.rs",
                 46467,
@@ -69007,6 +69057,36 @@ pub mod private_static {
         Ok(format!("path+file://{}#{fragment}", directory.display()))
     }
 
+    // Closed workspace package names, including names outside `reverie-*`.
+    // The resolve test compares this set in both directions with real Cargo
+    // workspace metadata, so additions and removals require a reviewed update.
+    const REVERIE_WORKSPACE_PACKAGES: &[&str] = &[
+        "nostd-print",
+        "reverie-core",
+        "reverie-examples",
+        "reverie-inguest",
+        "reverie-kvm",
+        "reverie-kvm-core",
+        "reverie-linux-provider",
+        "reverie-linuxemu",
+        "reverie-liteinst",
+        "reverie-liteinst-artifact",
+        "reverie-liteinst-preload",
+        "reverie-loader",
+        "reverie-memory",
+        "reverie-process",
+        "reverie-procfs",
+        "reverie-ptrace",
+        "reverie-rpc",
+        "reverie-rpc-macros",
+        "reverie-rpc-transport",
+        "reverie-syscalls",
+        "reverie-test-support",
+        "reverie-util",
+        "riptrace-rpc",
+        "safeptrace",
+    ];
+
     /// Binds the resolved Reverie crates to the pin and returns the
     /// manifest path of each bound package. For both kinds each bound
     /// package must appear once with the exact pinned git source; this
@@ -69030,16 +69110,13 @@ pub mod private_static {
     ///   path changes that resolved package's source and refuses here.
     /// - no crate that the pinned source carries to appear a second time
     ///   at another source (for example a direct leaf dependency on
-    ///   reverie-syscalls at another rev, coord7 lens A2 case V5).
+    ///   reverie-syscalls at another rev).
     /// - every `reverie-*` package to be at the pinned source, including
     ///   one the leaf declares directly at a fork or a stale rev that no
-    ///   pinned crate reaches (coord7 round-2 cases E3 and E5).
-    ///
-    /// Accepted residual (coord7 design ruling on 1982bdb7): a crate the
-    /// resolve carries only at a non-pinned source, declared there by the
-    /// leaf, outside the `reverie-*` name rule, is not recognized as
-    /// Reverie code. None exists at literoot 74c241de, whose leaf declares
-    /// only pinned Reverie crates plus libc and serde from crates.io.
+    ///   pinned crate reaches.
+    /// - every package with a closed workspace name to be at the pinned
+    ///   source, even when only the leaf declares it, including through a
+    ///   renamed dependency. Unrelated registry packages remain permitted.
     fn bound_reverie_manifests<'m>(
         metadata: &'m Value,
         binding: selected_initializers::WorkspaceBinding,
@@ -69134,6 +69211,15 @@ pub mod private_static {
                             .is_some_and(|n| n.starts_with("reverie-"))
                 }),
                 "static CargoGitRev resolve has a reverie-* package outside the pinned source",
+            )?;
+            require(
+                packages.iter().all(|p| {
+                    p["source"].as_str() == Some(source.as_str())
+                        || !p["name"]
+                            .as_str()
+                            .is_some_and(|name| REVERIE_WORKSPACE_PACKAGES.contains(&name))
+                }),
+                "static CargoGitRev resolve has a workspace package outside the pinned source",
             )?;
         }
         Ok(bound)
@@ -69306,7 +69392,7 @@ pub mod private_static {
                         "--filter-platform".into(),
                         TARGET.into(),
                         "--features".into(),
-                        consumer.features().join(","),
+                        consumer.requested_features().join(","),
                     ],
                     expected.workspace,
                 )?;
@@ -69438,7 +69524,7 @@ pub mod private_static {
                         "--profile".into(),
                         "liteinst-runtime".into(),
                         "--features".into(),
-                        self.consumer.source().features().join(","),
+                        self.consumer.source().requested_features().join(","),
                         "--crate-type".into(),
                         "staticlib".into(),
                         "--message-format=json-render-diagnostics".into(),
@@ -70048,7 +70134,10 @@ pub mod private_static {
                     (
                         "entry",
                         &self.workspace,
-                        self.consumer.source().entry_source_relative(),
+                        self.consumer
+                            .source()
+                            .generation_symbols(selected_initializers::GenerationKind::First)?
+                            .entry_source_relative(),
                     ),
                     (
                         "exec_private",
@@ -71452,6 +71541,297 @@ pub mod private_static {
                 }
             }
         }
+        #[test]
+        fn cargo_git_rev_refuses_leaf_only_workspace_crates_outside_pin() {
+            let pin = "02973cdcfcadd21190fda864dfa9eb1b3e6ed1c1";
+            let other = "ffffffffffffffffffffffffffffffffffffffff";
+            let pinned = format!("git+https://github.com/rrnewton/reverie?rev={pin}#{pin}");
+            let registry = "registry+https://github.com/rust-lang/crates.io-index";
+            let leaf = "path+file:///ws/preload#literoot-preload@0.0.1";
+            let binding = selected_initializers::WorkspaceBinding::CargoGitRev;
+            // No pinned package declares or resolves safeptrace. It is a
+            // leaf-only dependency; the duplicate-copy and pinned-edge rules
+            // cannot recognize its outside source.
+            let metadata = |resolved: &str, declared: &str, rename: Option<&str>| {
+                let id = format!("{}#safeptrace@0.5.7", resolved.split('#').next().unwrap());
+                let mut packages = vec![serde_json::json!({
+                    "id": leaf, "name": "literoot-preload", "source": null,
+                    "dependencies": [{"name": "safeptrace", "rename": rename, "source": declared}],
+                    "manifest_path": "/ws/preload/Cargo.toml",
+                })];
+                let mut nodes = vec![serde_json::json!({
+                    "id": leaf, "deps": [{"name": rename.unwrap_or("safeptrace"), "pkg": id}],
+                })];
+                for name in ["reverie-inguest", "reverie-liteinst", "reverie-loader"] {
+                    let id = format!("{}#{name}@0.5.7", pinned.split('#').next().unwrap());
+                    packages.push(serde_json::json!({
+                        "id": id, "name": name, "source": pinned, "dependencies": [],
+                        "manifest_path": format!("/cache/reverie/{name}/Cargo.toml"),
+                    }));
+                    nodes.push(serde_json::json!({"id": id, "deps": []}));
+                }
+                packages.push(serde_json::json!({
+                    "id": id, "name": "safeptrace", "source": resolved,
+                    "dependencies": [], "manifest_path": "/cache/leaf/safeptrace/Cargo.toml",
+                }));
+                nodes.push(serde_json::json!({"id": id, "deps": []}));
+                packages.push(serde_json::json!({
+                    "id": format!("{registry}#libc@0.2.186"), "name": "libc",
+                    "source": registry, "dependencies": [],
+                }));
+                serde_json::json!({"packages": packages, "resolve": {"nodes": nodes}})
+            };
+            let exact = metadata(&pinned, pinned.split('#').next().unwrap(), None);
+            assert_eq!(
+                bound_reverie_manifests(&exact, binding, pin, leaf).unwrap(),
+                [
+                    (
+                        "reverie-inguest",
+                        "/cache/reverie/reverie-inguest/Cargo.toml"
+                    ),
+                    (
+                        "reverie-liteinst",
+                        "/cache/reverie/reverie-liteinst/Cargo.toml"
+                    ),
+                    ("reverie-loader", "/cache/reverie/reverie-loader/Cargo.toml"),
+                ]
+            );
+            for outside in [
+                format!("git+https://github.com/fork/reverie?rev={other}#{other}"),
+                format!("git+https://github.com/rrnewton/reverie?rev={other}#{other}"),
+                registry.to_owned(),
+            ] {
+                for rename in [None, Some("tracing_alias")] {
+                    let graph = metadata(&outside, outside.split('#').next().unwrap(), rename);
+                    assert_eq!(
+                        bound_reverie_manifests(&graph, binding, pin, leaf)
+                            .err()
+                            .as_deref(),
+                        Some(
+                            "static CargoGitRev resolve has a workspace package outside the pinned source"
+                        ),
+                        "consistent leaf-only safeptrace source {outside}, rename {rename:?}"
+                    );
+                }
+                let swapped = metadata(&outside, pinned.split('#').next().unwrap(), None);
+                assert_eq!(
+                    bound_reverie_manifests(&swapped, binding, pin, leaf)
+                        .err()
+                        .as_deref(),
+                    Some(
+                        "static CargoGitRev Reverie dependency resolves outside the pinned source"
+                    )
+                );
+            }
+            for resolved in [
+                pinned.split('#').next().unwrap().to_owned(),
+                format!("{}#{other}", pinned.split('#').next().unwrap()),
+            ] {
+                let graph = metadata(
+                    &resolved,
+                    pinned.split('#').next().unwrap(),
+                    Some("tracing_alias"),
+                );
+                assert_eq!(
+                    bound_reverie_manifests(&graph, binding, pin, leaf)
+                        .err()
+                        .as_deref(),
+                    Some(
+                        "static CargoGitRev Reverie dependency resolves outside the pinned source"
+                    )
+                );
+            }
+            for name in ["nostd-print", "riptrace-rpc", "safeptrace"] {
+                let mut graph = metadata(registry, registry, Some("renamed_internal"));
+                let id = serde_json::json!(format!("{registry}#{name}@0.5.7"));
+                graph["packages"][0]["dependencies"][0]["name"] = serde_json::json!(name);
+                graph["packages"][4]["name"] = serde_json::json!(name);
+                graph["packages"][4]["id"] = id.clone();
+                graph["resolve"]["nodes"][0]["deps"][0]["pkg"] = id.clone();
+                graph["resolve"]["nodes"][4]["id"] = id;
+                assert_eq!(
+                    bound_reverie_manifests(&graph, binding, pin, leaf).unwrap_err(),
+                    "static CargoGitRev resolve has a workspace package outside the pinned source",
+                    "leaf-only internal name {name}"
+                );
+            }
+            let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+            let output = std::process::Command::new(env!("CARGO"))
+                .current_dir(workspace)
+                .args([
+                    "metadata",
+                    "--no-deps",
+                    "--locked",
+                    "--offline",
+                    "--format-version=1",
+                ])
+                .output()
+                .expect("real workspace metadata");
+            assert!(
+                output.status.success(),
+                "workspace metadata failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let metadata: Value = serde_json::from_slice(&output.stdout).unwrap();
+            let members = metadata["workspace_members"].as_array().unwrap();
+            let actual = metadata["packages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|package| members.contains(&package["id"]))
+                .map(|package| package["name"].as_str().unwrap())
+                .collect::<BTreeSet<_>>();
+            let reviewed = REVERIE_WORKSPACE_PACKAGES
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                reviewed.len(),
+                REVERIE_WORKSPACE_PACKAGES.len(),
+                "duplicate reviewed workspace name"
+            );
+            assert_eq!(
+                reviewed, actual,
+                "closed package names must match the workspace in both directions"
+            );
+        }
+
+        #[test]
+        fn literoot_archive_requires_exact_activated_features() {
+            let features = [
+                "default",
+                "exec-stage",
+                "liteinst",
+                "mapped-successor",
+                "mapped-successor-image",
+                "successor",
+            ];
+            assert_eq!(
+                selected_initializers::MappedConsumer::Literoot
+                    .source()
+                    .features(),
+                features
+            );
+            assert_eq!(
+                selected_initializers::MappedConsumer::Literoot
+                    .source()
+                    .requested_features(),
+                ["mapped-successor-image"]
+            );
+            let detcore = selected_initializers::MappedConsumer::Detcore.source();
+            assert_eq!(detcore.requested_features(), detcore.features());
+            // Fabricated rows below exercise refusals only. The qualified
+            // positive must come from a fresh real build_archive transaction.
+            let package = PackageIdentity {
+                id: "path+file:///ws/preload#literoot-preload@0.0.1".into(),
+                name: "literoot-preload".into(),
+                manifest: PathBuf::from("/ws/preload/Cargo.toml"),
+                source: None,
+                target: "literoot_preload".into(),
+                kind: vec!["staticlib".into()],
+                crate_types: vec!["staticlib".into()],
+                target_source: PathBuf::from("/ws/preload/src/lib.rs"),
+            };
+            let target = serde_json::json!({"name": "literoot_preload", "kind": ["staticlib"], "crate_types": ["staticlib"]});
+            let row = serde_json::json!({
+                "reason": "compiler-artifact", "package_id": package.id,
+                "manifest_path": package.manifest, "target": target, "features": features,
+                "profile": {"test": false, "opt_level": "3", "debuginfo": 0, "debug_assertions": true, "overflow_checks": true},
+                "executable": null, "filenames": [],
+            });
+            let refused = |rows: &[Value]| {
+                let output = rows
+                    .iter()
+                    .map(Value::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                select_archive(
+                    output.as_bytes(),
+                    &package,
+                    &target,
+                    &[],
+                    ArchiveSelectionExpectation {
+                        target_dir: Path::new("/"),
+                        metadata_sha256: "negative control",
+                        expected_features: &features,
+                        archive_owner: &Arc::new(ArchiveSourceOwner { _reserved: 0 }),
+                    },
+                )
+                .err()
+                .expect("fabricated rows must never construct an archive")
+            };
+            let finished = serde_json::json!({"reason": "build-finished", "success": true});
+            assert_eq!(
+                refused(&[row.clone(), finished.clone()]),
+                "static archive output ambiguous"
+            );
+            let mut variants: Vec<Vec<&str>> = (0..features.len())
+                .map(|missing| {
+                    features
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, feature)| (i != missing).then_some(*feature))
+                        .collect()
+                })
+                .collect();
+            variants.extend([
+                vec!["mapped-successor-image"],
+                features.iter().copied().chain(["mapped-initial"]).collect(),
+                features.iter().copied().chain(["unexpected"]).collect(),
+            ]);
+            for features in variants {
+                let mut bad = row.clone();
+                bad["features"] = serde_json::json!(features);
+                assert_eq!(
+                    refused(&[bad, finished.clone()]),
+                    "static feature/test/executable mismatch"
+                );
+            }
+            for (field, value) in [
+                ("opt_level", serde_json::json!("2")),
+                ("debuginfo", serde_json::json!(1)),
+                ("debug_assertions", serde_json::json!(false)),
+                ("overflow_checks", serde_json::json!(false)),
+            ] {
+                let mut bad = row.clone();
+                bad["profile"][field] = value;
+                assert_eq!(
+                    refused(&[bad, finished.clone()]),
+                    "static liteinst-runtime profile differs"
+                );
+            }
+            for (field, value) in [
+                ("test", serde_json::json!(true)),
+                ("executable", serde_json::json!("/unexpected")),
+            ] {
+                let mut bad = row.clone();
+                if field == "test" {
+                    bad["profile"][field] = value;
+                } else {
+                    bad[field] = value;
+                }
+                assert_eq!(
+                    refused(&[bad, finished.clone()]),
+                    "static feature/test/executable mismatch"
+                );
+            }
+            for rows in [
+                vec![],
+                vec![row.clone()],
+                vec![
+                    row.clone(),
+                    serde_json::json!({"reason": "build-finished", "success": false}),
+                ],
+                vec![row.clone(), finished.clone(), finished.clone()],
+                vec![row.clone(), row, finished],
+            ] {
+                assert_eq!(
+                    refused(&rows),
+                    "static producer lacks one successful current archive"
+                );
+            }
+        }
+
         #[test]
         fn private_static_archive_selector_refuses_zero_failed_and_duplicate_build_records() {
             // Fabricated selector inputs are negative controls only. They do

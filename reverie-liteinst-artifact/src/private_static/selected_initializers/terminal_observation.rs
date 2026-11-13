@@ -1,8 +1,32 @@
 //! Finite mapped-entry terminal/observer observations, never entry admission.
 use super::*;
 
-fn accepted_entry_source(consumer: &MappedConsumerSource, digest: &str) -> bool {
-    consumer.accepted_entry_sources.contains(&digest)
+fn accepted_entry_source(
+    consumer: &MappedConsumerSource,
+    generation: GenerationKind,
+    relative: &str,
+    digest: &str,
+) -> Result<()> {
+    let symbols = consumer.generation_symbols(generation)?;
+    require(
+        relative == symbols.entry_source_relative
+            && symbols.accepted_entry_sources.contains(&digest),
+        "terminal actual source differs",
+    )
+}
+
+fn terminal_source_paths(
+    consumer: &MappedConsumerSource,
+) -> Vec<(&'static str, Option<GenerationKind>)> {
+    [GenerationKind::First, GenerationKind::Successor]
+        .into_iter()
+        .filter_map(|generation| {
+            consumer
+                .generation(generation)
+                .map(|symbols| (symbols.entry_source_relative, Some(generation)))
+        })
+        .chain(std::iter::once((PRIVATE_SOURCE_PATH, None)))
+        .collect()
 }
 
 pub(super) const PRIVATE_SOURCE_PATH: &str = "reverie-inguest/src/guest/exec_private.rs";
@@ -406,10 +430,8 @@ impl VerifiedStaticSource {
                         == "0a1b558f444ed2bca7fb467dede7416a651bc490b1abc77705ab470d99c527c1",
                     "terminal objdump differs",
                 )?;
-                for (relative, cargo) in [
-                    (consumer.entry_source_relative, false),
-                    (PRIVATE_SOURCE_PATH, true),
-                ] {
+                for (relative, source_generation) in terminal_source_paths(consumer) {
+                    let cargo = source_generation.is_none();
                     let roots = self
                         .guard
                         .roots
@@ -422,14 +444,15 @@ impl VerifiedStaticSource {
                         .collect::<Vec<_>>();
                     require(roots.len() == 1, "terminal guarded source root ambiguous")?;
                     let file = FileIdentity::read(&roots[0].join(relative))?;
-                    require(
-                        if cargo {
-                            accepted_private_source(&file.sha256)
-                        } else {
-                            accepted_entry_source(consumer, &file.sha256)
-                        },
-                        "terminal actual source differs",
-                    )?;
+                    match source_generation {
+                        Some(generation) => {
+                            accepted_entry_source(consumer, generation, relative, &file.sha256)?;
+                        }
+                        None => require(
+                            accepted_private_source(&file.sha256),
+                            "terminal actual source differs",
+                        )?,
+                    }
                     files.push(file);
                 }
                 let mut backing = extract_objects(&archive.file, 0)?;
@@ -481,8 +504,9 @@ impl VerifiedStaticSource {
                 // The ELF header names the first-image entry for
                 // every consumer; a successor observation's root
                 // is joined by its exact symbol instead and must
-                // not be the header entry. The first-image text is
-                // the Detcore-only producer's, unchanged.
+                // not be the header entry. Every consumer's first
+                // image, Detcore's and Literoot's, takes the First
+                // branch below.
                 match generation {
                     GenerationKind::First => require(
                         elf.entry == root.address,
@@ -708,6 +732,129 @@ impl VerifiedStaticSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Consumer-isolation controls below range over each closed generation;
+    // the production predicate always binds one generation and exact path.
+    fn accepts_consumer_digest(consumer: &MappedConsumerSource, digest: &str) -> bool {
+        [GenerationKind::First, GenerationKind::Successor]
+            .into_iter()
+            .any(|generation| {
+                consumer.generation(generation).is_some_and(|symbols| {
+                    accepted_entry_source(
+                        consumer,
+                        generation,
+                        symbols.entry_source_relative,
+                        digest,
+                    )
+                    .is_ok()
+                })
+            })
+    }
+
+    #[test]
+    fn literoot_entry_sources_are_exact_for_each_generation() {
+        let literoot = MappedConsumer::Literoot.source();
+        let first = "96cbfe6ae8cac1f5410486c0ccbbebc08191712326fc2dd63ef03381c64a7e25";
+        let successor = "13c86e80c0ab927508422539f4d81c93b9af24d45e545464d7d2c9210177a9d0";
+        assert!(
+            accepts_consumer_digest(literoot, first),
+            "reviewed first entry source"
+        );
+        assert_eq!(
+            terminal_source_paths(literoot),
+            [
+                (
+                    "preload/src/mapped_initial_entry.rs",
+                    Some(GenerationKind::First)
+                ),
+                (
+                    "preload/src/mapped_entry.rs",
+                    Some(GenerationKind::Successor)
+                ),
+                (PRIVATE_SOURCE_PATH, None),
+            ]
+        );
+        assert_eq!(
+            terminal_source_paths(&DETCORE),
+            [
+                (
+                    "detcore-liteinst/src/exec_initial/mapped_entry.rs",
+                    Some(GenerationKind::First)
+                ),
+                (PRIVATE_SOURCE_PATH, None),
+            ]
+        );
+        for (generation, relative, digest, other) in [
+            (
+                GenerationKind::First,
+                "preload/src/mapped_initial_entry.rs",
+                first,
+                successor,
+            ),
+            (
+                GenerationKind::Successor,
+                "preload/src/mapped_entry.rs",
+                successor,
+                first,
+            ),
+        ] {
+            accepted_entry_source(literoot, generation, relative, digest).unwrap();
+            for wrong in [
+                other,
+                PRIVATE_SOURCE,
+                "3bf5cb31162ceb23e212d318195ee38e058c98c474bb4e09c3c39b1647b7043f",
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            ] {
+                assert_eq!(
+                    accepted_entry_source(literoot, generation, relative, wrong).unwrap_err(),
+                    "terminal actual source differs"
+                );
+            }
+            for wrong_path in [
+                "preload/src/lib.rs",
+                "preload/src/../src/mapped_entry.rs",
+                "mapped_initial_entry.rs",
+                if generation == GenerationKind::First {
+                    "preload/src/mapped_entry.rs"
+                } else {
+                    "preload/src/mapped_initial_entry.rs"
+                },
+            ] {
+                assert!(accepted_entry_source(literoot, generation, wrong_path, digest).is_err());
+            }
+            for wrong_digest in [
+                digest[..63].to_owned(),
+                format!("{digest}0"),
+                digest.to_ascii_uppercase(),
+                format!("sha256:{digest}"),
+            ] {
+                assert!(
+                    accepted_entry_source(literoot, generation, relative, &wrong_digest).is_err()
+                );
+            }
+            for index in 0..digest.len() {
+                let mut changed = digest.as_bytes().to_vec();
+                changed[index] = if changed[index] == b'0' { b'1' } else { b'0' };
+                assert!(
+                    accepted_entry_source(
+                        literoot,
+                        generation,
+                        relative,
+                        &String::from_utf8(changed).unwrap()
+                    )
+                    .is_err()
+                );
+            }
+            assert!(
+                accepted_entry_source(&DETCORE, GenerationKind::First, relative, digest).is_err()
+            );
+            assert_eq!(
+                accepted_entry_source(&DETCORE, GenerationKind::Successor, relative, digest)
+                    .unwrap_err(),
+                GENERATION_ABSENT
+            );
+        }
+    }
+
     #[test]
     fn terminal_actual_reload_and_native_entry_are_both_required() {
         let mut code = vec![
@@ -783,12 +930,20 @@ mod tests {
     #[test]
     fn entry_sources_are_accepted_only_for_their_own_consumer() {
         let literoot = MappedConsumer::Literoot.source();
-        for digest in literoot.accepted_entry_sources {
-            assert!(accepted_entry_source(literoot, digest));
-            assert!(!accepted_entry_source(&DETCORE, digest));
+        for digest in literoot
+            .generation_symbols(GenerationKind::Successor)
+            .unwrap()
+            .accepted_entry_sources
+        {
+            assert!(accepts_consumer_digest(literoot, digest));
+            assert!(!accepts_consumer_digest(&DETCORE, digest));
         }
-        for digest in DETCORE.accepted_entry_sources {
-            assert!(!accepted_entry_source(literoot, digest));
+        for digest in DETCORE
+            .generation_symbols(GenerationKind::First)
+            .unwrap()
+            .accepted_entry_sources
+        {
+            assert!(!accepts_consumer_digest(literoot, digest));
         }
     }
 
@@ -815,8 +970,12 @@ mod tests {
 
     #[test]
     fn mapped_terminal_entry_sources_remain_exact_closed_declarations() {
-        for digest in DETCORE.accepted_entry_sources {
-            assert!(accepted_entry_source(&DETCORE, digest));
+        for digest in DETCORE
+            .generation_symbols(GenerationKind::First)
+            .unwrap()
+            .accepted_entry_sources
+        {
+            assert!(accepts_consumer_digest(&DETCORE, digest));
             for refused in [
                 "0".repeat(64),
                 digest[..63].to_owned(),
@@ -824,18 +983,18 @@ mod tests {
                 digest.to_ascii_uppercase(),
                 format!("sha256:{digest}"),
             ] {
-                assert!(!accepted_entry_source(&DETCORE, &refused));
+                assert!(!accepts_consumer_digest(&DETCORE, &refused));
             }
             for index in 0..digest.len() {
                 let mut modified = digest.as_bytes().to_vec();
                 modified[index] = if modified[index] == b'0' { b'1' } else { b'0' };
-                assert!(!accepted_entry_source(
+                assert!(!accepts_consumer_digest(
                     &DETCORE,
                     &String::from_utf8(modified).unwrap()
                 ));
             }
         }
-        assert!(!accepted_entry_source(&DETCORE, PRIVATE_SOURCE));
+        assert!(!accepts_consumer_digest(&DETCORE, PRIVATE_SOURCE));
     }
     #[test]
     fn terminal_private_sources_remain_exact_closed_declarations() {
@@ -862,13 +1021,17 @@ mod tests {
                 ));
             }
         }
-        for digest in DETCORE.accepted_entry_sources {
+        for digest in DETCORE
+            .generation_symbols(GenerationKind::First)
+            .unwrap()
+            .accepted_entry_sources
+        {
             assert!(!accepted_private_source(digest));
         }
-        assert!(!accepted_entry_source(
+        assert!(!accepts_consumer_digest(
             &DETCORE,
             MAPPED_CALLBACK_PRIVATE_SOURCE
         ));
-        assert!(!accepted_entry_source(&DETCORE, SUCCESSOR_PRIVATE_SOURCE));
+        assert!(!accepts_consumer_digest(&DETCORE, SUCCESSOR_PRIVATE_SOURCE));
     }
 }
