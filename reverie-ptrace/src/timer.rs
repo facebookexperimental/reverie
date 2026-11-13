@@ -1288,7 +1288,6 @@ thread_local! {
     static HOST_TIMED_TIMER_EVENTS: std::cell::Cell<HostTimedTimerEvents> = const {
         std::cell::Cell::new(HostTimedTimerEvents {
             overshoot: 0,
-            unstepped_at_target: 0,
             preempted_overflow: 0,
         })
     };
@@ -1301,14 +1300,9 @@ thread_local! {
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct HostTimedTimerEvents {
-    /// The signal was handled past the target, which also prints
+    /// The signal was handled at or past the target, which also prints
     /// [`SKID_OVERSHOOT_MARKER`]: the event fires at the observed counter.
     pub overshoot: u64,
-    /// The signal was handled exactly at the target count with no
-    /// instruction offset, so no single-step placed the event: it fires
-    /// wherever the guest was stopped between the target branch and the next
-    /// one.
-    pub unstepped_at_target: u64,
     /// A stop other than the timer's own signal stop ended the timer's one
     /// allowed stop after the counter had passed the programmed overflow, and
     /// that overflow's signal was not handled first. The stop cancels a timer
@@ -1321,7 +1315,7 @@ pub(crate) struct HostTimedTimerEvents {
 impl HostTimedTimerEvents {
     /// The number of host-timed outcomes of every kind.
     pub fn total(&self) -> u64 {
-        self.overshoot + self.unstepped_at_target + self.preempted_overflow
+        self.overshoot + self.preempted_overflow
     }
 }
 
@@ -3315,6 +3309,22 @@ impl TimerImpl {
 
         // Last check to see if this an unexpected wakeup (a signal before the minimum expected)
         let ctr = self.read_clock();
+        // Every notification's counter, before anything decides what the
+        // notification does, so that each one leaves a record that does not
+        // depend on the decision.
+        match self.event {
+            ActiveEvent::Precise {
+                clock_target,
+                offset,
+            } => debug!(
+                "Timer notification tid={} ctr={} target={} offset={}",
+                self.guest_tid, ctr, clock_target, offset
+            ),
+            ActiveEvent::Imprecise { clock_min } => debug!(
+                "Timer notification tid={} ctr={} min={}",
+                self.guest_tid, ctr, clock_min
+            ),
+        }
         let first_stage = self.first_stage.take();
         if self.rearm_short_of_target(ctr, first_stage) {
             return Err(HandleFailure::Cancelled(task));
@@ -3332,27 +3342,11 @@ impl TimerImpl {
                 offset,
             } => {
                 // No single step places an event that the notification finds
-                // exactly at its target count with no instruction offset.
-                #[cfg(test)]
-                if ctr == clock_target && offset == 0 {
-                    count_host_timed(|events| events.unstepped_at_target += 1);
-                }
-                // Nor does one place an offset event that the notification
-                // finds at or past its target count: the guest has run an
-                // unknown number of instructions past the target branch.
-                if get_pmu_config().record_offset_notification_at_or_past_target(
-                    ctr,
-                    clock_target,
-                    offset,
-                ) {
-                    warn!(
-                        "Precise timer interrupt arrived at or after target {} with {} \
-                         instructions still to step (counter {}); delivering the timer event \
-                         at the observed counter",
-                        clock_target, offset, ctr
-                    );
-                    #[cfg(test)]
-                    count_host_timed(|events| events.overshoot += 1);
+                // at or past its target count, whatever its instruction
+                // offset: the guest has run an unknown number of instructions
+                // past the target branch, and steps only move forward. The
+                // event is delivered at the observed counter, before any step.
+                if self.record_notification_at_or_past_target(ctr, clock_target, offset) {
                     return Ok(task);
                 }
                 let current = ClockCounter::new(ctr, 0, clock_target);
@@ -3383,14 +3377,18 @@ impl TimerImpl {
         waits: &std::sync::Arc<PtracerWaitOwner>,
     ) -> Result<Stopped, HandleFailure> {
         let target_rcb = current.target_rcb;
-        // The perf interrupt can arrive *past* the target: the guest retires
-        // branches until the interrupt stops the counter, so the skid is its
-        // branch rate times the interrupt's latency, which can exceed the
-        // margin (https://github.com/rrnewton/hermit/issues/3810). Single
-        // stepping cannot move the guest backward, so record the overshoot and
-        // deliver the timer event at the observed counter. The Tool can then
-        // account for the late event and either end the timeslice or re-arm
-        // the next timer through its normal callback.
+        // A notification that finds the thread at or past the target never
+        // gets here from `deliver`: `deliver` records it as a skid overshoot
+        // (https://github.com/rrnewton/hermit/issues/3810) and delivers the
+        // event before any step. This guard is for a resumed, counted step
+        // sequence (`Unfinished::Steps`), which `continue_stepping` hands here
+        // directly after `catch_up`. Such a sequence reached its counter by
+        // counted steps, so arriving exactly at the target is canonical and
+        // continues. Only a counter strictly past the target is recorded:
+        // single stepping cannot move the guest backward, so the event is
+        // delivered at the observed counter. The Tool can then account for the
+        // late event and either end the timeslice or re-arm the next timer
+        // through its normal callback.
         if self.record_late_delivery(current.rcbs(), target_rcb) {
             return Ok(task);
         }
@@ -4094,6 +4092,38 @@ impl TimerImpl {
         warn!(
             "Precise timer interrupt arrived after target: {detail}; delivering timer event \
              at the observed counter"
+        );
+        reverie::record_skid_overshoot_detail(detail);
+        #[cfg(test)]
+        count_host_timed(|events| events.overshoot += 1);
+        true
+    }
+
+    /// Records the notification of a precise event that found the thread at
+    /// `ctr`, at or past its target `clock_target`, as a skid overshoot, with
+    /// its detail, and returns `true`, whatever the instruction `offset`: the
+    /// counter cannot show how many instructions ran past the target branch,
+    /// so no step can place the event. A notification short of the target
+    /// records nothing and returns `false`.
+    fn record_notification_at_or_past_target(
+        &mut self,
+        ctr: u64,
+        clock_target: u64,
+        offset: u64,
+    ) -> bool {
+        if !get_pmu_config().record_offset_notification_at_or_past_target(ctr, clock_target, offset)
+        {
+            return false;
+        }
+        let detail = self.overflow_evidence().detail(
+            self.guest_tid,
+            SkidOvershootKind::DeliveredLate,
+            ctr,
+            clock_target,
+        );
+        warn!(
+            "Precise timer notification at or past target: {detail} offset={offset}; delivering \
+             the timer event at the observed counter"
         );
         reverie::record_skid_overshoot_detail(detail);
         #[cfg(test)]
@@ -9146,17 +9176,252 @@ mod tests {
         assert!(config.record_missed_if_target_reached(u64::MAX, 0));
         assert_eq!(reverie::take_skid_overshoot_count(), 1);
 
-        // --- The notification of an offset event before any step: one at
-        // the target itself cannot be placed either. Without an offset,
-        // `record_overshoot_if_past_target` alone decides, as before. ---
-        assert!(!config.record_offset_notification_at_or_past_target(32_999, 33_000, 7));
-        assert!(!config.record_offset_notification_at_or_past_target(33_000, 33_000, 0));
-        assert!(!config.record_offset_notification_at_or_past_target(33_001, 33_000, 0));
-        assert_eq!(reverie::take_skid_overshoot_count(), 0);
-        assert!(config.record_offset_notification_at_or_past_target(33_000, 33_000, 7));
-        assert_eq!(reverie::take_skid_overshoot_count(), 1);
-        assert!(config.record_offset_notification_at_or_past_target(33_001, 33_000, 1));
-        assert_eq!(reverie::take_skid_overshoot_count(), 1);
+        // The offset decider's at- and past-target cases run in their own exact-test child:
+        // notification_decision_reports_every_offset_at_or_past_target.
+    }
+
+    // The notification of a precise event before any step: one at or past the
+    // target cannot be placed, whatever the instruction offset, because the
+    // counter cannot show how many instructions ran past the target branch,
+    // so it is reported. The witness count is process global and other tests
+    // in this binary drain it, so the decisions run in a fresh exact-test
+    // process, and its stderr carries their markers.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn notification_decision_reports_every_offset_at_or_past_target() {
+        const CHILD: &str = "REVERIE_PTRACE_NOTIFICATION_DECISION_CHILD";
+        const TEST: &str = "notification_decision_reports_every_offset_at_or_past_target";
+        if std::env::var_os(CHILD).is_some() {
+            notification_decisions_at_and_around_the_target();
+            return;
+        }
+        let (_, module) = module_path!()
+            .split_once("::")
+            .expect("the module path names the crate");
+        let output =
+            std::process::Command::new(std::env::current_exe().expect("locate test binary"))
+                .args([
+                    "--exact",
+                    &format!("{module}::{TEST}"),
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .env_remove(super::WITNESS_TOKEN_ENV)
+                .env_remove(super::SKID_MARGIN_OVERRIDE_ENV)
+                .output()
+                .expect("run the notification-decision child test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "notification-decision child test failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        let markers: Vec<&str> = stderr
+            .lines()
+            .filter(|line| line.contains(super::SKID_OVERSHOOT_MARKER))
+            .collect();
+        let at_target = format!(
+            "{} rcb_actual=33000 rcb_target=33000 skid_margin=2000 overshoot=0",
+            super::SKID_OVERSHOOT_MARKER
+        );
+        let past_target = format!(
+            "{} rcb_actual=33001 rcb_target=33000 skid_margin=2000 overshoot=1",
+            super::SKID_OVERSHOOT_MARKER
+        );
+        let expected = [
+            at_target.as_str(),
+            at_target.as_str(),
+            past_target.as_str(),
+            past_target.as_str(),
+        ];
+        assert_eq!(
+            markers, expected,
+            "rows 3 and 4 each mark the target, rows 5 and 6 each mark one past it, and no other \
+             row marks anything\nstderr:\n{stderr}"
+        );
+    }
+
+    /// The decisions of [`notification_decision_reports_every_offset_at_or_past_target`],
+    /// in the exact-test child process that owns the witness count, in this
+    /// order. Each row takes its own witness delta before the next row runs.
+    #[cfg(target_arch = "x86_64")]
+    fn notification_decisions_at_and_around_the_target() {
+        let _ = reverie::take_skid_overshoot_count();
+        let _ = reverie::take_skid_overshoot_details();
+        // EPYC 9D85, skid margin 2000. The decision keys only on the counts.
+        let config = PmuConfig::from_family_model(0x1A, 0x11);
+        assert_eq!(config.skid_margin(), 2000);
+
+        // Short of the target, with or without an offset: nothing is reported.
+        assert!(
+            !config.record_offset_notification_at_or_past_target(32_999, 33_000, 0),
+            "row 1 ctr=32999 offset=0"
+        );
+        assert_eq!(reverie::take_skid_overshoot_count(), 0, "row 1 witness");
+        assert!(
+            !config.record_offset_notification_at_or_past_target(32_999, 33_000, 7),
+            "row 2 ctr=32999 offset=7"
+        );
+        assert_eq!(reverie::take_skid_overshoot_count(), 0, "row 2 witness");
+        // Equality, offset 0: the guest may be anywhere between the target
+        // branch and the next one.
+        assert!(
+            config.record_offset_notification_at_or_past_target(33_000, 33_000, 0),
+            "row 3 ctr=33000 offset=0"
+        );
+        assert_eq!(reverie::take_skid_overshoot_count(), 1, "row 3 witness");
+        assert!(
+            config.record_offset_notification_at_or_past_target(33_000, 33_000, 7),
+            "row 4 ctr=33000 offset=7"
+        );
+        assert_eq!(reverie::take_skid_overshoot_count(), 1, "row 4 witness");
+        // Past target, offset 0.
+        assert!(
+            config.record_offset_notification_at_or_past_target(33_001, 33_000, 0),
+            "row 5 ctr=33001 offset=0"
+        );
+        assert_eq!(reverie::take_skid_overshoot_count(), 1, "row 5 witness");
+        assert!(
+            config.record_offset_notification_at_or_past_target(33_001, 33_000, 1),
+            "row 6 ctr=33001 offset=1"
+        );
+        assert_eq!(reverie::take_skid_overshoot_count(), 1, "row 6 witness");
+        assert!(
+            reverie::take_skid_overshoot_details().is_empty(),
+            "the decision records no detail"
+        );
+    }
+
+    // The report of a notification at or past its target at the timer: one
+    // marker, one witness increment and one late-delivery detail each, for
+    // every instruction offset, and nothing short of the target. Constructing
+    // a TimerImpl opens hardware performance counters, so this test needs a
+    // working PMU and fails without one; it is not skipped. The witness count
+    // and details are process global, so the reports happen in a fresh
+    // exact-test process.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn notification_at_or_past_target_records_a_late_delivery_detail() {
+        const CHILD: &str = "REVERIE_PTRACE_NOTIFICATION_DETAIL_CHILD";
+        const TEST: &str = "notification_at_or_past_target_records_a_late_delivery_detail";
+        if std::env::var_os(CHILD).is_some() {
+            notification_reports_at_and_around_the_target();
+            return;
+        }
+        let (_, module) = module_path!()
+            .split_once("::")
+            .expect("the module path names the crate");
+        let output =
+            std::process::Command::new(std::env::current_exe().expect("locate test binary"))
+                .args([
+                    "--exact",
+                    &format!("{module}::{TEST}"),
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .env_remove(super::WITNESS_TOKEN_ENV)
+                .env_remove(super::SKID_MARGIN_OVERRIDE_ENV)
+                .output()
+                .expect("run the notification-detail child test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "notification-detail child test failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        let margin = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("NOTIFICATION-MARGIN "))
+            .expect("the child prints its skid margin");
+        let token = super::SKID_OVERSHOOT_MARKER;
+        let target = format!("rcb_target=33000 skid_margin={margin}");
+        let marker = |actual: u64| {
+            let overshoot = actual - 33_000;
+            format!("{token} rcb_actual={actual} {target} overshoot={overshoot}")
+        };
+        let expected = [
+            marker(33_000),
+            marker(33_001),
+            marker(33_000),
+            marker(33_001),
+        ];
+        let markers: Vec<&str> = stderr
+            .lines()
+            .filter(|line| line.contains(super::SKID_OVERSHOOT_MARKER))
+            .collect();
+        assert_eq!(
+            markers, expected,
+            "each offset marks the target and one past it, and nothing short of the target\n\
+             stderr:\n{stderr}"
+        );
+    }
+
+    /// The reports of [`notification_at_or_past_target_records_a_late_delivery_detail`],
+    /// in the exact-test child process that owns the witness count and
+    /// details: for offsets 0 and 2, one short of the target, at it and one
+    /// past it, in that order.
+    #[cfg(target_arch = "x86_64")]
+    fn notification_reports_at_and_around_the_target() {
+        use reverie::Pid;
+        use reverie::SkidOvershootKind;
+
+        use super::ActiveEvent;
+        use super::TimerImpl;
+
+        // A synthetic target: the reports are checked by their counts, and no
+        // real notification occurs.
+        const TARGET: u64 = 33_000;
+        block_timer_signal();
+        let pid = Pid::from_raw(unsafe { libc::getpid() });
+        let tid = Pid::from_raw(unsafe { libc::syscall(libc::SYS_gettid) } as i32);
+        let mut timer = TimerImpl::new(pid, tid, false).expect("control requires a working PMU");
+        let _ = reverie::take_skid_overshoot_count();
+        let _ = reverie::take_skid_overshoot_details();
+        let margin = super::get_pmu_config().skid_margin();
+        // On a line of its own: libtest may have written `test <name> ... `
+        // without a newline before this.
+        println!("\nNOTIFICATION-MARGIN {margin}");
+        for offset in [0, 2] {
+            timer.event = ActiveEvent::Precise {
+                clock_target: TARGET,
+                offset,
+            };
+            let short = TARGET - 1;
+            assert!(
+                !timer.record_notification_at_or_past_target(short, TARGET, offset),
+                "ctr={short} offset={offset}"
+            );
+            assert_eq!(
+                reverie::take_skid_overshoot_count(),
+                0,
+                "ctr={short} offset={offset}: witness"
+            );
+            assert!(
+                reverie::take_skid_overshoot_details().is_empty(),
+                "ctr={short} offset={offset}: detail"
+            );
+            for ctr in [TARGET, TARGET + 1] {
+                assert!(
+                    timer.record_notification_at_or_past_target(ctr, TARGET, offset),
+                    "ctr={ctr} offset={offset}"
+                );
+                assert_eq!(
+                    reverie::take_skid_overshoot_count(),
+                    1,
+                    "ctr={ctr} offset={offset}: witness"
+                );
+                let details = reverie::take_skid_overshoot_details();
+                assert_eq!(details.len(), 1, "ctr={ctr} offset={offset}: {details:?}");
+                let detail = &details[0];
+                assert_eq!(detail.tid, tid);
+                assert_eq!(detail.kind, SkidOvershootKind::DeliveredLate);
+                assert_eq!(detail.rcb_actual, ctr);
+                assert_eq!(detail.rcb_target, TARGET);
+                assert_eq!(detail.past_target(), ctr - TARGET);
+            }
+        }
     }
 
     /// An uncounted interrupted step matters only while the steps count

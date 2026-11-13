@@ -140,6 +140,8 @@ jobs:
     - name: Test regular workspace cases
       run: |
         source scripts/stable-features.sh
+        # notification_at_or_past_target_records_a_late_delivery_detail constructs a TimerImpl,
+        # which opens hardware performance counters; the self-hosted hardware job runs it.
         cargo test --workspace --exclude reverie-kvm --exclude reverie-kvm-core --exclude reverie-linuxemu --exclude reverie-inguest --features "${STABLE_FEATURES_REGULAR}" --no-fail-fast -- \
         --test-threads=1 \
         --skip container::tests::bind_to_low_port \
@@ -161,6 +163,7 @@ jobs:
         --skip tests::pid_namespace \
         --skip tests::port_isolation \
         --skip tests::seccomp_notify \
+        --skip timer::tests::notification_at_or_past_target_records_a_late_delivery_detail \
         --skip tests::uid_namespace
     - name: Documentation tests
       run: cargo test --workspace --doc

@@ -3637,11 +3637,13 @@ fn panic_text(panic: &(dyn std::any::Any + Send)) -> String {
 /// `check` of the (inject, tail) runs. An attempt is retried, up to
 /// `TIMER_ATTEMPTS` attempts, only when it failed and one of its runs had a
 /// host-timed timer outcome (`HostTimedTimerEvents`, counted by the timer on
-/// this thread): the perf overflow signal was handled past the target, or
-/// exactly at the target with no step to place the event, or after another
-/// stop had already ended the timer although its overflow was due. Each of
-/// these puts the timer event (or its absence) where the host's signal
-/// delivery put it.
+/// this thread): the perf overflow signal was handled at or past the target
+/// (`overshoot`, which includes a notification exactly at the target, where
+/// no step can place the event), or after another stop had already ended the
+/// timer although its overflow was due (`preempted_overflow`). Each of these
+/// puts the timer event (or its absence) where the host's signal delivery put
+/// it. The retry rule reads `total()`, which counts both kinds, so which
+/// cases are retried is unchanged.
 ///
 /// A failed attempt without such an outcome fails the test at once. If
 /// every attempt fails, each with such an outcome, the test fails too,

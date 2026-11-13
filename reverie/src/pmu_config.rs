@@ -761,11 +761,14 @@ impl PmuConfig {
     /// with no Tool callback, as a stop that reschedules a spurious wakeup
     /// does, and stops add no RCBs. The measured rate is a past average: it
     /// bounds neither a faster suffix nor the interrupt latency's tail, so
-    /// a notification can still arrive past the target. That case keeps the
-    /// existing overshoot contract (see `TimerImpl::attempt_single_step`):
-    /// the overshoot is recorded and the event is delivered at the observed
-    /// counter. A mismeasured rate changes the cost and how likely that is,
-    /// not where an on-target event is delivered.
+    /// a notification can still arrive at or past the target. Such a
+    /// notification is late, because the counter cannot show how many
+    /// instructions ran past the target branch, and it keeps the existing
+    /// overshoot contract (see `TimerImpl::deliver` and
+    /// `TimerImpl::attempt_single_step`): the overshoot is recorded and the
+    /// event is delivered at the observed counter. A mismeasured rate changes
+    /// the cost and how likely that is, not where an on-target event is
+    /// delivered.
     ///
     /// An event is staged only if the first stage programs a notification,
     /// rather than sending an artificial signal, and if a second stage can
@@ -876,24 +879,24 @@ impl PmuConfig {
         }
     }
 
-    /// Decision-and-record site for the notification of a precise event with
-    /// an instruction offset, before any step: iff the notification found the
-    /// guest at or past the target branch, emit the canonical
-    /// [`SKID_OVERSHOOT_MARKER`] line, increment the process-global witness
-    /// counter, and return `true`. The guest may have run any number of
-    /// instructions past the target branch before the notification stopped
-    /// it, and counting the offset from there would place the event where
-    /// host timing left the guest, so it is delivered at the observed
-    /// counter instead, as a late notification is. Without an offset an
-    /// event at its target is delivered where it was found, as before, and
-    /// only one past it is recorded ([`Self::record_overshoot_if_past_target`]).
+    /// Decision-and-record site for the notification of a precise event,
+    /// before any step: iff the notification found the guest at or past the
+    /// target branch, emit the canonical [`SKID_OVERSHOOT_MARKER`] line,
+    /// increment the process-global witness counter, and return `true`. This
+    /// holds for every instruction offset, 0 included. The counter counts
+    /// only retired conditional branches, so the guest may have run any
+    /// number of instructions past the target branch before the notification
+    /// stopped it. Single steps only move forward, so neither the target's
+    /// first instruction nor an offset counted from there can be reached:
+    /// the event is delivered at the observed counter instead, as a late
+    /// notification is. The instruction offset does not affect the decision.
     pub fn record_offset_notification_at_or_past_target(
         &self,
         rcb_actual: u64,
         rcb_target: u64,
-        instr_offset: u64,
+        _instr_offset: u64,
     ) -> bool {
-        if instr_offset > 0 && rcb_actual >= rcb_target {
+        if rcb_actual >= rcb_target {
             self.emit_skid_overshoot_marker(rcb_actual, rcb_target);
             crate::record_skid_overshoot();
             true

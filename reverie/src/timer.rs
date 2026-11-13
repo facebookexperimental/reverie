@@ -87,9 +87,9 @@ pub fn skid_overshoot_count() -> u64 {
 /// [`SkidOvershootDetail`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SkidOvershootKind {
-    /// The event's overflow notification found the thread already past the
-    /// target, or the kernel lost the notification and a later stop found it
-    /// there, and the event was delivered at the observed counter.
+    /// The event's overflow notification found the thread already at or past
+    /// the target, or the kernel lost the notification and a later stop found
+    /// it there, and the event was delivered at the observed counter.
     DeliveredLate,
     /// The thread reached the event's delivery point, but something other
     /// than the event's notification ended the event first, undelivered.

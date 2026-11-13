@@ -1508,11 +1508,13 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 88] = [
     // measured count from an unmeasured one instead of reporting an
     // invented number. Size/digest cover both reviewed changes, and the
     // literoot sprint rebase's "fix interim PMU shim architecture
-    // refusals" (M1; reviewed as b8f4a6ebe, sprint commit eedaa8b6a).
+    // refusals" (M1; reviewed as b8f4a6ebe, sprint commit eedaa8b6a). They
+    // also cover the change that reports a precise timer notification found
+    // at its target, with any instruction offset, as a late delivery.
     (
         "reverie/src/pmu_config.rs",
-        78983,
-        "fa0e30d174f53dd047d94e9c55dba50fdc8d114586de4e9b4b706c6a954da5cc",
+        79136,
+        "58f6a6e0fdaa52173cbd4e252574e5868e8e2973712621f93b98e36eec1a7649",
     ),
     (
         "reverie/src/in_guest_rcb.rs",
@@ -39584,6 +39586,11 @@ mod tests {
                 "reverie/Cargo.toml",
                 2373,
                 "f07451bd4bb57c7ed5dfefadc4e84de136dce47cb0f1cd55f20b978d3df66dd1",
+            ),
+            (
+                "reverie/src/pmu_config.rs",
+                78983,
+                "fa0e30d174f53dd047d94e9c55dba50fdc8d114586de4e9b4b706c6a954da5cc",
             ),
         ] {
             let entries: Vec<_> = CONTENT_REVERIE_CATALOG
