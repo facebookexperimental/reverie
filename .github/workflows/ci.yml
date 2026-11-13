@@ -117,6 +117,8 @@ jobs:
       run: |
         source scripts/stable-features.sh
         cargo build --workspace --features "${STABLE_FEATURES}"
+    - name: Fetch locked dependencies
+      run: cargo fetch --locked
     - name: LiteInst allocator fixtures
       timeout-minutes: 10
       run: |
@@ -125,6 +127,16 @@ jobs:
         generation="$RUNNER_TEMP/liteinst-allocator-$GITHUB_JOB-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
         scripts/build-liteinst-test-runtime.rs --for-ci "$generation"
         cat "$generation/bundle/github.env" >> "$GITHUB_ENV"
+    - name: Upload LiteInst allocator producer logs
+      # Keep the producer's per-command logs when the step fails; they are the
+      # only record of the failing command's own output.
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: liteinst-allocator-logs-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+        path: ${{ runner.temp }}/liteinst-allocator-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}/bundle/logs
+        if-no-files-found: warn
+        retention-days: 3
     - name: Test regular workspace cases
       run: |
         source scripts/stable-features.sh
