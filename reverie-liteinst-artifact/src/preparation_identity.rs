@@ -1036,6 +1036,29 @@ mod tests {
         constructor_native_bridge(&bytes, address, initializing, gate, owner).unwrap()
     }
 
+    /// The source factory's hang backstop. Its Git commands and Cargo's
+    /// locked metadata take a few CPU-seconds in all; the wall they need grows
+    /// with host load.
+    const SOURCE_FACTORY_WALL_BACKSTOP: Duration = Duration::from_secs(300);
+    /// The work bound of each source-factory command, where CPU is accounted.
+    const SOURCE_FACTORY_COMMAND_CPU: Duration = Duration::from_secs(60);
+
+    /// Whether this process can give a command a CPU budget: a throwaway
+    /// CPU-bounded `/bin/true` either runs or refuses for want of accounting.
+    fn cpu_accounting_available(scratch: &Path) -> bool {
+        let mut probe = Runner::new(
+            scratch.join("cpu-accounting-probe"),
+            Duration::from_secs(30),
+            4096,
+        )
+        .unwrap();
+        match probe.run_cpu_bounded("/bin/true", &[], scratch, Duration::from_secs(5)) {
+            Ok(_) => true,
+            Err(error) if error.contains("producer CPU accounting unavailable") => false,
+            Err(error) => panic!("CPU accounting probe failed: {error}"),
+        }
+    }
+
     #[test]
     fn qualify_transfers_refuses_nonidentity_missing_sources_and_wrong_owned_entry() {
         // This is a real factory transaction over the independently current,
@@ -1097,12 +1120,30 @@ mod tests {
             }
         }
         let scratch = Scratch(scratch);
+        // The wall deadline is a hang backstop, not a work bound (see
+        // `Runner`). A 30 s deadline fired while Cargo was still resolving the
+        // locked metadata on a 3-CPU GitHub-hosted runner: command wall 29.75 s
+        // in facebookexperimental/hermit Actions runs 43349902907 and
+        // 43352961937. Bound each command's work by CPU where this host can
+        // account it, and keep a finite wall backstop for a hang. Where it
+        // cannot, say so and run under the backstop alone.
         let mut runner = Runner::new(
             scratch.0.join("source-factory"),
-            Duration::from_secs(30),
+            SOURCE_FACTORY_WALL_BACKSTOP,
             16 * 1024 * 1024,
         )
         .unwrap();
+        if cpu_accounting_available(&scratch.0) {
+            runner
+                .bound_every_command_by_cpu(SOURCE_FACTORY_COMMAND_CPU)
+                .unwrap();
+        } else {
+            eprintln!(
+                "preparation identity source factory: CPU accounting unavailable; \
+                 running under the {} s wall backstop only",
+                SOURCE_FACTORY_WALL_BACKSTOP.as_secs()
+            );
+        }
         let pin = runner
             .text(
                 "git",

@@ -256,6 +256,9 @@ pub fn verify_guest_receipt(
 /// [`Runner::run_cpu_bounded`]. That command runs in a fresh child of this
 /// process's cgroup (`CommandCgroup`), so `cpu.stat` counts the CPU of every
 /// process it starts, reaped or not, and `cgroup.kill` reaches all of them.
+/// A caller whose commands are issued by library code (compiled-source
+/// resolution, for one) bounds them all with
+/// [`Runner::bound_every_command_by_cpu`].
 pub struct Runner {
     pub logs: PathBuf,
     pub deadline: Instant,
@@ -267,6 +270,9 @@ pub struct Runner {
     /// schema denies unknown fields.
     pub command_cpu: Vec<Option<Duration>>,
     wall_budget: Duration,
+    /// The CPU budget of every command not given its own through
+    /// `run_cpu_bounded`; `None` leaves them bounded by the wall deadline only.
+    every_command_cpu: Option<Duration>,
     #[cfg(test)]
     cgroup_parent: Option<PathBuf>,
     /// Every command cgroup this Runner created, so a test can check its own
@@ -294,6 +300,7 @@ impl Runner {
             commands: Vec::new(),
             command_cpu: Vec::new(),
             wall_budget: budget,
+            every_command_cpu: None,
             #[cfg(test)]
             cgroup_parent: None,
             #[cfg(test)]
@@ -322,6 +329,17 @@ impl Runner {
         self.run_with_limits(program, args, cwd, None, Some(cpu_budget))
     }
 
+    /// Give every later command that has no budget of its own this CPU
+    /// budget, as [`Runner::run_cpu_bounded`] would, with the wall deadline
+    /// still the backstop. This bounds the work of commands that library code
+    /// issues through this Runner. As with `run_cpu_bounded`, a command is not
+    /// started where its CPU cannot be accounted.
+    pub fn bound_every_command_by_cpu(&mut self, cpu_budget: Duration) -> Result<()> {
+        require(!cpu_budget.is_zero(), "CPU budget must be positive")?;
+        self.every_command_cpu = Some(cpu_budget);
+        Ok(())
+    }
+
     fn run_with_combined_limit(
         &mut self,
         program: &str,
@@ -329,7 +347,8 @@ impl Runner {
         cwd: &Path,
         combined_limit: Option<usize>,
     ) -> Result<Vec<u8>> {
-        self.run_with_limits(program, args, cwd, combined_limit, None)
+        let cpu_budget = self.every_command_cpu;
+        self.run_with_limits(program, args, cwd, combined_limit, cpu_budget)
     }
 
     fn cgroup_parent(&self) -> Result<PathBuf> {
@@ -73156,6 +73175,70 @@ mod runner_cpu_budget_tests {
         // The same Runner still runs an unbudgeted command.
         runner.run("/bin/true", &[], &scratch.0).unwrap();
         assert_eq!(runner.command_cpu, vec![None]);
+    }
+
+    /// Once a Runner is bounded by CPU, the budget also covers the commands
+    /// that carry none of their own, the ones library code issues through
+    /// `run` and `text`. A busy one is killed near the budget. An idle one
+    /// records its CPU. Without accounting, none starts.
+    #[test]
+    fn every_command_is_cpu_bounded_once_the_runner_is() {
+        let scratch = Scratch::new("every");
+        let mut runner =
+            Runner::new(scratch.0.join("logs"), Duration::from_secs(60), 1 << 20).unwrap();
+        let zero = runner
+            .bound_every_command_by_cpu(Duration::ZERO)
+            .unwrap_err();
+        assert!(zero.contains("CPU budget must be positive"), "{zero}");
+        let budget = Duration::from_secs(1);
+        runner.bound_every_command_by_cpu(budget).unwrap();
+        let started = Instant::now();
+        let error = runner
+            .run("/bin/sh", &sh("while :; do :; done"), &scratch.0)
+            .unwrap_err();
+        let wall = started.elapsed();
+        assert!(
+            error.contains("stopped: exceeded the producer CPU budget (used "),
+            "{error}"
+        );
+        let used = runner.command_cpu.last().copied().flatten().unwrap();
+        assert!(
+            used >= budget && used < 2 * budget,
+            "killed at {used:?} of CPU for a {budget:?} budget"
+        );
+        assert!(wall < Duration::from_secs(30), "took {wall:?} of wall");
+        assert_eq!(
+            runner
+                .text("/bin/sh", &["-c", "echo ok"], &scratch.0)
+                .unwrap(),
+            "ok\n"
+        );
+        assert!(runner.command_cpu.last().copied().flatten().is_some());
+        assert_own_cgroups_removed(&runner, 2);
+
+        let marker = scratch.0.join("ran");
+        let mut closed = Runner::new(
+            scratch.0.join("closed-logs"),
+            Duration::from_secs(60),
+            1 << 20,
+        )
+        .unwrap();
+        closed.bound_every_command_by_cpu(budget).unwrap();
+        // A plain directory is not a cgroup: accounting is unavailable.
+        closed.cgroup_parent = Some(scratch.0.clone());
+        let error = closed
+            .run(
+                "/bin/sh",
+                &sh(&format!("touch {}", marker.display())),
+                &scratch.0,
+            )
+            .unwrap_err();
+        assert!(
+            error.contains("/bin/sh not started: producer CPU accounting unavailable"),
+            "{error}"
+        );
+        assert!(!marker.exists(), "the refused command ran");
+        assert!(closed.commands.is_empty() && closed.command_cpu.is_empty());
     }
 
     /// A budgeted command that succeeds records its CPU, and accounting costs
