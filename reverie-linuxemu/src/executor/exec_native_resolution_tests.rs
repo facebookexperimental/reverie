@@ -303,7 +303,11 @@ fn exec_of_a_directory_is_eacces() {
         b"dir".to_vec(),
     ] {
         let label = String::from_utf8_lossy(&name).into_owned();
-        assert_eq!(native_execve(&cwd, &name, &[]), Err(libc::EACCES), "{label} natively");
+        assert_eq!(
+            native_execve(&cwd, &name, &[]),
+            Err(libc::EACCES),
+            "{label} natively"
+        );
         exec_interpreter_assert_refused(
             native_resolution_exec(test_state(&root.0), &name, &[]),
             libc::EACCES,
@@ -380,14 +384,15 @@ fn exec_of_a_device_is_eacces_and_never_reads_it() {
     let request = native_resolution_exec_request(&mut memory, b"/dev/zero", &[]);
     let mut executor = ElfExecutor::new(test_state(&root.0), false);
     let headroom = (HOST_RESOURCES_MEMORY + 64 * 1024 * 1024) as u64;
-    let ((result, refusal, action), _) = host_resources_with_address_space_headroom(headroom, || {
-        let result = executor.execute_process_action(&request, &memory);
-        (
-            result,
-            executor.take_unsupported_refusal(),
-            executor.take_process_action(),
-        )
-    });
+    let ((result, refusal, action), _) =
+        host_resources_with_address_space_headroom(headroom, || {
+            let result = executor.execute_process_action(&request, &memory);
+            (
+                result,
+                executor.take_unsupported_refusal(),
+                executor.take_process_action(),
+            )
+        });
     exec_interpreter_assert_refused(
         ExecInterpreterOutcome {
             result,
@@ -426,7 +431,10 @@ fn a_script_interpreter_that_is_a_directory_is_eacces() {
     let root = TestDir::new();
     std::fs::create_dir(root.0.join("dir")).unwrap();
     let script = root.0.join("script");
-    host_resources_write_executable(&script, format!("#!{}\n", root.0.join("dir").display()).as_bytes());
+    host_resources_write_executable(
+        &script,
+        format!("#!{}\n", root.0.join("dir").display()).as_bytes(),
+    );
     let cwd = std::fs::File::open(&root.0).unwrap();
     assert_eq!(
         native_execve(&cwd, script.as_os_str().as_bytes(), &[]),
@@ -450,7 +458,11 @@ fn a_script_interpreter_that_is_a_directory_is_eacces() {
 fn a_program_the_caller_may_not_execute_is_eacces() {
     let root = TestDir::new();
     let cwd = std::fs::File::open(&root.0).unwrap();
-    for (name, mode) in [("mode-0644", 0o644), ("mode-0411", 0o411), ("mode-0111", 0o111)] {
+    for (name, mode) in [
+        ("mode-0644", 0o644),
+        ("mode-0411", 0o411),
+        ("mode-0111", 0o111),
+    ] {
         let path = root.0.join(name);
         native_resolution_write_program(&path);
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
@@ -575,8 +587,11 @@ fn a_relative_name_resolves_against_the_working_directory_itself() {
 
     std::fs::create_dir(root.0.join("d")).unwrap();
     std::fs::write(root.0.join("d/prog"), b"another program").unwrap();
-    std::fs::set_permissions(root.0.join("d/prog"), std::fs::Permissions::from_mode(0o700))
-        .unwrap();
+    std::fs::set_permissions(
+        root.0.join("d/prog"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
     let resolved = resolve_guest_exec_image(&state, b"prog".to_vec(), &mut None).unwrap();
     assert_eq!(resolved.image, image, "a new directory under the old name");
 }
@@ -715,14 +730,28 @@ fn a_dot_dot_after_a_missing_name_or_a_file_is_answered_as_linux_does() {
     let cwd = std::fs::File::open(&root.0).unwrap();
     let up = "../".repeat(depth + 1);
     for (name, errno) in [
-        (format!("{}/missing/{up}proc/self/exe", root.0.display()), libc::ENOENT),
-        (format!("{}/file/{up}proc/self/exe", root.0.display()), libc::ENOTDIR),
+        (
+            format!("{}/missing/{up}proc/self/exe", root.0.display()),
+            libc::ENOENT,
+        ),
+        (
+            format!("{}/file/{up}proc/self/exe", root.0.display()),
+            libc::ENOTDIR,
+        ),
         (format!("missing/{up}proc/self/exe"), libc::ENOENT),
         (format!("file/{up}proc/self/exe"), libc::ENOTDIR),
     ] {
-        assert_eq!(native_execve(&cwd, name.as_bytes(), &[]), Err(errno), "{name} natively");
+        assert_eq!(
+            native_execve(&cwd, name.as_bytes(), &[]),
+            Err(errno),
+            "{name} natively"
+        );
         exec_interpreter_assert_refused(
-            native_resolution_exec(native_resolution_state_with_own_image(&root.0), name.as_bytes(), &[]),
+            native_resolution_exec(
+                native_resolution_state_with_own_image(&root.0),
+                name.as_bytes(),
+                &[],
+            ),
             errno,
             &name,
         );
@@ -741,8 +770,15 @@ fn a_dot_dot_after_a_symlink_climbs_from_its_target() {
     let image = native_resolution_write_program(&root.0.join("a/prog"));
     std::os::unix::fs::symlink(root.0.join("a/b"), root.0.join("l")).unwrap();
     let cwd = std::fs::File::open(&root.0).unwrap();
-    for name in [format!("{}/l/../prog", root.0.display()), "l/../prog".to_string()] {
-        assert_eq!(native_execve(&cwd, name.as_bytes(), &[]), Ok(0), "{name} natively");
+    for name in [
+        format!("{}/l/../prog", root.0.display()),
+        "l/../prog".to_string(),
+    ] {
+        assert_eq!(
+            native_execve(&cwd, name.as_bytes(), &[]),
+            Ok(0),
+            "{name} natively"
+        );
         assert_eq!(
             native_resolution_published_image(
                 native_resolution_exec(test_state(&root.0), name.as_bytes(), &[]),
@@ -754,10 +790,22 @@ fn a_dot_dot_after_a_symlink_climbs_from_its_target() {
     }
     // From `l` a lexical fold of depth + 1 `..` reaches the root; the walk,
     // from a/b, stops one directory below it, where there is no proc/self/exe.
-    let name = format!("{}/l/{}proc/self/exe", root.0.display(), "../".repeat(depth + 1));
-    assert_eq!(native_execve(&cwd, name.as_bytes(), &[]), Err(libc::ENOENT), "natively");
+    let name = format!(
+        "{}/l/{}proc/self/exe",
+        root.0.display(),
+        "../".repeat(depth + 1)
+    );
+    assert_eq!(
+        native_execve(&cwd, name.as_bytes(), &[]),
+        Err(libc::ENOENT),
+        "natively"
+    );
     exec_interpreter_assert_refused(
-        native_resolution_exec(native_resolution_state_with_own_image(&root.0), name.as_bytes(), &[]),
+        native_resolution_exec(
+            native_resolution_state_with_own_image(&root.0),
+            name.as_bytes(),
+            &[],
+        ),
         libc::ENOENT,
         &name,
     );
@@ -777,7 +825,11 @@ fn a_dot_dot_above_the_root_stays_at_the_root() {
         format!("/../../{relative}/prog"),
         format!("{}{relative}/prog", "../".repeat(depth + 3)),
     ] {
-        assert_eq!(native_execve(&cwd, name.as_bytes(), &[]), Ok(0), "{name} natively");
+        assert_eq!(
+            native_execve(&cwd, name.as_bytes(), &[]),
+            Ok(0),
+            "{name} natively"
+        );
         assert_eq!(
             native_resolution_published_image(
                 native_resolution_exec(test_state(&root.0), name.as_bytes(), &[]),
@@ -808,12 +860,28 @@ fn an_fd_link_followed_by_dot_dot_climbs_from_the_guests_file() {
     let cwd = std::fs::File::open(&root.0).unwrap();
     let up = "../".repeat(native_resolution_depth(&root.0));
     for (guest_name, native_name) in [
-        (format!("/proc/self/fd/{guest}/../prog"), format!("/proc/self/fd/{host}/../prog")),
-        (format!("/dev/fd/{guest}/../prog"), format!("/dev/fd/{host}/../prog")),
-        (format!("/proc/self/fd/{guest}/..//prog"), format!("/proc/self/fd/{host}/..//prog")),
-        (format!("{up}proc/self/fd/{guest}/../prog"), format!("{up}proc/self/fd/{host}/../prog")),
+        (
+            format!("/proc/self/fd/{guest}/../prog"),
+            format!("/proc/self/fd/{host}/../prog"),
+        ),
+        (
+            format!("/dev/fd/{guest}/../prog"),
+            format!("/dev/fd/{host}/../prog"),
+        ),
+        (
+            format!("/proc/self/fd/{guest}/..//prog"),
+            format!("/proc/self/fd/{host}/..//prog"),
+        ),
+        (
+            format!("{up}proc/self/fd/{guest}/../prog"),
+            format!("{up}proc/self/fd/{host}/../prog"),
+        ),
     ] {
-        assert_eq!(native_execve(&cwd, native_name.as_bytes(), &[]), Ok(0), "{native_name} natively");
+        assert_eq!(
+            native_execve(&cwd, native_name.as_bytes(), &[]),
+            Ok(0),
+            "{native_name} natively"
+        );
         let resolved = resolve_guest_exec_image(&state, guest_name.clone().into_bytes(), &mut None)
             .unwrap_or_else(|errno| panic!("{guest_name}: {errno}"));
         assert_eq!(
@@ -824,7 +892,11 @@ fn an_fd_link_followed_by_dot_dot_climbs_from_the_guests_file() {
     }
     let free = exec_interpreter_free_number();
     let name = format!("/proc/self/fd/{free}/../prog");
-    assert_eq!(native_execve(&cwd, name.as_bytes(), &[]), Err(libc::ENOENT), "natively");
+    assert_eq!(
+        native_execve(&cwd, name.as_bytes(), &[]),
+        Err(libc::ENOENT),
+        "natively"
+    );
     assert_eq!(
         resolve_guest_exec_image(&state, name.into_bytes(), &mut None).unwrap_err(),
         negative_errno(libc::ENOENT)
@@ -857,18 +929,31 @@ fn slashes_after_a_dot_dot_keep_the_rest_relative() {
         "sub/..///./prog".to_string(),
         format!("{}/sub/..//prog", root.0.display()),
     ] {
-        assert_eq!(native_execve(&cwd, name.as_bytes(), &[]), Ok(0), "{name} natively");
-        let resolved = resolve_guest_exec_image(&test_state(&root.0), name.clone().into_bytes(), &mut None)
-            .unwrap_or_else(|errno| panic!("{name}: {errno}"));
+        assert_eq!(
+            native_execve(&cwd, name.as_bytes(), &[]),
+            Ok(0),
+            "{name} natively"
+        );
+        let resolved =
+            resolve_guest_exec_image(&test_state(&root.0), name.clone().into_bytes(), &mut None)
+                .unwrap_or_else(|errno| panic!("{name}: {errno}"));
         assert_eq!(
             exec_interpreter_identity(resolved.file.as_ref().unwrap().metadata().unwrap()),
             exec_interpreter_identity(std::fs::metadata(&program).unwrap()),
             "{name}"
         );
     }
-    let at_root = if Path::new("/usr/bin/env").exists() { "usr/bin/env" } else { "bin/sh" };
+    let at_root = if Path::new("/usr/bin/env").exists() {
+        "usr/bin/env"
+    } else {
+        "bin/sh"
+    };
     let name = format!("sub/..//{at_root}");
-    assert_eq!(native_execve(&cwd, name.as_bytes(), &[]), Err(libc::ENOENT), "natively");
+    assert_eq!(
+        native_execve(&cwd, name.as_bytes(), &[]),
+        Err(libc::ENOENT),
+        "natively"
+    );
     exec_interpreter_assert_refused(
         native_resolution_exec(test_state(&root.0), name.as_bytes(), &[]),
         libc::ENOENT,
@@ -887,10 +972,16 @@ fn a_relative_fd_link_from_dev_is_answered_by_the_guests_table() {
     native_resolution_write_program(&program);
     let mut state = test_state(Path::new("/dev"));
     let mut memory = GuestMemory::new(0, 2 * PAGE_SIZE as usize).unwrap();
-    let guest = guest_open(&mut memory, &mut state, program.to_str().unwrap(), libc::O_RDONLY);
+    let guest = guest_open(
+        &mut memory,
+        &mut state,
+        program.to_str().unwrap(),
+        libc::O_RDONLY,
+    );
     assert!(guest >= 0, "open prog: {guest}");
     assert_eq!(
-        resolve_guest_exec_image(&state, format!("fd/{guest}").into_bytes(), &mut None).unwrap_err(),
+        resolve_guest_exec_image(&state, format!("fd/{guest}").into_bytes(), &mut None)
+            .unwrap_err(),
         negative_errno(libc::ELOOP)
     );
     let dev = std::fs::File::open("/dev").unwrap();
@@ -903,7 +994,8 @@ fn a_relative_fd_link_from_dev_is_answered_by_the_guests_table() {
     let planted = exec_interpreter_plant(&std::fs::File::open(&program).unwrap());
     for number in [free, planted.as_raw_fd()] {
         assert_eq!(
-            resolve_guest_exec_image(&state, format!("fd/{number}").into_bytes(), &mut None).unwrap_err(),
+            resolve_guest_exec_image(&state, format!("fd/{number}").into_bytes(), &mut None)
+                .unwrap_err(),
             negative_errno(libc::ENOENT),
             "fd/{number}: a number the guest does not hold"
         );
@@ -925,7 +1017,12 @@ fn a_relative_name_is_classified_by_the_working_directory_not_its_recorded_path(
     let mut state = test_state(&root.0.join("cwd"));
     let mut memory = GuestMemory::new(0, 2 * PAGE_SIZE as usize).unwrap();
     let held = root.0.join("held");
-    let guest = guest_open(&mut memory, &mut state, held.to_str().unwrap(), libc::O_RDONLY);
+    let guest = guest_open(
+        &mut memory,
+        &mut state,
+        held.to_str().unwrap(),
+        libc::O_RDONLY,
+    );
     assert!(guest >= 0, "open held: {guest}");
     std::fs::create_dir_all(root.0.join(format!("cwd/fd/{guest}"))).unwrap();
     let program = root.0.join(format!("cwd/fd/{guest}/prog"));
@@ -933,7 +1030,11 @@ fn a_relative_name_is_classified_by_the_working_directory_not_its_recorded_path(
     state.fs_context.cwd = std::path::PathBuf::from("/dev");
     let name = format!("fd/{guest}/prog");
     let cwd = std::fs::File::open(root.0.join("cwd")).unwrap();
-    assert_eq!(native_execve(&cwd, name.as_bytes(), &[]), Ok(0), "{name} natively");
+    assert_eq!(
+        native_execve(&cwd, name.as_bytes(), &[]),
+        Ok(0),
+        "{name} natively"
+    );
     let ours = resolve_guest_exec_image(&state, name.clone().into_bytes(), &mut None).unwrap();
     assert_eq!(
         exec_interpreter_identity(ours.file.as_ref().unwrap().metadata().unwrap()),
@@ -970,7 +1071,10 @@ fn a_trailing_slash_after_a_link_asks_for_a_directory() {
     let (_, file, directory) = holding();
     let rows = ["/", "/."].into_iter().flat_map(|tail| {
         [
-            (format!("/proc/self/fd/{file}{tail}"), format!("/proc/self/fd/{}{tail}", native_file.as_raw_fd())),
+            (
+                format!("/proc/self/fd/{file}{tail}"),
+                format!("/proc/self/fd/{}{tail}", native_file.as_raw_fd()),
+            ),
             (
                 format!("/proc/self/fd/{directory}{tail}"),
                 format!("/proc/self/fd/{}{tail}", native_directory.as_raw_fd()),
@@ -986,11 +1090,19 @@ fn a_trailing_slash_after_a_link_asks_for_a_directory() {
             panic!("{native_name} ran natively");
         };
         let (state, _, _) = holding();
-        exec_interpreter_assert_refused(native_resolution_exec(state, name.as_bytes(), &[]), errno, &name);
+        exec_interpreter_assert_refused(
+            native_resolution_exec(state, name.as_bytes(), &[]),
+            errno,
+            &name,
+        );
     }
     for name in ["/proc/self/exe/", "/proc/self/exe/."] {
         exec_interpreter_assert_refused(
-            native_resolution_exec(native_resolution_state_with_own_image(&root.0), name.as_bytes(), &[]),
+            native_resolution_exec(
+                native_resolution_state_with_own_image(&root.0),
+                name.as_bytes(),
+                &[],
+            ),
             libc::ELOOP,
             name,
         );
@@ -1006,10 +1118,19 @@ fn a_trailing_slash_after_a_link_asks_for_a_directory() {
 fn repeated_slashes_and_dot_components_in_the_exe_link_name_nothing() {
     let root = TestDir::new();
     let state = native_resolution_state_with_own_image(&root.0);
-    for name in ["//proc/self/exe", "///proc/thread-self/exe", "/proc//self/exe", "/proc/./self/exe"] {
-        let resolved = resolve_guest_exec_image(&state, name.as_bytes().to_vec(), &mut None).unwrap();
+    for name in [
+        "//proc/self/exe",
+        "///proc/thread-self/exe",
+        "/proc//self/exe",
+        "/proc/./self/exe",
+    ] {
+        let resolved =
+            resolve_guest_exec_image(&state, name.as_bytes().to_vec(), &mut None).unwrap();
         assert!(
-            Arc::ptr_eq(resolved.file.as_ref().unwrap(), state.executable_file.as_ref().unwrap()),
+            Arc::ptr_eq(
+                resolved.file.as_ref().unwrap(),
+                state.executable_file.as_ref().unwrap()
+            ),
             "{name}"
         );
         assert_eq!(resolved.image, b"own image", "{name}");
@@ -1038,13 +1159,21 @@ fn a_climb_from_a_directory_deeper_than_a_page_matches_linux() {
     let deep_name = CString::new(name.clone()).unwrap();
     // SAFETY: a live descriptor and a NUL-terminated name; the result is owned.
     let deep = unsafe {
-        assert_eq!(libc::mkdirat(parent_file.as_raw_fd(), deep_name.as_ptr(), 0o755), 0, "mkdirat");
+        assert_eq!(
+            libc::mkdirat(parent_file.as_raw_fd(), deep_name.as_ptr(), 0o755),
+            0,
+            "mkdirat"
+        );
         let fd = libc::openat(
             parent_file.as_raw_fd(),
             deep_name.as_ptr(),
             libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
         );
-        assert!(fd >= 0, "open the deep directory: {}", std::io::Error::last_os_error());
+        assert!(
+            fd >= 0,
+            "open the deep directory: {}",
+            std::io::Error::last_os_error()
+        );
         <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fd)
     };
     assert_eq!(
@@ -1056,19 +1185,36 @@ fn a_climb_from_a_directory_deeper_than_a_page_matches_linux() {
     );
     let identity = exec_interpreter_identity(std::fs::metadata(&program).unwrap());
 
-    assert_eq!(native_execve(&deep, b"../prog", &[]), Ok(0), "../prog natively");
+    assert_eq!(
+        native_execve(&deep, b"../prog", &[]),
+        Ok(0),
+        "../prog natively"
+    );
     let mut state = test_state(&parent);
     state.fs_context.cwd_fd = deep.try_clone().unwrap();
     let ours = resolve_guest_exec_image(&state, b"../prog".to_vec(), &mut None).unwrap();
-    assert_eq!(exec_interpreter_identity(ours.file.as_ref().unwrap().metadata().unwrap()), identity, "../prog");
+    assert_eq!(
+        exec_interpreter_identity(ours.file.as_ref().unwrap().metadata().unwrap()),
+        identity,
+        "../prog"
+    );
 
     let native_name = format!("/proc/self/fd/{}/../prog", deep.as_raw_fd());
-    assert_eq!(native_execve(&parent_file, native_name.as_bytes(), &[]), Ok(0), "{native_name} natively");
+    assert_eq!(
+        native_execve(&parent_file, native_name.as_bytes(), &[]),
+        Ok(0),
+        "{native_name} natively"
+    );
     let mut state = test_state(&parent);
     let mut memory = GuestMemory::new(0, 2 * PAGE_SIZE as usize).unwrap();
     let held = guest_open(&mut memory, &mut state, &name, libc::O_RDONLY);
     assert!(held >= 0, "open the deep directory: {held}");
-    let ours = resolve_guest_exec_image(&state, format!("/proc/self/fd/{held}/../prog").into_bytes(), &mut None).unwrap();
+    let ours = resolve_guest_exec_image(
+        &state,
+        format!("/proc/self/fd/{held}/../prog").into_bytes(),
+        &mut None,
+    )
+    .unwrap();
     assert_eq!(
         exec_interpreter_identity(ours.file.as_ref().unwrap().metadata().unwrap()),
         identity,
@@ -1096,34 +1242,67 @@ fn a_program_deeper_than_a_page_is_refused_before_anything_is_published() {
     let deep_name = CString::new(name.clone()).unwrap();
     // SAFETY: live descriptors and NUL-terminated names; the results are owned.
     let (deep, mut program) = unsafe {
-        assert_eq!(libc::mkdirat(parent_file.as_raw_fd(), deep_name.as_ptr(), 0o755), 0, "mkdirat");
+        assert_eq!(
+            libc::mkdirat(parent_file.as_raw_fd(), deep_name.as_ptr(), 0o755),
+            0,
+            "mkdirat"
+        );
         let fd = libc::openat(
             parent_file.as_raw_fd(),
             deep_name.as_ptr(),
             libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
         );
-        assert!(fd >= 0, "open the deep directory: {}", std::io::Error::last_os_error());
-        let program = libc::openat(fd, c"prog".as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC, 0o700);
-        assert!(program >= 0, "create the deep program: {}", std::io::Error::last_os_error());
+        assert!(
+            fd >= 0,
+            "open the deep directory: {}",
+            std::io::Error::last_os_error()
+        );
+        let program = libc::openat(
+            fd,
+            c"prog".as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
+            0o700,
+        );
+        assert!(
+            program >= 0,
+            "create the deep program: {}",
+            std::io::Error::last_os_error()
+        );
         (
             <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fd),
             <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(program),
         )
     };
-    std::io::Write::write_all(&mut program, &crate::elf::minimal_test_elf(&EXEC_INTERPRETER_EXIT_ZERO)).unwrap();
+    std::io::Write::write_all(
+        &mut program,
+        &crate::elf::minimal_test_elf(&EXEC_INTERPRETER_EXIT_ZERO),
+    )
+    .unwrap();
     drop(program);
-    assert_eq!(native_execve(&deep, b"./prog", &[]), Ok(0), "./prog natively");
+    assert_eq!(
+        native_execve(&deep, b"./prog", &[]),
+        Ok(0),
+        "./prog natively"
+    );
 
     let mut state = test_state(&parent);
     state.fs_context.cwd_fd = deep.try_clone().unwrap();
-    exec_interpreter_assert_refused(native_resolution_exec(state, b"./prog", &[]), libc::ENOEXEC, "./prog");
+    exec_interpreter_assert_refused(
+        native_resolution_exec(state, b"./prog", &[]),
+        libc::ENOEXEC,
+        "./prog",
+    );
 
     let mut state = test_state(&parent);
     let mut memory = GuestMemory::new(0, 2 * PAGE_SIZE as usize).unwrap();
     let held = guest_open(&mut memory, &mut state, &name, libc::O_RDONLY);
     assert!(held >= 0, "open the deep directory: {held}");
     let spelling = format!("/proc/self/fd/{held}/prog");
-    exec_interpreter_assert_refused(native_resolution_exec(state, spelling.as_bytes(), &[]), libc::ENOEXEC, &spelling);
+    exec_interpreter_assert_refused(
+        native_resolution_exec(state, spelling.as_bytes(), &[]),
+        libc::ENOEXEC,
+        &spelling,
+    );
 }
 
 /// An exec through an ordinary symbolic link into /proc/self/fd, or of
@@ -1140,10 +1319,14 @@ fn an_exec_through_a_symlink_into_the_descriptor_table_is_refused() {
     std::os::unix::fs::symlink(format!("/proc/self/fd/{held}"), root.0.join("link")).unwrap();
     for name in ["link", "/dev/stdin"] {
         let mut state = test_state(&root.0);
-        assert_eq!(guest_open(&mut memory, &mut state, "prog", libc::O_RDONLY), held);
+        assert_eq!(
+            guest_open(&mut memory, &mut state, "prog", libc::O_RDONLY),
+            held
+        );
         let outcome = native_resolution_exec(state, name.as_bytes(), &[]);
         assert!(
-            outcome.result == Some(negative_errno(libc::ELOOP)) || outcome.result == Some(negative_errno(libc::ENOENT)),
+            outcome.result == Some(negative_errno(libc::ELOOP))
+                || outcome.result == Some(negative_errno(libc::ENOENT)),
             "{name}: {:?}",
             outcome.result
         );
@@ -1163,7 +1346,11 @@ fn an_exec_from_a_removed_working_directory_matches_linux() {
     let state = test_state(&root.0.join("gone"));
     let cwd = std::fs::File::open(root.0.join("gone")).unwrap();
     std::fs::remove_dir(root.0.join("gone")).unwrap();
-    assert_eq!(native_execve(&cwd, b"prog", &[]), Err(libc::ENOENT), "prog natively");
+    assert_eq!(
+        native_execve(&cwd, b"prog", &[]),
+        Err(libc::ENOENT),
+        "prog natively"
+    );
     assert_eq!(
         resolve_guest_exec_image(&state, b"prog".to_vec(), &mut None).unwrap_err(),
         negative_errno(libc::ENOENT)
@@ -1220,8 +1407,14 @@ fn native_resolution_assert_lookup_refused(errno: i32) {
     let held = guest_open(&mut memory, &mut held_state, "sub", libc::O_RDONLY);
     assert!(held >= 0, "open sub: {held}");
     let mut cases = vec![
-        (root.0.join("prog").display().to_string(), test_state(&root.0)),
-        (format!("{}/sub/../prog", root.0.display()), test_state(&root.0)),
+        (
+            root.0.join("prog").display().to_string(),
+            test_state(&root.0),
+        ),
+        (
+            format!("{}/sub/../prog", root.0.display()),
+            test_state(&root.0),
+        ),
         ("prog".to_string(), test_state(&root.0)),
     ];
     cases.push((format!("/proc/self/fd/{held}/prog"), held_state));
@@ -1229,9 +1422,17 @@ fn native_resolution_assert_lookup_refused(errno: i32) {
     for (name, state) in cases {
         let name = &name;
         let outcome = native_resolution_exec(state, name.as_bytes(), &[]);
-        assert_eq!(outcome.result, Some(negative_errno(libc::EOPNOTSUPP)), "{name}");
+        assert_eq!(
+            outcome.result,
+            Some(negative_errno(libc::EOPNOTSUPP)),
+            "{name}"
+        );
         let refusal = outcome.refusal.expect("a typed refusal");
-        assert_eq!(refusal.operation, reverie::UnsupportedOperation::Exec, "{name}");
+        assert_eq!(
+            refusal.operation,
+            reverie::UnsupportedOperation::Exec,
+            "{name}"
+        );
         assert_eq!(refusal.diagnostic, EXEC_PATH_LOOKUP_REFUSAL, "{name}");
         assert!(outcome.action.is_none(), "{name}: an exec was published");
     }
@@ -1246,7 +1447,12 @@ fn native_resolution_refuse_openat2(errno: i32) {
     const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
     const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
     let filter = [
-        libc::sock_filter { code: LOAD_NR, jt: 0, jf: 0, k: 0 },
+        libc::sock_filter {
+            code: LOAD_NR,
+            jt: 0,
+            jf: 0,
+            k: 0,
+        },
         libc::sock_filter {
             code: JUMP_EQ,
             jt: 0,
@@ -1259,7 +1465,12 @@ fn native_resolution_refuse_openat2(errno: i32) {
             jf: 0,
             k: SECCOMP_RET_ERRNO | errno as u32,
         },
-        libc::sock_filter { code: RETURN, jt: 0, jf: 0, k: SECCOMP_RET_ALLOW },
+        libc::sock_filter {
+            code: RETURN,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_RET_ALLOW,
+        },
     ];
     let program = libc::sock_fprog {
         len: filter.len() as u16,
@@ -1289,7 +1500,10 @@ fn an_interpreter_spelled_with_dot_dot_is_looked_up_physically() {
     let interpreter = root.0.join("interpreter");
     exec_interpreter_write(&interpreter);
     let program = root.0.join("program");
-    exec_interpreter_write_program(&program, &format!("{}/sub/../interpreter", root.0.display()));
+    exec_interpreter_write_program(
+        &program,
+        &format!("{}/sub/../interpreter", root.0.display()),
+    );
     let native = std::process::Command::new(&program).status().unwrap();
     assert_eq!(native.code(), Some(0), "natively: {native:?}");
     let staged = exec_interpreter_staged(

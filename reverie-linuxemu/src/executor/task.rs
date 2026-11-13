@@ -1191,8 +1191,7 @@ impl ElfExecutor {
             };
             match path {
                 Some(path) => {
-                    match read_exec_interpreter(&self.state, &path, &mut self.unsupported_refusal)
-                    {
+                    match read_exec_interpreter(&self.state, &path, &mut self.unsupported_refusal) {
                         Ok(interpreter) => Some(interpreter),
                         Err(errno) => return errno,
                     }

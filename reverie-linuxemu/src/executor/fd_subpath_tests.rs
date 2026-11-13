@@ -101,12 +101,7 @@ fn fd_link_subpaths_resolve_below_the_guest_descriptor() {
     assert_eq!(guest_read(&mut memory, &mut state, opened), b"guest-marker");
 
     // Below a regular-file descriptor the kernel answers ENOTDIR.
-    let file = guest_open(
-        &mut memory,
-        &mut state,
-        "sentinel/marker",
-        libc::O_RDONLY,
-    );
+    let file = guest_open(&mut memory, &mut state, "sentinel/marker", libc::O_RDONLY);
     assert!(file >= 0, "open marker file: {file}");
     assert_eq!(
         guest_open(
@@ -180,11 +175,7 @@ fn fd_link_spellings_match_the_native_oracle() {
         let guest_fd = guest_open(&mut memory, &mut state, &guest_path, libc::O_RDONLY);
         match (native, guest_fd) {
             (Ok(bytes), fd) if fd >= 0 => {
-                assert_eq!(
-                    guest_read(&mut memory, &mut state, fd),
-                    bytes,
-                    "{template}"
-                );
+                assert_eq!(guest_read(&mut memory, &mut state, fd), bytes, "{template}");
             }
             (Err(Some(errno)), fd) => {
                 assert_eq!(fd, negative_errno(errno), "{template}");
@@ -256,7 +247,10 @@ fn fd_link_spellings_never_reach_the_supervisors_descriptors() {
     let secret = std::fs::File::open(root.0.join("supervisor-secret")).unwrap();
     // SAFETY: fcntl duplicates the descriptor `secret` owns; it returns a new descriptor or -1.
     let planted_fd = unsafe { libc::fcntl(secret.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 4000) };
-    assert!(planted_fd >= 4000, "planting supervisor descriptor: {planted_fd}");
+    assert!(
+        planted_fd >= 4000,
+        "planting supervisor descriptor: {planted_fd}"
+    );
     // Owns only the planted number; `secret` keeps its own descriptor.
     // SAFETY: fcntl just returned this new descriptor (checked above), and nothing else owns it.
     let _planted =
@@ -312,8 +306,7 @@ fn exact_fd_link_exec_and_stat_split_on_whether_the_guest_holds_the_descriptor()
 
     for spelling in spellings(held) {
         assert_eq!(
-            resolve_guest_exec_image(&state, spelling.clone().into_bytes(), &mut None)
-                .err(),
+            resolve_guest_exec_image(&state, spelling.clone().into_bytes(), &mut None).err(),
             Some(negative_errno(libc::ELOOP)),
             "exec {spelling} of a held descriptor"
         );
@@ -330,8 +323,7 @@ fn exact_fd_link_exec_and_stat_split_on_whether_the_guest_holds_the_descriptor()
     }
     for spelling in spellings(i64::from(planted)) {
         assert_eq!(
-            resolve_guest_exec_image(&state, spelling.clone().into_bytes(), &mut None)
-                .err(),
+            resolve_guest_exec_image(&state, spelling.clone().into_bytes(), &mut None).err(),
             Some(negative_errno(libc::ENOENT)),
             "exec {spelling} reached the supervisor's descriptor {planted}"
         );

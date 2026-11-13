@@ -13455,9 +13455,7 @@ mod tests {
         let held = std::fs::read_dir("/proc/self/fd")
             .unwrap()
             .filter_map(|entry| std::fs::metadata(entry.ok()?.path()).ok())
-            .any(|metadata| {
-                (metadata.dev(), metadata.ino()) == identity && metadata.nlink() == 0
-            });
+            .any(|metadata| (metadata.dev(), metadata.ino()) == identity && metadata.nlink() == 0);
         assert!(
             held,
             "nothing holds the removed staged interpreter {identity:?} after the exec"
@@ -13496,7 +13494,10 @@ mod tests {
         else {
             panic!("the preflight scheduled an exec");
         };
-        assert!(interpreter.is_some(), "the preflight staged the interpreter");
+        assert!(
+            interpreter.is_some(),
+            "the preflight staged the interpreter"
+        );
         let action = ProcessAction::Exec {
             executable_path,
             executable_file,

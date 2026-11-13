@@ -310,7 +310,9 @@ fn exec_lookup(state: &LoadedStaticElf, path: &[u8]) -> Result<ExecLookup, i64> 
                 reverie_procfs::FdLinkPath::Below { fd, rest } => (fd, rest.to_vec()),
                 reverie_procfs::FdLinkPath::OtherTask => return Err(negative_errno(libc::ENOENT)),
             };
-            if state.proc_files.contains_key(&guest_fd) || state.fdinfo_files.contains_key(&guest_fd) {
+            if state.proc_files.contains_key(&guest_fd)
+                || state.fdinfo_files.contains_key(&guest_fd)
+            {
                 // Synthetic carriers are regular-file descriptions: below one
                 // is ENOTDIR, as below any regular file.
                 return Err(negative_errno(libc::ENOTDIR));
@@ -357,7 +359,10 @@ fn exec_next_climb(path: &[u8]) -> Option<(usize, usize)> {
 
 /// `path` without its leading `/` characters.
 fn exec_strip_leading_slashes(path: &[u8]) -> &[u8] {
-    &path[path.iter().position(|byte| *byte != b'/').unwrap_or(path.len())..]
+    &path[path
+        .iter()
+        .position(|byte| *byte != b'/')
+        .unwrap_or(path.len())..]
 }
 
 /// The spelling of `rest` (relative, with no `..` component) below the
@@ -373,7 +378,11 @@ fn exec_join(base_path: &[u8], rest: &[u8]) -> Vec<u8> {
         .filter(|component| !matches!(*component, b"" | b"."))
         .peekable();
     if components.peek().is_none() {
-        return if base_path.is_empty() { b"/".to_vec() } else { base_path.to_vec() };
+        return if base_path.is_empty() {
+            b"/".to_vec()
+        } else {
+            base_path.to_vec()
+        };
     }
     let mut spelling = base_path.to_vec();
     for component in components {
@@ -451,12 +460,15 @@ fn open_exec_lookup(
     // (`host_dirfd_and_path`): ENOENT for a descriptor the guest does not
     // hold, as Linux answers for an fd that is not open (fs/proc/fd.c
     // proc_lookupfd_common), and below a descriptor it holds, the file there.
-    let opened = match lookup
-        .spelling
-        .as_deref()
-        .and_then(|spelling| Some((spelling, reverie_procfs::parse_fd_link(spelling, state.pid, state.tid)?)))
-    {
-        Some((_, reverie_procfs::FdLinkPath::Exact(guest_fd))) if host_fd(state, guest_fd).is_some() => {
+    let opened = match lookup.spelling.as_deref().and_then(|spelling| {
+        Some((
+            spelling,
+            reverie_procfs::parse_fd_link(spelling, state.pid, state.tid)?,
+        ))
+    }) {
+        Some((_, reverie_procfs::FdLinkPath::Exact(guest_fd)))
+            if host_fd(state, guest_fd).is_some() =>
+        {
             return Err(negative_errno(libc::ELOOP));
         }
         Some((spelling, _)) => open_metadata_path(state, libc::AT_FDCWD, spelling, false),
@@ -611,7 +623,8 @@ pub(super) fn resolve_guest_exec_image(
     const OPENING: &str = "opening the new program";
     // The caller's own exe link is recognized by its spelling from the root
     // (`exec_lookup`), as an fd-link spelling is.
-    let lookup = exec_lookup(state, &path).map_err(|errno| exec_open_errno(errno, OPENING, refusal))?;
+    let lookup =
+        exec_lookup(state, &path).map_err(|errno| exec_open_errno(errno, OPENING, refusal))?;
     let exe_link = lookup.spelling.as_deref().and_then(|spelling| {
         reverie_procfs::classify_exe_path(spelling, &|tid| live_thread_in_process(state, tid))
     });

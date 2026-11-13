@@ -2277,9 +2277,7 @@ fn load_executable(
     let staged_interpreter;
     let (interpreter_image, interpreter_file) =
         match (interpreter_path(image, &elf)?, interpreter_source) {
-            (None, InterpreterSource::HostPath | InterpreterSource::Resolved(None)) => {
-                (None, None)
-            }
+            (None, InterpreterSource::HostPath | InterpreterSource::Resolved(None)) => (None, None),
             (None, InterpreterSource::Resolved(Some(_))) => {
                 return Err(Error::UnsupportedElf(
                     "an interpreter was resolved for an image with no PT_INTERP".to_string(),

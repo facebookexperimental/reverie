@@ -116,10 +116,12 @@ fn exec_interpreter_mapped_inodes(memory: &GuestMemory) -> Vec<u64> {
     memory
         .mapping_identities_in(memory.guest_base(), memory.len() as u64)
         .iter()
-        .filter_map(|identity| match identity.downcast_ref::<super::mapping_list::MappedObject>() {
-            Some(super::mapping_list::MappedObject::File { raw_inode, .. }) => Some(*raw_inode),
-            _ => None,
-        })
+        .filter_map(
+            |identity| match identity.downcast_ref::<super::mapping_list::MappedObject>() {
+                Some(super::mapping_list::MappedObject::File { raw_inode, .. }) => Some(*raw_inode),
+                _ => None,
+            },
+        )
         .collect()
 }
 
@@ -289,7 +291,12 @@ fn an_interpreter_named_by_a_held_descriptor_link_is_eloop() {
     exec_interpreter_write(&interpreter);
     let mut executor = ElfExecutor::new(test_state(&root.0), false);
     let mut memory = GuestMemory::new(0, HOST_RESOURCES_MEMORY).unwrap();
-    let low = guest_open(&mut memory, &mut executor.state, "interpreter", libc::O_RDONLY);
+    let low = guest_open(
+        &mut memory,
+        &mut executor.state,
+        "interpreter",
+        libc::O_RDONLY,
+    );
     assert!(low >= 0, "open interpreter: {low}");
     let high = exec_interpreter_free_number();
     assert_eq!(
@@ -320,8 +327,7 @@ fn an_interpreter_named_by_a_held_descriptor_link_is_eloop() {
             );
             let program = root.0.join(format!("program-{index}-{form}"));
             exec_interpreter_write_program(&program, &spelling);
-            let request =
-                host_resources_exec_request(&mut memory, program.as_os_str().as_bytes());
+            let request = host_resources_exec_request(&mut memory, program.as_os_str().as_bytes());
             let result = executor.execute_process_action(&request, &memory);
             exec_interpreter_assert_refused(
                 ExecInterpreterOutcome {
@@ -412,7 +418,11 @@ fn an_interpreter_symlink_chain_resolves_and_a_loop_is_eloop() {
     let native = std::process::Command::new(&looping)
         .status()
         .expect_err("Linux refuses the exec");
-    assert_eq!(native.raw_os_error(), Some(libc::ELOOP), "loop natively: {native}");
+    assert_eq!(
+        native.raw_os_error(),
+        Some(libc::ELOOP),
+        "loop natively: {native}"
+    );
     exec_interpreter_assert_refused(
         exec_interpreter_exec(test_state(&root.0), looping.to_str().unwrap()),
         libc::ELOOP,
@@ -458,7 +468,11 @@ fn an_interpreter_that_is_a_fifo_is_eacces_and_never_opened() {
     let native = std::process::Command::new(&program)
         .status()
         .expect_err("Linux refuses the exec");
-    assert_eq!(native.raw_os_error(), Some(libc::EACCES), "natively: {native}");
+    assert_eq!(
+        native.raw_os_error(),
+        Some(libc::EACCES),
+        "natively: {native}"
+    );
 
     let (sender, receiver) = std::sync::mpsc::channel();
     let directory = root.0.clone();
@@ -506,10 +520,7 @@ fn the_interpreter_of_a_scripts_program_is_resolved_in_the_guests_view() {
     let program = root.0.join("program");
     exec_interpreter_write_program(&program, &format!("/proc/self/fd/{}", planted.as_raw_fd()));
     let script = root.0.join("script");
-    host_resources_write_executable(
-        &script,
-        format!("#!{}\n", program.display()).as_bytes(),
-    );
+    host_resources_write_executable(&script, format!("#!{}\n", program.display()).as_bytes());
     exec_interpreter_assert_refused(
         exec_interpreter_exec(test_state(&root.0), script.to_str().unwrap()),
         libc::ENOENT,
@@ -557,7 +568,11 @@ fn an_interpreter_that_is_not_an_executable_regular_file_is_eacces() {
     let outcome = exec_interpreter_exec(test_state(&root.0), program.to_str().unwrap());
     match std::process::Command::new(&program).status() {
         Err(native) => {
-            assert_eq!(native.raw_os_error(), Some(libc::EACCES), "natively: {native}");
+            assert_eq!(
+                native.raw_os_error(),
+                Some(libc::EACCES),
+                "natively: {native}"
+            );
             exec_interpreter_assert_refused(outcome, libc::EACCES, "mode 0411 interpreter");
         }
         Ok(native) => {
@@ -640,7 +655,11 @@ fn a_pt_interp_without_its_nul_or_with_an_embedded_nul_is_enoexec() {
     let native = std::process::Command::new(&unterminated)
         .status()
         .expect_err("Linux refuses the exec");
-    assert_eq!(native.raw_os_error(), Some(libc::ENOEXEC), "natively: {native}");
+    assert_eq!(
+        native.raw_os_error(),
+        Some(libc::ENOEXEC),
+        "natively: {native}"
+    );
     exec_interpreter_assert_refused(
         exec_interpreter_exec(test_state(&root.0), unterminated.to_str().unwrap()),
         libc::ENOEXEC,
@@ -716,7 +735,8 @@ fn a_load_maps_only_the_interpreter_the_exec_staged() {
     other_named.push(0);
     let other_image = crate::elf::minimal_test_elf_with_interpreter(&[0x0f, 0x0b], &other_named);
     let mut memory = GuestMemory::new(0, HOST_RESOURCES_MEMORY).unwrap();
-    let error = load(&mut memory, &other_image, Some(&staged)).expect_err("staged for another path");
+    let error =
+        load(&mut memory, &other_image, Some(&staged)).expect_err("staged for another path");
     assert!(
         matches!(&error, crate::Error::UnsupportedElf(message)
             if *message == format!("the interpreter {other:?} was not resolved for this exec")),

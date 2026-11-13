@@ -43516,8 +43516,7 @@ mod tests {
             }
         }
         assert_eq!(
-            resolve_guest_exec_image(&leader, b"/proc/39/exe".to_vec(), &mut None)
-                .unwrap_err(),
+            resolve_guest_exec_image(&leader, b"/proc/39/exe".to_vec(), &mut None).unwrap_err(),
             negative_errno(libc::ENOENT),
         );
         for foreign in [
@@ -43555,8 +43554,7 @@ mod tests {
         // do_open_execat): the exec'd fixtures are mode 0700.
         std::fs::set_permissions(&relative, std::fs::Permissions::from_mode(0o700)).unwrap();
         let resolved =
-            resolve_guest_exec_image(&leader, b"relative/program".to_vec(), &mut None)
-                .unwrap();
+            resolve_guest_exec_image(&leader, b"relative/program".to_vec(), &mut None).unwrap();
         // Resolved against the working directory itself, as Linux does, and
         // named by the spelling the guest gave.
         assert_eq!(resolved.path, Path::new("relative/program"));
@@ -43564,12 +43562,9 @@ mod tests {
         let absolute = dir.0.join("absolute-program");
         std::fs::write(&absolute, b"absolute image").unwrap();
         std::fs::set_permissions(&absolute, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let resolved = resolve_guest_exec_image(
-            &leader,
-            absolute.as_os_str().as_bytes().to_vec(),
-            &mut None,
-        )
-        .unwrap();
+        let resolved =
+            resolve_guest_exec_image(&leader, absolute.as_os_str().as_bytes().to_vec(), &mut None)
+                .unwrap();
         assert_eq!(resolved.path, absolute);
         assert_eq!(resolved.image, b"absolute image");
 
@@ -43582,8 +43577,7 @@ mod tests {
         // filename as any path): a bare name is resolved against the working
         // directory, which has no searched-program.
         assert_eq!(
-            resolve_guest_exec_image(&leader, b"searched-program".to_vec(), &mut None)
-                .unwrap_err(),
+            resolve_guest_exec_image(&leader, b"searched-program".to_vec(), &mut None).unwrap_err(),
             negative_errno(libc::ENOENT),
         );
         let in_cwd = dir.0.join("cwd-program");
@@ -43599,12 +43593,9 @@ mod tests {
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
         let alias = dir.0.join("program-link");
         std::os::unix::fs::symlink(&target, &alias).unwrap();
-        let resolved = resolve_guest_exec_image(
-            &leader,
-            alias.as_os_str().as_bytes().to_vec(),
-            &mut None,
-        )
-        .unwrap();
+        let resolved =
+            resolve_guest_exec_image(&leader, alias.as_os_str().as_bytes().to_vec(), &mut None)
+                .unwrap();
         assert_eq!(resolved.path, alias);
         assert_eq!(resolved.image, b"target image");
     }
@@ -43774,12 +43765,7 @@ mod tests {
             ),
             // A bare name, resolved against the working directory as any
             // relative name is (no PATH is given), keeps its spelling.
-            (
-                b"program".to_vec(),
-                vec!["name", "arg"],
-                vec![],
-                name_arg(),
-            ),
+            (b"program".to_vec(), vec!["name", "arg"], vec![], name_arg()),
             // A name that is not UTF-8 keeps its bytes.
             (
                 b"sub/\xff".to_vec(),
