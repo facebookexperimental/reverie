@@ -38591,6 +38591,636 @@ mod tests {
         assert!(current_build_evidence(&sources, &current.command, &selected, &target).is_err());
     }
 
+    /// Every (path, size, digest) binding `CONTENT_REVERIE_CATALOG` has held since
+    /// this list was added, in the order each was bound. It is append-only: a
+    /// re-bind adds the new tuple here and puts the old one in the rejected-prior
+    /// list of `content_source_identity_controls`; no tuple is removed. Bindings
+    /// from before this list existed are not reconstructed. The seals below make
+    /// a removal visible in this file, and
+    /// scripts/check-catalog-bindings-append-only.rs refuses one against the
+    /// change's merge-base.
+    const CONTENT_REVERIE_CATALOG_BINDINGS: &[(&str, u64, &str)] = &[
+        (
+            "reverie-liteinst-artifact/src/preparation_identity.rs",
+            49430,
+            "4a2c6fafef085ed18cb87c66f048c15b5825f9eb6d3c068a6da90dcb14981829",
+        ),
+        (
+            "reverie-inguest/src/guest/continuation.rs",
+            46450,
+            "a25e871591adb957ed150a3b2007b31bc671f9d330e6a861fdab391b3df5ed25",
+        ),
+        (
+            "reverie-inguest/src/guest/instruction.rs",
+            25458,
+            "98417972e3a1db14435f9e235b841b838b32a201c278780fbb0bd6a9d79169d5",
+        ),
+        (
+            "reverie-inguest/src/guest/isa.rs",
+            15627,
+            "f7c8ae886b4b8450ce4ca7867bdcbfa7890a7d89b679e7e6a421a56fc7497724",
+        ),
+        (
+            "reverie-inguest/src/guest/isa/aarch64.rs",
+            17629,
+            "735c5827a1ed85f6808733887dfe2ce568fd777b46d1851685ce58e6a06470bf",
+        ),
+        (
+            "reverie-inguest/src/guest/isa/x86_64.rs",
+            31237,
+            "eb8cff672a8a84060132a67070a9d4a16e323e8725ca2977c63035fb228521cf",
+        ),
+        (
+            "reverie-inguest/src/guest/runtime_mask.rs",
+            31555,
+            "a02f801df3187185afb7d05357f753f26e7309462be7d3be67856500e9d45ecb",
+        ),
+        (
+            "reverie-inguest/src/guest/sigalrm.rs",
+            55729,
+            "85ca6bb23aca2309a91524aea5e7dab733ab0be384ed155fcc4f822d92eb1cd4",
+        ),
+        (
+            "reverie-inguest/src/guest/signal.rs",
+            40726,
+            "be85ab5df679525272409d50ec20c90a6fbf474621e8b7e79a9a8fee66b41353",
+        ),
+        (
+            "reverie-inguest/src/guest/tool_install.rs",
+            28887,
+            "fccf7936590e1458419a344c44e0986b390bdeb4a9b0b9c32fb386721bfe3ab5",
+        ),
+        (
+            "reverie-inguest/src/signal.rs",
+            13338,
+            "cbdd3081dd22b50fe833fa5b30cb9893c960f6754843b892955307879032520c",
+        ),
+        (
+            "reverie-liteinst-artifact/src/private_static/selected_initializers/bootstrap_env_aux.rs",
+            20712,
+            "f29f4ce995093779f8af596e9dd0fba76f60f73da9e46230a4f2c38fef40b9a1",
+        ),
+        (
+            "reverie-liteinst-artifact/src/private_static/selected_initializers/bootstrap_descriptor.rs",
+            34149,
+            "74c4491bab5e935d555d9306718dfbb01597c4771d9ba7454b813232570f3a89",
+        ),
+        (
+            "reverie-liteinst-artifact/src/private_static/selected_initializers/bootstrap_role.rs",
+            9427,
+            "c9203a45dde54743969d6ff79ef5d53138738e894cf613ae650e3f4f6339099e",
+        ),
+        (
+            "reverie-liteinst-artifact/src/private_static/selected_initializers/bootstrap_site.rs",
+            18097,
+            "32d4f8bc715befaeea69c124f54b14f5e396e9eac6188fce0a04c88d3c8d80bc",
+        ),
+        (
+            "reverie-loader/src/mapped_inputs.rs",
+            17803,
+            "81cd7474215ff617fb1bc16b236461d4deb33697c7d559130f4bdb98b0f0e2c2",
+        ),
+        (
+            "reverie-liteinst-artifact/src/private_static/tls_sources.rs",
+            44390,
+            "bb1e19542aa5db52a9d7338892dc7b122a9d6a136ff594c3018041077f563e95",
+        ),
+        (
+            "Cargo.toml",
+            706,
+            "c16e991c5e8ba091ada2475358a4f5e4fc17c5b8aa9f82d7877ec3a7cac3d50b",
+        ),
+        (
+            "reverie-liteinst-artifact/Cargo.toml",
+            518,
+            "e9cd4eac53fb454640e75e640e93957298db66ecdbba7302c0ed79ef71a3e9fb",
+        ),
+        (
+            "reverie-liteinst-artifact/src/private_static/selected_initializers/view_site.rs",
+            53114,
+            "7a7ed42c8051003e24f342c8e47ccc328cafb91f43e833c20b7edc8d4949ea23",
+        ),
+        (
+            "reverie-liteinst-artifact/src/private_static/selected_initializers/view_site/caller.rs",
+            53493,
+            "51e9bda17ab26329e7ae0a18e1382261c084b24a65995c19e9cbbd98656a803c",
+        ),
+        (
+            "reverie-liteinst-artifact/src/private_static/selected_initializers/view_table.rs",
+            41738,
+            "58a79bacbba2daa0f7a26bc147555e4cb95a24fd7c69d7ae62e67905387e5c44",
+        ),
+        (
+            "reverie-liteinst-artifact/src/private_static/selected_initializers.rs",
+            284108,
+            "e681ba4a4d55fc841dc4107b1665d3c03edde4f5ff2daf4b4f0ac51885bed582",
+        ),
+        (
+            "reverie-liteinst-artifact/src/private_static/selected_initializers/package_roles.rs",
+            83186,
+            "b568a674b69e960aa26a3287bbd0803518aeb9d6fd529f4f8095ed1a2cea2fde",
+        ),
+        (
+            "reverie-liteinst-artifact/src/private_static/selected_initializers/package_roles.rs",
+            94265,
+            "f611b85197795bc53fcd6524b26b819446ff6c3f3136e927bca38c6fb97eb43c",
+        ),
+        (
+            "reverie-liteinst-artifact/tests/fixtures/package_roles_fallback_member.rs",
+            807404,
+            "04ff07ffea256146614bdc1a91b6b0bbadadaf2ad907416173d38095393de724",
+        ),
+        (
+            "reverie-liteinst-artifact/tests/fixtures/package_roles_fallback_owner_member.rs",
+            1191856,
+            "b918c5dd74976dc593edf27c5b0f7cba9f34f3100c57a7963bf42e3d731bffc5",
+        ),
+        (
+            "reverie-liteinst-artifact/tests/fixtures/package_roles_fallback_definer_member.rs",
+            772556,
+            "6aeac2a90bc79dd3cdbeafffb0c8081e67a17cdd34dec1bc85f379dc57887540",
+        ),
+        (
+            "reverie-liteinst-artifact/tests/fixtures/package_roles_libc_member.rs",
+            55656,
+            "3bab7521b595ec2000429a78f28f9aa068d1e99e39d89c0f2723474accd79c92",
+        ),
+        (
+            "reverie-liteinst-artifact/tests/fixtures/package_roles_tp_member.rs",
+            45656,
+            "947830c8caee21ca600939d2c13c719eda58f88175fff1c64e89eb7b6cddf3b0",
+        ),
+        (
+            "reverie-liteinst-artifact/src/private_static/selected_initializers/native_leaves.rs",
+            30116,
+            "d0416981ed42c74e04a19f02fd39f043599ecd871777b1d02b26a6e91b2c660c",
+        ),
+        (
+            "reverie-liteinst-artifact/tests/fixtures/musl_memset_member.rs",
+            16456,
+            "ad476420b823fefdaa7c6d1d781af44b19a8e2ba93b2cdb7c475c27486defa20",
+        ),
+        (
+            "reverie-liteinst-artifact/tests/fixtures/musl_memset_source.txt",
+            1128,
+            "aa843bcfb5b75e232df8d26dab6e5cec4f7123b33bebe655ce957f95f839f2e1",
+        ),
+        (
+            "reverie-liteinst-artifact/tests/fixtures/musl_set_thread_area_member.rs",
+            15104,
+            "55a308d6862950454c4f2014473f33478dc220bca60e6427f21648ecf23a62b3",
+        ),
+        (
+            "reverie-liteinst-artifact/tests/fixtures/musl_set_thread_area_source.txt",
+            395,
+            "9a6299228be5f8f467652263e8f98c1f9ab2e0937243589b8c5642f0ebe3236d",
+        ),
+        (
+            "reverie-liteinst-artifact/tests/fixtures/musl_libc_common_map.txt",
+            323,
+            "dceebb278ea1d8eac22e4586cccb514515a0975094bdcf2a59cf7b6ce6832d07",
+        ),
+        (
+            "reverie-liteinst-artifact/tests/fixtures/musl_libc_common_member.rs",
+            12456,
+            "a09edf665fdef9480e559d6d88302c6055067df809494e89a4ab0c7dea40f5d5",
+        ),
+        (
+            "reverie-liteinst-artifact/src/private_static/optional-zero-a03.json",
+            130343,
+            "4463a36c54c10c986a68be0c3656ea21329de269bfe4a82488c89b4b1ef705a8",
+        ),
+        (
+            "reverie-liteinst-artifact/src/private_static/selected_initializers/ordinary_gate.rs",
+            95051,
+            "7a6d9adbdab1f17c2c458986cff499e61fe8c0a38b3a58885054d98b7fdc60b9",
+        ),
+        (
+            "reverie-liteinst-artifact/src/private_static/selected_initializers/terminal_observation.rs",
+            35240,
+            "3bcced9c84ed853d04ed5d99931a74a983a9597c1555ad66cea91dbcf9889090",
+        ),
+        (
+            "reverie-liteinst-artifact/tests/fixtures/ordinary_preceding_gate_page.rs",
+            21838,
+            "2bfed2d5b5afacc74f1cf5aabc90f693e25c291859d34c06cfe8de1704d788a8",
+        ),
+        (
+            "reverie-liteinst-artifact/tests/fixtures/selected_init_v12.json",
+            14075,
+            "1813a5af6b45159a6dbb822aead73abe97c23f8049d57fec073098d89e599764",
+        ),
+        (
+            "reverie-inguest/Cargo.toml",
+            6495,
+            "2ee5115d633d33984ebfae0d5debd0278596536e8866587a25b68f26940b63e0",
+        ),
+        (
+            "reverie-inguest/src/lib.rs",
+            13478,
+            "9b619884552f14046a056f68693c49fc46d065b2a084ad49ca07819a10ec27b1",
+        ),
+        (
+            "reverie-syscalls/Cargo.toml",
+            1293,
+            "f1ce8b0305c6a6f488a7f4dbebc1360f06274faf6d2825a7bdb854dc717dc71d",
+        ),
+        (
+            "reverie-syscalls/src/lib.rs",
+            1194,
+            "b24191133b84f9d7e2c76a1ce59b289c3735d9cf40590571a070481ca53d654f",
+        ),
+        (
+            "reverie-syscalls/src/linux_abi.rs",
+            8696,
+            "ff08eaa565df48839bb298d7ee3eb72deca2cfd870a7453e05efd821b0b29dc6",
+        ),
+        (
+            "reverie-syscalls/src/linux_abi/socket.rs",
+            10201,
+            "80277acf8b49f71d8162518730cc3085bb6373b9a2889df08cab3126b1c538eb",
+        ),
+        (
+            "reverie-syscalls/src/reserved_fds.rs",
+            19493,
+            "7292ea41830525c114eae8d2acf394dee1accd7a48804412c446c6737a181f23",
+        ),
+        (
+            "reverie-liteinst/Cargo.toml",
+            6685,
+            "74ccbbbf72f7921dfad0e0adafddf414be8ab5d5f6ea2a8a2f15d842d65db9f6",
+        ),
+        (
+            "reverie-liteinst/src/lib.rs",
+            35663,
+            "f90201e80854dda44cc9d76fdbf3fa45a01970baf6ff0b211a2f667c2401b50f",
+        ),
+        (
+            "reverie-liteinst-preload/Cargo.toml",
+            980,
+            "4853e2f273fa7a60306bc5aea84987325778b923d64219c7bbf8b57098b62f1d",
+        ),
+        (
+            "reverie-liteinst-preload/src/lib.rs",
+            1301,
+            "5d8059e7b6924429422672eda8f96c11e1163d684232a5d856f7ab4deaefea28",
+        ),
+        (
+            "reverie-liteinst/src/patch_alloc.rs",
+            26591,
+            "62646a8519771eabf5a43c6dcb351d49d0ba6b8c8bde2e5d6defeda7fd79bbd0",
+        ),
+        (
+            "reverie-inguest/src/guest/alloc.rs",
+            46692,
+            "05d881f55c0c89e41c86b8ff5521b13430bbbf7d2bd72a6cf430b9e2d7be118a",
+        ),
+        (
+            "reverie-inguest/src/guest/tool_region_constructor.rs",
+            47324,
+            "7d62d70deb74244b71b4e00c0325afd73667babe7018ccf38829e5bee534460f",
+        ),
+        (
+            "reverie-inguest/src/guest/tool_region_arena.rs",
+            16617,
+            "f20a635748faaad7e568cb3786d6c91576b25a03fb9185f70ade34e9f3eb4daa",
+        ),
+        (
+            "reverie-inguest/src/guest/tool_region.rs",
+            52895,
+            "ca12300ee6d5ccffb72cbf7d095abf73b0b37dc510957d026f2c246d810c913a",
+        ),
+        (
+            "reverie-inguest/src/guest/tool_region_keyed.rs",
+            24969,
+            "272e5e3bf719e317f54551fbf174ba8a1d5020373356102d9003fbe77a512be1",
+        ),
+        (
+            "reverie-inguest/src/guest/installed_tool.rs",
+            35986,
+            "cc560e970e06233c2edb8e54595ddae617ca857d0969d714151134e8c86c09da",
+        ),
+        (
+            "reverie-inguest/src/guest/mod.rs",
+            2422,
+            "c92177576ab8dda0aa36876075877e35ff98e5acae1b0c1b67539e28317aab49",
+        ),
+        (
+            "reverie-inguest/src/guest/rpc.rs",
+            54818,
+            "efeb70d95dfdad205ff00a0d885741d28917efbb7b6908750c51d275454af2de",
+        ),
+        (
+            "reverie-inguest/src/guest/host.rs",
+            406223,
+            "f31ba739d85a7671bb57d1c7f494bd6d751c296431bd5bd47a8e9d39966f32a6",
+        ),
+        (
+            "reverie-inguest/src/guest/host_linux.rs",
+            25125,
+            "32716178d7f5dc17be65ebe23343b8e23706c3898f4acb9ed9501b8c4acb94ed",
+        ),
+        (
+            "reverie-liteinst/src/tool_host.rs",
+            85990,
+            "a6115c160ec28cd2959509c96ab2e64606c8ab26317066d0afbdb5cdd96999d9",
+        ),
+        (
+            "reverie/Cargo.toml",
+            2373,
+            "632b995fb8060c8cd780b0a819440cbb9a94cb124125d6d3c08b7d67d646805e",
+        ),
+        (
+            "reverie/src/tool_configuration.rs",
+            12136,
+            "4ff810b6d3dc814e937deab612495ae0b19351dd584cdccef87004aa81ef6e07",
+        ),
+        (
+            "reverie/src/lib.rs",
+            7201,
+            "1c657bd9280262618b1ce11e0bc7a7aec2af748c409fb9de3b118657cd390cb5",
+        ),
+        (
+            "reverie/src/perf.rs",
+            83433,
+            "20f3002e6864a55cb759e95be7b82bdaaf0680bf238487f6f16c5302eceeb40a",
+        ),
+        (
+            "reverie/src/pmu_config.rs",
+            79136,
+            "58f6a6e0fdaa52173cbd4e252574e5868e8e2973712621f93b98e36eec1a7649",
+        ),
+        (
+            "reverie/src/in_guest_rcb.rs",
+            8240,
+            "62eac925b053b3c21e3292e0ae7c4bd469b4259e9cdec87b2b1f019d7b2a4837",
+        ),
+        (
+            "reverie/src/pmu.rs",
+            8175,
+            "9ca37a8ef80bc02e2282f8f823fba954ad9d86a7be26aa5968347cd44305cba6",
+        ),
+        (
+            "reverie-inguest/src/guest/clock.rs",
+            25951,
+            "34d773ff0b576151381353320eedc4a082ebabd081a1c6d59871470c91a5a503",
+        ),
+        (
+            "reverie-inguest/src/lifecycle.rs",
+            10589,
+            "aca81cb3a1067d6f1ac4b4717f18c4637a8850470086c7e1c23b225959fc708b",
+        ),
+        (
+            "reverie-inguest/src/guest/pidfd_self.rs",
+            4857,
+            "36533da10ec418ebe730221e74eb8f0a4e0cd46d1c1df9cfe8086aaa184c8dd7",
+        ),
+        (
+            "reverie/src/guest.rs",
+            110256,
+            "bc36728d33e68881868a2a450e3317d6a29bb838180287894dcfe6bcc0084bac",
+        ),
+        (
+            "reverie/src/pidfd_self.rs",
+            21903,
+            "dd5e46c1ae38714c99dc146a95099787b6f9b92f1dfeac0d5f1c8e385a76b764",
+        ),
+        (
+            "reverie/src/tool_process.rs",
+            12833,
+            "2c45ce4db577d912a668c883bd0a2c6fa5b6a369a2a8b0460c643cfdbd1eb525",
+        ),
+        (
+            "reverie/src/tool_outcome.rs",
+            13455,
+            "09904e7dcaf30866b7a4b64871a18efbaa586cf2fe43c5601e068c5c1a3778b3",
+        ),
+        (
+            "reverie-inguest/src/tool_host.rs",
+            29756,
+            "243cdd3d67ce1dbe4d539bbd85379983a2b293be582e36b6477e57661b7398ff",
+        ),
+        (
+            "reverie-rpc-transport/src/lib.rs",
+            5043,
+            "5bfc05680ef93b8ae846a4cafa96c16c4b6e3db0582064289644b20496ac800c",
+        ),
+        (
+            "reverie-rpc-transport/src/server.rs",
+            129298,
+            "8aca80d978e602a386f46c0331b31653b7adb7bbe0a83b097670168686754f34",
+        ),
+        (
+            "reverie-rpc-transport/src/blocking_client.rs",
+            41752,
+            "231274923759cb4351f265409b9c23370fe5b7ee8cc88b8b324bfd07b5e8b456",
+        ),
+        (
+            "reverie-rpc-transport/src/tool_activation.rs",
+            17031,
+            "3195980ecdb940374c21fe38ccb98839798d078aed929b69edb179283b87536c",
+        ),
+        (
+            "reverie-inguest/src/launcher/mod.rs",
+            144269,
+            "def24cd44c55b43e78759a1f87aac9eb227bb98b1f178b5aaa700a10249ed646",
+        ),
+        (
+            "reverie/src/native_syscall.rs",
+            18119,
+            "8fa204c9dae0c51519dba7d5fcf21f680fb358e04624d97e572f84f3afb5ad0e",
+        ),
+        (
+            "reverie/src/reserved_input/mod.rs",
+            17622,
+            "bc5ccc57598ce3fb9ed9752433960f68c120f36c70c8e449659c2421a7849476",
+        ),
+        (
+            "reverie/src/reserved_input/registry.rs",
+            112423,
+            "a345a0f79ff904aa032b16753ec7260b5448e92ca53f1b0af7e572ef70db10b3",
+        ),
+        (
+            "reverie/src/tool.rs",
+            80301,
+            "89ae1888619a96b89c1adbcd6703b55c78af093de55f6a2e362af152c4fff321",
+        ),
+    ];
+
+    /// Seals over prefixes of `CONTENT_REVERIE_CATALOG_BINDINGS`: (rows covered,
+    /// SHA-256 of `binding_history_encoding` of those rows). A change that appends
+    /// bindings appends one seal covering every row; existing seals never change.
+    /// Removing or replacing a recorded binding breaks every seal at or after it, so
+    /// hiding it means editing existing seal lines. This is tamper-evident within
+    /// one revision; scripts/check-catalog-bindings-append-only.rs compares a change
+    /// with its merge-base, which is the independent check.
+    const CONTENT_REVERIE_CATALOG_BINDING_SEALS: &[(usize, &str)] = &[(
+        89,
+        "2f07e10f1e2338d112d2483587cc5f4cc34a8762477765d8482f6a91c7524c63",
+    )];
+
+    /// The canonical bytes a binding seal covers: one `path\tsize\tdigest\n` line
+    /// per binding, in order.
+    fn binding_history_encoding(bindings: &[(&str, u64, &str)]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for (path, size, digest) in bindings {
+            bytes.extend_from_slice(format!("{path}\t{size}\t{digest}\n").as_bytes());
+        }
+        bytes
+    }
+
+    /// Every seal must match the current prefix it covers, seal lengths must
+    /// strictly increase, and the last seal must cover every binding. Returns
+    /// every violation.
+    fn binding_seals_hold(
+        bindings: &[(&str, u64, &str)],
+        seals: &[(usize, &str)],
+    ) -> std::result::Result<(), String> {
+        let mut problems = Vec::new();
+        let mut previous = 0;
+        for &(covered, digest) in seals {
+            if covered <= previous {
+                problems.push(format!(
+                    "seal lengths must strictly increase: {covered} after {previous}"
+                ));
+            }
+            previous = covered;
+            match bindings.get(..covered) {
+                None => problems.push(format!(
+                    "a seal covers {covered} bindings but only {} are recorded",
+                    bindings.len()
+                )),
+                Some(prefix) => {
+                    let actual = sha256(&binding_history_encoding(prefix));
+                    if actual != digest {
+                        problems.push(format!(
+                            "the first {covered} recorded bindings no longer match their seal \
+                             ({digest}, now {actual}): a recorded binding was removed or replaced"
+                        ));
+                    }
+                }
+            }
+        }
+        if previous != bindings.len() {
+            problems.push(format!(
+                "the last seal covers {previous} bindings but {} are recorded: append a seal \
+                 covering every binding",
+                bindings.len()
+            ));
+        }
+        if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(problems.join("\n"))
+        }
+    }
+
+    #[test]
+    fn the_catalogue_binding_history_matches_its_seals() {
+        binding_seals_hold(
+            CONTENT_REVERIE_CATALOG_BINDINGS,
+            CONTENT_REVERIE_CATALOG_BINDING_SEALS,
+        )
+        .unwrap_or_else(|problems| panic!("{problems}"));
+    }
+
+    #[test]
+    fn a_binding_seal_refuses_a_removed_or_replaced_binding() {
+        let old = ("a.rs", 1, "11");
+        let new = ("a.rs", 2, "22");
+        let other = ("b.rs", 3, "33");
+        let seal = |rows: &[(&str, u64, &str)]| sha256(&binding_history_encoding(rows));
+        let first = seal(&[old, other]);
+        let second = seal(&[old, other, new]);
+        // Appending with a seal over every row: accepted.
+        binding_seals_hold(
+            &[old, other, new],
+            &[(2, first.as_str()), (3, second.as_str())],
+        )
+        .unwrap();
+        // Appending without a new seal: refused.
+        assert!(binding_seals_hold(&[old, other, new], &[(2, first.as_str())]).is_err());
+        // Replacing the old binding in place: refused.
+        let error = binding_seals_hold(&[new, other], &[(2, first.as_str())]).unwrap_err();
+        assert!(error.contains("removed or replaced"), "{error}");
+        // Deleting it, even with the seal lengths cut to match: refused.
+        assert!(
+            binding_seals_hold(&[other, new], &[(1, first.as_str()), (2, second.as_str())])
+                .is_err()
+        );
+        // Seal lengths must strictly increase.
+        assert!(
+            binding_seals_hold(&[old, other], &[(2, first.as_str()), (2, first.as_str())]).is_err()
+        );
+    }
+
+    /// A catalogue re-bind must leave the binding it replaced refusable by name.
+    /// Every row of `catalog` must be recorded in `bindings`, and every recorded
+    /// binding of a path still in `catalog` must be either its current row or in
+    /// `rejected_prior`. A path that left the catalogue keeps its bindings, which
+    /// the catalogue then refuses as an undeclared source. Returns every violation.
+    fn catalogue_rebinds_recorded(
+        catalog: &[(&str, u64, &str)],
+        bindings: &[(&str, u64, &str)],
+        rejected_prior: &[(&str, u64, &str)],
+    ) -> std::result::Result<(), String> {
+        let mut problems = Vec::new();
+        for row in catalog {
+            if !bindings.contains(row) {
+                problems.push(format!(
+                    "{} is bound to ({}, {}) but that binding is not recorded in \
+                     CONTENT_REVERIE_CATALOG_BINDINGS",
+                    row.0, row.1, row.2
+                ));
+            }
+        }
+        for binding in bindings {
+            if catalog.contains(binding) || rejected_prior.contains(binding) {
+                continue;
+            }
+            if let Some(row) = catalog.iter().find(|row| row.0 == binding.0) {
+                problems.push(format!(
+                    "{} was re-bound from ({}, {}) to ({}, {}) without its previous \
+                     tuple in the rejected-prior list",
+                    binding.0, binding.1, binding.2, row.1, row.2
+                ));
+            }
+        }
+        if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(problems.join("\n"))
+        }
+    }
+
+    #[test]
+    fn a_catalogue_rebind_must_record_its_previous_tuple() {
+        let old = ("a.rs", 1, "11");
+        let new = ("a.rs", 2, "22");
+        let other = ("b.rs", 3, "33");
+        // Re-bound in the catalogue alone: the new row is not recorded.
+        let error = catalogue_rebinds_recorded(&[new, other], &[old, other], &[]).unwrap_err();
+        assert!(error.contains("a.rs is bound to (2, 22)"), "{error}");
+        // Recorded but the old tuple not rejected: refused by name.
+        let error = catalogue_rebinds_recorded(&[new, other], &[old, new, other], &[]).unwrap_err();
+        assert_eq!(
+            error,
+            "a.rs was re-bound from (1, 11) to (2, 22) without its previous tuple in the \
+             rejected-prior list"
+        );
+        // Recorded and rejected: accepted.
+        catalogue_rebinds_recorded(&[new, other], &[old, new, other], &[old]).unwrap();
+        // A new path needs its binding recorded, and nothing rejected.
+        let added = ("c.rs", 4, "44");
+        assert!(
+            catalogue_rebinds_recorded(&[new, other, added], &[old, new, other], &[old]).is_err()
+        );
+        catalogue_rebinds_recorded(&[new, other, added], &[old, new, other, added], &[old])
+            .unwrap();
+        // A path that left the catalogue keeps its bindings.
+        catalogue_rebinds_recorded(&[other], &[old, new, other], &[]).unwrap();
+    }
+
     // Additional controls in the existing current-artifact test. These exercise
     // production catalog/mapping/readback predicates without creating opaque
     // source authority or pretending test JSON is fresh Cargo metadata.
@@ -38981,7 +39611,7 @@ mod tests {
         // These reviewed sources changed for startup or returning-injection contracts.
         // Keep the fixed catalog authoritative and reject their prior tuples.
         assert_eq!(CONTENT_REVERIE_CATALOG.len(), 88);
-        for (relative, old_size, old_digest) in [
+        let rejected_prior = [
             (
                 "reverie-inguest/src/guest/continuation.rs",
                 46467,
@@ -39592,7 +40222,30 @@ mod tests {
                 78983,
                 "fa0e30d174f53dd047d94e9c55dba50fdc8d114586de4e9b4b706c6a954da5cc",
             ),
-        ] {
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers/package_roles.rs",
+                83186,
+                "b568a674b69e960aa26a3287bbd0803518aeb9d6fd529f4f8095ed1a2cea2fde",
+            ),
+        ];
+        // A re-bind records its previous tuple above, for every path, not only these.
+        // Catalogue-rebind enforcement runs here, inside content_source_identity_controls,
+        // via missing_build_finished_is_a_failed_current_artifact_selection.
+        catalogue_rebinds_recorded(
+            &CONTENT_REVERIE_CATALOG,
+            CONTENT_REVERIE_CATALOG_BINDINGS,
+            &rejected_prior,
+        )
+        .unwrap_or_else(|problems| panic!("{problems}"));
+        for &(relative, size, digest) in CONTENT_REVERIE_CATALOG_BINDINGS {
+            if !CONTENT_REVERIE_CATALOG.contains(&(relative, size, digest)) {
+                assert!(
+                    content_catalog_matches(relative, size, digest).is_err(),
+                    "a replaced binding must refuse: {relative}"
+                );
+            }
+        }
+        for (relative, old_size, old_digest) in rejected_prior {
             let entries: Vec<_> = CONTENT_REVERIE_CATALOG
                 .iter()
                 .filter(|entry| entry.0 == relative)

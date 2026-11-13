@@ -31,6 +31,30 @@
     },
     {
       "group": "check",
+      "job": "catalog_bindings_append_only",
+      "desc": "Catalogue history append-only",
+      "description": "Runs scripts/check-catalog-bindings-append-only.rs: the content-catalogue history tables in reverie-liteinst-artifact/src/lib.rs (bindings, binding seals, rejected-prior) must keep every row of the merge-base with origin/<landing branch> unchanged. Without a resolvable merge-base it fails; it never skips.",
+      "labels": [
+        "full"
+      ],
+      "cmd": "./scripts/check-catalog-bindings-append-only.rs",
+      "deps": [],
+      "env": {},
+      "timeout": 600,
+      "cpu_timeout": 120,
+      "priority": 60,
+      "hint": {
+        "resources": {},
+        "est_duration_s": 10,
+        "rss_baseline_bytes": 1000000000,
+        "hard_mem_max_bytes": 16000000000,
+        "classification": "cpu-bound",
+        "preferred_inner_jobs": 1
+      },
+      "jobs_flag": ""
+    },
+    {
+      "group": "check",
       "job": "detcore_alloc_recipe_self_test",
       "desc": "Detcore TLS-cell recipe generator round trip",
       "description": "Runs scripts/detcore-alloc-recipe.py --self-test on reverie-liteinst-artifact/src/lib.rs, no ELF and no build, for both roles that read the INSTALLATION_DEPTH cell as a literal: the 241-byte fixed_patch_alloc rows and the 22-byte fixed_tls_fn_once rows. Every such row must be in the generator's canonical form. A row without the generated-row marker must be one of the role's pinned legacy rows (body and structure digest), each present once. Every row generated from a real ELF must agree with its own provenance comment: the recorded body SHA256, the recorded INSTALLATION_DEPTH cell against the encoded TLS read, and the operands and transfers of the cited masked-equal row, with the selecting GOT callee recorded whenever that digest has several structures. Controls that must be refused: hand edits of the encoded cell, an operand displacement, the recorded digest or the selecting callee; a stripped marker; a new unmarked row; a dropped legacy row of each role; and, on a synthetic ELF built from each generated row, the row derived again and, for rows with GOT operands, any GOT operand bound to another callee, including when it is the only masked-equal structure. Data and PLT operands are left to full qualification, and the node does not re-derive a row from its original image; that comparison is the review's.",

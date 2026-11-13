@@ -1022,6 +1022,7 @@ run_validation_dag() {
 
 run_validation_serial() {
 run_check "Cross-client skill discovery" "$ROOT_DIR/scripts/check-skill-discovery.rs"
+run_check "Catalogue history append-only" "$ROOT_DIR/scripts/check-catalog-bindings-append-only.rs"
 run_check "Build workspace" cargo build --workspace --features "$STABLE_FEATURES"
 run_check "LiteInst allocator fixtures" build_liteinst_allocator_fixtures
 setup_validation_tmpdir || return 1
