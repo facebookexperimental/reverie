@@ -308,12 +308,11 @@ fn exact_fd_link_exec_and_stat_split_on_whether_the_guest_holds_the_descriptor()
     let mut memory = GuestMemory::new(0, 2 * PAGE_SIZE as usize).unwrap();
     let held = guest_open(&mut memory, &mut state, "program", libc::O_RDONLY);
     assert!(held >= 0, "open program: {held}");
-    let envp = Vec::new();
     let spellings = |fd: i64| [format!("/proc/self/fd/{fd}"), format!("/dev/fd/{fd}")];
 
     for spelling in spellings(held) {
         assert_eq!(
-            resolve_guest_exec_image(&state, spelling.clone().into_bytes(), &envp, &mut None)
+            resolve_guest_exec_image(&state, spelling.clone().into_bytes(), &mut None)
                 .err(),
             Some(negative_errno(libc::ELOOP)),
             "exec {spelling} of a held descriptor"
@@ -331,7 +330,7 @@ fn exact_fd_link_exec_and_stat_split_on_whether_the_guest_holds_the_descriptor()
     }
     for spelling in spellings(i64::from(planted)) {
         assert_eq!(
-            resolve_guest_exec_image(&state, spelling.clone().into_bytes(), &envp, &mut None)
+            resolve_guest_exec_image(&state, spelling.clone().into_bytes(), &mut None)
                 .err(),
             Some(negative_errno(libc::ENOENT)),
             "exec {spelling} reached the supervisor's descriptor {planted}"

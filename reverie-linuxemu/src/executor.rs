@@ -48,7 +48,6 @@ use crate::elf::TASK_COMM_LEN;
 #[cfg(any(test, feature = "test-support", feature = "native-test-support"))]
 use crate::elf::initialize_regular_create_directory_policy;
 use crate::elf::load_static_elf_image_of;
-use crate::elf::resolve_executable_path;
 use crate::error::ErrorExt;
 use crate::memory::AllocationCursors;
 use crate::memory::MMAP_BASE;
@@ -626,6 +625,7 @@ mod tests {
     include!("executor/descriptor_generic_tests.rs");
     include!("executor/fd_subpath_tests.rs");
     include!("executor/exec_interpreter_tests.rs");
+    include!("executor/exec_native_resolution_tests.rs");
     include!("executor/tool_directory_tests.rs");
     include!("executor/host_resources_tests.rs");
     include!("executor/script_line_tests.rs");
@@ -38829,6 +38829,11 @@ mod tests {
         image[0x1000..].copy_from_slice(&[0x0f, 0x0b]);
         std::fs::write(&valid_path, &image).unwrap();
         std::fs::write(&malformed_path, b"not an ELF image").unwrap();
+        // Linux execs only a file its caller may execute (fs/exec.c
+        // do_open_execat), as the executor checks before the image.
+        for path in [&valid_path, &malformed_path] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         assert!(!missing_path.exists());
         let mut memory = GuestMemory::new(0, 16 * 1024 * 1024).unwrap();
         memory.write(SENTINEL_ADDRESS, &SENTINEL).unwrap();
@@ -43483,8 +43488,6 @@ mod tests {
         let mut worker = leader.try_clone_for_fork(38).unwrap();
         worker.pid = 37;
         worker.ppid = leader.ppid;
-        let envp = Vec::new();
-
         let aliases = |tid: i32| {
             [
                 b"/proc/self/exe".to_vec(),
@@ -43502,7 +43505,7 @@ mod tests {
         for state in [&leader, &worker] {
             for alias in aliases(state.tid) {
                 let invoked = PathBuf::from(std::ffi::OsString::from_vec(alias.clone()));
-                let resolved = resolve_guest_exec_image(state, alias, &envp, &mut None).unwrap();
+                let resolved = resolve_guest_exec_image(state, alias, &mut None).unwrap();
                 assert_eq!(resolved.path, invoked);
                 assert!(resolved.file.is_some());
                 assert!(Arc::ptr_eq(
@@ -43513,7 +43516,7 @@ mod tests {
             }
         }
         assert_eq!(
-            resolve_guest_exec_image(&leader, b"/proc/39/exe".to_vec(), &envp, &mut None)
+            resolve_guest_exec_image(&leader, b"/proc/39/exe".to_vec(), &mut None)
                 .unwrap_err(),
             negative_errno(libc::ENOENT),
         );
@@ -43523,7 +43526,7 @@ mod tests {
             b"/proc/39/task/38/exe".to_vec(),
         ] {
             assert_eq!(
-                resolve_guest_exec_image(&leader, foreign, &envp, &mut None).unwrap_err(),
+                resolve_guest_exec_image(&leader, foreign, &mut None).unwrap_err(),
                 negative_errno(libc::ENOENT),
             );
         }
@@ -43532,14 +43535,14 @@ mod tests {
         let supervisor_exe = format!("/proc/{supervisor_pid}/exe").into_bytes();
         assert!(std::path::Path::new(std::ffi::OsStr::from_bytes(&supervisor_exe)).exists());
         assert_eq!(
-            resolve_guest_exec_image(&leader, supervisor_exe, &envp, &mut None).unwrap_err(),
+            resolve_guest_exec_image(&leader, supervisor_exe, &mut None).unwrap_err(),
             negative_errno(libc::ENOENT),
             "a live supervisor proc entry must not become a guest executable",
         );
 
         std::fs::remove_file(&executable).unwrap();
         let resolved =
-            resolve_guest_exec_image(&worker, b"/proc/thread-self/exe".to_vec(), &envp, &mut None)
+            resolve_guest_exec_image(&worker, b"/proc/thread-self/exe".to_vec(), &mut None)
                 .unwrap();
         assert_eq!(resolved.path, Path::new("/proc/thread-self/exe"));
         assert!(resolved.file.is_some());
@@ -43548,17 +43551,22 @@ mod tests {
         std::fs::create_dir(dir.0.join("relative")).unwrap();
         let relative = dir.0.join("relative/program");
         std::fs::write(&relative, b"relative image").unwrap();
+        // Linux execs only a file its caller may execute (fs/exec.c
+        // do_open_execat): the exec'd fixtures are mode 0700.
+        std::fs::set_permissions(&relative, std::fs::Permissions::from_mode(0o700)).unwrap();
         let resolved =
-            resolve_guest_exec_image(&leader, b"relative/program".to_vec(), &envp, &mut None)
+            resolve_guest_exec_image(&leader, b"relative/program".to_vec(), &mut None)
                 .unwrap();
-        assert_eq!(resolved.path, relative);
+        // Resolved against the working directory itself, as Linux does, and
+        // named by the spelling the guest gave.
+        assert_eq!(resolved.path, Path::new("relative/program"));
         assert_eq!(resolved.image, b"relative image");
         let absolute = dir.0.join("absolute-program");
         std::fs::write(&absolute, b"absolute image").unwrap();
+        std::fs::set_permissions(&absolute, std::fs::Permissions::from_mode(0o700)).unwrap();
         let resolved = resolve_guest_exec_image(
             &leader,
             absolute.as_os_str().as_bytes().to_vec(),
-            &envp,
             &mut None,
         )
         .unwrap();
@@ -43569,21 +43577,31 @@ mod tests {
         std::fs::create_dir(&bin).unwrap();
         let searched = bin.join("searched-program");
         std::fs::write(&searched, b"image").unwrap();
-        let envp = vec![format!("PATH={}", bin.display())];
+        std::fs::set_permissions(&searched, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // execve does not search PATH (fs/exec.c do_open_execat resolves the
+        // filename as any path): a bare name is resolved against the working
+        // directory, which has no searched-program.
+        assert_eq!(
+            resolve_guest_exec_image(&leader, b"searched-program".to_vec(), &mut None)
+                .unwrap_err(),
+            negative_errno(libc::ENOENT),
+        );
+        let in_cwd = dir.0.join("cwd-program");
+        std::fs::write(&in_cwd, b"cwd image").unwrap();
+        std::fs::set_permissions(&in_cwd, std::fs::Permissions::from_mode(0o700)).unwrap();
         let resolved =
-            resolve_guest_exec_image(&leader, b"searched-program".to_vec(), &envp, &mut None)
-                .unwrap();
-        assert_eq!(resolved.path, searched.canonicalize().unwrap());
-        assert_eq!(resolved.image, b"image");
+            resolve_guest_exec_image(&leader, b"cwd-program".to_vec(), &mut None).unwrap();
+        assert_eq!(resolved.path, Path::new("cwd-program"));
+        assert_eq!(resolved.image, b"cwd image");
 
         let target = dir.0.join("target-program");
         std::fs::write(&target, b"target image").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
         let alias = dir.0.join("program-link");
         std::os::unix::fs::symlink(&target, &alias).unwrap();
         let resolved = resolve_guest_exec_image(
             &leader,
             alias.as_os_str().as_bytes().to_vec(),
-            &envp,
             &mut None,
         )
         .unwrap();
@@ -43732,7 +43750,6 @@ mod tests {
             &crate::elf::minimal_test_elf(&[0xf4]),
         );
         let program_name = program.to_str().unwrap().to_owned();
-        let path_env = format!("PATH={}", root.0.display());
         let name_arg = || vec!["name".to_owned(), "arg".to_owned()];
 
         for (filename, argv, envp, expected_argv) in [
@@ -43755,11 +43772,12 @@ mod tests {
                     "arg".to_owned(),
                 ],
             ),
-            // A bare name this backend finds on PATH keeps its spelling.
+            // A bare name, resolved against the working directory as any
+            // relative name is (no PATH is given), keeps its spelling.
             (
                 b"program".to_vec(),
                 vec!["name", "arg"],
-                vec![path_env.as_str()],
+                vec![],
                 name_arg(),
             ),
             // A name that is not UTF-8 keeps its bytes.

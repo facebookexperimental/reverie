@@ -991,7 +991,7 @@ fn open_metadata_path_unchecked(
 
 // AUTONOMOUS-BOT-IMPLEMENTED: Resolve mutation targets without host magic links.
 // TODO-HUMAN-REVIEW(#86): Review procfs isolation and Linux mutation semantics.
-fn open_host_metadata_path(
+pub(super) fn open_host_metadata_path(
     state: &LoadedStaticElf,
     host_dirfd: RawFd,
     path: &CStr,
@@ -1679,7 +1679,8 @@ pub(super) fn getcwd(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[
 // Both replace `state.fs_context.cwd_fd` with a fresh `O_PATH|O_DIRECTORY` handle so cwd
 // identity survives host renames (the same invariant `cwd_fd` had at load).
 // `getcwd` walks that handle at each call; `state.fs_context.cwd` keeps the path at the
-// last change for exec's relative paths and the synthetic /proc/self/cwd.
+// last change for the synthetic /proc/self/cwd. An exec looks up a relative name
+// through the handle, never by that path (read_write.rs `exec_lookup`).
 pub(super) fn chdir(memory: &GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
     let path = match read_c_string(&ProviderMemory(memory), args[0], 4096) {
         Ok(path) => path,

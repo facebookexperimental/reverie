@@ -158,14 +158,42 @@ pub(super) struct ResolvedExecutable {
 /// answered with an errno Linux would give for the guest's own reasons. Every
 /// other failure is the errno Linux gives the guest, except an exact fd-link
 /// spelling of a descriptor the guest holds, which Linux would follow and run:
-/// that is refused with ELOOP, below.
+/// that is refused with ELOOP, below. As Linux's do_open_execat (fs/exec.c)
+/// does, a file that is not regular is EACCES, and so is one the caller may
+/// not execute; a FIFO is never opened and a device never read. Known
+/// differences from Linux: a program the caller may execute but not read is
+/// EACCES (it is read through a descriptor opened for reading); a spelling
+/// through a descriptor link, `/proc/self/exe`, `/proc/self/root` or
+/// `/proc/self/cwd` that this resolution does not recognize is refused
+/// (ELOOP, ENOENT or EACCES); a path through a symlink into /proc (such as
+/// /dev/stdin), or through /proc entries other than the recognized
+/// descriptor and exe links, is resolved against this process's /proc rather
+/// than answered from the guest's view, so it is refused or may not match
+/// Linux; a program whose own path is longer than a page is ENOEXEC (its
+/// load names it by that path); a program open for writing is not refused
+/// with ETXTBSY (the image is read, not executed by the host); and the
+/// execute check is this process's (`check_executable_regular_file`).
 pub(super) fn read_executable_file(
     state: &LoadedStaticElf,
     path: &std::path::Path,
     refusal: &mut Option<reverie::UnsupportedRefusal>,
 ) -> Result<ResolvedExecutable, i64> {
     const OPENING: &str = "opening the new program";
-    let pinned = open_exec_path(state, path, OPENING, refusal)?;
+    let lookup = exec_lookup(state, path.as_os_str().as_bytes())
+        .map_err(|errno| exec_open_errno(errno, OPENING, refusal))?;
+    read_executable_lookup(state, path, lookup, refusal)
+}
+
+/// [`read_executable_file`] for a `path` whose lookup is already known.
+fn read_executable_lookup(
+    state: &LoadedStaticElf,
+    path: &std::path::Path,
+    lookup: ExecLookup,
+    refusal: &mut Option<reverie::UnsupportedRefusal>,
+) -> Result<ResolvedExecutable, i64> {
+    const OPENING: &str = "opening the new program";
+    let pinned = open_exec_lookup(state, lookup, OPENING, refusal)?;
+    check_executable_regular_file(&pinned)?;
     let (image, file) = read_opened_exec_file(
         &pinned,
         None,
@@ -181,6 +209,219 @@ pub(super) fn read_executable_file(
     })
 }
 
+/// What an exec path is looked up below (`exec_lookup`).
+enum ExecBase {
+    /// The root, for an absolute name.
+    Root,
+    /// The working-directory handle, for a relative name.
+    Cwd,
+    /// The directory that a run of `..` components led to.
+    Directory(std::fs::File),
+    /// The file a descriptor the guest holds names: this process's
+    /// descriptor for it.
+    GuestDescriptor(RawFd),
+}
+
+impl ExecBase {
+    /// The descriptor a lookup below this base starts from; `None` for the
+    /// root, which a lookup reaches by an absolute path.
+    fn host_dirfd(&self, state: &LoadedStaticElf) -> Option<RawFd> {
+        match self {
+            Self::Root => None,
+            Self::Cwd => Some(state.fs_context.cwd_fd.as_raw_fd()),
+            Self::Directory(directory) => Some(directory.as_raw_fd()),
+            Self::GuestDescriptor(host_fd) => Some(*host_fd),
+        }
+    }
+}
+
+/// An exec path, looked up as far as `exec_lookup` goes.
+struct ExecLookup {
+    base: ExecBase,
+    /// The part still to look up below `base`, with no `..` component and
+    /// no leading `/`.
+    rest: Vec<u8>,
+    /// The spelling from the root of `rest` below `base`, where the base's
+    /// path is known: an fd link or the caller's own exe link is recognized
+    /// by it.
+    spelling: Option<Vec<u8>>,
+}
+
+/// How Linux would walk the exec path `path`, without a lexical step.
+///
+/// The walk starts at the root for an absolute name, else at the
+/// working-directory handle, and goes one segment at a time: the components
+/// before the next `..`, then the run of `..` after them. A `..` is the
+/// parent of the directory the walk has reached, which neither the spelling
+/// nor the recorded working-directory path can tell, so each segment and its
+/// `..` run are looked up physically below the directory reached, without
+/// following a magic link (`open_host_metadata_path`); a failure there is that
+/// walk's errno. Before that, the segment's spelling from the root (the
+/// current path of the directory reached, as /proc/self/fd reads it, and the
+/// segment) is classified: an fd-link spelling of a descriptor the guest
+/// holds continues the walk below the file that descriptor names, as Linux
+/// follows the magic link; one it does not hold, or another task's, is
+/// ENOENT. The last segment, with no `..` after it, is classified the same
+/// way when it is opened (`open_exec_lookup`).
+///
+/// The classification only chooses between those routes. It reads the
+/// directory's path after the directory is pinned, so a rename in between
+/// can only make a segment take the guest-view route where it would not, or
+/// not take it where it would; either way the walk below the pinned
+/// directory is the physical one, which follows no magic link and refuses a
+/// /proc object at the end of each segment, so neither route opens a file
+/// outside the guest's view. A directory that has been removed, or whose
+/// path is too long to read, has no path to classify by, so a segment below
+/// it is only looked up physically.
+///
+/// The root is this process's: the guest's absolute paths are this process's
+/// (`host_dirfd_and_path`), and a `..` at the root stays there (fs/namei.c
+/// follow_dotdot). That holds while the guest's root is this process's root;
+/// an emulated chroot or pivot_root would have to make these lookups with
+/// RESOLVE_IN_ROOT from the guest's root.
+fn exec_lookup(state: &LoadedStaticElf, path: &[u8]) -> Result<ExecLookup, i64> {
+    let (mut base, mut rest) = if path.starts_with(b"/") {
+        (ExecBase::Root, exec_strip_leading_slashes(path).to_vec())
+    } else {
+        (ExecBase::Cwd, path.to_vec())
+    };
+    loop {
+        let base_path = exec_base_path(state, &base)?;
+        let Some((segment_end, climb_end)) = exec_next_climb(&rest) else {
+            let spelling = base_path.map(|base_path| exec_join(&base_path, &rest));
+            return Ok(ExecLookup {
+                base,
+                rest,
+                spelling,
+            });
+        };
+        // The segment ends at the `/` before its `..`, which is not part of
+        // the name a link would be.
+        let segment = &rest[..segment_end];
+        let segment = segment.strip_suffix(b"/").unwrap_or(segment);
+        let spelling = base_path.map(|base_path| exec_join(&base_path, segment));
+        let link = spelling
+            .as_deref()
+            .and_then(|spelling| reverie_procfs::parse_fd_link(spelling, state.pid, state.tid));
+        if let Some(link) = link {
+            let after = exec_strip_leading_slashes(&rest[segment_end..]).to_vec();
+            let (guest_fd, below) = match link {
+                reverie_procfs::FdLinkPath::Exact(guest_fd) => (guest_fd, Vec::new()),
+                reverie_procfs::FdLinkPath::Below { fd, rest } => (fd, rest.to_vec()),
+                reverie_procfs::FdLinkPath::OtherTask => return Err(negative_errno(libc::ENOENT)),
+            };
+            if state.proc_files.contains_key(&guest_fd) || state.fdinfo_files.contains_key(&guest_fd) {
+                // Synthetic carriers are regular-file descriptions: below one
+                // is ENOTDIR, as below any regular file.
+                return Err(negative_errno(libc::ENOTDIR));
+            }
+            let Some(host_fd) = host_fd(state, guest_fd) else {
+                return Err(negative_errno(libc::ENOENT));
+            };
+            base = ExecBase::GuestDescriptor(host_fd);
+            rest = if below.is_empty() {
+                after
+            } else {
+                [&below[..], b"/", &after[..]].concat()
+            };
+            continue;
+        }
+        let directory = open_exec_component(state, &base, &rest[..climb_end])?;
+        rest = exec_strip_leading_slashes(&rest[climb_end..]).to_vec();
+        base = ExecBase::Directory(directory);
+    }
+}
+
+/// The byte offsets in `path` (relative) of the end of the components before
+/// its first `..` component, and of the end of the run of `..`, `.` and
+/// empty components from there; `None` if it has no `..` component.
+fn exec_next_climb(path: &[u8]) -> Option<(usize, usize)> {
+    let mut offset = 0;
+    let mut segment_end = None;
+    let mut climb_end = 0;
+    for component in path.split(|byte| *byte == b'/') {
+        let end = offset + component.len();
+        match (segment_end, component) {
+            (None, b"..") => {
+                segment_end = Some(offset);
+                climb_end = end;
+            }
+            (Some(_), b".." | b"." | b"") => climb_end = end,
+            (Some(_), _) => break,
+            (None, _) => {}
+        }
+        offset = end + 1;
+    }
+    segment_end.map(|segment_end| (segment_end, climb_end))
+}
+
+/// `path` without its leading `/` characters.
+fn exec_strip_leading_slashes(path: &[u8]) -> &[u8] {
+    &path[path.iter().position(|byte| *byte != b'/').unwrap_or(path.len())..]
+}
+
+/// The spelling of `rest` (relative, with no `..` component) below the
+/// directory at `base_path`. Empty and `.` components name nothing, so they
+/// are dropped, as Linux skips them; with no `..` left this is exact. A
+/// trailing `/` or `/.` is kept as a trailing `/`: it asks for a directory,
+/// so `/proc/self/exe/` is not the exe link, and `/proc/self/fd/<n>/` is the
+/// directory below descriptor <n>, as Linux reads them.
+fn exec_join(base_path: &[u8], rest: &[u8]) -> Vec<u8> {
+    let base_path = base_path.strip_suffix(b"/").unwrap_or(base_path);
+    let mut components = rest
+        .split(|byte| *byte == b'/')
+        .filter(|component| !matches!(*component, b"" | b"."))
+        .peekable();
+    if components.peek().is_none() {
+        return if base_path.is_empty() { b"/".to_vec() } else { base_path.to_vec() };
+    }
+    let mut spelling = base_path.to_vec();
+    for component in components {
+        spelling.push(b'/');
+        spelling.extend_from_slice(component);
+    }
+    if rest.ends_with(b"/") || rest.ends_with(b"/.") {
+        spelling.push(b'/');
+    }
+    spelling
+}
+
+/// The current path of the directory `base` is, as /proc/self/fd reads it:
+/// `None` for one that has been removed, or whose path is too long to read
+/// (ENAMETOOLONG). Neither can spell an fd link or the exe link, so a segment
+/// below either is only looked up physically.
+fn exec_base_path(state: &LoadedStaticElf, base: &ExecBase) -> Result<Option<Vec<u8>>, i64> {
+    let Some(host_dirfd) = base.host_dirfd(state) else {
+        return Ok(Some(b"/".to_vec()));
+    };
+    let path = match std::fs::read_link(format!("/proc/self/fd/{host_dirfd}")) {
+        Ok(path) => path,
+        Err(error) if error.raw_os_error() == Some(libc::ENAMETOOLONG) => return Ok(None),
+        Err(error) => return Err(io_error(error)),
+    };
+    let path = path.into_os_string().into_vec();
+    if !path.starts_with(b"/") || path.ends_with(b" (deleted)") {
+        return Ok(None);
+    }
+    Ok(Some(path))
+}
+
+/// An O_PATH handle on `path` below `base`, looked up without following a
+/// magic link and checked as every guest lookup is (`open_host_metadata_path`).
+fn open_exec_component(
+    state: &LoadedStaticElf,
+    base: &ExecBase,
+    path: &[u8],
+) -> Result<std::fs::File, i64> {
+    let (host_dirfd, path) = match base.host_dirfd(state) {
+        None => (libc::AT_FDCWD, [&b"/"[..], path].concat()),
+        Some(host_dirfd) if path.is_empty() => (host_dirfd, b".".to_vec()),
+        Some(host_dirfd) => (host_dirfd, path.to_vec()),
+    };
+    let path = std::ffi::CString::new(path).map_err(|_| negative_errno(libc::EINVAL))?;
+    open_host_metadata_path(state, host_dirfd, &path, false)
+}
+
 /// Opens `path` for an exec in the guest's view, as [`read_executable_file`]
 /// describes, and returns the O_PATH handle that pins the file found.
 fn open_exec_path(
@@ -189,21 +430,87 @@ fn open_exec_path(
     opening: &str,
     refusal: &mut Option<reverie::UnsupportedRefusal>,
 ) -> Result<std::fs::File, i64> {
+    let lookup = exec_lookup(state, path.as_os_str().as_bytes())
+        .map_err(|errno| exec_open_errno(errno, opening, refusal))?;
+    open_exec_lookup(state, lookup, opening, refusal)
+}
+
+/// Opens the file `lookup` names for an exec ([`open_exec_path`]), once:
+/// the handle returned is the file the exec checks and reads.
+fn open_exec_lookup(
+    state: &LoadedStaticElf,
+    lookup: ExecLookup,
+    opening: &str,
+    refusal: &mut Option<reverie::UnsupportedRefusal>,
+) -> Result<std::fs::File, i64> {
     // This executor opens an exec path without following magic links, so an
     // exact fd-link spelling of a descriptor the guest holds is refused with
     // the errno Linux gives a magic link it will not follow, ELOOP
-    // (fs/namei.c nd_jump_link under LOOKUP_NO_MAGICLINKS). A descriptor the
-    // guest does not hold continues to open_metadata_path, which answers
-    // ENOENT, as Linux does for an fd that is not open (fs/proc/fd.c
-    // proc_lookupfd_common).
-    if let Some(reverie_procfs::FdLinkPath::Exact(guest_fd)) =
-        reverie_procfs::parse_fd_link(path.as_os_str().as_bytes(), state.pid, state.tid)
-        && host_fd(state, guest_fd).is_some()
+    // (fs/namei.c nd_jump_link under LOOKUP_NO_MAGICLINKS). Any other fd-link
+    // spelling is answered from the guest's descriptor table
+    // (`host_dirfd_and_path`): ENOENT for a descriptor the guest does not
+    // hold, as Linux answers for an fd that is not open (fs/proc/fd.c
+    // proc_lookupfd_common), and below a descriptor it holds, the file there.
+    let opened = match lookup
+        .spelling
+        .as_deref()
+        .and_then(|spelling| Some((spelling, reverie_procfs::parse_fd_link(spelling, state.pid, state.tid)?)))
     {
-        return Err(negative_errno(libc::ELOOP));
+        Some((_, reverie_procfs::FdLinkPath::Exact(guest_fd))) if host_fd(state, guest_fd).is_some() => {
+            return Err(negative_errno(libc::ELOOP));
+        }
+        Some((spelling, _)) => open_metadata_path(state, libc::AT_FDCWD, spelling, false),
+        None => open_exec_component(state, &lookup.base, &lookup.rest),
+    };
+    opened.map_err(|errno| exec_open_errno(errno, opening, refusal))
+}
+
+/// The answer to an exec whose path lookup failed with `errno`. A host that
+/// refuses the openat2 call the lookup is made with (ENOSYS or EPERM from a
+/// kernel or sandbox without it, E2BIG or EINVAL for its arguments) leaves
+/// no lookup this executor trusts: the exec is refused by name, with
+/// `refusal` recording it, and never resolved another way. Otherwise it is
+/// [`exec_step_errno`].
+fn exec_open_errno(
+    errno: i64,
+    opening: &str,
+    refusal: &mut Option<reverie::UnsupportedRefusal>,
+) -> i64 {
+    if [libc::ENOSYS, libc::EPERM, libc::E2BIG, libc::EINVAL]
+        .iter()
+        .any(|unavailable| errno == negative_errno(*unavailable))
+    {
+        *refusal = Some(exec_path_lookup_refusal());
+        return negative_errno(libc::EOPNOTSUPP);
     }
-    open_metadata_path(state, libc::AT_FDCWD, path.as_os_str().as_bytes(), false)
-        .map_err(|errno| exec_step_errno(errno, opening, refusal))
+    exec_step_errno(errno, opening, refusal)
+}
+
+/// Refuses, with EACCES, an exec of a file `pinned` holds unless it is a
+/// regular file the caller may execute, as Linux's do_open_execat does
+/// (fs/exec.c; may_open refuses any other type under MAY_EXEC, fs/namei.c).
+/// The checks are on the O_PATH handle, so a FIFO is never opened. The
+/// execute check is faccessat2 with AT_EACCESS, so it judges this process's
+/// credentials, as every guest open does; a host that refuses faccessat2
+/// (ENOSYS or EPERM) gives the exec that errno.
+fn check_executable_regular_file(pinned: &std::fs::File) -> Result<(), i64> {
+    if file_mode(pinned)? & libc::S_IFMT != libc::S_IFREG {
+        return Err(negative_errno(libc::EACCES));
+    }
+    // SAFETY: the empty path is NUL-terminated and pinned's descriptor is live.
+    let access = unsafe {
+        libc::syscall(
+            libc::SYS_faccessat2,
+            pinned.as_raw_fd(),
+            c"".as_ptr(),
+            libc::X_OK,
+            libc::AT_EMPTY_PATH | libc::AT_EACCESS,
+        )
+    };
+    if access != 0 {
+        return Err(io_error(std::io::Error::last_os_error()));
+    }
+    Ok(())
 }
 
 /// Reads the file `pinned` holds, through a descriptor of its own that is
@@ -266,8 +573,8 @@ fn read_opened_exec_file(
 /// with ENOEXEC as an unloadable interpreter. Known differences from Linux:
 /// an interpreter the caller may execute but not read is EACCES (it is read
 /// through a descriptor opened for reading); a spelling through a descriptor
-/// link, `/proc/self/exe`, `/proc/self/root` or `/proc/self/cwd` is refused
-/// (ELOOP or ENOENT).
+/// link, `/proc/self/exe`, `/proc/self/root` or `/proc/self/cwd` that this
+/// resolution does not recognize is refused (ELOOP, ENOENT or EACCES).
 pub(super) fn read_exec_interpreter(
     state: &LoadedStaticElf,
     path: &str,
@@ -275,22 +582,7 @@ pub(super) fn read_exec_interpreter(
 ) -> Result<crate::elf::ExecInterpreter, i64> {
     const OPENING: &str = "opening the program interpreter";
     let pinned = open_exec_path(state, std::path::Path::new(path), OPENING, refusal)?;
-    if file_mode(&pinned)? & libc::S_IFMT != libc::S_IFREG {
-        return Err(negative_errno(libc::EACCES));
-    }
-    // SAFETY: the empty path is NUL-terminated and pinned's descriptor is live.
-    let access = unsafe {
-        libc::syscall(
-            libc::SYS_faccessat2,
-            pinned.as_raw_fd(),
-            c"".as_ptr(),
-            libc::X_OK,
-            libc::AT_EMPTY_PATH | libc::AT_EACCESS,
-        )
-    };
-    if access != 0 {
-        return Err(io_error(std::io::Error::last_os_error()));
-    }
+    check_executable_regular_file(&pinned)?;
     let (image, file) = read_opened_exec_file(
         &pinned,
         Some(crate::elf::MAX_INTERPRETER_BYTES),
@@ -314,10 +606,16 @@ pub(super) fn read_exec_interpreter(
 pub(super) fn resolve_guest_exec_image(
     state: &LoadedStaticElf,
     path: Vec<u8>,
-    envp: &[String],
     refusal: &mut Option<reverie::UnsupportedRefusal>,
 ) -> Result<ResolvedExecutable, i64> {
-    match reverie_procfs::classify_exe_path(&path, &|tid| live_thread_in_process(state, tid)) {
+    const OPENING: &str = "opening the new program";
+    // The caller's own exe link is recognized by its spelling from the root
+    // (`exec_lookup`), as an fd-link spelling is.
+    let lookup = exec_lookup(state, &path).map_err(|errno| exec_open_errno(errno, OPENING, refusal))?;
+    let exe_link = lookup.spelling.as_deref().and_then(|spelling| {
+        reverie_procfs::classify_exe_path(spelling, &|tid| live_thread_in_process(state, tid))
+    });
+    match exe_link {
         Some(true) => {
             let file = state
                 .executable_file
@@ -356,34 +654,13 @@ pub(super) fn resolve_guest_exec_image(
         Some(false) => return Err(negative_errno(libc::ENOENT)),
         None => {}
     }
-    let path = std::path::PathBuf::from(std::ffi::OsString::from_vec(path));
-    // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-kvm-execve-path): PATH resolution for a
-    // slash-less execve program name. A bare name such as
-    // `execve("bash", ...)` must be searched on PATH the same way the
-    // initial ELF loader (elf::resolve_executable_path) and libc's execvp
-    // do; joining a bare name onto cwd yields ENOENT and breaks every
-    // KVM-backend corpus example launched by bare name (bash/python3).
-    // Under the ptrace backend the initial launcher resolves the program
-    // via execvp before the guest starts, so this restores parity for the
-    // initial exec that Detcore re-injects with a rewritten path pointer.
-    // Names that already contain a slash keep exact execve(2) semantics
-    // (absolute used as-is, relative resolved against cwd) and are NOT
-    // PATH-searched.
-    let path = if path.is_absolute() || path.components().count() > 1 {
-        if path.is_absolute() {
-            path
-        } else {
-            state.fs_context.cwd.join(path)
-        }
-    } else {
-        let envp_refs = envp.iter().map(String::as_str).collect::<Vec<_>>();
-        match resolve_executable_path(&path.to_string_lossy(), &envp_refs, &state.fs_context.cwd) {
-            Ok(resolved) => resolved,
-            Err(_) => return Err(negative_errno(libc::ENOENT)),
-        }
-    };
-    read_executable_file(state, &path, refusal)
+    // Linux resolves an exec's filename as it resolves any path (fs/exec.c
+    // do_open_execat): an absolute one from the root, any other, with or
+    // without a slash, from the working directory. execve never searches
+    // PATH: execvp(3), posix_spawnp(3) and shells search it themselves and
+    // pass the path they found.
+    let executable_path = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&path));
+    read_executable_lookup(state, &executable_path, lookup, refusal)
 }
 
 /// Maximum `#!` interpreter indirection levels, matching the Linux kernel's

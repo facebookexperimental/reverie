@@ -3015,16 +3015,15 @@ fn in_guest_exec_names_each_image_by_its_filename() {
                  execve:./script-name-over-16-bytes.sh,execve:chosen-alias,\
                  procfd:./chosen-alias,devfd:./chosen-alias,empty:./chosen-alias,\
                  dirrel:chosen-alias";
-    // A bare name: Linux resolves it against the working directory, the
-    // executor searches PATH, which names only that directory here, so both
-    // run the link; it is named after the link, not its resolved target.
-    let path = format!("PATH={}", directory.0.display());
+    // A bare name: Linux resolves it against the working directory, as the
+    // executor does (no PATH is given), so it runs the link; it is named after
+    // the link, not its resolved target.
     let mut backend = KvmBackend::new(256 * 1024 * 1024).unwrap();
     backend
         .install_static_elf_file_with_context(
             std::fs::File::open(&program).unwrap(),
             &[program.to_str().unwrap()],
-            &[steps, &path],
+            &[steps],
             &directory.0,
         )
         .unwrap();
@@ -4621,6 +4620,9 @@ impl TestExecutable {
         let path =
             std::env::temp_dir().join(format!("reverie-kvm-exec-{}-{id}", std::process::id()));
         std::fs::write(&path, image).unwrap();
+        // Linux execs only a file its caller may execute (fs/exec.c
+        // do_open_execat), as the executor now checks.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         Self(path)
     }
 }

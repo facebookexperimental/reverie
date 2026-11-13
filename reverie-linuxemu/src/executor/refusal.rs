@@ -45,6 +45,23 @@ pub(super) fn nonleader_exec_refusal(
     })
 }
 
+/// Diagnostic of this backend's typed refusal of an exec whose path lookup
+/// the host refused (`exec_path_lookup_refusal`).
+pub(crate) const EXEC_PATH_LOOKUP_REFUSAL: &str = "KVM exec: the host refused an openat2 call \
+     that looks up a path the exec names, the program's or its interpreter's (ENOSYS, EPERM, \
+     E2BIG or EINVAL); the exec is refused rather than looked up another way";
+
+/// The typed refusal of an exec whose path lookup the host refused: this
+/// executor looks an exec path up only with openat2, which can refuse to
+/// follow a magic link, and resolves it no other way.
+pub(super) fn exec_path_lookup_refusal() -> reverie::UnsupportedRefusal {
+    reverie::UnsupportedRefusal::new(
+        reverie::UnsupportedOperation::Exec,
+        reverie::Errno::EOPNOTSUPP,
+        EXEC_PATH_LOOKUP_REFUSAL,
+    )
+}
+
 /// Diagnostic of this backend's typed refusal of an exec whose preparation a
 /// host call or allocation failed with ENOMEM, where no more specific
 /// diagnostic was recorded, and the one every refusal of host resources falls

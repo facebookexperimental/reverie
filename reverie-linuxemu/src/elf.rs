@@ -1888,7 +1888,7 @@ pub fn load_static_elf_with_execfn(
         execfn,
         argv,
         envp,
-        cwd,
+        CwdSource::HostPath(cwd),
     )
 }
 
@@ -1928,6 +1928,29 @@ enum InterpreterSource<'a> {
     Resolved(Option<&'a ExecInterpreter>),
 }
 
+/// Where [`load_executable`] takes the loaded image's working directory from.
+#[derive(Clone, Copy)]
+enum CwdSource<'a> {
+    /// Open this directory by its path. Only for an initial image, whose
+    /// directory the caller names.
+    HostPath(&'a Path),
+    /// The execing task's: the loader duplicates its working-directory
+    /// handle and opens no path. Its recorded path can be stale (Linux holds
+    /// a working directory by reference, not by name), so a renamed or
+    /// removed directory does not fail the load.
+    Task(&'a FsContext),
+}
+
+impl CwdSource<'_> {
+    /// The working directory's recorded path.
+    fn path(&self) -> &Path {
+        match self {
+            Self::HostPath(path) => path,
+            Self::Task(fs_context) => &fs_context.cwd,
+        }
+    }
+}
+
 /// The `PT_INTERP` path `image` names, checked as [`load_executable`] checks
 /// it (the ELF header and program headers first, then the path), or `None`
 /// for an image with no interpreter.
@@ -1943,7 +1966,9 @@ pub(crate) fn exec_interpreter_path(image: &[u8]) -> Result<Option<String>> {
 /// `PT_INTERP` interpreter is `interpreter`, which the exec resolved and
 /// read before this load; this load opens no interpreter path itself, and an
 /// image with a `PT_INTERP` but no `interpreter` is refused. `None` for
-/// `executable_file` loads an image that is no file's.
+/// `executable_file` loads an image that is no file's. `fs_context` is the
+/// execing task's: the loader takes a duplicate of its working-directory
+/// handle and never reopens the directory by its recorded path.
 #[allow(clippy::too_many_arguments)]
 pub fn load_static_elf_image_of(
     memory: &mut GuestMemory,
@@ -1953,7 +1978,7 @@ pub fn load_static_elf_image_of(
     execfn: Option<&[u8]>,
     argv: &[&str],
     envp: &[&str],
-    cwd: &Path,
+    fs_context: &FsContext,
 ) -> Result<LoadedStaticElf> {
     load_image_of(
         memory,
@@ -1963,7 +1988,7 @@ pub fn load_static_elf_image_of(
         execfn,
         argv,
         envp,
-        cwd,
+        CwdSource::Task(fs_context),
     )
 }
 
@@ -1976,7 +2001,7 @@ fn load_image_of(
     execfn: Option<&[u8]>,
     argv: &[&str],
     envp: &[&str],
-    cwd: &Path,
+    cwd: CwdSource<'_>,
 ) -> Result<LoadedStaticElf> {
     initialize_regular_create_directory_policy()?;
     // Fix the host core_pattern before the first image runs (`core_dump`).
@@ -2060,7 +2085,7 @@ pub fn load_static_elf_file_with_execfn(
         script_name.as_deref(),
         argv,
         envp,
-        cwd,
+        CwdSource::HostPath(cwd),
         0,
         Some(Arc::new(file)),
         InterpreterSource::HostPath,
@@ -2159,7 +2184,7 @@ fn load_executable(
     script_name: Option<&str>,
     argv: &[&str],
     envp: &[&str],
-    cwd: &Path,
+    cwd: CwdSource<'_>,
     script_depth: usize,
     executable_file: Option<Arc<File>>,
     interpreter_source: InterpreterSource<'_>,
@@ -2187,9 +2212,9 @@ fn load_executable(
         } else if let Some(file) = executable_file.as_ref() {
             std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))?
         } else {
-            resolve_executable_path(argv0, envp, cwd)?
+            resolve_executable_path(argv0, envp, cwd.path())?
         };
-        let interpreter_path = resolve_executable_path(&interpreter, envp, cwd)?;
+        let interpreter_path = resolve_executable_path(&interpreter, envp, cwd.path())?;
         let read_error = |error| {
             Error::UnsupportedElf(format!(
                 "cannot read script interpreter {interpreter_path:?}: {error}"
@@ -2507,15 +2532,22 @@ fn load_executable(
         (None, None) => mmap_next,
     };
 
-    let cwd_fd = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_PATH | libc::O_DIRECTORY)
-        .open(cwd)?;
+    let cwd_fd = match cwd {
+        CwdSource::HostPath(path) => OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_DIRECTORY)
+            .open(path)?,
+        CwdSource::Task(fs_context) => fs_context.cwd_fd.try_clone()?,
+    };
 
     let executable_path = if let Some(file) = executable_file.as_ref() {
         std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))?
+    } else if let CwdSource::HostPath(path) = cwd {
+        resolve_executable_path(argv0, envp, path).unwrap_or_else(|_| PathBuf::from(argv0))
     } else {
-        resolve_executable_path(argv0, envp, cwd).unwrap_or_else(|_| PathBuf::from(argv0))
+        // An exec names its image by the file it opened, never by a host
+        // search for argv[0].
+        PathBuf::from(argv0)
     };
     // Named by the filename the image was exec'd by, as given: a `#!`
     // script's, not its interpreter's, and a symlink's, not its target's.
@@ -2564,7 +2596,7 @@ fn load_executable(
         executable_image,
         argv0,
         fs_context: FsContext {
-            cwd: cwd.to_owned(),
+            cwd: cwd.path().to_owned(),
             cwd_fd,
             umask: launcher.umask,
         },
@@ -5136,10 +5168,9 @@ mod tests {
         assert_eq!(parse_shebang(b"\x7fELF").unwrap(), None);
     }
 
-    // TODO-HUMAN-REVIEW(PR-kvm-execve-path): Covers PATH resolution of a
-    // slash-less execve program name, the behavior prepare_exec now relies on
-    // so `execve("bash", ...)` matches the ptrace initial launcher instead of
-    // returning ENOENT.
+    // Covers PATH resolution of an initial program's argv[0] by the loader
+    // when it is given no executable file. An in-guest execve never searches
+    // PATH (executor::resolve_guest_exec_image).
     #[test]
     fn resolves_bare_program_name_via_path() {
         use std::io::Write;

@@ -3259,10 +3259,9 @@ impl KvmBackend {
         // this reset onward, any exceptional loader or KVM failure is fatal to
         // the backend and is never reported back to the old guest image. This
         // is the same point-of-no-return behavior as the prior zero_raw reset.
-        // The reload loads the image and the program interpreter the
-        // preflight read, but it opens the working directory again by path.
-        // If that changed since the preflight, the reload can fail where the
-        // preflight did not. A host resource of this process's own that ran out (memory,
+        // The reload loads the image, the program interpreter and the file
+        // the preflight read, with a duplicate of the task's working-directory
+        // handle, and opens no path. A host resource of this process's own that ran out (memory,
         // a descriptor, the host's file table) ends the run with the named
         // refusal; any other failure ends it as a backend fault.
         self.replace_process_image(executor, executable, interpreter, execfn, image, argv, envp)
@@ -3317,7 +3316,7 @@ impl KvmBackend {
             execfn,
             &argv,
             &envp,
-            executor.cwd(),
+            executor.fs_context(),
         )?;
         loaded.executable_path = executable_file
             .as_ref()
@@ -13377,6 +13376,11 @@ mod tests {
             .unwrap();
         cleanup.0.push(executable.clone());
         executable_file.write_all(&image).unwrap();
+        // Linux execs only a file its caller may execute (fs/exec.c
+        // do_open_execat), as the preflight checks.
+        executable_file
+            .set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
         drop(executable_file);
 
         let stack_bottom = crate::memory::USER_ADDRESS_END - crate::elf::STACK_LIMIT;

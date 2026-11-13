@@ -692,7 +692,7 @@ fn a_load_maps_only_the_interpreter_the_exec_staged() {
             None,
             &["program"],
             &[],
-            &root.0,
+            &state.fs_context,
         )
     };
 

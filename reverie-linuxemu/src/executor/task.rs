@@ -1125,7 +1125,6 @@ impl ElfExecutor {
             None => match resolve_guest_exec_image(
                 &self.state,
                 path.clone(),
-                &envp,
                 &mut self.unsupported_refusal,
             ) {
                 Ok(executable) => executable,
@@ -1217,17 +1216,20 @@ impl ElfExecutor {
                 return negative_errno(libc::ENOMEM);
             }
         };
+        // The validation load is given what the reload is given: the file the
+        // exec opened and this task's working-directory handle, so it opens
+        // no path of its own.
         let argv_refs = argv.iter().map(String::as_str).collect::<Vec<_>>();
         let envp_refs = envp.iter().map(String::as_str).collect::<Vec<_>>();
         if let Err(error) = load_static_elf_image_of(
             &mut validation_memory,
             &image,
-            None,
+            executable_file.clone(),
             interpreter.as_ref(),
             Some(&execfn),
             &argv_refs,
             &envp_refs,
-            &self.state.fs_context.cwd,
+            &self.state.fs_context,
         ) {
             return exec_image_load_error(
                 "loading the new image into the validation memory",
@@ -2645,8 +2647,10 @@ impl ElfExecutor {
         }
     }
 
-    pub fn cwd(&self) -> &std::path::Path {
-        &self.state.fs_context.cwd
+    /// This task's filesystem context: an exec load gives the new image's
+    /// loader a duplicate of its working-directory handle.
+    pub fn fs_context(&self) -> &crate::elf::FsContext {
+        &self.state.fs_context
     }
 
     pub fn auxv(&self) -> &[(libc::c_ulong, libc::c_ulong)] {
