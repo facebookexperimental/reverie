@@ -570,62 +570,132 @@ fn fallback_target(
         19 => "21completion_generation",
         _ => return Err("package fallback target field differs".into()),
     };
-    require(
-        source.st_type() == sym::STT_SECTION
-            && source.st_bind() == sym::STB_LOCAL
-            && source.st_value == 0
-            && source.st_size == 0,
-        "package fallback source section target differs",
-    )?;
-    let name = section_name(&owner.elf, &source)?;
-    let prefix = if offset == 6 { ".rodata." } else { ".text." };
-    let rust = name
-        .strip_prefix(prefix)
-        .ok_or("package fallback target section kind differs")?;
     let expected = if offset == 6 {
         format!("_RNvNtNtNtCs_15reverie_inguest5guest3isa6x86_64{suffix}")
     } else {
         format!("_RNvNtNtCs_15reverie_inguest5guest12continuation{suffix}")
     };
-    require(
-        !rust.contains(".llvm.")
-            && canonical_rust_symbol(rust).as_deref() == Some(expected.as_str()),
-        "package fallback exact source operand path differs",
-    )?;
-    let definitions = owner
-        .elf
-        .syms
-        .iter()
-        .filter(|s| {
-            s.st_shndx == source.st_shndx && owner.elf.strtab.get_at(s.st_name) == Some(rust)
-        })
-        .collect::<Vec<_>>();
-    require(
-        definitions.len() == 1,
-        "package fallback source operand absent/duplicate",
-    )?;
-    let target = definitions[0];
-    let section = &owner.elf.section_headers[source.st_shndx];
-    require(
-        target.st_value == 0
-            && target.st_size == section.sh_size
-            && target.st_size > 0
-            && target.st_size <= 4096
-            && section.sh_type == 1
-            && target.st_bind() == sym::STB_LOCAL
-            && target.st_type()
-                == if offset == 6 {
-                    sym::STT_OBJECT
-                } else {
-                    sym::STT_FUNC
-                },
-        "package fallback complete source operand extent differs",
-    )?;
+    // Two source shapes carry the same operand identity. The historical one
+    // (and offset 6 in every build) references a LOCAL section symbol whose
+    // section holds the complete LOCAL definition in this same object. Since
+    // the Isa move (reverie 63f7a2197) made dispatch/completion_generation
+    // pub(crate), offsets 14/19 instead reference the undefined GLOBAL HIDDEN
+    // function symbol, defined GLOBAL HIDDEN in another member. Identity is
+    // bound by the same canonical mangled path in both shapes; only the
+    // definition lookup widens, to one unique archive-wide definition.
+    let cross_member = offset != 6 && source.st_shndx == 0;
+    let (rust, target, section) = if cross_member {
+        require(
+            source.st_type() == sym::STT_NOTYPE
+                && source.st_bind() == sym::STB_GLOBAL
+                && source.st_visibility() == sym::STV_HIDDEN
+                && source.st_value == 0
+                && source.st_size == 0,
+            "package fallback source section target differs",
+        )?;
+        let rust = owner
+            .elf
+            .strtab
+            .get_at(source.st_name)
+            .ok_or("package fallback target absent")?
+            .to_owned();
+        require(
+            !rust.contains(".llvm.")
+                && canonical_rust_symbol(&rust).as_deref() == Some(expected.as_str()),
+            "package fallback exact source operand path differs",
+        )?;
+        let mut definitions = Vec::new();
+        for object in objects {
+            for candidate in object.elf.syms.iter().filter(|s| {
+                s.st_shndx != 0 && object.elf.strtab.get_at(s.st_name) == Some(rust.as_str())
+            }) {
+                definitions.push((object, candidate));
+            }
+        }
+        require(
+            definitions.len() == 1,
+            "package fallback source operand absent/duplicate",
+        )?;
+        let (definer, target) = definitions[0];
+        let section = definer
+            .elf
+            .section_headers
+            .get(target.st_shndx)
+            .ok_or("package fallback source operand section absent")?
+            .clone();
+        require(
+            definer.elf.shdr_strtab.get_at(section.sh_name)
+                == Some(format!(".text.{rust}").as_str()),
+            "package fallback target section kind differs",
+        )?;
+        require(
+            target.st_value == 0
+                && target.st_size == section.sh_size
+                && target.st_size > 0
+                && target.st_size <= 4096
+                && section.sh_type == 1
+                && target.st_bind() == sym::STB_GLOBAL
+                && target.st_visibility() == sym::STV_HIDDEN
+                && target.st_type() == sym::STT_FUNC,
+            "package fallback complete source operand extent differs",
+        )?;
+        (rust, target, section)
+    } else {
+        require(
+            source.st_type() == sym::STT_SECTION
+                && source.st_bind() == sym::STB_LOCAL
+                && source.st_value == 0
+                && source.st_size == 0,
+            "package fallback source section target differs",
+        )?;
+        let name = section_name(&owner.elf, &source)?;
+        let prefix = if offset == 6 { ".rodata." } else { ".text." };
+        let rust = name
+            .strip_prefix(prefix)
+            .ok_or("package fallback target section kind differs")?
+            .to_owned();
+        require(
+            !rust.contains(".llvm.")
+                && canonical_rust_symbol(&rust).as_deref() == Some(expected.as_str()),
+            "package fallback exact source operand path differs",
+        )?;
+        let definitions = owner
+            .elf
+            .syms
+            .iter()
+            .filter(|s| {
+                s.st_shndx == source.st_shndx
+                    && owner.elf.strtab.get_at(s.st_name) == Some(rust.as_str())
+            })
+            .collect::<Vec<_>>();
+        require(
+            definitions.len() == 1,
+            "package fallback source operand absent/duplicate",
+        )?;
+        let target = definitions[0];
+        let section = owner.elf.section_headers[source.st_shndx].clone();
+        require(
+            target.st_value == 0
+                && target.st_size == section.sh_size
+                && target.st_size > 0
+                && target.st_size <= 4096
+                && section.sh_type == 1
+                && target.st_bind() == sym::STB_LOCAL
+                && target.st_type()
+                    == if offset == 6 {
+                        sym::STT_OBJECT
+                    } else {
+                        sym::STT_FUNC
+                    },
+            "package fallback complete source operand extent differs",
+        )?;
+        (rust, target, section)
+    };
     let selected = resolve_input_target(map, owner, index, objects, elf, bytes)?;
     let finals = elf
         .syms
         .iter()
-        .filter(|s| elf.strtab.get_at(s.st_name) == Some(rust) && s.st_shndx != 0)
+        .filter(|s| elf.strtab.get_at(s.st_name) == Some(rust.as_str()) && s.st_shndx != 0)
         .collect::<Vec<_>>();
     require(
         finals.len() == 1
@@ -661,7 +731,7 @@ fn fallback_target(
             target.st_size == 4
                 && section.sh_flags == 2
                 && mapping.p_flags == 4
-                && section_file_bytes(section, owner.bytes)? == [0x80, 0x1f, 0, 0]
+                && section_file_bytes(&section, owner.bytes)? == [0x80, 0x1f, 0, 0]
                 && bytes.get(at..at + 4) == Some(&[0x80, 0x1f, 0, 0]),
             "package fallback MXCSR complete source/RO value differs",
         )?;
@@ -1151,6 +1221,14 @@ mod tests {
     const LIBC: &[u8] = &include!("../../../tests/fixtures/package_roles_libc_member.rs");
     const TP: &[u8] = &include!("../../../tests/fixtures/package_roles_tp_member.rs");
     const FALLBACK: &[u8] = &include!("../../../tests/fixtures/package_roles_fallback_member.rs");
+    // Current factory members (libdetcore_liteinst.a at Reverie 10c4c1b7,
+    // hermit 4cb0468a): the fallback owner (cgu.12, sha256 71af8ac5...) whose
+    // dispatch/completion_generation references are PLT32 against undefined
+    // GLOBAL HIDDEN symbols, and their defining member (cgu.03, eafe0edb...).
+    const FALLBACK_OWNER_CURRENT: &[u8] =
+        &include!("../../../tests/fixtures/package_roles_fallback_owner_member.rs");
+    const FALLBACK_DEFINER_CURRENT: &[u8] =
+        &include!("../../../tests/fixtures/package_roles_fallback_definer_member.rs");
     fn object(raw: &[u8], role: InitializerRole) -> ObjectInput<'_> {
         let (path, name, ordinal, header) = match role {
             InitializerRole::PackageLibc => ("/bound/libc.a", "__libc_start_main.lo", 135, 699442),
@@ -2180,6 +2258,194 @@ mod tests {
         let objects = [object(&data, InitializerRole::PackageFallback)];
         let joined = join_fallback(&objects[0], &objects, &map, &elf, &raw).unwrap();
         assert_eq!((joined.bytes, joined.relocation_fields), (48, 3));
+    }
+    fn current_definer(raw: &[u8], ordinal: usize) -> ObjectInput<'_> {
+        let mut definer = object(raw, InitializerRole::PackageFallback);
+        definer.member_name = if ordinal == 1 {
+            "reverie_inguest-definer.o"
+        } else {
+            "reverie_inguest-definer2.o"
+        };
+        definer.ordinal = ordinal;
+        definer
+    }
+    // Linked image + map for the post-Isa-move factory shape: offset 6 stays a
+    // section-symbol PC32 inside the owner; offsets 14/19 are PLT32 against
+    // undefined GLOBAL HIDDEN symbols whose definitions live in the definer.
+    fn fallback_current_image(
+        owner: &ObjectInput<'_>,
+        definer: &ObjectInput<'_>,
+    ) -> (Vec<u8>, String) {
+        let symbol = fallback_input(owner).unwrap();
+        let source = relocation_rows(owner, symbol.st_shndx, 48).unwrap();
+        let mut targets: Vec<(String, u64, usize, Vec<u8>, String)> = Vec::new();
+        for r in &source {
+            let relocation = owner.elf.syms.get(r.3).unwrap();
+            if r.0 == 6 {
+                let name = section_name(&owner.elf, &relocation).unwrap();
+                let raw_name = name.strip_prefix(".rodata.").unwrap().to_owned();
+                let data = section_file_bytes(
+                    &owner.elf.section_headers[relocation.st_shndx],
+                    owner.bytes,
+                )
+                .unwrap()
+                .to_vec();
+                targets.push((
+                    raw_name,
+                    0x500100,
+                    0x6100,
+                    data,
+                    map_row(owner, relocation.st_shndx, 0x500100),
+                ));
+            } else {
+                let (address, at) = if r.0 == 14 {
+                    (0x402000, 0x2000)
+                } else {
+                    (0x403000, 0x3000)
+                };
+                let name = owner
+                    .elf
+                    .strtab
+                    .get_at(relocation.st_name)
+                    .unwrap()
+                    .to_owned();
+                let (_, definition) = named(&definer.elf, &name).unwrap();
+                let data = section_file_bytes(
+                    &definer.elf.section_headers[definition.st_shndx],
+                    definer.bytes,
+                )
+                .unwrap()
+                .to_vec();
+                targets.push((
+                    name,
+                    address,
+                    at,
+                    data,
+                    map_row(definer, definition.st_shndx, address),
+                ));
+            }
+        }
+        let mut rows = vec![
+            (
+                "runtime.rs",
+                sym::STT_FILE,
+                0,
+                section_header::SHN_ABS as usize,
+                0,
+                0,
+            ),
+            ("fallback_entry", sym::STT_FUNC, 2, 1, 0x401000, 48),
+            ("fallback_completion_syscall", 0, 2, 1, 0x40102c, 0),
+            ("fallback_completion_return", 0, 2, 1, 0x40102e, 0),
+            (
+                "reverie_inguest_trusted_syscall",
+                sym::STT_FUNC,
+                2,
+                1,
+                0x401070,
+                44,
+            ),
+        ];
+        for (name, address, _, data, _) in &targets {
+            rows.push((
+                name.as_str(),
+                if *address == 0x500100 {
+                    sym::STT_OBJECT
+                } else {
+                    sym::STT_FUNC
+                },
+                0,
+                if *address == 0x500100 { 2 } else { 1 },
+                *address,
+                data.len() as u64,
+            ));
+        }
+        let body =
+            section_file_bytes(&owner.elf.section_headers[symbol.st_shndx], owner.bytes).unwrap();
+        let relocs = source
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (0x401000 + r.0, r.1, r.2, 6 + i))
+            .collect::<Vec<_>>();
+        let mut result = image(&rows, body, &relocs);
+        let mut map = map_row(owner, symbol.st_shndx, 0x401000);
+        for (i, (_, address, at, data, row)) in targets.iter().enumerate() {
+            map.push_str(row);
+            result[*at..*at + data.len()].copy_from_slice(data);
+            let r = source[i];
+            let encoded = checked_pc32(*address, r.2, 0x401000 + r.0).unwrap();
+            result[0x1000 + r.0 as usize..0x1000 + r.0 as usize + 4].copy_from_slice(&encoded);
+        }
+        (result, map)
+    }
+    #[test]
+    fn package_roles_fallback_joins_current_factory_cross_member_operands() {
+        let objects = [
+            object(FALLBACK_OWNER_CURRENT, InitializerRole::PackageFallback),
+            current_definer(FALLBACK_DEFINER_CURRENT, 1),
+        ];
+        let (raw, map) = fallback_current_image(&objects[0], &objects[1]);
+        let elf = Elf::parse(&raw).unwrap();
+        let joined = join_fallback(&objects[0], &objects, &map, &elf, &raw).unwrap();
+        assert_eq!((joined.bytes, joined.relocation_fields), (48, 3));
+        let observed = role_body(
+            InitializerRole::PackageFallback,
+            &objects[0],
+            &objects,
+            &map,
+            &elf,
+            &raw,
+        )
+        .unwrap();
+        assert_eq!(observed.relocations.len(), 3);
+    }
+    #[test]
+    fn package_roles_fallback_refuses_global_default_cross_member_definition() {
+        let owner = object(FALLBACK_OWNER_CURRENT, InitializerRole::PackageFallback);
+        let definer = current_definer(FALLBACK_DEFINER_CURRENT, 1);
+        let (raw, map) = fallback_current_image(&owner, &definer);
+        let elf = Elf::parse(&raw).unwrap();
+        let (index, _) = definer
+            .elf
+            .syms
+            .iter()
+            .enumerate()
+            .find(|(_, s)| {
+                definer
+                    .elf
+                    .strtab
+                    .get_at(s.st_name)
+                    .is_some_and(|n| n.ends_with("12continuation8dispatch"))
+            })
+            .unwrap();
+        let table = definer
+            .elf
+            .section_headers
+            .iter()
+            .find(|s| s.sh_type == 2)
+            .unwrap();
+        let mut bad = FALLBACK_DEFINER_CURRENT.to_vec();
+        // st_other: STV_HIDDEN (2) -> STV_DEFAULT (0) on the definition.
+        put(&mut bad, table.sh_offset as usize + index * 24 + 5, 1, 0);
+        let objects = [owner, current_definer(&bad, 1)];
+        let error = join_fallback(&objects[0], &objects, &map, &elf, &raw).unwrap_err();
+        assert!(
+            error.contains("package fallback complete source operand extent differs"),
+            "{error}"
+        );
+    }
+    #[test]
+    fn package_roles_fallback_refuses_duplicate_cross_member_definition() {
+        let owner = object(FALLBACK_OWNER_CURRENT, InitializerRole::PackageFallback);
+        let definer = current_definer(FALLBACK_DEFINER_CURRENT, 1);
+        let (raw, map) = fallback_current_image(&owner, &definer);
+        let elf = Elf::parse(&raw).unwrap();
+        let objects = [owner, definer, current_definer(FALLBACK_DEFINER_CURRENT, 2)];
+        let error = join_fallback(&objects[0], &objects, &map, &elf, &raw).unwrap_err();
+        assert!(
+            error.contains("package fallback source operand absent/duplicate"),
+            "{error}"
+        );
     }
     #[test]
     fn package_roles_fallback_exact_subextent_never_weakens_whole_section_join() {

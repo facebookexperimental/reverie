@@ -1159,7 +1159,7 @@ fn content_manifest_relative(image_kind: FixedImageKind) -> &'static str {
 }
 // Reviewed literal expectations, not hashes generated from the current checkout
 // or bytes embedded after a runtime edit. The qualifier self-hash is separate.
-const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
+const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 88] = [
     (
         "reverie-liteinst-artifact/src/preparation_identity.rs",
         49430,
@@ -1278,13 +1278,23 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers/package_roles.rs",
-        83186,
-        "b568a674b69e960aa26a3287bbd0803518aeb9d6fd529f4f8095ed1a2cea2fde",
+        94265,
+        "f611b85197795bc53fcd6524b26b819446ff6c3f3136e927bca38c6fb97eb43c",
     ),
     (
         "reverie-liteinst-artifact/tests/fixtures/package_roles_fallback_member.rs",
         807404,
         "04ff07ffea256146614bdc1a91b6b0bbadadaf2ad907416173d38095393de724",
+    ),
+    (
+        "reverie-liteinst-artifact/tests/fixtures/package_roles_fallback_owner_member.rs",
+        1191856,
+        "b918c5dd74976dc593edf27c5b0f7cba9f34f3100c57a7963bf42e3d731bffc5",
+    ),
+    (
+        "reverie-liteinst-artifact/tests/fixtures/package_roles_fallback_definer_member.rs",
+        772556,
+        "6aeac2a90bc79dd3cdbeafffb0c8081e67a17cdd34dec1bc85f379dc57887540",
     ),
     (
         "reverie-liteinst-artifact/tests/fixtures/package_roles_libc_member.rs",
@@ -38607,7 +38617,7 @@ mod tests {
         let rv_two = cargo_two.join(suffix);
         // Current compiled bytes are inputs only. Each must independently match
         // the fixed reviewed length/digest catalog before any positive is earned.
-        let compiled_files: [(&str, &[u8]); 88] = [
+        let compiled_files: [(&str, &[u8]); 90] = [
             (
                 "reverie/src/tool_process.rs",
                 include_bytes!("../../reverie/src/tool_process.rs"),
@@ -38874,6 +38884,14 @@ mod tests {
                 include_bytes!("../tests/fixtures/package_roles_fallback_member.rs"),
             ),
             (
+                "reverie-liteinst-artifact/tests/fixtures/package_roles_fallback_owner_member.rs",
+                include_bytes!("../tests/fixtures/package_roles_fallback_owner_member.rs"),
+            ),
+            (
+                "reverie-liteinst-artifact/tests/fixtures/package_roles_fallback_definer_member.rs",
+                include_bytes!("../tests/fixtures/package_roles_fallback_definer_member.rs"),
+            ),
+            (
                 "reverie-liteinst-artifact/tests/fixtures/package_roles_libc_member.rs",
                 include_bytes!("../tests/fixtures/package_roles_libc_member.rs"),
             ),
@@ -38960,7 +38978,7 @@ mod tests {
         ];
         // These reviewed sources changed for startup or returning-injection contracts.
         // Keep the fixed catalog authoritative and reject their prior tuples.
-        assert_eq!(CONTENT_REVERIE_CATALOG.len(), 86);
+        assert_eq!(CONTENT_REVERIE_CATALOG.len(), 88);
         for (relative, old_size, old_digest) in [
             (
                 "reverie-inguest/src/guest/continuation.rs",
@@ -39594,11 +39612,11 @@ mod tests {
             }
         }
         let (rv_inventory, _) = content_reverie_inventory(&rv_one).unwrap();
-        // 86 reviewed sources plus the independently checked qualifier.
-        assert_eq!(rv_inventory.len(), 87);
+        // 88 reviewed sources plus the independently checked qualifier.
+        assert_eq!(rv_inventory.len(), 89);
         let (detcore_inventory, _) =
             content_reverie_inventory_for_image(&rv_one, FixedImageKind::Detcore).unwrap();
-        assert_eq!(detcore_inventory.len(), 88);
+        assert_eq!(detcore_inventory.len(), 90);
         for relative in [
             "reverie-inguest/src/guest/pidfd_self.rs",
             "reverie/src/pidfd_self.rs",
