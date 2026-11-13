@@ -37,6 +37,7 @@ use crate::GuestMemory;
 use crate::SyscallRequest;
 use crate::bootstrap::BOOT_RESERVED_END;
 use crate::bootstrap::SegmentBase;
+use crate::elf::ExecInterpreter;
 use crate::elf::GuestFileIdentity;
 use crate::elf::GuestFileIdentityEntry;
 use crate::elf::IdentityTimestamps;
@@ -46,7 +47,7 @@ use crate::elf::STACK_LIMIT;
 use crate::elf::TASK_COMM_LEN;
 #[cfg(any(test, feature = "test-support", feature = "native-test-support"))]
 use crate::elf::initialize_regular_create_directory_policy;
-use crate::elf::load_static_elf_with_execfn;
+use crate::elf::load_static_elf_image_of;
 use crate::elf::resolve_executable_path;
 use crate::error::ErrorExt;
 use crate::memory::AllocationCursors;
@@ -295,6 +296,9 @@ pub enum ProcessAction {
     Exec {
         executable_path: std::path::PathBuf,
         executable_file: Option<Arc<std::fs::File>>,
+        /// The new image's program interpreter (`PT_INTERP`), resolved and
+        /// read through the guest's view before the exec was reported.
+        interpreter: Option<ExecInterpreter>,
         /// The filename execve was given, byte for byte, for `AT_EXECFN`;
         /// `None` is `argv[0]`.
         execfn: Option<Vec<u8>>,
@@ -621,6 +625,7 @@ mod tests {
     include!("executor/read_zero_cancel_tests.rs");
     include!("executor/descriptor_generic_tests.rs");
     include!("executor/fd_subpath_tests.rs");
+    include!("executor/exec_interpreter_tests.rs");
     include!("executor/tool_directory_tests.rs");
     include!("executor/host_resources_tests.rs");
     include!("executor/script_line_tests.rs");
@@ -22245,6 +22250,7 @@ mod tests {
             f.executor.process_action = Some(ProcessAction::Exec {
                 executable_path: f.root.0.join("b"),
                 executable_file: Some(file),
+                interpreter: None,
                 execfn: None,
                 image: Vec::new(),
                 argv: Vec::new(),

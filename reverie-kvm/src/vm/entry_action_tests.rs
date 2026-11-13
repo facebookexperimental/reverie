@@ -323,6 +323,7 @@ pub(crate) mod entry_action_tests {
                 ProcessAction::Exec {
                     executable_path: Path::new("/bin/entry-action-new").to_owned(),
                     executable_file: None,
+                    interpreter: None,
                     execfn: None,
                     image: minimal_test_elf(&code),
                     argv: vec!["/bin/entry-action-new".to_owned()],

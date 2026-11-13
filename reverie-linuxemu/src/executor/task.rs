@@ -1171,6 +1171,36 @@ impl ElfExecutor {
                 Err(errno) => return errno,
             }
         };
+        // Linux opens the new image's program interpreter (`PT_INTERP`) as
+        // it opens the program, through the caller's view of the filesystem
+        // and before the old image is gone (fs/binfmt_elf.c
+        // `load_elf_binary`). It is resolved and read once here; both loads
+        // below map this file and open no interpreter path themselves. The
+        // retained static image has no interpreter.
+        let interpreter = if retained_static_image {
+            None
+        } else {
+            let path = match crate::elf::exec_interpreter_path(&image) {
+                Ok(path) => path,
+                Err(error) => {
+                    return exec_image_load_error(
+                        "reading the new image's program interpreter path",
+                        &error,
+                        &mut self.unsupported_refusal,
+                    );
+                }
+            };
+            match path {
+                Some(path) => {
+                    match read_exec_interpreter(&self.state, &path, &mut self.unsupported_refusal)
+                    {
+                        Ok(interpreter) => Some(interpreter),
+                        Err(errno) => return errno,
+                    }
+                }
+                None => None,
+            }
+        };
         // TODO-HUMAN-REVIEW(PR-156): Review preflight validation before exec image replacement.
         // Loading the live image clears guest memory, so validate against an
         // isolated mapping before reporting exec success to the Reverie tool.
@@ -1189,30 +1219,21 @@ impl ElfExecutor {
         };
         let argv_refs = argv.iter().map(String::as_str).collect::<Vec<_>>();
         let envp_refs = envp.iter().map(String::as_str).collect::<Vec<_>>();
-        if let Err(error) = load_static_elf_with_execfn(
+        if let Err(error) = load_static_elf_image_of(
             &mut validation_memory,
             &image,
+            None,
+            interpreter.as_ref(),
             Some(&execfn),
             &argv_refs,
             &envp_refs,
             &self.state.fs_context.cwd,
         ) {
-            // A host resource this process ran out of while loading (memory
-            // for the image's copy or its PT_INTERP image, a descriptor to
-            // open the interpreter) says nothing about the image, so the exec
-            // is refused by name. Every other loader failure is an image that
-            // is malformed or that this loader cannot place: ENOEXEC.
-            return match error.host_resource_exhaustion() {
-                Some(exhaustion) => {
-                    self.unsupported_refusal = Some(exec_host_resource_refusal(
-                        "loading the new image into the validation memory",
-                        &error,
-                        &exhaustion,
-                    ));
-                    negative_errno(libc::ENOMEM)
-                }
-                None => negative_errno(libc::ENOEXEC),
-            };
+            return exec_image_load_error(
+                "loading the new image into the validation memory",
+                &error,
+                &mut self.unsupported_refusal,
+            );
         }
         // Linux makes a non-leader caller the new thread-group leader while it
         // tears down every sibling. The KVM backend does not yet implement that
@@ -1225,6 +1246,7 @@ impl ElfExecutor {
         self.process_action = Some(ProcessAction::Exec {
             executable_path,
             executable_file,
+            interpreter,
             execfn: Some(execfn),
             image,
             argv,
@@ -1879,10 +1901,13 @@ impl ElfExecutor {
         files.extend(retired.into_values().map(Owned));
         files.extend(stdin.map(Owned));
         if let Some(ProcessAction::Exec {
-            executable_file, ..
+            executable_file,
+            interpreter,
+            ..
         }) = self.process_action.take()
         {
             files.extend(executable_file.map(Shared));
+            files.extend(interpreter.map(|interpreter| Shared(interpreter.into_file())));
         }
         files.extend(self.state.executable_file.take().map(Shared));
         if let Some(snapshot) = self
@@ -1964,10 +1989,16 @@ impl ElfExecutor {
             .file_retirement
             .retire(retired.into_values().chain(stdin));
         if let Some(ProcessAction::Exec {
-            executable_file, ..
+            executable_file,
+            interpreter,
+            ..
         }) = action
         {
-            self.state.file_retirement.retire_shared(executable_file);
+            self.state.file_retirement.retire_shared(
+                executable_file
+                    .into_iter()
+                    .chain(interpreter.map(ExecInterpreter::into_file)),
+            );
         }
     }
 

@@ -77,7 +77,7 @@ pub const CONTAINER_INIT_PID: i32 = 1;
 /// table of up to 64 KiB ([`MAX_PROGRAM_HEADER_TABLE`]), and an interpreter's
 /// table, which is not copied, is accepted up to that.
 const MAX_PROGRAM_HEADERS_SIZE: usize = PAGE_SIZE as usize;
-const MAX_INTERPRETER_BYTES: u64 = 16 * 1024 * 1024;
+pub(crate) const MAX_INTERPRETER_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_SCRIPT_INTERPRETERS: usize = 4;
 const MAIN_LOAD_BIAS: u64 = 2 * 1024 * 1024;
 const _: () = assert!(BOOT_RESERVED_END <= MAIN_LOAD_BIAS);
@@ -1880,18 +1880,99 @@ pub fn load_static_elf_with_execfn(
     envp: &[&str],
     cwd: &Path,
 ) -> Result<LoadedStaticElf> {
-    load_static_elf_image_of(memory, image, None, execfn, argv, envp, cwd)
+    load_image_of(
+        memory,
+        image,
+        None,
+        InterpreterSource::HostPath,
+        execfn,
+        argv,
+        envp,
+        cwd,
+    )
+}
+
+/// The program interpreter an exec resolved for its new image (`PT_INTERP`),
+/// read through the caller's own view of the filesystem before the image is
+/// loaded: `path` as the image names it, its `image`, and the `file` the
+/// image was read from, which the interpreter's mappings map.
+pub struct ExecInterpreter {
+    path: String,
+    image: Vec<u8>,
+    file: Arc<File>,
+}
+
+impl ExecInterpreter {
+    pub(crate) fn new(path: String, image: Vec<u8>, file: Arc<File>) -> Self {
+        Self { path, image, file }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn file(&self) -> &Arc<File> {
+        &self.file
+    }
+
+    pub(crate) fn into_file(self) -> Arc<File> {
+        self.file
+    }
+}
+
+/// Where [`load_executable`] takes a `PT_INTERP` interpreter from.
+#[derive(Clone, Copy)]
+enum InterpreterSource<'a> {
+    /// Read the interpreter by its path. Only for an initial image, which
+    /// the user names, never for an image a guest execs.
+    HostPath,
+    /// The interpreter the exec already resolved, or none: a loader never
+    /// opens an interpreter path itself here.
+    Resolved(Option<&'a ExecInterpreter>),
+}
+
+/// The `PT_INTERP` path `image` names, checked as [`load_executable`] checks
+/// it (the ELF header and program headers first, then the path), or `None`
+/// for an image with no interpreter.
+pub(crate) fn exec_interpreter_path(image: &[u8]) -> Result<Option<String>> {
+    let elf = parse_elf(image)?;
+    validate_elf(&elf, true)?;
+    interpreter_path(image, &elf)
 }
 
 /// [`load_static_elf_with_execfn`] for `image` read from `executable_file`,
 /// the file an `execve` opened: its segments are mappings of that file, as
-/// the process's memory map lists them (`executor::mapping_list`), and its
-/// `PT_INTERP` interpreter is read through a file of its own, likewise.
-/// `None` loads an image that is no file's.
+/// the process's memory map lists them (`executor::mapping_list`). Its
+/// `PT_INTERP` interpreter is `interpreter`, which the exec resolved and
+/// read before this load; this load opens no interpreter path itself, and an
+/// image with a `PT_INTERP` but no `interpreter` is refused. `None` for
+/// `executable_file` loads an image that is no file's.
+#[allow(clippy::too_many_arguments)]
 pub fn load_static_elf_image_of(
     memory: &mut GuestMemory,
     image: &[u8],
     executable_file: Option<Arc<File>>,
+    interpreter: Option<&ExecInterpreter>,
+    execfn: Option<&[u8]>,
+    argv: &[&str],
+    envp: &[&str],
+    cwd: &Path,
+) -> Result<LoadedStaticElf> {
+    load_image_of(
+        memory,
+        image,
+        executable_file,
+        InterpreterSource::Resolved(interpreter),
+        execfn,
+        argv,
+        envp,
+        cwd,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_image_of(
+    memory: &mut GuestMemory,
+    image: &[u8],
+    executable_file: Option<Arc<File>>,
+    interpreter_source: InterpreterSource<'_>,
     execfn: Option<&[u8]>,
     argv: &[&str],
     envp: &[&str],
@@ -1915,6 +1996,7 @@ pub fn load_static_elf_image_of(
         cwd,
         0,
         executable_file,
+        interpreter_source,
     );
     if result.is_err() {
         memory.clear_user_access();
@@ -1981,6 +2063,7 @@ pub fn load_static_elf_file_with_execfn(
         cwd,
         0,
         Some(Arc::new(file)),
+        InterpreterSource::HostPath,
     );
     let mut loaded = match result {
         Ok(loaded) => loaded,
@@ -2079,12 +2162,21 @@ fn load_executable(
     cwd: &Path,
     script_depth: usize,
     executable_file: Option<Arc<File>>,
+    interpreter_source: InterpreterSource<'_>,
 ) -> Result<LoadedStaticElf> {
     let argv0 = *argv
         .first()
         .ok_or_else(|| Error::UnsupportedElf("argv must contain at least argv[0]".to_string()))?;
     let execfn = execfn.unwrap_or(argv0.as_bytes());
     if let Some((interpreter, optional_argument)) = parse_shebang(image)? {
+        // An exec resolves every `#!` level itself, in the guest's view,
+        // before it loads (`resolve_exec_shebang`); a script reaching an
+        // exec load would have its interpreter opened by path here.
+        if matches!(interpreter_source, InterpreterSource::Resolved(_)) {
+            return Err(Error::UnsupportedElf(
+                "an exec load was handed a #! script".to_string(),
+            ));
+        }
         if script_depth >= MAX_SCRIPT_INTERPRETERS {
             return Err(Error::UnsupportedElf(
                 "script interpreter recursion limit exceeded".to_string(),
@@ -2137,6 +2229,7 @@ fn load_executable(
             cwd,
             script_depth + 1,
             interpreter_file,
+            interpreter_source,
         );
     }
 
@@ -2156,18 +2249,35 @@ fn load_executable(
         }
     }
 
-    let (interpreter_image, interpreter_file) = match interpreter_path(image, &elf)? {
-        Some(path) => {
-            let (image, file) = read_interpreter(&path)?;
-            (Some(image), Some(file))
-        }
-        None => (None, None),
-    };
+    let staged_interpreter;
+    let (interpreter_image, interpreter_file) =
+        match (interpreter_path(image, &elf)?, interpreter_source) {
+            (None, InterpreterSource::HostPath | InterpreterSource::Resolved(None)) => {
+                (None, None)
+            }
+            (None, InterpreterSource::Resolved(Some(_))) => {
+                return Err(Error::UnsupportedElf(
+                    "an interpreter was resolved for an image with no PT_INTERP".to_string(),
+                ));
+            }
+            (Some(path), InterpreterSource::HostPath) => {
+                let (image, file) = read_interpreter(&path)?;
+                staged_interpreter = image;
+                (Some(staged_interpreter.as_slice()), Some(file))
+            }
+            (Some(path), InterpreterSource::Resolved(Some(resolved))) if resolved.path == path => {
+                (Some(resolved.image.as_slice()), Some(resolved.file.clone()))
+            }
+            (Some(path), InterpreterSource::Resolved(_)) => {
+                return Err(Error::UnsupportedElf(format!(
+                    "the interpreter {path:?} was not resolved for this exec"
+                )));
+            }
+        };
     let image_identity = executable_file.as_ref().and_then(|file| {
         crate::executor::mapping_list::MappedObject::file(file, &segment_shapes(&elf))
     });
     let interpreter = interpreter_image
-        .as_deref()
         .map(|interpreter_image| -> Result<_> {
             let interpreter = parse_elf(interpreter_image)?;
             validate_elf(&interpreter, false)?;
@@ -2299,7 +2409,7 @@ fn load_executable(
             let physical_bias = physical_start.checked_sub(*first).ok_or_else(bias_error)?;
             load_segments(
                 memory,
-                interpreter_image.as_deref().unwrap_or_default(),
+                interpreter_image.unwrap_or_default(),
                 interpreter,
                 physical_bias,
                 interpreter_identity.as_ref(),

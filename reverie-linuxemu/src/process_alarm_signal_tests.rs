@@ -391,6 +391,7 @@ fn process_alarm_signal_receiver_lifetime_and_process_actions_refuse_before_muta
                 executor.process_action = Some(ProcessAction::Exec {
                     executable_path: root.0.join("pending-exec"),
                     executable_file: None,
+                    interpreter: None,
                     execfn: None,
                     image: Vec::new(),
                     argv: Vec::new(),

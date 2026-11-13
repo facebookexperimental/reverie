@@ -112,6 +112,7 @@ fn an_exec_the_host_cannot_finish_past_its_point_of_no_return_is_the_host_resour
         &mut executor,
         (Path::new(&argv[0]), None),
         None,
+        None,
         &image,
         &argv,
         &[],
@@ -154,6 +155,7 @@ fn an_exec_the_host_cannot_finish_past_its_point_of_no_return_is_the_host_resour
         .exec_process(
             &mut executor,
             (Path::new(&argv[0]), None),
+            None,
             None,
             &image,
             &argv,
@@ -220,6 +222,7 @@ fn an_exec_reload_of_an_image_with_vast_section_metadata_reads_only_its_program_
     let result = backend.exec_process(
         &mut executor,
         (Path::new(&argv[0]), None),
+        None,
         None,
         &image,
         &argv,

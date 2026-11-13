@@ -164,8 +164,31 @@ pub(super) fn read_executable_file(
     path: &std::path::Path,
     refusal: &mut Option<reverie::UnsupportedRefusal>,
 ) -> Result<ResolvedExecutable, i64> {
-    use std::io::Read;
     const OPENING: &str = "opening the new program";
+    let pinned = open_exec_path(state, path, OPENING, refusal)?;
+    let (image, file) = read_opened_exec_file(
+        &pinned,
+        None,
+        OPENING,
+        "the new program's image",
+        "reading the new program's image",
+        refusal,
+    )?;
+    Ok(ResolvedExecutable {
+        path: path.to_owned(),
+        file: Some(Arc::new(file)),
+        image,
+    })
+}
+
+/// Opens `path` for an exec in the guest's view, as [`read_executable_file`]
+/// describes, and returns the O_PATH handle that pins the file found.
+fn open_exec_path(
+    state: &LoadedStaticElf,
+    path: &std::path::Path,
+    opening: &str,
+    refusal: &mut Option<reverie::UnsupportedRefusal>,
+) -> Result<std::fs::File, i64> {
     // This executor opens an exec path without following magic links, so an
     // exact fd-link spelling of a descriptor the guest holds is refused with
     // the errno Linux gives a magic link it will not follow, ELOOP
@@ -179,30 +202,108 @@ pub(super) fn read_executable_file(
     {
         return Err(negative_errno(libc::ELOOP));
     }
-    let pinned = open_metadata_path(state, libc::AT_FDCWD, path.as_os_str().as_bytes(), false)
-        .map_err(|errno| exec_step_errno(errno, OPENING, refusal))?;
+    open_metadata_path(state, libc::AT_FDCWD, path.as_os_str().as_bytes(), false)
+        .map_err(|errno| exec_step_errno(errno, opening, refusal))
+}
+
+/// Reads the file `pinned` holds, through a descriptor of its own that is
+/// returned with the image. With a `cap`, a file larger than `cap` bytes is
+/// refused with ENOEXEC before any of it is read, and again if it grew past
+/// `cap` while it was read.
+fn read_opened_exec_file(
+    pinned: &std::fs::File,
+    cap: Option<u64>,
+    opening: &str,
+    what: &str,
+    reading: &str,
+    refusal: &mut Option<reverie::UnsupportedRefusal>,
+) -> Result<(Vec<u8>, std::fs::File), i64> {
+    use std::io::Read;
     let mut file = std::fs::File::open(format!("/proc/self/fd/{}", pinned.as_raw_fd()))
-        .map_err(|error| exec_step_io_error(error, OPENING, refusal))?;
+        .map_err(|error| exec_step_io_error(error, opening, refusal))?;
+    let length = file.metadata().ok().map(|metadata| metadata.len());
+    if let (Some(cap), Some(length)) = (cap, length)
+        && length > cap
+    {
+        return Err(negative_errno(libc::ENOEXEC));
+    }
     let mut image = Vec::new();
     // Reserved whole and up front, so that a buffer this process cannot
     // allocate is refused naming the request. read_to_end's own growth, for a
     // file that grew since, is fallible too: it reports OutOfMemory.
-    if let Some(length) = file
-        .metadata()
-        .ok()
-        .and_then(|metadata| usize::try_from(metadata.len()).ok())
+    if let Some(length) = length.and_then(|length| usize::try_from(length).ok())
         && image.try_reserve_exact(length).is_err()
     {
-        *refusal = Some(exec_allocation_refusal(length, "the new program's image"));
+        *refusal = Some(exec_allocation_refusal(length, what));
         return Err(negative_errno(libc::ENOMEM));
     }
-    file.read_to_end(&mut image)
-        .map_err(|error| exec_step_io_error(error, "reading the new program's image", refusal))?;
-    Ok(ResolvedExecutable {
-        path: path.to_owned(),
-        file: Some(Arc::new(file)),
+    match cap {
+        Some(cap) => {
+            (&mut file)
+                .take(cap.saturating_add(1))
+                .read_to_end(&mut image)
+                .map_err(|error| exec_step_io_error(error, reading, refusal))?;
+            if image.len() as u64 > cap {
+                return Err(negative_errno(libc::ENOEXEC));
+            }
+        }
+        None => {
+            file.read_to_end(&mut image)
+                .map_err(|error| exec_step_io_error(error, reading, refusal))?;
+        }
+    }
+    Ok((image, file))
+}
+
+/// Resolves and reads the program interpreter at `path`, an exec's new image
+/// names it (`PT_INTERP`), in the guest's view as [`read_executable_file`]
+/// opens a program, so that a load maps the interpreter the guest names and
+/// never opens the path itself. Linux opens an interpreter as it opens a
+/// program (fs/binfmt_elf.c `load_elf_binary` calls `open_exec`): a
+/// non-regular file, or one the caller may not execute, is EACCES
+/// (fs/exec.c `do_open_execat`). A file of more than
+/// [`crate::elf::MAX_INTERPRETER_BYTES`] is this loader's own limit, refused
+/// with ENOEXEC as an unloadable interpreter. Known differences from Linux:
+/// an interpreter the caller may execute but not read is EACCES (it is read
+/// through a descriptor opened for reading); a spelling through a descriptor
+/// link, `/proc/self/exe`, `/proc/self/root` or `/proc/self/cwd` is refused
+/// (ELOOP or ENOENT).
+pub(super) fn read_exec_interpreter(
+    state: &LoadedStaticElf,
+    path: &str,
+    refusal: &mut Option<reverie::UnsupportedRefusal>,
+) -> Result<crate::elf::ExecInterpreter, i64> {
+    const OPENING: &str = "opening the program interpreter";
+    let pinned = open_exec_path(state, std::path::Path::new(path), OPENING, refusal)?;
+    if file_mode(&pinned)? & libc::S_IFMT != libc::S_IFREG {
+        return Err(negative_errno(libc::EACCES));
+    }
+    // SAFETY: the empty path is NUL-terminated and pinned's descriptor is live.
+    let access = unsafe {
+        libc::syscall(
+            libc::SYS_faccessat2,
+            pinned.as_raw_fd(),
+            c"".as_ptr(),
+            libc::X_OK,
+            libc::AT_EMPTY_PATH | libc::AT_EACCESS,
+        )
+    };
+    if access != 0 {
+        return Err(io_error(std::io::Error::last_os_error()));
+    }
+    let (image, file) = read_opened_exec_file(
+        &pinned,
+        Some(crate::elf::MAX_INTERPRETER_BYTES),
+        OPENING,
+        "the program interpreter's image",
+        "reading the program interpreter's image",
+        refusal,
+    )?;
+    Ok(crate::elf::ExecInterpreter::new(
+        path.to_owned(),
         image,
-    })
+        Arc::new(file),
+    ))
 }
 
 /// Resolves and reads the image an exec of the guest's `path` runs, as

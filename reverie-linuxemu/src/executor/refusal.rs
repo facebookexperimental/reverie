@@ -183,6 +183,26 @@ pub(super) fn exec_step_io_error(
     }
 }
 
+/// The answer to an exec whose new image the loader refused in `step` with
+/// `error`. A host resource this process ran out of while loading (memory
+/// for the image's copy or its PT_INTERP image) says nothing about the
+/// image, so `refusal` records the typed refusal and the answer is ENOMEM.
+/// Every other loader failure is an image that is malformed or that this
+/// loader cannot place: ENOEXEC.
+pub(super) fn exec_image_load_error(
+    step: &str,
+    error: &crate::Error,
+    refusal: &mut Option<reverie::UnsupportedRefusal>,
+) -> i64 {
+    match error.host_resource_exhaustion() {
+        Some(exhaustion) => {
+            *refusal = Some(exec_host_resource_refusal(step, error, &exhaustion));
+            negative_errno(libc::ENOMEM)
+        }
+        None => negative_errno(libc::ENOEXEC),
+    }
+}
+
 /// [`exec_step_io_error`] for a host call whose failure is already the
 /// negative errno `errno`.
 pub(super) fn exec_step_errno(

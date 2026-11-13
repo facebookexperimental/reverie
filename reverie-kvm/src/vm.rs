@@ -77,6 +77,7 @@ use crate::bootstrap::syscall_hypercall_address;
 use crate::bootstrap::thread_tool_stack_top;
 use crate::bootstrap::try_set_syscall_return_park;
 use crate::clock::StepMode;
+use crate::elf::ExecInterpreter;
 use crate::elf::LoadedStaticElf;
 use crate::elf::TaskLifecycleTable;
 use crate::elf::load_static_elf;
@@ -2788,9 +2789,10 @@ impl KvmBackend {
 
     /// Loads a static ELF executable and prepares the vCPU to enter it in long mode.
     ///
-    /// The initial process personality supports x86-64 `ET_EXEC` images without a
-    /// `PT_INTERP` segment. Dynamic executables require a userspace dynamic linker
-    /// and are deliberately rejected.
+    /// The initial process personality loads x86-64 `ET_EXEC` and `ET_DYN`
+    /// images. The program interpreter an initial image names (`PT_INTERP`)
+    /// is read by that path, as the caller who names the image runs it; a
+    /// guest's own exec resolves its interpreter through the guest's view.
     /// After executing an initial ELF, create a fresh backend for another initial
     /// image. Guest exec is a separate supported continuation of its clock.
     pub fn install_static_elf(&mut self, image: &[u8], argv0: &str) -> Result<()> {
@@ -3242,6 +3244,7 @@ impl KvmBackend {
         &mut self,
         executor: &mut ElfExecutor,
         executable: (&Path, Option<Arc<File>>),
+        interpreter: Option<&ExecInterpreter>,
         execfn: Option<&[u8]>,
         image: &[u8],
         argv: &[String],
@@ -3256,14 +3259,13 @@ impl KvmBackend {
         // this reset onward, any exceptional loader or KVM failure is fatal to
         // the backend and is never reported back to the old guest image. This
         // is the same point-of-no-return behavior as the prior zero_raw reset.
-        // The reload loads the image the preflight read, but it opens the
-        // program interpreter and the working directory again by path. If
-        // either changed since the preflight, the reload can fail where the
-        // preflight did not, or load an interpreter the preflight did not
-        // check. A host resource of this process's own that ran out (memory,
+        // The reload loads the image and the program interpreter the
+        // preflight read, but it opens the working directory again by path.
+        // If that changed since the preflight, the reload can fail where the
+        // preflight did not. A host resource of this process's own that ran out (memory,
         // a descriptor, the host's file table) ends the run with the named
         // refusal; any other failure ends it as a backend fault.
-        self.replace_process_image(executor, executable, execfn, image, argv, envp)
+        self.replace_process_image(executor, executable, interpreter, execfn, image, argv, envp)
             .map_err(exec_after_point_of_no_return_error)?;
         // The new image's mm is used only by this process's threads (Linux's
         // exec_mmap gives the process a new mm, and the other threads have
@@ -3281,6 +3283,7 @@ impl KvmBackend {
         &mut self,
         executor: &mut ElfExecutor,
         executable: (&Path, Option<Arc<File>>),
+        interpreter: Option<&ExecInterpreter>,
         execfn: Option<&[u8]>,
         image: &[u8],
         argv: &[String],
@@ -3310,6 +3313,7 @@ impl KvmBackend {
             &mut self.memory,
             image,
             executable_file.clone(),
+            interpreter,
             execfn,
             &argv,
             &envp,
@@ -4279,6 +4283,7 @@ impl KvmBackend {
             ProcessAction::Exec {
                 executable_path,
                 executable_file,
+                interpreter,
                 execfn,
                 image,
                 argv,
@@ -4308,6 +4313,7 @@ impl KvmBackend {
                 let result = self.exec_process(
                     executor,
                     (&executable_path, executable_file),
+                    interpreter.as_ref(),
                     execfn.as_deref(),
                     &image,
                     &argv,
@@ -9265,6 +9271,7 @@ mod tests {
         let exec = ProcessAction::Exec {
             executable_path: std::path::PathBuf::new(),
             executable_file: None,
+            interpreter: None,
             execfn: None,
             image: Vec::new(),
             argv: Vec::new(),
@@ -9363,6 +9370,7 @@ mod tests {
         ProcessAction::Exec {
             executable_path: std::path::PathBuf::new(),
             executable_file: None,
+            interpreter: None,
             execfn: None,
             image: Vec::new(),
             argv: Vec::new(),
@@ -12434,6 +12442,7 @@ mod tests {
                         &mut executor,
                         (Path::new("/page-zero-exec"), None),
                         None,
+                        None,
                         &minimal_test_elf(&[HLT]),
                         &["/page-zero-exec".to_owned()],
                         &[],
@@ -13185,6 +13194,7 @@ mod tests {
             ProcessAction::Exec {
                 executable_path: Path::new("/worker-exec-guard").to_owned(),
                 executable_file: None,
+                interpreter: None,
                 execfn: None,
                 image,
                 argv: vec!["/worker-exec-guard".to_owned()],
@@ -13272,8 +13282,33 @@ mod tests {
         );
     }
 
-    #[test]
-    fn post_preflight_interpreter_failure_is_fatal_after_image_reset() {
+    /// The paths [`post_preflight_exec`] wrote, removed when it is dropped.
+    struct PostPreflightCleanup(Vec<std::path::PathBuf>);
+
+    impl Drop for PostPreflightCleanup {
+        fn drop(&mut self) {
+            for path in &self.0 {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+
+    /// An exec that passed the executor's preflight and is not yet run: a
+    /// copy of `/usr/bin/true` whose `PT_INTERP` names a copy of its
+    /// interpreter.
+    struct PostPreflightExec {
+        backend: KvmBackend,
+        executor: ElfExecutor,
+        action: ProcessAction,
+        interpreter_copy: std::path::PathBuf,
+        stack_bottom: u64,
+        _cleanup: PostPreflightCleanup,
+    }
+
+    /// Runs `/usr/bin/true`'s preflight exec as [`PostPreflightExec`]
+    /// describes, with `tag` in the copies' names. `None` without a usable
+    /// `/dev/kvm`, unless `REVERIE_REQUIRE_KVM` is set.
+    fn post_preflight_exec(tag: &str) -> Option<PostPreflightExec> {
         use std::io::Write;
         use std::os::unix::ffi::OsStrExt;
         use std::os::unix::ffi::OsStringExt;
@@ -13287,7 +13322,7 @@ mod tests {
                 if std::env::var_os("REVERIE_REQUIRE_KVM").is_some() {
                     panic!("post-preflight exec test requires usable /dev/kvm: {error}");
                 }
-                return;
+                return None;
             }
             Err(error) => panic!("failed to create KVM backend: {error}"),
         };
@@ -13308,21 +13343,13 @@ mod tests {
         drop(elf);
 
         let suffix = std::process::id();
-        let mut interpreter_path = format!("/tmp/kvmld-{suffix}").into_bytes();
+        let mut interpreter_path = format!("/tmp/kvmld-{suffix}-{tag}").into_bytes();
         assert!(interpreter_path.len() < interpreter_capacity);
         interpreter_path.resize(interpreter_capacity - 1, b'x');
         let interpreter_copy =
             std::path::PathBuf::from(std::ffi::OsString::from_vec(interpreter_path));
-        let executable = std::env::temp_dir().join(format!("kvmexec-{suffix}"));
-        struct Cleanup(Vec<std::path::PathBuf>);
-        impl Drop for Cleanup {
-            fn drop(&mut self) {
-                for path in &self.0 {
-                    let _ = std::fs::remove_file(path);
-                }
-            }
-        }
-        let mut cleanup = Cleanup(Vec::new());
+        let executable = std::env::temp_dir().join(format!("kvmexec-{suffix}-{tag}"));
+        let mut cleanup = PostPreflightCleanup(Vec::new());
         let mut interpreter_file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -13331,6 +13358,11 @@ mod tests {
         cleanup.0.push(interpreter_copy.clone());
         interpreter_file
             .write_all(&std::fs::read(interpreter).unwrap())
+            .unwrap();
+        // Linux execs an interpreter only if the caller may execute it
+        // (fs/exec.c `do_open_execat`), as the preflight checks.
+        interpreter_file
+            .set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o755))
             .unwrap();
         drop(interpreter_file);
         let interpreter_path = interpreter_copy.as_os_str().as_bytes();
@@ -13380,12 +13412,96 @@ mod tests {
         let action = executor
             .take_process_action()
             .expect("successful preflight must schedule exec");
+        Some(PostPreflightExec {
+            backend,
+            executor,
+            action,
+            interpreter_copy,
+            stack_bottom,
+            _cleanup: cleanup,
+        })
+    }
 
-        // Removing the interpreter after the executor's successful preflight
-        // forces a rare failure beyond exec's point of no return. The backend
-        // must fail instead of resuming the now-reset old image, matching Linux
-        // semantics when exec fails after tearing down the old address space.
+    /// The preflight resolved and read the new image's interpreter, and the
+    /// exec loads that file: one removed after the preflight still runs, and
+    /// the new image's mappings hold that file open, though its path is gone.
+    #[test]
+    fn interpreter_removed_after_preflight_still_loads_the_staged_file() {
+        use std::os::unix::fs::MetadataExt;
+
+        let Some(PostPreflightExec {
+            mut backend,
+            mut executor,
+            action,
+            interpreter_copy,
+            _cleanup,
+            ..
+        }) = post_preflight_exec("staged")
+        else {
+            return;
+        };
+        let metadata = std::fs::metadata(&interpreter_copy).unwrap();
+        let identity = (metadata.dev(), metadata.ino());
         std::fs::remove_file(&interpreter_copy).unwrap();
+        backend
+            .run_process_action(&mut executor, action, false)
+            .expect("the exec loads the interpreter the preflight read");
+        // The action, and the staged interpreter it carried, are gone; what
+        // holds the removed file open now is the new image's mappings of it.
+        let held = std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(|entry| std::fs::metadata(entry.ok()?.path()).ok())
+            .any(|metadata| {
+                (metadata.dev(), metadata.ino()) == identity && metadata.nlink() == 0
+            });
+        assert!(
+            held,
+            "nothing holds the removed staged interpreter {identity:?} after the exec"
+        );
+    }
+
+    #[test]
+    fn post_preflight_interpreter_failure_is_fatal_after_image_reset() {
+        let Some(PostPreflightExec {
+            mut backend,
+            mut executor,
+            action,
+            interpreter_copy,
+            stack_bottom,
+            _cleanup,
+        }) = post_preflight_exec("fatal")
+        else {
+            return;
+        };
+
+        // An exec whose staged interpreter is withdrawn after the executor's
+        // successful preflight forces a rare failure beyond exec's point of
+        // no return: the reload opens no interpreter path itself, so it has
+        // none to load. The backend must fail instead of resuming the
+        // now-reset old image, matching Linux semantics when exec fails after
+        // tearing down the old address space.
+        let ProcessAction::Exec {
+            executable_path,
+            executable_file,
+            interpreter,
+            execfn,
+            image,
+            argv,
+            envp,
+        } = action
+        else {
+            panic!("the preflight scheduled an exec");
+        };
+        assert!(interpreter.is_some(), "the preflight staged the interpreter");
+        let action = ProcessAction::Exec {
+            executable_path,
+            executable_file,
+            interpreter: None,
+            execfn,
+            image,
+            argv,
+            envp,
+        };
         let sentinel_address = stack_bottom + PAGE_SIZE;
         const SENTINEL: [u8; 16] = *b"old-image-state!";
         backend.memory.write(sentinel_address, &SENTINEL).unwrap();
@@ -13397,10 +13513,14 @@ mod tests {
         let error = backend
             .run_process_action(&mut executor, action, false)
             .unwrap_err();
+        let expected = format!(
+            "the interpreter {:?} was not resolved for this exec",
+            interpreter_copy.to_str().unwrap()
+        );
         assert!(
             matches!(
                 &error,
-                Error::UnsupportedElf(message) if message.contains("interpreter")
+                Error::UnsupportedElf(message) if *message == expected
             ),
             "unexpected exec error: {error:?}"
         );
