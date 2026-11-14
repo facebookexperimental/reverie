@@ -106,7 +106,7 @@ impl StackToken {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_arch = "x86_64"))]
     pub(super) fn arena(&self) -> Arc<StackArena> {
         self.arena.clone()
     }

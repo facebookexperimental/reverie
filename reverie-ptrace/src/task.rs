@@ -4608,7 +4608,7 @@ thread_local! {
 
 /// Test-only: the private-page injections of `nr` made by `syscall_stops`
 /// transport on this thread (`PRIVATE_TRANSPORTS_FOR_TEST`).
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64"))]
 pub(crate) fn private_transports_for_test(nr: Sysno, syscall_stops: bool) -> u64 {
     PRIVATE_TRANSPORTS_FOR_TEST.with(|counts| {
         counts

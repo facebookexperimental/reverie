@@ -5547,15 +5547,18 @@ mod tests {
         /// Queued by an untraced `rt_tgsigqueueinfo` that the first step
         /// runs (x86_64 only: the steps start at a stop just before the
         /// `syscall`).
+        #[cfg(target_arch = "x86_64")]
         Stepped,
         /// As `Stepped`, with bits above 31 set in the signal register,
         /// which Linux ignores (`queues_the_thread_a_sigtrap`).
+        #[cfg(target_arch = "x86_64")]
         SteppedPadded,
     }
 
     /// `FPE_INTDIV` (include/uapi/asm-generic/siginfo.h), a positive code.
     const FPE_INTDIV: i32 = 1;
     /// `SI_QUEUE` (include/uapi/asm-generic/siginfo.h), `sigqueue`'s code.
+    #[cfg(target_arch = "x86_64")]
     const SI_QUEUE: i32 = -1;
 
     /// Runs a precise timer's steps on a traced child that queues itself a
@@ -5663,8 +5666,6 @@ mod tests {
                         lateout("rcx") _,
                         lateout("r11") _,
                     ),
-                    #[cfg(not(target_arch = "x86_64"))]
-                    QueuedTrap::Stepped | QueuedTrap::SteppedPadded => libc::_exit(2),
                 }
                 let mut count = 0u64;
                 loop {
@@ -5724,6 +5725,7 @@ mod tests {
                 assert_eq!(event, TraceEvent::Syscall);
                 task
             }
+            #[cfg(target_arch = "x86_64")]
             QueuedTrap::Stepped | QueuedTrap::SteppedPadded => {
                 let (mut task, mut event) = task
                     .resume(None)
