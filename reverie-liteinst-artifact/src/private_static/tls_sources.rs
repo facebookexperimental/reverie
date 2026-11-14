@@ -685,6 +685,63 @@ const SHARED_INPUTS_057_LINTS: &[SourceRow] = &[
     ),
 ];
 
+// The 0.5.8 manifests on master: rows 0 and 6 (the two Cargo
+// manifests) differ from SHARED_INPUTS_057_LINTS; every other row
+// is that cohort's. Regenerated from this checkout's observed
+// rows after the publish=false removal landed.
+const SHARED_INPUTS_058: &[SourceRow] = &[
+    (
+        "reverie-inguest/Cargo.toml",
+        6494,
+        "ca20b0547879c0d9cd83916f89783efcd2890983e0eabdd8e0932a9b4f13b232",
+    ),
+    (
+        "reverie-inguest/src/lib.rs",
+        13478,
+        "9b619884552f14046a056f68693c49fc46d065b2a084ad49ca07819a10ec27b1",
+    ),
+    (
+        "reverie-inguest/src/private_runtime/mod.rs",
+        2093,
+        "f6764939d2016bd3c9414b17b35f21f8cf7217f128135b83cfb5459aa3ae5e1e",
+    ),
+    (
+        "reverie-inguest/src/private_runtime/tls/mod.rs",
+        5001,
+        "ba3a02d320c26c283acde7dfc0e0273ff7b04e68b4b5daa7a4f72619758f9f98",
+    ),
+    (
+        "reverie-inguest/src/private_runtime/tls/abi.rs",
+        23707,
+        "216dd2050bec7f6611bfa51b9de9e308bf1e23d2831b46b2da9a8901a226dbaf",
+    ),
+    (
+        "reverie-inguest/src/private_runtime/tls/layout.rs",
+        743,
+        "8ee91d78869426196e2f4542dcffb2cf8be3b1372647bd407d9a28ca5b7d20c0",
+    ),
+    (
+        "reverie-loader/Cargo.toml",
+        327,
+        "580f9f63552a3f63a480c159a8284c9baa5ec71adce97de1da06cae25d0531d3",
+    ),
+    (
+        "reverie-loader/src/lib.rs",
+        2486,
+        "02aa2dae7b6eec327a0dcf68b92a66f512162d2fdd3a7f9ac89a3e8a51b1f5bf",
+    ),
+    (
+        "reverie-loader/src/musl_tls.rs",
+        17178,
+        "18ca3aec385c4dd8ec79ee5f45e8a30863e28e8a49422cf6c1ae90eb2743696d",
+    ),
+    (
+        "reverie-loader/src/mapped_inputs.rs",
+        17803,
+        "81cd7474215ff617fb1bc16b236461d4deb33697c7d559130f4bdb98b0f0e2c2",
+    ),
+];
+
 fn classify(observed: &[(String, u64, String)]) -> Result<Variant> {
     let same = |expected: &[SourceRow]| {
         observed.len() == expected.len()
@@ -705,23 +762,203 @@ fn classify(observed: &[(String, u64, String)]) -> Result<Variant> {
         same(SHARED_INPUTS_057),
         same(SHARED_INPUTS_057_EXPORTS),
         same(SHARED_INPUTS_057_LINTS),
+        same(SHARED_INPUTS_058),
     ) {
-        (true, false, false, false, false, false, false, false, false, false, false, false) => {
-            Ok(Variant::LegacyInguest)
-        }
-        (false, true, false, false, false, false, false, false, false, false, false, false)
-        | (false, false, true, false, false, false, false, false, false, false, false, false)
-        | (false, false, false, true, false, false, false, false, false, false, false, false)
-        | (false, false, false, false, true, false, false, false, false, false, false, false)
-        | (false, false, false, false, false, true, false, false, false, false, false, false)
-        | (false, false, false, false, false, false, true, false, false, false, false, false)
-        | (false, false, false, false, false, false, false, true, false, false, false, false)
-        | (false, false, false, false, false, false, false, false, true, false, false, false)
-        | (false, false, false, false, false, false, false, false, false, true, false, false)
-        | (false, false, false, false, false, false, false, false, false, false, true, false)
-        | (false, false, false, false, false, false, false, false, false, false, false, true) => {
-            Ok(Variant::SharedLoader)
-        }
+        (
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        ) => Ok(Variant::LegacyInguest),
+        (
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        | (
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        | (
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        | (
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        | (
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        | (
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        | (
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        | (
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+        )
+        | (
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+        )
+        | (
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+        )
+        | (
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+        )
+        | (
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+        ) => Ok(Variant::SharedLoader),
         _ => Err("runtime TLS sources are not one complete reviewed tuple".into()),
     }
 }
@@ -1045,6 +1282,26 @@ mod tests {
         }
         refuse_mixed_versions(SHARED_INPUTS_057_LINTS, SHARED_INPUTS_057, &[0, 4]);
     }
+    // The 0.5.8 manifests on master: only rows 0 and 6 (the two Cargo
+    // manifests) differ from SHARED_INPUTS_057_LINTS.
+    #[test]
+    fn tls_source_declarations_select_complete_058() {
+        refuse_each_missing_changed_extra_or_duplicate_row(SHARED_INPUTS_058);
+        assert_eq!(SHARED_INPUTS_058.len(), SHARED_INPUTS_057_LINTS.len());
+        for (index, (new, lints)) in SHARED_INPUTS_058
+            .iter()
+            .zip(SHARED_INPUTS_057_LINTS)
+            .enumerate()
+        {
+            assert_eq!(new.0, lints.0, "row {index} path");
+            assert_eq!(
+                new != lints,
+                index == 0 || index == 6,
+                "row {index} change set"
+            );
+        }
+        refuse_mixed_versions(SHARED_INPUTS_058, SHARED_INPUTS_057, &[0, 4, 6]);
+    }
     #[test]
     fn tls_source_declarations_are_pairwise_distinct() {
         let lists = [
@@ -1060,6 +1317,7 @@ mod tests {
             SHARED_INPUTS_057,
             SHARED_INPUTS_057_EXPORTS,
             SHARED_INPUTS_057_LINTS,
+            SHARED_INPUTS_058,
         ];
         for (index, first) in lists.iter().enumerate() {
             for second in &lists[index + 1..] {
