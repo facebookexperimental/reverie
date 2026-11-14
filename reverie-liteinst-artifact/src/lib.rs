@@ -69038,16 +69038,72 @@ pub mod private_static {
         }
     }
 
+    /// The git repository a CargoGitRev consumer's Reverie packages
+    /// resolve from, spelled exactly as the consumer's manifests and lock
+    /// spell it: Cargo keeps that spelling in every source string, so
+    /// another spelling of the same repository refuses.
+    ///
+    /// [`CargoGitRepository::DEFAULT`] is literoot's spelling of
+    /// rrnewton/reverie, the repository the closed descriptors were
+    /// qualified against. A consumer that pins another repository passes
+    /// it explicitly to [`VerifiedStaticSource::with_resolved_from`]; only
+    /// a CargoGitRev consumer may (a Hermit Git link binds Reverie by
+    /// its gitlink, not by a URL).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct CargoGitRepository<'a>(&'a str);
+
+    impl CargoGitRepository<'static> {
+        /// `https://github.com/rrnewton/reverie`, with no `.git`.
+        pub const DEFAULT: Self = CargoGitRepository("https://github.com/rrnewton/reverie");
+    }
+
+    impl<'a> CargoGitRepository<'a> {
+        /// An explicit repository URL. It must be an `https://` URL with
+        /// no query, fragment, whitespace or control character, since it
+        /// is spliced into Cargo's `git+<url>?rev=<rev>#<rev>` form.
+        pub fn new(url: &'a str) -> Result<Self> {
+            require(
+                url.strip_prefix("https://")
+                    .is_some_and(|rest| !rest.is_empty())
+                    && !url
+                        .chars()
+                        .any(|c| c == '?' || c == '#' || c.is_whitespace() || c.is_control()),
+                "a CargoGitRev Reverie repository must be an https:// URL with no query or fragment",
+            )?;
+            Ok(CargoGitRepository(url))
+        }
+
+        /// The URL as given.
+        pub fn url(&self) -> &'a str {
+            self.0
+        }
+    }
+
+    /// Whether `repository` may be used with a consumer bound by
+    /// `binding`: any repository for CargoGitRev, only the default for a
+    /// Hermit Git link, whose Reverie is its gitlink (an override there
+    /// would be silently ignored, so it refuses).
+    fn repository_admitted(
+        binding: selected_initializers::WorkspaceBinding,
+        repository: CargoGitRepository<'_>,
+    ) -> Result<()> {
+        require(
+            binding == selected_initializers::WorkspaceBinding::CargoGitRev
+                || repository == CargoGitRepository::DEFAULT,
+            "a Reverie repository override applies only to a CargoGitRev consumer",
+        )
+    }
+
     /// The git source string CargoGitRev expects for the pinned
-    /// Reverie rev. Cargo keeps the URL spelling the manifest uses:
-    /// literoot's manifests and locks say
-    /// `git+https://github.com/rrnewton/reverie?rev=...` while Hermit's
-    /// Cargo.lock says `...reverie.git?rev=...`. This is literoot's
-    /// spelling; any other spelling refuses. Both CargoGitRev checks
-    /// (root lock and metadata source equality) build their expected
-    /// string here so they cannot drift.
-    fn cargo_git_source(pin: &str) -> String {
-        format!("git+https://github.com/rrnewton/reverie?rev={pin}#{pin}")
+    /// Reverie rev in `repository`. Cargo keeps the URL spelling the
+    /// manifest uses: literoot's manifests and locks say
+    /// `git+https://github.com/rrnewton/reverie?rev=...` (the default)
+    /// while Hermit's Cargo.lock says `...reverie.git?rev=...`; any
+    /// spelling other than `repository`'s refuses. Both CargoGitRev
+    /// checks (root lock and metadata source equality) build their
+    /// expected string here so they cannot drift.
+    fn cargo_git_source(repository: CargoGitRepository<'_>, pin: &str) -> String {
+        format!("git+{}?rev={pin}#{pin}", repository.url())
     }
 
     /// The package id cargo (1.97.1, measured) reports for the path
@@ -69131,9 +69187,20 @@ pub mod private_static {
     /// - every package with a closed workspace name to be at the pinned
     ///   source, even when only the leaf declares it, including through a
     ///   renamed dependency. Unrelated registry packages remain permitted.
+    #[cfg(test)]
     fn bound_reverie_manifests<'m>(
         metadata: &'m Value,
         binding: selected_initializers::WorkspaceBinding,
+        pin: &str,
+        leaf_id: &str,
+    ) -> Result<Vec<(&'static str, &'m str)>> {
+        bound_reverie_manifests_from(metadata, binding, CargoGitRepository::DEFAULT, pin, leaf_id)
+    }
+
+    fn bound_reverie_manifests_from<'m>(
+        metadata: &'m Value,
+        binding: selected_initializers::WorkspaceBinding,
+        repository: CargoGitRepository<'_>,
         pin: &str,
         leaf_id: &str,
     ) -> Result<Vec<(&'static str, &'m str)>> {
@@ -69141,7 +69208,9 @@ pub mod private_static {
             .as_array()
             .ok_or("static metadata lacks packages")?;
         let source = match binding {
-            selected_initializers::WorkspaceBinding::CargoGitRev => cargo_git_source(pin),
+            selected_initializers::WorkspaceBinding::CargoGitRev => {
+                cargo_git_source(repository, pin)
+            }
             selected_initializers::WorkspaceBinding::HermitGitlink { .. } => {
                 format!("git+https://github.com/rrnewton/reverie.git?rev={pin}#{pin}")
             }
@@ -69243,8 +69312,20 @@ pub mod private_static {
     /// least once. This is an early refusal only (one matching line
     /// satisfies it); `bound_reverie_manifests` is what binds the
     /// compiled Reverie crates.
+    #[cfg(test)]
     fn cargo_git_rev_lock_accepts(lock_text: &str, pin: &str) -> bool {
-        lock_text.contains(&format!("source = \"{}\"", cargo_git_source(pin)))
+        cargo_git_rev_lock_accepts_from(lock_text, CargoGitRepository::DEFAULT, pin)
+    }
+
+    fn cargo_git_rev_lock_accepts_from(
+        lock_text: &str,
+        repository: CargoGitRepository<'_>,
+        pin: &str,
+    ) -> bool {
+        lock_text.contains(&format!(
+            "source = \"{}\"",
+            cargo_git_source(repository, pin)
+        ))
     }
 
     impl VerifiedStaticSource {
@@ -69285,13 +69366,37 @@ pub mod private_static {
         /// Consumer-selected form. The workspace binding kind
         /// in the closed descriptor decides how the Reverie
         /// source is bound; every other identity check reads
-        /// the same descriptor, never per-site literals.
+        /// the same descriptor, never per-site literals. A
+        /// CargoGitRev consumer's Reverie must resolve from
+        /// [`CargoGitRepository::DEFAULT`]; see
+        /// [`Self::with_resolved_from`] for another repository.
         pub fn with_resolved_for<T>(
             selected: selected_initializers::MappedConsumer,
             expected: &SourceExpectation<'_>,
             runner: &mut Runner,
             body: impl FnOnce(&Self, &mut Runner) -> Result<T>,
         ) -> Result<T> {
+            Self::with_resolved_from(
+                selected,
+                CargoGitRepository::DEFAULT,
+                expected,
+                runner,
+                body,
+            )
+        }
+
+        /// [`Self::with_resolved_for`], with the git repository a
+        /// CargoGitRev consumer's Reverie packages must resolve from
+        /// given explicitly. A Hermit Git link consumer refuses any
+        /// repository but the default.
+        pub fn with_resolved_from<T>(
+            selected: selected_initializers::MappedConsumer,
+            repository: CargoGitRepository<'_>,
+            expected: &SourceExpectation<'_>,
+            runner: &mut Runner,
+            body: impl FnOnce(&Self, &mut Runner) -> Result<T>,
+        ) -> Result<T> {
+            repository_admitted(selected.source().binding(), repository)?;
             require(
                 source_pin_is_full(expected.workspace_head)
                     && source_pin_is_full(expected.reverie_pin),
@@ -69389,7 +69494,7 @@ pub mod private_static {
                         fs::read_to_string(expected.workspace.join(consumer.root_lock_relative()))
                             .map_err(|e| e.to_string())?;
                     require(
-                        cargo_git_rev_lock_accepts(&lock, expected.reverie_pin),
+                        cargo_git_rev_lock_accepts_from(&lock, repository, expected.reverie_pin),
                         "static CargoGitRev lock does not name the exact Reverie rev (local patch refused)",
                     )?;
                 }
@@ -69416,9 +69521,10 @@ pub mod private_static {
                     .ok_or("static metadata lacks packages")?;
                 let mut roots = Vec::new();
                 let id = leaf_package_id(expected.workspace, consumer)?;
-                for (name, manifest) in bound_reverie_manifests(
+                for (name, manifest) in bound_reverie_manifests_from(
                     &metadata,
                     consumer.binding(),
+                    repository,
                     expected.reverie_pin,
                     &id,
                 )? {
@@ -70957,6 +71063,516 @@ pub mod private_static {
             let mut no_resolve = exact.clone();
             no_resolve["resolve"] = Value::Null;
             assert!(bound_reverie_manifests(&no_resolve, cargo, pin, leaf).is_err());
+
+            // An explicit repository binds a resolve from that repository,
+            // and only from it; the default still binds only rrnewton's.
+            let moved_spelling = |rev: &str| {
+                format!("git+https://github.com/facebookexperimental/reverie?rev={rev}#{rev}")
+            };
+            let moved = metadata(&moved_spelling, &[]);
+            let repository =
+                CargoGitRepository::new("https://github.com/facebookexperimental/reverie").unwrap();
+            assert_eq!(
+                bound_reverie_manifests_from(&moved, cargo, repository, pin, leaf)
+                    .unwrap()
+                    .iter()
+                    .map(|(name, _)| *name)
+                    .collect::<Vec<_>>(),
+                ["reverie-inguest", "reverie-liteinst", "reverie-loader"]
+            );
+            assert_eq!(
+                bound_reverie_manifests(&moved, cargo, pin, leaf).unwrap_err(),
+                "static metadata R source/uniqueness mismatch"
+            );
+            assert_eq!(
+                bound_reverie_manifests_from(&exact, cargo, repository, pin, leaf).unwrap_err(),
+                "static metadata R source/uniqueness mismatch"
+            );
+            // A moved crate that still resolves from rrnewton is a second
+            // source under the explicit repository, as under the default.
+            let mixed = metadata(
+                &moved_spelling,
+                &[("reverie-syscalls", Some(canonical(pin)))],
+            );
+            assert!(bound_reverie_manifests_from(&mixed, cargo, repository, pin, leaf).is_err());
+        }
+
+        #[test]
+        fn a_cargo_git_repository_override_is_honoured_and_the_default_is_unchanged() {
+            let pin = "02973cdcfcadd21190fda864dfa9eb1b3e6ed1c1";
+            // The default is the literal spelling the descriptors were
+            // qualified against, written out rather than built from the
+            // implementation's format string.
+            assert_eq!(
+                CargoGitRepository::DEFAULT.url(),
+                "https://github.com/rrnewton/reverie"
+            );
+            assert_eq!(
+                cargo_git_source(CargoGitRepository::DEFAULT, pin),
+                "git+https://github.com/rrnewton/reverie?rev=02973cdcfcadd21190fda864dfa9eb1b3e6ed1c1#02973cdcfcadd21190fda864dfa9eb1b3e6ed1c1"
+            );
+            let moved =
+                CargoGitRepository::new("https://github.com/facebookexperimental/reverie").unwrap();
+            assert_eq!(
+                cargo_git_source(moved, pin),
+                "git+https://github.com/facebookexperimental/reverie?rev=02973cdcfcadd21190fda864dfa9eb1b3e6ed1c1#02973cdcfcadd21190fda864dfa9eb1b3e6ed1c1"
+            );
+            let rrnewton_lock = "[[package]]\nname = \"reverie-core\"\nversion = \"0.5.4\"\nsource = \"git+https://github.com/rrnewton/reverie?rev=02973cdcfcadd21190fda864dfa9eb1b3e6ed1c1#02973cdcfcadd21190fda864dfa9eb1b3e6ed1c1\"\n";
+            let moved_lock = rrnewton_lock.replace("rrnewton/", "facebookexperimental/");
+            assert!(cargo_git_rev_lock_accepts(rrnewton_lock, pin));
+            assert!(!cargo_git_rev_lock_accepts(&moved_lock, pin));
+            assert!(cargo_git_rev_lock_accepts_from(&moved_lock, moved, pin));
+            assert!(!cargo_git_rev_lock_accepts_from(rrnewton_lock, moved, pin));
+            assert!(cargo_git_rev_lock_accepts_from(
+                rrnewton_lock,
+                CargoGitRepository::DEFAULT,
+                pin
+            ));
+            // Spelling is exact: the `.git` form is another repository.
+            let dot_git =
+                CargoGitRepository::new("https://github.com/facebookexperimental/reverie.git")
+                    .unwrap();
+            assert!(!cargo_git_rev_lock_accepts_from(&moved_lock, dot_git, pin));
+            for refused in [
+                "",
+                "https://",
+                "http://github.com/facebookexperimental/reverie",
+                "git+https://github.com/facebookexperimental/reverie",
+                "https://github.com/facebookexperimental/reverie?rev=x",
+                "https://github.com/facebookexperimental/reverie#x",
+                "https://github.com/facebook experimental/reverie",
+                "https://github.com/facebookexperimental/reverie\n",
+            ] {
+                assert_eq!(
+                    CargoGitRepository::new(refused).unwrap_err(),
+                    "a CargoGitRev Reverie repository must be an https:// URL with no query or fragment",
+                    "{refused:?}"
+                );
+            }
+            let hermit = selected_initializers::WorkspaceBinding::HermitGitlink {
+                reverie_gitlink_relative: "reverie",
+            };
+            let cargo = selected_initializers::WorkspaceBinding::CargoGitRev;
+            repository_admitted(cargo, CargoGitRepository::DEFAULT).unwrap();
+            repository_admitted(cargo, moved).unwrap();
+            repository_admitted(hermit, CargoGitRepository::DEFAULT).unwrap();
+            assert_eq!(
+                repository_admitted(hermit, moved).unwrap_err(),
+                "a Reverie repository override applies only to a CargoGitRev consumer"
+            );
+        }
+
+        #[test]
+        fn with_resolved_from_admits_an_override_only_for_a_cargo_git_rev_consumer() {
+            static SERIAL: AtomicUsize = AtomicUsize::new(0);
+            let logs = std::env::temp_dir().join(format!(
+                "hermit-private-static-repository-{}-{}",
+                std::process::id(),
+                SERIAL.fetch_add(1, Ordering::Relaxed)
+            ));
+            let mut runner = Runner::new(logs.clone(), Duration::from_secs(60), 1 << 20).unwrap();
+            // Nothing here exists, and the heads are short: a call that gets
+            // past the repository check stops at the next one.
+            let absent = logs.join("absent");
+            let expected = SourceExpectation {
+                workspace: &absent,
+                workspace_head: "short",
+                reverie_pin: "short",
+                cargo: &absent,
+                rustc: &absent,
+                target_dir: &absent,
+            };
+            let moved =
+                CargoGitRepository::new("https://github.com/facebookexperimental/reverie").unwrap();
+            let outcome = |consumer, repository, runner: &mut Runner| {
+                VerifiedStaticSource::with_resolved_from(
+                    consumer,
+                    repository,
+                    &expected,
+                    runner,
+                    |_, _| Ok(()),
+                )
+                .unwrap_err()
+            };
+            assert_eq!(
+                outcome(
+                    selected_initializers::MappedConsumer::Detcore,
+                    moved,
+                    &mut runner
+                ),
+                "a Reverie repository override applies only to a CargoGitRev consumer"
+            );
+            for (consumer, repository) in [
+                (
+                    selected_initializers::MappedConsumer::Detcore,
+                    CargoGitRepository::DEFAULT,
+                ),
+                (
+                    selected_initializers::MappedConsumer::Literoot,
+                    CargoGitRepository::DEFAULT,
+                ),
+                (selected_initializers::MappedConsumer::Literoot, moved),
+            ] {
+                assert_eq!(
+                    outcome(consumer, repository, &mut runner),
+                    "static source needs full independent H/R heads",
+                    "{consumer:?} {repository:?}"
+                );
+            }
+            assert!(runner.commands.is_empty());
+            fs::remove_dir(&logs).unwrap();
+        }
+
+        /// The fixture directory a child process of
+        /// `with_resolved_from_checks_the_lock_against_the_given_repository`
+        /// works in; set only for that child.
+        const LOCK_CHECK_CHILD: &str = "REVERIE_LITEINST_ARTIFACT_LOCK_CHECK_CHILD";
+        const LOCK_CHECK_PIN: &str = "02973cdcfcadd21190fda864dfa9eb1b3e6ed1c1";
+        const LOCK_CHECK_REPOSITORY: &str = "https://github.com/facebookexperimental/reverie";
+
+        /// `with_resolved_from` must check the CargoGitRev lock, and bind
+        /// Cargo's metadata, against the repository it was given. The entry
+        /// point reads `RUSTC` from the process environment, so the
+        /// resolutions run in a child process of this test binary with
+        /// `RUSTC` naming the fixture's compiler; this process's environment
+        /// is not changed.
+        #[test]
+        fn with_resolved_from_checks_the_lock_against_the_given_repository() {
+            assert!(
+                std::env::var_os(LOCK_CHECK_CHILD).is_none(),
+                "the lock-check child must not start another child"
+            );
+            static SERIAL: AtomicUsize = AtomicUsize::new(0);
+            // Removes the fixture directory however this test ends; a
+            // removal error is reported only when not already unwinding.
+            struct OwnedScratch(PathBuf);
+            impl Drop for OwnedScratch {
+                fn drop(&mut self) {
+                    let removed = fs::remove_dir_all(&self.0);
+                    if !std::thread::panicking() {
+                        removed.unwrap();
+                    }
+                }
+            }
+            let base = std::env::temp_dir().join(format!(
+                "hermit-private-static-lock-check-{}-{}",
+                std::process::id(),
+                SERIAL.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&base).unwrap();
+            let scratch = OwnedScratch(base);
+            let base = fs::canonicalize(&scratch.0).unwrap();
+            let tools = base.join("tools");
+            fs::create_dir(&tools).unwrap();
+            // The sentinel Cargo fails at whatever it is asked to do; the
+            // metadata call is the first Cargo command the entry point runs.
+            fs::write(
+                tools.join("cargo"),
+                b"#!/bin/sh\necho \"sentinel cargo refused: $1\" >&2\nexit 97\n",
+            )
+            .unwrap();
+            fs::set_permissions(
+                tools.join("cargo"),
+                std::os::unix::fs::PermissionsExt::from_mode(0o755),
+            )
+            .unwrap();
+            // Never run before the metadata call; only its identity is read.
+            fs::write(tools.join("rustc"), b"fixture compiler identity\n").unwrap();
+            let child = "private_static::tests::with_resolved_from_lock_check_child_process";
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    child,
+                    "--ignored",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env(LOCK_CHECK_CHILD, &base)
+                .env("RUSTC", tools.join("rustc"))
+                .env_remove("RUSTC_WRAPPER")
+                .env_remove("RUSTC_WORKSPACE_WRAPPER")
+                .env_remove("CARGO_BUILD_RUSTC")
+                .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+                .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // `1 passed` also proves the child test ran: a name that matches
+            // nothing exits 0 with `0 passed`.
+            assert!(
+                output.status.success()
+                    && stdout.contains(&format!("test {child} ... ok"))
+                    && stdout.contains("test result: ok. 1 passed"),
+                "lock-check child failed ({}):\n{stdout}\n{stderr}",
+                output.status
+            );
+            drop(scratch);
+        }
+
+        /// Run only by
+        /// `with_resolved_from_checks_the_lock_against_the_given_repository`,
+        /// in a child process whose `RUSTC` names the fixture's compiler.
+        #[test]
+        #[ignore = "run in a child process by with_resolved_from_checks_the_lock_against_the_given_repository"]
+        fn with_resolved_from_lock_check_child_process() {
+            let base = PathBuf::from(std::env::var_os(LOCK_CHECK_CHILD).expect(
+                "run only by with_resolved_from_checks_the_lock_against_the_given_repository",
+            ));
+            let sentinel = base.join("tools/cargo");
+            let rustc = base.join("tools/rustc");
+            let target = base.join("target");
+            fs::create_dir(&target).unwrap();
+            let fixture = selected_initializers::MappedConsumer::TwoGenerationFixture;
+            let moved = CargoGitRepository::new(LOCK_CHECK_REPOSITORY).unwrap();
+            let new_runner = |name: &str| {
+                Runner::new(
+                    base.join(format!("logs-{name}")),
+                    Duration::from_secs(120),
+                    8 * 1024 * 1024,
+                )
+                .unwrap()
+            };
+            // A clean committed workspace holding exactly the fixture
+            // consumer's root manifest, lock and library source. The lock
+            // names the Reverie rev only in the repository at `url`.
+            let committed_workspace = |name: &str, url: &str| {
+                let workspace = base.join(name);
+                fs::create_dir_all(workspace.join("fixture/src")).unwrap();
+                fs::write(
+                    workspace.join("fixture/Cargo.toml"),
+                    b"[package]\nname = \"fixture-preload\"\nversion = \"0.0.0\"\n",
+                )
+                .unwrap();
+                fs::write(
+                    workspace.join("fixture/Cargo.lock"),
+                    format!(
+                        "version = 4\n\n[[package]]\nname = \"reverie-core\"\nversion = \"0.5.7\"\n\
+                         source = \"git+{url}?rev={LOCK_CHECK_PIN}#{LOCK_CHECK_PIN}\"\n"
+                    ),
+                )
+                .unwrap();
+                fs::write(
+                    workspace.join("fixture/src/lib.rs"),
+                    b"pub fn fixture() {}\n",
+                )
+                .unwrap();
+                let mut setup = new_runner(&format!("setup-{name}"));
+                setup.text("git", &["init", "--quiet"], &workspace).unwrap();
+                setup.text("git", &["add", "fixture"], &workspace).unwrap();
+                setup
+                    .text(
+                        "git",
+                        &[
+                            "-c",
+                            "user.name=static-source-test",
+                            "-c",
+                            "user.email=static-source-test@invalid",
+                            "-c",
+                            "commit.gpgsign=false",
+                            "commit",
+                            "--quiet",
+                            "-m",
+                            "fixture",
+                        ],
+                        &workspace,
+                    )
+                    .unwrap();
+                let head = setup
+                    .text("git", &["rev-parse", "HEAD"], &workspace)
+                    .unwrap()
+                    .trim()
+                    .to_owned();
+                (workspace, head)
+            };
+            // A diagnostic Cargo that prints a fixed metadata document: the
+            // fixture leaf, and the three bound Reverie packages at the
+            // repository `url`'s pinned source with manifests under a
+            // directory that is never created. A resolve that binds them
+            // therefore stops at the first manifest; synthetic metadata never
+            // becomes source authority.
+            let absent = base.join("absent-checkout");
+            let metadata_cargo = |name: &str, workspace: &Path, url: &str| {
+                let source = format!("git+{url}?rev={LOCK_CHECK_PIN}#{LOCK_CHECK_PIN}");
+                let leaf = leaf_package_id(workspace, fixture.source()).unwrap();
+                let mut packages = vec![serde_json::json!({
+                    "name": "fixture-preload",
+                    "id": leaf,
+                    "source": null,
+                    "manifest_path": workspace.join("fixture/Cargo.toml"),
+                    "dependencies": [],
+                })];
+                let mut nodes = vec![serde_json::json!({"id": leaf, "deps": []})];
+                for package in ["reverie-inguest", "reverie-liteinst", "reverie-loader"] {
+                    let id = format!("git+{url}?rev={LOCK_CHECK_PIN}#{package}@0.5.7");
+                    packages.push(serde_json::json!({
+                        "name": package,
+                        "id": id,
+                        "source": source,
+                        "manifest_path": absent.join(package).join("Cargo.toml"),
+                        "dependencies": [],
+                    }));
+                    nodes.push(serde_json::json!({"id": id, "deps": []}));
+                }
+                let document = base.join(format!("{name}.json"));
+                fs::write(
+                    &document,
+                    serde_json::to_vec(&serde_json::json!({
+                        "packages": packages,
+                        "workspace_members": [leaf],
+                        "resolve": {"nodes": nodes},
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+                let cargo = base.join(format!("tools/{name}"));
+                fs::write(
+                    &cargo,
+                    format!("#!/bin/sh\nexec cat '{}'\n", document.display()),
+                )
+                .unwrap();
+                fs::set_permissions(&cargo, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+                    .unwrap();
+                cargo
+            };
+            let entered = std::cell::Cell::new(false);
+            // One resolution; returns its refusal and the Cargo commands it ran.
+            let resolve = |workspace: &Path,
+                           head: &str,
+                           cargo: &Path,
+                           repository: CargoGitRepository<'_>,
+                           logs: &str| {
+                let expected = SourceExpectation {
+                    workspace,
+                    workspace_head: head,
+                    reverie_pin: LOCK_CHECK_PIN,
+                    cargo,
+                    rustc: &rustc,
+                    target_dir: &target,
+                };
+                let mut runner = new_runner(logs);
+                let refused = VerifiedStaticSource::with_resolved_from(
+                    fixture,
+                    repository,
+                    &expected,
+                    &mut runner,
+                    |_, _| {
+                        entered.set(true);
+                        Ok(())
+                    },
+                )
+                .unwrap_err();
+                let runs = runner
+                    .commands
+                    .iter()
+                    .filter(|command| Path::new(&command.program) == cargo)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                (refused, runs)
+            };
+            let (moved_workspace, moved_head) =
+                committed_workspace("workspace-moved", LOCK_CHECK_REPOSITORY);
+            let (default_workspace, default_head) =
+                committed_workspace("workspace-default", CargoGitRepository::DEFAULT.url());
+
+            // Lock gate. The override passes it and reaches Cargo's metadata
+            // call, where the sentinel refuses.
+            let (refused, runs) = resolve(
+                &moved_workspace,
+                &moved_head,
+                &sentinel,
+                moved,
+                "lock-moved",
+            );
+            assert!(
+                refused.starts_with(&format!(
+                    "{} failed (exit status: 97); logs ",
+                    sentinel.display()
+                )),
+                "{refused}"
+            );
+            assert_eq!(runs.len(), 1, "{runs:?}");
+            assert_eq!(
+                runs[0].arguments.first().map(String::as_str),
+                Some("metadata")
+            );
+            assert_eq!(runs[0].status, 97);
+            // The default repository refuses the same lock before any Cargo
+            // command.
+            let (refused, runs) = resolve(
+                &moved_workspace,
+                &moved_head,
+                &sentinel,
+                CargoGitRepository::DEFAULT,
+                "lock-default",
+            );
+            assert_eq!(
+                refused,
+                "static CargoGitRev lock does not name the exact Reverie rev (local patch refused)"
+            );
+            assert!(runs.is_empty(), "{runs:?}");
+
+            // Metadata binding. Past the lock gate, Cargo's metadata binds
+            // only at the given repository's source: a match gets past the
+            // binding to the absent first manifest; the other repository's
+            // source refuses at the binding.
+            let unbound = format!(
+                "metadata {}: No such file or directory (os error 2)",
+                absent.join("reverie-inguest/Cargo.toml").display()
+            );
+            let mismatch = "static metadata R source/uniqueness mismatch";
+            let cases = [
+                (
+                    &moved_workspace,
+                    &moved_head,
+                    moved,
+                    LOCK_CHECK_REPOSITORY,
+                    unbound.as_str(),
+                ),
+                (
+                    &moved_workspace,
+                    &moved_head,
+                    moved,
+                    CargoGitRepository::DEFAULT.url(),
+                    mismatch,
+                ),
+                (
+                    &default_workspace,
+                    &default_head,
+                    CargoGitRepository::DEFAULT,
+                    CargoGitRepository::DEFAULT.url(),
+                    unbound.as_str(),
+                ),
+                (
+                    &default_workspace,
+                    &default_head,
+                    CargoGitRepository::DEFAULT,
+                    LOCK_CHECK_REPOSITORY,
+                    mismatch,
+                ),
+            ];
+            for (index, (workspace, head, repository, metadata_url, outcome)) in
+                cases.into_iter().enumerate()
+            {
+                let cargo =
+                    metadata_cargo(&format!("cargo-metadata-{index}"), workspace, metadata_url);
+                let (refused, runs) = resolve(
+                    workspace,
+                    head,
+                    &cargo,
+                    repository,
+                    &format!("metadata-{index}"),
+                );
+                assert_eq!(refused, outcome, "metadata case {index}");
+                assert_eq!(runs.len(), 1, "metadata case {index}: {runs:?}");
+                assert_eq!(
+                    runs[0].arguments.first().map(String::as_str),
+                    Some("metadata"),
+                    "metadata case {index}"
+                );
+                assert_eq!(runs[0].status, 0, "metadata case {index}");
+            }
+            assert!(!entered.get());
         }
 
         struct CacheFixture {
