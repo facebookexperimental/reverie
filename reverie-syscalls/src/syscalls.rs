@@ -62,6 +62,38 @@ pub trait SyscallInfo: Displayable + Copy + Send {
     fn into_parts(self) -> (Sysno, SyscallArgs);
 }
 
+/// A syscall whose number the type-safe table cannot name: the raw number
+/// and arguments, exactly as the guest issued them.
+///
+/// [`Syscall::from_raw`] needs a [`Sysno`], so a number the `syscalls`
+/// crate's table does not contain -- a syscall newer than the table, a
+/// number in a gap in it, or one the guest simply invented -- cannot become
+/// a [`Syscall`] at all. A backend that intercepts such a call (because the
+/// Tool's subscription asks it to, through the `reverie` crate's
+/// `UnknownSyscallPolicy`) reports this instead.
+///
+/// "Unknown" is a property of the table this crate was built with, not of
+/// the running kernel: the host kernel may well implement the number.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub struct RawSyscall {
+    /// The raw syscall number: the guest's syscall-number register (or the
+    /// backend's transport word), untruncated. Whether a value is unknown
+    /// is decided by each backend with the same conversion it already uses
+    /// to build a [`Sysno`], so the value reported here can carry bits that
+    /// conversion discarded.
+    pub nr: u64,
+
+    /// The six raw syscall arguments, in ABI order.
+    pub args: SyscallArgs,
+}
+
+impl RawSyscall {
+    /// Creates a raw syscall from its number and arguments.
+    pub fn new(nr: u64, args: SyscallArgs) -> Self {
+        Self { nr, args }
+    }
+}
+
 // After adding a new type-safe syscall, uncomment the corresponding line below.
 // The syscalls lower ranks and higher probabilities should be implemented
 // first.

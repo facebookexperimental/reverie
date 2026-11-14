@@ -8,7 +8,6 @@
 
 //! Register-frame support for syscall events injected by a binary rewriter.
 
-#[cfg(target_arch = "x86_64")]
 use reverie::Errno;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallArgs;
@@ -72,14 +71,18 @@ impl InjectedSyscallFrame {
     /// Returns the syscall number without materializing the full [`Syscall`]
     /// enum. Instrumentation bridges use this compact accessor on bounded
     /// trampoline stacks.
-    pub fn syscall_number(&self) -> Sysno {
-        Sysno::from(self.rax as i32)
+    ///
+    /// The frame's `rax` is guest-controlled, so the decode is checked: a
+    /// number the syscall table cannot name is `Err(ENOSYS)`, never a panic.
+    pub fn syscall_number(&self) -> Result<Sysno, Errno> {
+        Sysno::new(self.rax as i32 as usize).ok_or(Errno::ENOSYS)
     }
 
-    /// Decodes the syscall stored in this e9tool frame.
-    pub fn syscall(&self) -> Syscall {
-        Syscall::from_raw(
-            self.syscall_number(),
+    /// Decodes the syscall stored in this e9tool frame. See
+    /// [`InjectedSyscallFrame::syscall_number`] for the unknown-number error.
+    pub fn syscall(&self) -> Result<Syscall, Errno> {
+        Ok(Syscall::from_raw(
+            self.syscall_number()?,
             SyscallArgs::new(
                 self.rdi as usize,
                 self.rsi as usize,
@@ -88,7 +91,7 @@ impl InjectedSyscallFrame {
                 self.r8 as usize,
                 self.r9 as usize,
             ),
-        )
+        ))
     }
 
     /// Returns the six raw syscall arguments in Linux x86-64 ABI order.
@@ -283,7 +286,16 @@ mod tests {
         assert_eq!(core::mem::size_of::<InjectedSyscallFrame>(), 18 * 8);
         assert_eq!(core::mem::offset_of!(InjectedSyscallFrame, rax), 15 * 8);
         assert_eq!(core::mem::offset_of!(InjectedSyscallFrame, rip), 17 * 8);
-        assert_eq!(frame().syscall_number(), Sysno::write);
+        assert_eq!(frame().syscall_number(), Ok(Sysno::write));
+    }
+
+    #[test]
+    fn unknown_frame_number_is_an_error_not_a_panic() {
+        // Guest-controlled rax with no Sysno (the x86_64 table ends at 461).
+        let mut unknown = frame();
+        unknown.rax = 463;
+        assert_eq!(unknown.syscall_number(), Err(Errno::ENOSYS));
+        assert_eq!(unknown.syscall(), Err(Errno::ENOSYS));
     }
 
     #[test]

@@ -1613,8 +1613,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 88] = [
     ),
     (
         "reverie/src/tool.rs",
-        80301,
-        "89ae1888619a96b89c1adbcd6703b55c78af093de55f6a2e362af152c4fff321",
+        81727,
+        "247f65ad00154dcaa21be8324e2315f30658df52c51c9db91717aab6e5bc64c1",
     ),
 ];
 // Native Detcore's fixed-gate publication ordering is a separately declared
@@ -39651,6 +39651,11 @@ mod tests {
         // Keep the fixed catalog authoritative and reject their prior tuples.
         assert_eq!(CONTENT_REVERIE_CATALOG.len(), 88);
         let rejected_prior = [
+            (
+                "reverie/src/tool.rs",
+                80301,
+                "89ae1888619a96b89c1adbcd6703b55c78af093de55f6a2e362af152c4fff321",
+            ),
             (
                 "reverie-liteinst-artifact/src/preparation_identity.rs",
                 49430,

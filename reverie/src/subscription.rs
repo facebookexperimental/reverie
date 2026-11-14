@@ -18,11 +18,63 @@ bitflags! {
     }
 }
 
+/// What a backend does with a guest syscall whose number the `syscalls`
+/// crate's table cannot name: a number with no [`Sysno`], carried to the
+/// Tool as a `RawSyscall` when it is reported at all.
+///
+/// The policy applies *only* to such unknown numbers. A syscall the table
+/// knows but the Tool did not subscribe to keeps its legacy routing under
+/// every variant (on the ptrace backend it runs natively, untraced).
+///
+/// "Unknown" is a property of the table Reverie was built with, not of the
+/// running kernel, which may implement the number. `ENOSYS` below is what
+/// Linux itself returns for a number it does not implement.
+#[derive(Default, Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum UnknownSyscallPolicy {
+    /// The backend's legacy behavior, unchanged. This is the default, so
+    /// Tools that never choose a policy see no change.
+    ///
+    /// On the ptrace backend the seccomp filter allows the call and the
+    /// host kernel executes it (returning `-ENOSYS` itself if it does not
+    /// implement the number either). No stop is generated, so the call is
+    /// not observable; if the guest's own filter nevertheless traces it,
+    /// the tracer keeps its legacy behavior of failing the stop with an
+    /// error. On the KVM backend the number fails to decode and the run
+    /// aborts, as it did before this policy existed.
+    #[default]
+    AllowNative,
+
+    /// The guest receives `-ENOSYS` and the call never executes in the
+    /// kernel. The backend handles it without a Tool callback.
+    ///
+    /// The call is still intercepted: on the ptrace backend it arrives as
+    /// a seccomp trace stop the backend answers itself, so the stop is
+    /// observable to anything watching stops, but the Tool receives no
+    /// event for it.
+    Enosys,
+
+    /// The guest receives `-ENOSYS`, resolved without stopping the guest
+    /// where the backend can: on the ptrace backend the seccomp filter's
+    /// default action is `SECCOMP_RET_ERRNO` with `ENOSYS`, so the kernel
+    /// answers inline. There is no tracer round-trip and the call is not
+    /// observable as a stop. A backend with no such in-kernel filter (KVM)
+    /// behaves exactly as [`UnknownSyscallPolicy::Enosys`]; the guest
+    /// cannot tell the two apart.
+    EnosysFast,
+
+    /// The backend stops the guest and calls `Tool::handle_unknown_syscall`
+    /// for each such call; the value it returns is the call's result. The
+    /// call is observable by definition, and costs the same interception
+    /// as a subscribed syscall.
+    TrapToTool,
+}
+
 /// A set of events to subscribe to.
 #[derive(Default, Clone, Eq, PartialEq)]
 pub struct Subscription {
     instructions: Instructions,
     syscalls: SysnoSet,
+    unknown_syscall_policy: UnknownSyscallPolicy,
 }
 
 impl Subscription {
@@ -31,6 +83,7 @@ impl Subscription {
         Subscription {
             instructions: Instructions::empty(),
             syscalls: SysnoSet::empty(),
+            unknown_syscall_policy: UnknownSyscallPolicy::AllowNative,
         }
     }
 
@@ -39,6 +92,7 @@ impl Subscription {
         Subscription {
             instructions: Instructions::CPUID | Instructions::RDTSC,
             syscalls: SysnoSet::all(),
+            unknown_syscall_policy: UnknownSyscallPolicy::AllowNative,
         }
     }
 
@@ -47,6 +101,7 @@ impl Subscription {
         Subscription {
             instructions: Instructions::empty(),
             syscalls: SysnoSet::all(),
+            unknown_syscall_policy: UnknownSyscallPolicy::AllowNative,
         }
     }
 
@@ -129,6 +184,22 @@ impl Subscription {
     pub fn iter_syscalls(&self) -> impl Iterator<Item = Sysno> + '_ {
         self.syscalls.iter()
     }
+
+    /// Sets what a backend does with a syscall number the syscall table
+    /// cannot name. See [`UnknownSyscallPolicy`]; the default is
+    /// [`UnknownSyscallPolicy::AllowNative`], the legacy behavior.
+    #[inline]
+    pub fn set_unknown_syscall_policy(&mut self, policy: UnknownSyscallPolicy) -> &mut Self {
+        self.unknown_syscall_policy = policy;
+        self
+    }
+
+    /// What a backend does with a syscall number the syscall table cannot
+    /// name, as set by [`Subscription::set_unknown_syscall_policy`].
+    #[inline]
+    pub fn unknown_syscall_policy(&self) -> UnknownSyscallPolicy {
+        self.unknown_syscall_policy
+    }
 }
 
 impl core::ops::BitOr for Subscription {
@@ -144,6 +215,13 @@ impl core::ops::BitOrAssign for Subscription {
     fn bitor_assign(&mut self, rhs: Self) {
         self.instructions |= rhs.instructions;
         self.syscalls |= rhs.syscalls;
+        // A merge keeps an explicitly chosen unknown-syscall policy: the
+        // right-hand side wins when it chose one, so merging in a
+        // subscription that never set a policy cannot silently restore
+        // the legacy default.
+        if rhs.unknown_syscall_policy != UnknownSyscallPolicy::AllowNative {
+            self.unknown_syscall_policy = rhs.unknown_syscall_policy;
+        }
     }
 }
 
@@ -176,6 +254,7 @@ impl core::fmt::Debug for Subscription {
         f.debug_struct("Subscription")
             .field("instructions", &self.instructions)
             .field("syscalls", &syscalls)
+            .field("unknown_syscall_policy", &self.unknown_syscall_policy)
             .finish()
     }
 }
@@ -208,6 +287,41 @@ mod tests {
         assert!(union.contains(&Sysno::read));
         assert!(union.contains(&Sysno::write));
         assert!(union.contains(&Sysno::openat));
+    }
+
+    #[test]
+    fn unknown_syscall_policy_defaults_and_merges() {
+        // Every constructor keeps the legacy default.
+        for s in [
+            Subscription::none(),
+            Subscription::all(),
+            Subscription::all_syscalls(),
+            Subscription::default(),
+        ] {
+            assert_eq!(
+                s.unknown_syscall_policy(),
+                UnknownSyscallPolicy::AllowNative
+            );
+        }
+
+        let mut chosen = Subscription::none();
+        chosen.set_unknown_syscall_policy(UnknownSyscallPolicy::Enosys);
+        assert_eq!(
+            chosen.unknown_syscall_policy(),
+            UnknownSyscallPolicy::Enosys
+        );
+
+        // Merging in a subscription that never chose keeps the choice;
+        // merging in one that did takes its choice.
+        let kept = chosen.clone() | Subscription::all();
+        assert_eq!(kept.unknown_syscall_policy(), UnknownSyscallPolicy::Enosys);
+        let mut fast = Subscription::none();
+        fast.set_unknown_syscall_policy(UnknownSyscallPolicy::EnosysFast);
+        let replaced = chosen | fast;
+        assert_eq!(
+            replaced.unknown_syscall_policy(),
+            UnknownSyscallPolicy::EnosysFast
+        );
     }
 
     #[test]

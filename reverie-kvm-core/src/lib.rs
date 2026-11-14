@@ -48,6 +48,9 @@ pub mod alias_failure;
 
 pub use error::Error;
 pub use memory::GuestMemory;
+pub use syscall::DecodedSyscall;
 pub use syscall::SyscallRequest;
+pub use syscall::UnknownSyscallDisposition;
+pub use syscall::unknown_syscall_disposition;
 
 pub type Result<T> = std::result::Result<T, Error>;

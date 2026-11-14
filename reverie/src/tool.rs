@@ -13,6 +13,7 @@
 //! same process.
 
 use async_trait::async_trait;
+use reverie_syscalls::RawSyscall;
 use reverie_syscalls::Syscall;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -1018,6 +1019,35 @@ pub trait Tool: Send + Sync + Default {
         c: Syscall,
     ) -> Result<i64, Error> {
         guest.tail_inject(c).await
+    }
+
+    /// Handles a guest syscall whose number the syscall table cannot name
+    /// (a number with no `Sysno`, so no [`Syscall`] can be built for it),
+    /// in the moment *before* it executes, like
+    /// [`Tool::handle_syscall_event`]. `raw` carries the number and the six
+    /// arguments exactly as the guest issued them.
+    ///
+    /// This is called only when the subscriptions choose
+    /// [`crate::UnknownSyscallPolicy::TrapToTool`]
+    /// ([`Subscription::set_unknown_syscall_policy`]); under every other
+    /// policy the backend answers such a call itself and this hook never
+    /// runs.
+    ///
+    /// The return value means exactly what `handle_syscall_event`'s does:
+    /// `Ok(value)` is the raw word the guest's syscall returns, and an
+    /// `Err` carrying an [`Errno`] answers the guest with `-errno`. The
+    /// backend skips the guest's own call and delivers that result;
+    /// nothing runs natively unless this hook injects it through `guest`.
+    ///
+    /// The default answers `-ENOSYS`, as Linux does for a number it does
+    /// not implement, so a Tool that selects `TrapToTool` but does not
+    /// implement this hook still gives the guest a faithful result.
+    async fn handle_unknown_syscall<T: Guest<Self>>(
+        &self,
+        _guest: &mut T,
+        _raw: RawSyscall,
+    ) -> Result<i64, Error> {
+        Err(Errno::ENOSYS.into())
     }
 
     /// CPUID is trapped, the tool should implement this function to return

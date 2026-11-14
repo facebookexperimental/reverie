@@ -24,6 +24,7 @@ const AUDIT_ARCH_AARCH64: u32 = 0xc000_00b7;
 const RET_ALLOW: u32 = 0x7fff_0000;
 const RET_KILL_PROCESS: u32 = 0x8000_0000;
 const RET_TRACE: u32 = 0x7ff0_0000;
+const RET_ERRNO_ENOSYS: u32 = 0x0005_0000 | (libc::ENOSYS as u32);
 
 type Insn = (u16, u8, u8, u32);
 
@@ -93,7 +94,7 @@ fn run(program: &[Insn], nr: u32, arch: u32, ip: u64) -> u32 {
 #[test]
 fn plain_filter_for_all_syscalls_is_byte_identical_to_the_capture() {
     assert_eq!(
-        render(&seccomp_filter(&Subscription::all(), false)),
+        render(&seccomp_filter(&Subscription::all(), false).unwrap()),
         fixture_body(include_str!(
             "../tests/fixtures/ptrace_seccomp_filter_all_syscalls.txt"
         ))
@@ -106,7 +107,7 @@ fn plain_filter_for_all_syscalls_is_byte_identical_to_the_capture() {
 #[test]
 fn plain_filter_for_no_syscalls_is_byte_identical_to_the_capture() {
     assert_eq!(
-        render(&seccomp_filter(&Subscription::none(), false)),
+        render(&seccomp_filter(&Subscription::none(), false).unwrap()),
         fixture_body(include_str!(
             "../tests/fixtures/ptrace_seccomp_filter_no_syscalls.txt"
         ))
@@ -137,7 +138,7 @@ fn filter_decodes_as_specified() {
         0x1_7100_0006,
     ];
     for events in [Subscription::all(), Subscription::none()] {
-        let filter = insns(&seccomp_filter(&events, false));
+        let filter = insns(&seccomp_filter(&events, false).unwrap());
         for nr in numbers {
             for ip in ips {
                 assert_eq!(
@@ -151,11 +152,106 @@ fn filter_decodes_as_specified() {
             }
         }
     }
-    let all = insns(&seccomp_filter(&Subscription::all(), false));
+    let all = insns(&seccomp_filter(&Subscription::all(), false).unwrap());
     assert_eq!(run(&all, 39, AUDIT_ARCH_X86_64, 0x40_1000), RET_TRACE);
     assert_eq!(run(&all, 15, AUDIT_ARCH_X86_64, 0x40_1000), RET_ALLOW);
-    let none = insns(&seccomp_filter(&Subscription::none(), false));
+    let none = insns(&seccomp_filter(&Subscription::none(), false).unwrap());
     assert_eq!(run(&none, 39, AUDIT_ARCH_X86_64, 0x40_1000), RET_ALLOW);
+}
+
+/// A number with no `Sysno` in the table this crate was built with (the
+/// x86_64 table ends at 461): what makes a number "unknown" to the policy.
+const UNKNOWN_NR: u32 = 463;
+
+fn with_policy(mut events: Subscription, policy: UnknownSyscallPolicy) -> Subscription {
+    events.set_unknown_syscall_policy(policy);
+    events
+}
+
+/// The unknown-syscall policy, decoded: with only `getpid` subscribed, the
+/// unknown number takes the policy's verdict, while a known-but-unsubscribed
+/// number (`read`) is allowed under every policy, the subscribed number is
+/// traced, and `rt_sigreturn` keeps its override. Reverie's own trampoline
+/// return address is allowed whatever the number or policy, and the
+/// architecture check still kills first.
+#[test]
+fn unknown_number_verdicts_follow_the_policy() {
+    assert_eq!(Sysno::new(UNKNOWN_NR as usize), None);
+    let ordinary = 0x40_1000;
+    let trampoline = 0x7100_0002;
+    let cases = [
+        (UnknownSyscallPolicy::AllowNative, RET_ALLOW),
+        (UnknownSyscallPolicy::Enosys, RET_TRACE),
+        (UnknownSyscallPolicy::EnosysFast, RET_ERRNO_ENOSYS),
+        (UnknownSyscallPolicy::TrapToTool, RET_TRACE),
+    ];
+    for (policy, unknown_verdict) in cases {
+        let mut events = Subscription::none();
+        events.syscall(Sysno::getpid);
+        let filter = insns(&seccomp_filter(&with_policy(events, policy), false).unwrap());
+        assert_eq!(
+            run(&filter, UNKNOWN_NR, AUDIT_ARCH_X86_64, ordinary),
+            unknown_verdict,
+            "unknown number under {policy:?}"
+        );
+        assert_eq!(
+            run(&filter, Sysno::read as u32, AUDIT_ARCH_X86_64, ordinary),
+            RET_ALLOW,
+            "known but unsubscribed under {policy:?}"
+        );
+        assert_eq!(
+            run(&filter, Sysno::getpid as u32, AUDIT_ARCH_X86_64, ordinary),
+            RET_TRACE,
+            "subscribed under {policy:?}"
+        );
+        assert_eq!(
+            run(
+                &filter,
+                Sysno::rt_sigreturn as u32,
+                AUDIT_ARCH_X86_64,
+                ordinary
+            ),
+            RET_ALLOW,
+            "rt_sigreturn under {policy:?}"
+        );
+        assert_eq!(
+            run(&filter, UNKNOWN_NR, AUDIT_ARCH_X86_64, trampoline),
+            RET_ALLOW,
+            "trampoline return address under {policy:?}"
+        );
+        assert_eq!(
+            run(&filter, UNKNOWN_NR, AUDIT_ARCH_I386, ordinary),
+            RET_KILL_PROCESS,
+            "wrong architecture under {policy:?}"
+        );
+    }
+}
+
+/// A non-legacy policy names every known syscall in the filter, so the
+/// program grows with the syscall table. Both extremes -- every syscall
+/// subscribed and none -- must stay within the kernel's 4096-instruction
+/// BPF limit, or `seccomp_filter` refuses to build the filter at all.
+#[test]
+fn unknown_policy_filters_fit_the_kernel_bpf_limit() {
+    for policy in [
+        UnknownSyscallPolicy::Enosys,
+        UnknownSyscallPolicy::EnosysFast,
+        UnknownSyscallPolicy::TrapToTool,
+    ] {
+        for (name, events) in [
+            ("all-subscribed", Subscription::all()),
+            ("none-subscribed", Subscription::none()),
+        ] {
+            let filter = seccomp_filter(&with_policy(events, policy), false).unwrap();
+            let count = filter.instructions().len();
+            eprintln!("{policy:?} {name}: {count} BPF instructions");
+            assert!(
+                count <= SECCOMP_FILTER_MAX_INSTRUCTIONS,
+                "{policy:?} {name}: {count} instructions over the kernel limit \
+                 {SECCOMP_FILTER_MAX_INSTRUCTIONS}"
+            );
+        }
+    }
 }
 
 // Signals that report the child's verdict. The child cannot exit with a
@@ -245,7 +341,7 @@ fn kernel_verdict(filter: &Filter, ip: u64) -> u32 {
     ignore = "AddressSanitizer build (cfg reverie_asan): ASan reserves [0x7fff7000, 0x10007fff8000), so MAP_FIXED_NOREPLACE of a probe stub page there fails with EEXIST; the feasible assertions run in the interpreter, low-page and high-memory tests; not a product pass"
 )]
 fn plain_ip_range_verdicts_match_the_kernel_witness() {
-    let filter = seccomp_filter(&Subscription::all(), false);
+    let filter = seccomp_filter(&Subscription::all(), false).unwrap();
     let all = insns(&filter);
     let mut rows = Vec::new();
     for ip in [
@@ -286,7 +382,7 @@ fn plain_ip_range_verdicts_match_the_kernel_witness() {
     ignore = "AddressSanitizer build (cfg reverie_asan): ASan reserves [0x7fff7000, 0x10007fff8000), so MAP_FIXED_NOREPLACE of a probe stub page there fails with EEXIST; the feasible assertions run in the interpreter, low-page and high-memory tests; not a product pass"
 )]
 fn kernel_allows_every_ip_under_the_filter_for_no_syscalls() {
-    let filter = seccomp_filter(&Subscription::none(), false);
+    let filter = seccomp_filter(&Subscription::none(), false).unwrap();
     let program = insns(&filter);
     let mut rows = Vec::new();
     for ip in [
@@ -314,7 +410,7 @@ fn kernel_allows_every_ip_under_the_filter_for_no_syscalls() {
 /// reserves [0x7fff7000, 0x10007fff8000)).
 #[test]
 fn plain_ip_range_interpreter_verdicts() {
-    let all = insns(&seccomp_filter(&Subscription::all(), false));
+    let all = insns(&seccomp_filter(&Subscription::all(), false).unwrap());
     let mut rows = Vec::new();
     for ip in [
         0x7100_0001u64,
@@ -345,7 +441,7 @@ fn plain_ip_range_interpreter_verdicts() {
 /// assertion: the interpreter and the kernel both give the expected verdict.
 #[test]
 fn plain_ip_range_low_page_verdicts_match_the_kernel_witness() {
-    let filter = seccomp_filter(&Subscription::all(), false);
+    let filter = seccomp_filter(&Subscription::all(), false).unwrap();
     let all = insns(&filter);
     let mut rows = Vec::new();
     for ip in [
@@ -376,7 +472,7 @@ fn plain_ip_range_low_page_verdicts_match_the_kernel_witness() {
 /// probes, each allowed, without the kernel witness.
 #[test]
 fn interpreter_allows_every_ip_under_the_filter_for_no_syscalls() {
-    let program = insns(&seccomp_filter(&Subscription::none(), false));
+    let program = insns(&seccomp_filter(&Subscription::none(), false).unwrap());
     let mut rows = Vec::new();
     for ip in [
         0x7100_0006u64,
@@ -401,7 +497,7 @@ fn interpreter_allows_every_ip_under_the_filter_for_no_syscalls() {
 /// same assertion: the interpreter and the kernel both allow `getpid`.
 #[test]
 fn kernel_allows_every_low_page_ip_under_the_filter_for_no_syscalls() {
-    let filter = seccomp_filter(&Subscription::none(), false);
+    let filter = seccomp_filter(&Subscription::none(), false).unwrap();
     let program = insns(&filter);
     let mut rows = Vec::new();
     for ip in [
@@ -430,7 +526,7 @@ fn kernel_allows_every_low_page_ip_under_the_filter_for_no_syscalls() {
 /// with the assertion of `plain_ip_range_verdicts_match_the_kernel_witness`.
 #[test]
 fn plain_ip_range_high_memory_verdicts_match_the_kernel_witness() {
-    let filter = seccomp_filter(&Subscription::all(), false);
+    let filter = seccomp_filter(&Subscription::all(), false).unwrap();
     let all = insns(&filter);
     let mut rows = Vec::new();
     for ip in [0x1001_7100_0002u64, 0x1002_0000_0002] {
@@ -456,7 +552,7 @@ fn plain_ip_range_high_memory_verdicts_match_the_kernel_witness() {
 /// interpreter and the kernel.
 #[test]
 fn kernel_allows_a_high_memory_ip_under_the_filter_for_no_syscalls() {
-    let filter = seccomp_filter(&Subscription::none(), false);
+    let filter = seccomp_filter(&Subscription::none(), false).unwrap();
     let program = insns(&filter);
     let mut rows = Vec::new();
     {
@@ -479,7 +575,7 @@ fn kernel_allows_a_high_memory_ip_under_the_filter_for_no_syscalls() {
 /// deleted trap-only I386 route test.)
 #[test]
 fn kernel_kills_an_i386_syscall_with_sigsys() {
-    let filter = seccomp_filter(&Subscription::none(), false);
+    let filter = seccomp_filter(&Subscription::none(), false).unwrap();
     // SAFETY: the child only makes raw syscalls and exits.
     let pid = unsafe { libc::fork() };
     assert!(pid >= 0, "fork failed");

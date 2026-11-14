@@ -38,6 +38,8 @@ use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::Errno;
 use reverie::syscalls::MemoryAccess;
+use reverie::syscalls::RawSyscall;
+use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 
 use crate::Error;
@@ -70,6 +72,9 @@ use crate::failure::FailureCheck;
 use crate::failure::FailureContext;
 use crate::failure::RunFailure;
 use crate::failure::wait_for_failure;
+use crate::syscall::DecodedSyscall;
+use crate::syscall::UnknownSyscallDisposition;
+use crate::syscall::unknown_syscall_disposition;
 
 /// Bounded test observations around the existing wait registration boundary.
 /// Registration is current-host scoped and invokes no closure under its borrow.
@@ -5982,8 +5987,41 @@ impl KvmBackend {
                         let return_slot = std::ptr::from_mut(exit.ret) as usize;
                         let registers = self.vcpu.get_regs()?;
                         let mut request = SyscallRequest::read_from(&memory, frame_address)?;
-                        let mut syscall = request.into_syscall()?;
-                        let subscribed = subscribed_syscalls.contains(syscall.number());
+                        let mut pending = match request.decode() {
+                            DecodedSyscall::Known(syscall) => PendingCall::Known(syscall),
+                            DecodedSyscall::Unknown(raw) => {
+                                match unknown_syscall_disposition(
+                                    subscriptions.unknown_syscall_policy(),
+                                ) {
+                                    // The rejecting decode always fails here,
+                                    // with the error this path raised before
+                                    // the policy existed.
+                                    UnknownSyscallDisposition::Abort => {
+                                        PendingCall::Known(request.into_syscall()?)
+                                    }
+                                    UnknownSyscallDisposition::Answer(result) => {
+                                        self.check_entry_owner()?;
+                                        // SAFETY: as the handled-result write
+                                        // below, return_slot points into this
+                                        // vCPU's stable KVM_RUN mapping while
+                                        // it remains stopped.
+                                        unsafe {
+                                            (return_slot as *mut u64).write(result as u64);
+                                        }
+                                        continue;
+                                    }
+                                    UnknownSyscallDisposition::AskTool => PendingCall::Unknown(raw),
+                                }
+                            }
+                        };
+                        // An unknown number reaches here only when the policy
+                        // traps it to the Tool, which is its subscription.
+                        let subscribed = match pending {
+                            PendingCall::Known(syscall) => {
+                                subscribed_syscalls.contains(syscall.number())
+                            }
+                            PendingCall::Unknown(_) => true,
+                        };
                         let result = if subscribed {
                             // Same restart protocol as the process-syscall
                             // path below; see `classify_handler_result`. This
@@ -6027,7 +6065,18 @@ impl KvmBackend {
                                         Some(&callback_watch),
                                     );
                                     drive_entry_handler_completion_from(
-                                        || tool.handle_syscall_event(&mut guest, syscall),
+                                        || async {
+                                            match pending {
+                                                PendingCall::Known(syscall) => {
+                                                    tool.handle_syscall_event(&mut guest, syscall)
+                                                        .await
+                                                }
+                                                PendingCall::Unknown(raw) => {
+                                                    tool.handle_unknown_syscall(&mut guest, raw)
+                                                        .await
+                                                }
+                                            }
+                                        },
                                         handler_signal,
                                         pending_child_starts,
                                         wait_for_failure(&global_state, None),
@@ -6062,8 +6111,10 @@ impl KvmBackend {
                                                     class.number_without_handler(request.number()),
                                                     *request.args(),
                                                 );
-                                                syscall = request.into_syscall()?;
-                                                if subscribed_syscalls.contains(syscall.number()) {
+                                                let restarted = request.into_syscall()?;
+                                                pending = PendingCall::Known(restarted);
+                                                if subscribed_syscalls.contains(restarted.number())
+                                                {
                                                     continue;
                                                 }
                                                 executor.execute(&request, &memory)
@@ -8127,7 +8178,23 @@ impl KvmBackend {
                     }
                     continue;
                 }
-                let syscall = request.into_syscall()?;
+                let (pending, answered) = match request.decode() {
+                    DecodedSyscall::Known(syscall) => (PendingCall::Known(syscall), None),
+                    DecodedSyscall::Unknown(raw) => {
+                        match unknown_syscall_disposition(subscriptions.unknown_syscall_policy()) {
+                            // The rejecting decode always fails here, with
+                            // the error this path raised before the policy
+                            // existed.
+                            UnknownSyscallDisposition::Abort => {
+                                (PendingCall::Known(request.into_syscall()?), None)
+                            }
+                            UnknownSyscallDisposition::Answer(result) => {
+                                (PendingCall::Unknown(raw), Some(result))
+                            }
+                            UnknownSyscallDisposition::AskTool => (PendingCall::Unknown(raw), None),
+                        }
+                    }
+                };
                 // TODO-HUMAN-REVIEW(PR-156): Review root process-syscall Tool dispatch.
                 // CLONE_THREAD is deliberately NOT backend-owned: the parent's
                 // clone is delivered to the Tool (Detcore) so the worker inherits
@@ -8137,13 +8204,26 @@ impl KvmBackend {
                 // `handle_thread_start` the parent's clone handler waits for.
                 let backend_owned = is_backend_owned_syscall(request.number(), thread_ownership)
                     && !executor.is_tool_visible_read(&request);
-                let subscribed = !backend_owned && subscribed_syscalls.contains(syscall.number());
+                // An unknown number is never backend-owned (the owned set is
+                // futex/read/readv/ppoll); unanswered, it is here only
+                // because the policy traps it to the Tool.
+                let subscribed = !backend_owned
+                    && match pending {
+                        PendingCall::Known(syscall) => {
+                            subscribed_syscalls.contains(syscall.number())
+                        }
+                        PendingCall::Unknown(_) => answered.is_none(),
+                    };
                 let (
                     mut result,
                     handler_replaced_image,
                     _handler_process_completed,
                     restart_requested,
-                ) = if subscribed {
+                ) = if let Some(result) = answered {
+                    // Answered by the backend without executing the call or
+                    // running a callback, in the shape of an emulated return.
+                    (result, false, false, None)
+                } else if subscribed {
                     let mut handler_process_completed = false;
                     // With no eligible virtual signal, a restart class that
                     // re-runs the same syscall immediately re-enters the
@@ -8224,7 +8304,16 @@ impl KvmBackend {
                             );
                             guest.set_rpc_failure(&rpc_failure);
                             drive_entry_handler_completion_from(
-                                || tool.handle_syscall_event(&mut guest, syscall),
+                                || async {
+                                    match pending {
+                                        PendingCall::Known(syscall) => {
+                                            tool.handle_syscall_event(&mut guest, syscall).await
+                                        }
+                                        PendingCall::Unknown(raw) => {
+                                            tool.handle_unknown_syscall(&mut guest, raw).await
+                                        }
+                                    }
+                                },
                                 handler_signal.clone(),
                                 pending_child_starts.clone(),
                                 Pin::new(&mut callback_failure),
@@ -8978,6 +9067,15 @@ impl RestartClass {
     fn reruns_same_syscall(self) -> bool {
         !matches!(self, Self::RestartBlock)
     }
+}
+
+/// A guest syscall awaiting its Tool callback: the typed syscall, or the
+/// raw request when its number has no `Sysno` and the unknown-syscall
+/// policy traps it to the Tool.
+#[derive(Clone, Copy)]
+enum PendingCall {
+    Known(Syscall),
+    Unknown(RawSyscall),
 }
 
 /// What a Tool handler's return value asks of the syscall frame.

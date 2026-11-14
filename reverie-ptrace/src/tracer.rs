@@ -55,6 +55,7 @@ use reverie::GlobalTool;
 use reverie::Pid;
 use reverie::Subscription;
 use reverie::Tool;
+use reverie::UnknownSyscallPolicy;
 use reverie::process::ChildStderr;
 use reverie::process::ChildStdin;
 use reverie::process::ChildStdout;
@@ -4116,22 +4117,52 @@ async fn postspawn<L: Tool + 'static>(
     Ok((tracer, ordinary_session))
 }
 
+/// The kernel refuses a seccomp filter longer than this (`BPF_MAXINSNS`).
+const SECCOMP_FILTER_MAX_INSTRUCTIONS: usize = 4096;
+
 /// Creates the seccomp filter. This lets us control which syscalls are traced
 /// and which ones are allowed through. `observes_sigreturns` is
 /// [`Tool::observes_sigreturns`]: the guest's own `rt_sigreturn` is traced
 /// only then.
-fn seccomp_filter(events: &Subscription, observes_sigreturns: bool) -> seccomp::Filter {
+///
+/// A number the syscall table does not contain gets the filter's default
+/// action, which the subscription's unknown-syscall policy chooses: allow
+/// (legacy), trace (the backend answers `ENOSYS`, or the Tool decides), or
+/// `SECCOMP_RET_ERRNO` (the kernel answers `ENOSYS` with no stop). Under
+/// any policy but the legacy one, every known-but-unsubscribed number is
+/// explicitly allowed, so its routing is exactly the legacy one and the
+/// default is reached only by unknown numbers.
+fn seccomp_filter(
+    events: &Subscription,
+    observes_sigreturns: bool,
+) -> Result<seccomp::Filter, Error> {
     use reverie::process::seccomp::Action;
 
-    seccomp::FilterBuilder::new()
-        // By default, all syscalls are allowed through untraced. Then, we can
-        // intercept only the syscalls we are interested in.
-        .default_action(Action::Allow)
-        .syscalls(
-            events
-                .iter_syscalls()
-                .map(|syscall| (syscall, Action::Trace(0))),
-        )
+    let policy = events.unknown_syscall_policy();
+    let mut builder = seccomp::FilterBuilder::new();
+    // By default, all syscalls are allowed through untraced. Then, we can
+    // intercept only the syscalls we are interested in. A non-legacy
+    // unknown-syscall policy changes only what an unknown number gets.
+    builder.default_action(match policy {
+        UnknownSyscallPolicy::AllowNative => Action::Allow,
+        UnknownSyscallPolicy::Enosys | UnknownSyscallPolicy::TrapToTool => Action::Trace(0),
+        UnknownSyscallPolicy::EnosysFast => Action::Errno(Errno::ENOSYS),
+    });
+    let mut subscribed: Vec<Sysno> = events.iter_syscalls().collect();
+    subscribed.sort_unstable();
+    builder.syscalls(
+        subscribed
+            .iter()
+            .map(|syscall| (*syscall, Action::Trace(0))),
+    );
+    if policy != UnknownSyscallPolicy::AllowNative {
+        builder.syscalls(
+            Sysno::iter()
+                .filter(|syscall| subscribed.binary_search(syscall).is_err())
+                .map(|syscall| (syscall, Action::Allow)),
+        );
+    }
+    builder
         // The guest's rt_sigreturn is never shown to handle_syscall_event. It
         // is traced only to report it to Tool::handle_sigreturn, and Reverie's
         // own, run from its private page, is allowed by the ip_range rule
@@ -4152,8 +4183,23 @@ fn seccomp_filter(events: &Subscription, observes_sigreturns: bool) -> seccomp::
             (cp::TRAMPOLINE_BASE + cp::SYSCALL_INSTR_SIZE) as u64,
             (cp::TRAMPOLINE_BASE + cp::SYSCALL_INSTR_SIZE + cp::UD_INSTR_SIZE) as u64,
             Action::Allow,
+        );
+    let filter = builder.build();
+    // A non-legacy policy names every known syscall, so the program grows
+    // with the table. Refuse here, naming the cause, rather than silently
+    // installing a weaker filter (or letting the kernel refuse it with an
+    // unexplained error at load time).
+    let instructions = filter.instructions().len();
+    if instructions > SECCOMP_FILTER_MAX_INSTRUCTIONS {
+        return Err(anyhow::anyhow!(
+            "seccomp filter needs {instructions} BPF instructions (kernel limit \
+             {SECCOMP_FILTER_MAX_INSTRUCTIONS}) for {} subscribed syscalls under \
+             unknown-syscall policy {policy:?}; refusing to run with a weaker filter",
+            subscribed.len()
         )
-        .build()
+        .into());
+    }
+    Ok(filter)
 }
 
 /// Specifies *how* the GDB server should listen for incoming connections.
@@ -4428,7 +4474,7 @@ impl<T: Tool + 'static> TracerBuilder<T> {
             cfg!(target_arch = "x86_64")
                 && T::observes_sigreturns(&config)
                 && self.gdbserver.is_none(),
-        ));
+        )?);
 
         // Command::spawn holds the launch lock from the child's first pipe
         // until clone returns, and not while it waits for the child to start
@@ -4614,7 +4660,7 @@ where
     let seccomp_filter = seccomp_filter(
         &events,
         cfg!(target_arch = "x86_64") && L::observes_sigreturns(&config),
-    );
+    )?;
 
     // While the pipes are made, no transient open of another thread may be
     // in flight: its descriptor would take a number from the pipes' budget.

@@ -73,8 +73,8 @@ fn run(filter: &Filter, nr: u32, arch: u32, ip: u64) -> u32 {
 fn only_the_untraced_stub_return_address_bypasses_the_tracer() {
     let untraced = (cp::TRAMPOLINE_BASE + cp::SYSCALL_INSTR_SIZE) as u64;
     assert_eq!(untraced, 0x7100_0002);
-    let all = seccomp_filter(&Subscription::all(), false);
-    let none = seccomp_filter(&Subscription::none(), false);
+    let all = seccomp_filter(&Subscription::all(), false).unwrap();
+    let none = seccomp_filter(&Subscription::none(), false).unwrap();
     let getpgid = Sysno::getpgid as u32;
     let mut wrong = Vec::new();
     for ip in [
@@ -124,8 +124,8 @@ fn rt_sigreturn_is_traced_only_for_a_tool_that_observes_sigreturns() {
     let untraced = (cp::TRAMPOLINE_BASE + cp::SYSCALL_INSTR_SIZE) as u64;
     let rt_sigreturn = Sysno::rt_sigreturn as u32;
     for (subscription, name) in [(Subscription::all(), "all"), (Subscription::none(), "none")] {
-        let observing = seccomp_filter(&subscription, true);
-        let plain = seccomp_filter(&subscription, false);
+        let observing = seccomp_filter(&subscription, true).unwrap();
+        let plain = seccomp_filter(&subscription, false).unwrap();
         for ip in [
             0,
             0x40_0000,

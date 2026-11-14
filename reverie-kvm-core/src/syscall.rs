@@ -6,6 +6,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use reverie::UnknownSyscallPolicy;
+use reverie::syscalls::RawSyscall;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallArgs;
 use reverie::syscalls::SyscallInfo;
@@ -84,20 +86,41 @@ impl SyscallRequest {
         unsafe { &*std::ptr::from_ref(request).cast::<Self>() }
     }
 
+    /// This request as a raw number and arguments, whether or not the
+    /// syscall table can name the number.
+    pub fn raw(self) -> RawSyscall {
+        let args = self.args().map(|argument| argument as usize);
+        RawSyscall::new(
+            self.number(),
+            SyscallArgs::new(args[0], args[1], args[2], args[3], args[4], args[5]),
+        )
+    }
+
+    /// Decodes this raw transport frame through Reverie's complete syscall
+    /// table, keeping a number the table cannot name as a [`RawSyscall`]
+    /// for the caller to route by the Tool's unknown-syscall policy.
+    pub fn decode(self) -> DecodedSyscall {
+        match usize::try_from(self.number()).ok().and_then(Sysno::new) {
+            Some(number) => {
+                let args = self.args().map(|argument| argument as usize);
+                DecodedSyscall::Known(Syscall::from_raw(
+                    number,
+                    SyscallArgs::new(args[0], args[1], args[2], args[3], args[4], args[5]),
+                ))
+            }
+            None => DecodedSyscall::Unknown(self.raw()),
+        }
+    }
+
     /// Decodes this raw transport frame through Reverie's complete syscall table.
     ///
     /// A number outside the architecture syscall table is rejected instead of
     /// being forwarded as an untyped request.
     pub fn into_syscall(self) -> Result<Syscall> {
-        let number = usize::try_from(self.number())
-            .ok()
-            .and_then(Sysno::new)
-            .ok_or(Error::InvalidSyscallNumber(self.number()))?;
-        let args = self.args().map(|argument| argument as usize);
-        Ok(Syscall::from_raw(
-            number,
-            SyscallArgs::new(args[0], args[1], args[2], args[3], args[4], args[5]),
-        ))
+        match self.decode() {
+            DecodedSyscall::Known(syscall) => Ok(syscall),
+            DecodedSyscall::Unknown(raw) => Err(Error::InvalidSyscallNumber(raw.nr)),
+        }
     }
 
     /// Encodes the request at a guest-physical address.
@@ -144,6 +167,44 @@ impl SyscallRequest {
             guest_address + (RESULT_WORD * WORD_SIZE) as u64,
             &result.to_le_bytes(),
         )
+    }
+}
+
+/// A decoded transport request: the typed syscall, or the raw request when
+/// its number has no `Sysno` in the table Reverie was built with.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DecodedSyscall {
+    /// A number the syscall table names, decoded as usual.
+    Known(Syscall),
+    /// A number the syscall table cannot name, kept raw.
+    Unknown(RawSyscall),
+}
+
+/// How the KVM backend answers a request whose number the syscall table
+/// cannot name, per the Tool's [`UnknownSyscallPolicy`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UnknownSyscallDisposition {
+    /// Keep the legacy behavior: fail the run with
+    /// [`Error::InvalidSyscallNumber`].
+    Abort,
+    /// Write this result to the guest's frame and continue, with no Tool
+    /// callback.
+    Answer(i64),
+    /// Call the Tool's unknown-syscall hook and write its result.
+    AskTool,
+}
+
+/// Maps an [`UnknownSyscallPolicy`] to this backend's handling of an
+/// unknown number. `EnosysFast` has no in-kernel filter to be fast with
+/// here, so it answers exactly as `Enosys` does; the guest cannot tell
+/// them apart.
+pub fn unknown_syscall_disposition(policy: UnknownSyscallPolicy) -> UnknownSyscallDisposition {
+    match policy {
+        UnknownSyscallPolicy::AllowNative => UnknownSyscallDisposition::Abort,
+        UnknownSyscallPolicy::Enosys | UnknownSyscallPolicy::EnosysFast => {
+            UnknownSyscallDisposition::Answer(-(libc::ENOSYS as i64))
+        }
+        UnknownSyscallPolicy::TrapToTool => UnknownSyscallDisposition::AskTool,
     }
 }
 
@@ -207,5 +268,47 @@ mod tests {
             .into_syscall()
             .unwrap_err();
         assert!(matches!(error, Error::InvalidSyscallNumber(u64::MAX)));
+    }
+
+    #[test]
+    fn decode_keeps_an_unknown_number_raw() {
+        // No Sysno in the x86_64 table (it ends at 461), as the guest
+        // issued it: number and arguments survive untruncated.
+        let request = SyscallRequest::new(463, [1, 2, 3, 4, 5, 6]);
+        assert_eq!(
+            request.decode(),
+            DecodedSyscall::Unknown(RawSyscall::new(463, SyscallArgs::new(1, 2, 3, 4, 5, 6),))
+        );
+        assert_eq!(request.raw().nr, 463);
+        // The rejecting decode reports the same number.
+        assert!(matches!(
+            request.into_syscall().unwrap_err(),
+            Error::InvalidSyscallNumber(463)
+        ));
+        // A known number still decodes typed.
+        match SyscallRequest::new(Sysno::getpid.id() as u64, [0; 6]).decode() {
+            DecodedSyscall::Known(syscall) => assert_eq!(syscall.number(), Sysno::getpid),
+            DecodedSyscall::Unknown(raw) => panic!("getpid decoded as unknown: {raw:?}"),
+        }
+    }
+
+    #[test]
+    fn policy_maps_to_the_backend_disposition() {
+        assert_eq!(
+            unknown_syscall_disposition(UnknownSyscallPolicy::AllowNative),
+            UnknownSyscallDisposition::Abort
+        );
+        assert_eq!(
+            unknown_syscall_disposition(UnknownSyscallPolicy::Enosys),
+            UnknownSyscallDisposition::Answer(-(libc::ENOSYS as i64))
+        );
+        assert_eq!(
+            unknown_syscall_disposition(UnknownSyscallPolicy::EnosysFast),
+            UnknownSyscallDisposition::Answer(-(libc::ENOSYS as i64))
+        );
+        assert_eq!(
+            unknown_syscall_disposition(UnknownSyscallPolicy::TrapToTool),
+            UnknownSyscallDisposition::AskTool
+        );
     }
 }

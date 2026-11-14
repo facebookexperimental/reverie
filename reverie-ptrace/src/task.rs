@@ -58,10 +58,12 @@ use reverie::Subscription;
 use reverie::Tid;
 use reverie::TimerSchedule;
 use reverie::Tool;
+use reverie::UnknownSyscallPolicy;
 use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Mprotect;
+use reverie::syscalls::RawSyscall;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallArgs;
 use reverie::syscalls::SyscallInfo;
@@ -5895,14 +5897,35 @@ impl<L: Tool> TracedTask<L> {
 
     fn get_syscall(&self, task: &Stopped) -> Result<Syscall, TraceError> {
         let regs = task.getregs()?;
-        // A checked decode: the filter traces only numbers the syscall table
-        // knows, so an unknown number here is an error, never a panic.
+        // A checked decode: an unknown number here is an error, never a
+        // panic. `handle_seccomp` recognizes that error and routes the
+        // stop by the subscription's unknown-syscall policy.
         let nr = Sysno::new(regs.orig_syscall() as i32 as usize).ok_or(Errno::ENOSYS)?;
 
         let args = regs.args();
 
         Ok(Syscall::from_raw(
             nr,
+            SyscallArgs::new(
+                args.0 as usize,
+                args.1 as usize,
+                args.2 as usize,
+                args.3 as usize,
+                args.4 as usize,
+                args.5 as usize,
+            ),
+        ))
+    }
+
+    /// The stop's syscall as raw number and arguments, for a number
+    /// `get_syscall` cannot name. The number is the guest's
+    /// syscall-number register, untruncated; whether it is unknown is
+    /// decided with `get_syscall`'s own conversion.
+    fn get_raw_syscall(&self, task: &Stopped) -> Result<RawSyscall, TraceError> {
+        let regs = task.getregs()?;
+        let args = regs.args();
+        Ok(RawSyscall::new(
+            regs.orig_syscall(),
             SyscallArgs::new(
                 args.0 as usize,
                 args.1 as usize,
@@ -7632,7 +7655,7 @@ impl<L: Tool + 'static> TracedTask<L> {
     ) -> Result<Wait, TraceError> {
         self.injected_tail_result = None;
         let mut frame = self.read_injected_syscall_frame(&task, frame_address)?;
-        let syscall = frame.syscall();
+        let syscall = frame.syscall()?;
         let (nr, args) = syscall.into_parts();
         // AUTONOMOUS-BOT-IMPLEMENTED
         if nr == Sysno::rt_sigreturn {
@@ -9432,9 +9455,31 @@ impl<L: Tool + 'static> TracedTask<L> {
         let tid = self.tid();
         self.native_user_continuation(&task)
             .tracee_context(tid, "account previous native continuation")?;
-        let syscall = self
-            .get_syscall(&task)
-            .tracee_context(tid, "read registers at seccomp stop")?;
+        let syscall = match self.get_syscall(&task) {
+            Ok(syscall) => syscall,
+            Err(error) => match self.get_raw_syscall(&task) {
+                // A number the syscall table cannot name, traced because
+                // the subscription's unknown-syscall policy (or the guest's
+                // own filter) asked for the stop: the policy routes it.
+                // Anything else that failed to decode keeps its error.
+                Ok(raw) if Sysno::new(raw.nr as i32 as usize).is_none() => {
+                    return match self.global_state.subscriptions.unknown_syscall_policy() {
+                        // Legacy. Under EnosysFast the kernel answers unknown
+                        // numbers inline, so only the guest's own filter can
+                        // stop one here; it keeps the same legacy error.
+                        UnknownSyscallPolicy::AllowNative | UnknownSyscallPolicy::EnosysFast => {
+                            Err(error).tracee_context(tid, "read registers at seccomp stop")
+                        }
+                        UnknownSyscallPolicy::Enosys | UnknownSyscallPolicy::TrapToTool => {
+                            self.handle_unknown_seccomp(task, raw).await
+                        }
+                    };
+                }
+                _ => {
+                    return Err(error).tracee_context(tid, "read registers at seccomp stop");
+                }
+            },
+        };
         let (nr, args) = syscall.into_parts();
         // Original syscall admission, including exit/exit_group, before Tool
         // handling or any injected repair. Injection uses a separate owner path.
@@ -9754,6 +9799,139 @@ impl<L: Tool + 'static> TracedTask<L> {
         }
         .instrument(span)
         .await
+    }
+
+    /// A seccomp stop for a syscall number the table cannot name, routed
+    /// here by `handle_seccomp` under the `Enosys` or `TrapToTool`
+    /// unknown-syscall policy. The guest's call never executes: it is
+    /// skipped and answered with `-ENOSYS`, or with the Tool's result
+    /// under `TrapToTool`, following the same steps as an emulated
+    /// subscribed syscall in `handle_seccomp` -- the SIGTRAP-action
+    /// repair first, and the timer's request finalization after, so this
+    /// stop decides the timer event as any intercepted syscall's does.
+    /// There is no `pending_syscall`: with no `Sysno` the Tool cannot
+    /// tail-inject the original call, so anything it injects is a
+    /// separate known syscall, and the value it returns is delivered as
+    /// this call's result.
+    async fn handle_unknown_seccomp(
+        &mut self,
+        mut task: Stopped,
+        raw: RawSyscall,
+    ) -> Result<Wait, Error> {
+        let tid = self.tid();
+        tracing::trace!(
+            target: "reverie_ptrace::syscall",
+            tid = %tid,
+            nr = raw.nr,
+            args = ?raw.args,
+            "intercepting guest syscall with an unknown number"
+        );
+        #[cfg(feature = "rcb-observation")]
+        self.observe_guest_rcb(&task, "syscall_entry", raw.nr as i64)
+            .tracee_context(tid, "observe original syscall RCB")?;
+        // A SIGTRAP action that a Reverie trap reset is written back before
+        // the Tool or the syscall can read it, as at any seccomp stop. The
+        // legacy vsyscall page issues only known numbers, so it needs no
+        // result emulation here; a taken SIGTRAP there keeps the main
+        // path's refusal.
+        #[cfg(target_arch = "x86_64")]
+        let is_legacy_vsyscall = is_legacy_vsyscall_ip(
+            task.getregs()
+                .tracee_context(tid, "identify legacy vsyscall stop")?
+                .ip(),
+        );
+        #[cfg(not(target_arch = "x86_64"))]
+        let is_legacy_vsyscall = false;
+        if !is_legacy_vsyscall {
+            task = self
+                .repair_sigtrap_at_seccomp_stop(task)
+                .await
+                .tracee_context(tid, "write back SIGTRAP's action at a seccomp stop")?;
+        } else if self.stashed_sigtrap.is_some() {
+            return Err(self
+                .fail_pending_sigtrap(task.pid(), "legacy vsyscall stop")
+                .into());
+        }
+
+        let (retval, deferred_native) =
+            match self.global_state.subscriptions.unknown_syscall_policy() {
+                UnknownSyscallPolicy::Enosys => {
+                    (Some(Ok(-(Errno::ENOSYS.into_raw() as i64))), None)
+                }
+                UnknownSyscallPolicy::TrapToTool => {
+                    let native_callback = self
+                        .global_state
+                        .fatal_session
+                        .native_sequence
+                        .try_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                            old.checked_add(1)
+                        })
+                        .map_err(|_| self.input_failure("native-callback-identity-exhausted"))?;
+                    self.native_callback = Some(native_callback);
+                    self.native_entry_pending = Some(Arc::new(AtomicBool::new(true)));
+
+                    self.in_syscall_callback = true;
+                    let mut parked = self.park_for_gdb();
+                    let retval = ParkedForGdb::hold(
+                        &mut parked,
+                        cancellable(self.cancel_handler.clone(), async {
+                            self.process_state
+                                .clone()
+                                .handle_unknown_syscall(self, raw)
+                                .await
+                        }),
+                    )
+                    .await;
+                    self.unpark(parked);
+                    self.in_syscall_callback = false;
+                    self.native_callback = None;
+                    let retval = retval?;
+                    let deferred_native = self.deferred_native_call.take();
+                    if deferred_native
+                        .as_ref()
+                        .is_some_and(|call| call.callback != native_callback)
+                    {
+                        return Err(self.input_failure("native-tail-callback-mismatch").into());
+                    }
+                    let retval = match retval {
+                        Some(Err(error)) if !matches!(error, reverie::Error::Errno(_)) => {
+                            self.publish_ordinary_failure("ptrace unknown syscall callback", error);
+                            return Err(Error::RunFailed);
+                        }
+                        result => result,
+                    };
+                    (retval, deferred_native)
+                }
+                // `handle_seccomp` routes only the two trapping policies here.
+                UnknownSyscallPolicy::AllowNative | UnknownSyscallPolicy::EnosysFast => {
+                    unreachable!("unknown syscall stop routed under a non-trapping policy")
+                }
+            };
+
+        self.ordinary_continuation()?;
+        task = self
+            .skip_seccomp_syscall(task)
+            .await
+            .tracee_context(tid, "skip unknown syscall")?;
+        self.ordinary_trace_continuation()?;
+        self.timer.finalize_requests();
+
+        if let Some(retval) = retval {
+            let ret = match retval {
+                Ok(x) => x as u64,
+                Err(err) => (-(err.into_errno()?.into_raw() as i64)) as u64,
+            };
+            set_ret(&task, ret).tracee_context(tid, "set unknown syscall result")?;
+        }
+
+        let held = self.take_pending_signal_for_resume()?;
+        let resume = self.report_held_signal(&task, None, held).await?;
+        let wait = self
+            .resume_with_signal_and_native(task, resume, deferred_native.as_ref())
+            .await
+            .tracee_context(tid, "resume after unknown syscall stop")?;
+        self.native_entry_pending = None;
+        Ok(wait)
     }
 
     fn liteinst_root_stop_slot(&self) -> Option<Arc<StdMutex<Option<HeldRootStop>>>> {
