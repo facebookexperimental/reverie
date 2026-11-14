@@ -456,7 +456,7 @@ pub(super) fn inject_capture_error_for_current_thread(error: Errno) {
         .push_back(error);
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(sanitized)))]
 pub(super) fn inject_sync_decode_capture_error(pid: Pid, error: Errno) {
     SYNC_DECODE_CAPTURE_ERRORS.lock().insert(pid, error);
 }
@@ -4845,7 +4845,7 @@ impl AlignedProcfs {
         Ok(unsafe { OwnedFd::from_raw_fd(raw) })
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, not(sanitized)))]
     fn current_thread_status(&self) -> Result<RetainedProcStatus, Errno> {
         retained_proc_status(self.open_current_thread()?.as_raw_fd())
     }
@@ -9759,6 +9759,7 @@ mod test {
     /// Keep completion evidence on a separate physical line even beside
     /// C signal-handler output or libtest's unfinished progress line. One
     /// bounded write keeps both delimiters and the unchanged marker atomic.
+    #[cfg(not(sanitized))]
     fn emit_completion_marker(marker: &str) {
         let line = format!("\n{marker}\n");
         assert!(line.len() <= libc::PIPE_BUF);
@@ -9798,6 +9799,7 @@ mod test {
     // SIGKILL never converts scheduling delay into a failure ahead of
     // the inner assertions (the previous 5 s could). The test runner's
     // per-test CPU/wall caps remain the hang backstop.
+    #[cfg(not(sanitized))]
     const EXACT_TEST_SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(60);
     const REGISTRATION_RETRY_TIMEOUT: Duration = Duration::from_millis(100);
 
@@ -10391,6 +10393,7 @@ mod test {
             Ok(stopped.exit_event())
         }
 
+        #[cfg(not(sanitized))]
         fn exit_event_on_ptracer_thread(
             &mut self,
             stopped: &Stopped,

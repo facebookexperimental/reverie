@@ -6,6 +6,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[cfg(not(sanitized))]
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum ManagedForkCallback {
     Clone,
@@ -13,6 +14,7 @@ enum ManagedForkCallback {
     Wake,
 }
 
+#[cfg(not(sanitized))]
 struct ManagedWakerFork {
     callback: ManagedForkCallback,
     origin: libc::pid_t,
@@ -39,6 +41,7 @@ fn guarded_native_reservation_keeps_local_auto_traits() {
     not_trait!(Sync);
 }
 
+#[cfg(not(sanitized))]
 impl ManagedWakerFork {
     fn new(callback: ManagedForkCallback) -> Arc<Self> {
         let mut pipe = [-1; 2];
@@ -138,6 +141,7 @@ impl ManagedWakerFork {
     }
 }
 
+#[cfg(not(sanitized))]
 fn run_managed_native_outer(name: &str, marker: &str, unavailable: &str) -> bool {
     const INNER: &str = "SAFEPTRACE_MANAGED_NATIVE_INNER";
     if env::var_os(INNER).is_some() {
@@ -158,6 +162,7 @@ fn run_managed_native_outer(name: &str, marker: &str, unavailable: &str) -> bool
     true
 }
 
+#[cfg(not(sanitized))]
 struct ManagedNativeGuest {
     root: Pid,
     running: Option<Running>,
@@ -168,6 +173,7 @@ struct ManagedNativeGuest {
     deadline: Instant,
 }
 
+#[cfg(not(sanitized))]
 fn managed_native_guest(signal_first: bool, unavailable: &str) -> Option<ManagedNativeGuest> {
     let root = match unsafe { fork() }.unwrap() {
         ForkResult::Parent { child } => child,
@@ -228,6 +234,7 @@ fn managed_native_guest(signal_first: bool, unavailable: &str) -> Option<Managed
     })
 }
 
+#[cfg(not(sanitized))]
 fn poll_managed_wait_until_ready(
     future: &mut OwnedWaitFuture,
     guard: &PtracerThreadGuard,
@@ -245,6 +252,7 @@ fn poll_managed_wait_until_ready(
     }
 }
 
+#[cfg(not(sanitized))]
 fn finish_managed_native_guest(mut guest: ManagedNativeGuest, stopped: Option<Stopped>) {
     let running = if let Some(stopped) = stopped {
         drop(guest.running.take());

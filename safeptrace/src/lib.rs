@@ -4054,6 +4054,7 @@ mod test {
     }
 
     /// The calling thread's blocked-signal mask, as the kernel reports it.
+    #[cfg(not(sanitized))]
     fn own_sigmask() -> u64 {
         let mut mask = 0u64;
         let ret = unsafe {
@@ -4074,6 +4075,7 @@ mod test {
     /// `raise()` in glibc 2.26 to 2.33, and in musl, blocks signals around its
     /// tgkill and restores the saved mask afterwards; that restore would run
     /// after the tracer's PTRACE_SETSIGMASK at this stop and overwrite it.
+    #[cfg(not(sanitized))]
     fn stop_self_with_raw_tgkill() {
         let ret = unsafe {
             let pid = libc::syscall(libc::SYS_getpid);
@@ -4085,6 +4087,7 @@ mod test {
 
     /// Waits for the tracee's next stop, which must be a signal-delivery stop
     /// for `signal`.
+    #[cfg(not(sanitized))]
     fn expect_signal_stop(running: Running, signal: Signal) -> Stopped {
         match running.wait().unwrap() {
             Wait::Stopped(stopped, Event::Signal(got)) if got == signal => stopped,
@@ -4123,9 +4126,11 @@ mod test {
         Ok(())
     }
 
+    #[cfg(not(sanitized))]
     static SIGUSR1_HANDLED: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
 
+    #[cfg(not(sanitized))]
     extern "C" fn note_sigusr1(_signal: libc::c_int) {
         SIGUSR1_HANDLED.store(true, std::sync::atomic::Ordering::SeqCst);
     }
@@ -4410,8 +4415,10 @@ mod test {
         Ok(())
     }
 
+    #[cfg(not(sanitized))]
     static RT_HANDLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+    #[cfg(not(sanitized))]
     extern "C" fn note_realtime(signal: libc::c_int) {
         RT_HANDLED.fetch_or(1 << (signal - 1), std::sync::atomic::Ordering::SeqCst);
     }
