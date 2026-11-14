@@ -986,6 +986,15 @@ thread_local! {
     /// `AlignedProcfs::from_root`, which `RETAINED_STATUS_READS` does not
     /// count.
     static OTHER_STATUS_OPENS: Cell<usize> = const { Cell::new(0) };
+    /// `legacy_stop_proves_owner` calls on this thread that proved the
+    /// owner without a status read.
+    static LEGACY_STOP_PROOFS_ACCEPTED: Cell<usize> = const { Cell::new(0) };
+    /// `legacy_stop_proves_owner` calls on this thread that tried the
+    /// kernel proof for a bound owner and did not complete it.
+    static LEGACY_STOP_PROOFS_REFUSED: Cell<usize> = const { Cell::new(0) };
+    /// Statuses `try_assist_legacy_wait` consumed on this thread and pushed
+    /// onto `consumed` for the worker to publish.
+    static LEGACY_ASSIST_CONSUMPTIONS: Cell<usize> = const { Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -3368,6 +3377,8 @@ impl EventHandle {
             // Retirement takes this same mutex and drains this FIFO first.
             // It cannot publish ECHILD between our real reap and this push.
             progress.consumed.push_back(status);
+            #[cfg(test)]
+            LEGACY_ASSIST_CONSUMPTIONS.with(|consumed| consumed.set(consumed.get() + 1));
             progress.observed = None;
             progress.error = None;
             // The worker publishes it on its next turn: run that turn now.
@@ -4714,6 +4725,67 @@ fn authenticate_legacy_wait_owner(identity: &WorkerIdentity, event: &Event) -> R
     Ok(())
 }
 
+/// Proves for an observed stop, without reading status, the identity facts
+/// that `authenticate_legacy_wait_owner` checks: the executing thread is the
+/// Event's bound owner and the target's current ptracer, and the number still
+/// names the retained PID object. `false` means unproved, never refused: the
+/// caller then authenticates through the status read, which decides the
+/// verdict and its error.
+///
+/// The identity verdict is the read path's. The owner is bound only after
+/// that path has checked TracerPid against this thread through the same
+/// retained mount, so an identity this accepts, the read accepts too.
+///
+/// One difference is deliberate, and it is a contract change: an operational
+/// status-read error (EMFILE, ENFILE, ENOMEM and the like) no longer fails
+/// authentication when this whole proof succeeds (the bound owner's signal-0
+/// self proof, GETEVENTMSG, and signal 0 through the retained descriptor),
+/// because the status file is never opened. Such errors say nothing about
+/// identity. A proof that does not succeed still falls back to the read and
+/// returns its error, as before. Binding a missing owner stays with the read
+/// path.
+///
+/// The caller holds the Event's gate exclusively. Do not take
+/// [`EventHandle::hold_tid`] here, as `PtracerAffinity::check_attachment`
+/// does for the same proof: it takes the gate's read side, which this thread
+/// already holds for write, so it would deadlock. It is not needed either:
+/// the exclusive gate keeps out the registered reaper, which is all a hold
+/// keeps out.
+fn legacy_stop_proves_owner(identity: &WorkerIdentity, event: &Event) -> bool {
+    let Some(owner) = event.legacy_wait_owner.get() else {
+        return false;
+    };
+    let proved = owner.is_current() == Ok(true)
+        && numeric_stop_names_retained_task(identity.pid, || identity.pidfd_is_live());
+    #[cfg(test)]
+    if proved {
+        LEGACY_STOP_PROOFS_ACCEPTED.with(|proofs| proofs.set(proofs.get() + 1));
+    } else {
+        LEGACY_STOP_PROOFS_REFUSED.with(|proofs| proofs.set(proofs.get() + 1));
+    }
+    proved
+}
+
+/// Whether `pid` names a task in a ptrace stop of this exact thread, and
+/// still names the PID object the caller retains.
+///
+/// GETEVENTMSG is a nondestructive scratch read. The kernel serves it only
+/// if the task holding `pid` has this thread as its tracer (a task pointer
+/// comparison) and is held in a ptrace stop with no fatal signal pending
+/// (`ptrace_check_attach`). The retained descriptor is checked AFTER that
+/// numeric request, so a request served by a task that reused the number
+/// never proves anything: a number leaves the kernel's table only when its
+/// PID object has lost its last task, and such an object never gains a task
+/// again. So if the retained object still has a task, the number named it
+/// from capture until now, including when GETEVENTMSG resolved it. A
+/// refused liveness answer proves nothing.
+fn numeric_stop_names_retained_task(
+    pid: Pid,
+    retained_is_live: impl FnOnce() -> Result<bool, Errno>,
+) -> bool {
+    nix::sys::ptrace::getevent(pid.into()).is_ok() && retained_is_live() == Ok(true)
+}
+
 /// Consumes at most one actual status on the live actual ptracer thread.
 /// The caller holds `legacy_wait`, excluding the observation worker's
 /// retirement. The exclusive gate drains every Safe execution-control
@@ -4738,24 +4810,35 @@ fn try_consume_legacy_status(
             | libc::__WALL
             | libc::__WNOTHREAD,
     );
-    // Observe before authenticating, so that one retained read serves as
-    // both the observation's postcheck (see `ThreadHandle::legacy_wait_once`)
-    // and the owner's authentication. The observation consumes nothing, and
+    // Observe before authenticating, so that one proof serves as both the
+    // observation's postcheck (see `ThreadHandle::legacy_wait_once`) and the
+    // owner's authentication. The observation consumes nothing, and
     // __WNOTHREAD admits only this thread's own children and tracees.
     let observed = observe_numeric(identity.pid, observe);
-    // Capture-time TracerPid is never authority: this reads the current one.
-    // A refused authentication returns its error before the observation's,
-    // as it did when it ran first.
-    authenticate_legacy_wait_owner(identity, event)?;
+    // An observed stop is proved without reading status, so an operational
+    // status-read error cannot refuse it (see `legacy_stop_proves_owner`).
+    // Its GETEVENTMSG reaches only a task in a ptrace stop of this thread, so
+    // it also shows the retained non-leader had not exec'd: its exec moves
+    // the retained PID object to the dying former leader, never back.
+    // Everything else, zombies and refused proofs included, authenticates
+    // through the retained read and returns its errors. Capture-time
+    // TracerPid is never authority: the read checks the current one. A
+    // refused authentication returns its error before the observation's, as
+    // it did when it ran first.
+    let stop_proved = matches!(&observed, Ok(Some(status)) if libc::WIFSTOPPED(*status))
+        && legacy_stop_proves_owner(identity, event);
+    if !stop_proved {
+        authenticate_legacy_wait_owner(identity, event)?;
+    }
     let Some(observed) = observed? else {
         return Ok(None);
     };
     // No second authentication before the irreversible query below. From
-    // the one above until that query returns, this thread runs no ptrace
-    // request and cannot exit, so the tracee stays attached to it. Only
-    // this thread's thread group can reap the tracee, and every Safe
-    // execution-control operation is drained by the exclusive gate. The
-    // stop or zombie observed above therefore keeps holding the TID.
+    // the one above, by either route, until that query returns, this thread
+    // runs no other ptrace request and cannot exit, so the tracee stays
+    // attached to it. Only this thread's thread group can reap the tracee,
+    // and every Safe execution-control operation is drained by the exclusive
+    // gate. The stop or zombie observed above therefore keeps holding the TID.
     let terminal = libc::WIFEXITED(observed) || libc::WIFSIGNALED(observed);
     let flags = WaitPidFlag::from_bits_retain(
         if terminal {

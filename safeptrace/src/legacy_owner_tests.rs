@@ -873,3 +873,475 @@ async fn forced_legacy_wait_preserves_authority_after_non_utf8_name_change() {
     drop(running);
     emit_completion_marker("ACTUAL_LEGACY_NON_UTF8_WAIT_EXERCISED");
 }
+
+/// The procfs state letter of thread `tid` in `root`'s thread group.
+#[cfg(not(sanitized))]
+fn legacy_owner_thread_state(root: Pid, tid: Pid) -> Option<String> {
+    let stat = fs::read_to_string(format!("/proc/{root}/task/{tid}/stat")).ok()?;
+    Some(
+        stat.rsplit_once(')')?
+            .1
+            .split_whitespace()
+            .next()?
+            .to_owned(),
+    )
+}
+
+/// With signal 0 refused, the stop proof cannot complete: the attempt that
+/// consumes a stop tries it, falls back to the retained status read, and
+/// consumes as before.
+#[tokio::test(flavor = "current_thread")]
+#[cfg(not(sanitized))]
+async fn forced_legacy_stop_proof_falls_back_when_signal0_is_denied() {
+    if run_legacy_test_outer_with_outcome(
+        "forced_legacy_stop_proof_falls_back_when_signal0_is_denied",
+        Some("ACTUAL_LEGACY_STOP_PROOF_DENIED_FALLBACK_EXERCISED"),
+    ) {
+        return;
+    }
+    let (root, tid, release, mut root_cleanup) = legacy_owner_guest();
+    let _force = LegacyThreadGroup::new(root);
+    let running = Running::seize_on_ptracer_thread(tid.into(), legacy_thread_options()).unwrap();
+    let terminal = running.terminal_cleanup();
+    terminal.ensure_registered().unwrap();
+    let identity = terminal.event.identity().unwrap().clone();
+    assert!(matches!(identity.pidfd, ThreadHandle::Procfs { .. }));
+    legacy_owner_deny_signal0();
+    assert_eq!(identity.pidfd_is_live(), Err(Errno::EPERM));
+    // A first stop through an ordinary wait starts the observation worker.
+    running.interrupt().unwrap();
+    let (stopped, event) =
+        tokio::time::timeout(TRACEE_WAIT_TIMEOUT, running.wait_owned_on_ptracer_thread())
+            .await
+            .unwrap()
+            .unwrap()
+            .assume_stopped();
+    assert_eq!(event, crate::Event::Stop);
+    // Counted attempts consume the second stop.
+    let running = stopped.resume(None).unwrap();
+    running.interrupt().unwrap();
+    legacy_owner_until(|| legacy_owner_thread_state(root, tid).as_deref() == Some("t"));
+    let mut attempts = legacy_attempts_until_consumed(&terminal);
+    let consuming = attempts.pop().unwrap();
+    assert_eq!(
+        consuming,
+        LegacyAttempt {
+            reads: 1,
+            accepted: 0,
+            refused: 1,
+            consumed: 1,
+        },
+        "the consuming attempt did not fall back to the status read"
+    );
+    assert!(
+        attempts
+            .iter()
+            .all(|attempt| attempt.accepted == 0 && attempt.consumed == 0),
+        "an attempt proved its owner with signal 0 refused, or consumed early: {attempts:?}"
+    );
+    let (stopped, event) =
+        tokio::time::timeout(TRACEE_WAIT_TIMEOUT, running.wait_owned_on_ptracer_thread())
+            .await
+            .unwrap()
+            .unwrap()
+            .assume_stopped();
+    assert_eq!(event, crate::Event::Stop);
+    let exit = stopped.exit_event_on_ptracer_thread();
+    assert_eq!(
+        unsafe { libc::write(release.as_raw_fd(), b"x".as_ptr().cast(), 1) },
+        1
+    );
+    let running = stopped.resume(None).unwrap();
+    let stopped = tokio::time::timeout(TRACEE_WAIT_TIMEOUT, exit)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stopped.getevent().unwrap(), 23 << 8);
+    assert_eq!(
+        tokio::time::timeout(
+            TRACEE_WAIT_TIMEOUT,
+            stopped.resume(None).unwrap().wait_owned_on_ptracer_thread()
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .assume_exited(),
+        (tid.into(), crate::ExitStatus::Exited(23))
+    );
+    assert!(terminal.wait(TRACEE_WAIT_TIMEOUT));
+    legacy_owner_reap_root(root, &mut root_cleanup);
+    drop(running);
+    emit_completion_marker("ACTUAL_LEGACY_STOP_PROOF_DENIED_FALLBACK_EXERCISED");
+}
+
+/// A zombie is in no ptrace stop, so the stop proof never serves it: the
+/// attempt that reaps it authenticates through the retained status read.
+#[tokio::test(flavor = "current_thread")]
+#[cfg(not(sanitized))]
+async fn forced_legacy_zombie_observation_authenticates_through_status() {
+    if run_legacy_test_outer_with_outcome(
+        "forced_legacy_zombie_observation_authenticates_through_status",
+        Some("ACTUAL_LEGACY_ZOMBIE_READ_AUTHENTICATION_EXERCISED"),
+    ) {
+        return;
+    }
+    let (root, tid, release, mut root_cleanup) = legacy_owner_guest();
+    let _force = LegacyThreadGroup::new(root);
+    let running = Running::seize_on_ptracer_thread(tid.into(), legacy_thread_options()).unwrap();
+    let terminal = running.terminal_cleanup();
+    terminal.ensure_registered().unwrap();
+    assert!(matches!(
+        terminal.event.identity().unwrap().pidfd,
+        ThreadHandle::Procfs { .. }
+    ));
+    running.interrupt().unwrap();
+    let (stopped, event) =
+        tokio::time::timeout(TRACEE_WAIT_TIMEOUT, running.wait_owned_on_ptracer_thread())
+            .await
+            .unwrap()
+            .unwrap()
+            .assume_stopped();
+    assert_eq!(event, crate::Event::Stop);
+    let exit = stopped.exit_event_on_ptracer_thread();
+    assert_eq!(
+        unsafe { libc::write(release.as_raw_fd(), b"x".as_ptr().cast(), 1) },
+        1
+    );
+    let running = stopped.resume(None).unwrap();
+    let stopped = tokio::time::timeout(TRACEE_WAIT_TIMEOUT, exit)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stopped.getevent().unwrap(), 23 << 8);
+    // Counted attempts reap the zombie.
+    let exited = stopped.resume(None).unwrap();
+    legacy_owner_until(|| legacy_owner_thread_state(root, tid).as_deref() == Some("Z"));
+    let mut attempts = legacy_attempts_until_consumed(&terminal);
+    let reaping = attempts.pop().unwrap();
+    assert_eq!(
+        reaping,
+        LegacyAttempt {
+            reads: 1,
+            accepted: 0,
+            refused: 0,
+            consumed: 1,
+        },
+        "the reaping attempt did not authenticate through the status read"
+    );
+    assert!(
+        attempts
+            .iter()
+            .all(|attempt| attempt.accepted == 0 && attempt.refused == 0 && attempt.consumed == 0),
+        "an attempt ran the stop proof for a zombie, or consumed early: {attempts:?}"
+    );
+    assert_eq!(
+        tokio::time::timeout(TRACEE_WAIT_TIMEOUT, exited.wait_owned_on_ptracer_thread())
+            .await
+            .unwrap()
+            .unwrap()
+            .assume_exited(),
+        (tid.into(), crate::ExitStatus::Exited(23))
+    );
+    assert!(terminal.wait(TRACEE_WAIT_TIMEOUT));
+    legacy_owner_reap_root(root, &mut root_cleanup);
+    drop(running);
+    emit_completion_marker("ACTUAL_LEGACY_ZOMBIE_READ_AUTHENTICATION_EXERCISED");
+}
+
+/// The ptrace stop status of an interrupt of a seized thread.
+#[cfg(not(sanitized))]
+const LEGACY_OWNER_EVENT_STOP: i32 = 0x7f | (libc::SIGTRAP << 8) | (libc::PTRACE_EVENT_STOP << 16);
+
+/// Lowers RLIMIT_NOFILE to this process's lowest free descriptor, so that
+/// the next descriptor any thread allocates fails with EMFILE, and returns
+/// the limit to restore.
+#[cfg(not(sanitized))]
+fn legacy_owner_exhaust_descriptors() -> libc::rlimit {
+    let mut saved = unsafe { mem::zeroed::<libc::rlimit>() };
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut saved) },
+        0
+    );
+    let lowest = unsafe { libc::fcntl(libc::STDERR_FILENO, libc::F_DUPFD_CLOEXEC, 0) };
+    assert!(
+        lowest >= 0,
+        "find the lowest free descriptor: {}",
+        Errno::last()
+    );
+    assert_eq!(unsafe { libc::close(lowest) }, 0);
+    let exhausted = libc::rlimit {
+        rlim_cur: lowest as libc::rlim_t,
+        rlim_max: saved.rlim_max,
+    };
+    assert_eq!(
+        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &exhausted) },
+        0
+    );
+    let probe = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    assert_eq!(
+        (probe, Errno::last()),
+        (-1, Errno::EMFILE),
+        "the descriptor table is not exhausted"
+    );
+    saved
+}
+
+#[cfg(not(sanitized))]
+fn legacy_owner_restore_descriptors(saved: &libc::rlimit) {
+    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, saved) }, 0);
+}
+
+/// The contract boundary of the stop proof, with exact results. While no
+/// descriptor can be opened, the status read fails with EMFILE. An observed
+/// stop whose proof succeeds is still consumed, with no read. An observed stop
+/// whose proof is refused, and an attempt that observes nothing, authenticate
+/// through the read and return its EMFILE, consuming nothing.
+#[tokio::test(flavor = "current_thread")]
+#[cfg(not(sanitized))]
+async fn forced_legacy_stop_proof_needs_no_status_open_but_a_refused_proof_does() {
+    if run_legacy_test_outer_with_outcome(
+        "forced_legacy_stop_proof_needs_no_status_open_but_a_refused_proof_does",
+        Some("ACTUAL_LEGACY_STOP_PROOF_EMFILE_BOUNDARY_EXERCISED"),
+    ) {
+        return;
+    }
+    let (root, tid, release, mut root_cleanup) = legacy_owner_guest();
+    let _force = LegacyThreadGroup::new(root);
+    let running = Running::seize_on_ptracer_thread(tid.into(), legacy_thread_options()).unwrap();
+    let terminal = running.terminal_cleanup();
+    terminal.ensure_registered().unwrap();
+    let identity = terminal.event.identity().unwrap().clone();
+    assert!(matches!(identity.pidfd, ThreadHandle::Procfs { .. }));
+    // A first stop through an ordinary wait starts the observation worker.
+    running.interrupt().unwrap();
+    let (stopped, event) =
+        tokio::time::timeout(TRACEE_WAIT_TIMEOUT, running.wait_owned_on_ptracer_thread())
+            .await
+            .unwrap()
+            .unwrap()
+            .assume_stopped();
+    assert_eq!(event, crate::Event::Stop);
+    let running = stopped.resume(None).unwrap();
+    running.interrupt().unwrap();
+    legacy_owner_until(|| legacy_owner_thread_state(root, tid).as_deref() == Some("t"));
+    let event = Arc::clone(terminal.event.event());
+    let stop = legacy_owner_observe(tid, WaitPidFlag::WSTOPPED);
+    assert_eq!(stop, LEGACY_OWNER_EVENT_STOP);
+    // The worker turns only under this mutex, so holding it keeps every other
+    // status read out of the exhausted window. The block releases it before
+    // the next await.
+    let (refused, refused_attempt, after_refusal, accepted, accepted_attempt, empty, empty_attempt) = {
+        let mut progress = event.legacy_wait.lock();
+        assert!(event.worker_is_running() && !progress.retiring);
+        assert!(progress.consumed.is_empty());
+        let saved = legacy_owner_exhaust_descriptors();
+        assert_eq!(identity.current_tracer_pid(), Err(Errno::EMFILE));
+
+        // A refused proof (signal 0 through the retained descriptor refused).
+        PIDFD_LIVENESS_ERRORS
+            .lock()
+            .entry(tid.into())
+            .or_default()
+            .push_back(Errno::EPERM);
+        let before = LegacyAttempt::now();
+        let refused = try_consume_legacy_status(&identity, &event, None);
+        let refused_attempt = LegacyAttempt::since(before);
+        let after_refusal = legacy_owner_observe(tid, WaitPidFlag::WSTOPPED);
+        // A proof that succeeds.
+        let before = LegacyAttempt::now();
+        let accepted = try_consume_legacy_status(&identity, &event, None);
+        let accepted_attempt = LegacyAttempt::since(before);
+        // Nothing observed: the stop is consumed.
+        let before = LegacyAttempt::now();
+        let empty = try_consume_legacy_status(&identity, &event, None);
+        let empty_attempt = LegacyAttempt::since(before);
+        legacy_owner_restore_descriptors(&saved);
+
+        // Hand a consumed stop to the worker, as `try_assist_legacy_wait`
+        // does, so that the SDK wait below returns it.
+        if let Ok(Some(status)) = accepted {
+            progress.consumed.push_back(status);
+            progress.observed = None;
+            progress.error = None;
+            event.count_legacy_wakeup();
+        }
+        (
+            refused,
+            refused_attempt,
+            after_refusal,
+            accepted,
+            accepted_attempt,
+            empty,
+            empty_attempt,
+        )
+    };
+    event.notify_legacy_worker();
+
+    // Direct calls queue nothing for the worker, so `consumed` stays 0 even
+    // for the attempt that consumed the stop from the kernel.
+    assert_eq!(refused, Err(Errno::EMFILE));
+    assert_eq!(
+        refused_attempt,
+        LegacyAttempt {
+            reads: 1,
+            accepted: 0,
+            refused: 1,
+            consumed: 0,
+        }
+    );
+    assert_eq!(after_refusal, stop, "the refused attempt consumed the stop");
+    assert_eq!(accepted, Ok(Some(stop)));
+    assert_eq!(
+        accepted_attempt,
+        LegacyAttempt {
+            reads: 0,
+            accepted: 1,
+            refused: 0,
+            consumed: 0,
+        }
+    );
+    assert_eq!(empty, Err(Errno::EMFILE));
+    assert_eq!(
+        empty_attempt,
+        LegacyAttempt {
+            reads: 1,
+            accepted: 0,
+            refused: 0,
+            consumed: 0,
+        }
+    );
+    let (stopped, event) =
+        tokio::time::timeout(TRACEE_WAIT_TIMEOUT, running.wait_owned_on_ptracer_thread())
+            .await
+            .unwrap()
+            .unwrap()
+            .assume_stopped();
+    assert_eq!(event, crate::Event::Stop);
+    let exit = stopped.exit_event_on_ptracer_thread();
+    assert_eq!(
+        unsafe { libc::write(release.as_raw_fd(), b"x".as_ptr().cast(), 1) },
+        1
+    );
+    let running = stopped.resume(None).unwrap();
+    let stopped = tokio::time::timeout(TRACEE_WAIT_TIMEOUT, exit)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stopped.getevent().unwrap(), 23 << 8);
+    assert_eq!(
+        tokio::time::timeout(
+            TRACEE_WAIT_TIMEOUT,
+            stopped.resume(None).unwrap().wait_owned_on_ptracer_thread()
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .assume_exited(),
+        (tid.into(), crate::ExitStatus::Exited(23))
+    );
+    assert!(terminal.wait(TRACEE_WAIT_TIMEOUT));
+    legacy_owner_reap_root(root, &mut root_cleanup);
+    drop(running);
+    emit_completion_marker("ACTUAL_LEGACY_STOP_PROOF_EMFILE_BOUNDARY_EXERCISED");
+}
+
+/// The stop proof needs the Event's bound owner, not merely the target's
+/// current tracer. When another thread of this process becomes the tracer
+/// behind the Event's back (a raw detach and seize that skip
+/// `reconnect_attachment`, which would retire the Event), its attempt on the
+/// old Event is refused with EPERM through the read, and the stop it holds is
+/// left unconsumed.
+#[test]
+#[cfg(not(sanitized))]
+fn forced_legacy_stop_proof_refuses_a_tracer_that_is_not_the_bound_owner() {
+    if run_legacy_test_outer_with_outcome(
+        "forced_legacy_stop_proof_refuses_a_tracer_that_is_not_the_bound_owner",
+        Some("ACTUAL_LEGACY_STOP_PROOF_WRONG_OWNER_EXERCISED"),
+    ) {
+        return;
+    }
+    let (root, tid, release, mut root_cleanup) = legacy_owner_guest();
+    let _force = LegacyThreadGroup::new(root);
+    let running = Running::seize_on_ptracer_thread(tid.into(), legacy_thread_options()).unwrap();
+    let terminal = running.terminal_cleanup();
+    assert!(matches!(
+        terminal.event.identity().unwrap().pidfd,
+        ThreadHandle::Procfs { .. }
+    ));
+    let event = Arc::clone(terminal.event.event());
+    assert!(
+        event
+            .legacy_wait_owner
+            .get()
+            .is_some_and(|owner| owner.is_current() == Ok(true))
+    );
+    running.interrupt().unwrap();
+    let (stopped, stop_event) = running
+        .wait_sync_on_ptracer_thread()
+        .wait()
+        .unwrap()
+        .assume_stopped();
+    assert_eq!(stop_event, crate::Event::Stop);
+    // The observation worker turns only under `legacy_wait`. Holding it from
+    // here until the bound owner has the target back keeps the worker from
+    // seeing the hand-offs below; the other thread's attempt runs under it.
+    let progress = event.legacy_wait.lock();
+    // A raw detach leaves this Event, its open gate and its bound owner.
+    nix::sys::ptrace::detach(tid, None).unwrap();
+    assert!(!*event.terminal_reaping.read());
+    let handle = terminal.event.clone();
+    let other = thread::spawn(move || {
+        let identity = handle.identity().unwrap();
+        let event = handle.event();
+        nix::sys::ptrace::seize(tid, Options::PTRACE_O_EXITKILL).unwrap();
+        nix::sys::ptrace::interrupt(tid).unwrap();
+        let stop = legacy_owner_observe(tid, WaitPidFlag::WSTOPPED);
+        let before = LegacyAttempt::now();
+        let result = try_consume_legacy_status(identity, event, None);
+        let attempt = LegacyAttempt::since(before);
+        let left = waitid::wait_raw(
+            waitid::IdType::Pid(tid),
+            WaitPidFlag::from_bits_retain(
+                WaitPidFlag::WSTOPPED.bits()
+                    | WaitPidFlag::WNOWAIT.bits()
+                    | WaitPidFlag::WNOHANG.bits()
+                    | libc::__WALL
+                    | libc::__WNOTHREAD,
+            ),
+        );
+        nix::sys::ptrace::detach(tid, None).unwrap();
+        (stop, result, attempt, left)
+    });
+    let (stop, result, attempt, left) = other.join().unwrap();
+    assert_eq!(stop, LEGACY_OWNER_EVENT_STOP);
+    assert_eq!(result, Err(Errno::EPERM));
+    // A direct call queues nothing for the worker: `consumed` stays 0.
+    assert_eq!(
+        attempt,
+        LegacyAttempt {
+            reads: 1,
+            accepted: 0,
+            refused: 1,
+            consumed: 0,
+        }
+    );
+    assert_eq!(
+        left,
+        Ok(Some(stop)),
+        "the refused attempt consumed the stop"
+    );
+    // The bound owner takes the target back and detaches through the SDK.
+    nix::sys::ptrace::seize(tid, legacy_thread_options()).unwrap();
+    nix::sys::ptrace::interrupt(tid).unwrap();
+    let status = waitpid_status_bounded(tid, libc::__WALL, TRACEE_WAIT_TIMEOUT).unwrap();
+    assert_eq!(status, LEGACY_OWNER_EVENT_STOP);
+    drop(progress);
+    let detached = stopped.detach(None).unwrap();
+    assert_eq!(
+        unsafe { libc::write(release.as_raw_fd(), b"x".as_ptr().cast(), 1) },
+        1
+    );
+    legacy_owner_reap_root(root, &mut root_cleanup);
+    drop(detached);
+    emit_completion_marker("ACTUAL_LEGACY_STOP_PROOF_WRONG_OWNER_EXERCISED");
+}

@@ -1573,24 +1573,69 @@ async fn forced_legacy_nonleader_steps_are_not_paced_by_the_poll_period() {
     );
 }
 
-/// Counts this thread's retained status reads during each legacy consuming
-/// attempt until `done`, asserting that no attempt reads more than once, and
-/// returns how many attempts read.
+/// What one legacy consuming attempt did on this thread.
 #[cfg(not(sanitized))]
-fn legacy_attempt_reads(terminal: &TerminalCleanup, done: impl Fn() -> bool) -> usize {
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct LegacyAttempt {
+    /// Retained status reads.
+    reads: usize,
+    /// Stop proofs that authenticated the owner without a read.
+    accepted: usize,
+    /// Stop proofs tried for a bound owner that did not complete.
+    refused: usize,
+    /// Statuses this attempt consumed and queued for the worker.
+    consumed: usize,
+}
+
+#[cfg(not(sanitized))]
+impl LegacyAttempt {
+    fn now() -> Self {
+        Self {
+            reads: RETAINED_STATUS_READS.with(Cell::get),
+            accepted: LEGACY_STOP_PROOFS_ACCEPTED.with(Cell::get),
+            refused: LEGACY_STOP_PROOFS_REFUSED.with(Cell::get),
+            consumed: LEGACY_ASSIST_CONSUMPTIONS.with(Cell::get),
+        }
+    }
+
+    fn since(before: Self) -> Self {
+        let after = Self::now();
+        Self {
+            reads: after.reads - before.reads,
+            accepted: after.accepted - before.accepted,
+            refused: after.refused - before.refused,
+            consumed: after.consumed - before.consumed,
+        }
+    }
+}
+
+/// Runs legacy consuming attempts on this thread until `done` accepts the
+/// latest one, asserting that no attempt reads status or consumes more than
+/// once, and returns what each attempt did, in order.
+#[cfg(not(sanitized))]
+fn legacy_attempts(
+    terminal: &TerminalCleanup,
+    mut done: impl FnMut(&LegacyAttempt) -> bool,
+) -> Vec<LegacyAttempt> {
     let deadline = Instant::now() + TRACEE_WAIT_TIMEOUT;
-    let mut attempts_that_read = 0;
+    let mut attempts = Vec::new();
     loop {
-        let before = RETAINED_STATUS_READS.with(Cell::get);
+        let before = LegacyAttempt::now();
         terminal.event.try_assist_legacy_wait().unwrap();
-        let reads = RETAINED_STATUS_READS.with(Cell::get) - before;
+        let attempt = LegacyAttempt::since(before);
         assert!(
-            reads <= 1,
-            "one legacy consuming attempt read status {reads} times"
+            attempt.reads <= 1,
+            "one legacy consuming attempt read status {} times",
+            attempt.reads
         );
-        attempts_that_read += reads;
-        if done() {
-            return attempts_that_read;
+        assert!(
+            attempt.consumed <= 1,
+            "one legacy consuming attempt consumed {} statuses",
+            attempt.consumed
+        );
+        attempts.push(attempt);
+        if done(&attempt) {
+            return attempts;
         }
         assert!(
             Instant::now() < deadline,
@@ -1600,11 +1645,23 @@ fn legacy_attempt_reads(terminal: &TerminalCleanup, done: impl Fn() -> bool) -> 
     }
 }
 
-/// A consuming attempt on the legacy path reads the target's retained status
-/// once, whether it finds nothing or consumes a stop: the read follows the
-/// numeric observation, so it is both that observation's postcheck and the
-/// owner's authentication. The observation worker's turns that find nothing
-/// read it at most once per LEGACY_CHECK_PERIOD.
+/// Runs legacy consuming attempts on this thread until one consumes a
+/// status, and returns them all: exactly the last one consumed. The loop
+/// ends on this thread's own consumption, never on the worker's publication:
+/// from the worker's pop of `consumed` until its `update` returns, neither
+/// `consumed` nor `pending` shows the status.
+#[cfg(not(sanitized))]
+fn legacy_attempts_until_consumed(terminal: &TerminalCleanup) -> Vec<LegacyAttempt> {
+    legacy_attempts(terminal, |attempt| attempt.consumed == 1)
+}
+
+/// A ptracer attempt on the legacy path that finds nothing reads the target's
+/// retained status once: the read follows the numeric observation, so it is
+/// both that observation's postcheck and the owner's authentication. An
+/// attempt that consumes a stop proves the same two things without reading
+/// status: GETEVENTMSG on the number, then signal 0 through the retained
+/// descriptor. The observation worker's turns that find nothing read it at
+/// most once per LEGACY_CHECK_PERIOD.
 #[tokio::test(flavor = "current_thread")]
 #[cfg(not(sanitized))]
 async fn forced_legacy_waits_read_target_status_once_per_attempt_or_period() {
@@ -1669,13 +1726,28 @@ async fn forced_legacy_waits_read_target_status_once_per_attempt_or_period() {
         );
     }
 
-    // Every ptracer attempt finds nothing as well.
-    let attempts = std::cell::Cell::new(0);
-    let empty = legacy_attempt_reads(&terminal, || {
-        attempts.set(attempts.get() + 1);
-        attempts.get() == 32
+    // Every ptracer attempt finds nothing as well, so none runs the stop
+    // proof, and each authenticates through at most one read.
+    let mut attempts = 0;
+    let empty = legacy_attempts(&terminal, |_| {
+        attempts += 1;
+        attempts == 32
     });
-    assert!(empty > 0, "no empty attempt reached its authentication");
+    assert!(
+        empty
+            .iter()
+            .all(|attempt| attempt.accepted == 0 && attempt.refused == 0),
+        "an attempt that found nothing ran the stop proof: {empty:?}"
+    );
+    assert!(
+        empty.iter().all(|attempt| attempt.consumed == 0),
+        "an attempt consumed with nothing to consume: {empty:?}"
+    );
+    let empty_reads: usize = empty.iter().map(|attempt| attempt.reads).sum();
+    assert!(
+        empty_reads > 0,
+        "no empty attempt reached its authentication"
+    );
     assert!(terminal.event.event().pending_is_empty());
 
     let state = || {
@@ -1697,9 +1769,33 @@ async fn forced_legacy_waits_read_target_status_once_per_attempt_or_period() {
         assert!(Instant::now() < deadline, "thread never reached its stop");
         thread::sleep(Duration::from_millis(1));
     }
-    let event = terminal.event.event().clone();
-    let consumed = || !event.legacy_wait.lock().consumed.is_empty() || !event.pending_is_empty();
-    assert!(legacy_attempt_reads(&terminal, consumed) > 0);
+    // The attempt that consumes the stop authenticates its owner itself,
+    // through the stop proof and without a read. No earlier attempt proved
+    // anything without consuming. The wait below then returns the stop the
+    // worker published.
+    let mut attempts = legacy_attempts_until_consumed(&terminal);
+    let evidence: usize = attempts
+        .iter()
+        .map(|attempt| attempt.reads + attempt.accepted)
+        .sum();
+    assert!(evidence > 0, "no consuming-phase attempt authenticated");
+    let consuming = attempts.pop().unwrap();
+    assert_eq!(
+        consuming,
+        LegacyAttempt {
+            reads: 0,
+            accepted: 1,
+            refused: 0,
+            consumed: 1,
+        },
+        "the consuming attempt did not prove its owner without a read"
+    );
+    assert!(
+        attempts
+            .iter()
+            .all(|attempt| attempt.accepted == 0 && attempt.consumed == 0),
+        "an attempt proved its owner or consumed before the consuming one: {attempts:?}"
+    );
     let (child, event) = tokio::time::timeout(
         TRACEE_WAIT_TIMEOUT,
         child_running.wait_owned_on_ptracer_thread(),

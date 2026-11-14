@@ -14,6 +14,8 @@ mod retired_tid {
     const INNER: &str = "SAFEPTRACE_RETIRED_TARGET_INNER";
     const FORCE: &str = "SAFEPTRACE_RETIRED_TARGET_FORCE";
     const KEEP_WARM: &str = "SAFEPTRACE_RETIRED_TARGET_KEEP_AUTH_WARM";
+    const STOP_PROOF: &str = "SAFEPTRACE_RETIRED_TARGET_STOP_PROOF";
+    const STOP_PROOF_ROW: &str = "ACTUAL_TID_REUSE_STOP_PROOF_REFUSED ";
     const MARKER: &str = "ACTUAL_EXPLICIT_UNREGISTERED_RETIRED_TARGET_EXERCISED";
 
     struct FixtureDirectory(std::path::PathBuf);
@@ -162,6 +164,33 @@ mod retired_tid {
             );
         }
         emit_completion_marker("ACTUAL_WARM_AUTH_CACHE_TID_REUSE_REFUSED");
+    }
+
+    /// The stop proof that lets a legacy consume skip its status read never
+    /// accepts a reused number. A replacement thread holds the former TID and
+    /// sits in a ptrace stop of this same thread, so GETEVENTMSG on the
+    /// number succeeds; the retained descriptor of the retired original has
+    /// no task, so the proof fails, the status read refuses with ECHILD, and
+    /// the replacement's stop is left unconsumed.
+    #[test]
+    fn legacy_stop_proof_refuses_actual_retired_tid_reuse() {
+        let output = run_exact_in_pid_namespace_bounded(
+            NAME,
+            &[(INNER, "1"), (FORCE, "1"), (STOP_PROOF, "1")],
+        )
+        .expect("start real forced-legacy exec/exact-reuse control");
+        assert!(output.status.success(), "stop proof reuse: {output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let rows: Vec<_> = stdout
+            .lines()
+            .filter(|line| line.starts_with(STOP_PROOF_ROW))
+            .collect();
+        assert_eq!(
+            rows.len(),
+            1,
+            "stop proof control omitted its completed reuse row: {output:?}"
+        );
+        emit_completion_marker(rows[0]);
     }
 
     #[test]
@@ -318,6 +347,38 @@ mod retired_tid {
             replacement, former,
             "actual clone3 same-group former TID reuse"
         );
+        let stop_proof_row = env::var_os(STOP_PROOF).map(|_| {
+            assert!(forced, "the stop proof serves only legacy procfs identities");
+            let identity = original.identity().unwrap();
+            let event = original.event();
+            assert!(matches!(identity.pidfd, ThreadHandle::Procfs { .. }));
+            assert!(event.legacy_wait_owner.get().is_some());
+            // The replacement's newborn stop, reported by the number and not
+            // consumed.
+            let reported = legacy_owner_observe(former, WaitPidFlag::WSTOPPED);
+            assert!(libc::WIFSTOPPED(reported));
+            assert_eq!(reported >> 16, libc::PTRACE_EVENT_STOP);
+            // The number names a task in a ptrace stop of THIS thread, while
+            // the retained PID object of the original has no task.
+            assert!(nix::sys::ptrace::getevent(former).is_ok());
+            assert_eq!(identity.pidfd_is_live(), Ok(false));
+            let reads = RETAINED_STATUS_READS.with(Cell::get);
+            let accepted = LEGACY_STOP_PROOFS_ACCEPTED.with(Cell::get);
+            let refused = LEGACY_STOP_PROOFS_REFUSED.with(Cell::get);
+            let progress = event.legacy_wait.lock();
+            let result = try_consume_legacy_status(identity, event, None);
+            drop(progress);
+            let reads = RETAINED_STATUS_READS.with(Cell::get) - reads;
+            let accepted = LEGACY_STOP_PROOFS_ACCEPTED.with(Cell::get) - accepted;
+            let refused = LEGACY_STOP_PROOFS_REFUSED.with(Cell::get) - refused;
+            assert_eq!(result, Err(Errno::ECHILD));
+            assert_eq!((reads, accepted, refused), (1, 0, 1));
+            let still = legacy_owner_observe(former, WaitPidFlag::WSTOPPED);
+            assert_eq!(still, reported, "the refused attempt consumed a status");
+            format!(
+                "{STOP_PROOF_ROW}former_tid={former} replacement_tid={replacement} replacement_stop=EVENT_STOP geteventmsg_on_number=ok original_pidfd_live=false try_consume={result:?} status_reads={reads} proofs_accepted={accepted} proofs_refused={refused} replacement_stop_unconsumed=true"
+            )
+        });
         let (pid, newborn) = raw_wait(replacement);
         assert_eq!(pid, replacement);
         assert!(libc::WIFSTOPPED(newborn));
@@ -528,6 +589,9 @@ mod retired_tid {
                 epoch
             );
             emit_completion_marker("ACTUAL_WARM_AUTH_CACHE_TID_REUSE_REFUSED");
+        }
+        if let Some(row) = stop_proof_row {
+            emit_completion_marker(&row);
         }
         emit_completion_marker(&format!(
             "RETIRED_EXPLICIT_TARGET_REFUSAL native={native} forced={forced} former_tid={former} exact_reuse=true same_ptracer=true old_gate_open=true old_worker_unstarted=true actual_original_retired=ESRCH retired_numeric_requests=ESRCH replacement_siginfo_and_registers_preserved=true actual_fresh_interrupt=EVENT_STOP actual_group_kill=SIGKILL root_and_member_reaped=true final_ECHILD=true"

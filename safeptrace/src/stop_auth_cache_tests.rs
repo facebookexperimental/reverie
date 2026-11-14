@@ -425,3 +425,139 @@ fn fresh_kernel_attachment_proof_preserves_raw_owner_handoff() {
     }
     emit_completion_marker("ACTUAL_FRESH_KERNEL_ATTACHMENT_PROOF_EXERCISED");
 }
+
+/// The two kernel halves of the legacy stop proof, on plain children.
+/// GETEVENTMSG on a number succeeds only for a task held in a ptrace stop of
+/// this thread, so a running, exited, untraced, or sibling-traced task never
+/// passes it, even while its retained descriptor still reaches it. A liveness
+/// answer other than `Ok(true)` never proves anything.
+#[cfg(not(sanitized))]
+#[test]
+fn numeric_stop_proof_needs_a_held_stop_of_this_thread() {
+    if run_legacy_test_outer_with_outcome(
+        "numeric_stop_proof_needs_a_held_stop_of_this_thread",
+        Some("ACTUAL_NUMERIC_STOP_PROOF_HALVES_EXERCISED"),
+    ) {
+        return;
+    }
+    let open_directory = |pid: Pid| {
+        let path = std::ffi::CString::new(format!("/proc/{pid}")).unwrap();
+        let raw = unsafe {
+            libc::open(
+                path.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        assert!(raw >= 0, "open /proc/{pid}: {}", Errno::last());
+        unsafe { OwnedFd::from_raw_fd(raw) }
+    };
+    let proves = |pid: Pid, directory: &OwnedFd| {
+        numeric_stop_names_retained_task(pid.into(), || descriptor_is_live(directory.as_raw_fd()))
+    };
+    let state = |pid: Pid| {
+        fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| {
+                Some(
+                    stat.rsplit_once(')')?
+                        .1
+                        .split_whitespace()
+                        .next()?
+                        .to_owned(),
+                )
+            })
+    };
+
+    // Held in a ptrace stop of this thread: the proof holds.
+    let traced = match unsafe { fork() }.unwrap() {
+        ForkResult::Parent { child } => child,
+        ForkResult::Child => {
+            crate::traceme_and_stop().unwrap();
+            loop {
+                unsafe { libc::pause() };
+            }
+        }
+    };
+    let mut traced_cleanup = TraceeCleanupGuard::new(traced).unwrap();
+    let status = waitpid_status_bounded(traced, libc::__WALL, TRACEE_WAIT_TIMEOUT).unwrap();
+    assert!(libc::WIFSTOPPED(status));
+    let traced_directory = open_directory(traced);
+    assert!(proves(traced, &traced_directory));
+    // A refused or negative liveness answer never proves.
+    assert!(!numeric_stop_names_retained_task(traced.into(), || Err(
+        Errno::EPERM
+    )));
+    assert!(!numeric_stop_names_retained_task(traced.into(), || Ok(
+        false
+    )));
+
+    // Running, asleep in pause(): no ptrace stop, though the descriptor is live.
+    nix::sys::ptrace::cont(traced, None).unwrap();
+    legacy_owner_until(|| state(traced).as_deref() == Some("S"));
+    assert_eq!(descriptor_is_live(traced_directory.as_raw_fd()), Ok(true));
+    assert!(!proves(traced, &traced_directory));
+
+    // An unreaped zombie of this tracer still holds its PID object, so its
+    // descriptor is live, but it is in no ptrace stop.
+    nix::sys::signal::kill(traced, Signal::SIGKILL).unwrap();
+    let exited = legacy_owner_observe(traced, WaitPidFlag::WEXITED);
+    assert!(libc::WIFSIGNALED(exited));
+    assert_eq!(descriptor_is_live(traced_directory.as_raw_fd()), Ok(true));
+    assert!(!proves(traced, &traced_directory));
+    let status = waitpid_status_bounded(traced, libc::__WALL, TRACEE_WAIT_TIMEOUT).unwrap();
+    assert!(libc::WIFSIGNALED(status));
+    traced_cleanup.disarm();
+    assert_eq!(descriptor_is_live(traced_directory.as_raw_fd()), Ok(false));
+
+    // Stopped, but traced by no one.
+    let untraced = match unsafe { fork() }.unwrap() {
+        ForkResult::Parent { child } => child,
+        ForkResult::Child => {
+            unsafe { libc::raise(libc::SIGSTOP) };
+            loop {
+                unsafe { libc::pause() };
+            }
+        }
+    };
+    let mut untraced_cleanup = TraceeCleanupGuard::new(untraced).unwrap();
+    let status = waitpid_status_bounded(untraced, libc::WUNTRACED, TRACEE_WAIT_TIMEOUT).unwrap();
+    assert!(libc::WIFSTOPPED(status));
+    let untraced_directory = open_directory(untraced);
+    assert_eq!(descriptor_is_live(untraced_directory.as_raw_fd()), Ok(true));
+    assert!(!proves(untraced, &untraced_directory));
+    nix::sys::signal::kill(untraced, Signal::SIGKILL).unwrap();
+    let status = waitpid_status_bounded(untraced, 0, TRACEE_WAIT_TIMEOUT).unwrap();
+    assert!(libc::WIFSIGNALED(status));
+    untraced_cleanup.disarm();
+
+    // Held in a ptrace stop of a sibling thread of this process: the kernel
+    // compares the tracer with the calling thread itself, not its process.
+    let (ready, received) = mpsc::sync_channel(1);
+    let (finish, finished) = mpsc::sync_channel::<()>(1);
+    let sibling = thread::spawn(move || {
+        let child = match unsafe { fork() }.unwrap() {
+            ForkResult::Parent { child } => child,
+            ForkResult::Child => {
+                crate::traceme_and_stop().unwrap();
+                loop {
+                    unsafe { libc::pause() };
+                }
+            }
+        };
+        let status = waitpid_status_bounded(child, libc::__WALL, TRACEE_WAIT_TIMEOUT).unwrap();
+        assert!(libc::WIFSTOPPED(status));
+        assert!(nix::sys::ptrace::getevent(child).is_ok());
+        ready.send(child).unwrap();
+        finished.recv_timeout(TRACEE_WAIT_TIMEOUT).unwrap();
+        nix::sys::signal::kill(child, Signal::SIGKILL).unwrap();
+        let status = waitpid_status_bounded(child, libc::__WALL, TRACEE_WAIT_TIMEOUT).unwrap();
+        assert!(libc::WIFSIGNALED(status));
+    });
+    let sibling_child = received.recv_timeout(TRACEE_WAIT_TIMEOUT).unwrap();
+    let sibling_directory = open_directory(sibling_child);
+    assert_eq!(descriptor_is_live(sibling_directory.as_raw_fd()), Ok(true));
+    assert!(!proves(sibling_child, &sibling_directory));
+    finish.send(()).unwrap();
+    sibling.join().unwrap();
+    emit_completion_marker("ACTUAL_NUMERIC_STOP_PROOF_HALVES_EXERCISED");
+}
