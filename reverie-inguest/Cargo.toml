@@ -80,7 +80,7 @@ serde_json = { version = "1.0.149", optional = true }
 sha2 = { version = "0.10.9", optional = true }
 iced-x86 = { version = "1.21.0", default-features = false, features = ["std", "decoder"], optional = true }
 libc = "0.2.186"
-syscalls = "0.6.18"
+syscalls = "0.7.0"
 reverie-syscalls = { version = "0.5.7", path = "../reverie-syscalls" }
 serde = { version = "1.0.219", features = ["derive"], optional = true }
 bincode = { version = "2", features = ["serde"], optional = true }
