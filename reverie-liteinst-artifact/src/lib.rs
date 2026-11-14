@@ -1162,8 +1162,8 @@ fn content_manifest_relative(image_kind: FixedImageKind) -> &'static str {
 const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 88] = [
     (
         "reverie-liteinst-artifact/src/preparation_identity.rs",
-        49430,
-        "4a2c6fafef085ed18cb87c66f048c15b5825f9eb6d3c068a6da90dcb14981829",
+        51471,
+        "d208d83f330b3b10348fbe9811c952eae5c6399f9f210a1bc219f8f519bcba64",
     ),
     // Bind the signal-mask gate and every changed native-source premise of it.
     (
@@ -39065,6 +39065,11 @@ mod tests {
             41076,
             "21839c56aaee95a3c2c83dfaa22ae579265fd0a35624863b0b04e8e1ac34dbbc",
         ),
+        (
+            "reverie-liteinst-artifact/src/preparation_identity.rs",
+            51471,
+            "d208d83f330b3b10348fbe9811c952eae5c6399f9f210a1bc219f8f519bcba64",
+        ),
     ];
 
     /// Seals over prefixes of `CONTENT_REVERIE_CATALOG_BINDINGS`: (rows covered,
@@ -39086,6 +39091,10 @@ mod tests {
         (
             93,
             "7f545874ce3166c5f9f52e1b7c4d12f8c37b24a7f2e3ac38ff697b37aa6ad242",
+        ),
+        (
+            94,
+            "cefef4888c744a1f6e1d3e49e2df0f95497c02ad996b717a8d25214b9d04fb30",
         ),
     ];
 
@@ -39642,6 +39651,11 @@ mod tests {
         // Keep the fixed catalog authoritative and reject their prior tuples.
         assert_eq!(CONTENT_REVERIE_CATALOG.len(), 88);
         let rejected_prior = [
+            (
+                "reverie-liteinst-artifact/src/preparation_identity.rs",
+                49430,
+                "4a2c6fafef085ed18cb87c66f048c15b5825f9eb6d3c068a6da90dcb14981829",
+            ),
             (
                 "reverie-liteinst-artifact/src/private_static/selected_initializers.rs",
                 291996,
