@@ -1281,6 +1281,14 @@ impl Stopped {
     /// Converts this capability into the running state after a successful
     /// ptrace request moved the tracee out of its stop.
     fn into_running(self) -> Running {
+        self.leave_stop(false)
+    }
+
+    /// [`Self::into_running`]. With `resumed`, the request was a resumption,
+    /// after which the actual ptracer waits for the next stop: a legacy
+    /// observation worker is then notified by that wait's first empty assist
+    /// rather than at once (`EventHandle::expect_stop_on_poll`).
+    fn leave_stop(self, resumed: bool) -> Running {
         #[cfg(feature = "notifier")]
         {
             // The resume that ends this stop may run arbitrary guest
@@ -1288,8 +1296,14 @@ impl Stopped {
             // registers survive it (see `Event::regs_cache`).
             self.1.event().invalidate_regs();
             self.1.event().invalidate_numeric_auth();
-            self.1.event().expect_stop();
+            if resumed {
+                self.1.event().expect_stop_on_poll();
+            } else {
+                self.1.event().expect_stop();
+            }
         }
+        #[cfg(not(feature = "notifier"))]
+        let _ = resumed;
         self.retire_statuses_before_exit_stop();
         Running::from_token(self.0, self.1)
     }
@@ -1316,7 +1330,7 @@ impl Stopped {
         ));
         #[cfg(not(feature = "notifier"))]
         let mark = ResumeMark::default();
-        let mut running = self.into_running();
+        let mut running = self.leave_stop(true);
         running.2 = mark;
         running
     }
@@ -2701,8 +2715,10 @@ impl Running {
             })
             .map(drop)
         })?;
+        // The caller waits for the interrupt's stop: its first empty assist
+        // notifies a legacy observation worker.
         #[cfg(feature = "notifier")]
-        self.1.event().expect_stop();
+        self.1.event().expect_stop_on_poll();
         Ok(())
     }
 

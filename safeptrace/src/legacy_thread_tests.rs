@@ -54,9 +54,46 @@ fn run_legacy_test_outer_checked(
     marker: Option<&str>,
     check: impl FnOnce(&BoundedSubprocess),
 ) -> bool {
+    let Some(result) = run_legacy_test_outer_bounded(name) else {
+        return false;
+    };
+    if let Some(marker) = marker {
+        assert!(
+            String::from_utf8_lossy(&result.output.stdout)
+                .lines()
+                .any(|line| line == marker),
+            "legacy-thread test omitted actual outcome marker {marker}: {result:?}"
+        );
+        emit_completion_marker(marker);
+    }
+    check(&result);
+    true
+}
+
+/// As [`run_legacy_test_outer`], and re-emits each line of the inner run's
+/// stdout that starts with `prefix`, so that a passing run's report reaches
+/// the outer log.
+#[cfg(not(sanitized))]
+fn run_legacy_test_outer_reporting(name: &str, prefix: &str) -> bool {
+    let Some(result) = run_legacy_test_outer_bounded(name) else {
+        return false;
+    };
+    for line in String::from_utf8_lossy(&result.output.stdout)
+        .lines()
+        .filter(|line| line.starts_with(prefix))
+    {
+        emit_completion_marker(line);
+    }
+    true
+}
+
+/// Runs the test `name` alone in a bounded child process and asserts that it
+/// passed, returning its result. In that child process, returns `None`.
+#[cfg(not(sanitized))]
+fn run_legacy_test_outer_bounded(name: &str) -> Option<BoundedSubprocess> {
     const INNER: &str = "SAFEPTRACE_LEGACY_THREAD_INNER";
     if env::var(INNER).as_deref() == Ok(name) {
-        return false;
+        return None;
     }
     let result = run_exact_test_bounded(
         &format!("notifier::test::{name}"),
@@ -73,17 +110,7 @@ fn run_legacy_test_outer_checked(
         result.output.status.success(),
         "legacy-thread test failed: {result:?}"
     );
-    if let Some(marker) = marker {
-        assert!(
-            String::from_utf8_lossy(&result.output.stdout)
-                .lines()
-                .any(|line| line == marker),
-            "legacy-thread test omitted actual outcome marker {marker}: {result:?}"
-        );
-        emit_completion_marker(marker);
-    }
-    check(&result);
-    true
+    Some(result)
 }
 
 #[test]
@@ -201,6 +228,12 @@ fn spawn_legacy_threads(
                         while now() - start < 300_000 {}
                         unsafe { libc::syscall(libc::SYS_getppid) };
                     }
+                }
+                if mode >= 2000 {
+                    // Read one byte, then exit.
+                    let mut byte = 0u8;
+                    unsafe { libc::read((mode - 2000) as i32, (&mut byte as *mut u8).cast(), 1) };
+                    unsafe { libc::syscall(libc::SYS_exit, 0) };
                 }
                 if mode >= 1000 {
                     let mut byte = 0u8;
@@ -2953,4 +2986,2077 @@ async fn forced_legacy_held_turn_check_waits_out_a_late_consume_notify() {
     );
     assert!(root_terminal.wait(TRACEE_WAIT_TIMEOUT));
     root_cleanup.disarm();
+}
+
+/// The legacy worker counters the deferred-wake tests read, at one moment.
+#[cfg(not(sanitized))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LegacyWakeCounts {
+    /// Observation turns (`legacy_worker_turns`).
+    turns: usize,
+    /// Turns whose observation found a status.
+    hints: usize,
+    /// Notifies that woke the worker.
+    notify_wakes: usize,
+    /// Deferred wakeups that an empty assist notified.
+    flushes: usize,
+    /// Stops the worker found only after a held wait's timeout.
+    expiry_finds: usize,
+}
+
+#[cfg(not(sanitized))]
+impl LegacyWakeCounts {
+    fn of(event: &Event) -> Self {
+        Self {
+            turns: event.legacy_worker_turns.load(Ordering::Relaxed),
+            hints: event.legacy_hint_turns.load(Ordering::Relaxed),
+            notify_wakes: event.legacy_notify_wakes.load(Ordering::Relaxed),
+            flushes: event.legacy_deferred_flushes.load(Ordering::Relaxed),
+            expiry_finds: event.legacy_held_expiry_finds.load(Ordering::Relaxed),
+        }
+    }
+
+    fn since(self, before: Self) -> Self {
+        Self {
+            turns: self.turns - before.turns,
+            hints: self.hints - before.hints,
+            notify_wakes: self.notify_wakes - before.notify_wakes,
+            flushes: self.flushes - before.flushes,
+            expiry_finds: self.expiry_finds - before.expiry_finds,
+        }
+    }
+}
+
+/// How a deferred-wake round waits for the pipe-reading thread's read exit.
+#[cfg(not(sanitized))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeferredWakePath {
+    /// The async ptracer wait. For 20 ms after the resume, no worker turn or
+    /// hint; then one poll with a no-op waker, which flushes the deferred
+    /// wake, and the parked half ([`deferred_wake_parked_wait`]).
+    Async,
+    /// [`Self::Async`], also checking for those 20 ms that no notify woke the
+    /// worker and that it observed nothing.
+    Pinned,
+    /// The synchronous ptracer wait, with the byte written 5 ms in.
+    Sync,
+    /// The cleanup driver's pending reservation, with the byte written 5 ms
+    /// in.
+    Cleanup,
+}
+
+/// How long after its stop arrives a deferred-wake test's wait may return:
+/// half the production held period, so that a wakeup that reached the worker
+/// only through a held wait's timeout cannot pass. The tests also set the
+/// held period to 60 s.
+#[cfg(not(sanitized))]
+const DEFERRED_WAKE_BOUND: Duration = Duration::from_millis(50);
+
+/// Writes one byte to the fixture thread's pipe.
+#[cfg(not(sanitized))]
+fn deferred_wake_write(write_end: &OwnedFd) {
+    assert_eq!(
+        unsafe { libc::write(write_end.as_raw_fd(), b"r".as_ptr().cast(), 1) },
+        1
+    );
+}
+
+/// Writes one byte to `write_end` from another thread 5 ms from now, and
+/// returns when it wrote.
+#[cfg(not(sanitized))]
+fn deferred_wake_write_later(write_end: &Arc<OwnedFd>) -> JoinHandle<Instant> {
+    let write_end = Arc::clone(write_end);
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(5));
+        let written = Instant::now();
+        deferred_wake_write(&write_end);
+        written
+    })
+}
+
+/// The procfs state letter of the fixture thread `tid` in `root`'s group.
+#[cfg(not(sanitized))]
+fn deferred_wake_thread_state(root: Pid, tid: crate::Pid) -> Option<String> {
+    fs::read_to_string(format!("/proc/{root}/task/{tid}/stat"))
+        .ok()
+        .and_then(|stat| {
+            Some(
+                stat.rsplit_once(')')?
+                    .1
+                    .split_whitespace()
+                    .next()?
+                    .to_owned(),
+            )
+        })
+}
+
+/// Runs a forced-legacy non-leader that loops reading a pipe up to its first
+/// read entry, its worker's held period set to 60 s, then runs `rounds`
+/// rounds of `round`, then kills and reaps the group. `round` gets the stop
+/// at a read entry, with the worker parked in a fresh held wait, and returns
+/// the thread's stop at its next read entry, with `legacy_held_waits` as read
+/// right before the wait that returned that stop
+/// ([`deferred_wake_next_read_entry`]).
+#[cfg(not(sanitized))]
+async fn with_deferred_wake_pipe_thread<F, R>(rounds: usize, mut round: F)
+where
+    F: FnMut(usize, Stopped, Arc<Event>, Arc<OwnedFd>, Pid) -> R,
+    R: Future<Output = (Stopped, usize)>,
+{
+    let [read_end, write_end] = legacy_pipe();
+    let modes: &'static [usize] = Box::leak(Box::new([1000 + read_end.as_raw_fd() as usize]));
+    let (root, stopped, mut root_cleanup, _force) = spawn_legacy_threads(
+        modes,
+        legacy_thread_options() | Options::PTRACE_O_TRACESYSGOOD,
+        LegacyAttachMethod::Traceme,
+    );
+    drop(read_end);
+    let write_end = Arc::new(write_end);
+    let root_exit = root_cleanup.exit_event_on_ptracer_thread(&stopped).unwrap();
+    let root_terminal = stopped.terminal_cleanup();
+    let (parent, crate::Event::NewChild(crate::ChildOp::Clone, child)) = tokio::time::timeout(
+        TRACEE_WAIT_TIMEOUT,
+        stopped.resume(None).unwrap().wait_owned_on_ptracer_thread(),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .assume_stopped() else {
+        panic!("missing reading pthread clone");
+    };
+    let child_tid = child.pid();
+    let mut child_cleanup = legacy_child_cleanup(&child);
+    let terminal = child.terminal_cleanup();
+    let event = Arc::clone(terminal.event.event());
+    *event.legacy_held_period.lock() = Some(Duration::from_secs(60));
+    let (mut child, sigstop) =
+        tokio::time::timeout(TRACEE_WAIT_TIMEOUT, child.wait_owned_on_ptracer_thread())
+            .await
+            .unwrap()
+            .unwrap()
+            .assume_stopped();
+    assert_eq!(sigstop, crate::Event::Signal(Signal::SIGSTOP));
+    let parent_running = parent.resume(None).unwrap();
+    let read_fd = modes[0] as u64 - 1000;
+    let is_read_entry = |stopped: &Stopped| {
+        matches!(
+            stopped.getsyscallinfo().unwrap().operation,
+            crate::SyscallInfoOp::Entry { number, arguments }
+                if number == libc::SYS_read as u64 && arguments[0] == read_fd
+        )
+    };
+    let mut entries = 0;
+    let mut held = event.legacy_held_waits.load(Ordering::Relaxed);
+    while !is_read_entry(&child) {
+        entries += 1;
+        assert!(entries < 200, "the thread never reached its read");
+        held = event.legacy_held_waits.load(Ordering::Relaxed);
+        child = next_syscall_stop(child).await;
+    }
+    for index in 0..rounds {
+        wait_for_fresh_held_wait(&event, held, &format!("round {index}: read entry"), || {});
+        (child, held) = round(
+            index,
+            child,
+            Arc::clone(&event),
+            Arc::clone(&write_end),
+            root,
+        )
+        .await;
+        assert!(
+            is_read_entry(&child),
+            "round {index}: not back at a read entry"
+        );
+    }
+
+    let exit = child_cleanup.exit_event_on_ptracer_thread(&child).unwrap();
+    terminal.request_sigkill().unwrap();
+    drop(child);
+    let child = tokio::time::timeout(TRACEE_WAIT_TIMEOUT, exit)
+        .await
+        .unwrap()
+        .unwrap();
+    child_cleanup.mark_claimed_exit();
+    assert_eq!(
+        tokio::time::timeout(
+            TRACEE_WAIT_TIMEOUT,
+            child.resume(None).unwrap().wait_owned_on_ptracer_thread()
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .assume_exited(),
+        (
+            child_tid,
+            crate::ExitStatus::Signaled(Signal::SIGKILL, false)
+        ),
+    );
+    assert!(terminal.wait(TRACEE_WAIT_TIMEOUT));
+    child_cleanup.disarm();
+    let parent = tokio::time::timeout(TRACEE_WAIT_TIMEOUT, root_exit)
+        .await
+        .unwrap()
+        .unwrap();
+    root_cleanup.mark_claimed_exit();
+    drop(parent_running);
+    assert_eq!(
+        tokio::time::timeout(
+            TRACEE_WAIT_TIMEOUT,
+            parent.resume(None).unwrap().wait_owned_on_ptracer_thread()
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .assume_exited(),
+        (
+            root.into(),
+            crate::ExitStatus::Signaled(Signal::SIGKILL, false)
+        ),
+    );
+    assert!(root_terminal.wait(TRACEE_WAIT_TIMEOUT));
+    root_cleanup.disarm();
+}
+
+/// Resumes the fixture thread from its read exit to its next read entry.
+/// Returns that stop, and `legacy_held_waits` as read right before the wait:
+/// the worker's held wait for the read entry starts after that count.
+#[cfg(not(sanitized))]
+async fn deferred_wake_next_read_entry(exit: Stopped, event: &Event) -> (Stopped, usize) {
+    let held = event.legacy_held_waits.load(Ordering::Relaxed);
+    (next_syscall_stop(exit).await, held)
+}
+
+/// The prefix of the deferred-wake tests' report lines, which the outer run
+/// re-emits ([`run_legacy_test_outer_reporting`]).
+#[cfg(not(sanitized))]
+const DEFERRED_WAKE_REPORT: &str = "deferred-wake report: ";
+
+/// What one parked deferred-wake round's counted-wake check found
+/// ([`DeferredWakeCounted::check`]): what the round lacked, if anything, how
+/// many uncounted wakes the worker had up to the check, and how many of them
+/// were late consume notifies.
+#[cfg(not(sanitized))]
+type DeferredWakeCheck = (Option<String>, usize, usize);
+
+/// The counted-wake evidence of one parked deferred-wake round: the targeted
+/// wakeup count just before and just after its request, where its entries
+/// start in the worker's wake log ([`Event::legacy_wake_log`]), and
+/// `legacy_held_waits` just before the request.
+#[cfg(not(sanitized))]
+struct DeferredWakeCounted {
+    before: u64,
+    after: u64,
+    log_start: usize,
+    held: usize,
+}
+
+/// Runs a round's resume or interrupt `request`, reading the targeted wakeup
+/// count just before and just after it.
+#[cfg(not(sanitized))]
+fn deferred_wake_counted_request<T>(
+    event: &Event,
+    request: impl FnOnce() -> T,
+) -> (T, DeferredWakeCounted) {
+    let log_start = event.legacy_wake_log.lock().len();
+    let held = event.legacy_held_waits.load(Ordering::Relaxed);
+    let before = event.legacy_wakeup.lock().targeted;
+    let output = request();
+    let after = event.legacy_wakeup.lock().targeted;
+    (
+        output,
+        DeferredWakeCounted {
+            before,
+            after,
+            log_start,
+            held,
+        },
+    )
+}
+
+/// A wait of the legacy worker that a notify ended, in a round's wake log:
+/// the index of its [`LegacyWakeLogEntry::WaitBegin`] (`None` for the wait
+/// the round began in, which began before the round's log), the targeted
+/// count the worker had acted on, and whether the notify had moved a count.
+#[cfg(not(sanitized))]
+struct NotifyEndedWait {
+    begin: Option<usize>,
+    seen: u64,
+    counted: bool,
+}
+
+/// Names a notify of the legacy worker, with the receipt of the count it
+/// stands for.
+#[cfg(not(sanitized))]
+fn deferred_wake_notify_source(source: LegacyNotifySource) -> String {
+    let receipt = |receipt: Option<LegacyCountReceipt>| match receipt {
+        Some(receipt) => format!(
+            "receipt {} for targeted {}",
+            receipt.serial, receipt.targeted
+        ),
+        None => "no receipt".to_owned(),
+    };
+    match source {
+        LegacyNotifySource::Immediate(r) => format!("an immediate wake ({})", receipt(r)),
+        LegacyNotifySource::Flush(r) => format!("a deferred wake's flush ({})", receipt(r)),
+        LegacyNotifySource::Probe(count) => format!("a probe (probes {count})"),
+        LegacyNotifySource::Consume(r) => format!("a consume ({})", receipt(r)),
+        LegacyNotifySource::Unknown => "a notify that named no source".to_owned(),
+    }
+}
+
+/// Audit (d) of [`DeferredWakeCounted::check`] over a round's wake log, taken
+/// once the worker is quiescent.
+///
+/// Every notify that names a site that counts (an immediate wake, a
+/// deferral's flush, a consume) must carry the receipt of that site's own
+/// count ([`LegacyCountReceipt`]): minted, and logged as
+/// [`LegacyWakeLogEntry::Counted`], inside that count, and used by at most
+/// one notify of the round, counted or uncounted. A notify that made no
+/// count, a receipt never counted, and a receipt used twice each fail.
+///
+/// Each wait of the worker that a notify ended is assigned, in order, the
+/// earliest unassigned [`LegacyWakeLogEntry::Notified`] entry after its
+/// `WaitBegin`: a notify that woke the worker found it parked, so it came
+/// after that `WaitBegin`, and in these fixtures every such notify runs on
+/// the test thread, in order. An uncounted wake is allowed only as a late
+/// consume notify: its notify is a consume whose receipt passed the rules
+/// above, whose `Counted` entry precedes the wait's `WaitBegin`, and whose
+/// count the worker had acted on (`targeted <= seen`). So the worker began
+/// the wait after acting on that consume's own increment, and the consume's
+/// notify, sent after it released `legacy_wait`, arrived during it.
+/// Anything else is unexplained: an uncounted wake by any other notify, a
+/// notify-ended wait with no notify logged, or a notify that woke the worker
+/// with no wake logged.
+///
+/// (d) sees only notifies whose `notify_one` returned true, that is, notifies
+/// that found the worker parked. A notify that lands while the worker runs
+/// is invisible to it, and has no effect. So whether an extra notify is
+/// caught depends on timing, round by round. It is reliable where the worker
+/// sits in one long held wait, as in
+/// `forced_legacy_deferred_wake_reaches_an_async_wait`. In the mutation runs
+/// at the time of writing, that test caught an extra notify after the hint in
+/// every round, and the exit-wait and pinned tests in most; that is an
+/// observation, not a guarantee for every round.
+/// `forced_legacy_counted_wake_check_refuses_extra_notifies_to_a_parked_worker`
+/// is the deterministic negative control: it delivers each extra notify to a
+/// worker it has proven parked.
+///
+/// Returns the late consume notifies and what is unexplained. `before` is
+/// the targeted count when the round began.
+#[cfg(not(sanitized))]
+fn deferred_wake_late_consume_audit(
+    log: &[LegacyWakeLogEntry],
+    before: u64,
+) -> (usize, Vec<String>) {
+    let mut waits = Vec::new();
+    // Each notify: its index, its source, whether a wait took it, and
+    // whether its receipt passed (an uncounted wake needs that).
+    let mut notifies = Vec::new();
+    let mut counted = std::collections::HashMap::new();
+    let mut used_receipts = std::collections::HashSet::new();
+    let mut open = Some((None, before));
+    let mut unexplained = Vec::new();
+    for (at, entry) in log.iter().enumerate() {
+        match *entry {
+            LegacyWakeLogEntry::WaitBegin(seen) => open = Some((Some(at), seen)),
+            LegacyWakeLogEntry::CountedWake | LegacyWakeLogEntry::Uncounted => match open.take() {
+                Some((begin, seen)) => waits.push(NotifyEndedWait {
+                    begin,
+                    seen,
+                    counted: *entry == LegacyWakeLogEntry::CountedWake,
+                }),
+                None => unexplained.push(format!("a wake at entry {at} with no wait begun")),
+            },
+            LegacyWakeLogEntry::Counted(receipt) => {
+                counted.insert(receipt.serial, (at, receipt));
+            }
+            LegacyWakeLogEntry::Notified(source) => {
+                let receipt = match source {
+                    LegacyNotifySource::Immediate(receipt)
+                    | LegacyNotifySource::Flush(receipt)
+                    | LegacyNotifySource::Consume(receipt) => Some(receipt),
+                    LegacyNotifySource::Probe(_) | LegacyNotifySource::Unknown => None,
+                };
+                let named = deferred_wake_notify_source(source);
+                let receipt_passed = match receipt {
+                    None => false,
+                    Some(None) => {
+                        unexplained.push(format!("{named} made no count"));
+                        false
+                    }
+                    Some(Some(receipt)) => {
+                        let minted = counted
+                            .get(&receipt.serial)
+                            .is_some_and(|(_, minted)| *minted == receipt);
+                        if !minted {
+                            unexplained.push(format!(
+                                "receipt {} was never counted ({named})",
+                                receipt.serial
+                            ));
+                        }
+                        let first = used_receipts.insert(receipt.serial);
+                        if !first {
+                            unexplained.push(format!(
+                                "receipt {} used by a second notify ({named})",
+                                receipt.serial
+                            ));
+                        }
+                        minted && first
+                    }
+                };
+                notifies.push((at, source, false, receipt_passed));
+            }
+            _ => {}
+        }
+    }
+    let mut late = 0;
+    for wait in &waits {
+        let assigned = notifies
+            .iter_mut()
+            .find(|(at, _, used, _)| !*used && wait.begin.is_none_or(|begin| *at > begin));
+        let Some((_, source, used, receipt_passed)) = assigned else {
+            unexplained.push(format!(
+                "a wait begun at entry {:?} ended by a notify that was not logged",
+                wait.begin
+            ));
+            continue;
+        };
+        *used = true;
+        if wait.counted {
+            continue;
+        }
+        let late_consume = match *source {
+            LegacyNotifySource::Consume(Some(receipt)) => {
+                *receipt_passed
+                    && receipt.targeted <= wait.seen
+                    && wait.begin.is_some_and(|begin| {
+                        counted
+                            .get(&receipt.serial)
+                            .is_some_and(|(at, _)| *at < begin)
+                    })
+            }
+            _ => false,
+        };
+        if late_consume {
+            late += 1;
+        } else {
+            unexplained.push(format!(
+                "an uncounted wake of the wait begun at entry {:?} (the worker had acted on \
+                 targeted count {}) ended by {}",
+                wait.begin,
+                wait.seen,
+                deferred_wake_notify_source(*source)
+            ));
+        }
+    }
+    let extra = notifies.iter().filter(|(_, _, used, _)| !*used).count();
+    if extra != 0 {
+        unexplained.push(format!(
+            "{extra} notify(s) woke the worker with no wake logged"
+        ));
+    }
+    (late, unexplained)
+}
+
+// The late-consume audit on synthetic logs, with no tracee. It accepts the
+// real late-consume window: a consume counts, the worker acts on that count
+// and parks, and only then does the consume's notify reach it. It refuses a
+// consume that made no count, a receipt used twice (by two uncounted wakes,
+// or by a counted and an uncounted one), a receipt never counted, an
+// uncounted wake by a count the worker had not acted on, an uncounted wake
+// by a flush, a wake with no notify logged, and a notify with no wake.
+#[test]
+#[cfg(not(sanitized))]
+fn deferred_wake_audit_accepts_only_a_receipted_late_consume_notify() {
+    use LegacyNotifySource::Consume;
+    use LegacyNotifySource::Flush;
+    use LegacyWakeLogEntry::Counted;
+    use LegacyWakeLogEntry::CountedWake;
+    use LegacyWakeLogEntry::Hint;
+    use LegacyWakeLogEntry::Notified;
+    use LegacyWakeLogEntry::Uncounted;
+    use LegacyWakeLogEntry::WaitBegin;
+    let r = |serial, targeted| LegacyCountReceipt { serial, targeted };
+    let opening = [
+        Counted(r(1, 4)),
+        Notified(Flush(Some(r(1, 4)))),
+        CountedWake,
+        Hint,
+    ];
+    let with_opening = |rest: &[LegacyWakeLogEntry]| -> Vec<LegacyWakeLogEntry> {
+        opening.iter().chain(rest).copied().collect()
+    };
+    let window = with_opening(&[
+        Counted(r(2, 5)),
+        WaitBegin(5),
+        Notified(Consume(Some(r(2, 5)))),
+        Uncounted,
+    ]);
+    assert_eq!(
+        deferred_wake_late_consume_audit(&window, 3),
+        (1, Vec::new()),
+        "the real late-consume window was not accepted"
+    );
+    let refused = |log: &[LegacyWakeLogEntry], reason: &str, late: usize| {
+        let (accepted, unexplained) = deferred_wake_late_consume_audit(log, 3);
+        assert!(
+            unexplained.iter().any(|what| what.contains(reason)),
+            "no refusal naming {reason:?} in {unexplained:?} for {log:?}"
+        );
+        assert_eq!(accepted, late, "late consume notifies for {log:?}");
+    };
+    refused(
+        &with_opening(&[WaitBegin(4), Notified(Consume(None)), Uncounted]),
+        "a consume (no receipt) made no count",
+        0,
+    );
+    let mut twice = window.clone();
+    twice.extend([WaitBegin(5), Notified(Consume(Some(r(2, 5)))), Uncounted]);
+    refused(&twice, "receipt 2 used by a second notify", 1);
+    refused(
+        &with_opening(&[
+            Counted(r(2, 5)),
+            Notified(Consume(Some(r(2, 5)))),
+            CountedWake,
+            WaitBegin(5),
+            Notified(Consume(Some(r(2, 5)))),
+            Uncounted,
+        ]),
+        "receipt 2 used by a second notify",
+        0,
+    );
+    refused(
+        &with_opening(&[WaitBegin(4), Notified(Consume(Some(r(9, 4)))), Uncounted]),
+        "receipt 9 was never counted",
+        0,
+    );
+    refused(
+        &with_opening(&[
+            WaitBegin(4),
+            Counted(r(2, 5)),
+            Notified(Consume(Some(r(2, 5)))),
+            Uncounted,
+        ]),
+        "an uncounted wake of the wait begun at entry Some(4)",
+        0,
+    );
+    refused(
+        &[
+            Counted(r(1, 4)),
+            WaitBegin(4),
+            Notified(Flush(Some(r(1, 4)))),
+            Uncounted,
+        ],
+        "ended by a deferred wake's flush",
+        0,
+    );
+    refused(
+        &[WaitBegin(4), Uncounted],
+        "ended by a notify that was not logged",
+        0,
+    );
+    refused(
+        &[Counted(r(1, 4)), Notified(Flush(Some(r(1, 4))))],
+        "1 notify(s) woke the worker with no wake logged",
+        0,
+    );
+}
+
+#[cfg(not(sanitized))]
+impl DeferredWakeCounted {
+    /// After the round's wait returned, whether the round shows that its
+    /// request's counted wakeup is what released the worker, and that every
+    /// later wake of the worker is accounted for: (a) the request counted
+    /// exactly one targeted wakeup; (b) no uncounted wake came before the
+    /// worker's first hint of the round; (c) the round's first hold end
+    /// carries exactly the request's count and precedes that hint, which
+    /// precedes Ready (only the worker's hint can wake a parked wait after
+    /// the byte); (d) through Ready and until the worker is quiescent, every
+    /// uncounted wake is a late consume notify, matched one for one to the
+    /// consume whose count the worker had already acted on
+    /// ([`deferred_wake_late_consume_audit`]).
+    ///
+    /// The check first waits until the worker is parked held after its last
+    /// delivered wake ([`wait_for_fresh_held_wait`]). Every notifier of the
+    /// round has returned by then: they ran on this thread, or are the
+    /// worker's own probe of itself, which returns before it waits. So the
+    /// log it then reads holds the worker's response to every notify sent
+    /// before it.
+    ///
+    /// Before the check ran to quiescence, it stopped its uncounted-wake test
+    /// at the first hint, and only reported a count taken from the snapshot
+    /// after Ready, `uncounted_at_check`. That count was 0 in all 820 rounds
+    /// of the gate runs of 2026-11-13 at
+    /// 9e3672ef93012b531fda2ccb1758de524824459e: 400 of
+    /// `forced_legacy_deferred_wake_reaches_an_async_wait`, 400 of
+    /// `forced_legacy_deferred_wake_reaches_an_exit_wait`, and 20 of
+    /// `forced_legacy_resume_does_not_wake_a_parked_worker_until_the_first_empty_assist`.
+    /// That snapshot could miss a wake the worker had not logged yet.
+    fn check(&self, event: &Event, what: &str) -> DeferredWakeCheck {
+        wait_for_fresh_held_wait(
+            event,
+            self.held,
+            &format!("{what}: counted-wake check"),
+            || {},
+        );
+        let log = event.legacy_wake_log.lock()[self.log_start..].to_vec();
+        let hint = log
+            .iter()
+            .position(|entry| *entry == LegacyWakeLogEntry::Hint);
+        let first_end = log.iter().enumerate().find_map(|(at, entry)| match entry {
+            LegacyWakeLogEntry::HoldEndedByCount(count) => Some((at, *count)),
+            _ => None,
+        });
+        let uncounted = |entries: &[LegacyWakeLogEntry]| {
+            entries
+                .iter()
+                .filter(|entry| **entry == LegacyWakeLogEntry::Uncounted)
+                .count()
+        };
+        let mut lacks = Vec::new();
+        let counted = self.after.wrapping_sub(self.before);
+        if counted != 1 {
+            lacks.push(format!(
+                "(a) the request counted {counted} targeted wakeups, not 1"
+            ));
+        }
+        let early = uncounted(&log[..hint.unwrap_or(log.len())]);
+        if early != 0 {
+            lacks.push(format!(
+                "(b) {early} uncounted wake(s) before the worker's hint"
+            ));
+        }
+        if !matches!((first_end, hint), (Some((at, count)), Some(hint)) if count == self.after && at < hint)
+        {
+            lacks.push(format!(
+                "(c) the hold was not ended by the request's count {} before the worker's hint",
+                self.after
+            ));
+        }
+        let (late, unexplained) = deferred_wake_late_consume_audit(&log, self.before);
+        lacks.extend(unexplained.into_iter().map(|what| format!("(d) {what}")));
+        let lacks = (!lacks.is_empty()).then(|| format!("{}; wake log {log:?}", lacks.join("; ")));
+        (lacks, uncounted(&log), late)
+    }
+}
+
+/// Prints a parked deferred-wake test's counted-wake report: its rounds, the
+/// rounds that failed the check ([`DeferredWakeCounted::check`]), the
+/// worker's uncounted wakes up to each check, and how many of them were late
+/// consume notifies. Returns the failed rounds, for
+/// [`deferred_wake_assert_counted`].
+#[cfg(not(sanitized))]
+fn deferred_wake_report_counted(label: &str, checks: &[DeferredWakeCheck]) -> Vec<(usize, String)> {
+    let failed: Vec<(usize, String)> = checks
+        .iter()
+        .enumerate()
+        .filter_map(|(round, (lacks, _, _))| lacks.clone().map(|lacks| (round, lacks)))
+        .collect();
+    let rounds: Vec<usize> = failed.iter().map(|(round, _)| *round).collect();
+    let uncounted: usize = checks.iter().map(|(_, uncounted, _)| uncounted).sum();
+    let late: usize = checks.iter().map(|(_, _, late)| late).sum();
+    println!(
+        "{DEFERRED_WAKE_REPORT}{label}: counted-wake n={} failed={} {rounds:?} \
+         uncounted_to_quiescence={uncounted} late_consume_notify={late}",
+        checks.len(),
+        failed.len(),
+    );
+    failed
+}
+
+/// Fails if any of `rounds` rounds failed the counted-wake check, with what
+/// each lacked.
+#[cfg(not(sanitized))]
+fn deferred_wake_assert_counted(label: &str, rounds: usize, failed: &[(usize, String)]) {
+    assert!(
+        failed.is_empty(),
+        "{label}: {} of {rounds} rounds failed the counted-wake check: {failed:?}",
+        failed.len(),
+    );
+}
+
+/// Reports one deferred-wake test's rounds and asserts that none missed its
+/// bound. `rounds` holds each round's time from the write to the return, or
+/// `None` for a round that missed the bound. The report line gives the
+/// missed rounds, and the median (the element at index n/2 of the sorted
+/// values) and the maximum of the others.
+#[cfg(not(sanitized))]
+fn deferred_wake_check_rounds(label: &str, rounds: &[Option<Duration>]) {
+    let missed: Vec<usize> = (0..rounds.len()).filter(|&i| rounds[i].is_none()).collect();
+    let mut sorted: Vec<Duration> = rounds.iter().flatten().copied().collect();
+    sorted.sort();
+    let (p50, max) = match sorted.last() {
+        Some(max) => (
+            sorted[sorted.len() / 2].as_micros().to_string(),
+            max.as_micros().to_string(),
+        ),
+        None => ("-".to_owned(), "-".to_owned()),
+    };
+    println!(
+        "{DEFERRED_WAKE_REPORT}{label}: n={} missed={} {missed:?} p50_us={p50} max_us={max}",
+        rounds.len(),
+        missed.len(),
+    );
+    assert!(
+        missed.is_empty(),
+        "{label}: {} of {} rounds missed the {DEFERRED_WAKE_BOUND:?} bound: rounds {missed:?}",
+        missed.len(),
+        rounds.len()
+    );
+}
+
+/// Polls `wait` each time `counter` moves past `seen`, which the caller read
+/// before its last poll, until the wait is ready or `deadline` passes. It
+/// never polls before the counter moves.
+#[cfg(not(sanitized))]
+fn deferred_wake_poll_on_wakes<F: Future>(
+    mut wait: Pin<&mut F>,
+    counter: &WakeCounter,
+    cx: &mut Context<'_>,
+    mut seen: usize,
+    deadline: Instant,
+) -> Option<F::Output> {
+    loop {
+        while counter.0.load(Ordering::SeqCst) == seen {
+            if Instant::now() >= deadline {
+                return None;
+            }
+            thread::sleep(Duration::from_micros(100));
+        }
+        seen = counter.0.load(Ordering::SeqCst);
+        if let Poll::Ready(output) = wait.as_mut().poll(cx) {
+            return Some(output);
+        }
+    }
+}
+
+/// The parked half of a deferred-wake round, after the first poll flushed
+/// the deferred wake. Polls `wait` a second time with a counting waker and
+/// asserts it is still pending and unwoken, so the waiter is parked before
+/// its stop can exist. Then writes the byte, and polls only when the counter
+/// moves: only the worker, released by the flush, can move it. Returns the
+/// wait's output, and its time from the write if it was ready within
+/// [`DEFERRED_WAKE_BOUND`] (`None` if not). A round that misses the bound is
+/// recovered: the assist consumes the stop, which stays in the kernel.
+#[cfg(not(sanitized))]
+fn deferred_wake_parked_wait<F: Future>(
+    mut wait: Pin<&mut F>,
+    write_end: &OwnedFd,
+    what: &str,
+) -> (F::Output, Option<Duration>) {
+    let counter = Arc::new(WakeCounter::default());
+    let waker = Waker::from(Arc::clone(&counter));
+    let mut cx = Context::from_waker(&waker);
+    assert!(
+        wait.as_mut().poll(&mut cx).is_pending(),
+        "{what}: the second poll returned before the byte"
+    );
+    assert_eq!(
+        counter.0.load(Ordering::SeqCst),
+        0,
+        "{what}: the parked waiter was woken before the byte"
+    );
+    let written = Instant::now();
+    deferred_wake_write(write_end);
+    if let Some(output) = deferred_wake_poll_on_wakes(
+        wait.as_mut(),
+        &counter,
+        &mut cx,
+        0,
+        written + DEFERRED_WAKE_BOUND,
+    ) {
+        let latency = written.elapsed();
+        assert!(
+            counter.0.load(Ordering::SeqCst) >= 1,
+            "{what}: ready without a wake"
+        );
+        return (output, (latency < DEFERRED_WAKE_BOUND).then_some(latency));
+    }
+    let seen = counter.0.load(Ordering::SeqCst);
+    let output = match wait.as_mut().poll(&mut cx) {
+        Poll::Ready(output) => output,
+        Poll::Pending => deferred_wake_poll_on_wakes(
+            wait.as_mut(),
+            &counter,
+            &mut cx,
+            seen,
+            Instant::now() + Duration::from_secs(2),
+        )
+        .unwrap_or_else(|| panic!("{what}: the missed round did not recover its stop")),
+    };
+    (output, None)
+}
+
+/// Checks for 20 ms after a resume that the parked worker stayed asleep: no
+/// worker turn and no hint since `before`. With `strict`, also no notify that
+/// woke the worker, and no observation.
+#[cfg(not(sanitized))]
+fn deferred_wake_pin(event: &Event, before: LegacyWakeCounts, strict: bool, what: &str) {
+    let deadline = Instant::now() + Duration::from_millis(20);
+    loop {
+        let moved = LegacyWakeCounts::of(event).since(before);
+        assert_eq!(
+            (moved.turns, moved.hints),
+            (0, 0),
+            "{what}: the resume woke the parked worker: {moved:?}"
+        );
+        if strict {
+            assert_eq!(
+                moved.notify_wakes, 0,
+                "{what}: the resume notified the parked worker: {moved:?}"
+            );
+            assert!(
+                event.legacy_wait.lock().observed.is_none(),
+                "{what}: the worker observed a status before any assist"
+            );
+        }
+        if Instant::now() >= deadline {
+            return;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// One round of a deferred-wake test on the pipe-reading thread. From a read
+/// entry, with the worker parked in a fresh held wait: resumes into the read,
+/// waits on `path` for the read's exit, with the byte written as `path`
+/// says, then resumes on to the next read entry. Returns that entry and its
+/// held-wait count ([`deferred_wake_next_read_entry`]), and how long after
+/// the byte's write the wait returned the read's exit.
+#[cfg(not(sanitized))]
+async fn deferred_wake_round(
+    path: DeferredWakePath,
+    round: usize,
+    entry: Stopped,
+    event: &Event,
+    write_end: &Arc<OwnedFd>,
+) -> (Stopped, usize, Option<Duration>, Option<DeferredWakeCheck>) {
+    let what = format!("{path:?} round {round}");
+    let before = LegacyWakeCounts::of(event);
+    let (exit, latency, counted) = match path {
+        DeferredWakePath::Async | DeferredWakePath::Pinned => {
+            let (running, counted) =
+                deferred_wake_counted_request(event, || entry.syscall(None).unwrap());
+            deferred_wake_pin(event, before, path == DeferredWakePath::Pinned, &what);
+            let mut wait = std::pin::pin!(running.wait_owned_on_ptracer_thread());
+            assert!(
+                wait.as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending(),
+                "{what}: the read returned before its byte"
+            );
+            assert_eq!(
+                LegacyWakeCounts::of(event).since(before).flushes,
+                1,
+                "{what}: the first empty assist did not flush the deferred wake"
+            );
+            let (wait, latency) = deferred_wake_parked_wait(wait.as_mut(), write_end, &what);
+            let check = counted.check(event, &what);
+            let (exit, stop) = wait.unwrap().assume_stopped();
+            assert_eq!(stop, crate::Event::Syscall);
+            (exit, latency, Some(check))
+        }
+        DeferredWakePath::Sync => {
+            let running = entry.syscall(None).unwrap();
+            let writer = deferred_wake_write_later(write_end);
+            let mut wait = running.wait_sync_on_ptracer_thread();
+            let (exit, stop) = wait.wait().unwrap().assume_stopped();
+            let returned = Instant::now();
+            assert_eq!(stop, crate::Event::Syscall);
+            let latency = returned.saturating_duration_since(writer.join().unwrap());
+            assert!(
+                latency < DEFERRED_WAKE_BOUND,
+                "{what}: the wait returned {latency:?} after the byte"
+            );
+            (exit, Some(latency), None)
+        }
+        DeferredWakePath::Cleanup => {
+            let mut cleanup = entry.terminal_cleanup_on_ptracer_thread().into_driver();
+            let running = entry.syscall(None).unwrap();
+            let writer = deferred_wake_write_later(write_end);
+            let pending = cleanup
+                .reserve_pending_on_ptracer_thread(Duration::from_secs(2))
+                .unwrap()
+                .unwrap_or_else(|| panic!("{what}: no stop within 2 s"));
+            let returned = Instant::now();
+            let (exit, stop) = pending.decode().unwrap().assume_stopped();
+            pending.commit();
+            drop(running);
+            assert_eq!(stop, crate::Event::Syscall);
+            let latency = returned.saturating_duration_since(writer.join().unwrap());
+            assert!(
+                latency < DEFERRED_WAKE_BOUND,
+                "{what}: the wait returned {latency:?} after the byte"
+            );
+            (exit, Some(latency), None)
+        }
+    };
+    assert_eq!(
+        exit.getsyscallinfo().unwrap().operation,
+        crate::SyscallInfoOp::Exit {
+            return_value: 1,
+            is_error: false
+        },
+        "{what}: not the read's exit"
+    );
+    assert_eq!(
+        event.legacy_held_expiry_finds.load(Ordering::Relaxed),
+        0,
+        "{what}: the worker found a stop only after a held wait's timeout"
+    );
+    let (entry, held) = deferred_wake_next_read_entry(exit, event).await;
+    (entry, held, latency, counted)
+}
+
+/// Runs `plan`'s rounds in order on one pipe-reading thread
+/// ([`with_deferred_wake_pipe_thread`]): for each entry, that many rounds of
+/// [`deferred_wake_round`] on its path. Returns each entry's rounds, for
+/// [`deferred_wake_check_rounds`], and each entry's counted-wake checks, for
+/// [`deferred_wake_report_counted`] (the parked paths only).
+#[cfg(not(sanitized))]
+async fn deferred_wake_rounds(
+    plan: &[(DeferredWakePath, usize)],
+) -> (Vec<Vec<Option<Duration>>>, Vec<Vec<DeferredWakeCheck>>) {
+    let slots: Vec<usize> = plan
+        .iter()
+        .enumerate()
+        .flat_map(|(slot, &(_, rounds))| std::iter::repeat_n(slot, rounds))
+        .collect();
+    let latencies = Rc::new(std::cell::RefCell::new(vec![Vec::new(); plan.len()]));
+    let checks = Rc::new(std::cell::RefCell::new(vec![Vec::new(); plan.len()]));
+    with_deferred_wake_pipe_thread(slots.len(), |round, entry, event, write_end, _root| {
+        let slot = slots[round];
+        let path = plan[slot].0;
+        let latencies = Rc::clone(&latencies);
+        let checks = Rc::clone(&checks);
+        async move {
+            let (entry, held, latency, check) =
+                deferred_wake_round(path, round, entry, &event, &write_end).await;
+            latencies.borrow_mut()[slot].push(latency);
+            if let Some(check) = check {
+                checks.borrow_mut()[slot].push(check);
+            }
+            (entry, held)
+        }
+    })
+    .await;
+    (latencies.take(), checks.take())
+}
+
+/// The voluntary context switches of the fixture thread `tid` in `root`'s
+/// group. A thread that enters a ptrace stop switches out voluntarily.
+#[cfg(not(sanitized))]
+fn deferred_wake_voluntary_switches(root: Pid, tid: crate::Pid) -> u64 {
+    fs::read_to_string(format!("/proc/{root}/task/{tid}/status"))
+        .unwrap()
+        .lines()
+        .find_map(|line| line.strip_prefix("voluntary_ctxt_switches:"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+/// One step of `forced_legacy_stop_found_at_first_poll_takes_one_worker_wake`.
+/// Resumes `stopped` to its next syscall stop, writing the byte first if
+/// `write_end` is given. Waits until that stop is in the kernel: the thread
+/// has switched out voluntarily since the resume, and shows `t`. Only then
+/// waits for the stop. Returns it, and `legacy_held_waits` as read before the
+/// resume.
+#[cfg(not(sanitized))]
+async fn deferred_wake_found_step(
+    stopped: Stopped,
+    event: &Event,
+    root: Pid,
+    write_end: Option<&OwnedFd>,
+    what: &str,
+) -> (Stopped, usize) {
+    let tid = stopped.pid();
+    let held = event.legacy_held_waits.load(Ordering::Relaxed);
+    let switches = deferred_wake_voluntary_switches(root, tid);
+    if let Some(write_end) = write_end {
+        deferred_wake_write(write_end);
+    }
+    let running = stopped.syscall(None).unwrap();
+    let deadline = Instant::now() + TRACEE_WAIT_TIMEOUT;
+    while deferred_wake_voluntary_switches(root, tid) <= switches
+        || deferred_wake_thread_state(root, tid).as_deref() != Some("t")
+    {
+        assert!(
+            Instant::now() < deadline,
+            "{what}: the stop never reached the kernel"
+        );
+        thread::sleep(Duration::from_micros(200));
+    }
+    let (next, stop) =
+        tokio::time::timeout(TRACEE_WAIT_TIMEOUT, running.wait_owned_on_ptracer_thread())
+            .await
+            .unwrap()
+            .unwrap()
+            .assume_stopped();
+    assert_eq!(stop, crate::Event::Syscall);
+    (next, held)
+}
+
+// A stop that is already in the kernel when the ptracer first waits for it
+// costs the legacy worker one wake: the consume's notify, after which the
+// worker takes one empty turn and parks again. The resume that led to the
+// stop defers its wake, and the ptracer's first assist consumes the stop, so
+// nothing flushes that wake, and the worker never observes the stop by
+// itself. The pipe-reading non-leader is stepped 50 times (read exit, read
+// entry, ...), each time with its worker parked in a fresh held wait first;
+// for a read exit the byte is written before the resume.
+#[tokio::test(flavor = "current_thread")]
+#[cfg(not(sanitized))]
+async fn forced_legacy_stop_found_at_first_poll_takes_one_worker_wake() {
+    if run_legacy_test_outer_reporting(
+        "forced_legacy_stop_found_at_first_poll_takes_one_worker_wake",
+        DEFERRED_WAKE_REPORT,
+    ) {
+        return;
+    }
+    const ROUNDS: usize = 25;
+    let start = Rc::new(Cell::new(None));
+    let end = Rc::new(Cell::new(None));
+    // Status reads by the attachment check on this ptracer thread, and
+    // deferrals that woke a status waker, over the 50 steps.
+    let extra = Rc::new(Cell::new((0, 0)));
+    with_deferred_wake_pipe_thread(ROUNDS, |round, entry, event, write_end, root| {
+        let (start, end, extra) = (Rc::clone(&start), Rc::clone(&end), Rc::clone(&extra));
+        async move {
+            if round == 0 {
+                start.set(Some(LegacyWakeCounts::of(&event)));
+                extra.set((
+                    PTRACER_ATTACHMENT_STATUS_READS.with(Cell::get),
+                    event.legacy_deferred_status_wakes.load(Ordering::Relaxed),
+                ));
+            }
+            let what = format!("round {round}: read exit");
+            let (exit, held) =
+                deferred_wake_found_step(entry, &event, root, Some(&*write_end), &what).await;
+            wait_for_fresh_held_wait(&event, held, &what, || {});
+            let what = format!("round {round}: read entry");
+            let (entry, held) = deferred_wake_found_step(exit, &event, root, None, &what).await;
+            if round == ROUNDS - 1 {
+                wait_for_fresh_held_wait(&event, held, &what, || {});
+                end.set(Some(LegacyWakeCounts::of(&event)));
+                let (reads, status_wakes) = extra.get();
+                extra.set((
+                    PTRACER_ATTACHMENT_STATUS_READS.with(Cell::get) - reads,
+                    event.legacy_deferred_status_wakes.load(Ordering::Relaxed) - status_wakes,
+                ));
+                // No exit waiter is registered here, so no deferral wakes one.
+                assert_eq!(
+                    event.legacy_deferred_exit_wakes.load(Ordering::Relaxed),
+                    0,
+                    "a deferral woke an exit waiter, but none was registered"
+                );
+            }
+            (entry, held)
+        }
+    })
+    .await;
+    let steps = end.get().unwrap().since(start.get().unwrap());
+    let (status_reads, status_wakes) = extra.get();
+    println!(
+        "{DEFERRED_WAKE_REPORT}stop found at first poll, {} steps: {steps:?}, \
+         status reads {status_reads}, deferral status wakes {status_wakes}",
+        2 * ROUNDS
+    );
+    assert_eq!(
+        steps,
+        LegacyWakeCounts {
+            turns: 2 * ROUNDS,
+            hints: 0,
+            notify_wakes: 2 * ROUNDS,
+            flushes: 0,
+            expiry_finds: 0,
+        },
+        "a stop found at the first poll did not cost exactly one worker wake and one turn"
+    );
+}
+
+// A resume's deferred wake reaches a parked async ptracer wait (W1). Each of
+// 20 rounds resumes the pipe-reading non-leader into its read with the
+// worker parked held (period 60 s), and checks for 20 ms that no turn or
+// hint follows. It polls the wait once (Pending; that empty assist flushes
+// the wake), then again with a counting waker (Pending, unwoken), so that
+// the waiter is parked before its stop can exist. Only then does it write
+// the byte, and it polls again only when the waker is woken, which only the
+// worker released by the flush can do. Every round must return the read's
+// exit within 50 ms of the write, and the worker must never have found a
+// stop through a held wait's timeout.
+#[tokio::test(flavor = "current_thread")]
+#[cfg(not(sanitized))]
+async fn forced_legacy_deferred_wake_reaches_an_async_wait() {
+    if run_legacy_test_outer_reporting(
+        "forced_legacy_deferred_wake_reaches_an_async_wait",
+        DEFERRED_WAKE_REPORT,
+    ) {
+        return;
+    }
+    let (rounds, checks) = deferred_wake_rounds(&[(DeferredWakePath::Async, 20)]).await;
+    let failed = deferred_wake_report_counted("parked async wait", &checks[0]);
+    deferred_wake_check_rounds("parked async wait, write to return", &rounds[0]);
+    deferred_wake_assert_counted("parked async wait", checks[0].len(), &failed);
+}
+
+// A resume's deferred wake reaches a parked exit wait (W2). Each of 20 fresh
+// non-leaders reads one byte and exits. At its read entry, with its worker
+// parked held (period 60 s), it is resumed, and for 20 ms no turn or hint
+// follows. Its exit wait is polled once (Pending; that empty assist flushes
+// the wake), then again with a counting waker (Pending, unwoken), so that
+// the waiter is parked before its stop can exist. Only then is the byte
+// written, and the wait is polled again only when the waker is woken, which
+// only the worker released by the flush can do. Every round's exit wait
+// must return within 50 ms of the write, with no stop found through a held
+// wait's timeout.
+#[tokio::test(flavor = "current_thread")]
+#[cfg(not(sanitized))]
+async fn forced_legacy_deferred_wake_reaches_an_exit_wait() {
+    if run_legacy_test_outer_reporting(
+        "forced_legacy_deferred_wake_reaches_an_exit_wait",
+        DEFERRED_WAKE_REPORT,
+    ) {
+        return;
+    }
+    const ROUNDS: usize = 20;
+    let [read_end, write_end] = legacy_pipe();
+    let modes: &'static [usize] =
+        Box::leak(Box::new([2000 + read_end.as_raw_fd() as usize; ROUNDS]));
+    let (root, stopped, mut root_cleanup, _force) = spawn_legacy_threads(
+        modes,
+        legacy_thread_options() | Options::PTRACE_O_TRACESYSGOOD,
+        LegacyAttachMethod::Traceme,
+    );
+    drop(read_end);
+    let read_fd = modes[0] as u64 - 2000;
+    let is_read_entry = |stopped: &Stopped| {
+        matches!(
+            stopped.getsyscallinfo().unwrap().operation,
+            crate::SyscallInfoOp::Entry { number, arguments }
+                if number == libc::SYS_read as u64 && arguments[0] == read_fd
+        )
+    };
+    let root_exit = root_cleanup.exit_event_on_ptracer_thread(&stopped).unwrap();
+    let root_terminal = stopped.terminal_cleanup();
+    let mut parent_running = stopped.resume(None).unwrap();
+    let mut latencies = Vec::new();
+    let mut checks = Vec::new();
+    for round in 0..ROUNDS {
+        let what = format!("exit round {round}");
+        let (parent, crate::Event::NewChild(crate::ChildOp::Clone, child)) = tokio::time::timeout(
+            TRACEE_WAIT_TIMEOUT,
+            parent_running.wait_owned_on_ptracer_thread(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .assume_stopped() else {
+            panic!("{what}: missing reading pthread clone");
+        };
+        let child_tid = child.pid();
+        let mut child_cleanup = legacy_child_cleanup(&child);
+        let terminal = child.terminal_cleanup();
+        let event = Arc::clone(terminal.event.event());
+        *event.legacy_held_period.lock() = Some(Duration::from_secs(60));
+        let (mut child, sigstop) =
+            tokio::time::timeout(TRACEE_WAIT_TIMEOUT, child.wait_owned_on_ptracer_thread())
+                .await
+                .unwrap()
+                .unwrap()
+                .assume_stopped();
+        assert_eq!(sigstop, crate::Event::Signal(Signal::SIGSTOP));
+        let mut entries = 0;
+        let mut held = event.legacy_held_waits.load(Ordering::Relaxed);
+        while !is_read_entry(&child) {
+            entries += 1;
+            assert!(entries < 200, "{what}: the thread never reached its read");
+            held = event.legacy_held_waits.load(Ordering::Relaxed);
+            child = next_syscall_stop(child).await;
+        }
+        wait_for_fresh_held_wait(&event, held, &format!("{what}: read entry"), || {});
+        let exit = child_cleanup.exit_event_on_ptracer_thread(&child).unwrap();
+        let before = LegacyWakeCounts::of(&event);
+        let (running, counted) =
+            deferred_wake_counted_request(&event, || child.resume(None).unwrap());
+        deferred_wake_pin(&event, before, false, &what);
+        let mut exit = std::pin::pin!(exit);
+        assert!(
+            exit.as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending(),
+            "{what}: the thread exited before its byte"
+        );
+        assert_eq!(
+            LegacyWakeCounts::of(&event).since(before).flushes,
+            1,
+            "{what}: the first empty assist did not flush the deferred wake"
+        );
+        let (exiting, latency) = deferred_wake_parked_wait(exit.as_mut(), &write_end, &what);
+        checks.push(counted.check(&event, &what));
+        let exiting = exiting.unwrap();
+        child_cleanup.mark_claimed_exit();
+        drop(running);
+        assert_eq!(exiting.pid(), child_tid);
+        assert_eq!(exiting.getevent().unwrap(), 0);
+        assert_eq!(
+            event.legacy_held_expiry_finds.load(Ordering::Relaxed),
+            0,
+            "{what}: the worker found the exit stop only after a held wait's timeout"
+        );
+        latencies.push(latency);
+        assert_eq!(
+            tokio::time::timeout(
+                TRACEE_WAIT_TIMEOUT,
+                exiting.resume(None).unwrap().wait_owned_on_ptracer_thread()
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .assume_exited(),
+            (child_tid, crate::ExitStatus::Exited(0)),
+        );
+        assert!(terminal.wait(TRACEE_WAIT_TIMEOUT));
+        child_cleanup.disarm();
+        // The leader stays at its clone stop until the thread is reaped: once
+        // its join returns it starts the next thread or, after the last,
+        // exits the group, and a thread reaped during a group exit reports
+        // the group's exit code.
+        parent_running = parent.resume(None).unwrap();
+    }
+    let parent = tokio::time::timeout(TRACEE_WAIT_TIMEOUT, root_exit)
+        .await
+        .unwrap()
+        .unwrap();
+    root_cleanup.mark_claimed_exit();
+    drop(parent_running);
+    assert_eq!(
+        tokio::time::timeout(
+            TRACEE_WAIT_TIMEOUT,
+            parent.resume(None).unwrap().wait_owned_on_ptracer_thread()
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .assume_exited(),
+        (root.into(), crate::ExitStatus::Exited(42)),
+    );
+    assert!(root_terminal.wait(TRACEE_WAIT_TIMEOUT));
+    root_cleanup.disarm();
+    let failed = deferred_wake_report_counted("parked exit wait", &checks);
+    deferred_wake_check_rounds("parked exit wait, write to return", &latencies);
+    deferred_wake_assert_counted("parked exit wait", checks.len(), &failed);
+}
+
+// The synchronous ptracer wait (W3) and the cleanup driver's pending
+// reservation (W4) meet the same bound after a deferred resume: 20 rounds
+// each on the pipe-reading non-leader, its worker parked held (period
+// 60 s), with the byte written by another thread 5 ms after the wait
+// starts. Each wait must return the read's exit within 50 ms of the write.
+// Both paths assist every 1 ms or less by themselves, so this shows their
+// bound, not the flush.
+#[tokio::test(flavor = "current_thread")]
+#[cfg(not(sanitized))]
+async fn forced_legacy_deferred_wake_meets_the_sync_and_cleanup_bounds() {
+    if run_legacy_test_outer_reporting(
+        "forced_legacy_deferred_wake_meets_the_sync_and_cleanup_bounds",
+        DEFERRED_WAKE_REPORT,
+    ) {
+        return;
+    }
+    let (rounds, _checks) = deferred_wake_rounds(&[
+        (DeferredWakePath::Sync, 20),
+        (DeferredWakePath::Cleanup, 20),
+    ])
+    .await;
+    deferred_wake_check_rounds("sync wait, write to return", &rounds[0]);
+    deferred_wake_check_rounds("cleanup reservation, write to return", &rounds[1]);
+}
+
+// A resume of a legacy non-leader whose worker is parked held does not wake
+// the worker: for 20 ms after it, the worker takes no turn, observes
+// nothing, and no notify wakes it. The resume's count still ends the hold:
+// the ptracer's first empty assist flushes the deferred wake, and that alone
+// ends a parked wait. The wait is polled again with a counting waker
+// (Pending, unwoken) before the byte is written, and not again until the
+// waker is woken; it must return the read's exit within 50 ms of the write,
+// with no stop found through a held wait's timeout (period 60 s).
+#[tokio::test(flavor = "current_thread")]
+#[cfg(not(sanitized))]
+async fn forced_legacy_resume_does_not_wake_a_parked_worker_until_the_first_empty_assist() {
+    if run_legacy_test_outer_reporting(
+        "forced_legacy_resume_does_not_wake_a_parked_worker_until_the_first_empty_assist",
+        DEFERRED_WAKE_REPORT,
+    ) {
+        return;
+    }
+    let (rounds, checks) = deferred_wake_rounds(&[(DeferredWakePath::Pinned, 1)]).await;
+    let failed = deferred_wake_report_counted("pinned parked async wait", &checks[0]);
+    deferred_wake_check_rounds("pinned parked async wait, write to return", &rounds[0]);
+    deferred_wake_assert_counted("pinned parked async wait", checks[0].len(), &failed);
+}
+
+/// The outcome line of `forced_legacy_exit_wait_parked_before_a_resume_gets_its_stop`.
+#[cfg(not(sanitized))]
+const PARKED_EXIT_WAIT_MARKER: &str =
+    "exit wait parked before the resume: woken and ready within the bound";
+
+// An exit wait already parked before a resume still gets its stop, as the
+// exit future reverie-ptrace's run loop keeps across every resume must. A
+// non-leader reads one byte and exits. At its read entry, with its worker
+// parked held (period 60 s), its exit wait is polled once with a counting
+// waker, before any resume: Pending. Only then is the thread resumed, with
+// the Running handle kept, the leader held at its clone stop so that no
+// group exit intervenes, and no other wait or assist. After the byte is
+// written, nothing polls until the waker is woken. The exit stop must be
+// ready within 50 ms of the write, with no stop found through a held wait's
+// timeout. The resume's deferral wakes the parked exit wait, from the
+// ptracer thread.
+#[tokio::test(flavor = "current_thread")]
+#[cfg(not(sanitized))]
+async fn forced_legacy_exit_wait_parked_before_a_resume_gets_its_stop() {
+    if run_legacy_test_outer_with_outcome(
+        "forced_legacy_exit_wait_parked_before_a_resume_gets_its_stop",
+        Some(PARKED_EXIT_WAIT_MARKER),
+    ) {
+        return;
+    }
+    let [read_end, write_end] = legacy_pipe();
+    let modes: &'static [usize] = Box::leak(Box::new([2000 + read_end.as_raw_fd() as usize]));
+    let (root, stopped, mut root_cleanup, _force) = spawn_legacy_threads(
+        modes,
+        legacy_thread_options() | Options::PTRACE_O_TRACESYSGOOD,
+        LegacyAttachMethod::Traceme,
+    );
+    drop(read_end);
+    let read_fd = modes[0] as u64 - 2000;
+    let root_exit = root_cleanup.exit_event_on_ptracer_thread(&stopped).unwrap();
+    let root_terminal = stopped.terminal_cleanup();
+    let (parent, crate::Event::NewChild(crate::ChildOp::Clone, child)) = tokio::time::timeout(
+        TRACEE_WAIT_TIMEOUT,
+        stopped.resume(None).unwrap().wait_owned_on_ptracer_thread(),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .assume_stopped() else {
+        panic!("missing reading pthread clone");
+    };
+    // The leader stays at this clone stop until the thread is reaped, so no
+    // group exit can end or replace the thread's stops.
+    let child_tid = child.pid();
+    let mut child_cleanup = legacy_child_cleanup(&child);
+    let terminal = child.terminal_cleanup();
+    let event = Arc::clone(terminal.event.event());
+    *event.legacy_held_period.lock() = Some(Duration::from_secs(60));
+    let (mut child, sigstop) =
+        tokio::time::timeout(TRACEE_WAIT_TIMEOUT, child.wait_owned_on_ptracer_thread())
+            .await
+            .unwrap()
+            .unwrap()
+            .assume_stopped();
+    assert_eq!(sigstop, crate::Event::Signal(Signal::SIGSTOP));
+    let mut entries = 0;
+    let mut held = event.legacy_held_waits.load(Ordering::Relaxed);
+    while !matches!(
+        child.getsyscallinfo().unwrap().operation,
+        crate::SyscallInfoOp::Entry { number, arguments }
+            if number == libc::SYS_read as u64 && arguments[0] == read_fd
+    ) {
+        entries += 1;
+        assert!(entries < 200, "the thread never reached its read");
+        held = event.legacy_held_waits.load(Ordering::Relaxed);
+        child = next_syscall_stop(child).await;
+    }
+    wait_for_fresh_held_wait(&event, held, "read entry", || {});
+    // Park the exit wait before the resume: one real poll, with a counting
+    // waker, on this ptracer thread.
+    let exit = child_cleanup.exit_event_on_ptracer_thread(&child).unwrap();
+    let mut exit = std::pin::pin!(exit);
+    let counter = ThreadWakeCounter::new();
+    let waker = Waker::from(Arc::clone(&counter));
+    let mut cx = Context::from_waker(&waker);
+    assert!(
+        exit.as_mut().poll(&mut cx).is_pending(),
+        "the exit wait returned before the resume"
+    );
+    let exit_wakes_before = event.legacy_deferred_exit_wakes.load(Ordering::Relaxed);
+    let (wakes_before, off_thread_before) = (counter.wakes(), counter.off_thread());
+    let running = child.resume(None).unwrap();
+    // The resume's deferral wakes the parked exit wait (`defer_legacy_wake`),
+    // within the request, on this ptracer thread. The worker parked held
+    // wakes nothing meanwhile; its later hint and publication wake the exit
+    // wait from its own thread, as before.
+    let exit_wakes = event.legacy_deferred_exit_wakes.load(Ordering::Relaxed) - exit_wakes_before;
+    let request_wakes = counter.wakes() - wakes_before;
+    let request_off_thread = counter.off_thread() - off_thread_before;
+    let written = Instant::now();
+    assert_eq!(
+        unsafe { libc::write(write_end.as_raw_fd(), b"r".as_ptr().cast(), 1) },
+        1
+    );
+    // No poll until the waker is woken; then poll on each wake, all within
+    // the bound.
+    let deadline = written + DEFERRED_WAKE_BOUND;
+    let mut seen = 0;
+    let mut ready = None;
+    while ready.is_none() && Instant::now() < deadline {
+        if counter.wakes() == seen {
+            thread::sleep(Duration::from_micros(100));
+            continue;
+        }
+        seen = counter.wakes();
+        if let Poll::Ready(output) = exit.as_mut().poll(&mut cx) {
+            ready = Some((output, written.elapsed()));
+        }
+    }
+    let woken = counter.wakes();
+    let (exiting, latency) = match ready {
+        Some((output, latency)) => (output, Some(latency)),
+        None => {
+            // Recover the stop, which stays in the kernel, so that the group
+            // is torn down cleanly before the verdict.
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let output = loop {
+                if let Poll::Ready(output) = exit.as_mut().poll(&mut cx) {
+                    break output;
+                }
+                assert!(Instant::now() < deadline, "the exit stop was not recovered");
+                thread::sleep(Duration::from_micros(100));
+            };
+            (output, None)
+        }
+    };
+    let exiting = exiting.unwrap();
+    child_cleanup.mark_claimed_exit();
+    drop(running);
+    assert_eq!(exiting.pid(), child_tid);
+    assert_eq!(exiting.getevent().unwrap(), 0);
+    assert_eq!(
+        event.legacy_held_expiry_finds.load(Ordering::Relaxed),
+        0,
+        "the worker found the exit stop only after a held wait's timeout"
+    );
+    assert_eq!(
+        tokio::time::timeout(
+            TRACEE_WAIT_TIMEOUT,
+            exiting.resume(None).unwrap().wait_owned_on_ptracer_thread()
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .assume_exited(),
+        (child_tid, crate::ExitStatus::Exited(0)),
+    );
+    assert!(terminal.wait(TRACEE_WAIT_TIMEOUT));
+    child_cleanup.disarm();
+    let parent_running = parent.resume(None).unwrap();
+    let parent = tokio::time::timeout(TRACEE_WAIT_TIMEOUT, root_exit)
+        .await
+        .unwrap()
+        .unwrap();
+    root_cleanup.mark_claimed_exit();
+    drop(parent_running);
+    assert_eq!(
+        tokio::time::timeout(
+            TRACEE_WAIT_TIMEOUT,
+            parent.resume(None).unwrap().wait_owned_on_ptracer_thread()
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .assume_exited(),
+        (root.into(), crate::ExitStatus::Exited(42)),
+    );
+    assert!(root_terminal.wait(TRACEE_WAIT_TIMEOUT));
+    root_cleanup.disarm();
+    println!("parked exit wait before the resume: woken {woken} times, write to ready {latency:?}");
+    assert!(
+        latency.is_some_and(|latency| latency < DEFERRED_WAKE_BOUND),
+        "the exit wait parked before the resume was not ready within 50 ms of the byte \
+         (woken {woken} times, write to ready {latency:?})"
+    );
+    assert_eq!(
+        exit_wakes, 1,
+        "the resume did not wake the parked exit wait"
+    );
+    assert!(
+        request_wakes >= 1,
+        "the resume did not wake the parked exit wait's waker"
+    );
+    assert_eq!(
+        request_off_thread, 0,
+        "the resume's wake of the parked exit wait came from another thread"
+    );
+    emit_completion_marker(PARKED_EXIT_WAIT_MARKER);
+}
+
+/// A waker that counts its wakes, and those that came from a thread other
+/// than the one that made it.
+#[cfg(not(sanitized))]
+struct ThreadWakeCounter {
+    home: ThreadId,
+    wakes: AtomicUsize,
+    off_thread: AtomicUsize,
+}
+
+#[cfg(not(sanitized))]
+impl ThreadWakeCounter {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            home: thread::current().id(),
+            wakes: AtomicUsize::new(0),
+            off_thread: AtomicUsize::new(0),
+        })
+    }
+
+    fn wakes(&self) -> usize {
+        self.wakes.load(Ordering::SeqCst)
+    }
+
+    fn off_thread(&self) -> usize {
+        self.off_thread.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(not(sanitized))]
+impl Wake for ThreadWakeCounter {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        if thread::current().id() != self.home {
+            self.off_thread.fetch_add(1, Ordering::SeqCst);
+        }
+        self.wakes.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+// With an exit wait parked across every request, as reverie-ptrace's run
+// loop keeps one, a stop found at the first poll still costs the legacy
+// worker one wake, and the exit wait's extra polls take nothing from the
+// waits. The pipe-reading non-leader is stepped 50 times (read exit, read
+// entry, ...). One exit wait is created and polled Pending before the first
+// request, and kept to the end. Each step, with the worker parked in a fresh
+// held wait: the request (for a read exit, after the byte), then, once the
+// stop is in the kernel, the exit wait is polled first, as the task the
+// request woke polls it in the run loop's `select_biased!` order. Its assist
+// consumes the stop and has the worker publish it; it stays Pending. Once
+// the worker has published that ordinary stop, and before anything that
+// can claim it has been polled, the exit wait is polled again: it must stay
+// Pending and take nothing. Only then is the step's wait polled, and it
+// must find its stop at once, in order. All 50 of those checks must run.
+// Over the 50 steps the worker counts must be exactly those of
+// `forced_legacy_stop_found_at_first_poll_takes_one_worker_wake`, and every
+// wake of the exit wait must come from this ptracer thread. The status
+// reads of the attachment check and the deferrals' status wakes are
+// reported.
+#[tokio::test(flavor = "current_thread")]
+#[cfg(not(sanitized))]
+async fn forced_legacy_stop_found_at_first_poll_with_a_parked_exit_wait_takes_one_worker_wake() {
+    if run_legacy_test_outer_reporting(
+        "forced_legacy_stop_found_at_first_poll_with_a_parked_exit_wait_takes_one_worker_wake",
+        DEFERRED_WAKE_REPORT,
+    ) {
+        return;
+    }
+    const STEPS: usize = 50;
+    let [read_end, write_end] = legacy_pipe();
+    let modes: &'static [usize] = Box::leak(Box::new([1000 + read_end.as_raw_fd() as usize]));
+    let (root, stopped, mut root_cleanup, _force) = spawn_legacy_threads(
+        modes,
+        legacy_thread_options() | Options::PTRACE_O_TRACESYSGOOD,
+        LegacyAttachMethod::Traceme,
+    );
+    drop(read_end);
+    let read_fd = modes[0] as u64 - 1000;
+    let is_read_entry = |stopped: &Stopped| {
+        matches!(
+            stopped.getsyscallinfo().unwrap().operation,
+            crate::SyscallInfoOp::Entry { number, arguments }
+                if number == libc::SYS_read as u64 && arguments[0] == read_fd
+        )
+    };
+    let root_exit = root_cleanup.exit_event_on_ptracer_thread(&stopped).unwrap();
+    let root_terminal = stopped.terminal_cleanup();
+    let (parent, crate::Event::NewChild(crate::ChildOp::Clone, child)) = tokio::time::timeout(
+        TRACEE_WAIT_TIMEOUT,
+        stopped.resume(None).unwrap().wait_owned_on_ptracer_thread(),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .assume_stopped() else {
+        panic!("missing reading pthread clone");
+    };
+    let child_tid = child.pid();
+    let mut child_cleanup = legacy_child_cleanup(&child);
+    let terminal = child.terminal_cleanup();
+    let event = Arc::clone(terminal.event.event());
+    *event.legacy_held_period.lock() = Some(Duration::from_secs(60));
+    let (mut child, sigstop) =
+        tokio::time::timeout(TRACEE_WAIT_TIMEOUT, child.wait_owned_on_ptracer_thread())
+            .await
+            .unwrap()
+            .unwrap()
+            .assume_stopped();
+    assert_eq!(sigstop, crate::Event::Signal(Signal::SIGSTOP));
+    let parent_running = parent.resume(None).unwrap();
+    let mut entries = 0;
+    let mut held = event.legacy_held_waits.load(Ordering::Relaxed);
+    while !is_read_entry(&child) {
+        entries += 1;
+        assert!(entries < 200, "the thread never reached its read");
+        held = event.legacy_held_waits.load(Ordering::Relaxed);
+        child = next_syscall_stop(child).await;
+    }
+    wait_for_fresh_held_wait(&event, held, "read entry", || {});
+    // The long-lived exit wait, parked before the first request.
+    let exit = child_cleanup.exit_event_on_ptracer_thread(&child).unwrap();
+    let mut exit = std::pin::pin!(exit);
+    let exit_counter = ThreadWakeCounter::new();
+    let exit_waker = Waker::from(Arc::clone(&exit_counter));
+    assert!(
+        exit.as_mut()
+            .poll(&mut Context::from_waker(&exit_waker))
+            .is_pending(),
+        "the exit wait returned before the first request"
+    );
+    let start = LegacyWakeCounts::of(&event);
+    let exit_wakes_start = event.legacy_deferred_exit_wakes.load(Ordering::Relaxed);
+    let status_wakes_start = event.legacy_deferred_status_wakes.load(Ordering::Relaxed);
+    // Wakes of the exit wait within the request calls, and how many of them
+    // came from another thread. The worker's own later wakes are not counted.
+    let (mut request_wakes, mut request_off_thread) = (0, 0);
+    let (mut exit_checks, mut status_reads) = (0, 0);
+    for step in 0..STEPS {
+        let what = format!("step {step}");
+        let to_exit = is_read_entry(&child);
+        assert_eq!(to_exit, step % 2 == 0, "{what}: out of order");
+        let tid = child.pid();
+        let held = event.legacy_held_waits.load(Ordering::Relaxed);
+        let switches = deferred_wake_voluntary_switches(root, tid);
+        if to_exit {
+            deferred_wake_write(&write_end);
+        }
+        let reads_before = PTRACER_ATTACHMENT_STATUS_READS.with(Cell::get);
+        let (wakes_before, off_thread_before) = (exit_counter.wakes(), exit_counter.off_thread());
+        let running = child.syscall(None).unwrap();
+        request_wakes += exit_counter.wakes() - wakes_before;
+        request_off_thread += exit_counter.off_thread() - off_thread_before;
+        let deadline = Instant::now() + TRACEE_WAIT_TIMEOUT;
+        while deferred_wake_voluntary_switches(root, tid) <= switches
+            || deferred_wake_thread_state(root, tid).as_deref() != Some("t")
+        {
+            assert!(
+                Instant::now() < deadline,
+                "{what}: the stop never reached the kernel"
+            );
+            thread::sleep(Duration::from_micros(200));
+        }
+        // The task the request woke polls the exit wait first: its assist
+        // consumes the stop and notifies the worker to publish it.
+        assert!(
+            exit.as_mut()
+                .poll(&mut Context::from_waker(&exit_waker))
+                .is_pending(),
+            "{what}: the exit wait returned on an ordinary stop"
+        );
+        let deadline = Instant::now() + TRACEE_WAIT_TIMEOUT;
+        while event.pending_is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "{what}: the ordinary stop was never published"
+            );
+            thread::sleep(Duration::from_micros(100));
+        }
+        // With that stop published, and nothing that can claim it polled
+        // yet, the exit wait is polled again: it stays Pending and takes
+        // nothing.
+        assert!(
+            exit.as_mut()
+                .poll(&mut Context::from_waker(&exit_waker))
+                .is_pending(),
+            "{what}: the exit wait returned on a published ordinary stop"
+        );
+        assert!(
+            !event.pending_is_empty(),
+            "{what}: the exit wait's poll took the published stop"
+        );
+        exit_checks += 1;
+        // Only now is the run loop's wait polled: it finds its stop at once.
+        let mut wait = std::pin::pin!(running.wait_owned_on_ptracer_thread());
+        let Poll::Ready(output) = wait.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+        else {
+            panic!("{what}: the wait lost its published stop after the exit wait's poll");
+        };
+        let (next, stop) = output.unwrap().assume_stopped();
+        assert_eq!(stop, crate::Event::Syscall, "{what}");
+        if to_exit {
+            assert_eq!(
+                next.getsyscallinfo().unwrap().operation,
+                crate::SyscallInfoOp::Exit {
+                    return_value: 1,
+                    is_error: false
+                },
+                "{what}: not the read's exit"
+            );
+        } else {
+            assert!(is_read_entry(&next), "{what}: not the next read entry");
+        }
+        status_reads += PTRACER_ATTACHMENT_STATUS_READS.with(Cell::get) - reads_before;
+        child = next;
+        wait_for_fresh_held_wait(&event, held, &what, || {});
+    }
+    let steps = LegacyWakeCounts::of(&event).since(start);
+    let exit_wakes = event.legacy_deferred_exit_wakes.load(Ordering::Relaxed) - exit_wakes_start;
+    let status_wakes =
+        event.legacy_deferred_status_wakes.load(Ordering::Relaxed) - status_wakes_start;
+    println!(
+        "{DEFERRED_WAKE_REPORT}stop found at first poll with a parked exit wait, {STEPS} steps: \
+         {steps:?}, deferral exit wakes {exit_wakes}, request wakes {request_wakes}, \
+         request off-thread {request_off_thread}, exit checks {exit_checks}, \
+         status reads {status_reads}, deferral status wakes {status_wakes}"
+    );
+    // The same exit wait gets the exit stop of a group SIGKILL.
+    terminal.request_sigkill().unwrap();
+    drop(child);
+    let child = tokio::time::timeout(TRACEE_WAIT_TIMEOUT, exit)
+        .await
+        .unwrap()
+        .unwrap();
+    child_cleanup.mark_claimed_exit();
+    assert_eq!(
+        tokio::time::timeout(
+            TRACEE_WAIT_TIMEOUT,
+            child.resume(None).unwrap().wait_owned_on_ptracer_thread()
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .assume_exited(),
+        (
+            child_tid,
+            crate::ExitStatus::Signaled(Signal::SIGKILL, false)
+        ),
+    );
+    assert!(terminal.wait(TRACEE_WAIT_TIMEOUT));
+    child_cleanup.disarm();
+    let parent = tokio::time::timeout(TRACEE_WAIT_TIMEOUT, root_exit)
+        .await
+        .unwrap()
+        .unwrap();
+    root_cleanup.mark_claimed_exit();
+    drop(parent_running);
+    assert_eq!(
+        tokio::time::timeout(
+            TRACEE_WAIT_TIMEOUT,
+            parent.resume(None).unwrap().wait_owned_on_ptracer_thread()
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .assume_exited(),
+        (
+            root.into(),
+            crate::ExitStatus::Signaled(Signal::SIGKILL, false)
+        ),
+    );
+    assert!(root_terminal.wait(TRACEE_WAIT_TIMEOUT));
+    root_cleanup.disarm();
+    assert_eq!(
+        steps,
+        LegacyWakeCounts {
+            turns: STEPS,
+            hints: 0,
+            notify_wakes: STEPS,
+            flushes: 0,
+            expiry_finds: 0,
+        },
+        "with a parked exit wait, a stop found at the first poll did not cost exactly one \
+         worker wake and one turn"
+    );
+    assert_eq!(
+        exit_checks, STEPS,
+        "not every step polled the exit wait with its ordinary stop published and unclaimed"
+    );
+    assert_eq!(
+        request_off_thread, 0,
+        "a request's wake of the exit wait came from another thread"
+    );
+}
+
+/// The outcome line of
+/// `forced_legacy_wait_parked_before_a_rebuilt_controllers_request_gets_its_stop`.
+#[cfg(not(sanitized))]
+const PARKED_STATUS_WAIT_MARKER: &str =
+    "wait parked before a rebuilt controller's request: woken and ready within the bound";
+
+/// What `forced_legacy_wait_parked_before_a_rebuilt_controllers_request_gets_its_stop`
+/// saw in its round, for the verdict after the teardown.
+#[cfg(not(sanitized))]
+#[derive(Debug)]
+struct ParkedStatusWaitRound {
+    latency: Option<Duration>,
+    woken: usize,
+    request_wakes: usize,
+    request_off_thread: usize,
+    status_wakes: usize,
+    flushed: usize,
+    expiry_finds: usize,
+}
+
+// An ordinary wait already parked before a request that another capability
+// for the same generation makes still gets its stop.
+// `TraceeGeneration::assume_stopped` rebuilds a controller for a tracee the
+// caller knows is stopped, while the original capability waits. On the
+// pipe-reading non-leader at a read entry, with its worker parked held
+// (period 60 s), the controller is rebuilt, and the original capability is
+// moved into its wait, which is polled once with a counting waker: Pending,
+// unwoken. Only then does the rebuilt controller resume the thread into its
+// read, with its Running kept, no exit waiter, and no other wait or assist.
+// The wait is polled only when its waker is woken: for the request's wake,
+// before the byte (that poll's empty assist sends the deferred notify), then
+// after the byte. The read's exit must be ready within 50 ms of the write,
+// with no stop found through a held wait's timeout. The request's deferral
+// wakes the parked wait, from the ptracer thread.
+#[tokio::test(flavor = "current_thread")]
+#[cfg(not(sanitized))]
+async fn forced_legacy_wait_parked_before_a_rebuilt_controllers_request_gets_its_stop() {
+    if run_legacy_test_outer_with_outcome(
+        "forced_legacy_wait_parked_before_a_rebuilt_controllers_request_gets_its_stop",
+        Some(PARKED_STATUS_WAIT_MARKER),
+    ) {
+        return;
+    }
+    let seen_round = Rc::new(std::cell::RefCell::new(None));
+    with_deferred_wake_pipe_thread(1, |_round, entry, event, write_end, _root| {
+        let seen_round = Rc::clone(&seen_round);
+        async move {
+            let controller = entry.generation().assume_stopped();
+            let mut wait = std::pin::pin!(entry.wait_owned_on_ptracer_thread());
+            let counter = ThreadWakeCounter::new();
+            let waker = Waker::from(Arc::clone(&counter));
+            let mut cx = Context::from_waker(&waker);
+            assert!(
+                wait.as_mut().poll(&mut cx).is_pending(),
+                "the wait returned before the request"
+            );
+            assert_eq!(
+                counter.wakes(),
+                0,
+                "the parked wait was woken before the request"
+            );
+            let status_wakes_before = event.legacy_deferred_status_wakes.load(Ordering::Relaxed);
+            let flushes_before = event.legacy_deferred_flushes.load(Ordering::Relaxed);
+            let running = controller.syscall(None).unwrap();
+            let status_wakes =
+                event.legacy_deferred_status_wakes.load(Ordering::Relaxed) - status_wakes_before;
+            let (request_wakes, request_off_thread) = (counter.wakes(), counter.off_thread());
+            // The woken task polls the wait, before the byte: Pending, and
+            // its empty assist sends the deferred notify.
+            let mut seen = counter.wakes();
+            if seen > 0 {
+                assert!(
+                    wait.as_mut().poll(&mut cx).is_pending(),
+                    "the read returned before its byte"
+                );
+            }
+            let flushed = event.legacy_deferred_flushes.load(Ordering::Relaxed) - flushes_before;
+            let written = Instant::now();
+            deferred_wake_write(&write_end);
+            let deadline = written + DEFERRED_WAKE_BOUND;
+            let mut ready = None;
+            while ready.is_none() && Instant::now() < deadline {
+                if counter.wakes() == seen {
+                    thread::sleep(Duration::from_micros(100));
+                    continue;
+                }
+                seen = counter.wakes();
+                if let Poll::Ready(output) = wait.as_mut().poll(&mut cx) {
+                    ready = Some((output, written.elapsed()));
+                }
+            }
+            let woken = counter.wakes();
+            let (output, latency) = match ready {
+                Some((output, latency)) => (output, Some(latency)),
+                None => {
+                    // Recover the stop, which stays in the kernel, so that
+                    // the group is torn down cleanly before the verdict.
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    let output = loop {
+                        if let Poll::Ready(output) = wait.as_mut().poll(&mut cx) {
+                            break output;
+                        }
+                        assert!(
+                            Instant::now() < deadline,
+                            "the read's exit was not recovered"
+                        );
+                        thread::sleep(Duration::from_micros(100));
+                    };
+                    (output, None)
+                }
+            };
+            drop(running);
+            let (exit, stop) = output.unwrap().assume_stopped();
+            assert_eq!(stop, crate::Event::Syscall);
+            assert_eq!(
+                exit.getsyscallinfo().unwrap().operation,
+                crate::SyscallInfoOp::Exit {
+                    return_value: 1,
+                    is_error: false
+                },
+                "not the read's exit"
+            );
+            *seen_round.borrow_mut() = Some(ParkedStatusWaitRound {
+                latency,
+                woken,
+                request_wakes,
+                request_off_thread,
+                status_wakes,
+                flushed,
+                expiry_finds: event.legacy_held_expiry_finds.load(Ordering::Relaxed),
+            });
+            deferred_wake_next_read_entry(exit, &event).await
+        }
+    })
+    .await;
+    let round = seen_round.borrow_mut().take().unwrap();
+    println!("wait parked before a rebuilt controller's request: {round:?}");
+    assert!(
+        round
+            .latency
+            .is_some_and(|latency| latency < DEFERRED_WAKE_BOUND),
+        "the wait parked before the rebuilt controller's request was not ready within 50 ms \
+         of the byte (woken {} times, write to ready {:?})",
+        round.woken,
+        round.latency,
+    );
+    assert_eq!(
+        round.expiry_finds, 0,
+        "the worker found the read's exit only after a held wait's timeout"
+    );
+    assert_eq!(
+        round.status_wakes, 1,
+        "the request's deferral did not wake the parked wait"
+    );
+    assert!(
+        round.request_wakes >= 1,
+        "the request did not wake the parked wait's waker"
+    );
+    assert_eq!(
+        round.request_off_thread, 0,
+        "the request's wake of the parked wait came from another thread"
+    );
+    assert_eq!(
+        round.flushed, 1,
+        "the woken poll before the byte did not send the deferred notify"
+    );
+    emit_completion_marker(PARKED_STATUS_WAIT_MARKER);
+}
+
+/// The outcome line of
+/// `forced_legacy_counted_wake_check_refuses_extra_notifies_to_a_parked_worker`.
+#[cfg(not(sanitized))]
+const EXTRA_NOTIFY_MARKER: &str = "counted-wake check: the real round passed, and each extra notify to the parked worker was refused";
+
+/// What a delivered extra notify was, how many notifies the worker counted
+/// for it, and the counted-wake check of the round after it.
+#[cfg(not(sanitized))]
+type ExtraNotifyVerdict = (Option<LegacyNotifySource>, usize, DeferredWakeCheck);
+
+// The counted-wake check refuses an extra notify that reaches the parked
+// worker. One parked async round, as in
+// `forced_legacy_deferred_wake_reaches_an_async_wait`, must pass the check.
+// Then three notifies are delivered to the worker, each while it is proven
+// parked in its held wait: after the check's quiescence, the test takes
+// `legacy_wakeup`, which the worker releases only inside `wait_for`. Each
+// carries a source that no real notify of that round can: a consume reusing
+// the receipt of the round's own deferral (already used by its flush), a
+// consume with no receipt, and no source. After each, the check of the same
+// round must fail, naming that notify.
+#[tokio::test(flavor = "current_thread")]
+#[cfg(not(sanitized))]
+async fn forced_legacy_counted_wake_check_refuses_extra_notifies_to_a_parked_worker() {
+    if run_legacy_test_outer_with_outcome(
+        "forced_legacy_counted_wake_check_refuses_extra_notifies_to_a_parked_worker",
+        Some(EXTRA_NOTIFY_MARKER),
+    ) {
+        return;
+    }
+    let verdicts = Rc::new(std::cell::RefCell::new(None));
+    with_deferred_wake_pipe_thread(1, |round, entry, event, write_end, _root| {
+        let verdicts = Rc::clone(&verdicts);
+        async move {
+            let what = format!("round {round}");
+            let (running, counted) =
+                deferred_wake_counted_request(&event, || entry.syscall(None).unwrap());
+            let mut wait = std::pin::pin!(running.wait_owned_on_ptracer_thread());
+            assert!(
+                wait.as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending(),
+                "{what}: the read returned before its byte"
+            );
+            let (output, _latency) = deferred_wake_parked_wait(wait.as_mut(), &write_end, &what);
+            let real = counted.check(&event, &what);
+            let flush_receipt = event.legacy_wake_log.lock()[counted.log_start..]
+                .iter()
+                .find_map(|entry| match entry {
+                    LegacyWakeLogEntry::Notified(LegacyNotifySource::Flush(receipt)) => *receipt,
+                    _ => None,
+                });
+            let mut injected: Vec<ExtraNotifyVerdict> = Vec::new();
+            for source in [
+                flush_receipt.map(|receipt| LegacyNotifySource::Consume(Some(receipt))),
+                Some(LegacyNotifySource::Consume(None)),
+                None,
+            ] {
+                let delivered = event.legacy_notify_wakes.load(Ordering::Relaxed);
+                {
+                    // The last check left the worker quiescent in its held
+                    // wait. It holds this lock until `wait_for` parks it.
+                    let _parked = event.legacy_wakeup.lock();
+                    if let Some(source) = source {
+                        note_legacy_notify_source(source);
+                    }
+                    event.notify_legacy_worker();
+                }
+                let delivered = event.legacy_notify_wakes.load(Ordering::Relaxed) - delivered;
+                injected.push((source, delivered, counted.check(&event, &what)));
+            }
+            *verdicts.borrow_mut() = Some((real, flush_receipt, injected));
+            let (exit, stop) = output.unwrap().assume_stopped();
+            assert_eq!(stop, crate::Event::Syscall);
+            deferred_wake_next_read_entry(exit, &event).await
+        }
+    })
+    .await;
+    let (real, flush_receipt, injected) = verdicts.borrow_mut().take().unwrap();
+    assert!(
+        real.0.is_none(),
+        "the real round failed the counted-wake check: {:?}",
+        real.0
+    );
+    let flush_receipt = flush_receipt.expect("the round's flush carried no receipt");
+    let reasons = [
+        format!("receipt {} used by a second notify", flush_receipt.serial),
+        "a consume (no receipt) made no count".to_owned(),
+        "ended by a notify that named no source".to_owned(),
+    ];
+    for ((source, delivered, check), reason) in injected.iter().zip(&reasons) {
+        assert_eq!(
+            *delivered, 1,
+            "the extra notify {source:?} did not reach the parked worker"
+        );
+        let lacks = check.0.as_deref().unwrap_or("");
+        assert!(
+            lacks.contains(reason.as_str()),
+            "the check did not refuse the extra notify {source:?} with {reason:?}: {lacks}"
+        );
+    }
+    println!("extra notifies to a parked worker: {injected:?}");
+    emit_completion_marker(EXTRA_NOTIFY_MARKER);
 }

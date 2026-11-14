@@ -556,7 +556,9 @@ pub(super) fn note_waker_callbacks() {
 
 #[derive(Debug, Default)]
 struct WakerSlot {
-    waker: Mutex<Option<Waker>>,
+    /// Shared, so that [`Self::wake`] takes the registered waker under the
+    /// lock without running any of its callbacks there.
+    waker: Mutex<Option<Arc<Waker>>>,
     data: AtomicPtr<()>,
     vtable: AtomicPtr<RawWakerVTable>,
 }
@@ -573,6 +575,12 @@ impl Drop for WakerSlot {
 
 impl WakerSlot {
     /// Keeps one task registered across all status events for a PID.
+    ///
+    /// No waker callback runs under the slot lock: a callback is arbitrary
+    /// code, which may poll a future that registers or wakes through this
+    /// same slot. The new waker is cloned before the lock is taken to
+    /// install it, and the one it replaces is dropped after the lock is
+    /// released.
     fn register(&self, waker: &Waker) -> bool {
         let data = waker.data().cast_mut();
         let vtable = std::ptr::from_ref(waker.vtable()).cast_mut();
@@ -585,8 +593,9 @@ impl WakerSlot {
             return false;
         }
 
-        let mut slot = self.waker.lock();
-        if slot
+        if self
+            .waker
+            .lock()
             .as_ref()
             .is_some_and(|registered| registered.will_wake(waker))
         {
@@ -595,21 +604,33 @@ impl WakerSlot {
 
         // Cloning the new waker and dropping the old one run their callbacks.
         note_waker_callbacks();
-        *slot = Some(waker.clone());
+        let new = Arc::new(waker.clone());
+        let old = {
+            let mut slot = self.waker.lock();
+            let old = slot.replace(new);
+            self.vtable.store(vtable, Ordering::Relaxed);
+            // Publish data last so an Acquire match also observes the vtable.
+            self.data.store(data, Ordering::Release);
+            old
+        };
+        drop(old);
         note_waker_callbacks();
-        self.vtable.store(vtable, Ordering::Relaxed);
-        // Publish data last so an Acquire match also observes the vtable.
-        self.data.store(data, Ordering::Release);
         true
     }
 
-    fn wake(&self) {
+    /// Wakes the registered task, if any, and returns whether one was
+    /// registered. The registered waker is shared out under the lock, then
+    /// woken and released after it, so that its callbacks run outside the
+    /// lock (see [`Self::register`]).
+    fn wake(&self) -> bool {
         note_waker_callbacks();
-        let waker = self.waker.lock().as_ref().cloned();
+        let waker = self.waker.lock().clone();
+        let registered = waker.is_some();
         if let Some(waker) = waker {
-            waker.wake();
+            waker.wake_by_ref();
         }
         note_waker_callbacks();
+        registered
     }
 }
 
@@ -635,7 +656,8 @@ impl ExitWaiters {
         }
     }
 
-    fn wake_all(&self) {
+    /// Wakes every live registered waiter, and returns how many.
+    fn wake_all(&self) -> usize {
         let live = {
             let mut waiters = self.waiters.lock();
             let mut live = Vec::with_capacity(waiters.len());
@@ -649,9 +671,11 @@ impl ExitWaiters {
             });
             live
         };
+        let woken = live.len();
         for waiter in live {
             waiter.waker.wake();
         }
+        woken
     }
 }
 
@@ -743,6 +767,10 @@ struct Event {
     legacy_wakeup: Mutex<LegacyWakeups>,
     /// Wakes the legacy observation worker waiting on `legacy_wakeup`.
     legacy_wake: Condvar,
+    /// A wakeup counted by a resume or an interrupt whose notify is deferred
+    /// to the actual ptracer's first assist that consumes nothing
+    /// ([`Event::defer_legacy_wake`], [`Event::flush_deferred_legacy_wake`]).
+    legacy_wake_deferred: AtomicBool,
     /// Replaces [`LEGACY_HELD_PERIOD`] for this generation's worker.
     #[cfg(test)]
     legacy_held_period: Mutex<Option<Duration>>,
@@ -905,6 +933,37 @@ struct Event {
     legacy_worker_turns: AtomicUsize,
     #[cfg(test)]
     legacy_worker_status_reads: AtomicUsize,
+    /// Turns of the legacy worker whose observation found a status (a hint).
+    #[cfg(test)]
+    legacy_hint_turns: AtomicUsize,
+    /// Turns of the legacy worker that found a status right after a held
+    /// wait that ended by its timeout, not by a notify: a wakeup that reached
+    /// the worker only through the held period.
+    #[cfg(test)]
+    legacy_held_expiry_finds: AtomicUsize,
+    /// Deferred wakeups that [`Event::flush_deferred_legacy_wake`] notified.
+    #[cfg(test)]
+    legacy_deferred_flushes: AtomicUsize,
+    /// Deferrals ([`Event::defer_legacy_wake`]) that woke at least one live
+    /// registered exit waiter.
+    #[cfg(test)]
+    legacy_deferred_exit_wakes: AtomicUsize,
+    /// Deferrals ([`Event::defer_legacy_wake`]) that found a status waker
+    /// registered, and woke it.
+    #[cfg(test)]
+    legacy_deferred_status_wakes: AtomicUsize,
+    /// The legacy worker's waits, wakes, hold ends and first observations,
+    /// and the notifies that woke it, in order ([`LegacyWakeLogEntry`]).
+    #[cfg(all(test, not(sanitized)))]
+    legacy_wake_log: Mutex<Vec<LegacyWakeLogEntry>>,
+    /// The receipt of the last deferral's count, for the provenance of its
+    /// flush ([`LegacyNotifySource::Flush`]), which takes it.
+    #[cfg(all(test, not(sanitized)))]
+    legacy_deferred_receipt: Mutex<Option<LegacyCountReceipt>>,
+    /// The serial of the last [`LegacyCountReceipt`] minted for this Event,
+    /// advanced under `legacy_wakeup`.
+    #[cfg(all(test, not(sanitized)))]
+    legacy_count_serial: AtomicU64,
 }
 
 /// Keeps a generation's TID from being reaped. See [`EventHandle::hold_tid`].
@@ -930,6 +989,92 @@ struct LegacyWakeups {
     targeted: u64,
     /// [`Event::probe_legacy_worker`] calls.
     probes: u64,
+}
+
+/// One entry of [`Event::legacy_wake_log`], in the order it was pushed: by
+/// the legacy observation worker ([`legacy_worker_thread`]), or, for
+/// [`Self::Notified`], by the notifier that woke it.
+#[cfg(all(test, not(sanitized)))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LegacyWakeLogEntry {
+    /// A held worker saw the targeted count move off the count its hold
+    /// was taken at, and ended the hold: the targeted count it saw.
+    HoldEndedByCount(u64),
+    /// The worker's wait ended by a notify that had moved neither count
+    /// since the worker last acted on them.
+    Uncounted,
+    /// A turn observed a stop that the previous turn had not.
+    Hint,
+    /// The worker starts a wait on `legacy_wake`, under `legacy_wakeup`,
+    /// having acted on this targeted count.
+    WaitBegin(u64),
+    /// The worker's wait ended by a notify that had moved a count.
+    CountedWake,
+    /// A notify woke the worker. Pushed by [`Event::notify_legacy_worker`]
+    /// once `notify_one` returned true, so after the [`Self::WaitBegin`] of
+    /// the wait it ended (the worker parks only after pushing that).
+    Notified(LegacyNotifySource),
+    /// [`Event::count_legacy_wakeup`] made one targeted count, and minted
+    /// this receipt for it. Pushed under `legacy_wakeup`, so before any
+    /// [`Self::WaitBegin`] whose count includes it.
+    Counted(LegacyCountReceipt),
+}
+
+/// The receipt of one targeted count, minted inside
+/// [`Event::count_legacy_wakeup`] under `legacy_wakeup`. Each counting site
+/// takes its own receipt the very next statement and carries it to its own
+/// notify, so a notify's receipt names the increment that site made, and a
+/// site that made no increment carries none.
+#[cfg(all(test, not(sanitized)))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LegacyCountReceipt {
+    /// Unique within the Event, in count order.
+    serial: u64,
+    /// The targeted count the increment made.
+    targeted: u64,
+}
+
+/// Which notify of `legacy_wake` woke the legacy worker
+/// ([`LegacyWakeLogEntry::Notified`]): for a site that counts, with the
+/// receipt of its own count (`None` if it made none).
+#[cfg(all(test, not(sanitized)))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LegacyNotifySource {
+    /// [`Event::wake_legacy_worker`].
+    Immediate(Option<LegacyCountReceipt>),
+    /// [`Event::flush_deferred_legacy_wake`], with the deferral's receipt.
+    Flush(Option<LegacyCountReceipt>),
+    /// [`Event::probe_legacy_worker`], with the probe count it made (a probe
+    /// makes no targeted count).
+    Probe(u64),
+    /// The ptracer's consume or ECHILD in
+    /// [`EventHandle::try_assist_legacy_wait`], counted under `legacy_wait`
+    /// before it released that lock and notified.
+    Consume(Option<LegacyCountReceipt>),
+    /// A notify whose caller named no source.
+    Unknown,
+}
+
+#[cfg(all(test, not(sanitized)))]
+thread_local! {
+    /// The receipt that this thread's last [`Event::count_legacy_wakeup`]
+    /// minted, until its caller takes it, the very next statement.
+    static LEGACY_COUNT_RECEIPT: Cell<Option<LegacyCountReceipt>> = const { Cell::new(None) };
+    /// The source of this thread's next [`Event::notify_legacy_worker`].
+    static LEGACY_NOTIFY_SOURCE: Cell<Option<LegacyNotifySource>> = const { Cell::new(None) };
+}
+
+/// Names the source of this thread's next [`Event::notify_legacy_worker`].
+#[cfg(all(test, not(sanitized)))]
+fn note_legacy_notify_source(source: LegacyNotifySource) {
+    LEGACY_NOTIFY_SOURCE.with(|next| next.set(Some(source)));
+}
+
+/// Takes the receipt of the count this thread just made, if it made one
+/// since the last take.
+#[cfg(all(test, not(sanitized)))]
+fn take_legacy_count_receipt() -> Option<LegacyCountReceipt> {
+    LEGACY_COUNT_RECEIPT.with(Cell::take)
 }
 
 #[derive(Debug)]
@@ -1518,6 +1663,7 @@ impl Event {
             legacy_wait: Mutex::new(LegacyWaitProgress::default()),
             legacy_wakeup: Mutex::new(LegacyWakeups::default()),
             legacy_wake: Condvar::new(),
+            legacy_wake_deferred: AtomicBool::new(false),
             #[cfg(test)]
             legacy_held_period: Mutex::new(None),
             #[cfg(test)]
@@ -1589,6 +1735,22 @@ impl Event {
             legacy_worker_turns: AtomicUsize::new(0),
             #[cfg(test)]
             legacy_worker_status_reads: AtomicUsize::new(0),
+            #[cfg(test)]
+            legacy_hint_turns: AtomicUsize::new(0),
+            #[cfg(test)]
+            legacy_held_expiry_finds: AtomicUsize::new(0),
+            #[cfg(test)]
+            legacy_deferred_flushes: AtomicUsize::new(0),
+            #[cfg(test)]
+            legacy_deferred_exit_wakes: AtomicUsize::new(0),
+            #[cfg(test)]
+            legacy_deferred_status_wakes: AtomicUsize::new(0),
+            #[cfg(all(test, not(sanitized)))]
+            legacy_wake_log: Mutex::new(Vec::new()),
+            #[cfg(all(test, not(sanitized)))]
+            legacy_deferred_receipt: Mutex::new(None),
+            #[cfg(all(test, not(sanitized)))]
+            legacy_count_serial: AtomicU64::new(0),
         }
     }
 
@@ -1610,10 +1772,107 @@ impl Event {
     /// stop from the shortest wait up, and a stop it published before this
     /// call no longer counts as held (see [`legacy_worker_thread`]). A wakeup
     /// only moves the worker's next turn earlier; the turn checks and
-    /// observes what it would have at its due time.
+    /// observes what it would have at its due time. Its notify also stands
+    /// in for a deferred one ([`Self::defer_legacy_wake`]).
     fn wake_legacy_worker(&self) {
         self.count_legacy_wakeup();
+        #[cfg(all(test, not(sanitized)))]
+        let receipt = take_legacy_count_receipt();
+        self.legacy_wake_deferred.store(false, Ordering::Release);
+        #[cfg(all(test, not(sanitized)))]
+        note_legacy_notify_source(LegacyNotifySource::Immediate(receipt));
         self.notify_legacy_worker();
+    }
+
+    /// [`Self::wake_legacy_worker`] for a resume or an interrupt, after which
+    /// the actual ptracer waits for the next stop: the wakeup counts now,
+    /// and its notify waits for that ptracer's first assist that consumes
+    /// nothing ([`Self::flush_deferred_legacy_wake`]).
+    ///
+    /// The count alone ends a hold at the worker's next sleep check, which
+    /// compares the counts under `legacy_wakeup` (see
+    /// [`legacy_worker_thread`]). Only a held wait the worker had already
+    /// started needs the notify, and a stop is held in the kernel until the
+    /// ptracer consumes it, so deferring the notify delays and never loses
+    /// a status. When the stop is already there at the ptracer's first
+    /// assist, that assist consumes it and notifies the worker to publish
+    /// it, and the deferred notify, with the worker turn it would have
+    /// started, is not needed. Otherwise every waiter that parks or blocks
+    /// first assists, and its empty assist sends the notify.
+    ///
+    /// Two kinds of waiter can be parked before the request, and nothing
+    /// else would poll either again, so this wakes both. The next poll of
+    /// each assists, consuming the stop if it is there, sending the
+    /// deferred notify if not:
+    ///
+    /// - an exit waiter: `exit_event_on_ptracer_thread` returns an owned
+    ///   future from `&Stopped` or `&Running`, and reverie-ptrace keeps one
+    ///   parked across every resume of an ordinary thread;
+    /// - the status waiter of a wait whose capability was moved into it
+    ///   before another capability for this generation made the request:
+    ///   one rebuilt through
+    ///   [`TraceeGeneration::assume_stopped`](super::TraceeGeneration::assume_stopped)
+    ///   while the tracee was known to be stopped, or [`Running::new`] for
+    ///   an interrupt.
+    ///
+    /// [`WakerSlot`] keeps the last registered status waker after its wait
+    /// returned, so the status wake usually reaches a task that no longer
+    /// waits on this Event: one spurious poll at most, and none in
+    /// reverie-ptrace, whose run-loop task registered both wakers and is
+    /// already woken by its exit waiter's wake. A woken poll moves a stop
+    /// only into this Event's own `consumed` FIFO, which the worker
+    /// publishes in order; an exit waiter never takes an entry of the FIFO
+    /// that waits read ([`Self::poll_exit_epoch`]).
+    ///
+    /// This runs only on the ptracer thread: its callers run after their
+    /// ptrace request succeeded, and Linux accepts a request only from the
+    /// tracer task (`ptrace_check_attach`). Each waker in a Procfs Event's
+    /// `exit_waiters` and `status_waker` was registered by a poll that passed
+    /// [`PtracerAffinity::check_host`] for this ptracer thread (the Native
+    /// policy is refused for Procfs). The wakes hand the waiting tasks to
+    /// their executors through [`Waker::wake_by_ref`], outside every lock of
+    /// this crate ([`WakerSlot::wake`]); they notify no condvar of this
+    /// crate.
+    ///
+    /// Bound: the wait returns at most `LEGACY_POLL_PERIOD` (plus scheduling
+    /// delay) after the later of the stop and the first assist after the
+    /// request: that of a wait that starts after it, or that of a waiter
+    /// parked before it, which these wakes schedule.
+    fn defer_legacy_wake(&self) {
+        self.count_legacy_wakeup();
+        #[cfg(all(test, not(sanitized)))]
+        {
+            *self.legacy_deferred_receipt.lock() = take_legacy_count_receipt();
+        }
+        self.legacy_wake_deferred.store(true, Ordering::Release);
+        let _exit_woken = self.exit_waiters.wake_all();
+        let _status_woken = self.status_waker.wake();
+        #[cfg(test)]
+        {
+            if _exit_woken > 0 {
+                self.legacy_deferred_exit_wakes
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            if _status_woken {
+                self.legacy_deferred_status_wakes
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Sends the notify of a wakeup [`Self::defer_legacy_wake`] counted, if
+    /// one is still deferred. Called by the actual ptracer's assist when it
+    /// consumes nothing, before its waiter parks or blocks.
+    fn flush_deferred_legacy_wake(&self) {
+        if self.legacy_wake_deferred.swap(false, Ordering::AcqRel) {
+            #[cfg(test)]
+            self.legacy_deferred_flushes.fetch_add(1, Ordering::Relaxed);
+            #[cfg(all(test, not(sanitized)))]
+            note_legacy_notify_source(LegacyNotifySource::Flush(
+                self.legacy_deferred_receipt.lock().take(),
+            ));
+            self.notify_legacy_worker();
+        }
     }
 
     /// Notifies `legacy_wake`, after the caller counted a wakeup and
@@ -1635,6 +1894,19 @@ impl Event {
     /// wait and this function from its count, either may run ahead.
     fn notify_legacy_worker(&self) {
         let _woke = self.legacy_wake.notify_one();
+        // Logged before `legacy_notify_wakes` moves, so that a test that saw
+        // the count also sees the entry.
+        #[cfg(all(test, not(sanitized)))]
+        {
+            let source = LEGACY_NOTIFY_SOURCE
+                .with(Cell::take)
+                .unwrap_or(LegacyNotifySource::Unknown);
+            if _woke {
+                self.legacy_wake_log
+                    .lock()
+                    .push(LegacyWakeLogEntry::Notified(source));
+            }
+        }
         #[cfg(test)]
         if _woke {
             self.legacy_notify_wakes.fetch_add(1, Ordering::Relaxed);
@@ -1649,6 +1921,17 @@ impl Event {
     fn count_legacy_wakeup(&self) {
         let mut wakeups = self.legacy_wakeup.lock();
         wakeups.targeted = wakeups.targeted.wrapping_add(1);
+        #[cfg(all(test, not(sanitized)))]
+        {
+            let receipt = LegacyCountReceipt {
+                serial: self.legacy_count_serial.fetch_add(1, Ordering::Relaxed) + 1,
+                targeted: wakeups.targeted,
+            };
+            self.legacy_wake_log
+                .lock()
+                .push(LegacyWakeLogEntry::Counted(receipt));
+            LEGACY_COUNT_RECEIPT.with(|slot| slot.set(Some(receipt)));
+        }
     }
 
     /// Runs this generation's legacy observation worker now, and lets a
@@ -1660,6 +1943,8 @@ impl Event {
     fn probe_legacy_worker(&self) {
         let mut wakeups = self.legacy_wakeup.lock();
         wakeups.probes = wakeups.probes.wrapping_add(1);
+        #[cfg(all(test, not(sanitized)))]
+        note_legacy_notify_source(LegacyNotifySource::Probe(wakeups.probes));
         drop(wakeups);
         self.notify_legacy_worker();
     }
@@ -3173,18 +3458,35 @@ impl EventHandle {
         })
     }
 
-    /// After a request that makes a stop likely soon (a resumption or an
-    /// interrupt): a legacy (Procfs) generation's observation worker polls
-    /// for it from the shortest wait up ([`Event::wake_legacy_worker`]).
-    /// Nothing for a native generation, whose worker the kernel wakes.
+    /// After a request that may end or replace a stop without a wait that
+    /// follows (see [`Self::stop_may_have_ended`] and the cancelled
+    /// synchronous status): a legacy (Procfs) generation's observation worker
+    /// polls for the next stop from the shortest wait up, at once
+    /// ([`Event::wake_legacy_worker`]). Nothing for a native generation,
+    /// whose worker the kernel wakes.
     pub(super) fn expect_stop(&self) {
+        self.with_legacy_worker_event(Event::wake_legacy_worker);
+    }
+
+    /// [`Self::expect_stop`] for a resumption or an interrupt, after which
+    /// the actual ptracer waits for the stop: the wakeup counts now, live
+    /// exit waiters (parked before the request) are woken to poll again, and
+    /// the worker is notified by the first assist after the request that
+    /// consumes nothing ([`Event::defer_legacy_wake`]).
+    pub(super) fn expect_stop_on_poll(&self) {
+        self.with_legacy_worker_event(Event::defer_legacy_wake);
+    }
+
+    /// Runs `wake` on this generation's Event if a legacy (Procfs)
+    /// observation worker serves it.
+    fn with_legacy_worker_event(&self, wake: impl FnOnce(&Event)) {
         let handle = self.resolved();
         if handle
             .identity()
             .is_some_and(|identity| matches!(identity.pidfd, ThreadHandle::Procfs { .. }))
             && handle.event().native_wait_identity.get().is_none()
         {
-            handle.event().wake_legacy_worker();
+            wake(handle.event());
         }
     }
 
@@ -3329,17 +3631,34 @@ impl EventHandle {
     /// This runs only on the authenticated actual ptracer OS thread. The
     /// observation worker publishes the resulting FIFO; future polls never
     /// wait for publication/status locks or for a physical state transition.
+    ///
+    /// Every ptracer-thread wait on a Procfs generation calls this before it
+    /// parks or blocks, and a waiter parked before a resume or an interrupt,
+    /// exit or status, is woken by it to poll again. An assist that does not
+    /// notify the worker itself therefore sends any notify a resume or an
+    /// interrupt deferred ([`Event::defer_legacy_wake`]), so that the worker
+    /// is running before its waiter depends on it for a hint.
     fn try_assist_legacy_wait(&self) -> Result<(), Errno> {
+        let result = self.assist_legacy_wait_once();
+        if !matches!(result, Ok(true)) {
+            self.event().flush_deferred_legacy_wake();
+        }
+        result.map(drop)
+    }
+
+    /// The query of [`Self::try_assist_legacy_wait`]. `Ok(true)` when it
+    /// notified the worker (a consumed status, or ECHILD for it to decide).
+    fn assist_legacy_wait_once(&self) -> Result<bool, Errno> {
         let handle = self.resolved();
         let Some(identity) = handle.identity() else {
-            return Ok(());
+            return Ok(false);
         };
         if !matches!(identity.pidfd, ThreadHandle::Procfs { .. }) {
-            return Ok(());
+            return Ok(false);
         }
         let event = handle.event();
         let Some(mut progress) = event.legacy_wait.try_lock() else {
-            return Ok(());
+            return Ok(false);
         };
         if event.native_wait_identity.get().is_some()
             || progress.retiring
@@ -3349,7 +3668,7 @@ impl EventHandle {
                 WAIT_OWNER_NOTIFIER | WAIT_OWNER_NOTIFIER_RETURNING
             )
         {
-            return Ok(());
+            return Ok(false);
         }
         if let Some(error) = progress.error {
             return Err(error);
@@ -3360,6 +3679,9 @@ impl EventHandle {
         // notify waits until `legacy_wait` is released below, so that the
         // woken worker takes `legacy_wait` without first blocking on it.
         let mut notify = false;
+        // The receipt of this consume's own count, carried to its notify.
+        #[cfg(all(test, not(sanitized)))]
+        let mut consume_receipt = None;
         let status = match try_consume_legacy_status(identity, event, Some(handle)) {
             Ok(status) => status,
             // The observation owner decides transient newborn ECHILD versus
@@ -3367,6 +3689,10 @@ impl EventHandle {
             // Have it decide now: a held worker's next turn may be far off.
             Err(Errno::ECHILD) => {
                 event.count_legacy_wakeup();
+                #[cfg(all(test, not(sanitized)))]
+                {
+                    consume_receipt = take_legacy_count_receipt();
+                }
                 notify = true;
                 None
             }
@@ -3383,15 +3709,25 @@ impl EventHandle {
             progress.error = None;
             // The worker publishes it on its next turn: run that turn now.
             event.count_legacy_wakeup();
+            #[cfg(all(test, not(sanitized)))]
+            {
+                consume_receipt = take_legacy_count_receipt();
+            }
             notify = true;
         }
         drop(progress);
+        #[cfg(all(test, not(sanitized)))]
+        let consume_source = LegacyNotifySource::Consume(consume_receipt);
         if notify {
+            // This notify also stands in for a deferred one.
+            event.legacy_wake_deferred.store(false, Ordering::Release);
             #[cfg(test)]
             pause_retirement_for_test(&event.legacy_assist_notify_pause);
+            #[cfg(all(test, not(sanitized)))]
+            note_legacy_notify_source(consume_source);
             event.notify_legacy_worker();
         }
-        Ok(())
+        Ok(notify)
     }
 
     fn uses_procfs_wait(&self) -> bool {
@@ -5090,7 +5426,10 @@ const LEGACY_CHECK_PERIOD: Duration = Duration::from_millis(10);
 /// wakes it ([`legacy_worker_thread`]).
 ///
 /// A held tracee leaves its stop when the ptracer resumes, interrupts or
-/// detaches it, which wakes the worker ([`EventHandle::expect_stop`]); when
+/// detaches it, which wakes the worker: a detach at once
+/// ([`EventHandle::expect_stop`]), a resumption or an interrupt at the
+/// ptracer's first empty assist of the wait that follows
+/// ([`EventHandle::expect_stop_on_poll`]); when
 /// a SIGKILL ends the stop (sent directly, or by a group exit or an exec in
 /// another thread), which in the usual cases also probes the worker
 /// ([`probe_legacy_workers`]); or when its host ptracer thread exits. This
@@ -5209,6 +5548,8 @@ fn legacy_poll_period(event: &Event) -> Duration {
 /// ([`Event::wake_legacy_worker`]); one that publishes takes the next turn
 /// at once. A wakeup (a consume, or a resumption or interrupt of the
 /// tracee) starts the next turn at once and the waits over from the first.
+/// A resumption or an interrupt counts its wakeup at once but notifies at
+/// the ptracer's first empty assist ([`Event::defer_legacy_wake`]).
 ///
 /// Once it has published a stop, the ptracer holds the tracee in that stop
 /// until it sends a request, which wakes the worker. Until then, each turn
@@ -5262,6 +5603,9 @@ fn legacy_worker_thread(
     // The status of that publication, for `legacy_held_wait_paused_on`.
     #[cfg(test)]
     let mut held_status = 0;
+    // Whether the last wait was a held wait that its timeout ended.
+    #[cfg(test)]
+    let mut held_wait_expired = false;
     // While a probed held worker polls: until when.
     let mut probing_until: Option<Instant> = None;
     loop {
@@ -5431,6 +5775,20 @@ fn legacy_worker_thread(
         }
         #[cfg(test)]
         if progress.observed.is_some() {
+            event.legacy_hint_turns.fetch_add(1, Ordering::Relaxed);
+        }
+        #[cfg(all(test, not(sanitized)))]
+        if !hinted_before && progress.observed.is_some() {
+            event.legacy_wake_log.lock().push(LegacyWakeLogEntry::Hint);
+        }
+        #[cfg(test)]
+        if std::mem::take(&mut held_wait_expired) && progress.observed.is_some() {
+            event
+                .legacy_held_expiry_finds
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        #[cfg(test)]
+        if progress.observed.is_some() {
             pause_retirement_for_test(&event.legacy_observation_pause);
         }
         drop(progress);
@@ -5455,6 +5813,9 @@ fn legacy_worker_thread(
         if wake {
             pause_retirement_for_test(&event.legacy_sleep_check_pause);
         }
+        // Whether this pass's wait ended by a notify, not a timeout.
+        #[cfg(all(test, not(sanitized)))]
+        let mut woke_by_notify = false;
         let mut wakeups = event.legacy_wakeup.lock();
         let held_timeout = held_wait && held == Some(wakeups.targeted);
         let timeout = if wake {
@@ -5483,15 +5844,42 @@ fn legacy_worker_thread(
                     .store(observed, Ordering::Relaxed);
                 event.legacy_held_waits.fetch_add(1, Ordering::Relaxed);
             }
+            #[cfg(all(test, not(sanitized)))]
+            event
+                .legacy_wake_log
+                .lock()
+                .push(LegacyWakeLogEntry::WaitBegin(wakeups.targeted));
             let _waited = event.legacy_wake.wait_for(&mut wakeups, timeout);
+            #[cfg(all(test, not(sanitized)))]
+            {
+                woke_by_notify = !_waited.timed_out();
+            }
             #[cfg(test)]
             if !_waited.timed_out() {
                 event.legacy_worker_wakes.fetch_add(1, Ordering::Relaxed);
             }
+            #[cfg(test)]
+            {
+                held_wait_expired = held_timeout && _waited.timed_out();
+            }
         }
         let targeted = wakeups.targeted != seen.targeted;
         let probed = wakeups.probes != seen.probes;
+        // parking_lot's Condvar never wakes spuriously: a notify woke it.
+        #[cfg(all(test, not(sanitized)))]
+        if woke_by_notify {
+            event.legacy_wake_log.lock().push(if targeted || probed {
+                LegacyWakeLogEntry::CountedWake
+            } else {
+                LegacyWakeLogEntry::Uncounted
+            });
+        }
         if held.is_some_and(|count| count != wakeups.targeted) {
+            #[cfg(all(test, not(sanitized)))]
+            event
+                .legacy_wake_log
+                .lock()
+                .push(LegacyWakeLogEntry::HoldEndedByCount(wakeups.targeted));
             held = None;
             probing_until = None;
         }
@@ -10599,6 +10987,215 @@ mod test {
         assert_eq!(counter.0.load(Ordering::SeqCst), 1);
         assert_eq!(event.poll_status(&waker), Poll::Ready(Ok(stopped)));
         assert!(!event.status_waker.register(&waker));
+    }
+
+    /// A waker whose callbacks re-enter the slot it is registered in, once
+    /// armed: the first of its clone, wake or drop callbacks to run after
+    /// [`Self::arm`] runs `reenter`, which takes that slot's lock again to
+    /// register another waker there, as a nested poll of its future would.
+    #[cfg(not(sanitized))]
+    struct ReentrantWaker {
+        reenter: Box<dyn Fn() + Send + Sync>,
+        armed: AtomicBool,
+        reentries: AtomicUsize,
+        wakes: AtomicUsize,
+    }
+
+    #[cfg(not(sanitized))]
+    static REENTRANT_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
+        reentrant_waker_clone,
+        reentrant_waker_wake,
+        reentrant_waker_wake,
+        reentrant_waker_drop,
+    );
+
+    #[cfg(not(sanitized))]
+    fn reentrant_waker(data: *const ()) -> &'static ReentrantWaker {
+        // SAFETY: every waker of this vtable is made by
+        // `ReentrantWaker::waker` from a leaked, never freed `ReentrantWaker`.
+        unsafe { &*data.cast::<ReentrantWaker>() }
+    }
+
+    #[cfg(not(sanitized))]
+    fn reentrant_waker_clone(data: *const ()) -> std::task::RawWaker {
+        reentrant_waker(data).reenter_once();
+        std::task::RawWaker::new(data, &REENTRANT_WAKER_VTABLE)
+    }
+
+    #[cfg(not(sanitized))]
+    fn reentrant_waker_wake(data: *const ()) {
+        let waker = reentrant_waker(data);
+        waker.reenter_once();
+        waker.wakes.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[cfg(not(sanitized))]
+    fn reentrant_waker_drop(data: *const ()) {
+        reentrant_waker(data).reenter_once();
+    }
+
+    #[cfg(not(sanitized))]
+    impl ReentrantWaker {
+        /// Leaks a new disarmed waker state, so that its wakers need no
+        /// reference count.
+        fn leak(reenter: impl Fn() + Send + Sync + 'static) -> &'static Self {
+            Box::leak(Box::new(Self {
+                reenter: Box::new(reenter),
+                armed: AtomicBool::new(false),
+                reentries: AtomicUsize::new(0),
+                wakes: AtomicUsize::new(0),
+            }))
+        }
+
+        fn waker(&'static self) -> Waker {
+            let data = std::ptr::from_ref(self).cast::<()>();
+            // SAFETY: the vtable's functions only read the leaked state
+            // behind `data`, which lives for the rest of the process and is
+            // `Sync`.
+            unsafe { Waker::from_raw(std::task::RawWaker::new(data, &REENTRANT_WAKER_VTABLE)) }
+        }
+
+        fn arm(&self) {
+            self.armed.store(true, Ordering::SeqCst);
+        }
+
+        fn reenter_once(&self) {
+            if self.armed.swap(false, Ordering::SeqCst) {
+                self.reentries.fetch_add(1, Ordering::SeqCst);
+                (self.reenter)();
+            }
+        }
+
+        fn counts(&self) -> (usize, usize) {
+            (
+                self.reentries.load(Ordering::SeqCst),
+                self.wakes.load(Ordering::SeqCst),
+            )
+        }
+    }
+
+    /// Runs `operation` on another thread, and fails unless it returns
+    /// within 10 s: a waker callback that re-entered a slot whose lock its
+    /// caller held blocks that thread for good, as parking_lot's mutex is
+    /// not reentrant.
+    #[cfg(not(sanitized))]
+    fn returns_within_bound(what: &str, operation: impl FnOnce() + Send + 'static) {
+        let (returned, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            operation();
+            let _ = returned.send(());
+        });
+        match receiver.recv_timeout(Duration::from_secs(10)) {
+            Ok(()) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => panic!(
+                "{what}: did not return within 10 s: a waker callback that re-entered the \
+                 slot blocked on its lock"
+            ),
+            Err(mpsc::RecvTimeoutError::Disconnected) => panic!("{what}: panicked"),
+        }
+    }
+
+    // A waker callback is arbitrary code, and may poll a future that
+    // registers or wakes through the very slot that runs it. No `WakerSlot`
+    // runs one under its lock. Each case arms a `ReentrantWaker` whose first
+    // callback registers another waker in the same slot, then runs, bounded,
+    // the slot operation that calls it: a resume's deferral waking a parked
+    // exit waiter (`ExitWaiters::wake_all`), the same deferral waking a
+    // status waiter, a registration that clones the new waker, and one that
+    // drops the waker it replaces.
+    #[test]
+    #[cfg(not(sanitized))]
+    fn waker_slots_run_no_waker_callback_under_their_lock() {
+        // A deferral wakes a parked exit waiter.
+        let event = Arc::new(Event::new());
+        let waiter = Arc::new(ExitWaiter::default());
+        let reentrant = {
+            let (event, waiter) = (Arc::clone(&event), Arc::clone(&waiter));
+            ReentrantWaker::leak(move || event.exit_waiters.register(&waiter, Waker::noop()))
+        };
+        event.exit_waiters.register(&waiter, &reentrant.waker());
+        reentrant.arm();
+        returns_within_bound("a deferral's wake of an exit waiter", {
+            let event = Arc::clone(&event);
+            move || event.defer_legacy_wake()
+        });
+        assert_eq!(
+            reentrant.counts(),
+            (1, 1),
+            "the exit waiter's waker was not woken once, re-entering its slot once"
+        );
+
+        // The same deferral wakes a registered status waiter.
+        let event = Arc::new(Event::new());
+        let reentrant = {
+            let event = Arc::clone(&event);
+            ReentrantWaker::leak(move || {
+                let _ = event.poll_status(Waker::noop());
+            })
+        };
+        assert_eq!(event.poll_status(&reentrant.waker()), Poll::Pending);
+        reentrant.arm();
+        returns_within_bound("a deferral's wake of a status waiter", {
+            let event = Arc::clone(&event);
+            move || event.defer_legacy_wake()
+        });
+        assert_eq!(
+            reentrant.counts(),
+            (1, 1),
+            "the status waiter's waker was not woken once, re-entering its slot once"
+        );
+
+        // A registration clones the new waker.
+        let event = Arc::new(Event::new());
+        let counter = Arc::new(WakeCounter::default());
+        assert_eq!(
+            event.poll_status(&Waker::from(Arc::clone(&counter))),
+            Poll::Pending
+        );
+        let reentrant = {
+            let event = Arc::clone(&event);
+            ReentrantWaker::leak(move || {
+                let _ = event.poll_status(Waker::noop());
+            })
+        };
+        reentrant.arm();
+        returns_within_bound("registering a waker whose clone re-enters the slot", {
+            let event = Arc::clone(&event);
+            move || {
+                let _ = event.poll_status(&reentrant.waker());
+            }
+        });
+        assert_eq!(
+            reentrant.counts(),
+            (1, 0),
+            "the registration's clone did not re-enter the slot once"
+        );
+        assert!(
+            !event.status_waker.register(&reentrant.waker()),
+            "the slot does not hold the waker registered last"
+        );
+
+        // A registration drops the waker it replaces.
+        let event = Arc::new(Event::new());
+        let reentrant = {
+            let event = Arc::clone(&event);
+            ReentrantWaker::leak(move || {
+                let _ = event.poll_status(Waker::noop());
+            })
+        };
+        assert_eq!(event.poll_status(&reentrant.waker()), Poll::Pending);
+        reentrant.arm();
+        returns_within_bound("replacing a waker whose drop re-enters the slot", {
+            let event = Arc::clone(&event);
+            move || {
+                let _ = event.poll_status(&Waker::from(counter));
+            }
+        });
+        assert_eq!(
+            reentrant.counts(),
+            (1, 0),
+            "dropping the replaced waker did not re-enter the slot once"
+        );
     }
 
     #[test]
