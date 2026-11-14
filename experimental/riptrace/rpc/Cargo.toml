@@ -12,4 +12,4 @@ license = "BSD-2-Clause"
 [dependencies]
 reverie-rpc = { version = "0.5.7", path = "../../reverie-rpc" }
 serde = { version = "1.0.185", features = ["derive", "rc"] }
-syscalls = { version = "0.7.0", features = ["serde"] }
+syscalls = { version = "0.8.1", features = ["serde"] }

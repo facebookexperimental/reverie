@@ -18,7 +18,7 @@ nightly = ["reverie-ptrace/nightly"]
 
 [dependencies]
 libc = "0.2.186"
-syscalls = "0.7.0"
+syscalls = "0.8.1"
 nix = { version = "0.30.1", features = ["fs", "process", "signal"] }
 reverie = { version = "0.5.7", path = "../reverie", package = "reverie-core" }
 reverie-ptrace = { version = "0.5.7", path = "../reverie-ptrace" }
