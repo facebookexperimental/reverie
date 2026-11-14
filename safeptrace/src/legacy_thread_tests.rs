@@ -1895,7 +1895,10 @@ async fn forced_legacy_waits_read_target_status_once_per_attempt_or_period() {
 fn wait_for_legacy_hint(event: &Event, what: &str) {
     let deadline = Instant::now() + Duration::from_secs(2);
     while event.legacy_wait.lock().observed.is_none() {
-        assert!(Instant::now() < deadline, "{what}: the worker never observed it");
+        assert!(
+            Instant::now() < deadline,
+            "{what}: the worker never observed it"
+        );
         thread::sleep(Duration::from_micros(200));
     }
 }
@@ -1906,7 +1909,10 @@ fn wait_for_legacy_hint(event: &Event, what: &str) {
 fn wait_for_held_wait(event: &Event, before: usize, what: &str) {
     let deadline = Instant::now() + TRACEE_WAIT_TIMEOUT;
     while event.legacy_held_waits.load(Ordering::Relaxed) <= before {
-        assert!(Instant::now() < deadline, "{what}: the worker never held the stop");
+        assert!(
+            Instant::now() < deadline,
+            "{what}: the worker never held the stop"
+        );
         thread::sleep(Duration::from_micros(200));
     }
 }
@@ -1959,7 +1965,10 @@ fn wait_for_fresh_held_wait(
 async fn next_syscall_stop(stopped: Stopped) -> Stopped {
     let (next, stop) = tokio::time::timeout(
         TRACEE_WAIT_TIMEOUT,
-        stopped.syscall(None).unwrap().wait_owned_on_ptracer_thread(),
+        stopped
+            .syscall(None)
+            .unwrap()
+            .wait_owned_on_ptracer_thread(),
     )
     .await
     .unwrap()
@@ -2095,7 +2104,9 @@ async fn legacy_resume_racing_a_held_wait(late_notify_round: Option<usize>) {
         wait_for_fresh_held_wait(&event, held, &format!("round {round}: read exit"), || {
             if let Some(release) = late_turn.take() {
                 release.send(()).unwrap_or_else(|_| {
-                    panic!("round {round}: the late turn resumed by itself before the sync released it")
+                    panic!(
+                        "round {round}: the late turn resumed by itself before the sync released it"
+                    )
                 });
             }
         });
@@ -2121,7 +2132,9 @@ async fn legacy_resume_racing_a_held_wait(late_notify_round: Option<usize>) {
                     .legacy_held_wait_paused_on
                     .lock()
                     .take()
-                    .unwrap_or_else(|| panic!("round {round}: the held-wait pause recorded nothing"));
+                    .unwrap_or_else(|| {
+                        panic!("round {round}: the held-wait pause recorded nothing")
+                    });
                 assert!(
                     count > armed,
                     "round {round}: the pause captured the old stop: it held status {status:#x} \
@@ -2149,7 +2162,9 @@ async fn legacy_resume_racing_a_held_wait(late_notify_round: Option<usize>) {
             drop(release);
             capture
                 .recv_timeout(Duration::from_secs(1))
-                .unwrap_or_else(|_| panic!("round {round}: the late turn never reached the armed pause"));
+                .unwrap_or_else(|_| {
+                    panic!("round {round}: the late turn never reached the armed pause")
+                });
             check_capture();
             captured_before_resume = true;
         } else if let Some(late_wake) = late_wake.take() {
@@ -2170,7 +2185,10 @@ async fn legacy_resume_racing_a_held_wait(late_notify_round: Option<usize>) {
                 .unwrap_or_else(|_| panic!("round {round}: the worker never reached the pause"));
             check_capture();
         }
-        assert!(is_read_entry(&entry), "round {round}: not at the read entry");
+        assert!(
+            is_read_entry(&entry),
+            "round {round}: not at the read entry"
+        );
         let running = entry.syscall(None).unwrap();
         release
             .send(())
@@ -2180,8 +2198,8 @@ async fn legacy_resume_racing_a_held_wait(late_notify_round: Option<usize>) {
         write_byte();
         wait_for_legacy_hint(&event, &format!("round {round}: read exit"));
         held = event.legacy_held_waits.load(Ordering::Relaxed);
-        let late = (late_notify_round == Some(round + 1))
-            .then(|| notify_after_held_park(&event, held));
+        let late =
+            (late_notify_round == Some(round + 1)).then(|| notify_after_held_park(&event, held));
         let (exit, stop) =
             tokio::time::timeout(TRACEE_WAIT_TIMEOUT, running.wait_owned_on_ptracer_thread())
                 .await
@@ -2283,21 +2301,23 @@ async fn forced_legacy_cleanup_guards_reap_a_held_nonleader_on_unwind() {
     let record = Arc::clone(&reached);
     let unwind = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async move {
         let (root, stopped, _root_cleanup, _force) = spawn_legacy_thread_tracee(true);
-        let (parent, crate::Event::NewChild(crate::ChildOp::Clone, child)) =
-            tokio::time::timeout(
-                TRACEE_WAIT_TIMEOUT,
-                stopped.resume(None).unwrap().wait_owned_on_ptracer_thread(),
-            )
-            .await
-            .unwrap()
-            .unwrap()
-            .assume_stopped()
-        else {
+        let (parent, crate::Event::NewChild(crate::ChildOp::Clone, child)) = tokio::time::timeout(
+            TRACEE_WAIT_TIMEOUT,
+            stopped.resume(None).unwrap().wait_owned_on_ptracer_thread(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .assume_stopped() else {
             panic!("missing paused pthread clone");
         };
         let _child_cleanup = legacy_child_cleanup(&child);
-        *child.terminal_cleanup().event.event().legacy_held_period.lock() =
-            Some(Duration::from_secs(60));
+        *child
+            .terminal_cleanup()
+            .event
+            .event()
+            .legacy_held_period
+            .lock() = Some(Duration::from_secs(60));
         let (_child, sigstop) =
             tokio::time::timeout(TRACEE_WAIT_TIMEOUT, child.wait_owned_on_ptracer_thread())
                 .await
@@ -2369,7 +2389,10 @@ async fn forced_legacy_held_worker_waits_for_a_wakeup_or_probe() {
     let before = turns();
     thread::sleep(Duration::from_millis(200));
     let held_turns = turns() - before;
-    assert_eq!(held_turns, 0, "a held worker took {held_turns} turns in 200 ms");
+    assert_eq!(
+        held_turns, 0,
+        "a held worker took {held_turns} turns in 200 ms"
+    );
 
     let exit = child_cleanup.exit_event_on_ptracer_thread(&child).unwrap();
     // Neither a ptrace request nor a cancellation signal of this ptracer.
@@ -2789,7 +2812,10 @@ async fn legacy_skipped_held_wait_is_not_counted(case: HeldWaitSkip) {
     let before = turns();
     thread::sleep(Duration::from_millis(200));
     let held_turns = turns() - before;
-    assert_eq!(held_turns, 0, "a held worker took {held_turns} turns in 200 ms");
+    assert_eq!(
+        held_turns, 0,
+        "a held worker took {held_turns} turns in 200 ms"
+    );
 
     let exit = child_cleanup.exit_event_on_ptracer_thread(&child).unwrap();
     // Neither a ptrace request nor a cancellation signal of this ptracer.
@@ -2932,7 +2958,10 @@ async fn forced_legacy_held_turn_check_waits_out_a_late_consume_notify() {
     let before = turns();
     thread::sleep(Duration::from_millis(200));
     let held_turns = turns() - before;
-    assert_eq!(held_turns, 0, "a held worker took {held_turns} turns in 200 ms");
+    assert_eq!(
+        held_turns, 0,
+        "a held worker took {held_turns} turns in 200 ms"
+    );
 
     let exit = child_cleanup.exit_event_on_ptracer_thread(&child).unwrap();
     // Neither a ptrace request nor a cancellation signal of this ptracer.

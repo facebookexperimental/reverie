@@ -65,8 +65,12 @@ mod retired_tid {
     #[test]
     fn fixture_directories_stay_distinct_at_the_same_nanos() {
         let base = FixtureDirectory(
-            create_unique_dir(&env::temp_dir(), "safeptrace-retired-same-nanos", clock_nonce())
-                .unwrap(),
+            create_unique_dir(
+                &env::temp_dir(),
+                "safeptrace-retired-same-nanos",
+                clock_nonce(),
+            )
+            .unwrap(),
         );
         let first = create_unique_dir(&base.0, "safeptrace-retired", 7).unwrap();
         let second = create_unique_dir(&base.0, "safeptrace-retired", 7).unwrap();
