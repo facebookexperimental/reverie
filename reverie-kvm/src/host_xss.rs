@@ -260,7 +260,7 @@ fn write_xss(vcpu: &VcpuFd, value: u64) -> Result<()> {
     }
 }
 
-fn read_xss(vcpu: &VcpuFd) -> Result<u64> {
+pub(crate) fn read_xss(vcpu: &VcpuFd) -> Result<u64> {
     let mut entries = Msrs::from_entries(&[kvm_msr_entry {
         index: MSR_IA32_XSS,
         ..Default::default()

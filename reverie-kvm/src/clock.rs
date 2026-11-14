@@ -699,6 +699,75 @@ impl CountedVcpu {
     }
 }
 
+/// How the guest probe's one `immediate_exit` entry ended
+/// ([`CountedVcpu::run_with_immediate_exit`]).
+#[derive(Debug)]
+pub(crate) enum ImmediateExitRun {
+    /// KVM_RUN returned -1 with this errno; the probe requires EINTR. The
+    /// exit reason is not defined after an error return and is not read.
+    Failed(kvm_ioctls::Error),
+    /// KVM_RUN returned 0, which `immediate_exit` = 1 forbids. The probe
+    /// refuses; the exit is not decoded further.
+    Returned,
+}
+
+impl CountedVcpu {
+    /// The guest probe's P6 entry (`guest_probe`): one KVM_RUN with
+    /// `kvm_run.immediate_exit` = 1, so KVM completes the pending user-space
+    /// exit and returns -EINTR without entering the guest.
+    ///
+    /// It is admitted exactly as [`Self::run`] admits an entry, through
+    /// `Participant::prepare`. While admission is not open that returns `None`
+    /// before anything is armed, so this method returns `None` too: it sets
+    /// no byte and issues no KVM_RUN. The byte is set only inside the admitted
+    /// entry, after `prepare`, and `RunEntry::run_vcpu` retracts it (stores 0)
+    /// right after the ioctl, as it does for a kick.
+    ///
+    /// The byte is written as the kick handler writes it: with a single-byte
+    /// atomic, on the thread that runs the entry, and with no Rust reference
+    /// into the `kvm_run` page alive while the entry is published (the
+    /// contract of reverie-kvm-core's `ImmediateExit`). Its address is taken
+    /// before `prepare` publishes the entry, when no handler can store there.
+    ///
+    /// Only an untracked vCPU may use it: no clock interval, no stepping.
+    pub(crate) fn run_with_immediate_exit(&mut self) -> Result<Option<ImmediateExitRun>> {
+        if self.clock.tracking {
+            return Err(Error::UnexpectedVcpuExit(
+                "an immediate_exit entry needs an untracked vCPU".to_string(),
+            ));
+        }
+        self.synced_exit
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.next_step_mode = StepMode::Off;
+        self.apply_step_mode(StepMode::Off)?;
+        self.stepped = false;
+        self.clock.stepping_entry = false;
+        // Unpublished: the momentary `&mut kvm_run` aliases no handler store.
+        let byte = std::ptr::addr_of_mut!(self.fd.get_kvm_run().immediate_exit);
+        let Some(mut entry) = self
+            .participant
+            .prepare(Some(self.immediate_exit))
+            .map_err(|failure| failure.error())?
+        else {
+            return Ok(None);
+        };
+        self.clock.ran_untracked = true;
+        self.initial_elf_ran |= self.image_is_elf;
+        // SAFETY: `byte` points into fd's kvm_run mapping, which fd keeps
+        // mapped; this thread runs the entry; and a single-byte atomic is how
+        // the kick handler stores to the same byte. No reference into the
+        // page is alive here.
+        unsafe { AtomicU8::from_ptr(byte) }.store(1, Ordering::Relaxed);
+        std::sync::atomic::compiler_fence(Ordering::SeqCst);
+        let outcome = match entry.run_vcpu(&mut self.fd) {
+            Ok(_) => ImmediateExitRun::Returned,
+            Err(error) => ImmediateExitRun::Failed(error),
+        };
+        entry.finish(Ok(())).map_err(|failure| failure.error())?;
+        Ok(Some(outcome))
+    }
+}
+
 fn finish_entry<T>(result: Result<T>, entry: RunEntry<'_>) -> Result<T> {
     match result {
         // An actual ioctl error, including EINTR, retains the caller's existing

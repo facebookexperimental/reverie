@@ -28,6 +28,7 @@
 mod clock;
 mod cpuid_instruction;
 mod entry_driver;
+pub mod guest_probe;
 mod host_xss;
 mod preemption_timer;
 mod runtime;

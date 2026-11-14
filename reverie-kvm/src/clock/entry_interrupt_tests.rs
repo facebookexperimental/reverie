@@ -928,3 +928,32 @@ fn an_unrecorded_reserved_signal_with_a_recorded_kick_is_still_refused() {
         );
     }
 }
+
+/// The guest probe's immediate_exit entry is admitted exactly as `run` is.
+/// With admission closed it returns None, leaves the byte clear and issues no
+/// KVM_RUN. With admission open its one KVM_RUN returns EINTR, and the byte is
+/// clear again afterwards. A KVM_RUN loads and puts the guest FPU even when it
+/// enters nothing (`fpu_reload`), so `fpu_reload` witnesses whether one ran.
+#[test]
+fn an_immediate_exit_entry_is_admitted_like_any_entry_and_retracts_its_byte() {
+    let mut backend = crate::KvmBackend::new(16 * 1024 * 1024).expect("actual KVM is mandatory");
+    let stats = crate::guest_probe::VcpuStats::open(&backend.vcpu).unwrap();
+    let gate = backend.memory.entry_gate();
+
+    let closed = futures::executor::block_on(gate.try_close().unwrap().unwrap().finish()).unwrap();
+    let before = stats.snapshot().unwrap();
+    assert!(backend.vcpu.run_with_immediate_exit().unwrap().is_none());
+    assert!(!backend.vcpu.immediate_exit.get());
+    let delta = before.delta_to(&stats.snapshot().unwrap()).unwrap();
+    assert_eq!(delta, crate::guest_probe::VcpuStatsSnapshot::default());
+    drop(closed);
+
+    let before = stats.snapshot().unwrap();
+    match backend.vcpu.run_with_immediate_exit().unwrap() {
+        Some(ImmediateExitRun::Failed(error)) => assert_eq!(error.errno(), libc::EINTR),
+        other => panic!("expected EINTR, got {other:?}"),
+    }
+    assert!(!backend.vcpu.immediate_exit.get());
+    let delta = before.delta_to(&stats.snapshot().unwrap()).unwrap();
+    assert_eq!((delta.exits, delta.fpu_reload), (0, 1));
+}

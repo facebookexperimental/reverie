@@ -2130,6 +2130,9 @@ pub struct KvmBackend {
     hypercall_instruction: [u8; 3],
     syscall_trampoline_address: u64,
     pub(crate) syscall_frame_address: u64,
+    /// What `match_host_xss` left in the vCPU at construction. Only the guest
+    /// probe reads it (`guest_probe`), through [`Self::xss_outcome`].
+    xss_outcome: crate::host_xss::Outcome,
     thread_group: Arc<GuestThreadGroup>,
     pub(crate) tool_failure: Option<crate::failure::FailureContext>,
     pub(crate) entry_driver: Option<crate::entry::owner::DriverOwner>,
@@ -2284,6 +2287,7 @@ struct InitializedKvmResources {
     vm: VmFd,
     kvm: Kvm,
     hypercall_instruction: [u8; 3],
+    xss_outcome: crate::host_xss::Outcome,
 }
 
 impl KvmBackend {
@@ -2483,7 +2487,7 @@ impl KvmBackend {
         // longer writes the MSR around every guest entry. If the write fails,
         // the vCPU falls back to 0; an error here means 0 could not be
         // confirmed, and it stops the backend before any guest entry.
-        crate::host_xss::match_host_xss(&vcpu, supported_xsave, &cpuid)?;
+        let xss_outcome = crate::host_xss::match_host_xss(&vcpu, supported_xsave, &cpuid)?;
         let wanted = kvm_bindings::KVM_SYNC_X86_REGS | kvm_bindings::KVM_SYNC_X86_SREGS;
         // A negative result is a failed probe, not a mask.
         let offered = vm.check_extension_int(Cap::SyncRegs);
@@ -2494,7 +2498,25 @@ impl KvmBackend {
             vm,
             kvm,
             hypercall_instruction,
+            xss_outcome,
         })
+    }
+
+    /// The hypercall instruction this backend's trampoline issues: VMCALL or
+    /// VMMCALL, chosen from the vCPU's CPUID table at construction. A copy;
+    /// nothing outside construction changes it.
+    pub(crate) fn hypercall_instruction(&self) -> [u8; 3] {
+        self.hypercall_instruction
+    }
+
+    /// The guest address of this backend's syscall trampoline (LSTAR). A copy.
+    pub(crate) fn syscall_trampoline_address(&self) -> u64 {
+        self.syscall_trampoline_address
+    }
+
+    /// What `match_host_xss` left in the vCPU at construction. A copy.
+    pub(crate) fn xss_outcome(&self) -> crate::host_xss::Outcome {
+        self.xss_outcome
     }
 
     fn new_with_memory(memory: GuestMemory, stdin: Option<File>) -> Result<Self> {
@@ -2507,6 +2529,7 @@ impl KvmBackend {
             vm,
             kvm,
             hypercall_instruction,
+            xss_outcome,
         } = loop {
             attempts += 1;
             match Self::initialize_resources(&memory) {
@@ -2524,6 +2547,7 @@ impl KvmBackend {
             hypercall_instruction,
             syscall_trampoline_address: SYSCALL_TRAMPOLINE_ADDRESS,
             syscall_frame_address: SYSCALL_FRAME_ADDRESS,
+            xss_outcome,
             thread_group: Arc::new(GuestThreadGroup::default()),
             tool_failure: None,
             entry_driver: None,
