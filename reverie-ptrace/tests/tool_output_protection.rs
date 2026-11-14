@@ -9,7 +9,7 @@
 //! A Tool's output write respects the guest's page protection at every size,
 //! as the kernel's own `put_user` does. Before, an eight-byte write went
 //! through `PTRACE_POKEDATA` and silently wrote read-only pages, including
-//! Reverie's private page (https://github.com/rrnewton/reverie/issues/1064).
+//! Reverie's private page (https://github.com/rrnewton/reverie/issues/1523).
 //! The same holds for a Tool's stack commit, whose address the guest controls
 //! through its stack pointer, and an eight-byte scalar is published entirely
 //! or not at all.

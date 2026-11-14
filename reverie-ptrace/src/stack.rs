@@ -45,7 +45,7 @@ pub struct GuestStack {
     buf: Vec<u64>,
     // The commit is a Tool write into guest-chosen memory (the guest controls
     // its stack pointer), so it respects page protection and the private page
-    // as every other Tool write does (https://github.com/rrnewton/reverie/issues/1064).
+    // as every other Tool write does (https://github.com/rrnewton/reverie/issues/1523).
     task: ToolMemory,
     token: StackToken,
 }

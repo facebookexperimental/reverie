@@ -8,7 +8,7 @@
 
 //! A guest that jumps to the untraced `syscall` of Reverie's private page
 //! makes a syscall no tool sees, then takes a SIGILL at the `ud2` after it
-//! (<https://github.com/rrnewton/reverie/issues/1064>). Reverie used to deliver
+//! (<https://github.com/rrnewton/reverie/issues/1523>). Reverie used to deliver
 //! that SIGILL, so a handler could keep the result and continue, and a forked
 //! child could die of it with its effect already made. Now the run ends with
 //! the named `UntracedStubSyscall` failure in both cases, while Reverie's own

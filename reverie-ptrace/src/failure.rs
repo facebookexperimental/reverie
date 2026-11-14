@@ -655,7 +655,7 @@ pub struct UnattributedSigtrap {
 /// no tool saw. The call has already taken effect; Reverie ends the run rather
 /// than deliver the SIGILL, which a handler or a forked child could otherwise
 /// use to keep the result and continue
-/// (<https://github.com/rrnewton/reverie/issues/1064>).
+/// (<https://github.com/rrnewton/reverie/issues/1523>).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error(
     "the guest made a syscall through Reverie's untraced private-page stub \

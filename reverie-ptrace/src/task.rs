@@ -8867,7 +8867,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         // so none reaches this point. The call was invisible to the Tool and
         // has already taken effect. End the run with a named failure instead
         // of delivering the SIGILL, which a handler or a forked child could use
-        // to keep the result (https://github.com/rrnewton/reverie/issues/1064).
+        // to keep the result (https://github.com/rrnewton/reverie/issues/1523).
         if sig.as_nix() == Some(Signal::SIGILL) && !group_stop {
             let address = task.getregs()?.ip();
             if address == (cp::TRAMPOLINE_BASE + cp::SYSCALL_INSTR_SIZE) as u64 {
