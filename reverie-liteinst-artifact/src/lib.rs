@@ -1243,8 +1243,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 88] = [
     ),
     (
         "reverie-liteinst-artifact/src/private_static/tls_sources.rs",
-        44390,
-        "bb1e19542aa5db52a9d7338892dc7b122a9d6a136ff594c3018041077f563e95",
+        49362,
+        "acaa0ea0162f9a603aef16a0d769a2d78dd979cf32d87dc36afe237f2ff20bde",
     ),
     (
         "Cargo.toml",
@@ -1253,8 +1253,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 88] = [
     ),
     (
         "reverie-liteinst-artifact/Cargo.toml",
-        518,
-        "e9cd4eac53fb454640e75e640e93957298db66ecdbba7302c0ed79ef71a3e9fb",
+        502,
+        "fad4de089d2d6c7ec95a425a37277bd5e0d93f0ec874ddbee9f8fa45d78f752e",
     ),
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers/view_site.rs",
@@ -1368,8 +1368,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 88] = [
     ),
     (
         "reverie-inguest/Cargo.toml",
-        6495,
-        "2ee5115d633d33984ebfae0d5debd0278596536e8866587a25b68f26940b63e0",
+        6494,
+        "ca20b0547879c0d9cd83916f89783efcd2890983e0eabdd8e0932a9b4f13b232",
     ),
     (
         "reverie-inguest/src/lib.rs",
@@ -1378,8 +1378,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 88] = [
     ),
     (
         "reverie-syscalls/Cargo.toml",
-        1293,
-        "f1ce8b0305c6a6f488a7f4dbebc1360f06274faf6d2825a7bdb854dc717dc71d",
+        1292,
+        "e67f31883496075dcb2ef3b1183d09cb1d3140e024d0c64f866f12332d4c61b9",
     ),
     (
         "reverie-syscalls/src/lib.rs",
@@ -1483,8 +1483,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 88] = [
     ),
     (
         "reverie/Cargo.toml",
-        2373,
-        "632b995fb8060c8cd780b0a819440cbb9a94cb124125d6d3c08b7d67d646805e",
+        2372,
+        "d6b88aa1724c0a7da989fcbc2eafb22e68d5643b93c48ecaee6e8dc531280d36",
     ),
     (
         "reverie/src/tool_configuration.rs",
@@ -39070,6 +39070,36 @@ mod tests {
             51471,
             "d208d83f330b3b10348fbe9811c952eae5c6399f9f210a1bc219f8f519bcba64",
         ),
+        (
+            "reverie-liteinst-artifact/src/private_static/tls_sources.rs",
+            49362,
+            "acaa0ea0162f9a603aef16a0d769a2d78dd979cf32d87dc36afe237f2ff20bde",
+        ),
+        (
+            "reverie-liteinst-artifact/Cargo.toml",
+            502,
+            "fad4de089d2d6c7ec95a425a37277bd5e0d93f0ec874ddbee9f8fa45d78f752e",
+        ),
+        (
+            "reverie-inguest/Cargo.toml",
+            6494,
+            "ca20b0547879c0d9cd83916f89783efcd2890983e0eabdd8e0932a9b4f13b232",
+        ),
+        (
+            "reverie-syscalls/Cargo.toml",
+            1292,
+            "e67f31883496075dcb2ef3b1183d09cb1d3140e024d0c64f866f12332d4c61b9",
+        ),
+        (
+            "reverie/Cargo.toml",
+            2372,
+            "d6b88aa1724c0a7da989fcbc2eafb22e68d5643b93c48ecaee6e8dc531280d36",
+        ),
+        (
+            "reverie/src/tool.rs",
+            81727,
+            "247f65ad00154dcaa21be8324e2315f30658df52c51c9db91717aab6e5bc64c1",
+        ),
     ];
 
     /// Seals over prefixes of `CONTENT_REVERIE_CATALOG_BINDINGS`: (rows covered,
@@ -39095,6 +39125,10 @@ mod tests {
         (
             94,
             "cefef4888c744a1f6e1d3e49e2df0f95497c02ad996b717a8d25214b9d04fb30",
+        ),
+        (
+            100,
+            "446cbb406df9cf560849d01b75ceb4429b84b7b70cb6f75e285ac2db299926d4",
         ),
     ];
 
@@ -40295,6 +40329,31 @@ mod tests {
                 "reverie-liteinst-artifact/src/private_static/selected_initializers/package_roles.rs",
                 83186,
                 "b568a674b69e960aa26a3287bbd0803518aeb9d6fd529f4f8095ed1a2cea2fde",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/tls_sources.rs",
+                44390,
+                "bb1e19542aa5db52a9d7338892dc7b122a9d6a136ff594c3018041077f563e95",
+            ),
+            (
+                "reverie-liteinst-artifact/Cargo.toml",
+                518,
+                "e9cd4eac53fb454640e75e640e93957298db66ecdbba7302c0ed79ef71a3e9fb",
+            ),
+            (
+                "reverie-inguest/Cargo.toml",
+                6495,
+                "2ee5115d633d33984ebfae0d5debd0278596536e8866587a25b68f26940b63e0",
+            ),
+            (
+                "reverie-syscalls/Cargo.toml",
+                1293,
+                "f1ce8b0305c6a6f488a7f4dbebc1360f06274faf6d2825a7bdb854dc717dc71d",
+            ),
+            (
+                "reverie/Cargo.toml",
+                2373,
+                "632b995fb8060c8cd780b0a819440cbb9a94cb124125d6d3c08b7d67d646805e",
             ),
         ];
         // A re-bind records its previous tuple above, for every path, not only these.
