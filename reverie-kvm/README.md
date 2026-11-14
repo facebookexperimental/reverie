@@ -567,22 +567,44 @@ page-aligned frame per request, so a single KVM run can route several syscalls.
 
 ## CPUID
 
-The backend keeps no CPUID profile of its own. A Tool that subscribes to
-CPUID answers every guest CPUID: the vCPU's CPL3 CPUID faulting is enabled,
-and each fault goes to `Tool::handle_cpuid_event` (under Hermit, Detcore's
-machine description, the table its `/proc/cpuinfo` is rendered from).
+A Tool that subscribes to CPUID answers every guest CPUID: the vCPU's CPL3
+CPUID faulting is enabled, and each fault goes to `Tool::handle_cpuid_event`
+(under Hermit, Detcore's machine description, the table its `/proc/cpuinfo` is
+rendered from).
 
 For a Tool that does not subscribe, the guest reads the vCPU's table, which
 `KVM_SET_CPUID2` installs before the first `KVM_RUN`: KVM's host-supported
 leaves with the host's own registers, so the guest reads what the same
-program reads natively. Two exceptions: KVM's hypervisor leaves stay KVM's,
-and leaf 0xd advertises only the x87, SSE and YMM components the backend's
-signal frames carry, because KVM sizes the guest's XSAVE state from it. KVM
-still computes the fields that describe the vCPU itself, such as OSXSAVE and
-the XSAVE sizes.
+program reads natively. Three exceptions:
+
+- KVM's hypervisor leaves stay KVM's.
+- Leaf 0xd advertises only the x87, SSE and YMM components the backend's
+  signal frames carry, because KVM sizes the guest's XSAVE state from it.
+- Four feature bits are cleared on every vendor: RDRAND (leaf 1 ECX bit 30),
+  and HLE, RTM and RDSEED (leaf 7.0 EBX bits 4, 11 and 18). KVM keys its own
+  handling of those instructions on this table, not on what a Tool answers:
+  on VMX it makes RDRAND and RDSEED raise #UD where the processor has the
+  VM-execution controls for them, and makes RTM abort (TSX_CTRL with
+  RTM_DISABLE) where the host has TSX_CTRL. SVM has no RDRAND or RDSEED
+  intercept (AMD64 APM Vol. 2, Table 15-7), so on AMD hosts those two
+  instructions still execute natively
+  (<https://github.com/rrnewton/hermit/issues/5478>).
+
+KVM still computes the fields that describe the vCPU itself, such as OSXSAVE
+and the XSAVE sizes.
+
+Because KVM's handling follows the table and not the Tool's answers, a Tool
+that subscribes to CPUID should hide those four bits as well. Reverie's
+default answer passes the host's rows through, so it passes through any of
+these features the host advertises, and its CPUID answers can disagree with
+the instructions available to the guest: on an Intel KVM host, RDRAND and
+RDSEED can raise #UD, and RTM aborts where the host has TSX_CTRL, whatever the
+guest was told. (Every Hermit table that runs under KVM hides all four.)
 
 The KVM integration tests execute CPUID inside the VM and compare the
-registers with the host's.
+registers with the host's. For leaves 1 and 7.0 they compare only the four
+cleared bits, which must read clear, because KVM computes other fields of
+those leaves for the vCPU itself (the APIC ID, OSXSAVE, OSPKE).
 
 ## Relationship to gVisor
 

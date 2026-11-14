@@ -2446,10 +2446,12 @@ impl KvmBackend {
         // The vCPU gets KVM's host-supported CPUID table, with its extended
         // state limited to the x87, SSE and YMM components the backend's
         // signal frames carry (`signal::FIXED_XFEATURES`); with more, KVM would
-        // save state (AVX-512, PKRU) that no frame can hold. A guest never
-        // reads this table: every guest CPUID faults to the Tool, whose answer
-        // is the guest's (Detcore's machine description under Hermit, the
-        // host's by Reverie's default).
+        // save state (AVX-512, PKRU) that no frame can hold. It also lacks
+        // RDRAND, RDSEED, HLE and RTM on every vendor, which KVM's own
+        // handling of those instructions keys on (`vcpu_cpuid`). A guest
+        // whose Tool subscribes to CPUID never reads this table: every guest
+        // CPUID faults to the Tool, whose answer is the guest's (Detcore's
+        // machine description under Hermit, the host's by Reverie's default).
         let supported = kvm.get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)?;
         let supported_xsave = crate::host_xss::XsaveSubleaf::of_table(&supported);
         let cpuid = vcpu_cpuid(supported)?;
@@ -7675,10 +7677,44 @@ pub(crate) fn clear_tid_and_wake(memory: &mut GuestMemory, address: Option<u64>)
 ///   host's IA32_XSS components, which `host_xss` relies on: KVM accepts a
 ///   vCPU IA32_XSS value only within them.
 ///
+/// - four feature bits, cleared on every vendor: RDRAND (leaf 1 ECX bit 30),
+///   RDSEED (leaf 7.0 EBX bit 18), HLE (bit 4) and RTM (bit 11). KVM keys
+///   its own handling of those instructions on this table, not on what a Tool
+///   answers: on VMX, only when the table lacks the feature (and, for RDRAND
+///   and RDSEED, where the processor has the exiting control), it sets RDRAND
+///   and RDSEED exiting, answered with #UD, and loads TSX_CTRL with
+///   RTM_DISABLE where the host has TSX_CTRL, so RTM aborts. SVM has no RDRAND
+///   or RDSEED intercept (AMD64 APM Vol. 2, Table 15-7), so on AMD those two
+///   still execute natively: "every vendor" is about the CPUID bits, not the
+///   instructions (<https://github.com/rrnewton/hermit/issues/5478>). A guest
+///   whose Tool does not subscribe to CPUID reads these four bits clear. A
+///   Tool that subscribes answers the guest's CPUID itself, so it should hide
+///   them as well. Reverie's default answer, the host's rows
+///   (`Tool::handle_cpuid_event`), passes through any of them the host
+///   advertises, so on VMX its answers can disagree with the instructions
+///   available to the guest.
+///
 /// KVM still computes the fields that describe the vCPU itself (OSXSAVE from
 /// the guest's CR4, the XSAVE sizes from its XCR0 and IA32_XSS) when the guest
 /// reads them.
 pub(crate) fn vcpu_cpuid(supported: CpuId) -> Result<CpuId> {
+    vcpu_cpuid_with(supported, |leaf, subleaf| {
+        core::arch::x86_64::__cpuid_count(leaf, subleaf)
+    })
+}
+
+/// Leaf 1 ECX bits [`vcpu_cpuid`] clears: RDRAND.
+const VCPU_LEAF1_ECX_CLEARED: u32 = 1 << 30;
+/// Leaf 7.0 EBX bits [`vcpu_cpuid`] clears: HLE, RTM and RDSEED.
+const VCPU_LEAF7_EBX_CLEARED: u32 = (1 << 4) | (1 << 11) | (1 << 18);
+
+/// [`vcpu_cpuid`] with the host's CPUID instruction as a parameter, so a test
+/// can supply the native rows the table copies. The four-bit mask applies
+/// after the copy, to what KVM is given.
+fn vcpu_cpuid_with(
+    supported: CpuId,
+    native: impl Fn(u32, u32) -> core::arch::x86_64::CpuidResult,
+) -> Result<CpuId> {
     let fixed = crate::signal::FIXED_XFEATURES;
     let entries = supported
         .as_slice()
@@ -7689,7 +7725,7 @@ pub(crate) fn vcpu_cpuid(supported: CpuId) -> Result<CpuId> {
         .map(|entry| {
             let mut entry = *entry;
             if !(0x4000_0000..0x5000_0000).contains(&entry.function) {
-                let host = core::arch::x86_64::__cpuid_count(entry.function, entry.index);
+                let host = native(entry.function, entry.index);
                 (entry.eax, entry.ebx, entry.ecx, entry.edx) =
                     (host.eax, host.ebx, host.ecx, host.edx);
             }
@@ -7697,12 +7733,145 @@ pub(crate) fn vcpu_cpuid(supported: CpuId) -> Result<CpuId> {
                 entry.eax &= fixed as u32;
                 entry.edx &= (fixed >> 32) as u32;
             }
+            if entry.function == 1 {
+                entry.ecx &= !VCPU_LEAF1_ECX_CLEARED;
+            }
+            if entry.function == 7 && entry.index == 0 {
+                entry.ebx &= !VCPU_LEAF7_EBX_CLEARED;
+            }
             entry
         })
         .collect::<Vec<_>>();
     CpuId::from_entries(&entries).map_err(|error| {
         Error::UnsupportedCpuidProfile(format!("KVM's CPUID table did not fit: {error:?}"))
     })
+}
+
+#[cfg(test)]
+mod vcpu_cpuid_tests {
+    use core::arch::x86_64::CpuidResult;
+
+    use kvm_bindings::kvm_cpuid_entry2;
+
+    use super::*;
+
+    fn entry(function: u32, index: u32, regs: [u32; 4]) -> kvm_cpuid_entry2 {
+        kvm_cpuid_entry2 {
+            function,
+            index,
+            eax: regs[0],
+            ebx: regs[1],
+            ecx: regs[2],
+            edx: regs[3],
+            ..Default::default()
+        }
+    }
+
+    /// A native source with every bit set in leaves 1 and 7.0, and a
+    /// distinct pattern elsewhere, so the test sees what the copy delivers.
+    fn native(leaf: u32, subleaf: u32) -> CpuidResult {
+        if leaf == 1 || (leaf == 7 && subleaf == 0) {
+            CpuidResult {
+                eax: u32::MAX,
+                ebx: u32::MAX,
+                ecx: u32::MAX,
+                edx: u32::MAX,
+            }
+        } else {
+            let p = leaf.rotate_left(8) ^ subleaf;
+            CpuidResult {
+                eax: p,
+                ebx: p ^ 1,
+                ecx: p ^ 2,
+                edx: p ^ 3,
+            }
+        }
+    }
+
+    fn regs(table: &CpuId, function: u32, index: u32) -> [u32; 4] {
+        let e = table
+            .as_slice()
+            .iter()
+            .find(|e| e.function == function && e.index == index)
+            .unwrap();
+        [e.eax, e.ebx, e.ecx, e.edx]
+    }
+
+    /// The vCPU table clears RDRAND, RDSEED, HLE and RTM from the native rows
+    /// it copies, and nothing else; KVM's hypervisor leaves and the leaf-0xD
+    /// limit are as before (<https://github.com/rrnewton/hermit/issues/5478>).
+    /// Each of the four clears is needed: the native rows here set all four.
+    #[test]
+    fn the_vcpu_table_clears_exactly_rdrand_rdseed_hle_and_rtm() {
+        let supported = CpuId::from_entries(&[
+            entry(1, 0, [0; 4]),
+            entry(7, 0, [0; 4]),
+            entry(7, 1, [0; 4]),
+            entry(0xd, 0, [0; 4]),
+            entry(0x8000_0001, 0, [0; 4]),
+            entry(0x4000_0001, 0, [11, 22, 33, 44]),
+        ])
+        .unwrap();
+        let table = vcpu_cpuid_with(supported, native).unwrap();
+        assert_eq!(
+            regs(&table, 1, 0),
+            [u32::MAX, u32::MAX, !(1 << 30), u32::MAX]
+        );
+        assert_eq!(
+            regs(&table, 7, 0),
+            [
+                u32::MAX,
+                !((1 << 4) | (1 << 11) | (1 << 18)),
+                u32::MAX,
+                u32::MAX
+            ]
+        );
+        for (function, index) in [(7, 1), (0x8000_0001, 0)] {
+            let n = native(function, index);
+            assert_eq!(regs(&table, function, index), [n.eax, n.ebx, n.ecx, n.edx]);
+        }
+        let fixed = crate::signal::FIXED_XFEATURES;
+        let n = native(0xd, 0);
+        assert_eq!(
+            regs(&table, 0xd, 0),
+            [
+                n.eax & fixed as u32,
+                n.ebx,
+                n.ecx,
+                n.edx & (fixed >> 32) as u32
+            ]
+        );
+        assert_eq!(regs(&table, 0x4000_0001, 0), [11, 22, 33, 44]);
+    }
+
+    /// The table KVM holds for a real vCPU, read back with KVM_GET_CPUID2,
+    /// has the four bits clear whatever this host's CPU has.
+    #[test]
+    fn kvm_reads_back_the_vcpu_table_without_the_four_bits() {
+        let backend = KvmBackend::new(16 * 1024 * 1024)
+            .expect("the vCPU table read-back test requires /dev/kvm");
+        let table = backend
+            .vcpu
+            .get_cpuid2(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
+            .unwrap();
+        let leaf = |function: u32| {
+            table
+                .as_slice()
+                .iter()
+                .find(|e| e.function == function && e.index == 0)
+                .copied()
+        };
+        let leaf1 = leaf(1).expect("KVM lists leaf 1");
+        assert_eq!(leaf1.ecx & (1 << 30), 0, "RDRAND");
+        if let Some(leaf7) = leaf(7) {
+            assert_eq!(
+                leaf7.ebx & ((1 << 4) | (1 << 11) | (1 << 18)),
+                0,
+                "{:#x}",
+                leaf7.ebx
+            );
+        }
+    }
 }
 
 fn supported_hypercall_instruction(cpuid: &CpuId) -> Result<[u8; 3]> {

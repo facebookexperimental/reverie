@@ -137,7 +137,9 @@ fn host_cpuid_rows_are_visible_inside_vm() {
     }
 
     // No Tool traps CPUID here, so the vCPU's table answers, and it holds the
-    // host's rows: the backend keeps no CPUID profile of its own.
+    // host's rows: the backend keeps no CPUID profile of its own, except that
+    // it clears RDRAND, RDSEED, HLE and RTM on every vendor
+    // (https://github.com/rrnewton/hermit/issues/5478; `masked` below).
     let probes: [(u32, u32); 7] = [
         (0, 0),
         (0x8000_0000, 0),
@@ -156,7 +158,21 @@ fn host_cpuid_rows_are_visible_inside_vm() {
             CPUID_RESULT_ADDRESS + 16 * index as u16,
         );
     }
-    let xstate_address = CPUID_RESULT_ADDRESS + 16 * probes.len() as u16;
+    // (leaf, subleaf, the bits the vCPU table clears in EAX, EBX, ECX, EDX).
+    let masked: [(u32, u32, [u32; 4]); 2] = [
+        (1, 0, [0, 0, 1 << 30, 0]),
+        (7, 0, [0, (1 << 4) | (1 << 11) | (1 << 18), 0, 0]),
+    ];
+    let masked_address = CPUID_RESULT_ADDRESS + 16 * probes.len() as u16;
+    for (index, (leaf, subleaf, _)) in masked.iter().enumerate() {
+        append_cpuid_probe(
+            &mut program,
+            *leaf,
+            *subleaf,
+            masked_address + 16 * index as u16,
+        );
+    }
+    let xstate_address = masked_address + 16 * masked.len() as u16;
     append_cpuid_probe(&mut program, 0xd, 0, xstate_address);
     append_cpuid_probe(&mut program, 0xd, 17, xstate_address + 16);
     append_cpuid_probe(&mut program, 0xd, 19, xstate_address + 32);
@@ -176,6 +192,17 @@ fn host_cpuid_rows_are_visible_inside_vm() {
             read_cpuid_result(&backend, CPUID_RESULT_ADDRESS + 16 * index as u16),
             [host.eax, host.ebx, host.ecx, host.edx],
             "leaf {leaf:#x}, subleaf {subleaf}"
+        );
+    }
+    // Only the four bits are compared: KVM computes other fields of these
+    // leaves for the vCPU itself (the APIC ID, OSXSAVE, OSPKE), so the rest
+    // of each row is not the host's.
+    for (index, (leaf, subleaf, cleared)) in masked.iter().enumerate() {
+        let guest = read_cpuid_result(&backend, masked_address + 16 * index as u16);
+        let leaked: [u32; 4] = std::array::from_fn(|i| guest[i] & cleared[i]);
+        assert_eq!(
+            leaked, [0; 4],
+            "leaf {leaf:#x}, subleaf {subleaf}: {guest:#x?}"
         );
     }
     // Leaf 0xd advertises only the x87, SSE and YMM components the signal

@@ -4,6 +4,24 @@ Versions 0.5.1 and 0.5.3 describe selected development snapshots; 0.5.0
 describes the registry release. Backend-specific entries retain the limits
 of those execution paths.
 
+## Unreleased
+
+- reverie-kvm: the vCPU's CPUID table (KVM_SET_CPUID2) no longer offers
+  RDRAND, RDSEED, HLE or RTM, on every vendor. KVM keys its own handling of
+  those instructions on this table, not on what a Tool answers: on VMX it now
+  sets RDRAND and RDSEED exiting where the processor has those controls,
+  answered with #UD, and loads TSX_CTRL with RTM_DISABLE where the host has
+  it, so RTM aborts. SVM has no RDRAND or
+  RDSEED intercept, so on AMD hosts those two still execute natively. A guest
+  whose Tool does not subscribe to CPUID reads those four bits clear where it
+  read the host's before. A guest whose Tool subscribes reads the Tool's
+  answers as before, but on VMX the instructions now behave as the table
+  says, whatever the Tool answers. So a Tool that subscribes should hide the
+  four bits. Reverie's default answer, the host's rows, passes through any of
+  them the host advertises, so its answers can disagree with the instructions
+  available to the guest (every Hermit table that runs under KVM hides all
+  four) (https://github.com/rrnewton/hermit/issues/5478).
+
 ## 0.5.7
 
 Release cut for the 2026-11-11 fbsource import, taken at Reverie main. It
