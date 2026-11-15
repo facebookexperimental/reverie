@@ -273,6 +273,13 @@ pub struct Runner {
     /// The CPU budget of every command not given its own through
     /// `run_cpu_bounded`; `None` leaves them bounded by the wall deadline only.
     every_command_cpu: Option<Duration>,
+    /// A substitute `cargo` program for this Runner, set through
+    /// [`Self::set_cargo_program`]; `None` spawns the `cargo` found on
+    /// PATH, exactly as before. It exists so a test can inject a stand-in
+    /// cargo without mutating the process-wide PATH. Test-only: production
+    /// code neither sets nor reads it.
+    #[cfg(test)]
+    cargo_program: Option<PathBuf>,
     #[cfg(test)]
     cgroup_parent: Option<PathBuf>,
     /// Every command cgroup this Runner created, so a test can check its own
@@ -301,6 +308,8 @@ impl Runner {
             command_cpu: Vec::new(),
             wall_budget: budget,
             every_command_cpu: None,
+            #[cfg(test)]
+            cargo_program: None,
             #[cfg(test)]
             cgroup_parent: None,
             #[cfg(test)]
@@ -351,6 +360,15 @@ impl Runner {
         self.run_with_limits(program, args, cwd, combined_limit, cpu_budget)
     }
 
+    /// Spawn `program` from this path instead of PATH when the command
+    /// being run is `cargo`. Only the test that injects a stand-in cargo
+    /// uses this; production callers never set it, so their behaviour is
+    /// unchanged.
+    #[cfg(test)]
+    pub fn set_cargo_program(&mut self, program: PathBuf) {
+        self.cargo_program = Some(program);
+    }
+
     fn cgroup_parent(&self) -> Result<PathBuf> {
         #[cfg(test)]
         if let Some(parent) = &self.cgroup_parent {
@@ -394,6 +412,11 @@ impl Runner {
         }
         self.serial += 1;
         let prefix = self.logs.join(format!("{:04}", self.serial));
+        #[cfg(test)]
+        let program = match (program, &self.cargo_program) {
+            ("cargo", Some(substitute)) => substitute.to_str().expect("cargo substitute is UTF-8"),
+            _ => program,
+        };
         let mut command = Command::new(program);
         command
             .args(args)
@@ -2446,9 +2469,37 @@ fn compiled_role_filename(
             .to_vec(),
     })
 }
+/// The compiled-source path's historical Reverie repository: the
+/// rrnewton spelling Hermit's manifests used when the compiled
+/// checks were written, equal as a repository to
+/// [`private_static::CargoGitRepository::DEFAULT`] (which spells it
+/// without `.git`, as literoot's manifests do). Consumers whose
+/// manifests spell another repository select it explicitly through
+/// the `*_with_repository` entry points; this default never accepts
+/// another spelling.
+fn compiled_default_repository() -> private_static::CargoGitRepository<'static> {
+    private_static::CargoGitRepository::new("https://github.com/rrnewton/reverie.git")
+        .expect("the compiled default repository is a valid https URL")
+}
 impl VerifiedCompiledSources {
     pub fn resolve(expected: &CompiledSourceExpectation<'_>, runner: &mut Runner) -> Result<Self> {
         let verified = Self::resolve_candidate(expected, runner)?;
+        verified.verify_unchanged(runner)?;
+        Ok(verified)
+    }
+
+    /// Like [`Self::resolve`], but the consumer explicitly selects the
+    /// Reverie repository its Cargo manifests and lock spell (see
+    /// [`private_static::CargoGitRepository`]). A consumer whose
+    /// manifests spell another repository than the compiled default
+    /// must use this; the default keeps the historical rrnewton
+    /// spelling and refuses any other.
+    pub fn resolve_with_repository(
+        expected: &CompiledSourceExpectation<'_>,
+        repository: private_static::CargoGitRepository<'_>,
+        runner: &mut Runner,
+    ) -> Result<Self> {
+        let verified = Self::resolve_candidate_with_repository(expected, repository, runner)?;
         verified.verify_unchanged(runner)?;
         Ok(verified)
     }
@@ -2473,7 +2524,18 @@ impl VerifiedCompiledSources {
         runner: &mut Runner,
         body: impl FnOnce(&Self) -> Result<T>,
     ) -> Result<(T, CompiledSources)> {
-        let candidate = Self::resolve_candidate(expected, runner)?;
+        Self::with_resolved_with_repository(expected, compiled_default_repository(), runner, body)
+    }
+
+    /// Like [`Self::with_resolved`], with the consumer's explicitly
+    /// selected Reverie repository (see [`Self::resolve_with_repository`]).
+    pub fn with_resolved_with_repository<T>(
+        expected: &CompiledSourceExpectation<'_>,
+        repository: private_static::CargoGitRepository<'_>,
+        runner: &mut Runner,
+        body: impl FnOnce(&Self) -> Result<T>,
+    ) -> Result<(T, CompiledSources)> {
+        let candidate = Self::resolve_candidate_with_repository(expected, repository, runner)?;
         let result = body(&candidate);
         // Do not propagate the body's error before closing. The fixture's
         // ordinary failure path must check the same source boundary as success.
@@ -2492,6 +2554,14 @@ impl VerifiedCompiledSources {
     // closes sources before returning an owned result.
     fn resolve_candidate(
         expected: &CompiledSourceExpectation<'_>,
+        runner: &mut Runner,
+    ) -> Result<Self> {
+        Self::resolve_candidate_with_repository(expected, compiled_default_repository(), runner)
+    }
+
+    fn resolve_candidate_with_repository(
+        expected: &CompiledSourceExpectation<'_>,
+        repository: private_static::CargoGitRepository<'_>,
         runner: &mut Runner,
     ) -> Result<Self> {
         require(
@@ -2565,10 +2635,7 @@ impl VerifiedCompiledSources {
         )?;
         let metadata: Value = serde_json::from_slice(&output)
             .map_err(|e| format!("fresh compiled source metadata: {e}"))?;
-        let source = format!(
-            "git+https://github.com/rrnewton/reverie.git?rev={0}#{0}",
-            expected.reverie_pin
-        );
+        let source = private_static::cargo_git_source(repository, expected.reverie_pin);
         let source = (expected.layout == CompiledSourceLayout::HermitGit).then_some(source);
         let rv_root = if source.is_some() {
             let packages = metadata["packages"]
@@ -2715,6 +2782,16 @@ impl VerifiedCompiledSources {
         expected: &CompiledSourceExpectation<'_>,
         runner: &mut Runner,
     ) -> Result<Self> {
+        Self::resolve_content_with_repository(expected, compiled_default_repository(), runner)
+    }
+
+    /// Like [`Self::resolve_content`], with the consumer's explicitly
+    /// selected Reverie repository (see [`Self::resolve_with_repository`]).
+    pub fn resolve_content_with_repository(
+        expected: &CompiledSourceExpectation<'_>,
+        repository: private_static::CargoGitRepository<'_>,
+        runner: &mut Runner,
+    ) -> Result<Self> {
         require(
             expected.layout == CompiledSourceLayout::HermitGit,
             "declared content factory supports only closed Hermit image profiles",
@@ -2767,10 +2844,7 @@ impl VerifiedCompiledSources {
         )?;
         let metadata: Value = serde_json::from_slice(&output)
             .map_err(|e| format!("fresh compiled source metadata: {e}"))?;
-        let source = format!(
-            "git+https://github.com/rrnewton/reverie.git?rev={0}#{0}",
-            expected.reverie_pin
-        );
+        let source = private_static::cargo_git_source(repository, expected.reverie_pin);
         let binding = content_root_binding(&metadata, expected.reverie_pin)?;
         let producer_metadata = match expected.image_kind {
             FixedImageKind::Standalone => None,
@@ -40816,6 +40890,352 @@ mod tests {
         assert!(serde_json::from_value::<CompiledSourceAuthority>(unknown).is_err());
         drop(owned);
     }
+    #[test]
+    fn compiled_source_repository_selection_accepts_its_spelling_and_refuses_another() {
+        // The compiled-source expected source string derives from the
+        // expectation's explicitly selected repository: a consumer whose
+        // manifests spell facebookexperimental is accepted under that
+        // selection, and a third repository refuses by name.
+        use private_static::CargoGitRepository;
+        use private_static::cargo_git_source;
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let parent = fs::canonicalize(std::env::temp_dir()).unwrap();
+        let root = parent.join(format!(
+            "compiled-repository-selection-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let pin = "0123456789abcdef0123456789abcdef01234567";
+        let moved =
+            CargoGitRepository::new("https://github.com/facebookexperimental/reverie.git").unwrap();
+        let third = CargoGitRepository::new("https://github.com/example/reverie.git").unwrap();
+        let moved_source = cargo_git_source(moved, pin);
+        assert_eq!(
+            moved_source,
+            format!("git+https://github.com/facebookexperimental/reverie.git?rev={pin}#{pin}")
+        );
+        let build = |source: &str| {
+            let dependencies = [
+                ("reverie-core", Some("reverie"), false),
+                ("reverie-inguest", None, false),
+                ("reverie-liteinst", None, false),
+                ("reverie-rpc-transport", None, true),
+            ]
+            .into_iter()
+            .map(|(name, rename, optional)| {
+                serde_json::json!({
+                    "name": name, "source": source.rsplit_once('#').unwrap().0,
+                    "kind": null, "rename": rename, "path": null, "target": null, "optional": optional
+                })
+            })
+            .collect::<Vec<_>>();
+            serde_json::json!({"workspace_root": root, "packages": [{
+                "name": "detcore-liteinst", "version": "0.5.7",
+                "id": format!("path+file://{}#0.5.7", root.join("detcore-liteinst").display()),
+                "source": null, "manifest_path": root.join("detcore-liteinst/Cargo.toml"),
+                "dependencies": dependencies,
+                "targets": [{"name": "detcore_liteinst", "kind": ["cdylib"],
+                    "crate_types": ["cdylib"], "src_path": root.join("detcore-liteinst/src/lib.rs")}]
+            }]})
+        };
+        let dir = root.join("detcore-liteinst");
+        fs::create_dir_all(&dir).unwrap();
+        let lock = [
+            "reverie-core",
+            "reverie-inguest",
+            "reverie-liteinst",
+            "reverie-rpc-transport",
+        ]
+        .into_iter()
+        .map(|name| {
+            format!(
+                "[[package]]\nname = \"{name}\"\nversion = \"0.5.7\"\nsource = \"{moved_source}\"\n"
+            )
+        })
+        .collect::<String>();
+        let lock = lock + "[[package]]\nname = \"detcore-liteinst\"\nversion = \"0.5.7\"\n";
+        fs::write(root.join("Cargo.lock"), &lock).unwrap();
+        content_detcore_manifest_and_lock_pin(&build(&moved_source), &root, &moved_source).unwrap();
+        let third_source = cargo_git_source(third, pin);
+        let refusal =
+            content_detcore_manifest_and_lock_pin(&build(&moved_source), &root, &third_source)
+                .expect_err("a third repository must refuse the moved consumer's spelling");
+        assert!(
+            refusal.contains(
+                "content Detcore dependency differs from independent full pin: reverie-core"
+            ),
+            "the refusal must name the mismatched dependency: {refusal}"
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn compiled_repository_selection_goes_through_both_factories() {
+        use std::io::Write as _;
+
+        use private_static::CargoGitRepository;
+        // The temp root is removed even if a check below panics. The
+        // stand-in cargo is injected into this test's Runner (see
+        // Runner::set_cargo_program), never through the process PATH,
+        // so concurrent tests spawning real cargo or git are unaffected.
+        struct RootCleanup(PathBuf);
+        impl Drop for RootCleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let parent = fs::canonicalize(std::env::temp_dir()).unwrap();
+        let root = parent.join(format!(
+            "compiled-repository-through-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let _root_cleanup = RootCleanup(root.clone());
+        let git = |dir: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_NAME", "fixture")
+                .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+                .env("GIT_COMMITTER_NAME", "fixture")
+                .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        // Checkout: a real Reverie tree at the pin (catalogue files copied
+        // from this crate's own tree, so the catalogue rows match).
+        let checkout = root.join("checkout");
+        let real_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        for relative in CONTENT_REVERIE_CATALOG.iter().map(|row| row.0) {
+            let to = checkout.join(relative);
+            fs::create_dir_all(to.parent().unwrap()).unwrap();
+            fs::copy(real_root.join(relative), &to).unwrap();
+        }
+        for relative in [
+            CONTENT_DETCORE_FIXED_GATE.0,
+            "reverie-liteinst-artifact/Cargo.toml",
+            "reverie-liteinst-artifact/src/lib.rs",
+            "reverie-inguest/Cargo.toml",
+            "reverie-inguest/src/lib.rs",
+            "reverie-syscalls/Cargo.toml",
+            "reverie-syscalls/src/lib.rs",
+            "reverie-liteinst/Cargo.toml",
+            "reverie-liteinst/src/lib.rs",
+            "reverie-liteinst-preload/Cargo.toml",
+            "reverie-liteinst-preload/src/lib.rs",
+        ] {
+            let to = checkout.join(relative);
+            fs::create_dir_all(to.parent().unwrap()).unwrap();
+            fs::copy(real_root.join(relative), &to).unwrap();
+        }
+        git(&checkout, &["init", "-q", "."]);
+        git(&checkout, &["add", "-A"]);
+        git(&checkout, &["commit", "-qm", "fixture checkout"]);
+        let pin = {
+            let out = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&checkout)
+                .output()
+                .unwrap();
+            String::from_utf8(out.stdout).unwrap().trim().to_owned()
+        };
+        // Hermit root: declared workspace files, the leaf, locks, gitlink.
+        let hermit = root.join("hermit");
+        for relative in CONTENT_DETCORE_WORKSPACE_FILES {
+            let to = hermit.join(relative);
+            fs::create_dir_all(to.parent().unwrap()).unwrap();
+            fs::write(&to, format!("fixture {relative}\n")).unwrap();
+        }
+        fs::create_dir_all(hermit.join("detcore-liteinst/src")).unwrap();
+        fs::write(
+            hermit.join("detcore-liteinst/Cargo.toml"),
+            "fixture detcore-liteinst\n",
+        )
+        .unwrap();
+        fs::write(
+            hermit.join("detcore-liteinst/src/lib.rs"),
+            "fixture detcore lib\n",
+        )
+        .unwrap();
+        let moved =
+            CargoGitRepository::new("https://github.com/facebookexperimental/reverie.git").unwrap();
+        let moved_source = private_static::cargo_git_source(moved, &pin);
+        let lock = [
+            "reverie-core",
+            "reverie-inguest",
+            "reverie-syscalls",
+            "reverie-liteinst",
+            "reverie-liteinst-preload",
+            "reverie-liteinst-artifact",
+            "reverie-rpc-transport",
+        ]
+        .into_iter()
+        .map(|name| {
+            format!(
+                "[[package]]\nname = \"{name}\"\nversion = \"0.5.7\"\nsource = \"{moved_source}\"\n"
+            )
+        })
+        .chain([format!(
+            "[[package]]\nname = \"detcore-liteinst\"\nversion = \"0.5.7\"\n"
+        )])
+        .collect::<String>();
+        fs::write(hermit.join("Cargo.lock"), &lock).unwrap();
+        fs::write(hermit.join("liteinst-runtime-build/Cargo.lock"), &lock).unwrap();
+        // The gitlink target must exist as a checkout at the pin, or the
+        // Hermit tree reads as dirty (a gitlink with no directory).
+        git(
+            &root,
+            &[
+                "clone",
+                "-q",
+                checkout.to_str().unwrap(),
+                hermit.join("reverie").to_str().unwrap(),
+            ],
+        );
+        git(&hermit, &["init", "-q", "."]);
+        git(&hermit, &["add", "-A"]);
+        git(
+            &hermit,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{pin},reverie"),
+            ],
+        );
+        git(&hermit, &["commit", "-qm", "fixture hermit"]);
+        // Stand-in cargo: one merged metadata document for every call.
+        let pkg = |name: &str, manifest: PathBuf, git_pkg: bool, kind: &[&str], target: &str| {
+            serde_json::json!({
+                "name": name, "version": "0.5.7",
+                "id": if git_pkg { format!("{}#{name}@0.5.7", moved_source.rsplit_once('#').unwrap().0) } else { format!("path+file://{}#0.5.7", manifest.parent().unwrap().display()) },
+                "source": if git_pkg { Some(moved_source.as_str()) } else { None },
+                "manifest_path": manifest,
+                "targets": [{"name": target, "kind": kind, "crate_types": kind,
+                    "src_path": manifest.parent().unwrap().join("src/lib.rs")}],
+                "dependencies": []
+            })
+        };
+        let mut detcore = pkg(
+            "detcore-liteinst",
+            hermit.join("detcore-liteinst/Cargo.toml"),
+            false,
+            &["cdylib"],
+            "detcore_liteinst",
+        );
+        detcore["dependencies"] = serde_json::json!([
+            {"name": "reverie-core", "source": moved_source.rsplit_once('#').unwrap().0, "kind": null, "rename": "reverie", "path": null, "target": null, "optional": false},
+            {"name": "reverie-inguest", "source": moved_source.rsplit_once('#').unwrap().0, "kind": null, "rename": null, "path": null, "target": null, "optional": false},
+            {"name": "reverie-liteinst", "source": moved_source.rsplit_once('#').unwrap().0, "kind": null, "rename": null, "path": null, "target": null, "optional": false},
+            {"name": "reverie-rpc-transport", "source": moved_source.rsplit_once('#').unwrap().0, "kind": null, "rename": null, "path": null, "target": null, "optional": true}
+        ]);
+        let metadata = serde_json::json!({"workspace_root": hermit, "packages": [
+            detcore,
+            pkg("reverie-inguest", checkout.join("reverie-inguest/Cargo.toml"), true, &["cdylib", "rlib"], "reverie_inguest"),
+            pkg("reverie-syscalls", checkout.join("reverie-syscalls/Cargo.toml"), true, &["lib"], "reverie_syscalls"),
+            pkg("reverie-liteinst", checkout.join("reverie-liteinst/Cargo.toml"), true, &["rlib"], "reverie_liteinst"),
+            pkg("reverie-liteinst-preload", checkout.join("reverie-liteinst-preload/Cargo.toml"), true, &["cdylib"], "reverie_liteinst_preload"),
+            pkg("reverie-liteinst-artifact", checkout.join("reverie-liteinst-artifact/Cargo.toml"), true, &["lib"], "reverie_liteinst_artifact"),
+            pkg("hermit-liteinst-runtime-build", hermit.join("liteinst-runtime-build/Cargo.toml"), false, &["lib"], "hermit_liteinst_runtime_build"),
+            pkg("hermit-liteinst-runtime-artifact", hermit.join("liteinst-runtime-build/runtime/Cargo.toml"), false, &["lib"], "hermit_liteinst_runtime_artifact")
+        ]});
+        // Producer packages need their declared dependencies for the
+        // producer-manifest check; add them now.
+        let mut metadata = metadata;
+        for p in metadata["packages"].as_array_mut().unwrap() {
+            match p["name"].as_str().unwrap() {
+                "hermit-liteinst-runtime-build" => {
+                    p["dependencies"] = serde_json::json!([{"name": "reverie-liteinst-artifact", "source": moved_source.rsplit_once('#').unwrap().0, "kind": "build", "rename": null, "path": null}]);
+                }
+                "hermit-liteinst-runtime-artifact" => {
+                    p["dependencies"] = serde_json::json!([{"name": "reverie-liteinst-preload", "source": moved_source.rsplit_once('#').unwrap().0, "kind": null, "rename": null, "path": null}]);
+                }
+                _ => {}
+            }
+        }
+        let bin = root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let json_path = root.join("metadata.json");
+        fs::write(&json_path, serde_json::to_string(&metadata).unwrap()).unwrap();
+        let cargo_path = bin.join("cargo");
+        {
+            let mut f = fs::File::create(&cargo_path).unwrap();
+            writeln!(f, "#!/bin/sh\ncat {}", json_path.display()).unwrap();
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&cargo_path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut runner =
+            Runner::new(root.join("logs"), Duration::from_secs(120), 64 << 20).unwrap();
+        runner.set_cargo_program(bin.join("cargo"));
+        let standalone_manifest = hermit.join("liteinst-runtime-build/Cargo.toml");
+        let expectation = CompiledSourceExpectation {
+            layout: CompiledSourceLayout::HermitGit,
+            image_kind: FixedImageKind::Standalone,
+            workspace_root: &hermit,
+            manifest: &standalone_manifest,
+            reverie_pin: &pin,
+        };
+        let moved_result =
+            VerifiedCompiledSources::resolve_with_repository(&expectation, moved, &mut runner);
+        let third = CargoGitRepository::new("https://github.com/example/reverie.git").unwrap();
+        let third_result =
+            VerifiedCompiledSources::resolve_with_repository(&expectation, third, &mut runner);
+        let default_result = VerifiedCompiledSources::resolve(&expectation, &mut runner);
+        let content_expectation = CompiledSourceExpectation {
+            layout: CompiledSourceLayout::HermitGit,
+            image_kind: FixedImageKind::Detcore,
+            workspace_root: &hermit,
+            manifest: &hermit.join("Cargo.toml"),
+            reverie_pin: &pin,
+        };
+        let content_result = VerifiedCompiledSources::resolve_content_with_repository(
+            &content_expectation,
+            moved,
+            &mut runner,
+        );
+        let content_third = VerifiedCompiledSources::resolve_content_with_repository(
+            &content_expectation,
+            third,
+            &mut runner,
+        );
+        moved_result.expect("the moved spelling must resolve through the candidate factory");
+        content_result.expect("the moved spelling must resolve through the content factory");
+        assert_eq!(
+            third_result.err(),
+            Some("compiled dependency differs from expected full Git source".to_owned()),
+            "a third repository must refuse through the candidate factory by name"
+        );
+        let content_refusal = match content_third {
+            Ok(_) => panic!("a third repository must refuse through the content factory"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            content_refusal,
+            "content Detcore dependency differs from independent full pin: reverie-core",
+            "the content refusal must name the mismatched dependency"
+        );
+        assert_eq!(
+            default_result.err(),
+            Some("compiled dependency differs from expected full Git source".to_owned()),
+            "the historical default must refuse the moved spelling by name"
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
     // Data controls on an actual gitless source-copy fixture. Metadata shapes
     // here refute the production predicates; they never manufacture verified
     // compiler authority or replace either factory's fresh Cargo commands.
@@ -69166,7 +69586,7 @@ pub mod private_static {
     /// spelling other than `repository`'s refuses. Both CargoGitRev
     /// checks (root lock and metadata source equality) build their
     /// expected string here so they cannot drift.
-    fn cargo_git_source(repository: CargoGitRepository<'_>, pin: &str) -> String {
+    pub(crate) fn cargo_git_source(repository: CargoGitRepository<'_>, pin: &str) -> String {
         format!("git+{}?rev={pin}#{pin}", repository.url())
     }
 
