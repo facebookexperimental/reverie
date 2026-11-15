@@ -4613,6 +4613,93 @@ fn exit_forked_guest(code: i32) -> ! {
     unsafe { libc::_exit(code) }
 }
 
+/// The exit status of a guest forked by `spawn_fn_with_config` whose setup
+/// failed before its function could run (`end_failed_guest_setup`). As a
+/// shell reports a program it could not execute.
+const FORKED_GUEST_SETUP_FAILED: i32 = 127;
+
+/// The setup of a guest forked by `spawn_fn_with_config`, from the fork to
+/// its function: each step that fails returns what it was doing, as a
+/// phrase completing "could not", and its error.
+fn set_up_forked_guest(
+    output: [OwnedFd; 4],
+    capture_output: bool,
+    intercept_rdtsc: bool,
+    seccomp_filter: &seccomp::Filter,
+) -> Result<(), (&'static str, Errno)> {
+    let io_errno = |error: std::io::Error| Errno::new(error.raw_os_error().unwrap_or(libc::EIO));
+    let nix_errno = |error: nix::Error| Errno::new(error as i32);
+    let [read1, read2, write1, write2] = output;
+    read1
+        .close()
+        .and_then(|()| read2.close())
+        .map_err(|error| ("close the read ends of its output pipes", io_errno(error)))?;
+    if capture_output {
+        unistd::dup2_stdout(&write1)
+            .map_err(|error| ("redirect its stdout to its pipe", nix_errno(error)))?;
+        unistd::dup2_stderr(&write2)
+            .map_err(|error| ("redirect its stderr to its pipe", nix_errno(error)))?;
+        write1
+            .close()
+            .and_then(|()| write2.close())
+            .map_err(|error| ("close its output pipes once redirected", io_errno(error)))?;
+    } else {
+        // The guest keeps the write ends, as it always has.
+        std::mem::forget(write1);
+        std::mem::forget(write2);
+    }
+    init_tracee(intercept_rdtsc).map_err(|errno| ("prepare itself for tracing", errno))?;
+    seccomp_filter
+        .load()
+        .map_err(|errno| ("install its seccomp filter", errno))
+}
+
+/// Ends a guest forked by `spawn_fn_with_config` whose setup `step` failed
+/// with `errno`, with a message on its stderr and status
+/// `FORKED_GUEST_SETUP_FAILED`. Returning or unwinding instead would run on
+/// in the parent's copied caller, whose async runtime waits forever for
+/// threads the child does not have. Nothing here allocates or takes a lock,
+/// which another thread of the parent may have held at the fork.
+fn end_failed_guest_setup(step: &'static str, errno: Errno) -> ! {
+    let parts: [&[u8]; 5] = [
+        b"ERROR: Reverie's forked guest could not ",
+        step.as_bytes(),
+        b": ",
+        errno.name().unwrap_or("unknown errno").as_bytes(),
+        b"; it exits before running its function\n",
+    ];
+    for part in parts {
+        // SAFETY: write is async-signal-safe and every part is static.
+        let _ = unsafe { libc::write(libc::STDERR_FILENO, part.as_ptr().cast(), part.len()) };
+    }
+    // SAFETY: exits without running the parent's runtime cleanup.
+    unsafe { libc::_exit(FORKED_GUEST_SETUP_FAILED) }
+}
+
+/// What a guest forked by `spawn_fn_with_config` wrote to its captured
+/// stderr `fd` before it ended during ptrace initialization, read without
+/// blocking: another process forked meanwhile may hold the pipe's write end.
+/// `fd` stays owned by the caller's `ChildStderr`, open for this call.
+fn guest_stderr_at_initialization_failure(fd: std::os::fd::RawFd) -> String {
+    // SAFETY: fcntl on a descriptor the caller keeps open, with integer
+    // arguments.
+    let set = unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        flags != -1 && libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) != -1
+    };
+    let mut text = Vec::new();
+    let mut buffer = [0u8; 4096];
+    while set && text.len() < 64 * 1024 {
+        // SAFETY: reads into a buffer of the length given.
+        let read = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len()) };
+        let Ok(read @ 1..) = usize::try_from(read) else {
+            break;
+        };
+        text.extend_from_slice(&buffer[..read]);
+    }
+    String::from_utf8_lossy(&text).trim_end().to_owned()
+}
+
 /// Spawn a function with instrumentation rather than a subprocess indicated with
 /// a Command. This still creates a fresh child process and runs it under ptrace.
 /// However, the child process is a fork of the current process, and is used to
@@ -4631,7 +4718,14 @@ fn exit_forked_guest(code: i32) -> ! {
 ///
 /// The child ends with `_exit` once the function returns (status 0) or panics
 /// (status 1), after flushing Rust's stdout and every C stdio stream; a
-/// failed flush turns status 0 into 1. Because it never runs the process's
+/// failed flush turns status 0 into 1. A setup step that fails before the
+/// function runs ends the child with status 127 and a message on its stderr
+/// naming the step. If the step comes before the child's stop for tracing
+/// (`init_tracee` up to `PTRACE_TRACEME`), this returns an error, with what
+/// the child wrote to its captured stderr, if anything, attached as context.
+/// A step after that stop (`init_tracee`'s signal dispositions, or loading
+/// the seccomp filter) fails once this has returned: the run's output then
+/// has status 127 and the message in its stderr. Because it never runs the process's
 /// exit-time cleanup, `atexit` handlers and destructors registered in the
 /// child or inherited from the parent do not run. In particular, a coverage
 /// build's profile write-out (an `atexit` hook) is skipped, so code executed
@@ -4688,18 +4782,16 @@ where
     // panicking, etc).  We make a best-effort attempt to solve some of these issues.
     match unsafe { unistd::fork() }.expect("unistd::fork failed") {
         ForkResult::Child => {
-            read1.close()?;
-            read2.close()?;
-            if capture_output {
-                unistd::dup2_stdout(&write1).map_err(from_nix_error)?;
-                unistd::dup2_stderr(&write2).map_err(from_nix_error)?;
-                write1.close()?;
-                write2.close()?;
+            // Nothing here may return or unwind into the caller: it runs on a
+            // copy of the parent, whose other threads the child does not have.
+            if let Err((step, errno)) = set_up_forked_guest(
+                [read1, read2, write1, write2],
+                capture_output,
+                events.has_rdtsc(),
+                &seccomp_filter,
+            ) {
+                end_failed_guest_setup(step, errno);
             }
-
-            init_tracee(events.has_rdtsc()).expect("init_tracee failed");
-
-            seccomp_filter.load().expect("Failed to set seccomp filter");
 
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(fun)) {
                 Ok(()) => exit_forked_guest(0),
@@ -4725,6 +4817,7 @@ where
             write2.close()?;
 
             let stdout = read1.into();
+            let stderr_fd = read2.as_raw_fd();
             let stderr = read2.into();
             let (tracer, ordinary_session) = match postspawn::<L>(
                 child,
@@ -4749,7 +4842,24 @@ where
             .await
             {
                 Ok(tracer) => tracer,
-                Err(err) => return Err(postspawn_error(guest_pid, err, &root_waits).await),
+                Err(err) => {
+                    let ended = matches!(
+                        err,
+                        PostspawnError::Exited { .. } | PostspawnError::Trace(TraceError::Died(_))
+                    );
+                    let error = postspawn_error(guest_pid, err, &root_waits).await;
+                    let guest_stderr = if ended {
+                        guest_stderr_at_initialization_failure(stderr_fd)
+                    } else {
+                        String::new()
+                    };
+                    if guest_stderr.is_empty() {
+                        return Err(error);
+                    }
+                    return Err(anyhow::Error::new(error)
+                        .context(format!("the guest's stderr before it ended: {guest_stderr}"))
+                        .into());
+                }
             };
 
             Ok(Tracer {
