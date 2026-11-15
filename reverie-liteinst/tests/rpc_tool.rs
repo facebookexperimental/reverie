@@ -395,6 +395,59 @@ fn protection_keys_with_signal_stack(on_alt_stack: bool) {
     print!("{stdout}");
 }
 
+/// A guest sendmsg or sendmmsg trapped at an unpatched site runs through the
+/// installed Tool on the runtime's checked copy of its message headers and
+/// control data (https://github.com/facebookexperimental/reverie/issues/56),
+/// which the runtime makes, and into which it stores a sent message's
+/// msg_len, with the interrupted guest's protection-key rights. The guest
+/// compares each case with the same call made natively before the Tool was
+/// installed: control data or a msghdr under a key the guest denies gives
+/// EFAULT and sends nothing; with the key allowed the message is sent with
+/// the guest's pipe; a two-message vector sends one message per call, and
+/// the guest's retry of the remainder ends where Linux's one call ends; a
+/// vector the guest may read but not write sends its message and gives
+/// EFAULT. The fallback continuation runs with every key allowed, so a copy
+/// made without the guest's rights would send the denied cases.
+#[test]
+fn a_trapped_send_copies_its_message_with_the_guest_s_key_rights() {
+    let binary = env!("CARGO_BIN_EXE_reverie-liteinst-rpc-tool-guest");
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("coordinator.sock");
+    let mut coordinator = KillOnDropChild::new(
+        Command::new(binary)
+            .arg("coordinator")
+            .arg(&socket)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !socket.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let ready = socket.exists();
+    let mut command = Command::new(binary);
+    command.arg("syscall-fallback-scm-pkey").arg(&socket);
+    let output = ready.then(|| output_with_timeout(command, Duration::from_secs(20)));
+    let _ = coordinator.kill_and_wait();
+    let output = output.expect("coordinator socket was not created");
+    if output.status.code() == Some(77) {
+        assert_eq!(output.stdout, b"fallback scm pkeys: OSPKE unavailable\n");
+        assert!(output.stderr.is_empty(), "{output:?}");
+        println!("SKIPPED: protection keys are not enabled on this host");
+        return;
+    }
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(
+        stdout,
+        "fallback scm pkeys: denied=matched allowed=matched vector=1+1 native=2 read-only=matched traps=6 hooks=0\n"
+    );
+    print!("{stdout}");
+}
+
 #[test]
 fn fork_child_accounts_for_fallback_and_installed_dispatch() {
     let binary = env!("CARGO_BIN_EXE_reverie-liteinst-rpc-tool-guest");

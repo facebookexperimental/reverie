@@ -1069,6 +1069,306 @@ unsafe fn protect_runtime_descriptors_inner(
     true
 }
 
+/// How many of a guest `sendmmsg`'s messages one call carries on the copy
+/// ([`dispatch_with_scm_rights_copy`]): one. Linux stores each sent message's
+/// `msg_len` into the caller's vector before it sends the next, and stops at a
+/// store that fails. With one message per call the runtime makes that store
+/// itself, into the guest's vector, after the send and before any later
+/// message is sent. Linux's own limit is UIO_MAXIOV (1024).
+pub const SCM_COPY_MESSAGES: usize = 1;
+/// The control data one call copies. Linux's own limit is
+/// net.core.optmem_max.
+pub const SCM_COPY_CONTROL_BYTES: usize = 4096;
+/// The bytes of a 64-bit `struct user_msghdr`, which Linux reads for each
+/// message, and where its `msg_control` and `msg_controllen` sit.
+const MSGHDR_BYTES: usize = 56;
+const MSG_CONTROL: usize = 32;
+const MSG_CONTROLLEN: usize = 40;
+/// The size of a `struct mmsghdr`, and where its `msg_len` sits.
+const MMSGHDR_BYTES: usize = 64;
+const MMSG_LEN: usize = 56;
+
+/// A guest `sendmsg`'s or `sendmmsg`'s message headers and control data,
+/// copied into runtime memory and checked, for the kernel to read in place of
+/// the guest's (https://github.com/facebookexperimental/reverie/issues/56).
+struct ScmRightsCopy {
+    /// One `struct mmsghdr` per message; a `sendmsg` uses the first one's
+    /// `msghdr`.
+    headers: [[u64; MMSGHDR_BYTES / 8]; SCM_COPY_MESSAGES],
+    control: [u64; SCM_COPY_CONTROL_BYTES / 8],
+    guest_args: [u64; 6],
+    messages: usize,
+}
+
+/// Entry `index` of a copy's headers, as bytes. It borrows the headers alone,
+/// never the whole copy, whose control words a raw pointer addresses.
+fn header_bytes(
+    headers: &mut [[u64; MMSGHDR_BYTES / 8]; SCM_COPY_MESSAGES],
+    index: usize,
+) -> &mut [u8] {
+    // SAFETY: each entry is MMSGHDR_BYTES of plain u64 words.
+    unsafe { core::slice::from_raw_parts_mut(headers[index].as_mut_ptr().cast(), MMSGHDR_BYTES) }
+}
+
+/// Copies `buffer.len()` bytes of guest memory at `address` into `buffer`,
+/// reading them the way Linux reads the guest's own call. The copy is
+/// `process_vm_writev` from this process (`pid`, which the caller reads once
+/// for all of a call's copies) to itself, issued through the guest
+/// gate with the interrupted guest's protection-key rights `guest_pkru` (the
+/// rights the forwarded call itself runs under; `None` where none were
+/// observed). The kernel reads its source side with `copy_from_user` under
+/// those rights, so what the guest's sendmsg could read is read here: a
+/// write-only page, and a `VM_PFNMAP` page such as a perf ring buffer, which
+/// `process_vm_readv`'s page lookup refuses (mm/gup.c `check_vma_flags`). A
+/// page under a key the guest denies is refused, as Linux refuses it. The
+/// runtime buffer is the remote side, pinned by GUP, which checks no key.
+/// Anything short of every byte fails: a negative result is returned as it is
+/// (a guest seccomp filter can choose it), and a short or zero count is
+/// EFAULT.
+fn copy_from_guest(
+    pid: u64,
+    address: u64,
+    buffer: &mut [u8],
+    guest_pkru: Option<u32>,
+) -> Result<(), i64> {
+    let source = libc::iovec {
+        iov_base: address as *mut libc::c_void,
+        iov_len: buffer.len(),
+    };
+    let target = libc::iovec {
+        iov_base: buffer.as_mut_ptr().cast(),
+        iov_len: buffer.len(),
+    };
+    let args = [
+        pid,
+        (&raw const source) as u64,
+        1,
+        (&raw const target) as u64,
+        1,
+        0,
+    ];
+    // SAFETY: the iovecs and the buffer are this frame's and outlive the
+    // call; the kernel writes only `buffer`.
+    let copied = unsafe {
+        crate::trap::raw_syscall6_with_result(libc::SYS_process_vm_writev, args, guest_pkru)
+    }
+    .result;
+    if copied == buffer.len() as i64 {
+        Ok(())
+    } else if copied < 0 {
+        Err(copied)
+    } else {
+        Err(-i64::from(libc::EFAULT))
+    }
+}
+
+/// Writes `bytes` to guest memory at `address` the way Linux writes the
+/// guest's own call's results: by `process_vm_readv` from this process to
+/// itself through the guest gate with the guest's rights `guest_pkru`, whose
+/// destination side the kernel writes with `copy_to_user` under those rights.
+/// False unless every byte was written.
+fn write_to_guest(address: u64, bytes: &[u8], guest_pkru: Option<u32>) -> bool {
+    let target = libc::iovec {
+        iov_base: address as *mut libc::c_void,
+        iov_len: bytes.len(),
+    };
+    let source = libc::iovec {
+        iov_base: bytes.as_ptr() as *mut libc::c_void,
+        iov_len: bytes.len(),
+    };
+    let pid = unsafe { raw_syscall6(libc::SYS_getpid, [0; 6]) };
+    if pid <= 0 {
+        return false;
+    }
+    let args = [
+        pid as u64,
+        (&raw const target) as u64,
+        1,
+        (&raw const source) as u64,
+        1,
+        0,
+    ];
+    // SAFETY: the iovecs and `bytes` are this frame's; the kernel writes only
+    // guest memory, under the guest's rights, as the guest's own call would.
+    unsafe { crate::trap::raw_syscall6_with_result(libc::SYS_process_vm_readv, args, guest_pkru) }
+        .result
+        == bytes.len() as i64
+}
+
+/// Runs `dispatch` on `event`, a genuine guest syscall not yet run. A guest
+/// `sendmsg` or `sendmmsg` runs on a runtime-owned copy of its message headers
+/// and control data (https://github.com/facebookexperimental/reverie/issues/56):
+///
+/// - Each message's 56-byte `msghdr` is copied, then its control data when
+///   `msg_controllen` is above 0 ([`copy_from_guest`], which reads what the
+///   guest's own call could read, with the interrupted guest's protection-key
+///   rights). In the copy, every reserved descriptor that `SCM_RIGHTS` data
+///   names becomes -1 ([`reserved_fds::scm_rights_hide_reserved`]), and each
+///   copied header's `msg_control` points at the copied control data.
+/// - The call's message pointer (and a `sendmmsg`'s count) then point at the
+///   copy for the Tool's handling and the kernel's read; this frame holds the
+///   copy until the call returns. Nothing else can change it between the
+///   check and the read: not another process writing shared memory, not an
+///   I/O completion, not a guest thread. `msg_name` and the iovec stay guest
+///   memory: only the control data carries descriptors.
+/// - Linux runs every check of its own, in its own order, on the copy. Its
+///   only reader of `SCM_RIGHTS` numbers is `scm_fp_copy` (net/core/scm.c),
+///   reached for AF_UNIX only. It fails the call with EBADF for a -1 as for
+///   any number the caller does not have open, before AF_UNIX queues any of
+///   the message (net/unix/af_unix.c: `scm_send` comes first). Netlink
+///   refuses the record with EINVAL before any lookup, and a family such as
+///   IP ignores it (net/core/sock.c `__sock_cmsg_send`): the answers Linux
+///   gives for a closed number.
+/// - A `sendmmsg` carries one message per call ([`SCM_COPY_MESSAGES`]), with
+///   control data or without, and returns 1 once it is sent: a short count,
+///   which sendmmsg may always return. Linux sends messages in order, stores
+///   each sent message's `msg_len` into the caller's vector before it sends
+///   the next, and stops at a store that fails, answering EFAULT when it has
+///   counted no message (net/socket.c `__sys_sendmmsg`). After the call, the
+///   sent message's `msg_len`, which the kernel wrote into the copy, is stored
+///   into the guest's vector with the guest's rights, and a store that fails
+///   answers EFAULT. This call sends no later message, so a `msg_len` that is
+///   unwritable when that store is made, whenever it became so, ends the
+///   count where Linux ends it. A -1 in the message fails the call as Linux
+///   fails it for a closed number. The guest's own arguments are put back.
+/// - The call never runs after a failed copy of its first message. A header
+///   or control data that cannot be copied ends the call with the copy's
+///   error (EFAULT, or an error a guest seccomp filter chose), and a first
+///   message's control data over [`SCM_COPY_CONTROL_BYTES`] ends it with
+///   ENOBUFS, Linux's answer for control data over its own limit.
+///
+/// The Tool sees the copy. During `dispatch`, `args[1]` is the copy's address
+/// and a `sendmmsg`'s `args[2]` the count carried (1), and the result there is
+/// the kernel's, before a failed `msg_len` store makes it EFAULT. The copy
+/// lives in this frame, so the call must be issued before `dispatch` returns:
+/// the local forward and an inline injection are, and a kernel restart reuses
+/// the live frame.
+///
+/// The copy, and the iovecs its `process_vm_*` calls pass, are on the
+/// dispatching frame's stack, which the kernel reads with the guest's rights.
+/// That stack is key-zero runtime memory, so a guest whose rights deny key
+/// zero gets EFAULT. This needs guest-readable dispatch stacks: if the keyed
+/// owner (`tool_region_keyed`) ever keys the callback stacks, every guest
+/// sendmsg made while a reserved descriptor exists fails with EFAULT.
+///
+/// # Safety
+///
+/// As [`protect_runtime_descriptors`]: `event` is a genuine guest syscall of
+/// this thread, not yet run. `dispatch` runs it at most once, before this
+/// returns, and keeps no pointer from its arguments.
+pub unsafe fn dispatch_with_scm_rights_copy(
+    event: &mut SyscallEvent,
+    dispatch: impl FnOnce(&mut SyscallEvent),
+) {
+    let sendmmsg = event.number == libc::SYS_sendmmsg;
+    if !sendmmsg && event.number != libc::SYS_sendmsg {
+        return dispatch(event);
+    }
+    let (protected, count) = protected_descriptors(true);
+    let reserved = &protected[..count];
+    // vlen is an unsigned int; a vlen of 0 sends nothing and reads nothing.
+    let wanted = if sendmmsg {
+        (event.args[2] as u32 as usize).min(SCM_COPY_MESSAGES)
+    } else {
+        1
+    };
+    if reserved.is_empty() || wanted == 0 {
+        return dispatch(event);
+    }
+    // The interrupted guest's rights, which the forwarded call runs under.
+    let guest_pkru = event.guest_pkru;
+    // This process, for every copy below: nothing between here and the
+    // dispatch can change it.
+    let pid = unsafe { raw_syscall6(libc::SYS_getpid, [0; 6]) };
+    if pid <= 0 {
+        event.result = if pid < 0 {
+            pid
+        } else {
+            -i64::from(libc::EFAULT)
+        };
+        return;
+    }
+    let pid = pid as u64;
+    let mut copy = ScmRightsCopy {
+        headers: [[0; MMSGHDR_BYTES / 8]; SCM_COPY_MESSAGES],
+        control: [0; SCM_COPY_CONTROL_BYTES / 8],
+        guest_args: event.args,
+        messages: 0,
+    };
+    let control_base = copy.control.as_mut_ptr().cast::<u8>();
+    let stride = if sendmmsg { MMSGHDR_BYTES as u64 } else { 0 };
+    let mut used = 0;
+    for index in 0..wanted {
+        let source = event.args[1].wrapping_add(stride * index as u64);
+        let entry = header_bytes(&mut copy.headers, index);
+        let refused = match copy_from_guest(pid, source, &mut entry[..MSGHDR_BYTES], guest_pkru) {
+            Err(result) => Some(result),
+            Ok(()) => {
+                let length = u64::from_ne_bytes(
+                    entry[MSG_CONTROLLEN..MSG_CONTROLLEN + 8]
+                        .try_into()
+                        .unwrap(),
+                );
+                let pointer =
+                    u64::from_ne_bytes(entry[MSG_CONTROL..MSG_CONTROL + 8].try_into().unwrap());
+                let start = (used + 7) & !7;
+                if length == 0 || length > i32::MAX as u64 {
+                    // No control data, or more than Linux takes: it answers
+                    // ENOBUFS at this message before reading any.
+                    None
+                } else if length > (SCM_COPY_CONTROL_BYTES - start) as u64 {
+                    Some(-i64::from(libc::ENOBUFS))
+                } else {
+                    let length = length as usize;
+                    // SAFETY: start + length is within the control words.
+                    let area =
+                        unsafe { core::slice::from_raw_parts_mut(control_base.add(start), length) };
+                    match copy_from_guest(pid, pointer, area, guest_pkru) {
+                        Err(result) => Some(result),
+                        Ok(()) => {
+                            reserved_fds::scm_rights_hide_reserved(area, reserved);
+                            entry[MSG_CONTROL..MSG_CONTROL + 8]
+                                .copy_from_slice(&(area.as_ptr() as u64).to_ne_bytes());
+                            used = start + length;
+                            None
+                        }
+                    }
+                }
+            }
+        };
+        if let Some(result) = refused {
+            if index == 0 {
+                event.result = result;
+                return;
+            }
+            break;
+        }
+        copy.messages = index + 1;
+    }
+    event.args[1] = copy.headers.as_mut_ptr() as u64;
+    if sendmmsg {
+        event.args[2] = copy.messages as u64;
+    }
+    dispatch(event);
+    // The store below follows Linux's order only because the call carried one
+    // message: no message is sent after the one whose msg_len it stores.
+    const _: () = assert!(SCM_COPY_MESSAGES == 1);
+    if sendmmsg && event.result > 0 {
+        // The one message carried was sent. Linux stores its msg_len into the
+        // caller's vector after the send and, when that store fails, answers
+        // EFAULT, having counted no message (net/socket.c `__sys_sendmmsg`).
+        // The runtime makes that store into the guest's vector, with the
+        // guest's rights, now. write_to_guest reads this process's id again:
+        // the Tool's dispatch may have forked.
+        let target = copy.guest_args[1].wrapping_add(MMSG_LEN as u64);
+        let entry = header_bytes(&mut copy.headers, 0);
+        if !write_to_guest(target, &entry[MMSG_LEN..MMSG_LEN + 4], guest_pkru) {
+            event.result = -i64::from(libc::EFAULT);
+        }
+    }
+    event.args = copy.guest_args;
+}
+
 /// Same runtime descriptor protections plus the mapped owner's actual sealed
 /// input lease. The ordinary owned startup socket is not an extra reserved FD.
 /// # Safety
@@ -1519,6 +1819,1246 @@ pub(crate) mod tests {
             }
             assert!(taken >= 0, "F_DUPFD failed: {taken}");
         }
+    }
+
+    /// An AF_UNIX datagram socket pair, close-on-exec.
+    fn unix_pair() -> [libc::c_int; 2] {
+        let mut pair = [0 as libc::c_int; 2];
+        let kind = libc::SOCK_DGRAM | libc::SOCK_CLOEXEC;
+        assert_eq!(
+            unsafe { libc::socketpair(libc::AF_UNIX, kind, 0, pair.as_mut_ptr()) },
+            0
+        );
+        pair
+    }
+
+    /// A pipe's read end: unlike eventfds, which share one inode, it has an
+    /// inode of its own, so a received duplicate can be told apart.
+    fn pipe_file() -> libc::c_int {
+        let mut ends = [0 as libc::c_int; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        ends[0]
+    }
+
+    fn inode(fd: libc::c_int) -> u64 {
+        let mut stat: libc::stat = unsafe { core::mem::zeroed() };
+        assert_eq!(unsafe { libc::fstat(fd, &mut stat) }, 0, "fstat {fd}");
+        stat.st_ino
+    }
+
+    /// Control data of (level, type, payload words) entries in 8-byte words,
+    /// each header's `cmsg_len` covering its payload and each entry starting
+    /// `CMSG_ALIGN`ed, and its `msg_controllen`.
+    fn cmsgs(entries: &[(i32, i32, &[i32])]) -> (Vec<u64>, usize) {
+        let mut bytes = Vec::new();
+        for &(level, kind, words) in entries {
+            let start = bytes.len();
+            bytes.extend_from_slice(&((16 + 4 * words.len()) as u64).to_ne_bytes());
+            bytes.extend_from_slice(&level.to_ne_bytes());
+            bytes.extend_from_slice(&kind.to_ne_bytes());
+            for word in words {
+                bytes.extend_from_slice(&word.to_ne_bytes());
+            }
+            bytes.resize(start + ((bytes.len() - start + 7) & !7), 0);
+        }
+        let length = bytes.len();
+        let mut words = vec![0_u64; length.div_ceil(8).max(1)];
+        for (index, chunk) in bytes.chunks(8).enumerate() {
+            let mut word = [0_u8; 8];
+            word[..chunk.len()].copy_from_slice(chunk);
+            words[index] = u64::from_ne_bytes(word);
+        }
+        (words, length)
+    }
+
+    /// One `SCM_RIGHTS` message carrying `fds`.
+    fn rights(fds: &[libc::c_int]) -> (Vec<u64>, usize) {
+        cmsgs(&[(libc::SOL_SOCKET, libc::SCM_RIGHTS, fds)])
+    }
+
+    /// A msghdr sending `iov`'s byte with `length` bytes of `control`.
+    fn msghdr_with(iov: &mut libc::iovec, control: &mut [u64], length: usize) -> libc::msghdr {
+        let mut message: libc::msghdr = unsafe { core::mem::zeroed() };
+        message.msg_iov = iov;
+        message.msg_iovlen = 1;
+        if length > 0 {
+            message.msg_control = control.as_mut_ptr().cast();
+            message.msg_controllen = length as _;
+        }
+        message
+    }
+
+    /// Runs a guest send as `runtime_seam::process_tool_syscall_with` runs a
+    /// guest syscall, with a dispatch that first runs `writer` (another writer
+    /// of guest memory, after the check) and then the call itself, as a Tool's
+    /// forward does. Returns the call's result.
+    fn guest_send(number: i64, args: [u64; 6], writer: impl FnOnce()) -> i64 {
+        let mut call = event(number, args);
+        unsafe {
+            dispatch_with_scm_rights_copy(&mut call, |call| {
+                writer();
+                call.result = raw_syscall6(call.number, call.args);
+            })
+        };
+        assert_eq!(call.args, args, "the guest's own arguments are put back");
+        call.result
+    }
+
+    /// Every message queued on `socket`, without waiting: each one's first
+    /// byte, and the descriptors its `SCM_RIGHTS` data carried (now open
+    /// here, close-on-exec).
+    fn receive_all(socket: libc::c_int) -> Vec<(u8, Vec<libc::c_int>)> {
+        let mut messages = Vec::new();
+        loop {
+            let mut byte = [0_u8; 8];
+            let mut iov = libc::iovec {
+                iov_base: byte.as_mut_ptr().cast(),
+                iov_len: byte.len(),
+            };
+            let mut control = [0_u64; 64];
+            let mut message: libc::msghdr = unsafe { core::mem::zeroed() };
+            message.msg_iov = &raw mut iov;
+            message.msg_iovlen = 1;
+            message.msg_control = control.as_mut_ptr().cast();
+            message.msg_controllen = core::mem::size_of_val(&control) as _;
+            let flags = libc::MSG_DONTWAIT | libc::MSG_CMSG_CLOEXEC;
+            if unsafe { libc::recvmsg(socket, &raw mut message, flags) } < 0 {
+                assert_eq!(
+                    io::Error::last_os_error().raw_os_error(),
+                    Some(libc::EAGAIN)
+                );
+                return messages;
+            }
+            let mut fds = Vec::new();
+            let mut header = unsafe { libc::CMSG_FIRSTHDR(&raw const message) };
+            while !header.is_null() {
+                let (level, kind, length) = unsafe {
+                    (
+                        (*header).cmsg_level,
+                        (*header).cmsg_type,
+                        (*header).cmsg_len,
+                    )
+                };
+                if level == libc::SOL_SOCKET && kind == libc::SCM_RIGHTS {
+                    let data = unsafe { libc::CMSG_DATA(header) }.cast::<libc::c_int>();
+                    let count = (length - unsafe { libc::CMSG_LEN(0) } as usize) / 4;
+                    for index in 0..count {
+                        fds.push(unsafe { data.add(index).read_unaligned() });
+                    }
+                }
+                header = unsafe { libc::CMSG_NXTHDR(&raw const message, header) };
+            }
+            messages.push((byte[0], fds));
+        }
+    }
+
+    /// The runtime's counter for these tests: an eventfd placed and recorded
+    /// as the runtime's own.
+    fn runtime_counter() -> libc::c_int {
+        let counter = place_runtime_fd(open_eventfd()).unwrap();
+        record_runtime_fd(counter).unwrap();
+        counter
+    }
+
+    /// A guest sendmsg whose `SCM_RIGHTS` data names a runtime descriptor
+    /// fails with EBADF and sends nothing: Linux reads the runtime's copy, in
+    /// which that number is -1, and refuses the whole message
+    /// (https://github.com/facebookexperimental/reverie/issues/56). The
+    /// guest's own control data is untouched. One naming only a descriptor the
+    /// guest owns, or carrying no control data, is sent as Linux sends it.
+    #[test]
+    fn scm_rights_never_sends_a_runtime_descriptor() {
+        in_child_with_soft_nofile(2048, || {
+            let counter = runtime_counter();
+            let file = pipe_file();
+            let pair = unix_pair();
+            let mut byte = *b"m";
+            let mut iov = libc::iovec {
+                iov_base: byte.as_mut_ptr().cast(),
+                iov_len: 1,
+            };
+
+            let (mut control, length) = rights(&[file, counter]);
+            let message = msghdr_with(&mut iov, &mut control, length);
+            let args = [pair[0] as u64, (&raw const message) as u64, 0, 0, 0, 0];
+            let result = guest_send(libc::SYS_sendmsg, args, || {});
+            let delivered = receive_all(pair[1]);
+            assert!(
+                delivered.is_empty(),
+                "a runtime descriptor was sent: {delivered:?}"
+            );
+            assert_eq!(result, -i64::from(libc::EBADF));
+            assert_eq!(control, rights(&[file, counter]).0);
+
+            let (mut control, length) = rights(&[file]);
+            let message = msghdr_with(&mut iov, &mut control, length);
+            let args = [pair[0] as u64, (&raw const message) as u64, 0, 0, 0, 0];
+            assert_eq!(guest_send(libc::SYS_sendmsg, args, || {}), 1);
+            let delivered = receive_all(pair[1]);
+            assert_eq!(delivered.len(), 1, "{delivered:?}");
+            assert_eq!(delivered[0].1.len(), 1);
+            assert_eq!(inode(delivered[0].1[0]), inode(file));
+
+            let plain = msghdr_with(&mut iov, &mut [], 0);
+            let args = [pair[0] as u64, (&raw const plain) as u64, 0, 0, 0, 0];
+            assert_eq!(guest_send(libc::SYS_sendmsg, args, || {}), 1);
+            let delivered = receive_all(pair[1]);
+            assert_eq!(delivered.len(), 1, "{delivered:?}");
+            assert!(delivered[0].1.is_empty());
+        });
+    }
+
+    /// The kernel reads the runtime's checked copy, never guest memory: a
+    /// writer that changes the guest's control data, and its msghdr's
+    /// `msg_control`, after the check (another process writing shared memory,
+    /// an I/O completion) changes nothing that is sent.
+    #[test]
+    fn the_kernel_reads_the_checked_copy_not_guest_memory() {
+        in_child_with_soft_nofile(2048, || {
+            let counter = runtime_counter();
+            let file = pipe_file();
+            let pair = unix_pair();
+            let mut byte = *b"c";
+            let mut iov = libc::iovec {
+                iov_base: byte.as_mut_ptr().cast(),
+                iov_len: 1,
+            };
+            let (mut control, length) = rights(&[file]);
+            let (mut other, _) = rights(&[counter]);
+            let mut message = msghdr_with(&mut iov, &mut control, length);
+            let args = [pair[0] as u64, (&raw const message) as u64, 0, 0, 0, 0];
+            let control_at = control.as_mut_ptr();
+            let other_at = other.as_mut_ptr();
+            let message_at = &raw mut message;
+            let result = guest_send(libc::SYS_sendmsg, args, || unsafe {
+                // The guest's control data now names the runtime's counter,
+                // and its msghdr points at other data naming it too.
+                control_at.add(2).cast::<libc::c_int>().write(counter);
+                (*message_at).msg_control = other_at.cast();
+            });
+            let delivered = receive_all(pair[1]);
+            assert_eq!(delivered.len(), 1, "{delivered:?}");
+            assert_eq!(delivered[0].1.len(), 1, "{delivered:?}");
+            assert_ne!(
+                inode(delivered[0].1[0]),
+                inode(counter),
+                "the kernel read guest memory after the check: the runtime's descriptor was sent"
+            );
+            assert_eq!(inode(delivered[0].1[0]), inode(file));
+            assert_eq!(result, 1);
+        });
+    }
+
+    /// A guest sendmmsg whose second message names a runtime descriptor sends
+    /// the first and returns 1, Linux's answer for a closed number in message
+    /// 1 (net/socket.c `__sys_sendmmsg`) and the count one call carries. The
+    /// peer receives exactly message 0, with no runtime descriptor, and
+    /// message 0's `msg_len` is stored into the guest's vector. The guest's
+    /// retry of the remainder, message 1 alone, fails with EBADF and sends
+    /// nothing, as Linux fails a message naming a closed number.
+    #[test]
+    fn sendmmsg_sends_only_the_messages_before_a_reserved_descriptor() {
+        in_child_with_soft_nofile(2048, || {
+            let counter = runtime_counter();
+            let file = pipe_file();
+            let pair = unix_pair();
+            let mut first = *b"0";
+            let mut second = *b"1";
+            let mut iov0 = libc::iovec {
+                iov_base: first.as_mut_ptr().cast(),
+                iov_len: 1,
+            };
+            let mut iov1 = libc::iovec {
+                iov_base: second.as_mut_ptr().cast(),
+                iov_len: 1,
+            };
+            let (mut clean, clean_length) = rights(&[file]);
+            let (mut reserved, reserved_length) = rights(&[counter]);
+            let mut vector: [libc::mmsghdr; 2] = unsafe { core::mem::zeroed() };
+            vector[0].msg_hdr = msghdr_with(&mut iov0, &mut clean, clean_length);
+            vector[1].msg_hdr = msghdr_with(&mut iov1, &mut reserved, reserved_length);
+            let args = [pair[0] as u64, vector.as_mut_ptr() as u64, 2, 0, 0, 0];
+            let result = guest_send(libc::SYS_sendmmsg, args, || {});
+            let delivered = receive_all(pair[1]);
+            assert_eq!(
+                result, 1,
+                "sendmmsg sent {result} messages; Linux stops at the reserved descriptor: {delivered:?}"
+            );
+            assert_eq!(delivered.len(), 1, "{delivered:?}");
+            assert_eq!(delivered[0].0, b'0');
+            assert_eq!(delivered[0].1.len(), 1);
+            assert_eq!(inode(delivered[0].1[0]), inode(file));
+            assert_eq!(vector[0].msg_len, 1);
+            assert_eq!(vector[1].msg_len, 0);
+            assert_eq!(
+                vector[0].msg_hdr.msg_control,
+                clean.as_mut_ptr().cast::<libc::c_void>()
+            );
+            let rest = [pair[0] as u64, vector[1..].as_mut_ptr() as u64, 1, 0, 0, 0];
+            assert_eq!(
+                guest_send(libc::SYS_sendmmsg, rest, || {}),
+                -i64::from(libc::EBADF)
+            );
+            let delivered = receive_all(pair[1]);
+            assert!(
+                delivered.is_empty(),
+                "a runtime descriptor was sent: {delivered:?}"
+            );
+            assert_eq!(vector[1].msg_len, 0);
+        });
+    }
+
+    /// Sends `control` from `place`, a page the test has prepared, naming the
+    /// runtime's counter, and returns the result and what was delivered.
+    fn send_control_at(
+        pair: [libc::c_int; 2],
+        place: *mut u8,
+        control: &[u64],
+        length: usize,
+    ) -> (i64, Vec<(u8, Vec<libc::c_int>)>) {
+        unsafe { core::ptr::copy_nonoverlapping(control.as_ptr().cast::<u8>(), place, length) };
+        let mut byte = *b"p";
+        let mut iov = libc::iovec {
+            iov_base: byte.as_mut_ptr().cast(),
+            iov_len: 1,
+        };
+        let mut message: libc::msghdr = unsafe { core::mem::zeroed() };
+        message.msg_iov = &raw mut iov;
+        message.msg_iovlen = 1;
+        message.msg_control = place.cast();
+        message.msg_controllen = length as _;
+        let args = [pair[0] as u64, (&raw const message) as u64, 0, 0, 0, 0];
+        let result = guest_send(libc::SYS_sendmsg, args, || {});
+        (result, receive_all(pair[1]))
+    }
+
+    /// Control data on a write-only page, which Linux reads (an x86-64 page
+    /// cannot be writable but unreadable) and process_vm_readv refuses (it
+    /// requires VM_READ), is copied and checked as Linux reads it. So is a
+    /// msghdr on a write-only page, and a sendmmsg vector on one: its first
+    /// message, naming a pipe the guest owns, is sent and its `msg_len`
+    /// stored into the write-only page, and the retry of its second, naming
+    /// the runtime's counter, fails with EBADF and sends nothing.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn write_only_control_data_is_checked_as_linux_reads_it() {
+        in_child_with_soft_nofile(2048, || {
+            let counter = runtime_counter();
+            let pair = unix_pair();
+            let page = unsafe {
+                libc::mmap(
+                    core::ptr::null_mut(),
+                    4096,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            assert_ne!(page, libc::MAP_FAILED);
+            let (control, length) = rights(&[counter]);
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    control.as_ptr().cast::<u8>(),
+                    page.cast::<u8>(),
+                    length,
+                )
+            };
+            assert_eq!(unsafe { libc::mprotect(page, 4096, libc::PROT_WRITE) }, 0);
+            let mut byte = *b"w";
+            let mut iov = libc::iovec {
+                iov_base: byte.as_mut_ptr().cast(),
+                iov_len: 1,
+            };
+            let mut message: libc::msghdr = unsafe { core::mem::zeroed() };
+            message.msg_iov = &raw mut iov;
+            message.msg_iovlen = 1;
+            message.msg_control = page;
+            message.msg_controllen = length as _;
+            let args = [pair[0] as u64, (&raw const message) as u64, 0, 0, 0, 0];
+            let result = guest_send(libc::SYS_sendmsg, args, || {});
+            let delivered = receive_all(pair[1]);
+            assert!(
+                delivered.is_empty(),
+                "write-only control data let a runtime descriptor through: {delivered:?}"
+            );
+            assert_eq!(result, -i64::from(libc::EBADF));
+
+            let fresh_page = || {
+                let page = unsafe {
+                    libc::mmap(
+                        core::ptr::null_mut(),
+                        4096,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                        -1,
+                        0,
+                    )
+                };
+                assert_ne!(page, libc::MAP_FAILED);
+                page
+            };
+            // The msghdr on a write-only page; its control data, naming the
+            // runtime's counter, in ordinary memory.
+            let (mut named, named_length) = rights(&[counter]);
+            let header_page = fresh_page();
+            let header = header_page.cast::<libc::msghdr>();
+            unsafe { header.write(msghdr_with(&mut iov, &mut named, named_length)) };
+            assert_eq!(
+                unsafe { libc::mprotect(header_page, 4096, libc::PROT_WRITE) },
+                0
+            );
+            let args = [pair[0] as u64, header as u64, 0, 0, 0, 0];
+            assert_eq!(
+                guest_send(libc::SYS_sendmsg, args, || {}),
+                -i64::from(libc::EBADF)
+            );
+            assert!(receive_all(pair[1]).is_empty());
+
+            // A sendmmsg vector on a write-only page.
+            let file = pipe_file();
+            let (mut clean, clean_length) = rights(&[file]);
+            let vector_page = fresh_page();
+            let vector = vector_page.cast::<libc::mmsghdr>();
+            unsafe {
+                vector.write(core::mem::zeroed());
+                (*vector).msg_hdr = msghdr_with(&mut iov, &mut clean, clean_length);
+                vector.add(1).write(core::mem::zeroed());
+                (*vector.add(1)).msg_hdr = msghdr_with(&mut iov, &mut named, named_length);
+            }
+            assert_eq!(
+                unsafe { libc::mprotect(vector_page, 4096, libc::PROT_WRITE) },
+                0
+            );
+            let args = [pair[0] as u64, vector as u64, 2, 0, 0, 0];
+            assert_eq!(guest_send(libc::SYS_sendmmsg, args, || {}), 1);
+            let delivered = receive_all(pair[1]);
+            assert_eq!(delivered.len(), 1, "{delivered:?}");
+            assert_eq!(delivered[0].1.len(), 1, "{delivered:?}");
+            assert_eq!(inode(delivered[0].1[0]), inode(file));
+            let rest = [pair[0] as u64, unsafe { vector.add(1) } as u64, 1, 0, 0, 0];
+            assert_eq!(
+                guest_send(libc::SYS_sendmmsg, rest, || {}),
+                -i64::from(libc::EBADF)
+            );
+            assert!(receive_all(pair[1]).is_empty());
+            let readable = libc::PROT_READ | libc::PROT_WRITE;
+            assert_eq!(unsafe { libc::mprotect(vector_page, 4096, readable) }, 0);
+            assert_eq!(unsafe { (*vector).msg_len }, 1);
+            assert_eq!(unsafe { (*vector.add(1)).msg_len }, 0);
+        });
+    }
+
+    /// Control data in a perf ring buffer's page, a VM_PFNMAP mapping which
+    /// Linux reads and process_vm_readv refuses (mm/gup.c `check_vma_flags`),
+    /// is copied and checked as Linux reads it. The guest's own disabled
+    /// software event's user page is mapped writable; the data sits in its
+    /// reserved second half, which the kernel does not write.
+    #[test]
+    fn perf_buffer_control_data_is_checked_as_linux_reads_it() {
+        in_child_with_soft_nofile(2048, || {
+            let counter = runtime_counter();
+            let pair = unix_pair();
+            let mut attr = [0_u64; 8];
+            attr[0] = 1 | (64 << 32); // PERF_TYPE_SOFTWARE; size PERF_ATTR_SIZE_VER0
+            attr[1] = 9; // PERF_COUNT_SW_DUMMY
+            attr[5] = 0x61; // disabled, exclude_kernel, exclude_hv
+            let no_cpu = u64::from(u32::MAX);
+            let perf = unsafe {
+                raw_syscall6(
+                    libc::SYS_perf_event_open,
+                    [attr.as_ptr() as u64, 0, no_cpu, u64::MAX, 8, 0],
+                )
+            };
+            assert!(
+                perf >= 0,
+                "a software perf event is needed here (perf_event_paranoid <= 2): {perf}"
+            );
+            let page = unsafe {
+                libc::mmap(
+                    core::ptr::null_mut(),
+                    4096,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    perf as libc::c_int,
+                    0,
+                )
+            };
+            assert_ne!(page, libc::MAP_FAILED, "{}", io::Error::last_os_error());
+            let (control, length) = rights(&[counter]);
+            let place = unsafe { page.cast::<u8>().add(2048) };
+            let (result, delivered) = send_control_at(pair, place, &control, length);
+            assert!(
+                delivered.is_empty(),
+                "control data in a perf buffer page let a runtime descriptor through: {delivered:?}"
+            );
+            assert_eq!(result, -i64::from(libc::EBADF));
+        });
+    }
+
+    /// A copy that a guest seccomp filter fakes, answering process_vm_writev
+    /// with 0 as if nothing were copied, never lets the call run, and neither
+    /// does a copy it denies with EPERM. The call fails with EFAULT or with
+    /// the filter's errno, for a sendmsg and for a sendmmsg, and nothing is
+    /// sent. A filter cannot be removed, so each runs in a child of its own.
+    #[test]
+    fn a_faked_copy_never_sends_a_reserved_descriptor() {
+        for (data, expected) in [
+            (0_u32, -i64::from(libc::EFAULT)),
+            (libc::EPERM as u32, -i64::from(libc::EPERM)),
+        ] {
+            in_child_with_soft_nofile(2048, move || {
+                let counter = runtime_counter();
+                let pair = unix_pair();
+                // Load the syscall number; process_vm_writev returns -data
+                // (SECCOMP_RET_ERRNO); everything else is allowed.
+                let filter = [
+                    libc::sock_filter {
+                        code: 0x20, // BPF_LD | BPF_W | BPF_ABS
+                        jt: 0,
+                        jf: 0,
+                        k: 0,
+                    },
+                    libc::sock_filter {
+                        code: 0x15, // BPF_JMP | BPF_JEQ | BPF_K
+                        jt: 0,
+                        jf: 1,
+                        k: libc::SYS_process_vm_writev as u32,
+                    },
+                    libc::sock_filter {
+                        code: 0x06, // BPF_RET | BPF_K
+                        jt: 0,
+                        jf: 0,
+                        k: 0x0005_0000 | data, // SECCOMP_RET_ERRNO | data
+                    },
+                    libc::sock_filter {
+                        code: 0x06,
+                        jt: 0,
+                        jf: 0,
+                        k: 0x7fff_0000, // SECCOMP_RET_ALLOW
+                    },
+                ];
+                let program = libc::sock_fprog {
+                    len: filter.len() as u16,
+                    filter: filter.as_ptr().cast_mut(),
+                };
+                let no_new_privs = [libc::PR_SET_NO_NEW_PRIVS as u64, 1, 0, 0, 0, 0];
+                assert_eq!(unsafe { raw_syscall6(libc::SYS_prctl, no_new_privs) }, 0);
+                // seccomp(SECCOMP_SET_MODE_FILTER, 0, &program).
+                let install = [1, 0, (&raw const program) as u64, 0, 0, 0];
+                assert_eq!(unsafe { raw_syscall6(libc::SYS_seccomp, install) }, 0);
+                let (mut control, length) = rights(&[counter]);
+                let mut byte = *b"f";
+                let mut iov = libc::iovec {
+                    iov_base: byte.as_mut_ptr().cast(),
+                    iov_len: 1,
+                };
+                let message = msghdr_with(&mut iov, &mut control, length);
+                let args = [pair[0] as u64, (&raw const message) as u64, 0, 0, 0, 0];
+                let result = guest_send(libc::SYS_sendmsg, args, || {});
+                let delivered = receive_all(pair[1]);
+                assert!(
+                    delivered.is_empty(),
+                    "a faked copy let a runtime descriptor through: {delivered:?}"
+                );
+                assert_eq!(result, expected);
+
+                let mut vector: [libc::mmsghdr; 1] = unsafe { core::mem::zeroed() };
+                vector[0].msg_hdr = msghdr_with(&mut iov, &mut control, length);
+                let args = [pair[0] as u64, vector.as_mut_ptr() as u64, 1, 0, 0, 0];
+                assert_eq!(guest_send(libc::SYS_sendmmsg, args, || {}), expected);
+                assert!(receive_all(pair[1]).is_empty());
+                assert_eq!(vector[0].msg_len, 0);
+            });
+        }
+    }
+
+    /// The call never runs after a failed copy: a msghdr or control data the
+    /// copy cannot read ends it with the copy's error, EFAULT here, which is
+    /// also Linux's answer for memory nobody can read. For a sendmmsg whose
+    /// second header cannot be read, the first message is sent and the call
+    /// returns 1, as Linux returns, and the guest's retry of the remainder,
+    /// which starts at that header, fails with EFAULT. (This replaces r2's
+    /// unreadable_guest_memory_is_left_to_linux, which let the call run.)
+    #[test]
+    fn unreadable_guest_memory_is_refused() {
+        in_child_with_soft_nofile(2048, || {
+            let counter = runtime_counter();
+            let file = pipe_file();
+            let pair = unix_pair();
+            let pages = unsafe {
+                libc::mmap(
+                    core::ptr::null_mut(),
+                    8192,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            assert_ne!(pages, libc::MAP_FAILED);
+            let unreadable = unsafe { pages.cast::<u8>().add(4096) };
+            assert_eq!(
+                unsafe { libc::mprotect(unreadable.cast(), 4096, libc::PROT_NONE) },
+                0
+            );
+            let mut byte = *b"u";
+            let mut iov = libc::iovec {
+                iov_base: byte.as_mut_ptr().cast(),
+                iov_len: 1,
+            };
+            // Unreadable control data.
+            let (_, length) = rights(&[counter]);
+            let mut message: libc::msghdr = unsafe { core::mem::zeroed() };
+            message.msg_iov = &raw mut iov;
+            message.msg_iovlen = 1;
+            message.msg_control = unreadable.cast();
+            message.msg_controllen = length as _;
+            let args = [pair[0] as u64, (&raw const message) as u64, 0, 0, 0, 0];
+            assert_eq!(
+                guest_send(libc::SYS_sendmsg, args, || {}),
+                -i64::from(libc::EFAULT)
+            );
+            // An unreadable msghdr.
+            let args = [pair[0] as u64, unreadable as u64, 0, 0, 0, 0];
+            assert_eq!(
+                guest_send(libc::SYS_sendmsg, args, || {}),
+                -i64::from(libc::EFAULT)
+            );
+            assert!(receive_all(pair[1]).is_empty());
+            // A sendmmsg whose second header is on the unreadable page.
+            let (mut clean, clean_length) = rights(&[file]);
+            let entry = unsafe { unreadable.sub(64) }.cast::<libc::mmsghdr>();
+            unsafe {
+                entry.write(core::mem::zeroed());
+                (*entry).msg_hdr = msghdr_with(&mut iov, &mut clean, clean_length);
+            }
+            let args = [pair[0] as u64, entry as u64, 2, 0, 0, 0];
+            assert_eq!(guest_send(libc::SYS_sendmmsg, args, || {}), 1);
+            let delivered = receive_all(pair[1]);
+            assert_eq!(delivered.len(), 1, "{delivered:?}");
+            assert_eq!(inode(delivered[0].1[0]), inode(file));
+            let rest = [pair[0] as u64, unreadable as u64, 1, 0, 0, 0];
+            assert_eq!(
+                guest_send(libc::SYS_sendmmsg, rest, || {}),
+                -i64::from(libc::EFAULT)
+            );
+            assert!(receive_all(pair[1]).is_empty());
+        });
+    }
+
+    /// A message naming a runtime descriptor gets exactly the answer Linux
+    /// gives the same message naming a number nobody has open, each computed
+    /// here, in every order of checks: an invalid SCM_CREDENTIALS first, an
+    /// unknown SOL_SOCKET type first, a malformed header first, and a clean
+    /// SCM_RIGHTS message first. On the AF_UNIX socket each one fails and
+    /// nothing is sent. A UDP socket ignores SCM_CREDENTIALS and SCM_RIGHTS
+    /// records (net/core/sock.c `__sock_cmsg_send`), so there Linux sends the
+    /// credentials-first and clean-rights-first messages: the results are
+    /// compared with Linux's, and the bound receiver is not read. Control data
+    /// over the copy's bound fails with ENOBUFS, Linux's answer over its own
+    /// limit, and is not sent.
+    #[test]
+    fn a_runtime_descriptor_gets_linux_s_answer_for_a_closed_number() {
+        in_child_with_soft_nofile(2048, || {
+            let counter = runtime_counter();
+            let file = pipe_file();
+            let pair = unix_pair();
+            let closed = 1000;
+            assert_eq!(unsafe { libc::fcntl(closed, libc::F_GETFD) }, -1);
+            let me = unsafe { [1, libc::getuid() as i32, libc::getgid() as i32] };
+            type Layout = fn(i32, i32, [i32; 3]) -> (Vec<u64>, usize);
+            let layouts: [(&str, Layout); 4] = [
+                ("credentials first", |fd, _, creds| {
+                    cmsgs(&[
+                        (libc::SOL_SOCKET, libc::SCM_CREDENTIALS, &creds),
+                        (libc::SOL_SOCKET, libc::SCM_RIGHTS, &[fd]),
+                    ])
+                }),
+                ("unknown type first", |fd, _, _| {
+                    cmsgs(&[
+                        (libc::SOL_SOCKET, 99, &[0]),
+                        (libc::SOL_SOCKET, libc::SCM_RIGHTS, &[fd]),
+                    ])
+                }),
+                ("clean rights first", |fd, file, _| {
+                    cmsgs(&[
+                        (libc::SOL_SOCKET, libc::SCM_RIGHTS, &[file]),
+                        (libc::SOL_SOCKET, libc::SCM_RIGHTS, &[fd]),
+                    ])
+                }),
+                ("malformed header first", |fd, _, _| {
+                    let (mut words, length) = cmsgs(&[
+                        (libc::SOL_SOCKET, libc::SCM_RIGHTS, &[0]),
+                        (libc::SOL_SOCKET, libc::SCM_RIGHTS, &[fd]),
+                    ]);
+                    words[0] = 8; // cmsg_len below a header: CMSG_OK fails
+                    (words, length)
+                }),
+            ];
+            let mut byte = *b"l";
+            let mut iov = libc::iovec {
+                iov_base: byte.as_mut_ptr().cast(),
+                iov_len: 1,
+            };
+            // A bound receiver, so that no ICMP port-unreachable makes a later
+            // send on the connected socket fail with ECONNREFUSED.
+            let receiver =
+                unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+            assert!(receiver >= 0);
+            let mut address: libc::sockaddr_in = unsafe { core::mem::zeroed() };
+            address.sin_family = libc::AF_INET as libc::sa_family_t;
+            address.sin_addr.s_addr = u32::from_be_bytes([127, 0, 0, 1]).to_be();
+            let mut size = core::mem::size_of_val(&address) as libc::socklen_t;
+            assert_eq!(
+                unsafe { libc::bind(receiver, (&raw const address).cast(), size) },
+                0
+            );
+            assert_eq!(
+                unsafe { libc::getsockname(receiver, (&raw mut address).cast(), &mut size) },
+                0
+            );
+            let udp =
+                unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+            assert!(udp >= 0);
+            assert_eq!(
+                unsafe { libc::connect(udp, (&raw const address).cast(), size) },
+                0
+            );
+            for socket in [pair[0], udp] {
+                for (name, layout) in layouts {
+                    let (mut named, length) = layout(counter, file, me);
+                    let message = msghdr_with(&mut iov, &mut named, length);
+                    let args = [socket as u64, (&raw const message) as u64, 0, 0, 0, 0];
+                    let result = guest_send(libc::SYS_sendmsg, args, || {});
+                    let (mut closed_data, length) = layout(closed, file, me);
+                    let message = msghdr_with(&mut iov, &mut closed_data, length);
+                    let args = [socket as u64, (&raw const message) as u64, 0, 0, 0, 0];
+                    let linux = unsafe { raw_syscall6(libc::SYS_sendmsg, args) };
+                    assert_eq!(result, linux, "{name} on socket {socket}");
+                    if socket == pair[0] {
+                        assert!(linux < 0, "{name} on the AF_UNIX socket: {linux}");
+                    }
+                }
+            }
+            assert!(receive_all(pair[1]).is_empty());
+
+            let (mut words, _) = rights(&[counter]);
+            words.resize(SCM_COPY_CONTROL_BYTES / 8 + 2, 0);
+            let length = SCM_COPY_CONTROL_BYTES + 16;
+            let message = msghdr_with(&mut iov, &mut words, length);
+            let args = [pair[0] as u64, (&raw const message) as u64, 0, 0, 0, 0];
+            assert_eq!(
+                guest_send(libc::SYS_sendmsg, args, || {}),
+                -i64::from(libc::ENOBUFS)
+            );
+            assert!(receive_all(pair[1]).is_empty());
+        });
+    }
+
+    /// A two-message sendmmsg whose vector the guest cannot write: Linux sends
+    /// message 0, cannot write its msg_len and stops before message 1,
+    /// answering EFAULT (net/socket.c `__sys_sendmmsg`). The wrapper gives the
+    /// same result, and its peer receives the same messages, as Linux gives
+    /// and delivers for the same vector on a second socket pair.
+    #[test]
+    fn sendmmsg_stops_where_linux_cannot_write_msg_len() {
+        in_child_with_soft_nofile(2048, || {
+            let _counter = runtime_counter();
+            let mut first = *b"a";
+            let mut second = *b"b";
+            let mut iov0 = libc::iovec {
+                iov_base: first.as_mut_ptr().cast(),
+                iov_len: 1,
+            };
+            let mut iov1 = libc::iovec {
+                iov_base: second.as_mut_ptr().cast(),
+                iov_len: 1,
+            };
+            let page = unsafe {
+                libc::mmap(
+                    core::ptr::null_mut(),
+                    4096,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            assert_ne!(page, libc::MAP_FAILED);
+            let vector = page.cast::<libc::mmsghdr>();
+            unsafe {
+                vector.write(core::mem::zeroed());
+                (*vector).msg_hdr = msghdr_with(&mut iov0, &mut [], 0);
+                vector.add(1).write(core::mem::zeroed());
+                (*vector.add(1)).msg_hdr = msghdr_with(&mut iov1, &mut [], 0);
+            }
+            assert_eq!(unsafe { libc::mprotect(page, 4096, libc::PROT_READ) }, 0);
+            let ours = unix_pair();
+            let args = [ours[0] as u64, vector as u64, 2, 0, 0, 0];
+            let result = guest_send(libc::SYS_sendmmsg, args, || {});
+            let delivered = receive_all(ours[1]);
+            let native = unix_pair();
+            let linux = unsafe {
+                raw_syscall6(
+                    libc::SYS_sendmmsg,
+                    [native[0] as u64, vector as u64, 2, 0, 0, 0],
+                )
+            };
+            let expected = receive_all(native[1]);
+            let bytes = |messages: &[(u8, Vec<libc::c_int>)]| -> Vec<u8> {
+                messages.iter().map(|message| message.0).collect()
+            };
+            assert_eq!(
+                (result, bytes(&delivered)),
+                (linux, bytes(&expected)),
+                "sendmmsg went past a msg_len Linux cannot write"
+            );
+            assert_eq!(linux, -i64::from(libc::EFAULT));
+            assert_eq!(bytes(&expected), [b'a']);
+        });
+    }
+
+    /// A two-message vector on a fresh page, sending `iov0`'s and `iov1`'s
+    /// bytes with no control data.
+    fn two_message_vector(iov0: &mut libc::iovec, iov1: &mut libc::iovec) -> *mut libc::mmsghdr {
+        let page = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                4096,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(page, libc::MAP_FAILED);
+        let vector = page.cast::<libc::mmsghdr>();
+        unsafe {
+            vector.write(core::mem::zeroed());
+            (*vector).msg_hdr = msghdr_with(iov0, &mut [], 0);
+            vector.add(1).write(core::mem::zeroed());
+            (*vector.add(1)).msg_hdr = msghdr_with(iov1, &mut [], 0);
+        }
+        vector
+    }
+
+    /// A msg_len that becomes unwritable after the check: a writer that makes
+    /// a two-message vector read-only once the copy is made (another guest
+    /// thread's mprotect) leaves the call where Linux leaves it. Linux sends
+    /// message 0, cannot store its msg_len and answers EFAULT, never sending
+    /// message 1 (net/socket.c `__sys_sendmmsg`). The wrapper gives the same
+    /// result, and its peer receives the same messages, as Linux gives and
+    /// delivers for the same vector, made read-only before the call, on a
+    /// second socket pair.
+    #[test]
+    fn sendmmsg_stops_where_a_msg_len_becomes_unwritable_after_the_check() {
+        in_child_with_soft_nofile(2048, || {
+            let _counter = runtime_counter();
+            let mut first = *b"a";
+            let mut second = *b"b";
+            let mut iov0 = libc::iovec {
+                iov_base: first.as_mut_ptr().cast(),
+                iov_len: 1,
+            };
+            let mut iov1 = libc::iovec {
+                iov_base: second.as_mut_ptr().cast(),
+                iov_len: 1,
+            };
+            let read_only = |vector: *mut libc::mmsghdr| {
+                assert_eq!(
+                    unsafe { libc::mprotect(vector.cast(), 4096, libc::PROT_READ) },
+                    0
+                );
+            };
+            let ours = unix_pair();
+            let vector = two_message_vector(&mut iov0, &mut iov1);
+            let args = [ours[0] as u64, vector as u64, 2, 0, 0, 0];
+            let result = guest_send(libc::SYS_sendmmsg, args, || read_only(vector));
+            let delivered = receive_all(ours[1]);
+            let native = unix_pair();
+            let native_vector = two_message_vector(&mut iov0, &mut iov1);
+            read_only(native_vector);
+            let linux = unsafe {
+                raw_syscall6(
+                    libc::SYS_sendmmsg,
+                    [native[0] as u64, native_vector as u64, 2, 0, 0, 0],
+                )
+            };
+            let expected = receive_all(native[1]);
+            let bytes = |messages: &[(u8, Vec<libc::c_int>)]| -> Vec<u8> {
+                messages.iter().map(|message| message.0).collect()
+            };
+            assert_eq!(
+                (result, bytes(&delivered)),
+                (linux, bytes(&expected)),
+                "sendmmsg went past a msg_len that became unwritable after the check"
+            );
+            assert_eq!(linux, -i64::from(libc::EFAULT));
+            assert_eq!(bytes(&expected), [b'a']);
+            assert_eq!(
+                unsafe { ((*vector).msg_len, (*vector.add(1)).msg_len) },
+                (0, 0)
+            );
+        });
+    }
+
+    /// Whether this host enables protection keys (CPUID.(EAX=7,ECX=0):ECX
+    /// bit 4, OSPKE), and if so a page under a fresh key that this test may
+    /// read and write.
+    #[cfg(target_arch = "x86_64")]
+    fn keyed_page() -> Option<(*mut u8, u32)> {
+        #[allow(unused_unsafe)]
+        let leaf = unsafe { core::arch::x86_64::__cpuid_count(7, 0) };
+        if leaf.ecx & (1 << 4) == 0 {
+            println!("SKIPPED: protection keys are not enabled on this host");
+            return None;
+        }
+        let key = unsafe { raw_syscall6(libc::SYS_pkey_alloc, [0; 6]) };
+        assert!(key > 0, "pkey_alloc: {key}");
+        let page = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                4096,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(page, libc::MAP_FAILED);
+        let rights = (libc::PROT_READ | libc::PROT_WRITE) as u64;
+        let protect = [page as u64, 4096, rights, key as u64, 0, 0];
+        assert_eq!(unsafe { raw_syscall6(libc::SYS_pkey_mprotect, protect) }, 0);
+        Some((page.cast(), key as u32))
+    }
+
+    /// This thread's PKRU.
+    #[cfg(target_arch = "x86_64")]
+    fn current_pkru() -> u32 {
+        let pkru: u32;
+        unsafe {
+            core::arch::asm!(
+                "rdpkru",
+                in("ecx") 0,
+                out("eax") pkru,
+                out("edx") _,
+                options(nomem, nostack, preserves_flags)
+            )
+        };
+        pkru
+    }
+
+    /// Sets this thread's PKRU. Not `nomem`: it changes which memory may be
+    /// accessed, so no access may move across it.
+    #[cfg(target_arch = "x86_64")]
+    fn set_pkru(value: u32) {
+        unsafe {
+            core::arch::asm!(
+                "wrpkru",
+                in("eax") value,
+                in("ecx") 0,
+                in("edx") 0,
+                options(nostack, preserves_flags)
+            )
+        };
+    }
+
+    /// Runs a guest call with the interrupted guest's PKRU `pkru`, as the
+    /// dispatcher does: the wrapper's copies and the forwarded call itself
+    /// both use it.
+    #[cfg(target_arch = "x86_64")]
+    fn keyed_send(number: i64, args: [u64; 6], pkru: u32) -> i64 {
+        let mut call = event(number, args);
+        call.guest_pkru = Some(pkru);
+        unsafe {
+            dispatch_with_scm_rights_copy(&mut call, |call| {
+                call.result =
+                    crate::trap::raw_syscall6_with_result(call.number, call.args, call.guest_pkru)
+                        .result;
+            })
+        };
+        assert_eq!(call.args, args, "the guest's own arguments are put back");
+        call.result
+    }
+
+    /// The copy has the interrupted guest's protection-key rights. Control
+    /// data, or a msghdr, on a page under a key the guest denies fails with
+    /// EFAULT and nothing is sent, as the guest's own call fails. With the key
+    /// allowed, the same message is sent. A sendmmsg vector under a key the
+    /// guest may read but not write sends message 0 and answers EFAULT, as
+    /// Linux does when it cannot write msg_len.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_copy_has_the_guest_s_protection_key_rights() {
+        in_child_with_soft_nofile(2048, || {
+            let Some((page, key)) = keyed_page() else {
+                return;
+            };
+            let _counter = runtime_counter();
+            let file = pipe_file();
+            let pair = unix_pair();
+            let allow = current_pkru() & !(3 << (2 * key));
+            let deny = allow | 1 << (2 * key);
+            let write_deny = allow | 2 << (2 * key);
+            let mut byte = *b"k";
+            let mut iov = libc::iovec {
+                iov_base: byte.as_mut_ptr().cast(),
+                iov_len: 1,
+            };
+            // Control data naming the guest's own pipe, at offset 512.
+            let (control, length) = rights(&[file]);
+            let keyed_control = unsafe { page.add(512) };
+            unsafe {
+                core::ptr::copy_nonoverlapping(control.as_ptr().cast::<u8>(), keyed_control, length)
+            };
+            let mut header: libc::msghdr = unsafe { core::mem::zeroed() };
+            header.msg_iov = &raw mut iov;
+            header.msg_iovlen = 1;
+            header.msg_control = keyed_control.cast();
+            header.msg_controllen = length as _;
+            let args = [pair[0] as u64, (&raw const header) as u64, 0, 0, 0, 0];
+            let result = keyed_send(libc::SYS_sendmsg, args, deny);
+            let delivered = receive_all(pair[1]);
+            assert!(
+                delivered.is_empty(),
+                "control data under a key the guest denies was sent: {delivered:?}"
+            );
+            assert_eq!(result, -i64::from(libc::EFAULT));
+            // The msghdr itself on the keyed page.
+            let keyed_header = page.cast::<libc::msghdr>();
+            unsafe { keyed_header.write(header) };
+            let args = [pair[0] as u64, keyed_header as u64, 0, 0, 0, 0];
+            assert_eq!(
+                keyed_send(libc::SYS_sendmsg, args, deny),
+                -i64::from(libc::EFAULT)
+            );
+            assert!(receive_all(pair[1]).is_empty());
+            // The key allowed: sent, with the guest's pipe.
+            assert_eq!(keyed_send(libc::SYS_sendmsg, args, allow), 1);
+            let delivered = receive_all(pair[1]);
+            assert_eq!(delivered.len(), 1, "{delivered:?}");
+            assert_eq!(inode(delivered[0].1[0]), inode(file));
+            // A two-message vector the guest may read but not write.
+            let vector = unsafe { page.add(1024) }.cast::<libc::mmsghdr>();
+            unsafe {
+                vector.write(core::mem::zeroed());
+                (*vector).msg_hdr = msghdr_with(&mut iov, &mut [], 0);
+                vector.add(1).write(core::mem::zeroed());
+                (*vector.add(1)).msg_hdr = msghdr_with(&mut iov, &mut [], 0);
+            }
+            let args = [pair[0] as u64, vector as u64, 2, 0, 0, 0];
+            assert_eq!(
+                keyed_send(libc::SYS_sendmmsg, args, write_deny),
+                -i64::from(libc::EFAULT),
+                "a sendmmsg went past a msg_len the guest's key cannot write"
+            );
+            assert_eq!(receive_all(pair[1]).len(), 1);
+            assert_eq!(unsafe { (*vector).msg_len }, 0);
+        });
+    }
+
+    /// The guest's key rights apply where the runtime's deny the key. Linux
+    /// starts a signal handler with init_pkru, which denies keys 1 to 15
+    /// (arch/x86/kernel/signal.c `handle_signal`, arch/x86/mm/pkeys.c), and
+    /// the in-guest SIGSYS handler keeps it, while the guest may allow a key
+    /// it uses. Here this thread denies the key, as that handler does, and
+    /// the guest allows it. A two-message sendmmsg vector on the keyed page,
+    /// whose message 0 names the guest's pipe in control data on that page,
+    /// is sent as a program that honours a short count sends it: the
+    /// remainder again until both messages are counted. The headers and
+    /// control data are copied, and each sent message's msg_len stored, with
+    /// the guest's rights. The peer then holds both messages, the first with
+    /// the pipe, and both msg_len words are 1, as after Linux's one call that
+    /// sends both.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_guest_s_key_rights_apply_where_the_runtime_s_deny_the_key() {
+        in_child_with_soft_nofile(2048, || {
+            let Some((page, key)) = keyed_page() else {
+                return;
+            };
+            let _counter = runtime_counter();
+            let file = pipe_file();
+            let pair = unix_pair();
+            let own = current_pkru();
+            let allow = own & !(3 << (2 * key));
+            let deny = allow | 1 << (2 * key);
+            let mut bytes = *b"01";
+            let (zero, one) = bytes.split_at_mut(1);
+            let mut iov0 = libc::iovec {
+                iov_base: zero.as_mut_ptr().cast(),
+                iov_len: 1,
+            };
+            let mut iov1 = libc::iovec {
+                iov_base: one.as_mut_ptr().cast(),
+                iov_len: 1,
+            };
+            let (control, length) = rights(&[file]);
+            let keyed_control = unsafe { page.add(2048) };
+            unsafe {
+                core::ptr::copy_nonoverlapping(control.as_ptr().cast::<u8>(), keyed_control, length)
+            };
+            let vector = page.cast::<libc::mmsghdr>();
+            unsafe {
+                vector.write(core::mem::zeroed());
+                (*vector).msg_hdr = msghdr_with(&mut iov0, &mut [], 0);
+                (*vector).msg_hdr.msg_control = keyed_control.cast();
+                (*vector).msg_hdr.msg_controllen = length as _;
+                vector.add(1).write(core::mem::zeroed());
+                (*vector.add(1)).msg_hdr = msghdr_with(&mut iov1, &mut [], 0);
+            }
+            let mut results = Vec::new();
+            let mut sent = 0;
+            // This thread now has the handler's rights for the key: none.
+            set_pkru(deny);
+            while sent < 2 {
+                let rest = unsafe { vector.add(sent) } as u64;
+                let args = [pair[0] as u64, rest, (2 - sent) as u64, 0, 0, 0];
+                let result = keyed_send(libc::SYS_sendmmsg, args, allow);
+                results.push(result);
+                if result <= 0 {
+                    break;
+                }
+                sent += result as usize;
+            }
+            set_pkru(own);
+            let delivered = receive_all(pair[1]);
+            let efault = -i64::from(libc::EFAULT);
+            assert!(
+                !(results[0] == efault && delivered.is_empty()),
+                "the copy had the runtime's rights, which deny the key: nothing was sent"
+            );
+            assert!(
+                !results.contains(&efault),
+                "the msg_len store had the runtime's rights, which deny the key: {results:?} {delivered:?}"
+            );
+            assert_eq!(sent, 2, "{results:?}");
+            assert_eq!(delivered.len(), 2, "{delivered:?}");
+            assert_eq!((delivered[0].0, delivered[1].0), (b'0', b'1'));
+            assert_eq!(delivered[0].1.len(), 1, "{delivered:?}");
+            assert_eq!(inode(delivered[0].1[0]), inode(file));
+            assert!(delivered[1].1.is_empty(), "{delivered:?}");
+            assert_eq!(
+                unsafe { ((*vector).msg_len, (*vector.add(1)).msg_len) },
+                (1, 1)
+            );
+        });
+    }
+
+    /// A sendmmsg carries one message per call, with control data or without
+    /// (a declared limit, which keeps Linux's order of sends and msg_len
+    /// stores): of three messages it sends the first and returns 1, a short
+    /// count, where Linux would send all three. Message 0's msg_len is
+    /// stored; the others are left as they were.
+    #[test]
+    fn a_sendmmsg_carries_one_message_per_call() {
+        in_child_with_soft_nofile(2048, || {
+            let _counter = runtime_counter();
+            let pair = unix_pair();
+            let mut byte = *b"s";
+            let mut iov = libc::iovec {
+                iov_base: byte.as_mut_ptr().cast(),
+                iov_len: 1,
+            };
+            let mut vector: Vec<libc::mmsghdr> = (0..3)
+                .map(|_| {
+                    let mut entry: libc::mmsghdr = unsafe { core::mem::zeroed() };
+                    entry.msg_hdr = msghdr_with(&mut iov, &mut [], 0);
+                    entry
+                })
+                .collect();
+            let args = [pair[0] as u64, vector.as_mut_ptr() as u64, 3, 0, 0, 0];
+            let result = guest_send(libc::SYS_sendmmsg, args, || {});
+            assert_eq!(
+                result, 1,
+                "a sendmmsg carried more than one message: {result}"
+            );
+            assert_eq!(receive_all(pair[1]).len(), 1);
+            let lengths: Vec<u32> = vector.iter().map(|entry| entry.msg_len).collect();
+            assert_eq!(lengths, [1_u32, 0, 0]);
+        });
+    }
+
+    /// A two-message sendmmsg returns 1, a short count, having sent message 0
+    /// and stored its msg_len; the guest's retry of the remainder sends
+    /// message 1 and stores its msg_len. The peer then holds what Linux's one
+    /// call sends for the same vector on a second socket pair, both messages
+    /// in order with message 0's descriptor, and both msg_len words equal
+    /// Linux's, 1 and 2.
+    #[test]
+    fn a_sendmmsg_retry_of_the_remainder_sends_what_linux_sends() {
+        in_child_with_soft_nofile(2048, || {
+            let _counter = runtime_counter();
+            let file = pipe_file();
+            let mut first = *b"a";
+            let mut second = *b"bc";
+            let mut iov0 = libc::iovec {
+                iov_base: first.as_mut_ptr().cast(),
+                iov_len: 1,
+            };
+            let mut iov1 = libc::iovec {
+                iov_base: second.as_mut_ptr().cast(),
+                iov_len: 2,
+            };
+            let (mut control, length) = rights(&[file]);
+            let mut vector: [libc::mmsghdr; 2] = unsafe { core::mem::zeroed() };
+            vector[0].msg_hdr = msghdr_with(&mut iov0, &mut control, length);
+            vector[1].msg_hdr = msghdr_with(&mut iov1, &mut [], 0);
+            let mut native_vector: [libc::mmsghdr; 2] = unsafe { core::mem::zeroed() };
+            native_vector[0].msg_hdr = msghdr_with(&mut iov0, &mut control, length);
+            native_vector[1].msg_hdr = msghdr_with(&mut iov1, &mut [], 0);
+            let ours = unix_pair();
+            let args = [ours[0] as u64, vector.as_mut_ptr() as u64, 2, 0, 0, 0];
+            let result = guest_send(libc::SYS_sendmmsg, args, || {});
+            assert_eq!(
+                result, 1,
+                "a two-message sendmmsg did not return the short count 1: {result}"
+            );
+            assert_eq!((vector[0].msg_len, vector[1].msg_len), (1, 0));
+            let rest = [ours[0] as u64, vector[1..].as_mut_ptr() as u64, 1, 0, 0, 0];
+            let retry = guest_send(libc::SYS_sendmmsg, rest, || {});
+            assert_eq!(
+                retry, 1,
+                "the retry of the remainder did not send message 1: {retry}"
+            );
+            let delivered = receive_all(ours[1]);
+            let native = unix_pair();
+            let linux = unsafe {
+                raw_syscall6(
+                    libc::SYS_sendmmsg,
+                    [
+                        native[0] as u64,
+                        native_vector.as_mut_ptr() as u64,
+                        2,
+                        0,
+                        0,
+                        0,
+                    ],
+                )
+            };
+            assert_eq!(linux, 2);
+            let expected = receive_all(native[1]);
+            let shape = |messages: &[(u8, Vec<libc::c_int>)]| -> Vec<(u8, Vec<u64>)> {
+                messages
+                    .iter()
+                    .map(|(byte, fds)| (*byte, fds.iter().map(|&fd| inode(fd)).collect()))
+                    .collect()
+            };
+            assert_eq!(shape(&delivered), shape(&expected));
+            assert_eq!(
+                shape(&delivered),
+                vec![(b'a', vec![inode(file)]), (b'b', vec![])]
+            );
+            assert_eq!(
+                (vector[0].msg_len, vector[1].msg_len),
+                (native_vector[0].msg_len, native_vector[1].msg_len)
+            );
+            assert_eq!((native_vector[0].msg_len, native_vector[1].msg_len), (1, 2));
+        });
     }
 
     /// A descriptor the runtime records sits at or above [`RUNTIME_FD_MIN`]

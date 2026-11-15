@@ -15,6 +15,8 @@ use reverie::syscalls::Sysno;
 
 static SITE: AtomicUsize = AtomicUsize::new(0);
 static EXPECTED_RSP: AtomicUsize = AtomicUsize::new(0);
+#[path = "syscall_fallback/scm_pkey.rs"]
+mod scm_pkey;
 #[path = "syscall_fallback/xstate.rs"]
 mod xstate;
 
@@ -280,6 +282,10 @@ pub(super) fn run_xstate(path: &Path) {
 
 pub(super) fn run_pkey(path: &Path) {
     xstate::run_pkey(path);
+}
+
+pub(super) fn run_scm_pkey(path: &Path) {
+    scm_pkey::run(path);
 }
 
 pub(super) fn run_fork(path: &Path, installed: bool) {

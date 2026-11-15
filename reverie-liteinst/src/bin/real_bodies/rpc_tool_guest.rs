@@ -3517,6 +3517,7 @@ pub fn main() {
         Some("syscall-fallback-fork") => syscall_fallback_guest::run_fork(Path::new(&path), false),
         Some("syscall-installed-fork") => syscall_fallback_guest::run_fork(Path::new(&path), true),
         Some("syscall-fallback-pkey") => syscall_fallback_guest::run_pkey(Path::new(&path)),
+        Some("syscall-fallback-scm-pkey") => syscall_fallback_guest::run_scm_pkey(Path::new(&path)),
         Some("memory-access") => memory_access_guest::run(Path::new(&path)),
         Some("owned-frame") => owned_frame_guest::run(Path::new(&path)),
         Some("preinstalled-handler") => preinstalled_handler_guest(Path::new(&path)),

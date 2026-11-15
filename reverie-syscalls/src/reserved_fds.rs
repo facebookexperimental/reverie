@@ -10,8 +10,10 @@
 //! every backend that runs inside the guest process (the in-guest runtime and
 //! LiteInst, SaBRe and e9patch's tool host): which syscalls name a descriptor,
 //! how the kernel reads a descriptor argument, what a guest `epoll_wait` on a
-//! descriptor it does not have returns, and how a guest `close_range` closes
-//! everything in its range except the reserved descriptors.
+//! descriptor it does not have returns, how a guest `close_range` closes
+//! everything in its range except the reserved descriptors, and how a private
+//! copy of a message's control data is kept from carrying a reserved
+//! descriptor in `SCM_RIGHTS` data ([`scm_rights_hide_reserved`]).
 //!
 //! To the guest a reserved descriptor is not open. Each backend decides which
 //! numbers it reserves and keeps its own registry of them; this module only
@@ -215,6 +217,60 @@ pub fn epoll_wait_result(number: i64, args: &[u64; 6], fd: u64) -> Option<i64> {
     }
 }
 
+/// The size of a `cmsghdr` on the 64-bit ABIs: `cmsg_len` (a `size_t`), then
+/// `cmsg_level` and `cmsg_type`.
+const CMSGHDR_SIZE: usize = 16;
+
+/// In `control`, a private copy of one message's control data that the kernel
+/// will read in place of the caller's, replaces with -1 every descriptor an
+/// `SCM_RIGHTS` message names that is in `reserved`, and returns how many it
+/// replaced. Linux then fails the whole call with EBADF when its walk reaches
+/// that descriptor, as for any number the caller does not have open
+/// (`scm_fp_copy`), after every check it makes first and before anything of
+/// the message is queued.
+///
+/// The walk is Linux's (`for_each_cmsghdr` and `CMSG_OK` in `__scm_send`): the
+/// first header when the data holds a whole one, then each next header
+/// `CMSG_ALIGN(cmsg_len)` further on while a whole header fits, stopping at a
+/// header that fails `CMSG_OK`, where Linux refuses the message with EINVAL
+/// before it reads any later descriptor. Headers of another level or type are
+/// left alone: Linux refuses an unknown `SOL_SOCKET` type itself, and other
+/// levels belong to the protocol. A negative number is left alone too; Linux
+/// answers it with EBADF. Allocates nothing.
+pub fn scm_rights_hide_reserved(control: &mut [u8], reserved: &[u64]) -> usize {
+    let length = control.len();
+    let mut offset = 0;
+    let mut hidden = 0;
+    while length - offset >= CMSGHDR_SIZE {
+        let header = &control[offset..offset + CMSGHDR_SIZE];
+        let cmsg_len = u64::from_ne_bytes(header[..8].try_into().unwrap());
+        let level = i32::from_ne_bytes(header[8..12].try_into().unwrap());
+        let kind = i32::from_ne_bytes(header[12..16].try_into().unwrap());
+        // CMSG_OK: at least a header, and no more than the data left.
+        if cmsg_len < CMSGHDR_SIZE as u64 || cmsg_len > (length - offset) as u64 {
+            break;
+        }
+        let cmsg_len = cmsg_len as usize;
+        if level == libc::SOL_SOCKET && kind == libc::SCM_RIGHTS {
+            for index in 0..(cmsg_len - CMSGHDR_SIZE) / 4 {
+                let at = offset + CMSGHDR_SIZE + 4 * index;
+                let fd = i32::from_ne_bytes(control[at..at + 4].try_into().unwrap());
+                if fd >= 0 && reserved.contains(&(fd as u64)) {
+                    control[at..at + 4].copy_from_slice(&(-1_i32).to_ne_bytes());
+                    hidden += 1;
+                }
+            }
+        }
+        // CMSG_ALIGN rounds to the size of a long. The next header must fit
+        // whole, which the loop condition checks once offset is in range.
+        offset += (cmsg_len + 7) & !7;
+        if offset > length {
+            break;
+        }
+    }
+    hidden
+}
+
 /// Whether a `close_range` with `args` covers one of `reserved`.
 pub fn close_range_covers(args: &[u64; 6], reserved: &[u64]) -> bool {
     let (first, last) = (descriptor_arg(args, 0), descriptor_arg(args, 1));
@@ -348,6 +404,102 @@ mod tests {
         assert_eq!(descriptor_arg(&args, 0), 1024);
         assert!(names_descriptor(libc::SYS_read, &args, 1024));
         assert!(socket_call_names_descriptor(libc::SYS_sendto, &args, 1024));
+    }
+
+    /// Control data built from (level, type, payload words) entries, each
+    /// header's `cmsg_len` covering its payload and each entry starting
+    /// `CMSG_ALIGN`ed, as a caller lays it out.
+    fn control_data(entries: &[(i32, i32, &[i32])]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for &(level, kind, words) in entries {
+            let start = bytes.len();
+            bytes.extend_from_slice(&((CMSGHDR_SIZE + 4 * words.len()) as u64).to_ne_bytes());
+            bytes.extend_from_slice(&level.to_ne_bytes());
+            bytes.extend_from_slice(&kind.to_ne_bytes());
+            for word in words {
+                bytes.extend_from_slice(&word.to_ne_bytes());
+            }
+            bytes.resize(start + ((bytes.len() - start + 7) & !7), 0);
+        }
+        bytes
+    }
+
+    fn words_at(control: &[u8], offset: usize, count: usize) -> Vec<i32> {
+        (0..count)
+            .map(|index| {
+                let at = offset + 4 * index;
+                i32::from_ne_bytes(control[at..at + 4].try_into().unwrap())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn scm_rights_hides_only_reserved_descriptors() {
+        let (sol, rights) = (libc::SOL_SOCKET, libc::SCM_RIGHTS);
+        let mut control = control_data(&[(sol, rights, &[3, 1025, 4, 1026])]);
+        assert_eq!(scm_rights_hide_reserved(&mut control, &[1025, 1026]), 2);
+        assert_eq!(words_at(&control, CMSGHDR_SIZE, 4), [3, -1, 4, -1]);
+        // Nothing reserved named: unchanged.
+        let mut clean = control_data(&[(sol, rights, &[3, 4])]);
+        let before = clean.clone();
+        assert_eq!(scm_rights_hide_reserved(&mut clean, &[1025]), 0);
+        assert_eq!(clean, before);
+        // A negative number is Linux's to refuse.
+        let mut negative = control_data(&[(sol, rights, &[-5])]);
+        assert_eq!(scm_rights_hide_reserved(&mut negative, &[u64::MAX]), 0);
+        assert_eq!(words_at(&negative, CMSGHDR_SIZE, 1), [-5]);
+    }
+
+    #[test]
+    fn other_levels_and_types_are_left_alone() {
+        // SCM_CREDENTIALS (2) whose words equal a reserved number, and a
+        // protocol level's option: neither is SCM_RIGHTS data.
+        let mut control = control_data(&[
+            (libc::SOL_SOCKET, libc::SCM_CREDENTIALS, &[1025, 1025, 1025]),
+            (libc::IPPROTO_IP, libc::SCM_RIGHTS, &[1025]),
+            (libc::SOL_SOCKET, libc::SCM_RIGHTS, &[1025]),
+        ]);
+        assert_eq!(scm_rights_hide_reserved(&mut control, &[1025]), 1);
+        assert_eq!(words_at(&control, CMSGHDR_SIZE, 3), [1025, 1025, 1025]);
+        assert_eq!(words_at(&control, 32 + CMSGHDR_SIZE, 1), [1025]);
+        assert_eq!(words_at(&control, 56 + CMSGHDR_SIZE, 1), [-1]);
+    }
+
+    #[test]
+    fn the_walk_steps_by_cmsg_align() {
+        // One descriptor makes cmsg_len 20; the next header starts at 24.
+        let mut control = control_data(&[
+            (libc::SOL_SOCKET, libc::SCM_RIGHTS, &[7]),
+            (libc::SOL_SOCKET, libc::SCM_RIGHTS, &[1025, 8]),
+        ]);
+        assert_eq!(control.len(), 24 + 24);
+        assert_eq!(scm_rights_hide_reserved(&mut control, &[1025]), 1);
+        assert_eq!(words_at(&control, 24 + CMSGHDR_SIZE, 2), [-1, 8]);
+    }
+
+    #[test]
+    fn the_walk_stops_where_linux_refuses_a_header() {
+        let mut control = control_data(&[
+            (libc::SOL_SOCKET, libc::SCM_RIGHTS, &[1025]),
+            (libc::SOL_SOCKET, libc::SCM_RIGHTS, &[1025]),
+        ]);
+        // The second header claims more than the data holds (CMSG_OK fails):
+        // Linux refuses there with EINVAL, so its descriptor is never read.
+        let second = 24;
+        control[second..second + 8].copy_from_slice(&64_u64.to_ne_bytes());
+        assert_eq!(scm_rights_hide_reserved(&mut control, &[1025]), 1);
+        assert_eq!(words_at(&control, second + CMSGHDR_SIZE, 1), [1025]);
+        // A cmsg_len shorter than a header fails CMSG_OK too.
+        let mut short = control_data(&[(libc::SOL_SOCKET, libc::SCM_RIGHTS, &[1025])]);
+        short[..8].copy_from_slice(&8_u64.to_ne_bytes());
+        assert_eq!(scm_rights_hide_reserved(&mut short, &[1025]), 0);
+        // Data shorter than one header holds no header.
+        let mut tiny = vec![0_u8; CMSGHDR_SIZE - 1];
+        assert_eq!(scm_rights_hide_reserved(&mut tiny, &[0]), 0);
+        // A huge cmsg_len never wraps the offset.
+        let mut huge = control_data(&[(libc::SOL_SOCKET, libc::SCM_RIGHTS, &[1025])]);
+        huge[..8].copy_from_slice(&u64::MAX.to_ne_bytes());
+        assert_eq!(scm_rights_hide_reserved(&mut huge, &[1025]), 0);
     }
 
     #[test]
