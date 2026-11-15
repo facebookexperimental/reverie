@@ -225,6 +225,91 @@ impl Drop for SignalInstallGuard {
     }
 }
 
+/// The birth-window block set: every signal except the unblockable
+/// pair, the runtime reserved set, and the synchronous fault set
+/// {SIGILL, SIGTRAP, SIGBUS, SIGFPE, SIGSEGV, SIGSYS}. The window is
+/// only the physical clone (block just before it, restore right after
+/// it and before any lock release): a wider window would let the
+/// creator's rt_sigprocmask states leak into the callback mask checks.
+#[allow(dead_code)] // first caller is the B3b claim; unit-tested in B3a
+pub(crate) fn birth_block_mask(reserved: u64) -> u64 {
+    const UNBLOCKABLE: u64 = (1 << (libc::SIGKILL - 1)) | (1 << (libc::SIGSTOP - 1));
+    const FAULTS: u64 = (1 << (libc::SIGILL - 1))
+        | (1 << (libc::SIGTRAP - 1))
+        | (1 << (libc::SIGBUS - 1))
+        | (1 << (libc::SIGFPE - 1))
+        | (1 << (libc::SIGSEGV - 1))
+        | (1 << (libc::SIGSYS - 1));
+    !(UNBLOCKABLE | reserved | FAULTS)
+}
+
+/// RAII birth signal window on the creator thread. Restores the exact
+/// saved mask on drop; `PrivateBirthGuard::resolve` takes it by value
+/// and drops it before either birth hook runs, so no hook or Tool libc
+/// call executes under the birth mask.
+#[allow(dead_code)] // first caller is the B3b claim; round-trip tested in B3a
+pub(crate) struct BirthSignalGuard {
+    saved: u64,
+    /// Dropping this on another thread would restore the mask there.
+    _not_send: PhantomData<*mut ()>,
+}
+
+#[allow(dead_code)]
+impl BirthSignalGuard {
+    pub(crate) fn arm(reserved: u64) -> std::io::Result<Self> {
+        let mask = birth_block_mask(reserved);
+        let mut saved = 0_u64;
+        // SAFETY: both mask words are owned locals of the exact 8-byte
+        // kernel sigset size; the fixed gate needs no FS switch here.
+        let result = unsafe {
+            raw_syscall6(
+                libc::SYS_rt_sigprocmask,
+                [
+                    libc::SIG_BLOCK as u64,
+                    (&raw const mask) as u64,
+                    (&raw mut saved) as u64,
+                    8,
+                    0,
+                    0,
+                ],
+            )
+        };
+        if result != 0 {
+            return Err(std::io::Error::from_raw_os_error(
+                i32::try_from(-result).unwrap_or(libc::EIO),
+            ));
+        }
+        Ok(Self {
+            saved,
+            _not_send: PhantomData,
+        })
+    }
+
+    pub(crate) fn saved_mask(&self) -> u64 {
+        self.saved
+    }
+}
+
+impl Drop for BirthSignalGuard {
+    fn drop(&mut self) {
+        // SAFETY: same owned mask word as arm(); restore is best-effort
+        // on unwind paths exactly as on the normal path.
+        unsafe {
+            raw_syscall6(
+                libc::SYS_rt_sigprocmask,
+                [
+                    libc::SIG_SETMASK as u64,
+                    (&raw const self.saved) as u64,
+                    0,
+                    8,
+                    0,
+                    0,
+                ],
+            );
+        }
+    }
+}
+
 // Reentry is a property of Tool execution, not of syscall-event storage:
 // instruction callbacks have no current SyscallEvent but must take the same
 // native/raw bypasses while holding Tool and thread-state locks.

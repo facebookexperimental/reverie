@@ -1739,3 +1739,178 @@ fn invalid_kernel_break_query_refuses_without_returning_an_errno_as_a_pointer() 
         },
     );
 }
+
+#[test]
+fn slot_blocks_lease_and_preclaimed_view_lifetimes() {
+    isolated("slot_blocks_lease_and_preclaimed_view_lifetimes", || {
+        let region = ToolRegion::reserve().unwrap();
+        let spans = region.free_spans().unwrap();
+        let (first, _) = spans
+            .iter()
+            .copied()
+            .find(|&(_, len)| len >= 128)
+            .expect("a span big enough for the test claims");
+        let slot_pages = 64usize;
+        let callback_pages = 10usize;
+        let slot_base = BASE + first * PAGE;
+        let lease = region
+            .slot_blocks(
+                first,
+                slot_pages,
+                first + slot_pages,
+                callback_pages,
+                &[(slot_base + PAGE, PAGE)],
+            )
+            .unwrap();
+        assert_eq!(lease.slot_base(), slot_base);
+        // The one writable interior is usable; guards stay as claimed.
+        let record = (slot_base + PAGE) as *mut u64;
+        unsafe {
+            record.write_volatile(0x5eed);
+            assert_eq!(record.read_volatile(), 0x5eed);
+        }
+        // The preclaimed view belongs to this region, protects writable,
+        // and dropping copies frees nothing: re-claiming its pages fails
+        // while the lease lives, then succeeds after lease drop.
+        let bottom = lease.callback_base() + PAGE;
+        let view = region.preclaimed_stack(bottom, PAGE).unwrap();
+        assert!(view.belongs_to(region));
+        region.protect_callback_stack(view).unwrap();
+        let stack_word = view.top() as *mut u64;
+        unsafe {
+            stack_word.sub(1).write_volatile(7);
+            assert_eq!(stack_word.sub(1).read_volatile(), 7);
+        }
+        let _ = view; // Copy: dropping a copy frees nothing, by design.
+        // The view's own callback pages stay claimed after protect,
+        // including the usable page at view.base() itself.
+        let view_page = (view.base() - BASE) / PAGE;
+        assert!(region.claim_at(view_page, 1).is_err());
+        assert!(region.claim_at(first + slot_pages, 1).is_err());
+        drop(lease);
+        // The unpublished drop released BOTH extents whole.
+        region.claim_at(first, slot_pages).unwrap();
+        region.claim_at(first + slot_pages, callback_pages).unwrap();
+    });
+}
+
+#[test]
+fn slot_blocks_failed_callback_claim_releases_slot_bits() {
+    isolated(
+        "slot_blocks_failed_callback_claim_releases_slot_bits",
+        || {
+            let region = ToolRegion::reserve().unwrap();
+            let (first, _) = region
+                .free_spans()
+                .unwrap()
+                .into_iter()
+                .find(|&(_, len)| len >= 128)
+                .expect("span for rollback test");
+            let slot_pages = 64usize;
+            let callback_start = first + slot_pages;
+            // Occupy the callback start so the second claim inside slot_blocks
+            // fails after the slot claim succeeded.
+            region.claim_at(callback_start, 1).unwrap();
+            assert!(
+                region
+                    .slot_blocks(first, slot_pages, callback_start, 10, &[])
+                    .is_err()
+            );
+            // The slot extent was rolled back whole.
+            region.claim_at(first, 1).unwrap();
+            // An unaligned writable range refuses up front (EINVAL), and
+            // the refusal claims nothing.
+            let (start, _) = region
+                .free_spans()
+                .unwrap()
+                .into_iter()
+                .find(|&(_, len)| len >= 128)
+                .expect("span for unaligned-range test");
+            let slot_base = BASE + start * PAGE;
+            assert_eq!(
+                region
+                    .slot_blocks(start, 64, start + 64, 10, &[(slot_base + PAGE + 8, PAGE)])
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(libc::EINVAL)
+            );
+            region.claim_at(start, 64).unwrap();
+            region.claim_at(start + 64, 10).unwrap();
+            // A published lease keeps its bits for the process lifetime.
+            let spans = region.free_spans().unwrap();
+            let (start, _) = spans
+                .into_iter()
+                .find(|&(_, len)| len >= 128)
+                .expect("span for publish test");
+            let lease = region
+                .slot_blocks(start, slot_pages, start + slot_pages, 10, &[])
+                .unwrap();
+            let _ = lease.publish();
+            assert!(region.claim_at(start, 1).is_err());
+        },
+    );
+}
+
+#[test]
+fn preclaimed_stack_rejects_foreign_region_and_out_of_range() {
+    isolated(
+        "preclaimed_stack_rejects_foreign_region_and_out_of_range",
+        || {
+            let region = ToolRegion::reserve().unwrap();
+            // The view factory itself binds ranges to this reservation.
+            assert_eq!(
+                region
+                    .preclaimed_stack(BASE, PAGE)
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(libc::EINVAL)
+            );
+            assert_eq!(
+                region
+                    .preclaimed_stack(BASE + (DATA_FIRST + 1) * PAGE, usize::MAX - PAGE)
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(libc::EINVAL)
+            );
+            // A foreign zeroed region value: protect must refuse on pointer
+            // identity before touching its (null) control.
+            let foreign: &'static ToolRegion =
+                Box::leak(Box::new(unsafe { core::mem::zeroed::<ToolRegion>() }));
+            let (first, _) = region
+                .free_spans()
+                .unwrap()
+                .into_iter()
+                .find(|&(_, len)| len >= 128)
+                .expect("span for foreign test");
+            let lease = region.slot_blocks(first, 64, first + 64, 10, &[]).unwrap();
+            let view = region
+                .preclaimed_stack(lease.callback_base() + PAGE, PAGE)
+                .unwrap();
+            assert_eq!(
+                foreign
+                    .protect_callback_stack(view)
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(libc::EINVAL)
+            );
+            // Writable ranges outside the slot extent refuse before claiming.
+            let spans = region.free_spans().unwrap();
+            let (start, _) = spans
+                .into_iter()
+                .find(|&(_, len)| len >= 128)
+                .expect("span for writable-range test");
+            assert!(
+                region
+                    .slot_blocks(
+                        start,
+                        64,
+                        start + 64,
+                        10,
+                        &[(BASE + start * PAGE - PAGE, PAGE)]
+                    )
+                    .is_err()
+            );
+            region.claim_at(start, 1).unwrap();
+        },
+    );
+}

@@ -43,7 +43,7 @@ pub const END: usize = BASE + BYTES;
 /// The page unit the version-one layout is expressed in. Hosts with
 /// a different runtime page size are refused by [`ToolRegion::reserve`].
 pub(crate) const LAYOUT_PAGE: usize = 4096;
-const PAGE: usize = LAYOUT_PAGE;
+pub(crate) const PAGE: usize = LAYOUT_PAGE;
 const CONTROL_BYTES: usize = 1024 * 1024;
 const DATA_FIRST: usize = CONTROL_BYTES / PAGE;
 const DATA_END: usize = BYTES / PAGE - 1;
@@ -445,6 +445,195 @@ impl ToolRegion {
         Ok(lease)
     }
 
+    /// Snapshot the free page spans as `(start_page, len_pages)` in
+    /// address order, for pure fit computation before any claim.
+    #[cfg(any(test, feature = "exec-private-init"))]
+    pub(crate) fn free_spans(&self) -> io::Result<Vec<(usize, usize)>> {
+        let mut guard = self.lock()?;
+        let bitmap = guard.bitmap();
+        let mut spans = Vec::new();
+        let mut start = DATA_FIRST;
+        let mut length = 0usize;
+        for page in DATA_FIRST..DATA_END {
+            if bitmap[page / 64] & (1 << (page % 64)) == 0 {
+                if length == 0 {
+                    start = page;
+                }
+                length += 1;
+            } else if length != 0 {
+                spans.push((start, length));
+                length = 0;
+            }
+        }
+        if length != 0 {
+            spans.push((start, length));
+        }
+        Ok(spans)
+    }
+
+    #[cfg(any(test, feature = "exec-private-init"))]
+    pub(crate) fn claim_at(&self, start: usize, pages: usize) -> io::Result<()> {
+        if pages == 0 || start < DATA_FIRST || start + pages > DATA_END {
+            return Err(io::Error::from_raw_os_error(libc::ENOMEM));
+        }
+        let mut guard = self.lock()?;
+        let bitmap = guard.bitmap();
+        if (start..start + pages).any(|page| bitmap[page / 64] & (1 << (page % 64)) != 0) {
+            return Err(io::Error::from_raw_os_error(libc::ENOMEM));
+        }
+        for page in start..start + pages {
+            bitmap[page / 64] |= 1 << (page % 64);
+        }
+        Ok(())
+    }
+
+    #[cfg(any(test, feature = "exec-private-init"))]
+    fn release_claim(&self, start: usize, pages: usize) {
+        // Unpublished slot-block rollback: whole-extent reset, unlike the
+        // guard-shaped StackLease release below.
+        let base = BASE + start * PAGE;
+        let bytes = pages * PAGE;
+        if unsafe {
+            raw_syscall6(
+                libc::SYS_mprotect,
+                [base as u64, bytes as u64, libc::PROT_NONE as u64, 0, 0, 0],
+            )
+        } != 0
+        {
+            return; // Quarantined, never falsely reclaimed.
+        }
+        if unsafe {
+            raw_syscall6(
+                libc::SYS_madvise,
+                [
+                    base as u64,
+                    bytes as u64,
+                    libc::MADV_DONTNEED as u64,
+                    0,
+                    0,
+                    0,
+                ],
+            )
+        } != 0
+        {
+            return;
+        }
+        let Ok(mut guard) = self.lock() else {
+            return;
+        };
+        let bitmap = guard.bitmap();
+        for page in start..start + pages {
+            bitmap[page / 64] &= !(1 << (page % 64));
+        }
+    }
+
+    /// Claim the per-thread Tool TLS slot block and callback-stack pool at
+    /// precomputed page positions (see `tool_tls_slots::compute_layout`)
+    /// and make only the slot RW interiors writable; guards and the whole
+    /// callback pool stay `PROT_NONE` until a birth arms one range.
+    /// Init-time only, same contract as `stack()`.
+    #[cfg(any(test, feature = "exec-private-init"))]
+    pub(crate) fn slot_blocks(
+        &'static self,
+        slot_start: usize,
+        slot_pages: usize,
+        callback_start: usize,
+        callback_pages: usize,
+        writable: &[(usize, usize)],
+    ) -> io::Result<SlotBlocksLease> {
+        // Every writable interior must lie inside the slot extent; a
+        // range outside it would mprotect memory this claim does not own.
+        let slot_lo = BASE + slot_start * PAGE;
+        let slot_hi = slot_lo + slot_pages * PAGE;
+        for &(base, bytes) in writable {
+            let end = base
+                .checked_add(bytes)
+                .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
+            if bytes == 0 || !base.is_multiple_of(PAGE) || base < slot_lo || end > slot_hi {
+                return Err(io::Error::from_raw_os_error(libc::EINVAL));
+            }
+        }
+        self.claim_at(slot_start, slot_pages)?;
+        let mut lease = SlotBlocksLease {
+            region: self,
+            slot_start,
+            slot_pages,
+            callback_start,
+            callback_pages: 0,
+            published: false,
+        };
+        self.claim_at(callback_start, callback_pages)?;
+        lease.callback_pages = callback_pages;
+        for &(base, bytes) in writable {
+            raw_zero_result(unsafe {
+                raw_syscall6(
+                    libc::SYS_mprotect,
+                    [
+                        base as u64,
+                        bytes as u64,
+                        (libc::PROT_READ | libc::PROT_WRITE) as u64,
+                        0,
+                        0,
+                        0,
+                    ],
+                )
+            })?;
+        }
+        Ok(lease)
+    }
+
+    /// Make one preclaimed callback-stack range writable at birth-claim
+    /// time (parent-side, before the physical clone). First production
+    /// caller is the B3 claim; B1 exercises it in lease tests.
+    #[allow(dead_code)]
+    #[cfg(any(test, feature = "exec-private-init"))]
+    pub(crate) fn protect_callback_stack(&self, stack: PreclaimedStack) -> io::Result<()> {
+        if !stack.belongs_to(self) {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        raw_zero_result(unsafe {
+            raw_syscall6(
+                libc::SYS_mprotect,
+                [
+                    stack.base() as u64,
+                    stack.usable_bytes() as u64,
+                    (libc::PROT_READ | libc::PROT_WRITE) as u64,
+                    0,
+                    0,
+                    0,
+                ],
+            )
+        })
+    }
+
+    /// Descriptor for one range of the preclaimed callback pool. It never
+    /// frees bitmap bits: the published slot-blocks lease owns them.
+    #[allow(dead_code)]
+    #[cfg(any(test, feature = "exec-private-init"))]
+    pub(crate) fn preclaimed_stack(
+        &'static self,
+        bottom: usize,
+        usable_bytes: usize,
+    ) -> io::Result<PreclaimedStack> {
+        let extent_end = bottom
+            .checked_add(usable_bytes)
+            .and_then(|top| top.checked_add(PAGE))
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
+        if usable_bytes == 0
+            || !bottom.is_multiple_of(PAGE)
+            || !usable_bytes.is_multiple_of(PAGE)
+            || bottom < BASE + (DATA_FIRST + 1) * PAGE
+            || extent_end > END
+        {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        Ok(PreclaimedStack {
+            region: self,
+            bottom,
+            usable_bytes,
+        })
+    }
+
     fn release(&self, start: usize, pages: usize) {
         // Called only for an unpublished, uniquely owned lease. Keep every
         // page occupied throughout rollback, including any failed syscall.
@@ -601,6 +790,88 @@ impl StackLease {
 impl Drop for StackLease {
     fn drop(&mut self) {
         self.region.release(self.start, self.pages);
+    }
+}
+
+/// The unpublished per-thread TLS slot block + callback pool claim.
+/// Publication retains it for the process lifetime; an unpublished drop
+/// rolls both claims back whole.
+#[derive(Debug)]
+#[cfg(any(test, feature = "exec-private-init"))]
+pub(crate) struct SlotBlocksLease {
+    region: &'static ToolRegion,
+    slot_start: usize,
+    slot_pages: usize,
+    callback_start: usize,
+    callback_pages: usize,
+    published: bool,
+}
+
+#[cfg(any(test, feature = "exec-private-init"))]
+impl SlotBlocksLease {
+    pub(crate) fn slot_base(&self) -> usize {
+        BASE + self.slot_start * PAGE
+    }
+
+    pub(crate) fn callback_base(&self) -> usize {
+        BASE + self.callback_start * PAGE
+    }
+
+    /// Retain both claims for the process lifetime. Returns the two bases.
+    pub(crate) fn publish(mut self) -> (usize, usize) {
+        self.published = true;
+        let bases = (self.slot_base(), self.callback_base());
+        core::mem::forget(self);
+        bases
+    }
+}
+
+#[cfg(any(test, feature = "exec-private-init"))]
+impl Drop for SlotBlocksLease {
+    fn drop(&mut self) {
+        if self.published {
+            return;
+        }
+        if self.callback_pages != 0 {
+            self.region
+                .release_claim(self.callback_start, self.callback_pages);
+        }
+        self.region.release_claim(self.slot_start, self.slot_pages);
+    }
+}
+
+/// A non-owning view of one preclaimed callback-stack range (usable
+/// interior plus one guard page each side, the `StackLease` shape).
+/// Copying or dropping it never frees bitmap bits.
+#[derive(Clone, Copy, Debug)]
+#[cfg(any(test, feature = "exec-private-init"))]
+pub(crate) struct PreclaimedStack {
+    region: &'static ToolRegion,
+    bottom: usize,
+    usable_bytes: usize,
+}
+
+#[cfg(any(test, feature = "exec-private-init"))]
+#[allow(dead_code)]
+impl PreclaimedStack {
+    pub(crate) fn belongs_to(&self, region: &ToolRegion) -> bool {
+        core::ptr::eq(self.region, region)
+    }
+
+    pub(crate) fn base(&self) -> usize {
+        self.bottom
+    }
+
+    pub(crate) fn usable_bytes(&self) -> usize {
+        self.usable_bytes
+    }
+
+    pub(crate) fn top(&self) -> usize {
+        self.bottom + self.usable_bytes
+    }
+
+    pub(crate) fn extent(&self) -> (usize, usize) {
+        (self.bottom - PAGE, self.top() + PAGE)
     }
 }
 

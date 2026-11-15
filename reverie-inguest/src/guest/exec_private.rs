@@ -15,7 +15,17 @@ use std::io;
 #[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
 pub mod mapped_initial;
 
+#[cfg(all(
+    feature = "loader-private-runtime",
+    target_env = "musl",
+    not(target_arch = "x86_64")
+))]
+compile_error!(
+    "the mapped musl Running relay (mapped_initial) is x86_64-only today: its signal-frame, register and altstack paths name x86_64 registers; this is the named aarch64 refusal for that leg until those paths are ported"
+);
+
 pub(crate) mod tool_tls_registry;
+pub(crate) mod tool_tls_slots;
 
 #[cfg(feature = "coordinator-rpc")]
 mod native_io;
@@ -23,6 +33,11 @@ mod native_io;
 pub(crate) use native_io::NativeGateIoBinding;
 #[cfg(feature = "coordinator-rpc")]
 pub use native_io::NativeInitializationIoGuard;
+
+#[cfg(test)]
+pub(crate) use super::support::BirthSignalGuard;
+#[cfg(test)]
+pub(crate) use super::support::birth_block_mask;
 
 /// Native control ABI shared with the private GNU runner.
 #[repr(C, align(64))]
@@ -200,6 +215,246 @@ pub fn callback_kernel_registrations() -> Option<GuestKernelRegistrations> {
     (rc == 0 && head == recorded.robust_head && length == recorded.robust_len).then_some(recorded)
 }
 
+/// This thread's Tool thread pointer (the FS base on x86_64, TPIDR_EL0
+/// on aarch64), or None where it cannot be read. Stage C derives the
+/// callback slot from this value, never from the stack pointer:
+/// callbacks run on the continuation stack, not the slot altstack.
+#[cfg(any(test, all(feature = "loader-private-runtime", target_env = "musl")))]
+fn current_thread_pointer() -> Option<u64> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut tp = 0_u64;
+        // SAFETY: ARCH_GET_FS writes one word to the owned out slot.
+        let rc = unsafe {
+            crate::trap::raw_syscall6(
+                libc::SYS_arch_prctl,
+                [0x1003, (&raw mut tp) as u64, 0, 0, 0, 0],
+            )
+        };
+        return (rc == 0 && tp != 0).then_some(tp);
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let tp: u64;
+        // SAFETY: reading TPIDR_EL0 has no memory effect.
+        unsafe {
+            core::arch::asm!("mrs {}, tpidr_el0", out(reg) tp, options(nomem, nostack));
+        }
+        return (tp != 0).then_some(tp);
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
+/// Which record a thread pointer resolves to: the leader's
+/// NativeControl, or one slot's record. Shared by the Stage C
+/// callback predicate and the musl Running relay.
+#[cfg(any(test, all(feature = "loader-private-runtime", target_env = "musl")))]
+#[derive(Clone, Copy)]
+pub(crate) enum CurrentCallbackRecord {
+    Leader,
+    Slot {
+        index: usize,
+        record: *mut tool_tls_slots::SlotRecord,
+    },
+}
+
+/// Resolve a thread pointer to its callback record. The leader is
+/// decided by exact equality with the control's tool thread pointer,
+/// as today; a slot requires the exact slot thread pointer under a
+/// published layout. Anything else resolves nowhere.
+#[cfg(any(test, all(feature = "loader-private-runtime", target_env = "musl")))]
+pub(crate) fn current_callback_record(
+    tp: u64,
+    control: *mut NativeControl,
+) -> Option<CurrentCallbackRecord> {
+    if tp != 0 && tp == unsafe { (&raw const (*control).tool_fs).read_volatile() } {
+        return Some(CurrentCallbackRecord::Leader);
+    }
+    let layout = tool_tls_slots::layout()?;
+    match layout.record_for_tp(tp as usize) {
+        tool_tls_slots::RecordRef::Slot(index) => Some(CurrentCallbackRecord::Slot {
+            index,
+            record: layout.record_addr(index) as *mut tool_tls_slots::SlotRecord,
+        }),
+        _ => None,
+    }
+}
+
+/// The actual ready Tool thread while its callback is active (Stage
+/// C predicate split): slot 0 is the leader exactly as
+/// `callback_native_tid`, and a non-leader slot must additionally be
+/// the registry's Ready holder of this tid. Read-only, like
+/// `callback_native_tid`; registrations, exec facts and execve
+/// routing keep using that leader-only predicate unchanged.
+#[cfg(any(test, all(feature = "loader-private-runtime", target_env = "musl")))]
+pub(crate) fn callback_tool_tid() -> Option<i32> {
+    let control = control_pointer();
+    if control.is_null() {
+        return None;
+    }
+    let read = |p: *const u64| unsafe { p.read_volatile() };
+    if read(unsafe { &raw const (*control).abi_version }) != 1
+        || read(unsafe { &raw const (*control).byte_len }) != size_of::<NativeControl>() as u64
+        || read(unsafe { &raw const (*control).runtime_ready }) != 1
+    {
+        return None;
+    }
+    let tp = current_thread_pointer()?;
+    let tid = unsafe { crate::trap::raw_syscall6(libc::SYS_gettid, [0; 6]) };
+    if tid <= 0 {
+        return None;
+    }
+    let tid = i32::try_from(tid).ok()?;
+    let (slot, phase) = match current_callback_record(tp, control)? {
+        CurrentCallbackRecord::Leader => {
+            let pid = unsafe { crate::trap::raw_syscall6(libc::SYS_getpid, [0; 6]) };
+            if pid != i64::from(tid)
+                || u64::try_from(tid).ok()? != read(unsafe { &raw const (*control).native_tid })
+            {
+                return None;
+            }
+            (0, read(unsafe { &raw const (*control).phase }))
+        }
+        CurrentCallbackRecord::Slot { index, record } => {
+            // The geometry already required the exact slot thread
+            // pointer; re-check the record's own word rather than
+            // trusting the geometry alone (as the ledger write does).
+            if read(unsafe { &raw const (*record).tool_fs }) != tp {
+                return None;
+            }
+            (index, read(unsafe { &raw const (*record).phase }))
+        }
+    };
+    if phase != 4 {
+        return None;
+    }
+    (tool_tls_registry::TOOL_TLS_REGISTRY.lookup_ready(tid) == Some(slot)).then_some(tid)
+}
+
+/// Current guest registrations against one slot record's ledger: the
+/// slot beside the leader-only `callback_kernel_registrations`. The
+/// robust-list query must agree with the slot's success-only guest
+/// ledger, exactly as the leader check requires of NativeControl.
+/// Unlike its leader sibling this does not authenticate the caller:
+/// the caller must already have established that the current thread
+/// owns `record` (thread-pointer, phase and registry checks, as
+/// `verify_slot_owner` does before calling it).
+#[cfg(any(test, all(feature = "loader-private-runtime", target_env = "musl")))]
+pub(crate) fn callback_slot_registrations(
+    record: *mut tool_tls_slots::SlotRecord,
+) -> Option<GuestKernelRegistrations> {
+    if record.is_null() {
+        return None;
+    }
+    let read = |p: *const u64| unsafe { p.read_volatile() };
+    let recorded = GuestKernelRegistrations {
+        clear_tid: read(unsafe { &raw const (*record).guest_clear_tid }),
+        robust_head: read(unsafe { &raw const (*record).guest_robust_head }),
+        robust_len: read(unsafe { &raw const (*record).guest_robust_len }),
+    };
+    let mut head = 0_u64;
+    let mut length = 0_u64;
+    let rc = unsafe {
+        crate::trap::raw_syscall6(
+            libc::SYS_get_robust_list,
+            [0, (&raw mut head) as u64, (&raw mut length) as u64, 0, 0, 0],
+        )
+    };
+    (rc == 0 && head == recorded.robust_head && length == recorded.robust_len).then_some(recorded)
+}
+
+/// Why a non-leader mapping-class syscall is refused by name during a
+/// mapped relay callback: mapping, break and mapping-tracking state
+/// are process-global and leader-owned (restorer owner-mapping
+/// bookkeeping and the nested trackers assume the leader is the only
+/// thread mutating mappings), so a physical mapping change from an
+/// admitted non-leader would race that accounting. Tracked for
+/// lifting by minibeads dh-gpxse, which owns per-slot mapping
+/// accounting.
+#[cfg(any(test, all(feature = "loader-private-runtime", target_env = "musl")))]
+pub(crate) const NON_LEADER_MAPPING_CLASS_REASON: &str =
+    "non-leader mapping-class syscall during mapped relay (dh-gpxse)";
+
+/// The refusal result for [`NON_LEADER_MAPPING_CLASS_REASON`]: the
+/// same `-EPERM` the owner-mapping guard on this forwarding path
+/// already returns for refused mapping changes.
+#[cfg(any(test, all(feature = "loader-private-runtime", target_env = "musl")))]
+pub(crate) const NON_LEADER_MAPPING_CLASS_ERRNO: i64 = -(libc::EPERM as i64);
+
+/// How a non-leader mapping-class syscall is refused during a mapped
+/// relay callback, preserving each syscall's raw ABI.
+#[cfg(any(test, all(feature = "loader-private-runtime", target_env = "musl")))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NonLeaderMappingRefusal {
+    /// Return this raw result (a negative errno) without executing.
+    Errno(i64),
+    /// `brk` has no errno return: answer with the unchanged current
+    /// break, as the owner-mapping guard does for a denied change.
+    UnchangedBreak,
+}
+
+/// Classify the non-leader mapping-class refusal set. None means the
+/// syscall is not mapping-class and forwards normally. The set is a
+/// superset of every syscall the owner-mapping guard classifies as a
+/// mapping change (restorer.rs `mapping_change_refused_with_fixed_
+/// region`), plus `shmdt`, which also unmaps: the stated reason --
+/// a physical mapping change races leader-owned accounting -- covers
+/// all of them, argument shapes aside.
+#[cfg(any(test, all(feature = "loader-private-runtime", target_env = "musl")))]
+pub(crate) fn non_leader_mapping_refusal(number: i64) -> Option<NonLeaderMappingRefusal> {
+    match number {
+        libc::SYS_brk => Some(NonLeaderMappingRefusal::UnchangedBreak),
+        libc::SYS_mmap
+        | libc::SYS_mprotect
+        | libc::SYS_munmap
+        | libc::SYS_mremap
+        | libc::SYS_madvise
+        | libc::SYS_pkey_mprotect
+        | libc::SYS_remap_file_pages
+        | libc::SYS_mseal
+        | libc::SYS_process_madvise
+        | libc::SYS_shmat
+        | libc::SYS_shmdt => Some(NonLeaderMappingRefusal::Errno(
+            NON_LEADER_MAPPING_CLASS_ERRNO,
+        )),
+        _ => None,
+    }
+}
+
+/// The resolved refusal outcome: the raw result to answer with, or a
+/// failed break query, which has no honest brk-shaped answer and is
+/// fatal at the relay.
+#[cfg(any(test, all(feature = "loader-private-runtime", target_env = "musl")))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NonLeaderMappingOutcome {
+    Result(i64),
+    BreakQueryFailed,
+}
+
+/// The one refusal outcome seam shared by the musl relay and the gnu
+/// witnesses: classifier plus result value, including the brk(0)
+/// answer. `query_current_break` is the caller's own physical
+/// brk(0) query (the relay's kernel gate; a trap handler's
+/// pre-queried break), issued only for `brk`.
+#[cfg(any(test, all(feature = "loader-private-runtime", target_env = "musl")))]
+pub(crate) fn non_leader_mapping_outcome(
+    number: i64,
+    query_current_break: impl FnOnce() -> i64,
+) -> Option<NonLeaderMappingOutcome> {
+    match non_leader_mapping_refusal(number)? {
+        NonLeaderMappingRefusal::Errno(errno) => Some(NonLeaderMappingOutcome::Result(errno)),
+        NonLeaderMappingRefusal::UnchangedBreak => {
+            let current = query_current_break();
+            Some(if current > 0 {
+                NonLeaderMappingOutcome::Result(current)
+            } else {
+                NonLeaderMappingOutcome::BreakQueryFailed
+            })
+        }
+    }
+}
+
 /// Read-only actual callback observations, not native exec admission authority.
 #[cfg(feature = "exec-native-injection")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -347,7 +602,7 @@ impl IssuedNativeExecLeaf {
             // admitted scalar domain are unchanged. The existing assembly
             // selects guest FS, executes all six original registers, captures
             // actual PKRU/guest FS, and restores Tool FS before Rust resumes.
-            reverie_inguest_private_guest_call(
+            reverie_inguest_private_leader_guest_call(
                 original.number(),
                 args.as_ptr(),
                 u64::from(original.pkru().unwrap_or(0)),
@@ -828,6 +1083,16 @@ unsafe extern "C" {
         guest_pkru: u64,
         use_pkru: u64,
     ) -> PhysicalResult;
+    // The only production caller is IssuedNativeExecLeaf::call,
+    // compiled only with exec-native-injection; declare the leaf
+    // exactly where it can be called (tests call it directly).
+    #[cfg(any(test, feature = "exec-native-injection"))]
+    fn reverie_inguest_private_leader_guest_call(
+        number: i64,
+        args: *const u64,
+        guest_pkru: u64,
+        use_pkru: u64,
+    ) -> PhysicalResult;
     #[cfg(any(
         feature = "exec-private-successor",
         all(feature = "exec-private-init", feature = "coordinator-rpc")
@@ -864,13 +1129,34 @@ pub unsafe fn physical_syscall(
     // The assembly leaf has restored Tool FS and callback phase before any
     // Rust executes. Preserve actual failed-call state; do not infer success
     // merely from the requested address or a Detcore-emulated return value.
+    // The registration ledger is per-record: with a slot layout published,
+    // these two syscalls (and only these two) re-derive the caller's
+    // record from its thread pointer; every other call writes nothing.
     let control = control_pointer();
+    let is_registration =
+        number == libc::SYS_set_tid_address || number == libc::SYS_set_robust_list;
+    let slot_record = if is_registration {
+        current_slot_record_for_ledger(control)
+    } else {
+        None
+    };
     unsafe {
         if number == libc::SYS_set_tid_address && result.result > 0 {
-            (&raw mut (*control).kernel_clear_tid).write_volatile(args[0]);
+            match slot_record {
+                Some(record) => (&raw mut (*record).guest_clear_tid).write_volatile(args[0]),
+                None => (&raw mut (*control).kernel_clear_tid).write_volatile(args[0]),
+            }
         } else if number == libc::SYS_set_robust_list && result.result == 0 {
-            (&raw mut (*control).kernel_robust_head).write_volatile(args[0]);
-            (&raw mut (*control).kernel_robust_len).write_volatile(args[1]);
+            match slot_record {
+                Some(record) => {
+                    (&raw mut (*record).guest_robust_head).write_volatile(args[0]);
+                    (&raw mut (*record).guest_robust_len).write_volatile(args[1]);
+                }
+                None => {
+                    (&raw mut (*control).kernel_robust_head).write_volatile(args[0]);
+                    (&raw mut (*control).kernel_robust_len).write_volatile(args[1]);
+                }
+            }
         }
     }
     crate::trap::NativeSyscallResult {
@@ -895,12 +1181,21 @@ reverie_inguest_private_guest_call:
     jmp .Lprivate_call_common
     .size reverie_inguest_private_guest_call, .-reverie_inguest_private_guest_call
     .p2align 4
+    .global reverie_inguest_private_leader_guest_call
+    .hidden reverie_inguest_private_leader_guest_call
+    .type reverie_inguest_private_leader_guest_call,@function
+reverie_inguest_private_leader_guest_call:
+    endbr64
+    mov r11d, 0x104
+    jmp .Lprivate_call_common
+    .size reverie_inguest_private_leader_guest_call, .-reverie_inguest_private_leader_guest_call
+    .p2align 4
     .global reverie_inguest_private_lifecycle_call
     .hidden reverie_inguest_private_lifecycle_call
     .type reverie_inguest_private_lifecycle_call,@function
 reverie_inguest_private_lifecycle_call:
     endbr64
-    mov r11d, 6
+    mov r11d, 0x106
 .Lprivate_call_common:
     push r12
     push r13
@@ -917,7 +1212,55 @@ reverie_inguest_private_lifecycle_call:
     mov r13, [rip + reverie_inguest_private_exec_control]
     test r13, r13
     jz .Lprivate_terminal
+    // Record derivation (B2): the leaf finds its own record from the
+    // thread pointer, read with ARCH_GET_FS through the fixed gate
+    // (zone-B option 1: no FS-relative operand in this leaf); no
+    // caller supplies it. With no slot layout published the leader
+    // record is used exactly as before.
+    mov rax, [rip + reverie_inguest_private_slot_base]
+    test rax, rax
+    jz .Lprivate_call_have_record
+    mov eax, 158
+    mov edi, 0x1003
+    lea rsi, [rsp + 32]
+    lea r12, [rip + .Lprivate_got_tool_fs]
+    movabs r11, {native_gate}
+    jmp r11
+.Lprivate_got_tool_fs:
+    endbr64
+    test rax, rax
+    jnz .Lprivate_terminal
+    mov rax, [rip + reverie_inguest_private_slot_base]
+    mov rcx, [rsp + 32]
+    cmp rcx, [r13 + 32]
+    je .Lprivate_call_leader_record
+    cmp rcx, rax
+    jb .Lprivate_terminal
+    mov r10, rcx
+    sub r10, rax
+    mov rcx, [rip + reverie_inguest_private_slot_stride_log2]
+    mov r11, r10
+    shr r11, cl
+    test r11, r11
+    jz .Lprivate_terminal
+    cmp r11, {max_threads}
+    jae .Lprivate_terminal
+    shl r11, cl
+    add rax, r11
+    add rax, [rip + reverie_inguest_private_slot_record_offset]
+    mov rcx, [rsp + 32]
+    cmp [rax + 32], rcx
+    jne .Lprivate_terminal
+    mov r13, rax
+    // Leader-only entries (lifecycle/exec) refuse any slot record here.
+    test qword ptr [rsp + 40], 0x100
+    jnz .Lprivate_terminal
+    jmp .Lprivate_call_have_record
+.Lprivate_call_leader_record:
+    // TP is the leader's: NativeControl is the record.
+.Lprivate_call_have_record:
     mov rax, [rsp + 40]
+    and rax, 0xff
     cmp [r13 + 16], rax
     jne .Lprivate_terminal
     mov qword ptr [r13 + 16], 5
@@ -983,6 +1326,7 @@ reverie_inguest_private_lifecycle_call:
     cmp qword ptr [r13 + 16], 5
     jne .Lprivate_terminal
     mov rax, [rsp + 40]
+    and rax, 0xff
     mov [r13 + 16], rax
     mov rax, r14
     mov rdx, r15
@@ -1002,6 +1346,7 @@ reverie_inguest_private_lifecycle_call:
     .size reverie_inguest_private_lifecycle_call, .-reverie_inguest_private_lifecycle_call
 "#,
     native_gate = const crate::trap::FIXED_NATIVE_ENTRY,
+    max_threads = const tool_tls_registry::MAX_PRIVATE_TOOL_THREADS,
     guest_gate = const crate::trap::FIXED_GUEST_ENTRY,
 );
 
@@ -1031,16 +1376,84 @@ fn terminal() -> ! {
         core::hint::spin_loop();
     }
 }
+
+/// The caller's current stack pointer, for slot-record derivation in
+/// signal-handler context (the current frame lives on the signal stack).
+fn current_stack_pointer() -> usize {
+    let sp: usize;
+    // SAFETY: reading rsp has no memory effect; the value is only
+    // range-checked against the published layout.
+    unsafe {
+        core::arch::asm!("mov {}, rsp", out(reg) sp, options(nomem, nostack));
+    }
+    sp
+}
+
+/// Phase word of the record this thread is running under: the slot
+/// record when a layout is published and the current stack is a slot
+/// altstack, NativeControl for the leader ranges, terminal otherwise.
+/// With no layout published this is exactly the pre-B2 leader word.
+fn current_phase_word(control: *mut NativeControl) -> *mut u64 {
+    let Some(layout) = tool_tls_slots::layout() else {
+        return unsafe { &raw mut (*control).phase };
+    };
+    match layout.record_for_rsp(current_stack_pointer()) {
+        tool_tls_slots::RecordRef::Leader => unsafe { &raw mut (*control).phase },
+        tool_tls_slots::RecordRef::Slot(index) => {
+            let record = layout.record_addr(index) as *mut tool_tls_slots::SlotRecord;
+            unsafe { &raw mut (*record).phase }
+        }
+        tool_tls_slots::RecordRef::Terminal => terminal(),
+    }
+}
+
+/// The caller's slot record for the two guest-registration syscalls
+/// only (called solely from physical_syscall's ledger write, only
+/// when a layout is published). `None` is the leader/system record.
+/// A thread pointer resolving nowhere is terminal, mirroring the leaf.
+fn current_slot_record_for_ledger(
+    control: *mut NativeControl,
+) -> Option<*mut tool_tls_slots::SlotRecord> {
+    let layout = tool_tls_slots::layout()?;
+    let mut fs = 0_u64;
+    // SAFETY: ARCH_GET_FS writes one word to the owned out slot.
+    let result = unsafe {
+        crate::trap::raw_syscall6(
+            libc::SYS_arch_prctl,
+            [0x1003, (&raw mut fs) as u64, 0, 0, 0, 0],
+        )
+    };
+    if result != 0 {
+        terminal();
+    }
+    // SAFETY: the published control stays valid for the process lifetime.
+    if fs == unsafe { (&raw const (*control).tool_fs).read_volatile() } {
+        return None;
+    }
+    match layout.record_for_tp(fs as usize) {
+        tool_tls_slots::RecordRef::Slot(index) => {
+            let record = layout.record_addr(index) as *mut tool_tls_slots::SlotRecord;
+            // The leaf already checked this in assembly; the ledger write
+            // re-checks it rather than trusting the geometry alone.
+            if unsafe { (&raw const (*record).tool_fs).read_volatile() } != fs {
+                terminal();
+            }
+            Some(record)
+        }
+        _ => terminal(),
+    }
+}
 pub(crate) fn callback_prepared() {
     let control = control_pointer();
     if control.is_null() {
         return;
     }
+    let phase = current_phase_word(control);
     unsafe {
-        if (&raw const (*control).phase).read_volatile() != 3 {
+        if phase.read_volatile() != 3 {
             terminal();
         }
-        (&raw mut (*control).phase).write_volatile(4);
+        phase.write_volatile(4);
     }
 }
 pub(crate) fn guest_completed() {
@@ -1048,11 +1461,12 @@ pub(crate) fn guest_completed() {
     if control.is_null() {
         return;
     }
+    let phase = current_phase_word(control);
     unsafe {
-        if (&raw const (*control).phase).read_volatile() != 4 {
+        if phase.read_volatile() != 4 {
             terminal();
         }
-        (&raw mut (*control).phase).write_volatile(3);
+        phase.write_volatile(3);
     }
 }
 pub(crate) fn private_instruction(address: u64) -> bool {
@@ -1060,8 +1474,9 @@ pub(crate) fn private_instruction(address: u64) -> bool {
     if control.is_null() {
         return false;
     }
+    let phase = current_phase_word(control);
     unsafe {
-        if !matches!((&raw const (*control).phase).read_volatile(), 2 | 4 | 6) {
+        if !matches!(phase.read_volatile(), 2 | 4 | 6) {
             return false;
         }
         let count = (&raw const (*control).private_code_count).read_volatile();
@@ -1090,9 +1505,28 @@ pub(super) fn mapped_callback_origin() -> bool {
 #[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
 pub(super) fn mapped_callback_candidate() -> bool {
     let c = control_pointer();
-    mapped_callback_origin()
-        && !c.is_null()
-        && unsafe { (&raw const (*c).phase).read_volatile() } == 4
+    if !mapped_callback_origin() || c.is_null() {
+        return false;
+    }
+    // The current record's phase (slot altstack -> that slot's record,
+    // leader ranges -> NativeControl): a sibling in phase 4 no longer
+    // classifies a leader-phase trap as a callback. Classification
+    // only, so an event on no known altstack is simply not a
+    // candidate here; the terminal derivation stays with the entry
+    // helpers that own admission.
+    let Some(layout) = tool_tls_slots::layout() else {
+        return unsafe { (&raw const (*c).phase).read_volatile() } == 4;
+    };
+    match layout.record_for_rsp(current_stack_pointer()) {
+        tool_tls_slots::RecordRef::Leader => {
+            (unsafe { (&raw const (*c).phase).read_volatile() }) == 4
+        }
+        tool_tls_slots::RecordRef::Slot(index) => {
+            let record = layout.record_addr(index) as *mut tool_tls_slots::SlotRecord;
+            (unsafe { (&raw const (*record).phase).read_volatile() }) == 4
+        }
+        tool_tls_slots::RecordRef::Terminal => false,
+    }
 }
 
 #[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
@@ -1182,6 +1616,58 @@ core::arch::global_asm!(r#"
     mov r13, [rip + reverie_inguest_private_exec_control]
     test r13, r13
     jz .Lprivate_signal_terminal
+    // Record derivation (B2): with no slot layout published the leader
+    // record is used exactly as before. With one published, the entry
+    // RSP (rsp + 72 after the pushes above) selects the record: a slot
+    // altstack interior gives that slot's record, a published leader
+    // altstack range gives NativeControl, anything else is terminal.
+    mov rax, [rip + reverie_inguest_private_slot_base]
+    test rax, rax
+    jz .Lprivate_signal_have_record
+    lea rcx, [rsp + 72]
+    cmp rcx, rax
+    jb .Lprivate_signal_leader_check
+    mov r10, rcx
+    sub r10, rax
+    mov rcx, [rip + reverie_inguest_private_slot_stride_log2]
+    mov r11, r10
+    shr r11, cl
+    cmp r11, {max_threads}
+    jae .Lprivate_signal_leader_check
+    test r11, r11
+    jz .Lprivate_signal_terminal
+    mov r8, 1
+    shl r8, cl
+    dec r8
+    and r10, r8
+    cmp r10, [rip + reverie_inguest_private_slot_altstack_offset]
+    jb .Lprivate_signal_terminal
+    sub r10, [rip + reverie_inguest_private_slot_altstack_offset]
+    cmp r10, [rip + reverie_inguest_private_slot_altstack_bytes]
+    jae .Lprivate_signal_terminal
+    shl r11, cl
+    add rax, r11
+    add rax, [rip + reverie_inguest_private_slot_record_offset]
+    mov r13, rax
+    jmp .Lprivate_signal_have_record
+.Lprivate_signal_leader_check:
+    lea rcx, [rsp + 72]
+    mov rax, [rip + reverie_inguest_private_slot_leader_alt0]
+    test rax, rax
+    jz .Lprivate_signal_leader_check2
+    cmp rcx, rax
+    jb .Lprivate_signal_leader_check2
+    cmp rcx, [rip + reverie_inguest_private_slot_leader_alt1]
+    jb .Lprivate_signal_have_record
+.Lprivate_signal_leader_check2:
+    mov rax, [rip + reverie_inguest_private_slot_leader_alt2]
+    test rax, rax
+    jz .Lprivate_signal_terminal
+    cmp rcx, rax
+    jb .Lprivate_signal_terminal
+    cmp rcx, [rip + reverie_inguest_private_slot_leader_alt3]
+    jae .Lprivate_signal_terminal
+.Lprivate_signal_have_record:
     mov eax, 158
     mov edi, 0x1003
     mov rsi, rsp
@@ -1264,6 +1750,7 @@ core::arch::global_asm!(r#"
     jmp r11
 "#,
     native_gate = const crate::trap::FIXED_NATIVE_ENTRY,
+    max_threads = const tool_tls_registry::MAX_PRIVATE_TOOL_THREADS,
     syscall_handler = sym crate::trap::sigsys_handler,
     instruction_handler = sym super::instruction::instruction_sigsegv_handler,
 );
@@ -1305,7 +1792,22 @@ pub(super) fn lifecycle_test_owner() -> (Box<NativeControl>, InitialImageControl
     native.tool_fs = fs;
     native.native_tid = unsafe { crate::trap::raw_syscall6(libc::SYS_gettid, [0; 6]) } as u64;
     let address = core::ptr::from_mut(native.as_mut()) as usize;
-    reverie_inguest_private_exec_control.store(address, Ordering::Release);
+    // Publish through the one physical publication so slot 0 exists in
+    // the registry, exactly as the authenticated origins leave it. A
+    // later call in the same isolated child (some tests rebuild the
+    // owner per mutation, one even unpublishes mid-loop) keeps the
+    // direct store instead: slot 0 is already registered for this
+    // same child tid.
+    match publish_control_slot(core::ptr::from_mut(native.as_mut())) {
+        Ok(()) => {}
+        Err(_)
+            if tool_tls_registry::TOOL_TLS_REGISTRY.leader()
+                == i32::try_from(native.native_tid).ok() =>
+        {
+            reverie_inguest_private_exec_control.store(address, Ordering::Release);
+        }
+        Err(error) => panic!("fixture control publication failed: {error}"),
+    }
     (native, InitialImageControl::new(address))
 }
 
@@ -1645,6 +2147,10 @@ impl InitialImageControl {
         let region = unsafe { region.as_ref() }
             .ok_or_else(|| io::Error::other("private frontend has no owned signal stack"))?;
         unsafe { verify_final_frontend(control, region)? };
+        // Per-thread Tool TLS slot layout (B1): claimed only when thread
+        // admission was requested before finish; failure degrades births
+        // and never fails this finish.
+        tool_tls_slots::claim_and_publish_if_requested(region, control);
         #[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
         unsafe {
             // Retire startup authority BEFORE genuine Ready; never carry it
@@ -2781,7 +3287,22 @@ pub(super) fn successor_test_owner() -> (Box<NativeControl>, SuccessorImageContr
     native.guest_ld_entry = 0x5678_0000;
     native.native_tid = unsafe { crate::trap::raw_syscall6(libc::SYS_gettid, [0; 6]) } as u64;
     let address = core::ptr::from_mut(native.as_mut()) as usize;
-    reverie_inguest_private_exec_control.store(address, Ordering::Release);
+    // Publish through the one physical publication so slot 0 exists in
+    // the registry, exactly as the authenticated origins leave it. A
+    // later call in the same isolated child (some tests rebuild the
+    // owner per mutation, one even unpublishes mid-loop) keeps the
+    // direct store instead: slot 0 is already registered for this
+    // same child tid.
+    match publish_control_slot(core::ptr::from_mut(native.as_mut())) {
+        Ok(()) => {}
+        Err(_)
+            if tool_tls_registry::TOOL_TLS_REGISTRY.leader()
+                == i32::try_from(native.native_tid).ok() =>
+        {
+            reverie_inguest_private_exec_control.store(address, Ordering::Release);
+        }
+        Err(error) => panic!("fixture control publication failed: {error}"),
+    }
     let owner = SuccessorImageControl {
         control: address,
         binding: SuccessorBinding {
@@ -4047,6 +4568,780 @@ mod tests {
         );
     }
     #[test]
+    fn birth_block_mask_excludes_reserved_unblockable_and_faults() {
+        let bit = |signal: i32| 1_u64 << (signal - 1);
+        // SIGALRM is in neither the fault nor the unblockable set, so
+        // only the reserved argument can keep it unblocked.
+        let reserved = bit(libc::SIGSYS) | bit(libc::SIGSEGV) | bit(libc::SIGALRM);
+        let mask = birth_block_mask(reserved);
+        assert_ne!(mask & bit(libc::SIGUSR1), 0);
+        assert_eq!(mask & bit(libc::SIGALRM), 0);
+        for signal in [
+            libc::SIGKILL,
+            libc::SIGSTOP,
+            libc::SIGILL,
+            libc::SIGTRAP,
+            libc::SIGBUS,
+            libc::SIGFPE,
+            libc::SIGSEGV,
+            libc::SIGSYS,
+        ] {
+            assert_eq!(mask & bit(signal), 0, "signal {signal} must stay unblocked");
+        }
+        // With nothing reserved, the fault set itself must still keep
+        // every synchronous fault signal (SIGSYS included) unblocked.
+        let bare = birth_block_mask(0);
+        assert_ne!(bare & bit(libc::SIGUSR1), 0);
+        for signal in [
+            libc::SIGILL,
+            libc::SIGTRAP,
+            libc::SIGBUS,
+            libc::SIGFPE,
+            libc::SIGSEGV,
+            libc::SIGSYS,
+        ] {
+            assert_eq!(
+                bare & bit(signal),
+                0,
+                "fault signal {signal} must stay unblocked with no reserved set"
+            );
+        }
+    }
+
+    #[test]
+    fn birth_signal_guard_is_not_send() {
+        // Ambiguous-impl pattern (as in static_assertions'
+        // assert_not_impl_any): if BirthSignalGuard were Send, both
+        // impls would apply and the check call would not compile.
+        // Dropping the guard on another thread would restore the
+        // mask there, so Send must stay off.
+        trait AmbiguousIfSend<A> {
+            fn check() {}
+        }
+        impl<T: ?Sized> AmbiguousIfSend<()> for T {}
+        struct Invalid;
+        impl<T: ?Sized + Send> AmbiguousIfSend<Invalid> for T {}
+        <BirthSignalGuard as AmbiguousIfSend<_>>::check();
+    }
+
+    #[test]
+    fn birth_signal_guard_round_trips_the_exact_mask() {
+        isolated(
+            || {
+                fn query_mask() -> u64 {
+                    let mut current = 0_u64;
+                    let result = unsafe {
+                        crate::trap::raw_syscall6(
+                            libc::SYS_rt_sigprocmask,
+                            [0, 0, (&raw mut current) as u64, 8, 0, 0],
+                        )
+                    };
+                    assert_eq!(result, 0);
+                    current
+                }
+                // Seed a mask the guard must neither clear (SIGBUS is a
+                // fault signal the birth set skips) nor invent bits over.
+                let seeded_bits: u64 = (1 << (libc::SIGUSR2 - 1)) | (1 << (libc::SIGBUS - 1));
+                assert_eq!(
+                    unsafe {
+                        crate::trap::raw_syscall6(
+                            libc::SYS_rt_sigprocmask,
+                            [0, (&raw const seeded_bits) as u64, 0, 8, 0, 0],
+                        )
+                    },
+                    0
+                );
+                let before = query_mask();
+                assert_eq!(before & seeded_bits, seeded_bits);
+                {
+                    let guard = BirthSignalGuard::arm(1 << (libc::SIGALRM - 1)).unwrap();
+                    assert_eq!(guard.saved_mask(), before);
+                    let during = query_mask();
+                    assert_ne!(during & (1 << (libc::SIGUSR1 - 1)), 0);
+                    assert_ne!(during & (1 << (libc::SIGBUS - 1)), 0);
+                    assert_eq!(during & (1 << (libc::SIGALRM - 1)), 0);
+                    assert_eq!(during & (1 << (libc::SIGSEGV - 1)), 0);
+                }
+                assert_eq!(query_mask(), before);
+            },
+            0,
+        );
+    }
+
+    #[test]
+    fn physical_call_on_slot_record_writes_slot_ledger() {
+        isolated(
+            || {
+                let mut control = unsafe { scalar_control() };
+                reverie_inguest_private_exec_control
+                    .store((&raw mut control) as usize, Ordering::Release);
+                let real_fs = control.tool_fs;
+                let tid = unsafe { crate::trap::raw_syscall6(libc::SYS_gettid, [0; 6]) };
+                // Synthetic two-stride block; slot 1 carries a minimal TCB
+                // whose canary word copies this thread's, so Rust frames
+                // between the FS switches still validate.
+                let stride = 128 * 1024usize;
+                let total = 3 * stride;
+                let raw = unsafe {
+                    libc::mmap(
+                        core::ptr::null_mut(),
+                        total,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                        -1,
+                        0,
+                    )
+                };
+                assert_ne!(raw, libc::MAP_FAILED);
+                let base = (raw as usize + stride - 1) & !(stride - 1);
+                let layout = tool_tls_slots::SlotLayout {
+                    block_base: base,
+                    stride_log2: 17,
+                    stride,
+                    record_offset: 4096,
+                    tsd_offset: 8192,
+                    altstack_offset: 16384,
+                    altstack_bytes: 65536,
+                    backing_offset: 16384 + 65536 + 4096,
+                    tp_offset: 4096,
+                    callback_base: 0,
+                    callback_stride: 8 * 1024 * 1024 + 8192,
+                    leader_altstacks: [(0, 0), (0, 0)],
+                };
+                let tp = layout.tool_fs_for_slot(1);
+                let backing = layout.backing(1) as *mut u64;
+                let mut guest_tls = [0_u64; 16];
+                let guest_fs = guest_tls.as_mut_ptr() as u64;
+                let clear_word = Box::into_raw(Box::new(0_u64));
+                let record = layout.record_addr(1) as *mut u64;
+                unsafe {
+                    *backing = 1;
+                    *backing.add(1) = backing as u64;
+                    *(tp as *mut u64) = tp as u64;
+                    *((tp + 8) as *mut u64) = backing as u64;
+                    *((tp + 0x28) as *mut u64) = *((real_fs + 0x28) as *const u64);
+                    *record.add(2) = 4; // phase
+                    *record.add(3) = guest_fs;
+                    *record.add(4) = tp as u64;
+                }
+                tool_tls_slots::install_layout_for_test(layout);
+                // No TLS, errno or allocation access between the switches:
+                // only raw gate calls and the leaf itself.
+                let codes = unsafe {
+                    let set = crate::trap::raw_syscall6(
+                        libc::SYS_arch_prctl,
+                        [0x1002, tp as u64, 0, 0, 0, 0],
+                    );
+                    let got_tid = physical_syscall(libc::SYS_gettid, [0; 6], None).result;
+                    let settid = physical_syscall(
+                        libc::SYS_set_tid_address,
+                        [clear_word as u64, 0, 0, 0, 0, 0],
+                        None,
+                    )
+                    .result;
+                    let robust =
+                        physical_syscall(libc::SYS_set_robust_list, [0x5000, 24, 0, 0, 0, 0], None)
+                            .result;
+                    let back = crate::trap::raw_syscall6(
+                        libc::SYS_arch_prctl,
+                        [0x1002, real_fs, 0, 0, 0, 0],
+                    );
+                    (set, got_tid, settid, robust, back)
+                };
+                assert_eq!(codes, (0, tid, tid, 0, 0));
+                unsafe {
+                    // The slot ledger took the registration; the leader's
+                    // did not. Guest FS was captured into the slot record.
+                    assert_eq!(*record.add(11), clear_word as u64); // guest_clear_tid
+                    assert_eq!(*record.add(12), 0x5000); // guest_robust_head
+                    assert_eq!(*record.add(13), 24); // guest_robust_len
+                    assert_eq!(*record.add(3), guest_fs);
+                    assert_eq!(*record.add(2), 4);
+                }
+                assert_eq!(control.kernel_clear_tid, 0);
+                assert_eq!(control.kernel_robust_head, 0);
+                assert_eq!(control.kernel_robust_len, 0);
+                assert_eq!(control.guest_fs, 0);
+            },
+            0,
+        );
+    }
+    static SLOT_OVERLAP_ARRIVED: core::sync::atomic::AtomicUsize =
+        core::sync::atomic::AtomicUsize::new(0);
+    static SLOT_OVERLAP_PHASES: [core::sync::atomic::AtomicU64; 2] = [
+        core::sync::atomic::AtomicU64::new(0),
+        core::sync::atomic::AtomicU64::new(0),
+    ];
+
+    extern "C" fn slot_overlap_handler(_signal: i32) {
+        // Runs on this thread's slot altstack (SA_ONSTACK delivery).
+        callback_prepared();
+        // Record the phase this thread's own record shows at the barrier,
+        // not only the end state after completion.
+        if let Some(layout) = tool_tls_slots::layout()
+            && let tool_tls_slots::RecordRef::Slot(index) =
+                layout.record_for_rsp(current_stack_pointer())
+            && (1..=2).contains(&index)
+        {
+            let phase = current_phase_word(control_pointer());
+            SLOT_OVERLAP_PHASES[index - 1].store(
+                unsafe { phase.read_volatile() },
+                core::sync::atomic::Ordering::SeqCst,
+            );
+        }
+        SLOT_OVERLAP_ARRIVED.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+        while SLOT_OVERLAP_ARRIVED.load(core::sync::atomic::Ordering::SeqCst) < 2 {
+            // SAFETY: scalar yield through libc; no TLS state is touched.
+            unsafe {
+                libc::syscall(libc::SYS_sched_yield);
+            }
+        }
+        guest_completed();
+    }
+
+    fn synthetic_two_slot_layout(record_words: bool) -> (usize, tool_tls_slots::SlotLayout) {
+        let stride = 128 * 1024usize;
+        // One extra stride of slack so the stride-aligned base plus two
+        // full slots (slot index 2's altstack top included) always stays
+        // inside the mapping.
+        let total = 4 * stride;
+        let raw = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                total,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(raw, libc::MAP_FAILED);
+        let base = (raw as usize + stride - 1) & !(stride - 1);
+        let layout = tool_tls_slots::SlotLayout {
+            block_base: base,
+            stride_log2: 17,
+            stride,
+            record_offset: 4096,
+            tsd_offset: 8192,
+            altstack_offset: 16384,
+            altstack_bytes: 65536,
+            backing_offset: 16384 + 65536 + 4096,
+            tp_offset: 4096,
+            callback_base: 0,
+            callback_stride: 8 * 1024 * 1024 + 8192,
+            leader_altstacks: [(0, 0), (0, 0)],
+        };
+        if record_words {
+            for index in 1..=2usize {
+                let record = layout.record_addr(index) as *mut u64;
+                unsafe {
+                    *record.add(2) = 3; // phase: guest
+                    *record.add(3) = 0; // guest_fs
+                    *record.add(4) = layout.tool_fs_for_slot(index) as u64;
+                }
+            }
+        }
+        (raw as usize, layout)
+    }
+
+    fn run_on_altstack(altstack: (usize, usize)) {
+        let stack = libc::stack_t {
+            ss_sp: altstack.0 as *mut libc::c_void,
+            ss_flags: 0,
+            ss_size: altstack.1 - altstack.0,
+        };
+        unsafe {
+            assert_eq!(
+                libc::sigaltstack(&raw const stack, core::ptr::null_mut()),
+                0
+            );
+            let tid = libc::syscall(libc::SYS_gettid);
+            assert_eq!(
+                libc::syscall(libc::SYS_tgkill, std::process::id(), tid, libc::SIGURG,),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn slot_phase_helpers_overlap_on_slot_altstacks() {
+        isolated(
+            || {
+                let mut control = unsafe { scalar_control() };
+                reverie_inguest_private_exec_control
+                    .store((&raw mut control) as usize, Ordering::Release);
+                let (_raw, layout) = synthetic_two_slot_layout(true);
+                SLOT_OVERLAP_ARRIVED.store(0, core::sync::atomic::Ordering::SeqCst);
+                let mut action: libc::sigaction = unsafe { core::mem::zeroed() };
+                action.sa_sigaction = slot_overlap_handler as *const () as usize;
+                action.sa_flags = libc::SA_ONSTACK;
+                unsafe {
+                    assert_eq!(libc::sigemptyset(&raw mut action.sa_mask), 0);
+                    assert_eq!(
+                        libc::sigaction(libc::SIGURG, &raw const action, core::ptr::null_mut()),
+                        0
+                    );
+                }
+                tool_tls_slots::install_layout_for_test(layout);
+                let threads: Vec<_> = (1..=2usize)
+                    .map(|index| {
+                        let altstack = layout.altstack_for_slot(index);
+                        std::thread::spawn(move || run_on_altstack(altstack))
+                    })
+                    .collect();
+                for thread in threads {
+                    thread.join().unwrap();
+                }
+                // Both records were at phase 4 *at the barrier* (not only
+                // back at 3 afterwards); the leader word is untouched.
+                assert_eq!(
+                    SLOT_OVERLAP_PHASES[0].load(core::sync::atomic::Ordering::SeqCst),
+                    4
+                );
+                assert_eq!(
+                    SLOT_OVERLAP_PHASES[1].load(core::sync::atomic::Ordering::SeqCst),
+                    4
+                );
+                for index in 1..=2usize {
+                    let record = layout.record_addr(index) as *const u64;
+                    assert_eq!(unsafe { *record.add(2) }, 3);
+                }
+                assert_eq!(control.phase, 4);
+            },
+            0,
+        );
+        // Negative control, same body (SIGURG on slot-shaped altstacks)
+        // with no layout published: both helpers resolve to the single
+        // global phase word and the second entrant takes the terminal
+        // exactly as today's code does. Spawning is sequential so the
+        // first entrant is already at phase 4, parked in the handler,
+        // when the second is delivered — no read/write race.
+        isolated(
+            || {
+                let mut control = unsafe { scalar_control() };
+                control.phase = 3;
+                reverie_inguest_private_exec_control
+                    .store((&raw mut control) as usize, Ordering::Release);
+                let (_raw, layout) = synthetic_two_slot_layout(true);
+                SLOT_OVERLAP_ARRIVED.store(0, core::sync::atomic::Ordering::SeqCst);
+                let mut action: libc::sigaction = unsafe { core::mem::zeroed() };
+                action.sa_sigaction = slot_overlap_handler as *const () as usize;
+                action.sa_flags = libc::SA_ONSTACK;
+                unsafe {
+                    assert_eq!(libc::sigemptyset(&raw mut action.sa_mask), 0);
+                    assert_eq!(
+                        libc::sigaction(libc::SIGURG, &raw const action, core::ptr::null_mut()),
+                        0
+                    );
+                }
+                let first = {
+                    let altstack = layout.altstack_for_slot(1);
+                    std::thread::spawn(move || run_on_altstack(altstack))
+                };
+                while SLOT_OVERLAP_ARRIVED.load(core::sync::atomic::Ordering::SeqCst) < 1 {
+                    std::thread::yield_now();
+                }
+                let second = {
+                    let altstack = layout.altstack_for_slot(2);
+                    std::thread::spawn(move || run_on_altstack(altstack))
+                };
+                let _ = first.join();
+                let _ = second.join();
+            },
+            127,
+        );
+    }
+
+    fn wide_synthetic_layout() -> (usize, tool_tls_slots::SlotLayout) {
+        // 68 strides: one slack stride below the aligned base and room
+        // for an idx-64 TP/altstack above the 64 published slots.
+        let stride = 128 * 1024usize;
+        let raw = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                68 * stride,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(raw, libc::MAP_FAILED);
+        let base = ((raw as usize + stride - 1) & !(stride - 1)) + stride;
+        (
+            raw as usize,
+            tool_tls_slots::SlotLayout {
+                block_base: base,
+                stride_log2: 17,
+                stride,
+                record_offset: 4096,
+                tsd_offset: 8192,
+                altstack_offset: 16384,
+                altstack_bytes: 65536,
+                backing_offset: 16384 + 65536 + 4096,
+                tp_offset: 4096,
+                callback_base: 0,
+                callback_stride: 8 * 1024 * 1024 + 8192,
+                leader_altstacks: [(0, 0), (0, 0)],
+            },
+        )
+    }
+
+    fn install_private_sigsys_entry() {
+        let mut action: libc::sigaction = unsafe { core::mem::zeroed() };
+        action.sa_sigaction =
+            signal_entry(false, crate::trap::pkru_present()) as *const () as usize;
+        action.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
+        unsafe {
+            assert_eq!(libc::sigemptyset(&raw mut action.sa_mask), 0);
+            assert_eq!(
+                libc::sigaction(libc::SIGSYS, &raw const action, core::ptr::null_mut()),
+                0
+            );
+        }
+    }
+
+    fn install_altstack_and_raise_sigsys(stack: Option<(usize, usize)>) {
+        if let Some((lo, hi)) = stack {
+            let alt = libc::stack_t {
+                ss_sp: lo as *mut libc::c_void,
+                ss_flags: 0,
+                ss_size: hi - lo,
+            };
+            assert_eq!(
+                unsafe { libc::sigaltstack(&raw const alt, core::ptr::null_mut()) },
+                0
+            );
+        }
+        unsafe {
+            let tid = crate::trap::raw_syscall6(libc::SYS_gettid, [0; 6]);
+            crate::trap::raw_syscall6(
+                libc::SYS_tgkill,
+                [
+                    std::process::id() as u64,
+                    tid as u64,
+                    libc::SIGSYS as u64,
+                    0,
+                    0,
+                    0,
+                ],
+            );
+        }
+    }
+
+    // kind: 0 slot, 1 tool_fs mismatch, 2 ordinary stack, 3 in-block
+    // non-altstack, 4 slot 0, 5 idx >= 64, 6 leader range, 7 no layout,
+    // 8 invalid slot phase (control phase is a valid 2).
+    fn signal_entry_arm(kind: u8) {
+        let mut control = unsafe { scalar_control() };
+        control.phase = 2;
+        let real_fs = control.tool_fs;
+        reverie_inguest_private_exec_control.store((&raw mut control) as usize, Ordering::Release);
+        let (_raw, mut layout) = wide_synthetic_layout();
+        let leader_stack = vec![0_u8; 65536].leak();
+        layout.leader_altstacks[0] = (
+            leader_stack.as_ptr() as usize,
+            leader_stack.as_ptr() as usize + leader_stack.len(),
+        );
+        let record = layout.record_addr(1) as *mut u64;
+        unsafe {
+            *record.add(2) = if kind == 8 { 9 } else { 2 }; // phase
+            *record.add(3) = 0;
+            *record.add(4) = if kind == 1 {
+                real_fs + 0x1_0000
+            } else {
+                real_fs
+            };
+            // Decoys at indices 0 and 64 are fully valid records, so the
+            // index bound is the ONLY thing that can refuse arms 4/5.
+            for decoy in [0usize, 64] {
+                let decoy_record = layout.record_addr(decoy) as *mut u64;
+                *decoy_record.add(2) = 2;
+                *decoy_record.add(3) = 0;
+                *decoy_record.add(4) = real_fs;
+            }
+        }
+        if kind != 7 {
+            tool_tls_slots::install_layout_for_test(layout);
+        }
+        install_private_sigsys_entry();
+        let stack = match kind {
+            0 | 1 | 8 => Some(layout.altstack_for_slot(1)),
+            2 | 7 => None,
+            3 => Some((layout.record_addr(1), layout.record_addr(1) + 4096)),
+            4 => Some((
+                layout.block_base + layout.altstack_offset,
+                layout.block_base + layout.altstack_offset + layout.altstack_bytes,
+            )),
+            5 => {
+                let lo = layout.block_base + 64 * layout.stride + layout.altstack_offset;
+                Some((lo, lo + layout.altstack_bytes))
+            }
+            _ => Some(layout.leader_altstacks[0]),
+        };
+        install_altstack_and_raise_sigsys(stack);
+        panic!("signal entry returned");
+    }
+
+    #[test]
+    fn signal_entry_record_derivation_arms() {
+        // A non-seccomp SIGSYS reaches the handler and exits 126; a
+        // terminal in the entry derivation exits 127. The pair pins
+        // which record the assembly selected.
+        isolated(|| signal_entry_arm(0), 126); // slot altstack, slot record
+        isolated(|| signal_entry_arm(1), 127); // record tool_fs != FS
+        isolated(|| signal_entry_arm(2), 127); // ordinary stack (test j)
+        isolated(|| signal_entry_arm(3), 127); // in block, not an altstack
+        isolated(|| signal_entry_arm(4), 127); // slot 0 stride
+        isolated(|| signal_entry_arm(5), 127); // idx >= 64
+        isolated(|| signal_entry_arm(6), 126); // leader altstack range
+        isolated(|| signal_entry_arm(7), 126); // no layout: today's code
+        isolated(|| signal_entry_arm(8), 127); // invalid slot phase
+    }
+
+    // kind: 0 tool_fs mismatch, 1 TP below block, 2 slot-0 TP,
+    // 3 idx-64 TP, 4 leader-only guest entry, 5 lifecycle entry (0x106),
+    // both on a good slot TP (record at phase 6 for kind 5).
+    fn leaf_refusal_arm(kind: u8) {
+        let mut control = unsafe { scalar_control() };
+        reverie_inguest_private_exec_control.store((&raw mut control) as usize, Ordering::Release);
+        let real_fs = control.tool_fs;
+        let canary = unsafe { *((real_fs + 0x28) as *const u64) };
+        let (_raw, layout) = wide_synthetic_layout();
+        let tp = match kind {
+            1 => layout.block_base - 2048,
+            2 => layout.backing(0) + layout.tp_offset,
+            3 => layout.backing(64) + layout.tp_offset,
+            _ => layout.tool_fs_for_slot(1),
+        };
+        let record = layout.record_addr(1) as *mut u64;
+        unsafe {
+            *(tp as *mut u64) = tp as u64;
+            *((tp + 8) as *mut u64) = tp as u64;
+            *((tp + 0x28) as *mut u64) = canary;
+            *record.add(2) = if kind == 5 { 6 } else { 4 }; // phase
+            *record.add(3) = 0;
+            *record.add(4) = if kind == 0 {
+                tp as u64 + 0x1_0000
+            } else {
+                tp as u64
+            };
+            // Decoys at indices 0 and 64 pass the phase and [rec+32]
+            // checks for their own TPs, so only the index bound refuses.
+            for decoy in [0usize, 64] {
+                let decoy_record = layout.record_addr(decoy) as *mut u64;
+                *decoy_record.add(2) = 4;
+                *decoy_record.add(3) = 0;
+                *decoy_record.add(4) = layout.tool_fs_for_slot(decoy) as u64;
+            }
+        }
+        tool_tls_slots::install_layout_for_test(layout);
+        let args = [0_u64; 6];
+        unsafe {
+            crate::trap::raw_syscall6(libc::SYS_arch_prctl, [0x1002, tp as u64, 0, 0, 0, 0]);
+            if kind == 4 {
+                reverie_inguest_private_leader_guest_call(libc::SYS_gettid, args.as_ptr(), 0, 0);
+            } else if kind == 5 {
+                #[cfg(feature = "exec-private-successor")]
+                reverie_inguest_private_lifecycle_call(libc::SYS_gettid, args.as_ptr(), 0, 0);
+                #[cfg(not(feature = "exec-private-successor"))]
+                physical_syscall(libc::SYS_gettid, args, None);
+            } else {
+                physical_syscall(libc::SYS_gettid, args, None);
+            }
+        }
+        panic!("call leaf returned");
+    }
+
+    #[test]
+    fn call_leaf_refusal_arms_are_terminal() {
+        isolated(|| leaf_refusal_arm(0), 127); // [record+32] != FS base
+        isolated(|| leaf_refusal_arm(1), 127); // TP below the block
+        isolated(|| leaf_refusal_arm(2), 127); // slot-0 TP
+        isolated(|| leaf_refusal_arm(3), 127); // idx >= 64 TP
+        isolated(|| leaf_refusal_arm(4), 127); // leader-only entry, slot TP
+        #[cfg(feature = "exec-private-successor")]
+        isolated(|| leaf_refusal_arm(5), 127); // lifecycle 0x106, slot TP at phase 6
+    }
+
+    // The leaf's identity source is the FS base (read with
+    // ARCH_GET_FS), never the TCB self word: with slot 1's self word
+    // pointing at slot 2's TP (or zero), a call made on slot 1's TP
+    // still derives slot 1's record, restores slot 1's TP, and
+    // leaves slot 2 and the leader control untouched.
+    fn leaf_decoy_self_word_arm(self_word_zero: bool) {
+        let mut control = unsafe { scalar_control() };
+        reverie_inguest_private_exec_control.store((&raw mut control) as usize, Ordering::Release);
+        let real_fs = control.tool_fs;
+        let canary = unsafe { *((real_fs + 0x28) as *const u64) };
+        let tid = unsafe { crate::trap::raw_syscall6(libc::SYS_gettid, [0; 6]) };
+        let (_raw, layout) = synthetic_two_slot_layout(false);
+        let tp1 = layout.tool_fs_for_slot(1);
+        let tp2 = layout.tool_fs_for_slot(2);
+        let mut guest_tls1 = [0_u64; 16];
+        let mut guest_tls2 = [0_u64; 16];
+        let guest_fs1 = guest_tls1.as_mut_ptr() as u64;
+        let guest_fs2 = guest_tls2.as_mut_ptr() as u64;
+        for (index, tp, guest_fs) in [(1usize, tp1, guest_fs1), (2, tp2, guest_fs2)] {
+            let backing = layout.backing(index) as *mut u64;
+            let record = layout.record_addr(index) as *mut u64;
+            unsafe {
+                *backing = 1;
+                *backing.add(1) = backing as u64;
+                *(tp as *mut u64) = tp as u64;
+                *((tp + 8) as *mut u64) = backing as u64;
+                *((tp + 0x28) as *mut u64) = canary;
+                *record.add(2) = 4; // phase
+                *record.add(3) = guest_fs;
+                *record.add(4) = tp as u64;
+            }
+        }
+        // The decoy: slot 1's TCB self word names slot 2 (or nothing).
+        unsafe {
+            *(tp1 as *mut u64) = if self_word_zero { 0 } else { tp2 as u64 };
+        }
+        tool_tls_slots::install_layout_for_test(layout);
+        let mut after_fs = 0_u64;
+        // No TLS, errno or allocation access between the switches:
+        // only raw gate calls and the leaf itself.
+        let codes = unsafe {
+            let set =
+                crate::trap::raw_syscall6(libc::SYS_arch_prctl, [0x1002, tp1 as u64, 0, 0, 0, 0]);
+            let got = physical_syscall(libc::SYS_gettid, [0; 6], None).result;
+            let get = crate::trap::raw_syscall6(
+                libc::SYS_arch_prctl,
+                [0x1003, (&raw mut after_fs) as u64, 0, 0, 0, 0],
+            );
+            let back =
+                crate::trap::raw_syscall6(libc::SYS_arch_prctl, [0x1002, real_fs, 0, 0, 0, 0]);
+            (set, got, get, back)
+        };
+        assert_eq!(codes, (0, tid, 0, 0));
+        assert_eq!(after_fs, tp1 as u64, "leaf restored the wrong tool FS");
+        let r1 = layout.record_addr(1) as *const u64;
+        let r2 = layout.record_addr(2) as *const u64;
+        unsafe {
+            assert_eq!((*r1.add(2), *r1.add(3)), (4, guest_fs1));
+            assert_eq!(
+                (*r2.add(2), *r2.add(3), *r2.add(4)),
+                (4, guest_fs2, tp2 as u64)
+            );
+            for word in 11..=13 {
+                assert_eq!(*r1.add(word), 0);
+                assert_eq!(*r2.add(word), 0);
+            }
+        }
+        assert_eq!((control.phase, control.guest_fs), (4, 0));
+    }
+
+    #[test]
+    fn call_leaf_derives_record_from_fs_base_not_tcb_self_word() {
+        isolated(|| leaf_decoy_self_word_arm(false), 0);
+        isolated(|| leaf_decoy_self_word_arm(true), 0);
+    }
+
+    #[test]
+    fn call_leaf_leader_path_positive_with_layout_published() {
+        isolated(
+            || {
+                let mut control = unsafe { scalar_control() };
+                reverie_inguest_private_exec_control
+                    .store((&raw mut control) as usize, Ordering::Release);
+                let tid = unsafe { crate::trap::raw_syscall6(libc::SYS_gettid, [0; 6]) };
+                let (_raw, layout) = synthetic_two_slot_layout(false);
+                for index in 1..=2usize {
+                    let record = layout.record_addr(index) as *mut u64;
+                    unsafe {
+                        *record.add(2) = 4; // phase
+                        *record.add(3) = 0x1111 * index as u64; // guest_fs sentinel
+                        *record.add(4) = layout.tool_fs_for_slot(index) as u64;
+                    }
+                }
+                tool_tls_slots::install_layout_for_test(layout);
+                // FS stays the leader's tool_fs: the call must take the
+                // leader record even with a layout published.
+                let mut guest_tls = [0_u64; 16];
+                let selected = guest_tls.as_mut_ptr() as u64;
+                let got = unsafe { physical_syscall(libc::SYS_gettid, [0; 6], None) }.result;
+                assert_eq!(got, tid);
+                let set = unsafe {
+                    physical_syscall(libc::SYS_arch_prctl, [0x1002, selected, 0, 0, 0, 0], None)
+                }
+                .result;
+                assert_eq!(set, 0);
+                assert_eq!(control.phase, 4);
+                assert_eq!(control.guest_fs, selected);
+                for index in 1..=2usize {
+                    let record = layout.record_addr(index) as *const u64;
+                    unsafe {
+                        assert_eq!(
+                            (*record.add(2), *record.add(3), *record.add(4)),
+                            (
+                                4,
+                                0x1111 * index as u64,
+                                layout.tool_fs_for_slot(index) as u64
+                            )
+                        );
+                    }
+                }
+            },
+            0,
+        );
+    }
+
+    #[test]
+    fn slot_phase_helper_from_unknown_stack_is_terminal_with_layout() {
+        isolated(
+            || {
+                let mut control = unsafe { scalar_control() };
+                // A leader fallback would find phase 3 here and succeed;
+                // the published layout must refuse this unknown stack.
+                control.phase = 3;
+                reverie_inguest_private_exec_control
+                    .store((&raw mut control) as usize, Ordering::Release);
+                let (_raw, layout) = synthetic_two_slot_layout(true);
+                tool_tls_slots::install_layout_for_test(layout);
+                callback_prepared();
+                panic!("unknown stack fell back to the leader record");
+            },
+            127,
+        );
+    }
+
+    #[test]
+    fn ledger_lookup_refuses_when_record_tool_fs_differs() {
+        isolated(
+            || {
+                let mut control = unsafe { scalar_control() };
+                reverie_inguest_private_exec_control
+                    .store((&raw mut control) as usize, Ordering::Release);
+                let real_fs = control.tool_fs;
+                let canary = unsafe { *((real_fs + 0x28) as *const u64) };
+                let (_raw, layout) = wide_synthetic_layout();
+                let tp = layout.tool_fs_for_slot(1);
+                let record = layout.record_addr(1) as *mut u64;
+                unsafe {
+                    *(tp as *mut u64) = tp as u64;
+                    *((tp + 0x28) as *mut u64) = canary;
+                    *record.add(4) = tp as u64 + 0x1_0000; // not ARCH_GET_FS
+                }
+                tool_tls_slots::install_layout_for_test(layout);
+                // Switch to the slot TP, then ask the ledger lookup to
+                // resolve: geometry finds slot 1, the tool_fs re-check kills.
+                unsafe {
+                    crate::trap::raw_syscall6(
+                        libc::SYS_arch_prctl,
+                        [0x1002, tp as u64, 0, 0, 0, 0],
+                    );
+                    let _ = current_slot_record_for_ledger(control_pointer());
+                }
+                panic!("ledger lookup accepted a mismatched record tool_fs");
+            },
+            127,
+        );
+    }
+
+    #[test]
     fn guest_injection_outside_its_callback_ends_before_the_syscall() {
         isolated(
             || {
@@ -4491,6 +5786,163 @@ mod tests {
         );
     }
 
+    fn maps_perms(address: usize) -> String {
+        let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+        for line in maps.lines() {
+            let mut fields = line.split_whitespace();
+            let Some(range) = fields.next() else { continue };
+            let Some(perms) = fields.next() else { continue };
+            let Some((lo, hi)) = range.split_once('-') else {
+                continue;
+            };
+            let (Ok(lo), Ok(hi)) = (usize::from_str_radix(lo, 16), usize::from_str_radix(hi, 16))
+            else {
+                continue;
+            };
+            if address >= lo && address < hi {
+                return perms.to_owned();
+            }
+        }
+        panic!("address {address:#x} is unmapped");
+    }
+
+    fn capture_test_geometry() {
+        capture_test_geometry_with(0x6000_0000);
+    }
+
+    fn capture_test_geometry_with(leader_backing_start: usize) {
+        tool_tls_slots::capture_geometry_inputs(4096, 16, 96, leader_backing_start, 64 * 1024);
+    }
+
+    #[test]
+    fn slot_claim_admission_off_on_and_forced_failure() {
+        // Admission off: finish-time claim must not claim anything.
+        isolated(
+            || {
+                let region = crate::guest::tool_region::ToolRegion::reserve().unwrap();
+                let mut control: Box<NativeControl> = Box::new(unsafe { core::mem::zeroed() });
+                capture_test_geometry();
+                tool_tls_slots::note_thread_admission_requested(false);
+                let before = region.free_spans().unwrap();
+                tool_tls_slots::claim_and_publish_if_requested(region, &raw mut *control);
+                assert_eq!(region.free_spans().unwrap(), before);
+                assert_eq!(tool_tls_slots::layout(), None);
+                assert_eq!(tool_tls_slots::claim_status_for_test(), "not-attempted");
+            },
+            0,
+        );
+        // Admission on: layout published, records stamped, guards sealed.
+        isolated(
+            || {
+                let region = crate::guest::tool_region::ToolRegion::reserve().unwrap();
+                let mut control: Box<NativeControl> = Box::new(unsafe { core::mem::zeroed() });
+                capture_test_geometry();
+                tool_tls_slots::note_thread_admission_requested(true);
+                tool_tls_slots::claim_and_publish_if_requested(region, &raw mut *control);
+                let layout = tool_tls_slots::layout().expect("layout published");
+                assert_eq!(tool_tls_slots::claim_status_for_test(), "ready");
+                assert_eq!(
+                    tool_tls_slots::published_slot_base_for_test(),
+                    layout.block_base
+                );
+                assert_eq!(layout.block_base % layout.stride, 0);
+                for index in [1usize, 63] {
+                    let record = layout.record_addr(index) as *const u64;
+                    assert_eq!(
+                        unsafe { record.read_volatile() },
+                        tool_tls_slots::SLOT_RECORD_MAGIC
+                    );
+                    assert_eq!(unsafe { record.add(1).read_volatile() }, index as u64);
+                    let (alt_lo, alt_hi) = layout.altstack_for_slot(index);
+                    for guard in [
+                        layout.slot_base(index),
+                        layout.slot_base(index) + 3 * 4096,
+                        alt_hi,
+                    ] {
+                        assert_eq!(maps_perms(guard), "---p", "guard {guard:#x}");
+                    }
+                    assert_eq!(maps_perms(layout.record_addr(index)), "rw-p");
+                    assert_eq!(maps_perms(alt_lo), "rw-p");
+                }
+                let pool_end = layout.callback_base + 63 * layout.callback_stride;
+                for address in [
+                    layout.callback_base,
+                    layout.callback_base + (pool_end - layout.callback_base) / 2,
+                    pool_end - 1,
+                ] {
+                    assert_eq!(maps_perms(address), "---p", "pool {address:#x}");
+                }
+                // Callback stack views: bounds and exact slot extents.
+                let usable = crate::guest::continuation::CALLBACK_STACK_BYTES;
+                assert!(layout.callback_stack_for_slot(region, 0, usable).is_none());
+                assert!(layout.callback_stack_for_slot(region, 64, usable).is_none());
+                assert!(
+                    layout
+                        .callback_stack_for_slot(region, 1, usable + 4096)
+                        .is_none()
+                );
+                for index in [1usize, 63] {
+                    let view = layout
+                        .callback_stack_for_slot(region, index, usable)
+                        .expect("slot callback stack");
+                    let extent = layout.callback_base + (index - 1) * layout.callback_stride;
+                    assert_eq!(view.extent(), (extent, extent + layout.callback_stride));
+                    assert_eq!(view.base(), extent + 4096);
+                    assert_eq!(view.top(), extent + 4096 + usable);
+                }
+            },
+            0,
+        );
+        // Forced failure: fragment the largest free span below the pool's
+        // contiguous need; the claim must degrade by name, not panic.
+        isolated(
+            || {
+                let region = crate::guest::tool_region::ToolRegion::reserve().unwrap();
+                let mut control: Box<NativeControl> = Box::new(unsafe { core::mem::zeroed() });
+                let spans = region.free_spans().unwrap();
+                let &(start, len) = spans.iter().max_by_key(|&(_, len)| len).unwrap();
+                let mut page = start + 100_000;
+                while page < start + len {
+                    region.claim_at(page, 1).unwrap();
+                    page += 100_000;
+                }
+                capture_test_geometry();
+                tool_tls_slots::note_thread_admission_requested(true);
+                let before = region.free_spans().unwrap();
+                tool_tls_slots::claim_and_publish_if_requested(region, &raw mut *control);
+                assert_eq!(region.free_spans().unwrap(), before);
+                assert_eq!(tool_tls_slots::layout(), None);
+                assert_eq!(tool_tls_slots::claim_status_for_test(), "claim-failed");
+                let failure = tool_tls_slots::claim_failure_reason().expect("named claim failure");
+                assert_eq!(failure.errno, libc::ENOMEM);
+                assert_eq!(
+                    failure.reason,
+                    tool_tls_slots::LayoutError::NoAlignedSpan.name()
+                );
+            },
+            0,
+        );
+        // Leader backing not a multiple of tls_align: named EINVAL refusal.
+        isolated(
+            || {
+                let region = crate::guest::tool_region::ToolRegion::reserve().unwrap();
+                let mut control: Box<NativeControl> = Box::new(unsafe { core::mem::zeroed() });
+                capture_test_geometry_with(8);
+                tool_tls_slots::note_thread_admission_requested(true);
+                tool_tls_slots::claim_and_publish_if_requested(region, &raw mut *control);
+                assert_eq!(tool_tls_slots::layout(), None);
+                let failure =
+                    tool_tls_slots::claim_failure_reason().expect("named leader-backing refusal");
+                assert_eq!(failure.errno, libc::EINVAL);
+                assert_eq!(
+                    failure.reason,
+                    "leader backing is not a multiple of tls_align"
+                );
+            },
+            0,
+        );
+    }
+
     #[test]
     fn initial_vdso_context_requires_same_fresh_native_owner() {
         isolated(
@@ -4733,6 +6185,578 @@ mod tests {
                 unsafe { (&raw mut native.abi_version).write_volatile(1) };
                 unsafe { (&raw mut native.byte_len).write_volatile(native.byte_len - 8) };
                 assert_eq!(callback_native_tid(), None);
+            },
+            0,
+        );
+    }
+
+    #[test]
+    fn callback_tool_tid_leader_requires_registered_ready_slot_zero() {
+        isolated(
+            || {
+                assert_eq!(callback_tool_tid(), None);
+                let mut native = unsafe { scalar_control() };
+                native.native_tid =
+                    unsafe { crate::trap::raw_syscall6(libc::SYS_gettid, [0; 6]) } as u64;
+                reverie_inguest_private_exec_control
+                    .store((&raw mut native) as usize, Ordering::Release);
+                unsafe { (&raw mut native.runtime_ready).write_volatile(1) };
+                // The leader identity is ready, but slot 0 is not in
+                // the registry: an unpublished-registry control is
+                // refused by the split predicate (named, not passed).
+                assert_eq!(callback_native_tid(), Some(native.native_tid as i32));
+                assert_eq!(callback_tool_tid(), None);
+                tool_tls_registry::register_leader(native.native_tid as i32).unwrap();
+                assert_eq!(callback_tool_tid(), Some(native.native_tid as i32));
+                unsafe { (&raw mut native.phase).write_volatile(3) };
+                assert_eq!(callback_tool_tid(), None);
+            },
+            0,
+        );
+    }
+
+    #[test]
+    fn callback_tool_tid_slot_requires_bound_ready_and_phase_four() {
+        isolated(
+            || {
+                let mut control = unsafe { scalar_control() };
+                reverie_inguest_private_exec_control
+                    .store((&raw mut control) as usize, Ordering::Release);
+                let real_fs = control.tool_fs;
+                let tid = unsafe { crate::trap::raw_syscall6(libc::SYS_gettid, [0; 6]) } as i32;
+                control.native_tid = (tid + 1000) as u64;
+                unsafe { (&raw mut control.runtime_ready).write_volatile(1) };
+                // Synthetic slot-1 block (the B2 ledger pattern): the
+                // slot TCB copies this thread's canary so Rust frames
+                // between the FS switches still validate.
+                let stride = 128 * 1024usize;
+                let total = 3 * stride;
+                let raw = unsafe {
+                    libc::mmap(
+                        core::ptr::null_mut(),
+                        total,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                        -1,
+                        0,
+                    )
+                };
+                assert_ne!(raw, libc::MAP_FAILED);
+                let base = (raw as usize + stride - 1) & !(stride - 1);
+                let layout = tool_tls_slots::SlotLayout {
+                    block_base: base,
+                    stride_log2: 17,
+                    stride,
+                    record_offset: 4096,
+                    tsd_offset: 8192,
+                    altstack_offset: 16384,
+                    altstack_bytes: 65536,
+                    backing_offset: 16384 + 65536 + 4096,
+                    tp_offset: 4096,
+                    callback_base: 0,
+                    callback_stride: 8 * 1024 * 1024 + 8192,
+                    leader_altstacks: [(0, 0), (0, 0)],
+                };
+                let tp = layout.tool_fs_for_slot(1);
+                let backing = layout.backing(1) as *mut u64;
+                let record = layout.record_addr(1) as *mut u64;
+                unsafe {
+                    *backing = 1;
+                    *backing.add(1) = backing as u64;
+                    *(tp as *mut u64) = tp as u64;
+                    *((tp + 8) as *mut u64) = backing as u64;
+                    *((tp + 0x28) as *mut u64) = *((real_fs + 0x28) as *const u64);
+                    *record.add(2) = 4; // phase
+                    *record.add(4) = tp as u64; // tool thread pointer
+                }
+                tool_tls_slots::install_layout_for_test(layout);
+                // Claimed but not yet bound: lookup_ready has no slot
+                // for this tid, so the Building arm must refuse.
+                assert_eq!(tool_tls_registry::TOOL_TLS_REGISTRY.claim(), Some(1));
+                // No TLS, errno or allocation access between the
+                // switches: only raw gate calls and the predicate.
+                let on_slot = |phase: u64| {
+                    unsafe { *record.add(2) = phase };
+                    let (set, result, back) = unsafe {
+                        let set = crate::trap::raw_syscall6(
+                            libc::SYS_arch_prctl,
+                            [0x1002, tp as u64, 0, 0, 0, 0],
+                        );
+                        let result = callback_tool_tid();
+                        let back = crate::trap::raw_syscall6(
+                            libc::SYS_arch_prctl,
+                            [0x1002, real_fs, 0, 0, 0, 0],
+                        );
+                        (set, result, back)
+                    };
+                    assert_eq!((set, back), (0, 0));
+                    result
+                };
+                assert_eq!(on_slot(4), None); // Building: not Ready
+                assert!(tool_tls_registry::TOOL_TLS_REGISTRY.bind_ready(1, tid));
+                assert_eq!(on_slot(4), Some(tid));
+                assert_eq!(on_slot(3), None); // record not in callback phase
+                // The record's own thread-pointer word must agree with
+                // the geometry thread pointer, not just resolve to it.
+                unsafe { *record.add(4) ^= 8 };
+                assert_eq!(on_slot(4), None);
+                unsafe { *record.add(4) ^= 8 };
+            },
+            0,
+        );
+    }
+
+    /// Install a synthetic two-slot layout whose slot TCBs copy this
+    /// thread's canary (the B2 ledger pattern) and return both slots'
+    /// thread pointers. Records start at phase 4.
+    fn install_two_slot_test_layout(real_fs: u64) -> [usize; 2] {
+        let stride = 128 * 1024usize;
+        let total = 5 * stride;
+        let raw = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                total,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(raw, libc::MAP_FAILED);
+        let base = (raw as usize + stride - 1) & !(stride - 1);
+        let layout = tool_tls_slots::SlotLayout {
+            block_base: base,
+            stride_log2: 17,
+            stride,
+            record_offset: 4096,
+            tsd_offset: 8192,
+            altstack_offset: 16384,
+            altstack_bytes: 65536,
+            backing_offset: 16384 + 65536 + 4096,
+            tp_offset: 4096,
+            callback_base: 0,
+            callback_stride: 8 * 1024 * 1024 + 8192,
+            leader_altstacks: [(0, 0), (0, 0)],
+        };
+        let mut tps = [0usize; 2];
+        for (slot, index) in [(0usize, 1usize), (1, 2)] {
+            let tp = layout.tool_fs_for_slot(index);
+            let backing = layout.backing(index) as *mut u64;
+            let record = layout.record_addr(index) as *mut u64;
+            unsafe {
+                *backing = 1;
+                *backing.add(1) = backing as u64;
+                *(tp as *mut u64) = tp as u64;
+                *((tp + 8) as *mut u64) = backing as u64;
+                *((tp + 0x28) as *mut u64) = *((real_fs + 0x28) as *const u64);
+                *record.add(2) = 4; // phase
+                *record.add(4) = tp as u64; // tool thread pointer
+            }
+            tps[slot] = tp;
+        }
+        tool_tls_slots::install_layout_for_test(layout);
+        tps
+    }
+
+    /// Run `callback_tool_tid` on the given synthetic thread pointer:
+    /// no TLS, errno or allocation access between the FS switches.
+    fn tool_tid_on_tp(tp: usize, real_fs: u64) -> Option<i32> {
+        let (set, result, back) = unsafe {
+            let set =
+                crate::trap::raw_syscall6(libc::SYS_arch_prctl, [0x1002, tp as u64, 0, 0, 0, 0]);
+            let result = callback_tool_tid();
+            let back =
+                crate::trap::raw_syscall6(libc::SYS_arch_prctl, [0x1002, real_fs, 0, 0, 0, 0]);
+            (set, result, back)
+        };
+        assert_eq!((set, back), (0, 0));
+        result
+    }
+
+    #[test]
+    fn callback_tool_tid_refuses_ready_tid_on_other_slot_thread_pointer() {
+        isolated(
+            || {
+                let mut control = unsafe { scalar_control() };
+                reverie_inguest_private_exec_control
+                    .store((&raw mut control) as usize, Ordering::Release);
+                let real_fs = control.tool_fs;
+                let tid = unsafe { crate::trap::raw_syscall6(libc::SYS_gettid, [0; 6]) } as i32;
+                control.native_tid = (tid + 1000) as u64;
+                unsafe { (&raw mut control.runtime_ready).write_volatile(1) };
+                let tps = install_two_slot_test_layout(real_fs);
+                // This tid is Ready in slot 1 only; slot 2 stays
+                // Building with its record at phase 4.
+                assert_eq!(tool_tls_registry::TOOL_TLS_REGISTRY.claim(), Some(1));
+                assert_eq!(tool_tls_registry::TOOL_TLS_REGISTRY.claim(), Some(2));
+                assert!(tool_tls_registry::TOOL_TLS_REGISTRY.bind_ready(1, tid));
+                assert_eq!(
+                    tool_tls_registry::TOOL_TLS_REGISTRY.lookup_ready(tid),
+                    Some(1)
+                );
+                // Ready in a different slot never admits this TP.
+                assert_eq!(tool_tid_on_tp(tps[1], real_fs), None);
+                assert_eq!(tool_tid_on_tp(tps[0], real_fs), Some(tid));
+            },
+            0,
+        );
+    }
+
+    #[test]
+    fn callback_tool_tid_refuses_slot_one_tp_when_tid_ready_in_slot_two() {
+        isolated(
+            || {
+                let mut control = unsafe { scalar_control() };
+                reverie_inguest_private_exec_control
+                    .store((&raw mut control) as usize, Ordering::Release);
+                let real_fs = control.tool_fs;
+                let tid = unsafe { crate::trap::raw_syscall6(libc::SYS_gettid, [0; 6]) } as i32;
+                control.native_tid = (tid + 1000) as u64;
+                unsafe { (&raw mut control.runtime_ready).write_volatile(1) };
+                let tps = install_two_slot_test_layout(real_fs);
+                // Mirror image of the cross-slot negative above: this
+                // tid is Ready in slot 2 only, so slot 1's thread
+                // pointer must not admit it either.
+                assert_eq!(tool_tls_registry::TOOL_TLS_REGISTRY.claim(), Some(1));
+                assert_eq!(tool_tls_registry::TOOL_TLS_REGISTRY.claim(), Some(2));
+                assert!(tool_tls_registry::TOOL_TLS_REGISTRY.bind_ready(2, tid));
+                assert_eq!(
+                    tool_tls_registry::TOOL_TLS_REGISTRY.lookup_ready(tid),
+                    Some(2)
+                );
+                assert_eq!(tool_tid_on_tp(tps[0], real_fs), None);
+                assert_eq!(tool_tid_on_tp(tps[1], real_fs), Some(tid));
+            },
+            0,
+        );
+    }
+
+    #[test]
+    fn callback_slot_registrations_agree_with_slot_ledger() {
+        isolated(
+            || {
+                let page = unsafe {
+                    libc::mmap(
+                        core::ptr::null_mut(),
+                        4096,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                        -1,
+                        0,
+                    )
+                };
+                assert_ne!(page, libc::MAP_FAILED);
+                let record = page as *mut tool_tls_slots::SlotRecord;
+                let mut robust = [0_u64; 3];
+                let robust_address = robust.as_mut_ptr() as u64;
+                robust[0] = robust_address;
+                let robust_len = size_of_val(&robust) as u64;
+                assert_eq!(
+                    unsafe {
+                        crate::trap::raw_syscall6(
+                            libc::SYS_set_robust_list,
+                            [robust_address, robust_len, 0, 0, 0, 0],
+                        )
+                    },
+                    0
+                );
+                unsafe {
+                    (*record).guest_clear_tid = 0x7000;
+                    (*record).guest_robust_head = robust_address;
+                    (*record).guest_robust_len = robust_len;
+                }
+                assert_eq!(
+                    callback_slot_registrations(record),
+                    Some(GuestKernelRegistrations {
+                        clear_tid: 0x7000,
+                        robust_head: robust_address,
+                        robust_len,
+                    })
+                );
+                unsafe { (*record).guest_robust_len = robust_len + 8 };
+                assert_eq!(callback_slot_registrations(record), None);
+                assert_eq!(
+                    unsafe {
+                        crate::trap::raw_syscall6(
+                            libc::SYS_set_robust_list,
+                            [0, robust_len, 0, 0, 0, 0],
+                        )
+                    },
+                    0
+                );
+            },
+            0,
+        );
+    }
+
+    #[test]
+    fn non_leader_mapping_class_refusal_pins_errno_and_break_shape() {
+        // Classifier-level pin only: every errno-shaped member of the
+        // set resolves through the shared outcome seam to the raw
+        // -EPERM result (in the kernel error range an mmap caller
+        // reads as MAP_FAILED), and brk resolves to the queried
+        // unchanged break. A real caller consuming those outcomes is
+        // exercised by the seccomp witness below, not here.
+        for number in [
+            libc::SYS_mmap,
+            libc::SYS_mprotect,
+            libc::SYS_munmap,
+            libc::SYS_mremap,
+            libc::SYS_madvise,
+            libc::SYS_pkey_mprotect,
+            libc::SYS_remap_file_pages,
+            libc::SYS_mseal,
+            libc::SYS_process_madvise,
+            libc::SYS_shmat,
+            libc::SYS_shmdt,
+        ] {
+            let Some(NonLeaderMappingRefusal::Errno(result)) = non_leader_mapping_refusal(number)
+            else {
+                panic!("syscall {number} must refuse with an errno");
+            };
+            assert_eq!(result, -i64::from(libc::EPERM), "syscall {number}");
+            assert_eq!(result, NON_LEADER_MAPPING_CLASS_ERRNO);
+            assert!((-4095..=-1).contains(&result), "syscall {number}");
+            assert_eq!(
+                non_leader_mapping_outcome(number, || 0x5000),
+                Some(NonLeaderMappingOutcome::Result(result)),
+                "syscall {number}"
+            );
+        }
+        // brk has no errno return: a denied change answers with the
+        // unchanged current break instead.
+        assert_eq!(
+            non_leader_mapping_refusal(libc::SYS_brk),
+            Some(NonLeaderMappingRefusal::UnchangedBreak)
+        );
+        assert_eq!(
+            non_leader_mapping_outcome(libc::SYS_brk, || 0x5000),
+            Some(NonLeaderMappingOutcome::Result(0x5000))
+        );
+        assert_eq!(
+            non_leader_mapping_outcome(libc::SYS_brk, || 0),
+            Some(NonLeaderMappingOutcome::BreakQueryFailed)
+        );
+        for number in [
+            libc::SYS_read,
+            libc::SYS_gettid,
+            libc::SYS_futex,
+            libc::SYS_clone,
+        ] {
+            assert_eq!(non_leader_mapping_refusal(number), None, "syscall {number}");
+            assert_eq!(non_leader_mapping_outcome(number, || 0x5000), None);
+        }
+        assert!(NON_LEADER_MAPPING_CLASS_REASON.contains("dh-gpxse"));
+        // Derived cross-check: probe the owner-mapping guard itself
+        // (restorer.rs) for every syscall number it classifies as a
+        // mapping change, and require the refusal set to cover each
+        // one. A copied list could not see the guard grow.
+        let derived: Vec<i64> = (0..1024)
+            .filter(|&number| crate::guest::restorer::owner_mapping_guard_classifies(number))
+            .collect();
+        assert!(
+            derived.contains(&libc::SYS_mmap) && derived.contains(&libc::SYS_shmat),
+            "derived guard set {derived:?} must reach the argument-dependent arms"
+        );
+        // Lower bound: the probe must still reach every syscall the
+        // guard classifies today, so an arm narrowing (or a probe
+        // change) cannot silently shrink the derived set. Growth is
+        // still detected through the derivation itself below.
+        for expected in [
+            libc::SYS_mmap,
+            libc::SYS_mprotect,
+            libc::SYS_munmap,
+            libc::SYS_mremap,
+            libc::SYS_madvise,
+            libc::SYS_pkey_mprotect,
+            libc::SYS_remap_file_pages,
+            libc::SYS_mseal,
+            libc::SYS_process_madvise,
+            libc::SYS_shmat,
+        ] {
+            assert!(
+                derived.contains(&expected),
+                "probe lost guard syscall {expected}"
+            );
+        }
+        for number in derived {
+            assert!(
+                non_leader_mapping_refusal(number).is_some(),
+                "derived guard syscall {number} not refused"
+            );
+        }
+    }
+
+    #[cfg(all(target_env = "gnu", target_arch = "x86_64"))]
+    static MAPPING_TRAP_CURRENT_BREAK: core::sync::atomic::AtomicI64 =
+        core::sync::atomic::AtomicI64::new(0);
+    #[cfg(all(target_env = "gnu", target_arch = "x86_64"))]
+    static MAPPING_TRAPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    #[cfg(all(target_env = "gnu", target_arch = "x86_64"))]
+    static MAPPING_TRAP_BRK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    #[cfg(all(target_env = "gnu", target_arch = "x86_64"))]
+    static MAPPING_TRAP_ERRNO: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(0);
+    #[cfg(all(target_env = "gnu", target_arch = "x86_64"))]
+    static MAPPING_WORKER_DONE: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+    #[cfg(all(target_env = "gnu", target_arch = "x86_64"))]
+    static MAPPING_WORKER_NULL: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+
+    #[cfg(all(target_env = "gnu", target_arch = "x86_64"))]
+    extern "C" fn mapping_trap_handler(
+        _signal: i32,
+        _info: *mut libc::siginfo_t,
+        context: *mut libc::c_void,
+    ) {
+        let context = unsafe { &mut *(context as *mut libc::ucontext_t) };
+        let number = context.uc_mcontext.gregs[libc::REG_RAX as usize];
+        MAPPING_TRAPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        match non_leader_mapping_refusal(number) {
+            Some(NonLeaderMappingRefusal::UnchangedBreak) => {
+                MAPPING_TRAP_BRK.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+            Some(NonLeaderMappingRefusal::Errno(_)) => {
+                MAPPING_TRAP_ERRNO.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+            None => {}
+        }
+        let result = match non_leader_mapping_outcome(number, || {
+            MAPPING_TRAP_CURRENT_BREAK.load(core::sync::atomic::Ordering::Relaxed)
+        }) {
+            Some(NonLeaderMappingOutcome::Result(result)) => result,
+            _ => -i64::from(libc::ENOSYS),
+        };
+        context.uc_mcontext.gregs[libc::REG_RAX as usize] = result;
+        // SECCOMP_RET_TRAP does not execute the syscall, and the
+        // signal frame already resumes after the syscall instruction:
+        // only the result register is replaced.
+    }
+
+    #[cfg(all(target_env = "gnu", target_arch = "x86_64"))]
+    #[test]
+    fn non_leader_mapping_outcome_lets_worker_malloc_fail_not_crash() {
+        isolated(
+            || {
+                unsafe extern "C" {
+                    fn mallopt(param: i32, value: i32) -> i32;
+                    fn malloc_trim(pad: usize) -> i32;
+                }
+                // One arena (M_ARENA_MAX): the worker shares the main
+                // arena, so a large allocation that cannot mmap
+                // reaches glibc's sbrk fallback and both refusal
+                // shapes meet a real consumer. Trim first so no
+                // retained top chunk can serve the request silently.
+                assert_eq!(unsafe { mallopt(-8, 1) }, 1);
+                unsafe { malloc_trim(0) };
+                let mut action: libc::sigaction = unsafe { core::mem::zeroed() };
+                action.sa_sigaction = mapping_trap_handler as *const () as usize;
+                action.sa_flags = libc::SA_SIGINFO;
+                unsafe {
+                    assert_eq!(libc::sigemptyset(&raw mut action.sa_mask), 0);
+                    assert_eq!(
+                        libc::sigaction(libc::SIGSYS, &raw const action, core::ptr::null_mut()),
+                        0
+                    );
+                }
+                let worker = std::thread::spawn(|| {
+                    // The break query cannot run inside the handler
+                    // (brk itself is trapped), so record the unchanged
+                    // break before installing the filter.
+                    let current = unsafe { libc::syscall(libc::SYS_brk, 0_i64) };
+                    assert!(current > 0);
+                    MAPPING_TRAP_CURRENT_BREAK
+                        .store(current, core::sync::atomic::Ordering::Relaxed);
+                    // Thread-scoped filter (no TSYNC) trapping exactly
+                    // the production classifier's set.
+                    const BPF_LD_W_ABS: u16 = 0x20;
+                    const BPF_JMP_JEQ_K: u16 = 0x15;
+                    const BPF_RET_K: u16 = 0x06;
+                    const SECCOMP_RET_TRAP: u32 = 0x0003_0000;
+                    const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
+                    let filter =
+                        |code: u16, jt: u8, jf: u8, k: u32| libc::sock_filter { code, jt, jf, k };
+                    let mut prog = vec![filter(BPF_LD_W_ABS, 0, 0, 0)];
+                    for number in [
+                        libc::SYS_brk,
+                        libc::SYS_mmap,
+                        libc::SYS_mprotect,
+                        libc::SYS_munmap,
+                        libc::SYS_mremap,
+                        libc::SYS_madvise,
+                        libc::SYS_pkey_mprotect,
+                        libc::SYS_remap_file_pages,
+                        libc::SYS_mseal,
+                        libc::SYS_process_madvise,
+                        libc::SYS_shmat,
+                        libc::SYS_shmdt,
+                    ] {
+                        if non_leader_mapping_refusal(number).is_some() {
+                            prog.push(filter(BPF_JMP_JEQ_K, 0, 1, number as u32));
+                            prog.push(filter(BPF_RET_K, 0, 0, SECCOMP_RET_TRAP));
+                        }
+                    }
+                    prog.push(filter(BPF_RET_K, 0, 0, SECCOMP_RET_ALLOW));
+                    assert_eq!(
+                        unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) },
+                        0
+                    );
+                    let mut fprog = libc::sock_fprog {
+                        len: prog.len() as u16,
+                        filter: prog.as_mut_ptr(),
+                    };
+                    assert_eq!(
+                        unsafe { libc::syscall(libc::SYS_seccomp, 1_i64, 0_i64, &raw mut fprog) },
+                        0
+                    );
+                    // Above glibc's 128 KiB mmap threshold: mmap is
+                    // refused -EPERM, the sbrk fallback gets the
+                    // unchanged break, and malloc must fail cleanly.
+                    let ptr = unsafe { libc::malloc(1024 * 1024) };
+                    MAPPING_WORKER_NULL.store(ptr.is_null(), core::sync::atomic::Ordering::Release);
+                    MAPPING_WORKER_DONE.store(true, core::sync::atomic::Ordering::Release);
+                    // Raw thread exit: pthread teardown would issue its
+                    // own stack munmap back through this same filter,
+                    // which is harness machinery, not the allocation
+                    // under test. The result is already recorded above.
+                    unsafe { libc::syscall(libc::SYS_exit, 0_i64) };
+                    loop {
+                        core::hint::spin_loop();
+                    }
+                });
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                while !MAPPING_WORKER_DONE.load(core::sync::atomic::Ordering::Acquire) {
+                    if worker.is_finished() || std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
+                drop(worker);
+                assert!(
+                    MAPPING_WORKER_DONE.load(core::sync::atomic::Ordering::Acquire),
+                    "worker finished without recording a result"
+                );
+                assert!(
+                    MAPPING_WORKER_NULL.load(core::sync::atomic::Ordering::Acquire),
+                    "refused worker malloc must return NULL"
+                );
+                assert!(
+                    MAPPING_TRAPS.load(core::sync::atomic::Ordering::Relaxed) >= 1,
+                    "the allocation never reached the refusal outcome"
+                );
+                // Both refusal shapes must meet the consumer: at
+                // least one errno-class trap (mmap and friends) and
+                // at least one brk trap answered with the unchanged
+                // break, not just whichever the allocator tries first.
+                assert!(
+                    MAPPING_TRAP_ERRNO.load(core::sync::atomic::Ordering::Relaxed) >= 1,
+                    "no errno-class refusal reached the worker"
+                );
+                assert!(
+                    MAPPING_TRAP_BRK.load(core::sync::atomic::Ordering::Relaxed) >= 1,
+                    "no brk refusal reached the worker"
+                );
             },
             0,
         );

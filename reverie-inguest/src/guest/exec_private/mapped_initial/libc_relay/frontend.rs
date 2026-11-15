@@ -456,6 +456,41 @@ pub(super) unsafe fn verify_callback_frontend(
     (installed.region, facts)
 }
 
+// The Stage C non-leader sibling of verify_callback_frontend: the same
+// retired-frontend, host, control, region, dispatcher, reserved-mask
+// and callback-mask checks, but the signal stack is the caller's slot
+// altstack instead of the leader's registered alternate stack (that
+// equality check is leader-only). The handler and restorer are the
+// shared installed pair. Called only under the slot's relay-busy word.
+pub(super) unsafe fn verify_slot_callback_frontend(
+    s: &RelayState,
+    p: &Progress,
+    host: usize,
+    callback_mask: u64,
+    slot_stack: Extent,
+) -> (&'static ToolRegion, FrameFacts) {
+    let Frontend::Retired(installed) = p.frontend else {
+        die(INVALID)
+    };
+    check(p.libc_cleaned && p.tool_init && host != 0 && host == installed.host);
+    check(super::super::super::control_pointer() == s.control.as_ptr());
+    check(
+        crate::guest::tool_region::published_owner()
+            .is_some_and(|region| core::ptr::eq(region, installed.region)),
+    );
+    check(crate::trap::has_dispatcher() && crate::trap::signal_return_restricted());
+    check(crate::guest::signal::reserved_signal_mask() == installed.reserved);
+    check(callback_mask & installed.reserved == 0);
+    let facts = FrameFacts {
+        stack: slot_stack,
+        mask: callback_mask,
+        restorer: installed.signal.restorer,
+        handler: installed.signal.handler,
+    };
+    unsafe { verify_signal_facts(facts, Some(installed.reserved), true) };
+    (installed.region, facts)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -129,19 +129,16 @@ impl ToolTlsRegistry {
         None
     }
 
-    /// Record the newborn kernel tid on a claimed slot once the creating
-    /// clone has produced it. Fails unless the slot is `Building` unbound.
-    pub fn bind_tid(&self, index: usize, tid: i32) -> bool {
+    /// The child binds itself and publishes callback-ready in one CAS,
+    /// `{BUILDING,0}→{READY,tid}`, after its own TCB, FS, continuation
+    /// and clock are installed. The parent never writes the registry
+    /// after the claim, so host timing cannot decide whether the
+    /// newborn lives. Legal only from an unbound Building slot.
+    pub fn bind_ready(&self, index: usize, tid: i32) -> bool {
         if tid <= 0 {
             return false;
         }
-        self.transition(index, pack(BUILDING, 0), pack(BUILDING, tid))
-    }
-
-    /// Publish a bound slot as callback-ready. This publication, after the
-    /// thread's own TCB and FS are installed, is the admission point.
-    pub fn mark_ready(&self, index: usize, tid: i32) -> bool {
-        self.transition(index, pack(BUILDING, tid), pack(READY, tid))
+        self.transition(index, pack(BUILDING, 0), pack(READY, tid))
     }
 
     /// Mark a live slot retiring at thread exit. A `Retiring` slot is never
@@ -150,11 +147,12 @@ impl ToolTlsRegistry {
         self.transition(index, pack(READY, tid), pack(RETIRING, tid))
     }
 
-    /// Release a claim whose physical clone failed before any thread
-    /// existed. Only an *unbound* `Building` slot (tid still 0) can
-    /// return to `Free`: a bound tid means the creating clone already
-    /// succeeded and a thread may be running on that slot's TCB, so a
-    /// bound slot can never be released or reused.
+    /// Release a claim only when no clone was ever issued for it, or
+    /// the clone returned an error (rc < 0). Once a clone has returned
+    /// a tid > 0 this is illegal even though the slot still reads
+    /// `{BUILDING, 0}`: binding is child-side, so 0 no longer means
+    /// "no thread exists". The birth guard enforces this by resolving
+    /// the clone result exactly once.
     pub fn release_claim(&self, index: usize) -> bool {
         self.transition(index, pack(BUILDING, 0), pack(FREE, 0))
     }
@@ -235,17 +233,15 @@ mod tests {
         assert_eq!((first, second), (1, 2));
         // An unbound building slot admits nobody.
         assert_eq!(registry.lookup_ready(0), None);
-        assert!(!registry.mark_ready(first, 101));
-        assert!(registry.bind_tid(first, 101));
-        assert!(!registry.bind_tid(first, 102));
-        assert_eq!(registry.lookup_ready(101), None);
-        assert!(registry.mark_ready(first, 101));
+        assert!(!registry.bind_ready(first, 0));
+        assert!(registry.bind_ready(first, 101));
+        assert!(!registry.bind_ready(first, 102));
         assert_eq!(registry.lookup_ready(101), Some(first));
         assert!(registry.mark_retiring(first, 101));
         assert_eq!(registry.lookup_ready(101), None);
         // A recycled kernel tid never resolves to the retired slot, and
         // the retired slot is never handed out again.
-        assert!(!registry.mark_ready(first, 101));
+        assert!(!registry.bind_ready(first, 101));
         assert!(!registry.release_claim(first));
         assert_eq!(registry.claim(), Some(3));
     }
@@ -258,11 +254,11 @@ mod tests {
         // The same lowest slot is offered to the next birth attempt only
         // because no thread ever occupied it.
         assert_eq!(registry.claim(), Some(slot));
-        assert!(registry.bind_tid(slot, 55));
+        assert!(registry.bind_ready(slot, 55));
         // A bound tid means the clone succeeded: the slot held a born
         // thread and must never return to Free or be handed out again.
         assert!(!registry.release_claim(slot));
-        assert_eq!(registry.lookup_ready(55), None);
+        assert_eq!(registry.lookup_ready(55), Some(slot));
         let next = registry.claim().unwrap();
         assert_ne!(next, slot);
     }
@@ -278,15 +274,32 @@ mod tests {
     }
 
     #[test]
+    fn bind_ready_only_from_unbound_building() {
+        let registry = ToolTlsRegistry::new();
+        registry.register_leader(1).unwrap();
+        // FREE slot refuses; a claim is required first.
+        assert!(!registry.bind_ready(5, 77));
+        let slot = registry.claim().unwrap();
+        // Non-positive tids refuse and leave the claim unbound.
+        assert!(!registry.bind_ready(slot, 0));
+        assert!(!registry.bind_ready(slot, -3));
+        assert!(registry.release_claim(slot));
+        // READY and RETIRING refuse a second bind.
+        let slot = registry.claim().unwrap();
+        assert!(registry.bind_ready(slot, 77));
+        assert!(!registry.bind_ready(slot, 78));
+        assert!(registry.mark_retiring(slot, 77));
+        assert!(!registry.bind_ready(slot, 79));
+    }
+
+    #[test]
     fn out_of_range_and_mismatched_tid_never_transition() {
         let registry = ToolTlsRegistry::new();
-        assert!(!registry.bind_tid(MAX_PRIVATE_TOOL_THREADS, 9));
-        assert!(!registry.mark_ready(MAX_PRIVATE_TOOL_THREADS, 9));
+        assert!(!registry.bind_ready(MAX_PRIVATE_TOOL_THREADS, 9));
         assert!(!registry.mark_retiring(0, 9));
         assert!(!registry.release_claim(MAX_PRIVATE_TOOL_THREADS));
         let slot = registry.claim().unwrap();
-        assert!(registry.bind_tid(slot, 9));
-        assert!(registry.mark_ready(slot, 9));
+        assert!(registry.bind_ready(slot, 9));
         assert!(!registry.mark_retiring(slot, 10));
         assert_eq!(registry.lookup_ready(9), Some(slot));
     }

@@ -1191,8 +1191,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 88] = [
     // Bind the signal-mask gate and every changed native-source premise of it.
     (
         "reverie-inguest/src/guest/continuation.rs",
-        46450,
-        "a25e871591adb957ed150a3b2007b31bc671f9d330e6a861fdab391b3df5ed25",
+        46459,
+        "96f958b6b9f785c24fcfa06a825a2778988c207b8312b7c1440b0856fe2314a2",
     ),
     (
         "reverie-inguest/src/guest/instruction.rs",
@@ -1231,8 +1231,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 88] = [
     ),
     (
         "reverie-inguest/src/guest/tool_install.rs",
-        28887,
-        "fccf7936590e1458419a344c44e0986b390bdeb4a9b0b9c32fb386721bfe3ab5",
+        29482,
+        "17686c4cf863478c8bb2d11c06f40cb61bea8394e34aec34ddfbf59d2274f639",
     ),
     (
         "reverie-inguest/src/signal.rs",
@@ -1266,8 +1266,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 88] = [
     ),
     (
         "reverie-liteinst-artifact/src/private_static/tls_sources.rs",
-        49362,
-        "acaa0ea0162f9a603aef16a0d769a2d78dd979cf32d87dc36afe237f2ff20bde",
+        48972,
+        "dbff8fe036562ceae35eb3d7c5c39f83d679698a3ce4c368a55a0c60cb49dc54",
     ),
     (
         "Cargo.toml",
@@ -1376,8 +1376,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 88] = [
     ),
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers/terminal_observation.rs",
-        41076,
-        "21839c56aaee95a3c2c83dfaa22ae579265fd0a35624863b0b04e8e1ac34dbbc",
+        41630,
+        "ec2fc219c5b436da53637a6ac49d8ec5d36eb537e41f213ba1db07037c4ccdf7",
     ),
     (
         "reverie-liteinst-artifact/tests/fixtures/ordinary_preceding_gate_page.rs",
@@ -1391,8 +1391,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 88] = [
     ),
     (
         "reverie-inguest/Cargo.toml",
-        6494,
-        "ca20b0547879c0d9cd83916f89783efcd2890983e0eabdd8e0932a9b4f13b232",
+        6700,
+        "963157dfe127c39634f3047e3e21cd7ae6e5e37814be5bc3a763057f6a9f330e",
     ),
     (
         "reverie-inguest/src/lib.rs",
@@ -1466,8 +1466,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 88] = [
     ),
     (
         "reverie-inguest/src/guest/tool_region.rs",
-        52895,
-        "ca12300ee6d5ccffb72cbf7d095abf73b0b37dc510957d026f2c246d810c913a",
+        61922,
+        "8a0580d8f15bc3c783ef783cfe246f586050049c94d2669ac786b9f5049bb1ee",
     ),
     (
         "reverie-inguest/src/guest/tool_region_keyed.rs",
@@ -1491,8 +1491,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 88] = [
     ),
     (
         "reverie-inguest/src/guest/host.rs",
-        406223,
-        "f31ba739d85a7671bb57d1c7f494bd6d751c296431bd5bd47a8e9d39966f32a6",
+        424647,
+        "e2704b332e4106751c232cf59ca0bffe59463c4a54fda100c6ae46516736b927",
     ),
     (
         "reverie-inguest/src/guest/host_linux.rs",
@@ -39174,6 +39174,51 @@ mod tests {
             81727,
             "247f65ad00154dcaa21be8324e2315f30658df52c51c9db91717aab6e5bc64c1",
         ),
+        (
+            "reverie-inguest/src/guest/continuation.rs",
+            46459,
+            "96f958b6b9f785c24fcfa06a825a2778988c207b8312b7c1440b0856fe2314a2",
+        ),
+        (
+            "reverie-inguest/src/guest/tool_install.rs",
+            29482,
+            "17686c4cf863478c8bb2d11c06f40cb61bea8394e34aec34ddfbf59d2274f639",
+        ),
+        (
+            "reverie-liteinst-artifact/src/private_static/tls_sources.rs",
+            48972,
+            "dbff8fe036562ceae35eb3d7c5c39f83d679698a3ce4c368a55a0c60cb49dc54",
+        ),
+        (
+            "reverie-liteinst-artifact/src/private_static/selected_initializers/terminal_observation.rs",
+            41630,
+            "e1dc0867246d0a206adb942b8ddd166367d9eed73bb2f3437ee6707ab780ef8a",
+        ),
+        (
+            "reverie-inguest/Cargo.toml",
+            6700,
+            "963157dfe127c39634f3047e3e21cd7ae6e5e37814be5bc3a763057f6a9f330e",
+        ),
+        (
+            "reverie-inguest/src/guest/tool_region.rs",
+            61922,
+            "8a0580d8f15bc3c783ef783cfe246f586050049c94d2669ac786b9f5049bb1ee",
+        ),
+        (
+            "reverie-inguest/src/guest/host.rs",
+            424647,
+            "e2704b332e4106751c232cf59ca0bffe59463c4a54fda100c6ae46516736b927",
+        ),
+        (
+            "reverie-liteinst-artifact/src/private_static/selected_initializers/terminal_observation.rs",
+            41630,
+            "7b657b568e71103fa60d6a27ba26017de172f3bb8bd94f699ca5f48f98d43f3a",
+        ),
+        (
+            "reverie-liteinst-artifact/src/private_static/selected_initializers/terminal_observation.rs",
+            41630,
+            "ec2fc219c5b436da53637a6ac49d8ec5d36eb537e41f213ba1db07037c4ccdf7",
+        ),
     ];
 
     /// Seals over prefixes of `CONTENT_REVERIE_CATALOG_BINDINGS`: (rows covered,
@@ -39203,6 +39248,10 @@ mod tests {
         (
             100,
             "446cbb406df9cf560849d01b75ceb4429b84b7b70cb6f75e285ac2db299926d4",
+        ),
+        (
+            109,
+            "80c01a8ac2d6b12a7761d2bcd5ed8d68d1259f4c961f3d58384531e2947cd2fc",
         ),
     ];
 
@@ -40428,6 +40477,51 @@ mod tests {
                 "reverie/Cargo.toml",
                 2373,
                 "632b995fb8060c8cd780b0a819440cbb9a94cb124125d6d3c08b7d67d646805e",
+            ),
+            (
+                "reverie-inguest/src/guest/continuation.rs",
+                46450,
+                "a25e871591adb957ed150a3b2007b31bc671f9d330e6a861fdab391b3df5ed25",
+            ),
+            (
+                "reverie-inguest/src/guest/tool_install.rs",
+                28887,
+                "fccf7936590e1458419a344c44e0986b390bdeb4a9b0b9c32fb386721bfe3ab5",
+            ),
+            (
+                "reverie-inguest/src/guest/tool_region.rs",
+                52895,
+                "ca12300ee6d5ccffb72cbf7d095abf73b0b37dc510957d026f2c246d810c913a",
+            ),
+            (
+                "reverie-inguest/src/guest/host.rs",
+                406223,
+                "f31ba739d85a7671bb57d1c7f494bd6d751c296431bd5bd47a8e9d39966f32a6",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers/terminal_observation.rs",
+                41076,
+                "21839c56aaee95a3c2c83dfaa22ae579265fd0a35624863b0b04e8e1ac34dbbc",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/tls_sources.rs",
+                49362,
+                "acaa0ea0162f9a603aef16a0d769a2d78dd979cf32d87dc36afe237f2ff20bde",
+            ),
+            (
+                "reverie-inguest/Cargo.toml",
+                6494,
+                "ca20b0547879c0d9cd83916f89783efcd2890983e0eabdd8e0932a9b4f13b232",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers/terminal_observation.rs",
+                41630,
+                "e1dc0867246d0a206adb942b8ddd166367d9eed73bb2f3437ee6707ab780ef8a",
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers/terminal_observation.rs",
+                41630,
+                "7b657b568e71103fa60d6a27ba26017de172f3bb8bd94f699ca5f48f98d43f3a",
             ),
         ];
         // A re-bind records its previous tuple above, for every path, not only these.
@@ -70191,6 +70285,35 @@ pub mod private_static {
         archive_owner: &'a Arc<ArchiveSourceOwner>,
     }
 
+    /// The test-only admission selector must never be resolved into a
+    /// production private image, by direct selection or by forwarding.
+    const FORBIDDEN_INGUEST_FEATURE: &str = "test-thread-admission";
+
+    fn compiler_row_is_reverie_inguest(row: &Value) -> bool {
+        let package_id = row["package_id"].as_str().unwrap_or_default();
+        let manifest = Path::new(row["manifest_path"].as_str().unwrap_or_default());
+        let package_dir = manifest
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .and_then(|name| name.to_str());
+        package_dir == Some("reverie-inguest")
+            || package_id.contains("#reverie-inguest@")
+            || package_id.starts_with("reverie-inguest@")
+            || row["target"]["name"].as_str() == Some("reverie_inguest")
+    }
+
+    fn reject_forbidden_inguest_feature(row: &Value) -> Result<()> {
+        if row["reason"] != "compiler-artifact" || !compiler_row_is_reverie_inguest(row) {
+            return Ok(());
+        }
+        require(
+            !strings(&row["features"])?
+                .iter()
+                .any(|f| f == FORBIDDEN_INGUEST_FEATURE),
+            "static producer resolved forbidden reverie-inguest test feature",
+        )
+    }
+
     fn select_archive(
         output: &[u8],
         package: &PackageIdentity,
@@ -70216,6 +70339,7 @@ pub mod private_static {
             if row["reason"] != "compiler-artifact" {
                 continue;
             }
+            reject_forbidden_inguest_feature(&row)?;
             if row["package_id"] != package.id
                 && row["manifest_path"].as_str() != package.manifest.to_str()
             {
@@ -72983,6 +73107,66 @@ pub mod private_static {
                 );
             }
         }
+        #[test]
+        fn private_static_refuses_resolved_test_thread_admission() {
+            fn inguest_row(features: &[&str]) -> Value {
+                serde_json::json!({
+                    "reason": "compiler-artifact",
+                    "package_id": "git+https://github.com/rrnewton/reverie.git?rev=0123456789abcdef0123456789abcdef01234567#reverie-inguest@0.5.4",
+                    "manifest_path": "/cache/checkouts/reverie-inguest/Cargo.toml",
+                    "target": {"name": "reverie_inguest"},
+                    "features": features,
+                })
+            }
+            reject_forbidden_inguest_feature(&inguest_row(&[
+                "exec-private-init",
+                "loader-private-runtime",
+            ]))
+            .unwrap();
+            let error = reject_forbidden_inguest_feature(&inguest_row(&[
+                "exec-private-init",
+                "test-thread-admission",
+            ]))
+            .unwrap_err();
+            assert!(
+                error.contains("forbidden reverie-inguest test feature"),
+                "{error}"
+            );
+            // End-to-end through the selector: the forbidden row is refused
+            // before any archive selection takes place.
+            let package = PackageIdentity {
+                id: "test".into(),
+                name: "detcore-liteinst".into(),
+                manifest: PathBuf::from("/not-a-source/Cargo.toml"),
+                source: None,
+                target: "detcore_liteinst".into(),
+                kind: vec!["staticlib".into()],
+                crate_types: vec!["staticlib".into()],
+                target_source: PathBuf::from("/not-a-source/src/lib.rs"),
+            };
+            let mut output = serde_json::to_vec(&inguest_row(&["test-thread-admission"])).unwrap();
+            output.push(b'\n');
+            let error = match select_archive(
+                &output,
+                &package,
+                &serde_json::json!({}),
+                &[],
+                ArchiveSelectionExpectation {
+                    target_dir: Path::new("/"),
+                    metadata_sha256: "not-authority",
+                    expected_features: FEATURES,
+                    archive_owner: &Arc::new(ArchiveSourceOwner { _reserved: 0 }),
+                },
+            ) {
+                Ok(_) => panic!("forbidden feature row was accepted"),
+                Err(error) => error,
+            };
+            assert!(
+                error.contains("forbidden reverie-inguest test feature"),
+                "{error}"
+            );
+        }
+
         #[test]
         fn private_static_archive_owner_rejects_another_context_with_identical_metadata() {
             let metadata = "same actual metadata digest";

@@ -742,6 +742,62 @@ const SHARED_INPUTS_058: &[SourceRow] = &[
     ),
 ];
 
+// The reverie-inguest manifest gains the test-only `test-thread-admission`
+// feature (row 0); no source row changes. Every other row is exactly
+// SHARED_INPUTS_058.
+const SHARED_INPUTS_059: &[SourceRow] = &[
+    (
+        "reverie-inguest/Cargo.toml",
+        6700,
+        "963157dfe127c39634f3047e3e21cd7ae6e5e37814be5bc3a763057f6a9f330e",
+    ),
+    (
+        "reverie-inguest/src/lib.rs",
+        13478,
+        "9b619884552f14046a056f68693c49fc46d065b2a084ad49ca07819a10ec27b1",
+    ),
+    (
+        "reverie-inguest/src/private_runtime/mod.rs",
+        2093,
+        "f6764939d2016bd3c9414b17b35f21f8cf7217f128135b83cfb5459aa3ae5e1e",
+    ),
+    (
+        "reverie-inguest/src/private_runtime/tls/mod.rs",
+        5001,
+        "ba3a02d320c26c283acde7dfc0e0273ff7b04e68b4b5daa7a4f72619758f9f98",
+    ),
+    (
+        "reverie-inguest/src/private_runtime/tls/abi.rs",
+        23707,
+        "216dd2050bec7f6611bfa51b9de9e308bf1e23d2831b46b2da9a8901a226dbaf",
+    ),
+    (
+        "reverie-inguest/src/private_runtime/tls/layout.rs",
+        743,
+        "8ee91d78869426196e2f4542dcffb2cf8be3b1372647bd407d9a28ca5b7d20c0",
+    ),
+    (
+        "reverie-loader/Cargo.toml",
+        327,
+        "580f9f63552a3f63a480c159a8284c9baa5ec71adce97de1da06cae25d0531d3",
+    ),
+    (
+        "reverie-loader/src/lib.rs",
+        2486,
+        "02aa2dae7b6eec327a0dcf68b92a66f512162d2fdd3a7f9ac89a3e8a51b1f5bf",
+    ),
+    (
+        "reverie-loader/src/musl_tls.rs",
+        17178,
+        "18ca3aec385c4dd8ec79ee5f45e8a30863e28e8a49422cf6c1ae90eb2743696d",
+    ),
+    (
+        "reverie-loader/src/mapped_inputs.rs",
+        17803,
+        "81cd7474215ff617fb1bc16b236461d4deb33697c7d559130f4bdb98b0f0e2c2",
+    ),
+];
+
 fn classify(observed: &[(String, u64, String)]) -> Result<Variant> {
     let same = |expected: &[SourceRow]| {
         observed.len() == expected.len()
@@ -749,7 +805,10 @@ fn classify(observed: &[(String, u64, String)]) -> Result<Variant> {
                 actual.0 == expected.0 && actual.1 == expected.1 && actual.2 == expected.2
             })
     };
-    match (
+    // Exactly one complete cohort may match: the legacy cohort alone
+    // selects the legacy in-guest geometry, any one shared cohort alone
+    // selects the shared loader, and zero or several matches refuse.
+    let matched = [
         same(LEGACY),
         same(SHARED),
         same(SHARED_INPUTS),
@@ -763,202 +822,11 @@ fn classify(observed: &[(String, u64, String)]) -> Result<Variant> {
         same(SHARED_INPUTS_057_EXPORTS),
         same(SHARED_INPUTS_057_LINTS),
         same(SHARED_INPUTS_058),
-    ) {
-        (
-            true,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-        ) => Ok(Variant::LegacyInguest),
-        (
-            false,
-            true,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-        )
-        | (
-            false,
-            false,
-            true,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-        )
-        | (
-            false,
-            false,
-            false,
-            true,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-        )
-        | (
-            false,
-            false,
-            false,
-            false,
-            true,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-        )
-        | (
-            false,
-            false,
-            false,
-            false,
-            false,
-            true,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-        )
-        | (
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            true,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-        )
-        | (
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            true,
-            false,
-            false,
-            false,
-            false,
-            false,
-        )
-        | (
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            true,
-            false,
-            false,
-            false,
-            false,
-        )
-        | (
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            true,
-            false,
-            false,
-            false,
-        )
-        | (
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            true,
-            false,
-            false,
-        )
-        | (
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            true,
-            false,
-        )
-        | (
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            true,
-        ) => Ok(Variant::SharedLoader),
+        same(SHARED_INPUTS_059),
+    ];
+    match matched.iter().filter(|matched| **matched).count() {
+        1 if matched[0] => Ok(Variant::LegacyInguest),
+        1 => Ok(Variant::SharedLoader),
         _ => Err("runtime TLS sources are not one complete reviewed tuple".into()),
     }
 }
@@ -1302,6 +1170,23 @@ mod tests {
         }
         refuse_mixed_versions(SHARED_INPUTS_058, SHARED_INPUTS_057, &[0, 4, 6]);
     }
+    // The thread-admission manifest: only row 0 (the reverie-inguest
+    // manifest) differs from SHARED_INPUTS_058.
+    #[test]
+    fn tls_source_declarations_select_complete_059() {
+        refuse_each_missing_changed_extra_or_duplicate_row(SHARED_INPUTS_059);
+        assert_eq!(SHARED_INPUTS_059.len(), SHARED_INPUTS_058.len());
+        for (index, (new, prior)) in SHARED_INPUTS_059.iter().zip(SHARED_INPUTS_058).enumerate() {
+            assert_eq!(new.0, prior.0, "row {index} path");
+            assert_eq!(new != prior, index == 0, "row {index} change set");
+        }
+        // Genuine mixtures refuse: against SHARED_INPUTS_057, which
+        // differs at rows 0, 4 and 6, each single-row swap lands between
+        // complete cohorts and matches none of them. (Against 058 the
+        // row-0 swap would rebuild that complete, admitted cohort itself,
+        // so it is not a mixture.)
+        refuse_mixed_versions(SHARED_INPUTS_059, SHARED_INPUTS_057, &[0, 4, 6]);
+    }
     #[test]
     fn tls_source_declarations_are_pairwise_distinct() {
         let lists = [
@@ -1318,6 +1203,7 @@ mod tests {
             SHARED_INPUTS_057_EXPORTS,
             SHARED_INPUTS_057_LINTS,
             SHARED_INPUTS_058,
+            SHARED_INPUTS_059,
         ];
         for (index, first) in lists.iter().enumerate() {
             for second in &lists[index + 1..] {

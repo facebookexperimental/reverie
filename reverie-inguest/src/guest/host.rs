@@ -185,6 +185,170 @@ pub trait HostRuntime: Send + Sync + 'static {
     fn verify_thread_admission(&self, _tid: Pid) -> io::Result<()> {
         Ok(())
     }
+
+    /// Claim one private per-thread Tool TLS slot for a guest thread
+    /// birth, parent-side and pre-clone (dh-7ryuo B3). The default is
+    /// not-private: the birth proceeds exactly as today. A runtime
+    /// that implements this must be prepared for exactly one of
+    /// `commit_private_birth`/`abort_private_birth` per returned claim,
+    /// both on the claiming thread.
+    fn claim_private_birth(
+        &self,
+        _request: &PrivateBirthRequest,
+    ) -> Result<Option<PrivateBirthClaim>, PrivateBirthRefusal> {
+        Ok(None)
+    }
+
+    /// Commit a claimed birth after the physical clone succeeded, in
+    /// this order: link bookkeeping, then unlock the thread-list
+    /// lock. The creator's signal mask is already restored when this
+    /// runs: `PrivateBirthGuard::resolve` drops the birth signal
+    /// guard before calling either hook, so no Tool libc call runs
+    /// while the birth mask is blocked, and a list waiter woken by
+    /// the unlock never runs with the birth mask still on.
+    /// Infallible-or-terminal: a returned token must never be aborted.
+    fn commit_private_birth(&self, _claim: PrivateBirthClaim, _child_tid: Pid) {}
+
+    /// Abort a claim whose clone was never issued or returned an
+    /// error, in this order: unlock the thread-list lock, then
+    /// release only the never-born claim. On the resolve path, the
+    /// signal guard is dropped before this hook, so the creator's
+    /// mask is already restored. On the drop-without-resolve path,
+    /// the claim guard does not own the signal guard: the call site
+    /// must drop the signal guard first — by creating the claim
+    /// guard before arming the signal guard, so reverse-order local
+    /// drops restore first, or by dropping the signal guard
+    /// explicitly before the claim guard can drop.
+    /// Illegal once a clone returned a tid > 0; the guard enforces
+    /// that by resolving the clone result exactly once.
+    fn abort_private_birth(&self, _claim: PrivateBirthClaim) {}
+
+    /// Child-side private admission on the newborn's own TCB, in this
+    /// order: initialize its continuation, stamp the clock policy,
+    /// publish the registry Ready. `false` is fatal 126 at the call
+    /// site; there is no guest-visible error for a failed admission.
+    /// The default is `false` (fail closed): a runtime that overrides
+    /// the claim hook but forgets this one must not admit silently.
+    fn admit_private_child(&self, _claim: &PrivateBirthClaim, _tid: Pid) -> bool {
+        false
+    }
+}
+
+/// Parent-side private-birth inputs, all derived from the checked
+/// clone copy before any physical clone is issued.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrivateBirthRequest {
+    /// The creating guest thread.
+    pub creator: Pid,
+    /// The clone carries CLONE_SETTLS (guest FS comes from the kernel).
+    pub settls: bool,
+    /// Guest stack top from the checked clone record.
+    pub guest_stack_top: u64,
+    /// Guest stack size from the checked clone record (0 if unknown).
+    pub guest_stack_size: u64,
+    /// Guest clear-tid destination (CLONE_CHILD_CLEARTID), else 0.
+    pub guest_clear_tid: u64,
+    /// Runtime reserved-signal mask excluded from the birth block set.
+    pub reserved_mask: u64,
+    /// Creator's FS-swap record address (NativeControl or slot record).
+    pub creator_record: usize,
+}
+
+/// One claimed private slot, plain words only so it can ride through
+/// the birth context. Owned by the RAII guard between claim and resolution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrivateBirthClaim {
+    /// Registry slot index (never 0 for a private claim).
+    pub slot: u64,
+    /// The newborn Tool thread pointer for its slot.
+    pub tp: u64,
+    /// The slot's FS-swap record address.
+    pub record: usize,
+}
+
+/// Why a private birth claim was refused. `Fatal` is a host invariant
+/// break (fatal 126 at the call site), never a guest errno.
+#[derive(Debug)]
+pub enum PrivateBirthRefusal {
+    /// Slot cap reached or the finish-time claim degraded.
+    Exhausted,
+    /// Private births are not supported in this image (no layout).
+    Unsupported,
+    /// Host invariant breakage, with its io context.
+    Fatal(io::Error),
+}
+
+impl PrivateBirthRefusal {
+    /// The guest-visible errno, if this refusal may reach the guest.
+    pub fn guest_errno(&self) -> Option<i64> {
+        match self {
+            PrivateBirthRefusal::Exhausted => Some(libc::EAGAIN as i64),
+            PrivateBirthRefusal::Unsupported => Some(libc::EOPNOTSUPP as i64),
+            PrivateBirthRefusal::Fatal(_) => None,
+        }
+    }
+}
+
+/// RAII owner of a private birth claim between the claim hook and
+/// resolution. Dropping it — return, error or unwind — aborts the claim
+/// exactly once (mmap failure included), so a claim-side lock cannot
+/// leak. `resolve` consumes the token before either hook runs: a
+/// successful clone is never aborted, and the child's own rc == 0 is
+/// fatal before either hook.
+pub struct PrivateBirthGuard<'a, R: HostRuntime> {
+    runtime: &'a R,
+    claim: Option<PrivateBirthClaim>,
+}
+
+impl<'a, R: HostRuntime> PrivateBirthGuard<'a, R> {
+    pub fn new(runtime: &'a R, claim: PrivateBirthClaim) -> Self {
+        Self {
+            runtime,
+            claim: Some(claim),
+        }
+    }
+
+    pub fn claim(&self) -> &PrivateBirthClaim {
+        self.claim.as_ref().expect("claim taken only by resolve")
+    }
+
+    /// Resolve the clone result exactly once: a tid > 0 commits (and
+    /// can never abort), any rc < 0 aborts the never-born claim.
+    /// Drops `signal_guard` first, restoring the creator's mask
+    /// before either hook runs, so the blocked window is the clone
+    /// alone. Call sites use this instead of branching on the result
+    /// themselves, so no early return or panic can fall between a
+    /// successful clone and its commit.
+    #[allow(dead_code)] // first caller is the B3b wiring; unit-tested here
+    pub(crate) fn resolve(mut self, signal_guard: super::support::BirthSignalGuard, clone_rc: i64) {
+        let claim = self.claim.take().expect("claim taken only by resolve");
+        drop(signal_guard);
+        if clone_rc > 0 {
+            let Ok(raw_tid) = i32::try_from(clone_rc) else {
+                fatal(126);
+            };
+            self.runtime
+                .commit_private_birth(claim, Pid::from_raw(raw_tid));
+        } else if clone_rc < 0 {
+            self.runtime.abort_private_birth(claim);
+        } else {
+            // rc == 0 is the child's own clone return; reaching this
+            // parent-side guard means the child shares the creator's
+            // stack (vfork-style). Neither hook may run for it: an
+            // abort would release the live slot and unlock in shared
+            // memory. The claim was taken above, so Drop cannot abort
+            // either; die before any hook.
+            fatal(126);
+        }
+    }
+}
+
+impl<R: HostRuntime> Drop for PrivateBirthGuard<'_, R> {
+    fn drop(&mut self) {
+        if let Some(claim) = self.claim.take() {
+            self.runtime.abort_private_birth(claim);
+        }
+    }
 }
 
 /// Decide a guest signal call through the runtime's virtual SIGALRM state;
@@ -9465,5 +9629,306 @@ mod tests {
         // terminates; the intentionally leaked lease/Arc are reclaimed by
         // process teardown.
         unsafe { libc::exit(0) };
+    }
+
+    fn current_mask() -> u64 {
+        let mut current = 0_u64;
+        let result = unsafe {
+            crate::trap::raw_syscall6(
+                libc::SYS_rt_sigprocmask,
+                [0, 0, (&raw mut current) as u64, 8, 0, 0],
+            )
+        };
+        assert_eq!(result, 0);
+        current
+    }
+
+    #[derive(Default)]
+    struct BirthRuntime {
+        log: std::sync::Mutex<Vec<&'static str>>,
+        masks: std::sync::Mutex<Vec<u64>>,
+        child_ready: std::sync::atomic::AtomicBool,
+    }
+    impl HostRuntime for BirthRuntime {
+        fn fork_child_rebind(&self) {}
+        fn emit_stage(&self, _: &[u8]) {}
+        fn fork_child_reset(&self, _: &SyscallEvent) {}
+        fn cpuid_interception_enabled(&self) -> bool {
+            false
+        }
+        fn exit_process_stats(&self, _: Pid) -> io::Result<()> {
+            Ok(())
+        }
+        fn read_clock(&self) -> io::Result<u64> {
+            Ok(0)
+        }
+        fn signal_action_supported(&self, _: i64, _: [u64; 6]) -> bool {
+            false
+        }
+        fn reserved_signal_mask(&self) -> u64 {
+            1 << (libc::SIGSYS - 1)
+        }
+        fn claim_private_birth(
+            &self,
+            _: &PrivateBirthRequest,
+        ) -> Result<Option<PrivateBirthClaim>, PrivateBirthRefusal> {
+            self.log.lock().unwrap().push("claim");
+            Ok(Some(PrivateBirthClaim {
+                slot: 1,
+                tp: 0x1000,
+                record: 0x2000,
+            }))
+        }
+        fn commit_private_birth(&self, claim: PrivateBirthClaim, child_tid: Pid) {
+            assert_eq!(claim.slot, 1);
+            assert_eq!(child_tid, Pid::from_raw(4243));
+            // The restore is resolve's job, not the hook's: record the
+            // mask this hook actually runs under so the test can prove
+            // the guard was dropped before the hook.
+            self.masks.lock().unwrap().push(current_mask());
+            self.log.lock().unwrap().push("unlock-commit");
+        }
+        fn abort_private_birth(&self, claim: PrivateBirthClaim) {
+            assert_eq!(claim.slot, 1);
+            self.masks.lock().unwrap().push(current_mask());
+            self.log.lock().unwrap().push("unlock-abort");
+        }
+        fn admit_private_child(&self, _: &PrivateBirthClaim, _: Pid) -> bool {
+            self.log.lock().unwrap().push("child");
+            self.child_ready
+                .store(true, std::sync::atomic::Ordering::Release);
+            true
+        }
+    }
+
+    fn birth_request() -> PrivateBirthRequest {
+        PrivateBirthRequest {
+            creator: Pid::from_raw(4242),
+            settls: true,
+            guest_stack_top: 0x7000,
+            guest_stack_size: 0x8000,
+            guest_clear_tid: 0x9000,
+            reserved_mask: 1 << (libc::SIGSYS - 1),
+            creator_record: 0x3000,
+        }
+    }
+
+    #[test]
+    fn private_birth_guard_aborts_exactly_once_and_commit_disarms() {
+        use crate::guest::support::BirthSignalGuard;
+        // Seed a mask on this thread that every hook must observe:
+        // resolve drops the armed birth guard before any hook, so a
+        // hook that reads the real mask must see exactly this, never
+        // the birth window's block set. SIGBUS is a fault signal the
+        // birth set skips, so it also proves the seed is not cleared.
+        let pre_seed = current_mask();
+        let seeded_bits: u64 = (1 << (libc::SIGUSR2 - 1)) | (1 << (libc::SIGBUS - 1));
+        assert_eq!(
+            unsafe {
+                crate::trap::raw_syscall6(
+                    libc::SYS_rt_sigprocmask,
+                    [0, (&raw const seeded_bits) as u64, 0, 8, 0, 0],
+                )
+            },
+            0
+        );
+        let seeded = current_mask();
+        assert_eq!(seeded & seeded_bits, seeded_bits);
+        let arm = || BirthSignalGuard::arm(birth_request().reserved_mask).unwrap();
+
+        let runtime = BirthRuntime::default();
+        let claim = runtime
+            .claim_private_birth(&birth_request())
+            .unwrap()
+            .unwrap();
+        // Drop without resolve (the mmap/clone failure paths) aborts
+        // once. The call site drops the signal guard first, so the
+        // abort hook still observes the seeded mask.
+        let signal_guard = arm();
+        assert_ne!(current_mask() & (1 << (libc::SIGUSR1 - 1)), 0);
+        drop(signal_guard);
+        drop(PrivateBirthGuard::new(&runtime, claim));
+        assert_eq!(*runtime.log.lock().unwrap(), ["claim", "unlock-abort"]);
+        assert_eq!(*runtime.masks.lock().unwrap(), [seeded]);
+
+        // Child publishes before the parent commit runs; commit still
+        // succeeds and does not abort.
+        let claim = runtime
+            .claim_private_birth(&birth_request())
+            .unwrap()
+            .unwrap();
+        let guard = PrivateBirthGuard::new(&runtime, claim);
+        assert!(runtime.admit_private_child(guard.claim(), Pid::from_raw(4243)));
+        assert!(
+            runtime
+                .child_ready
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        guard.resolve(arm(), 4243);
+        assert_eq!(
+            *runtime.log.lock().unwrap(),
+            ["claim", "unlock-abort", "claim", "child", "unlock-commit"]
+        );
+        assert_eq!(*runtime.masks.lock().unwrap(), [seeded, seeded]);
+        // A clone error resolves to abort under the same restored mask.
+        let claim = runtime
+            .claim_private_birth(&birth_request())
+            .unwrap()
+            .unwrap();
+        PrivateBirthGuard::new(&runtime, claim).resolve(arm(), -11);
+        assert_eq!(runtime.log.lock().unwrap()[5..], ["claim", "unlock-abort"]);
+        assert_eq!(*runtime.masks.lock().unwrap(), [seeded, seeded, seeded]);
+        assert_eq!(
+            PrivateBirthRefusal::Exhausted.guest_errno(),
+            Some(libc::EAGAIN as i64)
+        );
+        assert_eq!(
+            PrivateBirthRefusal::Unsupported.guest_errno(),
+            Some(libc::EOPNOTSUPP as i64)
+        );
+        // Leave this thread's mask as the test found it.
+        assert_eq!(
+            unsafe {
+                crate::trap::raw_syscall6(
+                    libc::SYS_rt_sigprocmask,
+                    [
+                        libc::SIG_SETMASK as u64,
+                        (&raw const pre_seed) as u64,
+                        0,
+                        8,
+                        0,
+                        0,
+                    ],
+                )
+            },
+            0
+        );
+    }
+
+    /// A runtime that claims but forgets the child-admit hook must
+    /// fail closed: the trait default admits nothing.
+    #[test]
+    fn private_birth_admit_default_fails_closed() {
+        #[derive(Default)]
+        struct ClaimOnlyRuntime;
+        impl HostRuntime for ClaimOnlyRuntime {
+            fn fork_child_rebind(&self) {}
+            fn emit_stage(&self, _: &[u8]) {}
+            fn fork_child_reset(&self, _: &SyscallEvent) {}
+            fn cpuid_interception_enabled(&self) -> bool {
+                false
+            }
+            fn exit_process_stats(&self, _: Pid) -> io::Result<()> {
+                Ok(())
+            }
+            fn read_clock(&self) -> io::Result<u64> {
+                Ok(0)
+            }
+            fn signal_action_supported(&self, _: i64, _: [u64; 6]) -> bool {
+                false
+            }
+            fn reserved_signal_mask(&self) -> u64 {
+                0
+            }
+            fn claim_private_birth(
+                &self,
+                _: &PrivateBirthRequest,
+            ) -> Result<Option<PrivateBirthClaim>, PrivateBirthRefusal> {
+                Ok(Some(PrivateBirthClaim {
+                    slot: 1,
+                    tp: 0x1000,
+                    record: 0x2000,
+                }))
+            }
+            // admit_private_child deliberately not overridden.
+        }
+        let runtime = ClaimOnlyRuntime;
+        let claim = runtime
+            .claim_private_birth(&birth_request())
+            .unwrap()
+            .unwrap();
+        assert!(!runtime.admit_private_child(&claim, Pid::from_raw(4243)));
+    }
+
+    /// rc == 0 is the child's own clone return: resolve must die
+    /// (126) before either hook, never commit or abort. Hook counts
+    /// live in a shared mapping so the parent can read them after
+    /// the child's fatal exit.
+    #[test]
+    fn private_birth_resolve_zero_is_fatal_before_either_hook() {
+        use crate::guest::support::BirthSignalGuard;
+        struct CountingRuntime {
+            counts: usize, // *mut [u64; 2]: [commits, aborts]
+        }
+        impl CountingRuntime {
+            fn bump(&self, index: usize) {
+                // SAFETY: counts names the 2-word shared mapping the
+                // test created; only this child writes it.
+                unsafe {
+                    let word = (self.counts as *mut u64).add(index);
+                    *word += 1;
+                }
+            }
+        }
+        impl HostRuntime for CountingRuntime {
+            fn fork_child_rebind(&self) {}
+            fn emit_stage(&self, _: &[u8]) {}
+            fn fork_child_reset(&self, _: &SyscallEvent) {}
+            fn cpuid_interception_enabled(&self) -> bool {
+                false
+            }
+            fn exit_process_stats(&self, _: Pid) -> io::Result<()> {
+                Ok(())
+            }
+            fn read_clock(&self) -> io::Result<u64> {
+                Ok(0)
+            }
+            fn signal_action_supported(&self, _: i64, _: [u64; 6]) -> bool {
+                false
+            }
+            fn reserved_signal_mask(&self) -> u64 {
+                0
+            }
+            fn commit_private_birth(&self, _: PrivateBirthClaim, _: Pid) {
+                self.bump(0);
+            }
+            fn abort_private_birth(&self, _: PrivateBirthClaim) {
+                self.bump(1);
+            }
+        }
+        let counts = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                4096,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(counts, libc::MAP_FAILED);
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            let runtime = CountingRuntime {
+                counts: counts as usize,
+            };
+            let claim = PrivateBirthClaim {
+                slot: 1,
+                tp: 0x1000,
+                record: 0x2000,
+            };
+            let signal_guard = BirthSignalGuard::arm(0).unwrap();
+            PrivateBirthGuard::new(&runtime, claim).resolve(signal_guard, 0);
+            // resolve(0) returned: neither fatal nor fatal-before-hook.
+            unsafe { libc::_exit(3) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status), "child wait status {status}");
+        assert_eq!(libc::WEXITSTATUS(status), 126);
+        let observed = unsafe { *(counts as *const [u64; 2]) };
+        unsafe { libc::munmap(counts, 4096) };
+        assert_eq!(observed, [0, 0], "no hook may run for resolve(0)");
     }
 }

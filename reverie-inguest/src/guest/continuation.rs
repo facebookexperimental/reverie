@@ -142,7 +142,7 @@ impl PendingKind {
     }
 }
 
-const CALLBACK_STACK_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const CALLBACK_STACK_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Phase {
@@ -379,7 +379,7 @@ fn mapped_running_owner(pointer: *mut Continuation) -> Option<u64> {
         if (&raw const (*pointer).phase).read() != Phase::Running
             || generation == 0
             || tid != current_tid()
-            || super::exec_private::callback_native_tid().map(i64::from) != Some(tid)
+            || super::exec_private::callback_tool_tid().map(i64::from) != Some(tid)
         {
             return None;
         }

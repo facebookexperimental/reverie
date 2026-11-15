@@ -598,11 +598,11 @@
       "group": "lint",
       "job": "clippy",
       "desc": "Clippy",
-      "description": "cargo clippy --workspace --all-targets --features \"$STABLE_FEATURES\" -- -D warnings (stable set from scripts/stable-features.sh, same as validate.sh's serial path). Also the compile-coverage backstop for the non-test lib profile now that the duplicate cargo build gate is gone.",
+      "description": "cargo clippy with the STABLE feature set, then reverie-inguest with the production private-image features (no test-thread-admission), same commands as validate.sh's serial path. Also the compile-coverage backstop for the non-test lib profile now that the duplicate cargo build gate is gone.",
       "labels": [
         "full"
       ],
-      "cmd": "source scripts/stable-features.sh && cargo clippy --workspace --all-targets --features \"$STABLE_FEATURES\" -- -D warnings",
+      "cmd": "source scripts/stable-features.sh && cargo clippy --workspace --all-targets --features \"$STABLE_FEATURES\" -- -D warnings && cargo clippy -p reverie-inguest --all-targets --features exec-native-injection,exec-private-init,loader-private-runtime -- -D warnings",
       "deps": [],
       "env": {},
       "timeout": 600,

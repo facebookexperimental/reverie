@@ -43,6 +43,10 @@ stage1a-probe = ["exec-stop", "dep:serde_json", "dep:sha2"]
 fixed-syscall-gates = []
 # Private GNU loader InitialImage experiment; no successor exec admission.
 exec-private-init = ["fixed-syscall-gates"]
+# Test-only private thread admission selector. The private-static
+# producer refuses any archive whose resolved reverie-inguest features
+# include it (reverie-liteinst-artifact).
+test-thread-admission = []
 # Explicit private-loader gate layout; effective only with target_env=musl.
 # GNU builds, including all-features, retain the legacy fixed gate ABI.
 # This selects coordinates only; it does not admit or initialize an image.

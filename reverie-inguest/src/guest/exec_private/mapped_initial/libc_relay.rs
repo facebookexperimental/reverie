@@ -661,6 +661,17 @@ impl CapturedMappedInitial {
             Ok(plan) => plan,
             Err(_) => die(INVALID),
         };
+        // Capture (do not claim) the geometry a finish-time slot claim
+        // needs; claiming is ordinary init in InitialImageControl::finish.
+        // Production images contain none of this: admission is test-only.
+        #[cfg(feature = "test-thread-admission")]
+        super::super::tool_tls_slots::capture_geometry_inputs(
+            plan.total_bytes(),
+            plan.tls_align(),
+            plan.pthread().start - plan.backing().start,
+            plan.backing().start,
+            input.layout.signal_stack.end - input.layout.signal_stack.start - 8192,
+        );
         let args = LibcInputs {
             storage: match NonNull::new(scalar(3) as *mut RelayStorage) {
                 Some(p) => p,
@@ -1144,6 +1155,89 @@ pub(in crate::guest::exec_private) mod callback {
         check(facts.stack.covers(rsp, 1));
     }
 
+    // Stage C non-leader sibling of verify_owner, which stays the
+    // byte-identical leader branch above. The slot's own record
+    // supplies the phase, thread pointer and guest-registration
+    // ledger; the frontend facts carry the slot altstack. Called only
+    // under this record's relay-busy word.
+    unsafe fn verify_slot_owner(
+        s: &RelayState,
+        p: &Progress,
+        frame: &SignalFrame<'_>,
+        index: usize,
+        record: *mut super::super::super::tool_tls_slots::SlotRecord,
+    ) {
+        let c = s.control.as_ptr();
+        check(callback_phase(
+            tool_init::read(unsafe { &raw const (*record).phase }),
+            tool_init::read(unsafe { &raw const (*c).runtime_ready }),
+            tool_init::read(unsafe { &raw const (*c).native_state }),
+        ));
+        check(tool_init::read(unsafe { &raw const (*c).init_input_fd }) == u64::MAX);
+        let Some(tp) = super::super::super::current_thread_pointer() else {
+            die(KERNEL_FAILURE)
+        };
+        check(tool_init::read(unsafe { &raw const (*record).tool_fs }) == tp);
+        check(super::super::super::callback_slot_registrations(record).is_some());
+        let region = match crate::guest::tool_region::published_owner() {
+            Some(region) => region,
+            None => die(INVALID),
+        };
+        let scope = match crate::guest::continuation::mapped_callback_facts(
+            frame.register(libc::REG_RSP as usize) as usize,
+            region,
+        ) {
+            Some(scope) => scope,
+            None => die(INVALID),
+        };
+        let Some(layout) = super::super::super::tool_tls_slots::layout() else {
+            die(INVALID)
+        };
+        let (lo, hi) = layout.altstack_for_slot(index);
+        let (installed_region, facts) = unsafe {
+            frontend::verify_slot_callback_frontend(s, p, scope.host, scope.mask, Extent { lo, hi })
+        };
+        check(core::ptr::eq(region, installed_region));
+        check(
+            frame.signal_mask() == scope.mask
+                && saved_stack_matches(frame.signal_stack(), facts.stack),
+        );
+        check(frame.on_owned_signal_stack(facts.stack.lo, facts.stack.hi, facts.restorer));
+        let rsp: usize;
+        unsafe {
+            core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack, preserves_flags))
+        };
+        check(facts.stack.covers(rsp, 1));
+    }
+
+    unsafe fn verify_current_owner(
+        s: &RelayState,
+        p: &Progress,
+        frame: &SignalFrame<'_>,
+        owner: super::super::super::CurrentCallbackRecord,
+    ) {
+        match owner {
+            super::super::super::CurrentCallbackRecord::Leader => unsafe {
+                verify_owner(s, p, frame)
+            },
+            super::super::super::CurrentCallbackRecord::Slot { index, record } => unsafe {
+                verify_slot_owner(s, p, frame, index, record)
+            },
+        }
+    }
+
+    fn release_relay_busy(s: &RelayState, owner: super::super::super::CurrentCallbackRecord) {
+        match owner {
+            super::super::super::CurrentCallbackRecord::Leader => {
+                s.busy.store(false, Ordering::Release);
+            }
+            super::super::super::CurrentCallbackRecord::Slot { record, .. } => {
+                let word = unsafe { &*(&raw const (*record).relay_busy) };
+                super::super::super::tool_tls_slots::release_relay_busy(word);
+            }
+        }
+    }
+
     /// # Safety
     /// `frame` is this invocation's exclusive actual SIGSYS frame, decoded by the
     /// normal signal handler under its reentry guard. Caller retains the physical
@@ -1162,16 +1256,38 @@ pub(in crate::guest::exec_private) mod callback {
         }
         // SAFETY: installed relay storage remains live for this physical image.
         let s = unsafe { &*raw };
-        if s.busy
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            die(REENTRY);
+        // Stage C: the relay window is per callback record. Slot 0
+        // keeps the global busy word exactly as before; a non-leader
+        // slot CASes its own record's relay-busy word, so two admitted
+        // slots' callbacks overlap without REENTRY against each other.
+        let Some(tp) = super::super::super::current_thread_pointer() else {
+            die(KERNEL_FAILURE)
+        };
+        let owner = match super::super::super::current_callback_record(tp, s.control.as_ptr()) {
+            Some(owner) => owner,
+            None => die(INVALID),
+        };
+        match owner {
+            super::super::super::CurrentCallbackRecord::Leader => {
+                if s.busy
+                    .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                    .is_err()
+                {
+                    die(REENTRY);
+                }
+            }
+            super::super::super::CurrentCallbackRecord::Slot { record, .. } => {
+                let word = unsafe { &*(&raw const (*record).relay_busy) };
+                if !super::super::super::tool_tls_slots::acquire_relay_busy(word) {
+                    die(REENTRY);
+                }
+            }
         }
-        // Only shared reads of the disjoint Progress while holding its existing
-        // exclusion. No runtime/callback owner or Ready state is constructed here.
+        // Only shared reads of the disjoint Progress while holding this
+        // record's busy exclusion. No runtime/callback owner or Ready state
+        // is constructed here.
         let p = unsafe { &*s.progress.get() };
-        unsafe { verify_owner(s, p, frame) };
+        unsafe { verify_current_owner(s, p, frame, owner) };
         let post = frame.register(libc::REG_RIP as usize) as u64;
         let number = frame.register(libc::REG_RAX as usize);
         let registers = [
@@ -1219,6 +1335,32 @@ pub(in crate::guest::exec_private) mod callback {
         if number as u64 & 0x4000_0000 != 0 || tool_init::changes_startup_domain(number, args) {
             die(OPERATION);
         }
+        if let super::super::super::CurrentCallbackRecord::Slot { .. } = owner
+            && let Some(outcome) = super::super::super::non_leader_mapping_outcome(number, || {
+                // SAFETY: brk(0) observes the current break and
+                // changes no mapping, as in the owner-mapping guard.
+                unsafe { kernel(libc::SYS_brk, [0; 6]) }
+            })
+        {
+            // NON_LEADER_MAPPING_CLASS (dh-gpxse): mapping, break and
+            // mapping-tracking state are process-global and
+            // leader-owned, so a physical mapping change from an
+            // admitted non-leader would race the leader's
+            // owner-mapping and tracker accounting. The shared
+            // outcome seam refuses by name without executing: -EPERM,
+            // or the unchanged current break for brk, whose ABI has
+            // no errno return. A failed allocation is survivable;
+            // desynced mapping accounting is not.
+            event.result = match outcome {
+                super::super::super::NonLeaderMappingOutcome::Result(result) => result,
+                super::super::super::NonLeaderMappingOutcome::BreakQueryFailed => {
+                    die(KERNEL_FAILURE)
+                }
+            };
+            unsafe { verify_current_owner(s, p, frame, owner) };
+            release_relay_busy(s, owner);
+            return;
+        }
         // All existing nested process/signal/registration, runtime descriptor and
         // owner-mapping guards run unchanged. Only the physical execution leaf
         // differs: keep actual Tool FS, do not call event.forward/Guest FS.
@@ -1233,10 +1375,10 @@ pub(in crate::guest::exec_private) mod callback {
                 event.guest_pkru = result.pkru;
             })
         };
-        unsafe { verify_owner(s, p, frame) };
+        unsafe { verify_current_owner(s, p, frame, owner) };
         // Linux may update the actual Tool PKRU result; normal trap return owns
         // committing RAX and PKRU to this same exclusive kernel frame afterward.
-        s.busy.store(false, Ordering::Release);
+        release_relay_busy(s, owner);
     }
 
     #[cfg(test)]

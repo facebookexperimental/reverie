@@ -1040,7 +1040,13 @@ run_test_check "Documentation tests" cargo test --workspace --doc --features "$S
 # backend whose inputs are missing is refused by name, and a host with no
 # ledger gets its verdicts reported, not judged (reverie-examples/e2e/README.md).
 run_check "Reverie-layer cross-backend e2e" "$ROOT_DIR/reverie-examples/e2e/run.sh"
-run_check "Clippy" cargo clippy --workspace --all-targets --features "$STABLE_FEATURES" -- -D warnings
+run_clippy() {
+    cargo clippy --workspace --all-targets --features "$STABLE_FEATURES" -- -D warnings || return $?
+    # Production private-image features, without the test-only admission
+    # selector that STABLE_FEATURES now carries (dh-7ryuo B1).
+    cargo clippy -p reverie-inguest --all-targets --features exec-native-injection,exec-private-init,loader-private-runtime -- -D warnings
+}
+run_check "Clippy" run_clippy
 run_check "Rustfmt" cargo fmt --all -- --check
 }
 

@@ -112,6 +112,15 @@ pub unsafe trait PatchHost {
         Ok(false)
     }
 
+    /// Test-only: whether private per-thread Tool TLS admission is
+    /// requested for this install. Compiled only under the
+    /// `test-thread-admission` feature, which production private-static
+    /// builds never enable (refused by the production producer).
+    #[cfg(feature = "test-thread-admission")]
+    fn thread_admission(&self) -> io::Result<bool> {
+        Ok(false)
+    }
+
     /// Whether lifecycle stages go to the diagnostic stream.
     fn stage_stream(&self) -> io::Result<bool>;
 
@@ -352,6 +361,10 @@ where
         configuration,
         syscall_subscriptions,
         project(host.runtime(stats)),
+    );
+    #[cfg(all(feature = "test-thread-admission", feature = "exec-private-init"))]
+    crate::guest::exec_private::tool_tls_slots::note_thread_admission_requested(
+        host.thread_admission()?,
     );
     if let Some(initialize) = initialize {
         tool_host.prepare_ordinary_root_state(initialize)?;

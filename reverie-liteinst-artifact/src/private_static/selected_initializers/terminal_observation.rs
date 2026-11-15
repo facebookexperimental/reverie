@@ -42,11 +42,19 @@ const MAPPED_CALLBACK_PRIVATE_SOURCE: &str =
 // role/control check below remains required.
 const SUCCESSOR_PRIVATE_SOURCE: &str =
     "a5bf6d729d2ca8daeadfef5b85c22f03cc9d8073b560db2093954727d8b0ce3a";
+// The thread-admission preparation source, over the a5bf6d72 source: the
+// per-thread Tool TLS registry and slots, the call-leaf record derivation
+// from the FS base, the birth signal guard and the non-leader mapping
+// refusal, with admission still off. Its terminal bodies are unchanged;
+// every emitted role/control check below remains required.
+const THREAD_PREP_PRIVATE_SOURCE: &str =
+    "86341ba489579c43a7e4088429dc597c1db17cb662cc79bc62b59976868ec9a6";
 
 pub(super) fn accepted_private_source(digest: &str) -> bool {
     digest == PRIVATE_SOURCE
         || digest == MAPPED_CALLBACK_PRIVATE_SOURCE
         || digest == SUCCESSOR_PRIVATE_SOURCE
+        || digest == THREAD_PREP_PRIVATE_SOURCE
 }
 
 /// Callback-scoped static observations only. No execution/Ready conversion.
@@ -1002,6 +1010,7 @@ mod tests {
             PRIVATE_SOURCE,
             MAPPED_CALLBACK_PRIVATE_SOURCE,
             SUCCESSOR_PRIVATE_SOURCE,
+            THREAD_PREP_PRIVATE_SOURCE,
         ] {
             assert!(accepted_private_source(digest));
             for refused in [

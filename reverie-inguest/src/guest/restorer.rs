@@ -981,6 +981,10 @@ fn mapping_change_refused_with_fixed_region(
         let (start, length) = round_out(start, length, unit);
         overlaps(start, length)
     };
+    // Editors: the test probe `owner_mapping_guard_classifies` below
+    // must keep reaching every arm of this match (Stage C derives its
+    // refusal cross-check from it); extend its argument shapes when
+    // adding an arm whose condition the current shapes cannot satisfy.
     match number {
         libc::SYS_munmap
         | libc::SYS_mprotect
@@ -1044,6 +1048,52 @@ fn mapping_change_refused_with_fixed_region(
         libc::SYS_shmat => args[2] as i32 & libc::SHM_REMAP != 0,
         _ => false,
     }
+}
+
+/// Test-only probe: does the owner-mapping guard classify `number`
+/// as a mapping change at all? Several argument shapes are ORed so
+/// arms conditioned on ownership, on a flag bit in args[2], or on an
+/// address in args[4] are reached too: an address inside the fixed
+/// gate region (the overlap arms and mseal), SHM_REMAP (shmat),
+/// MAP_FIXED (mmap), process_madvise (no argument), owner true and
+/// false, args[2] bit 0 set (MLOCK_ONFAULT-shaped), and args[4]
+/// inside the region. At this revision those shapes reach every
+/// arm; an arm whose condition no shape satisfies (an equality or a
+/// negated test) would still be missed, so editors adding an arm
+/// must extend these shapes. Stage C's refusal set must cover every
+/// number this returns true for.
+#[cfg(all(test, feature = "exec-private-init"))]
+pub(crate) fn owner_mapping_guard_classifies(number: i64) -> bool {
+    let table = [const { AtomicU64::new(0) }; MAX_PROTECTED_PAGES];
+    let facts = MappingFacts {
+        hugetlbfs_page_size: &|_| None,
+        default_huge_page_size: &|| Some(2 * 1024 * 1024),
+        page_size_at: &|_| Some(PAGE_SIZE),
+    };
+    let fixed = Some((
+        crate::trap::FIXED_GATE_BASE,
+        crate::trap::FIXED_GATE_BASE + crate::trap::FIXED_GATE_BYTES,
+    ));
+    let flags = (libc::MAP_FIXED | libc::MAP_ANONYMOUS | libc::MAP_PRIVATE) as u64;
+    let base_args = [
+        crate::trap::FIXED_GATE_BASE,
+        PAGE_SIZE,
+        libc::SHM_REMAP as u64,
+        flags,
+        0,
+        0,
+    ];
+    let mut onfault_args = base_args;
+    // Bit 0 of args[2] is MLOCK_ONFAULT for mlock2-shaped arms;
+    // args[4] inside the region reaches new-address arms.
+    onfault_args[2] |= 1;
+    onfault_args[4] = crate::trap::FIXED_GATE_BASE;
+    onfault_args[5] = PAGE_SIZE;
+    [(false, base_args), (true, base_args), (false, onfault_args)]
+        .into_iter()
+        .any(|(owner, args)| {
+            mapping_change_refused_with_fixed_region(&table, number, args, &facts, owner, fixed)
+        })
 }
 
 #[cfg(test)]
