@@ -14459,14 +14459,34 @@ mod tests {
             );
         }
 
-        // An unsupported AF_UNIX socket type is still rejected before the host
-        // call, matching the pre-existing SOCK_DGRAM/SOCK_STREAM allowlist.
+        // AF_UNIX SOCK_RAW is forwarded to the host like every other type
+        // (Detcore's handle_socket does the same); the kernel accepts it
+        // and normalizes it to a datagram socket.
+        let raw = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_socket,
+            [libc::AF_UNIX as u64, libc::SOCK_RAW as u64, 0, 0, 0, 0],
+        );
+        assert!(raw >= 0, "AF_UNIX SOCK_RAW socket() returned {raw}");
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_close,
+                [raw as u64, 0, 0, 0, 0, 0],
+            ),
+            0
+        );
+
+        // The same forwarding lets the kernel reject an AF_UNIX protocol
+        // other than 0 or PF_UNIX; it is not executor pre-validation.
         assert_eq!(
             syscall_result(
                 &mut memory,
                 &mut state,
                 libc::SYS_socket,
-                [libc::AF_UNIX as u64, libc::SOCK_RAW as u64, 0, 0, 0, 0],
+                [libc::AF_UNIX as u64, libc::SOCK_STREAM as u64, 2, 0, 0, 0],
             ),
             negative_errno(libc::EPROTONOSUPPORT)
         );
@@ -14591,7 +14611,8 @@ mod tests {
             12
         );
 
-        // An unsupported pair type is still refused before the host call.
+        // A SOCK_RAW pair is forwarded to the host like every other type;
+        // a non-AF_UNIX pair stays refused by the domain check.
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -14601,6 +14622,41 @@ mod tests {
                     libc::AF_UNIX as u64,
                     libc::SOCK_RAW as u64,
                     0,
+                    PAIR_FDS,
+                    0,
+                    0
+                ],
+            ),
+            0
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_socketpair,
+                [
+                    libc::AF_INET as u64,
+                    libc::SOCK_STREAM as u64,
+                    0,
+                    PAIR_FDS,
+                    0,
+                    0
+                ],
+            ),
+            negative_errno(libc::EOPNOTSUPP)
+        );
+
+        // Forwarding also preserves the kernel's AF_UNIX protocol
+        // refusal for protocols other than 0 or PF_UNIX.
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_socketpair,
+                [
+                    libc::AF_UNIX as u64,
+                    libc::SOCK_STREAM as u64,
+                    2,
                     PAIR_FDS,
                     0,
                     0
@@ -16568,7 +16624,30 @@ mod tests {
             "option length must win when value and length overlap"
         );
 
-        for unsupported in [libc::SO_RCVBUF, libc::SO_SNDBUF] {
+        for unsupported in [libc::SO_ERROR + 0x4000, libc::SO_ERROR + 0x4001] {
+            // These are not assigned SOL_SOCKET options. Confirm the
+            // host itself refuses each one before requiring the executor
+            // to publish neither its value nor its length.
+            let translated = host_fd(&state, socket_fd as libc::c_int).unwrap();
+            let mut host_value = 0_i32;
+            let mut host_length = std::mem::size_of_val(&host_value) as libc::socklen_t;
+            // SAFETY: both output pointers name initialized host storage
+            // and the translated descriptor stays live in state.
+            let host_result = unsafe {
+                libc::getsockopt(
+                    translated,
+                    libc::SOL_SOCKET,
+                    unsupported,
+                    std::ptr::from_mut(&mut host_value).cast::<libc::c_void>(),
+                    &mut host_length,
+                )
+            };
+            let host_errno = std::io::Error::last_os_error()
+                .raw_os_error()
+                .expect("host getsockopt failure carries an errno");
+            assert_eq!(host_result, -1, "host option={unsupported}");
+            assert_eq!(host_errno, libc::ENOPROTOOPT, "host option={unsupported}");
+
             let sentinel = 0x5a5a_5a5a_i32;
             let length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
             assert_eq!(
@@ -16670,6 +16749,1226 @@ mod tests {
             1,
             (0xa5a5_5a5a_u64 << 32) | option_length,
         );
+    }
+
+    /// Env marker naming the test re-executed inside its namespace.
+    const SOCKET_NETNS_TEST_ENV: &str = "REVERIE_LINUXEMU_SOCKET_NETNS_TEST";
+
+    /// Writes a named skip past libtest output capture (fd 2 directly),
+    /// so the counted runner and per-crate scorecard report it as
+    /// skipped rather than as a silent pass.
+    fn report_skip(test: &str, reason: &str) {
+        let line = format!("\nREVERIE_SKIP: {test}: {reason}\n");
+        let mut rest = line.as_bytes();
+        while !rest.is_empty() {
+            // SAFETY: writes only the buffer above to this process's stderr.
+            let written =
+                unsafe { libc::write(libc::STDERR_FILENO, rest.as_ptr().cast(), rest.len()) };
+            assert!(
+                written > 0,
+                "write the named skip for {test}: {}",
+                std::io::Error::last_os_error()
+            );
+            rest = &rest[written as usize..];
+        }
+    }
+
+    /// Between fork and exec: a new user namespace that maps the caller
+    /// to root, and a new network namespace, in which CAP_NET_RAW holds.
+    struct UserNetNamespace {
+        uid_map: Vec<u8>,
+        gid_map: Vec<u8>,
+    }
+
+    impl UserNetNamespace {
+        fn write(path: &std::ffi::CStr, bytes: &[u8]) -> std::io::Result<()> {
+            // SAFETY: path is NUL-terminated and bytes is a live buffer
+            // of its length; the descriptor is closed before returning.
+            unsafe {
+                let fd = libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+                if fd < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let written = libc::write(fd, bytes.as_ptr().cast(), bytes.len());
+                let error = std::io::Error::last_os_error();
+                libc::close(fd);
+                if written != bytes.len() as isize {
+                    return Err(error);
+                }
+            }
+            Ok(())
+        }
+
+        /// Only system calls, and no allocation: this runs in the forked
+        /// child before exec.
+        fn enter(&self) -> std::io::Result<()> {
+            // SAFETY: unshare takes no pointers.
+            if unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Self::write(c"/proc/self/setgroups", b"deny")?;
+            Self::write(c"/proc/self/uid_map", &self.uid_map)?;
+            Self::write(c"/proc/self/gid_map", &self.gid_map)
+        }
+
+        /// Probe entry in a forked child that never execs: exit 0 if
+        /// the namespace was entered, exit 77 (with the errno on the
+        /// pipe) if entry was refused. This is the only outcome that
+        /// may become a skip; fork/wait failures and any other child
+        /// status fail the test. If entry succeeds but a security
+        /// policy (for example AppArmor) strips capabilities inside
+        /// the namespace, the later body fails its assertions loudly
+        /// rather than skipping: the namespace exists, so the test
+        /// must really run.
+        fn probe(&self) -> Result<(), std::io::Error> {
+            let mut pipe = [-1_i32; 2];
+            // SAFETY: pipe has room for both new descriptors.
+            assert_eq!(
+                unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+                0,
+                "pipe2 for namespace probe: {}",
+                std::io::Error::last_os_error()
+            );
+            // SAFETY: the child makes only system calls on state built
+            // above, then leaves through _exit; it never returns.
+            let child = unsafe { libc::fork() };
+            assert!(child >= 0, "fork: {}", std::io::Error::last_os_error());
+            if child == 0 {
+                // SAFETY: both are descriptors this call just created.
+                unsafe {
+                    libc::close(pipe[0]);
+                    match self.enter() {
+                        Ok(()) => libc::_exit(0),
+                        Err(error) => {
+                            let raw = error.raw_os_error().unwrap_or(libc::EIO);
+                            let bytes = raw.to_ne_bytes();
+                            let _ = libc::write(pipe[1], bytes.as_ptr().cast(), bytes.len());
+                            libc::_exit(77)
+                        }
+                    }
+                }
+            }
+            // SAFETY: pipe[1] is owned by this call.
+            unsafe { libc::close(pipe[1]) };
+            let mut raw = [0_u8; 4];
+            let mut read = 0_usize;
+            while read < raw.len() {
+                // SAFETY: the buffer has room for the remaining bytes.
+                let count = unsafe {
+                    libc::read(pipe[0], raw[read..].as_mut_ptr().cast(), raw.len() - read)
+                };
+                if count <= 0 {
+                    break;
+                }
+                read += count as usize;
+            }
+            // SAFETY: pipe[0] is owned by this call.
+            unsafe { libc::close(pipe[0]) };
+            let mut status = 0_i32;
+            loop {
+                // SAFETY: status is writable and child is our child.
+                let waited = unsafe { libc::waitpid(child, &mut status, 0) };
+                if waited == child {
+                    break;
+                }
+                let error = std::io::Error::last_os_error();
+                assert!(
+                    error.raw_os_error() == Some(libc::EINTR),
+                    "waitpid namespace probe: {error}"
+                );
+            }
+            if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
+                return Ok(());
+            }
+            if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 77 {
+                let raw_errno = if read == raw.len() {
+                    i32::from_ne_bytes(raw)
+                } else {
+                    libc::EIO
+                };
+                return Err(std::io::Error::from_raw_os_error(raw_errno));
+            }
+            panic!("namespace probe child exited with status {status:#x}");
+        }
+    }
+
+    /// Spawn the namespaced child test process. Any spawn or exec
+    /// failure panics: it is a test failure, never a skip. Namespace
+    /// entry has already been probed by the caller.
+    fn spawn_namespaced_test_child(
+        exe: &std::path::Path,
+        name: &str,
+        test: &str,
+        log: &std::path::Path,
+        namespace: UserNetNamespace,
+    ) -> std::process::Output {
+        let mut command = std::process::Command::new(exe);
+        command
+            .args([
+                "--exact",
+                name,
+                "--nocapture",
+                "--test-threads=1",
+                "--logfile",
+            ])
+            .arg(log)
+            .env(SOCKET_NETNS_TEST_ENV, test);
+        // SAFETY: enter makes only system calls and allocates nothing.
+        unsafe {
+            std::os::unix::process::CommandExt::pre_exec(&mut command, move || namespace.enter())
+        };
+        command.output().expect("spawn namespaced test child")
+    }
+
+    /// Run the calling test, `test`, in a child process of this test
+    /// binary that has a user and network namespace of its own. In that
+    /// child, returns true where the caller runs its body; in the
+    /// parent, returns false once the child ran exactly that test and
+    /// it passed.
+    ///
+    /// Namespace entry is probed first in a forked child that never
+    /// execs; only a refusal there becomes a named skip. Once the
+    /// probe passes, any spawn or exec failure of the real child is a
+    /// test failure. If entry succeeds but a security policy (for
+    /// example AppArmor) strips capabilities inside the namespace,
+    /// the body likewise fails loudly rather than skipping.
+    fn in_own_user_net_namespace(test: &str) -> bool {
+        if std::env::var(SOCKET_NETNS_TEST_ENV).as_deref() == Ok(test) {
+            return true;
+        }
+        let scratch = std::env::temp_dir().join(format!(
+            "reverie-socket-netns-{test}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let log = scratch.join("libtest.log");
+        let module = module_path!()
+            .split_once("::")
+            .map_or(module_path!(), |(_, path)| path);
+        let name = format!("{module}::{test}");
+        // SAFETY: geteuid and getegid have no preconditions.
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        let namespace = UserNetNamespace {
+            uid_map: format!("0 {uid} 1").into_bytes(),
+            gid_map: format!("0 {gid} 1").into_bytes(),
+        };
+        if let Err(error) = namespace.probe() {
+            std::fs::remove_dir_all(&scratch).unwrap();
+            report_skip(&name, &format!("user+net namespace setup refused: {error}"));
+            return false;
+        }
+        let output = spawn_namespaced_test_child(
+            &std::env::current_exe().unwrap(),
+            &name,
+            test,
+            &log,
+            namespace,
+        );
+        let record = std::fs::read_to_string(&log);
+        std::fs::remove_dir_all(&scratch).unwrap();
+        assert!(
+            output.status.success(),
+            "{test} in its namespace: {:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // Exactly one completed, passing run of this test, and no other.
+        assert_eq!(
+            record.unwrap(),
+            format!("ok {name}\n"),
+            "{test}: the child's execution record"
+        );
+        false
+    }
+
+    /// A spawn/exec failure after a successful namespace probe must
+    /// fail the test, never degrade to a skip: a deliberately bad
+    /// exec path panics in the spawn helper.
+    #[test]
+    #[should_panic(expected = "spawn namespaced test child")]
+    fn namespaced_spawn_bad_exec_path_fails_not_skips() {
+        // SAFETY: geteuid and getegid have no preconditions.
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        let namespace = UserNetNamespace {
+            uid_map: format!("0 {uid} 1").into_bytes(),
+            gid_map: format!("0 {gid} 1").into_bytes(),
+        };
+        let _ = spawn_namespaced_test_child(
+            std::path::Path::new("/nonexistent/reverie-test-binary"),
+            "executor::tests::dummy",
+            "dummy",
+            std::path::Path::new("/nonexistent/libtest.log"),
+            namespace,
+        );
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    #[test]
+    fn getsockopt_configuration_options_and_socket_types_forward_to_host() {
+        const VALUE: u64 = 0x100;
+        const LENGTH: u64 = 0x200;
+        const PAIR: u64 = 0x300;
+
+        fn host_int_option(fd: RawFd, level: libc::c_int, option: libc::c_int) -> libc::c_int {
+            let mut value = -1_i32;
+            let mut length = std::mem::size_of_val(&value) as libc::socklen_t;
+            // SAFETY: both output pointers name initialized host storage and
+            // the descriptor stays live for this call.
+            assert_eq!(
+                unsafe {
+                    libc::getsockopt(
+                        fd,
+                        level,
+                        option,
+                        std::ptr::from_mut(&mut value).cast::<libc::c_void>(),
+                        &mut length,
+                    )
+                },
+                0,
+                "raw host getsockopt level={level} option={option}"
+            );
+            value
+        }
+
+        fn guest_option(
+            memory: &mut GuestMemory,
+            state: &mut LoadedStaticElf,
+            fd: i64,
+            level: libc::c_int,
+            option: libc::c_int,
+            capacity: libc::socklen_t,
+        ) -> i64 {
+            assert_eq!(
+                write_struct(&mut ProviderMemory(memory), LENGTH, &capacity),
+                0
+            );
+            syscall_result(
+                memory,
+                state,
+                libc::SYS_getsockopt,
+                [fd as u64, level as u64, option as u64, VALUE, LENGTH, 0],
+            )
+        }
+
+        fn host_errno() -> i64 {
+            negative_errno(
+                std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .expect("host socket failure carries an errno"),
+            )
+        }
+
+        fn host_socket_result(
+            domain: libc::c_int,
+            socket_type: libc::c_int,
+            protocol: libc::c_int,
+        ) -> Result<(libc::c_int, libc::c_int), i64> {
+            // SAFETY: socket creation takes only scalar arguments.
+            let fd = unsafe { libc::socket(domain, socket_type, protocol) };
+            if fd < 0 {
+                return Err(host_errno());
+            }
+            let result = (
+                host_int_option(fd, libc::SOL_SOCKET, libc::SO_DOMAIN),
+                host_int_option(fd, libc::SOL_SOCKET, libc::SO_TYPE),
+            );
+            // SAFETY: fd was just created by this helper and is owned here.
+            unsafe { libc::close(fd) };
+            Ok(result)
+        }
+
+        fn assert_socket_matches_host(
+            memory: &mut GuestMemory,
+            state: &mut LoadedStaticElf,
+            domain: libc::c_int,
+            socket_type: libc::c_int,
+            protocol: libc::c_int,
+        ) {
+            let guest = syscall_result(
+                memory,
+                state,
+                libc::SYS_socket,
+                [domain as u64, socket_type as u64, protocol as u64, 0, 0, 0],
+            );
+            match host_socket_result(domain, socket_type, protocol) {
+                Err(errno) => assert_eq!(
+                    guest, errno,
+                    "socket domain={domain} type={socket_type} protocol={protocol}"
+                ),
+                Ok(expected) => {
+                    assert!(
+                        guest >= 0,
+                        "socket domain={domain} type={socket_type} protocol={protocol}: {guest}"
+                    );
+                    let translated = host_fd(state, guest as libc::c_int).unwrap();
+                    assert_eq!(
+                        (
+                            host_int_option(translated, libc::SOL_SOCKET, libc::SO_DOMAIN),
+                            host_int_option(translated, libc::SOL_SOCKET, libc::SO_TYPE),
+                        ),
+                        expected,
+                        "socket domain={domain} type={socket_type} protocol={protocol}"
+                    );
+                    assert_eq!(
+                        syscall_result(
+                            memory,
+                            state,
+                            libc::SYS_close,
+                            [guest as u64, 0, 0, 0, 0, 0],
+                        ),
+                        0
+                    );
+                }
+            }
+        }
+
+        fn host_socketpair_result(
+            domain: libc::c_int,
+            socket_type: libc::c_int,
+            protocol: libc::c_int,
+        ) -> Result<(libc::c_int, libc::c_int), i64> {
+            let mut pair = [-1; 2];
+            // SAFETY: pair is writable storage for two descriptors.
+            let result =
+                unsafe { libc::socketpair(domain, socket_type, protocol, pair.as_mut_ptr()) };
+            if result != 0 {
+                return Err(host_errno());
+            }
+            let values = (
+                host_int_option(pair[0], libc::SOL_SOCKET, libc::SO_DOMAIN),
+                host_int_option(pair[0], libc::SOL_SOCKET, libc::SO_TYPE),
+            );
+            for fd in pair {
+                // SAFETY: both descriptors were just created above.
+                unsafe { libc::close(fd) };
+            }
+            Ok(values)
+        }
+
+        fn assert_socketpair_matches_host(
+            memory: &mut GuestMemory,
+            state: &mut LoadedStaticElf,
+            domain: libc::c_int,
+            socket_type: libc::c_int,
+            protocol: libc::c_int,
+        ) {
+            let guest = syscall_result(
+                memory,
+                state,
+                libc::SYS_socketpair,
+                [
+                    domain as u64,
+                    socket_type as u64,
+                    protocol as u64,
+                    PAIR,
+                    0,
+                    0,
+                ],
+            );
+            match host_socketpair_result(domain, socket_type, protocol) {
+                Err(errno) => assert_eq!(
+                    guest, errno,
+                    "socketpair domain={domain} type={socket_type} protocol={protocol}"
+                ),
+                Ok(expected) => {
+                    assert_eq!(
+                        guest, 0,
+                        "socketpair domain={domain} type={socket_type} protocol={protocol}"
+                    );
+                    let pair: [libc::c_int; 2] = read_struct(memory, PAIR);
+                    assert!(pair[0] >= 0 && pair[1] >= 0 && pair[0] != pair[1]);
+                    let translated = host_fd(state, pair[0]).unwrap();
+                    assert_eq!(
+                        (
+                            host_int_option(translated, libc::SOL_SOCKET, libc::SO_DOMAIN),
+                            host_int_option(translated, libc::SOL_SOCKET, libc::SO_TYPE),
+                        ),
+                        expected,
+                        "socketpair domain={domain} type={socket_type} protocol={protocol}"
+                    );
+                    for fd in pair {
+                        assert_eq!(
+                            syscall_result(
+                                memory,
+                                state,
+                                libc::SYS_close,
+                                [fd as u64, 0, 0, 0, 0, 0],
+                            ),
+                            0
+                        );
+                    }
+                }
+            }
+        }
+
+        fn host_timeval_option(fd: RawFd, option: libc::c_int) -> libc::timeval {
+            // SAFETY: an all-zero timeval is valid output storage.
+            let mut value: libc::timeval = unsafe { std::mem::zeroed() };
+            let mut length = std::mem::size_of_val(&value) as libc::socklen_t;
+            // SAFETY: both output pointers name initialized host storage and
+            // the descriptor stays live for this call.
+            assert_eq!(
+                unsafe {
+                    libc::getsockopt(
+                        fd,
+                        libc::SOL_SOCKET,
+                        option,
+                        std::ptr::from_mut(&mut value).cast::<libc::c_void>(),
+                        &mut length,
+                    )
+                },
+                0,
+                "raw host timeval getsockopt option={option}"
+            );
+            value
+        }
+
+        fn host_option_bytes(
+            fd: RawFd,
+            level: libc::c_int,
+            option: libc::c_int,
+            capacity: libc::socklen_t,
+        ) -> Result<Vec<u8>, i64> {
+            let mut value = vec![0_u8; capacity as usize];
+            let mut length = capacity;
+            let value_pointer = if value.is_empty() {
+                std::ptr::null_mut()
+            } else {
+                value.as_mut_ptr().cast::<libc::c_void>()
+            };
+            // SAFETY: value_pointer is null for an empty request or
+            // writable for capacity bytes, and fd stays live.
+            let result = unsafe { libc::getsockopt(fd, level, option, value_pointer, &mut length) };
+            if result != 0 {
+                return Err(host_errno());
+            }
+            value.truncate((length as usize).min(value.len()));
+            Ok(value)
+        }
+
+        fn host_option_input_bytes(
+            fd: RawFd,
+            level: libc::c_int,
+            option: libc::c_int,
+            input: &[u8],
+        ) -> Result<Vec<u8>, i64> {
+            let mut value = input.to_vec();
+            let mut length = value.len() as libc::socklen_t;
+            let value_pointer = if value.is_empty() {
+                std::ptr::null_mut()
+            } else {
+                value.as_mut_ptr().cast::<libc::c_void>()
+            };
+            // SAFETY: value_pointer is null for an empty request or
+            // readable/writable for input.len() bytes, and fd stays live.
+            let result = unsafe { libc::getsockopt(fd, level, option, value_pointer, &mut length) };
+            if result != 0 {
+                return Err(host_errno());
+            }
+            value.truncate((length as usize).min(value.len()));
+            Ok(value)
+        }
+
+        fn assert_input_option_matches_host(
+            memory: &mut GuestMemory,
+            state: &mut LoadedStaticElf,
+            guest_fd: i64,
+            expected_host_fd: RawFd,
+            level: libc::c_int,
+            option: libc::c_int,
+            input: &[u8],
+        ) {
+            let expected = host_option_input_bytes(expected_host_fd, level, option, input);
+            memory.write(VALUE, input).unwrap();
+            let guest = guest_option(
+                memory,
+                state,
+                guest_fd,
+                level,
+                option,
+                input.len() as libc::socklen_t,
+            );
+            match expected {
+                Err(errno) => assert_eq!(
+                    guest, errno,
+                    "input getsockopt guest_fd={guest_fd} level={level} option={option}"
+                ),
+                Ok(bytes) => {
+                    assert_eq!(
+                        guest, 0,
+                        "input getsockopt guest_fd={guest_fd} level={level} option={option}"
+                    );
+                    assert_eq!(
+                        read_struct::<libc::socklen_t>(memory, LENGTH) as usize,
+                        bytes.len(),
+                        "input getsockopt length guest_fd={guest_fd} level={level} option={option}"
+                    );
+                    let mut got = vec![0_u8; bytes.len()];
+                    memory.read(VALUE, &mut got).unwrap();
+                    assert_eq!(
+                        got, bytes,
+                        "input getsockopt value guest_fd={guest_fd} level={level} option={option}"
+                    );
+                }
+            }
+        }
+
+        fn assert_guest_option_matches_host(
+            memory: &mut GuestMemory,
+            state: &mut LoadedStaticElf,
+            guest_fd: i64,
+            expected_host_fd: RawFd,
+            level: libc::c_int,
+            option: libc::c_int,
+            capacity: libc::socklen_t,
+        ) {
+            let expected = host_option_bytes(expected_host_fd, level, option, capacity);
+            let guest = guest_option(memory, state, guest_fd, level, option, capacity);
+            match expected {
+                Err(errno) => assert_eq!(
+                    guest, errno,
+                    "getsockopt guest_fd={guest_fd} level={level} option={option}"
+                ),
+                Ok(bytes) => {
+                    assert_eq!(
+                        guest, 0,
+                        "getsockopt guest_fd={guest_fd} level={level} option={option}"
+                    );
+                    assert_eq!(
+                        read_struct::<libc::socklen_t>(memory, LENGTH) as usize,
+                        bytes.len(),
+                        "getsockopt length guest_fd={guest_fd} level={level} option={option}"
+                    );
+                    let mut got = vec![0_u8; bytes.len()];
+                    memory.read(VALUE, &mut got).unwrap();
+                    assert_eq!(
+                        got, bytes,
+                        "getsockopt value guest_fd={guest_fd} level={level} option={option}"
+                    );
+                }
+            }
+        }
+
+        fn host_option_error(fd: RawFd, level: libc::c_int, option: libc::c_int) -> i64 {
+            let mut value = 0_i32;
+            let mut length = std::mem::size_of_val(&value) as libc::socklen_t;
+            // SAFETY: both output pointers name initialized host storage and
+            // the descriptor stays live for this call.
+            let result = unsafe {
+                libc::getsockopt(
+                    fd,
+                    level,
+                    option,
+                    std::ptr::from_mut(&mut value).cast::<libc::c_void>(),
+                    &mut length,
+                )
+            };
+            let errno = host_errno();
+            assert_eq!(
+                result, -1,
+                "raw host getsockopt level={level} option={option}"
+            );
+            errno
+        }
+
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+
+        // AF_UNIX SOCK_RAW is host mechanics: the host kernel accepts it
+        // and normalizes SO_TYPE to SOCK_DGRAM. The executor must not
+        // pre-validate the type away (Detcore's handle_socket forwards).
+        let raw_fd = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_socket,
+            [libc::AF_UNIX as u64, libc::SOCK_RAW as u64, 0, 0, 0, 0],
+        );
+        assert!(raw_fd >= 0, "AF_UNIX SOCK_RAW socket() returned {raw_fd}");
+        let raw_host = host_fd(&state, raw_fd as libc::c_int).unwrap();
+        assert_eq!(
+            guest_option(
+                &mut memory,
+                &mut state,
+                raw_fd,
+                libc::SOL_SOCKET,
+                libc::SO_TYPE,
+                4,
+            ),
+            0
+        );
+        assert_eq!(
+            read_struct::<libc::c_int>(&memory, VALUE),
+            host_int_option(raw_host, libc::SOL_SOCKET, libc::SO_TYPE),
+        );
+
+        // Forward AF_UNIX pairs exactly as the host decides them,
+        // including its protocol and type refusals. A non-AF_UNIX pair
+        // likewise gets the host's exact refusal.
+        for (kind, protocol) in [
+            (libc::SOCK_STREAM, 1),
+            (libc::SOCK_RAW, 0),
+            (libc::SOCK_STREAM, 2),
+            (6, 0),
+            (10, 0),
+            (17, 0),
+            (libc::SOCK_STREAM | 0x8000, 0),
+        ] {
+            assert_socketpair_matches_host(&mut memory, &mut state, libc::AF_UNIX, kind, protocol);
+        }
+        assert_socketpair_matches_host(
+            &mut memory,
+            &mut state,
+            libc::AF_INET,
+            libc::SOCK_STREAM,
+            0,
+        );
+
+        // Forwarding still lets the host refuse what it refuses, with
+        // the host's exact errno: unsupported types (ESOCKTNOSUPPORT),
+        // bad types/flags (EINVAL), bad AF_UNIX protocols
+        // (EPROTONOSUPPORT), and refused raw/packet creation. A
+        // successful AF_INET/SOCK_PACKET creation is pinned to the
+        // host's resulting domain and type (AF_PACKET on Linux).
+        for (domain, kind, protocol) in [
+            (libc::AF_UNIX, 6, 0),
+            (libc::AF_UNIX, 10, 0),
+            (libc::AF_UNIX, libc::SOCK_STREAM, 2),
+            (libc::AF_UNIX, 17, 0),
+            (libc::AF_UNIX, libc::SOCK_STREAM | 0x8000, 0),
+            (libc::AF_NETLINK, libc::SOCK_STREAM, 0),
+            (libc::AF_INET, libc::SOCK_SEQPACKET, 0),
+            // SOCK_PACKET (10), with ETH_P_ALL (0x0003) in network byte
+            // order. The numeric type avoids libc's deprecated alias.
+            (libc::AF_INET, 10, 768),
+            (libc::AF_INET, libc::SOCK_RAW, libc::IPPROTO_ICMP),
+            (libc::AF_INET6, libc::SOCK_RAW, libc::IPPROTO_RAW),
+        ] {
+            assert_socket_matches_host(&mut memory, &mut state, domain, kind, protocol);
+        }
+
+        // Configuration options are forwarded and read back the host's
+        // values, as on the ptrace backend; Detcore post-processes the
+        // host-identity options above this layer.
+        let tcp_fd = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_socket,
+            [libc::AF_INET as u64, libc::SOCK_STREAM as u64, 0, 0, 0, 0],
+        );
+        assert!(tcp_fd >= 0);
+        let tcp_host = host_fd(&state, tcp_fd as libc::c_int).unwrap();
+        for option in [
+            libc::SO_SNDBUF,
+            libc::SO_RCVBUF,
+            libc::SO_SNDLOWAT,
+            libc::SO_RCVLOWAT,
+            libc::SO_REUSEPORT,
+            libc::SO_OOBINLINE,
+            libc::SO_PROTOCOL,
+        ] {
+            assert_eq!(
+                guest_option(&mut memory, &mut state, tcp_fd, libc::SOL_SOCKET, option, 4,),
+                0,
+                "getsockopt SOL_SOCKET option={option}"
+            );
+            assert_eq!(
+                read_struct::<libc::c_int>(&memory, VALUE),
+                host_int_option(tcp_host, libc::SOL_SOCKET, option),
+                "forwarded value must equal host SOL_SOCKET option={option}"
+            );
+        }
+        for option in [
+            libc::TCP_NODELAY,
+            libc::TCP_CORK,
+            libc::TCP_KEEPIDLE,
+            libc::TCP_KEEPINTVL,
+            libc::TCP_KEEPCNT,
+            libc::TCP_USER_TIMEOUT,
+        ] {
+            assert_eq!(
+                guest_option(
+                    &mut memory,
+                    &mut state,
+                    tcp_fd,
+                    libc::IPPROTO_TCP,
+                    option,
+                    4,
+                ),
+                0,
+                "getsockopt IPPROTO_TCP option={option}"
+            );
+            assert_eq!(
+                read_struct::<libc::c_int>(&memory, VALUE),
+                host_int_option(tcp_host, libc::IPPROTO_TCP, option),
+                "forwarded value must equal host IPPROTO_TCP option={option}"
+            );
+        }
+
+        // Struct-valued configuration options round-trip through the
+        // already-forwarded setsockopt.
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: 5,
+        };
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), VALUE, &linger),
+            0
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_setsockopt,
+                [
+                    tcp_fd as u64,
+                    libc::SOL_SOCKET as u64,
+                    libc::SO_LINGER as u64,
+                    VALUE,
+                    std::mem::size_of::<libc::linger>() as u64,
+                    0,
+                ],
+            ),
+            0,
+            "setsockopt SO_LINGER"
+        );
+        assert_eq!(
+            guest_option(
+                &mut memory,
+                &mut state,
+                tcp_fd,
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                std::mem::size_of::<libc::linger>() as libc::socklen_t,
+            ),
+            0,
+            "getsockopt SO_LINGER"
+        );
+        let got_linger: libc::linger = read_struct(&memory, VALUE);
+        assert_eq!((got_linger.l_onoff, got_linger.l_linger), (1, 5));
+
+        for option in [libc::SO_RCVTIMEO, libc::SO_SNDTIMEO] {
+            assert_eq!(
+                guest_option(
+                    &mut memory,
+                    &mut state,
+                    tcp_fd,
+                    libc::SOL_SOCKET,
+                    option,
+                    std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+                ),
+                0,
+                "getsockopt SOL_SOCKET timeval option={option}"
+            );
+            let got_timeout: libc::timeval = read_struct(&memory, VALUE);
+            let expected_timeout = host_timeval_option(tcp_host, option);
+            assert_eq!(
+                (got_timeout.tv_sec, got_timeout.tv_usec),
+                (expected_timeout.tv_sec, expected_timeout.tv_usec),
+                "forwarded value must equal host SOL_SOCKET timeval option={option}"
+            );
+        }
+
+        // Levels this executor does not model are forwarded to the host
+        // socket, per family: unknown/cross-protocol levels get the
+        // host's exact refusal, and real NETLINK options get its value.
+        let udp_fd = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_socket,
+            [libc::AF_INET as u64, libc::SOCK_DGRAM as u64, 0, 0, 0, 0],
+        );
+        let tcp6_fd = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_socket,
+            [libc::AF_INET6 as u64, libc::SOCK_STREAM as u64, 0, 0, 0, 0],
+        );
+        let udp6_fd = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_socket,
+            [libc::AF_INET6 as u64, libc::SOCK_DGRAM as u64, 0, 0, 0, 0],
+        );
+        let unix_fd = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_socket,
+            [libc::AF_UNIX as u64, libc::SOCK_STREAM as u64, 0, 0, 0, 0],
+        );
+        let netlink_fd = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_socket,
+            [libc::AF_NETLINK as u64, libc::SOCK_DGRAM as u64, 0, 0, 0, 0],
+        );
+        for guest_fd in [
+            tcp_fd, udp_fd, tcp6_fd, udp6_fd, unix_fd, raw_fd, netlink_fd,
+        ] {
+            assert!(guest_fd >= 0, "matrix socket guest_fd={guest_fd}");
+            let expected_host = host_fd(&state, guest_fd as libc::c_int).unwrap();
+            for (level, option) in [
+                (999, libc::SO_TYPE),
+                (libc::IPPROTO_IP, 9999),
+                (libc::IPPROTO_IPV6, 9999),
+                (libc::IPPROTO_TCP, 9999),
+                (libc::IPPROTO_UDP, 9999),
+                // SOL_PACKET and SOL_NETLINK.
+                (263, 9999),
+                (270, 9999),
+            ] {
+                assert_guest_option_matches_host(
+                    &mut memory,
+                    &mut state,
+                    guest_fd,
+                    expected_host,
+                    level,
+                    option,
+                    16,
+                );
+            }
+        }
+        // SOL_NETLINK (270), NETLINK_CAP_ACK (10): a real positive answer
+        // at a level the executor does not model.
+        let netlink_host = host_fd(&state, netlink_fd as libc::c_int).unwrap();
+        assert_guest_option_matches_host(
+            &mut memory,
+            &mut state,
+            netlink_fd,
+            netlink_host,
+            270,
+            10,
+            4,
+        );
+
+        // SOL_RAW / SOL_ICMPV6 positives, and PACKET_HDRLEN's
+        // input version, are exercised unconditionally in
+        // getsockopt_raw_levels_answer_in_user_net_namespace, which
+        // makes a user namespace where CAP_NET_RAW holds (or reports
+        // a named skip); they do not belong in this unprivileged twin.
+
+        // Options that read their optval as input must see the guest's
+        // bytes, not a zero-filled staging buffer: a zero filter is
+        // EINVAL where the addressed filter is ENODEV/EADDRNOTAVAIL.
+        let udp_host = host_fd(&state, udp_fd as libc::c_int).unwrap();
+        let mut ip_msfilter = [0_u8; 24];
+        ip_msfilter[..4].copy_from_slice(&[239, 1, 2, 3]);
+        ip_msfilter[12..16].copy_from_slice(&1_u32.to_ne_bytes());
+        assert_input_option_matches_host(
+            &mut memory,
+            &mut state,
+            udp_fd,
+            udp_host,
+            libc::IPPROTO_IP,
+            libc::IP_MSFILTER,
+            &ip_msfilter,
+        );
+        let mut group_filter = [0_u8; 144];
+        group_filter[8..10].copy_from_slice(&(libc::AF_INET as u16).to_ne_bytes());
+        group_filter[12..16].copy_from_slice(&[239, 1, 2, 3]);
+        assert_input_option_matches_host(
+            &mut memory,
+            &mut state,
+            udp_fd,
+            udp_host,
+            libc::IPPROTO_IP,
+            libc::MCAST_MSFILTER,
+            &group_filter,
+        );
+
+        // Known divergences at the two modeled levels: Linux answers
+        // these real options, but the bounded forward set refuses them
+        // and publishes neither value nor length. One per modeled level:
+        // SO_DEBUG at SOL_SOCKET and TCP_MAXSEG at IPPROTO_TCP.
+        // Tracked in https://github.com/facebookexperimental/hermit/issues/125
+        for (level, option) in [
+            (libc::SOL_SOCKET, libc::SO_DEBUG),
+            (libc::IPPROTO_TCP, libc::TCP_MAXSEG),
+        ] {
+            // The host really does answer this option.
+            let _host_value = host_int_option(tcp_host, level, option);
+            let sentinel = 0x5a5a_5a5a_i32;
+            assert_eq!(
+                write_struct(&mut ProviderMemory(&memory), VALUE, &sentinel),
+                0
+            );
+            assert_eq!(
+                guest_option(&mut memory, &mut state, tcp_fd, level, option, 4),
+                negative_errno(libc::ENOPROTOOPT),
+                "known-divergence refusal level={level} option={option}"
+            );
+            assert_eq!(read_struct::<libc::c_int>(&memory, VALUE), sentinel);
+            assert_eq!(read_struct::<libc::socklen_t>(&memory, LENGTH), 4);
+        }
+
+        // Socketpair ordering: a refused family still publishes the
+        // two reserved guest descriptor numbers first (Linux writes
+        // them before creating the sockets), and a bad array pointer
+        // faults before the family refusal.
+        let sentinel_pair = [-7_i32, -8];
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), PAIR, &sentinel_pair),
+            0
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_socketpair,
+                [
+                    libc::AF_INET as u64,
+                    libc::SOCK_STREAM as u64,
+                    0,
+                    PAIR,
+                    0,
+                    0
+                ],
+            ),
+            host_socketpair_result(libc::AF_INET, libc::SOCK_STREAM, 0)
+                .expect_err("host refuses AF_INET socketpair")
+        );
+        let published_pair: [libc::c_int; 2] = read_struct(&memory, PAIR);
+        assert!(
+            published_pair != sentinel_pair
+                && published_pair[0] >= 0
+                && published_pair[1] >= 0
+                && published_pair[0] != published_pair[1],
+            "refused socketpair must still publish reserved fds: {published_pair:?}"
+        );
+        for fd in published_pair {
+            assert!(
+                !state.files.copies().contains_key(&fd),
+                "reserved fd {fd} must not stay inserted after refusal"
+            );
+        }
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_socketpair,
+                [
+                    libc::AF_INET as u64,
+                    libc::SOCK_STREAM as u64,
+                    0,
+                    u64::MAX,
+                    0,
+                    0
+                ],
+            ),
+            negative_errno(libc::EFAULT),
+            "bad socketpair array pointer must fault before family refusal"
+        );
+
+        // The modeled-level allowlist stays bounded: unlisted options
+        // there are refused without copying a host value out. Where
+        // Linux itself refuses the same request (unknown options), the
+        // executor publishes the same errno the host published.
+        for (level, option) in [
+            (libc::SOL_SOCKET, libc::SO_ERROR + 0x4000),
+            (999, libc::SO_TYPE),
+        ] {
+            assert_eq!(
+                guest_option(&mut memory, &mut state, tcp_fd, level, option, 4),
+                host_option_error(tcp_host, level, option),
+                "unlisted getsockopt level={level} option={option}"
+            );
+        }
+    }
+
+    #[test]
+    fn getsockopt_raw_levels_answer_in_user_net_namespace() {
+        if !in_own_user_net_namespace("getsockopt_raw_levels_answer_in_user_net_namespace") {
+            return;
+        }
+        getsockopt_raw_levels_body();
+    }
+
+    fn getsockopt_raw_levels_body() {
+        const VALUE: u64 = 0x100;
+        const LENGTH: u64 = 0x200;
+
+        fn check(
+            memory: &mut GuestMemory,
+            state: &mut LoadedStaticElf,
+            guest_fd: i64,
+            direct: RawFd,
+            level: libc::c_int,
+            option: libc::c_int,
+            input: &[u8],
+        ) {
+            let mut host_value = input.to_vec();
+            let mut host_length = input.len() as libc::socklen_t;
+            // SAFETY: both output pointers name writable host storage
+            // for the live direct socket.
+            let host_result = unsafe {
+                libc::getsockopt(
+                    direct,
+                    level,
+                    option,
+                    host_value.as_mut_ptr().cast::<libc::c_void>(),
+                    &mut host_length,
+                )
+            };
+            let host_errno = if host_result != 0 {
+                Some(negative_errno(
+                    std::io::Error::last_os_error()
+                        .raw_os_error()
+                        .expect("host getsockopt failure carries an errno"),
+                ))
+            } else {
+                host_value.truncate(host_length as usize);
+                None
+            };
+            memory.write(VALUE, input).unwrap();
+            assert_eq!(
+                write_struct(
+                    &mut ProviderMemory(memory),
+                    LENGTH,
+                    &(input.len() as libc::socklen_t),
+                ),
+                0
+            );
+            let guest = syscall_result(
+                memory,
+                state,
+                libc::SYS_getsockopt,
+                [
+                    guest_fd as u64,
+                    level as u64,
+                    option as u64,
+                    VALUE,
+                    LENGTH,
+                    0,
+                ],
+            );
+            if let Some(errno) = host_errno {
+                assert_eq!(
+                    guest, errno,
+                    "getsockopt guest_fd={guest_fd} level={level} option={option}"
+                );
+                return;
+            }
+            assert_eq!(
+                guest, 0,
+                "getsockopt guest_fd={guest_fd} level={level} option={option}"
+            );
+            assert_eq!(
+                read_struct::<libc::socklen_t>(memory, LENGTH),
+                host_length,
+                "getsockopt length guest_fd={guest_fd} level={level} option={option}"
+            );
+            let mut got = vec![0_u8; host_value.len()];
+            memory.read(VALUE, &mut got).unwrap();
+            assert_eq!(
+                got, host_value,
+                "getsockopt value guest_fd={guest_fd} level={level} option={option}"
+            );
+        }
+
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+
+        for (domain, protocol, level, option, input) in [
+            (
+                libc::AF_INET,
+                libc::IPPROTO_ICMP,
+                // SOL_RAW, ICMP_FILTER.
+                255,
+                1,
+                [0_u8; 32].as_slice(),
+            ),
+            (
+                libc::AF_INET6,
+                libc::IPPROTO_ICMPV6,
+                // SOL_ICMPV6, ICMP6_FILTER.
+                58,
+                1,
+                [0_u8; 32].as_slice(),
+            ),
+            (
+                libc::AF_INET6,
+                libc::IPPROTO_ICMPV6,
+                // SOL_RAW, IPV6_CHECKSUM.
+                255,
+                7,
+                (-1_i32).to_ne_bytes().as_slice(),
+            ),
+        ] {
+            // SAFETY: plain host raw socket creation; this body runs
+            // only in a user namespace where CAP_NET_RAW holds.
+            let direct = unsafe { libc::socket(domain, libc::SOCK_RAW, protocol) };
+            assert!(
+                direct >= 0,
+                "direct raw socket domain={domain} protocol={protocol}: {}",
+                std::io::Error::last_os_error()
+            );
+            let guest = syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_socket,
+                [
+                    domain as u64,
+                    libc::SOCK_RAW as u64,
+                    protocol as u64,
+                    0,
+                    0,
+                    0,
+                ],
+            );
+            assert!(
+                guest >= 0,
+                "guest raw socket domain={domain} protocol={protocol}: {guest}"
+            );
+            check(&mut memory, &mut state, guest, direct, level, option, input);
+            assert_eq!(
+                syscall_result(
+                    &mut memory,
+                    &mut state,
+                    libc::SYS_close,
+                    [guest as u64, 0, 0, 0, 0, 0],
+                ),
+                0
+            );
+            // SAFETY: direct was created by this test above.
+            unsafe { libc::close(direct) };
+        }
+
+        // PACKET_HDRLEN's requested version on a real packet socket
+        // inserted into the guest table (a second direct socket gives
+        // the host's answer).
+        // SAFETY: plain host packet socket creation; ETH_P_ALL in
+        // network byte order.
+        let direct_packet = unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW, 768) };
+        assert!(
+            direct_packet >= 0,
+            "direct packet socket: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: as above, a second direct packet socket.
+        let expected_packet = unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW, 768) };
+        assert!(
+            expected_packet >= 0,
+            "expected packet socket: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: ownership transfer of the just-created descriptor.
+        let file = unsafe { std::fs::File::from_raw_fd(direct_packet) };
+        let packet_fd = insert_file_with_flags(&mut state, file, false, None);
+        assert!(packet_fd >= 0);
+        check(
+            &mut memory,
+            &mut state,
+            packet_fd,
+            expected_packet,
+            libc::SOL_PACKET,
+            // PACKET_HDRLEN.
+            11,
+            &2_u32.to_ne_bytes(),
+        );
+        // SAFETY: expected_packet was created by this test above.
+        unsafe { libc::close(expected_packet) };
     }
 
     #[test]
@@ -17527,6 +18826,137 @@ mod tests {
             ),
             expected,
             "TCP_INFO publishes optlen first, then faults copying the value"
+        );
+    }
+
+    #[test]
+    fn socket_query_copyout_packet_writes_optlen_after_value_fault() {
+        if !in_own_user_net_namespace("socket_query_copyout_packet_writes_optlen_after_value_fault")
+        {
+            return;
+        }
+        socket_query_copyout_packet_body();
+    }
+
+    fn socket_query_copyout_packet_body() {
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        // SAFETY: plain host socket creation for comparison. A real
+        // AF_PACKET socket (not the obsolete AF_INET/SOCK_PACKET spkt
+        // socket, whose getsockopt is unsupported) with ETH_P_ALL
+        // (0x0003) in network byte order. This body runs only in a
+        // user namespace where CAP_NET_RAW holds, so creation succeeds.
+        let direct = unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW, 768) };
+        assert!(
+            direct >= 0,
+            "direct packet socket: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: into_raw_fd-style transfer of the just-created
+        // descriptor to the owning File.
+        let file = unsafe { std::fs::File::from_raw_fd(direct) };
+        let fd = insert_file_with_flags(&mut state, file, false, None) as i32;
+        assert!(fd >= 0);
+
+        // PACKET_STATISTICS (6): learn the host's answer length first.
+        let mut stats = [0_u8; 32];
+        let mut stats_length = stats.len() as libc::socklen_t;
+        // SAFETY: both output pointers name writable host storage for
+        // the live packet socket.
+        assert_eq!(
+            unsafe {
+                libc::getsockopt(
+                    host_fd(&state, fd).unwrap(),
+                    libc::SOL_PACKET,
+                    6,
+                    stats.as_mut_ptr().cast(),
+                    &mut stats_length,
+                )
+            },
+            0
+        );
+        let mut buffer = SocketQueryCopyoutBuffer::new();
+        buffer.length(0x100, stats_length + 8);
+        let mut expected = buffer.bytes();
+        expected[0x100..0x104].copy_from_slice(&stats_length.to_ne_bytes());
+        buffer.protect_page(1, libc::PROT_NONE);
+        assert_eq!(
+            buffer.option_fault_matches_native(
+                &mut state,
+                fd,
+                libc::SYS_getsockopt,
+                (libc::SOL_PACKET, 6),
+                PAGE_SIZE,
+                0x100,
+            ),
+            expected,
+            "packet getsockopt writes optlen after the handler, even when the value copy faults"
+        );
+
+        // The iter wrapper writes optlen even when the handler itself
+        // failed: with a read-only optlen page, a wrong-level call
+        // must fault on that write instead of publishing the handler's
+        // level refusal, and no guest bytes change.
+        let mut failure_buffer = SocketQueryCopyoutBuffer::new();
+        failure_buffer.length(0x100, 16);
+        let failure_expected = failure_buffer.bytes();
+        failure_buffer.protect_page(0, libc::PROT_READ);
+        assert_eq!(
+            failure_buffer.option_fault_matches_native(
+                &mut state,
+                fd,
+                libc::SYS_getsockopt,
+                (999, 6),
+                PAGE_SIZE,
+                0x100,
+            ),
+            failure_expected,
+            "packet getsockopt writes optlen back on the failure path"
+        );
+
+        // Same-address optval/optlen distinguishes the copy order:
+        // Linux copies the value first, then overwrites its first word
+        // with the published length.
+        let mut alias_memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        let alias: u64 = 0x180;
+        alias_memory.write(alias, &16_u32.to_ne_bytes()).unwrap();
+        // SAFETY: a second direct packet socket for the host answer.
+        let expected_packet = unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW, 768) };
+        assert!(
+            expected_packet >= 0,
+            "expected packet socket: {}",
+            std::io::Error::last_os_error()
+        );
+        let mut host_storage = [0_u8; 16];
+        host_storage[..4].copy_from_slice(&16_u32.to_ne_bytes());
+        // SAFETY: both kernel output pointers deliberately alias the
+        // first word of host_storage, which stays live for the call.
+        let host_alias_result = unsafe {
+            libc::getsockopt(
+                expected_packet,
+                libc::SOL_PACKET,
+                6,
+                host_storage.as_mut_ptr().cast(),
+                host_storage.as_mut_ptr().cast(),
+            )
+        };
+        // SAFETY: expected_packet was created by this test above.
+        unsafe { libc::close(expected_packet) };
+        assert_eq!(host_alias_result, 0);
+        assert_eq!(
+            syscall_result(
+                &mut alias_memory,
+                &mut state,
+                libc::SYS_getsockopt,
+                [fd as u64, libc::SOL_PACKET as u64, 6, alias, alias, 0],
+            ),
+            0
+        );
+        let mut got_alias = [0_u8; 16];
+        alias_memory.read(alias, &mut got_alias).unwrap();
+        assert_eq!(
+            got_alias, host_storage,
+            "packet getsockopt copies the value before publishing optlen at the same address"
         );
     }
 

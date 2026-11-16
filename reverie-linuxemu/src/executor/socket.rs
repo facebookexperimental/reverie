@@ -24,31 +24,30 @@ pub(super) fn socket(state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
         return negative_errno(libc::EAFNOSUPPORT);
     }
     let protocol = args[2] as libc::c_int;
-    if domain == libc::AF_UNIX && protocol != 0 {
-        return negative_errno(libc::EPROTONOSUPPORT);
-    }
     let socket_type = args[1] as libc::c_int;
-    let base_type = socket_type & !(libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK);
-    // Detcore's golden handle_socket (hermit detcore/src/syscalls/files.rs:1806)
-    // forwards every socket type to the host and lets the kernel validate the
-    // (family, type) pair. SOCK_SEQPACKET is a valid AF_UNIX type that takes the
-    // exact same socket -> bind(autobind) -> getsockname path as the already
-    // supported SOCK_STREAM/SOCK_DGRAM, so accept it here as well. For AF_INET /
-    // AF_INET6 the host libc::socket call below rejects SOCK_SEQPACKET with
-    // EPROTONOSUPPORT, matching the ptrace backend's forward-to-host result.
-    let supported_type = if domain == libc::AF_NETLINK {
-        matches!(base_type, libc::SOCK_DGRAM | libc::SOCK_RAW)
-    } else {
-        matches!(
-            base_type,
-            libc::SOCK_DGRAM | libc::SOCK_STREAM | libc::SOCK_SEQPACKET
-        )
-    };
-    if !supported_type {
-        return negative_errno(libc::EPROTONOSUPPORT);
-    }
-    // SAFETY: domain and type are restricted above; the kernel validates the
-    // protocol and returns a new owned descriptor on success.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(kvm-socket-parity): Review forward-to-host socket
+    // type/protocol validation.
+    //
+    // Detcore's golden handle_socket (hermit detcore/src/syscalls/files.rs)
+    // forwards every socket type to the host and lets the kernel validate
+    // the (family, type, protocol) triple, so an executor-side allowlist
+    // only invents refusals the ptrace backend never produces. Forward the
+    // type and protocol and let the host call below decide, exactly as
+    // injected calls from Detcore already expect. For AF_UNIX, the kernel
+    // accepts SOCK_RAW (normalizing it to SOCK_DGRAM) and protocols 0 and
+    // PF_UNIX only; it rejects other protocols.
+    //
+    // The domain check above is not a bound on the resulting family or
+    // host surface: Linux maps an AF_INET/SOCK_PACKET request to an
+    // AF_PACKET socket, and raw AF_INET/AF_INET6 requests reach the
+    // host capability check. That matches ptrace, whose guests already
+    // make the same host calls. The determinism exposure from raw and
+    // packet sockets is tracked at:
+    // https://github.com/facebookexperimental/hermit/issues/123
+    //
+    // SAFETY: domain is restricted above; the kernel validates the type
+    // and protocol and returns a new owned descriptor on success.
     let host_fd = unsafe { libc::socket(domain, socket_type | libc::SOCK_CLOEXEC, protocol) };
     if host_fd < 0 {
         return io_error(std::io::Error::last_os_error());
@@ -95,6 +94,62 @@ pub(super) fn captured_output_socket_error(
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(kvm-socket-parity): Review socket error precedence preflight.
+/// One scalar SOL_SOCKET option read back from the host socket, if the
+/// host names it.
+fn host_socket_sol_option(host_fd: RawFd, option: libc::c_int) -> Option<libc::c_int> {
+    let mut value = 0_i32;
+    let mut length = std::mem::size_of_val(&value) as libc::socklen_t;
+    // SAFETY: both output pointers name initialized host storage and
+    // host_fd is held live by the guest file table for this dispatch.
+    if unsafe {
+        libc::getsockopt(
+            host_fd,
+            libc::SOL_SOCKET,
+            option,
+            std::ptr::from_mut(&mut value).cast::<libc::c_void>(),
+            &mut length,
+        )
+    } == 0
+    {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+/// Whether IPPROTO_TCP is this socket's own option level: an Internet
+/// stream socket whose protocol is TCP. A raw socket created with
+/// IPPROTO_TCP is not a TCP socket: Linux routes its getsockopt calls
+/// to the raw handler, which answers a TCP level with EOPNOTSUPP, so
+/// protocol alone cannot classify it. An unnamed domain, type, or
+/// protocol fails closed to modelled, keeping the bounded set.
+fn host_socket_is_tcp(host_fd: RawFd) -> bool {
+    let Some(domain) = host_socket_sol_option(host_fd, libc::SO_DOMAIN) else {
+        return true;
+    };
+    if !matches!(domain, libc::AF_INET | libc::AF_INET6) {
+        return false;
+    }
+    let Some(kind) = host_socket_sol_option(host_fd, libc::SO_TYPE) else {
+        return true;
+    };
+    if kind != libc::SOCK_STREAM {
+        return false;
+    }
+    host_socket_sol_option(host_fd, libc::SO_PROTOCOL).unwrap_or(libc::IPPROTO_TCP)
+        == libc::IPPROTO_TCP
+}
+
+/// Whether this host socket is served by packet's iter-based
+/// getsockopt. The obsolete AF_INET/SOCK_PACKET socket reports type
+/// SOCK_PACKET and uses the legacy ops instead, so it is excluded.
+fn host_socket_is_packet_iter(host_fd: RawFd) -> bool {
+    // SOCK_PACKET (10); the numeric type avoids libc's deprecated alias.
+    const SOCK_PACKET: libc::c_int = 10;
+    host_socket_sol_option(host_fd, libc::SO_DOMAIN) == Some(libc::AF_PACKET)
+        && host_socket_sol_option(host_fd, libc::SO_TYPE) != Some(SOCK_PACKET)
+}
+
 fn ensure_host_socket(host_fd: RawFd) -> Result<(), i64> {
     let mut socket_type = 0_i32;
     let mut length = std::mem::size_of_val(&socket_type) as libc::socklen_t;
@@ -183,8 +238,36 @@ pub(super) fn getsockopt(
     // backend. Where its answer is host state (the TCP_INFO counters,
     // SO_COOKIE, SO_NETNS_COOKIE and SO_INCOMING_CPU), a Tool that needs a
     // reproducible value rewrites it after the call, as on every backend.
+    // Forwarding whole unmodeled levels likewise makes run-varying
+    // host/connection values reachable on KVM, including
+    // PACKET_STATISTICS, MPTCP_INFO, and IP_MTU; ptrace guests read the
+    // same host values today. See the determinism tracking issue below.
     // SO_ERROR reads and clears the socket's pending error; a guest polls for
     // a nonblocking connect's completion before asking.
+    //
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(kvm-socket-parity): Review the widened
+    // configuration-option forward set.
+    //
+    // Most of the newly forwarded options are the ones Detcore itself
+    // treats as host-readable configuration (hermit
+    // detcore/src/syscalls/network_trace.rs
+    // `is_configuration_option`): the guest set them through the already
+    // forwarded `setsockopt`, or Linux fixes them, so reading them back
+    // from the host socket is the ptrace backend's answer bit for bit.
+    // SO_SNDBUF, SO_RCVBUF, and SO_SNDLOWAT are not in Detcore's list
+    // (its test explicitly excludes SO_RCVBUF). Those buffer options are
+    // forwarded to the host, matching ptrace, even though they report
+    // host and connection state and are not determinised on any backend
+    // today; that exposure is tracked at:
+    // https://github.com/facebookexperimental/hermit/issues/123
+    //
+    // SOL_SOCKET, and IPPROTO_TCP on a TCP socket, are the levels this
+    // executor models with a bounded forward set. Every other level is
+    // forwarded whole to the host call below, so the kernel's answer
+    // (value or refusal, including for SOL_NETLINK, SOL_RAW,
+    // SOL_ICMPV6, and cross-protocol levels) is the answer, exactly as
+    // on ptrace; no errno is computed here for those levels.
     let level = args[1] as libc::c_int;
     let option = args[2] as libc::c_int;
     let forwarded = match level {
@@ -192,19 +275,47 @@ pub(super) fn getsockopt(
             option,
             libc::SO_TYPE
                 | libc::SO_DOMAIN
+                | libc::SO_PROTOCOL
                 | libc::SO_ACCEPTCONN
                 | libc::SO_REUSEADDR
+                | libc::SO_REUSEPORT
                 | libc::SO_KEEPALIVE
                 | libc::SO_BROADCAST
+                | libc::SO_OOBINLINE
+                | libc::SO_LINGER
+                | libc::SO_SNDBUF
+                | libc::SO_RCVBUF
+                | libc::SO_SNDLOWAT
+                | libc::SO_RCVLOWAT
+                | libc::SO_RCVTIMEO
+                | libc::SO_SNDTIMEO
                 | libc::SO_ERROR
                 | libc::SO_COOKIE
                 | libc::SO_NETNS_COOKIE
                 | libc::SO_INCOMING_CPU
         ),
-        libc::IPPROTO_TCP => option == libc::TCP_INFO,
-        _ => false,
+        libc::IPPROTO_TCP if host_socket_is_tcp(host_fd) => {
+            matches!(
+                option,
+                libc::TCP_INFO
+                    | libc::TCP_NODELAY
+                    | libc::TCP_CORK
+                    | libc::TCP_KEEPIDLE
+                    | libc::TCP_KEEPINTVL
+                    | libc::TCP_KEEPCNT
+                    | libc::TCP_USER_TIMEOUT
+            )
+        }
+        _ => true,
     };
     if !forwarded {
+        // Only a modeled level reaches this refusal (SOL_SOCKET, or
+        // IPPROTO_TCP on its own socket), where Linux answers an
+        // unknown option with ENOPROTOOPT. A real but unlisted option
+        // at a modeled level is a known divergence from ptrace: the
+        // bounded set above is deliberate, and no guest bytes are
+        // published for it. Tracked in
+        // https://github.com/facebookexperimental/hermit/issues/125
         return negative_errno(libc::ENOPROTOOPT);
     }
     if capacity != 0 && args[3] == 0 {
@@ -212,15 +323,51 @@ pub(super) fn getsockopt(
     }
 
     let mut value = vec![0; capacity];
+    if !value.is_empty() {
+        // Some getsockopt options read the guest's buffer as input
+        // (IP_MSFILTER and MCAST_MSFILTER's filter identity,
+        // PACKET_HDRLEN's requested TPACKET version). Stage the
+        // readable guest prefix so the host call sees those bytes
+        // rather than zeroes; the unread tail stays zero-filled, and a
+        // translation failure is the guest fault the input copy takes.
+        // Known edge: a wholly unreadable optval therefore gets EFAULT
+        // here before the host's level/option refusal, and a short
+        // readable prefix is zero-padded where Linux's handler copy
+        // would fault. Preserving the readable prefix is what lets
+        // output-only options keep their Linux fault order below.
+        if memory
+            .user()
+            .copy_from_user_prefix(args[3], &mut value)
+            .is_err()
+        {
+            return negative_errno(libc::EFAULT);
+        }
+    }
     let value_pointer = if value.is_empty() {
         std::ptr::null_mut()
     } else {
         value.as_mut_ptr().cast::<libc::c_void>()
     };
+    let packet_iter = level != libc::SOL_SOCKET && host_socket_is_packet_iter(host_fd);
     // SAFETY: value_pointer is null for a zero-length request or writable for
     // capacity bytes; host_fd belongs to the guest descriptor table.
     if unsafe { libc::getsockopt(host_fd, level, option, value_pointer, &mut length) } != 0 {
-        return io_error(std::io::Error::last_os_error());
+        let error = std::io::Error::last_os_error();
+        // For an iter-based packet handler, do_sock_getsockopt writes
+        // optlen back even when the handler returned an error (Linux
+        // v7.1 net/socket.c, the getsockopt_iter branch). The host call
+        // has already written that length to our staging length;
+        // publish it before returning the handler's error. A fault on
+        // that write replaces the handler error, as in Linux.
+        if packet_iter
+            && memory
+                .user()
+                .copy_to_user(args[4], &length.to_ne_bytes())
+                .is_err()
+        {
+            return negative_errno(libc::EFAULT);
+        }
+        return io_error(error);
     }
     let copy_length = capacity.min(length as usize);
     // Linux copies the option bytes and optlen with copy_to_sockptr, which
@@ -228,18 +375,32 @@ pub(super) fn getsockopt(
     // page faults, unlike move_addr_to_user's scalar length store. The order
     // depends on the level: sk_getsockopt copies the value first,
     // https://github.com/torvalds/linux/blob/v6.18/net/core/sock.c#L2159
-    // and do_tcp_getsockopt's TCP_INFO publishes optlen first,
+    // do_tcp_getsockopt's TCP_INFO publishes optlen first,
     // https://github.com/torvalds/linux/blob/v6.18/net/ipv4/tcp.c#L4494
+    // and packet's iter handler copies the value with copy_to_iter
+    // before do_sock_getsockopt writes optlen back after it returns
+    // (net/packet/af_packet.c and net/socket.c in v7.1), so a faulting
+    // value copy still leaves the published optlen behind; the packet
+    // case below therefore continues to the length copy after a value
+    // fault instead of returning at once.
     let length = length.to_ne_bytes();
     let copies = if level == libc::IPPROTO_TCP {
         [(args[4], &length[..]), (args[3], &value[..copy_length])]
     } else {
         [(args[3], &value[..copy_length]), (args[4], &length[..])]
     };
+    let mut value_copy_failed = false;
     for (address, bytes) in copies {
         if memory.user().copy_to_user(address, bytes).is_err() {
+            if packet_iter && address == args[3] {
+                value_copy_failed = true;
+                continue;
+            }
             return negative_errno(libc::EFAULT);
         }
+    }
+    if value_copy_failed {
+        return negative_errno(libc::EFAULT);
     }
     0
 }
@@ -498,7 +659,7 @@ pub(super) fn accept_socket(
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-205): Review AF_UNIX socketpair descriptor ownership.
+// TODO-HUMAN-REVIEW(PR-205): Review socketpair descriptor ownership.
 pub(super) fn socketpair(
     memory: &mut GuestMemory,
     state: &mut LoadedStaticElf,
@@ -507,30 +668,62 @@ pub(super) fn socketpair(
     let domain = args[0] as libc::c_int;
     let socket_type = args[1] as libc::c_int;
     let protocol = args[2] as libc::c_int;
-    if domain != libc::AF_UNIX {
-        return negative_errno(libc::EAFNOSUPPORT);
+
+    // Linux's `__sys_socketpair` (net/socket.c) first rejects flag bits
+    // outside SOCK_CLOEXEC/SOCK_NONBLOCK, then reserves both descriptor
+    // numbers and writes them to the user array, and only then asks the
+    // family to create the sockets. Preserve that precedence here:
+    // EINVAL, then the guest table's EMFILE, then EFAULT, all before a
+    // family, type, or protocol refusal from the host.
+    const SOCK_TYPE_MASK: libc::c_int = 0xf;
+    if socket_type & !(SOCK_TYPE_MASK | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK) != 0 {
+        return negative_errno(libc::EINVAL);
     }
-    if protocol != 0 {
-        return negative_errno(libc::EPROTONOSUPPORT);
+    let mut available = (0..guest_nofile_limit())
+        .filter(|fd| !is_open_standard(state, *fd) && !state.files.copies().contains_key(fd));
+    let (Some(first_reserved), Some(second_reserved)) = (available.next(), available.next()) else {
+        return negative_errno(libc::EMFILE);
+    };
+    // The numbers are only selected, not inserted: insert_file_pair
+    // allocates with the same predicate below and no guest-table
+    // mutation happens between this write and that insertion, so on
+    // success it publishes these same two numbers again.
+    let second_address = args[3].checked_add(std::mem::size_of::<libc::c_int>() as u64);
+    if memory
+        .user()
+        .write(args[3], &first_reserved.to_ne_bytes())
+        .is_err()
+        || second_address.is_none_or(|address| {
+            memory
+                .user()
+                .write(address, &second_reserved.to_ne_bytes())
+                .is_err()
+        })
+    {
+        return negative_errno(libc::EFAULT);
     }
-    let base_type = socket_type & !(libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK);
-    // A SOCK_SEQPACKET pair is host mechanics exactly as a stream or datagram
-    // pair is: the host kernel holds the pair, and every later call on its ends
-    // is the host call on their host descriptors (`sendmsg`, `recvmsg` and the
-    // rest below), so the kernel keeps each record whole, ends a receive at a
-    // record's end, and decides MSG_TRUNC, MSG_EOR and the descriptors an
-    // SCM_RIGHTS message carries, as socket(AF_UNIX, SOCK_SEQPACKET) already
-    // does above. A receive copies at most the caller's buffer even where
-    // MSG_TRUNC returns a record's whole length.
-    if !matches!(
-        base_type,
-        libc::SOCK_DGRAM | libc::SOCK_STREAM | libc::SOCK_SEQPACKET
-    ) {
-        return negative_errno(libc::EPROTONOSUPPORT);
-    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(kvm-socket-parity): Review forward-to-host pair
+    // type/protocol validation.
+    //
+    // A pair of any host-accepted family and type is host mechanics
+    // exactly as a stream or datagram pair is: the host kernel holds
+    // the pair, and every later call on its ends is the host call on
+    // their host descriptors (`sendmsg`, `recvmsg` and the rest below),
+    // so the kernel keeps each record whole, ends a receive at a
+    // record's end, and decides MSG_TRUNC, MSG_EOR and the descriptors
+    // an SCM_RIGHTS message carries. A receive copies at most the
+    // caller's buffer even where MSG_TRUNC returns a record's whole
+    // length. The kernel accepts AF_UNIX protocols 0 and PF_UNIX only
+    // and rejects others. Forward domain, type, and protocol to the
+    // host call below instead of pre-validating them into refusals the
+    // ptrace backend never produces, as socket() above does. This also
+    // lets families whose protocol implements socketpair (for example
+    // AF_TIPC) succeed exactly as they do on the host.
     let mut host_fds = [-1; 2];
-    // SAFETY: host_fds has room for both descriptors and the socket arguments
-    // were validated above.
+    // SAFETY: host_fds has room for both descriptors; the kernel
+    // validates the type and protocol.
     if unsafe {
         libc::socketpair(
             domain,
@@ -556,7 +749,10 @@ pub(super) fn socketpair(
         socket_type & libc::SOCK_CLOEXEC != 0,
         None,
     );
+    // Pair-route bookkeeping models Unix socket queues only; a
+    // host-made pair of any other family is just two host-backed files.
     if result == 0
+        && domain == libc::AF_UNIX
         && let [Some(first), Some(second)] = ends
     {
         record_socket_pair(state, [first, second]);
