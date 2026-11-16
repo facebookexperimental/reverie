@@ -13,6 +13,19 @@
 //! arrives as a parameter the caller decided; nothing here reads the
 //! host. Sanitizers coupled to caller state (mount snapshots, lock
 //! ledgers, signal-delivery policy) deliberately do not live here.
+//!
+//! Refusals: the grammar-backed sanitizers (`stat`, `statm`, `io`,
+//! `sched`, `fdinfo`) fail closed. Input they cannot account for is
+//! served as an empty file — the least-wrong bytes this snapshot
+//! API can produce after the kernel has already opened the file:
+//! the alternatives are republishing host bytes (a determinism and
+//! isolation leak) or fabricating a partial file. Every refusal is
+//! counted per format in [`sanitize_refusals`] and logged by name at
+//! `warn`, so a guest reading an empty file is always attributable
+//! in the host run's log and stats.
+
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 /// Every `smaps`/`smaps_rollup` field that counts pages the host currently
 /// holds for the mapping: resident, dirty, swapped, huge-page backed, reclaim
@@ -417,59 +430,150 @@ pub fn sanitize_numeric_lines(contents: &[u8], stable_fields: usize) -> Vec<u8> 
     normalized
 }
 
+/// Per-format sanitizer refusal counters for this process, by the
+/// format names in [`SanitizeRefusals`].
+static SANITIZE_REFUSALS: [AtomicU64; 5] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// Sanitizer refusals served as empty files, per format. See the
+/// module documentation for why empty is the refusal shape.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SanitizeRefusals {
+    /// Refused `stat` snapshots.
+    pub stat: u64,
+    /// Refused `statm` snapshots.
+    pub statm: u64,
+    /// Refused `io` snapshots.
+    pub io: u64,
+    /// Refused `sched` snapshots.
+    pub sched: u64,
+    /// Refused `fdinfo` snapshots.
+    pub fdinfo: u64,
+}
+
+/// Cumulative per-format refusal counts for this process, for run
+/// summaries and stats. Each refusal is also logged by name.
+pub fn sanitize_refusals() -> SanitizeRefusals {
+    let load = |i: usize| SANITIZE_REFUSALS[i].load(Ordering::Relaxed);
+    SanitizeRefusals {
+        stat: load(0),
+        statm: load(1),
+        io: load(2),
+        sched: load(3),
+        fdinfo: load(4),
+    }
+}
+
+fn refuse(index: usize, format: &str, reason: &dyn std::fmt::Display) -> Vec<u8> {
+    SANITIZE_REFUSALS[index].fetch_add(1, Ordering::Relaxed);
+    tracing::warn!("reverie-procfs sanitize refused {format}: {reason}; serving empty file");
+    Vec::new()
+}
+
+fn refuse_parse(
+    index: usize,
+    format: &str,
+    error: &reverie_proc_grammar::ProcParseError,
+) -> Vec<u8> {
+    refuse(index, format, error)
+}
+
+fn refuse_policy(index: usize, format: &str, reason: &str) -> Vec<u8> {
+    refuse(index, format, &reason)
+}
+
+/// Zero one volatile `stat` field by its 1-based field number. The
+/// field inventory is `do_task_stat`'s (`fs/proc/array.c`); the
+/// volatile set is this crate's consumer policy.
+fn zero_stat_field(stat: &mut reverie_proc_grammar::Stat, field: usize) {
+    match field {
+        10 => stat.minflt = 0,
+        11 => stat.cminflt = 0,
+        12 => stat.majflt = 0,
+        13 => stat.cmajflt = 0,
+        14 => stat.utime = 0,
+        15 => stat.stime = 0,
+        16 => stat.cutime = 0,
+        17 => stat.cstime = 0,
+        21 => stat.itrealvalue = 0,
+        22 => stat.starttime = 0,
+        23 => stat.vsize = 0,
+        24 => stat.rss = 0,
+        26 => stat.startcode = 0,
+        27 => stat.endcode = 0,
+        28 => stat.startstack = 0,
+        29 => stat.kstkesp = 0,
+        30 => stat.kstkeip = 0,
+        31 => stat.signal = 0,
+        32 => stat.blocked = 0,
+        33 => stat.sigignore = 0,
+        34 => stat.sigcatch = 0,
+        35 => stat.wchan = 0,
+        36 => stat.nswap = 0,
+        37 => stat.cnswap = 0,
+        39 => stat.processor = 0,
+        42 => stat.delayacct_blkio_ticks = 0,
+        43 => stat.guest_time = 0,
+        44 => stat.cguest_time = 0,
+        45 => stat.start_data = 0,
+        46 => stat.end_data = 0,
+        47 => stat.start_brk = 0,
+        48 => stat.arg_start = 0,
+        49 => stat.arg_end = 0,
+        50 => stat.env_start = 0,
+        51 => stat.env_end = 0,
+        _ => debug_assert!(false, "field {field} is not a volatile stat field"),
+    }
+}
+
 pub fn sanitize_stat(contents: &[u8], virtual_identity: Option<(i32, i32)>) -> Vec<u8> {
     const VOLATILE_FIELDS: &[usize] = &[
         10, 11, 12, 13, 14, 15, 16, 17, 21, 22, 23, 24, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36,
         37, 39, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51,
     ];
 
-    let Ok(text) = std::str::from_utf8(contents) else {
-        return contents.to_vec();
+    // Grammar-backed parse (bytes throughout; a non-UTF-8 comm parses
+    // like any other). Unparseable input is refused as an empty file,
+    // never republished: the previous text surgery returned the host
+    // bytes verbatim on exactly the inputs that needed sanitizing.
+    let mut stat = match reverie_proc_grammar::parse_stat(contents) {
+        Ok(stat) => stat,
+        Err(error) => return refuse_parse(0, "stat", &error),
     };
-    let Some(comm_start) = text.find(" (") else {
-        return contents.to_vec();
-    };
-    let Some(comm_end) = text.rfind(") ") else {
-        return contents.to_vec();
-    };
-    let comm = &text[comm_start..=comm_end];
-    let mut fields = text[comm_end + 2..]
-        .split_whitespace()
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    if fields.len() < 50 {
-        return contents.to_vec();
-    }
-
-    // `fields` starts with proc stat field 3 (state).
-    let pid = if let Some((virtual_pid, virtual_ppid)) = virtual_identity {
-        fields[4 - 3] = virtual_ppid.to_string();
-        fields[5 - 3] = "0".to_owned();
-        fields[6 - 3] = "0".to_owned();
-        virtual_pid.to_string()
+    if let Some((virtual_pid, virtual_ppid)) = virtual_identity {
+        stat.pid = virtual_pid;
+        stat.ppid = virtual_ppid;
+        stat.pgrp = 0;
+        stat.session = 0;
     } else {
-        fields[0] = "S".to_owned();
-        text[..comm_start].to_owned()
-    };
-    for field in VOLATILE_FIELDS {
-        fields[*field - 3] = "0".to_owned();
+        stat.state = b'S';
     }
-    format!("{pid}{comm} {}\n", fields.join(" ")).into_bytes()
+    for field in VOLATILE_FIELDS {
+        zero_stat_field(&mut stat, *field);
+    }
+    reverie_proc_grammar::render_stat(&stat)
 }
 
 pub fn sanitize_statm(contents: &[u8]) -> Vec<u8> {
-    let fields = contents
-        .split(|byte| byte.is_ascii_whitespace())
-        .filter(|field| !field.is_empty())
-        .collect::<Vec<_>>();
-    if fields.len() != 7
-        || fields
-            .iter()
-            .any(|field| !field.iter().all(u8::is_ascii_digit))
-    {
-        return contents.to_vec();
+    // Refused (counted, logged, empty) on unparseable input;
+    // previously host counts passed through verbatim.
+    if let Err(error) = reverie_proc_grammar::parse_statm(contents) {
+        return refuse_parse(1, "statm", &error);
     }
-    b"0 0 0 0 0 0 0\n".to_vec()
+    reverie_proc_grammar::render_statm(&reverie_proc_grammar::Statm {
+        size: 0,
+        resident: 0,
+        shared: 0,
+        text: 0,
+        lib: 0,
+        data: 0,
+        dirty: 0,
+    })
 }
 
 pub fn sanitize_diskstats(contents: &[u8]) -> Vec<u8> {
@@ -477,33 +581,22 @@ pub fn sanitize_diskstats(contents: &[u8]) -> Vec<u8> {
 }
 
 pub fn sanitize_process_io(contents: &[u8]) -> Vec<u8> {
-    const COUNTERS: &[&[u8]] = &[
-        b"rchar",
-        b"wchar",
-        b"syscr",
-        b"syscw",
-        b"read_bytes",
-        b"write_bytes",
-        b"cancelled_write_bytes",
-    ];
-
-    let mut normalized = Vec::with_capacity(contents.len());
-    for line in contents.split_inclusive(|byte| *byte == b'\n') {
-        let has_newline = line.last() == Some(&b'\n');
-        let body = line.strip_suffix(b"\n").unwrap_or(line);
-        let name_end = body.iter().position(|byte| *byte == b':');
-        let name = name_end.map_or(body, |end| &body[..end]);
-        if COUNTERS.contains(&name) {
-            normalized.extend_from_slice(name);
-            normalized.extend_from_slice(b": 0");
-        } else {
-            normalized.extend_from_slice(body);
-        }
-        if has_newline {
-            normalized.push(b'\n');
-        }
+    // Every counter becomes zero. Refused (counted, logged, empty)
+    // on unparseable input; previously unknown lines passed through
+    // verbatim, so a new kernel counter would have leaked host I/O
+    // accounting.
+    if let Err(error) = reverie_proc_grammar::parse_process_io(contents) {
+        return refuse_parse(2, "io", &error);
     }
-    normalized
+    reverie_proc_grammar::render_process_io(&reverie_proc_grammar::ProcessIo {
+        rchar: 0,
+        wchar: 0,
+        syscr: 0,
+        syscw: 0,
+        read_bytes: 0,
+        write_bytes: 0,
+        cancelled_write_bytes: 0,
+    })
 }
 
 pub fn sanitize_uptime(contents: &[u8], virtual_uptime_seconds: u64) -> Vec<u8> {
@@ -628,38 +721,38 @@ pub fn sanitize_sockstat(contents: &[u8]) -> Vec<u8> {
 }
 
 pub fn sanitize_self_sched(contents: &[u8]) -> Vec<u8> {
-    const FLOAT_FIELDS: &[&str] = &["se.exec_start", "se.vruntime", "se.sum_exec_runtime"];
-    const INTEGER_FIELDS: &[&str] = &[
-        "se.nr_migrations",
-        "nr_switches",
-        "nr_voluntary_switches",
-        "nr_involuntary_switches",
-        "se.avg.load_sum",
-        "se.avg.runnable_sum",
-        "se.avg.util_sum",
-        "se.avg.load_avg",
-        "se.avg.runnable_avg",
-        "se.avg.util_avg",
-        "se.avg.last_update_time",
-        "se.avg.util_est",
-        "clock-delta",
+    const FLOAT_FIELDS: &[&[u8]] = &[b"se.exec_start", b"se.vruntime", b"se.sum_exec_runtime"];
+    const INTEGER_FIELDS: &[&[u8]] = &[
+        b"se.nr_migrations",
+        b"nr_switches",
+        b"nr_voluntary_switches",
+        b"nr_involuntary_switches",
+        b"se.avg.load_sum",
+        b"se.avg.runnable_sum",
+        b"se.avg.util_sum",
+        b"se.avg.load_avg",
+        b"se.avg.runnable_avg",
+        b"se.avg.util_avg",
+        b"se.avg.last_update_time",
+        b"se.avg.util_est",
+        b"clock-delta",
     ];
-    const STABLE_INTEGER_FIELDS: &[&str] = &[
-        "se.load.weight",
-        "policy",
-        "prio",
-        "se.slice",
-        "ext.enabled",
-        "uclamp.min",
-        "uclamp.max",
-        "effective uclamp.min",
-        "effective uclamp.max",
+    const STABLE_INTEGER_FIELDS: &[&[u8]] = &[
+        b"se.load.weight",
+        b"policy",
+        b"prio",
+        b"se.slice",
+        b"ext.enabled",
+        b"uclamp.min",
+        b"uclamp.max",
+        b"effective uclamp.min",
+        b"effective uclamp.max",
     ];
-    const UCLAMP_FIELDS: &[(&str, &str)] = &[
-        ("uclamp.min", "0"),
-        ("uclamp.max", "1024"),
-        ("effective uclamp.min", "0"),
-        ("effective uclamp.max", "1024"),
+    const UCLAMP_FIELDS: &[(&[u8], i128)] = &[
+        (b"uclamp.min", 0),
+        (b"uclamp.max", 1024),
+        (b"effective uclamp.min", 0),
+        (b"effective uclamp.max", 1024),
     ];
     // NUMA balancing's lines, with its `current_node=` line and a
     // `numa_faults` line per node, which a kernel built without NUMA does
@@ -667,223 +760,143 @@ pub fn sanitize_self_sched(contents: &[u8]) -> Vec<u8> {
     // under `CONFIG_NUMA_BALANCING`, which depends on `CONFIG_NUMA`): each is
     // checked as the others are and left out, as is how many nodes the host
     // has.
-    const NUMA_BALANCING_FIELDS: &[&str] = &[
-        "mm->numa_scan_seq",
-        "numa_pages_migrated",
-        "numa_preferred_nid",
-        "total_numa_faults",
+    const NUMA_BALANCING_FIELDS: &[&[u8]] = &[
+        b"mm->numa_scan_seq",
+        b"numa_pages_migrated",
+        b"numa_preferred_nid",
+        b"total_numa_faults",
     ];
 
-    let Ok(text) = std::str::from_utf8(contents) else {
-        return Vec::new();
+    // Grammar-backed parse (comm as bytes, fixed-point values typed);
+    // the policy below — what is zeroed, kept, dropped, or refused —
+    // is unchanged from the text-surgery version it replaces.
+    let mut sched = match reverie_proc_grammar::parse_sched(contents) {
+        Ok(sched) => sched,
+        Err(error) => return refuse_parse(3, "sched", &error),
     };
-    let mut normalized = Vec::with_capacity(contents.len());
+    sched.pid = 0;
+    sched.threads = 1;
     let mut core_fields_seen = [false; 3];
-    let mut header_seen = false;
-
-    for (line_index, line) in text.split_inclusive('\n').enumerate() {
-        let has_newline = line.ends_with('\n');
-        let body = line.strip_suffix('\n').unwrap_or(line);
-        if line_index == 0 {
-            let Some((name, details)) = body.rsplit_once(" (") else {
-                return Vec::new();
-            };
-            let Some(details) = details.strip_suffix(')') else {
-                return Vec::new();
-            };
-            let Some((pid, threads)) = details.split_once(", #threads: ") else {
-                return Vec::new();
-            };
-            if pid.parse::<i32>().is_err() || threads.parse::<u64>().is_err() {
-                return Vec::new();
-            }
-            normalized.extend_from_slice(format!("{name} (0, #threads: 1)").as_bytes());
-            if has_newline {
-                normalized.push(b'\n');
-            }
-            header_seen = true;
-            continue;
-        }
-        let Some((left, right)) = body.split_once(':') else {
-            if !body.is_empty() && body.bytes().all(|byte| byte == b'-') {
-                normalized.extend_from_slice(body.as_bytes());
-            } else if body.starts_with("current_node=") {
-                let fields = body
-                    .replace(',', "")
-                    .split_whitespace()
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>();
-                if fields.len() != 2
-                    || !fields.iter().all(|field| {
-                        field.split_once('=').is_some_and(|(name, value)| {
-                            matches!(name, "current_node" | "numa_group_id")
-                                && value.parse::<i64>().is_ok()
-                        })
-                    })
+    let mut kept = Vec::with_capacity(sched.entries.len());
+    enum Action {
+        Keep,
+        Drop,
+        Set(reverie_proc_grammar::SchedValue),
+        Refuse,
+    }
+    for mut entry in std::mem::take(&mut sched.entries) {
+        use reverie_proc_grammar::SchedEntry;
+        use reverie_proc_grammar::SchedValue;
+        let action = match &entry {
+            SchedEntry::Separator(_) => Action::Keep,
+            SchedEntry::CurrentNode { .. } | SchedEntry::NumaFaults { .. } => Action::Drop,
+            SchedEntry::Field { label, value, .. } => {
+                if NUMA_BALANCING_FIELDS.contains(&label.as_slice()) {
+                    match value {
+                        SchedValue::Int(_) => Action::Drop,
+                        _ => Action::Refuse,
+                    }
+                } else if let Some(index) = FLOAT_FIELDS
+                    .iter()
+                    .position(|field| *field == label.as_slice())
                 {
-                    return Vec::new();
-                }
-                continue;
-            } else if body.starts_with("numa_faults ") {
-                let fields = body.split_whitespace().skip(1).collect::<Vec<_>>();
-                let expected = [
-                    "node",
-                    "task_private",
-                    "task_shared",
-                    "group_private",
-                    "group_shared",
-                ];
-                if fields.len() != expected.len()
-                    || !fields.iter().zip(expected).all(|(field, expected)| {
-                        field.split_once('=').is_some_and(|(name, value)| {
-                            name == expected && value.parse::<u64>().is_ok()
-                        })
-                    })
+                    match value {
+                        SchedValue::Fixed6(v) | SchedValue::Int(v) if *v >= 0 => {
+                            core_fields_seen[index] = true;
+                            Action::Set(SchedValue::Fixed6(0))
+                        }
+                        _ => Action::Refuse,
+                    }
+                } else if let Some((_, replacement)) = UCLAMP_FIELDS
+                    .iter()
+                    .find(|(field, _)| *field == label.as_slice())
                 {
-                    return Vec::new();
+                    match value {
+                        SchedValue::Int(v) if *v >= 0 => Action::Set(SchedValue::Int(*replacement)),
+                        _ => Action::Refuse,
+                    }
+                } else if INTEGER_FIELDS.contains(&label.as_slice()) {
+                    match value {
+                        SchedValue::Int(v) if *v >= 0 => Action::Set(SchedValue::Int(0)),
+                        _ => Action::Refuse,
+                    }
+                } else if STABLE_INTEGER_FIELDS.contains(&label.as_slice()) {
+                    match value {
+                        SchedValue::Int(_) => Action::Keep,
+                        _ => Action::Refuse,
+                    }
+                } else {
+                    // New kernels may append observational counters;
+                    // numeric telemetry is zeroed, anything else (a
+                    // negative unknown field) still fails closed. The
+                    // schedstats nanosecond fields print as fixed-point
+                    // milliseconds and land in the Fixed6 arm.
+                    match value {
+                        SchedValue::Int(v) if *v >= 0 => Action::Set(SchedValue::Int(0)),
+                        SchedValue::Fixed6(v) if *v >= 0 => Action::Set(SchedValue::Fixed6(0)),
+                        _ => Action::Refuse,
+                    }
                 }
-                continue;
-            } else {
-                return Vec::new();
             }
-            if has_newline {
-                normalized.push(b'\n');
-            }
-            continue;
+            _ => Action::Refuse,
         };
-        let label = left.trim();
-        if NUMA_BALANCING_FIELDS.contains(&label) {
-            if right.trim().parse::<i128>().is_err() {
-                return Vec::new();
+        match action {
+            Action::Keep => kept.push(entry),
+            Action::Drop => {}
+            Action::Set(new_value) => {
+                // Canonical column width for the new value, never the
+                // width the host value occupied.
+                entry.set_value(new_value);
+                kept.push(entry);
             }
-            continue;
-        }
-        let replacement = if let Some(index) = FLOAT_FIELDS.iter().position(|field| *field == label)
-        {
-            let Ok(value) = right.trim().parse::<f64>() else {
-                return Vec::new();
-            };
-            if !value.is_finite() || value.is_sign_negative() {
-                return Vec::new();
+            Action::Refuse => {
+                return refuse_policy(3, "sched", "scheduler accounting line refused by policy");
             }
-            core_fields_seen[index] = true;
-            Some("0.000000")
-        } else if let Some((_, replacement)) =
-            UCLAMP_FIELDS.iter().find(|(field, _)| *field == label)
-        {
-            if right.trim().parse::<u128>().is_err() {
-                return Vec::new();
-            }
-            Some(*replacement)
-        } else if INTEGER_FIELDS.contains(&label) {
-            if right.trim().parse::<u128>().is_err() {
-                return Vec::new();
-            }
-            Some("0")
-        } else if STABLE_INTEGER_FIELDS.contains(&label) {
-            if right.trim().parse::<i128>().is_err() {
-                return Vec::new();
-            }
-            None
-        } else if right.trim().parse::<u128>().is_ok() {
-            // New kernels may append observational scheduler counters. Keep
-            // forward-compatible numeric telemetry deterministic without
-            // accepting malformed or negative unknown fields.
-            Some("0")
-        } else if right
-            .trim()
-            .parse::<f64>()
-            .is_ok_and(|value| value.is_finite() && !value.is_sign_negative())
-            && right.trim().contains('.')
-        {
-            // With kernel.sched_schedstats=1 the kernel adds nanosecond fields
-            // printed as milliseconds with six decimals (sum_sleep_runtime,
-            // wait_max, avg_atom, ...; kernel/sched/debug.c,
-            // proc_sched_show_task). They are host timing, so they become
-            // zero; refusing them emptied the whole file for the guest.
-            Some("0.000000")
-        } else {
-            return Vec::new();
-        };
-
-        if let Some(value) = replacement {
-            normalized.extend_from_slice(left.as_bytes());
-            normalized.extend_from_slice(b": ");
-            normalized.extend_from_slice(value.as_bytes());
-        } else {
-            normalized.extend_from_slice(body.as_bytes());
-        }
-        if has_newline {
-            normalized.push(b'\n');
         }
     }
-
-    if header_seen && core_fields_seen.iter().all(|seen| *seen) {
-        normalized
-    } else {
-        Vec::new()
+    if !core_fields_seen.iter().all(|seen| *seen) {
+        return refuse_policy(3, "sched", "missing core scheduler fields");
     }
+    sched.entries = kept;
+    reverie_proc_grammar::render_sched(&sched)
 }
 
 pub fn sanitize_fdinfo(contents: &[u8], identity: Option<(u64, i32, u64, u64)>) -> Vec<u8> {
     let Some((virtual_inode, logical_flags, virtual_open_file, virtual_mount_id)) = identity else {
         return Vec::new();
     };
-    let Ok(text) = std::str::from_utf8(contents) else {
-        return Vec::new();
+    // Grammar-backed parse; identity substitution below is the same
+    // policy the line surgery applied. Writing through the typed
+    // value also makes the outputs kernel-shaped (flags as `0` +
+    // octal rather than zero-padded to seven digits). Kinds whose
+    // lines the grammar models but this policy does not serve
+    // (epoll, inotify, fuse), files carrying lock lines, and any
+    // unparseable input are refused counted, logged, and empty.
+    let mut fdinfo = match reverie_proc_grammar::parse_fdinfo(contents) {
+        Ok(fdinfo) => fdinfo,
+        Err(error) => return refuse_parse(4, "fdinfo", &error),
     };
-
-    let mut normalized = Vec::with_capacity(contents.len());
-    for line in text.split_inclusive('\n') {
-        let has_newline = line.ends_with('\n');
-        let body = line.strip_suffix('\n').unwrap_or(line);
-        if body.starts_with("mnt_id:") {
-            normalized.extend_from_slice(format!("mnt_id:\t{virtual_mount_id}").as_bytes());
-        } else if body.starts_with("ino:") {
-            normalized.extend_from_slice(format!("ino:\t{virtual_inode}").as_bytes());
-        } else if body.starts_with("flags:") {
-            normalized.extend_from_slice(format!("flags:\t{logical_flags:07o}").as_bytes());
-        } else if body.starts_with("eventfd-id:") {
-            normalized.extend_from_slice(format!("eventfd-id: {virtual_open_file}").as_bytes());
-        } else if body.starts_with("Pid:") {
-            normalized.extend_from_slice(b"Pid:\t1");
-        } else if body.starts_with("NSpid:") {
-            normalized.extend_from_slice(b"NSpid:\t1");
-        } else if body.starts_with("tfd:")
-            || body.starts_with("inotify ")
-            || body.starts_with("lock:")
-        {
-            return Vec::new();
-        } else {
-            let allowed = body.split_once(':').is_some_and(|(label, _)| {
-                matches!(
-                    label,
-                    "pos"
-                        | "eventfd-count"
-                        | "eventfd-semaphore"
-                        | "sigmask"
-                        | "clockid"
-                        | "ticks"
-                        | "settime flags"
-                        | "it_value"
-                        | "it_interval"
-                        | "seals"
-                        // Linux reports the number of descriptors currently
-                        // queued on this socket. It is socket state, not a
-                        // host-assigned identity, so preserve it verbatim.
-                        | "scm_fds"
-                )
-            });
-            if !allowed {
-                return Vec::new();
-            }
-            normalized.extend_from_slice(body.as_bytes());
-        }
-        if has_newline {
-            normalized.push(b'\n');
-        }
+    if !fdinfo.locks.is_empty() {
+        return refuse_policy(4, "fdinfo", "lock lines are not served");
     }
-    normalized
+    fdinfo.mnt_id = virtual_mount_id;
+    fdinfo.ino = virtual_inode;
+    fdinfo.flags = logical_flags as u32;
+    match &mut fdinfo.kind {
+        reverie_proc_grammar::FdinfoKind::Plain
+        | reverie_proc_grammar::FdinfoKind::Signalfd { .. }
+        | reverie_proc_grammar::FdinfoKind::Timerfd(_)
+        | reverie_proc_grammar::FdinfoKind::UnixSocket { .. } => {}
+        reverie_proc_grammar::FdinfoKind::Eventfd { id, .. } => {
+            *id = virtual_open_file;
+        }
+        reverie_proc_grammar::FdinfoKind::Pidfd { pid, nspid } => {
+            *pid = 1;
+            *nspid = vec![1];
+        }
+        _ => return refuse_policy(4, "fdinfo", "fd kind is not served"),
+    }
+    reverie_proc_grammar::render_fdinfo(&fdinfo)
 }
 
 pub fn sanitize_smaps_rollup(contents: &[u8]) -> Vec<u8> {
@@ -1859,20 +1872,31 @@ TCP 2304 many 12309 no 256 yes kernel\n";
 
     #[test]
     fn fdinfo_hides_backing_identity_only() {
-        let contents = b"pos:\t1\n\
-flags:\t0100002\n\
-mnt_id:\t16368\n\
-ino:\t47761541\n\
-eventfd-count: 0000000000000007\n\
-scm_fds: 2\n";
+        // Kernel-real shapes: an eventfd's three lines (count is
+        // space-padded hex, `%16llx`) and, separately, a unix
+        // socket's scm_fds. (The previous fixture mixed both kinds in
+        // one file with a zero-padded count, which no kernel prints.)
+        let contents = format!(
+            "pos:\t1\nflags:\t0100002\nmnt_id:\t16368\nino:\t47761541\n\
+             eventfd-count: {:16x}\neventfd-id: 999\neventfd-semaphore: 0\n",
+            7
+        )
+        .into_bytes();
         assert_eq!(
-            sanitize_fdinfo(contents, Some((9007, 0o100002, 42, 7))),
-            b"pos:\t1\n\
-flags:\t0100002\n\
-mnt_id:\t7\n\
-ino:\t9007\n\
-eventfd-count: 0000000000000007\n\
-scm_fds: 2\n"
+            sanitize_fdinfo(&contents, Some((9007, 0o100002, 42, 7))),
+            format!(
+                "pos:\t1\nflags:\t0100002\nmnt_id:\t7\nino:\t9007\n\
+                 eventfd-count: {:16x}\neventfd-id: 42\neventfd-semaphore: 0\n",
+                7
+            )
+            .into_bytes()
+        );
+        assert_eq!(
+            sanitize_fdinfo(
+                b"pos:\t0\nflags:\t02000002\nmnt_id:\t12\nino:\t99\nscm_fds: 2\n",
+                Some((9007, 0o2000002, 42, 7))
+            ),
+            b"pos:\t0\nflags:\t02000002\nmnt_id:\t7\nino:\t9007\nscm_fds: 2\n".as_slice()
         );
         assert!(
             sanitize_fdinfo(
@@ -1962,40 +1986,55 @@ x86_Thread_features_locked:\t\n"
         }
     }
 
+    /// One canonical kernel sched integer line (`%-45s:%21Ld`).
+    fn sched_int_line(label: &str, value: i64) -> String {
+        format!("{label:<45}:{value:>21}\n")
+    }
+
+    /// One canonical kernel sched fixed-point line
+    /// (`%-45s:%14Ld.%06ld`).
+    fn sched_fixed_line(label: &str, whole: i64, frac: u32) -> String {
+        format!("{label:<45}:{whole:>14}.{frac:06}\n")
+    }
+
     #[test]
     fn self_sched_hides_host_scheduler_accounting() {
-        let contents = b"cat (3, #threads: 7)\n\
-se.exec_start : 377650149.445644\n\
-se.vruntime : 133948666.432951\n\
-se.sum_exec_runtime : 3.637972\n\
-nr_switches : 149\n\
-se.avg.load_avg : 749\n\
-uclamp.min : 128\n\
-uclamp.max : 768\n\
-effective uclamp.min : 256\n\
-effective uclamp.max : 512\n\
-policy : 0\n\
-uclamp.max : 1024\n\
-new.kernel.counter : 55\n\
-current_node=7, numa_group_id=91\n\
-numa_faults node=7 task_private=8 task_shared=9 group_private=10 group_shared=11\n";
+        let contents = format!(
+            "cat (3, #threads: 7)\n{}{}{}{}{}{}{}{}{}{}{}{}current_node=7, numa_group_id=91\nnuma_faults node=7 task_private=8 task_shared=9 group_private=10 group_shared=11\n",
+            sched_fixed_line("se.exec_start", 377_650_149, 445_644),
+            sched_fixed_line("se.vruntime", 133_948_666, 432_951),
+            sched_fixed_line("se.sum_exec_runtime", 3, 637_972),
+            sched_int_line("nr_switches", 149),
+            sched_int_line("se.avg.load_avg", 749),
+            sched_int_line("uclamp.min", 128),
+            sched_int_line("uclamp.max", 768),
+            sched_int_line("effective uclamp.min", 256),
+            sched_int_line("effective uclamp.max", 512),
+            sched_int_line("policy", 0),
+            sched_int_line("uclamp.max", 1024),
+            sched_int_line("new.kernel.counter", 55),
+        )
+        .into_bytes();
 
-        assert_eq!(
-            sanitize_self_sched(contents),
-            b"cat (0, #threads: 1)\n\
-se.exec_start : 0.000000\n\
-se.vruntime : 0.000000\n\
-se.sum_exec_runtime : 0.000000\n\
-nr_switches : 0\n\
-se.avg.load_avg : 0\n\
-uclamp.min : 0\n\
-uclamp.max : 1024\n\
-effective uclamp.min : 0\n\
-effective uclamp.max : 1024\n\
-policy : 0\n\
-uclamp.max : 1024\n\
-new.kernel.counter : 0\n"
-        );
+        // Zeroed values render at the kernel's canonical column
+        // width, not at the width the host value occupied.
+        let expected = format!(
+            "cat (0, #threads: 1)\n{}{}{}{}{}{}{}{}{}{}{}{}",
+            sched_fixed_line("se.exec_start", 0, 0),
+            sched_fixed_line("se.vruntime", 0, 0),
+            sched_fixed_line("se.sum_exec_runtime", 0, 0),
+            sched_int_line("nr_switches", 0),
+            sched_int_line("se.avg.load_avg", 0),
+            sched_int_line("uclamp.min", 0),
+            sched_int_line("uclamp.max", 1024),
+            sched_int_line("effective uclamp.min", 0),
+            sched_int_line("effective uclamp.max", 1024),
+            sched_int_line("policy", 0),
+            sched_int_line("uclamp.max", 1024),
+            sched_int_line("new.kernel.counter", 0),
+        )
+        .into_bytes();
+        assert_eq!(sanitize_self_sched(&contents), expected);
     }
 
     /// A kernel built without NUMA prints none of NUMA balancing's lines
@@ -2004,10 +2043,12 @@ new.kernel.counter : 0\n"
     /// leaves the guest nothing, as any malformed line does.
     #[test]
     fn self_sched_leaves_out_numa_balancing() {
-        let core = "cat (3, #threads: 1)\n\
-se.exec_start : 377650149.445644\n\
-se.vruntime : 133948666.432951\n\
-se.sum_exec_runtime : 3.637972\n";
+        let core = format!(
+            "cat (3, #threads: 1)\n{}{}{}",
+            sched_fixed_line("se.exec_start", 377_650_149, 445_644),
+            sched_fixed_line("se.vruntime", 133_948_666, 432_951),
+            sched_fixed_line("se.sum_exec_runtime", 3, 637_972),
+        );
         let numa = "mm->numa_scan_seq                            :                    4\n\
 numa_pages_migrated                          :                    5\n\
 numa_preferred_nid                           :                   -1\n\
@@ -2039,17 +2080,20 @@ numa_faults node=1 task_private=7 task_shared=0 group_private=0 group_shared=0\n
     // becomes zero, and the file still reaches the guest.
     #[test]
     fn self_sched_hides_schedstats_fields() {
-        let core = "cat (3, #threads: 1)\n\
-se.exec_start : 377650149.445644\n\
-se.vruntime : 133948666.432951\n\
-se.sum_exec_runtime : 3.637972\n";
+        let core = format!(
+            "cat (3, #threads: 1)\n{}{}{}",
+            sched_fixed_line("se.exec_start", 377_650_149, 445_644),
+            sched_fixed_line("se.vruntime", 133_948_666, 432_951),
+            sched_fixed_line("se.sum_exec_runtime", 3, 637_972),
+        );
         let decimal = |label: &str, value: &str| format!("{label:<45}:{value:>21}\n");
-        let mut contents = core.to_owned();
-        let mut expected = "cat (0, #threads: 1)\n\
-se.exec_start : 0.000000\n\
-se.vruntime : 0.000000\n\
-se.sum_exec_runtime : 0.000000\n"
-            .to_owned();
+        let mut contents = core.clone();
+        let mut expected = format!(
+            "cat (0, #threads: 1)\n{}{}{}",
+            sched_fixed_line("se.exec_start", 0, 0),
+            sched_fixed_line("se.vruntime", 0, 0),
+            sched_fixed_line("se.sum_exec_runtime", 0, 0),
+        );
         for (label, value, zero) in [
             ("sum_sleep_runtime", "1234.567890", "0.000000"),
             ("wait_max", "2.500000", "0.000000"),
@@ -2057,7 +2101,8 @@ se.sum_exec_runtime : 0.000000\n"
             ("avg_atom", "0.000001", "0.000000"),
         ] {
             contents.push_str(&decimal(label, value));
-            expected.push_str(&format!("{label:<45}: {zero}\n"));
+            // The zero keeps the kernel's right-aligned column.
+            expected.push_str(&decimal(label, zero));
         }
         assert_eq!(
             String::from_utf8(sanitize_self_sched(contents.as_bytes())).unwrap(),

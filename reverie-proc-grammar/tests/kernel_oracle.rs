@@ -24,8 +24,22 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::sync::Mutex;
+use std::sync::MutexGuard;
 
 use reverie_proc_grammar::*;
+
+/// The oracle tests share one live `/proc`: the inventory counts
+/// this process's own threads and fds, so a sibling test opening
+/// fds concurrently can move the thin-population floors mid-scan.
+/// Serialize the tests in this binary instead of lowering them.
+static ORACLE_SERIAL: Mutex<()> = Mutex::new(());
+
+fn oracle_serial() -> MutexGuard<'static, ()> {
+    ORACLE_SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 fn pids() -> Vec<u32> {
     let mut pids: Vec<u32> = fs::read_dir("/proc")
@@ -42,6 +56,7 @@ fn pids() -> Vec<u32> {
 /// than per pid in the inventory below.
 #[test]
 fn live_mountinfo_round_trips() {
+    let _serial = oracle_serial();
     let bytes = fs::read("/proc/self/mountinfo").expect("read live mountinfo");
     let rows = parse_mountinfo(&bytes).expect("live mountinfo refused");
     assert!(!rows.is_empty(), "a live namespace has mounts");
@@ -50,6 +65,7 @@ fn live_mountinfo_round_trips() {
 
 #[test]
 fn live_proc_inventory() {
+    let _serial = oracle_serial();
     let mut ok: BTreeMap<&str, usize> = BTreeMap::new();
     let mut refused: BTreeMap<&str, usize> = BTreeMap::new();
     let mut failures: Vec<String> = Vec::new();
@@ -241,6 +257,7 @@ fn escaped_name(stored: &[u8]) -> Vec<u8> {
 
 #[test]
 fn pr_set_name_population() {
+    let _serial = oracle_serial();
     let names: &[&[u8]] = &[
         b"a b",
         b"a)b",
@@ -336,6 +353,7 @@ fn live_fdinfo(fd: i32) -> Fdinfo {
 
 #[test]
 fn fdinfo_kinds_from_live_objects() {
+    let _serial = oracle_serial();
     // SAFETY: each block creates one kernel object with the documented
     // arguments and closes it after the fdinfo read; fds are checked
     // before use.

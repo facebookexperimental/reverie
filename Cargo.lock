@@ -1498,6 +1498,7 @@ dependencies = [
  "reverie-proc-grammar",
  "serde",
  "syn 2.0.119",
+ "tracing",
 ]
 
 [[package]]
