@@ -4857,7 +4857,9 @@ where
                         return Err(error);
                     }
                     return Err(anyhow::Error::new(error)
-                        .context(format!("the guest's stderr before it ended: {guest_stderr}"))
+                        .context(format!(
+                            "the guest's stderr before it ended: {guest_stderr}"
+                        ))
                         .into());
                 }
             };
