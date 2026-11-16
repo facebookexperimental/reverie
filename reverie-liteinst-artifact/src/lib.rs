@@ -169,13 +169,13 @@ impl FileIdentity {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommandEvidence {
-    pub program: String,
-    pub arguments: Vec<String>,
-    pub cwd: PathBuf,
-    pub status: i32,
+    program: String,
+    arguments: Vec<String>,
+    cwd: PathBuf,
+    status: i32,
     elapsed_millis: u128,
-    pub stdout: FileIdentity,
-    pub stderr: FileIdentity,
+    stdout: FileIdentity,
+    stderr: FileIdentity,
     /// Provenance marker: `true` only on records `Runner::run_with_limits`
     /// built through `from_runner_record`. Serde skips it, so a
     /// deserialized record always carries `false` and cannot pose as
@@ -340,14 +340,12 @@ pub struct Runner {
     pub deadline: Instant,
     pub max_stream_bytes: usize,
     serial: u32,
-    /// Retained command records. Public at this head so landed readers
-    /// still compile; D132220437 makes the `Vec` private once every
-    /// reader uses [`Runner::commands`]. Until then insertion is not
-    /// compile-prevented, but a deserialized record still cannot bind a
-    /// Buck witness: `with_buck_build` requires the `from_runner`
-    /// marker only `from_runner_record` sets. Readers use
+    /// Retained command records. Private, with no public push: the only
+    /// entries are `from_runner_record` products of `run_with_limits`, so
+    /// a deserialized `CommandEvidence` cannot be inserted into a Runner
+    /// and later passed off as retained evidence. Readers use
     /// [`Runner::commands`].
-    pub commands: Vec<CommandEvidence>,
+    commands: Vec<CommandEvidence>,
     /// CPU measured for each entry of `commands`; `None` for a command run
     /// without a CPU budget. Kept apart from `CommandEvidence`, whose receipt
     /// schema denies unknown fields.
@@ -402,9 +400,8 @@ impl Runner {
         })
     }
 
-    /// Retained command records, in run order. Prefer this accessor:
-    /// the `Vec` field is public only until D132220437 (see the field
-    /// comment).
+    /// Retained command records, in run order (see the field comment for
+    /// why the `Vec` itself is not public).
     pub fn commands(&self) -> &[CommandEvidence] {
         &self.commands
     }
@@ -3501,15 +3498,12 @@ impl VerifiedCompiledSources {
     }
     /// Bind the actual Buck-built ELF to Buck-declared sources. The build
     /// evidence is `runner`'s last retained record, which must be the
-    /// pinned buck2 build that Runner just ran. There is no
-    /// `&CommandEvidence` parameter and no public `CommandEvidence`
-    /// constructor (`from_runner_record` is `pub(crate)`), and the
-    /// record's `from_runner` marker (set only by `from_runner_record`,
-    /// always `false` after deserialization) is required below, so a
-    /// deserialized record cannot bind here even though `Runner.commands`
-    /// and the recorded-fact fields are still public at this head;
-    /// D132220437 makes them private, after which a hand-built record
-    /// cannot be supplied at all. The ELF identity and the stored
+    /// pinned buck2 build that Runner just ran: `Runner`'s record `Vec`
+    /// is private with no public push, `CommandEvidence` has no public
+    /// constructor, and the record's `from_runner` marker (set only by
+    /// `from_runner_record`, always `false` after deserialization) is
+    /// required below, so a hand-built or deserialized command cannot be
+    /// supplied here at all. The ELF identity and the stored
     /// `output_sha256` are computed in this function from the file the
     /// retained `--show-full-output` stdout names, canonicalized through
     /// any buck-out symlink; no caller-supplied command or digest is
@@ -40663,9 +40657,7 @@ mod tests {
         // A Buck witness binds only through a Runner: Git sources refuse
         // even with one, and there is no `&CommandEvidence` parameter a
         // hand-built or deserialized record could be passed through
-        // (there is no public constructor; a deserialized record pushed
-        // through the still-public `Vec` still refuses by the marker,
-        // tested below).
+        // (externally such a record cannot even be constructed or pushed).
         assert!(
             git_sources
                 .with_buck_build(&runner, Path::new("/buck-controls/x.so"))
@@ -40684,10 +40676,10 @@ mod tests {
             fs::write(&path, b"data-only buck2 log").unwrap();
             FileIdentity::read(&path).unwrap()
         };
-        // Production records reach a Runner only as `from_runner_record`
-        // products, exactly as `run_with_limits` produces them; this test
-        // module pushes the same way in-crate (the `Vec` is still public
-        // at this head and becomes private in D132220437).
+        // Records reach a Runner only as `from_runner_record` products,
+        // exactly as `run_with_limits` produces them; this test module is
+        // the one in-crate place that can push into the private Vec,
+        // mirroring that single production push site.
         let buck_command = |arguments: Vec<String>, status: i32, stdout_path: &Path| {
             CommandEvidence::from_runner_record(
                 "buck2".into(),
@@ -40724,8 +40716,8 @@ mod tests {
             "Buck build witness requires a retained Runner buck2 build record"
         );
         // A deserialized record keeps the recorded facts but never the
-        // Runner marker: pushed here in-crate, it cannot bind a Buck
-        // witness. (Push becomes externally impossible in D132220437.)
+        // Runner marker: even pushed in-crate (impossible externally), it
+        // cannot bind a Buck witness.
         let good = buck_command(good_args(), 0, &good_stdout);
         let revived: CommandEvidence =
             serde_json::from_slice(&serde_json::to_vec(&good).unwrap()).unwrap();
