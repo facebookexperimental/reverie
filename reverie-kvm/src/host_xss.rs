@@ -93,6 +93,13 @@ impl XsaveSubleaf {
             })
     }
 
+    /// Whether the host saves extended state in compacted form (XSAVEC
+    /// or XSAVES, CPUID 0xD.1 EAX bits 1 and 3), in which a component in
+    /// its initial state need not appear in the save area at all.
+    pub(crate) fn compacted(&self) -> bool {
+        self.eax & 0b1010 != 0
+    }
+
     /// The subleaf as the host processor reports it.
     fn of_host() -> Self {
         let row = core::arch::x86_64::__cpuid_count(0xd, 1);
@@ -285,6 +292,24 @@ mod tests {
 
     fn row(eax: u32, ecx: u32, edx: u32) -> XsaveSubleaf {
         XsaveSubleaf { eax, ecx, edx }
+    }
+
+    #[test]
+    fn compacted_is_exactly_the_xsavec_and_xsaves_bits() {
+        // CPUID 0xD.1 EAX: bit 0 XSAVEOPT, bit 1 XSAVEC, bit 2 XGETBV
+        // with ECX=1, bit 3 XSAVES. Only the two compacted-format saves
+        // mean an initial component may be absent from the save area.
+        for (eax, compacted) in [
+            (0, false),
+            (1 << 0, false),
+            (1 << 1, true),
+            (1 << 2, false),
+            (1 << 3, true),
+            (EAX, true),
+            (!(0b1010), false),
+        ] {
+            assert_eq!(row(eax, 0, 0).compacted(), compacted, "eax={eax:#x}");
+        }
     }
 
     #[test]

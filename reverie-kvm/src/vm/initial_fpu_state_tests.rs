@@ -100,7 +100,7 @@ fn the_initial_fpu_image_covers_every_component_the_guest_enables() {
     );
     assert!(installed.region[40..104].iter().all(|word| *word == 0));
     assert!(installed.region[144..208].iter().all(|word| *word == 0));
-    let frame = XsaveImage::from_kvm(&installed);
+    let frame = XsaveImage::from_kvm(&installed, true);
     assert_eq!(
         u64::from_le_bytes(frame.bytes()[512..520].try_into().unwrap()),
         X87_AND_SSE

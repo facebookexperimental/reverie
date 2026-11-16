@@ -1622,7 +1622,9 @@ impl ProbeVm {
     pub(crate) fn consume_frame(&mut self, edit: &FrameEdit) -> Result<FrameConsumerRecord> {
         let xsave = self.backend.vcpu.get_xsave()?;
         let raw_get = xsave_bytes(&xsave);
-        let mut frame = crate::signal::XsaveImage::from_kvm(&xsave).bytes().to_vec();
+        let mut frame = crate::signal::XsaveImage::from_kvm(&xsave, self.backend.xsave_compacted())
+            .bytes()
+            .to_vec();
         for (offset, bytes) in &edit.patches {
             let Some(end) = offset
                 .checked_add(bytes.len())

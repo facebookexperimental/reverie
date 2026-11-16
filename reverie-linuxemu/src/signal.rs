@@ -1103,12 +1103,45 @@ impl XsaveImage {
     /// state present even when the vCPU had them in their initial state, as
     /// Linux's `save_xstate_epilog` does, so that rt_sigreturn applies a
     /// handler's edits to the saved control word, MXCSR or XMM registers.
-    pub fn from_kvm(xsave: &kvm_xsave) -> Self {
+    pub fn from_kvm(xsave: &kvm_xsave, compacted: bool) -> Self {
         let mut bytes = [0; XSAVE_SIGNAL_SIZE];
         for (index, word) in xsave.region[..XSAVE_SIZE / 4].iter().copied().enumerate() {
             bytes[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
         }
         let xstate_bv = read_u64(&bytes, XSTATE_BV_OFFSET);
+        // On a host whose vCPU state is saved in compacted form (XSAVEC or
+        // XSAVES, CPUID 0xD.1), a component in its initial state was not
+        // written to the save area, so KVM_GET_XSAVE's standard-format
+        // image can hold stale bytes for it. The sharp case is MXCSR: the
+        // kernel's conversion copies it when SSE or YMM is in use, but the
+        // compacted save skipped the legacy region while SSE was initial,
+        // so with YMM in use and SSE initial the copied MXCSR is stale. A
+        // component the header reports initial is in architectural initial
+        // state by definition; write those values instead, preserving
+        // MXCSR only where SSE is in use, and the MXCSR mask, which is not
+        // state. On a host without compacted saves the standard-format
+        // image's legacy region always holds the guest's real values, so
+        // nothing is rewritten there.
+        if compacted {
+            let mxcsr = read_u32(&bytes, 24);
+            let mxcsr_mask = read_u32(&bytes, MXCSR_MASK_OFFSET);
+            if xstate_bv & XFEATURE_X87 == 0 {
+                bytes[..XMM_OFFSET].fill(0);
+                write_u32(&mut bytes, 0, 0x37f);
+                if xstate_bv & XFEATURE_SSE != 0 {
+                    write_u32(&mut bytes, 24, mxcsr);
+                }
+                write_u32(&mut bytes, MXCSR_MASK_OFFSET, mxcsr_mask);
+            }
+            if xstate_bv & XFEATURE_SSE == 0 {
+                bytes[XMM_OFFSET..XMM_END].fill(0);
+                write_u32(&mut bytes, 24, 0x1f80);
+                write_u32(&mut bytes, MXCSR_MASK_OFFSET, mxcsr_mask);
+            }
+            if xstate_bv & XFEATURE_YMM == 0 {
+                bytes[XSTATE_RESERVED_END..XSAVE_SIZE].fill(0);
+            }
+        }
         write_u64(
             &mut bytes,
             XSTATE_BV_OFFSET,
@@ -1865,7 +1898,7 @@ mod tests {
         raw.region[32] = 0x1111_2222;
         raw.region[144] = 0x3333_4444;
         raw.region[XSTATE_BV_OFFSET / 4] = FIXED_XFEATURES as u32;
-        *XsaveImage::from_kvm(&raw).bytes()
+        *XsaveImage::from_kvm(&raw, true).bytes()
     }
 
     #[test]
@@ -1906,11 +1939,70 @@ mod tests {
         ] {
             let mut raw = kvm_xsave::default();
             raw.region[XSTATE_BV_OFFSET / 4] = reported as u32;
-            let bytes = *XsaveImage::from_kvm(&raw).bytes();
+            let bytes = *XsaveImage::from_kvm(&raw, true).bytes();
             assert_eq!(read_u64(&bytes, XSTATE_BV_OFFSET), framed, "{reported:#x}");
             let restored = XsaveImage::restore_from_signal(&bytes).unwrap();
             assert_eq!(restored.region[XSTATE_BV_OFFSET / 4] as u64, framed);
         }
+    }
+
+    #[test]
+    fn signal_frames_initialize_components_the_vcpu_reports_initial() {
+        // KVM_GET_XSAVE can leave the save area of a component in its
+        // initial state holding stale bytes from before it was initialized
+        // (measured for MXCSR on AMD Zen 5 in the signal spike for
+        // https://github.com/rrnewton/hermit/issues/5476: the guest's
+        // plain XSAVE read MXCSR 0x1f80 while the signal frame
+        // built from the same stopped vCPU carried the stale 0x3f80). Linux
+        // writes architectural initial values for those components, so the
+        // frame must not copy those bytes through.
+        let mut raw = kvm_xsave::default();
+        raw.region[0] = 0xdead_beef;
+        raw.region[6] = 0x0000_3f80;
+        raw.region[XMM_OFFSET / 4] = 0x1111_2222;
+        raw.region[XSTATE_RESERVED_END / 4] = 0x3333_4444;
+        raw.region[XSTATE_BV_OFFSET / 4] = 0;
+        let bytes = *XsaveImage::from_kvm(&raw, true).bytes();
+        assert_eq!(read_u32(&bytes, 0), 0x37f, "x87 control word");
+        assert_eq!(read_u32(&bytes, 24), 0x1f80, "MXCSR");
+        assert_eq!(read_u32(&bytes, XMM_OFFSET), 0, "XMM0");
+        assert_eq!(read_u32(&bytes, XSTATE_RESERVED_END), 0, "YMM upper");
+        assert_eq!(
+            read_u64(&bytes, XSTATE_BV_OFFSET),
+            XFEATURE_X87 | XFEATURE_SSE
+        );
+
+        // With SSE present its MXCSR and XMM state are the frame's, while
+        // x87 and YMM still initialize.
+        raw.region[XSTATE_BV_OFFSET / 4] = XFEATURE_SSE as u32;
+        let bytes = *XsaveImage::from_kvm(&raw, true).bytes();
+        assert_eq!(read_u32(&bytes, 0), 0x37f, "x87 control word");
+        assert_eq!(read_u32(&bytes, 24), 0x3f80, "MXCSR");
+        assert_eq!(read_u32(&bytes, XMM_OFFSET), 0x1111_2222, "XMM0");
+        assert_eq!(read_u32(&bytes, XSTATE_RESERVED_END), 0, "YMM upper");
+
+        // The stale-MXCSR trigger itself: YMM in use with SSE initial. The
+        // kernel's KVM_GET_XSAVE conversion copies MXCSR when SSE or YMM
+        // is in use, but a compacted save skipped the legacy region while
+        // SSE was initial, so the stale 0x3f80 must not reach the frame.
+        for bv in [XFEATURE_YMM, XFEATURE_X87 | XFEATURE_YMM] {
+            raw.region[XSTATE_BV_OFFSET / 4] = bv as u32;
+            let bytes = *XsaveImage::from_kvm(&raw, true).bytes();
+            assert_eq!(read_u32(&bytes, 24), 0x1f80, "MXCSR bv={bv:#x}");
+            assert_eq!(read_u32(&bytes, XMM_OFFSET), 0, "XMM0 bv={bv:#x}");
+            assert_eq!(
+                read_u32(&bytes, XSTATE_RESERVED_END),
+                0x3333_4444,
+                "YMM upper bv={bv:#x}"
+            );
+        }
+
+        // Without compacted saves the standard-format image always wrote
+        // the legacy region, so its MXCSR is the guest's real value and
+        // passes through even with SSE initial.
+        raw.region[XSTATE_BV_OFFSET / 4] = XFEATURE_YMM as u32;
+        let bytes = *XsaveImage::from_kvm(&raw, false).bytes();
+        assert_eq!(read_u32(&bytes, 24), 0x3f80, "MXCSR without compacted saves");
     }
 
     #[test]
@@ -1994,7 +2086,7 @@ mod tests {
             XFEATURE_X87 | XFEATURE_SSE
         );
         assert_eq!((image.region[0], image.region[6]), (0x037f, 0x1f80));
-        let bytes = *XsaveImage::from_kvm(&image).bytes();
+        let bytes = *XsaveImage::from_kvm(&image, true).bytes();
         assert_eq!(
             read_u64(&bytes, XSTATE_BV_OFFSET),
             XFEATURE_X87 | XFEATURE_SSE

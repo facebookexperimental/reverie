@@ -2133,6 +2133,10 @@ pub struct KvmBackend {
     /// What `match_host_xss` left in the vCPU at construction. Only the guest
     /// probe reads it (`guest_probe`), through [`Self::xss_outcome`].
     xss_outcome: crate::host_xss::Outcome,
+    /// Whether the host saves vCPU extended state in compacted form, so a
+    /// signal frame must initialize components KVM_GET_XSAVE reports
+    /// initial rather than copying their save-area bytes through.
+    xsave_compacted: bool,
     thread_group: Arc<GuestThreadGroup>,
     pub(crate) tool_failure: Option<crate::failure::FailureContext>,
     pub(crate) entry_driver: Option<crate::entry::owner::DriverOwner>,
@@ -2288,6 +2292,7 @@ struct InitializedKvmResources {
     kvm: Kvm,
     hypercall_instruction: [u8; 3],
     xss_outcome: crate::host_xss::Outcome,
+    xsave_compacted: bool,
 }
 
 /// The image [`KvmBackend::exec_process`] replaces the current image with:
@@ -2470,6 +2475,7 @@ impl KvmBackend {
         // machine description under Hermit, the host's by Reverie's default).
         let supported = kvm.get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)?;
         let supported_xsave = crate::host_xss::XsaveSubleaf::of_table(&supported);
+        let xsave_compacted = supported_xsave.is_some_and(|subleaf| subleaf.compacted());
         let cpuid = vcpu_cpuid(supported)?;
         // TODO-HUMAN-REVIEW(PR-129): Review host-selected private hypercall transport.
         let hypercall_instruction = supported_hypercall_instruction(&cpuid)?;
@@ -2511,6 +2517,7 @@ impl KvmBackend {
             kvm,
             hypercall_instruction,
             xss_outcome,
+            xsave_compacted,
         })
     }
 
@@ -2531,6 +2538,11 @@ impl KvmBackend {
         self.xss_outcome
     }
 
+    /// Whether the host saves vCPU extended state in compacted form. A copy.
+    pub(crate) fn xsave_compacted(&self) -> bool {
+        self.xsave_compacted
+    }
+
     fn new_with_memory(memory: GuestMemory, stdin: Option<File>) -> Result<Self> {
         install_worker_interrupt_handler()?;
         const INITIALIZATION_ATTEMPTS: usize = 3;
@@ -2542,6 +2554,7 @@ impl KvmBackend {
             kvm,
             hypercall_instruction,
             xss_outcome,
+            xsave_compacted,
         } = loop {
             attempts += 1;
             match Self::initialize_resources(&memory) {
@@ -2560,6 +2573,7 @@ impl KvmBackend {
             syscall_trampoline_address: SYSCALL_TRAMPOLINE_ADDRESS,
             syscall_frame_address: SYSCALL_FRAME_ADDRESS,
             xss_outcome,
+            xsave_compacted,
             thread_group: Arc::new(GuestThreadGroup::default()),
             tool_failure: None,
             entry_driver: None,
@@ -6271,9 +6285,9 @@ impl KvmBackend {
             return Ok(None);
         }
         let xsave = if let HandlerEntry::Fault(fault) = entry {
-            XsaveImage::from_kvm(&fault.xsave)
+            XsaveImage::from_kvm(&fault.xsave, self.xsave_compacted)
         } else {
-            XsaveImage::from_kvm(&self.vcpu.get_xsave()?)
+            XsaveImage::from_kvm(&self.vcpu.get_xsave()?, self.xsave_compacted)
         };
         // A temporary-mask call's saved mask, else the current one.
         let saved_mask = executor.frame_signal_mask();
