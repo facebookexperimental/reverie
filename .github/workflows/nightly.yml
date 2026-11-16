@@ -53,7 +53,10 @@ jobs:
     - name: Clippy and format (nightly-only options enforced here)
       run: |
         cargo clippy --workspace --all-targets --all-features
-        cargo fmt --all -- --check
+        # The Rustfmt gate (both legs, the include! guard included) is
+        # scripts/rustfmt-gate.sh, shared with validate.sh and the DAG;
+        # this step is what enforces the nightly-only options in it.
+        bash scripts/rustfmt-gate.sh
     - name: API docs all features (warnings denied)
       env:
         RUSTDOCFLAGS: "-D warnings"

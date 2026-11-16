@@ -1,4 +1,3 @@
-
 #[cfg(feature = "allocator-fixture")]
 #[path = "../lifecycle_guest/mapping_routes.rs"]
 mod mapping_routes;

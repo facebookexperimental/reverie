@@ -81,11 +81,11 @@
       "group": "lint",
       "job": "rustfmt",
       "desc": "Rustfmt",
-      "description": "cargo fmt --all -- --check over the whole workspace.",
+      "description": "scripts/rustfmt-gate.sh: cargo fmt --all -- --check over the whole workspace, plus a direct rustfmt --check of every file reached only through include! under reverie-liteinst/src/bin (derived at run time; the same script as validate.sh and the nightly workflow).",
       "labels": [
         "full"
       ],
-      "cmd": "cargo fmt --all -- --check",
+      "cmd": "bash scripts/rustfmt-gate.sh",
       "deps": [],
       "env": {},
       "timeout": 300,

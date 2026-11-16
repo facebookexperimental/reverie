@@ -1047,7 +1047,9 @@ run_clippy() {
     cargo clippy -p reverie-inguest --all-targets --features exec-native-injection,exec-private-init,loader-private-runtime -- -D warnings
 }
 run_check "Clippy" run_clippy
-run_check "Rustfmt" cargo fmt --all -- --check
+# The Rustfmt gate lives in one script, scripts/rustfmt-gate.sh, shared
+# with the DAG node and the nightly workflow so the copies cannot drift.
+run_check "Rustfmt" "$ROOT_DIR/scripts/rustfmt-gate.sh"
 }
 
 if [[ ${REVERIE_VALIDATE_DAG:-1} != 0 ]] &&
