@@ -592,6 +592,10 @@ type PtraceRequest = libc::c_uint;
 #[cfg(target_arch = "x86_64")]
 const PTRACE_SINGLEBLOCK: PtraceRequest = 33;
 
+/// `PTRACE_SYSEMU_SINGLESTEP` (arch/arm64/include/uapi/asm/ptrace.h).
+#[cfg(target_arch = "aarch64")]
+const PTRACE_SYSEMU_SINGLESTEP: PtraceRequest = 32;
+
 /// `ptrace(request, pid, 0, sig)` for a resuming request, with the signal as a
 /// raw number so that one `nix` cannot name can be delivered.
 fn ptrace_resume_raw(request: PtraceRequest, pid: Pid, sig: i32) -> Result<(), Errno> {
@@ -1053,6 +1057,9 @@ pub enum Transition {
     /// `PTRACE_SINGLEBLOCK`, delivering no signal.
     #[cfg(target_arch = "x86_64")]
     BlockStep,
+    /// `PTRACE_SYSEMU_SINGLESTEP` ([`Stopped::sysemu_step_raw`]).
+    #[cfg(target_arch = "aarch64")]
+    SysemuStep(i32),
 }
 
 impl fmt::Debug for Stopped {
@@ -1842,6 +1849,20 @@ impl Stopped {
         Ok(self.into_running_resumed())
     }
 
+    /// Like [`Stopped::step_raw`], with `PTRACE_SYSEMU_SINGLESTEP`: a
+    /// `svc` the thread enters next stops at its syscall-entry stop and is
+    /// then skipped without a seccomp check, and its exit reports the step
+    /// as a single step's SIGTRAP (arch/arm64/kernel/ptrace.c
+    /// `syscall_trace_enter` and `report_syscall`).
+    #[cfg(target_arch = "aarch64")]
+    pub fn sysemu_step_raw(self, sig: i32) -> Result<Running, Error> {
+        self.flush_regs()?;
+        self.1
+            .on_held_tid(|| ptrace_resume_raw(PTRACE_SYSEMU_SINGLESTEP, self.0, sig))
+            .map_err(|err| self.map_err(err))?;
+        Ok(self.into_running_resumed())
+    }
+
     /// Runs the process until it next takes a branch, with
     /// `PTRACE_SINGLEBLOCK`, delivering no signal.
     ///
@@ -2045,6 +2066,8 @@ impl Stopped {
             Transition::Step(signal) => (libc::PTRACE_SINGLESTEP, signal),
             #[cfg(target_arch = "x86_64")]
             Transition::BlockStep => (PTRACE_SINGLEBLOCK, 0),
+            #[cfg(target_arch = "aarch64")]
+            Transition::SysemuStep(signal) => (PTRACE_SYSEMU_SINGLESTEP, signal),
         };
         // Before the probe, so no system call is added between the
         // probe's final check and the resume request below.

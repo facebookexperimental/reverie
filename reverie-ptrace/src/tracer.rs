@@ -2518,6 +2518,16 @@ impl RootStopLease {
         })
     }
 
+    /// `PTRACE_SYSEMU_SINGLESTEP`, delivering a raw signal number
+    /// (`Stopped::sysemu_step_raw`).
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) fn sysemu_step_raw(mut self, signal: i32) -> Result<Running, TraceError> {
+        let task = self.take_for_transition()?;
+        self.transition(task, safeptrace::Transition::SysemuStep(signal), |task| {
+            task.sysemu_step_raw(signal)
+        })
+    }
+
     /// `syscall`, delivering a raw signal number (`Stopped::syscall_raw`).
     pub(crate) fn syscall_raw(mut self, signal: i32) -> Result<Running, TraceError> {
         let task = self.take_for_transition()?;

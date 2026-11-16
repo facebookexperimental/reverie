@@ -2249,8 +2249,15 @@ fn is_sigtrap_before_private_syscall(wait: &Wait) -> Result<bool, TraceError> {
 
 /// Whether the SIGTRAP `task` stopped with is the single-step report of a
 /// private-page `syscall`: x86 raises it at syscall exit with `si_addr` set to
-/// the RIP just past the instruction (`after_syscall`).
+/// the RIP just past the instruction (`after_syscall`). aarch64's report of a
+/// syscall step carries `SI_USER` with pid 0 and no address
+/// (`user_single_step_report`), which a kill can carry too, so none is
+/// recognized there: a stale one met before the private `svc` is discarded
+/// by `untraced_syscall_with`'s loop instead (`is_sigtrap_before_private_syscall`).
 fn is_private_step_trap(task: &Stopped, after_syscall: u64) -> Result<bool, TraceError> {
+    if cfg!(target_arch = "aarch64") {
+        return Ok(false);
+    }
     let siginfo = task.getsiginfo()?;
     // SAFETY: si_addr reads the fault-address member that SIGTRAP's
     // TRAP_TRACE and TRAP_BRKPT reports fill in.
@@ -2386,6 +2393,24 @@ pub(crate) fn classify_syscall_stop_exit(
         Some(false) => SyscallStopOutcome::Ran,
         Some(true) | None => SyscallStopOutcome::Unproven,
     }
+}
+
+/// Whether aarch64 steps a private-page injection of `nr` through its
+/// syscall-exit stop (`aarch64_run_to_exit_stop`): every call but those
+/// that stop at an event between their entry and exit or never return there
+/// (a clone, an exec, an exit, `rt_sigreturn`), which keep the plain step.
+#[cfg(target_arch = "aarch64")]
+fn aarch64_step_reads_exit_stop(nr: Sysno) -> bool {
+    !matches!(
+        nr,
+        Sysno::clone
+            | Sysno::clone3
+            | Sysno::execve
+            | Sysno::execveat
+            | Sysno::exit
+            | Sysno::exit_group
+            | Sysno::rt_sigreturn
+    )
 }
 
 /// Classifies an aarch64 exit stop as `classify_syscall_stop_exit` does an
@@ -10227,6 +10252,32 @@ impl<L: Tool + 'static> TracedTask<L> {
         }
     }
 
+    /// `step_stopped_any_input` with `PTRACE_SYSEMU_SINGLESTEP`
+    /// (`aarch64_step_end_by_sysemu`).
+    #[cfg(target_arch = "aarch64")]
+    fn sysemu_step_stopped_any_input(
+        &self,
+        task: Stopped,
+        signal: Option<AnySignal>,
+        input: Option<&NativeCallContext>,
+    ) -> Result<Running, TraceError> {
+        self.input_continuation(input)?;
+        if self.global_state.fatal_session.is_failed() {
+            return Err(Errno::ECANCELED.into());
+        }
+        #[cfg(test)]
+        record_step_for_test(task.pid());
+        self.note_segv_signal_without_cont(signal.map(AnySignal::raw));
+        let guard = self.exit_stop_guard(&task);
+        self.native_transition_started(input);
+        let running = self
+            .lease_liteinst_root_stop(task)
+            .guard_exit_stop(guard)
+            .sysemu_step_raw(signal.map_or(0, AnySignal::raw))?;
+        self.native_resume_issued(input)?;
+        Ok(running)
+    }
+
     /// `syscall_stopped_input` for a signal that may be one nix cannot name.
     fn syscall_stopped_any_input(
         &self,
@@ -12680,7 +12731,27 @@ impl<L: Tool + 'static> TracedTask<L> {
             }
             Ok(())
         };
+        #[cfg(not(target_arch = "aarch64"))]
         let mut running = self.step_stopped_input(task, None, input)?;
+        // The exit-stop step makes requests main does not, which a tracer
+        // filter may refuse (`thread_may_be_seccomp_filtered`); under one the
+        // call is stepped as on main.
+        #[cfg(target_arch = "aarch64")]
+        let mut running = if aarch64_step_reads_exit_stop(nr) && !thread_may_be_seccomp_filtered() {
+            match self.aarch64_run_to_exit_stop(task, nr, input).await? {
+                Ok(exit_stop) => match self.aarch64_queue_step_trap(exit_stop)? {
+                    Ok(exit_stop) => {
+                        self.step_stopped_any_input(exit_stop, Some(Signal::SIGTRAP.into()), input)?
+                    }
+                    Err(exit_stop) => {
+                        return self.aarch64_step_end_by_sysemu(exit_stop, nr, input).await;
+                    }
+                },
+                Err(outcome) => return Ok(outcome),
+            }
+        } else {
+            self.step_stopped_input(task, None, input)?
+        };
         loop {
             let wait = running.next_state_with_owner(&self.ptracer_waits).await?;
             self.arm_liteinst_wait(&wait);
@@ -12828,6 +12899,279 @@ impl<L: Tool + 'static> TracedTask<L> {
                     Wait::Stopped(stopped, Event::from_signal(sig)),
                     seccomp_trapped,
                 ));
+            }
+        }
+    }
+
+    /// aarch64's step of a private-page `syscall`
+    /// (`step_private_syscall_unshielded`) reads the call's result at its
+    /// syscall-exit stop.
+    ///
+    /// A single step reports a syscall's end with a SIGTRAP raised at its
+    /// exit (`report_syscall`, arch/arm64/kernel/ptrace.c:2241-2283 at
+    /// v6.12.9), and the `do_signal` that delivers it first prepares a
+    /// restart of a call that returned a restart code: `pc` back at the `svc`
+    /// and `x0` set to `orig_x0` (arch/arm64/kernel/signal.c:1395-1427). At
+    /// the step's stop the code is gone, and the call cannot be told from one
+    /// a signal stopped before it ran
+    /// (<https://github.com/facebookexperimental/hermit/issues/116>). x86-64 prepares a
+    /// restart only after `get_signal` (arch/x86/kernel/signal.c:333-361),
+    /// so its step's stop shows the code.
+    ///
+    /// The call is therefore run to its syscall-exit stop with
+    /// `PTRACE_SYSCALL` (`aarch64_run_to_exit_stop`), where `x0` is its
+    /// result, before any signal work, and the kernel's `syscallno` is set
+    /// to `NO_SYSCALL` there, so that no `do_signal` prepares a restart of
+    /// it. The step's SIGTRAP is then queued from that stop
+    /// (`aarch64_queue_step_trap`) and taken before any other signal, as
+    /// x86-64's is, with `pc` just past the `svc` and `x0` the result; the
+    /// step loop goes on from there unchanged. Where SIGTRAP cannot be queued
+    /// so, the step's end is made with a second `svc`
+    /// (`aarch64_step_end_by_sysemu`).
+    ///
+    /// Returns the exit stop, or the outcome of a step that ended before it:
+    /// a stop before the call ran (for `status_to_result` to report), or the
+    /// thread's exit. A group stop and a stale step SIGTRAP before the call
+    /// are resumed past, as the step loop resumes them.
+    #[cfg(target_arch = "aarch64")]
+    async fn aarch64_run_to_exit_stop(
+        &mut self,
+        task: Stopped,
+        nr: Sysno,
+        input: Option<&NativeCallContext>,
+    ) -> Result<Result<Stopped, (Wait, bool)>, TraceError> {
+        let svc = cp::PRIVATE_PAGE_OFFSET as u64;
+        let after_syscall = svc + cp::SYSCALL_INSTR_SIZE as u64;
+        let mut entered = match task.getregs()?.ip() {
+            ip if ip == svc => false,
+            ip if ip == after_syscall => true,
+            ip => {
+                tracing::error!(
+                    "[scheduler/tool] (pid = {}) injected {} to step is at {:#x}, neither before nor just past the private syscall",
+                    task.pid(),
+                    nr,
+                    ip
+                );
+                return Err(Errno::EPROTO.into());
+            }
+        };
+        let mut running = self.syscall_stopped_any_input(task, None, input)?;
+        let (exit_stop, regs) = loop {
+            let wait = running.next_state_with_owner(&self.ptracer_waits).await?;
+            self.arm_liteinst_wait(&wait);
+            match wait {
+                Wait::Stopped(stopped, Event::Syscall) if !entered => {
+                    entered = true;
+                    running = self.syscall_stopped_any_input(stopped, None, input)?;
+                }
+                Wait::Stopped(stopped, Event::Syscall) => {
+                    let regs = stopped.getregs()?;
+                    if regs.ip() != after_syscall {
+                        tracing::error!(
+                            "[scheduler/tool] (pid = {}) injected {} reached its exit stop away from the private syscall",
+                            stopped.pid(),
+                            nr
+                        );
+                        return Err(Errno::EPROTO.into());
+                    }
+                    break (stopped, regs);
+                }
+                // A guest filter's `SECCOMP_RET_TRACE`, resumed so the call
+                // runs, as the step loop resumes it.
+                Wait::Stopped(stopped, Event::Seccomp) if entered => {
+                    running = self.syscall_stopped_any_input(stopped, None, input)?;
+                }
+                Wait::Stopped(stopped, event) if !entered && let Some(sig) = event.signal() => {
+                    if sig == Signal::SIGTRAP
+                        && std::mem::take(&mut self.stale_private_step_trap)
+                        && is_private_step_trap(&stopped, after_syscall)?
+                    {
+                        tracing::debug!(
+                            "[scheduler/tool] (pid = {}) discarding a stale step SIGTRAP before injected {}",
+                            stopped.pid(),
+                            nr
+                        );
+                        running = self.syscall_stopped_any_input(stopped, None, input)?;
+                    } else if is_group_stop(&stopped, sig)? {
+                        running = self.syscall_stopped_any_input(stopped, None, input)?;
+                    } else {
+                        // Stopped before the instruction ran.
+                        return Ok(Err((Wait::Stopped(stopped, event), false)));
+                    }
+                }
+                Wait::Stopped(stopped, Event::Exit) => {
+                    return Ok(Err((Wait::Stopped(stopped, Event::Exit), false)));
+                }
+                Wait::Stopped(stopped, event) => {
+                    tracing::error!(
+                        "[scheduler/tool] (pid = {}) injected {} stepped through its syscall stops stopped at {:?}",
+                        stopped.pid(),
+                        nr,
+                        event
+                    );
+                    return Err(Errno::EPROTO.into());
+                }
+                wait @ Wait::Exited(..) => return Ok(Err((wait, false))),
+            }
+        };
+        tracing::debug!(
+            "[scheduler/tool] (pid = {}) injected {} returned {:#x} at its exit stop",
+            exit_stop.pid(),
+            nr,
+            regs.ret()
+        );
+        exit_stop.set_syscall(-1)?;
+        Ok(Ok(exit_stop))
+    }
+
+    /// Queues the step's SIGTRAP at the syscall-exit stop `exit_stop` of an
+    /// aarch64 step (`aarch64_run_to_exit_stop`), when the mask in effect
+    /// lets SIGTRAP through and none is pending: the caller resumes the
+    /// thread with SIGTRAP, which Linux sends from a syscall stop
+    /// (`ptrace_report_syscall`, include/linux/ptrace.h:407-427) with a positive
+    /// code, and `get_signal` takes it before any other pending signal
+    /// (`dequeue_synchronous_signal`, kernel/signal.c:706-746), as x86-64
+    /// takes its step's: the thread stops with `pc` just past the `svc` and
+    /// `x0` the call's result, the other signals still queued. Unlike the
+    /// step's `force_sig`, the send resets no action. Otherwise returns the
+    /// stop unchanged in `Err`: a blocked SIGTRAP would stay pending past the
+    /// stop, and a pending one would absorb it.
+    #[cfg(target_arch = "aarch64")]
+    fn aarch64_queue_step_trap(
+        &self,
+        exit_stop: Stopped,
+    ) -> Result<Result<Stopped, Stopped>, TraceError> {
+        let state = ProcSignalState::read(&exit_stop)?;
+        let trap = signal_mask_bit(Signal::SIGTRAP);
+        Ok(if (state.blocked | state.pending) & trap == 0 {
+            Ok(exit_stop)
+        } else {
+            Err(exit_stop)
+        })
+    }
+
+    /// The end of an aarch64 step (`aarch64_run_to_exit_stop`) whose SIGTRAP
+    /// cannot be queued from its exit stop `exit_stop`
+    /// (`aarch64_queue_step_trap`), made as a step makes it, with no guest
+    /// instruction run: the thread runs the `svc` again under
+    /// `PTRACE_SYSEMU_SINGLESTEP`, which stops at its entry, skips it
+    /// without a seccomp check (`syscall_trace_enter`,
+    /// arch/arm64/kernel/ptrace.c:2285-2306) and reports its exit with the
+    /// step's SIGTRAP. Its `x0` is 0, so that its own `do_signal` prepares
+    /// no restart. At the SIGTRAP stop `x0` is set to the call's result.
+    ///
+    /// A signal pending when the call returned is taken by the first
+    /// `do_signal`, before the second `svc`, where a step would take it after
+    /// the step's SIGTRAP. It is decided as the step loop decides a signal
+    /// after the call: one already blocked, or blocked by the tracer, goes
+    /// back to the queue, and after a mask-swapping call one its temporary
+    /// mask lets through is held, its stop returned with `pc` just past the
+    /// `svc` and `x0` the result. One difference follows from the order: in
+    /// the step loop the step's SIGTRAP is already queued ahead of a signal
+    /// sent back to the queue, and ends the step first; here the second
+    /// `svc`'s SIGTRAP is queued behind it, and once that SIGTRAP is pending
+    /// `dequeue_synchronous_signal` (kernel/signal.c:706-746 at v6.12.9)
+    /// takes the first synchronous signal with a positive code, even a
+    /// blocked one. A requeued signal of that kind (a seccomp trap's SIGSYS,
+    /// or a fault a thread queued itself) therefore stops the thread again,
+    /// which this loop refuses as a protocol violation (`EPROTO`).
+    #[cfg(target_arch = "aarch64")]
+    async fn aarch64_step_end_by_sysemu(
+        &mut self,
+        exit_stop: Stopped,
+        nr: Sysno,
+        input: Option<&NativeCallContext>,
+    ) -> Result<(Wait, bool), TraceError> {
+        let svc = cp::PRIVATE_PAGE_OFFSET as u64;
+        let after_syscall = svc + cp::SYSCALL_INSTR_SIZE as u64;
+        let mut regs = exit_stop.getregs()?;
+        let result = regs.ret();
+        *regs.ip_mut() = svc;
+        *regs.ret_mut() = 0;
+        exit_stop.setregs(&regs)?;
+        // The step's end: `pc` just past the `svc`, `x0` the call's result.
+        let step_end = |stopped: &Stopped| -> Result<(), TraceError> {
+            let mut regs = stopped.getregs()?;
+            *regs.ip_mut() = after_syscall;
+            *regs.ret_mut() = result;
+            stopped.setregs(&regs)?;
+            Ok(())
+        };
+        let mut seccomp_trapped = false;
+        let mut requeued: u64 = 0;
+        let mut returned: u64 = 0;
+        let lift_requeued = |stopped: &Stopped, requeued: u64| -> Result<(), TraceError> {
+            if requeued != 0 {
+                let mask = stopped.getsigmask()?;
+                stopped.setsigmask(mask & !requeued)?;
+            }
+            Ok(())
+        };
+        let mut running = self.sysemu_step_stopped_any_input(exit_stop, None, input)?;
+        loop {
+            let wait = running.next_state_with_owner(&self.ptracer_waits).await?;
+            self.arm_liteinst_wait(&wait);
+            let (stopped, sig) = match wait {
+                // The second `svc`'s entry stop: it is skipped, and its exit
+                // reports the step.
+                Wait::Stopped(stopped, Event::Syscall) => {
+                    running = self.sysemu_step_stopped_any_input(stopped, None, input)?;
+                    continue;
+                }
+                Wait::Stopped(stopped, event) if let Some(sig) = event.signal() => (stopped, sig),
+                Wait::Stopped(stopped, event) => {
+                    lift_requeued(&stopped, requeued)?;
+                    return Ok((Wait::Stopped(stopped, event), seccomp_trapped));
+                }
+                wait => return Ok((wait, seccomp_trapped)),
+            };
+            if sig == Signal::SIGTRAP {
+                step_end(&stopped)?;
+                lift_requeued(&stopped, requeued)?;
+                return Ok((Wait::Stopped(stopped, Event::from_signal(sig)), seccomp_trapped));
+            }
+            if is_group_stop(&stopped, sig)? {
+                running = self.sysemu_step_stopped_any_input(stopped, None, input)?;
+                continue;
+            }
+            let any = sig;
+            let bit = signal_mask_bit(any);
+            if returned & bit != 0 {
+                tracing::error!(
+                    "[scheduler/tool] (pid = {}) {} stopped injected {} again after it was returned",
+                    stopped.pid(),
+                    sig,
+                    nr
+                );
+                return Err(Errno::EPROTO.into());
+            }
+            if sig == Signal::SIGSYS && is_private_seccomp_trap(&stopped, after_syscall)? {
+                seccomp_trapped = true;
+            }
+            let (blocked, mask) = if swaps_signal_mask(nr) {
+                (blocked_signal_mask(stopped.pid())?, None)
+            } else {
+                let mask = stopped.getsigmask()?;
+                (mask, Some(mask))
+            };
+            if blocked & bit != 0 {
+                returned |= bit;
+                running = self.sysemu_step_stopped_any_input(stopped, Some(any), input)?;
+            } else if let Some(mask) = mask {
+                stopped.setsigmask(mask | bit)?;
+                requeued |= bit;
+                returned |= bit;
+                running = self.sysemu_step_stopped_any_input(stopped, Some(any), input)?;
+            } else {
+                tracing::debug!(
+                    "[scheduler/tool] (pid = {}) holding {} delivered after injected {} completed; later signals stay queued",
+                    stopped.pid(),
+                    sig,
+                    nr
+                );
+                step_end(&stopped)?;
+                lift_requeued(&stopped, requeued)?;
+                return Ok((Wait::Stopped(stopped, Event::from_signal(sig)), seccomp_trapped));
             }
         }
     }
