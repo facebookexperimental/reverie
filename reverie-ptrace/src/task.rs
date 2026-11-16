@@ -2372,6 +2372,8 @@ pub(crate) enum SyscallStopOutcome {
 /// to the number (`syscall_rollback`) and forces SIGSYS on the thread before
 /// any signal work, which comes only after the exit stop; so any other return
 /// value, or no SIGSYS pending, means the instruction did not end in a trap.
+/// aarch64 classifies with `classify_rolled_back_syscall_exit`.
+#[cfg(any(test, target_arch = "x86_64"))]
 pub(crate) fn classify_syscall_stop_exit(
     ret: u64,
     nr: Sysno,
@@ -2383,6 +2385,22 @@ pub(crate) fn classify_syscall_stop_exit(
     match sigsys_pending {
         Some(false) => SyscallStopOutcome::Ran,
         Some(true) | None => SyscallStopOutcome::Unproven,
+    }
+}
+
+/// Classifies an aarch64 exit stop as `classify_syscall_stop_exit` does an
+/// x86-64 one: `rolled_back` is whether the return register holds what a
+/// `SECCOMP_RET_TRAP` leaves there, the call's first argument
+/// (`syscall_rollback`), and `sigsys_pending` whether SIGSYS is pending in
+/// the thread's own queue (`None`: unreadable).
+#[cfg(any(test, target_arch = "aarch64"))]
+pub(crate) fn classify_rolled_back_syscall_exit(
+    rolled_back: bool,
+    sigsys_pending: Option<bool>,
+) -> SyscallStopOutcome {
+    match (rolled_back, sigsys_pending) {
+        (false, _) | (true, Some(false)) => SyscallStopOutcome::Ran,
+        (true, Some(true) | None) => SyscallStopOutcome::Unproven,
     }
 }
 
@@ -4995,6 +5013,11 @@ pub struct TracedTask<L: Tool> {
     /// single-stepped (`syscall_stops_admitted`), from its admission until
     /// `status_to_result` takes its outcome; `None` for a stepped one.
     syscall_stop_injection: Option<Sysno>,
+    /// The registers an injection run between syscall stops was started with
+    /// (`syscall_stop_injection`), for its exit stop
+    /// (`aarch64_syscall_stop_exit`).
+    #[cfg(target_arch = "aarch64")]
+    syscall_stop_registers: Option<libc::user_regs_struct>,
     /// Set at an exec stop when SIGTRAP is neither ignored nor blocked and no
     /// repair is owed: then no step through pre-init and the new image's
     /// first instruction can reset it, and those steps skip the SIGTRAP work
@@ -5458,6 +5481,8 @@ impl<L: Tool> TracedTask<L> {
             absorbing_sigtrap: None,
             restore_maybe_pending: true,
             syscall_stop_injection: None,
+            #[cfg(target_arch = "aarch64")]
+            syscall_stop_registers: None,
             sigtrap_table,
             sigtrap_scratch_state: Arc::new(AtomicU8::new(SCRATCH_PENDING)),
             segv_run: StdMutex::new(SignalRun::Unknown),
@@ -5583,6 +5608,8 @@ impl<L: Tool> TracedTask<L> {
             absorbing_sigtrap: None,
             restore_maybe_pending: true,
             syscall_stop_injection: None,
+            #[cfg(target_arch = "aarch64")]
+            syscall_stop_registers: None,
             sigtrap_table: self.sigtrap_table,
             sigtrap_scratch_state: self.sigtrap_scratch_state.clone(),
             segv_run: StdMutex::new(SignalRun::Unknown),
@@ -5728,6 +5755,8 @@ impl<L: Tool> TracedTask<L> {
             absorbing_sigtrap: None,
             restore_maybe_pending: true,
             syscall_stop_injection: None,
+            #[cfg(target_arch = "aarch64")]
+            syscall_stop_registers: None,
             sigtrap_table,
             sigtrap_scratch_state,
             segv_run: StdMutex::new(SignalRun::Unknown),
@@ -12345,6 +12374,10 @@ impl<L: Tool + 'static> TracedTask<L> {
         // (`step_private_syscall`) uses the transport decided above.
         if syscall_stops {
             self.syscall_stop_injection = Some(nr);
+            #[cfg(target_arch = "aarch64")]
+            {
+                self.syscall_stop_registers = Some(regs);
+            }
         }
         if shield != 0 {
             // The shielded injection runs the thread to the syscall's entry
@@ -14288,7 +14321,9 @@ impl<L: Tool + 'static> TracedTask<L> {
     /// temporary mask's restore is pending, so whichever thread stops first
     /// pays it. A syscall-exit stop is a ptrace notification, which resets
     /// nothing. Admitted, decided afresh for each injection:
-    /// 1. on x86_64 (aarch64's restart and syscall-stop registers differ);
+    /// 1. on x86_64 or aarch64, whose exit stop reports `x7` as the stop's
+    ///    direction, rolls a seccomp trap back to the first argument and
+    ///    keeps the injected call's `syscallno` (`aarch64_syscall_stop_exit`);
     /// 2. a syscall that swaps the mask with these arguments
     ///    (`StepKind::SwapsMask` of `injection_swaps_signal_mask`): a poll
     ///    or wait that names no temporary mask swaps nothing, and its step
@@ -14299,7 +14334,8 @@ impl<L: Tool + 'static> TracedTask<L> {
     ///    tracer and a Tool that honours the serialized-execution contract;
     /// 5. in a thread with no seccomp filter of the guest's
     ///    (`guest_has_own_seccomp_filter`), whose `SECCOMP_RET_TRAP` the exit
-    ///    stop could not tell from a result (`classify_syscall_stop_exit`);
+    ///    stop could not tell from a result (`classify_syscall_stop_exit`,
+    ///    `classify_rolled_back_syscall_exit` on aarch64);
     /// 6. with no signal held for the resume (`pending_signal`), whose
     ///    siginfo is written back only at a signal-delivery stop
     ///    (`report_held_signal`).
@@ -14310,7 +14346,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         if NO_SYSCALL_STOPS_FOR_TEST.with(|none| none.get()) {
             return false;
         }
-        if !cfg!(target_arch = "x86_64")
+        if !cfg!(any(target_arch = "x86_64", target_arch = "aarch64"))
             || step_kind(nr, injection_swaps_signal_mask(nr, args)) != StepKind::SwapsMask
             || self.in_signal_callback
             || self.in_held_signal_callback
@@ -16399,6 +16435,58 @@ impl<L: Tool + 'static> TracedTask<L> {
         Ok(result)
     }
 
+    /// The exit stop of an aarch64 injection run between syscall stops
+    /// (`syscall_private_syscall`), read before any observer or restoration
+    /// reads it: its registers `regs`, corrected, and its outcome.
+    ///
+    /// arm64 differs from x86-64 there in three ways (`report_syscall`,
+    /// arch/arm64/kernel/ptrace.c:2241-2283 at v6.12.9):
+    /// - `x7` reads as the stop's direction (1 at exit) and the kernel puts
+    ///   its value back after the stop, discarding a write. The value the
+    ///   injection started with is written back here, so that registers read
+    ///   at this stop (`Guest::regs`, or a later injection's saved context)
+    ///   carry it.
+    /// - A `SECCOMP_RET_TRAP` leaves `x0` as `orig_x0`, the call's first
+    ///   argument (`syscall_rollback`, arch/arm64/include/asm/syscall.h:26-30),
+    ///   where x86-64 leaves the number. A thread with a guest filter of its
+    ///   own is never admitted to this transport, so the trap can come only
+    ///   from a filter another thread installs after that check
+    ///   (`syscall_stops_admitted`).
+    /// - The kernel's `syscallno` stays the injected call's: restoring
+    ///   `NT_PRSTATUS` does not write it. Resumed from this stop with a signal
+    ///   pending (the one that interrupted the call stays queued), the thread
+    ///   runs `do_signal` (arch/arm64/kernel/signal.c:1395-1427), which reads
+    ///   `x0` as that call's result while `syscallno` names a syscall: a later
+    ///   injection's first argument that reads as a restart code would rewind
+    ///   `pc` before the private page and be replaced by `orig_x0`, the
+    ///   injected call's first argument. It is set to `NO_SYSCALL` here, as
+    ///   `do_signal`'s `forget_syscall` leaves it after a stepped injection
+    ///   that a signal met.
+    #[cfg(target_arch = "aarch64")]
+    fn aarch64_syscall_stop_exit(
+        &mut self,
+        stopped: &Stopped,
+        mut regs: libc::user_regs_struct,
+    ) -> Result<(libc::user_regs_struct, SyscallStopOutcome), TraceError> {
+        let started = self
+            .syscall_stop_registers
+            .take()
+            .ok_or(TraceError::Errno(Errno::EPROTO))?;
+        regs.regs[7] = started.regs[7];
+        stopped.setregs(&regs)?;
+        let rolled_back = regs.ret() == started.regs[0];
+        let sigsys_pending = if rolled_back {
+            thread_sigsys_pending(stopped.pid())
+        } else {
+            None
+        };
+        let outcome = classify_rolled_back_syscall_exit(rolled_back, sigsys_pending);
+        if outcome == SyscallStopOutcome::Ran {
+            stopped.set_syscall(-1)?;
+        }
+        Ok((regs, outcome))
+    }
+
     async fn status_to_result(
         &mut self,
         wait_status: Wait,
@@ -16419,14 +16507,18 @@ impl<L: Tool + 'static> TracedTask<L> {
             && let Wait::Stopped(stopped, Event::Syscall) = &wait_status
         {
             let regs = stopped.getregs()?;
-            let sigsys_pending = if regs.ret() as i64 == nr.id() as i64 {
-                thread_sigsys_pending(stopped.pid())
-            } else {
-                None
+            #[cfg(target_arch = "x86_64")]
+            let outcome = {
+                let sigsys_pending = if regs.ret() as i64 == nr.id() as i64 {
+                    thread_sigsys_pending(stopped.pid())
+                } else {
+                    None
+                };
+                classify_syscall_stop_exit(regs.ret(), nr, sigsys_pending)
             };
-            if classify_syscall_stop_exit(regs.ret(), nr, sigsys_pending)
-                == SyscallStopOutcome::Unproven
-            {
+            #[cfg(target_arch = "aarch64")]
+            let (regs, outcome) = self.aarch64_syscall_stop_exit(stopped, regs)?;
+            if outcome == SyscallStopOutcome::Unproven {
                 return Err(self.fail_unproven_completion(stopped.pid(), nr));
             }
             self.note_injection_stop(&wait_status)?;
@@ -20214,5 +20306,30 @@ mod held_reason_tests {
             Some(Reason::HeldWithAnotherPending)
         );
         assert_eq!(held_pending_reason(None, 0), Some(Reason::HeldUnreadable));
+    }
+}
+
+/// The aarch64 exit-stop classification, which reads no tracee and so runs on
+/// every architecture.
+#[cfg(test)]
+mod aarch64_syscall_stop_exit_tests {
+    use super::*;
+
+    #[test]
+    fn only_a_rolled_back_first_argument_with_sigsys_pending_is_unproven() {
+        use SyscallStopOutcome::*;
+        assert_eq!(classify_rolled_back_syscall_exit(false, None), Ran);
+        assert_eq!(classify_rolled_back_syscall_exit(false, Some(true)), Ran);
+        assert_eq!(
+            classify_rolled_back_syscall_exit(true, Some(false)),
+            Ran,
+            "a result equal to the first argument with no SIGSYS pending ran"
+        );
+        assert_eq!(classify_rolled_back_syscall_exit(true, Some(true)), Unproven);
+        assert_eq!(
+            classify_rolled_back_syscall_exit(true, None),
+            Unproven,
+            "SIGSYS unreadable"
+        );
     }
 }
