@@ -32,7 +32,7 @@
 //!   (`arch/signal_amd64`, `kernel/task_signals`, `kernel/pending_signals`).
 //! - `proc_mechanics`: the core-owned `/proc` mechanics -- synthetic
 //!   file identities, guest path classification, and
-//!   [`SingleRecordSeq`](proc_mechanics::SingleRecordSeq), the
+//!   `SingleRecordSeq`, the
 //!   single-record seq_file state that reads of the synthetic
 //!   `/proc/self/status` go through (`fsimpl/proc`).
 //! - [`provider`]: the `reverie::provider` interface as LinuxEmu answers it.

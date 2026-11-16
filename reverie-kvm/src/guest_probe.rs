@@ -707,7 +707,7 @@ pub struct RunnerFacts {
     pub cpuid_7_0_ebx: u32,
     /// CPUID.80000008H:EBX, for XSAVEERPTR (bit 2) on AMD.
     pub cpuid_8000_0008_ebx: u32,
-    /// CPUID.1:ECX[31]: the host itself runs under a hypervisor.
+    /// CPUID.1:ECX\[31\]: the host itself runs under a hypervisor.
     pub hypervisor: bool,
     /// /sys/kernel/sched_ext/state. A sched_ext scheduler in full-switch mode
     /// schedules SCHED_OTHER threads without changing what

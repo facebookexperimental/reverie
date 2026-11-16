@@ -8753,7 +8753,7 @@ impl OwnedWaitFuture {
 
     /// Blocks until this wait's Event has a status to return, for at most
     /// `timeout`, without reserving or consuming it (see
-    /// [`Event::block_until_status`]), so that the next poll finds it. A
+    /// `Event::block_until_status`), so that the next poll finds it. A
     /// Procfs (legacy non-leader) wait, whose status the ptracer thread
     /// consumes itself, returns `None` at once, as does a completed wait.
     pub fn block_until_ready(&self, timeout: Duration) -> Option<bool> {

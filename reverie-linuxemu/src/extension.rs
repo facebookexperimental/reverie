@@ -13,7 +13,7 @@
 //! numbers the core does not answer and synthetic `/proc/self` paths
 //! the core does not serve. It receives the narrow [`ExtensionCtx`]
 //! facade and its own per-task slot; it never names
-//! [`LoadedStaticElf`](crate::elf::LoadedStaticElf), a scheduler, a
+//! [`LoadedStaticElf`], a scheduler, a
 //! clock, or host state.
 //!
 //! Hermit's composition installs the empty table, so every seam below

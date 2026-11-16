@@ -1,10 +1,18 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
 //! A guest sendmsg or sendmmsg at an unpatched syscall site, trapped and run
 //! through the installed Tool's fallback path, with control data, a msghdr
 //! or a sendmmsg vector on a page under a protection key the guest denies,
 //! allows, or allows only for reading. While a reserved descriptor exists
 //! (the coordinator connection is one), the runtime runs such a send on a
 //! checked copy of its message headers and control data
-//! (https://github.com/facebookexperimental/reverie/issues/56), which it
+//! (<https://github.com/facebookexperimental/reverie/issues/56>), which it
 //! makes, and into which it stores a sent message's msg_len, with the
 //! interrupted guest's rights. Every case runs natively first, before the
 //! Tool is installed, and then through the Tool, and the two are compared.
