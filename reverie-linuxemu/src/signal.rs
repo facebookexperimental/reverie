@@ -36,7 +36,7 @@ pub(crate) const UCONTEXT_SIZE: usize = 304;
 pub const LEGACY_FPSTATE_SIZE: usize = 512;
 pub const RT_SIGFRAME_SIZE: usize = 8 + UCONTEXT_SIZE + SIGINFO_SIZE;
 pub const RT_SIGRETURN_SIZE: usize = 8 + UCONTEXT_SIZE;
-pub(crate) const XSAVE_SIZE: usize = 832;
+pub const XSAVE_SIZE: usize = 832;
 pub(crate) const XSAVE_SIGNAL_SIZE: usize = XSAVE_SIZE + 4;
 
 pub(crate) const SIGNAL_RED_ZONE: u64 = 128;

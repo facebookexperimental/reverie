@@ -72,6 +72,24 @@ const CR4_OSXSAVE: u64 = 1 << 18;
 const XCR0_X87: u64 = 1 << 0;
 const XCR0_SSE: u64 = 1 << 1;
 const XCR0_YMM: u64 = 1 << 2;
+
+/// The exact guest XCR0 every vCPU is configured with: x87, SSE and YMM
+/// only, the components its CPUID table presents (the backend's signal
+/// frames carry exactly these). Pinned against the other definitions
+/// of the same machine by cross-crate tests.
+pub const FIXED_GUEST_XCR0: u64 = XCR0_X87 | XCR0_SSE | XCR0_YMM;
+
+/// The named refusal for a vCPU whose installed XCR0 is not exactly
+/// [`FIXED_GUEST_XCR0`], or `None` when it is. Pure, so the readback
+/// check is testable without a vCPU.
+pub(crate) fn fixed_xcr0_refusal(installed: u64) -> Option<Error> {
+    (installed != FIXED_GUEST_XCR0).then(|| {
+        Error::UnsupportedCpuidProfile(format!(
+            "KVM installed guest XCR0 {installed:#x}, not the fixed {FIXED_GUEST_XCR0:#x} \
+             (x87, SSE and YMM); use a host whose KVM supports AVX, or run with --backend=ptrace"
+        ))
+    })
+}
 const EFER_SCE: u64 = 1 << 0;
 const EFER_LME: u64 = 1 << 8;
 const EFER_LMA: u64 = 1 << 10;
@@ -209,8 +227,28 @@ pub fn configure_long_mode_with_syscall_area(
         .ok_or_else(|| {
             Error::UnsupportedCpuidProfile("KVM did not expose guest XCR0".to_string())
         })?;
-    xcr0.value |= XCR0_X87 | XCR0_SSE | XCR0_YMM;
-    vcpu.set_xcrs(&xcrs)?;
+    // The presented machine has exactly these components, never whatever
+    // a vCPU reset left above them.
+    xcr0.value = FIXED_GUEST_XCR0;
+    // KVM_SET_XCRS fails before any readback can disagree (EINVAL when
+    // the host's guest-supported XCR0 lacks a component), so name that
+    // refusal here instead of surfacing a bare ioctl errno.
+    vcpu.set_xcrs(&xcrs).map_err(|error| {
+        Error::UnsupportedCpuidProfile(format!(
+            "KVM refused guest XCR0 {FIXED_GUEST_XCR0:#x} (x87, SSE and YMM): {error}; \
+             use a host whose KVM supports AVX, or run with --backend=ptrace"
+        ))
+    })?;
+    let installed = vcpu.get_xcrs()?;
+    let installed = installed.xcrs[..installed.nr_xcrs as usize]
+        .iter()
+        .find(|xcr| xcr.xcr == 0)
+        .ok_or_else(|| {
+            Error::UnsupportedCpuidProfile("KVM did not expose guest XCR0".to_string())
+        })?;
+    if let Some(refusal) = fixed_xcr0_refusal(installed.value) {
+        return Err(refusal);
+    }
 
     let fpu = kvm_fpu {
         fcw: 0x37f,
@@ -1119,6 +1157,26 @@ pub fn frame_word_address_u64(syscall_frame_address: u64, word: usize) -> u64 {
 mod tests {
     use super::*;
     use crate::SyscallRequest;
+
+    #[test]
+    fn the_fixed_xcr0_readback_refuses_any_other_value_by_name() {
+        assert_eq!(FIXED_GUEST_XCR0, 0x7);
+        assert!(fixed_xcr0_refusal(FIXED_GUEST_XCR0).is_none());
+        // Extra component above YMM, missing YMM, x87 only, and a
+        // host-sized Zen 5 value all refuse, naming both values.
+        for installed in [0xfu64, 0x207, 0x2e7, 0x3, 0x1, 0] {
+            let refusal = fixed_xcr0_refusal(installed).expect("must refuse");
+            let Error::UnsupportedCpuidProfile(message) = refusal else {
+                panic!("refusal must be the named profile refusal: {refusal:?}");
+            };
+            assert!(
+                message.contains(&format!("{installed:#x}"))
+                    && message.contains("not the fixed 0x7")
+                    && message.contains("--backend=ptrace"),
+                "{message}"
+            );
+        }
+    }
 
     /// The memoized hypercall offset and return byte equal a fresh build of
     /// the trampoline for every input, including after the inputs change
