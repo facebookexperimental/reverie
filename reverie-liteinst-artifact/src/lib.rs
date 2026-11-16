@@ -1491,8 +1491,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 88] = [
     ),
     (
         "reverie-inguest/src/guest/host.rs",
-        424647,
-        "e2704b332e4106751c232cf59ca0bffe59463c4a54fda100c6ae46516736b927",
+        426999,
+        "b70381d892784ffe85fa93652b9e46620170bc0cb2f433bd4f2bf77cdcaaa402",
     ),
     (
         "reverie-inguest/src/guest/host_linux.rs",
@@ -1551,8 +1551,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 88] = [
     ),
     (
         "reverie-inguest/src/guest/clock.rs",
-        25951,
-        "34d773ff0b576151381353320eedc4a082ebabd081a1c6d59871470c91a5a503",
+        26432,
+        "a58f4388809fc4998398b77ac4952cd31a1ab67c1e134dfc6fef253fa630925d",
     ),
     (
         "reverie-inguest/src/lifecycle.rs",
@@ -39224,6 +39224,16 @@ mod tests {
             26923,
             "4de43d7e4b4883226c02ade760f43d29cbb155f5b7d5dd076845f6b6a16cc7cf",
         ),
+        (
+            "reverie-inguest/src/guest/host.rs",
+            426999,
+            "b70381d892784ffe85fa93652b9e46620170bc0cb2f433bd4f2bf77cdcaaa402",
+        ),
+        (
+            "reverie-inguest/src/guest/clock.rs",
+            26432,
+            "a58f4388809fc4998398b77ac4952cd31a1ab67c1e134dfc6fef253fa630925d",
+        ),
     ];
 
     /// Seals over prefixes of `CONTENT_REVERIE_CATALOG_BINDINGS`: (rows covered,
@@ -39261,6 +39271,10 @@ mod tests {
         (
             110,
             "3367ab61d430a4d823d9ac5536e7eed054a948ac628acc93cf43e6d1ad3548d0",
+        ),
+        (
+            112,
+            "78d7483cd8f4946cf91bde240882b3f080211a89ccd6b10b48518d1a3d411589",
         ),
     ];
 
@@ -40536,6 +40550,16 @@ mod tests {
                 "reverie-syscalls/src/reserved_fds.rs",
                 19493,
                 "7292ea41830525c114eae8d2acf394dee1accd7a48804412c446c6737a181f23",
+            ),
+            (
+                "reverie-inguest/src/guest/clock.rs",
+                25951,
+                "34d773ff0b576151381353320eedc4a082ebabd081a1c6d59871470c91a5a503",
+            ),
+            (
+                "reverie-inguest/src/guest/host.rs",
+                424647,
+                "e2704b332e4106751c232cf59ca0bffe59463c4a54fda100c6ae46516736b927",
             ),
         ];
         // A re-bind records its previous tuple above, for every path, not only these.
