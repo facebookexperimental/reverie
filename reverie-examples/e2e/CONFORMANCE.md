@@ -90,6 +90,26 @@ with a `REVERIE_SKIP:` line that the per-crate scorecard counts as
 skipped, never as passed (and fails outright when `REVERIE_REQUIRE_KVM`
 is set).
 
+The one named ledger difference at the `cargo test` layer is the
+in-guest `/proc/self/maps` read run segment
+(`MAPS_READ_RUN` in `tests/conformance.rs`): in-guest maps lists
+runtime mappings, so its content is about 3x the kernel's length
+(measured on Ubuntu 26.04 for `/bin/echo`: native 5,449 bytes vs
+in-guest-trap 16,287 and liteinst 17,268, all in full 1 KiB guest
+reads) and a guest reading it makes a different number of
+`read` calls. A record collapses exactly that segment — an
+`fstat`, a uniform full-size read run, an `lseek` returning the
+run's byte total, a second `lseek`, and `close` — only when the
+segment is bound by descriptor to a successful `openat` of
+`/proc/self/maps` in the same run's `strace_minimal` output
+(the native side binds against a ptrace strace run, whose name
+stream the ptrace leg proves equal to the native record);
+missing or unparsable strace output, a failed open, descriptor
+reuse, or any other path leaves the record literal. Every other
+call is still compared strictly. Whether synthetic maps should
+instead trim runtime mappings is
+https://github.com/facebookexperimental/hermit/issues/241.
+
 A backend that cannot host a tool or a program must refuse by name
 (`REFUSED:`), never fail silently or pass vacuously. A refusal is its own
 scorecard verdict, separate from a mismatch.
