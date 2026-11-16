@@ -1244,6 +1244,19 @@ pub struct LoadedStaticElf {
     /// `reverie_kvm::KvmBackend::reserve_tool_directory`; fork, clone and
     /// exec carry it unchanged.
     pub tool_directory: Option<ToolDirectory>,
+    /// The run's optional-extension composition ([`crate::extension`]),
+    /// installed on the loaded state before a backend runs it. Empty
+    /// by default, and always empty under Hermit, so the seams are
+    /// no-ops there. Fork, thread clone, and exec carry the same
+    /// table; there is no backend-side extension setter.
+    pub(crate) extension_table: std::sync::Arc<crate::extension::ExtensionTable>,
+    /// This task's extension slots, one per registered extension, in
+    /// registration order. Created by the table's factories at load,
+    /// derived by `on_clone` for a child task, and dropped and
+    /// recreated by a successful exec. Crate-private so a slot is
+    /// reachable only through the extension facade, never by
+    /// indexing another task's state.
+    pub(crate) extensions: Box<[Option<Box<dyn crate::extension::ExtensionState>>]>,
     /// Linux task name (`comm`), including the terminating NUL byte.
     ///
     /// This is per-thread state: fork and clone inherit the caller's value,
@@ -1489,7 +1502,11 @@ impl LoadedStaticElf {
         let _retirement = self.file_retirement.hold();
         let transaction = self.signal_transaction.clone();
         let _transaction = transaction.lock().unwrap_or_else(|p| p.into_inner());
-        self.try_clone_for_fork_locked(child_pid, crate::executor::ForkDescriptors::of_state(self)?)
+        self.try_clone_for_fork_locked(
+            child_pid,
+            crate::executor::ForkDescriptors::of_state(self)?,
+            crate::extension::ExtensionClone::process_fork(0),
+        )
     }
 
     /// A new task's state: this one's, with the descriptors `descriptors`.
@@ -1497,6 +1514,7 @@ impl LoadedStaticElf {
         &self,
         child_pid: i32,
         descriptors: crate::executor::ForkDescriptors,
+        extension_clone: crate::extension::ExtensionClone,
     ) -> Result<Self> {
         // TODO-HUMAN-REVIEW(PR-136): Review shared file identity inheritance across fork.
         let crate::executor::ForkDescriptors {
@@ -1568,6 +1586,8 @@ impl LoadedStaticElf {
             ids_per_task: self.ids_per_task,
             host_metadata_timestamps: self.host_metadata_timestamps,
             tool_directory: self.tool_directory.clone(),
+            extension_table: self.extension_table.clone(),
+            extensions: self.clone_extension_slots(extension_clone),
             thread_name: self.thread_name,
             thread_group_leader_name: std::sync::Arc::new(std::sync::Mutex::new(self.thread_name)),
             thp_disabled: std::sync::Arc::new(AtomicU8::new(
@@ -1813,6 +1833,13 @@ impl LoadedStaticElf {
         self.ids_per_task = previous.ids_per_task;
         self.host_metadata_timestamps = previous.host_metadata_timestamps;
         self.tool_directory = previous.tool_directory;
+        // The composition survives exec; its per-task slots do not.
+        // The previous slots drop with `previous` at the end of this
+        // commit, and the new image starts from the factories. A
+        // failed exec never reaches this replacement, so its slots
+        // are the identical objects.
+        self.extension_table = previous.extension_table.clone();
+        self.extensions = self.extension_table.new_slots();
         // `thread_name` intentionally remains the replacement image's name.
         self.thp_disabled = thp_disabled;
         self.credentials.keep_capabilities = false;
@@ -2619,6 +2646,8 @@ fn load_executable(
         ids_per_task: reverie::task_ids::LINUX_IDS_PER_TASK,
         host_metadata_timestamps: false,
         tool_directory: None,
+        extension_table: std::sync::Arc::new(crate::extension::ExtensionTable::empty()),
+        extensions: Box::default(),
         thread_name,
         thread_group_leader_name: std::sync::Arc::new(std::sync::Mutex::new(thread_name)),
         thp_disabled: std::sync::Arc::new(AtomicU8::new(0)),

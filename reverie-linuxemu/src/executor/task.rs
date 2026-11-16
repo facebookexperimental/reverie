@@ -813,7 +813,20 @@ impl ElfExecutor {
         }
         if number == libc::SYS_fork as u64 || number == libc::SYS_vfork as u64 {
             let share_address_space = number == libc::SYS_vfork as u64;
-            return Some(self.prepare_fork(None, None, None, None, false, share_address_space));
+            let clone_flags = if share_address_space {
+                libc::CLONE_VM as u64 | libc::CLONE_VFORK as u64
+            } else {
+                0
+            };
+            return Some(self.prepare_fork(
+                None,
+                None,
+                None,
+                None,
+                false,
+                share_address_space,
+                clone_flags,
+            ));
         }
         if number == libc::SYS_clone as u64 {
             return Some(self.prepare_clone(
@@ -854,6 +867,7 @@ impl ElfExecutor {
                             None,
                             request.flags & CLONE_CLEAR_SIGHAND != 0,
                             request.flags & libc::CLONE_VM as u64 != 0,
+                            request.flags,
                         ),
                     },
                     Err(error) => self.refuse_clone3_fields(error),
@@ -901,6 +915,7 @@ impl ElfExecutor {
             clear_child_tid,
             flags & CLONE_CLEAR_SIGHAND != 0,
             flags & libc::CLONE_VM as u64 != 0,
+            flags,
         )
     }
 
@@ -991,6 +1006,7 @@ impl ElfExecutor {
                 .then_some(child_tid_address)
                 .flatten(),
             tls,
+            clone_flags: flags,
         });
         i64::from(child_tid)
     }
@@ -1003,6 +1019,7 @@ impl ElfExecutor {
         clear_child_tid: Option<u64>,
         clear_sighand: bool,
         share_address_space: bool,
+        clone_flags: u64,
     ) -> i64 {
         if self.process_action.is_some() {
             return negative_errno(libc::EBUSY);
@@ -1037,6 +1054,7 @@ impl ElfExecutor {
             clear_child_tid,
             clear_sighand,
             share_address_space,
+            clone_flags,
         });
         i64::from(child_pid)
     }
@@ -1256,11 +1274,33 @@ impl ElfExecutor {
         0
     }
 
+    /// Direct backend/test entry, without staged clone flags:
+    /// `share_address_space` selects the `CLONE_VM | CLONE_VFORK`
+    /// pair, otherwise plain-fork flags 0. Staged guest clones use
+    /// [`Self::fork_child_with_clone_flags`] with validated flags.
     pub fn fork_child(
         &self,
         child_pid: i32,
         clear_sighand: bool,
         share_address_space: bool,
+    ) -> crate::Result<Self> {
+        let clone_flags = if share_address_space {
+            libc::CLONE_VM as u64 | libc::CLONE_VFORK as u64
+        } else {
+            0
+        };
+        self.fork_child_with_clone_flags(child_pid, clear_sighand, share_address_space, clone_flags)
+    }
+
+    /// [`Self::fork_child`], with the validated clone flags the
+    /// staged [`ProcessAction::Fork`] carries, for extension slot
+    /// lifecycle.
+    pub fn fork_child_with_clone_flags(
+        &self,
+        child_pid: i32,
+        clear_sighand: bool,
+        share_address_space: bool,
+        clone_flags: u64,
     ) -> crate::Result<Self> {
         let terminal_cleanup = self
             .terminal_factory
@@ -1295,6 +1335,7 @@ impl ElfExecutor {
         state = self.state.try_clone_for_fork_locked(
             child_pid,
             shared_files.fork_descriptors(&self.state.file_retirement)?,
+            crate::extension::ExtensionClone::for_process(clone_flags),
         )?;
         drop(shared_files);
         _child_retirement = state.file_retirement.hold();
@@ -1423,15 +1464,50 @@ impl ElfExecutor {
     }
 
     // TODO-HUMAN-REVIEW(PR-172): Review shared address-space and output ownership.
+    /// Direct backend/test entry: creates the thread with the
+    /// required thread-clone flag set. Staged guest clones use
+    /// [`Self::thread_child_with_clone_flags`] with validated flags.
     pub fn thread_child(&self, child_tid: i32) -> crate::Result<Self> {
+        self.thread_child_with_clone_flags(child_tid, THREAD_CLONE_REQUIRED_FLAGS)
+    }
+
+    /// [`Self::thread_child`], with the validated clone flags the
+    /// staged [`ProcessAction::Thread`] carries, for extension slot
+    /// lifecycle.
+    pub fn thread_child_with_clone_flags(
+        &self,
+        child_tid: i32,
+        clone_flags: u64,
+    ) -> crate::Result<Self> {
         let observe_ignored = self.state.thread_signals.lock().observe_ignored;
-        self.thread_child_with_signal_observation(child_tid, observe_ignored)
+        self.thread_child_inner(child_tid, observe_ignored, clone_flags)
     }
 
     pub fn thread_child_with_signal_observation(
         &self,
         child_tid: i32,
         observe_ignored: bool,
+    ) -> crate::Result<Self> {
+        self.thread_child_inner(child_tid, observe_ignored, THREAD_CLONE_REQUIRED_FLAGS)
+    }
+
+    /// [`Self::thread_child_with_signal_observation`], with the
+    /// validated clone flags the staged [`ProcessAction::Thread`]
+    /// carries.
+    pub fn thread_child_with_signal_observation_and_clone_flags(
+        &self,
+        child_tid: i32,
+        observe_ignored: bool,
+        clone_flags: u64,
+    ) -> crate::Result<Self> {
+        self.thread_child_inner(child_tid, observe_ignored, clone_flags)
+    }
+
+    fn thread_child_inner(
+        &self,
+        child_tid: i32,
+        observe_ignored: bool,
+        clone_flags: u64,
     ) -> crate::Result<Self> {
         let terminal_cleanup = self
             .terminal_factory
@@ -1456,9 +1532,11 @@ impl ElfExecutor {
                     .to_owned(),
             ));
         }
-        state = self
-            .state
-            .try_clone_for_fork_locked(child_tid, ForkDescriptors::of_state(&self.state)?)?;
+        state = self.state.try_clone_for_fork_locked(
+            child_tid,
+            ForkDescriptors::of_state(&self.state)?,
+            crate::extension::ExtensionClone::thread(clone_flags),
+        )?;
         _child_retirement = state.file_retirement.hold();
         state.pid = self.state.pid;
         state.ppid = self.state.ppid;
@@ -2536,6 +2614,14 @@ impl ElfExecutor {
             crate::memory::vfork_window_steps::note("wake");
         }
         Ok(true)
+    }
+
+    /// Installs an extension composition on this executor's state
+    /// ([`LoadedStaticElf::install_extension_table`]). Composition
+    /// does this before the state is handed to a backend; the table
+    /// is then reached only through LinuxEmu state.
+    pub fn install_extension_table(&mut self, table: Arc<crate::extension::ExtensionTable>) {
+        self.state.install_extension_table(table);
     }
 
     pub fn take_process_action(&mut self) -> Option<ProcessAction> {

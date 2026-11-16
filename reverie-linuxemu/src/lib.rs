@@ -26,6 +26,8 @@
 //!   table (`kernel/fd_table`), pipes, epoll, inotify and the other file
 //!   descriptions (`kernel/pipe`, `vfs`, `fsimpl/*`).
 //! - [`elf`]: the ELF loader (`loader`) and the per-task state it creates.
+//! - [`extension`]: the optional-extension seams (syscall fallback,
+//!   per-task slots, and synthetic `/proc` claims), empty under Hermit.
 //! - [`signal`]: the signal ABI and per-thread and per-process signal state
 //!   (`arch/signal_amd64`, `kernel/task_signals`, `kernel/pending_signals`).
 //! - [`SingleRecordSeq`](reverie_procfs::SingleRecordSeq), in reverie-procfs:
@@ -45,6 +47,7 @@ pub mod core_dump;
 pub mod credentials;
 pub mod elf;
 pub mod executor;
+pub mod extension;
 pub mod native_exit_broker;
 pub mod provider;
 pub mod signal;

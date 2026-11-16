@@ -305,6 +305,7 @@ pub(crate) mod entry_action_tests {
                 clear_child_tid: None,
                 clear_sighand: false,
                 share_address_space: false,
+                clone_flags: 0,
             },
             Site::HostThread | Site::ToolThread => ProcessAction::Thread {
                 child_tid: CHILD,
@@ -313,6 +314,7 @@ pub(crate) mod entry_action_tests {
                 child_tid_address: Some(CHILD_TID),
                 clear_child_tid: None,
                 tls: None,
+                clone_flags: 0,
             },
             Site::Exec => {
                 let mut code = vec![0xbf];

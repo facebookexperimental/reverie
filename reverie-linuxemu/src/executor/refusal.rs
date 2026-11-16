@@ -496,6 +496,13 @@ pub(crate) const TOOL_DECIDED_SYSCALLS: [libc::c_long; 31] = [
     libc::SYS_getpgrp,
 ];
 
+/// Whether `number` is one of the calls in `TOOL_DECIDED_SYSCALLS`.
+pub(crate) fn is_tool_decided_syscall(number: u64) -> bool {
+    TOOL_DECIDED_SYSCALLS
+        .iter()
+        .any(|&tool_decided| number == tool_decided as u64)
+}
+
 /// Diagnostic carried by this backend's typed refusal of a call in
 /// `TOOL_DECIDED_SYSCALLS`.
 pub(crate) const TOOL_DECIDED_REFUSAL: &str = "KVM leaves this call to the Tool: Detcore \

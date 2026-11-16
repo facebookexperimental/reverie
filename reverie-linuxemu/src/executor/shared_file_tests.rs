@@ -1185,6 +1185,7 @@ mod shared_file_dispatch_tests {
                     clear_child_tid,
                     clear_sighand,
                     share_address_space,
+                    ..
                 }) => {
                     assert_eq!(child_pid, next, "{label}");
                     assert!(share_address_space, "{label}");

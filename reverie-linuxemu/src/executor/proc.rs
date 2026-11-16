@@ -503,7 +503,9 @@ pub(super) fn synthetic_proc_content(state: &LoadedStaticElf, path: &[u8]) -> Op
     let content = match normalized.as_slice() {
         b"/proc/self/status" => proc_self_status_content(state),
         b"/proc/self/maps" => proc_self_maps_content(state),
-        _ => return None,
+        // Core claims win above; an extension claim serves only a
+        // path the core does not, and the empty table declines here.
+        _ => return state.extension_proc_content(&normalized),
     };
     Some(content)
 }

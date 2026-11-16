@@ -3725,6 +3725,11 @@ impl KvmBackend {
             clear_child_tid,
             clear_sighand,
             share_address_space,
+            if share_address_space {
+                libc::CLONE_VM as u64 | libc::CLONE_VFORK as u64
+            } else {
+                0
+            },
             park_syscall_return,
             fault,
             stop.as_mut(),
@@ -3743,6 +3748,7 @@ impl KvmBackend {
         clear_child_tid: Option<u64>,
         clear_sighand: bool,
         share_address_space: bool,
+        clone_flags: u64,
         park_syscall_return: bool,
         fault: Option<&UserTrap>,
         stop: Pin<&mut (dyn Future<Output = ()> + Send + '_)>,
@@ -3765,7 +3771,12 @@ impl KvmBackend {
         let mut prepared_executor = if shared_file_snapshot {
             None
         } else {
-            let child = executor.fork_child(child_pid, clear_sighand, share_address_space)?;
+            let child = executor.fork_child_with_clone_flags(
+                child_pid,
+                clear_sighand,
+                share_address_space,
+                clone_flags,
+            )?;
             #[cfg(test)]
             tests::entry_action_tests::observe("fork_executor");
             Some(child)
@@ -3848,8 +3859,12 @@ impl KvmBackend {
         let mut child_executor = match prepared_executor {
             Some(child) => child,
             None => {
-                let mut child_executor =
-                    executor.fork_child(child_pid, clear_sighand, share_address_space)?;
+                let mut child_executor = executor.fork_child_with_clone_flags(
+                    child_pid,
+                    clear_sighand,
+                    share_address_space,
+                    clone_flags,
+                )?;
                 #[cfg(test)]
                 tests::entry_action_tests::observe("fork_executor");
                 child_executor.set_clear_child_tid(clear_child_tid);
@@ -4020,6 +4035,7 @@ impl KvmBackend {
                 clear_child_tid,
                 clear_sighand,
                 share_address_space,
+                clone_flags,
             } => {
                 let Some(child) = self
                     .prepare_forked_process_admitted(
@@ -4031,6 +4047,7 @@ impl KvmBackend {
                         clear_child_tid,
                         clear_sighand,
                         share_address_space,
+                        clone_flags,
                         park_syscall_return,
                         fault,
                         stop.as_mut(),
@@ -4136,6 +4153,7 @@ impl KvmBackend {
                 child_tid_address,
                 clear_child_tid,
                 tls,
+                clone_flags,
             } => {
                 let Some((parent_registers, parent_xsave, parent_syscall_frame)) =
                     self.capture_thread_parent(stop.as_mut()).await?
@@ -4156,8 +4174,12 @@ impl KvmBackend {
                 write_tid_best_effort(&mut self.memory, parent_tid, child_tid);
                 write_tid_best_effort(&mut self.memory, child_tid_address, child_tid);
                 let child_fs = tls.unwrap_or(parent_fs);
-                let mut child_executor =
-                    executor.thread_child_with_signal_observation(child_tid, false)?;
+                let mut child_executor = executor
+                    .thread_child_with_signal_observation_and_clone_flags(
+                        child_tid,
+                        false,
+                        clone_flags,
+                    )?;
                 child_executor.set_thread_context(child_tid, child_fs, parent_gs);
                 child_executor.set_clear_child_tid(clear_child_tid);
                 let child_stdin = self.clone_reserved_stdin()?;
@@ -4626,6 +4648,7 @@ impl KvmBackend {
                 clear_child_tid,
                 clear_sighand,
                 share_address_space,
+                clone_flags,
             } => {
                 let Some(child) = self
                     .prepare_forked_process_admitted(
@@ -4637,6 +4660,7 @@ impl KvmBackend {
                         clear_child_tid,
                         clear_sighand,
                         share_address_space,
+                        clone_flags,
                         park_syscall_return,
                         fault,
                         stop.as_mut(),
@@ -4997,6 +5021,7 @@ impl KvmBackend {
                 child_tid_address,
                 clear_child_tid,
                 tls,
+                clone_flags,
             } => {
                 let Some((parent_registers, parent_xsave, parent_syscall_frame)) =
                     self.capture_thread_parent(stop.as_mut()).await?
@@ -5017,7 +5042,8 @@ impl KvmBackend {
                 write_tid_best_effort(&mut self.memory, parent_tid, child_tid);
                 write_tid_best_effort(&mut self.memory, child_tid_address, child_tid);
                 let child_fs = tls.unwrap_or(parent_fs);
-                let mut child_executor = executor.thread_child(child_tid)?;
+                let mut child_executor =
+                    executor.thread_child_with_clone_flags(child_tid, clone_flags)?;
                 child_executor.set_thread_context(child_tid, child_fs, parent_gs);
                 child_executor.set_clear_child_tid(clear_child_tid);
                 let child_stdin = self.clone_reserved_stdin()?;
@@ -9463,6 +9489,7 @@ mod tests {
             clear_child_tid: None,
             clear_sighand: false,
             share_address_space: false,
+            clone_flags: 0,
         };
         let thread = ProcessAction::Thread {
             child_tid: 3,
@@ -9471,6 +9498,7 @@ mod tests {
             child_tid_address: None,
             clear_child_tid: None,
             tls: None,
+            clone_flags: 0,
         };
         let exec = ProcessAction::Exec {
             executable_path: std::path::PathBuf::new(),
@@ -9770,6 +9798,7 @@ mod tests {
                             child_tid_address: None,
                             clear_child_tid: None,
                             tls: None,
+                            clone_flags: 0,
                         }
                     } else {
                         ProcessAction::Fork {
@@ -9780,6 +9809,7 @@ mod tests {
                             clear_child_tid: None,
                             clear_sighand: false,
                             share_address_space: false,
+                            clone_flags: 0,
                         }
                     };
                     let returned_registers = explicit_registers.then_some(user);
@@ -11051,6 +11081,7 @@ mod tests {
                         child_tid_address: None,
                         clear_child_tid: None,
                         tls: None,
+                        clone_flags: 0,
                     }
                 } else {
                     ProcessAction::Fork {
@@ -11061,6 +11092,7 @@ mod tests {
                         clear_child_tid: None,
                         clear_sighand: false,
                         share_address_space: false,
+                        clone_flags: 0,
                     }
                 };
                 let starts = Arc::new(Mutex::new(Vec::new()));
@@ -11702,6 +11734,7 @@ mod tests {
             child_tid_address: None,
             clear_child_tid: Some(address),
             tls: None,
+            clone_flags: 0,
         };
         let outcome = futures::executor::block_on(parent.run_process_action_with_tool_at_boundary(
             &mut executor,
@@ -12238,6 +12271,7 @@ mod tests {
                         child_tid_address: None,
                         clear_child_tid: None,
                         tls: None,
+                        clone_flags: 0,
                     }
                 } else {
                     ProcessAction::Fork {
@@ -12248,6 +12282,7 @@ mod tests {
                         clear_child_tid: None,
                         clear_sighand: false,
                         share_address_space: false,
+                        clone_flags: 0,
                     }
                 };
                 let continuation = ProcessActionContinuation::from_captured(&action, boundary);
@@ -12856,6 +12891,7 @@ mod tests {
                 clear_child_tid: None,
                 clear_sighand: false,
                 share_address_space: false,
+                clone_flags: 0,
             },
             PendingChildKind::ForkProcess(41),
         );
@@ -12871,6 +12907,7 @@ mod tests {
                 child_tid_address: None,
                 clear_child_tid: None,
                 tls: None,
+                clone_flags: 0,
             },
             PendingChildKind::ToolThread(42),
         );

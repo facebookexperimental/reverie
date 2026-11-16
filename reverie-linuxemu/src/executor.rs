@@ -282,6 +282,10 @@ pub enum ProcessAction {
         clear_sighand: bool,
         // `vfork` and its clone variants share the parent's address space until exec.
         share_address_space: bool,
+        // The validated clone flags, for extension slot lifecycle
+        // (`crate::extension::ExtensionClone`); plain `fork` is 0 and
+        // `vfork` is `CLONE_VM | CLONE_VFORK`.
+        clone_flags: u64,
     },
     // TODO-HUMAN-REVIEW(PR-132): Review cooperative single-vCPU thread cloning.
     Thread {
@@ -291,6 +295,8 @@ pub enum ProcessAction {
         child_tid_address: Option<u64>,
         clear_child_tid: Option<u64>,
         tls: Option<u64>,
+        // The validated thread-clone flags, as in `Fork`.
+        clone_flags: u64,
     },
     Exec {
         executable_path: std::path::PathBuf,
@@ -536,6 +542,8 @@ pub fn native_loaded_state(cwd: &std::path::Path) -> LoadedStaticElf {
         ids_per_task: reverie::task_ids::LINUX_IDS_PER_TASK,
         host_metadata_timestamps: false,
         tool_directory: None,
+        extension_table: Arc::new(crate::extension::ExtensionTable::empty()),
+        extensions: Box::default(),
         thread_name: *b"test\0\0\0\0\0\0\0\0\0\0\0\0",
         thread_group_leader_name: Arc::new(Mutex::new(*b"test\0\0\0\0\0\0\0\0\0\0\0\0")),
         thp_disabled: Arc::new(std::sync::atomic::AtomicU8::new(0)),
@@ -40368,6 +40376,7 @@ mod tests {
                 clear_child_tid,
                 clear_sighand,
                 share_address_space,
+                ..
             }) => {
                 assert_eq!(child_pid, 2);
                 assert_eq!(child_stack, None);
@@ -40671,6 +40680,7 @@ mod tests {
                 clear_child_tid,
                 clear_sighand,
                 share_address_space,
+                ..
             }) => {
                 assert_eq!(child_pid, 2);
                 assert_eq!(child_stack, Some(CHILD_STACK + CHILD_STACK_SIZE));
@@ -43845,7 +43855,7 @@ mod tests {
         assert_eq!(executor.allocate_task_id(), Some(i32::MAX - 1));
         for _ in 0..2 {
             assert_eq!(
-                executor.prepare_fork(None, None, None, None, false, false),
+                executor.prepare_fork(None, None, None, None, false, false, 0),
                 negative_errno(libc::EAGAIN),
             );
             assert_eq!(

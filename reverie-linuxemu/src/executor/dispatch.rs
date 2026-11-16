@@ -1093,7 +1093,11 @@ fn execute_basic_syscall_inner(
         _ => {
             // Includes every call in `TOOL_DECIDED_SYSCALLS`, whose ENOSYS the
             // checked dispatch reports as the typed refusal `ToolDecided`.
-            negative_errno(libc::ENOSYS)
+            // An extension answers only here, after every core arm, and
+            // the builder refuses every tool-decided number, so the
+            // empty table leaves this default exactly ENOSYS.
+            crate::extension::execute_extension_syscall(memory, state, number, args)
+                .unwrap_or_else(|| negative_errno(libc::ENOSYS))
         }
     };
 
