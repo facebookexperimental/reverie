@@ -2462,17 +2462,40 @@ fn content_package(
         raw["manifest_path"].as_str() == compiler_manifest.to_str(),
         "content metadata manifest differs from exact compiler spelling",
     )?;
+    // Two source forms bind this package to the pin, and no third: the
+    // git form names the exact source string; the path form (since
+    // 7aaca4df) is sourceless and must resolve to the crate directory
+    // directly under the verified compiler root, whose HEAD and gitlink
+    // resolve_content_with_repository checks against the pin. The
+    // manifest_path require above has already pinned the manifest to
+    // that root's exact spelling, so the path form cannot name a
+    // directory elsewhere.
+    let git_form = raw["source"].as_str() == Some(source);
+    let path_form = raw["source"].is_null();
     require(
-        raw["source"].as_str() == Some(source) && raw["version"] == "0.5.7",
+        (git_form || path_form) && raw["version"] == "0.5.7",
         "content metadata source/version differs from full pin",
     )?;
-    let id = format!(
-        "{}#{name}@0.5.7",
-        source
-            .rsplit_once('#')
-            .ok_or("content Git source lacks revision")?
-            .0
-    );
+    let id = if git_form {
+        format!(
+            "{}#{name}@0.5.7",
+            source
+                .rsplit_once('#')
+                .ok_or("content Git source lacks revision")?
+                .0
+        )
+    } else {
+        // Cargo's measured path package-id spelling (leaf_package_id):
+        // `#<version>` when the directory name is the package name,
+        // else `#<name>@<version>`.
+        let directory = binding.logical_root.join(name);
+        let fragment = if directory.file_name().and_then(|n| n.to_str()) == Some(name) {
+            "0.5.7".to_owned()
+        } else {
+            format!("{name}@0.5.7")
+        };
+        format!("path+file://{}#{fragment}", directory.display())
+    };
     require(
         raw["id"] == id,
         "content package ID differs from independent full pin",
@@ -2515,17 +2538,117 @@ fn content_package(
         id,
         name: name.into(),
         manifest,
-        source: Some(source.into()),
+        source: git_form.then(|| source.into()),
         target: target.into(),
         kind: kind.iter().map(|s| (*s).into()).collect(),
         crate_types: kind.iter().map(|s| (*s).into()).collect(),
         target_source,
     })
 }
-fn content_manifest_and_lock_pin(metadata: &Value, root: &Path, source: &str) -> Result<()> {
+/// The path form binds by location under the compiler root, so when
+/// that root is a Git checkout the root itself must be the pin: its
+/// clean HEAD and the Hermit tree's recorded gitlink must both name
+/// it, the same shape compiled-source resolution already requires.
+/// Without this a checkout at another revision whose catalogued files
+/// happen to match would be certified as the pin. A gitless source
+/// copy has no HEAD to check and stays git-free by construction
+/// (the source-copy test asserts the runner ran no git command at
+/// all): it uses the git form, whose source string carries the
+/// revision, so it never reaches the path-form check below.
+fn require_reverie_checkout_at_pin(
+    root: &Path,
+    binding: &CompilerRootBinding,
+    pin: &str,
+    path_form: bool,
+    runner: &mut Runner,
+) -> Result<()> {
+    // The git form carries its revision in the source string itself
+    // and needs no checkout check; it stays byte-unchanged here.
+    if !path_form {
+        return Ok(());
+    }
+    // The path form binds by location only, so it fails closed
+    // without Git metadata to judge: a wrong-revision tree with .git
+    // removed must not certify as the pin on location plus the
+    // catalogued files. Declared-content provenance ("constructed
+    // from a verified checkout") is not a revision proof and is not
+    // relied on for this form.
+    require(
+        binding.canonical_root.join(".git").exists(),
+        "path-form content Reverie root has no Git metadata to bind to the pin",
+    )?;
+    // In-tree roots must be the Hermit tree's own reverie directory; a
+    // Cargo-home checkout is tied to the pin by its pin-short
+    // directory name in resolve_cargo_home.
+    if binding.cargo_home.is_none() {
+        require(
+            binding.canonical_root.as_os_str()
+                == fs::canonicalize(root.join("reverie"))
+                    .map_err(|e| e.to_string())?
+                    .as_os_str(),
+            "content Reverie root is not the Hermit tree's reverie checkout",
+        )?;
+    }
+    let (rv_head, _rv_tree) = compiled_git_identity(&binding.canonical_root, runner)?;
+    require(
+        rv_head == pin,
+        "content Reverie checkout HEAD differs from independent full pin",
+    )?;
+    if root.join(".git").exists() {
+        let gitlink = runner.text(
+            "git",
+            &["--no-replace-objects", "ls-tree", "HEAD", "--", "reverie"],
+            root,
+        )?;
+        require(
+            gitlink == format!("160000 commit {pin}\treverie\n"),
+            "Hermit Git link differs from the expected Reverie pin",
+        )?;
+    }
+    Ok(())
+}
+
+fn content_manifest_and_lock_pin(
+    metadata: &Value,
+    root: &Path,
+    source: &str,
+    reverie_root: &Path,
+) -> Result<bool> {
+    // Since 7aaca4df ("Path-depend on Reverie: gitlink is the one pin")
+    // the producer manifests name these dependencies by path into the
+    // pinned submodule instead of by git source. A path form is bound
+    // to the pin only when it names the crate directory directly under
+    // the verified compiler root (`reverie_root`, whose declared
+    // inventory digest is checked separately); anything else — a git
+    // source at the wrong rev, a path outside that root, a rename —
+    // still differs from the independent full pin and refuses.
     let packages = metadata["packages"]
         .as_array()
         .ok_or("content metadata packages missing")?;
+    // One layout per graph: a dependency is git-form or path-form, and
+    // every dependency and lock entry below must agree on which. A
+    // mixed graph is two source authorities for one pin and refuses.
+    let mut layout: Option<bool> = None;
+    let mut lay = |git: bool| {
+        let previous = layout.replace(git);
+        previous.is_none() || previous == Some(git)
+    };
+    let at_pin = |dependency: &Value, crate_dir: &str, layout: &mut dyn FnMut(bool) -> bool| {
+        if !dependency["rename"].is_null() {
+            return false;
+        }
+        if dependency["source"].as_str() == source.rsplit_once('#').map(|s| s.0)
+            && dependency["path"].is_null()
+        {
+            return layout(true);
+        }
+        if dependency["source"].is_null()
+            && dependency["path"].as_str() == reverie_root.join(crate_dir).to_str()
+        {
+            return layout(false);
+        }
+        false
+    };
     for (name, relative, dependency, kind) in [
         (
             "hermit-liteinst-runtime-build",
@@ -2554,11 +2677,9 @@ fn content_manifest_and_lock_pin(metadata: &Value, root: &Path, source: &str) ->
             .collect();
         require(
             dependencies.len() == 1
-                && dependencies[0]["source"].as_str() == source.rsplit_once('#').map(|s| s.0)
                 && dependencies[0]["kind"].as_str() == kind
                 && (kind.is_some() || dependencies[0]["kind"].is_null())
-                && dependencies[0]["rename"].is_null()
-                && dependencies[0]["path"].is_null(),
+                && at_pin(dependencies[0], dependency, &mut lay),
             "content manifest dependency differs from independent full pin",
         )?;
     }
@@ -2577,17 +2698,32 @@ fn content_manifest_and_lock_pin(metadata: &Value, root: &Path, source: &str) ->
             .filter(|entry| entry.lines().any(|line| line == name_line))
             .collect();
         let source_line = format!("source = \"{source}\"");
+        // A path package carries no source line; that is at the pin only
+        // when metadata resolves the same single package to the crate
+        // directory under the verified compiler root.
+        let path_bound = {
+            let selected: Vec<_> = packages.iter().filter(|p| p["name"] == name).collect();
+            selected.len() == 1
+                && selected[0]["source"].is_null()
+                && selected[0]["manifest_path"].as_str()
+                    == reverie_root.join(name).join("Cargo.toml").to_str()
+        };
         require(
             entries.len() == 1
-                && entries[0]
+                && match entries[0]
                     .lines()
                     .filter(|line| line.starts_with("source = "))
                     .collect::<Vec<_>>()
-                    == [source_line.as_str()],
+                    .as_slice()
+                {
+                    [only] => *only == source_line.as_str() && lay(true),
+                    [] => path_bound && lay(false),
+                    _ => false,
+                },
             "content lock source differs from independent full pin",
         )?;
     }
-    Ok(())
+    Ok(layout == Some(false))
 }
 // Runtime and producer are separate locked Cargo graphs. Neither may stand
 // in for the other, and they must identify the same actual compiler checkout.
@@ -3130,6 +3266,7 @@ impl VerifiedCompiledSources {
             .map_err(|e| format!("fresh compiled source metadata: {e}"))?;
         let source = private_static::cargo_git_source(repository, expected.reverie_pin);
         let binding = content_root_binding(&metadata, expected.reverie_pin)?;
+        // (pin binding for the path form runs below, once the layout is known)
         let producer_metadata = match expected.image_kind {
             FixedImageKind::Standalone => None,
             FixedImageKind::Detcore => {
@@ -3163,7 +3300,19 @@ impl VerifiedCompiledSources {
             }
         };
         let producer_metadata = producer_metadata.as_ref().unwrap_or(&metadata);
-        content_manifest_and_lock_pin(producer_metadata, &root, &source)?;
+        let path_form = content_manifest_and_lock_pin(
+            producer_metadata,
+            &root,
+            &source,
+            &binding.canonical_root,
+        )?;
+        require_reverie_checkout_at_pin(
+            &root,
+            &binding,
+            expected.reverie_pin,
+            path_form,
+            runner,
+        )?;
         let (reverie_inventory, reverie_files) =
             content_reverie_inventory_for_image(&binding.canonical_root, expected.image_kind)?;
         let mut packages = BTreeMap::new();
@@ -42669,7 +42818,7 @@ mod tests {
             {"name":"hermit-liteinst-runtime-artifact", "manifest_path":root.join("liteinst-runtime-build/runtime/Cargo.toml"),
              "dependencies":[{"name":"reverie-liteinst-preload", "source":source.rsplit_once('#').unwrap().0, "kind":null, "rename":null, "path":null}]}
         ]});
-        content_manifest_and_lock_pin(&pin_metadata, &root, &source).unwrap();
+        content_manifest_and_lock_pin(&pin_metadata, &root, &source, &rv_one).unwrap();
         for index in 0..2 {
             for (field, value) in [
                 ("name", serde_json::json!("wrong-dependency")),
@@ -42684,7 +42833,7 @@ mod tests {
                 let mut bad = pin_metadata.clone();
                 bad["packages"][index]["dependencies"][0][field] = value;
                 assert!(
-                    content_manifest_and_lock_pin(&bad, &root, &source).is_err(),
+                    content_manifest_and_lock_pin(&bad, &root, &source, &rv_one).is_err(),
                     "declared manifest dependency {index}/{field}"
                 );
             }
@@ -42693,7 +42842,7 @@ mod tests {
                 "{}/./liteinst-runtime-build/Cargo.toml",
                 root.display()
             ));
-            assert!(content_manifest_and_lock_pin(&bad, &root, &source).is_err());
+            assert!(content_manifest_and_lock_pin(&bad, &root, &source, &rv_one).is_err());
         }
         for wrong in [
             lock_bytes.replacen(pin, "047e802e861094bbf827c4fc1bb067c18de7d8dd", 1),
@@ -42709,10 +42858,11 @@ mod tests {
             format!("{lock_bytes}{lock_bytes}"),
         ] {
             fs::write(&lock, wrong).unwrap();
-            assert!(content_manifest_and_lock_pin(&pin_metadata, &root, &source).is_err());
+            assert!(content_manifest_and_lock_pin(&pin_metadata, &root, &source, &rv_one).is_err());
             fs::write(&lock, &lock_bytes).unwrap();
-            content_manifest_and_lock_pin(&pin_metadata, &root, &source).unwrap();
+            content_manifest_and_lock_pin(&pin_metadata, &root, &source, &rv_one).unwrap();
         }
+        fs::write(&lock, &lock_bytes).unwrap();
         let (workspace_inventory, _) = declared_inventory(&root, &CONTENT_WORKSPACE_FILES).unwrap();
         let workspace_digest = declared_inventory_sha256(&workspace_inventory).unwrap();
         let verify = || {
@@ -42777,6 +42927,201 @@ mod tests {
         assert!(serde_json::from_value::<CompiledSourceAuthority>(unknown).is_err());
         drop(owned);
     }
+    /// The path-dependency cases for content_manifest_and_lock_pin,
+    /// standalone so they run at a head whose CONTENT_REVERIE_CATALOG
+    /// drift blocks the enclosing content_source_identity_controls:
+    /// this function reads only the lock file and the JSON.
+    #[test]
+    fn content_manifest_and_lock_pin_path_form_controls() {
+        let parent = fs::canonicalize(std::env::temp_dir()).unwrap();
+        let root = parent.join(format!("pin-path-form-root-{}", std::process::id()));
+        let rv_one = parent.join(format!("pin-path-form-reverie-{}", std::process::id()));
+        fs::create_dir_all(root.join("liteinst-runtime-build")).unwrap();
+        let pin = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let source = private_static::cargo_git_source(
+            private_static::CargoGitRepository::new(
+                "https://github.com/facebookexperimental/reverie.git",
+            )
+            .unwrap(),
+            pin,
+        );
+        let lock = root.join("liteinst-runtime-build/Cargo.lock");
+        // Path-dependency form (7aaca4df): the same two dependencies by
+        // path under the verified root pass, and a path anywhere else is
+        // skew and refuses. The lock carries no source lines for path
+        // packages; binding comes from metadata resolving each package
+        // to its crate directory under that same root.
+        let path_metadata = serde_json::json!({"packages": [
+            {"name":"hermit-liteinst-runtime-build", "manifest_path":root.join("liteinst-runtime-build/Cargo.toml"),
+             "dependencies":[{"name":"reverie-liteinst-artifact", "source":null, "kind":"build", "rename":null, "path":rv_one.join("reverie-liteinst-artifact")}]},
+            {"name":"hermit-liteinst-runtime-artifact", "manifest_path":root.join("liteinst-runtime-build/runtime/Cargo.toml"),
+             "dependencies":[{"name":"reverie-liteinst-preload", "source":null, "kind":null, "rename":null, "path":rv_one.join("reverie-liteinst-preload")}]},
+            {"name":"reverie-inguest", "source":null, "manifest_path":rv_one.join("reverie-inguest/Cargo.toml")},
+            {"name":"reverie-syscalls", "source":null, "manifest_path":rv_one.join("reverie-syscalls/Cargo.toml")},
+            {"name":"reverie-liteinst", "source":null, "manifest_path":rv_one.join("reverie-liteinst/Cargo.toml")},
+            {"name":"reverie-liteinst-preload", "source":null, "manifest_path":rv_one.join("reverie-liteinst-preload/Cargo.toml")},
+            {"name":"reverie-liteinst-artifact", "source":null, "manifest_path":rv_one.join("reverie-liteinst-artifact/Cargo.toml")}
+        ]});
+        let path_lock_bytes = [
+            "reverie-inguest",
+            "reverie-syscalls",
+            "reverie-liteinst",
+            "reverie-liteinst-preload",
+            "reverie-liteinst-artifact",
+        ]
+        .into_iter()
+        .map(|name| format!("[[package]]\nname = \"{name}\"\n"))
+        .collect::<String>();
+        fs::write(&lock, &path_lock_bytes).unwrap();
+        content_manifest_and_lock_pin(&path_metadata, &root, &source, &rv_one).unwrap();
+        // Red: a path dependency outside the verified root is real skew.
+        let mut outside = path_metadata.clone();
+        outside["packages"][0]["dependencies"][0]["path"] =
+            serde_json::json!(root.join("elsewhere/reverie-liteinst-artifact"));
+        assert!(content_manifest_and_lock_pin(&outside, &root, &source, &rv_one).is_err());
+        // Red: a sourceless lock entry whose package resolves elsewhere.
+        let mut stray = path_metadata.clone();
+        stray["packages"][2]["manifest_path"] =
+            serde_json::json!(root.join("elsewhere/reverie-inguest/Cargo.toml"));
+        assert!(content_manifest_and_lock_pin(&stray, &root, &source, &rv_one).is_err());
+        // Red: a renamed path dependency refuses (rename must be null
+        // in both forms).
+        let mut renamed = path_metadata.clone();
+        renamed["packages"][0]["dependencies"][0]["rename"] = serde_json::json!("alias");
+        assert!(content_manifest_and_lock_pin(&renamed, &root, &source, &rv_one).is_err());
+        // Red: a git source together with an at-root path is neither form.
+        let mut both = path_metadata.clone();
+        both["packages"][0]["dependencies"][0]["source"] =
+            serde_json::json!(source.rsplit_once('#').unwrap().0);
+        assert!(content_manifest_and_lock_pin(&both, &root, &source, &rv_one).is_err());
+        // Red: a mixed layout (first dependency by path, second by git)
+        // is two source authorities for one pin.
+        let mut mixed = path_metadata.clone();
+        mixed["packages"][1]["dependencies"][0]["source"] =
+            serde_json::json!(source.rsplit_once('#').unwrap().0);
+        mixed["packages"][1]["dependencies"][0]["path"] = serde_json::Value::Null;
+        assert!(content_manifest_and_lock_pin(&mixed, &root, &source, &rv_one).is_err());
+        // Red: a sourceless lock entry while metadata reports a git
+        // source for the same package is not path-bound.
+        let mut gitmeta = path_metadata.clone();
+        gitmeta["packages"][2]["source"] = serde_json::json!(source);
+        assert!(content_manifest_and_lock_pin(&gitmeta, &root, &source, &rv_one).is_err());
+        // Red: a [patch]-redirected graph (manifests declare git
+        // sources, Cargo resolves path packages, lock entries are
+        // sourceless) must not slip into the git form and skip the
+        // HEAD/gitlink binding. Only the lock-side layout arm refuses
+        // it: drop either lay() call there and this is accepted as
+        // the git form with no revision check at all.
+        let mut patched = path_metadata.clone();
+        for package in patched["packages"].as_array_mut().unwrap() {
+            for dependency in package["dependencies"].as_array_mut().into_iter().flatten() {
+                dependency["source"] =
+                    serde_json::json!(source.rsplit_once('#').unwrap().0);
+                dependency["path"] = serde_json::Value::Null;
+            }
+        }
+        let patched_err =
+            content_manifest_and_lock_pin(&patched, &root, &source, &rv_one).unwrap_err();
+        assert!(
+            patched_err.contains("content lock source differs"),
+            "patch-redirect refusal must come from the lock layout arm: {patched_err}"
+        );
+        // Red: a duplicated path package is not the single bound package.
+        let mut dup = path_metadata.clone();
+        dup["packages"]
+            .as_array_mut()
+            .unwrap()
+            .push(path_metadata["packages"][2].clone());
+        assert!(content_manifest_and_lock_pin(&dup, &root, &source, &rv_one).is_err());
+        fs::remove_dir_all(root).expect("remove path-form fixture repository");
+    }
+
+    /// The path form's revision binding: a checkout at another revision
+    /// refuses even though every catalogued file is byte-identical, and
+    /// so do a dirty checkout and a gitlink naming another revision.
+    /// Deleting the HEAD == pin require makes the first case pass.
+    #[test]
+    fn reverie_checkout_at_pin_refuses_other_revisions() {
+        let parent = fs::canonicalize(std::env::temp_dir()).unwrap();
+        let case = parent.join(format!("pin-head-check-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&case);
+        let root = case.join("hermit");
+        let rv = root.join("reverie");
+        fs::create_dir_all(&rv).unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_NAME", "fixture")
+                .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+                .env("GIT_COMMITTER_NAME", "fixture")
+                .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+            String::from_utf8(out.stdout).unwrap().trim().to_owned()
+        };
+        git(&rv, &["init", "-q", "."]);
+        fs::write(rv.join("catalogued"), "same bytes\n").unwrap();
+        git(&rv, &["add", "-A"]);
+        git(&rv, &["commit", "-qm", "pin"]);
+        let pin = git(&rv, &["rev-parse", "HEAD"]);
+        git(&root, &["init", "-q", "."]);
+        git(&root, &["add", "-A"]);
+        git(
+            &root,
+            &["update-index", "--add", "--cacheinfo", &format!("160000,{pin},reverie")],
+        );
+        git(&root, &["commit", "-qm", "fixture hermit"]);
+        let binding = CompilerRootBinding::resolve(&root.join("reverie"), &pin).unwrap();
+        let mut runner =
+            Runner::new(case.join("logs"), Duration::from_secs(60), 1 << 20).unwrap();
+        require_reverie_checkout_at_pin(&root, &binding, &pin, true, &mut runner).unwrap();
+        // Another revision whose catalogued file is byte-identical: an
+        // uncatalogued file changes HEAD only. Must refuse.
+        fs::write(rv.join("uncatalogued"), "other revision\n").unwrap();
+        git(&rv, &["add", "-A"]);
+        git(&rv, &["commit", "-qm", "other revision"]);
+        assert!(
+            require_reverie_checkout_at_pin(&root, &binding, &pin, true, &mut runner).is_err(),
+            "a checkout at another revision must not certify as the pin"
+        );
+        // Back at the pin but dirty: compiled identity refuses.
+        git(&rv, &["checkout", "-q", &pin]);
+        fs::write(rv.join("catalogued"), "dirty\n").unwrap();
+        assert!(
+            require_reverie_checkout_at_pin(&root, &binding, &pin, true, &mut runner).is_err(),
+            "a dirty checkout at the pin must refuse"
+        );
+        fs::write(rv.join("catalogued"), "same bytes\n").unwrap();
+        // Gitlink naming another revision refuses even at the right HEAD.
+        git(
+            &root,
+            &[
+                "update-index",
+                "--cacheinfo",
+                &format!("160000,{},reverie", "b".repeat(40)),
+            ],
+        );
+        git(&root, &["commit", "-qm", "wrong gitlink"]);
+        assert!(
+            require_reverie_checkout_at_pin(&root, &binding, &pin, true, &mut runner).is_err(),
+            "a gitlink at another revision must refuse"
+        );
+        // No .git at the root: the path form fails closed (named
+        // refusal), while the git form runs no git command at all.
+        fs::remove_dir_all(rv.join(".git")).unwrap();
+        let closed = require_reverie_checkout_at_pin(&root, &binding, &pin, true, &mut runner)
+            .expect_err("path form without Git metadata must refuse");
+        assert!(
+            closed.contains("no Git metadata"),
+            "refusal must name the missing Git metadata: {closed}"
+        );
+        require_reverie_checkout_at_pin(&root, &binding, &pin, false, &mut runner)
+            .expect("git form runs no checkout check");
+        fs::remove_dir_all(&case).expect("remove pin-head fixture");
+    }
+
     #[test]
     fn compiled_source_repository_selection_accepts_its_spelling_and_refuses_another() {
         // The compiled-source expected source string derives from the
