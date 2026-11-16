@@ -332,7 +332,9 @@ jobs:
               jobs="$(gh api "repos/${REPO}/actions/runs/${run_id}/jobs?filter=latest&per_page=100")"
               rollup="$(jq '.jobs' <<< "$jobs" |
                 python3 .dev-hermit-policy/ci-hub/check_outcome.py --select-latest-rollup)"
-              regular="$(jq '[.[] | select(.name == "Regular tests (GitHub-hosted)")] | first // {}' <<< "$rollup")"
+              # ci.yml's hosted job runs no tests (the full test suite runs in
+              # extended.yml), so this leg is build-only evidence.
+              regular="$(jq '[.[] | select(.name == "Build (GitHub-hosted)")] | first // {}' <<< "$rollup")"
               host="$(jq '[.[] | select(.name == "Host-dependent tests (self-hosted)")] | first // {}' <<< "$rollup")"
               regular_status="$(jq -r '.status // "missing"' <<< "$regular")"
               regular_conclusion="$(jq -r '.conclusion // ""' <<< "$regular")"
@@ -343,12 +345,12 @@ jobs:
             regular_outcome=$(classify_check "$regular_status" "$regular_conclusion")
             host_outcome=$(classify_check "$host_status" "$host_conclusion")
             if [ "$regular_outcome" = FAILED ] || [ "$host_outcome" = FAILED ]; then
-              echo "::error::CI FAILED for PR #${pr_number} at $head_sha: regular=$regular_status/${regular_conclusion:-none} host=$host_status/${host_conclusion:-none}: ${url:-no run URL}."
+              echo "::error::CI FAILED for PR #${pr_number} at $head_sha: hosted-build=$regular_status/${regular_conclusion:-none} host=$host_status/${host_conclusion:-none}: ${url:-no run URL}."
               failed=1
             elif [ "$regular_outcome" = PASSED ] && [ "$host_outcome" = PASSED ]; then
-              echo "Both authoritative CI jobs PASSED for PR #${pr_number} at $head_sha: $url"
+              echo "Hosted build (build only; the full test suite runs in Extended checks) and host-dependent tests PASSED for PR #${pr_number} at $head_sha: $url"
             else
-              echo "CI has NO_RESULT for PR #${pr_number} at $head_sha: regular=$regular_status/${regular_conclusion:-none} host=$host_status/${host_conclusion:-none}; blocking without reporting failure."
+              echo "CI has NO_RESULT for PR #${pr_number} at $head_sha: hosted-build=$regular_status/${regular_conclusion:-none} host=$host_status/${host_conclusion:-none}; blocking without reporting failure."
               queue_retry "$status" "$run_id" "$pr_number" "$head_sha"
             fi
           done < <(jq -r '

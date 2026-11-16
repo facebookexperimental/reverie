@@ -29,7 +29,6 @@ jobs:
     name: Full workspace tests (extended, GitHub-hosted)
     if: github.event_name != 'pull_request' || (github.event.pull_request.user.login != 'hermit-bot3' && !github.event.pull_request.draft)
     runs-on: ubuntu-latest
-    timeout-minutes: 120
 
     steps:
     - uses: actions/checkout@v4

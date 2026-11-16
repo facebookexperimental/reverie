@@ -18,8 +18,11 @@ name: Rust
 # post-merge signal on the exported main tip. The self-hosted `hardware` job
 # keeps its earlier triggers and never runs for a push.
 #
-# Reduced push/PR lane: this file's hosted `regular` job keeps only the
-# build and the checks that pass reliably on hosted runners. The full
+# Reduced push/PR lane: this file's hosted `regular` job runs no tests. It
+# keeps the build, the locked-dependency fetch, the skill-discovery check and
+# the LiteInst allocator fixture build, which pass reliably on hosted runners,
+# so it is named "Build (GitHub-hosted)"; merge-gate.yml selects it by that
+# name and reports it as build-only. Its job id stays `regular`. The full
 # workspace test suite, documentation tests, Clippy, formatting, the
 # no-device cross-backend check, and the API-docs build moved to the
 # manual/scheduled Extended checks workflow (extended.yml), unchanged.
@@ -48,7 +51,7 @@ env:
 
 jobs:
   regular:
-    name: Regular tests (GitHub-hosted)
+    name: Build (GitHub-hosted)
     if: github.event_name != 'pull_request' || (github.event.pull_request.user.login != 'hermit-bot3' && !github.event.pull_request.draft)
     runs-on: ubuntu-latest
 
@@ -70,7 +73,7 @@ jobs:
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
         fi
         channel="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml | head -n 1)"
-        rustup toolchain install "$channel" --profile minimal --component clippy --component rustfmt
+        rustup toolchain install "$channel" --profile minimal
         rustc --version
     - name: Cross-client skill discovery
       run: |
