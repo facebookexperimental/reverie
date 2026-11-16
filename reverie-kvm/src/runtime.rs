@@ -4720,8 +4720,10 @@ async fn finish_tool_process_after_workers_with_panics<T: Tool>(
                             {
                                 Err(report("child wait completion", error))
                             } else {
+                                let forced = executor.forced_frame_failure_exit()
+                                    || executor.frame_failure_forced(context.child);
                                 debug_assert!(
-                                    !executor.forced_frame_failure_exit()
+                                    !forced
                                         || snapshot.completion.status.signal()
                                             == Some(libc::SIGSEGV),
                                     "forced provenance with a non-SIGSEGV published status"
@@ -4736,8 +4738,7 @@ async fn finish_tool_process_after_workers_with_panics<T: Tool>(
                                         user_ticks: snapshot.completion.user_ticks,
                                         system_ticks: snapshot.completion.system_ticks,
                                     },
-                                    forced: executor.forced_frame_failure_exit()
-                                        || executor.frame_failure_forced(context.child),
+                                    forced,
                                 };
                                 let mut callback = Box::pin(
                                     crate::failure::owned_future::catch_owned_future_from(|| {

@@ -609,10 +609,6 @@ impl ProcessSignalRegistry {
         }
     }
 
-    /// Freeze one process's terminal parent/wait policy at the authoritative
-    /// lifecycle transition. Host join completion and the later Tool callback
-    /// only consume this snapshot; they cannot resample a parent's newer
-    /// SIGCHLD disposition.
     /// Record that `process`'s committed exit status was caused by a
     /// signal-frame build or restore failure (on whichever of its
     /// threads took it), for the leader's child-wait publication.
@@ -631,6 +627,10 @@ impl ProcessSignalRegistry {
             .contains(&process_key(process))
     }
 
+    /// Freeze one process's terminal parent/wait policy at the authoritative
+    /// lifecycle transition. Host join completion and the later Tool callback
+    /// only consume this snapshot; they cannot resample a parent's newer
+    /// SIGCHLD disposition.
     pub(super) fn record_process_exit(
         &self,
         process: SignalProcessId,

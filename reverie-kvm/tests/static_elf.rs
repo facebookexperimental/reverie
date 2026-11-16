@@ -11055,6 +11055,7 @@ fn frame_failure_child_exits_carry_forced_provenance_on_real_kvm() {
         "frame-failure-provenance",
         r#"
 #define _GNU_SOURCE
+#include <pthread.h>
 #include <signal.h>
 #include <string.h>
 #include <sys/syscall.h>
@@ -11066,6 +11067,16 @@ static void corrupt(int signal, siginfo_t *info, void *uctx) {
   (void)signal;
   (void)info;
   ((ucontext_t *)uctx)->uc_mcontext.fpregs = (void *)0x414141000ULL;
+}
+static void *worker_corrupt(void *arg) {
+  (void)arg;
+  struct sigaction action = {0};
+  action.sa_sigaction = corrupt;
+  action.sa_flags = SA_SIGINFO;
+  sigemptyset(&action.sa_mask);
+  if (sigaction(SIGUSR1, &action, 0) != 0) _exit(97);
+  pthread_kill(pthread_self(), SIGUSR1);
+  return 0;
 }
 static void noop_handler(int signal) { (void)signal; }
 struct kernel_sigaction {
@@ -11097,6 +11108,10 @@ int main(int argc, char **argv) {
       kill(getpid(), SIGUSR1);
     } else if (argv[1][0] == '3') {
       kill(getpid(), SIGSEGV);
+    } else if (argv[1][0] == '4') {
+      pthread_t worker;
+      if (pthread_create(&worker, 0, worker_corrupt, 0) != 0) _exit(98);
+      pthread_join(worker, 0);
     } else {
       _exit(94);
     }
@@ -11114,8 +11129,11 @@ int main(int argc, char **argv) {
 
     // (1) an rt_sigreturn frame refusal and (2) a delivery frame that
     // cannot be built (no SA_RESTORER) are backend-forced; (3) a
-    // guest-sent SIGSEGV at the default action is not.
-    for (mode, forced) in [("1", true), ("2", true), ("3", false)] {
+    // guest-sent SIGSEGV at the default action is not; (4) the
+    // rt_sigreturn refusal taken by a worker thread is forced too: the
+    // leader never frame-fails, so its publication can only report the
+    // provenance the worker's commit recorded in the shared registry.
+    for (mode, forced) in [("1", true), ("2", true), ("3", false), ("4", true)] {
         let mut backend = KvmBackend::new(256 * 1024 * 1024).unwrap();
         backend.set_root_pid(17).unwrap();
         backend
