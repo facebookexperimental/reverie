@@ -142,6 +142,8 @@ jobs:
         source scripts/stable-features.sh
         # notification_at_or_past_target_records_a_late_delivery_detail constructs a TimerImpl,
         # which opens hardware performance counters; the self-hosted hardware job runs it.
+        # hardware_paused_clock_preserves_exact_branch_trajectory likewise requires
+        # the hardware PMU clock and does not skip unavailable hosts; the hardware job runs it.
         cargo test --workspace --exclude reverie-kvm --exclude reverie-kvm-core --exclude reverie-linuxemu --exclude reverie-inguest --features "${STABLE_FEATURES_REGULAR}" --no-fail-fast -- \
         --test-threads=1 \
         --skip container::tests::bind_to_low_port \
@@ -164,6 +166,7 @@ jobs:
         --skip tests::port_isolation \
         --skip tests::seccomp_notify \
         --skip timer::tests::notification_at_or_past_target_records_a_late_delivery_detail \
+        --skip in_guest_rcb::boundary_tests::hardware_paused_clock_preserves_exact_branch_trajectory \
         --skip tests::uid_namespace
     - name: Documentation tests
       run: cargo test --workspace --doc

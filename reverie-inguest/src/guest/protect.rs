@@ -1090,7 +1090,7 @@ const MMSG_LEN: usize = 56;
 
 /// A guest `sendmsg`'s or `sendmmsg`'s message headers and control data,
 /// copied into runtime memory and checked, for the kernel to read in place of
-/// the guest's (https://github.com/facebookexperimental/reverie/issues/56).
+/// the guest's (<https://github.com/facebookexperimental/reverie/issues/56>).
 struct ScmRightsCopy {
     /// One `struct mmsghdr` per message; a `sendmsg` uses the first one's
     /// `msghdr`.
@@ -1197,10 +1197,10 @@ fn write_to_guest(address: u64, bytes: &[u8], guest_pkru: Option<u32>) -> bool {
 
 /// Runs `dispatch` on `event`, a genuine guest syscall not yet run. A guest
 /// `sendmsg` or `sendmmsg` runs on a runtime-owned copy of its message headers
-/// and control data (https://github.com/facebookexperimental/reverie/issues/56):
+/// and control data (<https://github.com/facebookexperimental/reverie/issues/56>):
 ///
 /// - Each message's 56-byte `msghdr` is copied, then its control data when
-///   `msg_controllen` is above 0 ([`copy_from_guest`], which reads what the
+///   `msg_controllen` is above 0 (`copy_from_guest`, which reads what the
 ///   guest's own call could read, with the interrupted guest's protection-key
 ///   rights). In the copy, every reserved descriptor that `SCM_RIGHTS` data
 ///   names becomes -1 ([`reserved_fds::scm_rights_hide_reserved`]), and each
@@ -1966,7 +1966,7 @@ pub(crate) mod tests {
     /// A guest sendmsg whose `SCM_RIGHTS` data names a runtime descriptor
     /// fails with EBADF and sends nothing: Linux reads the runtime's copy, in
     /// which that number is -1, and refuses the whole message
-    /// (https://github.com/facebookexperimental/reverie/issues/56). The
+    /// (<https://github.com/facebookexperimental/reverie/issues/56>). The
     /// guest's own control data is untouched. One naming only a descriptor the
     /// guest owns, or carrying no control data, is sent as Linux sends it.
     #[test]
