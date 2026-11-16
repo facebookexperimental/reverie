@@ -596,18 +596,93 @@ mod tests {
         }
     }
 
-    /// The number of mappings this process has: the lines of its `maps`.
-    fn mappings() -> usize {
-        std::fs::read("/proc/self/maps")
-            .unwrap()
-            .iter()
-            .filter(|byte| **byte == b'\n')
-            .count()
+    /// One mapping a probe in this test could have created, as
+    /// `/proc/self/maps` prints it.
+    #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+    struct ProbeMapping {
+        start: u64,
+        end: u64,
+        perms: [u8; 4],
+        device_major: u32,
+        device_minor: u32,
+        inode: u64,
+        pathname: Vec<u8>,
+    }
+
+    fn hex_u64(token: &[u8]) -> u64 {
+        u64::from_str_radix(std::str::from_utf8(token).unwrap(), 16).unwrap()
+    }
+
+    fn hex_u32(token: &[u8]) -> u32 {
+        u32::from_str_radix(std::str::from_utf8(token).unwrap(), 16).unwrap()
+    }
+
+    /// The mappings of this process that a probe of `file` could have
+    /// created: mappings of that file (its device and inode), and
+    /// anonymous `PROT_NONE` mappings no larger than the largest
+    /// reservation these tests make (`length + PMD_SIZE + PAGE` for
+    /// `length <= PMD_SIZE`), which is what a probe reservation -- or
+    /// what one splits into around its window -- can look like.
+    /// Comparing this set before and after a probe is exact about
+    /// the probe's own mappings: a leaked reservation or file window
+    /// changes it, while an unrelated runtime mapping (a heap arena,
+    /// a lazy thread stack, the sanitizer shadow's multi-megabyte
+    /// `PROT_NONE` spans, a VMA the kernel merges or splits
+    /// elsewhere) cannot move it, as a whole-process VMA count could
+    /// and did (830 vs 829).
+    fn probe_mappings(file: &std::fs::File) -> std::collections::BTreeSet<ProbeMapping> {
+        // SAFETY: stat is writable and the descriptor is live.
+        let stat = unsafe {
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+            assert_eq!(libc::fstat(file.as_raw_fd(), stat.as_mut_ptr()), 0);
+            stat.assume_init()
+        };
+        let file_device = (libc::major(stat.st_dev), libc::minor(stat.st_dev));
+        let maps = std::fs::read("/proc/self/maps").unwrap();
+        maps.split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .filter_map(|line| {
+                let tokens: Vec<&[u8]> = line
+                    .split(|byte| *byte == b' ')
+                    .filter(|token| !token.is_empty())
+                    .collect();
+                if tokens.len() < 5 {
+                    return None;
+                }
+                let dash = tokens[0].iter().position(|byte| *byte == b'-')?;
+                let (start, end) = (&tokens[0][..dash], &tokens[0][dash + 1..]);
+                let colon = tokens[3].iter().position(|byte| *byte == b':')?;
+                let (major, minor) = (&tokens[3][..colon], &tokens[3][colon + 1..]);
+                let mapping = ProbeMapping {
+                    start: hex_u64(start),
+                    end: hex_u64(end),
+                    perms: tokens[1].try_into().unwrap(),
+                    device_major: hex_u32(major),
+                    device_minor: hex_u32(minor),
+                    inode: std::str::from_utf8(tokens[4]).unwrap().parse().unwrap(),
+                    pathname: tokens[5..].iter().fold(Vec::new(), |mut path, token| {
+                        if !path.is_empty() {
+                            path.push(b' ');
+                        }
+                        path.extend_from_slice(token);
+                        path
+                    }),
+                };
+                let of_the_file = (mapping.device_major, mapping.device_minor) == file_device
+                    && mapping.inode == stat.st_ino;
+                let reservation = mapping.perms == *b"---p"
+                    && mapping.inode == 0
+                    && mapping.pathname.is_empty()
+                    && mapping.end - mapping.start <= 2 * PMD_SIZE + PAGE;
+                (of_the_file || reservation).then_some(mapping)
+            })
+            .collect()
     }
 
     /// A probe removes everything it held: after a mapping in its
     /// reservation, the reservation's whole range is unmapped, and probes
-    /// leave this process with as many mappings as it had. It runs in a
+    /// leave exactly the probe-relevant mappings they found
+    /// ([`probe_mappings`]). It runs in a
     /// child process of this test binary ([`in_namespace`]), so no other
     /// test maps into a range it checks.
     #[test]
@@ -636,9 +711,9 @@ mod tests {
             assert!(unmapped(start, end), "{residue:?}");
         }
         // Once, so that what reading and probing allocate is in place.
-        mappings();
+        probe_mappings(&file);
         assert!(probe(&file, read, false, 0, PAGE, Placement::Anywhere).is_some());
-        let before = mappings();
+        let before = probe_mappings(&file);
         assert!(probe(&file, read, false, 0, PAGE, Placement::Anywhere).is_some());
         assert!(
             probe(
@@ -651,14 +726,15 @@ mod tests {
             )
             .is_some()
         );
-        assert_eq!(mappings(), before);
+        assert_eq!(probe_mappings(&file), before);
     }
 
     /// A probe that fails before it maps the file holds nothing after: where
     /// no reservation can be made (more address space than a process has),
     /// or where the offset within a PMD-sized block it was asked for is not
-    /// page-aligned, it answers `None` and leaves this process with as many
-    /// mappings as it had. It runs in a child process ([`in_namespace`]).
+    /// page-aligned, it answers `None` and leaves exactly the
+    /// probe-relevant mappings it found ([`probe_mappings`]). It runs
+    /// in a child process ([`in_namespace`]).
     #[test]
     fn a_probe_that_fails_early_holds_nothing() {
         if !in_namespace(module_path!(), "a_probe_that_fails_early_holds_nothing") {
@@ -666,9 +742,9 @@ mod tests {
         }
         let file = memfd(4 * PMD_SIZE);
         let read = libc::PROT_READ as u8;
-        mappings();
+        probe_mappings(&file);
         assert!(probe(&file, read, false, 0, PAGE, Placement::Anywhere).is_some());
-        let before = mappings();
+        let before = probe_mappings(&file);
         let huge = 1 << 47;
         assert!(map_in_reservation(&file, read, libc::MAP_PRIVATE, 0, huge, None).is_none());
         assert_eq!(
@@ -686,7 +762,99 @@ mod tests {
             ),
             None
         );
-        assert_eq!(mappings(), before);
+        assert_eq!(probe_mappings(&file), before);
+    }
+
+    /// The red twin for [`probe_mappings`]: a leaked mapping of either
+    /// shape a probe creates -- an anonymous `PROT_NONE` reservation
+    /// (one page, and a full-size one at the snapshot's size bound)
+    /// and a mapping of the probe's file -- changes the snapshot, and
+    /// removing it restores equality. Without this, narrowing the
+    /// whole-process count to the probe's own mappings could have
+    /// quietly stopped catching the leak the count existed for.
+    #[test]
+    fn probe_mappings_detect_a_leaked_probe_mapping() {
+        if !in_namespace(
+            module_path!(),
+            "probe_mappings_detect_a_leaked_probe_mapping",
+        ) {
+            return;
+        }
+        let file = memfd(4 * PMD_SIZE);
+        probe_mappings(&file);
+        let before = probe_mappings(&file);
+
+        // SAFETY: a new anonymous mapping at an address the kernel chooses.
+        let reservation = unsafe {
+            libc::syscall(
+                libc::SYS_mmap,
+                std::ptr::null_mut::<libc::c_void>(),
+                PAGE as usize,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(reservation, -1);
+        assert_ne!(
+            probe_mappings(&file),
+            before,
+            "a leaked reservation must be seen"
+        );
+        // SAFETY: the mapping was made just now, by this test.
+        unsafe { unmap(reservation as u64, PAGE) };
+        assert_eq!(probe_mappings(&file), before);
+
+        // A leaked reservation at the snapshot's size bound itself,
+        // made exactly as `map_in_reservation` makes one, must also
+        // be seen: a bound shrunk below a real reservation would let
+        // this through while the one-page leak above still passed.
+        let bound = 2 * PMD_SIZE + PAGE;
+        // SAFETY: a new anonymous mapping at an address the kernel chooses.
+        let full_reservation = unsafe {
+            libc::syscall(
+                libc::SYS_mmap,
+                std::ptr::null_mut::<libc::c_void>(),
+                bound as usize,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(full_reservation, -1);
+        assert_ne!(
+            probe_mappings(&file),
+            before,
+            "a leaked full-size reservation must be seen"
+        );
+        // SAFETY: the mapping was made just now, by this test.
+        unsafe { unmap(full_reservation as u64, bound) };
+        assert_eq!(probe_mappings(&file), before);
+
+        // SAFETY: a new mapping of this test's file at an address the
+        // kernel chooses; the result is checked.
+        let window = unsafe {
+            libc::syscall(
+                libc::SYS_mmap,
+                std::ptr::null_mut::<libc::c_void>(),
+                PAGE as usize,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(window, -1);
+        assert_ne!(
+            probe_mappings(&file),
+            before,
+            "a leaked file window must be seen"
+        );
+        // SAFETY: the mapping was made just now, by this test.
+        unsafe { unmap(window as u64, PAGE) };
+        assert_eq!(probe_mappings(&file), before);
     }
 
     /// A probe whose mapping fails after it gave its window back removes the
