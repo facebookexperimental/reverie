@@ -2404,6 +2404,33 @@ impl ElfExecutor {
     pub fn force_signal_exit(&mut self, signal: libc::c_int) {
         self.exit_status = terminating_signal_status(signal, self.current_dumpable());
         self.exit_group = true;
+        // This overwrite is not a frame failure's status.
+        self.forced_exit = false;
+    }
+
+    /// Force a SIGSEGV group exit for a signal frame the backend could
+    /// not build or refused to restore. Unlike a fatal signal's default
+    /// action applied at a delivery boundary, this death has no
+    /// controlled signal boundary: it is marked so the Tool can tell
+    /// this boundary-less backend fault apart from an ordinary
+    /// guest-sent or hardware-fault SIGSEGV death.
+    pub fn force_frame_failure_exit(&mut self) {
+        self.force_signal_exit(libc::SIGSEGV);
+        self.forced_exit = true;
+    }
+
+    /// Whether this task's pending exit was forced by a signal-frame
+    /// build or restore failure ([`Self::force_frame_failure_exit`]).
+    pub fn forced_frame_failure_exit(&self) -> bool {
+        self.forced_exit
+    }
+
+    /// Whether `process`'s committed exit status was caused by a
+    /// signal-frame failure on any of its threads, as recorded when
+    /// that status committed: the provenance a child-wait publication
+    /// reports, whoever took the failure.
+    pub fn frame_failure_forced(&self, process: reverie::SignalProcessId) -> bool {
+        self.signal_registry.frame_failure_forced(process)
     }
 
     pub fn set_current_user_stack_pointer(&mut self, stack_pointer: u64) {
@@ -2435,7 +2462,12 @@ impl ElfExecutor {
         let transaction = self.state.signal_transaction.clone();
         let _transaction = transaction.lock().unwrap_or_else(|p| p.into_inner());
         let mut status = self.exit_status.take()?;
+        // The frame-failure provenance describes this executor's own
+        // status; if the committed or published status ends up being a
+        // different one, the provenance must not travel with it.
+        let own_status = status;
         let mut group = std::mem::take(&mut self.exit_group);
+        let own_group = group;
         let (status, process_status, group_started) = {
             let mut lifecycle = self
                 .state
@@ -2468,6 +2500,7 @@ impl ElfExecutor {
                 // of a task whose exit was already taken is not a new exit.
                 group = false;
                 status = ExitStatus::SUCCESS;
+                self.forced_exit = false;
             }
             if guest_death {
                 // A previously committed exit_group owns the status even if a
@@ -2504,6 +2537,24 @@ impl ElfExecutor {
         // later scheduler turn could race the final peer's host retirement and
         // change success into an unsupported-reparenting error.
         let family_status = process_status.or(group_started.then_some(status));
+        if status != own_status
+            || (own_group && !group_started)
+            || family_status.is_some_and(|published| published != own_status)
+        {
+            // A previously committed group exit owns the published
+            // status - including a winner with the same status value,
+            // which only group_started distinguishes; this task's frame
+            // failure did not cause it.
+            self.forced_exit = false;
+        }
+        if self.forced_exit && family_status == Some(own_status) && (!own_group || group_started)
+        {
+            // This task's frame failure caused the committed process
+            // status: carry the provenance to the leader's publication,
+            // which may be reported by another thread's executor.
+            self.signal_registry
+                .record_frame_failure_forced(self.admitted_signal_identity().process);
+        }
         if let Some(process_status) = family_status {
             // Keep the exact process transaction held across both the final
             // lifecycle removal and its family-ledger transition. A direct
@@ -2524,6 +2575,10 @@ impl ElfExecutor {
     }
 
     pub fn retire_current_thread(&mut self, status: ExitStatus, group: bool) -> ProcessExit {
+        if self.exit_status.is_none() {
+            // The inserted status is not a frame failure's.
+            self.forced_exit = false;
+        }
         self.exit_status.get_or_insert(status);
         self.exit_group |= group;
         // Cleanup/cancellation is not a new guest death. Genuine group and
@@ -2533,6 +2588,9 @@ impl ElfExecutor {
     }
 
     pub fn retire_guest_thread(&mut self, status: ExitStatus, group: bool) -> ProcessExit {
+        if self.exit_status.is_none() {
+            self.forced_exit = false;
+        }
         self.exit_status.get_or_insert(status);
         self.exit_group |= group;
         self.take_exit().expect("guest exit has a status")

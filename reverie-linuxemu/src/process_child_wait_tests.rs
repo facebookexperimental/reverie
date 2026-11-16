@@ -676,6 +676,126 @@ fn a_signal_selection_before_any_group_exit_selects_and_admits() {
 }
 
 #[test]
+fn only_a_frame_failure_exit_carries_forced_provenance() {
+    // The typed provenance a Tool keys on is only the boundary-less
+    // frame-failure class: a fatal signal's default action forced
+    // through force_signal_exit (including SIGSEGV itself) does not
+    // carry it, so a guest-sent or hardware-fault SIGSEGV death cannot
+    // be mistaken for a backend frame fault.
+    let root = outside_init_root();
+    let mut by_signal = root.thread_child(9).unwrap();
+    by_signal.force_signal_exit(libc::SIGSEGV);
+    assert!(!by_signal.forced_frame_failure_exit());
+
+    let mut by_frame = root.thread_child(10).unwrap();
+    by_frame.force_frame_failure_exit();
+    assert!(by_frame.forced_frame_failure_exit());
+    assert_eq!(
+        by_frame.take_exit().map(|exit| exit.status.signal()),
+        Some(Some(libc::SIGSEGV))
+    );
+    // The mark survives taking the exit: publication reads it after.
+    assert!(by_frame.forced_frame_failure_exit());
+}
+
+#[test]
+fn an_exec_froze_override_clears_forced_provenance() {
+    // A worker's frame failure starts no group exit where another
+    // thread's exec froze its death: its published status becomes
+    // SUCCESS, which the frame failure did not cause, so the
+    // provenance must not travel with it.
+    let root = outside_init_root();
+    let mut worker = root.thread_child(9).unwrap();
+    root.prepare_parent_death_exec().unwrap();
+    worker.force_frame_failure_exit();
+    assert_eq!(
+        worker.take_exit(),
+        Some(super::super::ProcessExit {
+            status: reverie::ExitStatus::SUCCESS,
+            group: false
+        })
+    );
+    assert!(!worker.forced_frame_failure_exit());
+}
+
+#[test]
+fn a_competing_group_exit_winner_clears_forced_provenance() {
+    // A group exit committed by another thread owns the published
+    // status; the leader's own frame failure afterwards must not mark
+    // that winner as backend-forced.
+    let mut parent = outside_init_root();
+    let mut worker = parent.thread_child(9).unwrap();
+    worker.retire_current_thread(reverie::ExitStatus::Exited(37), true);
+    parent.force_frame_failure_exit();
+    let exit = parent.take_exit().expect("leader exit");
+    assert_eq!(exit.status, reverie::ExitStatus::Exited(37));
+    assert!(!parent.forced_frame_failure_exit());
+}
+
+#[test]
+fn a_later_forced_signal_exit_clears_frame_failure_provenance() {
+    // force_signal_exit overwrites the pending status; the provenance
+    // of the overwritten frame-failure status must not travel with
+    // the new one.
+    let mut parent = outside_init_root();
+    parent.force_frame_failure_exit();
+    assert!(parent.forced_frame_failure_exit());
+    parent.force_signal_exit(libc::SIGTERM);
+    assert!(!parent.forced_frame_failure_exit());
+    let exit = parent.take_exit().expect("leader exit");
+    assert_eq!(exit.status.signal(), Some(libc::SIGTERM));
+    assert!(!parent.forced_frame_failure_exit());
+}
+
+#[test]
+fn a_worker_frame_failure_carries_to_the_leaders_publication() {
+    // The worker takes the frame failure and its SIGSEGV commits as
+    // the process status; the leader, which never forced an exit,
+    // still reports the provenance for its publication.
+    let parent = outside_init_root();
+    let mut worker = parent.thread_child(9).unwrap();
+    worker.force_frame_failure_exit();
+    let exit = worker.take_exit().expect("worker exit");
+    assert_eq!(exit.status.signal(), Some(libc::SIGSEGV));
+    assert!(!parent.forced_frame_failure_exit());
+    assert!(parent.frame_failure_forced(identity(&parent)));
+}
+
+#[test]
+fn a_same_status_group_exit_winner_clears_forced_provenance() {
+    // The worker's guest-sent SIGSEGV commits the group exit first;
+    // the leader then frame-fails with the same status value. Status
+    // equality alone cannot tell them apart - only group_started can:
+    // the leader's failure did not start this group exit, so its
+    // provenance must not be reported for the winner's status.
+    let mut parent = outside_init_root();
+    let mut worker = parent.thread_child(9).unwrap();
+    worker.force_signal_exit(libc::SIGSEGV);
+    let worker_exit = worker.take_exit().expect("worker exit");
+    assert_eq!(worker_exit.status.signal(), Some(libc::SIGSEGV));
+    parent.force_frame_failure_exit();
+    let parent_process = identity(&parent);
+    let leader_exit = parent.take_exit().expect("leader exit");
+    assert_eq!(leader_exit.status.signal(), Some(libc::SIGSEGV));
+    assert!(!parent.forced_frame_failure_exit());
+    assert!(!parent.frame_failure_forced(parent_process));
+}
+
+#[test]
+fn an_exec_reset_clears_forced_provenance() {
+    // Exec discards the pending exit status; its provenance goes with
+    // it, so the new image cannot publish a stale frame-failure mark.
+    let mut parent = outside_init_root();
+    parent.force_frame_failure_exit();
+    assert!(parent.forced_frame_failure_exit());
+    parent
+        .replace_after_exec(crate::executor::test_state(&std::env::temp_dir()))
+        .unwrap();
+    assert!(!parent.forced_frame_failure_exit());
+    assert_eq!(parent.take_exit(), None);
+}
+
+#[test]
 fn a_fatal_signal_in_a_worker_that_an_exec_froze_starts_no_group_exit() {
     // A worker's fatal signal commits after another thread's exec froze the
     // worker's death (prepare_parent_death_exec). Linux's do_group_exit,

@@ -6261,7 +6261,7 @@ impl KvmBackend {
         let action = executor.signal_action(signal);
         if action.flags & SA_RESTORER == 0 || action.handler == 0 || action.handler >= (1_u64 << 47)
         {
-            executor.force_signal_exit(libc::SIGSEGV);
+            executor.force_frame_failure_exit();
             return Ok(None);
         }
         let altstack = executor.signal_altstack();
@@ -6269,19 +6269,19 @@ impl KvmBackend {
             match executor.signal_stack_top(action, interrupted.rsp) {
                 Ok(stack) => stack,
                 Err(_) => {
-                    executor.force_signal_exit(libc::SIGSEGV);
+                    executor.force_frame_failure_exit();
                     return Ok(None);
                 }
             };
         let layout = match SignalFrameLayout::below(stack_top, reserve_red_zone) {
             Ok(layout) => layout,
             Err(_) => {
-                executor.force_signal_exit(libc::SIGSEGV);
+                executor.force_frame_failure_exit();
                 return Ok(None);
             }
         };
         if lower_bound.is_some_and(|lower_bound| !layout.fits_above(lower_bound)) {
-            executor.force_signal_exit(libc::SIGSEGV);
+            executor.force_frame_failure_exit();
             return Ok(None);
         }
         let xsave = if let HandlerEntry::Fault(fault) = entry {
@@ -6324,7 +6324,7 @@ impl KvmBackend {
                 .copy_to_user(layout.xsave_address, xsave.bytes())
                 .is_err()
         {
-            executor.force_signal_exit(libc::SIGSEGV);
+            executor.force_frame_failure_exit();
             return Ok(None);
         }
 
@@ -6555,7 +6555,7 @@ impl KvmBackend {
             None,
         )?;
         let Some(frame_address) = current.rsp.checked_sub(8) else {
-            executor.force_signal_exit(libc::SIGSEGV);
+            executor.force_frame_failure_exit();
             return Ok(None);
         };
         let mut frame_bytes = [0; RT_SIGFRAME_SIZE];
@@ -6565,12 +6565,12 @@ impl KvmBackend {
             .read(frame_address, &mut frame_bytes[..RT_SIGRETURN_SIZE])
             .is_err()
         {
-            executor.force_signal_exit(libc::SIGSEGV);
+            executor.force_frame_failure_exit();
             return Ok(None);
         }
         let frame = RtSigframe::decode(frame_bytes);
         if frame.ucontext.mcontext.validate_for_restore().is_err() {
-            executor.force_signal_exit(libc::SIGSEGV);
+            executor.force_frame_failure_exit();
             return Ok(None);
         }
         let fpstate = frame.ucontext.mcontext.fpstate;
@@ -6579,13 +6579,13 @@ impl KvmBackend {
         } else {
             let mut prefix = [0; LEGACY_FPSTATE_SIZE];
             if self.memory.user().read(fpstate, &mut prefix).is_err() {
-                executor.force_signal_exit(libc::SIGSEGV);
+                executor.force_frame_failure_exit();
                 return Ok(None);
             }
             let size = match XsaveImage::restore_size(&prefix) {
                 Ok(size) => size,
                 Err(_) => {
-                    executor.force_signal_exit(libc::SIGSEGV);
+                    executor.force_frame_failure_exit();
                     return Ok(None);
                 }
             };
@@ -6595,7 +6595,7 @@ impl KvmBackend {
                 crate::signal::XSAVE_ALIGNMENT
             };
             if !fpstate.is_multiple_of(required_alignment) {
-                executor.force_signal_exit(libc::SIGSEGV);
+                executor.force_frame_failure_exit();
                 return Ok(None);
             }
             let mut bytes = vec![0; size];
@@ -6610,13 +6610,13 @@ impl KvmBackend {
                     )
                     .is_err()
             {
-                executor.force_signal_exit(libc::SIGSEGV);
+                executor.force_frame_failure_exit();
                 return Ok(None);
             }
             match XsaveImage::restore_from_signal(&bytes) {
                 Ok(xsave) => xsave,
                 Err(_) => {
-                    executor.force_signal_exit(libc::SIGSEGV);
+                    executor.force_frame_failure_exit();
                     return Ok(None);
                 }
             }

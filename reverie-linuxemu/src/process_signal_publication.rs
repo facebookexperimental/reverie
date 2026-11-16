@@ -438,6 +438,11 @@ pub struct ProcessSignalRegistry {
     // operation ledger: after dequeue, the same child could otherwise enqueue
     // a second SIGCHLD. Retain exact generations until the run ends.
     child_publications: Mutex<BTreeMap<(i32, u64), ChildPublicationRecord>>,
+    // Processes whose committed exit status was caused by a signal-frame
+    // build or restore failure on some thread of the process, recorded
+    // when that status commits so the leader's publication can report
+    // the provenance even when a worker thread took the failure.
+    frame_failure_forced: Mutex<std::collections::BTreeSet<ProcessKey>>,
     // No callbacks or G references. An eventual owner must make its own run
     // terminal after saving FailedAfterCommit. This latch refuses further
     // publication; it is not a substitute for that owner transition.
@@ -608,6 +613,24 @@ impl ProcessSignalRegistry {
     /// lifecycle transition. Host join completion and the later Tool callback
     /// only consume this snapshot; they cannot resample a parent's newer
     /// SIGCHLD disposition.
+    /// Record that `process`'s committed exit status was caused by a
+    /// signal-frame build or restore failure (on whichever of its
+    /// threads took it), for the leader's child-wait publication.
+    pub(super) fn record_frame_failure_forced(&self, process: SignalProcessId) {
+        self.frame_failure_forced
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(process_key(process));
+    }
+
+    /// Whether [`Self::record_frame_failure_forced`] recorded `process`.
+    pub(super) fn frame_failure_forced(&self, process: SignalProcessId) -> bool {
+        self.frame_failure_forced
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(&process_key(process))
+    }
+
     pub(super) fn record_process_exit(
         &self,
         process: SignalProcessId,

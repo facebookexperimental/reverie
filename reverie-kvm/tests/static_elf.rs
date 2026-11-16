@@ -10628,10 +10628,27 @@ fn child_wait_event_config(events: &SharedChildWaitEvents) -> u64 {
     child_wait_event_config_with_block(events, None)
 }
 
+/// Like [`child_wait_event_config`], but the Tool authorizes every
+/// selected signal delivery, not only SIGCHLD ones: for guests whose
+/// own signals must be delivered (the frame-failure provenance cases).
+fn child_wait_event_config_authorizing_all(events: &SharedChildWaitEvents) -> u64 {
+    let id = NEXT_CHILD_WAIT_EVENT_CONFIG.fetch_add(1, Ordering::SeqCst);
+    CHILD_WAIT_EVENT_CONFIGS.lock().unwrap().insert(
+        id,
+        ChildWaitEventConfig {
+            events: Arc::downgrade(events),
+            blocked_getpid: None,
+            authorize_all_signals: true,
+        },
+    );
+    id
+}
+
 #[derive(Clone)]
 struct ChildWaitEventConfig {
     events: Weak<Mutex<Vec<BackendChildWaitEvent>>>,
     blocked_getpid: Option<i32>,
+    authorize_all_signals: bool,
 }
 
 fn child_wait_event_config_with_block(
@@ -10644,6 +10661,7 @@ fn child_wait_event_config_with_block(
         ChildWaitEventConfig {
             events: Arc::downgrade(events),
             blocked_getpid,
+            authorize_all_signals: false,
         },
     );
     id
@@ -10652,6 +10670,7 @@ fn child_wait_event_config_with_block(
 #[derive(Debug, Default)]
 struct ChildWaitEventLog {
     events: SharedChildWaitEvents,
+    authorize_all_signals: bool,
     control: Mutex<Option<BackendSignalControl>>,
     publications: Mutex<Vec<reverie::ChildExitPublicationResult>>,
     delivery_sequence: AtomicU64,
@@ -10666,13 +10685,18 @@ impl GlobalTool for ChildWaitEventLog {
     type Config = u64;
 
     async fn init_global_state(events: &Self::Config) -> Self {
+        let config = CHILD_WAIT_EVENT_CONFIGS
+            .lock()
+            .unwrap()
+            .get(events)
+            .cloned()
+            .expect("child wait event config disappeared");
         Self {
-            events: CHILD_WAIT_EVENT_CONFIGS
-                .lock()
-                .unwrap()
-                .get(events)
-                .and_then(|config| config.events.upgrade())
+            events: config
+                .events
+                .upgrade()
                 .expect("child wait event config disappeared"),
+            authorize_all_signals: config.authorize_all_signals,
             ..Self::default()
         }
     }
@@ -10734,13 +10758,17 @@ impl GlobalTool for ChildWaitEventLog {
             .expect("child signal control poisoned")
             .clone()
             .expect("backend signal control was installed");
-        let eligible = control
-            .process
-            .signal_recipients(task.process, libc::SIGCHLD)?
-            .into_iter()
-            .any(|recipient| recipient.task == task);
-        if !eligible {
-            return Ok(None);
+        if !self.authorize_all_signals {
+            // The child-wait tests' policy: only a SIGCHLD delivery to
+            // an eligible recipient is authorized.
+            let eligible = control
+                .process
+                .signal_recipients(task.process, libc::SIGCHLD)?
+                .into_iter()
+                .any(|recipient| recipient.task == task);
+            if !eligible {
+                return Ok(None);
+            }
         }
         let permit = SignalDeliveryPermit {
             task,
@@ -10942,6 +10970,7 @@ int main(void) {
                     user_ticks: 0,
                     system_ticks: 0,
                 },
+            forced: false,
             },
             BackendChildWaitEvent {
                 parent: SignalProcessId {
@@ -10959,6 +10988,7 @@ int main(void) {
                     user_ticks: 0,
                     system_ticks: 0,
                 },
+            forced: false,
             },
             BackendChildWaitEvent {
                 parent: SignalProcessId {
@@ -10976,6 +11006,7 @@ int main(void) {
                     user_ticks: 0,
                     system_ticks: 0,
                 },
+            forced: false,
             },
         ],
         "the backend callback must describe every real terminal waitability transition",
@@ -11010,6 +11041,118 @@ int main(void) {
             reverie::ChildExitPublicationEffect::Queued,
         ]
     );
+}
+
+#[test]
+fn frame_failure_child_exits_carry_forced_provenance_on_real_kvm() {
+    if !kvm_available("frame_failure_child_exits_carry_forced_provenance_on_real_kvm") {
+        return;
+    }
+
+    let directory = TestDirectory::new();
+    let executable = compile_c_program(
+        &directory.0,
+        "frame-failure-provenance",
+        r#"
+#define _GNU_SOURCE
+#include <signal.h>
+#include <string.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <ucontext.h>
+#include <unistd.h>
+
+static void corrupt(int signal, siginfo_t *info, void *uctx) {
+  (void)signal;
+  (void)info;
+  ((ucontext_t *)uctx)->uc_mcontext.fpregs = (void *)0x414141000ULL;
+}
+static void noop_handler(int signal) { (void)signal; }
+struct kernel_sigaction {
+  void *handler;
+  unsigned long flags;
+  void *restorer;
+  unsigned long mask[2];
+};
+
+int main(int argc, char **argv) {
+  if (argc < 2) return 90;
+  pid_t child = fork();
+  if (child < 0) return 91;
+  if (child == 0) {
+    signal(SIGSEGV, SIG_DFL);
+    if (argv[1][0] == '1') {
+      struct sigaction action = {0};
+      action.sa_sigaction = corrupt;
+      action.sa_flags = SA_SIGINFO;
+      sigemptyset(&action.sa_mask);
+      if (sigaction(SIGUSR1, &action, 0) != 0) _exit(92);
+      kill(getpid(), SIGUSR1);
+    } else if (argv[1][0] == '2') {
+      struct kernel_sigaction action = {0};
+      action.handler = (void *)noop_handler;
+      action.flags = SA_SIGINFO;
+      if (syscall(SYS_rt_sigaction, SIGUSR1, &action, (void *)0, 8) != 0)
+        _exit(93);
+      kill(getpid(), SIGUSR1);
+    } else if (argv[1][0] == '3') {
+      kill(getpid(), SIGSEGV);
+    } else {
+      _exit(94);
+    }
+    _exit(42);
+  }
+  int status = 0;
+  if (waitpid(child, &status, 0) != child) return 95;
+  if (!WIFSIGNALED(status) || WTERMSIG(status) != SIGSEGV) return 96;
+  return 0;
+}
+"#,
+    );
+    let executable = executable.to_str().unwrap();
+    let image = std::fs::read(executable).unwrap();
+
+    // (1) an rt_sigreturn frame refusal and (2) a delivery frame that
+    // cannot be built (no SA_RESTORER) are backend-forced; (3) a
+    // guest-sent SIGSEGV at the default action is not.
+    for (mode, forced) in [("1", true), ("2", true), ("3", false)] {
+        let mut backend = KvmBackend::new(256 * 1024 * 1024).unwrap();
+        backend.set_root_pid(17).unwrap();
+        backend
+            .install_static_elf_with_context(
+                &image,
+                &[executable, mode],
+                &["PATH=/usr/bin:/bin"],
+                &directory.0,
+            )
+            .unwrap();
+        let event_log = Arc::new(Mutex::new(Vec::new()));
+        let config = child_wait_event_config_authorizing_all(&event_log);
+        let (global, code, _stdout, stderr) = futures::executor::block_on(
+            backend.run_static_elf_with_tool::<ChildWaitEventTool>(config, true),
+        )
+        .unwrap();
+        assert_eq!(
+            code,
+            0,
+            "mode {mode}: guest failed with code {code}; stderr={}",
+            String::from_utf8_lossy(&stderr),
+        );
+        let events = global
+            .events
+            .lock()
+            .expect("child wait-event log poisoned")
+            .clone();
+        assert_eq!(events.len(), 1, "mode {mode}: {events:?}");
+        let event = events[0];
+        assert_eq!(event.parent.tgid.as_raw(), 17, "mode {mode}");
+        assert_eq!(event.child.tgid.as_raw(), 18, "mode {mode}");
+        let BackendChildWaitState::Exited { status, .. } = event.state else {
+            panic!("mode {mode}: not an exit event: {event:?}");
+        };
+        assert_eq!(status.signal(), Some(libc::SIGSEGV), "mode {mode}");
+        assert_eq!(event.forced, forced, "mode {mode}: {event:?}");
+    }
 }
 
 #[test]
@@ -11204,6 +11347,7 @@ int main(int argc, char **argv) {
                 user_ticks: 0,
                 system_ticks: 0,
             },
+            forced: false,
         }
     };
 

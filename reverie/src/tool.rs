@@ -637,6 +637,18 @@ pub struct BackendChildWaitEvent {
     pub child: crate::SignalProcessId,
     /// The observed child state and whether it remains waitable.
     pub state: BackendChildWaitState,
+    /// Whether the backend forced this exit itself for a signal frame it
+    /// could not build or refused to restore, where no controlled exit
+    /// boundary exists. This is only that boundary-less frame-failure
+    /// class: a fatal signal's default action applied at a boundary, a
+    /// guest-sent kill, and ordinary exits all report `false`. A backend
+    /// reports `true` only where it can attribute the published status
+    /// to that frame failure; where it cannot attribute it, it reports
+    /// `false`, so `false` does not by itself prove that no frame
+    /// failure occurred. A Tool may key exceptional admission of an
+    /// unreserved exit on this typed provenance instead of inferring it
+    /// from the status alone.
+    pub forced: bool,
 }
 
 impl BackendChildWaitEvent {

@@ -751,6 +751,7 @@ impl ElfExecutor {
             current_user_stack_pointer: None,
             exit_status: None,
             exit_group: false,
+            forced_exit: false,
             clear_child_tid: None,
             vfork_parent: None,
         }
@@ -1454,6 +1455,7 @@ impl ElfExecutor {
             current_user_stack_pointer: None,
             exit_status: None,
             exit_group: false,
+            forced_exit: false,
             clear_child_tid: None,
             vfork_parent: share_address_space.then_some(reverie::SignalProcessId {
                 tgid: reverie::Pid::from_raw(self.state.pid),
@@ -1630,6 +1632,7 @@ impl ElfExecutor {
             current_user_stack_pointer: None,
             exit_status: None,
             exit_group: false,
+            forced_exit: false,
             clear_child_tid: None,
             vfork_parent: None,
         };
@@ -2715,6 +2718,7 @@ impl ElfExecutor {
         self.pending_segment = None;
         self.exit_status = None;
         self.exit_group = false;
+        self.forced_exit = false;
         self.clear_child_tid = None;
         drop(_transaction);
         drop(files);

@@ -433,6 +433,10 @@ pub struct ElfExecutor {
     current_user_stack_pointer: Option<u64>,
     exit_status: Option<ExitStatus>,
     exit_group: bool,
+    /// This task's exit was forced by a signal-frame build or restore
+    /// failure (`force_frame_failure_exit`), which has no controlled
+    /// signal boundary.
+    forced_exit: bool,
     clear_child_tid: Option<u64>,
     /// The process whose address space this task shares as a vfork child
     /// (`CLONE_VM | CLONE_VFORK`), until its window ends

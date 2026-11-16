@@ -4720,6 +4720,12 @@ async fn finish_tool_process_after_workers_with_panics<T: Tool>(
                             {
                                 Err(report("child wait completion", error))
                             } else {
+                                debug_assert!(
+                                    !executor.forced_frame_failure_exit()
+                                        || snapshot.completion.status.signal()
+                                            == Some(libc::SIGSEGV),
+                                    "forced provenance with a non-SIGSEGV published status"
+                                );
                                 let event = reverie::BackendChildWaitEvent {
                                     parent: snapshot.completion.parent,
                                     child: context.child,
@@ -4730,6 +4736,8 @@ async fn finish_tool_process_after_workers_with_panics<T: Tool>(
                                         user_ticks: snapshot.completion.user_ticks,
                                         system_ticks: snapshot.completion.system_ticks,
                                     },
+                                    forced: executor.forced_frame_failure_exit()
+                                        || executor.frame_failure_forced(context.child),
                                 };
                                 let mut callback = Box::pin(
                                     crate::failure::owned_future::catch_owned_future_from(|| {

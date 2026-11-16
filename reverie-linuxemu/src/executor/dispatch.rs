@@ -1339,6 +1339,7 @@ impl ElfExecutor {
             }
             SyscallAction::Exit(code) => {
                 self.exit_status = Some(code);
+                self.forced_exit = false;
                 self.exit_group = request.number() != libc::SYS_exit as u64;
                 Ok(0)
             }
