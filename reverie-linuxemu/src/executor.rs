@@ -16813,9 +16813,13 @@ mod tests {
 
         /// Probe entry in a forked child that never execs: exit 0 if
         /// the namespace was entered, exit 77 (with the errno on the
-        /// pipe) if entry was refused. This is the only outcome that
-        /// may become a skip; fork/wait failures and any other child
-        /// status fail the test. If entry succeeds but a security
+        /// pipe) if entry was refused. Entry covers both `unshare`
+        /// and the subsequent /proc writes, so cases such as fd
+        /// exhaustion or a missing /proc can still exit 77 even after
+        /// a successful `unshare`; the skip line shows that real errno
+        /// rather than implying `unshare` itself was denied. This is
+        /// the only outcome that may become a skip; fork/wait failures
+        /// and any other child status fail the test. If entry succeeds but a security
         /// policy (for example AppArmor) strips capabilities inside
         /// the namespace, the later body fails its assertions loudly
         /// rather than skipping: the namespace exists, so the test
