@@ -110,12 +110,14 @@ fn an_exec_the_host_cannot_finish_past_its_point_of_no_return_is_the_host_resour
     assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_AS, &lowered) }, 0);
     let result = backend.exec_process(
         &mut executor,
-        (Path::new(&argv[0]), None),
-        None,
-        None,
-        &image,
-        &argv,
-        &[],
+        ExecImage {
+            executable: (Path::new(&argv[0]), None),
+            interpreter: None,
+            execfn: None,
+            image: &image,
+            argv: &argv,
+            envp: &[],
+        },
     );
     // SAFETY: as above, with the original limits.
     assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_AS, &original) }, 0);
@@ -154,12 +156,14 @@ fn an_exec_the_host_cannot_finish_past_its_point_of_no_return_is_the_host_resour
     backend
         .exec_process(
             &mut executor,
-            (Path::new(&argv[0]), None),
-            None,
-            None,
-            &image,
-            &argv,
-            &[],
+            ExecImage {
+                executable: (Path::new(&argv[0]), None),
+                interpreter: None,
+                execfn: None,
+                image: &image,
+                argv: &argv,
+                envp: &[],
+            },
         )
         .expect("the same exec succeeds under the original limit");
 }
@@ -221,12 +225,14 @@ fn an_exec_reload_of_an_image_with_vast_section_metadata_reads_only_its_program_
     assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_AS, &lowered) }, 0);
     let result = backend.exec_process(
         &mut executor,
-        (Path::new(&argv[0]), None),
-        None,
-        None,
-        &image,
-        &argv,
-        &[],
+        ExecImage {
+            executable: (Path::new(&argv[0]), None),
+            interpreter: None,
+            execfn: None,
+            image: &image,
+            argv: &argv,
+            envp: &[],
+        },
     );
     // SAFETY: as above, with the original limits.
     assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_AS, &original) }, 0);

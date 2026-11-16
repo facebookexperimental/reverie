@@ -352,6 +352,7 @@ use crate::provider::ProviderOutcome;
 use crate::provider::ProviderRequest;
 use crate::vm::CompletedBoundarySlot;
 use crate::vm::CompletedSyscallBoundary;
+use crate::vm::ExecImage;
 use crate::vm::HandlerEntry;
 use crate::vm::ProcessActionContinuation;
 use crate::vm::ProcessActionOutcome;
@@ -1914,12 +1915,14 @@ where
                         } => {
                             self.backend.exec_process(
                                 self.executor,
-                                (&executable_path, executable_file),
-                                interpreter.as_ref(),
-                                execfn.as_deref(),
-                                &image,
-                                &argv,
-                                &envp,
+                                ExecImage {
+                                    executable: (&executable_path, executable_file),
+                                    interpreter: interpreter.as_ref(),
+                                    execfn: execfn.as_deref(),
+                                    image: &image,
+                                    argv: &argv,
+                                    envp: &envp,
+                                },
                             )?;
                             Ok(ProcessActionOutcome::replaced())
                         }

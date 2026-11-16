@@ -41194,9 +41194,7 @@ mod tests {
                 "[[package]]\nname = \"{name}\"\nversion = \"0.5.7\"\nsource = \"{moved_source}\"\n"
             )
         })
-        .chain([format!(
-            "[[package]]\nname = \"detcore-liteinst\"\nversion = \"0.5.7\"\n"
-        )])
+        .chain(["[[package]]\nname = \"detcore-liteinst\"\nversion = \"0.5.7\"\n".to_string()])
         .collect::<String>();
         fs::write(hermit.join("Cargo.lock"), &lock).unwrap();
         fs::write(hermit.join("liteinst-runtime-build/Cargo.lock"), &lock).unwrap();

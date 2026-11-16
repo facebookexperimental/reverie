@@ -6,7 +6,6 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-
 //! Per-thread Tool TLS slot layout: one record/TCB/altstack stride per
 //! Tool thread plus a pool of preclaimed continuation stacks.
 //!

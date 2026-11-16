@@ -2290,6 +2290,18 @@ struct InitializedKvmResources {
     xss_outcome: crate::host_xss::Outcome,
 }
 
+/// The image [`KvmBackend::exec_process`] replaces the current image with:
+/// the executable the preflight opened, its interpreter and `execfn`, the
+/// image bytes, and the new `argv`/`envp`.
+pub(crate) struct ExecImage<'a> {
+    pub(crate) executable: (&'a Path, Option<Arc<File>>),
+    pub(crate) interpreter: Option<&'a ExecInterpreter>,
+    pub(crate) execfn: Option<&'a [u8]>,
+    pub(crate) image: &'a [u8],
+    pub(crate) argv: &'a [String],
+    pub(crate) envp: &'a [String],
+}
+
 impl KvmBackend {
     /// The lexical scope remains with the invocation that will retire it.
     /// Child construction can carry parent memory views until this binding.
@@ -3269,12 +3281,7 @@ impl KvmBackend {
     pub(crate) fn exec_process(
         &mut self,
         executor: &mut ElfExecutor,
-        executable: (&Path, Option<Arc<File>>),
-        interpreter: Option<&ExecInterpreter>,
-        execfn: Option<&[u8]>,
-        image: &[u8],
-        argv: &[String],
-        envp: &[String],
+        image: ExecImage<'_>,
     ) -> Result<()> {
         if self.is_guest_thread {
             return Err(Error::GuestThreadExecUnsupported);
@@ -3290,7 +3297,7 @@ impl KvmBackend {
         // handle, and opens no path. A host resource of this process's own that ran out (memory,
         // a descriptor, the host's file table) ends the run with the named
         // refusal; any other failure ends it as a backend fault.
-        self.replace_process_image(executor, executable, interpreter, execfn, image, argv, envp)
+        self.replace_process_image(executor, image)
             .map_err(exec_after_point_of_no_return_error)?;
         // The new image's mm is used only by this process's threads (Linux's
         // exec_mmap gives the process a new mm, and the other threads have
@@ -3307,13 +3314,16 @@ impl KvmBackend {
     fn replace_process_image(
         &mut self,
         executor: &mut ElfExecutor,
-        executable: (&Path, Option<Arc<File>>),
-        interpreter: Option<&ExecInterpreter>,
-        execfn: Option<&[u8]>,
-        image: &[u8],
-        argv: &[String],
-        envp: &[String],
+        image: ExecImage<'_>,
     ) -> Result<()> {
+        let ExecImage {
+            executable,
+            interpreter,
+            execfn,
+            image,
+            argv,
+            envp,
+        } = image;
         let user_length = usize::try_from(self.memory.guest_end() - BOOT_RESERVED_END)
             .expect("guest memory length must fit usize");
         // A vfork child's window ends at its exec, at Linux's
@@ -4337,12 +4347,14 @@ impl KvmBackend {
                     .map_err(|error| Error::ExecWorkerTeardown(Box::new(error)))?;
                 let result = self.exec_process(
                     executor,
-                    (&executable_path, executable_file),
-                    interpreter.as_ref(),
-                    execfn.as_deref(),
-                    &image,
-                    &argv,
-                    &envp,
+                    ExecImage {
+                        executable: (&executable_path, executable_file),
+                        interpreter: interpreter.as_ref(),
+                        execfn: execfn.as_deref(),
+                        image: &image,
+                        argv: &argv,
+                        envp: &envp,
+                    },
                 );
                 self.thread_group.rearm_after_exec();
                 result?;
@@ -12632,12 +12644,14 @@ mod tests {
                 parent
                     .exec_process(
                         &mut executor,
-                        (Path::new("/page-zero-exec"), None),
-                        None,
-                        None,
-                        &minimal_test_elf(&[HLT]),
-                        &["/page-zero-exec".to_owned()],
-                        &[],
+                        ExecImage {
+                            executable: (Path::new("/page-zero-exec"), None),
+                            interpreter: None,
+                            execfn: None,
+                            image: &minimal_test_elf(&[HLT]),
+                            argv: &["/page-zero-exec".to_owned()],
+                            envp: &[],
+                        },
                     )
                     .unwrap();
                 assert_eq!(parent.vcpu.translate_gva(0).unwrap().valid, 0);

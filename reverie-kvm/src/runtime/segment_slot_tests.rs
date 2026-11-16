@@ -140,12 +140,14 @@ fn exec_process_discards_a_staged_fs_base() {
     backend
         .exec_process(
             &mut executor,
-            (std::path::Path::new("/bin/segment-slot-exec"), None),
-            None,
-            None,
-            &crate::vm::minimal_test_elf(&[0xf4]),
-            &["/bin/segment-slot-exec".to_owned()],
-            &[],
+            crate::vm::ExecImage {
+                executable: (std::path::Path::new("/bin/segment-slot-exec"), None),
+                interpreter: None,
+                execfn: None,
+                image: &crate::vm::minimal_test_elf(&[0xf4]),
+                argv: &["/bin/segment-slot-exec".to_owned()],
+                envp: &[],
+            },
         )
         .unwrap();
     let staged = staged_segment(&mut backend, &mut executor);
