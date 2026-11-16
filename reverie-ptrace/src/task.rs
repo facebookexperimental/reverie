@@ -87,6 +87,8 @@ use tokio::task::JoinHandle;
 use tracing::Instrument;
 
 use crate::PtraceBackendStatsSource;
+#[cfg(target_arch = "aarch64")]
+use crate::RestartRefusalReason;
 use crate::children;
 use crate::cp;
 use crate::error::Error;
@@ -1197,6 +1199,127 @@ pub(crate) fn blocked_signal_mask(tid: Pid) -> Result<u64, TraceError> {
         .and_then(|value| u64::from_str_radix(value.trim(), 16).ok())
         .ok_or_else(|| Errno::EPROTO.into())
 }
+
+/// A signal set procfs reports for the stopped thread `tid`, by its field
+/// name: `SigPnd` for the signals pending for the thread itself (not its
+/// thread group's, `ShdPnd`), `SigCgt` for the signals with a handler.
+#[cfg(target_arch = "aarch64")]
+fn proc_signal_set(tid: Pid, field: &str) -> Result<u64, TraceError> {
+    let status = read_status(format!("/proc/{tid}/status"))
+        .map_err(|err| Errno::new(err.raw_os_error().unwrap_or(libc::EIO)))?;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix(field)?.strip_prefix(':'))
+        .and_then(|value| u64::from_str_radix(value.trim(), 16).ok())
+        .ok_or_else(|| Errno::EPROTO.into())
+}
+
+/// What `return_restart_through_syscall_exit` puts back when its trick stops
+/// where it should not: the guest's registers and its signal mask.
+#[cfg(target_arch = "aarch64")]
+struct RestartTrickRestore {
+    guest: libc::user_regs_struct,
+    mask: u64,
+}
+
+#[cfg(target_arch = "aarch64")]
+impl RestartTrickRestore {
+    /// Best effort: the trick is failing already, with its own error.
+    fn apply(&self, task: &Stopped) {
+        let _ = task.setregs(&self.guest);
+        let _ = task.setsigmask(self.mask);
+    }
+}
+
+/// A thread's masks while a temporary mask's restore is pending: the mask to
+/// restore (`PTRACE_GETSIGMASK`) and the one in effect (procfs `SigBlk`).
+#[cfg(target_arch = "aarch64")]
+#[derive(Clone, Copy)]
+struct RestartMasks {
+    saved: u64,
+    in_effect: u64,
+}
+
+/// The first realtime signal, from 64 down, that `pending` (procfs `SigPnd`)
+/// does not hold, to carry a resume into `do_signal`
+/// (`return_restart_through_syscall_exit`); `None` when every one is pending.
+#[cfg(any(test, target_arch = "aarch64"))]
+fn free_carrier(pending: u64) -> Option<AnySignal> {
+    (34..=64)
+        .rev()
+        .filter_map(AnySignal::new)
+        .find(|carrier| pending & signal_mask_bit(*carrier) == 0)
+}
+
+/// Whether the instance the carrier's stop took is the tracer's own: queued
+/// with `SI_QUEUE` and the carrier's `cookie` as its value (`carrier_siginfo`).
+#[cfg(any(test, target_arch = "aarch64"))]
+fn carrier_instance_is_the_tracers(si_code: i32, value: u64, cookie: u64) -> bool {
+    si_code == libc::SI_QUEUE && value == cookie
+}
+
+/// A restart code `code` left in `x0` for the kernel to resolve, for the
+/// syscall whose `svc` ends at `at` and whose first argument is `arg0`
+/// (`TracedTask::deferred_restart`).
+#[cfg(target_arch = "aarch64")]
+#[derive(Clone, Copy, Debug)]
+struct DeferredRestart {
+    at: u64,
+    code: Reg,
+    arg0: Reg,
+}
+
+/// The siginfo of the carrier `return_restart_through_syscall_exit` queues:
+/// `SI_QUEUE` from the tracer, with `cookie` as its value, which tells the
+/// tracer's instance from any other of the same number at the carrier's stop.
+/// `SI_TKILL` and the sender's process ID cannot: Linux reports `si_pid` in the
+/// receiver's PID namespace, where a tracer outside it reads as 0.
+#[cfg(target_arch = "aarch64")]
+fn carrier_siginfo(carrier: AnySignal, cookie: u64) -> libc::siginfo_t {
+    // SAFETY: a zeroed siginfo is a valid one to fill in.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    info.si_signo = carrier.raw();
+    info.si_code = libc::SI_QUEUE;
+    let raw = &mut info as *mut libc::siginfo_t as *mut u8;
+    // SAFETY: the siginfo's `_rt` member on 64-bit Linux: `si_pid` at byte 16,
+    // `si_uid` at 20 and `si_value` at 24, all inside the 128-byte siginfo;
+    // getpid and getuid touch no memory.
+    unsafe {
+        raw.add(16).cast::<i32>().write_unaligned(libc::getpid());
+        raw.add(20).cast::<u32>().write_unaligned(libc::getuid());
+        raw.add(24).cast::<u64>().write_unaligned(cookie);
+    }
+    info
+}
+
+/// A value no two carriers share in one tracer (`carrier_siginfo`): random
+/// high bits, drawn once per tracer, over a counter. Nothing a guest observes
+/// depends on it: the carrier's own siginfo is never delivered.
+#[cfg(target_arch = "aarch64")]
+fn next_carrier_cookie() -> u64 {
+    static HIGH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let high = *HIGH.get_or_init(|| {
+        let mut bytes = [0u8; 4];
+        // SAFETY: getrandom writes at most `bytes.len()` bytes into `bytes`.
+        let filled = unsafe { libc::getrandom(bytes.as_mut_ptr().cast(), bytes.len(), 0) };
+        let random = if filled == bytes.len() as isize {
+            u32::from_ne_bytes(bytes)
+        } else {
+            // Without getrandom, the clock and the tracer's process ID: the
+            // cookie needs only to differ from a guest instance's value, and
+            // the guest never sees it.
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.subsec_nanos());
+            // SAFETY: getpid takes no arguments and touches no memory.
+            now ^ (unsafe { libc::getpid() } as u32).rotate_left(16)
+        };
+        u64::from(random) << 32
+    });
+    high | (NEXT.fetch_add(1, Ordering::Relaxed) & 0xffff_ffff)
+}
+
 
 /// `PTRACE_GETSIGMASK`, with an error from a tracee that died passed
 /// through `dead_or`, so that the paths that handle a killed tracee take it.
@@ -4951,6 +5074,12 @@ pub struct TracedTask<L: Tool> {
     /// (`records_watch_sigtrap`), for the repair at a hit
     /// (`restore_sigtrap_after_hit`).
     watch_run: StdMutex<SignalRun>,
+    /// A restart code left for the kernel to resolve with no signal held
+    /// (`defer_restart_under_pending_mask_restore`), whose restart debug
+    /// builds check for the guest's first argument
+    /// (`check_restarted_first_argument`).
+    #[cfg(target_arch = "aarch64")]
+    deferred_restart: Option<DeferredRestart>,
 
     /// The stack pointer the current image started with, recorded at its
     /// exec stop (`Guest::initial_stack_pointer`). Tasks forked or cloned
@@ -5089,6 +5218,16 @@ pub struct TracedTask<L: Tool> {
     /// `status_to_result`. Siginfo cannot classify the stop, because a guest
     /// may queue itself a SIGTRAP whose `si_code` mimics a syscall stop.
     latest_injection_stop: Option<Option<AnySignal>>,
+
+    /// The first argument of the last private-page syscall the thread entered
+    /// since the current stop was dispatched (`handle_stop_event`), or `None`
+    /// for none: the kernel's `orig_x0`, where a restart takes its first
+    /// argument from (`defer_restart_under_pending_mask_restore`). Set at the
+    /// call's syscall-entry stop where the backend sees one, and otherwise
+    /// once the injection is reported as run (`last_injection_ran`), so an
+    /// injection that never reached its `svc` changes nothing.
+    #[cfg(target_arch = "aarch64")]
+    private_first_argument: Option<Reg>,
     /// Whether anything wrote the siginfo of the stop this task holds since
     /// the kernel reported it. Until then the exit guard's one-call probe
     /// (`ExitProbe::ReportedSiginfo`) is sound; after a write only the full
@@ -5473,6 +5612,8 @@ impl<L: Tool> TracedTask<L> {
             has_cpuid_interception: false,
             watches: WatchSet::default(),
             watch_run: StdMutex::new(SignalRun::Unknown),
+            #[cfg(target_arch = "aarch64")]
+            deferred_restart: None,
             initial_stack_pointer: None,
             pending_syscall: None,
             native_callback: None,
@@ -5517,6 +5658,8 @@ impl<L: Tool> TracedTask<L> {
             ptracer_waits: Arc::new(PtracerWaitOwner::default()),
             preinit_generation: None,
             latest_injection_stop: None,
+            #[cfg(target_arch = "aarch64")]
+            private_first_argument: None,
             held_siginfo_written: AtomicBool::new(false),
             last_injection_ran: true,
             in_signal_callback: false,
@@ -5604,6 +5747,8 @@ impl<L: Tool> TracedTask<L> {
             has_cpuid_interception: self.has_cpuid_interception,
             watches: WatchSet::default(),
             watch_run: StdMutex::new(SignalRun::Unknown),
+            #[cfg(target_arch = "aarch64")]
+            deferred_restart: None,
             initial_stack_pointer: self.initial_stack_pointer,
             pending_syscall: None,
             native_callback: None,
@@ -5644,6 +5789,8 @@ impl<L: Tool> TracedTask<L> {
             ptracer_waits,
             preinit_generation: None,
             latest_injection_stop: None,
+            #[cfg(target_arch = "aarch64")]
+            private_first_argument: None,
             held_siginfo_written: AtomicBool::new(false),
             last_injection_ran: true,
             in_signal_callback: false,
@@ -5751,6 +5898,8 @@ impl<L: Tool> TracedTask<L> {
             has_cpuid_interception: self.has_cpuid_interception,
             watches: WatchSet::default(),
             watch_run: StdMutex::new(SignalRun::Unknown),
+            #[cfg(target_arch = "aarch64")]
+            deferred_restart: None,
             initial_stack_pointer: self.initial_stack_pointer,
             pending_syscall: None,
             native_callback: None,
@@ -5791,6 +5940,8 @@ impl<L: Tool> TracedTask<L> {
             ptracer_waits,
             preinit_generation: None,
             latest_injection_stop: None,
+            #[cfg(target_arch = "aarch64")]
+            private_first_argument: None,
             held_siginfo_written: AtomicBool::new(false),
             last_injection_ran: true,
             in_signal_callback: false,
@@ -7592,6 +7743,10 @@ impl<L: Tool + 'static> TracedTask<L> {
             self.mark_segv_unseen();
         }
         self.latest_injection_stop = None;
+        #[cfg(target_arch = "aarch64")]
+        {
+            self.private_first_argument = None;
+        }
         self.restore_maybe_pending = !matches!(event, Event::Seccomp);
         self.injection_proc_state = None;
 
@@ -7603,6 +7758,9 @@ impl<L: Tool + 'static> TracedTask<L> {
         let tid = self.tid();
 
         self.ordinary_continuation()?;
+        #[cfg(target_arch = "aarch64")]
+        self.check_restarted_first_argument(&stopped, &event)
+            .tracee_context(tid, "check a restarted syscall's first argument")?;
         let result = match event {
             Event::Signal(sig) => self
                 .handle_signal(stopped, sig.into(), unreported_stop_signal == Some(sig))
@@ -9509,6 +9667,10 @@ impl<L: Tool + 'static> TracedTask<L> {
         let tid = self.tid();
         self.native_user_continuation(&task)
             .tracee_context(tid, "account previous native continuation")?;
+        #[cfg(target_arch = "aarch64")]
+        {
+            self.deferred_restart = None;
+        }
         let syscall = match self.get_syscall(&task) {
             Ok(syscall) => syscall,
             Err(error) => match self.get_raw_syscall(&task) {
@@ -9760,6 +9922,8 @@ impl<L: Tool + 'static> TracedTask<L> {
             self.ordinary_trace_continuation()?;
             self.timer.finalize_requests();
 
+            #[cfg(target_arch = "aarch64")]
+            let mut restart_ret = None;
             if let Some(retval) = retval {
                 let ret = match retval {
                     Ok(x) => x as u64,
@@ -9781,6 +9945,11 @@ impl<L: Tool + 'static> TracedTask<L> {
 
                 #[cfg(not(target_arch = "x86_64"))]
                 set_ret(&task, ret).tracee_context(tid, "set intercepted syscall result")?;
+
+                #[cfg(target_arch = "aarch64")]
+                {
+                    restart_ret = Some(ret);
+                }
             }
 
             #[cfg(test)]
@@ -9805,7 +9974,33 @@ impl<L: Tool + 'static> TracedTask<L> {
                 self.pre_syscall_for_test(&regs, PreSyscallPoint::Late)
                     .await;
             }
+            // The held signal and the siginfo it was taken with, before the
+            // Tool's verdict, for a restart code returned below.
+            #[cfg(target_arch = "aarch64")]
+            let held_record = held.map(|sig| {
+                let taken = self.pending_signal_taken.filter(|taken| taken.signal == sig);
+                (sig, taken.map(|taken| taken.bytes))
+            });
             let resume = self.report_held_signal(&task, None, held).await?;
+            // A restart code written as the result is resolved by Linux only
+            // at a syscall's own exit on aarch64.
+            #[cfg(target_arch = "aarch64")]
+            if let Some(ret) = restart_ret
+                && !resume.step
+                && deferred_native.is_none()
+            {
+                task = self
+                    .return_restart_through_syscall_exit(
+                        task,
+                        nr,
+                        args.arg0 as Reg,
+                        ret,
+                        held_record,
+                        resume.signal,
+                    )
+                    .await
+                    .tracee_context(tid, "return a restart code through a syscall exit")?;
+            }
             // An original syscall that sets the mask, left to run on this
             // resume, is run to its exit stop where SIGSEGV's state is kept,
             // and the mask it set is read there (`note_segv_resume`), not
@@ -12252,6 +12447,617 @@ impl<L: Tool + 'static> TracedTask<L> {
         }
     }
 
+    /// Hands a restart code written as the guest syscall's result back to
+    /// Linux on aarch64, where the kernel would otherwise never resolve it.
+    ///
+    /// Linux turns a syscall's `-ERESTART*` result into a restart or `-EINTR`
+    /// on the way back to user mode. x86-64 decides at the delivery, after
+    /// the tracer's last stop, from `orig_ax` and `ax` as the tracer left them
+    /// (`handle_signal`, arch/x86/kernel/signal.c:263-281 at v6.12.9, and
+    /// `arch_do_signal_or_restart`, :344-361, with no handler), and the skip
+    /// puts the guest's `orig_ax` back at its trap (`skip_seccomp_syscall`),
+    /// so a result written at any later stop is resolved. arm64 decides before
+    /// `get_signal` and its ptrace stops (`do_signal`,
+    /// arch/arm64/kernel/signal.c:1395-1464 at v6.12.9): only while the
+    /// kernel's own syscall number (`syscallno`) names a syscall, it rewinds
+    /// `pc` to the `svc`, puts back `orig_x0` and forgets the syscall; after
+    /// the delivery stop it turns the restart into `-EINTR` for a handler
+    /// only while `pc` is still that `svc` (`-ERESTARTNOHAND`,
+    /// `-ERESTART_RESTARTBLOCK`, or `-ERESTARTSYS` without `SA_RESTART`); with
+    /// no handler it restarts, `-ERESTART_RESTARTBLOCK` as `restart_syscall`.
+    /// A result the Tool returns is written at the trap that ended the
+    /// syscall's skip (`skip_seccomp_syscall`) or the Tool's last injection,
+    /// after that decision was taken with no syscall named (the skip's -1, or
+    /// the injection's own call, forgotten), so the code would reach the
+    /// guest as its result.
+    ///
+    /// Applying the kernel's restart processing here is an exception to
+    /// Reverie's leaving Linux behaviour to the kernel: Reverie executes the
+    /// syscall in the Tool's stead and writes the Tool's result where the
+    /// kernel's own result would be, so it must let the kernel resolve that
+    /// result as it resolves its own, as x86-64's kernel does unaided. The Tool
+    /// chose the code, and the backend decides no outcome. Where the kernel's
+    /// route is open, the outcome is the kernel's for that code and the
+    /// action of the signal delivered. Where it is closed, a signal held for
+    /// the resume while a temporary mask's restore is pending
+    /// (`restart_under_pending_mask_restore`), the Tool decides it from the
+    /// facts the backend reads at that stop
+    /// (`Tool::resolve_restart_under_pending_mask_restore`).
+    ///
+    /// The result is therefore returned through a syscall exit of its own.
+    /// With every blockable signal blocked, the thread runs a skipped syscall
+    /// from the private page, whose entry saves the guest's first argument,
+    /// `arg0`, as `orig_x0`. At its exit stop the guest's registers and its
+    /// syscall number `nr` are put back. With no signal held for the resume
+    /// the guest's mask is put back too, and the caller resumes the thread
+    /// from that stop: `do_signal` resolves the code on the way back to user
+    /// mode for a signal pending by then, as x86-64's kernel resolves it with
+    /// `orig_ax` naming the call, and with none the guest gets the code, as
+    /// on x86-64. With a signal `held`, or after a SIGSTOP delivered meanwhile
+    /// (below), which leaves nothing pending to run `do_signal`, a carrier, a
+    /// realtime signal no instance of which is pending for the thread, is
+    /// queued for it with every other blockable signal blocked, with a value
+    /// only this instance carries (`carrier_siginfo`). The resume runs
+    /// `do_signal` for the guest's call, which prepares the restart, and stops
+    /// at the carrier's signal-delivery stop, which must take that instance,
+    /// or the run ends with a named refusal. There the guest's mask is put back,
+    /// with the siginfo the held signal was taken with, and the caller
+    /// resumes the thread delivering the signal it decided on (`deliver`),
+    /// or none, in the carrier's place. The kernel ends the restart by that
+    /// signal's action: `-EINTR` for a handler, as above, and a restart
+    /// otherwise, also when the Tool dropped the held signal, which the
+    /// kernel sees as a tracer suppressing it. No signal of the guest's is
+    /// sent again, so Linux's send-time handling of SIGCONT and the stop
+    /// signals (`prepare_signal`, kernel/signal.c:902-967 at v6.12.9), which
+    /// discards pending stop signals or a pending SIGCONT, runs for the
+    /// carrier alone, which is neither.
+    ///
+    /// A SIGSTOP, which no mask blocks, is delivered at its signal-delivery
+    /// stop wherever the thread takes one meanwhile, as the main loop delivers
+    /// it, and a group stop is resumed, as the stepped injections resume one
+    /// (`step_private_syscall_unshielded`): a thread traced with `PTRACE_TRACEME`
+    /// cannot be left in a group stop until a SIGCONT arrives, which takes
+    /// `PTRACE_SEIZE` and `PTRACE_LISTEN`.
+    ///
+    /// With a temporary mask's restore pending (`PTRACE_GETSIGMASK` then
+    /// reports the saved mask, procfs `SigBlk` the one in effect), writing the
+    /// mask would discard the restore. With no signal held the kernel's route
+    /// stays open (`defer_restart_under_pending_mask_restore`); for a held
+    /// signal the kernel's outcome is written to the registers instead
+    /// (`restart_under_pending_mask_restore`).
+    ///
+    /// Under a tracer that may be filtered (`thread_may_be_seccomp_filtered`),
+    /// which may not make the requests, or with a seccomp filter besides
+    /// Reverie's own, which could act on the skipped call, the code is
+    /// reported to the Tool (`Tool::handle_unresolved_restart`), whose answer
+    /// becomes the result.
+    #[cfg(target_arch = "aarch64")]
+    async fn return_restart_through_syscall_exit(
+        &mut self,
+        task: Stopped,
+        nr: Sysno,
+        arg0: Reg,
+        ret: Reg,
+        held: Option<(AnySignal, Option<SiginfoBytes>)>,
+        deliver: Option<AnySignal>,
+    ) -> Result<Stopped, TraceError> {
+        let code = match Errno::from_ret(ret as usize) {
+            Err(
+                code @ (Errno::ERESTARTSYS
+                | Errno::ERESTARTNOINTR
+                | Errno::ERESTARTNOHAND
+                | Errno::ERESTART_RESTARTBLOCK),
+            ) => code,
+            _ => return Ok(task),
+        };
+        if thread_may_be_seccomp_filtered() {
+            return self
+                .unresolved_restart(task, nr, code, reverie::UnresolvedRestart::TracerMayBeFiltered)
+                .await;
+        }
+        if !in_place_seccomp_baseline_admitted(self.global_state.seccomp_filter_baseline)
+            || self.guest_has_own_seccomp_filter(task.pid())
+        {
+            return self
+                .unresolved_restart(task, nr, code, reverie::UnresolvedRestart::GuestSeccompFilter)
+                .await;
+        }
+        let mask = sigmask(&task)?;
+        let in_effect = blocked_signal_mask(task.pid()).map_err(|error| dead_or(&task, error))?;
+        if in_effect != mask {
+            let masks = RestartMasks {
+                saved: mask,
+                in_effect,
+            };
+            match held {
+                Some(_) => {
+                    self.restart_under_pending_mask_restore(&task, nr, arg0, code, masks, deliver)
+                        .await?
+                }
+                None => {
+                    self.defer_restart_under_pending_mask_restore(&task, nr, arg0, code, masks)
+                        .await?
+                }
+            }
+            return Ok(task);
+        }
+        let guest = task.getregs()?;
+        let restore = RestartTrickRestore { guest, mask };
+        set_sigmask(&task, mask | BLOCKABLE_SIGNAL_BITS)?;
+        let mut entry = guest;
+        *entry.ip_mut() = cp::PRIVATE_PAGE_OFFSET as Reg;
+        *entry.ret_mut() = arg0;
+        task.setregs(&entry)?;
+        let mut stop_delivered = false;
+        let task = self
+            .resume_restart_trick(task, None, &restore, &mut stop_delivered)
+            .await?;
+        task.set_syscall(-1)?;
+        let task = self
+            .resume_restart_trick(task, None, &restore, &mut stop_delivered)
+            .await?;
+        task.setregs(&guest)?;
+        task.set_syscall(nr as i32)?;
+        // A SIGSTOP delivered meanwhile leaves nothing pending to run
+        // `do_signal` (`do_notify_resume`), so a carrier runs it then too.
+        let carrier = if held.is_some() || stop_delivered {
+            let pending =
+                proc_signal_set(task.pid(), "SigPnd").map_err(|error| dead_or(&task, error))?;
+            free_carrier(pending)
+        } else {
+            None
+        };
+        if !(held.is_some() || stop_delivered) {
+            // The caller's resume, with no signal, is from this syscall exit
+            // stop (`resume_with_signal_and_native`).
+            set_sigmask(&task, mask)?;
+            self.latest_injection_stop = Some(None);
+            return Ok(task);
+        }
+        let Some(carrier) = carrier else {
+            set_sigmask(&task, mask)?;
+            return Err(self.refuse_restart(
+                nr,
+                code,
+                RestartRefusalReason::NoFreeCarrierSignal,
+                "",
+            ));
+        };
+        set_sigmask(&task, BLOCKABLE_SIGNAL_BITS & !signal_mask_bit(carrier))?;
+        let cookie = next_carrier_cookie();
+        let sent = {
+            let info = carrier_siginfo(carrier, cookie);
+            // SAFETY: rt_tgsigqueueinfo reads the siginfo it is passed, which
+            // outlives the call.
+            unsafe {
+                libc::syscall(
+                    libc::SYS_rt_tgsigqueueinfo,
+                    self.pid().as_raw(),
+                    task.pid().as_raw(),
+                    carrier.raw(),
+                    &info as *const libc::siginfo_t,
+                )
+            }
+        };
+        if sent != 0 {
+            let error = dead_or(&task, Errno::last().into());
+            restore.apply(&task);
+            return Err(error);
+        }
+        let task = self
+            .resume_restart_trick(task, Some(carrier), &restore, &mut stop_delivered)
+            .await?;
+        // The stop must be the tracer's own instance: one of the guest's, of
+        // the same number and queued first, is taken before it.
+        let taken = task.getsiginfo().map_err(|error| dead_or(&task, error))?;
+        // SAFETY: a signal-delivery stop's siginfo; `si_value` reads the
+        // `_rt` member's value, which an `SI_QUEUE` siginfo carries.
+        let value = unsafe { taken.si_value().sival_ptr } as u64;
+        if !carrier_instance_is_the_tracers(taken.si_code, value, cookie) {
+            restore.apply(&task);
+            return Err(self.refuse_restart(
+                nr,
+                code,
+                RestartRefusalReason::CarrierInstanceNotTheTracers,
+                &format!(
+                    " (carrier {}, si_code {}, value {:#x})",
+                    carrier.raw(),
+                    taken.si_code,
+                    value
+                ),
+            ));
+        }
+        set_sigmask(&task, mask)?;
+        if let Some((_, Some(siginfo))) = held {
+            task.setsiginfo_bytes(&siginfo)
+                .map_err(|error| dead_or(&task, error))?;
+        }
+        // The caller's resume is now from a signal-delivery stop
+        // (`resume_with_signal_and_native`).
+        self.latest_injection_stop = Some(Some(carrier));
+        Ok(task)
+    }
+
+    /// `return_restart_through_syscall_exit` with a temporary mask's restore
+    /// pending (`masks`) and a signal held for the resume, whose
+    /// signal-delivery stop (or the stop that held it) is past the restart
+    /// decision `do_signal` takes before `get_signal`
+    /// (arch/arm64/kernel/signal.c:1395-1464 at v6.12.9), so the kernel's
+    /// route is closed and the outcome is written to the registers instead.
+    /// Linux leaves a restore pending only with `-ERESTARTNOHAND`
+    /// (`sigsuspend`, kernel/signal.c:4698-4709, and `poll_select_finish`,
+    /// fs/select.c:295-301).
+    ///
+    /// The backend decides no outcome. It reads the facts the outcome depends
+    /// on at this stop: the signal the caller delivers (`deliver`), the mask
+    /// in effect, the signals with a handler (procfs `SigCgt`) and those
+    /// pending, and writes the outcome the Tool returns for them
+    /// (`Tool::resolve_restart_under_pending_mask_restore`, whose default
+    /// refuses every case by name); an error the Tool returns ends the run.
+    /// The outcome is written as `do_signal` writes it: `-EINTR`, or `pc`
+    /// back at the `svc` with `x0` the first argument and `x8` naming
+    /// `restart_syscall` for `-ERESTART_RESTARTBLOCK`; with no handler the
+    /// saved mask is restored by `PTRACE_SETSIGMASK`, which ends the pending
+    /// restore as `restore_saved_sigmask` does. The facts are read before the
+    /// delivery, so an outcome decided from them differs from the kernel's
+    /// only if they change before it: a thread changes the signal's action in
+    /// between, or the Tool drops, replaces or defers a pending signal at its
+    /// own signal-delivery stop.
+    #[cfg(target_arch = "aarch64")]
+    async fn restart_under_pending_mask_restore(
+        &mut self,
+        task: &Stopped,
+        nr: Sysno,
+        arg0: Reg,
+        code: Errno,
+        masks: RestartMasks,
+        deliver: Option<AnySignal>,
+    ) -> Result<(), TraceError> {
+        let read = |field| proc_signal_set(task.pid(), field).map_err(|error| dead_or(task, error));
+        let facts = reverie::PendingMaskRestore::new(
+            self.tid(),
+            nr,
+            code,
+            deliver.map(AnySignal::raw),
+            masks.in_effect,
+            read("SigCgt")?,
+            read("SigPnd")? | read("ShdPnd")?,
+        );
+        let outcome = match self
+            .process_state
+            .clone()
+            .resolve_restart_under_pending_mask_restore(&*self, facts)
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                tracing::error!(
+                    "[scheduler/tool] (pid = {}) the Tool refuses {} as the result of {} under a pending mask restore ({:?}): {}",
+                    task.pid(),
+                    code,
+                    nr,
+                    facts,
+                    error
+                );
+                self.fatal_session().fail_at(
+                    BackendFailure {
+                        pid: self.pid(),
+                        tid: self.tid(),
+                        phase: "Tool::resolve_restart_under_pending_mask_restore",
+                    },
+                    error,
+                );
+                return Err(Errno::ECANCELED.into());
+            }
+        };
+        tracing::debug!(
+            "[scheduler/tool] (pid = {}) writes {:?} for {} as the result of {} ({:?})",
+            task.pid(),
+            outcome,
+            code,
+            nr,
+            facts
+        );
+        let mut regs = task.getregs()?;
+        let handler_runs = match outcome {
+            reverie::MaskRestoreOutcome::Interrupted { handler_runs } => {
+                *regs.ret_mut() = (-(libc::EINTR as i64)) as Reg;
+                handler_runs
+            }
+            reverie::MaskRestoreOutcome::Restart { handler_runs } => {
+                *regs.ip_mut() -= cp::SYSCALL_INSTR_SIZE as Reg;
+                *regs.ret_mut() = arg0;
+                if code == Errno::ERESTART_RESTARTBLOCK {
+                    *regs.syscall_mut() = Sysno::restart_syscall as Reg;
+                }
+                handler_runs
+            }
+            outcome => {
+                return Err(self.refuse_restart(
+                    nr,
+                    code,
+                    RestartRefusalReason::OutcomeNotWritable,
+                    &format!(" ({outcome:?})"),
+                ));
+            }
+        };
+        task.setregs(&regs)?;
+        if !handler_runs {
+            set_sigmask(task, masks.saved)?;
+        }
+        Ok(())
+    }
+
+    /// `return_restart_through_syscall_exit` with a temporary mask's restore
+    /// pending (`masks`) and no signal held for the resume. From a stop that is
+    /// not a signal-delivery stop the kernel's own route is open, as on
+    /// x86-64, where `orig_ax` names the call: the kernel's syscall number is
+    /// put back as `nr`, `x0` keeps the code, and the `do_signal` that runs on
+    /// the way back to user mode resolves it with the restore still pending.
+    ///
+    /// A restart there puts back `orig_x0`, the first argument of the last
+    /// syscall the thread entered (arch/arm64/kernel/signal.c:1395-1427 at
+    /// v6.12.9), so the kernel's route is taken only when that is the guest's
+    /// `arg0`: the thread entered no private-page syscall since this stop was
+    /// dispatched (the last one entered is the guest's own, run in place or
+    /// not), or the last one had `arg0` as its first argument
+    /// (`private_first_argument`). Otherwise the restart may not stop where a
+    /// tracer could put `arg0` back: `do_signal` prepares it before
+    /// `get_signal`, and when `get_signal` returns with no signal it restarts
+    /// the call with no ptrace stop (signal.c:1453-1460). That happens when a
+    /// sibling dequeues the process-directed signal that interrupted the call
+    /// while the tracer holds this thread (`ptrace_stop` never clears
+    /// `TIF_SIGPENDING`, kernel/signal.c:2376-2381), when `TIF_NOTIFY_SIGNAL`
+    /// task work runs with nothing pending (kernel/signal.c:2690-2695), and
+    /// when a sibling's group stop takes the thread and Reverie resumes it
+    /// with no signal left (kernel/signal.c:2765-2766). The outcome is then
+    /// written, with `arg0`, as from a signal-delivery stop, where
+    /// `do_signal` is past its restart decision: as for a held signal the
+    /// Tool dropped (`restart_under_pending_mask_restore`). A Tool that
+    /// declares serialized execution meets this whenever it returns a
+    /// mask-swapping injection's own restart code: that injection runs
+    /// between syscall stops from the private page (`syscall_stops_admitted`),
+    /// with its own arguments loaded before the `svc`.
+    #[cfg(target_arch = "aarch64")]
+    async fn defer_restart_under_pending_mask_restore(
+        &mut self,
+        task: &Stopped,
+        nr: Sysno,
+        arg0: Reg,
+        code: Errno,
+        masks: RestartMasks,
+    ) -> Result<(), TraceError> {
+        if matches!(self.latest_injection_stop, Some(Some(_))) {
+            tracing::debug!(
+                "[scheduler/tool] (pid = {}) writes the outcome of {} for {}: no signal is held, and do_signal is past its restart decision",
+                task.pid(),
+                code,
+                nr
+            );
+            return self
+                .restart_under_pending_mask_restore(task, nr, arg0, code, masks, None)
+                .await;
+        }
+        if let Some(first) = self.private_first_argument
+            && first != arg0
+        {
+            tracing::debug!(
+                "[scheduler/tool] (pid = {}) writes the outcome of {} for {}: a kernel restart would take the first argument of an injected call ({:#x} for {:#x})",
+                task.pid(),
+                code,
+                nr,
+                first,
+                arg0
+            );
+            return self
+                .restart_under_pending_mask_restore(task, nr, arg0, code, masks, None)
+                .await;
+        }
+        tracing::debug!(
+            "[scheduler/tool] (pid = {}) leaves {} for {} to the kernel's do_signal, a temporary mask's restore pending",
+            task.pid(),
+            code,
+            nr
+        );
+        task.set_syscall(nr as i32)?;
+        if self.latest_injection_stop.is_some() {
+            let regs = task.getregs()?;
+            self.deferred_restart = Some(DeferredRestart {
+                at: regs.ip(),
+                code: regs.ret(),
+                arg0,
+            });
+        }
+        Ok(())
+    }
+
+    /// Checks, in debug builds, that the kernel restarts the guest's call for
+    /// a deferred restart code (`deferred_restart`) with the guest's own first
+    /// argument, as `defer_restart_under_pending_mask_restore` routes it.
+    ///
+    /// The kernel prepares the restart in the `do_signal` that runs on the way
+    /// back to user mode, before `get_signal` and its stops: `pc` back at the
+    /// `svc` and `x0` set to `orig_x0` (arch/arm64/kernel/signal.c:1395-1427
+    /// at v6.12.9; the comment there says a debugger sees the changed `pc`).
+    /// With a signal left to deliver, the first stop after the resume that is
+    /// not a group stop is that `do_signal`'s signal-delivery stop, and no
+    /// user instruction has run since the deferral: there `pc` is at the `svc`
+    /// exactly when the restart was prepared, and `x0` is then `orig_x0`,
+    /// which must be the guest's first argument. The record is consumed at
+    /// the first stop that is not a group stop, whatever it is.
+    #[cfg(target_arch = "aarch64")]
+    fn check_restarted_first_argument(
+        &mut self,
+        task: &Stopped,
+        event: &Event,
+    ) -> Result<(), TraceError> {
+        let Some(restart) = self.deferred_restart else {
+            return Ok(());
+        };
+        if let Event::Signal(sig) = *event
+            && is_group_stop(task, sig)?
+        {
+            return Ok(());
+        }
+        self.deferred_restart = None;
+        if !cfg!(debug_assertions) || event.signal().is_none() {
+            return Ok(());
+        }
+        let regs = task.getregs()?;
+        if regs.ip() == restart.at - cp::SYSCALL_INSTR_SIZE as u64 && regs.ret() != restart.code {
+            debug_assert_eq!(
+                regs.ret(),
+                restart.arg0,
+                "the kernel restarts a deferred restart code's call with the guest's first argument"
+            );
+        }
+        Ok(())
+    }
+
+    /// Records the refusal to return the restart code `code` for `nr` with the
+    /// session, which ends the run with `RestartRefusal`, and returns the
+    /// error that unwinds the handler. `detail` is appended to the log line.
+    #[cfg(target_arch = "aarch64")]
+    fn refuse_restart(
+        &self,
+        nr: Sysno,
+        code: Errno,
+        reason: RestartRefusalReason,
+        detail: &str,
+    ) -> TraceError {
+        tracing::error!(
+            "[scheduler/tool] (pid = {}) refuses to return {} as the result of {}: {}{}",
+            self.tid(),
+            code,
+            nr,
+            reason,
+            detail
+        );
+        self.fatal_session().fail_at(
+            BackendFailure {
+                pid: self.pid(),
+                tid: self.tid(),
+                phase: "restart code refused",
+            },
+            anyhow::Error::new(crate::RestartRefusal {
+                tid: self.tid().as_raw(),
+                syscall: nr,
+                code,
+                reason,
+            })
+            .into(),
+        );
+        Errno::ECANCELED.into()
+    }
+
+    /// Reports a restart code the backend cannot hand to the kernel to the
+    /// Tool (`Tool::handle_unresolved_restart`), and writes what it returns as
+    /// the syscall's result.
+    #[cfg(target_arch = "aarch64")]
+    async fn unresolved_restart(
+        &mut self,
+        task: Stopped,
+        nr: Sysno,
+        code: Errno,
+        reason: reverie::UnresolvedRestart,
+    ) -> Result<Stopped, TraceError> {
+        let result = self
+            .process_state
+            .clone()
+            .handle_unresolved_restart(&*self, self.tid(), nr, code, reason)
+            .await;
+        tracing::warn!(
+            "[scheduler/tool] (pid = {}) cannot let the kernel resolve {} as the result of {} ({:?}); the Tool answers {:?}",
+            task.pid(),
+            code,
+            nr,
+            reason,
+            result
+        );
+        let ret = match result.map_err(reverie::Error::into_errno) {
+            Ok(value) => value as Reg,
+            Err(Ok(errno)) => (-(errno.into_raw() as i64)) as Reg,
+            // The Tool refused the code: its error ends the run.
+            Err(Err(error)) => {
+                self.fatal_session().fail_at(
+                    BackendFailure {
+                        pid: self.pid(),
+                        tid: self.tid(),
+                        phase: "Tool::handle_unresolved_restart",
+                    },
+                    error,
+                );
+                return Err(Errno::ECANCELED.into());
+            }
+        };
+        set_ret(&task, ret)?;
+        Ok(task)
+    }
+
+    /// Resumes `task` (`PTRACE_SYSCALL`) for
+    /// `return_restart_through_syscall_exit`: to its next syscall stop, or with
+    /// `until`, to the signal-delivery stop of that signal. A SIGSTOP's
+    /// signal-delivery stop delivers it, which sets `stop_delivered`, and a group
+    /// stop is resumed. Any other stop ends the trick with `EPROTO`, after
+    /// `restore` puts the guest's registers and mask back.
+    #[cfg(target_arch = "aarch64")]
+    async fn resume_restart_trick(
+        &mut self,
+        mut task: Stopped,
+        until: Option<AnySignal>,
+        restore: &RestartTrickRestore,
+        stop_delivered: &mut bool,
+    ) -> Result<Stopped, TraceError> {
+        let mut deliver = None;
+        loop {
+            let wait = self
+                .syscall_stopped(task, deliver.take())?
+                .next_state_with_owner(&self.ptracer_waits)
+                .await?;
+            self.arm_liteinst_wait(&wait);
+            match wait {
+                Wait::Stopped(stopped, Event::Syscall) if until.is_none() => return Ok(stopped),
+                Wait::Stopped(stopped, event) if until.is_some() && event.signal() == until => {
+                    return Ok(stopped);
+                }
+                Wait::Stopped(stopped, Event::Signal(sig)) => {
+                    if !is_group_stop(&stopped, sig)? {
+                        if sig != Signal::SIGSTOP {
+                            return Err(self.restart_trick_stopped_at(
+                                stopped,
+                                Event::Signal(sig),
+                                restore,
+                            ));
+                        }
+                        deliver = Some(Signal::SIGSTOP);
+                        *stop_delivered = true;
+                    }
+                    task = stopped;
+                }
+                Wait::Stopped(_, Event::Exit) | Wait::Exited(..) => return Err(Errno::ESRCH.into()),
+                Wait::Stopped(stopped, event) => {
+                    return Err(self.restart_trick_stopped_at(stopped, event, restore));
+                }
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn restart_trick_stopped_at(
+        &self,
+        task: Stopped,
+        event: Event,
+        restore: &RestartTrickRestore,
+    ) -> TraceError {
+        tracing::error!(
+            "[scheduler/tool] (pid = {}) returning a restart code stopped at {:?}",
+            task.pid(),
+            event
+        );
+        restore.apply(&task);
+        Errno::EPROTO.into()
+    }
+
     /// inject syscall for given tracee
     ///
     /// NB: limitations:
@@ -12364,6 +13170,8 @@ impl<L: Tool + 'static> TracedTask<L> {
             args.arg4 as Reg,
             args.arg5 as Reg,
         ));
+        #[cfg(target_arch = "aarch64")]
+        let first_argument = args.arg0 as Reg;
         let child_context = self.injected_syscall_frame.is_some().then_some(regs);
 
         // Jump to our private page to run the syscall instruction there. See
@@ -12449,6 +13257,10 @@ impl<L: Tool + 'static> TracedTask<L> {
                     restoration,
                 )
                 .await?;
+            #[cfg(target_arch = "aarch64")]
+            if self.last_injection_ran {
+                self.private_first_argument = Some(first_argument);
+            }
             if let Some(sigtrap) = sigtrap {
                 self.repair_sigtrap_after_injection(sigtrap, &result)
                     .await?;
@@ -12516,6 +13328,10 @@ impl<L: Tool + 'static> TracedTask<L> {
                 restoration,
             )
             .await?;
+        #[cfg(target_arch = "aarch64")]
+        if self.last_injection_ran {
+            self.private_first_argument = Some(first_argument);
+        }
         if let Some(sigtrap) = sigtrap {
             self.repair_sigtrap_after_injection(sigtrap, &result)
                 .await?;
@@ -14025,6 +14841,10 @@ impl<L: Tool + 'static> TracedTask<L> {
             match wait {
                 Wait::Stopped(stopped, Event::Syscall) if !entered => {
                     entered = true;
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        self.private_first_argument = Some(args.arg0 as Reg);
+                    }
                     running = self.syscall_stopped_any_input(stopped, None, Some(&native))?;
                 }
                 Wait::Stopped(stopped, Event::Syscall) => {
@@ -20674,6 +21494,52 @@ mod aarch64_syscall_stop_exit_tests {
             classify_rolled_back_syscall_exit(true, None),
             Unproven,
             "SIGSYS unreadable"
+        );
+    }
+}
+
+/// The aarch64 restart decisions, which read no tracee and so run on every
+/// architecture.
+#[cfg(test)]
+mod restart_decision_tests {
+    use super::*;
+
+    fn bit(signal: i32) -> u64 {
+        1 << (signal - 1)
+    }
+
+    fn sig(signal: i32) -> AnySignal {
+        AnySignal::new(signal).unwrap()
+    }
+
+    #[test]
+    fn a_carrier_is_the_highest_realtime_signal_not_pending() {
+        assert_eq!(free_carrier(0), Some(sig(64)));
+        assert_eq!(free_carrier(bit(64) | bit(63)), Some(sig(62)));
+        let every_realtime = (34..=64).map(bit).fold(0, |all, one| all | one);
+        assert_eq!(free_carrier(every_realtime), None, "none is free");
+        assert_eq!(
+            free_carrier(every_realtime & !bit(34)),
+            Some(sig(34)),
+            "34 is the lowest a carrier can be (glibc reserves 32 and 33)"
+        );
+    }
+
+    #[test]
+    fn a_carrier_stop_is_the_tracers_only_with_its_code_and_cookie() {
+        let cookie = 0x1234_5678_0000_0007;
+        assert!(carrier_instance_is_the_tracers(libc::SI_QUEUE, cookie, cookie));
+        assert!(
+            !carrier_instance_is_the_tracers(libc::SI_QUEUE, cookie + 1, cookie),
+            "a guest's sigqueue of the same number with another value"
+        );
+        assert!(
+            !carrier_instance_is_the_tracers(libc::SI_TKILL, cookie, cookie),
+            "a tgkill of the same number"
+        );
+        assert!(
+            !carrier_instance_is_the_tracers(libc::SI_USER, 0, cookie),
+            "a kill of the same number"
         );
     }
 }

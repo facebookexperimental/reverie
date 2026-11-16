@@ -99,6 +99,8 @@ pub use failure::PtraceCallbackStop;
 pub use failure::PtraceCleanupFailure;
 pub use failure::PtraceRunFailure;
 pub use failure::QueuedSigtrapAtStep;
+pub use failure::RestartRefusal;
+pub use failure::RestartRefusalReason;
 pub use failure::ToolRunCompletion;
 pub use failure::UnattributedSigtrap;
 pub use failure::UnprovenPrivateSyscallCompletion;

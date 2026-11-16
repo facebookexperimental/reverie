@@ -15,6 +15,7 @@
 use async_trait::async_trait;
 use reverie_syscalls::RawSyscall;
 use reverie_syscalls::Syscall;
+use reverie_syscalls::Sysno;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -536,6 +537,104 @@ pub struct BackendFailure {
     pub tid: Tid,
     /// Backend operation that failed.
     pub phase: &'static str,
+}
+
+/// Why a backend cannot let the kernel resolve a restart code that a Tool
+/// returned. See [`Tool::handle_unresolved_restart`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[non_exhaustive]
+pub enum UnresolvedRestart {
+    /// The tracer thread may be under a seccomp filter, which can refuse the
+    /// requests the backend makes to hand the code to the kernel.
+    TracerMayBeFiltered,
+    /// The guest thread has a seccomp filter besides the backend's own, which
+    /// could act on the syscall the backend runs to hand the code to the
+    /// kernel.
+    GuestSeccompFilter,
+}
+
+/// What a backend read at the stop where it must write the outcome of a
+/// restart code a Tool returned while a temporary signal mask's restore is
+/// pending and a signal is held for the resume. Facts only: deciding the
+/// outcome Linux would take from them is the Tool's. See
+/// [`Tool::resolve_restart_under_pending_mask_restore`]. Signal sets are
+/// bitmasks with bit `n - 1` for signal `n`, as procfs shows them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[non_exhaustive]
+pub struct PendingMaskRestore {
+    /// The thread whose syscall the Tool answered.
+    pub tid: Tid,
+    /// The syscall the Tool answered.
+    pub syscall: Sysno,
+    /// The restart code it answered it with.
+    pub code: Errno,
+    /// The signal the backend delivers at the resume, or `None` when the
+    /// Tool dropped the one held for it.
+    pub delivered: Option<i32>,
+    /// The temporary mask in effect (procfs `SigBlk`).
+    pub mask_in_effect: u64,
+    /// The signals with a handler (procfs `SigCgt`).
+    pub caught: u64,
+    /// The signals pending for the thread or its process (procfs `SigPnd`
+    /// and `ShdPnd`).
+    pub pending: u64,
+}
+
+impl PendingMaskRestore {
+    /// The facts a backend read (see the fields).
+    pub fn new(
+        tid: Tid,
+        syscall: Sysno,
+        code: Errno,
+        delivered: Option<i32>,
+        mask_in_effect: u64,
+        caught: u64,
+        pending: u64,
+    ) -> Self {
+        Self {
+            tid,
+            syscall,
+            code,
+            delivered,
+            mask_in_effect,
+            caught,
+            pending,
+        }
+    }
+}
+
+/// The outcome a backend writes for a restart code under a pending
+/// temporary mask's restore ([`Tool::resolve_restart_under_pending_mask_restore`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[non_exhaustive]
+pub enum MaskRestoreOutcome {
+    /// The call returns `-EINTR`.
+    Interrupted {
+        /// A handler runs, and its frame saves the mask to restore;
+        /// otherwise the saved mask is restored now.
+        handler_runs: bool,
+    },
+    /// The call restarts, as `restart_syscall` for `ERESTART_RESTARTBLOCK`.
+    Restart {
+        /// As for [`MaskRestoreOutcome::Interrupted`].
+        handler_runs: bool,
+    },
+}
+
+/// The default [`Tool::resolve_restart_under_pending_mask_restore`]'s
+/// refusal: a Tool that does not decide the outcome of a restart code under
+/// a pending temporary mask's restore ends the run with it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error(
+    "restart code refused (NotDecidedByTool): {syscall} was answered with {code} while a \
+     temporary signal mask's restore is pending and a signal is held, and the Tool decides \
+     no outcome"
+)]
+pub struct RestartUndecidable {
+    /// The syscall the Tool answered.
+    pub syscall: Sysno,
+    /// The restart code it answered it with.
+    pub code: Errno,
 }
 
 /// A guest thread held at its exit stop while a core-dumping fatal signal
@@ -1315,6 +1414,60 @@ pub trait Tool: Send + Sync + Default {
         true
     }
 
+    /// Called when a backend cannot let the kernel resolve a restart code
+    /// (`ERESTARTSYS`, `ERESTARTNOINTR`, `ERESTARTNOHAND` or
+    /// `ERESTART_RESTARTBLOCK`) that [`Tool::handle_syscall_event`] returned
+    /// as the result of `syscall`, for `reason`. Linux never returns these
+    /// codes to user space: its signal delivery turns them into a restart or
+    /// `EINTR`.
+    ///
+    /// # Return value
+    ///  - `Ok(value)` or `Err(Error::Errno(errno))`: the syscall's result
+    ///    instead of `code`, as from [`Tool::handle_syscall_event`].
+    ///  - Any other error: the Tool refuses the code, and the error ends the
+    ///    run.
+    ///
+    /// The hook can only decide: it gets the thread's ID and a handle that
+    /// can send RPCs to the global tool, and no access to the guest, so it
+    /// cannot inject a syscall or change the guest's registers, signal mask
+    /// or memory. The default returns `code` itself, which the guest then
+    /// sees as the result. Only the ptrace backend on aarch64 calls it;
+    /// elsewhere the kernel resolves every code.
+    async fn handle_unresolved_restart<R: GlobalRPC<Self::GlobalState>>(
+        &self,
+        _rpc: &R,
+        _tid: Tid,
+        _syscall: Sysno,
+        code: Errno,
+        _reason: UnresolvedRestart,
+    ) -> Result<i64, Error> {
+        Err(code.into())
+    }
+
+    /// Called when a backend must write the outcome of a restart code that
+    /// [`Tool::handle_syscall_event`] returned while a temporary signal
+    /// mask's restore is pending and a signal is held for the resume: the
+    /// kernel's restart decision is past at that stop, so the backend writes
+    /// the outcome to the registers, from the facts it read there (`facts`).
+    /// The backend decides nothing: it writes the outcome this returns, and
+    /// any error ends the run.
+    ///
+    /// The default decides nothing either: it refuses every case with
+    /// [`RestartUndecidable`], which ends the run. As for
+    /// [`Tool::handle_unresolved_restart`], the hook gets a handle that can
+    /// send RPCs and no access to the guest. Only the ptrace backend on
+    /// aarch64 calls it.
+    async fn resolve_restart_under_pending_mask_restore<R: GlobalRPC<Self::GlobalState>>(
+        &self,
+        _rpc: &R,
+        facts: PendingMaskRestore,
+    ) -> Result<MaskRestoreOutcome, Error> {
+        Err(Error::Tool(anyhow::Error::new(RestartUndecidable {
+            syscall: facts.syscall,
+            code: facts.code,
+        })))
+    }
+
     /// Whether this Tool wants every guest `rt_sigreturn` reported to
     /// [`Tool::handle_sigreturn`], known from configuration alone. A backend
     /// whose capabilities say it reports sigreturns
@@ -1672,4 +1825,65 @@ fn not_opted_in_announcement(signal: i32) -> Result<Option<crate::SignalAnnounce
         return Err(Errno::EINVAL);
     }
     Err(Errno::EOPNOTSUPP)
+}
+
+#[cfg(test)]
+mod pending_mask_restore_tests {
+    use super::*;
+
+    /// A handle that answers every RPC to the unit global tool.
+    struct NoRpc;
+
+    #[async_trait]
+    impl GlobalRPC<()> for NoRpc {
+        async fn send_rpc(&self, _message: ()) {}
+
+        fn config(&self) -> &() {
+            &()
+        }
+    }
+
+    #[test]
+    fn the_default_decision_refuses_every_case_by_name() {
+        let usr1 = libc::SIGUSR1;
+        let tid = Tid::from_raw(7);
+        for (code, delivered, caught) in [
+            (Errno::ERESTARTNOHAND, Some(usr1), 1u64 << (usr1 - 1)),
+            (Errno::ERESTARTSYS, Some(usr1), 1 << (usr1 - 1)),
+            (Errno::ERESTARTNOINTR, None, 0),
+            (Errno::ERESTART_RESTARTBLOCK, Some(usr1), 0),
+        ] {
+            let facts = PendingMaskRestore::new(tid, Sysno::ppoll, code, delivered, 0, caught, 0);
+            // The default awaits nothing, so one poll finishes it.
+            let mut decided =
+                <() as Tool>::resolve_restart_under_pending_mask_restore(&(), &NoRpc, facts);
+            let std::task::Poll::Ready(decided) = std::future::Future::poll(
+                decided.as_mut(),
+                &mut std::task::Context::from_waker(std::task::Waker::noop()),
+            ) else {
+                panic!("the default decision awaited");
+            };
+            match decided {
+                Err(Error::Tool(error)) => {
+                    let refusal = error
+                        .downcast_ref::<RestartUndecidable>()
+                        .unwrap_or_else(|| panic!("{error:?}"));
+                    assert_eq!(
+                        *refusal,
+                        RestartUndecidable {
+                            syscall: Sysno::ppoll,
+                            code
+                        }
+                    );
+                    assert!(
+                        refusal
+                            .to_string()
+                            .starts_with("restart code refused (NotDecidedByTool): ppoll"),
+                        "{refusal}"
+                    );
+                }
+                other => panic!("{code}: {other:?}"),
+            }
+        }
+    }
 }

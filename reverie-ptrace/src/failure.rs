@@ -543,6 +543,51 @@ mod tests {
     }
 }
 
+/// Why the ptrace backend ends a run rather than return a restart code
+/// (`ERESTARTSYS`, `ERESTARTNOINTR`, `ERESTARTNOHAND` or
+/// `ERESTART_RESTARTBLOCK`) that a Tool answered a guest syscall with
+/// ([`RestartRefusal`]). Linux never returns these codes to user space, and in
+/// each case the backend cannot carry the code to the kernel's restart
+/// processing. Only the aarch64 backend refuses: x86-64's kernel resolves
+/// every code. An outcome a Tool cannot decide is its own refusal
+/// (`reverie::RestartUndecidable`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, thiserror::Error)]
+#[non_exhaustive]
+pub enum RestartRefusalReason {
+    /// Every realtime signal is pending for the thread, so none is free to
+    /// carry the resume into the kernel's restart processing.
+    #[error("every realtime signal is pending for the thread, so none can carry the resume")]
+    NoFreeCarrierSignal,
+    /// The stop the carrier signal was to make took an instance of its number
+    /// that the tracer did not send: one the guest queued between the
+    /// tracer's check and its send, a timing race of the backend's own.
+    #[error("the carrier signal's stop took an instance of its number the tracer did not send")]
+    CarrierInstanceNotTheTracers,
+    /// The Tool decided an outcome for the code under a pending temporary
+    /// mask's restore (`reverie::MaskRestoreOutcome`) that this backend
+    /// cannot write.
+    #[error("the Tool decided an outcome for the code that this backend cannot write")]
+    OutcomeNotWritable,
+}
+
+/// The ptrace backend ended the run rather than return the restart code a
+/// Tool answered a guest syscall with ([`RestartRefusalReason`]). The guest's
+/// thread did not resume past the syscall.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "restart code refused ({reason:?}): thread {tid}'s {syscall} was answered with {code}; {reason}"
+)]
+pub struct RestartRefusal {
+    /// The thread whose syscall was answered.
+    pub tid: i32,
+    /// The syscall the Tool answered.
+    pub syscall: reverie::syscalls::Sysno,
+    /// The restart code the Tool answered it with.
+    pub code: reverie::Errno,
+    /// Why the backend refused it.
+    pub reason: RestartRefusalReason,
+}
+
 /// A guest thread had SIGTRAP blocked and one pending when Reverie had to
 /// single-step it (<https://github.com/rrnewton/hermit/issues/4409>).
 ///
