@@ -20,6 +20,11 @@ name: Guide
 # (integration). Every job acts on a push only when the pushed branch is
 # the repository's default branch; a push to any other listed branch
 # builds and deploys nothing.
+#
+# Reduced push/PR lane: the build job below keeps the mdBook build,
+# its snippet tests, and the under-construction count check. The API
+# docs build (cargo doc with warnings denied) moved to the
+# manual/scheduled Extended checks workflow (extended.yml), unchanged.
 
 on:
   pull_request:
@@ -68,30 +73,6 @@ jobs:
           stated=$(grep -o 'Under-construction regions in this guide: [0-9]*' guide/src/introduction.md | grep -o '[0-9]*$')
           echo "counted=$counted stated=$stated"
           [ "$counted" = "$stated" ]
-      - name: Rust toolchain
-        run: |
-          if ! command -v rustup >/dev/null 2>&1; then
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
-            export PATH="$HOME/.cargo/bin:$PATH"
-            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          fi
-          channel="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml | head -n 1)"
-          rustup toolchain install "$channel" --profile minimal
-          rustc --version
-      - name: Dependencies
-        # Same step as ci.yml: cargo doc runs build scripts (unwind-sys
-        # needs libunwind via pkg-config), so the doc step needs these.
-        # Refresh the index first: the runner image's index can name package
-        # versions the mirror no longer serves, and install then fails with 404.
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libunwind-dev liblzma-dev cmake zlib1g-dev
-      - name: API docs (workspace, no deps, warnings denied)
-        env:
-          RUSTDOCFLAGS: "-D warnings"
-        run: |
-          source scripts/stable-features.sh
-          cargo doc --workspace --features "${STABLE_FEATURES}" --no-deps
       - name: Upload Pages artifact
         if: vars.PAGES_ENABLED == 'true' && github.event_name == 'push' && github.ref_name == github.event.repository.default_branch
         uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3

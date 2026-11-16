@@ -1,0 +1,220 @@
+name: Extended checks
+
+# Manual/scheduled home for the checks that used to run on every push
+# and pull request in ci.yml (Rust) and guide.yml (Guide): the full
+# workspace test suite, documentation tests, Clippy, formatting, the
+# no-device cross-backend check, and the API-docs build. They moved
+# here unchanged so the push/PR lanes check less but stay reliably
+# green on hosted runners. This workflow is best-effort signal only:
+# it never gates a pull request and must not become a required status
+# check. Local validation (validate.sh) remains the real testing.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 5 * * 2"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: extended-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -C link-arg=-llzma
+
+jobs:
+  regular:
+    name: Full workspace tests (extended, GitHub-hosted)
+    if: github.event_name != 'pull_request' || (github.event.pull_request.user.login != 'hermit-bot3' && !github.event.pull_request.draft)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: false
+    - name: Dependencies
+      # Refresh the index first: the runner image's index can name package
+      # versions the mirror no longer serves, and install then fails with 404.
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libunwind-dev liblzma-dev cmake zlib1g-dev
+    - name: Establish ordinary-user namespace prerequisite
+      id: userns
+      timeout-minutes: 1
+      shell: bash
+      run: |
+        set -euo pipefail
+        # This setting is system-wide inside the disposable hosted runner VM.
+        # Never apply it on the shared hardware runner or from a local shell.
+        [[ ${GITHUB_ACTIONS:-} == true && ${RUNNER_ENVIRONMENT:-} == github-hosted ]]
+        [[ ${RUNNER_OS:-} == Linux && ${GITHUB_JOB:-} == regular && $EUID != 0 ]]
+        source /etc/os-release
+        [[ $ID == ubuntu ]]
+
+        setting=kernel.apparmor_restrict_unprivileged_userns
+        setting_path=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+        original=unavailable
+        if [[ -r $setting_path ]]; then
+          original=$(cat "$setting_path")
+        fi
+        printf 'Namespace prerequisite: uid=%s %s=%s\n' "$EUID" "$setting" "$original"
+        initial_status=0
+        /usr/bin/unshare --user --map-root-user --mount --propagation private -- /usr/bin/true || initial_status=$?
+        printf 'Initial namespace probe exit=%s (diagnostics retained above)\n' "$initial_status"
+        if [[ $initial_status == 0 ]]; then
+          echo 'Namespace prerequisite already satisfied; setting unchanged.'
+          exit 0
+        fi
+        if [[ $original != 1 ]]; then
+          echo '::error::Namespace prerequisite failed without the supported restriction value 1.'
+          exit "$initial_status"
+        fi
+
+        # Arm restoration before attempting the only permitted setting change.
+        # A failed write or second probe must still restore the recorded value.
+        echo 'original_restriction=1' >> "$GITHUB_OUTPUT"
+        echo 'restore_required=true' >> "$GITHUB_OUTPUT"
+        sudo -n sysctl -w "$setting=0"
+        [[ $(cat "$setting_path") == 0 ]]
+        repeated_status=0
+        /usr/bin/unshare --user --map-root-user --mount --propagation private -- /usr/bin/true || repeated_status=$?
+        printf 'Namespace probe after %s=0 exit=%s\n' "$setting" "$repeated_status"
+        if [[ $repeated_status != 0 ]]; then
+          echo '::error::Namespace prerequisite still fails; tests cannot start.'
+          exit "$repeated_status"
+        fi
+        echo 'Namespace probe passed after the controlled restriction change.'
+    - name: Rust toolchain
+      run: |
+        if ! command -v rustup >/dev/null 2>&1; then
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+          export PATH="$HOME/.cargo/bin:$PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+        fi
+        channel="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml | head -n 1)"
+        rustup toolchain install "$channel" --profile minimal --component clippy --component rustfmt
+        rustc --version
+    - name: Cross-client skill discovery
+      run: |
+        rustc scripts/check-skill-discovery.rs -o "$RUNNER_TEMP/check-skill-discovery"
+        "$RUNNER_TEMP/check-skill-discovery"
+    - name: Build
+      run: |
+        source scripts/stable-features.sh
+        cargo build --workspace --features "${STABLE_FEATURES}"
+    - name: Fetch locked dependencies
+      run: cargo fetch --locked
+    - name: LiteInst allocator fixtures
+      timeout-minutes: 10
+      run: |
+        set -euo pipefail
+        cargo install --locked rust-script
+        generation="$RUNNER_TEMP/liteinst-allocator-$GITHUB_JOB-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+        scripts/build-liteinst-test-runtime.rs --for-ci "$generation"
+        cat "$generation/bundle/github.env" >> "$GITHUB_ENV"
+    - name: Upload LiteInst allocator producer logs
+      # Keep the producer's per-command logs when the step fails; they are the
+      # only record of the failing command's own output.
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: liteinst-allocator-logs-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+        path: ${{ runner.temp }}/liteinst-allocator-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}/bundle/logs
+        if-no-files-found: warn
+        retention-days: 3
+    - name: Test regular workspace cases
+      run: |
+        source scripts/stable-features.sh
+        # notification_at_or_past_target_records_a_late_delivery_detail constructs a TimerImpl,
+        # which opens hardware performance counters; the self-hosted hardware job runs it.
+        # hardware_paused_clock_preserves_exact_branch_trajectory likewise requires
+        # the hardware PMU clock and does not skip unavailable hosts; the hardware job runs it.
+        cargo test --workspace --exclude reverie-kvm --exclude reverie-kvm-core --exclude reverie-linuxemu --exclude reverie-inguest --features "${STABLE_FEATURES_REGULAR}" --no-fail-fast -- \
+        --test-threads=1 \
+        --skip container::tests::bind_to_low_port \
+        --skip container::tests::mount_error_from_child_is_returned \
+        --skip container::tests::test_directory_is_available_after_mount \
+        --skip container::tests::pin_affinity_to_all_cores \
+        --skip tests::domainname \
+        --skip tests::hostname \
+        --skip tests::local_networking_loopback_flags \
+        --skip tests::local_networking_ping \
+        --skip tests::local_networking_there_can_be_only_one \
+        --skip tests::mount_and_move_tmpfs \
+        --skip tests::mount_bind \
+        --skip tests::mount_bind_readonly_rejects_writes \
+        --skip tests::mount_devpts_basic \
+        --skip tests::mount_devpts_isolated \
+        --skip tests::mount_proc \
+        --skip tests::mount_tmpfs \
+        --skip tests::pid_namespace \
+        --skip tests::port_isolation \
+        --skip tests::seccomp_notify \
+        --skip timer::tests::notification_at_or_past_target_records_a_late_delivery_detail \
+        --skip in_guest_rcb::boundary_tests::hardware_paused_clock_preserves_exact_branch_trajectory \
+        --skip tests::uid_namespace
+    - name: Documentation tests
+      run: cargo test --workspace --doc
+    - name: Clippy
+      run: |
+        source scripts/stable-features.sh
+        cargo clippy --workspace --all-targets --features "${STABLE_FEATURES}"
+    - name: Format
+      run: cargo fmt --all -- --check
+    # The cross-backend check on every backend that needs no device. A hosted
+    # runner's environment has no ledger, so its verdicts are reported, not
+    # judged (reverie-examples/e2e/README.md).
+    - name: Reverie-layer cross-backend e2e (no device)
+      run: reverie-examples/e2e/run.sh --backends ptrace,liteinst,in-guest-trap
+    - name: Restore hosted-runner namespace restriction
+      if: ${{ always() && steps.userns.outputs.restore_required == 'true' }}
+      timeout-minutes: 1
+      shell: bash
+      env:
+        ORIGINAL_RESTRICTION: ${{ steps.userns.outputs.original_restriction }}
+      run: |
+        set -euo pipefail
+        [[ ${GITHUB_ACTIONS:-} == true && ${RUNNER_ENVIRONMENT:-} == github-hosted ]]
+        [[ ${RUNNER_OS:-} == Linux && ${GITHUB_JOB:-} == regular && $EUID != 0 ]]
+        source /etc/os-release
+        [[ $ID == ubuntu && $ORIGINAL_RESTRICTION == 1 ]]
+        sudo -n sysctl -w "kernel.apparmor_restrict_unprivileged_userns=$ORIGINAL_RESTRICTION"
+        [[ $(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns) == "$ORIGINAL_RESTRICTION" ]]
+        echo "Restored namespace restriction to recorded value $ORIGINAL_RESTRICTION."
+
+
+  api-docs:
+    name: API docs (extended)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          submodules: false
+      - name: Rust toolchain
+        run: |
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+            export PATH="$HOME/.cargo/bin:$PATH"
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+          channel="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml | head -n 1)"
+          rustup toolchain install "$channel" --profile minimal
+          rustc --version
+      - name: Dependencies
+        # Same step as ci.yml: cargo doc runs build scripts (unwind-sys
+        # needs libunwind via pkg-config), so the doc step needs these.
+        # Refresh the index first: the runner image's index can name package
+        # versions the mirror no longer serves, and install then fails with 404.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libunwind-dev liblzma-dev cmake zlib1g-dev
+      - name: API docs (workspace, no deps, warnings denied)
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: |
+          source scripts/stable-features.sh
+          cargo doc --workspace --features "${STABLE_FEATURES}" --no-deps
