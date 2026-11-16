@@ -1,0 +1,96 @@
+name: repo-health
+# Detect-only repository health checks: PR tip reachability, a PR
+# census report, and approvals not bound to the current head.
+# CUTOVER: dispatch only until two manual runs are reviewed, then
+# uncomment both schedules.
+on:
+  workflow_dispatch:
+  # schedule:
+  #   - cron: "27 * * * *"      # hourly: tips, census
+  #   - cron: "23 14 * * *"     # daily: approvals
+permissions:
+  contents: read
+  pull-requests: read
+jobs:
+  hourly:
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '27 * * * *'
+    concurrency:
+      group: repo-health-hourly
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Unreachable tips and census (report)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          LIMIT: "200"
+        run: |
+          set -euo pipefail
+          gh pr list --repo "$REPO" --state open --limit "$LIMIT" \
+            --json number,title,isDraft,headRefOid,reviewDecision > prs.json
+          count=$(jq length prs.json)
+          if [ "$count" -ge "$LIMIT" ]; then
+            echo "::error::PR enumeration truncated at limit $LIMIT; sweep would be partial"
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json
+          prs = json.load(open("prs.json"))
+          with open("hourly.md", "w") as f:
+              f.write("## pr census (report)\n\n"
+                      f"open={len(prs)} drafts={sum(1 for p in prs if p['isDraft'])}\n")
+          PY
+          mkdir scratch && git init -q scratch
+          : > unreachable.txt
+          jq -r '.[] | "\(.number) \(.headRefOid)"' prs.json | while read -r n sha; do
+            if git -C scratch fetch -q --force "https://github.com/$REPO.git" "$sha:refs/tmp/reach/$n" 2>/dev/null; then continue; fi
+            if git -C scratch fetch -q --force "https://github.com/$REPO.git" "refs/pull/$n/head:refs/tmp/pull/$n" 2>/dev/null \
+               && [ "$(git -C scratch rev-parse "refs/tmp/pull/$n")" = "$sha" ]; then continue; fi
+            echo "#$n $sha" >> unreachable.txt
+          done
+          { cat hourly.md; echo; echo "## unreachable tips"; echo; cat unreachable.txt; } >> "$GITHUB_STEP_SUMMARY"
+          test ! -s unreachable.txt
+  daily:
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '23 14 * * *'
+    concurrency:
+      group: repo-health-daily
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Approvals vs head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          LIMIT: "200"
+        run: |
+          set -euo pipefail
+          gh pr list --repo "$REPO" --state open --limit "$LIMIT" \
+            --json number,headRefOid > prs.json
+          count=$(jq length prs.json)
+          if [ "$count" -ge "$LIMIT" ]; then
+            echo "::error::PR enumeration truncated at limit $LIMIT"
+            exit 1
+          fi
+          export REPO
+          python3 - <<'PY'
+          import json, os, subprocess
+          prs = json.load(open("prs.json"))
+          def api(path):
+              return json.loads(subprocess.run(["gh", "api", path],
+                  capture_output=True, text=True, check=True).stdout)
+          stale = []
+          for p in prs:
+              approved = [r for r in api(
+                  f"repos/{os.environ['REPO']}/pulls/{p['number']}/reviews?per_page=100")
+                  if r.get("state") == "APPROVED"]
+              if any(r.get("commit_id") == p["headRefOid"] for r in approved):
+                  continue
+              for r in approved:
+                  stale.append(f"#{p['number']} approved-at={str(r.get('commit_id'))[:12]}")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write("## approvals unverifiable against head\n\n")
+              f.write("\n".join(f"- {s}" for s in stale) if stale else "none\n")
+          raise SystemExit(1 if stale else 0)
+          PY
