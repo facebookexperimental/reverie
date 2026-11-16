@@ -14,6 +14,7 @@ categories = ["development-tools::debugging", "os::linux-apis"]
 
 [dependencies]
 libc = "0.2.186"
+reverie-proc-grammar = { version = "0.5.7", path = "../reverie-proc-grammar" }
 serde = { version = "1.0.219", features = ["derive"] }
 
 [dev-dependencies]

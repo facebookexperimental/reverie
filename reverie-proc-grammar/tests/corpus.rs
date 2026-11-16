@@ -465,3 +465,94 @@ fn bitmap_width_invariant_holds_for_constructed_values() {
         "constructed Bitmap changed across render/parse"
     );
 }
+
+#[test]
+fn mountinfo_rows_round_trip_and_peer_groups() {
+    // No collector fixtures for mountinfo: a live mount table is
+    // namespace-global host state the collector cannot anonymize, so
+    // these hand-written goldens plus the kernel-oracle live read
+    // pin the grammar instead.
+    let bytes = b"37 1 8:1 / / rw,relatime shared:9 - ext4 /dev/root rw\n\
+                  38 37 0:50 / /mnt/with\\040space ro master:7 propagate_from:9 unbindable - fuse.squashfuse_ll squashfuse_ll ro,user_id=0\n\
+                  39 37 0:21 / /proc rw,nosuid - proc proc rw\n";
+    let rows = parse_mountinfo(bytes).expect("canonical mountinfo refused");
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].mount_id, 37);
+    assert_eq!(rows[0].parent_id, 1);
+    assert_eq!(rows[0].device_major, 8);
+    assert_eq!(rows[0].device_minor, 1);
+    assert_eq!(rows[0].peer_groups(), [9]);
+    assert_eq!(rows[1].mount_point, b"/mnt/with\\040space");
+    assert_eq!(rows[1].peer_groups(), [7, 9]);
+    assert_eq!(rows[1].super_options, b"ro,user_id=0");
+    assert!(rows[2].optional_fields.is_empty());
+    assert_eq!(render_mountinfo(&rows), bytes);
+    assert_eq!(parse_mountinfo(b""), Ok(Vec::new()), "empty snapshot");
+}
+
+#[test]
+fn mountinfo_refuses_noncanonical_and_unknown_numeric_fields() {
+    let row = b"37 1 8:1 / / rw shared:9 - ext4 /dev/root rw\n";
+    assert!(parse_mountinfo(b"\n").is_err(), "a sole newline is one empty row");
+    assert!(
+        parse_mountinfo(b"37 1 8:1 / / rw - ext4 /dev/root rw").is_err(),
+        "missing final newline"
+    );
+    assert!(matches!(
+        parse_mountinfo(b"037 1 8:1 / / rw - ext4 /dev/root rw\n"),
+        Err(ProcParseError::BadNumber {
+            field: "mount_id",
+            ..
+        })
+    ));
+    assert!(matches!(
+        parse_mountinfo(b"37 1 8:1 / / rw shared:09 - ext4 /dev/root rw\n"),
+        Err(ProcParseError::BadNumber {
+            field: "shared",
+            ..
+        })
+    ));
+    assert!(
+        parse_mountinfo(b"37 1 8:1 / / rw future_peer:19 - ext4 /dev/root rw\n").is_err(),
+        "unknown numeric optional fields fail closed"
+    );
+    assert!(
+        parse_mountinfo(b"37 1 8:1 / / rw future_flag:value - ext4 /dev/root rw\n").is_ok(),
+        "unknown nonnumeric flags carry no numeric identity"
+    );
+    assert!(matches!(
+        parse_mountinfo(b"37 1 8:x / / rw - ext4 /dev/root rw\n"),
+        Err(ProcParseError::BadNumber {
+            field: "device_minor",
+            ..
+        })
+    ));
+    assert!(parse_mountinfo(b"37 1 8:1 / / rw ext4 /dev/root rw\n").is_err());
+    let duplicate = [row.as_slice(), row.as_slice()].concat();
+    assert!(matches!(
+        parse_mountinfo(&duplicate),
+        Err(ProcParseError::BadValue {
+            field: "mount_id",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn fdinfo_mount_id_extractor_keeps_its_tolerances() {
+    // An extractor, not the fdinfo file grammar: any line position,
+    // a tab or a space after the colon, and no final newline needed.
+    assert_eq!(parse_fdinfo_mount_id(b"pos:\t0\nmnt_id:\t37\n"), Some(37));
+    assert_eq!(parse_fdinfo_mount_id(b"mnt_id: 0"), Some(0));
+    assert_eq!(parse_fdinfo_mount_id(b"SqMask:\t0xff\nmnt_id:\t3\n"), Some(3));
+    for malformed in [
+        b"pos:\t0\n".as_slice(),
+        b"mnt_id:\t37\nmnt_id:\t38\n".as_slice(),
+        b"mnt_id:\t37 trailing\n".as_slice(),
+        b"mnt_id:\t-1\n".as_slice(),
+        b"mnt_id:\t18446744073709551616\n".as_slice(),
+        b"mnt_id:37\n".as_slice(),
+    ] {
+        assert_eq!(parse_fdinfo_mount_id(malformed), None, "{malformed:?}");
+    }
+}

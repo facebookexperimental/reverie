@@ -37,6 +37,17 @@ fn pids() -> Vec<u32> {
     pids
 }
 
+/// The live mount table round-trips byte-exactly. It is identical
+/// for every task in the namespace, so it is read once here rather
+/// than per pid in the inventory below.
+#[test]
+fn live_mountinfo_round_trips() {
+    let bytes = fs::read("/proc/self/mountinfo").expect("read live mountinfo");
+    let rows = parse_mountinfo(&bytes).expect("live mountinfo refused");
+    assert!(!rows.is_empty(), "a live namespace has mounts");
+    assert_eq!(render_mountinfo(&rows), bytes);
+}
+
 #[test]
 fn live_proc_inventory() {
     let mut ok: BTreeMap<&str, usize> = BTreeMap::new();

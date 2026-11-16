@@ -6,11 +6,20 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Strict parsers for Linux `mountinfo` snapshots and the `mnt_id`
-//! field of `fdinfo` files, in the grammar of
-//! `Documentation/filesystems/proc.rst` (mountinfo) and `fs/proc/fd.c`
-//! (fdinfo). Producers and consumers that capture or present mount
-//! identities share these so they accept exactly the same input.
+//! One-transition shim over `reverie_proc_grammar::mountinfo`, the
+//! grammar owner since Slice 2 (S2-R1). The shim keeps this crate's
+//! legacy identity-bearing row shape and `Option` surface so current
+//! consumers (detcore-model re-exports, LinuxEmu's host mount
+//! capture) change nothing: the grammar's typed refusal maps to
+//! `None`, and the legacy `raw_device` is computed here with
+//! `libc::makedev`, because `dev_t` encoding is libc ABI, not file
+//! grammar. The grammar's canonical-spelling rules are deliberately
+//! stricter than the loose decimal reader this replaces: a nonempty
+//! snapshot without its final newline, or with a leading-zero
+//! decimal, now refuses. Kernel-produced snapshots are always
+//! canonical, so no live consumer input changes accept/reject.
+
+pub use reverie_proc_grammar::mountinfo::MOUNT_PEER_PREFIXES;
 
 /// Identity-bearing fields from one Linux `/proc/*/mountinfo` row.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -27,64 +36,16 @@ pub struct MountInfoRow {
     pub super_options: Vec<u8>,
 }
 
-/// The optional-field prefixes that carry mount peer-group numbers.
-pub const MOUNT_PEER_PREFIXES: [&[u8]; 3] = [b"shared:", b"master:", b"propagate_from:"];
-
-fn decimal(field: &[u8]) -> Option<u64> {
-    if field.is_empty() || field.iter().any(|byte| !byte.is_ascii_digit()) {
-        return None;
-    }
-    std::str::from_utf8(field).ok()?.parse().ok()
-}
-
-fn mount_peer_group(field: &[u8]) -> Option<Option<u64>> {
-    for prefix in MOUNT_PEER_PREFIXES {
-        if let Some(raw) = field.strip_prefix(prefix) {
-            return Some(Some(decimal(raw)?));
-        }
-    }
-    Some(None)
-}
-
-fn parse_mountinfo_row(line: &[u8]) -> Option<MountInfoRow> {
-    let fields = line.split(|byte| *byte == b' ').collect::<Vec<_>>();
-    if fields.iter().any(|field| field.is_empty()) {
-        return None;
-    }
-    let separator = fields.iter().position(|field| *field == b"-")?;
-    if separator < 6 || separator + 4 != fields.len() {
-        return None;
-    }
-    let mut device = fields[2].split(|byte| *byte == b':');
-    let major = u32::try_from(decimal(device.next()?)?).ok()?;
-    let minor = u32::try_from(decimal(device.next()?)?).ok()?;
-    if device.next().is_some() {
-        return None;
-    }
-    let mut raw_peer_groups = Vec::new();
-    for field in &fields[6..separator] {
-        if let Some(raw) = mount_peer_group(field)? {
-            raw_peer_groups.push(raw);
-        } else if field
-            .iter()
-            .position(|byte| *byte == b':')
-            .is_some_and(|separator| decimal(&field[separator + 1..]).is_some())
-        {
-            // Unknown numeric optional fields can carry mount-namespace
-            // identity just like the peer-group fields above. Passing one
-            // through would expose an unmapped host identifier, so refuse
-            // until its Linux semantics and deterministic mapping are known.
-            return None;
-        }
-    }
-    Some(MountInfoRow {
-        raw_mount_id: decimal(fields[0])?,
-        raw_parent_id: decimal(fields[1])?,
-        raw_device: libc::makedev(major, minor),
-        root: fields[3].to_vec(),
+fn from_grammar(row: reverie_proc_grammar::MountInfoRow) -> MountInfoRow {
+    let raw_peer_groups = row.peer_groups();
+    MountInfoRow {
+        raw_mount_id: row.mount_id,
+        raw_parent_id: row.parent_id,
+        raw_device: libc::makedev(row.device_major, row.device_minor),
+        root: row.root,
         raw_peer_groups,
-        super_options: fields[separator + 3].to_vec(),
-    })
+        super_options: row.super_options,
+    }
 }
 
 /// Strictly parse a Linux `/proc/*/mountinfo` snapshot.
@@ -92,21 +53,9 @@ fn parse_mountinfo_row(line: &[u8]) -> Option<MountInfoRow> {
 /// Empty files are valid empty snapshots. Malformed rows and duplicate mount
 /// IDs are rejected so every producer and consumer accepts the same grammar.
 pub fn parse_mountinfo(contents: &[u8]) -> Option<Vec<MountInfoRow>> {
-    if contents.is_empty() {
-        return Some(Vec::new());
-    }
-    let body = contents.strip_suffix(b"\n").unwrap_or(contents);
-    if body.is_empty() {
-        return None;
-    }
-    let rows = body
-        .split(|byte| *byte == b'\n')
-        .map(parse_mountinfo_row)
-        .collect::<Option<Vec<_>>>()?;
-    let mut seen = std::collections::BTreeSet::new();
-    rows.iter()
-        .all(|row| seen.insert(row.raw_mount_id))
-        .then_some(rows)
+    reverie_proc_grammar::parse_mountinfo(contents)
+        .ok()
+        .map(|rows| rows.into_iter().map(from_grammar).collect())
 }
 
 /// Parse the one decimal `mnt_id` field required by Linux fdinfo.
@@ -115,22 +64,7 @@ pub fn parse_mountinfo(contents: &[u8]) -> Option<Vec<MountInfoRow>> {
 /// Sharing this byte parser prevents a capture path from accepting input a
 /// later consumer would refuse.
 pub fn parse_fdinfo_mount_id(contents: &[u8]) -> Option<u64> {
-    let mut mount_id = None;
-    for line in contents.split(|byte| *byte == b'\n') {
-        let Some(value) = line.strip_prefix(b"mnt_id:") else {
-            continue;
-        };
-        let value = value
-            .strip_prefix(b"\t")
-            .or_else(|| value.strip_prefix(b" "))?;
-        if value.is_empty() || value.iter().any(|byte| !byte.is_ascii_digit()) || mount_id.is_some()
-        {
-            return None;
-        }
-        let text = std::str::from_utf8(value).ok()?;
-        mount_id = Some(text.parse().ok()?);
-    }
-    mount_id
+    reverie_proc_grammar::parse_fdinfo_mount_id(contents)
 }
 
 #[cfg(test)]
@@ -163,6 +97,7 @@ mod tests {
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].raw_mount_id, 37);
         assert_eq!(parsed[0].raw_parent_id, 1);
+        assert_eq!(parsed[0].raw_device, libc::makedev(8, 1));
         assert_eq!(parsed[0].root, b"/");
         assert_eq!(parsed[0].raw_peer_groups, [9]);
         assert_eq!(parsed[0].super_options, b"rw");
@@ -185,5 +120,23 @@ mod tests {
         );
         let duplicate = [row.as_slice(), row.as_slice()].concat();
         assert!(parse_mountinfo(&duplicate).is_none());
+    }
+
+    #[test]
+    fn mountinfo_shim_applies_grammar_canonical_rules() {
+        // Deliberate deltas from the loose reader this shim replaces:
+        // the grammar refuses spellings the kernel never prints.
+        assert!(
+            parse_mountinfo(b"37 1 8:1 / / rw - ext4 /dev/root rw").is_none(),
+            "a nonempty snapshot without its final newline refuses"
+        );
+        assert!(
+            parse_mountinfo(b"037 1 8:1 / / rw - ext4 /dev/root rw\n").is_none(),
+            "a leading-zero decimal refuses"
+        );
+        assert!(
+            parse_mountinfo(b"37 1 08:1 / / rw - ext4 /dev/root rw\n").is_none(),
+            "a leading-zero device major refuses"
+        );
     }
 }

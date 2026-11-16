@@ -1,6 +1,6 @@
 [package]
 name = "reverie-proc-grammar"
-description = "Pure, grammar-backed parsers and renderers for Linux /proc per-task files (stat, status, comm, fdinfo, io, sched, statm)."
+description = "Pure, grammar-backed parsers and renderers for Linux /proc per-task files (stat, status, comm, fdinfo, io, sched, statm, mountinfo)."
 version = "0.5.7"
 authors = ["Meta Platforms"]
 edition = "2024"

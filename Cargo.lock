@@ -1495,6 +1495,7 @@ name = "reverie-procfs"
 version = "0.5.7"
 dependencies = [
  "libc",
+ "reverie-proc-grammar",
  "serde",
  "syn 2.0.119",
 ]

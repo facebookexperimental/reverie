@@ -27,6 +27,8 @@ pub enum Format {
     Sched,
     /// `/proc/<pid>/statm`.
     Statm,
+    /// `/proc/<pid>/mountinfo`.
+    Mountinfo,
 }
 
 impl Format {
@@ -40,6 +42,7 @@ impl Format {
             Format::ProcessIo => "io",
             Format::Sched => "sched",
             Format::Statm => "statm",
+            Format::Mountinfo => "mountinfo",
         }
     }
 }

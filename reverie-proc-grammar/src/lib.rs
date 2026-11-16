@@ -7,8 +7,8 @@
  */
 
 //! Grammar-backed parsers and renderers for the Linux `/proc` per-task
-//! text files: `stat`, `status`, `comm`, `fdinfo`, `io`, `sched`, and
-//! `statm`.
+//! text files: `stat`, `status`, `comm`, `fdinfo`, `io`, `sched`,
+//! `statm`, and `mountinfo`.
 //!
 //! Every format here is defined by one kernel printing function, named
 //! in the module that owns it. Each module provides the pair the kernel
@@ -34,6 +34,7 @@ extern crate alloc;
 pub mod comm;
 pub mod error;
 pub mod fdinfo;
+pub mod mountinfo;
 pub mod num;
 pub mod process_io;
 pub mod sched;
@@ -57,6 +58,11 @@ pub use fdinfo::LockMode;
 pub use fdinfo::Timerfd;
 pub use fdinfo::parse_fdinfo;
 pub use fdinfo::render_fdinfo;
+pub use mountinfo::MOUNT_PEER_PREFIXES;
+pub use mountinfo::MountInfoRow;
+pub use mountinfo::parse_fdinfo_mount_id;
+pub use mountinfo::parse_mountinfo;
+pub use mountinfo::render_mountinfo;
 pub use process_io::ProcessIo;
 pub use process_io::parse_process_io;
 pub use process_io::render_process_io;
