@@ -132,18 +132,18 @@ fn produced_row(
     archive: &reverie_liteinst_artifact::private_static::StaticArchive,
 ) -> Result<Value> {
     let builds = runner
-        .commands
+        .commands()
         .iter()
-        .filter(|command| command.arguments.iter().any(|arg| arg == "rustc"))
+        .filter(|command| command.arguments().iter().any(|arg| arg == "rustc"))
         .collect::<Vec<_>>();
     require(
         builds.len() == 1,
         "mapped fixture requires one actual Cargo archive build",
     )?;
-    requested_seed(&builds[0].arguments)?;
-    let bytes = fs::read(&builds[0].stdout.path).map_err(|e| e.to_string())?;
+    requested_seed(builds[0].arguments())?;
+    let bytes = fs::read(&builds[0].stdout().path).map_err(|e| e.to_string())?;
     require(
-        FileIdentity::read(&builds[0].stdout.path)?.sha256 == archive.cargo_messages_sha256(),
+        FileIdentity::read(&builds[0].stdout().path)?.sha256 == archive.cargo_messages_sha256(),
         "mapped fixture Cargo stream does not match selected archive",
     )?;
     let rows = bytes
@@ -273,11 +273,11 @@ fn literoot_image_qualifies_first_and_successor_with_nearby_refusals() -> Result
         &mut runner,
         |source, runner| {
             let metadata = runner
-                .commands
+                .commands()
                 .iter()
                 .filter(|command| {
                     command
-                        .arguments
+                        .arguments()
                         .first()
                         .is_some_and(|arg| arg == "metadata")
                 })
@@ -286,9 +286,9 @@ fn literoot_image_qualifies_first_and_successor_with_nearby_refusals() -> Result
                 metadata.len() == 1,
                 "mapped fixture metadata command absent/duplicate",
             )?;
-            requested_seed(&metadata[0].arguments)?;
+            requested_seed(metadata[0].arguments())?;
             require(
-                metadata[0].stdout.sha256 == source.metadata_sha256(),
+                metadata[0].stdout().sha256 == source.metadata_sha256(),
                 "mapped fixture metadata stream differs from source binding",
             )?;
             let archive = source.build_archive(runner)?;
@@ -601,7 +601,7 @@ fn literoot_image_qualifies_first_and_successor_with_nearby_refusals() -> Result
     );
     fs::write(
         fixture.evidence.join("commands.json"),
-        serde_json::to_vec_pretty(&runner.commands).map_err(|e| e.to_string())?,
+        serde_json::to_vec_pretty(runner.commands()).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
     let data = result.map_err(|e| format!("mapped fixture factory transaction refused: {e}"))?;

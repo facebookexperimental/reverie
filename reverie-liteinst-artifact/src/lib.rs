@@ -166,16 +166,92 @@ impl FileIdentity {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommandEvidence {
     pub program: String,
     pub arguments: Vec<String>,
     pub cwd: PathBuf,
     pub status: i32,
-    pub elapsed_millis: u128,
+    elapsed_millis: u128,
     pub stdout: FileIdentity,
     pub stderr: FileIdentity,
+    /// Provenance marker: `true` only on records `Runner::run_with_limits`
+    /// built through `from_runner_record`. Serde skips it, so a
+    /// deserialized record always carries `false` and cannot pose as
+    /// Runner-produced evidence where binding requires the marker (see
+    /// `VerifiedCompiledSources::with_buck_build`); retained-witness
+    /// verification instead re-derives every checked fact from the
+    /// hash-verified stdout/stderr and artifact files. Equality below
+    /// compares the recorded facts only and excludes this marker, so a
+    /// serialized record round-trips equal to its in-memory original.
+    #[serde(skip)]
+    from_runner: bool,
+}
+
+impl PartialEq for CommandEvidence {
+    fn eq(&self, other: &Self) -> bool {
+        self.program == other.program
+            && self.arguments == other.arguments
+            && self.cwd == other.cwd
+            && self.status == other.status
+            && self.elapsed_millis == other.elapsed_millis
+            && self.stdout == other.stdout
+            && self.stderr == other.stderr
+    }
+}
+
+impl Eq for CommandEvidence {}
+
+impl CommandEvidence {
+    pub(crate) fn from_runner_record(
+        program: String,
+        arguments: Vec<String>,
+        cwd: PathBuf,
+        status: i32,
+        elapsed_millis: u128,
+        stdout: FileIdentity,
+        stderr: FileIdentity,
+    ) -> Self {
+        Self {
+            program,
+            arguments,
+            cwd,
+            status,
+            elapsed_millis,
+            stdout,
+            stderr,
+            from_runner: true,
+        }
+    }
+
+    pub fn program(&self) -> &str {
+        &self.program
+    }
+
+    pub fn arguments(&self) -> &[String] {
+        &self.arguments
+    }
+
+    pub fn cwd(&self) -> &Path {
+        &self.cwd
+    }
+
+    pub fn status(&self) -> i32 {
+        self.status
+    }
+
+    pub fn elapsed_millis(&self) -> u128 {
+        self.elapsed_millis
+    }
+
+    pub fn stdout(&self) -> &FileIdentity {
+        &self.stdout
+    }
+
+    pub fn stderr(&self) -> &FileIdentity {
+        &self.stderr
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -264,6 +340,13 @@ pub struct Runner {
     pub deadline: Instant,
     pub max_stream_bytes: usize,
     serial: u32,
+    /// Retained command records. Public at this head so landed readers
+    /// still compile; D132220437 makes the `Vec` private once every
+    /// reader uses [`Runner::commands`]. Until then insertion is not
+    /// compile-prevented, but a deserialized record still cannot bind a
+    /// Buck witness: `with_buck_build` requires the `from_runner`
+    /// marker only `from_runner_record` sets. Readers use
+    /// [`Runner::commands`].
     pub commands: Vec<CommandEvidence>,
     /// CPU measured for each entry of `commands`; `None` for a command run
     /// without a CPU budget. Kept apart from `CommandEvidence`, whose receipt
@@ -317,6 +400,13 @@ impl Runner {
             #[cfg(test)]
             accounting_reads: Vec::new(),
         })
+    }
+
+    /// Retained command records, in run order. Prefer this accessor:
+    /// the `Vec` field is public only until D132220437 (see the field
+    /// comment).
+    pub fn commands(&self) -> &[CommandEvidence] {
+        &self.commands
     }
 
     pub fn run(&mut self, program: &str, args: &[String], cwd: &Path) -> Result<Vec<u8>> {
@@ -641,15 +731,15 @@ impl Runner {
         let stderr_path = prefix.with_extension("stderr");
         write_new(&stdout_path, &stdout)?;
         write_new(&stderr_path, &stderr)?;
-        let evidence = CommandEvidence {
-            program: program.to_owned(),
-            arguments: args.to_vec(),
-            cwd: fs::canonicalize(cwd).map_err(|e| e.to_string())?,
-            status: status.code().unwrap_or(-1),
-            elapsed_millis: start.elapsed().as_millis(),
-            stdout: FileIdentity::read(&stdout_path)?,
-            stderr: FileIdentity::read(&stderr_path)?,
-        };
+        let evidence = CommandEvidence::from_runner_record(
+            program.to_owned(),
+            args.to_vec(),
+            fs::canonicalize(cwd).map_err(|e| e.to_string())?,
+            status.code().unwrap_or(-1),
+            start.elapsed().as_millis(),
+            FileIdentity::read(&stdout_path)?,
+            FileIdentity::read(&stderr_path)?,
+        );
         write_new(
             &prefix.with_extension("command.json"),
             &serde_json::to_vec_pretty(&evidence).map_err(|e| e.to_string())?,
@@ -1065,6 +1155,10 @@ pub struct PackageIdentity {
 pub enum CompiledSourceLayout {
     ReverieWorkspace,
     HermitGit,
+    /// Buck-materialized source tree. Compiler filenames use the materialized
+    /// absolute spelling until a real Buck ELF's embedded paths are measured;
+    /// machine-code recipes still gate any qualification claim.
+    Buck,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FixedImageKind {
@@ -1086,6 +1180,52 @@ pub struct CompiledSourceExpectation<'a> {
     pub manifest: &'a Path,
     pub reverie_pin: &'a str,
 }
+pub struct ExpectedSourceFile<'a> {
+    pub relative: &'a str,
+    pub sha256: &'a str,
+}
+/// Inputs for the closed Buck factory. File lists are logical, label-relative
+/// paths the factory hashes itself; every computed workspace hash must equal
+/// its pinned `ExpectedSourceFile` digest or resolution refuses by name.
+/// Limit (D3): those pinned digests derive from the same `workspace_root`
+/// tree the factory inventories (the caller hashes that tree to build the
+/// expectation), so they detect drift between expectation and inventory,
+/// not a tree that was already wrong when both were taken from it.
+/// `target`/`platform`/`constraints` are recorded as literals in the authority
+/// and the Buck build witness must match them exactly.
+pub struct BuckCompiledSourceExpectation<'a> {
+    pub workspace_root: &'a Path,
+    pub reverie_root: &'a Path,
+    pub reverie_pin: &'a str,
+    pub imported_sha: &'a str,
+    pub profile_bzl: &'a Path,
+    pub target: &'a str,
+    pub platform: &'a str,
+    pub constraints: &'a [&'a str],
+    pub workspace_files: &'a [ExpectedSourceFile<'a>],
+    pub reverie_files: &'a [&'a str],
+}
+const BUCK_PROFILE_BZL_NAME: &str = "liteinst-runtime-profile.bzl";
+/// Canonical Buck literals, matched exactly (never by substring or superset).
+/// The target is the liteinst-runtime configured alias in the Hermit root
+/// `BUCK`; the constraints are the exact set that alias carries: the
+/// `:detcore-liteinst` cpu/os pair plus the profile's opt build mode.
+const BUCK_TARGET: &str = "//hermetic_infra/hermit:detcore-liteinst-liteinst-runtime[cdylib]";
+const BUCK_PLATFORM: &str = "ovr_config//platform/linux:x86_64-fbcode";
+const BUCK_CONSTRAINTS: [&str; 3] = [
+    "ovr_config//build_mode/constraints:opt",
+    "ovr_config//cpu:x86_64",
+    "ovr_config//os:linux",
+];
+const BUCK_QUALIFIER_SOURCE: &str = "reverie-liteinst-artifact/src/lib.rs";
+const BUCK_LEAF_SOURCE: &str = "detcore-liteinst/src/lib.rs";
+const BUCK_PROFILE_RELATIVE: &str = "fb-only/liteinst-runtime-profile.bzl";
+const BUCK_WORKSPACE_EXTRA_FILES: [&str; 4] = [
+    "detcore-liteinst/build.rs",
+    "common/inguest/glibc_compat.rs",
+    "BUCK",
+    BUCK_PROFILE_RELATIVE,
+];
 /// Semantic identities only. A newly run metadata command has a different
 /// evidence path and is retained by Runner, not mistaken for source inequality.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1117,6 +1257,22 @@ enum CompiledSourceAuthority {
         reverie_sha256: String,
         compiler_root: CompilerRootBinding,
     },
+    /// Declared Buck source filegroups, hashed by the closed `resolve_buck`
+    /// factory. No Git or Cargo evidence exists in the fbsource import; the
+    /// authority is the inventoried file bytes, the imported Hermit SHA, the
+    /// profile `.bzl` identity, and the recorded target/platform/constraints
+    /// literals the Buck witness must match exactly.
+    BuckDeclaredContent {
+        workspace_inventory: Vec<DeclaredSourceFile>,
+        workspace_sha256: String,
+        reverie_inventory: Vec<DeclaredSourceFile>,
+        reverie_sha256: String,
+        imported_sha: String,
+        profile_bzl: FileIdentity,
+        target: String,
+        platform: String,
+        constraints: Vec<String>,
+    },
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1132,11 +1288,11 @@ struct CompilerRootBinding {
     canonical_root: PathBuf,
     cargo_home: Option<(PathBuf, PathBuf)>,
 }
-/// Only the fresh Git/content factories can construct this type. Deserializing evidence does not
-/// authorize compiler filenames or establish the current Cargo source graph.
+/// Only the fresh Git/content/Buck factories can construct this type. Deserializing evidence does
+/// not authorize compiler filenames or establish the current Cargo source graph.
 pub struct VerifiedCompiledSources {
     record: CompiledSources,
-    current_build: Option<CurrentBuildEvidence>,
+    current_build: Option<BuildWitness>,
     standalone_metadata: Option<Value>,
 }
 const COMPILED_RV_LOCATION_FILES: [&str; 7] = [
@@ -1930,6 +2086,137 @@ fn verify_declared_content(
     )?;
     Ok(())
 }
+fn logical_declared_relative(relative: &str) -> Result<()> {
+    let path = Path::new(relative);
+    require(
+        !relative.is_empty()
+            && !relative.contains('\\')
+            && !path.is_absolute()
+            && path
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_))),
+        format!("declared Buck source is not a logical relative path: {relative}"),
+    )
+}
+/// Refuse a declared Buck workspace inventory that subsets the sources on
+/// disk: every `.rs` file under `detcore-liteinst/src/` must be declared, so
+/// an undeclared source file can never ride along outside the authority.
+fn require_complete_detcore_src_inventory(
+    workspace_root: &Path,
+    declared: &BTreeSet<&str>,
+) -> Result<()> {
+    fn scan(dir: &Path, workspace_root: &Path, declared: &BTreeSet<&str>) -> Result<()> {
+        let mut entries: Vec<_> = fs::read_dir(dir)
+            .map_err(|e| e.to_string())?
+            .collect::<std::result::Result<_, _>>()
+            .map_err(|e| e.to_string())?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let file_type = entry.file_type().map_err(|e| e.to_string())?;
+            let path = entry.path();
+            if file_type.is_symlink() {
+                return Err(format!(
+                    "Buck detcore-liteinst source scan refuses a symlink: {}",
+                    path.display()
+                ));
+            } else if file_type.is_dir() {
+                scan(&path, workspace_root, declared)?;
+            } else if file_type.is_file()
+                && path.extension().is_some_and(|extension| extension == "rs")
+            {
+                let relative_path = path
+                    .strip_prefix(workspace_root)
+                    .map_err(|e| e.to_string())?;
+                let relative = relative_path
+                    .to_str()
+                    .ok_or("Buck detcore-liteinst source path is not UTF-8")?;
+                require(
+                    declared.contains(relative),
+                    format!(
+                        "Buck workspace inventory is incomplete: {relative} is present under \
+                         detcore-liteinst/src but absent from the declared inventory"
+                    ),
+                )?;
+            }
+        }
+        Ok(())
+    }
+    scan(
+        &workspace_root.join("detcore-liteinst/src"),
+        workspace_root,
+        declared,
+    )
+}
+/// Buck Reverie content authority: every inventoried Reverie file's bytes
+/// must equal a reviewed expectation — the `CONTENT_REVERIE_CATALOG` digest
+/// for a catalogue-covered file, the reviewed fixed-gate tuple for the
+/// Detcore fixed gate, or the compiled host qualifier hash for the
+/// qualifier source. A file with no reviewed expectation refuses by name
+/// through the catalogue check; declared presence alone never authorizes
+/// content.
+fn buck_reverie_content_matches(inventory: &[DeclaredSourceFile]) -> Result<()> {
+    require(
+        inventory
+            .iter()
+            .any(|entry| entry.relative == BUCK_QUALIFIER_SOURCE),
+        "declared Buck Reverie inventory lacks the qualifier source",
+    )?;
+    for entry in inventory {
+        if entry.relative == BUCK_QUALIFIER_SOURCE {
+            require(
+                entry.sha256 == qualifier_source_sha256(),
+                "declared Buck qualifier source differs from compiled host qualifier",
+            )?;
+        } else if entry.relative == CONTENT_DETCORE_FIXED_GATE.0 {
+            require(
+                entry.size == CONTENT_DETCORE_FIXED_GATE.1
+                    && entry.sha256 == CONTENT_DETCORE_FIXED_GATE.2,
+                format!(
+                    "declared Buck Reverie source differs from reviewed catalog: {}",
+                    entry.relative
+                ),
+            )?;
+        } else {
+            content_catalog_matches(&entry.relative, entry.size, &entry.sha256)?;
+        }
+    }
+    Ok(())
+}
+fn verify_buck_declared_content(
+    (workspace_root, workspace_inventory, workspace_sha256): (&Path, &[DeclaredSourceFile], &str),
+    (reverie_root, reverie_inventory, reverie_sha256): (&Path, &[DeclaredSourceFile], &str),
+    profile_bzl: &FileIdentity,
+) -> Result<()> {
+    profile_bzl.verify()?;
+    for (root, inventory, digest, label) in [
+        (
+            workspace_root,
+            workspace_inventory,
+            workspace_sha256,
+            "workspace",
+        ),
+        (reverie_root, reverie_inventory, reverie_sha256, "Reverie"),
+    ] {
+        let relatives: Vec<&str> = inventory
+            .iter()
+            .map(|entry| entry.relative.as_str())
+            .collect();
+        let (current, _) = declared_inventory(root, &relatives)?;
+        require(
+            current == inventory && declared_inventory_sha256(&current)? == digest,
+            format!("declared Buck {label} content changed during use"),
+        )?;
+    }
+    buck_reverie_content_matches(reverie_inventory)?;
+    require_complete_detcore_src_inventory(
+        workspace_root,
+        &workspace_inventory
+            .iter()
+            .map(|entry| entry.relative.as_str())
+            .collect(),
+    )?;
+    Ok(())
+}
 fn source_pin_is_full(pin: &str) -> bool {
     pin.len() == 40
         && pin
@@ -2461,7 +2748,7 @@ fn compiled_role_filename(
     file.verify()?;
     Ok(match layout {
         CompiledSourceLayout::ReverieWorkspace => relative.as_bytes().to_vec(),
-        CompiledSourceLayout::HermitGit => file
+        CompiledSourceLayout::Buck | CompiledSourceLayout::HermitGit => file
             .path
             .to_str()
             .ok_or("compiled source filename is not UTF-8")?
@@ -2971,6 +3258,176 @@ impl VerifiedCompiledSources {
         verified.verify_unchanged(runner)?;
         Ok(verified)
     }
+    /// Closed Buck source-copy authority for the Detcore image. It runs no Git
+    /// or Cargo command: the declared workspace/Reverie file inventories are
+    /// hashed here, the qualifier source must be the compiled host qualifier,
+    /// and the leaf package is synthesized with `source: None` (cdylib) over
+    /// the hashed leaf source file. Detcore qualification still requires this
+    /// opaque context exactly as it requires the Git/content factories.
+    pub fn resolve_buck(expected: &BuckCompiledSourceExpectation<'_>) -> Result<Self> {
+        require(
+            source_pin_is_full(expected.reverie_pin),
+            "Buck compiled source requires an independent full Reverie pin",
+        )?;
+        require(
+            source_pin_is_full(expected.imported_sha),
+            "Buck compiled source requires a full imported Hermit SHA",
+        )?;
+        require(
+            expected.target == BUCK_TARGET && expected.platform == BUCK_PLATFORM,
+            "Buck compiled source requires the exact detcore-liteinst-liteinst-runtime \
+             target and x86_64-fbcode platform literals",
+        )?;
+        let constraint_set: BTreeSet<&str> = expected.constraints.iter().copied().collect();
+        require(
+            constraint_set.len() == expected.constraints.len()
+                && constraint_set == BUCK_CONSTRAINTS.iter().copied().collect(),
+            "Buck constraints must be exactly the cpu, os and opt constraint set",
+        )?;
+        let constraints: Vec<String> = BUCK_CONSTRAINTS
+            .iter()
+            .map(|constraint| (*constraint).to_owned())
+            .collect();
+        let workspace_relatives: Vec<&str> = expected
+            .workspace_files
+            .iter()
+            .map(|file| file.relative)
+            .collect();
+        for relative in workspace_relatives
+            .iter()
+            .copied()
+            .chain(expected.reverie_files.iter().copied())
+        {
+            logical_declared_relative(relative)?;
+        }
+        require(
+            workspace_relatives.contains(&BUCK_LEAF_SOURCE)
+                && BUCK_WORKSPACE_EXTRA_FILES
+                    .iter()
+                    .all(|extra| workspace_relatives.contains(extra))
+                && workspace_relatives.iter().all(|relative| {
+                    BUCK_WORKSPACE_EXTRA_FILES.contains(relative)
+                        || (relative.starts_with("detcore-liteinst/src/")
+                            && relative.ends_with(".rs"))
+                }),
+            "Buck workspace files must be the detcore-liteinst sources, build.rs and glibc_compat.rs",
+        )?;
+        let expected_reverie: BTreeSet<&str> = COMPILED_RV_LOCATION_FILES
+            .into_iter()
+            .chain([BUCK_QUALIFIER_SOURCE, CONTENT_DETCORE_FIXED_GATE.0])
+            .collect();
+        require(
+            expected
+                .reverie_files
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
+                == expected_reverie
+                && expected.reverie_files.len() == expected_reverie.len(),
+            "Buck Reverie files must be the compiled-location set, fixed gate and qualifier source",
+        )?;
+        let root = fs::canonicalize(expected.workspace_root).map_err(|e| e.to_string())?;
+        require(
+            root.as_os_str() == expected.workspace_root.as_os_str(),
+            "Buck compiled source workspace is not canonical",
+        )?;
+        let reverie_root = fs::canonicalize(expected.reverie_root).map_err(|e| e.to_string())?;
+        require(
+            reverie_root.as_os_str() == expected.reverie_root.as_os_str(),
+            "Buck compiled Reverie root is not canonical",
+        )?;
+        require_complete_detcore_src_inventory(
+            &root,
+            &workspace_relatives.iter().copied().collect(),
+        )?;
+        let profile_bzl = FileIdentity::read(expected.profile_bzl)?;
+        require(
+            profile_bzl
+                .path
+                .file_name()
+                .is_some_and(|name| name == BUCK_PROFILE_BZL_NAME),
+            "Buck profile input is not the liteinst-runtime profile .bzl",
+        )?;
+        let (workspace_inventory, workspace_files) =
+            declared_inventory(&root, &workspace_relatives)?;
+        for expected_file in expected.workspace_files {
+            let relative = expected_file.relative;
+            require(
+                workspace_inventory
+                    .iter()
+                    .find(|entry| entry.relative == relative)
+                    .is_some_and(|entry| entry.sha256 == expected_file.sha256),
+                format!("declared workspace source differs from pinned expectation: {relative}"),
+            )?;
+        }
+        require(
+            workspace_inventory
+                .iter()
+                .find(|entry| entry.relative == BUCK_PROFILE_RELATIVE)
+                .is_some_and(|entry| entry.sha256 == profile_bzl.sha256),
+            format!(
+                "declared workspace source differs from pinned expectation: {BUCK_PROFILE_RELATIVE}"
+            ),
+        )?;
+        let (reverie_inventory, reverie_files) =
+            declared_inventory(&reverie_root, expected.reverie_files)?;
+        buck_reverie_content_matches(&reverie_inventory)?;
+        let leaf_source = workspace_files
+            .get(BUCK_LEAF_SOURCE)
+            .ok_or("declared Buck leaf source missing")?;
+        let leaf = PackageIdentity {
+            id: expected.target.to_owned(),
+            name: "detcore-liteinst".into(),
+            // The declaring BUCK file is the leaf's build manifest analogue;
+            // the exact target label is recorded in the authority and `id`.
+            manifest: root.join("BUCK"),
+            source: None,
+            target: "detcore_liteinst".into(),
+            kind: vec!["cdylib".into()],
+            crate_types: vec!["cdylib".into()],
+            target_source: leaf_source.path.clone(),
+        };
+        let mut packages = BTreeMap::new();
+        packages.insert(leaf.name.clone(), leaf.clone());
+        let files = workspace_files
+            .into_iter()
+            .map(|(path, file)| (format!("workspace:{path}"), file))
+            .chain(
+                reverie_files
+                    .into_iter()
+                    .map(|(path, file)| (format!("rv:{path}"), file)),
+            )
+            .collect();
+        let authority = CompiledSourceAuthority::BuckDeclaredContent {
+            workspace_sha256: declared_inventory_sha256(&workspace_inventory)?,
+            workspace_inventory,
+            reverie_sha256: declared_inventory_sha256(&reverie_inventory)?,
+            reverie_inventory,
+            imported_sha: expected.imported_sha.into(),
+            profile_bzl: profile_bzl.clone(),
+            target: expected.target.into(),
+            platform: expected.platform.into(),
+            constraints,
+        };
+        let verified = Self {
+            record: CompiledSources {
+                layout: CompiledSourceLayout::Buck,
+                image_kind: FixedImageKind::Detcore,
+                workspace_root: root,
+                authority,
+                manifest: profile_bzl,
+                reverie_pin: expected.reverie_pin.into(),
+                reverie_root,
+                packages,
+                files,
+                leaf,
+            },
+            current_build: None,
+            standalone_metadata: None,
+        };
+        verified.verify_files()?;
+        Ok(verified)
+    }
     pub fn record(&self) -> &CompiledSources {
         &self.record
     }
@@ -2989,12 +3446,19 @@ impl VerifiedCompiledSources {
         selected_elf: &Path,
         target_directory: &Path,
     ) -> Result<Self> {
+        require(
+            !matches!(
+                self.record.authority,
+                CompiledSourceAuthority::BuckDeclaredContent { .. }
+            ),
+            "Buck declared sources cannot bind a Cargo current-build witness",
+        )?;
         self.verify_files()?;
         let current_build =
             current_build_evidence(&self.record, command, selected_elf, target_directory)?;
         Ok(Self {
             record: self.record.clone(),
-            current_build: Some(current_build),
+            current_build: Some(BuildWitness::Cargo(Box::new(current_build))),
             standalone_metadata: self.standalone_metadata.clone(),
         })
     }
@@ -3031,7 +3495,104 @@ impl VerifiedCompiledSources {
         };
         Ok(Self {
             record: self.record.clone(),
-            current_build: Some(current_build),
+            current_build: Some(BuildWitness::Cargo(Box::new(current_build))),
+            standalone_metadata: self.standalone_metadata.clone(),
+        })
+    }
+    /// Bind the actual Buck-built ELF to Buck-declared sources. The build
+    /// evidence is `runner`'s last retained record, which must be the
+    /// pinned buck2 build that Runner just ran. There is no
+    /// `&CommandEvidence` parameter and no public `CommandEvidence`
+    /// constructor (`from_runner_record` is `pub(crate)`), and the
+    /// record's `from_runner` marker (set only by `from_runner_record`,
+    /// always `false` after deserialization) is required below, so a
+    /// deserialized record cannot bind here even though `Runner.commands`
+    /// and the recorded-fact fields are still public at this head;
+    /// D132220437 makes them private, after which a hand-built record
+    /// cannot be supplied at all. The ELF identity and the stored
+    /// `output_sha256` are computed in this function from the file the
+    /// retained `--show-full-output` stdout names, canonicalized through
+    /// any buck-out symlink; no caller-supplied command or digest is
+    /// accepted, and `selected_elf` must be that same file. The witness
+    /// refuses unless the retained command is the exact pinned buck2
+    /// invocation and succeeded. The per-crate features/profile are
+    /// recorded declarations cross-checked against the authority and
+    /// profile `.bzl` identity, never build evidence alone.
+    pub fn with_buck_build(&self, runner: &Runner, selected_elf: &Path) -> Result<Self> {
+        let (profile_bzl, target, platform, constraints) = match &self.record.authority {
+            CompiledSourceAuthority::BuckDeclaredContent {
+                profile_bzl,
+                target,
+                platform,
+                constraints,
+                ..
+            } => (
+                profile_bzl.clone(),
+                target.clone(),
+                platform.clone(),
+                constraints.clone(),
+            ),
+            _ => {
+                return Err("a Buck build witness requires Buck declared compiled sources".into());
+            }
+        };
+        require(
+            self.record.image_kind == FixedImageKind::Detcore,
+            "Buck build witness requires a Detcore source identity",
+        )?;
+        self.verify_files()?;
+        let command = runner
+            .commands
+            .last()
+            .ok_or("Buck build witness requires a retained Runner buck2 build record")?;
+        require(
+            command.from_runner,
+            "Buck build witness command was not produced by a Runner",
+        )?;
+        command.stderr.verify()?;
+        let derived = buck_build_stdout_artifact(command, &target)?;
+        let artifact = FileIdentity::read(&derived)?;
+        require(
+            FileIdentity::read(selected_elf)?.path == artifact.path,
+            "Buck build ELF path differs from the retained stdout output path",
+        )?;
+        let output_sha256 = artifact.sha256.clone();
+        let packages = NoScopeCohort::DetcoreOrdinaryBuck
+            .features()
+            .iter()
+            .map(|(name, features)| {
+                (
+                    (*name).to_owned(),
+                    BuckBuildPackage {
+                        features: features.iter().map(|f| (*f).to_owned()).collect(),
+                        profile: NoScopeCohort::DetcoreOrdinaryBuck.profile(),
+                    },
+                )
+            })
+            .collect();
+        let evidence = BuckBuildEvidence {
+            builder: "buck2".into(),
+            command: command.clone(),
+            profile_bzl,
+            target,
+            platform,
+            constraints,
+            artifact,
+            output_sha256,
+            compiled_sources_sha256: sha256(
+                &serde_json::to_vec(&self.record).map_err(|e| e.to_string())?,
+            ),
+            packages,
+        };
+        validate_buck_build_evidence(&evidence)?;
+        require(
+            build_witness_cohort(&BuildWitness::Buck(Box::new(evidence.clone())))?
+                == NoScopeCohort::DetcoreOrdinaryBuck,
+            "Buck build witness is not the reviewed ordinary Buck cohort",
+        )?;
+        Ok(Self {
+            record: self.record.clone(),
+            current_build: Some(BuildWitness::Buck(Box::new(evidence))),
             standalone_metadata: self.standalone_metadata.clone(),
         })
     }
@@ -3048,6 +3609,9 @@ impl VerifiedCompiledSources {
                     &self.record.leaf.manifest,
                     compiler_root,
                 )
+            }
+            CompiledSourceAuthority::BuckDeclaredContent { .. } => {
+                Err("Buck compiled sources have no Cargo compiler manifest".into())
             }
         }
     }
@@ -3075,7 +3639,7 @@ impl VerifiedCompiledSources {
     }
     fn verify_files(&self) -> Result<()> {
         if let Some(build) = &self.current_build {
-            verify_current_build_files(build)?;
+            build.verify_files()?;
         }
         if let CompiledSourceAuthority::DeclaredContent {
             workspace_inventory,
@@ -3094,6 +3658,25 @@ impl VerifiedCompiledSources {
                 ),
                 (&self.record.reverie_root, reverie_inventory, reverie_sha256),
                 compiler_root,
+            )?;
+        }
+        if let CompiledSourceAuthority::BuckDeclaredContent {
+            workspace_inventory,
+            workspace_sha256,
+            reverie_inventory,
+            reverie_sha256,
+            profile_bzl,
+            ..
+        } = &self.record.authority
+        {
+            verify_buck_declared_content(
+                (
+                    &self.record.workspace_root,
+                    workspace_inventory,
+                    workspace_sha256,
+                ),
+                (&self.record.reverie_root, reverie_inventory, reverie_sha256),
+                profile_bzl,
             )?;
         }
         self.record.manifest.verify()?;
@@ -3482,6 +4065,11 @@ fn standalone_current_build_sources(
                 )?;
                 workspace_files.insert(relative.to_owned(), file.clone());
             }
+        }
+        CompiledSourceAuthority::BuckDeclaredContent { .. } => {
+            return Err(
+                "standalone build source binding does not accept Buck Detcore sources".into(),
+            );
         }
     }
     require(
@@ -4068,6 +4656,113 @@ struct CurrentBuildEvidence {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct BuckBuildPackage {
+    features: Vec<String>,
+    profile: Value,
+}
+/// Buck counterpart of the retained Cargo build witness. Only `with_buck_build`
+/// can bind it to Buck-declared sources; deserializing it creates no authority.
+/// Its target/platform/constraints literals are copied from the source
+/// authority, and the retained buck2 `command` (argv and exit status) plus
+/// the caller-supplied `output_sha256` are cross-checked against those
+/// literals and the selected ELF by `validate_buck_build_evidence`; the
+/// digest itself is computed by `with_buck_build` from the stdout-derived
+/// ELF file, never supplied by a caller. The
+/// per-crate features/profile are recorded declarations, cohort-checked
+/// against the authority and profile identity, never build evidence alone.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BuckBuildEvidence {
+    builder: String,
+    command: CommandEvidence,
+    profile_bzl: FileIdentity,
+    target: String,
+    platform: String,
+    constraints: Vec<String>,
+    artifact: FileIdentity,
+    output_sha256: String,
+    compiled_sources_sha256: String,
+    packages: BTreeMap<String, BuckBuildPackage>,
+}
+/// Builder witness retained inside the absence arm. The Cargo arm serializes
+/// exactly as the historical `CurrentBuildEvidence` object (no tag or wrapper
+/// key); the Buck arm is distinguished by its `builder` field. Both arms deny
+/// unknown fields, so mixed Cargo/Buck records are refused at deserialization.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum BuildWitness {
+    Cargo(Box<CurrentBuildEvidence>),
+    Buck(Box<BuckBuildEvidence>),
+}
+impl BuildWitness {
+    fn artifact(&self) -> &FileIdentity {
+        match self {
+            Self::Cargo(build) => &build.artifact,
+            Self::Buck(build) => &build.artifact,
+        }
+    }
+    fn compiled_sources_sha256(&self) -> &str {
+        match self {
+            Self::Cargo(build) => &build.compiled_sources_sha256,
+            Self::Buck(build) => &build.compiled_sources_sha256,
+        }
+    }
+    fn verify_files(&self) -> Result<()> {
+        match self {
+            Self::Cargo(build) => verify_current_build_files(build),
+            Self::Buck(build) => {
+                build.artifact.verify()?;
+                build.command.stdout.verify()?;
+                build.command.stderr.verify()?;
+                build.profile_bzl.verify()?;
+                let derived = buck_build_stdout_artifact(&build.command, &build.target)?;
+                require(
+                    FileIdentity::read(&derived)?.path == build.artifact.path,
+                    "Buck build ELF path differs from the retained stdout output path",
+                )
+            }
+        }
+    }
+    #[cfg(test)]
+    fn cargo_mut(&mut self) -> &mut CurrentBuildEvidence {
+        match self {
+            Self::Cargo(build) => build,
+            Self::Buck(_) => panic!("test requires Cargo build witness"),
+        }
+    }
+}
+impl Serialize for BuildWitness {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        match self {
+            Self::Cargo(build) => build.serialize(serializer),
+            Self::Buck(build) => build.serialize(serializer),
+        }
+    }
+}
+impl<'de> Deserialize<'de> for BuildWitness {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        // As in AllocatorInstallationEvidence, decode through Value so the
+        // Cargo arm's u128 command timing survives; each arm then re-checks
+        // its complete deny_unknown_fields shape.
+        let value = Value::deserialize(deserializer)?;
+        if value.get("builder").is_some() {
+            serde_json::from_value(value)
+                .map(|build| Self::Buck(Box::new(build)))
+                .map_err(serde::de::Error::custom)
+        } else {
+            serde_json::from_value(value)
+                .map(|build| Self::Cargo(Box::new(build)))
+                .map_err(serde::de::Error::custom)
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UnisolatedTlsGetter {
     getter: SymbolEvidence,
     cell_offset: u64,
@@ -4087,7 +4782,7 @@ pub struct NoInstallationScopeEvidence {
     compiled_sources_sha256: String,
     reverie_pin: String,
     source: FileIdentity,
-    current_build: CurrentBuildEvidence,
+    current_build: BuildWitness,
     allocation: SymbolEvidence,
     allocation_sha256: String,
     mappings: Vec<TlsExecutableMapping>,
@@ -18385,6 +19080,12 @@ fn direct_tls_getter_census(
 enum NoScopeCohort {
     DetcoreNative101,
     DetcoreOrdinary101,
+    /// Ordinary Detcore runtime as declared in BUCK: `detcore-liteinst`
+    /// features `[]` over `:reverie-liteinst-sitepatch` (features
+    /// `["liteinst"]`) and `:reverie-inguest-liteinst`. This differs from the
+    /// Cargo ordinary cohort only in the sitepatch feature; it is not a copy
+    /// of `DetcoreOrdinary101`.
+    DetcoreOrdinaryBuck,
     StandaloneRelease62,
 }
 
@@ -18433,6 +19134,14 @@ impl NoScopeCohort {
                     &["coordinator-rpc", "launcher", "rcb-clock"],
                 ),
             ],
+            Self::DetcoreOrdinaryBuck => &[
+                ("detcore-liteinst", &[]),
+                ("reverie-liteinst", &["liteinst"]),
+                (
+                    "reverie-inguest",
+                    &["coordinator-rpc", "launcher", "rcb-clock"],
+                ),
+            ],
             Self::StandaloneRelease62 => &[
                 ("hermit-liteinst-runtime-artifact", &[]),
                 ("reverie-liteinst-preload", &[]),
@@ -18450,6 +19159,7 @@ fn select_no_scope_cohort(packages: &BTreeMap<&str, (&[String], &Value)>) -> Res
     let candidates: Vec<_> = [
         NoScopeCohort::DetcoreNative101,
         NoScopeCohort::DetcoreOrdinary101,
+        NoScopeCohort::DetcoreOrdinaryBuck,
         NoScopeCohort::StandaloneRelease62,
     ]
     .into_iter()
@@ -18476,6 +19186,7 @@ fn select_no_scope_cohort(packages: &BTreeMap<&str, (&[String], &Value)>) -> Res
     Ok(candidates[0])
 }
 
+// Not narrowed to Cargo cohorts here because build_witness_cohort separately refuses a Cargo witness that selects the Buck cohort.
 fn no_scope_build_features(build: &CurrentBuildEvidence) -> Result<NoScopeCohort> {
     let packages = build
         .packages
@@ -18539,6 +19250,121 @@ fn no_scope_build_features(build: &CurrentBuildEvidence) -> Result<NoScopeCohort
         )?;
     }
     Ok(cohort)
+}
+
+fn parse_buck_build_stdout(stdout: &str, target: &str) -> Result<PathBuf> {
+    let refused = "Buck build stdout is not the exact --show-full-output line for its target";
+    let mut lines = stdout.lines().filter(|line| !line.trim().is_empty());
+    let line = lines.next().ok_or(refused)?;
+    require(lines.next().is_none(), refused)?;
+    let (lhs, rhs) = line.split_once(' ').ok_or(refused)?;
+    require(lhs == target || lhs == format!("fbcode{target}"), refused)?;
+    let path = PathBuf::from(rhs.trim());
+    require(path.is_absolute(), refused)?;
+    Ok(path)
+}
+
+fn buck_build_stdout_artifact(command: &CommandEvidence, target: &str) -> Result<PathBuf> {
+    command.stdout.verify()?;
+    let stdout = fs::read_to_string(&command.stdout.path).map_err(|_| {
+        "Buck build stdout is not the exact --show-full-output line for its target".to_owned()
+    })?;
+    let derived = parse_buck_build_stdout(&stdout, target)?;
+    // Buck-out names its outputs through symlinks: canonicalize to the
+    // real file so every later identity is the regular file itself. A
+    // dangling link fails canonicalization; a link to a non-regular
+    // file refuses in `real_file`.
+    let canonical = fs::canonicalize(&derived)
+        .map_err(|e| format!("canonicalize {}: {e}", derived.display()))?;
+    real_file(&canonical)
+}
+
+/// Real Buck build identity: the retained buck2 command, its exit status
+/// and the stored output digest must agree with the witness literals and
+/// the selected ELF. Retained (possibly deserialized) witnesses are
+/// checked here and in `BuildWitness::verify_files` by re-deriving the
+/// ELF path and digest from the hash-verified stdout and artifact files,
+/// never by trusting the carried command fields alone, so an injected or
+/// tampered command refuses here, whichever seat validates it.
+fn validate_buck_build_evidence(build: &BuckBuildEvidence) -> Result<()> {
+    require(
+        build.builder == "buck2",
+        "Buck build witness does not name the buck2 builder",
+    )?;
+    require(
+        Path::new(&build.command.program)
+            .file_name()
+            .is_some_and(|name| name == "buck2"),
+        "Buck build witness command does not name the buck2 builder",
+    )?;
+    require(
+        build.command.status == 0,
+        "Buck build witness command did not succeed",
+    )?;
+    require(
+        build.command.arguments
+            == [
+                "build".to_owned(),
+                BUCK_TARGET.to_owned(),
+                "--target-platforms".to_owned(),
+                BUCK_PLATFORM.to_owned(),
+                "--show-full-output".to_owned(),
+                "--client-metadata".to_owned(),
+                "id=stage-detcore-liteinst".to_owned(),
+            ],
+        "Buck build witness command is not the exact pinned buck2 build invocation",
+    )?;
+    require(
+        build.output_sha256 == build.artifact.sha256,
+        "Buck build witness output digest differs from the selected ELF digest",
+    )?;
+    require(
+        build.target == BUCK_TARGET
+            && build.platform == BUCK_PLATFORM
+            && build.constraints.len() == BUCK_CONSTRAINTS.len()
+            && build
+                .constraints
+                .iter()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>()
+                == BUCK_CONSTRAINTS.iter().copied().collect::<BTreeSet<_>>(),
+        "Buck build witness literals differ from the reviewed Buck authority literals",
+    )
+}
+
+/// Cohort selection with builder-arm binding: a Cargo witness can never claim
+/// the Buck cohort and a Buck witness can claim only it. Feature/profile
+/// literals alone never let one builder's witness stand in for the other's.
+fn build_witness_cohort(witness: &BuildWitness) -> Result<NoScopeCohort> {
+    match witness {
+        BuildWitness::Cargo(build) => {
+            let cohort = no_scope_build_features(build)?;
+            require(
+                cohort != NoScopeCohort::DetcoreOrdinaryBuck,
+                "Cargo build witness cannot claim the Buck cohort",
+            )?;
+            Ok(cohort)
+        }
+        BuildWitness::Buck(build) => {
+            validate_buck_build_evidence(build)?;
+            let packages = build
+                .packages
+                .iter()
+                .map(|(name, package)| {
+                    (
+                        name.as_str(),
+                        (package.features.as_slice(), &package.profile),
+                    )
+                })
+                .collect();
+            let cohort = select_no_scope_cohort(&packages)?;
+            require(
+                cohort == NoScopeCohort::DetcoreOrdinaryBuck,
+                "Buck build witness is not the reviewed ordinary Buck cohort",
+            )?;
+            Ok(cohort)
+        }
+    }
 }
 
 fn installation_scope_raw_name(name: &str) -> bool {
@@ -19510,12 +20336,29 @@ fn derive_no_installation_scope_evidence(
         .current_build
         .as_ref()
         .ok_or("no-scope allocation needs actual current-build witness")?;
-    no_scope_build_features(build)?;
+    // Builder-arm binding: Buck sources require the Buck witness/cohort and
+    // Cargo sources the Cargo witness; the census and body-shape checks below
+    // are unchanged for either builder.
+    require(
+        matches!(
+            (&sources.record.authority, build),
+            (
+                CompiledSourceAuthority::BuckDeclaredContent { .. },
+                BuildWitness::Buck(_)
+            ) | (
+                CompiledSourceAuthority::Git { .. }
+                    | CompiledSourceAuthority::DeclaredContent { .. },
+                BuildWitness::Cargo(_)
+            )
+        ),
+        "no-scope build witness builder differs from its compiled source authority",
+    )?;
+    build_witness_cohort(build)?;
     let compiled_sources_sha256 =
         sha256(&serde_json::to_vec(sources.record()).map_err(|e| e.to_string())?);
     require(
-        build.compiled_sources_sha256 == compiled_sources_sha256
-            && build.artifact.sha256 == sha256(bytes),
+        build.compiled_sources_sha256() == compiled_sources_sha256
+            && build.artifact().sha256 == sha256(bytes),
         "no-scope current build is for different sources/ELF",
     )?;
     let source = sources
@@ -19588,7 +20431,7 @@ fn validate_no_installation_scope_evidence(
     let hash = |value: &str, n: usize| {
         value.len() == n && value.bytes().all(|byte| byte.is_ascii_hexdigit())
     };
-    no_scope_build_features(&proof.current_build)?;
+    build_witness_cohort(&proof.current_build)?;
     require(
         image_kind == FixedImageKind::Detcore
             && proof.kind == "no_installation_scope"
@@ -19597,20 +20440,42 @@ fn validate_no_installation_scope_evidence(
             && proof.other_tls_unisolated
             && hash(&proof.reverie_pin, 40)
             && proof.source.sha256 == NO_INSTALLATION_SCOPE_SOURCE.2
-            && proof.current_build.artifact.sha256 == proof.elf_sha256
-            && proof.current_build.compiled_sources_sha256 == proof.compiled_sources_sha256
-            && proof.current_build.command.status == 0
-            && match &proof.current_build.cargo_executable {
-                None => proof.current_build.command.program == "cargo",
-                Some(executable) => {
-                    executable.path.is_absolute()
-                        && executable
+            && proof.current_build.artifact().sha256 == proof.elf_sha256
+            && proof.current_build.compiled_sources_sha256() == proof.compiled_sources_sha256
+            && match &proof.current_build {
+                BuildWitness::Cargo(build) => {
+                    build.command.status == 0
+                        && match &build.cargo_executable {
+                            None => build.command.program == "cargo",
+                            Some(executable) => {
+                                executable.path.is_absolute()
+                                    && executable
+                                        .path
+                                        .file_name()
+                                        .is_some_and(|name| name == "cargo")
+                                    && executable.path.to_str()
+                                        == Some(build.command.program.as_str())
+                                    && hash(&executable.sha256, 64)
+                            }
+                        }
+                }
+                BuildWitness::Buck(build) => {
+                    build.builder == "buck2"
+                        && build.target == BUCK_TARGET
+                        && build.platform == BUCK_PLATFORM
+                        && build.constraints.len() == BUCK_CONSTRAINTS.len()
+                        && build
+                            .constraints
+                            .iter()
+                            .map(String::as_str)
+                            .collect::<BTreeSet<_>>()
+                            == BUCK_CONSTRAINTS.iter().copied().collect::<BTreeSet<_>>()
+                        && build
+                            .profile_bzl
                             .path
                             .file_name()
-                            .is_some_and(|name| name == "cargo")
-                        && executable.path.to_str()
-                            == Some(proof.current_build.command.program.as_str())
-                        && hash(&executable.sha256, 64)
+                            .is_some_and(|name| name == BUCK_PROFILE_BZL_NAME)
+                        && hash(&build.profile_bzl.sha256, 64)
                 }
             }
             && [
@@ -38477,6 +39342,7 @@ mod tests {
             ],
             stdout: FileIdentity::read(&stdout).unwrap(),
             stderr: FileIdentity::read(&stderr).unwrap(),
+            from_runner: false,
         };
         let selected = target.join("libdetcore_liteinst.so");
         let check = |messages: &[Value], template: &CommandEvidence| {
@@ -39438,6 +40304,884 @@ mod tests {
             .unwrap();
         // A path that left the catalogue keeps its bindings.
         catalogue_rebinds_recorded(&[other], &[old, new, other], &[]).unwrap();
+    }
+
+    // Buck factory/witness plumbing controls. Scratch files and the data-only
+    // ELF stand-in establish no qualification; no ELF proof runs here.
+    #[test]
+    fn buck_declared_content_factory_controls() {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        struct OwnedScratch(PathBuf);
+        impl Drop for OwnedScratch {
+            fn drop(&mut self) {
+                fs::remove_dir_all(&self.0).unwrap();
+            }
+        }
+        let root = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!(
+                "buck-declared-content-controls-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+        fs::create_dir(&root).unwrap();
+        let _owned = OwnedScratch(root.clone());
+        let workspace = root.join("hermit");
+        let reverie = root.join("reverie");
+        let workspace_files: Vec<&str> = vec![
+            "detcore-liteinst/src/lib.rs",
+            "common/inguest/glibc_compat.rs",
+            "detcore-liteinst/src/extra.rs",
+            "detcore-liteinst/build.rs",
+            "BUCK",
+            "fb-only/liteinst-runtime-profile.bzl",
+        ];
+        let reverie_files: Vec<&str> = COMPILED_RV_LOCATION_FILES
+            .into_iter()
+            .chain([BUCK_QUALIFIER_SOURCE, CONTENT_DETCORE_FIXED_GATE.0])
+            .collect();
+        for (base, files) in [(&workspace, &workspace_files), (&reverie, &reverie_files)] {
+            for relative in files {
+                let path = base.join(relative);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                let bytes: &[u8] = if *relative == BUCK_QUALIFIER_SOURCE {
+                    include_bytes!("lib.rs")
+                } else {
+                    b"data-only declared Buck source"
+                };
+                fs::write(&path, bytes).unwrap();
+            }
+        }
+        let profile = workspace.join("fb-only").join(BUCK_PROFILE_BZL_NAME);
+        fs::create_dir_all(profile.parent().unwrap()).unwrap();
+        fs::write(&profile, b"data-only profile flags").unwrap();
+        let mut workspace_shas: Vec<String> = workspace_files
+            .iter()
+            .map(|relative| FileIdentity::read(&workspace.join(relative)).unwrap().sha256)
+            .collect();
+        let workspace_expected: Vec<ExpectedSourceFile<'_>> = workspace_files
+            .iter()
+            .copied()
+            .zip(workspace_shas.iter().map(String::as_str))
+            .map(|(relative, sha256)| ExpectedSourceFile { relative, sha256 })
+            .collect();
+        let pin = "a".repeat(40);
+        let imported = "b".repeat(40);
+        fn expect<'a>(
+            workspace: &'a Path,
+            reverie: &'a Path,
+            pin: &'a str,
+            imported: &'a str,
+            profile: &'a Path,
+            workspace_files: &'a [ExpectedSourceFile<'a>],
+            reverie_files: &'a [&'a str],
+        ) -> BuckCompiledSourceExpectation<'a> {
+            BuckCompiledSourceExpectation {
+                workspace_root: workspace,
+                reverie_root: reverie,
+                reverie_pin: pin,
+                imported_sha: imported,
+                profile_bzl: profile,
+                target: BUCK_TARGET,
+                platform: BUCK_PLATFORM,
+                constraints: &BUCK_CONSTRAINTS,
+                workspace_files,
+                reverie_files,
+            }
+        }
+        macro_rules! expectation {
+            ($pin:expr, $files:expr) => {
+                expect(
+                    &workspace,
+                    &reverie,
+                    $pin,
+                    &imported,
+                    &profile,
+                    &workspace_expected,
+                    $files,
+                )
+            };
+        }
+        assert_eq!(
+            VerifiedCompiledSources::resolve_buck(&expectation!("abc", &reverie_files))
+                .err()
+                .unwrap(),
+            "Buck compiled source requires an independent full Reverie pin"
+        );
+        assert!(
+            VerifiedCompiledSources::resolve_buck(&expectation!(&pin, &reverie_files[..5]))
+                .is_err(),
+            "incomplete declared Reverie file set"
+        );
+        // Buck literals are exact: a target/platform that merely contains or
+        // extends the canonical spelling, and any constraint subset or
+        // superset, refuse.
+        for bad_target in [
+            "//hermetic_infra/hermit:detcore-liteinst",
+            "//hermetic_infra/hermit:detcore-liteinst[cdylib]",
+            "//hermetic_infra/hermit:detcore-liteinst-liteinst-runtime[cdylib]-extra",
+            "detcore-liteinst",
+        ] {
+            let mut bad = expectation!(&pin, &reverie_files);
+            bad.target = bad_target;
+            assert!(
+                VerifiedCompiledSources::resolve_buck(&bad).is_err(),
+                "non-canonical Buck target {bad_target}"
+            );
+        }
+        for bad_platform in [
+            "",
+            "ovr_config//platform/linux:x86_64-fbcode-extra",
+            "ovr_config//platform/linux:x86_64",
+        ] {
+            let mut bad = expectation!(&pin, &reverie_files);
+            bad.platform = bad_platform;
+            assert!(
+                VerifiedCompiledSources::resolve_buck(&bad).is_err(),
+                "non-canonical Buck platform {bad_platform}"
+            );
+        }
+        let subset: &[&str] = &["ovr_config//cpu:x86_64", "ovr_config//os:linux"];
+        let superset: &[&str] = &[
+            "ovr_config//build_mode/constraints:opt",
+            "ovr_config//cpu:x86_64",
+            "ovr_config//os:linux",
+            "ovr_config//os:linux-extra",
+        ];
+        let wrong_opt: &[&str] = &[
+            "ovr_config//build_mode:opt",
+            "ovr_config//cpu:x86_64",
+            "ovr_config//os:linux",
+        ];
+        for bad_constraints in [subset, superset, wrong_opt] {
+            let mut bad = expectation!(&pin, &reverie_files);
+            bad.constraints = bad_constraints;
+            assert!(
+                VerifiedCompiledSources::resolve_buck(&bad).is_err(),
+                "non-canonical Buck constraints {bad_constraints:?}"
+            );
+        }
+        // Inventory completeness: an on-disk .rs under detcore-liteinst/src
+        // that is absent from the declared inventory refuses, nested or not.
+        let undeclared = workspace.join("detcore-liteinst/src/undeclared.rs");
+        fs::write(&undeclared, b"undeclared source").unwrap();
+        assert!(
+            VerifiedCompiledSources::resolve_buck(&expectation!(&pin, &reverie_files)).is_err(),
+            "undeclared detcore-liteinst source present on disk"
+        );
+        fs::remove_file(&undeclared).unwrap();
+        let nested = workspace.join("detcore-liteinst/src/nested/undeclared.rs");
+        fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        fs::write(&nested, b"undeclared nested source").unwrap();
+        assert!(
+            VerifiedCompiledSources::resolve_buck(&expectation!(&pin, &reverie_files)).is_err(),
+            "undeclared nested detcore-liteinst source present on disk"
+        );
+        fs::remove_file(&nested).unwrap();
+        fs::remove_dir(nested.parent().unwrap()).unwrap();
+        // Junk Reverie content refuses by name against the reviewed
+        // catalogue digests: declared presence alone never authorizes bytes.
+        let junk_error = match VerifiedCompiledSources::resolve_buck(&expectation!(
+            &pin, &reverie_files
+        )) {
+            Ok(_) => panic!("junk Reverie content must refuse"),
+            Err(error) => error,
+        };
+        assert!(
+            junk_error.contains("reviewed catalog"),
+            "junk Reverie content must refuse by name: {junk_error}"
+        );
+        // Clean-content pass: the real fb Reverie sources, byte for byte.
+        for (relative, bytes) in [
+            (
+                "reverie-liteinst/src/patch_alloc.rs",
+                include_bytes!("../../reverie-liteinst/src/patch_alloc.rs").as_slice(),
+            ),
+            (
+                "reverie-inguest/src/guest/alloc.rs",
+                include_bytes!("../../reverie-inguest/src/guest/alloc.rs").as_slice(),
+            ),
+            (
+                "reverie-inguest/src/guest/tool_region_constructor.rs",
+                include_bytes!("../../reverie-inguest/src/guest/tool_region_constructor.rs")
+                    .as_slice(),
+            ),
+            (
+                "reverie-inguest/src/guest/tool_region_arena.rs",
+                include_bytes!("../../reverie-inguest/src/guest/tool_region_arena.rs")
+                    .as_slice(),
+            ),
+            (
+                "reverie-inguest/src/guest/tool_region.rs",
+                include_bytes!("../../reverie-inguest/src/guest/tool_region.rs").as_slice(),
+            ),
+            (
+                "reverie-inguest/src/guest/tool_region_keyed.rs",
+                include_bytes!("../../reverie-inguest/src/guest/tool_region_keyed.rs")
+                    .as_slice(),
+            ),
+            (
+                "reverie-liteinst-preload/src/lib.rs",
+                include_bytes!("../../reverie-liteinst-preload/src/lib.rs").as_slice(),
+            ),
+            (
+                "reverie-inguest/src/trap/fixed_gates.rs",
+                include_bytes!("../../reverie-inguest/src/trap/fixed_gates.rs").as_slice(),
+            ),
+        ] {
+            fs::write(reverie.join(relative), bytes).unwrap();
+        }
+        let sources =
+            VerifiedCompiledSources::resolve_buck(&expectation!(&pin, &reverie_files)).unwrap();
+        for junk_relative in [
+            "detcore-liteinst/src/extra.rs",
+            "BUCK",
+            "fb-only/liteinst-runtime-profile.bzl",
+        ] {
+            let junk_sha = "0".repeat(64);
+            let flipped: Vec<ExpectedSourceFile<'_>> = workspace_expected
+                .iter()
+                .map(|entry| ExpectedSourceFile {
+                    relative: entry.relative,
+                    sha256: if entry.relative == junk_relative {
+                        junk_sha.as_str()
+                    } else {
+                        entry.sha256
+                    },
+                })
+                .collect();
+            assert_eq!(
+                VerifiedCompiledSources::resolve_buck(&expect(
+                    &workspace,
+                    &reverie,
+                    &pin,
+                    &imported,
+                    &profile,
+                    &flipped,
+                    &reverie_files,
+                ))
+                .err()
+                .unwrap(),
+                format!(
+                    "declared workspace source differs from pinned expectation: {junk_relative}"
+                )
+            );
+        }
+        let alt_profile = root.join("alt-profile").join(BUCK_PROFILE_BZL_NAME);
+        fs::create_dir_all(alt_profile.parent().unwrap()).unwrap();
+        fs::write(&alt_profile, b"junk profile bytes").unwrap();
+        assert_eq!(
+            VerifiedCompiledSources::resolve_buck(&expect(
+                &workspace,
+                &reverie,
+                &pin,
+                &imported,
+                &alt_profile,
+                &workspace_expected,
+                &reverie_files,
+            ))
+            .err()
+            .unwrap(),
+            "declared workspace source differs from pinned expectation: fb-only/liteinst-runtime-profile.bzl"
+        );
+        let leaf = sources.package();
+        assert_eq!(leaf.name, "detcore-liteinst");
+        assert_eq!(leaf.source, None);
+        assert_eq!(leaf.kind, ["cdylib"]);
+        assert_eq!(leaf.crate_types, ["cdylib"]);
+        assert_eq!(leaf.target_source, workspace.join(BUCK_LEAF_SOURCE));
+        assert_eq!(sources.record().manifest.path, profile);
+        let CompiledSourceAuthority::BuckDeclaredContent {
+            workspace_inventory,
+            imported_sha,
+            target,
+            ..
+        } = &sources.record.authority
+        else {
+            panic!("Buck factory must record the Buck authority");
+        };
+        assert_eq!(imported_sha, &imported);
+        assert_eq!(target, BUCK_TARGET);
+        assert!(
+            workspace_inventory
+                .windows(2)
+                .all(|pair| pair[0].relative < pair[1].relative),
+            "inventory is sorted by logical relative path"
+        );
+        let mut runner = Runner::new(root.join("logs"), Duration::from_secs(60), 1 << 20).unwrap();
+        sources.verify_unchanged(&mut runner).unwrap();
+        // Completeness also binds retained sources: a new undeclared source
+        // appearing after resolution refuses verification.
+        fs::write(&undeclared, b"undeclared source").unwrap();
+        assert!(
+            sources.verify_unchanged(&mut runner).is_err(),
+            "undeclared detcore-liteinst source appeared after resolution"
+        );
+        fs::remove_file(&undeclared).unwrap();
+        sources.verify_unchanged(&mut runner).unwrap();
+        // Mixed builder arms refuse at the factory boundary, in both directions.
+        let dummy_file = FileIdentity {
+            path: "/buck-controls/absent".into(),
+            sha256: "0".repeat(64),
+        };
+        let dummy_command = CommandEvidence {
+            program: "cargo".into(),
+            arguments: vec![],
+            cwd: workspace.clone(),
+            status: 0,
+            elapsed_millis: 0,
+            stdout: dummy_file.clone(),
+            stderr: dummy_file.clone(),
+            from_runner: false,
+        };
+        assert!(
+            sources
+                .with_current_build(&dummy_command, Path::new("/buck-controls/x.so"), &root)
+                .is_err(),
+            "Buck sources cannot bind a Cargo witness"
+        );
+        let git_sources = VerifiedCompiledSources {
+            record: CompiledSources {
+                layout: CompiledSourceLayout::HermitGit,
+                image_kind: FixedImageKind::Detcore,
+                workspace_root: workspace.clone(),
+                authority: CompiledSourceAuthority::Git {
+                    workspace_head: "1".repeat(40),
+                    workspace_tree: "2".repeat(40),
+                    reverie_tree: "3".repeat(40),
+                },
+                manifest: dummy_file.clone(),
+                reverie_pin: pin.clone(),
+                reverie_root: reverie.clone(),
+                packages: BTreeMap::new(),
+                files: BTreeMap::new(),
+                leaf: leaf.clone(),
+            },
+            current_build: None,
+            standalone_metadata: None,
+        };
+        // A Buck witness binds only through a Runner: Git sources refuse
+        // even with one, and there is no `&CommandEvidence` parameter a
+        // hand-built or deserialized record could be passed through
+        // (there is no public constructor; a deserialized record pushed
+        // through the still-public `Vec` still refuses by the marker,
+        // tested below).
+        assert!(
+            git_sources
+                .with_buck_build(&runner, Path::new("/buck-controls/x.so"))
+                .is_err(),
+            "Git sources cannot bind a Buck witness"
+        );
+        let elf = root.join("libdetcore_liteinst.so");
+        fs::write(
+            &elf,
+            b"data-only witness stand-in, not an ELF qualification",
+        )
+        .unwrap();
+        let elf_digest = sha256(b"data-only witness stand-in, not an ELF qualification");
+        let buck_log = |name: &str| {
+            let path = root.join(name);
+            fs::write(&path, b"data-only buck2 log").unwrap();
+            FileIdentity::read(&path).unwrap()
+        };
+        // Production records reach a Runner only as `from_runner_record`
+        // products, exactly as `run_with_limits` produces them; this test
+        // module pushes the same way in-crate (the `Vec` is still public
+        // at this head and becomes private in D132220437).
+        let buck_command = |arguments: Vec<String>, status: i32, stdout_path: &Path| {
+            CommandEvidence::from_runner_record(
+                "buck2".into(),
+                arguments,
+                workspace.clone(),
+                status,
+                0,
+                FileIdentity::read(stdout_path).unwrap(),
+                buck_log("buck-stderr"),
+            )
+        };
+        let stdout_for = |name: &str, named: &Path| {
+            let path = root.join(name);
+            fs::write(&path, format!("{BUCK_TARGET} {}\n", named.display())).unwrap();
+            path
+        };
+        let good_stdout = stdout_for("buck-stdout", &elf);
+        let good_args = || {
+            vec![
+                "build".into(),
+                BUCK_TARGET.into(),
+                "--target-platforms".into(),
+                BUCK_PLATFORM.into(),
+                "--show-full-output".into(),
+                "--client-metadata".into(),
+                "id=stage-detcore-liteinst".into(),
+            ]
+        };
+        let mut buck_runner =
+            Runner::new(root.join("buck-logs"), Duration::from_secs(60), 1 << 20).unwrap();
+        // No retained Runner record yet refuses by name.
+        assert_eq!(
+            sources.with_buck_build(&buck_runner, &elf).err().unwrap(),
+            "Buck build witness requires a retained Runner buck2 build record"
+        );
+        // A deserialized record keeps the recorded facts but never the
+        // Runner marker: pushed here in-crate, it cannot bind a Buck
+        // witness. (Push becomes externally impossible in D132220437.)
+        let good = buck_command(good_args(), 0, &good_stdout);
+        let revived: CommandEvidence =
+            serde_json::from_slice(&serde_json::to_vec(&good).unwrap()).unwrap();
+        assert_eq!(revived, good, "serde round-trip keeps the recorded facts");
+        assert!(
+            !revived.from_runner,
+            "deserialization never sets the Runner marker"
+        );
+        buck_runner.commands.push(revived);
+        assert_eq!(
+            sources.with_buck_build(&buck_runner, &elf).err().unwrap(),
+            "Buck build witness command was not produced by a Runner"
+        );
+        // Real build identity mismatches refuse by exact name: a failed
+        // command, a non-build command, another target or platform, and
+        // the pre-client-metadata argv.
+        buck_runner
+            .commands
+            .push(buck_command(good_args(), 1, &good_stdout));
+        assert_eq!(
+            sources.with_buck_build(&buck_runner, &elf).err().unwrap(),
+            "Buck build witness command did not succeed"
+        );
+        for arguments in [
+            vec![
+                "check".into(),
+                BUCK_TARGET.into(),
+                "--target-platforms".into(),
+                BUCK_PLATFORM.into(),
+                "--show-full-output".into(),
+                "--client-metadata".into(),
+                "id=stage-detcore-liteinst".into(),
+            ],
+            vec![
+                "build".into(),
+                "//hermetic_infra/hermit:detcore-liteinst".into(),
+                "--target-platforms".into(),
+                BUCK_PLATFORM.into(),
+                "--show-full-output".into(),
+                "--client-metadata".into(),
+                "id=stage-detcore-liteinst".into(),
+            ],
+            vec![
+                "build".into(),
+                BUCK_TARGET.into(),
+                "--target-platforms".into(),
+                "ovr_config//platform/linux:x86_64".into(),
+                "--show-full-output".into(),
+                "--client-metadata".into(),
+                "id=stage-detcore-liteinst".into(),
+            ],
+            vec![
+                "build".into(),
+                BUCK_TARGET.into(),
+                "--target-platforms".into(),
+                BUCK_PLATFORM.into(),
+                "--show-full-output".into(),
+            ],
+        ] {
+            buck_runner
+                .commands
+                .push(buck_command(arguments, 0, &good_stdout));
+            assert_eq!(
+                sources.with_buck_build(&buck_runner, &elf).err().unwrap(),
+                "Buck build witness command is not the exact pinned buck2 build invocation"
+            );
+        }
+        let junk_stdout_path = root.join("buck-stdout-junk");
+        fs::write(&junk_stdout_path, b"not a buck2 output line\n").unwrap();
+        buck_runner
+            .commands
+            .push(buck_command(good_args(), 0, &junk_stdout_path));
+        assert_eq!(
+            sources.with_buck_build(&buck_runner, &elf).err().unwrap(),
+            "Buck build stdout is not the exact --show-full-output line for its target"
+        );
+        let other_elf = root.join("other-libdetcore_liteinst.so");
+        fs::write(&other_elf, b"other witness stand-in").unwrap();
+        let mismatch_stdout = stdout_for("buck-stdout-mismatch", &other_elf);
+        buck_runner
+            .commands
+            .push(buck_command(good_args(), 0, &mismatch_stdout));
+        assert_eq!(
+            sources.with_buck_build(&buck_runner, &elf).err().unwrap(),
+            "Buck build ELF path differs from the retained stdout output path"
+        );
+        // A buck-out-style symlink to the ELF canonicalizes to the real
+        // file and binds; a dangling symlink refuses.
+        let elf_link = root.join("buck-out-link.so");
+        std::os::unix::fs::symlink(&elf, &elf_link).unwrap();
+        let link_stdout = stdout_for("buck-stdout-link", &elf_link);
+        buck_runner
+            .commands
+            .push(buck_command(good_args(), 0, &link_stdout));
+        let link_bound = sources.with_buck_build(&buck_runner, &elf).unwrap();
+        assert_eq!(
+            link_bound
+                .current_build
+                .as_ref()
+                .unwrap()
+                .artifact()
+                .path,
+            FileIdentity::read(&elf).unwrap().path,
+            "stdout-derived symlink canonicalizes to the real ELF"
+        );
+        let dangling = root.join("buck-out-dangling.so");
+        std::os::unix::fs::symlink(root.join("absent-output"), &dangling).unwrap();
+        let dangling_stdout = stdout_for("buck-stdout-dangling", &dangling);
+        buck_runner
+            .commands
+            .push(buck_command(good_args(), 0, &dangling_stdout));
+        assert!(
+            sources.with_buck_build(&buck_runner, &elf).is_err(),
+            "dangling buck-out symlink"
+        );
+        buck_runner
+            .commands
+            .push(buck_command(good_args(), 0, &good_stdout));
+        let mut bound = sources.with_buck_build(&buck_runner, &elf).unwrap();
+        // The stored output digest is computed from the stdout-derived
+        // file in `with_buck_build`; no caller digest exists to disagree.
+        if let Some(BuildWitness::Buck(build)) = &bound.current_build {
+            assert_eq!(build.output_sha256, elf_digest);
+            assert_eq!(build.artifact.sha256, elf_digest);
+        } else {
+            panic!("bound witness must be the Buck arm");
+        }
+        bound.verify_unchanged(&mut runner).unwrap();
+        // Full-record round-trip: the verified sources record plus its Buck
+        // witness serialize, deserialize and compare equal.
+        let encoded = serde_json::to_vec(&(&bound.record, &bound.current_build)).unwrap();
+        let mut decoded: (CompiledSources, Option<BuildWitness>) =
+            serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.0, bound.record);
+        assert_eq!(decoded.1, bound.current_build);
+        // Retained verify re-derives rather than trusting carried fields:
+        // an argv injected into the deserialized witness refuses cohort
+        // validation by the exact pin name.
+        if let Some(BuildWitness::Buck(build)) = &mut decoded.1 {
+            build.command.arguments[0] = "check".into();
+        } else {
+            panic!("decoded witness must be the Buck arm");
+        }
+        assert_eq!(
+            build_witness_cohort(decoded.1.as_ref().unwrap()).unwrap_err(),
+            "Buck build witness command is not the exact pinned buck2 build invocation"
+        );
+        if let Some(BuildWitness::Buck(build)) = &mut bound.current_build {
+            build.artifact = FileIdentity::read(&other_elf).unwrap();
+        } else {
+            panic!("bound witness must be the Buck arm");
+        }
+        assert_eq!(
+            bound.verify_unchanged(&mut runner).unwrap_err(),
+            "Buck build ELF path differs from the retained stdout output path"
+        );
+        // A changed declared file and a missing declared file both refuse.
+        fs::write(workspace.join("detcore-liteinst/src/extra.rs"), b"changed").unwrap();
+        assert!(
+            sources.verify_unchanged(&mut runner).is_err(),
+            "changed file"
+        );
+        drop(workspace_expected);
+        workspace_shas = workspace_files
+            .iter()
+            .map(|relative| FileIdentity::read(&workspace.join(relative)).unwrap().sha256)
+            .collect();
+        let workspace_expected_changed: Vec<ExpectedSourceFile<'_>> = workspace_files
+            .iter()
+            .copied()
+            .zip(workspace_shas.iter().map(String::as_str))
+            .map(|(relative, sha256)| ExpectedSourceFile { relative, sha256 })
+            .collect();
+        assert!(
+            VerifiedCompiledSources::resolve_buck(&expect(
+                &workspace,
+                &reverie,
+                &pin,
+                &imported,
+                &profile,
+                &workspace_expected_changed,
+                &reverie_files,
+            ))
+            .is_ok(),
+            "re-resolving changed bytes with a refreshed pinned expectation is a new authority, not a continuation"
+        );
+        fs::remove_file(workspace.join("detcore-liteinst/build.rs")).unwrap();
+        assert!(
+            VerifiedCompiledSources::resolve_buck(&expect(
+                &workspace,
+                &reverie,
+                &pin,
+                &imported,
+                &profile,
+                &workspace_expected_changed,
+                &reverie_files,
+            ))
+            .is_err(),
+            "missing declared workspace file"
+        );
+        fs::write(
+            workspace.join("detcore-liteinst/build.rs"),
+            b"data-only declared Buck source",
+        )
+        .unwrap();
+        fs::write(reverie.join(BUCK_QUALIFIER_SOURCE), b"foreign qualifier").unwrap();
+        assert!(
+            VerifiedCompiledSources::resolve_buck(&expect(
+                &workspace,
+                &reverie,
+                &pin,
+                &imported,
+                &profile,
+                &workspace_expected_changed,
+                &reverie_files,
+            ))
+            .is_err(),
+            "qualifier source must be the compiled host qualifier"
+        );
+    }
+
+    // Data controls only: serde shapes and cohort binding, no source authority.
+    #[test]
+    fn buck_build_witness_serde_controls() {
+        let file = |path: &str| FileIdentity {
+            path: path.into(),
+            sha256: "0".repeat(64),
+        };
+        let profile = NoScopeCohort::DetcoreOrdinaryBuck.profile();
+        let cargo_package = |name: &str, features: Vec<String>| CurrentBuildPackage {
+            package: PackageIdentity {
+                id: name.into(),
+                name: name.into(),
+                manifest: format!("/witness/{name}/Cargo.toml").into(),
+                source: None,
+                target: name.replace('-', "_"),
+                kind: vec!["lib".into()],
+                crate_types: vec!["lib".into()],
+                target_source: format!("/witness/{name}/lib.rs").into(),
+            },
+            features,
+            profile: profile.clone(),
+            outputs: vec![format!("/witness/target/{name}").into()],
+        };
+        let ordinary = |liteinst_features: Vec<String>| {
+            BTreeMap::from([
+                (
+                    "detcore-liteinst".to_owned(),
+                    cargo_package("detcore-liteinst", vec![]),
+                ),
+                (
+                    "reverie-liteinst".to_owned(),
+                    cargo_package("reverie-liteinst", liteinst_features),
+                ),
+                (
+                    "reverie-inguest".to_owned(),
+                    cargo_package(
+                        "reverie-inguest",
+                        vec![
+                            "coordinator-rpc".into(),
+                            "launcher".into(),
+                            "rcb-clock".into(),
+                        ],
+                    ),
+                ),
+            ])
+        };
+        let cargo = CurrentBuildEvidence {
+            command: CommandEvidence {
+                program: "cargo".into(),
+                arguments: vec![],
+                cwd: "/witness".into(),
+                status: 0,
+                elapsed_millis: 0,
+                stdout: file("/witness/stdout"),
+                stderr: file("/witness/stderr"),
+                from_runner: false,
+            },
+            cargo_executable: None,
+            target_directory: "/witness/target".into(),
+            artifact: file("/witness/target/lib.so"),
+            compiled_sources_sha256: "1".repeat(64),
+            packages: ordinary(vec![]),
+            standalone_sources: None,
+        };
+        let buck_packages = ordinary(vec!["liteinst".into()])
+            .into_iter()
+            .map(|(name, package)| {
+                (
+                    name,
+                    BuckBuildPackage {
+                        features: package.features,
+                        profile: package.profile,
+                    },
+                )
+            })
+            .collect();
+        let buck = BuckBuildEvidence {
+            builder: "buck2".into(),
+            command: CommandEvidence {
+                program: "buck2".into(),
+                arguments: vec![
+                    "build".into(),
+                    BUCK_TARGET.into(),
+                    "--target-platforms".into(),
+                    BUCK_PLATFORM.into(),
+                    "--show-full-output".into(),
+                    "--client-metadata".into(),
+                    "id=stage-detcore-liteinst".into(),
+                ],
+                cwd: "/witness".into(),
+                status: 0,
+                elapsed_millis: 0,
+                stdout: file("/witness/buck-stdout"),
+                stderr: file("/witness/buck-stderr"),
+                from_runner: false,
+            },
+            profile_bzl: file("/witness/fb-only/liteinst-runtime-profile.bzl"),
+            target: BUCK_TARGET.into(),
+            platform: BUCK_PLATFORM.into(),
+            constraints: BUCK_CONSTRAINTS.iter().map(|c| (*c).to_owned()).collect(),
+            artifact: file("/witness/target/lib.so"),
+            output_sha256: "0".repeat(64),
+            compiled_sources_sha256: "1".repeat(64),
+            packages: buck_packages,
+        };
+        // The Cargo arm keeps its exact historical bytes: no tag or wrapper.
+        assert_eq!(
+            serde_json::to_vec(&BuildWitness::Cargo(Box::new(cargo.clone()))).unwrap(),
+            serde_json::to_vec(&cargo).unwrap()
+        );
+        // Golden bytes for the `cargo` value above: the pre-Buck
+        // `CurrentBuildEvidence` serialization, with the field set and
+        // field order of the struct at a9355f0 (before `BuildWitness`
+        // existed) and `standalone_sources: None` omitted. The Cargo arm
+        // must keep producing exactly these bytes, so field or order
+        // drift in the inner struct fails here rather than silently
+        // changing retained evidence.
+        const CARGO_WITNESS_GOLDEN: &str = concat!(
+            r#"{"command":{"program":"cargo","arguments":[],"cwd":"/witness","status":0,"#,
+            r#""elapsed_millis":0,"stdout":{"path":"/witness/stdout","sha256":"#,
+            r#""0000000000000000000000000000000000000000000000000000000000000000"},"stderr":"#,
+            r#"{"path":"/witness/stderr","sha256":"#,
+            r#""0000000000000000000000000000000000000000000000000000000000000000"}},"#,
+            r#""cargo_executable":null,"target_directory":"/witness/target","artifact":"#,
+            r#"{"path":"/witness/target/lib.so","sha256":"#,
+            r#""0000000000000000000000000000000000000000000000000000000000000000"},"#,
+            r#""compiled_sources_sha256":"#,
+            r#""1111111111111111111111111111111111111111111111111111111111111111","packages":"#,
+            r#"{"detcore-liteinst":{"package":{"id":"detcore-liteinst","name":"#,
+            r#""detcore-liteinst","manifest":"/witness/detcore-liteinst/Cargo.toml","#,
+            r#""source":null,"target":"detcore_liteinst","kind":["lib"],"crate_types":"#,
+            r#"["lib"],"target_source":"/witness/detcore-liteinst/lib.rs"},"features":[],"#,
+            r#""profile":{"debug_assertions":true,"debuginfo":0,"opt_level":"3","#,
+            r#""overflow_checks":true,"test":false},"outputs":"#,
+            r#"["/witness/target/detcore-liteinst"]},"reverie-inguest":{"package":"#,
+            r#"{"id":"reverie-inguest","name":"reverie-inguest","manifest":"#,
+            r#""/witness/reverie-inguest/Cargo.toml","source":null,"target":"#,
+            r#""reverie_inguest","kind":["lib"],"crate_types":["lib"],"target_source":"#,
+            r#""/witness/reverie-inguest/lib.rs"},"features":["coordinator-rpc","launcher","#,
+            r#""rcb-clock"],"profile":{"debug_assertions":true,"debuginfo":0,"opt_level":"#,
+            r#""3","overflow_checks":true,"test":false},"outputs":"#,
+            r#"["/witness/target/reverie-inguest"]},"reverie-liteinst":{"package":"#,
+            r#"{"id":"reverie-liteinst","name":"reverie-liteinst","manifest":"#,
+            r#""/witness/reverie-liteinst/Cargo.toml","source":null,"target":"#,
+            r#""reverie_liteinst","kind":["lib"],"crate_types":["lib"],"target_source":"#,
+            r#""/witness/reverie-liteinst/lib.rs"},"features":[],"profile":"#,
+            r#"{"debug_assertions":true,"debuginfo":0,"opt_level":"3","overflow_checks":"#,
+            r#"true,"test":false},"outputs":["/witness/target/reverie-liteinst"]}}}"#,
+        );
+        assert_eq!(
+            String::from_utf8(
+                serde_json::to_vec(&BuildWitness::Cargo(Box::new(cargo.clone()))).unwrap()
+            )
+            .unwrap(),
+            CARGO_WITNESS_GOLDEN,
+            "Cargo witness bytes drifted from the pre-Buck golden serialization"
+        );
+        assert_eq!(
+            serde_json::from_str::<CurrentBuildEvidence>(CARGO_WITNESS_GOLDEN).unwrap(),
+            cargo,
+            "golden bytes must decode as the pre-Buck inner struct"
+        );
+        assert_eq!(
+            serde_json::from_str::<BuildWitness>(CARGO_WITNESS_GOLDEN).unwrap(),
+            BuildWitness::Cargo(Box::new(cargo.clone()))
+        );
+        for witness in [
+            BuildWitness::Cargo(Box::new(cargo.clone())),
+            BuildWitness::Buck(Box::new(buck.clone())),
+        ] {
+            let encoded = serde_json::to_vec(&witness).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<BuildWitness>(&encoded).unwrap(),
+                witness
+            );
+        }
+        assert_eq!(
+            build_witness_cohort(&BuildWitness::Cargo(Box::new(cargo.clone()))).unwrap(),
+            NoScopeCohort::DetcoreOrdinary101
+        );
+        assert_eq!(
+            build_witness_cohort(&BuildWitness::Buck(Box::new(buck.clone()))).unwrap(),
+            NoScopeCohort::DetcoreOrdinaryBuck
+        );
+        // Mixed arms refuse: Buck features in a Cargo witness, Cargo ordinary
+        // features in a Buck witness, and mixed/unknown serde fields.
+        let mut cargo_buck_features = cargo.clone();
+        cargo_buck_features.packages = ordinary(vec!["liteinst".into()]);
+        assert!(build_witness_cohort(&BuildWitness::Cargo(Box::new(cargo_buck_features))).is_err());
+        let mut buck_cargo_features = buck.clone();
+        buck_cargo_features
+            .packages
+            .get_mut("reverie-liteinst")
+            .unwrap()
+            .features = vec![];
+        assert!(build_witness_cohort(&BuildWitness::Buck(Box::new(buck_cargo_features))).is_err());
+        let mut mixed = serde_json::to_value(&cargo).unwrap();
+        mixed["builder"] = serde_json::json!("buck2");
+        assert!(serde_json::from_value::<BuildWitness>(mixed).is_err());
+        let mut mixed = serde_json::to_value(&buck).unwrap();
+        mixed["command"] = serde_json::json!({});
+        assert!(serde_json::from_value::<BuildWitness>(mixed).is_err());
+        let mut untagged_buck = serde_json::to_value(&buck).unwrap();
+        untagged_buck.as_object_mut().unwrap().remove("builder");
+        assert!(serde_json::from_value::<BuildWitness>(untagged_buck).is_err());
+        // Older reader: the golden record without a builder key parses as
+        // the Cargo arm above; Buck-variant JSON fed to the Cargo-only
+        // strict reader refuses by name on its builder field.
+        let older_reader_error =
+            serde_json::from_slice::<CurrentBuildEvidence>(&serde_json::to_vec(&buck).unwrap())
+                .unwrap_err();
+        assert!(
+            older_reader_error.to_string().contains("builder"),
+            "{older_reader_error}"
+        );
+        // Retained Buck witnesses with false build identity refuse cohort
+        // validation: failed command, wrong output digest, wrong target.
+        let mut failed = buck.clone();
+        failed.command.status = 1;
+        assert!(build_witness_cohort(&BuildWitness::Buck(Box::new(failed))).is_err());
+        let mut wrong_output = buck.clone();
+        wrong_output.output_sha256 = "9".repeat(64);
+        assert!(build_witness_cohort(&BuildWitness::Buck(Box::new(wrong_output))).is_err());
+        let mut wrong_target = buck.clone();
+        wrong_target.command.arguments[1] = "//hermetic_infra/hermit:detcore-liteinst".into();
+        assert_eq!(
+            build_witness_cohort(&BuildWitness::Buck(Box::new(wrong_target))).unwrap_err(),
+            "Buck build witness command is not the exact pinned buck2 build invocation"
+        );
+        let mut non_build = buck.clone();
+        non_build.command.arguments[0] = "check".into();
+        assert_eq!(
+            build_witness_cohort(&BuildWitness::Buck(Box::new(non_build))).unwrap_err(),
+            "Buck build witness command is not the exact pinned buck2 build invocation"
+        );
     }
 
     // Additional controls in the existing current-artifact test. These exercise
@@ -50328,7 +52072,7 @@ mod tests {
                 "/schema/reverie-liteinst/src/patch_alloc.rs",
                 NO_INSTALLATION_SCOPE_SOURCE.2,
             ),
-            current_build: CurrentBuildEvidence {
+            current_build: BuildWitness::Cargo(Box::new(CurrentBuildEvidence {
                 command: CommandEvidence {
                     program: "cargo".into(),
                     arguments: vec![],
@@ -50337,6 +52081,7 @@ mod tests {
                     elapsed_millis: 0,
                     stdout: file("/schema/stdout", &"0".repeat(64)),
                     stderr: file("/schema/stderr", &"0".repeat(64)),
+                    from_runner: false,
                 },
                 cargo_executable: None,
                 target_directory: "/schema/target".into(),
@@ -50344,7 +52089,7 @@ mod tests {
                 compiled_sources_sha256: "2".repeat(64),
                 packages,
                 standalone_sources: None,
-            },
+            })),
             allocation,
             allocation_sha256: "5".repeat(64),
             mappings: vec![TlsExecutableMapping {
@@ -50388,6 +52133,74 @@ mod tests {
             validate_no_installation_scope_evidence(&backing, proof, FixedImageKind::Detcore)
         };
         check(&proof).unwrap();
+        // The retained Buck arm binds the same exact literals as the factory:
+        // the canonical witness validates, and a merely-containing target,
+        // an extended platform, and constraint subsets/supersets refuse.
+        let buck_packages = NoScopeCohort::DetcoreOrdinaryBuck
+            .features()
+            .iter()
+            .map(|(name, features)| {
+                (
+                    (*name).to_owned(),
+                    BuckBuildPackage {
+                        features: features.iter().map(|f| (*f).to_owned()).collect(),
+                        profile: NoScopeCohort::DetcoreOrdinaryBuck.profile(),
+                    },
+                )
+            })
+            .collect();
+        let mut buck_proof = proof.clone();
+        buck_proof.current_build = BuildWitness::Buck(Box::new(BuckBuildEvidence {
+            builder: "buck2".into(),
+            command: CommandEvidence {
+                program: "buck2".into(),
+                arguments: vec![
+                    "build".into(),
+                    BUCK_TARGET.into(),
+                    "--target-platforms".into(),
+                    BUCK_PLATFORM.into(),
+                    "--show-full-output".into(),
+                    "--client-metadata".into(),
+                    "id=stage-detcore-liteinst".into(),
+                ],
+                cwd: "/schema".into(),
+                status: 0,
+                elapsed_millis: 0,
+                stdout: file("/schema/buck-stdout", &"0".repeat(64)),
+                stderr: file("/schema/buck-stderr", &"0".repeat(64)),
+                from_runner: false,
+            },
+            profile_bzl: file(
+                "/schema/fb-only/liteinst-runtime-profile.bzl",
+                &"0".repeat(64),
+            ),
+            target: BUCK_TARGET.into(),
+            platform: BUCK_PLATFORM.into(),
+            constraints: BUCK_CONSTRAINTS.iter().map(|c| (*c).to_owned()).collect(),
+            artifact: file("/schema/target/lib.so", &"1".repeat(64)),
+            output_sha256: "1".repeat(64),
+            compiled_sources_sha256: "2".repeat(64),
+            packages: buck_packages,
+        }));
+        check(&buck_proof).unwrap();
+        for mutation in 0..5 {
+            let mut bad = buck_proof.clone();
+            let BuildWitness::Buck(build) = &mut bad.current_build else {
+                unreachable!("retained Buck controls require a Buck witness");
+            };
+            match mutation {
+                0 => build.target = "//hermetic_infra/hermit:detcore-liteinst[cdylib]".into(),
+                1 => build.target.push_str("-extra"),
+                2 => build.platform.push_str("-extra"),
+                3 => build.constraints.pop().map(|_| ()).unwrap(),
+                4 => build.constraints.push("ovr_config//os:linux-extra".into()),
+                _ => unreachable!(),
+            }
+            assert!(
+                check(&bad).is_err(),
+                "retained Buck witness with non-canonical literals{mutation}"
+            );
+        }
         let value = serde_json::to_value(AllocatorInstallationEvidence::NoInstallationScope(
             Box::new(proof.clone()),
         ))
@@ -50428,9 +52241,9 @@ mod tests {
                 4 => bad.installation_getters.push(0x1500),
                 5 => bad.installation_writer_count = 1,
                 6 => bad.source.sha256 = "0".repeat(64),
-                7 => bad.current_build.compiled_sources_sha256 = "0".repeat(64),
-                8 => bad.current_build.artifact.sha256 = "0".repeat(64),
-                9 => bad.current_build.command.status = 1,
+                7 => bad.current_build.cargo_mut().compiled_sources_sha256 = "0".repeat(64),
+                8 => bad.current_build.cargo_mut().artifact.sha256 = "0".repeat(64),
+                9 => bad.current_build.cargo_mut().command.status = 1,
                 10 => bad.allocation.size = 241,
                 11 => bad.allocation.binding = sym::STB_GLOBAL,
                 12 => bad.allocation_sha256 = "0".repeat(64),
@@ -50441,9 +52254,9 @@ mod tests {
                 17 => bad.other_tls_getters[0].getter.binding = sym::STB_GLOBAL,
                 18 => bad.other_tls_getters[0].getter.name.push('x'),
                 19 => bad.other_getter_pointer_slots = vec![8, 8],
-                20 => bad.current_build.command.program = "/toolchain/cargo".into(),
+                20 => bad.current_build.cargo_mut().command.program = "/toolchain/cargo".into(),
                 21 => {
-                    bad.current_build.cargo_executable =
+                    bad.current_build.cargo_mut().cargo_executable =
                         Some(file("/toolchain/cargo", &"0".repeat(64)))
                 }
                 _ => unreachable!(),

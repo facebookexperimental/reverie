@@ -61,7 +61,7 @@ pub fn produce(root: &Path, bundle: &Path, runner: &mut Runner) -> Result<(PathB
         binary: FileIdentity::read(&binary)?,
         compiler_version,
         command: runner
-            .commands
+            .commands()
             .last()
             .ok_or("fixed-arena compiler record missing")?
             .clone(),

@@ -12,6 +12,21 @@ cell needs a row for each (--role, default fixed_patch_alloc):
 - fixed_patch_alloc, the 241-byte TLS-arm allocation body, cell at [66..70];
 - fixed_tls_fn_once, the 22-byte FnOnce TLS thunk, cell at [16..20].
 
+A third role, fixed_patch_alloc_no_scope, derives the standalone
+DETCORE_NO_SCOPE_ALLOC const instead: the same fixed_patch_alloc function's
+101-byte no-installation-scope body, which reads no TLS cell. Its masked
+fields are exactly its six bound RIP operands; the operand structure and the
+GOT-callee binding are verified the same way as above, against the one
+existing const row in lib.rs, and the emitted form is the const itself. A
+body of any other length, one that differs outside the operand fields, or one
+whose GOT operands bind other callees is refused (exit 2/3) for a reviewed
+derivation, never mask-widened into a fit. Its one binding subtlety mirrors
+the qualifier's detcore_panic_null_operand_target exactly: the
+fixed_panic_null_reference GOT operand may bind fixed_heap_panic_null's
+function (the stable-core merge of the two panic entries), decided by the
+slot's own addend against the two uniquely named functions, and nothing
+else.
+
 The row's bytes, its TLS cell and its provenance are read from the ELF; the
 expected identities are read from reverie-liteinst-artifact/src/lib.rs, so
 nothing in the emitted row is typed by hand:
@@ -60,7 +75,12 @@ unmarked row; a legacy row removed; and, on a synthetic ELF built from each
 generated row, that the row is derived again. For a row with GOT operands it
 also refuses the callee clause dropped with the callee rekeyed, every GOT
 operand bound to another callee, and the case where the only masked-equal
-structure names a callee the ELF does not bind.
+structure names a callee the ELF does not bind. For the no-scope role it
+checks the const is in canonical form, derives it again verbatim from a
+synthetic ELF carrying its body, and refuses a flipped non-operand byte,
+every GOT operand bound to another callee, and a wrong-length body; the
+merged null-reference panic callee the qualifier accepts is derived, a
+third callee for that operand is not.
 
 Usage:
   detcore-alloc-recipe.py --self-test --lib reverie-liteinst-artifact/src/lib.rs
@@ -95,14 +115,24 @@ SHN_UNDEF = 0
 
 @dataclass(frozen=True)
 class Role:
-    """One DETCORE_VALIDATE_TEMPLATES role whose body reads the TLS cell."""
+    """One derivable template role. `cell` is the body's little-endian TLS
+    cell read range, or None for the no-scope body, which reads no cell and
+    whose template is the standalone const `const_name`, not a row of
+    DETCORE_VALIDATE_TEMPLATES. `template_role` is the role's name inside
+    lib.rs when it differs from the --role spelling."""
 
     name: str
     body_len: int
-    cell: tuple[int, int]  # the little-endian cell read's byte range in the body
+    cell: tuple[int, int] | None
     what: str
     synthetic_address: int
     legacy: frozenset
+    template_role: str = ""
+    const_name: str = ""
+
+
+def template_name(role: Role) -> str:
+    return role.template_role or role.name
 
 
 class Refusal(Exception):
@@ -269,13 +299,33 @@ def parse_lib(text: str, role: Role):
     for table in ("FIXED_SUPPORT_ROLE_SYMBOLS", "FIXED_EMITTED_ROLE_SYMBOLS"):
         for key, spelling in symbol_table(text, table):
             support.setdefault(key, set()).add(spelling)
-    spellings = set(re.findall(r'\(\s*"' + role.name + r'",\s*"(_R[^"]+)",\s*\)', text))
-    require(bool(spellings), f"lib.rs: no {role.name} role spellings found")
+    spellings = set(re.findall(r'\(\s*"' + template_name(role) + r'",\s*"(_R[^"]+)",\s*\)', text))
+    require(bool(spellings), f"lib.rs: no {template_name(role)} role spellings found")
+    if role.const_name:
+        start = text.index(f"const {role.const_name}: DetcoreValidateTemplate = "
+                           "DetcoreValidateTemplate {")
+        end = text.index("\n};", start)
+        rows = []
+        pattern = re.compile(
+            r'((?:[ \t]*//[^\n]*\n)*)const ' + role.const_name
+            + r': DetcoreValidateTemplate = DetcoreValidateTemplate \{\s*role: "'
+            + template_name(role) + r'",\s*'
+            r'hex: "([0-9a-f]+)",\s*operands: &\[(.*?)\],\s*transfers: &\[(.*?)\],\s*\};', re.S)
+        for match in pattern.finditer(text, 0, end + 3):
+            operands = [(int(d), int(n), k, g == "true") for d, n, k, g in re.findall(
+                r'displacement: (\d+),\s*next: (\d+),\s*key: "([^"]+)",\s*got: (true|false),',
+                match.group(3))]
+            transfers = [(int(a), int(b)) for a, b in re.findall(r"\((\d+), (\d+)\)", match.group(4))]
+            rows.append({"comment": match.group(1).strip(), "hex": match.group(2),
+                         "operands": operands, "transfers": transfers,
+                         "line": text.count("\n", 0, match.start(2)) + 1})
+        require(len(rows) == 1, f"lib.rs: {role.const_name} not one exact const row")
+        return tls_role.group(1), spellings, rows, support
     start = text.index("const DETCORE_VALIDATE_TEMPLATES: &[DetcoreValidateTemplate] = &[")
     end = text.index("\n];", start)
     rows = []
     pattern = re.compile(
-        r'((?:[ \t]*//[^\n]*\n)*)[ \t]*DetcoreValidateTemplate \{\s*role: "' + role.name + r'",\s*'
+        r'((?:[ \t]*//[^\n]*\n)*)[ \t]*DetcoreValidateTemplate \{\s*role: "' + template_name(role) + r'",\s*'
         r'hex: "([0-9a-f]+)",\s*operands: &\[(.*?)\],\s*transfers: &\[(.*?)\],\s*\},', re.S)
     for match in pattern.finditer(text, start, end):
         operands = [(int(d), int(n), k, g == "true") for d, n, k, g in re.findall(
@@ -292,7 +342,7 @@ def matches(body: bytes, row, role: Role) -> bool:
     known = bytes.fromhex(row["hex"])
     if len(known) != len(body):
         return False
-    masked = set(range(*role.cell))
+    masked = set(range(*role.cell)) if role.cell is not None else set()
     for displacement, nxt, _key, _got in row["operands"]:
         masked.update(range(displacement, nxt))
     return all(body[i] == known[i] for i in range(len(body)) if i not in masked)
@@ -350,15 +400,23 @@ LEGACY_FN_ONCE_ROWS = frozenset({
 
 ALLOC = Role("fixed_patch_alloc", 241, (66, 70), "TLS-arm allocation body", 0x1372580, LEGACY_ROWS)
 FN_ONCE = Role("fixed_tls_fn_once", 22, (16, 20), "FnOnce TLS thunk", 0x1372a20, LEGACY_FN_ONCE_ROWS)
-ROLES = {role.name: role for role in (ALLOC, FN_ONCE)}
+NO_SCOPE = Role("fixed_patch_alloc_no_scope", 101, None, "no-installation-scope allocation body",
+                0x1372e00, frozenset(), template_role="fixed_patch_alloc",
+                const_name="DETCORE_NO_SCOPE_ALLOC")
+ROLES = {role.name: role for role in (ALLOC, FN_ONCE, NO_SCOPE)}
 
 
 def got_mismatches(elf: Elf, address: int, body: bytes, structure, support: dict[str, set[str]],
-                   got: dict[int, int], only: set[int] | None = None) -> list[str]:
+                   got: dict[int, int], only: set[int] | None = None,
+                   panic_null_merge: bool = False) -> list[str]:
     """Every GOT operand of `structure` (or only those indexed by `only`) whose
     RIP-relative slot does not carry a unique R_X86_64_RELATIVE addend equal to
     the one local function lib.rs names for its key. A key lib.rs names no
-    function for cannot be verified and is reported too."""
+    function for cannot be verified and is reported too. With
+    `panic_null_merge` (the no-scope role only), the
+    fixed_panic_null_reference operand additionally accepts
+    fixed_heap_panic_null's function, exactly as the qualifier's
+    detcore_panic_null_operand_target resolves that merged callee."""
 
     functions: dict[str | None, set[int]] = {}
     for name, value, size, kind, _bind, _shndx in elf.symbols(".symtab", ".strtab"):
@@ -370,6 +428,12 @@ def got_mismatches(elf: Elf, address: int, body: bytes, structure, support: dict
             continue
         targets = set().union(*(functions.get(s, set()) for s in support.get(key, ())))
         slot = address + nxt + struct.unpack_from("<i", body, displacement)[0]
+        if panic_null_merge and key == "fixed_panic_null_reference":
+            merged = set().union(*(functions.get(s, set())
+                                   for s in support.get("fixed_heap_panic_null", ())))
+            if len(targets) <= 1 and len(merged) <= 1 and got.get(slot) in targets | merged:
+                continue
+            targets |= merged
         if len(targets) != 1 or got.get(slot) not in targets:
             bound = f"{got[slot]:#x}" if slot in got else "no unique RELATIVE"
             bad.append(f"{key}@{displacement} (slot {slot:#x} -> {bound}; "
@@ -378,7 +442,7 @@ def got_mismatches(elf: Elf, address: int, body: bytes, structure, support: dict
 
 
 def render(body: bytes, row, role: Role) -> str:
-    lines = ["    DetcoreValidateTemplate {", f'        role: "{role.name}",', f'        hex: "{body.hex()}",',
+    lines = ["    DetcoreValidateTemplate {", f'        role: "{template_name(role)}",', f'        hex: "{body.hex()}",',
              "        operands: &["]
     for displacement, nxt, key, got in row["operands"]:
         lines += ["            DetcoreValidateOperand {", f"                displacement: {displacement},",
@@ -386,6 +450,21 @@ def render(body: bytes, row, role: Role) -> str:
                   f"                got: {'true' if got else 'false'},", "            },"]
     transfers = ", ".join(f"({a}, {b})" for a, b in row["transfers"])
     lines += ["        ],", f"        transfers: &[{transfers}],", "    },"]
+    return "\n".join(lines)
+
+
+def render_const(body: bytes, row, role: Role) -> str:
+    """The standalone const form lib.rs carries `role.const_name` in."""
+
+    lines = [f"const {role.const_name}: DetcoreValidateTemplate = DetcoreValidateTemplate {{",
+             f'    role: "{template_name(role)}",', f'    hex: "{body.hex()}",',
+             "    operands: &["]
+    for displacement, nxt, key, got in row["operands"]:
+        lines += ["        DetcoreValidateOperand {", f"            displacement: {displacement},",
+                  f"            next: {nxt},", f'            key: "{key}",',
+                  f"            got: {'true' if got else 'false'},", "        },"]
+    transfers = ", ".join(f"({a}, {b})" for a, b in row["transfers"])
+    lines += ["    ],", f"    transfers: &[{transfers}],", "};"]
     return "\n".join(lines)
 
 
@@ -397,15 +476,20 @@ def derive(data: bytes, text: str, toolchain: str, profile: str, features: str,
     try:
         elf = Elf(data)
         tls_role, spellings, rows, support = parse_lib(text, role)
-        _cell_name, cell, (filesz, memsz) = fixed_tls_cell(elf, tls_role)
+        # The no-scope body reads no TLS cell, so no cell is located or bound;
+        # its identity is the masked-equal shape and bound GOT callees below.
+        cell = filesz = memsz = None
+        if role.cell is not None:
+            _cell_name, cell, (filesz, memsz) = fixed_tls_cell(elf, tls_role)
         funcs = [s for s in elf.symbols(".symtab", ".strtab")
                  if s[3] == STT_FUNC and s[2] > 0 and canonical_rust_symbol(s[0]) in spellings]
-        require(len(funcs) == 1, f"{role.name}: {len(funcs)} symbols carry a census spelling, expected exactly 1")
+        require(len(funcs) == 1, f"{template_name(role)}: {len(funcs)} symbols carry a census spelling, expected exactly 1")
         name, address, size = funcs[0][0], funcs[0][1], funcs[0][2]
-        require(size == role.body_len, f"{role.name} is {size} bytes, not the {role.body_len}-byte {role.what}")
+        require(size == role.body_len, f"{template_name(role)} is {size} bytes, not the {role.body_len}-byte {role.what}")
         body = elf.read_va(address, size)
-        encoded = struct.unpack_from("<I", body, role.cell[0])[0]
-        require(encoded == cell, f"{role.name} reads TLS cell {encoded:#x}, but INSTALLATION_DEPTH is {cell:#x}")
+        if role.cell is not None:
+            encoded = struct.unpack_from("<I", body, role.cell[0])[0]
+            require(encoded == cell, f"{template_name(role)} reads TLS cell {encoded:#x}, but INSTALLATION_DEPTH is {cell:#x}")
         versions = sorted({m.group(1) for c in elf.comment() for m in [re.search(r"rustc version (\S+)", c)] if m})
         require(len(versions) == 1 and versions[0] in toolchain.split(),
                 f"--toolchain {toolchain!r} does not name the ELF's rustc version {versions}")
@@ -426,7 +510,8 @@ def derive(data: bytes, text: str, toolchain: str, profile: str, features: str,
         layouts = {tuple((d, n, g) for d, n, _k, g in s[0]) + s[1] for s in ordered}
         if len(layouts) == 1 and all(ordered[0][0][i][3] for i in differing):
             structures = {s for s in ordered
-                          if not got_mismatches(elf, address, body, s, support, got, differing)}
+                          if not got_mismatches(elf, address, body, s, support, got, differing,
+                                                panic_null_merge=bool(role.const_name))}
             fitting = [r for r in fitting if structure_of(r) in structures]
             if len(structures) == 1:
                 chosen = next(iter(structures))[0]
@@ -439,7 +524,8 @@ def derive(data: bytes, text: str, toolchain: str, profile: str, features: str,
     # The structure that is used, however it was selected, binds every GOT
     # operand to the callee its key names; a lone masked-equal structure that
     # names another callee is refused, never emitted.
-    bad = got_mismatches(elf, address, body, structure_of(pattern), support, got)
+    bad = got_mismatches(elf, address, body, structure_of(pattern), support, got,
+                         panic_null_merge=bool(role.const_name))
     if bad:
         notes.append(f"detcore-alloc-recipe: REFUSED: the masked-equal structure at lib.rs:{pattern['line']} "
                      f"names GOT callees the ELF does not bind: {'; '.join(bad)}")
@@ -447,14 +533,19 @@ def derive(data: bytes, text: str, toolchain: str, profile: str, features: str,
     sha = hashlib.sha256(data).hexdigest()
     build_id = elf.build_id() or "none (no NT_GNU_BUILD_ID note)"
     comment = " / ".join(c for c in elf.comment() if "rustc" in c) or "(no rustc .comment)"
+    cited = "const" if role.const_name else "row"
+    where = (f"{template_name(role)} {name} at VA {address:#x}, {size} bytes; no INSTALLATION_DEPTH"
+             f" read; the only masked fields are the bound RIP operands below."
+             if role.cell is None else
+             f"{template_name(role)} {name} at VA {address:#x}, {size} bytes; INSTALLATION_DEPTH LOCAL8 cell {cell:#x}"
+             f" (PT_TLS filesz {filesz:#x}, memsz {memsz:#x}).")
     row = "\n".join([
         f"    {GENERATED_MARK} from a real ELF; compare, never hand-edit.",
         f"    // Toolchain: {toolchain}; ELF .comment: {comment}.",
         f"    // Profile {profile}; features {features}.",
         f"    // ELF SHA256 {sha}; build-id: {build_id}.",
-        f"    // {role.name} {name} at VA {address:#x}, {size} bytes; INSTALLATION_DEPTH LOCAL8 cell {cell:#x}"
-        f" (PT_TLS filesz {filesz:#x}, memsz {memsz:#x}).",
-        f"    // Operands and transfers: those of the masked-equal row with body SHA256"
+        f"    // {where}",
+        f"    // Operands and transfers: those of the masked-equal {cited} with body SHA256"
         f" {hashlib.sha256(bytes.fromhex(pattern['hex'])).hexdigest()}"
         + (f", selected by bound GOT callee {', '.join(callees)}." if callees else "."),
         f"    // Command: {command}",
@@ -462,7 +553,7 @@ def derive(data: bytes, text: str, toolchain: str, profile: str, features: str,
         f" --lib reverie-liteinst-artifact/src/lib.rs --toolchain <Toolchain above> --profile {profile}"
         f" --features {features} --command <Command above>",
         f"    // Complete {size}-byte body SHA256: {hashlib.sha256(body).hexdigest()}.",
-        render(body, pattern, role),
+        render_const(body, pattern, role) if role.const_name else render(body, pattern, role),
     ])
     return 0, row, "\n".join(notes)
 
@@ -549,7 +640,9 @@ def synthetic_elf(body: bytes, address: int, structure, support: dict[str, set[s
     def spelled(name: str) -> str:
         return name.replace("Cs_", "CsTest_")
 
-    cell = struct.unpack_from("<I", body, role.cell[0])[0]
+    # A no-scope body encodes no cell read; its synthetic TLS cell sits at 0
+    # and is never consulted by that role's derivation.
+    cell = struct.unpack_from("<I", body, role.cell[0])[0] if role.cell is not None else 0
     strtab, symbols, relocations = bytearray(b"\0"), [], []
 
     def symbol(name: str, info: int, shndx: int, value: int, size: int) -> None:
@@ -747,10 +840,77 @@ def self_test_role(text: str, role: Role) -> tuple[int, int, int, list[str]]:
     return count, len(generated), controls, failures
 
 
-def self_test(text: str) -> int:
-    """self_test_role for every role; any failure, or a role with no rows, fails."""
+def self_test_no_scope(text: str) -> tuple[int, int, int, list[str]]:
+    """(rows, generated rows, controls, failures) for the no-scope const: it
+    is in canonical form, a synthetic ELF carrying its body derives it again
+    verbatim, and each refusal control below holds."""
 
-    results = [self_test_role(text, role) for role in ROLES.values()]
+    role = NO_SCOPE
+    tls_role, spellings, rows, support = parse_lib(text, role)
+    row = rows[0]
+    body = bytes.fromhex(row["hex"])
+    failures: list[str] = []
+    controls = 0
+
+    def control(ok: bool, message: str) -> None:
+        nonlocal controls
+        controls += 1
+        if not ok:
+            failures.append(f"control: {message}")
+            print(f"self-test: control: {message}", file=sys.stderr)
+
+    at = text.index(f"const {role.const_name}:")
+    block = text[at:text.index("\n};", at) + len("\n};")]
+    if block != render_const(body, row, role):
+        failures.append(f"{role.const_name} at lib.rs:{row['line']} is not in canonical form")
+        print(f"self-test: {failures[-1]}", file=sys.stderr)
+    if len(body) != role.body_len:
+        failures.append(f"{role.const_name} body is {len(body)} bytes, not {role.body_len}")
+        print(f"self-test: {failures[-1]}", file=sys.stderr)
+    spelling, rustc = sorted(spellings)[0], "0.0.0-selftest"
+    args = (rustc, "selftest", "selftest", "selftest", role)
+
+    def elf_for(bind: dict[str, str], payload: bytes = body, structure=None) -> bytes:
+        return synthetic_elf(payload, role.synthetic_address, structure or structure_of(row),
+                             support, bind, tls_role, spelling, rustc, role)
+
+    rc, emitted, notes = derive(elf_for({}), text, *args)
+    control(rc == 0 and block in emitted,
+            f"the synthetic ELF for {role.const_name} did not derive its const verbatim (rc {rc}: {notes})")
+    # A flipped byte outside every operand field fits no structure (the mask
+    # is never widened to fit it); operand-field bytes stay derivable, as the
+    # verbatim derivation above already shows for this body's own fields.
+    masked = set()
+    for displacement, nxt, _key, _got in row["operands"]:
+        masked.update(range(displacement, nxt))
+    flipped = bytearray(body)
+    flipped[next(i for i in range(len(body)) if i not in masked)] ^= 1
+    rc, _emitted, _notes = derive(elf_for({}, bytes(flipped)), text, *args)
+    control(rc == 3, f"a flipped non-operand byte in the no-scope body was not refused (rc {rc})")
+    for key in [op[2] for op in row["operands"] if op[3]]:
+        # fixed_heap_panic_null is the one merged callee the null-reference
+        # operand may bind (derived below); a third callee must refuse.
+        other = next(k for k in sorted(support)
+                     if k != key and not (key == "fixed_panic_null_reference"
+                                          and k == "fixed_heap_panic_null"))
+        rc, _emitted, _notes = derive(elf_for({key: other}), text, *args)
+        control(rc == 3, f"no-scope GOT operand {key} bound to {other}'s function was not refused (rc {rc})")
+    rc, emitted, notes = derive(elf_for({"fixed_panic_null_reference": "fixed_heap_panic_null"}), text, *args)
+    control(rc == 0 and block in emitted,
+            f"the merged fixed_heap_panic_null callee was not derived verbatim (rc {rc}: {notes})")
+    rc, _emitted, _notes = derive(elf_for({}, body + b"\0"), text, *args)
+    control(rc == 2, f"a {role.body_len + 1}-byte no-scope body was not refused (rc {rc})")
+    print(f"self-test: 1 {role.body_len}-byte {role.name} const (0 generated), "
+          f"{controls} controls, {len(failures)} failure(s)")
+    return 1, 0, controls, failures
+
+
+def self_test(text: str) -> int:
+    """self_test_role for every table role plus the no-scope const; any
+    failure, or a role with no rows, fails."""
+
+    results = [self_test_role(text, role) for role in (ALLOC, FN_ONCE)]
+    results.append(self_test_no_scope(text))
     return 1 if any(failures or count == 0 for count, _generated, _controls, failures in results) else 0
 
 

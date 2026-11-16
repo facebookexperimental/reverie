@@ -222,20 +222,20 @@ fn command(
     root: &Path,
     expected: Expected,
 ) -> Result<Value> {
-    let before = runner.commands.len();
+    let before = runner.commands().len();
     let result = runner.run(rustc, args, root);
-    let record = runner.commands.get(before);
+    let record = runner.commands().get(before);
     let mut admitted = result.is_ok()
         && matches!(expected, Expected::Success)
-        && runner.commands.len() == before + 1
-        && record.is_some_and(|record| record.status == 0);
+        && runner.commands().len() == before + 1
+        && record.is_some_and(|record| record.status() == 0);
     if !matches!(expected, Expected::Success) {
         if let Some(record) = record {
             // Runner emits this exact terminal error only after bounds, stream,
             // process cleanup, log persistence and reap checks have succeeded.
             // A resource/setup error can never be converted to an expected red.
             let stem = record
-                .stdout
+                .stdout()
                 .path
                 .file_stem()
                 .ok_or("command log stem missing")?;
@@ -243,12 +243,12 @@ fn command(
                 "{rustc} failed (exit status: 1); logs {}",
                 runner.logs.join(stem).display()
             );
-            record.stdout.verify()?;
-            record.stderr.verify()?;
+            record.stdout().verify()?;
+            record.stderr().verify()?;
             let stderr =
-                fs::read_to_string(&record.stderr.path).map_err(|error| error.to_string())?;
-            admitted = runner.commands.len() == before + 1
-                && record.status == 1
+                fs::read_to_string(&record.stderr().path).map_err(|error| error.to_string())?;
+            admitted = runner.commands().len() == before + 1
+                && record.status() == 1
                 && result.as_ref().err() == Some(&terminal_error)
                 && named_link_rejection(&stderr, expected);
         }
@@ -511,7 +511,7 @@ pub fn run(
         "declaration controls exhausted the unchanged producer deadline",
     )?;
     let receipt = out.join("results.json");
-    write_new(&receipt, &serde_json::to_vec_pretty(&serde_json::json!({"inputs":FileIdentity::read(&out.join("inputs.json"))?, "controls":outcomes, "commands":runner.commands, "owner_archives":archives, "positive_elf_readbacks":elf_readbacks, "expected_link_rejections":3, "expected_links":2, "owner_compilations":2, "runtime_executions":0, "allocator_or_placement_pass_claimed":false})).map_err(|error| error.to_string())?)?;
+    write_new(&receipt, &serde_json::to_vec_pretty(&serde_json::json!({"inputs":FileIdentity::read(&out.join("inputs.json"))?, "controls":outcomes, "commands":runner.commands(), "owner_archives":archives, "positive_elf_readbacks":elf_readbacks, "expected_link_rejections":3, "expected_links":2, "owner_compilations":2, "runtime_executions":0, "allocator_or_placement_pass_claimed":false})).map_err(|error| error.to_string())?)?;
     Ok(receipt)
 }
 

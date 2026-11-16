@@ -193,7 +193,7 @@ fn produce_stack_guest(
         binary: FileIdentity::read(&binary_path)?,
         compiler_version,
         command: runner
-            .commands
+            .commands()
             .last()
             .ok_or("M2 C compiler command missing")?
             .clone(),
@@ -290,7 +290,7 @@ fn produce_standalone_inputs(
             binary: FileIdentity::read(output)?,
             compiler_version: compiler_version.clone(),
             command: runner
-                .commands
+                .commands()
                 .last()
                 .ok_or("standalone compiler command missing")?
                 .clone(),
@@ -466,7 +466,7 @@ fn produce(
         target.to_string_lossy().into_owned(),
         "--message-format=json-render-diagnostics".to_owned(),
     ];
-    let cargo_build_command_index = runner.commands.len();
+    let cargo_build_command_index = runner.commands().len();
     let output = runner.run("cargo", &arguments, &root)?;
     let messages =
         std::str::from_utf8(&output).map_err(|e| format!("Cargo artifact messages: {e}"))?;
@@ -478,10 +478,10 @@ fn produce(
         &target,
     )?;
     let declaration_messages = runner
-        .commands
+        .commands()
         .get(cargo_build_command_index)
         .ok_or("current Cargo command record missing")?
-        .stdout
+        .stdout()
         .clone();
     let declarations = allocator_declaration_fixture::run(
         &root,
@@ -554,7 +554,7 @@ fn produce(
         binary: FileIdentity::read(&guest_path)?,
         compiler_version,
         command: runner
-            .commands
+            .commands()
             .last()
             .ok_or("C compiler command missing")?
             .clone(),
@@ -606,7 +606,7 @@ fn produce(
         .map(|name| (name.to_owned(), std::env::var(name).ok()))
         .collect(),
         target_directory: target,
-        commands: runner.commands,
+        commands: runner.commands().to_vec(),
         executed_tests: 0,
         full_m1_pass_claimed: false,
     };
