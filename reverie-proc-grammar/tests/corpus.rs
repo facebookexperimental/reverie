@@ -400,3 +400,68 @@ fn sched_header_with_spaced_and_newline_comm() {
         "tab must not parse and re-render as space"
     );
 }
+
+#[test]
+fn sched_fixed6_submillisecond_negative_round_trips_via_kernel_spelling() {
+    // The kernel's SPLIT_NS split loses the sign below one
+    // millisecond, so a setter-constructed sub-millisecond negative
+    // must render in the kernel spelling and re-parse.
+    assert_eq!(SchedValue::Fixed6(-500_000).render(), b"0.500000");
+    let separator = "-".repeat(67);
+    let bytes = format!(
+        "x (1, #threads: 1)\n{separator}\n{}{}",
+        sched_fixed("se.exec_start", 0, 500_000),
+        sched_int("clock-delta", 36)
+    )
+    .into_bytes();
+    let mut sched = parse_sched(&bytes).unwrap();
+    assert!(sched.set(b"se.exec_start", SchedValue::Fixed6(-500_000)));
+    let rendered = render_sched(&sched);
+    assert!(
+        String::from_utf8_lossy(&rendered).contains("0.500000"),
+        "kernel spelling expected, got {:?}",
+        String::from_utf8_lossy(&rendered)
+    );
+    let reparsed = parse_sched(&rendered).expect("rendered sched must re-parse");
+    assert_eq!(render_sched(&reparsed), rendered);
+    assert_eq!(SchedValue::Fixed6(-1_500_000).render(), b"-1.500000");
+}
+
+#[test]
+fn bitmap_width_invariant_holds_for_constructed_values() {
+    // A first group needing more digits than the declared width
+    // is not a kernel spelling and cannot be constructed; with
+    // public fields it rendered at the wider width and re-parsed
+    // as a different value.
+    assert_eq!(Bitmap::new(1, vec![0x1ff_u32]), None);
+    assert_eq!(Bitmap::new(0, vec![1]), None);
+    assert_eq!(Bitmap::new(9, vec![1]), None);
+    assert_eq!(Bitmap::new(1, vec![]), None);
+    let bitmap = Bitmap::new(3, vec![0x1ff_u32]).expect("0x1ff fits three digits");
+    assert_eq!(bitmap.first_digits(), 3);
+    assert_eq!(bitmap.groups(), [0x1ff_u32].as_slice());
+    let mut status = fixture_files("status")
+        .into_iter()
+        .find_map(|bytes| {
+            parse_status_preserving_unknown(&bytes)
+                .ok()
+                .filter(|status| status.get(StatusLabel::CpusAllowed).is_some())
+        })
+        .expect("status fixture with CpusAllowed");
+    assert!(status.set(StatusLabel::CpusAllowed, StatusValue::Bitmap(bitmap)));
+    let rendered = render_status(&status);
+    let reparsed = parse_status(&rendered).expect("rendered status must re-parse");
+    let expected = match reparsed.get(StatusLabel::CpusAllowed) {
+        Some(StatusValue::Bitmap(bitmap)) => bitmap.clone(),
+        other => panic!("bitmap lost: {other:?}"),
+    };
+    let original = match status.get(StatusLabel::CpusAllowed) {
+        Some(StatusValue::Bitmap(bitmap)) => bitmap.clone(),
+        other => panic!("bitmap missing: {other:?}"),
+    };
+    assert_eq!(render_status(&reparsed), rendered);
+    assert_eq!(
+        expected, original,
+        "constructed Bitmap changed across render/parse"
+    );
+}

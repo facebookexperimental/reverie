@@ -232,10 +232,9 @@ fn gen_status(rng: &mut Rng) -> Status {
     }
     push(
         CpusAllowed,
-        StatusValue::Bitmap(Bitmap {
-            first_digits,
-            groups,
-        }),
+        StatusValue::Bitmap(
+            Bitmap::new(first_digits, groups).expect("top group masked to its digit width"),
+        ),
     );
     push(
         CpusAllowedList,

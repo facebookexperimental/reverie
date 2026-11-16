@@ -249,15 +249,52 @@ impl StatusLabel {
 /// 32-bit groups, most significant first, each group zero-padded to
 /// its digit width (8 for full groups, fewer for a partial top
 /// group).
+///
+/// The fields are private so the width invariant holds by
+/// construction: the most significant group always fits in
+/// `first_digits` hex digits. A declared width too narrow for the
+/// top group's value is a spelling the kernel never prints — its
+/// width comes from the mask's bit count, so the value's top bits
+/// are always inside it — and rendering such a value could only
+/// produce bytes whose re-parse is a different `Bitmap`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Bitmap {
     /// Hex digits in the most significant (first printed) group.
-    pub first_digits: u8,
+    first_digits: u8,
     /// Group values, most significant first.
-    pub groups: Vec<u32>,
+    groups: Vec<u32>,
 }
 
 impl Bitmap {
+    /// Build a bitmap from its first group's digit width and its
+    /// group values (most significant first). Returns `None` when
+    /// the pair cannot be a kernel spelling: no groups, a width
+    /// outside `1..=8`, or a most significant group that needs more
+    /// digits than `first_digits` declares.
+    pub fn new(first_digits: u8, groups: Vec<u32>) -> Option<Self> {
+        let first = *groups.first()?;
+        if !(1..=8).contains(&first_digits) {
+            return None;
+        }
+        if first_digits < 8 && first >> (4 * u32::from(first_digits)) != 0 {
+            return None;
+        }
+        Some(Self {
+            first_digits,
+            groups,
+        })
+    }
+
+    /// Hex digits in the most significant (first printed) group.
+    pub fn first_digits(&self) -> u8 {
+        self.first_digits
+    }
+
+    /// Group values, most significant first.
+    pub fn groups(&self) -> &[u32] {
+        &self.groups
+    }
+
     fn render(&self, out: &mut Vec<u8>) {
         for (i, group) in self.groups.iter().enumerate() {
             if i > 0 {

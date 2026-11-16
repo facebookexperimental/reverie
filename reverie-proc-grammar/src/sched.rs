@@ -48,8 +48,19 @@ impl SchedValue {
         match self {
             SchedValue::Int(value) => format!("{value}").into_bytes(),
             SchedValue::Fixed6(scaled) => {
-                let sign = if scaled < 0 { "-" } else { "" };
                 let abs = scaled.unsigned_abs();
+                // `SPLIT_NS` renders the whole part through
+                // `nsec_high`, which negates, divides, then negates
+                // back (`kernel/sched/debug.c`): a sub-millisecond
+                // negative therefore prints with no sign (`-0`
+                // negated is `0`) while `nsec_low` prints the
+                // absolute remainder. The kernel spelling loses
+                // that sign, and `-0.xxxxxx` is never printed.
+                let sign = if scaled < 0 && abs >= 1_000_000 {
+                    "-"
+                } else {
+                    ""
+                };
                 format!("{sign}{}.{:06}", abs / 1_000_000, abs % 1_000_000).into_bytes()
             }
         }
@@ -162,8 +173,11 @@ impl SchedValue {
         match self {
             SchedValue::Int(_) => 21.max(self.render().len()),
             SchedValue::Fixed6(scaled) => {
-                let whole_digits = (scaled.unsigned_abs() / 1_000_000).to_string().len();
-                let whole_len = whole_digits + usize::from(scaled < 0);
+                let abs = scaled.unsigned_abs();
+                let whole_digits = (abs / 1_000_000).to_string().len();
+                // The sign occupies width only when it prints (see
+                // the `SPLIT_NS` note in `render`).
+                let whole_len = whole_digits + usize::from(scaled < 0 && abs >= 1_000_000);
                 14.max(whole_len) + 1 + 6
             }
         }
