@@ -85,4 +85,54 @@ mod descriptor_check_order_tests {
             }
         }
     }
+
+    /// A `recvmmsg` timeout Linux cannot use is EINVAL before the
+    /// descriptor is checked, as is `MSG_CMSG_COMPAT`, and an unreadable
+    /// timeout pointer is EFAULT first (`do_recvmmsg`,
+    /// net/socket.c:2934-2947 at v6.17): with a descriptor that does not
+    /// exist, a usable or absent timeout is the only way to reach EBADF.
+    /// Before this the executor never read the argument, so an invalid
+    /// timeout became a would-block the caller polled on forever.
+    #[test]
+    fn recvmmsg_argument_errors_precede_the_descriptor_check() {
+        const TIMEOUT: u64 = 0x200;
+        const MSG_CMSG_COMPAT: u64 = 0x8000_0000;
+        let einval = -(libc::EINVAL as i64);
+        let ebadf = -(libc::EBADF as i64);
+        let efault = -(libc::EFAULT as i64);
+        let mut state = test_state(&std::env::current_dir().unwrap());
+        let mut memory = read_zero_memory();
+        let recvmmsg = |memory: &mut GuestMemory, state: &mut LoadedStaticElf, flags, timeout| {
+            syscall_result(
+                memory,
+                state,
+                libc::SYS_recvmmsg,
+                [99, 0x300, 1, flags, timeout, 0],
+            )
+        };
+        assert_eq!(recvmmsg(&mut memory, &mut state, MSG_CMSG_COMPAT, 0), einval);
+        assert_eq!(recvmmsg(&mut memory, &mut state, 0, 0), ebadf);
+        assert_eq!(
+            recvmmsg(&mut memory, &mut state, 0, READ_ZERO_PROTECTED),
+            efault
+        );
+        for (label, tv_sec, tv_nsec, expected) in [
+            ("both negative", -1_i64, -1_i64, einval),
+            ("negative seconds", -1, 0, einval),
+            ("nsec too large", 0, 1_000_000_000, einval),
+            ("nsec negative", 0, -1, einval),
+            ("zero", 0, 0, ebadf),
+            ("one second", 1, 999_999_999, ebadf),
+        ] {
+            let mut bytes = [0_u8; 16];
+            bytes[..8].copy_from_slice(&tv_sec.to_ne_bytes());
+            bytes[8..].copy_from_slice(&tv_nsec.to_ne_bytes());
+            memory.write(TIMEOUT, &bytes).unwrap();
+            assert_eq!(
+                recvmmsg(&mut memory, &mut state, 0, TIMEOUT),
+                expected,
+                "{label}"
+            );
+        }
+    }
 }

@@ -2906,6 +2906,33 @@ pub(super) fn recvmmsg(
     state: &mut LoadedStaticElf,
     args: &[u64; 6],
 ) -> i64 {
+    // Linux checks the call's own arguments before the descriptor, in
+    // this order: `MSG_CMSG_COMPAT` is EINVAL at the entry point
+    // (net/socket.c:3065-3066 at v6.17; the bit names a compat control
+    // layout, include/linux/socket.h:338, and libc does not export it),
+    // then the timeout is copied (EFAULT), then a timeout Linux cannot
+    // use is EINVAL (`do_recvmmsg`, net/socket.c:2934-2937, through
+    // `poll_select_set_timeout`, fs/select.c:271-276, and
+    // `timespec64_valid`, include/linux/time64.h:97-106) -- all before
+    // the descriptor check (net/socket.c:2941-2947). Without this an
+    // unusable timeout became a would-block result the caller's polling
+    // waits on forever. A usable timeout bounds only the messages after
+    // the first; the attempts below are nonblocking, so nothing here
+    // waits by it.
+    const MSG_CMSG_COMPAT: u64 = 0x8000_0000;
+    if args[3] & MSG_CMSG_COMPAT != 0 {
+        return negative_errno(libc::EINVAL);
+    }
+    if args[4] != 0 {
+        let timeout: libc::timespec =
+            match read_guest_struct(&ProviderMemory(memory), args[4]) {
+                Ok(timeout) => timeout,
+                Err(error) => return error,
+            };
+        if timeout.tv_sec < 0 || !(0..1_000_000_000).contains(&timeout.tv_nsec) {
+            return negative_errno(libc::EINVAL);
+        }
+    }
     let Some(host_fd) = host_fd(state, args[0] as libc::c_int) else {
         return negative_errno(libc::EBADF);
     };
