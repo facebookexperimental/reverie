@@ -653,7 +653,7 @@ impl ElfExecutor {
         })?;
         let alias = read_c_string(&ProviderMemory(memory), path_address, 4096)
             .map_err(|_| Self::parent_death_exec_error("enrolled exec alias is not readable"))?;
-        if reverie_procfs::classify_exe_path(&alias, &|tid| {
+        if crate::proc_mechanics::classify_exe_path(&alias, &|tid| {
             live_thread_in_process(&self.state, tid)
         }) != Some(true)
         {

@@ -30,8 +30,10 @@
 //!   per-task slots, and synthetic `/proc` claims), empty under Hermit.
 //! - [`signal`]: the signal ABI and per-thread and per-process signal state
 //!   (`arch/signal_amd64`, `kernel/task_signals`, `kernel/pending_signals`).
-//! - [`SingleRecordSeq`](reverie_procfs::SingleRecordSeq), in reverie-procfs:
-//!   the single-record seq_file state that reads of the synthetic
+//! - `proc_mechanics`: the core-owned `/proc` mechanics -- synthetic
+//!   file identities, guest path classification, and
+//!   [`SingleRecordSeq`](proc_mechanics::SingleRecordSeq), the
+//!   single-record seq_file state that reads of the synthetic
 //!   `/proc/self/status` go through (`fsimpl/proc`).
 //! - [`provider`]: the `reverie::provider` interface as LinuxEmu answers it.
 //! - [`terminal_read`] and [`terminal_cleanup`]: reads from a host terminal and
@@ -49,6 +51,7 @@ pub mod elf;
 pub mod executor;
 pub mod extension;
 pub mod native_exit_broker;
+pub(crate) mod proc_mechanics;
 pub mod provider;
 pub mod signal;
 pub mod terminal_cleanup;

@@ -139,7 +139,7 @@ pub(super) fn truncate(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u6
         Err(error) => return read_c_string_errno(error),
     };
     let held_file;
-    let target_fd = if let Some(guest_fd) = reverie_procfs::parse_fd_path(&path, state.pid) {
+    let target_fd = if let Some(guest_fd) = crate::proc_mechanics::parse_fd_path(&path, state.pid) {
         if state.proc_files.contains_key(&guest_fd) {
             return negative_errno(libc::EACCES);
         }
@@ -373,7 +373,7 @@ fn open_file(
                 return negative_errno(libc::EINVAL);
             }
         }
-        let normalized = reverie_procfs::normalize_self_path(path, state.pid)
+        let normalized = crate::proc_mechanics::normalize_self_path(path, state.pid)
             .expect("a synthesized /proc path always normalizes");
         if let Some(file) = ProcessProcFile::from_normalized_path(&normalized) {
             if !path_only {
@@ -400,8 +400,8 @@ fn open_file(
         );
     }
     let guest_cloexec = close_on_exec;
-    if let Some(reverie_procfs::FdLinkPath::Exact(guest_fd)) =
-        reverie_procfs::parse_fd_link(path, state.pid, state.tid)
+    if let Some(crate::proc_mechanics::FdLinkPath::Exact(guest_fd)) =
+        crate::proc_mechanics::parse_fd_link(path, state.pid, state.tid)
     {
         return open_guest_fd_path(state, guest_fd, flags, guest_cloexec);
     }
@@ -586,8 +586,8 @@ pub(super) fn guest_fd_metadata(
     path: &[u8],
     no_follow: bool,
 ) -> Result<Option<GuestFdMetadata>, i64> {
-    let Some(reverie_procfs::FdLinkPath::Exact(guest_fd)) =
-        reverie_procfs::parse_fd_link(path, state.pid, state.tid)
+    let Some(crate::proc_mechanics::FdLinkPath::Exact(guest_fd)) =
+        crate::proc_mechanics::parse_fd_link(path, state.pid, state.tid)
     else {
         return Ok(None);
     };
@@ -664,7 +664,7 @@ pub(super) fn open_guest_fd_path(
         return negative_errno(libc::EEXIST);
     }
     if source_proc_inode
-        .is_some_and(|inode| inode == reverie_procfs::path_inode(b"/proc/self/status"))
+        .is_some_and(|inode| inode == crate::proc_mechanics::path_inode(b"/proc/self/status"))
     {
         // Its content is rendered from the opener's process cells, which an
         // O_PATH backing does not carry. Refuse rather than expose its empty
@@ -2185,8 +2185,8 @@ pub(super) fn host_dirfd_and_path(
         // kernel resolves the magic link and continues below the file it
         // names; another task's spelling, an unknown descriptor, and
         // synthetic proc/fdinfo carriers fail closed with ENOENT.
-        match reverie_procfs::parse_fd_link(path, state.pid, state.tid) {
-            Some(reverie_procfs::FdLinkPath::Below { fd, rest }) => {
+        match crate::proc_mechanics::parse_fd_link(path, state.pid, state.tid) {
+            Some(crate::proc_mechanics::FdLinkPath::Below { fd, rest }) => {
                 if state.proc_files.contains_key(&fd) || state.fdinfo_files.contains_key(&fd) {
                     // Synthetic carriers are regular-file descriptions:
                     // below one is ENOTDIR, as below any regular file.
@@ -2200,10 +2200,10 @@ pub(super) fn host_dirfd_and_path(
                     .map(|rest| (host_fd, rest))
                     .map_err(|_| negative_errno(libc::EINVAL));
             }
-            Some(reverie_procfs::FdLinkPath::OtherTask) => {
+            Some(crate::proc_mechanics::FdLinkPath::OtherTask) => {
                 return Err(negative_errno(libc::ENOENT));
             }
-            Some(reverie_procfs::FdLinkPath::Exact(_)) => {
+            Some(crate::proc_mechanics::FdLinkPath::Exact(_)) => {
                 // Exact links are reopened by the callers that handle
                 // them; reaching here means a path family without that
                 // handling. Fail closed rather than forward the literal
@@ -2427,7 +2427,7 @@ pub(super) fn readlinkat(
 // another process's links (package K item 2b slice 2b-4 of
 // https://github.com/rrnewton/hermit/issues/4564). Following `/proc/self/exe`
 // (stat, and exec of the retained image, via
-// `reverie_procfs::classify_exe_path`) is not a readlink and stays.
+// `crate::proc_mechanics::classify_exe_path`) is not a readlink and stays.
 pub(super) fn readlink_at_impl(
     memory: &mut GuestMemory,
     state: &LoadedStaticElf,

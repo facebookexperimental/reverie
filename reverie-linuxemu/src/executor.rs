@@ -4238,7 +4238,7 @@ mod tests {
         );
         state
             .proc_files
-            .insert(3, reverie_procfs::path_inode(b"/proc/self/maps"));
+            .insert(3, crate::proc_mechanics::path_inode(b"/proc/self/maps"));
         let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
         write_c_string(&mut memory, PATH, "/proc/self/fd/3");
 
@@ -4921,8 +4921,8 @@ mod tests {
             assert_eq!(
                 (stat.st_dev, stat.st_ino),
                 (
-                    reverie_procfs::synthetic_dev(SYNTHETIC_DEV_MAJOR, SYNTHETIC_PROC_DEV_MINOR),
-                    reverie_procfs::path_inode(b"/proc/self/maps")
+                    crate::proc_mechanics::synthetic_dev(SYNTHETIC_DEV_MAJOR, SYNTHETIC_PROC_DEV_MINOR),
+                    crate::proc_mechanics::path_inode(b"/proc/self/maps")
                 )
             );
             assert_eq!(stat.st_mode, libc::S_IFREG | 0o444);
@@ -5114,10 +5114,10 @@ mod tests {
         );
         let stat: libc::stat = read_struct(&memory, stat_address);
         assert_eq!(stat.st_mode, libc::S_IFREG | 0o444);
-        assert_eq!(stat.st_ino, reverie_procfs::path_inode(b"/proc/self/maps"));
+        assert_eq!(stat.st_ino, crate::proc_mechanics::path_inode(b"/proc/self/maps"));
         assert_eq!(
             stat.st_dev,
-            reverie_procfs::synthetic_dev(SYNTHETIC_DEV_MAJOR, SYNTHETIC_PROC_DEV_MINOR)
+            crate::proc_mechanics::synthetic_dev(SYNTHETIC_DEV_MAJOR, SYNTHETIC_PROC_DEV_MINOR)
         );
         assert_eq!(stat.st_size, SELF_MAPS_CONTENT.len() as libc::off_t);
         assert_eq!(stat.st_uid, 0);
@@ -21086,19 +21086,19 @@ mod tests {
             negative_errno(libc::ENOENT)
         );
         assert_eq!(
-            reverie_procfs::parse_fd_path(b"/proc/self/fd/3", state.pid),
+            crate::proc_mechanics::parse_fd_path(b"/proc/self/fd/3", state.pid),
             Some(3)
         );
         assert_eq!(
-            reverie_procfs::parse_fd_path(b"/proc/thread-self/fd/3", state.pid),
+            crate::proc_mechanics::parse_fd_path(b"/proc/thread-self/fd/3", state.pid),
             Some(3)
         );
         assert_eq!(
-            reverie_procfs::parse_fd_path(b"/proc/1/fd/3", state.pid),
+            crate::proc_mechanics::parse_fd_path(b"/proc/1/fd/3", state.pid),
             Some(3)
         );
         assert_eq!(
-            reverie_procfs::parse_fd_path(b"/dev/fd/not-a-fd", state.pid),
+            crate::proc_mechanics::parse_fd_path(b"/dev/fd/not-a-fd", state.pid),
             None
         );
     }

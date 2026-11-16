@@ -302,13 +302,13 @@ fn exec_lookup(state: &LoadedStaticElf, path: &[u8]) -> Result<ExecLookup, i64> 
         let spelling = base_path.map(|base_path| exec_join(&base_path, segment));
         let link = spelling
             .as_deref()
-            .and_then(|spelling| reverie_procfs::parse_fd_link(spelling, state.pid, state.tid));
+            .and_then(|spelling| crate::proc_mechanics::parse_fd_link(spelling, state.pid, state.tid));
         if let Some(link) = link {
             let after = exec_strip_leading_slashes(&rest[segment_end..]).to_vec();
             let (guest_fd, below) = match link {
-                reverie_procfs::FdLinkPath::Exact(guest_fd) => (guest_fd, Vec::new()),
-                reverie_procfs::FdLinkPath::Below { fd, rest } => (fd, rest.to_vec()),
-                reverie_procfs::FdLinkPath::OtherTask => return Err(negative_errno(libc::ENOENT)),
+                crate::proc_mechanics::FdLinkPath::Exact(guest_fd) => (guest_fd, Vec::new()),
+                crate::proc_mechanics::FdLinkPath::Below { fd, rest } => (fd, rest.to_vec()),
+                crate::proc_mechanics::FdLinkPath::OtherTask => return Err(negative_errno(libc::ENOENT)),
             };
             if state.proc_files.contains_key(&guest_fd)
                 || state.fdinfo_files.contains_key(&guest_fd)
@@ -463,10 +463,10 @@ fn open_exec_lookup(
     let opened = match lookup.spelling.as_deref().and_then(|spelling| {
         Some((
             spelling,
-            reverie_procfs::parse_fd_link(spelling, state.pid, state.tid)?,
+            crate::proc_mechanics::parse_fd_link(spelling, state.pid, state.tid)?,
         ))
     }) {
-        Some((_, reverie_procfs::FdLinkPath::Exact(guest_fd)))
+        Some((_, crate::proc_mechanics::FdLinkPath::Exact(guest_fd)))
             if host_fd(state, guest_fd).is_some() =>
         {
             return Err(negative_errno(libc::ELOOP));
@@ -626,7 +626,7 @@ pub(super) fn resolve_guest_exec_image(
     let lookup =
         exec_lookup(state, &path).map_err(|errno| exec_open_errno(errno, OPENING, refusal))?;
     let exe_link = lookup.spelling.as_deref().and_then(|spelling| {
-        reverie_procfs::classify_exe_path(spelling, &|tid| live_thread_in_process(state, tid))
+        crate::proc_mechanics::classify_exe_path(spelling, &|tid| live_thread_in_process(state, tid))
     });
     match exe_link {
         Some(true) => {

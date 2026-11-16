@@ -499,7 +499,7 @@ pub(super) fn live_thread_in_process(state: &LoadedStaticElf, tid: i32) -> bool 
 /// Synthesize deterministic content for a recognized /proc path, or `None` when
 /// the path is not part of the supported surface.
 pub(super) fn synthetic_proc_content(state: &LoadedStaticElf, path: &[u8]) -> Option<Vec<u8>> {
-    let normalized = reverie_procfs::normalize_self_path(path, state.pid)?;
+    let normalized = crate::proc_mechanics::normalize_self_path(path, state.pid)?;
     let content = match normalized.as_slice() {
         b"/proc/self/status" => proc_self_status_content(state),
         b"/proc/self/maps" => proc_self_maps_content(state),
@@ -631,7 +631,7 @@ pub(super) fn open_synthetic_proc(
     // the proc-fd link creates a fresh O_RDONLY or O_PATH description at offset
     // zero without sharing the construction description.
     drop(file);
-    let inode = reverie_procfs::path_inode(normalized_path);
+    let inode = crate::proc_mechanics::path_inode(normalized_path);
     // The snapshot class lets a receiver of this descriptor, which has no
     // `proc_files` entry, keep timestamp 0.
     let guest_fd = insert_file_with_identity(
@@ -689,9 +689,9 @@ pub(super) fn sanitize_guest_fd_stat(
     stat: &mut libc::stat,
 ) {
     if let Some(&inode) = state.proc_files.get(&guest_fd) {
-        reverie_procfs::sanitize_synthetic_stat(
+        crate::proc_mechanics::sanitize_synthetic_stat(
             stat,
-            reverie_procfs::synthetic_dev(SYNTHETIC_DEV_MAJOR, SYNTHETIC_PROC_DEV_MINOR),
+            crate::proc_mechanics::synthetic_dev(SYNTHETIC_DEV_MAJOR, SYNTHETIC_PROC_DEV_MINOR),
             inode,
             PAGE_SIZE as u32,
         );
@@ -711,7 +711,7 @@ pub(super) fn sanitize_guest_fd_statx(
     stat: &mut libc::statx,
 ) {
     if let Some(&inode) = state.proc_files.get(&guest_fd) {
-        *stat = reverie_procfs::synthetic_statx(
+        *stat = crate::proc_mechanics::synthetic_statx(
             SYNTHETIC_DEV_MAJOR,
             SYNTHETIC_PROC_DEV_MINOR,
             inode,
