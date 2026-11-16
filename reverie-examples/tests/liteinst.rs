@@ -1470,7 +1470,7 @@ fn exact_chrome_trace_tool_writes_process_and_syscall_events() {
     let trace = std::fs::read(&trace_path).unwrap();
     std::fs::remove_file(&trace_path).unwrap();
     let trace: serde_json::Value = serde_json::from_slice(&trace).unwrap();
-    assert_chrome_trace_events(&trace);
+    assert_chrome_trace_events(&trace, false);
 }
 
 fn assert_chrome_trace_guest_output(output: &Output) {
@@ -1479,7 +1479,7 @@ fn assert_chrome_trace_guest_output(output: &Output) {
     assert!(output.stderr.is_empty(), "{output:?}");
 }
 
-fn assert_chrome_trace_events(trace: &serde_json::Value) {
+fn assert_chrome_trace_events(trace: &serde_json::Value, allow_splice_payload: bool) {
     let events = trace
         .as_array()
         .expect("chrome trace is not an event array");
@@ -1490,16 +1490,157 @@ fn assert_chrome_trace_events(trace: &serde_json::Value) {
         "{trace}"
     );
     assert!(
-        events.iter().any(|event| {
-            event["cat"] == "syscall"
-                && event["name"] == "write"
-                && event["args"]["pretty"]
-                    .as_str()
-                    .is_some_and(|pretty| pretty.starts_with("write(1,"))
-                && event["args"]["result"] == "Ok(6)"
-        }),
+        events
+            .iter()
+            .any(|event| is_stdout_payload_event(event, allow_splice_payload)),
         "{trace}"
     );
+}
+
+/// The 6-byte stdin payload (`"hello\n"`) reaching stdout in the
+/// `cat` caller. `cat` normally writes it with
+/// `write(1, buf, 6)`. The `cat` on GitHub-hosted Ubuntu 26.04
+/// runners instead relays through its own pipe — uutils' copy
+/// loop, fingerprinted in the failing trace as `pipe2`,
+/// `F_SETPIPE_SZ` of 1 MiB on both pipe ends, then
+/// `splice(0, NULL, 4, NULL, 1048576, 0)` = `Ok(6)` and
+/// `splice(3, NULL, 1, NULL, 6, 0)` = `Ok(6)` — so only the
+/// `cat` caller (`allow_splice_payload`) may accept the splice
+/// shape; the `echo` callers never splice and stay write-only.
+/// Both accepted shapes are the guest's own correct output,
+/// and the callers assert the stdout bytes separately.
+/// `sendfile` and `copy_file_range` are deliberately NOT
+/// accepted: no trace has shown them, and accepting a new
+/// payload shape needs its own evidence. Anything else —
+/// another fd, a non-NULL offset, a length other than 6, or
+/// a short result — still fails.
+fn is_stdout_payload_event(event: &serde_json::Value, allow_splice: bool) -> bool {
+    if event["cat"] != "syscall" || event["args"]["result"] != "Ok(6)" {
+        return false;
+    }
+    let Some(pretty) = event["args"]["pretty"].as_str() else {
+        return false;
+    };
+    match event["name"].as_str() {
+        Some("write") => {
+            let Some(args) = pretty
+                .strip_prefix("write(")
+                .and_then(|rest| rest.strip_suffix(")"))
+            else {
+                return false;
+            };
+            let fields: Vec<&str> = args.split(", ").collect();
+            fields.len() == 3 && fields[0] == "1" && fields[2] == "6"
+        }
+        Some("splice") if allow_splice => {
+            let Some(args) = pretty
+                .strip_prefix("splice(")
+                .and_then(|rest| rest.strip_suffix(")"))
+            else {
+                return false;
+            };
+            let fields: Vec<&str> = args.split(", ").collect();
+            fields.len() == 6
+                && fields[1] == "NULL"
+                && fields[2] == "1"
+                && fields[3] == "NULL"
+                && fields[4] == "6"
+        }
+        _ => false,
+    }
+}
+
+/// A synthetic trace holding the process begin plus one payload
+/// event, for the `assert_chrome_trace_events` accept/reject tests.
+fn payload_trace(name: &str, pretty: &str, result: &str) -> serde_json::Value {
+    serde_json::from_str(&format!(
+        r#"[{{"cat":"process","name":"TID 1","ph":"B","pid":1,"tid":1,"ts":0}},
+            {{"args":{{"pretty":"{pretty}","result":"{result}"}},
+             "cat":"syscall","name":"{name}","ph":"X","pid":1,"tid":1,"ts":1}}]"#
+    ))
+    .unwrap()
+}
+
+#[test]
+fn chrome_trace_accepts_write_stdout_payload() {
+    let trace = payload_trace("write", "write(1, 0x1000, 6)", "Ok(6)");
+    assert_chrome_trace_events(&trace, false);
+}
+
+#[test]
+fn chrome_trace_accepts_splice_stdout_payload() {
+    let trace = payload_trace("splice", "splice(3, NULL, 1, NULL, 6, 0)", "Ok(6)");
+    assert_chrome_trace_events(&trace, true);
+}
+
+#[test]
+#[should_panic(expected = "splice(3, NULL, 1")]
+fn chrome_trace_rejects_splice_for_echo_callers() {
+    let trace = payload_trace("splice", "splice(3, NULL, 1, NULL, 6, 0)", "Ok(6)");
+    assert_chrome_trace_events(&trace, false);
+}
+
+#[test]
+#[should_panic(expected = "splice(3, NULL, 2")]
+fn chrome_trace_rejects_splice_to_stderr() {
+    let trace = payload_trace("splice", "splice(3, NULL, 2, NULL, 6, 0)", "Ok(6)");
+    assert_chrome_trace_events(&trace, true);
+}
+
+#[test]
+#[should_panic(expected = "NULL, 7, 0")]
+fn chrome_trace_rejects_splice_wrong_length() {
+    let trace = payload_trace("splice", "splice(3, NULL, 1, NULL, 7, 0)", "Ok(6)");
+    assert_chrome_trace_events(&trace, true);
+}
+
+#[test]
+#[should_panic(expected = "Ok(5)")]
+fn chrome_trace_rejects_splice_short_result() {
+    let trace = payload_trace("splice", "splice(3, NULL, 1, NULL, 6, 0)", "Ok(5)");
+    assert_chrome_trace_events(&trace, true);
+}
+
+#[test]
+#[should_panic(expected = "0x7fffffffe000")]
+fn chrome_trace_rejects_splice_nonnull_offset() {
+    let trace = payload_trace(
+        "splice",
+        "splice(3, 0x7fffffffe000, 1, NULL, 6, 0)",
+        "Ok(6)",
+    );
+    assert_chrome_trace_events(&trace, true);
+}
+
+#[test]
+#[should_panic(expected = "write(2,")]
+fn chrome_trace_rejects_write_to_stderr() {
+    let trace = payload_trace("write", "write(2, 0x1000, 6)", "Ok(6)");
+    assert_chrome_trace_events(&trace, true);
+}
+
+#[test]
+#[should_panic(expected = "4096")]
+fn chrome_trace_rejects_write_wrong_length() {
+    let trace = payload_trace("write", "write(1, 0x1000, 4096)", "Ok(6)");
+    assert_chrome_trace_events(&trace, false);
+}
+
+#[test]
+#[should_panic(expected = "Ok(5)")]
+fn chrome_trace_rejects_short_stdout_write() {
+    let trace = payload_trace("write", "write(1, 0x1000, 6)", "Ok(5)");
+    assert_chrome_trace_events(&trace, false);
+}
+
+#[test]
+#[should_panic(expected = "TID 1")]
+fn chrome_trace_rejects_missing_payload_event() {
+    let trace: serde_json::Value = serde_json::from_str(
+        r#"[{"cat":"process","name":"TID 1","ph":"B","pid":1,"tid":1,"ts":0}]"#,
+    )
+    .unwrap();
+    assert_chrome_trace_events(&trace, true);
 }
 
 fn chrome_trace_command(backend: &str, trace_path: &Path) -> Command {
@@ -1527,7 +1668,7 @@ fn chrome_trace_writes_process_and_syscall_events(backend: &str, identity: &str)
     assert_chrome_trace_guest_output(&output);
     let trace = std::fs::read(&trace_path).unwrap();
     let trace: serde_json::Value = serde_json::from_slice(&trace).unwrap();
-    assert_chrome_trace_events(&trace);
+    assert_chrome_trace_events(&trace, false);
     // Keep the identity-owned trace on failure for diagnosis.
     std::fs::remove_file(&trace_path).unwrap();
 }
@@ -1555,7 +1696,7 @@ fn ptrace_chrome_trace_oracle_rejects_missing_events() {
     let trace: serde_json::Value = serde_json::from_slice(&trace).unwrap();
     // The unchanged oracle first accepts the real trace, so each rejection
     // below comes from the events removed from that real trace.
-    assert_chrome_trace_events(&trace);
+    assert_chrome_trace_events(&trace, false);
     let without = |drop: fn(&serde_json::Value) -> bool| {
         let events = trace.as_array().unwrap();
         let kept: Vec<_> = events
@@ -1573,7 +1714,7 @@ fn ptrace_chrome_trace_oracle_rejects_missing_events() {
         without(|event| event["cat"] == "syscall" && event["name"] == "write"),
     ] {
         eprintln!("Chrome trace oracle control: {mutated}");
-        assert!(std::panic::catch_unwind(|| assert_chrome_trace_events(&mutated)).is_err());
+        assert!(std::panic::catch_unwind(|| assert_chrome_trace_events(&mutated, false)).is_err());
     }
     std::fs::remove_file(&trace_path).unwrap();
 }
@@ -1597,7 +1738,7 @@ fn chrome_trace_preserves_stdin_and_writes_events(backend: &str, identity: &str)
     assert_chrome_trace_guest_output(&output);
     let trace = std::fs::read(&trace_path).unwrap();
     let trace: serde_json::Value = serde_json::from_slice(&trace).unwrap();
-    assert_chrome_trace_events(&trace);
+    assert_chrome_trace_events(&trace, true);
     // Keep the identity-owned trace on failure for diagnosis.
     std::fs::remove_file(&trace_path).unwrap();
 }
