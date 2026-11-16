@@ -1,0 +1,59 @@
+Name:	aaaaaaa-aaaaa
+Umask:	0022
+State:	S (sleeping)
+Tgid:	3616
+Ngid:	0
+Pid:	3616
+PPid:	1
+TracerPid:	0
+Uid:	0	0	0	0
+Gid:	0	0	0	0
+FDSize:	2048
+Groups:	 
+NStgid:	3616
+NSpid:	3616
+NSpgid:	3616
+NSsid:	3616
+Kthread:	0
+VmPeak:	   54040 kB
+VmSize:	   52268 kB
+VmLck:	       0 kB
+VmPin:	       0 kB
+VmHWM:	   25336 kB
+VmRSS:	    6000 kB
+RssAnon:	    3404 kB
+RssFile:	    2596 kB
+RssShmem:	       0 kB
+VmData:	   19308 kB
+VmStk:	     132 kB
+VmExe:	     416 kB
+VmLib:	   10824 kB
+VmPTE:	     112 kB
+VmSwap:	    1340 kB
+HugetlbPages:	       0 kB
+CoreDumping:	0
+THP_enabled:	1
+untag_mask:	0xffffffffffffffff
+Threads:	1
+SigQ:	2/3091460
+SigPnd:	0000000000000000
+ShdPnd:	0000000000000000
+SigBlk:	0008000000004003
+SigIgn:	0000000180001000
+SigCgt:	0000000000000000
+CapInh:	0000000000000000
+CapPrm:	000001f7fdffffff
+CapEff:	000001f7fdffffff
+CapBnd:	000001f7fdffffff
+CapAmb:	0000000000000000
+NoNewPrivs:	0
+Seccomp:	2
+Seccomp_filters:	14
+Speculation_Store_Bypass:	vulnerable
+SpeculationIndirectBranch:	always enabled
+Cpus_allowed:	fffffff,ffffffff,ffffffff,ffffffff,ffffffff,ffffffff,ffffffff,ffffffff,ffffffff,ffffffff
+Cpus_allowed_list:	0-315
+Mems_allowed:	00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000003
+Mems_allowed_list:	0-1
+voluntary_ctxt_switches:	7724317
+nonvoluntary_ctxt_switches:	48762

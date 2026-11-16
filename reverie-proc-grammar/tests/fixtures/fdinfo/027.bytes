@@ -1,0 +1,6 @@
+pos:	0
+flags:	00
+mnt_id:	18
+ino:	9225
+inotify wd:2 ino:124fb8d73 sdev:2f mask:c06 ignored_mask:0 fhandle-bytes:14 fhandle-type:4d f_handle:738dfb2401000000010100000000000022901b00
+inotify wd:1 ino:100 sdev:2f mask:784 ignored_mask:0 fhandle-bytes:14 fhandle-type:4d f_handle:0001000000000000010100000000000012000000

@@ -1,0 +1,8 @@
+pos:	0
+flags:	02000002
+mnt_id:	18
+ino:	9225
+tfd:       28 events: 80000019 data:               1c  pos:0 ino:2409 sdev:10
+tfd:       12 events:       19 data:                c  pos:0 ino:f02dfc41 sdev:a
+tfd:       29 events:       19 data:               1d  pos:0 ino:f02dfc40 sdev:a
+tfd:      158 events:       19 data:               9e  pos:0 ino:f02a7e24 sdev:a

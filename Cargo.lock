@@ -1462,6 +1462,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "reverie-proc-grammar"
+version = "0.5.7"
+dependencies = [
+ "libc",
+ "quickcheck",
+ "quickcheck_macros",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "reverie-process"
 version = "0.5.7"
 dependencies = [

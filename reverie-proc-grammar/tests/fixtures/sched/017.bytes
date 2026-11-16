@@ -1,0 +1,29 @@
+aaaaaaaa (2, #threads: 1)
+-------------------------------------------------------------------
+se.exec_start                                :     534836466.889814
+se.vruntime                                  :   24527059110.114227
+se.sum_exec_runtime                          :         43426.093790
+se.nr_migrations                             :                90023
+nr_switches                                  :               773901
+nr_voluntary_switches                        :               772638
+nr_involuntary_switches                      :                 1263
+se.load.weight                               :              1048576
+se.avg.load_sum                              :                   71
+se.avg.runnable_sum                          :                73515
+se.avg.util_sum                              :                73515
+se.avg.load_avg                              :                    0
+se.avg.runnable_avg                          :                    0
+se.avg.util_avg                              :                    0
+se.avg.last_update_time                      :      534835587078144
+se.avg.util_est                              :                    8
+policy                                       :                    0
+prio                                         :                  120
+se.slice                                     :              2800000
+ext.enabled                                  :                    0
+clock-delta                                  :                   20
+numa_pages_migrated                          :                    0
+numa_preferred_nid                           :                   -1
+total_numa_faults                            :                    0
+current_node=0, numa_group_id=0
+numa_faults node=0 task_private=0 task_shared=0 group_private=0 group_shared=0
+numa_faults node=1 task_private=0 task_shared=0 group_private=0 group_shared=0

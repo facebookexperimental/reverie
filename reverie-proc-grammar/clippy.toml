@@ -1,0 +1,52 @@
+# The purity rule: reverie-procfs formats bytes from caller-supplied
+# values only. Nothing in this crate may read a clock, the filesystem,
+# the environment, or a randomness source, spawn threads or processes,
+# or touch the network — its output must depend only on its inputs.
+# Clippy matches resolved paths, so aliases and grouped imports are
+# caught as well. tests/purity.rs is the second layer (it also covers
+# spellings in comments-checked source form and the libc entry points
+# below at the syntax level).
+disallowed-types = [
+    { path = "std::time::SystemTime", reason = "purity: no wall clock; callers pass times in" },
+    { path = "std::time::Instant", reason = "purity: no monotonic clock; callers pass times in" },
+    { path = "std::fs::File", reason = "purity: no filesystem access; callers pass bytes in" },
+    { path = "std::path::PathBuf", reason = "purity: no filesystem paths; names arrive as bytes" },
+    { path = "std::process::Command", reason = "purity: no process spawning" },
+    { path = "std::process::Child", reason = "purity: no process spawning" },
+    { path = "std::thread::Builder", reason = "purity: no thread spawning" },
+    { path = "std::net::TcpStream", reason = "purity: no network access" },
+    { path = "std::net::TcpListener", reason = "purity: no network access" },
+    { path = "std::net::UdpSocket", reason = "purity: no network access" },
+]
+disallowed-methods = [
+    { path = "std::time::SystemTime::now", reason = "purity: no wall clock" },
+    { path = "std::time::Instant::now", reason = "purity: no monotonic clock" },
+    { path = "std::env::var", reason = "purity: no environment reads" },
+    { path = "std::env::var_os", reason = "purity: no environment reads" },
+    { path = "std::env::vars", reason = "purity: no environment reads" },
+    { path = "std::env::vars_os", reason = "purity: no environment reads" },
+    { path = "std::env::current_dir", reason = "purity: no filesystem access" },
+    { path = "std::env::current_exe", reason = "purity: no filesystem access" },
+    { path = "std::fs::read", reason = "purity: no filesystem access" },
+    { path = "std::fs::read_to_string", reason = "purity: no filesystem access" },
+    { path = "std::fs::write", reason = "purity: no filesystem access" },
+    { path = "std::fs::File::open", reason = "purity: no filesystem access" },
+    { path = "std::fs::File::create", reason = "purity: no filesystem access" },
+    { path = "std::fs::metadata", reason = "purity: no filesystem access" },
+    { path = "std::fs::read_dir", reason = "purity: no filesystem access" },
+    { path = "std::thread::spawn", reason = "purity: no thread spawning" },
+    { path = "std::thread::scope", reason = "purity: no thread spawning" },
+    { path = "libc::time", reason = "purity: no wall clock through libc either" },
+    { path = "libc::clock_gettime", reason = "purity: no clock reads through libc either" },
+    { path = "libc::gettimeofday", reason = "purity: no clock reads through libc either" },
+    { path = "libc::getenv", reason = "purity: no environment reads through libc either" },
+    { path = "libc::setenv", reason = "purity: no environment writes" },
+    { path = "libc::open", reason = "purity: no filesystem access through libc either" },
+    { path = "libc::openat", reason = "purity: no filesystem access through libc either" },
+    { path = "libc::syscall", reason = "purity: no raw syscalls; they bypass every rule above" },
+    { path = "libc::rand", reason = "purity: no randomness source" },
+    { path = "libc::fork", reason = "purity: no process spawning" },
+    { path = "libc::vfork", reason = "purity: no process spawning" },
+    { path = "libc::clone", reason = "purity: no thread or process spawning" },
+    { path = "libc::pthread_create", reason = "purity: no thread spawning" },
+]

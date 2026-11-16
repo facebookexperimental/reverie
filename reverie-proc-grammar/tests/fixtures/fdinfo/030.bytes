@@ -1,0 +1,10 @@
+pos:	0
+flags:	02000000
+mnt_id:	18
+ino:	9225
+inotify wd:6 ino:d99efa9a sdev:2f mask:4000fc6 ignored_mask:0 fhandle-bytes:14 fhandle-type:4d f_handle:9afa9ed9000000000500000000000000ebfc1400
+inotify wd:5 ino:d99eee93 sdev:2f mask:4000fc6 ignored_mask:0 fhandle-bytes:14 fhandle-type:4d f_handle:93ee9ed9000000000500000000000000e8fc1400
+inotify wd:4 ino:d99eeac2 sdev:2f mask:4000fc6 ignored_mask:0 fhandle-bytes:14 fhandle-type:4d f_handle:c2ea9ed9000000000500000000000000e8fc1400
+inotify wd:3 ino:d99eeabb sdev:2f mask:4000fc6 ignored_mask:0 fhandle-bytes:14 fhandle-type:4d f_handle:bbea9ed9000000000500000000000000e8fc1400
+inotify wd:2 ino:d99ee9b8 sdev:2f mask:4000fc6 ignored_mask:0 fhandle-bytes:14 fhandle-type:4d f_handle:b8e99ed9000000000500000000000000e8fc1400
+inotify wd:1 ino:d99ee9b7 sdev:2f mask:4000fc6 ignored_mask:0 fhandle-bytes:14 fhandle-type:4d f_handle:b7e99ed9000000000500000000000000e8fc1400

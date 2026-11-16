@@ -1,0 +1,32 @@
+pos:	0
+flags:	02004000
+mnt_id:	18
+ino:	9225
+inotify wd:1c ino:100 sdev:20 mask:fc6 ignored_mask:0 fhandle-bytes:14 fhandle-type:4d f_handle:0001000000000000050000000000000003000000
+inotify wd:1b ino:48d0e sdev:3a mask:fc6 ignored_mask:0 fhandle-bytes:c fhandle-type:81 f_handle:0e8d04000000000000000000
+inotify wd:1a ino:116 sdev:2f mask:fc6 ignored_mask:0 fhandle-bytes:14 fhandle-type:4d f_handle:1601000000000000050000000000000000ac0200
+inotify wd:19 ino:362 sdev:2f mask:fc6 ignored_mask:0 fhandle-bytes:14 fhandle-type:4d f_handle:6203000000000000050000000000000000ac0200
+inotify wd:18 ino:f7ff7 sdev:2f mask:fc6 ignored_mask:0 fhandle-bytes:14 fhandle-type:4d f_handle:f77f0f000000000005000000000000002aac0200
+inotify wd:17 ino:f8e00 sdev:2f mask:fc6 ignored_mask:0 fhandle-bytes:14 fhandle-type:4d f_handle:008e0f000000000005000000000000002aac0200
+inotify wd:16 ino:1e192f1c sdev:2f mask:fc6 ignored_mask:0 fhandle-bytes:14 fhandle-type:4d f_handle:1c2f191e000000000500000000000000454c0f00
+inotify wd:15 ino:100 sdev:1fc mask:fc6 ignored_mask:0 fhandle-bytes:14 fhandle-type:4d f_handle:00010000000000002002000000000000ec5b0000
+inotify wd:14 ino:10b91 sdev:1fc mask:fc6 ignored_mask:0 fhandle-bytes:14 fhandle-type:4d f_handle:910b0100000000002002000000000000155c0000
+inotify wd:13 ino:f4d26 sdev:1fc mask:fc6 ignored_mask:0 fhandle-bytes:14 fhandle-type:4d f_handle:264d0f000000000020020000000000008a6a0000
+inotify wd:12 ino:f4da8 sdev:1fc mask:fc6 ignored_mask:0 fhandle-bytes:14 fhandle-type:4d f_handle:a84d0f00000000002002000000000000986a0000
+inotify wd:11 ino:f4dcf sdev:1fc mask:fc6 ignored_mask:0 fhandle-bytes:14 fhandle-type:4d f_handle:cf4d0f00000000002002000000000000986a0000
+inotify wd:10 ino:f4d8f sdev:1fc mask:fc6 ignored_mask:0 fhandle-bytes:14 fhandle-type:4d f_handle:8f4d0f00000000002002000000000000986a0000
+inotify wd:f ino:f4dc8 sdev:1fc mask:fc6 ignored_mask:0 fhandle-bytes:14 fhandle-type:4d f_handle:c84d0f00000000002002000000000000986a0000
+inotify wd:e ino:f4d80 sdev:1fc mask:fc6 ignored_mask:0 fhandle-bytes:14 fhandle-type:4d f_handle:804d0f00000000002002000000000000986a0000
+inotify wd:d ino:f4daf sdev:1fc mask:fc6 ignored_mask:0 fhandle-bytes:14 fhandle-type:4d f_handle:af4d0f00000000002002000000000000986a0000
+inotify wd:c ino:f4d98 sdev:1fc mask:fc6 ignored_mask:0 fhandle-bytes:14 fhandle-type:4d f_handle:984d0f00000000002002000000000000986a0000
+inotify wd:b ino:f4da3 sdev:1fc mask:fc6 ignored_mask:0 fhandle-bytes:14 fhandle-type:4d f_handle:a34d0f00000000002002000000000000986a0000
+inotify wd:a ino:f4d9a sdev:1fc mask:fc6 ignored_mask:0 fhandle-bytes:14 fhandle-type:4d f_handle:9a4d0f00000000002002000000000000986a0000
+inotify wd:9 ino:f4d89 sdev:1fc mask:fc6 ignored_mask:0 fhandle-bytes:14 fhandle-type:4d f_handle:894d0f00000000002002000000000000986a0000
+inotify wd:8 ino:f4d87 sdev:1fc mask:fc6 ignored_mask:0 fhandle-bytes:14 fhandle-type:4d f_handle:874d0f00000000002002000000000000986a0000
+inotify wd:7 ino:f4d93 sdev:1fc mask:fc6 ignored_mask:0 fhandle-bytes:14 fhandle-type:4d f_handle:934d0f00000000002002000000000000986a0000
+inotify wd:6 ino:f4dcb sdev:1fc mask:fc6 ignored_mask:0 fhandle-bytes:14 fhandle-type:4d f_handle:cb4d0f00000000002002000000000000986a0000
+inotify wd:5 ino:f4db8 sdev:1fc mask:fc6 ignored_mask:0 fhandle-bytes:14 fhandle-type:4d f_handle:b84d0f00000000002002000000000000986a0000
+inotify wd:4 ino:f4dc6 sdev:1fc mask:fc6 ignored_mask:0 fhandle-bytes:14 fhandle-type:4d f_handle:c64d0f00000000002002000000000000986a0000
+inotify wd:3 ino:f4db7 sdev:1fc mask:fc6 ignored_mask:0 fhandle-bytes:14 fhandle-type:4d f_handle:b74d0f00000000002002000000000000986a0000
+inotify wd:2 ino:f4d82 sdev:1fc mask:fc6 ignored_mask:0 fhandle-bytes:14 fhandle-type:4d f_handle:824d0f00000000002002000000000000986a0000
+inotify wd:1 ino:f4d28 sdev:1fc mask:fc6 ignored_mask:0 fhandle-bytes:14 fhandle-type:4d f_handle:284d0f000000000020020000000000008a6a0000
