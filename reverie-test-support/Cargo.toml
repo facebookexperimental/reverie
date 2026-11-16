@@ -77,56 +77,59 @@ path = "../tests/stack.rs"
 name = "suppression"
 path = "../tests/suppression.rs"
 
+# Guest names use '_', never '-': tests/BUCK sets each CARGO_BIN_EXE_<name>
+# in the test's run-time environment too, and remote execution refuses
+# environment variable names that contain '-'.
 [[bin]]
-name = "stat-rust-command-guest"
+name = "stat_rust_command_guest"
 path = "../tests/fixtures/stat-rust-command.rs"
 test = false
 bench = false
 
 [[bin]]
-name = "exit-rust-command-guest"
+name = "exit_rust_command_guest"
 path = "../tests/fixtures/exit-rust-command.rs"
 test = false
 bench = false
 
 [[bin]]
-name = "basics-rust-command-guest"
+name = "basics_rust_command_guest"
 path = "../tests/fixtures/basics-rust-command.rs"
 test = false
 bench = false
 
 [[bin]]
-name = "vdso-rust-command-guest"
+name = "vdso_rust_command_guest"
 path = "../tests/fixtures/vdso-rust-command.rs"
 test = false
 bench = false
 
 [[bin]]
-name = "inject-then-tail-rust-command-guest"
+name = "inject_then_tail_rust_command_guest"
 path = "../tests/fixtures/inject-then-tail-rust-command.rs"
 test = false
 bench = false
 
 [[bin]]
-name = "at-random-rust-command-guest"
+name = "at_random_rust_command_guest"
 path = "../tests/fixtures/at-random-rust-command.rs"
 test = false
 bench = false
 
 [[bin]]
-name = "thread-start-rust-command-guest"
+name = "thread_start_rust_command_guest"
 path = "../tests/fixtures/thread-start-rust-command.rs"
 test = false
 bench = false
 
 [[bin]]
-name = "stack-rust-command-guest"
+name = "stack_rust_command_guest"
 path = "../tests/fixtures/stack-rust-command.rs"
 test = false
 bench = false
 
 [[bin]]
-name = "suppression-rust-command-guest"
+name = "suppression_rust_command_guest"
 path = "../tests/fixtures/suppression-rust-command.rs"
 test = false
 bench = false

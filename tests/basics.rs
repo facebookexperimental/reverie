@@ -136,7 +136,7 @@ fn record_rust_command(
 
 #[cfg(not(sanitized))]
 fn rust_command_test() {
-    let program = reverie_test_support::guest_binary!("basics-rust-command-guest");
+    let program = reverie_test_support::guest_binary!("basics_rust_command_guest");
     eprintln!("basics Rust command image={program}");
     let output = std::process::Command::new(program).output().unwrap();
     eprintln!(
@@ -224,7 +224,7 @@ fn rust_output_command_test(mode: &str) {
         "print" => "write",
         _ => panic!("unknown Rust output mode: {mode}"),
     };
-    let program = reverie_test_support::guest_binary!("basics-rust-command-guest");
+    let program = reverie_test_support::guest_binary!("basics_rust_command_guest");
     eprintln!("basics Rust output mode={mode} image={program}");
 
     let output = std::process::Command::new(program)

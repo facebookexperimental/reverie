@@ -52,7 +52,7 @@ fn assert_rust_command_output(label: &str, output: &reverie::process::Output) {
 }
 
 fn rust_command_test() {
-    let program = reverie_test_support::guest_binary!("at-random-rust-command-guest");
+    let program = reverie_test_support::guest_binary!("at_random_rust_command_guest");
     eprintln!("at-random Rust guest: image={program}");
     let (output, ()): (_, ()) =
         reverie_test_support::test_cmd_with_config::<TestTool>(program, &[], ()).unwrap();

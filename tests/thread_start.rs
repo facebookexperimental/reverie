@@ -58,7 +58,7 @@ fn assert_command_output(
 }
 
 fn rust_command_test() {
-    let program = reverie_test_support::guest_binary!("thread-start-rust-command-guest");
+    let program = reverie_test_support::guest_binary!("thread_start_rust_command_guest");
     eprintln!("thread-start Rust command image={program}");
 
     let native = std::process::Command::new(program).output().unwrap();
@@ -79,7 +79,7 @@ fn rust_command_test() {
 fn rust_thread_start_tail_command() {
     use thread_start_tail_tool::TestTool;
 
-    let program = reverie_test_support::guest_binary!("thread-start-rust-command-guest");
+    let program = reverie_test_support::guest_binary!("thread_start_rust_command_guest");
     eprintln!("thread-start tail Rust command image={program}");
     let (output, ()) =
         reverie_test_support::test_cmd_with_config::<TestTool>(program, &[], ()).unwrap();

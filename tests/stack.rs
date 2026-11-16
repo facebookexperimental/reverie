@@ -275,7 +275,7 @@ mod tests {
     }
 
     fn rust_command_test() {
-        let program = reverie_test_support::guest_binary!("stack-rust-command-guest");
+        let program = reverie_test_support::guest_binary!("stack_rust_command_guest");
         eprintln!("stack good Rust command image={program}");
 
         let native = std::process::Command::new(program).output().unwrap();
