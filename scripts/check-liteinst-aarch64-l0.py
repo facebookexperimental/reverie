@@ -76,6 +76,7 @@ patch_alloc::tests::other_allocations_go_to_the_system_allocator
 patch_alloc::tests::patch_heap_is_largest_page_aligned_and_anonymous
 patch_alloc::tests::private_allocations_keep_their_owner_across_scope_changes
 patch_alloc::tests::private_exhaustion_has_no_system_fallback
+runtime::tests::aarch64_patching_host_refuses_legacy_stack_with_site_patching_on
 runtime::tests::alt_stack_defaults_to_the_shared_default_when_unset
 runtime::tests::alt_stack_env_is_distinct_from_the_other_selectors
 runtime::tests::alt_stack_parses_truthy_and_falsy_spellings
@@ -95,6 +96,7 @@ tests::aarch64_c_entry_refuses_selected_tool_as_subprocess
 tests::aarch64_install_surfaces_refuse_by_name
 tests::alt_stack_setter_round_trips_through_the_parser
 tests::generated_preload_leaves_precede_a_stale_canonical_artifact
+tests::no_manifest_enables_the_aarch64_test_selector
 tests::trap_only_build_defaults_off_and_refuses_explicit_patching
 """.split()
 )

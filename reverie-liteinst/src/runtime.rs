@@ -242,7 +242,6 @@ pub(crate) use reverie_inguest::guest::support::read_own_bytes;
 pub(crate) use reverie_inguest::guest::support::scan_own_maps;
 #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 pub(crate) use reverie_inguest::guest::support::tool_callback_active;
-#[cfg(target_arch = "x86_64")]
 use reverie_inguest::guest::tool_install::PatchHost;
 #[cfg(target_arch = "x86_64")]
 use reverie_inguest::guest::trap_dispatch::InGuestDispatcher;
@@ -587,8 +586,13 @@ pub fn site_patching_from_env_value(value: Option<&OsStr>) -> io::Result<bool> {
 /// selector) reports.
 /// Checks every selector, including an authenticated launcher's bootstrap.
 /// A trap-only build must never accept a request it cannot implement.
+///
+/// On aarch64 an explicit request is refused by name unless the build has the
+/// test-only `aarch64-trap-and-patch-test` feature, which exists so the aarch64
+/// lazy promoter's tests can select TrapAndPatch. That feature does not change
+/// the default, which stays off on aarch64 (`site_patching_from_env_value`).
 pub(crate) fn validate_site_patching(enabled: bool) -> io::Result<bool> {
-    if enabled && !cfg!(all(feature = "liteinst", target_arch = "x86_64")) {
+    if enabled && !site_patching_requestable() {
         // On aarch64 the feature may be enabled; site patching itself is
         // what does not exist there yet. Name the architecture, not the
         // feature, so the refusal cannot be mistaken for a build mistake.
@@ -604,6 +608,15 @@ pub(crate) fn validate_site_patching(enabled: bool) -> io::Result<bool> {
         ));
     }
     Ok(enabled)
+}
+
+/// Whether this build accepts an explicit site-patching request: an x86-64
+/// LiteInst build, or an aarch64 build with the test-only
+/// `aarch64-trap-and-patch-test` feature. No production configuration enables
+/// that feature (`no_manifest_enables_the_aarch64_test_selector` in lib.rs).
+const fn site_patching_requestable() -> bool {
+    cfg!(all(feature = "liteinst", target_arch = "x86_64"))
+        || cfg!(all(feature = "aarch64-trap-and-patch-test", target_arch = "aarch64"))
 }
 
 pub fn site_patching_enabled() -> bool {
@@ -924,7 +937,6 @@ struct EnvSelectors {
 }
 
 impl LiteinstPatchHost {
-    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     pub(crate) fn new(publication: PatchPublication) -> Self {
         Self {
             publication,
@@ -944,8 +956,10 @@ impl LiteinstPatchHost {
 // comment). The steps below are the code LiteInst's own installer runs at the
 // same points; the only handler they install, the SIGTRAP guard router (with
 // site patching on only), uses the runtime's raw signal operations and private
-// restorer.
-#[cfg(target_arch = "x86_64")]
+// restorer. On aarch64 it serves by trap only: site patching defaults off
+// there and `validate_site_patching` refuses an explicit request by name, so
+// nothing is published. (The test-only `aarch64-trap-and-patch-test` feature
+// is the one exception to that refusal; no production manifest enables it.)
 unsafe impl PatchHost for LiteinstPatchHost {
     type Runtime = crate::tool_host::LiteinstRuntime;
 
@@ -992,6 +1006,24 @@ unsafe impl PatchHost for LiteinstPatchHost {
 
     fn initialize_continuation(&self) -> io::Result<()> {
         crate::syscall_fallback::initialize()
+    }
+
+    fn stack_backing(&self) -> io::Result<reverie_inguest::guest::tool_region::StackBacking> {
+        use reverie_inguest::guest::tool_region::BackingDecision;
+        use reverie_inguest::guest::tool_region::BackingHost;
+        let decision = reverie_inguest::guest::tool_region::native_continuation_backing(
+            BackingHost::Patching,
+        )?;
+        // The legacy stack is admitted for this patching host only while
+        // site patching is off: patch sites need the Tool region's arenas.
+        // `select` has stored the captured setting before this step.
+        if decision == BackingDecision::Legacy && SITE_PATCHING_ENABLED.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "site patching needs the Tool region, which this host cannot reserve",
+            ));
+        }
+        decision.stack_backing()
     }
 
     fn prepare_entries(&self) -> io::Result<()> {
@@ -4841,6 +4873,34 @@ mod tests {
                 }
             }
         }
+    }
+
+    // The guard on this patching host's legacy stack: on aarch64 it takes
+    // the legacy stack only while site patching is off. L1.2 must remove or
+    // replace this guard explicitly when it turns site patching on there.
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn aarch64_patching_host_refuses_legacy_stack_with_site_patching_on() {
+        use reverie_inguest::guest::tool_install::PatchHost;
+        use reverie_inguest::guest::tool_region::StackBacking;
+        let previous = super::SITE_PATCHING_ENABLED.load(Ordering::Acquire);
+        let host = super::LiteinstPatchHost::new(super::PatchPublication::Concurrent);
+        super::SITE_PATCHING_ENABLED.store(true, Ordering::Release);
+        let refused = host.stack_backing();
+        super::SITE_PATCHING_ENABLED.store(false, Ordering::Release);
+        let admitted = host.stack_backing();
+        super::SITE_PATCHING_ENABLED.store(previous, Ordering::Release);
+        let error = refused
+            .err()
+            .expect("the legacy stack with site patching on must refuse");
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        assert!(
+            error
+                .to_string()
+                .contains("site patching needs the Tool region"),
+            "{error}"
+        );
+        assert!(matches!(admitted.unwrap(), StackBacking::Legacy));
     }
 
     #[test]

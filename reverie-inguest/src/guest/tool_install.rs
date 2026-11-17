@@ -49,8 +49,11 @@ use crate::guest::runtime_seam::install_instruction_handler;
 use crate::guest::runtime_seam::observe_registered_mapping;
 use crate::guest::runtime_seam::process_tool_syscall_callback;
 use crate::guest::runtime_seam::registered_patcher;
+use crate::guest::tool_region::BackingDecision;
+use crate::guest::tool_region::BackingHost;
 use crate::guest::tool_region::StackBacking;
 use crate::guest::tool_region::ToolRegion;
+use crate::guest::tool_region::native_continuation_backing;
 use crate::guest::trap_dispatch::InGuestDispatcher;
 use crate::lifecycle::InProcessSeccomp;
 use crate::lifecycle::RuntimeConfig;
@@ -468,6 +471,16 @@ fn activate_runtime(
     // SAFETY: as above; the seam's site questions go to the same patcher.
     let dispatcher =
         Box::new(unsafe { InGuestDispatcher::new(RuntimeSeam::new(patcher.0, stats)) });
+    // Tripwire: the installed-callback pool's stacks are Tool-region leases
+    // whose guards are sized for the 4096-byte layout page. Nothing may
+    // publish it on aarch64 before that layout is page-size-generic.
+    #[cfg(target_arch = "aarch64")]
+    if crate::guest::installed_stack::published() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "installed-callback pool published on aarch64 before a page-size-generic layout",
+        ));
+    }
     // SAFETY: once, before application threads start.
     unsafe { crate::install(dispatcher, &controller, &config)? };
     crate::guest::instruction::enable_instruction_faulting(instructions)?;
@@ -621,12 +634,13 @@ unsafe impl PatchHost for TrapHost {
     fn initialize_continuation(&self) -> io::Result<()> {
         // The shared continuation stacks on the ToolRegion, whose
         // version-one layout is expressed in 4096-byte pages and
-        // refuses other page sizes by name. TrapHost has no patcher
-        // and no ToolRegion arenas, so on those hosts its
-        // continuation runs on the legacy anonymous stack instead;
-        // the patching backends keep the refusal until the layout
-        // itself is page-size-generic.
-        if NativeIsa::page_size()? == crate::guest::tool_region::LAYOUT_PAGE as u64 {
+        // refuses other page sizes by name, and whose fixed-arena entry
+        // exists on x86-64 only. TrapHost has no patcher and no
+        // ToolRegion arenas, so wherever the region is unusable its
+        // continuation runs on the legacy anonymous stack instead; the
+        // patching backends keep the refusal until the layout itself is
+        // page-size-generic (see `continuation_backing`).
+        if native_continuation_backing(BackingHost::Trap)? != BackingDecision::Legacy {
             return initialize_shared_continuation();
         }
         // SAFETY: the shared handlers below are this module's own
@@ -646,11 +660,7 @@ unsafe impl PatchHost for TrapHost {
     }
 
     fn stack_backing(&self) -> io::Result<StackBacking> {
-        if NativeIsa::page_size()? == crate::guest::tool_region::LAYOUT_PAGE as u64 {
-            Ok(StackBacking::ToolRegion(ToolRegion::reserve()?))
-        } else {
-            Ok(StackBacking::Legacy)
-        }
+        native_continuation_backing(BackingHost::Trap)?.stack_backing()
     }
 
     fn stage_stream(&self) -> io::Result<bool> {
@@ -736,5 +746,29 @@ impl HostRuntime for TrapRuntime {
 
     fn exec_watch_armed(&self) -> bool {
         self.exec_watch
+    }
+}
+
+// aarch64 only: elsewhere this module would hold no test.
+#[cfg(all(test, target_arch = "aarch64"))]
+mod trap_host_backing_tests {
+    use super::*;
+
+    // Red twin: on aarch64 TrapHost takes the legacy stack at any page size
+    // and never reserves the Tool region, whose fixed-arena entry does not
+    // exist there. It discriminates at 4 KiB pages, where the Tool-region
+    // path failed with EOPNOTSUPP; at 64 KiB TrapHost already took the
+    // legacy stack.
+    #[test]
+    fn trap_host_stack_backing_on_aarch64_avoids_tool_region() {
+        assert_eq!(
+            native_continuation_backing(BackingHost::Trap).unwrap(),
+            BackingDecision::Legacy
+        );
+        let host = TrapHost::new(TrapOptions::default());
+        assert!(matches!(
+            host.stack_backing().unwrap(),
+            StackBacking::Legacy
+        ));
     }
 }

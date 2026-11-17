@@ -21,7 +21,13 @@ static REGISTRATION: OnceLock<Result<(), io::ErrorKind>> = OnceLock::new();
 /// (once per process) and prepares this thread's continuation.
 #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 pub(crate) fn initialize() -> io::Result<()> {
-    let region = reverie_inguest::guest::tool_region::ToolRegion::reserve()?;
+    // The Tool region on x86-64 at its layout page (the named page-size
+    // refusal elsewhere on x86-64); the legacy stack on aarch64, where this
+    // host serves by trap only (`continuation_backing`).
+    let backing = reverie_inguest::guest::tool_region::native_continuation_backing(
+        reverie_inguest::guest::tool_region::BackingHost::Patching,
+    )?
+    .stack_backing()?;
     // SAFETY: this one cache always denotes these same dispatch functions.
     // They synchronously use the continuation's genuine saved register block
     // and interrupted PKRU, preserving the shared entry's safety contract.
@@ -32,7 +38,7 @@ pub(crate) fn initialize() -> io::Result<()> {
                 syscall: dispatch_syscall,
                 instruction: dispatch_instruction,
             },
-            reverie_inguest::guest::tool_region::StackBacking::ToolRegion(region),
+            backing,
         )
     }
 }

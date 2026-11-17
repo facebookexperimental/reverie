@@ -216,6 +216,92 @@ pub enum StackBacking {
     ToolRegion(&'static ToolRegion),
 }
 
+/// The kind of installation host asking for a continuation stack.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackingHost {
+    /// A host with no patcher and no Tool-region arenas (the trap backend).
+    Trap,
+    /// A host whose patcher may publish sites and use Tool-region arenas.
+    Patching,
+}
+
+/// The architecture a backing decision is made for. It is a parameter so that
+/// [`continuation_backing`]'s whole table is checked on every target.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackingArch {
+    /// x86-64.
+    X86_64,
+    /// AArch64.
+    Aarch64,
+}
+
+impl BackingArch {
+    /// The architecture this image was built for.
+    #[cfg(target_arch = "x86_64")]
+    pub const NATIVE: Self = Self::X86_64;
+    /// The architecture this image was built for.
+    #[cfg(target_arch = "aarch64")]
+    pub const NATIVE: Self = Self::Aarch64;
+}
+
+/// Where an installation's continuation stack lives.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackingDecision {
+    /// Reserve the fixed Tool region and lease the stack from it.
+    ToolRegion,
+    /// The legacy anonymous stack, whose guards follow the runtime page size.
+    Legacy,
+    /// [`ToolRegion::reserve`]'s named page-size refusal applies.
+    RefusePageSize,
+}
+
+impl BackingDecision {
+    /// The stack backing this decision admits. [`Self::RefusePageSize`]
+    /// returns [`ToolRegion::reserve`]'s named refusal unchanged.
+    pub fn stack_backing(self) -> io::Result<StackBacking> {
+        match self {
+            Self::ToolRegion | Self::RefusePageSize => {
+                Ok(StackBacking::ToolRegion(ToolRegion::reserve()?))
+            }
+            Self::Legacy => Ok(StackBacking::Legacy),
+        }
+    }
+}
+
+/// Decide a continuation stack's backing, admitting only what is proven:
+///
+/// - x86-64 at the layout page: the Tool region, for every host;
+/// - x86-64 at another page: the legacy stack for a trap host, which has no
+///   patcher or arenas; the named page-size refusal for a patching host,
+///   whose arenas need the layout page;
+/// - aarch64 at any page: the legacy stack. Its fixed-arena initialization
+///   entry does not exist yet, so a reservation fails at every page size. A
+///   patching host may take this only while its site patching is off; the
+///   host enforces that.
+pub const fn continuation_backing(
+    arch: BackingArch,
+    page: u64,
+    host: BackingHost,
+) -> BackingDecision {
+    match arch {
+        BackingArch::X86_64 if page == LAYOUT_PAGE as u64 => BackingDecision::ToolRegion,
+        BackingArch::X86_64 => match host {
+            BackingHost::Trap => BackingDecision::Legacy,
+            BackingHost::Patching => BackingDecision::RefusePageSize,
+        },
+        BackingArch::Aarch64 => BackingDecision::Legacy,
+    }
+}
+
+/// [`continuation_backing`] for this image's architecture and runtime page.
+pub fn native_continuation_backing(host: BackingHost) -> io::Result<BackingDecision> {
+    Ok(continuation_backing(
+        BackingArch::NATIVE,
+        NativeIsa::page_size()?,
+        host,
+    ))
+}
+
 /// One runtime instance's process-lifetime, private fixed reservation.
 #[derive(Debug)]
 pub struct ToolRegion {
@@ -1558,6 +1644,90 @@ mod mapped_image_validation_tests {
             assert!(!unsafe { super::mapped_image::pristine(bytes.as_ptr(), bytes.len()) });
             assert_eq!(bytes, before);
             bytes[index] = 0;
+        }
+    }
+}
+
+// Runs on every target: the decision is a pure function of its arguments.
+#[cfg(test)]
+mod continuation_backing_tests {
+    use super::BackingArch;
+    use super::BackingDecision;
+    use super::BackingHost;
+    use super::LAYOUT_PAGE;
+    use super::continuation_backing;
+
+    const LAYOUT: u64 = LAYOUT_PAGE as u64;
+
+    #[test]
+    fn decision_table_admits_only_the_proven_cases() {
+        let rows = [
+            // A trap host has no patcher or arenas.
+            (
+                BackingArch::X86_64,
+                LAYOUT,
+                BackingHost::Trap,
+                BackingDecision::ToolRegion,
+            ),
+            (
+                BackingArch::X86_64,
+                65536,
+                BackingHost::Trap,
+                BackingDecision::Legacy,
+            ),
+            (
+                BackingArch::Aarch64,
+                LAYOUT,
+                BackingHost::Trap,
+                BackingDecision::Legacy,
+            ),
+            (
+                BackingArch::Aarch64,
+                65536,
+                BackingHost::Trap,
+                BackingDecision::Legacy,
+            ),
+            // A patching host keeps the Tool region where the layout fits...
+            (
+                BackingArch::X86_64,
+                LAYOUT,
+                BackingHost::Patching,
+                BackingDecision::ToolRegion,
+            ),
+            // ...and an x86-shaped patching host with a non-layout page still
+            // refuses by name, as before.
+            (
+                BackingArch::X86_64,
+                65536,
+                BackingHost::Patching,
+                BackingDecision::RefusePageSize,
+            ),
+            (
+                BackingArch::X86_64,
+                16384,
+                BackingHost::Patching,
+                BackingDecision::RefusePageSize,
+            ),
+            // On aarch64 the legacy stack, at both page sizes.
+            (
+                BackingArch::Aarch64,
+                LAYOUT,
+                BackingHost::Patching,
+                BackingDecision::Legacy,
+            ),
+            (
+                BackingArch::Aarch64,
+                65536,
+                BackingHost::Patching,
+                BackingDecision::Legacy,
+            ),
+        ];
+        for (arch, page, host, expected) in rows {
+            assert_eq!(
+                continuation_backing(arch, page, host),
+                expected,
+                "{arch:?} page {page} {host:?}"
+            );
         }
     }
 }

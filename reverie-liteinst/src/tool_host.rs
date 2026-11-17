@@ -246,12 +246,10 @@ pub unsafe fn install_tool_from_bootstrap<T>(coordinator: impl AsRef<Path>) -> i
 where
     T: Tool + 'static,
 {
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        let _ = &coordinator;
-        Err(aarch64_unsupported("install_tool_from_bootstrap"))
-    }
-    #[cfg(target_arch = "x86_64")]
+    // On aarch64 this serves by trap only: site patching defaults off there
+    // and an explicit request is refused by name
+    // (`runtime::validate_site_patching`), so the patcher publishes no site
+    // and the continuation runs on the legacy stack.
     unsafe {
         reverie_inguest::guest::tool_install::install_tool_with::<T, _>(
             coordinator.as_ref(),
@@ -285,17 +283,9 @@ where
     T: Tool + 'static,
     R: HostRuntime,
 {
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        let _ = &coordinator;
-        let _ = &project;
-        Err(aarch64_unsupported(
-            "install_tool_from_bootstrap_with_runtime",
-        ))
-    }
     // SAFETY: the caller retains the original installation and service
-    // projection obligations. No private image owner is created here.
-    #[cfg(target_arch = "x86_64")]
+    // projection obligations. No private image owner is created here. On
+    // aarch64 this serves by trap only, as in `install_tool_from_bootstrap`.
     unsafe {
         reverie_inguest::guest::tool_install::install_tool_with_runtime::<T, _, R, _>(
             coordinator.as_ref(),

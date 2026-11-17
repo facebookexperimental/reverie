@@ -1195,6 +1195,78 @@ mod tests {
         assert!(commit_context(&mut owner, 3).is_err());
     }
 
+    // Red twin for the legacy continuation stack, the only backing aarch64
+    // takes while it reserves no Tool region: a one-runtime-page no-access
+    // guard sits below the usable range at any page size, so a one-byte
+    // overrun past the low end faults. The control makes that guard writable
+    // and the same store then completes, so the fault is the guard's and not
+    // some unrelated address's. Each store runs in a re-executed child.
+    #[test]
+    fn legacy_stack_overrun_past_low_end_faults_at_guard() {
+        use std::os::unix::process::ExitStatusExt;
+        const CHILD: &str = "REVERIE_CONTINUATION_LEGACY_OVERRUN_CHILD";
+        const NAME: &str =
+            "guest::continuation::tests::legacy_stack_overrun_past_low_end_faults_at_guard";
+        const STORE: &str = "legacy-overrun-store";
+        if let Some(mode) = std::env::var_os(CHILD) {
+            let page = usize::try_from(crate::guest::support::page_size().unwrap()).unwrap();
+            let stack = CallbackStack::new(StackBacking::Legacy).unwrap();
+            let low = stack.top - CALLBACK_STACK_BYTES;
+            assert_eq!(stack.bytes, CALLBACK_STACK_BYTES + 2 * page);
+            assert_eq!(low, stack.mapping as usize + page);
+            // SAFETY: the lowest usable byte of this live stack mapping.
+            unsafe { (low as *mut u8).write_volatile(0x5a) };
+            if mode == "control" {
+                // SAFETY: the low guard page of this stack's own mapping.
+                assert_eq!(
+                    unsafe {
+                        libc::mprotect(stack.mapping, page, libc::PROT_READ | libc::PROT_WRITE)
+                    },
+                    0
+                );
+            } else {
+                assert_eq!(mode, "guard");
+                // The expected fault must leave no core file behind.
+                // SAFETY: changes only this child's own dumpable flag.
+                assert_eq!(unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) }, 0);
+            }
+            eprintln!("{STORE} {mode:?}");
+            // SAFETY: one byte below the usable range, inside this stack's own
+            // mapping; the parent asserts the outcome of exactly this store.
+            unsafe { ((low - 1) as *mut u8).write_volatile(0xa5) };
+            eprintln!("{STORE} completed");
+            return;
+        }
+        let run = |mode: &str| {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env(CHILD, mode)
+                .output()
+                .unwrap()
+        };
+        let guarded = run("guard");
+        let stderr = String::from_utf8_lossy(&guarded.stderr);
+        assert!(
+            stderr.contains("legacy-overrun-store \"guard\""),
+            "{guarded:?}"
+        );
+        assert!(
+            !stderr.contains("legacy-overrun-store completed"),
+            "{guarded:?}"
+        );
+        assert_eq!(guarded.status.signal(), Some(libc::SIGSEGV), "{guarded:?}");
+        let control = run("control");
+        assert!(control.status.success(), "{control:?}");
+        assert!(
+            String::from_utf8_lossy(&control.stderr).contains("legacy-overrun-store completed"),
+            "{control:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&control.stdout).contains("1 passed"),
+            "{control:?}"
+        );
+    }
+
     #[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
     #[test]
     fn mapped_callback_scope_requires_exact_live_owner_generation_and_host() {

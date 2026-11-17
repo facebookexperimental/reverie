@@ -681,7 +681,14 @@ mod tests {
             );
         }
     }
-    #[cfg(not(all(feature = "liteinst", target_arch = "x86_64")))]
+    // The production configuration of every build that cannot patch. On
+    // aarch64 this is the red twin of the test-only selector below: without
+    // `aarch64-trap-and-patch-test`, an explicit request is still refused by
+    // name.
+    #[cfg(not(any(
+        all(feature = "liteinst", target_arch = "x86_64"),
+        all(feature = "aarch64-trap-and-patch-test", target_arch = "aarch64"),
+    )))]
     #[test]
     fn trap_only_build_defaults_off_and_refuses_explicit_patching() {
         assert!(!site_patching_from_env_value(None).unwrap());
@@ -706,9 +713,125 @@ mod tests {
         }
     }
 
-    // L0 refusal surface (Decision F(2)): every aarch64 install/selector
-    // entry refuses by name before touching process-global state. Runs
-    // under qemu-aarch64 (G6) and on metal; never compiled on x86-64.
+    // The test-only TrapAndPatch selector (aarch64 lazy-promoter tests): an
+    // explicit request is accepted, from the environment and from a
+    // launcher's bootstrap value alike, while the default stays off and
+    // invalid values are still rejected.
+    #[cfg(all(feature = "aarch64-trap-and-patch-test", target_arch = "aarch64"))]
+    #[test]
+    fn aarch64_test_selector_accepts_explicit_patching_and_keeps_default_off() {
+        assert!(!site_patching_from_env_value(None).unwrap());
+        assert!(!site_patching_from_env_value(Some(OsStr::new("0"))).unwrap());
+        let mut command = Command::new("/bin/true");
+        set_guest_site_patching(&mut command, true);
+        let requested = command
+            .get_envs()
+            .find(|(key, _)| *key == OsStr::new(SITE_PATCHING_ENV))
+            .and_then(|(_, value)| value)
+            .unwrap();
+        assert!(site_patching_from_env_value(Some(requested)).unwrap());
+        assert!(crate::runtime::validate_site_patching(true).unwrap());
+        assert!(!crate::runtime::validate_site_patching(false).unwrap());
+        for rejected in ["", " 0", "0 ", "off", "false", "2", "yes"] {
+            let error = site_patching_from_env_value(Some(OsStr::new(rejected)))
+                .expect_err("invalid selectors must still be rejected");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        }
+    }
+
+    // The test-only selector must never reach a production build: only
+    // reverie-liteinst's own manifest names the feature, once, as its own
+    // definition, and its default list does not include it. The scan must find
+    // that definition and every workspace member's manifest, so it cannot pass
+    // by reading nothing or part of the tree. The crate directory is the
+    // run-time CARGO_MANIFEST_DIR: Cargo sets it when it runs a test, and the
+    // Buck test target points it into the workspace's staged manifests.
+    #[test]
+    fn no_manifest_enables_the_aarch64_test_selector() {
+        const FEATURE: &str = "aarch64-trap-and-patch-test";
+        let crate_dir = std::path::PathBuf::from(
+            std::env::var_os("CARGO_MANIFEST_DIR")
+                .expect("CARGO_MANIFEST_DIR names reverie-liteinst's directory at run time"),
+        );
+        let workspace = crate_dir.parent().expect("crate directory has a parent");
+        // Every Cargo.toml under the workspace root, at most 8 directories
+        // deep; never in target/ or a hidden directory.
+        fn collect(dir: &std::path::Path, depth: usize, manifests: &mut Vec<std::path::PathBuf>) {
+            let manifest = dir.join("Cargo.toml");
+            if manifest.is_file() {
+                manifests.push(manifest);
+            }
+            if depth == 0 {
+                return;
+            }
+            for entry in std::fs::read_dir(dir).expect("read a workspace directory") {
+                let path = entry.expect("read a workspace entry").path();
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if path.is_dir() && name != "target" && !name.starts_with('.') {
+                    collect(&path, depth - 1, manifests);
+                }
+            }
+        }
+        let mut manifests = Vec::new();
+        collect(workspace, 8, &mut manifests);
+        assert!(
+            manifests.len() >= 10,
+            "scanned only {} manifests under {}",
+            manifests.len(),
+            workspace.display()
+        );
+        // Each member the workspace manifest lists, one per line between
+        // `members = [` and `]`, had its manifest read.
+        let root = std::fs::read_to_string(workspace.join("Cargo.toml"))
+            .expect("read the workspace manifest");
+        let members: Vec<&str> = root
+            .lines()
+            .skip_while(|line| line.trim() != "members = [")
+            .skip(1)
+            .take_while(|line| line.trim() != "]")
+            .map(|line| line.trim().trim_end_matches(',').trim_matches('"'))
+            .collect();
+        assert!(
+            members.contains(&"reverie-liteinst"),
+            "the workspace manifest's members list was not read: {members:?}"
+        );
+        for member in &members {
+            assert!(
+                manifests.contains(&workspace.join(member).join("Cargo.toml")),
+                "the scan did not read workspace member {member}'s manifest under {}",
+                workspace.display()
+            );
+        }
+        let own = crate_dir.join("Cargo.toml");
+        let mut definitions = 0;
+        for manifest in &manifests {
+            let text = std::fs::read_to_string(manifest).expect("read a manifest");
+            for line in text.lines() {
+                let code = line.split('#').next().unwrap_or("");
+                if !code.contains(FEATURE) {
+                    continue;
+                }
+                assert_eq!(
+                    manifest, &own,
+                    "{} names the test-only feature: {line}",
+                    manifest.display()
+                );
+                assert_eq!(
+                    code.trim(),
+                    format!("{FEATURE} = []"),
+                    "only the feature's own definition may name it: {line}"
+                );
+                definitions += 1;
+            }
+        }
+        assert_eq!(definitions, 1, "the feature's definition was not found");
+    }
+
+    // L0 refusal surface (Decision F(2)): the aarch64 install/selector
+    // entries not yet served refuse by name before touching process-global
+    // state. The two bootstrap installers serve by trap (L1) and are covered
+    // by tests/aarch64_trap_install.rs. Runs under
+    // qemu-aarch64 (G6) and on metal; never compiled on x86-64.
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn aarch64_install_surfaces_refuse_by_name() {
@@ -729,25 +852,6 @@ mod tests {
         assert_refusal(
             "install_tool_quiescent",
             unsafe { crate::install_tool_quiescent::<()>("/nonexistent-coordinator") }.unwrap_err(),
-        );
-        assert_refusal(
-            "install_tool_from_bootstrap",
-            unsafe { crate::install_tool_from_bootstrap::<()>("/nonexistent-coordinator") }
-                .unwrap_err(),
-        );
-        assert_refusal(
-            "install_tool_from_bootstrap_with_runtime",
-            unsafe {
-                crate::install_tool_from_bootstrap_with_runtime::<(), _>(
-                    "/nonexistent-coordinator",
-                    |_services| {
-                        crate::tool_host::LiteinstRuntime::new(
-                            crate::stats::GuestStatsHooks::DISABLED,
-                        )
-                    },
-                )
-            }
-            .unwrap_err(),
         );
         // The selector path: selected refuses naming aarch64, unselected is Ok.
         let error =

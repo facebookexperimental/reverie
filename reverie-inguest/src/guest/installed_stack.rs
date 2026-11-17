@@ -87,6 +87,12 @@ const _: () = {
     assert!(STACK_BYTES & 15 == 0);
 };
 
+/// Whether this process has published the callback pool (its locator is set).
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+pub(crate) fn published() -> bool {
+    LOCATOR.load(Ordering::Acquire) != 0
+}
+
 /// Proof that the complete process-lifetime callback pool was published.
 ///
 /// This has no destructor or later initialization work. Copy it through the
