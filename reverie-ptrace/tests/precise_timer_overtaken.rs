@@ -359,14 +359,16 @@ fn timer_signal_set() -> libc::sigset_t {
 // `overtaken_precise_event_is_witnessed`, `TIMEOUT_RCBS - 1` branches leave the
 // guest exactly at the target when it unblocks the signal. Short of the target
 // no overflow is pending and the guest's syscall cancels the event. At or past
-// the target the notification delivers the event at the observed counter.
-// With an instruction offset it cannot count the offset from there, since the
-// guest may have run any number of instructions past the target branch, so it
-// is witnessed as a skid overshoot even exactly at the target. Without an
-// offset, an event found exactly at its target is delivered there unwitnessed
-// and one found past it is witnessed, as before.
+// the target the notification delivers the event at the observed counter and
+// is witnessed as a skid overshoot, with or without an instruction offset and
+// exactly at the target too: the counter counts only conditional branches, so
+// it cannot show how many instructions the guest ran past the target branch,
+// and single steps cannot go back to the delivery point (see
+// `PmuConfig::record_offset_notification_at_or_past_target`). Here the guest
+// has run past it: the notification is handled only on the return of the
+// `rt_sigprocmask` that unblocks the signal.
 #[test_case(TIMEOUT_RCBS / 2, OFFSET_INSTRS, 0, 0; "short of the target with an offset")]
-#[test_case(TIMEOUT_RCBS - 1, 0, 1, 0; "exactly at the target without an offset")]
+#[test_case(TIMEOUT_RCBS - 1, 0, 1, 1; "exactly at the target without an offset")]
 #[test_case(TIMEOUT_RCBS - 1, OFFSET_INSTRS, 1, 1; "exactly at the target with an offset")]
 #[test_case(TIMEOUT_RCBS * 2, OFFSET_INSTRS, 1, 1; "past the target with an offset")]
 #[test_case(TIMEOUT_RCBS * 2, 0, 1, 1; "past the target without an offset")]
