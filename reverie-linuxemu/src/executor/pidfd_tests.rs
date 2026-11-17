@@ -740,7 +740,7 @@ fn a_pidfd_for_another_process_is_refused_in_scm_rights() {
     message.msg_control = PIDFD_TEST_CONTROL as *mut libc::c_void;
     message.msg_controllen = space;
     assert_eq!(
-        write_struct(&mut ProviderMemory(&memory), PIDFD_TEST_MESSAGE, &message),
+        write_struct(&mut ProviderMemory(&memory), PIDFD_TEST_MESSAGE, &GuestMsghdr::from(&message)),
         0
     );
     assert_eq!(
@@ -1881,7 +1881,7 @@ fn pidfd_test_pass_right(executor: &mut ElfExecutor, memory: &GuestMemory, fd: i
     ] {
         memory.write_raw(PIDFD_TEST_CONTROL, &contents).unwrap();
         assert_eq!(
-            write_struct(&mut ProviderMemory(memory), PIDFD_TEST_MESSAGE, &message),
+            write_struct(&mut ProviderMemory(memory), PIDFD_TEST_MESSAGE, &GuestMsghdr::from(&message)),
             0
         );
         assert_eq!(
@@ -2044,7 +2044,7 @@ fn an_epoll_passed_in_scm_rights_keeps_its_pidfd_registration_after_its_original
     message.msg_control = PIDFD_TEST_CONTROL as usize as *mut libc::c_void;
     message.msg_controllen = control.len();
     assert_eq!(
-        write_struct(&mut ProviderMemory(&memory), PIDFD_TEST_MESSAGE, &message),
+        write_struct(&mut ProviderMemory(&memory), PIDFD_TEST_MESSAGE, &GuestMsghdr::from(&message)),
         0
     );
     assert_eq!(
@@ -2063,7 +2063,7 @@ fn an_epoll_passed_in_scm_rights_keeps_its_pidfd_registration_after_its_original
         .unwrap();
     message.msg_controllen = RIGHTS_CONTROL_CAPACITY;
     assert_eq!(
-        write_struct(&mut ProviderMemory(&memory), PIDFD_TEST_MESSAGE, &message),
+        write_struct(&mut ProviderMemory(&memory), PIDFD_TEST_MESSAGE, &GuestMsghdr::from(&message)),
         0
     );
     assert_eq!(
@@ -2993,7 +2993,7 @@ fn pidfd_test_message(memory: &GuestMemory, control_length: usize) {
     }
     message.msg_controllen = control_length;
     assert_eq!(
-        write_struct(&mut ProviderMemory(memory), PIDFD_TEST_MESSAGE, &message),
+        write_struct(&mut ProviderMemory(memory), PIDFD_TEST_MESSAGE, &GuestMsghdr::from(&message)),
         0
     );
 }
@@ -4919,7 +4919,7 @@ fn reviewer_discarded_epoll_send(
     message.msg_control = PIDFD_TEST_CONTROL as usize as *mut libc::c_void;
     message.msg_controllen = control.len();
     assert_eq!(
-        write_struct(&mut ProviderMemory(memory), PIDFD_TEST_MESSAGE, &message),
+        write_struct(&mut ProviderMemory(memory), PIDFD_TEST_MESSAGE, &GuestMsghdr::from(&message)),
         0
     );
     pidfd_test_call(
@@ -4950,7 +4950,7 @@ fn reviewer_discarded_epoll_prepare_receive(memory: &GuestMemory, control_capaci
     }
     message.msg_controllen = control_capacity;
     assert_eq!(
-        write_struct(&mut ProviderMemory(memory), PIDFD_TEST_MESSAGE, &message),
+        write_struct(&mut ProviderMemory(memory), PIDFD_TEST_MESSAGE, &GuestMsghdr::from(&message)),
         0
     );
 }
@@ -6552,7 +6552,7 @@ fn a_batch_that_loses_rights_after_delivering_a_message_ends_the_run() {
         write_struct(
             &mut ProviderMemory(&memory),
             PIDFD_TEST_MESSAGE + entry,
-            &second
+            &GuestMmsghdr::from(&second)
         ),
         0
     );
@@ -8052,7 +8052,7 @@ fn pidfd_test_receive_into(
                 msg_len: 0,
             };
             assert_eq!(
-                write_struct(&mut ProviderMemory(memory), PIDFD_TEST_MESSAGE, &message),
+                write_struct(&mut ProviderMemory(memory), PIDFD_TEST_MESSAGE, &GuestMmsghdr::from(&message)),
                 0
             );
             [socket as u64, PIDFD_TEST_MESSAGE, 1, flags, 0, 0]
@@ -9259,7 +9259,7 @@ fn reviewer_dgram_pair_external_epoll_route(named_send: bool) {
         let mut message: libc::msghdr = read_struct(&memory, PIDFD_TEST_MESSAGE);
         message.msg_name = PIDFD_TEST_INFO as usize as *mut libc::c_void;
         message.msg_namelen = address_len as libc::socklen_t;
-        assert_eq!(write_struct(&mut ProviderMemory(&memory), PIDFD_TEST_MESSAGE, &message), 0);
+        assert_eq!(write_struct(&mut ProviderMemory(&memory), PIDFD_TEST_MESSAGE, &GuestMsghdr::from(&message)), 0);
     }
     let sent = pidfd_test_call(
         &mut parent,

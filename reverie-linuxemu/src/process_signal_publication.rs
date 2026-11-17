@@ -4590,7 +4590,7 @@ mod tests {
             super::super::write_struct(
                 &mut crate::provider_memory::ProviderMemory(memory),
                 RIGHTS_HEADER,
-                &header
+                &super::super::GuestMsghdr::from(&header)
             ),
             0
         );

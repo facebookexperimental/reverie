@@ -2550,8 +2550,18 @@ pub(super) fn recvmsg(
         Ok(message) => message,
         Err(error) => return error,
     };
-    // Validate the final header copyout before consuming a datagram.
-    if write_struct(&mut ProviderMemory(memory), message_address, &message) != 0 {
+    // Validate the final header copyout before consuming a datagram,
+    // field by field exactly as the receive will write it back: Linux
+    // never writes the header's padding, so neither does this probe
+    // (a whole-struct copy would also carry host stack padding).
+    if !write_back_received_header(
+        memory,
+        message_address,
+        &message,
+        message.msg_namelen,
+        message.msg_flags,
+        message.msg_controllen,
+    ) {
         return negative_errno(libc::EFAULT);
     }
 

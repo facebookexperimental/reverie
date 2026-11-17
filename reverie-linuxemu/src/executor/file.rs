@@ -2128,17 +2128,14 @@ pub(super) fn fcntl(memory: &GuestMemory, state: &mut LoadedStaticElf, args: &[u
             if result != 0 {
                 return result;
             }
-            // SAFETY: flock is initialized plain data; the view is bounded to it.
-            let bytes = unsafe {
-                std::slice::from_raw_parts(
-                    std::ptr::from_ref(&lock).cast::<u8>(),
-                    std::mem::size_of::<libc::flock>(),
-                )
-            };
-            match memory.user().write(args[2], bytes) {
-                Ok(()) => 0,
-                Err(_) => negative_errno(libc::EFAULT),
-            }
+            // Through the GuestFlock mirror: libc::flock has hidden
+            // padding the kernel does not write, so a raw copy would
+            // carry this stack frame's padding bytes to the guest.
+            write_struct(
+                &mut ProviderMemory(memory),
+                args[2],
+                &GuestFlock::from(&lock),
+            )
         }
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(rrnewton/reverie#318): Review KVM guest pipe-capacity
