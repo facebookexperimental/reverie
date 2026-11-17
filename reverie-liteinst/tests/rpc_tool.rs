@@ -403,11 +403,13 @@ fn protection_keys_with_signal_stack(on_alt_stack: bool) {
 /// compares each case with the same call made natively before the Tool was
 /// installed: control data or a msghdr under a key the guest denies gives
 /// EFAULT and sends nothing; with the key allowed the message is sent with
-/// the guest's pipe; a two-message vector sends one message per call, and
-/// the guest's retry of the remainder ends where Linux's one call ends; a
-/// vector the guest may read but not write sends its message and gives
-/// EFAULT. The fallback continuation runs with every key allowed, so a copy
-/// made without the guest's rights would send the denied cases.
+/// the guest's pipe; a two-message vector sends in one call, as on
+/// Linux, and a separate case naming a runtime-reserved descriptor in
+/// its control data is refused with EBADF and delivers nothing, which
+/// only the checked copy does; a vector the guest may read but not
+/// write sends its message and gives EFAULT. The fallback continuation
+/// runs with every key allowed, so a copy made without the guest's
+/// rights would send the denied cases.
 #[test]
 fn a_trapped_send_copies_its_message_with_the_guest_s_key_rights() {
     let binary = env!("CARGO_BIN_EXE_reverie-liteinst-rpc-tool-guest");
@@ -443,7 +445,7 @@ fn a_trapped_send_copies_its_message_with_the_guest_s_key_rights() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert_eq!(
         stdout,
-        "fallback scm pkeys: denied=matched allowed=matched vector=1+1 native=2 read-only=matched traps=6 hooks=0\n"
+        "fallback scm pkeys: denied=matched allowed=matched vector=2 native=2 reserved=hidden read-only=matched traps=6 hooks=0\n"
     );
     print!("{stdout}");
 }

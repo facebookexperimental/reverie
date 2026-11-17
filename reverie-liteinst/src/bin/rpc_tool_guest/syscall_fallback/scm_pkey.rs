@@ -31,6 +31,7 @@ struct Outcome {
 }
 
 const EFAULT: i64 = -(libc::EFAULT as i64);
+const EBADF: i64 = -(libc::EBADF as i64);
 const LABELS: [&str; 5] = [
     "denied control",
     "denied header",
@@ -140,6 +141,74 @@ fn header(iov: *mut libc::iovec, control: *mut u8, length: usize) -> libc::msghd
 /// the PKRU back, and returns the call's result.
 fn call(site: usize, number: i64, args: [u64; 3], pkru: u32) -> i64 {
     unsafe { fallback_scm_pkey_call(site, number, args[0], args[1], args[2], pkru) }
+}
+
+/// The descriptor numbers this process has open, from /proc/self/fd.
+/// The listing itself opens a descriptor, so the numbers are collected
+/// first and only those whose link still resolves once the listing has
+/// closed are kept: the listing's own descriptor, and any other
+/// transient one, is gone by then and fails to resolve.
+fn fd_numbers() -> std::collections::BTreeSet<libc::c_int> {
+    let mut listed = Vec::new();
+    {
+        let entries = std::fs::read_dir("/proc/self/fd").expect("list /proc/self/fd");
+        for entry in entries {
+            let entry = entry.expect("read /proc/self/fd entry");
+            if let Ok(number) = entry.file_name().to_string_lossy().parse::<libc::c_int>() {
+                listed.push(number);
+            }
+        }
+    }
+    listed
+        .into_iter()
+        .filter(|number| std::fs::read_link(format!("/proc/self/fd/{number}")).is_ok())
+        .collect()
+}
+
+/// A descriptor the runtime reserved when the Tool was installed: one that
+/// appeared after install and was not open before it. The difference from
+/// the pre-install set decides, never a number range. Finding none is a
+/// failure, not a skip: without a reserved descriptor the checked-copy
+/// path this test guards is not in force.
+fn reserved_descriptor(before: &std::collections::BTreeSet<libc::c_int>) -> libc::c_int {
+    let after = fd_numbers();
+    let appeared: Vec<libc::c_int> = after.difference(before).copied().collect();
+    assert!(
+        !appeared.is_empty(),
+        "no runtime-reserved descriptor appeared after install; \
+         the runtime copy is not on the fallback path"
+    );
+    appeared[0]
+}
+
+/// Sends one allowed message through the site naming `reserved_fd` in its
+/// control data, and returns the result and what the peer received. On the
+/// checked copy the runtime replaces a reserved descriptor with -1, so the
+/// kernel answers EBADF and queues nothing; a raw forward of the guest's
+/// headers would deliver the descriptor and succeed.
+fn reserved_case(
+    site: usize,
+    keyed: *mut u8,
+    pair: [libc::c_int; 2],
+    reserved_fd: libc::c_int,
+    allow: u32,
+) -> (i64, Vec<(u8, Vec<u64>)>) {
+    let mut byte = b'r';
+    let mut iov = libc::iovec {
+        iov_base: (&raw mut byte).cast(),
+        iov_len: 1,
+    };
+    let keyed_header = keyed.cast::<libc::msghdr>();
+    let keyed_control = unsafe { keyed.add(512) };
+    let length = write_rights(keyed_control, reserved_fd);
+    unsafe { keyed_header.write(header(&raw mut iov, keyed_control, length)) };
+    let result = call(
+        site,
+        libc::SYS_sendmsg,
+        [pair[0] as u64, keyed_header as u64, 0],
+        allow,
+    );
+    (result, receive_all(pair[1]))
 }
 
 /// The five cases, on `keyed`, a page under the key: `allow`, `deny` and
@@ -327,8 +396,18 @@ pub(super) fn run(path: &Path) {
     let keyed = mapping.cast::<u8>();
 
     let native = cases(site, keyed, pair, file, pkru);
+    let before_install = fd_numbers();
     unsafe { reverie_liteinst::install_tool::<super::FallbackTool>(path) }.unwrap();
+    let reserved_fd = reserved_descriptor(&before_install);
     let tool = cases(site, keyed, pair, file, pkru);
+    let (reserved_result, reserved_delivered) =
+        reserved_case(site, keyed, pair, reserved_fd, pkru[0]);
+    // The reserved descriptor is still open after the send, so the
+    // EBADF below cannot be the answer for a closed number.
+    assert!(
+        fd_numbers().contains(&reserved_fd),
+        "case reserved descriptor: the reserved descriptor is no longer open"
+    );
 
     // Linux's own answers, which make the comparison meaningful.
     let pipe = inode(file);
@@ -362,8 +441,12 @@ pub(super) fn run(path: &Path) {
             "case {label}: the Tool path differs from native"
         );
     }
-    // The allowed vector: one message per call through the Tool, so the
-    // guest needs two calls where Linux needs one, and ends where Linux ends.
+    // The allowed vector: the runtime sends the whole vector through
+    // the checked copy in one guest call, as Linux does, so the result
+    // count [2] no longer shows which path the send took. The reserved
+    // descriptor case is the direct evidence: only the checked copy
+    // hides a reserved descriptor (as -1), so only it answers EBADF
+    // with nothing delivered.
     assert_eq!(
         (&tool[3].delivered, &tool[3].lengths),
         (&native[3].delivered, &native[3].lengths),
@@ -371,8 +454,16 @@ pub(super) fn run(path: &Path) {
     );
     assert_eq!(
         tool[3].results,
-        [1_i64, 1],
-        "case allowed vector: the runtime copy is not on the fallback path"
+        [2_i64],
+        "case allowed vector: the Tool path differs from native"
+    );
+    assert_eq!(
+        reserved_result, EBADF,
+        "case reserved descriptor: the runtime copy is not on the fallback path"
+    );
+    assert!(
+        reserved_delivered.is_empty(),
+        "case reserved descriptor: the runtime copy delivered a reserved descriptor"
     );
     assert_eq!(
         unsafe { std::slice::from_raw_parts(site as *const u8, 3) },
@@ -382,12 +473,15 @@ pub(super) fn run(path: &Path) {
         reverie_liteinst::reverie_liteinst_site_hook_count(site as u64),
         0
     );
+    // Six traps at the site in the Tool phase: the five cases (the
+    // allowed vector is one call) plus the reserved
+    // descriptor call.
     assert_eq!(
         reverie_liteinst::reverie_liteinst_site_trap_count(site as u64),
         6
     );
     println!(
-        "fallback scm pkeys: denied=matched allowed=matched vector=1+1 native=2 read-only=matched traps=6 hooks=0"
+        "fallback scm pkeys: denied=matched allowed=matched vector=2 native=2 reserved=hidden read-only=matched traps=6 hooks=0"
     );
 }
 
