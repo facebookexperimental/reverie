@@ -33,6 +33,9 @@ use std::os::fd::FromRawFd;
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::FileExt;
 
+use serde::Deserialize;
+use serde::Serialize;
+
 use crate::Error;
 use crate::Result;
 
@@ -274,7 +277,7 @@ impl VcpuStats {
 
 /// Why a vCPU keeps IA32_XSS = 0: the public mirror of the crate's private
 /// decision.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum XssKeepReason {
     /// The processor supports no IA32_XSS component.
     NoHostComponents,
@@ -297,7 +300,7 @@ pub enum XssKeepReason {
 }
 
 /// What the backend actually left in the vCPU's IA32_XSS at construction.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum XssOutcomeKind {
     /// The vCPU holds the host's IA32_XSS.
     Set(u64),
@@ -308,7 +311,7 @@ pub enum XssOutcomeKind {
 }
 
 /// [`XssOutcomeKind`] with the vCPU's IA32_XSS read back from KVM.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct XssOutcome {
     /// What construction did.
     pub kind: XssOutcomeKind,
@@ -2494,7 +2497,7 @@ impl GuestProbeRunner {
 /// its construction, and whether the guest's own XGETBV/XSAVE answers
 /// stayed identical across a VM exit (and, in the second trial, across
 /// the frame consumer's GET-frame-SET reinstall at that exit).
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct FixedXstateQualification {
     /// XGETBV(0) as the guest read it.
     pub guest_xcr0: u64,
