@@ -227,8 +227,8 @@ pub unsafe fn process_tool_syscall_with(event: &mut SyscallEvent, patcher: &dyn 
     // A guest send runs on a runtime-owned, checked copy of its message
     // headers and control data, which this frame holds until the call returns
     // (https://github.com/facebookexperimental/reverie/issues/56).
-    // SAFETY: as above; the Tool's dispatch runs the call at most once, before
-    // the wrapper returns.
+    // SAFETY: as above; the Tool's dispatch runs the call once per message
+    // carried, before the wrapper returns.
     unsafe {
         crate::guest::protect::dispatch_with_scm_rights_copy(event, |event| {
             crate::guest::installed_tool::dispatch(event)
