@@ -79,6 +79,8 @@ jobs:
       run: |
         rustc scripts/check-skill-discovery.rs -o "$RUNNER_TEMP/check-skill-discovery"
         "$RUNNER_TEMP/check-skill-discovery"
+    - name: Reverie layering
+      run: bash scripts/check-layering.sh
     - name: Build
       run: |
         source scripts/stable-features.sh

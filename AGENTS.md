@@ -15,6 +15,21 @@ names, feature flags and environment variables.
 - Every backend must pass Reverie's own generic tests without Hermit,
   including the strace and counter example tools. The backends are ptrace,
   KVM, DBT, LiteInst and in-guest.
+- `scripts/check-layering.sh` enforces this for code, manifests and build
+  files, with per-file counts that may only fall; boundary cases and the check:
+  the `reverie-layering` skill.
+
+**Review depth and post-facto tags.** Reverie is developed autonomously by
+agents, with asynchronous human guidance. A change to core Reverie types
+(`Tool`, `Guest`, `Backend`, the syscall-interception model) gets two
+cold-context reviewers on two different models, neither of them the author;
+any other change gets one cold-context reviewer who is not the author by
+default. A core-type change also carries the commit trailer
+`Post-facto-human-review: trigger-2 (<short reason>)` (trigger 2 is a change
+to these core types, in the numbering Hermit's post-facto review uses), plus
+the `post-facto-human-review` pull-request label where the forge has labels,
+so a human can find it later with `git log --grep='^Post-facto-human-review:'`
+when bisecting or building a changelog. The tag never waits for approval.
 
 **Rebind pinned sources in the same change.** The LiteInst artifact pins
 the raw size and sha256 of every source file listed in

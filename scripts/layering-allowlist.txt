@@ -1,0 +1,228 @@
+# Reverie files that name a consumer, one per line as `path -- N -- reason`.
+# N is the number of the file's lines that match, plus one when its path
+# matches; scripts/check-layering.sh --list prints the live counts. The check
+# fails on a matching file with no line, on a count above or below N, and on a
+# line whose file no longer matches, so counts only fall: remove mentions,
+# lower N, and delete the line at zero. A leading `?` marks a file only the
+# primary repository carries (recognized by fb-only/defs.bzl): there the line
+# is checked like any other; an exported tree must not have the file at all.
+# Never add a line or raise N to let a new mention pass. See
+# .claude/skills/reverie-layering/SKILL.md.
+BUCK -- 6 -- pre-check baseline 2026-11-17, classify me
+ci/run-dag.sh -- 2 -- pre-check baseline 2026-11-17, classify me
+?experimental/BUCK -- 3 -- known leak, remove: load()s a macro from hermit's tree (route it through fb-only/defs.bzl); also oncall metadata and a comment
+?fb-only/cargo-workspace.toml -- 2 -- fbsource-only glue, never exported; consumer names are routed here by design (fb-only/defs.bzl)
+?fb-only/defs.bzl -- 18 -- fbsource-only glue, never exported; consumer names are routed here by design (fb-only/defs.bzl)
+?fb-only/experiments/BUCK -- 1 -- fbsource-only glue, never exported; consumer names are routed here by design (fb-only/defs.bzl)
+?fb-only/experiments/malloc-test-tool/BUCK -- 1 -- fbsource-only glue, never exported; consumer names are routed here by design (fb-only/defs.bzl)
+?fb-only/experiments/skid/BUCK -- 1 -- fbsource-only glue, never exported; consumer names are routed here by design (fb-only/defs.bzl)
+?fb-only/rpc_compat/BUCK -- 1 -- fbsource-only glue, never exported; consumer names are routed here by design (fb-only/defs.bzl)
+?fb-only/scripts/cargo-toolchain.sh -- 1 -- fbsource-only glue, never exported; consumer names are routed here by design (fb-only/defs.bzl)
+?fb-only/smoke_tests.sh -- 6 -- fbsource-only glue, never exported; consumer names are routed here by design (fb-only/defs.bzl)
+reverie-examples/e2e/compare.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-examples/tests/conformance.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-inguest/Cargo.toml -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-inguest/native_exec/private-bootstrap.c -- 2 -- pre-check baseline 2026-11-17, classify me
+reverie-inguest/native_exec/private-control.h -- 2 -- declares detcore_liteinst_exec_initialize, the native entry point a consumer's in-guest runtime defines; a cross-repository ABI name, renamed only together with its definer
+reverie-inguest/native_exec/private-runner.c -- 2 -- calls detcore_liteinst_exec_initialize, the cross-repository ABI name declared in private-control.h
+reverie-inguest/src/bin/stage1a_probe/main.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-inguest/src/bootstrap_recipe.rs -- 5 -- pre-check baseline 2026-11-17, classify me
+reverie-inguest/src/guest/exec_private.rs -- 4 -- pre-check baseline 2026-11-17, classify me
+reverie-inguest/src/guest/exec_private/mapped_initial.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-inguest/src/guest/exec_private/mapped_initial/mapped_scalar.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-inguest/src/guest/generic_native_exec_driver.rs -- 5 -- pre-check baseline 2026-11-17, classify me
+reverie-inguest/src/guest/host.rs -- 5 -- pre-check baseline 2026-11-17, classify me
+reverie-inguest/src/guest/installed_stack_tests.rs -- 2 -- pre-check baseline 2026-11-17, classify me
+reverie-inguest/src/guest/mod.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-inguest/src/guest/native_entry_tests.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-inguest/src/guest/native_exec.rs -- 4 -- pre-check baseline 2026-11-17, classify me
+reverie-inguest/src/guest/native_exec_tests.rs -- 3 -- pre-check baseline 2026-11-17, classify me
+reverie-inguest/src/guest/native_exec_witness_tests.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-inguest/src/guest/protect.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-inguest/src/guest/restorer.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-inguest/src/guest/rpc.rs -- 2 -- pre-check baseline 2026-11-17, classify me
+reverie-inguest/src/guest/sigalrm.rs -- 6 -- pre-check baseline 2026-11-17, classify me
+reverie-inguest/src/guest/tool_install.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-inguest/src/guest/tool_region.rs -- 2 -- pre-check baseline 2026-11-17, classify me
+reverie-inguest/src/guest/tool_region_constructor_tests.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-inguest/src/launcher/exec_stop/initial_inputs.rs -- 2 -- pre-check baseline 2026-11-17, classify me
+reverie-inguest/src/launcher/exec_stop/mod.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-inguest/src/launcher/exec_stop/physical/borrowed_entry.rs -- 2 -- pre-check baseline 2026-11-17, classify me
+reverie-inguest/src/launcher/exec_stop/physical/borrowed_entry/handover.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-inguest/src/launcher/exec_stop/physical/borrowed_entry/observed_rcb.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-inguest/src/lifecycle.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-inguest/src/private_runtime/c_allocator.rs -- 2 -- pre-check baseline 2026-11-17, classify me
+reverie-inguest/src/private_runtime/mod.rs -- 4 -- pre-check baseline 2026-11-17, classify me
+reverie-inguest/src/private_runtime/tls/abi.rs -- 3 -- pre-check baseline 2026-11-17, classify me
+reverie-inguest/src/private_runtime/tls/mod.rs -- 2 -- pre-check baseline 2026-11-17, classify me
+reverie-inguest/src/rpc.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-inguest/src/tool_host.rs -- 2 -- pre-check baseline 2026-11-17, classify me
+reverie-inguest/tests/exec_stop.rs -- 2 -- pre-check baseline 2026-11-17, classify me
+reverie-inguest/tests/fixtures/probe_protocol.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-inguest/tests/fixtures/probe_runtime.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-inguest/tests/zone_b_no_tls.rs -- 6 -- pre-check baseline 2026-11-17, classify me
+reverie-kvm-core/Cargo.toml -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-kvm-core/src/failure.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-kvm-core/src/provider_memory.rs -- 3 -- pre-check baseline 2026-11-17, classify me
+reverie-kvm/Cargo.toml -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-kvm/src/clock.rs -- 2 -- pre-check baseline 2026-11-17, classify me
+reverie-kvm/src/clock/entry_interrupt_tests.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-kvm/src/runtime.rs -- 16 -- pre-check baseline 2026-11-17, classify me
+reverie-kvm/src/runtime/exit_descriptor_tests.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-kvm/src/runtime/parent_death_tests.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-kvm/src/vm.rs -- 13 -- pre-check baseline 2026-11-17, classify me
+reverie-kvm/src/vm/empty_signal_boundary_tests.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-kvm/tests/counter.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-kvm/tests/fixtures/blocked_sibling_wait.c -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-kvm/tests/fixtures/child_exit_signals.c -- 2 -- pre-check baseline 2026-11-17, classify me
+reverie-kvm/tests/fixtures/cross_thread_waitid.c -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-kvm/tests/fixtures/epoll_pwait2.c -- 2 -- pre-check baseline 2026-11-17, classify me
+reverie-kvm/tests/fixtures/exit_descriptor_ordering.c -- 2 -- pre-check baseline 2026-11-17, classify me
+reverie-kvm/tests/fixtures/fcntl_owner.c -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-kvm/tests/fixtures/pdeathsig_creator.c -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-kvm/tests/fixtures/pdeathsig_linger_process.c -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-kvm/tests/static_elf.rs -- 27 -- pre-check baseline 2026-11-17, classify me
+reverie-kvm/tests/support/captured_write_signals.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-kvm/tests/support/cpuid_terminal.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-kvm/tests/support/exit_descriptor_ordering.rs -- 3 -- pre-check baseline 2026-11-17, classify me
+reverie-kvm/tests/support/fcntl_owner.rs -- 2 -- pre-check baseline 2026-11-17, classify me
+reverie-kvm/tests/support/leader_exit.rs -- 2 -- pre-check baseline 2026-11-17, classify me
+reverie-kvm/tests/support/msync.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-kvm/tests/support/natural_retirement.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-kvm/tests/support/parked_signals.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-kvm/tests/support/random_device_stream.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-kvm/tests/support/syncfs.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-kvm/tests/support/timestamp_terminal.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-kvm/tests/vmcall.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-linux-provider/Cargo.toml -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-linux-provider/src/lib.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-linuxemu/Cargo.toml -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-linuxemu/src/elf.rs -- 4 -- pre-check baseline 2026-11-17, classify me
+reverie-linuxemu/src/executor.rs -- 27 -- pre-check baseline 2026-11-17, classify me
+reverie-linuxemu/src/executor/abi.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-linuxemu/src/executor/descriptor_generic_tests.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-linuxemu/src/executor/event_fds.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-linuxemu/src/executor/file.rs -- 3 -- pre-check baseline 2026-11-17, classify me
+reverie-linuxemu/src/executor/identity.rs -- 4 -- pre-check baseline 2026-11-17, classify me
+reverie-linuxemu/src/executor/inotify.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-linuxemu/src/executor/ioctl.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-linuxemu/src/executor/ioctl_nonblocking_tests.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-linuxemu/src/executor/personality_tests.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-linuxemu/src/executor/poll.rs -- 7 -- pre-check baseline 2026-11-17, classify me
+reverie-linuxemu/src/executor/proc.rs -- 12 -- pre-check baseline 2026-11-17, classify me
+reverie-linuxemu/src/executor/read_write.rs -- 4 -- pre-check baseline 2026-11-17, classify me
+reverie-linuxemu/src/executor/refusal.rs -- 6 -- pre-check baseline 2026-11-17, classify me
+reverie-linuxemu/src/executor/shared_file_tests.rs -- 2 -- pre-check baseline 2026-11-17, classify me
+reverie-linuxemu/src/executor/socket.rs -- 24 -- pre-check baseline 2026-11-17, classify me
+reverie-linuxemu/src/executor/stat.rs -- 3 -- pre-check baseline 2026-11-17, classify me
+reverie-linuxemu/src/executor/sys_signal.rs -- 4 -- pre-check baseline 2026-11-17, classify me
+reverie-linuxemu/src/executor/task.rs -- 4 -- pre-check baseline 2026-11-17, classify me
+reverie-linuxemu/src/executor/time.rs -- 4 -- pre-check baseline 2026-11-17, classify me
+reverie-linuxemu/src/extension.rs -- 4 -- pre-check baseline 2026-11-17, classify me
+reverie-linuxemu/src/lib.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-linuxemu/src/process_signal_publication.rs -- 4 -- pre-check baseline 2026-11-17, classify me
+reverie-linuxemu/src/provider.rs -- 6 -- pre-check baseline 2026-11-17, classify me
+reverie-linuxemu/src/signal.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-liteinst-artifact/Cargo.toml -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-liteinst-artifact/src/lib.rs -- 2557 -- pre-check baseline 2026-11-17, classify me
+reverie-liteinst-artifact/src/preparation_identity.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-liteinst-artifact/src/private_static/selected_initializers.rs -- 102 -- pre-check baseline 2026-11-17, classify me
+reverie-liteinst-artifact/src/private_static/selected_initializers/ordinary_gate.rs -- 2 -- pre-check baseline 2026-11-17, classify me
+reverie-liteinst-artifact/src/private_static/selected_initializers/package_roles.rs -- 2 -- pre-check baseline 2026-11-17, classify me
+reverie-liteinst-artifact/src/private_static/selected_initializers/terminal_observation.rs -- 15 -- pre-check baseline 2026-11-17, classify me
+reverie-liteinst-artifact/tests/factory_sources_self_check.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-liteinst-artifact/tests/tls_sources_self_check.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-liteinst-preload/build.rs -- 4 -- pre-check baseline 2026-11-17, classify me
+reverie-liteinst-preload/src/glibc_compat.rs -- 2 -- pre-check baseline 2026-11-17, classify me
+reverie-liteinst/Cargo.toml -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-liteinst/src/bin/real_bodies/lifecycle_guest.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-liteinst/src/bin/real_bodies/rpc_tool_guest.rs -- 4 -- pre-check baseline 2026-11-17, classify me
+reverie-liteinst/src/liteinst_census.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-liteinst/src/native_exec_state.rs -- 4 -- pre-check baseline 2026-11-17, classify me
+reverie-liteinst/src/runtime.rs -- 2 -- pre-check baseline 2026-11-17, classify me
+reverie-liteinst/src/tool_host.rs -- 2 -- pre-check baseline 2026-11-17, classify me
+reverie-liteinst/tests/fixtures/m1_allocator_guest.c -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-liteinst/tests/lifecycle.rs -- 2 -- pre-check baseline 2026-11-17, classify me
+reverie-liteinst/tests/native_unpublished.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-liteinst/tests/support/stack_observation.rs -- 5 -- pre-check baseline 2026-11-17, classify me
+reverie-liteinst/tests/tool_tls.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-loader/Cargo.toml -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-loader/src/handoff.rs -- 4 -- pre-check baseline 2026-11-17, classify me
+reverie-memory/Cargo.toml -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-proc-grammar/Cargo.toml -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-process/Cargo.toml -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-process/src/container.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-process/src/mount.rs -- 2 -- pre-check baseline 2026-11-17, classify me
+reverie-procfs/Cargo.toml -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-procfs/src/fdinfo.rs -- 2 -- pre-check baseline 2026-11-17, classify me
+reverie-procfs/src/fixed.rs -- 10 -- pre-check baseline 2026-11-17, classify me
+reverie-procfs/src/mountinfo.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-procfs/src/sanitize.rs -- 8 -- pre-check baseline 2026-11-17, classify me
+reverie-ptrace/Cargo.toml -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-ptrace/src/cp/consts.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-ptrace/src/failure.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-ptrace/src/gdbstub.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-ptrace/src/gdbstub/inferior.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-ptrace/src/gdbstub/server.rs -- 12 -- pre-check baseline 2026-11-17, classify me
+reverie-ptrace/src/lib.rs -- 3 -- pre-check baseline 2026-11-17, classify me
+reverie-ptrace/src/plain_guest_regression_tests.rs -- 39 -- pre-check baseline 2026-11-17, classify me
+reverie-ptrace/src/seccomp_filter_tests.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-ptrace/src/segv_state.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-ptrace/src/sigtrap_state.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-ptrace/src/task.rs -- 24 -- pre-check baseline 2026-11-17, classify me
+reverie-ptrace/src/task/thread_state_ready_tests.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-ptrace/src/testing.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-ptrace/src/timer.rs -- 5 -- pre-check baseline 2026-11-17, classify me
+reverie-ptrace/src/tracer.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-ptrace/src/validation.rs -- 2 -- pre-check baseline 2026-11-17, classify me
+reverie-ptrace/tests/deliver_signal.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-ptrace/tests/fixtures/plain_guest_regression.c -- 11 -- pre-check baseline 2026-11-17, classify me
+reverie-ptrace/tests/fixtures/repair_page_elf_segment.S -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-ptrace/tests/gdbstub_breakpoints.rs -- 2 -- pre-check baseline 2026-11-17, classify me
+reverie-ptrace/tests/gdbstub_precise_timer.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-ptrace/tests/guest_int3.rs -- 2 -- pre-check baseline 2026-11-17, classify me
+reverie-ptrace/tests/guest_sent_sigtrap.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-ptrace/tests/injected_syscall_group_stop.rs -- 3 -- pre-check baseline 2026-11-17, classify me
+reverie-ptrace/tests/mask_swapping_injection.rs -- 2 -- pre-check baseline 2026-11-17, classify me
+reverie-ptrace/tests/set_blocked_signals.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-ptrace/tests/single_step_guest_trap.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-ptrace/tests/static_image_and_descendant_vfork.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-ptrace/tests/tool_output_protection.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-ptrace/tests/tool_restart.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-rpc-transport/Cargo.toml -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-rpc-transport/src/blocking_client.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-rpc-transport/src/envelope.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-rpc-transport/src/exec_ticket.rs -- 8 -- pre-check baseline 2026-11-17, classify me
+reverie-rpc-transport/src/lib.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-rpc-transport/src/server.rs -- 2 -- pre-check baseline 2026-11-17, classify me
+reverie-rpc-transport/tests/connection_identity.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-rpc-transport/tests/exec_ticket_registry.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-syscalls/Cargo.toml -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-syscalls/src/args/sysinfo.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-syscalls/src/linux_abi.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-util/Cargo.toml -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie/Cargo.toml -- 2 -- pre-check baseline 2026-11-17, classify me
+reverie/src/auxv.rs -- 2 -- pre-check baseline 2026-11-17, classify me
+reverie/src/capabilities.rs -- 4 -- pre-check baseline 2026-11-17, classify me
+reverie/src/lib.rs -- 3 -- pre-check baseline 2026-11-17, classify me
+reverie/src/pmu_config.rs -- 6 -- pre-check baseline 2026-11-17, classify me
+reverie/src/provider.rs -- 3 -- pre-check baseline 2026-11-17, classify me
+reverie/src/provider/memory.rs -- 2 -- pre-check baseline 2026-11-17, classify me
+reverie/src/task_ids.rs -- 12 -- pre-check baseline 2026-11-17, classify me
+reverie/src/timer.rs -- 4 -- pre-check baseline 2026-11-17, classify me
+reverie/src/tool.rs -- 6 -- pre-check baseline 2026-11-17, classify me
+reverie/src/vdso.rs -- 2 -- pre-check baseline 2026-11-17, classify me
+reverie/src/vdso/canonical.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie/tests/validate_script_source.rs -- 3 -- pre-check baseline 2026-11-17, classify me
+safeptrace/Cargo.toml -- 1 -- pre-check baseline 2026-11-17, classify me
+safeptrace/src/lib.rs -- 3 -- pre-check baseline 2026-11-17, classify me
+safeptrace/src/ptracer_thread_tests.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+scripts/check-layering.sh -- 2 -- the check itself: it carries the pattern
+scripts/ci-timeout-watchdog.sh -- 1 -- pre-check baseline 2026-11-17, classify me
+scripts/detcore-alloc-recipe.py -- 26 -- pre-check baseline 2026-11-17, classify me
+scripts/libtest-counts.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+tests/BUCK -- 1 -- Buck oncall metadata naming the owning team
+?tests/gdbserver-integration/BUCK -- 3 -- known leak, remove: load()s a macro from hermit's tree (route it through fb-only/defs.bzl); also oncall metadata and a comment
+tests/gdbserver-integration/gdbserver-helper/src/main.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+?tests/gdbserver-integration/helpers.bzl -- 1 -- pre-check baseline 2026-11-17, classify me
+validate.sh -- 9 -- pre-check baseline 2026-11-17, classify me
