@@ -248,15 +248,48 @@ fn statx(fd: libc::c_int, mask: u32) -> std::io::Result<libc::statx> {
     Ok(unsafe { status.assume_init() })
 }
 
+/// The fields of one `mountinfo` row this module reads, in the legacy
+/// identity-bearing shape: `raw_device` is the printed major:minor pair
+/// encoded with `libc::makedev` at the conversion in [`parse_mountinfo`],
+/// exactly as the former `reverie-procfs` row computed it.
+struct MountInfoRow {
+    raw_mount_id: u64,
+    raw_device: u64,
+    super_options: Vec<u8>,
+}
+
+/// Parse a `mountinfo` snapshot with the shared grammar
+/// (`reverie-proc-grammar`, single grammar owner since Slice 2 S2-R1;
+/// this S2-R2 switch mirrors detcore-model's S2-D1 conversion).
+/// Grammar refusals map to `None` here and to the caller's `io` error
+/// in [`read_mountinfo`], as the former procfs parser's refusals did.
+/// One deliberate strictness follows the grammar: a nonempty snapshot
+/// without its final newline, or with noncanonical decimals, now
+/// refuses where the loose reader accepted. The only input is the
+/// live kernel file, which the kernel always spells canonically
+/// (`show_mountinfo`, `fs/proc_namespace.c`), so no live answer
+/// changes.
+fn parse_mountinfo(contents: &[u8]) -> Option<Vec<MountInfoRow>> {
+    reverie_proc_grammar::parse_mountinfo(contents).ok().map(|rows| {
+        rows.into_iter()
+            .map(|row| MountInfoRow {
+                raw_mount_id: row.mount_id,
+                raw_device: libc::makedev(row.device_major, row.device_minor),
+                super_options: row.super_options,
+            })
+            .collect()
+    })
+}
+
 /// The calling thread's `mountinfo` as it is now, with the descriptor it
 /// was read through.
-fn read_mountinfo() -> std::io::Result<(File, Vec<reverie_procfs::MountInfoRow>)> {
+fn read_mountinfo() -> std::io::Result<(File, Vec<MountInfoRow>)> {
     #[cfg(test)]
     MOUNTINFO_READS.with(|reads| reads.set(reads.get() + 1));
     let mut file = File::open("/proc/thread-self/mountinfo")?;
     let mut contents = Vec::new();
     file.read_to_end(&mut contents)?;
-    let rows = reverie_procfs::parse_mountinfo(&contents).ok_or_else(|| {
+    let rows = parse_mountinfo(&contents).ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "/proc/thread-self/mountinfo has a line that does not parse or lists a mount twice",
@@ -752,5 +785,36 @@ mod tests {
         let mut table = MountTable::read().unwrap();
         table.namespace = table.namespace.wrapping_add(1);
         assert!(table.stale().unwrap());
+    }
+
+    #[test]
+    fn mountinfo_rows_convert_with_makedev() {
+        let rows = parse_mountinfo(b"37 1 8:1 / / rw shared:9 - ext4 /dev/root ro,relatime\n")
+            .expect("canonical row parses");
+        assert_eq!(rows.len(), 1, "one row in, one row out");
+        assert_eq!(rows[0].raw_mount_id, 37);
+        assert_eq!(
+            rows[0].raw_device,
+            libc::makedev(8, 1),
+            "raw_device must be makedev(major, minor) as the procfs row computed it"
+        );
+        assert_eq!(rows[0].super_options, b"ro,relatime");
+    }
+
+    #[test]
+    fn mountinfo_grammar_strictness_is_deliberate() {
+        assert_eq!(
+            parse_mountinfo(b"").map(|rows| rows.len()),
+            Some(0),
+            "empty snapshot is valid"
+        );
+        assert!(
+            parse_mountinfo(b"37 1 8:1 / / rw - ext4 /dev/root rw").is_none(),
+            "missing final newline refuses under the grammar"
+        );
+        assert!(
+            parse_mountinfo(b"037 1 8:1 / / rw - ext4 /dev/root rw\n").is_none(),
+            "noncanonical decimals refuse under the grammar"
+        );
     }
 }
