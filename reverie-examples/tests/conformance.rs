@@ -407,22 +407,46 @@ fn collapse_maps_read_run(detailed: &[(String, String)], strace_calls: &[String]
     names
 }
 
+/// Second named conformance-ledger entry, in-guest backends
+/// only: where `brk` falls. The in-guest runtime grows the
+/// guest's `brk` heap before `main` and adds `LD_PRELOAD` to
+/// the guest's environment, so the call at which a program
+/// such as `sh` grows its heap depends on the runtime and on
+/// the environment's size; making the guest heap match native
+/// is https://github.com/facebookexperimental/reverie/issues/98.
+/// The in-guest order check therefore leaves `brk` out and
+/// compares only its count: the in-guest record may not hold
+/// more `brk` calls than the native one. Every other call keeps
+/// its order check, and the ptrace and KVM legs still compare
+/// every name exactly, `brk` included.
+const HEAP_GROWTH: &str = "brk";
+
 /// The production pairing for the in-guest subsequence check:
 /// each record collapses only segments its own strace run
 /// binds to `/proc/self/maps` (the native side's strace run
 /// uses the ptrace backend, whose name stream the ptrace leg
-/// proves equal to the native record). Tested directly below
-/// so replacing either confirmation with `true` fails a test.
+/// proves equal to the native record), then [`HEAP_GROWTH`]
+/// is compared by count rather than position. Tested directly
+/// below so replacing either confirmation with `true`, or
+/// dropping the count, fails a test.
 fn in_guest_is_native_subsequence(
     recorded_detailed: &[(String, String)],
     native_detailed: &[(String, String)],
     recorded_strace_stderr: &[u8],
     native_strace_stderr: &[u8],
 ) -> bool {
-    is_subsequence(
-        &collapse_maps_read_run(recorded_detailed, &strace_calls(recorded_strace_stderr)),
-        &collapse_maps_read_run(native_detailed, &strace_calls(native_strace_stderr)),
-    )
+    let recorded = collapse_maps_read_run(recorded_detailed, &strace_calls(recorded_strace_stderr));
+    let native = collapse_maps_read_run(native_detailed, &strace_calls(native_strace_stderr));
+    let heap_growths = |names: &[String]| names.iter().filter(|name| *name == HEAP_GROWTH).count();
+    let ordered = |names: &[String]| -> Vec<String> {
+        names
+            .iter()
+            .filter(|name| *name != HEAP_GROWTH)
+            .cloned()
+            .collect()
+    };
+    heap_growths(&recorded) <= heap_growths(&native)
+        && is_subsequence(&ordered(&recorded), &ordered(&native))
 }
 
 /// One detailed segment (open through close) on `fd`, for the
@@ -530,6 +554,66 @@ fn maps_read_run_segment_is_the_named_ledger_difference() {
             .iter()
             .any(|name| name == MAPS_READ_RUN)
     );
+}
+
+#[test]
+fn brk_position_is_the_named_ledger_difference() {
+    // The measured `sh -c` shape: natively the shell grows its heap
+    // inside a signal-mask pair; in-guest the same growth comes first.
+    let record = |names: &[&str]| -> Vec<(String, String)> {
+        names
+            .iter()
+            .map(|name| (name.to_string(), "ok".to_string()))
+            .collect()
+    };
+    let names = |detailed: &[(String, String)]| -> Vec<String> {
+        detailed.iter().map(|(name, _)| name.clone()).collect()
+    };
+    let native = record(&[
+        "getpgrp",
+        "ioctl",
+        "rt_sigaction",
+        "ioctl",
+        "prlimit64",
+        "rt_sigprocmask",
+        "brk",
+        "rt_sigprocmask",
+        "fstat",
+        "write",
+        "exit_group",
+    ]);
+    let inguest = record(&[
+        "getpgrp",
+        "ioctl",
+        "ioctl",
+        "prlimit64",
+        "brk",
+        "rt_sigprocmask",
+        "rt_sigprocmask",
+        "fstat",
+        "write",
+        "exit_group",
+    ]);
+    // Without the entry the in-guest record is not a subsequence;
+    // through the production pairing it is.
+    assert!(!is_subsequence(&names(&inguest), &names(&native)));
+    assert!(in_guest_is_native_subsequence(&inguest, &native, b"", b""));
+    // Control: the entry exempts only brk. The same record with one
+    // other call moved out of native order still fails.
+    let mut moved = inguest.clone();
+    let mask = moved
+        .iter()
+        .position(|(name, _)| name == "rt_sigprocmask")
+        .unwrap();
+    let call = moved.remove(mask);
+    let fstat = moved.iter().position(|(name, _)| name == "fstat").unwrap();
+    moved.insert(fstat + 1, call);
+    assert!(!in_guest_is_native_subsequence(&moved, &native, b"", b""));
+    // Control: brk keeps its count check. A brk the native run never
+    // made fails, wherever it sits.
+    let mut extra = inguest.clone();
+    extra.insert(1, (HEAP_GROWTH.to_owned(), "ok".to_owned()));
+    assert!(!in_guest_is_native_subsequence(&extra, &native, b"", b""));
 }
 
 #[test]
@@ -789,10 +873,11 @@ fn tools_agree_with_the_recorder(backend: &str) {
             // In-guest tools start late and legitimately miss calls, so
             // their names must appear in native order with none the
             // program never made. That subsequence check runs below,
-            // after the strace runs it needs for the one ledger entry
-            // here (MAPS_READ_RUN above). The judged native
-            // comparison, with its ledger of known missing calls, is
-            // the e2e comparator's job.
+            // after the strace runs it needs for the maps ledger entry
+            // (MAPS_READ_RUN above; the other entry, HEAP_GROWTH,
+            // needs none). The judged native comparison, with its
+            // ledger of known missing calls, is the e2e comparator's
+            // job.
             "liteinst" | "in-guest-trap" => {}
             other => unreachable!("unknown backend {other}"),
         }
@@ -831,16 +916,18 @@ fn tools_agree_with_the_recorder(backend: &str) {
             assert_eq!(comparable, recorded, "{backend} {program:?}");
         }
         if in_guest {
-            // The in-guest subsequence check, with the maps ledger
-            // entry: each record collapses only segments bound by
-            // descriptor to a successful /proc/self/maps open in
-            // its own strace run. The native side's pretty source
-            // is a ptrace strace run (strace_minimal has no native
-            // backend; the ptrace leg above proves its name stream
-            // equal to the native record). Programs make the same
-            // calls every run (the stability the counter transfer
-            // below also assumes), so each strace execution can
-            // bind its recorder execution's segment.
+            // The in-guest subsequence check, with both ledger
+            // entries: HEAP_GROWTH is compared by count, not
+            // position, and for the maps entry each record
+            // collapses only segments bound by descriptor to a
+            // successful /proc/self/maps open in its own strace
+            // run. The native side's pretty source is a ptrace
+            // strace run (strace_minimal has no native backend; the
+            // ptrace leg above proves its name stream equal to the
+            // native record). Programs make the same calls every
+            // run (the stability the counter transfer below also
+            // assumes), so each strace execution can bind its
+            // recorder execution's segment.
             let native_strace = run(env!("CARGO_BIN_EXE_strace_minimal"), "ptrace", program);
             // Pin the native binding source in this same test:
             // its exit and its call-name stream must be the

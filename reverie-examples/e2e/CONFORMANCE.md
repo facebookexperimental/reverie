@@ -90,8 +90,9 @@ with a `REVERIE_SKIP:` line that the per-crate scorecard counts as
 skipped, never as passed (and fails outright when `REVERIE_REQUIRE_KVM`
 is set).
 
-The one named ledger difference at the `cargo test` layer is the
-in-guest `/proc/self/maps` read run segment
+The `cargo test` layer has two named ledger differences, both for
+the in-guest backends only. The first is the in-guest
+`/proc/self/maps` read run segment
 (`MAPS_READ_RUN` in `tests/conformance.rs`): in-guest maps lists
 runtime mappings, so its content is about 3x the kernel's length
 (measured on Ubuntu 26.04 for `/bin/echo`: native 5,449 bytes vs
@@ -105,10 +106,21 @@ segment is bound by descriptor to a successful `openat` of
 (the native side binds against a ptrace strace run, whose name
 stream the ptrace leg proves equal to the native record);
 missing or unparsable strace output, a failed open, descriptor
-reuse, or any other path leaves the record literal. Every other
-call is still compared strictly. Whether synthetic maps should
-instead trim runtime mappings is
+reuse, or any other path leaves the record literal. Whether
+synthetic maps should instead trim runtime mappings is
 https://github.com/facebookexperimental/hermit/issues/241.
+
+The second is where `brk` falls (`HEAP_GROWTH` in
+`tests/conformance.rs`). The in-guest runtime grows the guest's
+`brk` heap before `main` and adds `LD_PRELOAD` to the guest's
+environment, so the call at which a program such as `sh` grows its
+heap depends on the runtime and on the environment's size. The
+in-guest order check therefore leaves `brk` out and compares only
+its count: an in-guest record may hold no more `brk` calls than the
+native one. Every other call is still compared strictly, and the
+ptrace and KVM legs compare every name exactly, `brk` included.
+Making the guest heap match native is
+https://github.com/facebookexperimental/reverie/issues/98.
 
 A backend that cannot host a tool or a program must refuse by name
 (`REFUSED:`), never fail silently or pass vacuously. A refusal is its own
@@ -133,7 +145,8 @@ them.
 
 - `cargo test` runs the environment-independent part
   (`../tests/recorder.rs`, `../tests/conformance.rs`): a few stable
-  programs, every backend this host has, no ledger.
+  programs, every backend this host has, no ledger rows (only the two
+  named in-guest differences above).
 - `run.sh` runs the full recorder corpus against the ledger for this
   host's environment; `validate.sh` and CI call it. Its output is the
   conformance scorecard for the recorder row: per backend, counts of
