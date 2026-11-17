@@ -161,53 +161,99 @@ for f in "${text[@]}"; do
     fi
 done
 
-# Every package's BUCK must hold the exact glob below in its layering group,
-# and every package but the root must be an entry
-# `"<dir relative to its parent package>": "<self>/<dir>:layering-files"` in
-# its nearest parent package's BUCK, so each group chains to the root's
-# layering-tree. Comments are stripped and whitespace ignored before matching.
+# Every package's BUCK must define its layering group (the root:
+# layering-tree; any other package: layering-files) as a buck_filegroup whose
+# text holds the exact glob below, and every package but the root must be an
+# entry `"<dir relative to its parent package>": "<self>/<dir>:layering-files"`
+# inside its nearest parent package's group, so each group chains to the
+# root's layering-tree. The root must also hold the Buck test that runs this
+# check on layering-tree. BUCK text is read call by call, without comments and
+# without whitespace outside strings (single, double and triple quotes).
 tree_glob='glob(["**",".*",".*/**","**/.*","**/.*/**",".*/**/.*",".*/**/.*/**"])'
-flat_buck() {
-    awk '{
-        out = ""; in_str = 0
-        for (i = 1; i <= length($0); i++) {
-            c = substr($0, i, 1)
-            if (in_str && c == "\\") { out = out c substr($0, i + 1, 1); i++; continue }
-            if (c == "\"") in_str = !in_str
-            if (!in_str && c == "#") break
-            out = out c
+buck_calls() {
+    awk 'BEGIN { q = "\047" }
+    { s = s $0 "\n" }
+    END {
+        n = length(s); state = ""; depth = 0; cur = ""; ident = ""
+        for (i = 1; i <= n; i++) {
+            c = substr(s, i, 1)
+            if (state == "") {
+                t = substr(s, i, 3)
+                if (t == "\"\"\"" || t == q q q) { state = t; if (depth) cur = cur t; i += 2; continue }
+                if (c == "\"" || c == q) { state = c; if (depth) cur = cur c; continue }
+                if (c == "#") { while (i <= n && substr(s, i, 1) != "\n") i++; continue }
+                if (c ~ /[ \t\r\n]/) continue
+                if (depth == 0) {
+                    if (c == "(") { depth = 1; cur = ident "("; ident = ""; continue }
+                    if (c ~ /[A-Za-z0-9_.]/) ident = ident c; else ident = ""
+                    continue
+                }
+                cur = cur c
+                if (c == "(" || c == "[" || c == "{") depth++
+                else if (c == ")" || c == "]" || c == "}") {
+                    depth--
+                    if (depth == 0) { print cur; cur = "" }
+                }
+                continue
+            }
+            # Inside a string. Newlines are written as \n, so each call stays on
+            # one output line and string text can never pose as a call.
+            if (c == "\\") {
+                nx = substr(s, i + 1, 1)
+                if (depth) cur = cur c (nx == "\n" ? "\\n" : nx)
+                i++
+                continue
+            }
+            if (length(state) == 3) {
+                if (substr(s, i, 3) == state) { if (depth) cur = cur state; i += 2; state = ""; continue }
+            } else if (c == state) { if (depth) cur = cur c; state = ""; continue }
+            else if (c == "\n") { state = ""; continue }
+            if (depth) cur = cur (c == "\n" ? "\\n" : c)
         }
-        printf "%s", out
-    }' "$1" | tr -d ' \t\n'
+    }' "$1"
+}
+# The one buck_filegroup call in BUCK file $1 named $2.
+group_call() {
+    local calls
+    calls=$(buck_calls "$1" | grep -F -e "name=\"$2\"" | grep -E '^buck_filegroup\(') || true
+    if [ "$(printf '%s' "$calls" | grep -c .)" -eq 1 ]; then
+        printf '%s' "$calls"
+    fi
 }
 declare -A is_package=()
 for b in "${buck_files[@]}"; do
     case "$b" in BUCK) is_package[.]=1 ;; *) is_package[${b%/BUCK}]=1 ;; esac
 done
 for b in "${buck_files[@]}"; do
-    if [ "$b" = BUCK ]; then
-        d=.
-        group='name="layering-tree"'
-    else
-        d=${b%/BUCK}
-        group='name="layering-files"'
-    fi
-    flat=$(flat_buck "$b") || exit 2
-    if [[ $flat != *"$group"* || $flat != *"$tree_glob"* ]]; then
-        echo "layering: $b must define its layering group ($group) with $tree_glob" >&2
+    if [ "$b" = BUCK ]; then d=.; group=layering-tree; else d=${b%/BUCK}; group=layering-files; fi
+    call=$(group_call "$b" "$group")
+    if [[ -z $call || $call != *"$tree_glob"* ]]; then
+        echo "layering: $b must define exactly one buck_filegroup named $group whose srcs use $tree_glob" >&2
         fail=1
     fi
-    [ "$d" != . ] || continue
+    if [ "$d" = . ]; then
+        if ! buck_calls BUCK | grep -E '^buck_sh_test\(' | grep -F -e 'name="check-layering"' |
+            grep -F -e 'args=["$(location :layering-tree)"]' |
+            grep -q -F -e 'test="fb-only/check_layering_test.sh"'; then
+            echo "layering: BUCK must hold buck_sh_test check-layering running fb-only/check_layering_test.sh on \$(location :layering-tree)" >&2
+            fail=1
+        fi
+        continue
+    fi
     parent=${d%/*}
     [ "$parent" != "$d" ] || parent=.
     while [ "$parent" != . ] && [ -z "${is_package[$parent]+x}" ]; do
         case "$parent" in */*) parent=${parent%/*} ;; *) parent=. ;; esac
     done
-    if [ "$parent" = . ]; then rel=$d; parent_buck=BUCK; else rel=${d#"$parent"/}; parent_buck=$parent/BUCK; fi
+    if [ "$parent" = . ]; then
+        rel=$d; parent_buck=BUCK; parent_group=layering-tree
+    else
+        rel=${d#"$parent"/}; parent_buck=$parent/BUCK; parent_group=layering-files
+    fi
     want="\"$rel\":\"$self/$d:layering-files\""
-    parent_flat=$(flat_buck "$parent_buck") || exit 2
-    if [[ $parent_flat != *"$want"* ]]; then
-        echo "layering: $b is not wired into the Buck tree: $parent_buck needs the entry \"$rel\": \"$self/$d:layering-files\" in its layering group" >&2
+    parent_call=$(group_call "$parent_buck" "$parent_group")
+    if [[ $parent_call != *"$want"* ]]; then
+        echo "layering: $b is not wired into the Buck tree: the $parent_group group in $parent_buck needs the entry \"$rel\": \"$self/$d:layering-files\"" >&2
         fail=1
     fi
 done
