@@ -806,7 +806,7 @@ fn the_fixed_xstate_qualification_is_stable_on_this_host() {
             &format!(
                 "UnsupportedHost: fixed-guest xstate unstable on this host: \
                  {qualification:?}; \
-                 see https://github.com/facebookexperimental/hermit/issues/307"
+                 matches the known unstable signature (is_issue_307_unstable_signature)"
             ),
         );
         return;
