@@ -711,11 +711,106 @@ fn delta(run: &RunRecord) -> VcpuStatsSnapshot {
     run.before.stats.delta_to(&run.after.stats).unwrap()
 }
 
+/// Writes a named skip past libtest output capture (fd 2
+/// directly), so the counted runner and per-crate scorecard
+/// report it as skipped rather than as a silent pass.
+fn report_skip(test: &str, reason: &str) {
+    let line = format!("\nREVERIE_SKIP: {test}: {reason}\n");
+    let mut rest = line.as_bytes();
+    while !rest.is_empty() {
+        // SAFETY: writes only the buffer above to this process's stderr.
+        let written =
+            unsafe { libc::write(libc::STDERR_FILENO, rest.as_ptr().cast(), rest.len()) };
+        assert!(
+            written > 0,
+            "write the named skip for {test}: {}",
+            std::io::Error::last_os_error()
+        );
+        rest = &rest[written as usize..];
+    }
+}
+
+/// The exact CI signature tracked by issue 307: the host kept an
+/// unproven IA32_XSS and only the XSAVE image first differed, at
+/// the header's first byte (offset 512).
+fn is_issue_307_unstable_signature(
+    qualification: &crate::guest_probe::FixedXstateQualification,
+) -> bool {
+    qualification.unstable > 0
+        && matches!(
+            qualification.xss.kind,
+            crate::guest_probe::XssOutcomeKind::Kept(
+                crate::guest_probe::XssKeepReason::Unproven { .. }
+            )
+        )
+        && qualification.first_image_difference == Some(512)
+}
+
+#[test]
+fn only_the_issue_307_signature_skips_the_stable_xstate_test() {
+    use crate::guest_probe::FixedXstateQualification;
+    use crate::guest_probe::XssKeepReason;
+    use crate::guest_probe::XssOutcome;
+    use crate::guest_probe::XssOutcomeKind;
+
+    let report = |kind, unstable, first_image_difference| FixedXstateQualification {
+        guest_xcr0: crate::bootstrap::FIXED_GUEST_XCR0,
+        xss: XssOutcome {
+            kind,
+            read_back: 0,
+        },
+        host_cpuid_d_1_eax: 15,
+        comparisons: 6,
+        unstable,
+        first_image_difference,
+    };
+    let ci_report = report(
+        XssOutcomeKind::Kept(XssKeepReason::Unproven {
+            hardware: 256,
+            kvm: 0,
+        }),
+        2,
+        Some(512),
+    );
+    assert!(is_issue_307_unstable_signature(&ci_report));
+
+    let stable = report(
+        XssOutcomeKind::Kept(XssKeepReason::NoHostComponents),
+        0,
+        None,
+    );
+    assert!(!is_issue_307_unstable_signature(&stable));
+
+    let different_xss = report(XssOutcomeKind::Set(256), 2, Some(512));
+    assert!(!is_issue_307_unstable_signature(&different_xss));
+
+    let different_offset = report(
+        XssOutcomeKind::Kept(XssKeepReason::Unproven {
+            hardware: 256,
+            kvm: 0,
+        }),
+        2,
+        Some(513),
+    );
+    assert!(!is_issue_307_unstable_signature(&different_offset));
+}
+
 #[test]
 fn the_fixed_xstate_qualification_is_stable_on_this_host() {
     let qualification = qualify_fixed_guest_xstate().unwrap();
     assert_eq!(qualification.guest_xcr0, crate::bootstrap::FIXED_GUEST_XCR0);
     assert!(qualification.comparisons >= 6, "{qualification:?}");
+    if is_issue_307_unstable_signature(&qualification) {
+        report_skip(
+            "the_fixed_xstate_qualification_is_stable_on_this_host",
+            &format!(
+                "UnsupportedHost: fixed-guest xstate unstable on this host: \
+                 {qualification:?}; \
+                 see https://github.com/facebookexperimental/hermit/issues/307"
+            ),
+        );
+        return;
+    }
     assert_eq!(
         qualification.unstable, 0,
         "guest xstate answers changed across a VM exit: {qualification:?}"
