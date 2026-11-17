@@ -22,11 +22,12 @@ use reverie::Subscription;
 use reverie::Tool;
 use reverie::UnknownSyscallPolicy;
 use reverie::syscalls::RawSyscall;
+use reverie::syscalls::Sysno;
 use reverie_ptrace::testing::check_fn;
 
-/// No `Sysno` in the x86_64 table this crate was built with (it ends at
-/// 461), whatever the host kernel implements there.
-const UNKNOWN_NR: i64 = 463;
+/// No `Sysno` in the x86_64 table this crate was built with, one past
+/// its last entry, whatever the host kernel implements there.
+const UNKNOWN_NR: i64 = Sysno::last().id() as i64 + 1;
 
 /// The unknown numbers the Tool was asked about, in order.
 #[derive(Default)]

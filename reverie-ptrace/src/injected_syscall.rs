@@ -291,9 +291,10 @@ mod tests {
 
     #[test]
     fn unknown_frame_number_is_an_error_not_a_panic() {
-        // Guest-controlled rax with no Sysno (the x86_64 table ends at 461).
+        // Guest-controlled rax with no Sysno, one past the table's last
+        // entry.
         let mut unknown = frame();
-        unknown.rax = 463;
+        unknown.rax = Sysno::last().id() as u64 + 1;
         assert_eq!(unknown.syscall_number(), Err(Errno::ENOSYS));
         assert_eq!(unknown.syscall(), Err(Errno::ENOSYS));
     }

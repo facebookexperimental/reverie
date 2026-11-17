@@ -159,9 +159,9 @@ fn filter_decodes_as_specified() {
     assert_eq!(run(&none, 39, AUDIT_ARCH_X86_64, 0x40_1000), RET_ALLOW);
 }
 
-/// A number with no `Sysno` in the table this crate was built with (the
-/// x86_64 table ends at 461): what makes a number "unknown" to the policy.
-const UNKNOWN_NR: u32 = 463;
+/// A number with no `Sysno` in the table this crate was built with, one
+/// past its last entry: what makes a number "unknown" to the policy.
+const UNKNOWN_NR: u32 = Sysno::last().id() as u32 + 1;
 
 fn with_policy(mut events: Subscription, policy: UnknownSyscallPolicy) -> Subscription {
     events.set_unknown_syscall_policy(policy);
