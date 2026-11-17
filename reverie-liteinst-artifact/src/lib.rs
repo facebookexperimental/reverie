@@ -76794,24 +76794,26 @@ pub mod private_static {
                         );
                         continue;
                     }
-                    if section == "[package]" {
-                        if let Some((key, value)) = line.split_once('=') {
-                            if key.trim() == "name" {
-                                package_name = Some(
-                                    value
-                                        .trim()
-                                        .strip_prefix('"')
-                                        .and_then(|v| v.strip_suffix('"'))
-                                        .unwrap_or_else(|| {
-                                            panic!(
-                                                "workspace member {member} package name is not a \
-                                                 plain string: {line}"
-                                            )
-                                        })
-                                        .to_owned(),
-                                );
-                            }
-                        }
+                    // One condition, not nested ifs: this file is also
+                    // compiled into edition-2024 test crates, where clippy
+                    // asks for let-chains that its own 2021 crate rejects.
+                    if let Some((_, value)) = line
+                        .split_once('=')
+                        .filter(|(key, _)| section == "[package]" && key.trim() == "name")
+                    {
+                        package_name = Some(
+                            value
+                                .trim()
+                                .strip_prefix('"')
+                                .and_then(|v| v.strip_suffix('"'))
+                                .unwrap_or_else(|| {
+                                    panic!(
+                                        "workspace member {member} package name is not a \
+                                         plain string: {line}"
+                                    )
+                                })
+                                .to_owned(),
+                        );
                     }
                 }
                 let package_name = package_name
