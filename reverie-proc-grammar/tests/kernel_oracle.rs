@@ -24,6 +24,8 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io;
+use std::path::Path;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 
@@ -39,6 +41,263 @@ fn oracle_serial() -> MutexGuard<'static, ()> {
     ORACLE_SERIAL
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The absolute anti-vacuity minimum for a live inventory format:
+/// twenty independently attempted tasks. Below that, even a 100%
+/// round-trip rate is too small a sample to call the format
+/// inventory exercised, so the run fails as too thin instead of
+/// passing on a handful of tasks.
+const MIN_ATTEMPTED_PER_FORMAT: usize = 20;
+
+/// The scaled successful-round-trip backstop for eligible
+/// entries: ~90% at any population, capped at 101. It cannot
+/// fire after the hard-fail asserts (every attempted entry has
+/// round-tripped there), so coverage in
+/// [`inventory_floor_met`] rests on the listed-entry accounting
+/// and the absolute attempted minimum, not on this ratio.
+fn scaled_floor(eligible: usize) -> usize {
+    usize::min(101, eligible * 9 / 10 + 1)
+}
+
+/// Whether an inventory format kept listed-entry coverage after
+/// only verified exclusions are removed from the listed total.
+/// Every eligible entry must have been attempted, the attempted
+/// population must reach the absolute minimum, and successful
+/// round-trips must clear the scaled backstop.
+fn inventory_floor_met(
+    listed: usize,
+    verified_excluded: usize,
+    attempted: usize,
+    ok: usize,
+) -> bool {
+    let eligible = listed.saturating_sub(verified_excluded);
+    attempted == eligible && attempted >= MIN_ATTEMPTED_PER_FORMAT && ok >= scaled_floor(eligible)
+}
+
+/// Per-format live-read categories. Only successful reads are
+/// attempted (parseable-or-refused); tasks that vanished mid-scan
+/// (`NotFound`) or are not visible to this reader
+/// (`PermissionDenied`, e.g. hidepid or another user) are counted
+/// separately; only the verified causes counted in
+/// `listed_not_found` / `listed_permission_denied` leave the
+/// listed-entry coverage denominator.
+#[derive(Clone, Default)]
+struct ReadCounts {
+    attempted: usize,
+    ok: usize,
+    not_found: usize,
+    permission_denied: usize,
+    listed_not_found: usize,
+    listed_permission_denied: usize,
+}
+
+/// The credential facts `__ptrace_may_access` compares, read from
+/// a task's `/proc/<pid>/status` plus the gated inode's owner.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AccessFacts {
+    uids: [u32; 4],
+    gids: [u32; 4],
+    cap_prm: u64,
+    cap_eff: u64,
+    gated_inode_uid: Option<u32>,
+}
+
+fn access_facts(status_path: &Path, gated_inode_uid: Option<u32>) -> Option<AccessFacts> {
+    let text = fs::read_to_string(status_path).ok()?;
+    let mut uids = None;
+    let mut gids = None;
+    let mut cap_prm = None;
+    let mut cap_eff = None;
+    for line in text.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        match fields.first().copied() {
+            Some("Uid:") if fields.len() == 5 => {
+                uids = Some([
+                    fields[1].parse().ok()?,
+                    fields[2].parse().ok()?,
+                    fields[3].parse().ok()?,
+                    fields[4].parse().ok()?,
+                ]);
+            }
+            Some("Gid:") if fields.len() == 5 => {
+                gids = Some([
+                    fields[1].parse().ok()?,
+                    fields[2].parse().ok()?,
+                    fields[3].parse().ok()?,
+                    fields[4].parse().ok()?,
+                ]);
+            }
+            Some("CapPrm:") if fields.len() == 2 => {
+                cap_prm = Some(u64::from_str_radix(fields[1], 16).ok()?);
+            }
+            Some("CapEff:") if fields.len() == 2 => {
+                cap_eff = Some(u64::from_str_radix(fields[1], 16).ok()?);
+            }
+            _ => {}
+        }
+    }
+    Some(AccessFacts {
+        uids: uids?,
+        gids: gids?,
+        cap_prm: cap_prm?,
+        cap_eff: cap_eff?,
+        gated_inode_uid,
+    })
+}
+
+/// The named reason a `PermissionDenied` from a ptrace-gated read
+/// (`/proc/<pid>/io` or listing `/proc/<pid>/fdinfo`) is the
+/// kernel's access check, following `__ptrace_may_access`
+/// (kernel/ptrace.c: reader fsuid/fsgid must equal the target's
+/// uid/euid/suid and gid/egid/sgid, and the task must be
+/// dumpable) and `cap_ptrace_access_check`
+/// (security/commoncap.c: the target's permitted capability set
+/// must be a subset of the reader's effective set). A root-owned
+/// gated inode (the io/status file, not the task directory) is the kernel's sign of a non-dumpable
+/// task. `None` means the denial is unexplained by those facts.
+fn ptrace_denial_reason(reader: &AccessFacts, target: &AccessFacts) -> Option<&'static str> {
+    // CAP_SYS_PTRACE lets the reader past the id, dumpable and
+    // capability-subset checks below, so a denial seen by such a
+    // reader is not explained by ptrace access at all.
+    if reader.cap_eff & (1 << 19) != 0 {
+        None
+    } else if target.uids[..3].iter().any(|uid| *uid != reader.uids[3]) {
+        Some("target uid/euid/suid differs from reader fsuid")
+    } else if target.gids[..3].iter().any(|gid| *gid != reader.gids[3]) {
+        Some("target gid/egid/sgid differs from reader fsgid")
+    } else if target.cap_prm & !reader.cap_eff != 0 {
+        Some("target CapPrm is not a subset of reader CapEff")
+    } else if target.gated_inode_uid == Some(0) && reader.uids[3] != 0 {
+        Some("target gated io/status inode is root-owned (non-dumpable task)")
+    } else {
+        None
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ReadDisposition {
+    /// The cause was verified at read time: the task or fd is
+    /// gone, it belongs to another user and this reader is not
+    /// root, or a ptrace-gated denial carries a named kernel
+    /// reason from the target's status facts.
+    Excluded,
+    /// No verified cause: the read error is an inventory failure.
+    Fail,
+}
+
+/// Classifies a failed inventory read. `verified_gone` must come
+/// from a re-check that the task (or fd entry) no longer exists;
+/// `task_uid` is the owner read from `/proc/{pid}` at scan time.
+fn classify_read_error(
+    kind: io::ErrorKind,
+    verified_gone: bool,
+    task_uid: Option<u32>,
+    my_uid: u32,
+    own_tasks_only: bool,
+    ptrace_gated: bool,
+    ptrace_reason: Option<&'static str>,
+) -> ReadDisposition {
+    match kind {
+        io::ErrorKind::NotFound if verified_gone => ReadDisposition::Excluded,
+        // Deliberate ptrace-gated exception (io file and fdinfo
+        // directory only, both non-floored paths): a denial the
+        // kernel's own access check explains from the target's
+        // status facts is not hidden inventory data. The caller
+        // supplies ptrace_denial_reason's verdict; no named reason
+        // means the denial is unexplained and fails.
+        io::ErrorKind::PermissionDenied if ptrace_gated && ptrace_reason.is_some() => {
+            ReadDisposition::Excluded
+        }
+        io::ErrorKind::PermissionDenied
+            if !own_tasks_only && my_uid != 0 && task_uid.is_some_and(|uid| uid != my_uid) =>
+        {
+            ReadDisposition::Excluded
+        }
+        _ => ReadDisposition::Fail,
+    }
+}
+
+fn verified_gone(path: &Path) -> bool {
+    matches!(path.try_exists(), Ok(false))
+}
+
+fn note_excluded_with_reason(
+    examples: &mut BTreeMap<(&str, io::ErrorKind), Vec<String>>,
+    format: &'static str,
+    path: &Path,
+    kind: io::ErrorKind,
+    reason: Option<&str>,
+) {
+    let examples = examples.entry((format, kind)).or_default();
+    if examples.len() < 3 {
+        match reason {
+            Some(reason) => examples.push(format!("{} ({kind:?}: {reason})", path.display())),
+            None => examples.push(format!("{} ({kind:?})", path.display())),
+        }
+    }
+}
+
+/// Reads one inventory file, classifying the outcome. Only a
+/// verified-vanished `NotFound`, a foreign-owned task's
+/// `PermissionDenied` (for a non-root reader, outside fdinfo's
+/// own-task walk), and a ptrace-gated denial with a named kernel
+/// reason are excluded; every other outcome is recorded in
+/// `failures` and hard-fails the inventory.
+#[allow(clippy::too_many_arguments)]
+fn read_inventory_file(
+    path: &Path,
+    verified_gone: impl FnOnce() -> bool,
+    task_uid: Option<u32>,
+    my_uid: u32,
+    own_tasks_only: bool,
+    ptrace_reason: Option<&'static str>,
+    format: &'static str,
+    counts: &mut ReadCounts,
+    examples: &mut BTreeMap<(&str, io::ErrorKind), Vec<String>>,
+    failures: &mut Vec<String>,
+) -> Option<Vec<u8>> {
+    match fs::read(path) {
+        Ok(bytes) => {
+            counts.attempted += 1;
+            Some(bytes)
+        }
+        Err(error) => {
+            let kind = error.kind();
+            let disposition = classify_read_error(
+                kind,
+                verified_gone(),
+                task_uid,
+                my_uid,
+                own_tasks_only,
+                format == "io",
+                ptrace_reason,
+            );
+            if disposition == ReadDisposition::Excluded {
+                match kind {
+                    io::ErrorKind::NotFound => {
+                        counts.not_found += 1;
+                        counts.listed_not_found += 1;
+                    }
+                    io::ErrorKind::PermissionDenied => {
+                        counts.permission_denied += 1;
+                        counts.listed_permission_denied += 1;
+                    }
+                    _ => unreachable!("only the two kinds above can be excluded"),
+                }
+                note_excluded_with_reason(
+                    examples,
+                    format,
+                    path,
+                    kind,
+                    if format == "io" { ptrace_reason } else { None },
+                );
+            } else if failures.len() < 10 {
+                failures.push(format!("{}: read failed: {error}", path.display()));
+            }
+            None
+        }
+    }
 }
 
 fn pids() -> Vec<u32> {
@@ -64,24 +323,337 @@ fn live_mountinfo_round_trips() {
 }
 
 #[test]
+fn inventory_floor_requires_an_absolute_attempted_minimum() {
+    // Full-host cap is unchanged: with 500 eligible entries the
+    // historical >100 volume requirement applies.
+    assert_eq!(scaled_floor(500), 101);
+    assert!(inventory_floor_met(500, 0, 500, 101));
+    assert!(!inventory_floor_met(500, 0, 500, 100));
+    // Issue https://github.com/facebookexperimental/reverie/issues/92 after verified
+    // exclusions are classified: 63 listed, 10 verified
+    // exclusions, and all 53 eligible entries attempted and
+    // round-tripped clears the scaled floor (48).
+    assert_eq!(scaled_floor(53), 48);
+    assert!(inventory_floor_met(63, 10, 53, 53));
+    // A majority-excluded population cannot pass on a perfect tiny
+    // remainder: 63 listed with 50 verified exclusions leaves 13
+    // attempted, below the absolute minimum even at 13/13.
+    assert!(!inventory_floor_met(63, 50, 13, 13));
+    assert!(!inventory_floor_met(0, 0, 0, 0));
+    // Eligible entries that were never attempted do not count as
+    // coverage, however good the success ratio among attempts is.
+    assert!(!inventory_floor_met(500, 0, 499, 499));
+}
+
+#[test]
+fn read_error_classification_requires_a_verified_cause() {
+    use ReadDisposition::{Excluded, Fail};
+
+    // A vanished task is the only excluded NotFound.
+    assert_eq!(
+        classify_read_error(
+            io::ErrorKind::NotFound,
+            true,
+            Some(1000),
+            1000,
+            false,
+            false,
+            None
+        ),
+        Excluded
+    );
+    assert_eq!(
+        classify_read_error(
+            io::ErrorKind::NotFound,
+            false,
+            Some(1000),
+            1000,
+            false,
+            false,
+            None
+        ),
+        Fail
+    );
+    // A foreign-owned task denied to a non-root reader is excluded;
+    // the same denial on an own-uid task, as root, with no owner
+    // evidence, or in fdinfo's own-task walk is a failure.
+    assert_eq!(
+        classify_read_error(
+            io::ErrorKind::PermissionDenied,
+            false,
+            Some(1001),
+            1000,
+            false,
+            false,
+            None,
+        ),
+        Excluded
+    );
+    assert_eq!(
+        classify_read_error(
+            io::ErrorKind::PermissionDenied,
+            false,
+            Some(1000),
+            1000,
+            false,
+            false,
+            None,
+        ),
+        Fail
+    );
+    assert_eq!(
+        classify_read_error(
+            io::ErrorKind::PermissionDenied,
+            false,
+            Some(1001),
+            0,
+            false,
+            false,
+            None,
+        ),
+        Fail
+    );
+    assert_eq!(
+        classify_read_error(
+            io::ErrorKind::PermissionDenied,
+            false,
+            None,
+            1000,
+            false,
+            false,
+            None,
+        ),
+        Fail
+    );
+    assert_eq!(
+        classify_read_error(
+            io::ErrorKind::PermissionDenied,
+            false,
+            Some(1001),
+            1000,
+            true,
+            false,
+            None,
+        ),
+        Fail
+    );
+    // Every other read error fails, verified cause or not.
+    assert_eq!(
+        classify_read_error(
+            io::ErrorKind::InvalidData,
+            true,
+            Some(1001),
+            1000,
+            false,
+            false,
+            None
+        ),
+        Fail
+    );
+    assert_eq!(
+        classify_read_error(
+            io::ErrorKind::Other,
+            true,
+            Some(1001),
+            1000,
+            false,
+            false,
+            None
+        ),
+        Fail
+    );
+    // A named ptrace reason does not widen the exemption beyond
+    // the gated paths: a floored-format file and a single fd entry
+    // in fdinfo's own-task walk still fail with one present.
+    assert_eq!(
+        classify_read_error(
+            io::ErrorKind::PermissionDenied,
+            false,
+            Some(1000),
+            1000,
+            false,
+            false,
+            Some("target gated io/status inode is root-owned (non-dumpable task)"),
+        ),
+        Fail
+    );
+    assert_eq!(
+        classify_read_error(
+            io::ErrorKind::PermissionDenied,
+            false,
+            Some(1000),
+            1000,
+            true,
+            false,
+            Some("target gated io/status inode is root-owned (non-dumpable task)"),
+        ),
+        Fail
+    );
+    // The deliberate ptrace-gated exception: a same-uid denial is
+    // excluded only when the caller verified a named ptrace
+    // reason, and still only for PermissionDenied.
+    assert_eq!(
+        classify_read_error(
+            io::ErrorKind::PermissionDenied,
+            false,
+            Some(1000),
+            1000,
+            false,
+            true,
+            Some("target gated io/status inode is root-owned (non-dumpable task)"),
+        ),
+        Excluded
+    );
+    assert_eq!(
+        classify_read_error(
+            io::ErrorKind::Other,
+            true,
+            Some(1000),
+            1000,
+            false,
+            true,
+            Some("target gated io/status inode is root-owned (non-dumpable task)")
+        ),
+        Fail
+    );
+}
+
+#[test]
+fn ptrace_denial_reason_names_each_kernel_check() {
+    // Reader real/saved ids intentionally differ from its fs ids:
+    // every comparison below must be judged by the fs ids.
+    let reader = AccessFacts {
+        uids: [999, 1000, 1000, 1000],
+        gids: [99, 100, 100, 100],
+        cap_prm: 0,
+        cap_eff: 0,
+        gated_inode_uid: Some(1000),
+    };
+    let equal = AccessFacts {
+        uids: [1000, 1000, 1000, 1000],
+        gids: [100, 100, 100, 100],
+        cap_prm: 0,
+        cap_eff: 0,
+        gated_inode_uid: Some(1000),
+    };
+    assert_eq!(ptrace_denial_reason(&reader, &equal), None);
+
+    // Each target real/effective/saved uid and gid alone names a
+    // reason; a differing target fs id alone does not (the kernel
+    // does not compare it).
+    for index in 0..3 {
+        let mut by_uid = equal.clone();
+        by_uid.uids[index] = 1001;
+        assert_eq!(
+            ptrace_denial_reason(&reader, &by_uid),
+            Some("target uid/euid/suid differs from reader fsuid"),
+            "uid field {index}"
+        );
+        let mut by_gid = equal.clone();
+        by_gid.gids[index] = 101;
+        assert_eq!(
+            ptrace_denial_reason(&reader, &by_gid),
+            Some("target gid/egid/sgid differs from reader fsgid"),
+            "gid field {index}"
+        );
+    }
+    let mut by_fsuid = equal.clone();
+    by_fsuid.uids[3] = 1001;
+    assert_eq!(ptrace_denial_reason(&reader, &by_fsuid), None);
+    let mut by_fsgid = equal.clone();
+    by_fsgid.gids[3] = 101;
+    assert_eq!(ptrace_denial_reason(&reader, &by_fsgid), None);
+
+    // CapPrm is compared with the reader's effective set, not its
+    // permitted set.
+    let mut reader_eff = reader.clone();
+    reader_eff.cap_eff = 1;
+    let mut by_caps = equal.clone();
+    by_caps.cap_prm = 1;
+    assert_eq!(ptrace_denial_reason(&reader_eff, &by_caps), None);
+    let mut reader_prm_only = reader.clone();
+    reader_prm_only.cap_prm = 1;
+    assert_eq!(
+        ptrace_denial_reason(&reader_prm_only, &by_caps),
+        Some("target CapPrm is not a subset of reader CapEff")
+    );
+
+    // CAP_SYS_PTRACE (bit 19) in the reader's effective set lets
+    // it past the id and dumpable checks, so no reason applies.
+    let mut privileged = reader.clone();
+    privileged.cap_eff = 1 << 19;
+    let mut otherwise_denied = equal.clone();
+    otherwise_denied.uids[0] = 1001;
+    otherwise_denied.gated_inode_uid = Some(0);
+    assert_eq!(ptrace_denial_reason(&privileged, &otherwise_denied), None);
+
+    let mut non_dumpable = equal.clone();
+    non_dumpable.gated_inode_uid = Some(0);
+    assert_eq!(
+        ptrace_denial_reason(&reader, &non_dumpable),
+        Some("target gated io/status inode is root-owned (non-dumpable task)")
+    );
+}
+
+#[test]
 fn live_proc_inventory() {
     let _serial = oracle_serial();
-    let mut ok: BTreeMap<&str, usize> = BTreeMap::new();
+    let my_uid = {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata("/proc/self")
+            .expect("stat /proc/self for the reader uid")
+            .uid()
+    };
+    let reader_access = access_facts(
+        Path::new("/proc/self/status"),
+        fs::metadata("/proc/self/io").ok().map(|metadata| {
+            use std::os::unix::fs::MetadataExt;
+            metadata.uid()
+        }),
+    )
+    .expect("reader access facts from /proc/self/status");
+    let mut reads: BTreeMap<&str, ReadCounts> = BTreeMap::new();
+    let mut excluded_examples: BTreeMap<(&str, io::ErrorKind), Vec<String>> = BTreeMap::new();
     let mut refused: BTreeMap<&str, usize> = BTreeMap::new();
     let mut failures: Vec<String> = Vec::new();
-    let my_uid = unsafe { libc::getuid() };
     let all_pids = pids();
     let population = all_pids.len();
 
     for pid in &all_pids {
         let base = format!("/proc/{pid}");
+        let task_path = Path::new(&base);
+        let task_uid = fs::metadata(task_path).ok().map(|metadata| {
+            use std::os::unix::fs::MetadataExt;
+            metadata.uid()
+        });
+        let task_access = access_facts(
+            &task_path.join("status"),
+            fs::metadata(task_path.join("io")).ok().map(|metadata| {
+                use std::os::unix::fs::MetadataExt;
+                metadata.uid()
+            }),
+        );
+        let task_ptrace_reason = task_access
+            .as_ref()
+            .and_then(|target| ptrace_denial_reason(&reader_access, target));
         macro_rules! check {
             ($file:literal, $parse:ident, $render:ident) => {
-                if let Ok(bytes) = fs::read(format!("{base}/{}", $file)) {
+                if let Some(bytes) = read_inventory_file(
+                    Path::new(&format!("{base}/{}", $file)),
+                    || verified_gone(task_path),
+                    task_uid,
+                    my_uid,
+                    false,
+                    task_ptrace_reason,
+                    $file,
+                    reads.entry($file).or_default(),
+                    &mut excluded_examples,
+                    &mut failures,
+                ) {
                     match $parse(&bytes) {
                         Ok(parsed) => {
                             if $render(&parsed) == bytes {
-                                *ok.entry($file).or_default() += 1;
+                                reads.entry($file).or_default().ok += 1;
                             } else if failures.len() < 10 {
                                 failures.push(format!(
                                     "{base}/{}: render(parse(bytes)) != bytes",
@@ -108,7 +680,18 @@ fn live_proc_inventory() {
         // grammar does not know yet: read through the preserving
         // parser so the failure can name the missing labels (the
         // strict default refusing them is unit-tested).
-        if let Ok(bytes) = fs::read(format!("{base}/status")) {
+        if let Some(bytes) = read_inventory_file(
+            Path::new(&format!("{base}/status")),
+            || verified_gone(task_path),
+            task_uid,
+            my_uid,
+            false,
+            task_ptrace_reason,
+            "status",
+            reads.entry("status").or_default(),
+            &mut excluded_examples,
+            &mut failures,
+        ) {
             match parse_status_preserving_unknown(&bytes) {
                 Ok(parsed) => {
                     let unknown: Vec<String> = parsed
@@ -123,7 +706,7 @@ fn live_proc_inventory() {
                             ));
                         }
                     } else if render_status(&parsed) == bytes {
-                        *ok.entry("status").or_default() += 1;
+                        reads.entry("status").or_default().ok += 1;
                     } else if failures.len() < 10 {
                         failures.push(format!("{base}/status: render(parse(bytes)) != bytes"));
                     }
@@ -142,17 +725,51 @@ fn live_proc_inventory() {
         "live /proc inventory failed (refusals by format: {refused:?}):\n{}",
         failures.join("\n")
     );
-    // The anti-vacuity floor scales with the population the host
-    // actually has: a big host must still produce >100 round-trips
-    // per format, while a small PID namespace (a CI container may
-    // hold only dozens of tasks) must round-trip ~all of its tasks.
-    // Refusals and render mismatches above hard-fail at any size.
-    let floor = usize::min(101, population * 9 / 10 + 1);
+    // Coverage is over listed entries after only verified
+    // exclusions: a re-checked-vanished task, a foreign-owned
+    // task denied to a non-root reader, or a ptrace-gated denial
+    // with a named kernel reason. The scaled ratio is a backstop
+    // (after the hard-fail asserts every attempted entry has
+    // round-tripped); coverage rests on every eligible entry
+    // having been attempted plus the absolute minimum.
+    // Refusals and render mismatches hard-fail above at any size.
+    for (format, counts) in &reads {
+        eprintln!(
+            "live_proc_inventory {format}: listed {population}, attempted {}, \
+             round-tripped {}, excluded not-found {}, permission-denied {}",
+            counts.attempted, counts.ok, counts.not_found, counts.permission_denied,
+        );
+    }
+    for ((format, kind), examples) in &excluded_examples {
+        eprintln!(
+            "live_proc_inventory excluded {format} {kind:?} examples: {}",
+            examples.join(", ")
+        );
+    }
     for format in ["stat", "status", "comm", "statm", "sched"] {
-        let count = ok.get(format).copied().unwrap_or(0);
+        let counts = reads.get(format).cloned().unwrap_or_default();
+        let verified_excluded = counts.listed_not_found + counts.listed_permission_denied;
+        let eligible = population - verified_excluded;
         assert!(
-            count >= floor,
-            "inventory too thin for {format}: {count} of {population} tasks (floor {floor})"
+            inventory_floor_met(population, verified_excluded, counts.attempted, counts.ok),
+            "inventory too thin for {format}: {} round-tripped of {} attempted \
+             ({population} listed, {eligible} eligible after {} verified-not-found \
+             and {} verified-foreign permission-denied exclusions; floor {} with \
+             absolute minimum {MIN_ATTEMPTED_PER_FORMAT}; excluded examples: \
+             not-found [{}], permission-denied [{}])",
+            counts.ok,
+            counts.attempted,
+            counts.not_found,
+            counts.permission_denied,
+            scaled_floor(eligible),
+            excluded_examples
+                .get(&(format, io::ErrorKind::NotFound))
+                .map(|examples| examples.join(", "))
+                .unwrap_or_default(),
+            excluded_examples
+                .get(&(format, io::ErrorKind::PermissionDenied))
+                .map(|examples| examples.join(", "))
+                .unwrap_or_default(),
         );
     }
 
@@ -175,30 +792,135 @@ fn live_proc_inventory() {
             .find(|line| !line.starts_with(b"lock:"))
             .is_some_and(|line| UNMODELLED.iter().any(|label| line.starts_with(label)))
     }
-    let mut fdinfo_ok = 0usize;
+    let mut fdinfo_reads = ReadCounts::default();
     let mut fdinfo_listed = 0usize;
     let mut fdinfo_unmodelled = 0usize;
     let mut fdinfo_bad: Vec<String> = Vec::new();
     for pid in &all_pids {
-        let uid = fs::metadata(format!("/proc/{pid}")).map(|m| {
+        let task_uid = fs::metadata(format!("/proc/{pid}")).ok().map(|m| {
             use std::os::unix::fs::MetadataExt;
             m.uid()
         });
-        if uid.ok() != Some(my_uid) {
+        if task_uid != Some(my_uid) {
             continue;
         }
-        let Ok(entries) = fs::read_dir(format!("/proc/{pid}/fdinfo")) else {
-            continue;
+        let task_access = access_facts(
+            Path::new(&format!("/proc/{pid}/status")),
+            fs::metadata(format!("/proc/{pid}/status"))
+                .ok()
+                .map(|metadata| {
+                    use std::os::unix::fs::MetadataExt;
+                    metadata.uid()
+                }),
+        );
+        let task_ptrace_reason = task_access
+            .as_ref()
+            .and_then(|target| ptrace_denial_reason(&reader_access, target));
+        let fdinfo_dir = format!("/proc/{pid}/fdinfo");
+        let entries = match fs::read_dir(&fdinfo_dir) {
+            Ok(entries) => entries,
+            Err(error) => {
+                let disposition = classify_read_error(
+                    error.kind(),
+                    verified_gone(Path::new(&format!("/proc/{pid}"))),
+                    task_uid,
+                    my_uid,
+                    true,
+                    true,
+                    task_ptrace_reason,
+                );
+                if disposition == ReadDisposition::Excluded {
+                    match error.kind() {
+                        io::ErrorKind::NotFound => fdinfo_reads.not_found += 1,
+                        io::ErrorKind::PermissionDenied => fdinfo_reads.permission_denied += 1,
+                        _ => unreachable!("only the two kinds above can be excluded"),
+                    }
+                    note_excluded_with_reason(
+                        &mut excluded_examples,
+                        "fdinfo",
+                        Path::new(&fdinfo_dir),
+                        error.kind(),
+                        task_ptrace_reason,
+                    );
+                } else if fdinfo_bad.len() < 10 {
+                    fdinfo_bad.push(format!("{fdinfo_dir}: list failed: {error}"));
+                }
+                continue;
+            }
         };
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    // A directory-entry error names no fd path to
+                    // re-check, so nothing here can verify a
+                    // vanished cause; fdinfo also walks only its
+                    // reader's own tasks, so PermissionDenied is a
+                    // failure too. Both go through the same
+                    // classifier with no verified cause.
+                    let disposition = classify_read_error(
+                        error.kind(),
+                        false,
+                        task_uid,
+                        my_uid,
+                        true,
+                        false,
+                        None,
+                    );
+                    if disposition == ReadDisposition::Excluded {
+                        match error.kind() {
+                            io::ErrorKind::NotFound => fdinfo_reads.not_found += 1,
+                            io::ErrorKind::PermissionDenied => fdinfo_reads.permission_denied += 1,
+                            _ => unreachable!("only the two kinds above can be excluded"),
+                        }
+                    } else if fdinfo_bad.len() < 10 {
+                        fdinfo_bad.push(format!("/proc/{pid}/fdinfo: list failed: {error}"));
+                    }
+                    continue;
+                }
+            };
             fdinfo_listed += 1;
-            let Ok(bytes) = fs::read(entry.path()) else {
+            let entry_path = entry.path();
+            let entry_identity = fs::symlink_metadata(&entry_path).ok().map(|metadata| {
+                use std::os::unix::fs::MetadataExt;
+                (
+                    metadata.dev(),
+                    metadata.ino(),
+                    fs::read_link(&entry_path).ok(),
+                )
+            });
+            let entry_recheck = entry_path.clone();
+            let Some(bytes) = read_inventory_file(
+                &entry_path,
+                move || {
+                    if verified_gone(&entry_recheck) {
+                        return true;
+                    }
+                    let current = fs::symlink_metadata(&entry_recheck).ok().map(|metadata| {
+                        use std::os::unix::fs::MetadataExt;
+                        (
+                            metadata.dev(),
+                            metadata.ino(),
+                            fs::read_link(&entry_recheck).ok(),
+                        )
+                    });
+                    entry_identity.is_some() && current != entry_identity
+                },
+                task_uid,
+                my_uid,
+                true,
+                task_ptrace_reason,
+                "fdinfo",
+                &mut fdinfo_reads,
+                &mut excluded_examples,
+                &mut fdinfo_bad,
+            ) else {
                 continue;
             };
             match parse_fdinfo(&bytes) {
                 Ok(parsed) => {
                     if render_fdinfo(&parsed) == bytes {
-                        fdinfo_ok += 1;
+                        fdinfo_reads.ok += 1;
                     } else if fdinfo_bad.len() < 10 {
                         fdinfo_bad
                             .push(format!("{:?}: render(parse(bytes)) != bytes", entry.path()));
@@ -218,19 +940,48 @@ fn live_proc_inventory() {
         "modelled fd kinds misparsed (unmodelled tolerated: {fdinfo_unmodelled}):\n{}",
         fdinfo_bad.join("\n")
     );
-    // Same scaled anti-vacuity floor as the per-task formats, but
-    // with the denominator counted from the directory listing:
-    // every enumerated fdinfo entry counts, including ones that
-    // vanished or could not be read, minus the tolerated
-    // unmodelled kinds actually observed. (Counting only entries
-    // that already round-tripped would make the floor vacuous
-    // next to the fdinfo_bad assert above.)
+    // Same listed-coverage floor as the per-task formats: the
+    // listed total is reduced only by verified exclusions and the
+    // tolerated unmodelled kinds actually observed.
+    let fdinfo_modelled_attempted = fdinfo_reads.attempted - fdinfo_unmodelled;
     let fdinfo_modelled_listed = fdinfo_listed - fdinfo_unmodelled;
-    let fdinfo_floor = usize::min(101, fdinfo_modelled_listed * 9 / 10 + 1);
+    let fdinfo_verified_excluded =
+        fdinfo_reads.listed_not_found + fdinfo_reads.listed_permission_denied;
+    eprintln!(
+        "live_proc_inventory fdinfo: listed {fdinfo_listed}, attempted {}, \
+         modelled attempted {fdinfo_modelled_attempted}, round-tripped {}, \
+         excluded not-found {}, permission-denied {}, unmodelled {}",
+        fdinfo_reads.attempted,
+        fdinfo_reads.ok,
+        fdinfo_reads.not_found,
+        fdinfo_reads.permission_denied,
+        fdinfo_unmodelled,
+    );
     assert!(
-        fdinfo_listed > 0 && fdinfo_ok >= fdinfo_floor,
-        "fdinfo inventory too thin: {fdinfo_ok} round-tripped of {fdinfo_listed} listed \
-         ({fdinfo_unmodelled} unmodelled tolerated, floor {fdinfo_floor})"
+        inventory_floor_met(
+            fdinfo_modelled_listed,
+            fdinfo_verified_excluded,
+            fdinfo_modelled_attempted,
+            fdinfo_reads.ok,
+        ),
+        "fdinfo inventory too thin: {} round-tripped of {fdinfo_modelled_attempted} \
+         modelled attempted ({fdinfo_modelled_listed} modelled listed, \
+         {fdinfo_listed} listed, {} verified-not-found, {} verified \
+         permission-denied, {fdinfo_unmodelled} unmodelled tolerated; floor {} \
+         with absolute minimum {MIN_ATTEMPTED_PER_FORMAT}; excluded examples: \
+         not-found [{}], permission-denied [{}])",
+        fdinfo_reads.ok,
+        fdinfo_reads.listed_not_found,
+        fdinfo_reads.listed_permission_denied,
+        scaled_floor(fdinfo_modelled_listed.saturating_sub(fdinfo_verified_excluded)),
+        excluded_examples
+            .get(&("fdinfo", io::ErrorKind::NotFound))
+            .map(|examples| examples.join(", "))
+            .unwrap_or_default(),
+        excluded_examples
+            .get(&("fdinfo", io::ErrorKind::PermissionDenied))
+            .map(|examples| examples.join(", "))
+            .unwrap_or_default(),
     );
 }
 
