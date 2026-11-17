@@ -259,8 +259,9 @@ struct MountInfoRow {
 }
 
 /// Parse a `mountinfo` snapshot with the shared grammar
-/// (`reverie-proc-grammar`, single grammar owner since Slice 2 S2-R1;
-/// this S2-R2 switch mirrors detcore-model's S2-D1 conversion).
+/// (`reverie-proc-grammar`, the single grammar owner): typed rows
+/// convert to the legacy identity-bearing shape below, encoding
+/// the device with `libc::makedev` at the conversion.
 /// Grammar refusals map to `None` here and to the caller's `io` error
 /// in [`read_mountinfo`], as the former procfs parser's refusals did.
 /// One deliberate strictness follows the grammar: a nonempty snapshot
