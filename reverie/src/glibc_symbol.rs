@@ -484,6 +484,42 @@ mod tests {
         tables
     }
 
+    /// The first symbol version of this architecture's glibc port, which every
+    /// function present since the port carries (`DEFAULT` in glibc's
+    /// sysdeps/unix/sysv/linux/<arch>/shlib-versions).
+    #[cfg(target_arch = "x86_64")]
+    const BASE: &str = "GLIBC_2.2.5";
+    #[cfg(target_arch = "aarch64")]
+    const BASE: &str = "GLIBC_2.17";
+
+    /// The version of libc's `memcpy`, an IFUNC on both architectures: x86_64
+    /// gave it a new version in glibc 2.14 (the one at `BASE` is the old
+    /// overlap-tolerant compatibility symbol), and the aarch64 port, which
+    /// began at 2.17, has only its first.
+    #[cfg(target_arch = "x86_64")]
+    const MEMCPY: &str = "GLIBC_2.14";
+    #[cfg(target_arch = "aarch64")]
+    const MEMCPY: &str = BASE;
+
+    /// Plain functions at versions this architecture's libc defines. x86_64's
+    /// `realpath` has two versions (see
+    /// `each_version_of_a_function_is_its_own`); aarch64's has one.
+    #[cfg(target_arch = "x86_64")]
+    const VERSIONED: &[(&str, &str)] = &[
+        ("dl_iterate_phdr", BASE),
+        ("dlvsym", "GLIBC_2.34"),
+        ("pthread_create", "GLIBC_2.34"),
+        ("realpath", "GLIBC_2.3"),
+        ("realpath", BASE),
+    ];
+    #[cfg(target_arch = "aarch64")]
+    const VERSIONED: &[(&str, &str)] = &[
+        ("dl_iterate_phdr", BASE),
+        ("dlvsym", "GLIBC_2.34"),
+        ("pthread_create", "GLIBC_2.34"),
+        ("realpath", BASE),
+    ];
+
     /// The lookup through both tables, through the GNU table alone and through
     /// the SysV table alone.
     fn each_table(name: &str, version: &str) -> [Option<usize>; 3] {
@@ -525,7 +561,7 @@ mod tests {
         let (gnu, sysv) = libc_tables();
         for (name, version) in [
             ("_dl_find_object", "GLIBC_2.35"),
-            ("realpath", "GLIBC_2.2.5"),
+            ("realpath", BASE),
         ] {
             let expected = dlvsym(name, version);
             for (keep_gnu, keep_sysv) in [(true, false), (false, true)] {
@@ -555,13 +591,7 @@ mod tests {
     /// `dlvsym` finds them.
     #[test]
     fn versioned_functions_are_found_where_dlvsym_finds_them() {
-        for (name, version) in [
-            ("dl_iterate_phdr", "GLIBC_2.2.5"),
-            ("dlvsym", "GLIBC_2.34"),
-            ("pthread_create", "GLIBC_2.34"),
-            ("realpath", "GLIBC_2.3"),
-            ("realpath", "GLIBC_2.2.5"),
-        ] {
+        for &(name, version) in VERSIONED {
             let expected = dlvsym(name, version);
             assert!(expected.is_some(), "dlvsym finds no {name}@{version}");
             assert_eq!(
@@ -576,6 +606,10 @@ mod tests {
     /// own, including the older, non-default one (its versym hidden bit is
     /// set).
     #[test]
+    #[cfg_attr(
+        not(target_arch = "x86_64"),
+        ignore = "glibc x86-only version nodes: realpath has two versions only in x86-64 glibc (GLIBC_2.2.5, GLIBC_2.3); aarch64's has one"
+    )]
     fn each_version_of_a_function_is_its_own() {
         let new = glibc_versioned_function(b"realpath", b"GLIBC_2.3");
         let old = glibc_versioned_function(b"realpath", b"GLIBC_2.2.5");
@@ -595,11 +629,11 @@ mod tests {
     }
 
     /// An IFUNC's symbol value is its resolver, not the function, so it is
-    /// refused (memcpy is an IFUNC in x86-64 glibc).
+    /// refused (see [`MEMCPY`]).
     #[test]
     fn an_ifunc_is_not_found() {
-        assert!(dlvsym("memcpy", "GLIBC_2.14").is_some());
-        assert_eq!(each_table("memcpy", "GLIBC_2.14"), [None; 3]);
+        assert!(dlvsym("memcpy", MEMCPY).is_some());
+        assert_eq!(each_table("memcpy", MEMCPY), [None; 3]);
     }
 
     /// The lookup changes no `dlerror` state: a caller's pending message is
@@ -614,7 +648,7 @@ mod tests {
             )
         };
         assert!(missing.is_null());
-        assert!(glibc_versioned_function(b"dl_iterate_phdr", b"GLIBC_2.2.5").is_some());
+        assert!(glibc_versioned_function(b"dl_iterate_phdr", BASE.as_bytes()).is_some());
         assert!(glibc_versioned_function(b"_dl_find_object", b"GLIBC_2.99").is_none());
         // SAFETY: dlerror has no preconditions; a non-null result is a
         // NUL-terminated message.

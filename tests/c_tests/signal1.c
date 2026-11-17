@@ -28,9 +28,36 @@ struct kernel_sigaction {
   unsigned long masks;
 };
 
-static int rt_sigreturn(void* regs) {
-  return (int)syscall(SYS_rt_sigreturn, regs);
-}
+// The SA_RESTORER the handler returns to. It must issue rt_sigreturn with the
+// stack pointer exactly as the handler left it, where the kernel built the
+// signal frame, so it is written in assembly. A C function calling syscall(2)
+// works only if the compiler turns the call into a jump: the x86_64 build does,
+// but the aarch64 build pushes a 16-byte frame record and calls, so the kernel
+// read the frame 16 bytes too low and the process died after the handler.
+extern void signal1_restorer(void);
+#if defined(__x86_64__)
+__asm__(
+    ".text\n"
+    ".globl signal1_restorer\n"
+    ".type signal1_restorer, @function\n"
+    "signal1_restorer:\n"
+    "  mov $15, %eax\n" // SYS_rt_sigreturn
+    "  syscall\n"
+    "  hlt\n"
+    ".size signal1_restorer, . - signal1_restorer\n");
+#elif defined(__aarch64__)
+__asm__(
+    ".text\n"
+    ".globl signal1_restorer\n"
+    ".type signal1_restorer, %function\n"
+    "signal1_restorer:\n"
+    "  mov x8, #139\n" // SYS_rt_sigreturn
+    "  svc #0\n"
+    "  brk #0\n"
+    ".size signal1_restorer, . - signal1_restorer\n");
+#else
+#error "no SA_RESTORER for this architecture"
+#endif
 
 static int rt_sigaction(
     int signum,
@@ -65,7 +92,7 @@ int main(int argc, char* argv[]) {
 
   new.sa__ = (unsigned long)handler;
   new.flags = SA_RESTART | SA_RESTORER | SA_SIGINFO;
-  new.restorer = (unsigned long)rt_sigreturn;
+  new.restorer = (unsigned long)signal1_restorer;
 
   ret = rt_sigaction(SIGALRM, &new, NULL);
   if (ret < 0) {

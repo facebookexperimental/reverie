@@ -18,7 +18,7 @@ fn main() -> std::process::ExitCode {
         [mode] if mode == "write" => guest::write_body("abcd"),
         [mode] if mode == "print" => guest::print_body("abcd"),
         _ => {
-            eprintln!("usage: basics-rust-command-guest [write|print]");
+            eprintln!("usage: basics_rust_command_guest [write|print]");
             return std::process::ExitCode::from(2);
         }
     }

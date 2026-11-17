@@ -32,6 +32,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(target_arch = "x86_64"),
+        ignore = "no vDSO getcpu on arm64: its vDSO exports only __kernel_* rt_sigreturn, gettimeofday, clock_gettime, clock_getres and, on newer kernels, getrandom"
+    )]
     fn run_guest_vdso_getcpu_test() {
         struct VdsoHandle(*mut libc::c_void);
 

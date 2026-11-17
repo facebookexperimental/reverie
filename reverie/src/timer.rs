@@ -13,11 +13,15 @@ pub enum TimerSchedule {
     /// Request that a timer event occur after approximataly this duration.
     /// Conversion to real time is best-effort only.
     Time(core::time::Duration),
-    /// Request that a timer event occur after exactly this many retired
-    /// conditional branches (RCBs).
+    /// Request that a timer event occur after exactly this many RCBs, as the
+    /// architecture's branch counter counts them. On x86_64 that is retired
+    /// conditional branches. On aarch64 it is the architectural `BR_RETIRED`
+    /// event, which counts every retired branch instruction, including
+    /// unconditional branches, calls (`BL`, `BLR`) and returns (`RET`), so
+    /// the same code reaches a given count sooner there.
     Rcbs(u64),
-    /// Request that a timer event occur after exactly this many retired
-    /// conditional branches (RCBs) and this many instructions
+    /// Request that a timer event occur after exactly this many RCBs,
+    /// counted as for [`TimerSchedule::Rcbs`], and this many instructions
     RcbsAndInstructions(u64, u64),
 }
 

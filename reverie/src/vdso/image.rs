@@ -743,12 +743,20 @@ mod tests {
         assert_eq!(entries[0].size, 16);
     }
 
+    /// The section end, not the 16-byte alignment, bounds the last entry
+    /// point. The function and its section are sized from this
+    /// architecture's `enosys` stub (8 bytes on x86_64, 16 on aarch64), so
+    /// the stub fits the room left: 9 bytes and a 12-byte room on x86_64,
+    /// 17 bytes and a 20-byte room on aarch64.
     #[test]
     fn last_entry_point_stops_at_the_end_of_its_section() {
-        let mut last = export("__vdso_future_call", 0x900, 9);
-        last.section_end = Some(0x90c);
+        let stub = stubs::enosys.len();
+        let (size, room) = (stub + 1, stub + 4);
+        assert!(room < align_up(size, 16));
+        let mut last = export("__vdso_future_call", 0x900, size);
+        last.section_end = Some(0x900 + room as u64);
         let entries = classify_vdso_exports(&[last]).unwrap();
-        assert_eq!(entries[0].size, 12);
+        assert_eq!(entries[0].size, room);
     }
 
     #[test]

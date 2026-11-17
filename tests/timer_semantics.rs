@@ -314,6 +314,31 @@ mod tests {
     //! be exact, be sure to precompute them in the tracer before moving them
     //! into the tracee, otherwise underflow or overflow checks will break the
     //! tests.
+    //!
+    //! Some cases expect x86_64 behaviour and are ignored elsewhere. Each
+    //! ignore names one of these causes:
+    //!
+    //! - RCB arithmetic: the expected counts are x86_64 retired conditional
+    //!   branches. The aarch64 counter, `BR_RETIRED`, counts every retired
+    //!   branch, so each call and return in the guest (around `do_branches`,
+    //!   and around a timer function called through its pointer) adds to the
+    //!   count and moves the exact boundaries these cases assert. In an opt
+    //!   build the surplus measured 2 RCBs around `do_branches` (its BL and
+    //!   RET) and 2 more around a timer function called through its pointer
+    //!   (BLR and RET), but which calls survive inlining, and which other
+    //!   unconditional branches the compiler emits around the assembly in
+    //!   `do_branches`, is the compiler's choice and can change with the build
+    //!   mode. x86_64 counts only the conditional branches the tests place, so
+    //!   there is no fixed aarch64 count to assert in their place.
+    //! - x86-only trapped instructions: `cpuid`, `rdtsc` and `rdtscp` trap to
+    //!   the tool on x86_64, which cancels the pending timer. On aarch64 those
+    //!   helpers are empty and no instruction traps to the tool in their place.
+    //! - imprecise-timer skid: an imprecise timer fires when the PMU overflow
+    //!   interrupt arrives. On aarch64 that comes up to hundreds of branches
+    //!   late (`reverie::pmu_config` records skids of 194 on Neoverse V2 and
+    //!   1,301 on Cortex-A78C), longer than the 7 to 300 branches the
+    //!   `LESS_RCBS` imprecise cases leave before the timer is cancelled. Skid
+    //!   varies with the core and the load, so it gives no value to assert.
 
     use reverie_ptrace::ret_without_perf;
     use reverie_ptrace::testing::check_fn;
@@ -435,7 +460,6 @@ mod tests {
     #[test_case(MANY_RCBS, sched_precise)]
     #[test_case(MANY_RCBS, sched_imprecise)]
     #[test_case(LESS_RCBS, sched_precise)]
-    #[test_case(LESS_RCBS, sched_imprecise)]
     fn timer_is_single(rcbs: u64, schedule_timer: fn() -> ()) {
         ret_without_perf!();
         let rcbx2 = rcbs * 2;
@@ -452,10 +476,24 @@ mod tests {
         assert_eq!(gs.num_timer_evts.into_inner(), 3);
     }
 
+    /// [`timer_is_single`] with an imprecise timer and `LESS_RCBS`.
+    #[test]
+    #[cfg_attr(
+        target_arch = "aarch64",
+        ignore = "imprecise-timer skid: aarch64 PMU overflow skid is longer than this case's branch windows"
+    )]
+    fn timer_is_single_less_rcbs_sched_imprecise() {
+        timer_is_single(LESS_RCBS, sched_imprecise);
+    }
+
     #[test_case(MANY_RCBS, sched_precise)]
     #[test_case(MANY_RCBS, sched_precise_and_inject)]
     #[test_case(LESS_RCBS, sched_precise)]
     #[test_case(LESS_RCBS, sched_precise_and_inject)]
+    #[cfg_attr(
+        target_arch = "aarch64",
+        ignore = "RCB arithmetic: aarch64 BR_RETIRED also counts the guest's calls and returns, whose number is the compiler's inlining and branch lowering, so no fixed aarch64 count exists"
+    )]
     fn precise_delivery_exact(rcbs: u64, schedule_timer: fn() -> ()) {
         ret_without_perf!();
 
@@ -496,30 +534,28 @@ mod tests {
         Imprecise,
     }
 
+    /// A syscall or a scheduled timer cancels a pending timer; the cases that
+    /// cancel with a trapped instruction are
+    /// [`assert_trapped_instructions_cancel_timers`]. On aarch64 the calls and
+    /// returns around `do_branches` and `fun` push the run that should stop 2
+    /// RCBs short of the timer's target past it, so even the imprecise cases
+    /// pass there only when skid delivers the timer after the syscall.
     #[test_case(MANY_RCBS, do_syscall, TimerKind::Precise, 0)]
     #[test_case(MANY_RCBS, do_syscall, TimerKind::Imprecise, 0)]
-    #[test_case(MANY_RCBS, cpuid, TimerKind::Precise, 0)]
-    #[test_case(MANY_RCBS, cpuid, TimerKind::Imprecise, 0)]
-    #[test_case(MANY_RCBS, rdtsc, TimerKind::Precise, 0)]
-    #[test_case(MANY_RCBS, rdtsc, TimerKind::Imprecise, 0)]
-    #[test_case(MANY_RCBS, rdtscp, TimerKind::Precise, 0)]
-    #[test_case(MANY_RCBS, rdtscp, TimerKind::Imprecise, 0)]
     #[test_case(MANY_RCBS, sched_precise, TimerKind::Precise, 1)]
     #[test_case(MANY_RCBS, sched_imprecise, TimerKind::Precise, 1)]
     #[test_case(MANY_RCBS, sched_imprecise, TimerKind::Imprecise, 1)]
     #[test_case(MANY_RCBS, sched_precise, TimerKind::Imprecise, 1)]
     #[test_case(LESS_RCBS, do_syscall, TimerKind::Precise, 0)]
     #[test_case(LESS_RCBS, do_syscall, TimerKind::Imprecise, 0)]
-    #[test_case(LESS_RCBS, cpuid, TimerKind::Precise, 0)]
-    #[test_case(LESS_RCBS, cpuid, TimerKind::Imprecise, 0)]
-    #[test_case(LESS_RCBS, rdtsc, TimerKind::Precise, 0)]
-    #[test_case(LESS_RCBS, rdtsc, TimerKind::Imprecise, 0)]
-    #[test_case(LESS_RCBS, rdtscp, TimerKind::Precise, 0)]
-    #[test_case(LESS_RCBS, rdtscp, TimerKind::Imprecise, 0)]
     #[test_case(LESS_RCBS, sched_precise, TimerKind::Precise, 1)]
     #[test_case(LESS_RCBS, sched_imprecise, TimerKind::Precise, 1)]
     #[test_case(LESS_RCBS, sched_imprecise, TimerKind::Imprecise, 1)]
     #[test_case(LESS_RCBS, sched_precise, TimerKind::Imprecise, 1)]
+    #[cfg_attr(
+        target_arch = "aarch64",
+        ignore = "RCB arithmetic: aarch64 BR_RETIRED also counts the guest's calls and returns, whose number is the compiler's inlining and branch lowering, so no fixed aarch64 count exists"
+    )]
     fn assert_cancels_timers(
         rcbs: u64,
         fun: fn() -> (),
@@ -565,10 +601,35 @@ mod tests {
         }
     }
 
+    /// [`assert_cancels_timers`] with an instruction that traps to the tool.
+    #[test_case(MANY_RCBS, cpuid, TimerKind::Precise, 0)]
+    #[test_case(MANY_RCBS, cpuid, TimerKind::Imprecise, 0)]
+    #[test_case(MANY_RCBS, rdtsc, TimerKind::Precise, 0)]
+    #[test_case(MANY_RCBS, rdtsc, TimerKind::Imprecise, 0)]
+    #[test_case(MANY_RCBS, rdtscp, TimerKind::Precise, 0)]
+    #[test_case(MANY_RCBS, rdtscp, TimerKind::Imprecise, 0)]
+    #[test_case(LESS_RCBS, cpuid, TimerKind::Precise, 0)]
+    #[test_case(LESS_RCBS, cpuid, TimerKind::Imprecise, 0)]
+    #[test_case(LESS_RCBS, rdtsc, TimerKind::Precise, 0)]
+    #[test_case(LESS_RCBS, rdtsc, TimerKind::Imprecise, 0)]
+    #[test_case(LESS_RCBS, rdtscp, TimerKind::Precise, 0)]
+    #[test_case(LESS_RCBS, rdtscp, TimerKind::Imprecise, 0)]
+    #[cfg_attr(
+        not(target_arch = "x86_64"),
+        ignore = "x86-only trapped instructions: cpuid, rdtsc and rdtscp have no aarch64 counterpart; the helpers are empty there"
+    )]
+    fn assert_trapped_instructions_cancel_timers(
+        rcbs: u64,
+        fun: fn() -> (),
+        timer_kind: TimerKind,
+        additional_evts: u64,
+    ) {
+        assert_cancels_timers(rcbs, fun, timer_kind, additional_evts);
+    }
+
     #[test_case(MANY_RCBS, sched_precise, sched_precise_and_raise)]
     #[test_case(MANY_RCBS, sched_imprecise, sched_imprecise_and_raise)]
     #[test_case(LESS_RCBS, sched_precise, sched_precise_and_raise)]
-    #[test_case(LESS_RCBS, sched_imprecise, sched_imprecise_and_raise)]
     fn signals_cancel_timers(
         rcbs: u64,
         schedule_timer: fn() -> (),
@@ -601,6 +662,16 @@ mod tests {
         });
         assert_eq!(gs.num_signals.into_inner(), 0); // defensive
         assert_eq!(gs.num_timer_evts.into_inner(), 2);
+    }
+
+    /// [`signals_cancel_timers`] with an imprecise timer and `LESS_RCBS`.
+    #[test]
+    #[cfg_attr(
+        target_arch = "aarch64",
+        ignore = "imprecise-timer skid: aarch64 PMU overflow skid is longer than this case's branch windows"
+    )]
+    fn signals_cancel_timers_less_rcbs_sched_imprecise() {
+        signals_cancel_timers(LESS_RCBS, sched_imprecise, sched_imprecise_and_raise);
     }
 
     #[test_case(MANY_RCBS, sched_precise)]
@@ -650,6 +721,10 @@ mod tests {
     #[test_case(MANY_RCBS, sched_precise_and_inject)]
     #[test_case(LESS_RCBS, sched_precise)]
     #[test_case(LESS_RCBS, sched_precise_and_inject)]
+    #[cfg_attr(
+        target_arch = "aarch64",
+        ignore = "RCB arithmetic: aarch64 BR_RETIRED also counts the guest's calls and returns, whose number is the compiler's inlining and branch lowering, so no fixed aarch64 count exists"
+    )]
     fn precise_deterministic_loop(rcbs: u64, schedule_timer: fn() -> ()) {
         ret_without_perf!();
         let rcbm2 = rcbs - 2;
@@ -673,6 +748,10 @@ mod tests {
     #[test_case(MANY_RCBS, sched_imprecise_and_inject)]
     #[test_case(LESS_RCBS, sched_imprecise)]
     #[test_case(LESS_RCBS, sched_imprecise_and_inject)]
+    #[cfg_attr(
+        target_arch = "aarch64",
+        ignore = "RCB arithmetic: aarch64 BR_RETIRED also counts the guest's calls and returns, whose number is the compiler's inlining and branch lowering, so no fixed aarch64 count exists"
+    )]
     fn imprecise_not_early_loop(rcbs: u64, schedule_timer: fn() -> ()) {
         ret_without_perf!();
         const ITERS: u64 = 2000;
@@ -730,6 +809,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_arch = "aarch64",
+        ignore = "RCB arithmetic: aarch64 BR_RETIRED also counts the guest's calls and returns, whose number is the compiler's inlining and branch lowering, so no fixed aarch64 count exists"
+    )]
     fn clock_accuracy() {
         ret_without_perf!();
         for r in [100, 1000, 10000, 100000, 1000000] {
@@ -743,6 +826,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_arch = "aarch64",
+        ignore = "RCB arithmetic: aarch64 BR_RETIRED also counts the guest's calls and returns, whose number is the compiler's inlining and branch lowering, so no fixed aarch64 count exists"
+    )]
     fn clock_stays_without_branch() {
         ret_without_perf!();
         let r = 2000;
@@ -766,6 +853,10 @@ mod tests {
     #[test_case(MANY_RCBS, sched_imprecise)]
     #[test_case(LESS_RCBS, sched_precise)]
     #[test_case(LESS_RCBS, sched_imprecise)]
+    #[cfg_attr(
+        target_arch = "aarch64",
+        ignore = "RCB arithmetic: aarch64 BR_RETIRED also counts the guest's calls and returns, whose number is the compiler's inlining and branch lowering, so no fixed aarch64 count exists"
+    )]
     fn clock_with_timer(rcbs: u64, schedule_timer: fn() -> ()) {
         ret_without_perf!();
         let a = rcbs * 2;

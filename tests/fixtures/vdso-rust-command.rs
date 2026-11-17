@@ -17,7 +17,7 @@ fn main() -> std::process::ExitCode {
         [selector] if selector == "getcpu" => getcpu_command(),
         [selector] if selector == "tod" => tod_command(),
         _ => {
-            eprintln!("usage: vdso-rust-command-guest [gettimeofday|getcpu|tod]");
+            eprintln!("usage: vdso_rust_command_guest [gettimeofday|getcpu|tod]");
             return std::process::ExitCode::from(2);
         }
     }

@@ -14011,6 +14011,10 @@ mod test {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        target_arch = "aarch64",
+        ignore = "PTRACE_PEEKUSR absent on arm64: peekuser fails with EIO there, https://github.com/facebookexperimental/reverie/issues/73"
+    )]
     async fn regs_writeback_collapses_setregs_until_flush() {
         let (_pid, stopped, cleanup) = spawn_traced_process(None).unwrap();
         let mut regs = stopped.getregs().unwrap();
@@ -14064,6 +14068,10 @@ mod test {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        target_arch = "aarch64",
+        ignore = "PTRACE_PEEKUSR absent on arm64: peekuser fails with EIO there, https://github.com/facebookexperimental/reverie/issues/73"
+    )]
     async fn regs_writeback_elides_a_no_op_setregs() {
         let (_pid, stopped, cleanup) = spawn_traced_process(None).unwrap();
         let regs = stopped.getregs().unwrap();
@@ -14115,6 +14123,10 @@ mod test {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        target_arch = "aarch64",
+        ignore = "PTRACE_PEEKUSR absent on arm64: peekuser fails with EIO there, https://github.com/facebookexperimental/reverie/issues/73"
+    )]
     async fn regs_writeback_foreign_thread_setregs_refused() {
         let (_pid, stopped, cleanup) = spawn_traced_process_as(None, |pid| {
             Stopped::new_unchecked_on_ptracer_thread(pid).unwrap()
@@ -14415,6 +14427,12 @@ mod test {
         let saved = unsafe { libc::fcntl(libc::STDERR_FILENO, libc::F_DUPFD_CLOEXEC, 3) };
         assert!(saved >= 0);
         let saved = unsafe { OwnedFd::from_raw_fd(saved) };
+        // The "full" mode's pipe: F_SETPIPE_SZ rounds a capacity up to at
+        // least one page (fcntl(2)), so the smallest pipe, and the bytes that
+        // fill it, is the page size: 4096 on 4 KiB pages, 65536 on 64 KiB.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        assert!(page > 0);
+        let page = page as usize;
         let mut full_reader = None;
         let mut regular_output = None;
         let mut previous_sigpipe = None;
@@ -14476,12 +14494,13 @@ mod test {
             let writer = unsafe { OwnedFd::from_raw_fd(descriptors[1]) };
             if mode == "full" {
                 assert_eq!(
-                    unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_SETPIPE_SZ, 4096) },
-                    4096
+                    unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_SETPIPE_SZ, page as libc::c_int) },
+                    page as libc::c_int
                 );
+                let fill = vec![b'x'; page];
                 assert_eq!(
-                    unsafe { libc::write(writer.as_raw_fd(), [b'x'; 4096].as_ptr().cast(), 4096) },
-                    4096
+                    unsafe { libc::write(writer.as_raw_fd(), fill.as_ptr().cast(), page) },
+                    page as isize
                 );
                 full_reader = Some(reader);
             } else {
@@ -14560,7 +14579,7 @@ mod test {
             );
         }
         if mode == "full" {
-            let mut bytes = [0; 4096];
+            let mut bytes = vec![0; page];
             assert_eq!(
                 unsafe {
                     libc::read(
@@ -14571,7 +14590,7 @@ mod test {
                 },
                 bytes.len() as isize
             );
-            assert_eq!(bytes, [b'x'; 4096]);
+            assert_eq!(bytes, vec![b'x'; page]);
         } else if let Some(fd) = regular_output {
             let expected = if mode == "file-limit" {
                 b"before\nafter\n".to_vec()

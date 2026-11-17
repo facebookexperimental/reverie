@@ -79,6 +79,10 @@ fn fn_test() {
 
 #[cfg(not(sanitized))]
 #[test]
+#[cfg_attr(
+    not(target_arch = "x86_64"),
+    ignore = "x86-only guest fixture: basics_rust_command_guest panics on other architectures (fixtures/basics-rust-command.rs)"
+)]
 fn run_fn_test() {
     fn_test();
     rust_command_test();
@@ -176,6 +180,10 @@ fn run_guest_command_test_closure() {
 
 #[cfg(not(sanitized))]
 #[test]
+#[cfg_attr(
+    not(target_arch = "x86_64"),
+    ignore = "x86-only guest fixture: basics_rust_command_guest panics on other architectures (fixtures/basics-rust-command.rs)"
+)]
 fn run_guest_func_write_test() {
     let msg = "abcd";
     let (output, _state) = test_fn::<CounterLocal, _>(move || rust_guest::write_body(msg)).unwrap();
@@ -186,6 +194,10 @@ fn run_guest_func_write_test() {
 
 #[cfg(not(sanitized))]
 #[test]
+#[cfg_attr(
+    not(target_arch = "x86_64"),
+    ignore = "x86-only guest fixture: basics_rust_command_guest panics on other architectures (fixtures/basics-rust-command.rs)"
+)]
 fn run_guest_func_print_test() {
     // The function guest prints with `println!`, which libtest's capture
     // intercepts before it reaches the output pipes unless reverie-ptrace's
