@@ -304,12 +304,18 @@ fn liteinst_aarch64_counting_runner_pins_every_target() {
     assert_eq!(count(&qemu_targets, "native", "ignored"), 0);
 }
 
-const WORKFLOW: &str = include_str!("../../.github/workflows/ci.yml");
+const CI_WORKFLOW: &str = include_str!("../../.github/workflows/ci.yml");
+const EXTENDED_WORKFLOW: &str = include_str!("../../.github/workflows/extended.yml");
 const CORE_MANIFEST: &str = include_str!("../../reverie-liteinst/Cargo.toml");
 const ALLOCATOR_TESTS: &str = include_str!("../../reverie-liteinst/tests/allocator_contract.rs");
 
+/// The local workspace gate (validate.sh) and the Extended full workspace
+/// test (extended.yml) require the allocator, and the self-hosted
+/// host-dependent job (ci.yml) builds the same preload before its tests.
+/// GitHub CI is supplemental: neither workflow gates a merge, so of these
+/// only the local workspace gate is a gate.
 #[test]
-fn allocator_contract_is_required_by_local_and_ci_workspace_gates() {
+fn allocator_contract_is_required_by_local_gate_and_extended_workspace_test() {
     const REGISTERED_TARGET: &str = r#"[[test]]
 name = "allocator_contract"
 path = "tests/allocator_contract.rs"
@@ -380,21 +386,27 @@ required-features = ["allocator-fixture"]"#;
         VALIDATE_SCRIPT
             .contains("build-liteinst-test-runtime.rs\" --for-ci \"$generation\" || return")
     );
-    assert!(WORKFLOW.contains("cargo test --workspace --exclude reverie-kvm --exclude reverie-kvm-core --exclude reverie-linuxemu --exclude reverie-inguest --features \"${STABLE_FEATURES_REGULAR}\" --no-fail-fast --"));
+    assert!(EXTENDED_WORKFLOW.contains("cargo test --workspace --exclude reverie-kvm --exclude reverie-kvm-core --exclude reverie-linuxemu --exclude reverie-inguest --features \"${STABLE_FEATURES_REGULAR}\" --no-fail-fast --"));
     assert!(
-        WORKFLOW.contains(
+        CI_WORKFLOW.contains(
             "cargo test --workspace --features \"${STABLE_FEATURES}\" -- --test-threads=1"
         )
     );
-    for job in ["  regular:", "  hardware:"] {
-        let section = &WORKFLOW[WORKFLOW.find(job).unwrap()..];
+    for (file, workflow, job) in [
+        ("extended.yml", EXTENDED_WORKFLOW, "regular"),
+        ("ci.yml", CI_WORKFLOW, "hardware"),
+    ] {
+        let start = workflow
+            .find(&format!("\n  {job}:\n"))
+            .unwrap_or_else(|| panic!("{file} has no {job} job"));
+        let section = &workflow[start..];
         let producer = section
             .find("scripts/build-liteinst-test-runtime.rs --for-ci \"$generation\"")
             .unwrap();
         let tests = section.find("cargo test --workspace").unwrap();
         assert!(
             producer < tests,
-            "{job} must qualify the actual preload before all-feature tests"
+            "{file} job {job} must qualify the actual preload before all-feature tests"
         );
         assert!(
             section[..tests].contains("cat \"$generation/bundle/github.env\" >> \"$GITHUB_ENV\"")
