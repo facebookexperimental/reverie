@@ -2489,6 +2489,144 @@ impl GuestProbeRunner {
     }
 }
 
+/// What one fixed-guest xstate qualification measured on this host: the
+/// guest XCR0 the probe vCPU ran with, the IA32_XSS outcome sampled at
+/// its construction, and whether the guest's own XGETBV/XSAVE answers
+/// stayed identical across a VM exit (and, in the second trial, across
+/// the frame consumer's GET-frame-SET reinstall at that exit).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FixedXstateQualification {
+    /// XGETBV(0) as the guest read it.
+    pub guest_xcr0: u64,
+    /// The probe vCPU's IA32_XSS outcome and read-back.
+    pub xss: XssOutcome,
+    /// Host CPUID 0xD.1 EAX (XSAVEOPT/XSAVEC/XSAVES feature bits).
+    pub host_cpuid_d_1_eax: u32,
+    /// Comparisons performed (per trial: XGETBV(0), XGETBV(1), and the
+    /// 832-byte XSAVE image, each before vs after the exit).
+    pub comparisons: u32,
+    /// Comparisons whose two sides differed.
+    pub unstable: u32,
+    /// First differing byte offset within the XSAVE image, if any did.
+    pub first_image_difference: Option<usize>,
+}
+
+/// The qualification blob: record XGETBV(0), XGETBV(1) and an XSAVE64
+/// image into the context, exit at FORCE, record them again, exit at
+/// DONE. Intel-syntax source (RDI = context):
+///   xor ecx,ecx; xgetbv; mov [rdi+0x40],eax; mov [rdi+0x44],edx
+///   mov ecx,1;   xgetbv; mov [rdi+0x48],eax; mov [rdi+0x4c],edx
+///   mov eax,-1;  mov edx,-1; xsave64 [rdi+0x100]
+///   mov eax,0x505801; syscall            (FORCE, returns at 50)
+///   (same records at 0x50/0x58 and [rdi+0x500])
+///   mov eax,0x505803; syscall; jmp $     (DONE, returns at 100)
+const XSTATE_QUAL_BLOB: [u8; 102] = [
+    0x31, 0xc9, 0x0f, 0x01, 0xd0, 0x89, 0x47, 0x40, 0x89, 0x57, 0x44, 0xb9, 0x01, 0x00, 0x00,
+    0x00, 0x0f, 0x01, 0xd0, 0x89, 0x47, 0x48, 0x89, 0x57, 0x4c, 0xb8, 0xff, 0xff, 0xff, 0xff,
+    0xba, 0xff, 0xff, 0xff, 0xff, 0x48, 0x0f, 0xae, 0xa7, 0x00, 0x01, 0x00, 0x00, 0xb8, 0x01,
+    0x58, 0x50, 0x00, 0x0f, 0x05, 0x31, 0xc9, 0x0f, 0x01, 0xd0, 0x89, 0x47, 0x50, 0x89, 0x57,
+    0x54, 0xb9, 0x01, 0x00, 0x00, 0x00, 0x0f, 0x01, 0xd0, 0x89, 0x47, 0x58, 0x89, 0x57, 0x5c,
+    0xb8, 0xff, 0xff, 0xff, 0xff, 0xba, 0xff, 0xff, 0xff, 0xff, 0x48, 0x0f, 0xae, 0xa7, 0x00,
+    0x05, 0x00, 0x00, 0xb8, 0x03, 0x58, 0x50, 0x00, 0x0f, 0x05, 0xeb, 0xfe,
+];
+
+/// The fixed machine's XSAVE area size, as the qualification compares.
+const FIXED_XSAVE_IMAGE: usize = 832;
+
+/// Qualify the fixed guest machine's xstate behavior on this host: run
+/// the qualification blob twice on a fresh probe vCPU - once with no
+/// host action at its forced exit, once with the frame consumer
+/// reinstalling the vCPU image through the signal-frame codec at that
+/// exit - and compare what the guest itself read before and after.
+/// This is evidence for admission to consume; it admits nothing.
+pub fn qualify_fixed_guest_xstate() -> Result<FixedXstateQualification> {
+    fn word(context: &[u8], offset: usize) -> u64 {
+        u64::from_le_bytes(context[offset..offset + 8].try_into().expect("word in context"))
+    }
+    let sites = [
+        ExitSite {
+            marker: PROBE_MARKER_FORCE,
+            return_offset: 50,
+        },
+        ExitSite {
+            marker: PROBE_MARKER_DONE,
+            return_offset: 100,
+        },
+    ];
+    let mut qualification: Option<FixedXstateQualification> = None;
+    for action in [
+        HostAction::None,
+        HostAction::FrameConsumer(FrameEdit::default()),
+    ] {
+        let runner = GuestProbeRunner::new(&XSTATE_QUAL_BLOB, 0, &[0; 0x1000], 0x3f_f000, &sites)?;
+        let facts_xss = runner.facts().xss;
+        let facts_d1 = runner.facts().cpuid_d_1_eax;
+        let record = runner.run_trial(
+            ProbeExitPath::P1,
+            &action,
+            None,
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        )?;
+        let ends: Vec<RunEnd> = record.runs.iter().map(|run| run.end).collect();
+        let expected = [
+            RunEnd::Trampoline(TrampolineExit {
+                marker: u64::from(PROBE_MARKER_FORCE),
+                return_rip: DEFAULT_LOAD_ADDRESS + 50,
+            }),
+            RunEnd::Trampoline(TrampolineExit {
+                marker: u64::from(PROBE_MARKER_DONE),
+                return_rip: DEFAULT_LOAD_ADDRESS + 100,
+            }),
+        ];
+        if matches!(action, HostAction::FrameConsumer(_)) && record.frame.is_none() {
+            return Err(Error::UnsupportedHost(
+                "the xstate qualification's frame consumer did not run".to_string(),
+            ));
+        }
+        if ends != expected || record.watchdog_kicked {
+            return Err(Error::UnsupportedHost(format!(
+                "the xstate qualification trial did not run as designed: ends {ends:?}, \
+                 watchdog kicked {}",
+                record.watchdog_kicked
+            )));
+        }
+        let context = &record.context;
+        let first = &context[0x100..0x100 + FIXED_XSAVE_IMAGE];
+        let second = &context[0x500..0x500 + FIXED_XSAVE_IMAGE];
+        let image_difference = first
+            .iter()
+            .zip(second)
+            .position(|(a, b)| a != b);
+        let mut unstable = u32::from(image_difference.is_some());
+        unstable += u32::from(word(context, 0x40) != word(context, 0x50));
+        unstable += u32::from(word(context, 0x48) != word(context, 0x58));
+        match &mut qualification {
+            None => {
+                qualification = Some(FixedXstateQualification {
+                    guest_xcr0: word(context, 0x40),
+                    xss: facts_xss,
+                    host_cpuid_d_1_eax: facts_d1,
+                    comparisons: 3,
+                    unstable,
+                    first_image_difference: image_difference,
+                });
+            }
+            Some(total) => {
+                total.comparisons += 3;
+                total.unstable += unstable;
+                if total.first_image_difference.is_none() {
+                    total.first_image_difference = image_difference;
+                }
+                if total.guest_xcr0 != word(context, 0x40) {
+                    total.unstable += 1;
+                    total.comparisons += 1;
+                }
+            }
+        }
+    }
+    Ok(qualification.expect("two trials ran"))
+}
+
 #[cfg(test)]
 #[path = "guest_probe_tests.rs"]
 mod tests;

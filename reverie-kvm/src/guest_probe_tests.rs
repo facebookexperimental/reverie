@@ -712,6 +712,18 @@ fn delta(run: &RunRecord) -> VcpuStatsSnapshot {
 }
 
 #[test]
+fn the_fixed_xstate_qualification_is_stable_on_this_host() {
+    let qualification = qualify_fixed_guest_xstate().unwrap();
+    assert_eq!(qualification.guest_xcr0, crate::bootstrap::FIXED_GUEST_XCR0);
+    assert!(qualification.comparisons >= 6, "{qualification:?}");
+    assert_eq!(
+        qualification.unstable, 0,
+        "guest xstate answers changed across a VM exit: {qualification:?}"
+    );
+    assert_eq!(qualification.first_image_difference, None);
+}
+
+#[test]
 fn a_real_p1_trial_exits_at_force_then_done() {
     let record = trial(
         &FORCE_DONE_BLOB,
