@@ -1061,57 +1061,39 @@ mod tests {
 
     #[test]
     fn qualify_transfers_refuses_nonidentity_missing_sources_and_wrong_owned_entry() {
-        // This is a real factory transaction over the independently current,
-        // clean workspace. The fixture never constructs opaque source authority.
-        // Requires a clean Git checkout, Git and Cargo, and an offline Cargo
-        // cache for locked workspace metadata. Missing prerequisites fail; no skip.
-        // Cargo spells file!() relative to the workspace root for workspace
-        // members, including through #[path] inclusion from another member's
-        // tests/support directory; path-included scripts use an absolute
-        // spelling, independent of their temporary Cargo package. Normalize
-        // lexical parents first so every relative spelling reduces to the
-        // workspace-relative source path before any filesystem access: a
-        // generated package directory in the spelling may already be gone.
-        let raw_source = Path::new(file!());
-        let mut source_path = PathBuf::new();
-        for component in raw_source.components() {
-            match component {
-                std::path::Component::ParentDir => assert!(
-                    source_path.pop(),
-                    "preparation identity test source path escapes its root"
-                ),
-                std::path::Component::CurDir => {}
-                component => source_path.push(component.as_os_str()),
-            }
-        }
-        let workspace = if source_path.is_absolute() {
-            fs::canonicalize(
-                source_path
-                    .ancestors()
-                    .nth(3)
-                    .expect("preparation identity test source path has no workspace ancestor"),
-            )
-            .expect("preparation identity test workspace source path cannot be resolved")
-        } else {
-            // The including crate's manifest dir names a workspace member,
-            // not necessarily this crate. Walk its ancestry for the first
-            // directory containing the normalized source path.
-            let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-            let root = manifest_dir
-                .ancestors()
-                .find(|ancestor| ancestor.join(&source_path).is_file())
-                .expect("preparation identity test source path is not under the workspace");
-            fs::canonicalize(root)
-                .expect("preparation identity test workspace source path cannot be resolved")
-        };
-        let scratch = std::env::temp_dir().join(format!(
-            "preparation-identity-entry-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        use std::io::Write as _;
+        // This is a real factory transaction over an independently clean,
+        // committed Git workspace built in a tempdir from the current
+        // sources. The fixture never constructs opaque source authority:
+        // VerifiedCompiledSources still comes only from the closed factory,
+        // which re-checks the synthetic repo's Git identity, every blob it
+        // pins, and the metadata package identities before lending the
+        // context, and again at close. Building the repo at run time --
+        // instead of assuming the surrounding checkout is a Git workspace
+        // with Cargo on PATH -- is what lets the same transaction run in a
+        // Buck test sandbox, which stages sources only. Requires `git` on
+        // PATH and the run-time CARGO_MANIFEST_DIR naming a workspace
+        // member's directory (Cargo sets it; the Buck unittest target
+        // points it into staged sources). Missing prerequisites fail by
+        // name; no skip.
+        let source_root = PathBuf::from(
+            std::env::var_os("CARGO_MANIFEST_DIR").expect(
+                "preparation identity test needs CARGO_MANIFEST_DIR at run time",
+            ),
+        )
+        .parent()
+        .expect("preparation identity test crate directory has a parent")
+        .to_path_buf();
+        let scratch = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!(
+                "preparation-identity-entry-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
         fs::create_dir(&scratch).unwrap();
         struct Scratch(PathBuf);
         impl Drop for Scratch {
@@ -1120,6 +1102,104 @@ mod tests {
             }
         }
         let scratch = Scratch(scratch);
+        // Exactly the files the ReverieWorkspace/Standalone factory pins:
+        // the root manifest, the compiled-location files, and the manifest
+        // and lib source of each package it selects. Copied from the
+        // current sources, never synthesized bytes -- the adoption check
+        // below re-reads tool_region_constructor.rs through the factory's
+        // file identities and refuses anything but the reviewed bytes.
+        let workspace = scratch.0.join("workspace");
+        for relative in [
+            "Cargo.toml",
+            "reverie-inguest/Cargo.toml",
+            "reverie-inguest/src/lib.rs",
+            "reverie-liteinst/Cargo.toml",
+            "reverie-liteinst/src/lib.rs",
+            "reverie-liteinst-preload/Cargo.toml",
+            "reverie-liteinst-preload/src/lib.rs",
+            "reverie-liteinst/src/patch_alloc.rs",
+            "reverie-inguest/src/guest/alloc.rs",
+            "reverie-inguest/src/guest/tool_region_constructor.rs",
+            "reverie-inguest/src/guest/tool_region_arena.rs",
+            "reverie-inguest/src/guest/tool_region.rs",
+            "reverie-inguest/src/guest/tool_region_keyed.rs",
+        ] {
+            let to = workspace.join(relative);
+            fs::create_dir_all(to.parent().unwrap()).unwrap();
+            fs::copy(source_root.join(relative), &to).unwrap_or_else(|error| {
+                panic!(
+                    "preparation identity fixture source {relative} under {}: {error}",
+                    source_root.display()
+                )
+            });
+        }
+        let workspace = fs::canonicalize(&workspace).unwrap();
+        // A fresh committed Git repo over those copies. `git` comes from
+        // PATH; its absence fails by name below, never a skip.
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&workspace)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("HOME", workspace.parent().unwrap())
+                .output()
+                .expect("preparation identity fixture requires git on PATH");
+            assert!(
+                output.status.success(),
+                "git {args:?} in the synthetic workspace failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output
+        };
+        git(&["init", "-q", "."]);
+        git(&["add", "-A"]);
+        git(&[
+            "-c",
+            "user.name=preparation-identity-test",
+            "-c",
+            "user.email=preparation-identity-test@localhost",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "preparation identity synthetic workspace",
+        ]);
+        // Locked metadata for exactly the packages the factory selects, in
+        // the shape Cargo 1.97.1 reports for this workspace (path package
+        // ids, source null), served by a stand-in cargo injected through
+        // Runner::set_cargo_program -- the pattern of the path-sourced
+        // factory tests. No real Cargo binary is assumed.
+        let package = |name: &str, target: &str, kind: &[&str]| {
+            serde_json::json!({
+                "name": name, "version": "0.5.7",
+                "id": format!("path+file://{}#0.5.7", workspace.join(name).display()),
+                "source": null,
+                "manifest_path": workspace.join(name).join("Cargo.toml"),
+                "targets": [{"name": target, "kind": kind, "crate_types": kind,
+                    "src_path": workspace.join(name).join("src/lib.rs")}],
+                "dependencies": []
+            })
+        };
+        let metadata = serde_json::json!({"workspace_root": workspace, "packages": [
+            package("reverie-inguest", "reverie_inguest", &["cdylib", "rlib"]),
+            package("reverie-liteinst", "reverie_liteinst", &["rlib"]),
+            package("reverie-liteinst-preload", "reverie_liteinst_preload", &["cdylib"]),
+        ]});
+        let bin = scratch.0.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let json_path = scratch.0.join("metadata.json");
+        fs::write(&json_path, serde_json::to_string(&metadata).unwrap()).unwrap();
+        let cargo_path = bin.join("cargo");
+        {
+            let mut f = fs::File::create(&cargo_path).unwrap();
+            writeln!(f, "#!/bin/sh\ncat {}", json_path.display()).unwrap();
+        }
+        fs::set_permissions(
+            &cargo_path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
         // The wall deadline is a hang backstop, not a work bound (see
         // `Runner`). A 30 s deadline fired while Cargo was still resolving the
         // locked metadata on a 3-CPU GitHub-hosted runner: command wall 29.75 s
@@ -1133,6 +1213,7 @@ mod tests {
             16 * 1024 * 1024,
         )
         .unwrap();
+        runner.set_cargo_program(cargo_path);
         if cpu_accounting_available(&scratch.0) {
             runner
                 .bound_every_command_by_cpu(SOURCE_FACTORY_COMMAND_CPU)
