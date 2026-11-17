@@ -16,7 +16,8 @@ build = "build.rs"
 [features]
 default = []
 native-test-support = ["reverie-kvm-core/native-test-support"]
-test-support = ["reverie-kvm-core/test-support"]
+broker-metadata-skip = []
+test-support = ["broker-metadata-skip", "reverie-kvm-core/test-support"]
 
 [dependencies]
 futures = { version = "0.3.31", features = ["async-await"] }

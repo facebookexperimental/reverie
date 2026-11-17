@@ -14,6 +14,9 @@ categories = ["development-tools::debugging", "os::linux-apis"]
 
 [features]
 default = []
+# Declared only so the shared broker test adapter can cfg-gate its
+# linuxemu-only metadata-query skip; never enabled here.
+broker-metadata-skip = []
 native-test-support = [
     "reverie-kvm-core/native-test-support",
     "reverie-linuxemu/native-test-support",

@@ -9,7 +9,7 @@
 //! The `vm_flags` the list of mappings reports (`vm_flags`,
 //! `mapping_list`), driven through the executor's syscalls as a guest makes
 //! them, against the `VmFlags` Linux 7.1.3 printed for the same calls (the
-//! host probes of dh-9j8ue: `probe/vmflags.py`, `tmp/probe2.py` and
+//! host probes recorded with this test module: `probe/vmflags.py`, `tmp/probe2.py` and
 //! `tmp/probe3.py`, quoted at each case), and the guard flag's upkeep
 //! across every call that edits the layout.
 
@@ -23,6 +23,42 @@ use super::vm_flags::HostVmFacts;
 use super::vm_flags::inject_host_vm_facts;
 use super::vm_flags::mnemonics;
 use super::*;
+
+/// The reverie-linuxemu crate root for source-reading guards.
+/// CARGO_MANIFEST_DIR is a relative fbsource path in buck builds and
+/// resolves only from an fbcode cwd; walk the cwd and
+/// exe ancestors through the known layouts so the ungated buck route
+/// finds the tree too. A candidate wins only when BOTH source dirs
+/// exist - partial absence still fails loudly in `functions`.
+fn source_root() -> std::path::PathBuf {
+    let layouts = [
+        "",
+        "fbcode/hermetic_infra/reverie/reverie-linuxemu",
+        "hermetic_infra/reverie/reverie-linuxemu",
+        "reverie/reverie-linuxemu",
+        "reverie-linuxemu",
+    ];
+    let mut starts: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(dir) = std::env::var_os("CARGO_MANIFEST_DIR") {
+        starts.push(std::path::PathBuf::from(dir));
+    }
+    starts.push(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+    if let Ok(cwd) = std::env::current_dir() {
+        starts.extend(cwd.ancestors().map(|path| path.to_path_buf()));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        starts.extend(exe.ancestors().map(|path| path.to_path_buf()));
+    }
+    for start in &starts {
+        for layout in layouts {
+            let root = start.join(layout);
+            if root.join("src").is_dir() && root.join("../reverie-kvm-core/src").is_dir() {
+                return root;
+            }
+        }
+    }
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
 
 const PAGE: u64 = PAGE_SIZE;
 const R: u64 = libc::PROT_READ as u64;
@@ -1147,7 +1183,8 @@ fn syscall_names(text: &str) -> BTreeSet<String> {
 /// only by the tests of the call it makes.
 #[test]
 fn the_guard_spread_runs_for_every_syscall_whose_dispatch_edits_the_layout() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = source_root();
+    let root = Path::new(&root);
     let core = functions(&root.join("../reverie-kvm-core/src"));
     let emu = functions(&root.join("src"));
     let mut method_names: BTreeMap<&str, usize> = BTreeMap::new();
@@ -1317,7 +1354,7 @@ fn the_guard_spread_runs_for_every_syscall_whose_dispatch_edits_the_layout() {
 // kept as they failed there, and the cases each fix adds. Every expected
 // `VmFlags` is native Linux 7.1.3's, from the reviewer's probes
 // (`rv1342-flags-probe.c`, `rv1342-flags-mergeable-probe.c`,
-// `rv1342-flags-unlock-probe.c`) or from `fix1_probe.c` (dh-9j8ue scratch,
+// `rv1342-flags-unlock-probe.c`) or from `fix1_probe.c` (recorded scratch probes,
 // `impl/fix1/probe/`), quoted at each case by its line name.
 
 /// Maps `pages` pages of descriptor `fd` (of the executor's state) at

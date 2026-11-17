@@ -4,10 +4,22 @@
 use crate::broker_library_tests::launcher_path;
 use crate::broker_library_tests::report_skip;
 
-/// True when the launcher refused setup because this host has no ambient
-/// mount in its bootstrap mountinfo (named host-capability refusal).
-fn ambient_mount_absent(stderr: &str) -> bool {
-    stderr.contains("ambient mount absent from bootstrap mountinfo")
+/// The named-skip reason when the launcher refused setup over a host
+/// capability it names itself: no ambient mount in its bootstrap
+/// mountinfo, or a filesystem metadata-query class it cannot prove
+/// (EOPNOTSUPP, as on Eden/FUSE checkouts; CI hosts cover these cases).
+fn broker_host_skip(stderr: &str) -> Option<&'static str> {
+    if stderr.contains("ambient mount absent from bootstrap mountinfo") {
+        Some("broker ambient mount absent from bootstrap mountinfo on this host (https://github.com/facebookexperimental/reverie/issues/96)")
+    } else if stderr.contains("unproved ambient filesystem metadata-query class") {
+        Some(
+            "broker ambient metadata-query unsupported on this filesystem \
+             (EOPNOTSUPP, e.g. Eden/FUSE); covered in CI \
+             (https://github.com/facebookexperimental/reverie/issues/94)",
+        )
+    } else {
+        None
+    }
 }
 
 /// The bootstrap ambient census classifies the broker's own socket
@@ -39,11 +51,11 @@ fn ambient_mount_visible() -> bool {
 
 /// These cases enter the existing helper before its ordinary bootstrap. They
 /// exercise actual host calls; no libtest thread asserts StartupAuthority.
-fn bootstrap_case(case: &str, expected: &str, accepted: bool) {
+fn bootstrap_case(test: &str, case: &str, expected: &str, accepted: bool) {
     if accepted && !ambient_mount_visible() {
         report_skip(
-            &format!("broker_library_selftests::bootstrap_{case}"),
-            "broker ambient mount absent from bootstrap mountinfo on this host",
+            test,
+            "broker ambient mount absent from bootstrap mountinfo on this host (https://github.com/facebookexperimental/reverie/issues/96)",
         );
         return;
     }
@@ -56,10 +68,16 @@ fn bootstrap_case(case: &str, expected: &str, accepted: bool) {
         .expect("start existing ordinary-main bootstrap helper");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    if !output.status.success() && ambient_mount_absent(&stderr) {
+    // Only the ambient-absent refusal skips here. The metadata-query
+    // (EOPNOTSUPP) signature deliberately does NOT: the procfs-reject
+    // case's expected outcome is itself an EOPNOTSUPP rejection, so
+    // skipping on that signature would mask its regression.
+    if !output.status.success()
+        && stderr.contains("ambient mount absent from bootstrap mountinfo")
+    {
         report_skip(
-            &format!("broker_library_selftests::bootstrap_{case}"),
-            "broker ambient mount absent from bootstrap mountinfo on this host",
+            test,
+            "broker ambient mount absent from bootstrap mountinfo on this host (https://github.com/facebookexperimental/reverie/issues/96)",
         );
         return;
     }
@@ -97,23 +115,43 @@ fn bootstrap_case(case: &str, expected: &str, accepted: bool) {
 
 #[test]
 fn bootstrap_unknown_filesystem_rejects_before_getattr() {
-    bootstrap_case("procfs-reject", "rejected-eopnotsupp", false);
+    bootstrap_case(
+        "broker_library_selftests::bootstrap_unknown_filesystem_rejects_before_getattr",
+        "procfs-reject",
+        "rejected-eopnotsupp",
+        false,
+    );
 }
 
 #[test]
 fn bootstrap_audited_regular_and_null_classes_preserve_originals() {
-    bootstrap_case("memfd-accept", "accepted-tmpfs", true);
-    bootstrap_case("null-accept", "accepted-null", true);
+    bootstrap_case(
+        "broker_library_selftests::bootstrap_audited_regular_and_null_classes_preserve_originals",
+        "memfd-accept",
+        "accepted-tmpfs",
+        true,
+    );
+    bootstrap_case(
+        "broker_library_selftests::bootstrap_audited_regular_and_null_classes_preserve_originals",
+        "null-accept",
+        "accepted-null",
+        true,
+    );
 }
 
 #[test]
 fn bootstrap_path_only_does_not_query_inode_attributes() {
-    bootstrap_case("opath-procfs-accept", "accepted-path-only", true);
+    bootstrap_case(
+        "broker_library_selftests::bootstrap_path_only_does_not_query_inode_attributes",
+        "opath-procfs-accept",
+        "accepted-path-only",
+        true,
+    );
 }
 
 /// Only the ordinary-main child owns startup authority. The waited status is
 /// case-specific: 125 records failed invocation termination, never cleanup.
-fn fatal_abort_case(case: &str, expected_status: i32) -> Option<String> {
+fn fatal_abort_case(test: &str, case: &str, expected_status: i32) -> Option<String> {
     let executable = std::env::current_exe().expect("library test executable");
     let output = std::process::Command::new("timeout")
         .args(["--kill-after=2s", "30s"])
@@ -123,11 +161,8 @@ fn fatal_abort_case(case: &str, expected_status: i32) -> Option<String> {
         .expect("start ordinary-main fatal invocation helper");
     let stdout = String::from_utf8(output.stdout).expect("native case stdout");
     let stderr = String::from_utf8(output.stderr).expect("native case stderr");
-    if ambient_mount_absent(&stderr) {
-        report_skip(
-            &format!("broker_library_selftests::fatal_{case}"),
-            "broker ambient mount absent from bootstrap mountinfo on this host",
-        );
+    if let Some(reason) = broker_host_skip(&stderr) {
+        report_skip(test, reason);
         return None;
     }
     assert_eq!(
@@ -148,7 +183,11 @@ fn fatal_case_pid(field: &str, prefix: &str) -> i32 {
 
 #[test]
 fn fatal_invocation_original_creator_exits_without_rust_drop_or_park() {
-    let Some(stdout) = fatal_abort_case("original-creator", 125) else {
+    let Some(stdout) = fatal_abort_case(
+        "broker_library_selftests::fatal_invocation_original_creator_exits_without_rust_drop_or_park",
+        "original-creator",
+        125,
+    ) else {
         return;
     };
     let lines: Vec<_> = stdout.lines().collect();
@@ -169,7 +208,11 @@ fn fatal_invocation_original_creator_exits_without_rust_drop_or_park() {
 
 #[test]
 fn fatal_invocation_wrong_process_returns_owner_before_two_native_waits() {
-    let Some(stdout) = fatal_abort_case("wrong-process", 0) else {
+    let Some(stdout) = fatal_abort_case(
+        "broker_library_selftests::fatal_invocation_wrong_process_returns_owner_before_two_native_waits",
+        "wrong-process",
+        0,
+    ) else {
         return;
     };
     let lines: Vec<_> = stdout.lines().collect();

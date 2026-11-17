@@ -2368,22 +2368,48 @@ mod tests {
         assert_eq!(registers.rflags & IOPL, 0, "frame must not grant IOPL");
     }
 
-    fn run_c_abi_probe(name: &str) -> BTreeMap<String, usize> {
+    fn c_abi_source(name: &str) -> std::path::PathBuf {
         // Prefer the run-time CARGO_MANIFEST_DIR, which Cargo and the fbsource
-        // BUCK rule set. The compile-time value is a directory on the build
-        // host and is missing on the test host when the binary was built
-        // remotely.
-        let source = std::env::var_os("CARGO_MANIFEST_DIR")
-            .map_or_else(
-                || {
-                    std::path::PathBuf::from(
-                        option_env!("CARGO_MANIFEST_DIR").unwrap_or("reverie-linuxemu"),
-                    )
-                },
-                std::path::PathBuf::from,
-            )
-            .join("tests/fixtures")
-            .join(format!("signal_abi_{name}.c"));
+        // BUCK rule set. The compile-time value is a relative fbsource
+        // path in buck builds and resolves only from an fbcode cwd
+        // so also walk the cwd and exe ancestors through
+        // the known layouts. A candidate wins only when the fixture
+        // file itself exists; partial absence keeps failing loudly at
+        // the compile below.
+        let file = format!("signal_abi_{name}.c");
+        let layouts = [
+            "",
+            "fbcode/hermetic_infra/reverie/reverie-linuxemu",
+            "hermetic_infra/reverie/reverie-linuxemu",
+            "reverie/reverie-linuxemu",
+            "reverie-linuxemu",
+        ];
+        let mut starts: Vec<std::path::PathBuf> = Vec::new();
+        if let Some(dir) = std::env::var_os("CARGO_MANIFEST_DIR") {
+            starts.push(std::path::PathBuf::from(dir));
+        }
+        starts.push(std::path::PathBuf::from(
+            option_env!("CARGO_MANIFEST_DIR").unwrap_or("reverie-linuxemu"),
+        ));
+        if let Ok(cwd) = std::env::current_dir() {
+            starts.extend(cwd.ancestors().map(|path| path.to_path_buf()));
+        }
+        if let Ok(exe) = std::env::current_exe() {
+            starts.extend(exe.ancestors().map(|path| path.to_path_buf()));
+        }
+        for start in &starts {
+            for layout in layouts {
+                let candidate = start.join(layout).join("tests/fixtures").join(&file);
+                if candidate.exists() {
+                    return candidate;
+                }
+            }
+        }
+        starts[0].join("tests/fixtures").join(file)
+    }
+
+    fn run_c_abi_probe(name: &str) -> BTreeMap<String, usize> {
+        let source = c_abi_source(name);
         let binary = std::env::temp_dir().join(format!(
             "reverie-kvm-signal-abi-{name}-{}",
             std::process::id()

@@ -79,6 +79,30 @@ fn host_resources_run_isolated(test: &str) {
         .output()
         .expect("failed to run the isolated host-resources check");
     let stdout = String::from_utf8_lossy(&output.stdout);
+    // Named skip, per test and exact signature only: under
+    // AddressSanitizer the lowered RLIMIT_AS aborts the sanitizer
+    // allocator on the tests' own 64 MiB image allocation instead of
+    // failing it, so the isolated child cannot run its body. Gated to
+    // the three observed names and the exact allocation size so a
+    // different ASan OOM in any other caller still fails loudly.
+    // The dev-nosan CI route covers these checks.
+    const ASAN_RLIMIT_TESTS: [&str; 3] = [
+        "an_exec_of_proc_self_exe_whose_image_copy_the_host_refuses_is_refused_as_host_resources",
+        "an_exec_whose_image_the_host_cannot_buffer_is_refused_as_host_resources",
+        "an_exec_whose_image_the_loader_cannot_copy_is_refused_as_host_resources",
+    ];
+    if !output.status.success()
+        && ASAN_RLIMIT_TESTS.contains(&test)
+        && String::from_utf8_lossy(&output.stderr).contains(
+            "AddressSanitizer: out of memory: allocator is trying to allocate 0x4000000 bytes",
+        )
+    {
+        report_skip(
+            &format!("executor::tests::{test}"),
+            "ASan allocator aborts on the 64 MiB image under the lowered RLIMIT_AS this check sets; covered in dev-nosan CI (https://github.com/facebookexperimental/reverie/issues/95)",
+        );
+        return;
+    }
     assert!(
         output.status.success() && stdout.contains("1 passed"),
         "isolated host-resources check {test} failed with {}\nstdout:\n{stdout}\nstderr:\n{}",
