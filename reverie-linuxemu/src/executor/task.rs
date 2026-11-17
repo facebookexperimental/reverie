@@ -813,21 +813,12 @@ impl ElfExecutor {
             return Some(i64::from(self.state.tid));
         }
         if number == libc::SYS_fork as u64 || number == libc::SYS_vfork as u64 {
-            let share_address_space = number == libc::SYS_vfork as u64;
-            let clone_flags = if share_address_space {
+            let clone_flags = if number == libc::SYS_vfork as u64 {
                 libc::CLONE_VM as u64 | libc::CLONE_VFORK as u64
             } else {
                 0
             };
-            return Some(self.prepare_fork(
-                None,
-                None,
-                None,
-                None,
-                false,
-                share_address_space,
-                clone_flags,
-            ));
+            return Some(self.prepare_fork(None, None, None, None, clone_flags));
         }
         if number == libc::SYS_clone as u64 {
             return Some(self.prepare_clone(
@@ -861,15 +852,9 @@ impl ElfExecutor {
                                 CLONE_FLAGS_REFUSAL,
                             ))
                         }
-                        Ok(()) => self.prepare_fork(
-                            request.child_stack,
-                            None,
-                            None,
-                            None,
-                            request.flags & CLONE_CLEAR_SIGHAND != 0,
-                            request.flags & libc::CLONE_VM as u64 != 0,
-                            request.flags,
-                        ),
+                        Ok(()) => {
+                            self.prepare_fork(request.child_stack, None, None, None, request.flags)
+                        }
                     },
                     Err(error) => self.refuse_clone3_fields(error),
                 },
@@ -909,15 +894,7 @@ impl ElfExecutor {
         let clear_child_tid = (flags & libc::CLONE_CHILD_CLEARTID as u64 != 0
             && child_tid_address != 0)
             .then_some(child_tid_address);
-        self.prepare_fork(
-            child_stack,
-            parent_tid,
-            child_tid,
-            clear_child_tid,
-            flags & CLONE_CLEAR_SIGHAND != 0,
-            flags & libc::CLONE_VM as u64 != 0,
-            flags,
-        )
+        self.prepare_fork(child_stack, parent_tid, child_tid, clear_child_tid, flags)
     }
 
     /// The answer to a clone this backend refuses, recording the typed
@@ -1012,14 +989,16 @@ impl ElfExecutor {
         i64::from(child_tid)
     }
 
+    /// Stages a process-creating clone. Whether the child resets its
+    /// signal handlers and whether it shares this address space are read
+    /// from `clone_flags` (`CLONE_CLEAR_SIGHAND`, `CLONE_VM`), so the staged
+    /// action cannot disagree with the flags it carries.
     pub(super) fn prepare_fork(
         &mut self,
         child_stack: Option<u64>,
         parent_tid: Option<u64>,
         child_tid: Option<u64>,
         clear_child_tid: Option<u64>,
-        clear_sighand: bool,
-        share_address_space: bool,
         clone_flags: u64,
     ) -> i64 {
         if self.process_action.is_some() {
@@ -1053,8 +1032,8 @@ impl ElfExecutor {
             parent_tid,
             child_tid,
             clear_child_tid,
-            clear_sighand,
-            share_address_space,
+            clear_sighand: clone_flags & CLONE_CLEAR_SIGHAND != 0,
+            share_address_space: clone_flags & libc::CLONE_VM as u64 != 0,
             clone_flags,
         });
         i64::from(child_pid)

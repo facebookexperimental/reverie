@@ -419,7 +419,7 @@ fn process_alarm_signal_receiver_lifetime_and_process_actions_refuse_before_muta
                 (Invalid, Errno::ESRCH)
             }
             6 => {
-                assert!(executor.prepare_fork(None, None, None, None, false, false, 0) > 0);
+                assert!(executor.prepare_fork(None, None, None, None, 0) > 0);
                 (Unsupported, Errno::ENOSYS)
             }
             _ => unreachable!(),

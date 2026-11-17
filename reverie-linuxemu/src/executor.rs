@@ -43859,7 +43859,7 @@ mod tests {
         assert_eq!(executor.allocate_task_id(), Some(i32::MAX - 1));
         for _ in 0..2 {
             assert_eq!(
-                executor.prepare_fork(None, None, None, None, false, false, 0),
+                executor.prepare_fork(None, None, None, None, 0),
                 negative_errno(libc::EAGAIN),
             );
             assert_eq!(
