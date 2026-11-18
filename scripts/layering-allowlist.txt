@@ -8,7 +8,7 @@
 # is checked like any other; an exported tree must not have the file at all.
 # Never add a line or raise N to let a new mention pass. See
 # .claude/skills/reverie-layering/SKILL.md.
-?BUCK -- 6 -- pre-check baseline 2026-11-17, classify me
+BUCK -- 6 -- pre-check baseline 2026-11-17, classify me
 ci/run-dag.sh -- 2 -- pre-check baseline 2026-11-17, classify me
 ?experimental/BUCK -- 3 -- known leak, remove: load()s a macro from hermit's tree (route it through fb-only/defs.bzl); also oncall metadata and a comment
 ?fb-only/cargo-workspace.toml -- 2 -- fbsource-only glue, never exported; consumer names are routed here by design (fb-only/defs.bzl)
@@ -221,7 +221,7 @@ scripts/check-layering.sh -- 2 -- the check itself: it carries the pattern
 scripts/ci-timeout-watchdog.sh -- 1 -- pre-check baseline 2026-11-17, classify me
 scripts/detcore-alloc-recipe.py -- 26 -- pre-check baseline 2026-11-17, classify me
 scripts/libtest-counts.rs -- 1 -- pre-check baseline 2026-11-17, classify me
-?tests/BUCK -- 1 -- Buck oncall metadata naming the owning team
+tests/BUCK -- 1 -- Buck oncall metadata naming the owning team
 ?tests/gdbserver-integration/BUCK -- 3 -- known leak, remove: load()s a macro from hermit's tree (route it through fb-only/defs.bzl); also oncall metadata and a comment
 tests/gdbserver-integration/gdbserver-helper/src/main.rs -- 1 -- pre-check baseline 2026-11-17, classify me
 ?tests/gdbserver-integration/helpers.bzl -- 1 -- pre-check baseline 2026-11-17, classify me
