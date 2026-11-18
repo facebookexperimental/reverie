@@ -42,6 +42,7 @@ tracing = "0.1.41"
 io-uring = "0.7.11"
 reverie-kvm-core = { version = "0.5.7", path = "../reverie-kvm-core", features = ["test-support"] }
 reverie-linuxemu = { version = "0.5.7", path = "../reverie-linuxemu", features = ["test-support"] }
+reverie-linuxemu-ext-procfs = { version = "0.5.7", path = "../reverie-linuxemu-ext-procfs" }
 # The reference backend of the timer tests' ptrace comparison (tests/timer_events.rs).
 reverie-ptrace = { version = "0.5.7", path = "../reverie-ptrace" }
 tokio = { version = "1.54.1", features = ["rt-multi-thread"] }

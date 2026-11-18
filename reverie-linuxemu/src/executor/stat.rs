@@ -156,13 +156,11 @@ fn fstatat_impl(
     // Path-addressed synthetic /proc file: synthesize deterministic metadata.
     // synthetic_proc_content returns None for an empty path, so no explicit
     // AT_EMPTY_PATH guard is needed here.
-    if let Some(content) = synthetic_proc_content(state, &path) {
-        let normalized = crate::proc_mechanics::normalize_self_path(&path, state.pid)
-            .expect("a synthesized /proc path always normalizes");
+    if let Some((normalized, size)) = synthetic_proc_stat_size(state, &path) {
         let stat = crate::proc_mechanics::synthetic_stat(
             crate::proc_mechanics::synthetic_dev(SYNTHETIC_DEV_MAJOR, SYNTHETIC_PROC_DEV_MINOR),
             crate::proc_mechanics::path_inode(&normalized),
-            synthetic_proc_path_size(&normalized, &content),
+            size,
             PAGE_SIZE as u32,
         );
         return write_struct(&mut ProviderMemory(memory), output_address, &stat);
@@ -331,14 +329,12 @@ pub(super) fn statx(
     }
     // Path-addressed synthetic /proc file: synthesize deterministic metadata.
     if !path.is_empty() {
-        if let Some(content) = synthetic_proc_content(state, &path) {
-            let normalized = crate::proc_mechanics::normalize_self_path(&path, state.pid)
-                .expect("a synthesized /proc path always normalizes");
+        if let Some((normalized, size)) = synthetic_proc_stat_size(state, &path) {
             let stx = crate::proc_mechanics::synthetic_statx(
                 SYNTHETIC_DEV_MAJOR,
                 SYNTHETIC_PROC_DEV_MINOR,
                 crate::proc_mechanics::path_inode(&normalized),
-                synthetic_proc_path_size(&normalized, &content) as u64,
+                size as u64,
                 PAGE_SIZE as u32,
             );
             return write_struct(&mut ProviderMemory(memory), args[4], &stx);
@@ -611,7 +607,7 @@ fn faccessat_impl(
     }
     // Synthetic /proc files exist and are world-readable but never writable or
     // executable, matching the read-only surface open_file serves.
-    if synthetic_proc_content(state, &path).is_some() {
+    if synthetic_proc_served(state, &path) {
         if mode & (libc::W_OK | libc::X_OK) != 0 {
             return negative_errno(libc::EACCES);
         }

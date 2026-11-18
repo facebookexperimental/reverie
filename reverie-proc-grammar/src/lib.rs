@@ -86,4 +86,5 @@ pub use status::parse_bitmap_token;
 pub use status::parse_range_list_token;
 pub use status::parse_status;
 pub use status::parse_status_preserving_unknown;
+pub use status::escape_status_name;
 pub use status::render_status;

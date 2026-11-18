@@ -19,7 +19,7 @@ members = [
     "reverie-memory",
     "reverie-process",
     "reverie-proc-grammar",
-    "reverie-procfs",
+    "reverie-linuxemu-ext-procfs",
     "reverie-ptrace",
     "reverie-rpc-transport",
     "reverie-syscalls",

@@ -868,6 +868,24 @@ fn render_value(value: &StatusValue, out: &mut Vec<u8>) {
     }
 }
 
+/// The `Name` field escaping of `/proc/<pid>/status`: Linux renders
+/// newline and backslash as two-byte escape sequences there
+/// (`proc_task_name` with escaping, `fs/proc/array.c`); `stat` keeps
+/// the raw bytes. Moved here from the procfs content crate at its
+/// rename (Slice 2 S2-R4) so core renderers that cannot depend on
+/// the extension crate share the one spelling.
+pub fn escape_status_name(comm: &[u8]) -> Vec<u8> {
+    let mut escaped = Vec::with_capacity(comm.len());
+    for byte in comm {
+        match byte {
+            b'\n' => escaped.extend_from_slice(b"\\n"),
+            b'\\' => escaped.extend_from_slice(b"\\\\"),
+            _ => escaped.push(*byte),
+        }
+    }
+    escaped
+}
+
 /// Render a [`Status`] in the kernel's byte shape (`Label:\tvalue`
 /// per line, in stored order).
 pub fn render_status(status: &Status) -> Vec<u8> {
@@ -888,4 +906,17 @@ pub fn render_status(status: &Status) -> Vec<u8> {
         out.push(b'\n');
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::escape_status_name;
+
+    #[test]
+    fn status_name_escaping() {
+        assert_eq!(escape_status_name(b"bash"), b"bash");
+        assert_eq!(escape_status_name(b"a\nb"), b"a\\nb");
+        assert_eq!(escape_status_name(b"a\\b"), b"a\\\\b");
+        assert_eq!(escape_status_name(b""), b"");
+    }
 }

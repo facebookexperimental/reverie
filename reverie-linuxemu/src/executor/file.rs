@@ -345,7 +345,22 @@ fn open_file(
     let close_on_exec = flags & libc::O_CLOEXEC as u64 != 0;
     // Serve the synthetic /proc surface before touching the host filesystem, so
     // deterministic content replaces the deliberately-refused real procfs.
-    if let Some(content) = synthetic_proc_content(state, path) {
+    // Core process files (the readable status seq description) route
+    // first: they are core mechanics, not extension claims, and must
+    // not depend on a composition registering anything (S2-R4 hoist).
+    let normalized_self = crate::proc_mechanics::normalize_self_path(path, state.pid);
+    let process_file = normalized_self
+        .as_deref()
+        .and_then(ProcessProcFile::from_normalized_path);
+    let extension_content = if process_file.is_none() {
+        normalized_self
+            .as_deref()
+            .and_then(|normalized| synthetic_proc_content_normalized(state, normalized))
+    } else {
+        None
+    };
+    if process_file.is_some() || extension_content.is_some() {
+        let content = extension_content.unwrap_or_default();
         if !path_only
             && flags & (libc::O_CREAT | libc::O_DIRECTORY) as u64
                 == (libc::O_CREAT | libc::O_DIRECTORY) as u64
@@ -373,9 +388,10 @@ fn open_file(
                 return negative_errno(libc::EINVAL);
             }
         }
-        let normalized = crate::proc_mechanics::normalize_self_path(path, state.pid)
+        let normalized = normalized_self
+            .as_deref()
             .expect("a synthesized /proc path always normalizes");
-        if let Some(file) = ProcessProcFile::from_normalized_path(&normalized) {
+        if let Some(file) = process_file {
             if !path_only {
                 return open_process_proc(state, &normalized, file, flags, close_on_exec);
             }

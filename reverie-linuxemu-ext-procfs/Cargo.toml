@@ -1,6 +1,6 @@
 [package]
-name = "reverie-procfs"
-description = "Pure Linux /proc content formatting and path classification helpers for the Reverie instrumentation framework."
+name = "reverie-linuxemu-ext-procfs"
+description = "LinuxEmu extension presenting synthetic /proc content for standalone compositions; not linked by compositions whose tool serves /proc."
 version = "0.5.7"
 authors = ["Meta Platforms"]
 edition = "2024"
@@ -8,12 +8,13 @@ repository = "https://github.com/facebookexperimental/reverie"
 license = "BSD-2-Clause"
 readme = "README.md"
 homepage = "https://hermetic-infra.org"
-documentation = "https://docs.rs/reverie-procfs"
+documentation = "https://docs.rs/reverie-linuxemu-ext-procfs"
 keywords = ["linux", "instrumentation", "hermit"]
 categories = ["development-tools::debugging", "os::linux-apis"]
 
 [dependencies]
 libc = "0.2.186"
+reverie-linuxemu = { version = "0.5.7", path = "../reverie-linuxemu" }
 reverie-proc-grammar = { version = "0.5.7", path = "../reverie-proc-grammar" }
 serde = { version = "1.0.219", features = ["derive"] }
 tracing = "0.1.44"

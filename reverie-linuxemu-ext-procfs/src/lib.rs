@@ -6,16 +6,26 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Pure helpers for presenting Linux `/proc` file *content* to a guest
-//! program: file-content formatting and the mountinfo shim over the
-//! grammar leaf.
+//! The LinuxEmu procfs extension: synthetic `/proc/self/maps`
+//! for standalone compositions, plus the pure `/proc` content
+//! helpers it renders with.
 //!
-//! Everything here is a pure function over caller-supplied values. The
-//! crate holds no process, descriptor, or scheduling state, makes no
-//! system calls, and decides no policy: which paths exist, what facts a
-//! file reports, and how a call is answered remain the caller's business.
-//! Backends and tools that present a `/proc` view share these helpers so
-//! the bytes and metadata they produce agree byte for byte.
+//! This crate is an extension crate (renamed from `reverie-procfs`
+//! at Slice 2 S2-R4): compositions whose tool serves `/proc`
+//! never link it, so they pay zero compile time or binary size
+//! for it. [`register`] claims the maps path on a standalone
+//! composition's extension table; without a registration the
+//! core refuses it by name. (`/proc/self/status` is core
+//! mechanics: the core serves its readable seq description
+//! unconditionally, so this crate claims maps only.) The
+//! rendering itself ([`render`]) is pure functions over the
+//! core's facts snapshot.
+//!
+//! The remaining helpers are likewise pure functions over
+//! caller-supplied values. The crate holds no process, descriptor,
+//! or scheduling state, makes no system calls, and decides no
+//! policy: which paths exist, what facts a file reports, and how a
+//! call is answered remain the caller's business.
 //!
 //! The core mechanics that used to live at this crate's root --
 //! synthetic file identities, guest path classification, and
@@ -31,8 +41,12 @@
 pub mod fdinfo;
 pub mod fixed;
 pub mod mountinfo;
+pub mod render;
 pub mod sanitize;
 pub mod task;
+
+pub use render::extension_table;
+pub use render::register;
 
 pub use sanitize::render_system_stat;
 
@@ -113,21 +127,7 @@ pub fn format_maps_line(entry: &MapsEntry<'_>) -> Vec<u8> {
     line.into_bytes()
 }
 
-/// The `Name` field escaping of `/proc/<pid>/status`: Linux renders
-/// newline and backslash as two-byte escape sequences there
-/// (`proc_task_name` with escaping, `fs/proc/array.c`); `stat` keeps the
-/// raw bytes.
-pub fn escape_status_name(comm: &[u8]) -> Vec<u8> {
-    let mut escaped = Vec::with_capacity(comm.len());
-    for byte in comm {
-        match byte {
-            b'\n' => escaped.extend_from_slice(b"\\n"),
-            b'\\' => escaped.extend_from_slice(b"\\\\"),
-            _ => escaped.push(*byte),
-        }
-    }
-    escaped
-}
+pub use reverie_proc_grammar::escape_status_name;
 
 #[cfg(test)]
 mod tests {

@@ -513,24 +513,58 @@ rust_library(
 )
 
 rust_library(
-    name = "reverie-procfs",
+    name = "reverie-linuxemu-ext-procfs",
     srcs = glob([
-        "reverie-procfs/src/**/*.rs",
+        "reverie-linuxemu-ext-procfs/src/**/*.rs",
         # include_str! tables for the fixed procfs files.
-        "reverie-procfs/src/tables/*.txt",
+        "reverie-linuxemu-ext-procfs/src/tables/*.txt",
     ]),
     autocargo = {
         "cargo_toml_config": {
             "package": {
-                "description": "Pure Linux /proc content formatting and path classification helpers for the Reverie instrumentation framework.",
+                "description": "LinuxEmu extension presenting synthetic /proc content for standalone compositions; not linked by compositions whose tool serves /proc.",
             },
         },
-        "cargo_toml_dir": "reverie-procfs",
+        "cargo_toml_dir": "reverie-linuxemu-ext-procfs",
     },
+    # Depends on :reverie-linuxemu, which is x86_64-only; the pure
+    # reverie-procfs it renames built on arm64, this extension does not.
+    target_compatible_with = [
+        "ovr_config//cpu:x86_64",
+        "ovr_config//os:linux",
+    ],
     deps = [
         "fbsource//third-party/rust:libc",
         "fbsource//third-party/rust:serde",
         "fbsource//third-party/rust:tracing",
+        ":reverie-linuxemu",
+        ":reverie-proc-grammar",
+    ],
+)
+
+# The same crate built against the test-support instance of
+# reverie-linuxemu, for the linuxemu unit tests' standalone test
+# composition (buck compiles the linuxemu crate once per feature
+# set, so the extension types must match the instance under test).
+rust_library(
+    name = "reverie-linuxemu-ext-procfs-test-support",
+    srcs = glob([
+        "reverie-linuxemu-ext-procfs/src/**/*.rs",
+        "reverie-linuxemu-ext-procfs/src/tables/*.txt",
+    ]),
+    autocargo = {"ignore_rule": True},
+    crate = "reverie_linuxemu_ext_procfs",
+    crate_root = "reverie-linuxemu-ext-procfs/src/lib.rs",
+    target_compatible_with = [
+        "ovr_config//cpu:x86_64",
+        "ovr_config//os:linux",
+    ],
+    unittests = False,
+    deps = [
+        "fbsource//third-party/rust:libc",
+        "fbsource//third-party/rust:serde",
+        "fbsource//third-party/rust:tracing",
+        ":reverie-linuxemu-test-support",  # @manual name:reverie_linuxemu
         ":reverie-proc-grammar",
     ],
 )
@@ -719,7 +753,6 @@ rust_library(
         ":reverie-kvm-core",
         ":reverie-linuxemu-terminal-read",
         ":reverie-proc-grammar",
-        ":reverie-procfs",
     ],
 )
 
@@ -847,7 +880,6 @@ rust_library(
         ":reverie-kvm-core-test-support",  # @manual name:reverie_kvm_core
         ":reverie-linuxemu-terminal-read",
         ":reverie-proc-grammar",
-        ":reverie-procfs",
     ],
 )
 
@@ -897,6 +929,7 @@ rust_unittest(
         "fbsource//third-party/rust:thiserror",
         "fbsource//third-party/rust:tracing",
         ":reverie-kvm-core-test-support",  # @manual name:reverie_kvm_core
+        ":reverie-linuxemu-ext-procfs-test-support",  # @manual name:reverie_linuxemu_ext_procfs
         ":reverie-linuxemu-test-support",
     ],
 )
@@ -952,7 +985,6 @@ rust_unittest(
         ":reverie-kvm-core-test-support",  # @manual name:reverie_kvm_core
         ":reverie-linuxemu-terminal-read",
         ":reverie-proc-grammar",
-        ":reverie-procfs",
     ],
 )
 
@@ -1075,6 +1107,7 @@ rust_unittest(
         "fbsource//third-party/rust:serde",
         ":reverie-kvm",
         ":reverie-linuxemu",
+        ":reverie-linuxemu-ext-procfs",
     ],
 )
 

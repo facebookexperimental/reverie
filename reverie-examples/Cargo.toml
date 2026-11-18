@@ -10,6 +10,9 @@
 # counter1 and counter2 select the first-party host through --backend.
 # External runtime packages reuse the shared Tool and neutral host APIs.
 # Keep the internal target synchronized before the next export.
+# S2-R4 registers the LinuxEmu procfs extension in the KVM example
+# runner (backend.rs run_kvm) and adds the extension dependency below.
+# Keep the internal target synchronized before the next export.
 
 [package]
 name = "reverie-examples"
@@ -32,6 +35,7 @@ conformance-tools = ["dep:syscalls"]
 runtime = [
     "host",
     "dep:reverie-kvm",
+    "dep:reverie-linuxemu-ext-procfs",
     "dep:reverie-liteinst",
     "dep:reverie-ptrace",
 ]
@@ -115,6 +119,7 @@ libc = "0.2.186"
 nix = { version = "0.30.1", features = ["ptrace", "signal"] }
 reverie = { version = "0.5.7", path = "../reverie", package = "reverie-core" }
 reverie-kvm = { version = "0.5.7", path = "../reverie-kvm", optional = true }
+reverie-linuxemu-ext-procfs = { version = "0.5.7", path = "../reverie-linuxemu-ext-procfs", optional = true }
 reverie-liteinst = { version = "0.5.7", path = "../reverie-liteinst", default-features = false, features = ["liteinst"], optional = true }
 reverie-ptrace = { version = "0.5.7", path = "../reverie-ptrace", optional = true }
 reverie-util = { version = "0.5.7", path = "../reverie-util" }

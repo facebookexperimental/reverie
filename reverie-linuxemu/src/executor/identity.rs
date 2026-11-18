@@ -138,7 +138,7 @@ pub(super) fn path_xattr_list(
         Ok(_) => return negative_errno(libc::ENOENT),
         Err(error) => return read_c_string_errno(error),
     };
-    if synthetic_proc_content(state, &path).is_some() {
+    if synthetic_proc_served(state, &path) {
         return 0;
     }
     match open_metadata_path(state, libc::AT_FDCWD, &path, no_follow) {

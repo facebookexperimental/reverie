@@ -250,6 +250,13 @@ where
     backend
         .install_static_elf_with_exec_context(&image, OsStr::new(&args.program), &argv, &envp, &cwd)
         .map_err(|error| anyhow::anyhow!("loading {program:?} into KVM: {error}"))?;
+    // The standalone composition serves the synthetic proc snapshot
+    // surface: /proc/self/maps is the procfs extension's claim, so
+    // register it on the loaded image, as the core served it before
+    // the claim moved behind the extension seam.
+    backend
+        .install_extension_table(reverie_linuxemu_ext_procfs::extension_table())
+        .map_err(|error| anyhow::anyhow!("installing the procfs extension: {error}"))?;
     drop(image);
     let (global_state, exit_code, _stdout, _stderr) = backend
         .run_static_elf_with_tool::<T>(config, false)

@@ -153,11 +153,11 @@ reverie-proc-grammar/Cargo.toml -- 1 -- pre-check baseline 2026-11-17, classify 
 reverie-process/Cargo.toml -- 1 -- pre-check baseline 2026-11-17, classify me
 reverie-process/src/container.rs -- 1 -- pre-check baseline 2026-11-17, classify me
 reverie-process/src/mount.rs -- 2 -- pre-check baseline 2026-11-17, classify me
-reverie-procfs/Cargo.toml -- 1 -- pre-check baseline 2026-11-17, classify me
-reverie-procfs/src/fdinfo.rs -- 2 -- pre-check baseline 2026-11-17, classify me
-reverie-procfs/src/fixed.rs -- 10 -- pre-check baseline 2026-11-17, classify me
-reverie-procfs/src/mountinfo.rs -- 1 -- pre-check baseline 2026-11-17, classify me
-reverie-procfs/src/sanitize.rs -- 8 -- pre-check baseline 2026-11-17, classify me
+reverie-linuxemu-ext-procfs/Cargo.toml -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-linuxemu-ext-procfs/src/fdinfo.rs -- 2 -- pre-check baseline 2026-11-17, classify me
+reverie-linuxemu-ext-procfs/src/fixed.rs -- 10 -- pre-check baseline 2026-11-17, classify me
+reverie-linuxemu-ext-procfs/src/mountinfo.rs -- 1 -- pre-check baseline 2026-11-17, classify me
+reverie-linuxemu-ext-procfs/src/sanitize.rs -- 8 -- pre-check baseline 2026-11-17, classify me
 reverie-ptrace/Cargo.toml -- 1 -- pre-check baseline 2026-11-17, classify me
 reverie-ptrace/src/cp/consts.rs -- 1 -- pre-check baseline 2026-11-17, classify me
 reverie-ptrace/src/failure.rs -- 1 -- pre-check baseline 2026-11-17, classify me

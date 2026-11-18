@@ -3023,6 +3023,25 @@ impl KvmBackend {
         self.install_loaded_static_elf(loaded)
     }
 
+    /// Installs an extension composition on the already-loaded initial
+    /// image, for compositions that load through this backend and so
+    /// never hold the loaded state themselves
+    /// (`LoadedStaticElf::install_extension_table`). Fails with
+    /// [`Error::StaticElfNotInstalled`] before any `install_static_elf*`
+    /// call, as the other loaded-image setters do.
+    pub fn install_extension_table(
+        &mut self,
+        table: Arc<reverie_linuxemu::extension::ExtensionTable>,
+    ) -> Result<()> {
+        AbandonedRuns::admit(&self.abandoned_runs)?;
+        let loaded = self
+            .static_elf
+            .as_mut()
+            .ok_or(Error::StaticElfNotInstalled)?;
+        loaded.install_extension_table(table);
+        Ok(())
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(https://github.com/rrnewton/reverie/issues/924):
     // Review host metadata timestamps for Tool runs.

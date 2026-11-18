@@ -51,7 +51,7 @@ fn validate_xattr_target_and_name(
         if path.is_empty() {
             return Err(negative_errno(libc::ENOENT));
         }
-        if synthetic_proc_content(state, &path).is_none() {
+        if !synthetic_proc_served(state, &path) {
             let nofollow = number == libc::SYS_lgetxattr as u64
                 || number == libc::SYS_lsetxattr as u64
                 || number == libc::SYS_lremovexattr as u64;

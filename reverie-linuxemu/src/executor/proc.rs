@@ -237,7 +237,7 @@ impl ProcessProcView {
 
     fn status(&self) -> Vec<u8> {
         let mut content = b"Name:\t".to_vec();
-        content.extend_from_slice(&reverie_procfs::escape_status_name(&self.comm()));
+        content.extend_from_slice(&reverie_proc_grammar::escape_status_name(&self.comm()));
         content.push(b'\n');
         content.extend_from_slice(
             format!(
@@ -482,10 +482,12 @@ pub(super) const SYNTHETIC_GUEST_FD_DEV_MINOR: u32 = 0xff02;
 // answers), which read the supervisor's fdinfo of the guest's descriptor and
 // rewrote its flags, and carried no marker.
 // Only tests read this table since the descriptor link arm of readlink went
-// (file.rs `readlink_at_impl`): the paths `synthetic_proc_content` serves.
+// (file.rs `readlink_at_impl`): the synthetic regular paths the core
+// itself serves in the unregistered test composition. `/proc/self/maps`
+// is an extension claim since S2-R4; its legs of the loops over this
+// table live in reverie-kvm's procfs acceptance tests.
 #[cfg(test)]
-pub(super) const SYNTHETIC_REGULAR_PROC_PATHS: &[&[u8]] =
-    &[b"/proc/self/status", b"/proc/self/maps"];
+pub(super) const SYNTHETIC_REGULAR_PROC_PATHS: &[&[u8]] = &[b"/proc/self/status"];
 
 pub(super) fn live_thread_in_process(state: &LoadedStaticElf, tid: i32) -> bool {
     state
@@ -496,18 +498,59 @@ pub(super) fn live_thread_in_process(state: &LoadedStaticElf, tid: i32) -> bool 
         .is_some_and(|task| task.tgid == state.pid)
 }
 
-/// Synthesize deterministic content for a recognized /proc path, or `None` when
-/// the path is not part of the supported surface.
+/// Extension content for a recognized /proc path, or `None` when no
+/// installed extension claims it. Maps is an extension claim (Slice 2
+/// S2-R4), served only when a standalone composition registered it
+/// and refused by name (None here) otherwise; the readable status
+/// seq description is core mechanics and never routes through here
+/// (see [`synthetic_proc_served`]). Only tests call this unnormalized
+/// spelling since the hoist routed production callers through
+/// [`synthetic_proc_served`] and [`synthetic_proc_stat_size`].
+#[cfg(test)]
 pub(super) fn synthetic_proc_content(state: &LoadedStaticElf, path: &[u8]) -> Option<Vec<u8>> {
     let normalized = crate::proc_mechanics::normalize_self_path(path, state.pid)?;
-    let content = match normalized.as_slice() {
-        b"/proc/self/status" => proc_self_status_content(state),
-        b"/proc/self/maps" => proc_self_maps_content(state),
-        // Core claims win above; an extension claim serves only a
-        // path the core does not, and the empty table declines here.
-        _ => return state.extension_proc_content(&normalized),
+    synthetic_proc_content_normalized(state, &normalized)
+}
+
+/// Extension content for an already-normalized synthetic path.
+/// Callers route core process files ([`ProcessProcFile`]) BEFORE this
+/// (hoisted in S2-R4): the readable status seq description is core
+/// mechanics, not an extension claim, and must not depend on a
+/// composition registering anything.
+pub(super) fn synthetic_proc_content_normalized(
+    state: &LoadedStaticElf,
+    normalized: &[u8],
+) -> Option<Vec<u8>> {
+    state.extension_proc_content(normalized)
+}
+
+/// Whether `path` names a served synthetic proc file: a core
+/// process file (readable status seq, always served) or a path an
+/// installed extension claims. Existence/metadata gates use this so
+/// the core status surface never depends on a composition.
+pub(super) fn synthetic_proc_served(state: &LoadedStaticElf, path: &[u8]) -> bool {
+    let Some(normalized) = crate::proc_mechanics::normalize_self_path(path, state.pid) else {
+        return false;
     };
-    Some(content)
+    ProcessProcFile::from_normalized_path(&normalized).is_some()
+        || synthetic_proc_content_normalized(state, &normalized).is_some()
+}
+
+/// `(normalized, reported size)` for a served synthetic path: core
+/// process files report size 0 (read-time seq files); extension
+/// content reports its rendered length unless the path is a process
+/// file (see [`synthetic_proc_path_size`]).
+pub(super) fn synthetic_proc_stat_size(
+    state: &LoadedStaticElf,
+    path: &[u8],
+) -> Option<(Vec<u8>, usize)> {
+    let normalized = crate::proc_mechanics::normalize_self_path(path, state.pid)?;
+    if ProcessProcFile::from_normalized_path(&normalized).is_some() {
+        return Some((normalized, 0));
+    }
+    let content = synthetic_proc_content_normalized(state, &normalized)?;
+    let size = synthetic_proc_path_size(&normalized, &content);
+    Some((normalized, size))
 }
 
 /// The thread-group leader's `comm`, without its terminating NUL byte.
@@ -516,24 +559,12 @@ pub(super) fn proc_comm(state: &LoadedStaticElf) -> Vec<u8> {
     ProcessProcView::of(state).comm()
 }
 
-// AUTONOMOUS-BOT-IMPLEMENTED: Expose only the deterministic guest stack map.
-// TODO-HUMAN-REVIEW(PR-223): Review the minimal synthetic process map surface.
-pub(super) fn proc_self_maps_content(_state: &LoadedStaticElf) -> Vec<u8> {
-    // The ELF loader places the stack in the window at the top of the user
-    // address space, below Linux's TASK_SIZE.
-    let stack_start = crate::memory::USER_ADDRESS_END - STACK_LIMIT;
-    let stack_end = crate::memory::USER_STACK_TOP;
-    reverie_procfs::format_maps_line(&reverie_procfs::MapsEntry {
-        start: stack_start,
-        end: stack_end,
-        perms: "rw-p",
-        offset: 0,
-        dev_major: 0,
-        dev_minor: 0,
-        inode: 0,
-        name: Some("[stack]"),
-    })
-}
+// The deterministic guest stack map moved to the procfs extension
+// (Slice 2 S2-R4): ProcFacts::of_state carries the same single
+// [stack] entry and the extension renders it. The AUTONOMOUS-BOT
+// audit tags that rode on the core copy move with it in spirit:
+// the minimal synthetic map surface remains TODO-HUMAN-REVIEW
+// (PR-223) in the extension crate.
 
 /// The size a path stat reports. Read-time files report zero, as Linux does
 /// and as their descriptors' empty backing does.
@@ -545,7 +576,10 @@ pub(super) fn synthetic_proc_path_size(normalized: &[u8], content: &[u8]) -> usi
     }
 }
 
+#[cfg(test)]
 pub(super) fn proc_self_status_content(state: &LoadedStaticElf) -> Vec<u8> {
+    // Test oracle for the seq status description below; the guest
+    // synthetic content path renders through the extension claim.
     ProcessProcView::of(state).status()
 }
 

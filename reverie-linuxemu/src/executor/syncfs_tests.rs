@@ -98,7 +98,7 @@ fn syncfs_closed_and_path_only_precede_private_refusal_without_host_call() {
             negative_errno(libc::EBADF)
         );
     }
-    for path in ["/proc/self/maps", root.0.to_str().unwrap()] {
+    for path in ["/proc/self/status", root.0.to_str().unwrap()] {
         let fd = open_with_flags(&mut memory, &mut state, path, libc::O_PATH);
         assert!(fd >= 0);
         assert_eq!(
@@ -324,56 +324,51 @@ fn syncfs_private_rights_remain_refused_after_sender_reuse_dup_fork_exec() {
     let root = TestDir::new();
     let replacement = root.0.join("replacement");
     std::fs::write(&replacement, SELF_MAPS_CONTENT).unwrap();
-    for path in ["/proc/self/maps", "/proc/self/status"] {
-        let mut state = test_state(&root.0);
-        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
-        let original = open_readonly(&mut memory, &mut state, path) as i32;
-        assert!(original >= 0, "{path}");
-        let original_key = host_file_key(host_fd(&state, original).unwrap()).unwrap();
-        let received = syncfs_transfer_after_sender_close(&mut state, original, &replacement);
+    // The maps snapshot leg is extension-served since S2-R4 (received
+    // refusal in reverie-kvm's procfs acceptance tests); the process
+    // status transfer below keeps the dup/fork/exec legs in-crate.
+    let path = "/proc/self/status";
+    let mut state = test_state(&root.0);
+    let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+    let original = open_readonly(&mut memory, &mut state, path) as i32;
+    assert!(original >= 0, "{path}");
+    let original_key = host_file_key(host_fd(&state, original).unwrap()).unwrap();
+    let received = syncfs_transfer_after_sender_close(&mut state, original, &replacement);
+    assert_eq!(
+        host_file_key(host_fd(&state, received).unwrap()).unwrap(),
+        original_key
+    );
+    let alias = duplicate_fd(&mut state, received as u64, None, 0, false) as i32;
+    assert!(alias > received);
+    let mut child = state.try_clone_for_fork(2).unwrap();
+    assert_eq!(close(&mut state, received as u64), 0);
+    assert_eq!(close(&mut state, alias as u64), 0);
+    let _hook = install_syncfs_test_hook(|_| panic!("private transfer reached host syncfs"));
+    for fd in [received, alias] {
         assert_eq!(
-            host_file_key(host_fd(&state, received).unwrap()).unwrap(),
-            original_key
+            syncfs_call(&mut memory, &mut child, fd as u64),
+            negative_errno(libc::ENOSYS),
+            "{path} fork fd={fd}"
         );
-        if path == "/proc/self/maps" {
-            assert!(
-                !state.proc_files.contains_key(&received),
-                "real transfer loses fixed metadata"
-            );
-            assert!(!state.fdinfo_files.contains_key(&received));
-        }
-        let alias = duplicate_fd(&mut state, received as u64, None, 0, false) as i32;
-        assert!(alias > received);
-        let mut child = state.try_clone_for_fork(2).unwrap();
-        assert_eq!(close(&mut state, received as u64), 0);
-        assert_eq!(close(&mut state, alias as u64), 0);
-        let _hook = install_syncfs_test_hook(|_| panic!("private transfer reached host syncfs"));
-        for fd in [received, alias] {
-            assert_eq!(
-                syncfs_call(&mut memory, &mut child, fd as u64),
-                negative_errno(libc::ENOSYS),
-                "{path} fork fd={fd}"
-            );
-        }
-        let mut exec = test_state(&root.0);
-        exec.inherit_process_state(child);
-        for fd in [received, alias] {
-            assert_eq!(
-                syncfs_call(&mut memory, &mut exec, fd as u64),
-                negative_errno(libc::ENOSYS),
-                "{path} exec fd={fd}"
-            );
-        }
-        drop(_hook);
-        // Reusing the sender's guest slot for ordinary same-content storage
-        // must not poison that slot, even while old aliases remain refused.
-        let expected = host_fd(&exec, original).unwrap();
-        let _hook = install_syncfs_test_hook(move |host| {
-            assert_eq!(host, expected);
-            0
-        });
-        assert_eq!(syncfs_call(&mut memory, &mut exec, original as u64), 0);
     }
+    let mut exec = test_state(&root.0);
+    exec.inherit_process_state(child);
+    for fd in [received, alias] {
+        assert_eq!(
+            syncfs_call(&mut memory, &mut exec, fd as u64),
+            negative_errno(libc::ENOSYS),
+            "{path} exec fd={fd}"
+        );
+    }
+    drop(_hook);
+    // Reusing the sender's guest slot for ordinary same-content storage
+    // must not poison that slot, even while old aliases remain refused.
+    let expected = host_fd(&exec, original).unwrap();
+    let _hook = install_syncfs_test_hook(move |host| {
+        assert_eq!(host, expected);
+        0
+    });
+    assert_eq!(syncfs_call(&mut memory, &mut exec, original as u64), 0);
 }
 
 #[test]
@@ -382,7 +377,11 @@ fn syncfs_known_private_descriptions_are_refused_without_host_call() {
     let mut state = test_state(&root.0);
     let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
     let mut fds = Vec::new();
-    for path in ["/proc/self/maps", "/proc/self/status"] {
+    // The maps element is extension-served since S2-R4; its syncfs
+    // refusal is pinned with the extension installed in reverie-kvm's
+    // procfs acceptance tests.
+    {
+        let path = "/proc/self/status";
         let fd = open_readonly(&mut memory, &mut state, path);
         assert!(fd >= 0, "{path}: {fd}");
         fds.push(fd);

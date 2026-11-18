@@ -1434,14 +1434,16 @@ mod tests {
             captured.descriptor_status(signalfd as i32),
             Err(FactError::NotProvided)
         );
-        let maps = open(
+        // The core status carrier here; the extension maps carrier's
+        // NotProvided is pinned in reverie-kvm's procfs acceptance tests.
+        let status = open(
             &mut captured,
             &mut memory,
-            b"/proc/self/maps",
+            b"/proc/self/status",
             libc::O_RDONLY,
         );
         assert_eq!(
-            captured.descriptor_status(maps),
+            captured.descriptor_status(status),
             Err(FactError::NotProvided)
         );
         let uncaptured = ElfExecutor::new(test_state(&directory.0), false);
@@ -1520,30 +1522,32 @@ mod tests {
         let mut memory = GuestMemory::new(0, PAGE as usize).unwrap();
         let mut executor = ElfExecutor::new(test_state(&directory.0), false);
         let [sender, receiver] = socket_pair(&mut executor, &memory);
-        for path in [&b"/proc/self/maps"[..], b"/proc/self/status"] {
-            let name = String::from_utf8_lossy(path);
-            let carrier = open(&mut executor, &mut memory, path, libc::O_RDONLY);
+        // The maps snapshot carrier's transfer leg is extension-served
+        // since S2-R4 (reverie-kvm's procfs acceptance tests); the
+        // process status carrier keeps the transfer legs here.
+        let path: &[u8] = b"/proc/self/status";
+        let name = String::from_utf8_lossy(path);
+        let carrier = open(&mut executor, &mut memory, path, libc::O_RDONLY);
+        assert_eq!(
+            executor.descriptor_status(carrier),
+            Err(FactError::NotProvided),
+            "{name}"
+        );
+        send_descriptor(&mut executor, &mut memory, sender, carrier);
+        close(&mut executor, &memory, carrier);
+        let received = receive_descriptor(&mut executor, &mut memory, receiver);
+        let duplicate = new_fd(
+            &mut executor,
+            &memory,
+            libc::SYS_dup,
+            [received as u64, 0, 0, 0, 0, 0],
+        );
+        for fd in [received, duplicate] {
             assert_eq!(
-                executor.descriptor_status(carrier),
+                executor.descriptor_status(fd),
                 Err(FactError::NotProvided),
-                "{name}"
+                "{name}, fd {fd}"
             );
-            send_descriptor(&mut executor, &mut memory, sender, carrier);
-            close(&mut executor, &memory, carrier);
-            let received = receive_descriptor(&mut executor, &mut memory, receiver);
-            let duplicate = new_fd(
-                &mut executor,
-                &memory,
-                libc::SYS_dup,
-                [received as u64, 0, 0, 0, 0, 0],
-            );
-            for fd in [received, duplicate] {
-                assert_eq!(
-                    executor.descriptor_status(fd),
-                    Err(FactError::NotProvided),
-                    "{name}, fd {fd}"
-                );
-            }
         }
         // A guest memfd, with an open file description lock that travels
         // with its description.
@@ -1842,30 +1846,31 @@ mod tests {
             let mut memory = GuestMemory::new(0, PAGE as usize).unwrap();
             let mut executor = ElfExecutor::new(test_state(&directory.0), false);
             let [sender, receiver] = socket_pair(&mut executor, &memory);
-            for name in [&b"/proc/self/maps"[..], b"/proc/self/status"] {
-                let label = String::from_utf8_lossy(name);
-                let carrier = open(&mut executor, &mut memory, name, libc::O_RDONLY);
+            // Maps leg: extension-served since S2-R4, pinned in
+            // reverie-kvm's procfs acceptance tests.
+            let name: &[u8] = b"/proc/self/status";
+            let label = String::from_utf8_lossy(name);
+            let carrier = open(&mut executor, &mut memory, name, libc::O_RDONLY);
+            assert_eq!(
+                descriptor(&executor, carrier),
+                Err(FactError::NotProvided),
+                "{label}"
+            );
+            send_descriptor(&mut executor, &mut memory, sender, carrier);
+            close(&mut executor, &memory, carrier);
+            let received = receive_descriptor(&mut executor, &mut memory, receiver);
+            let duplicate = new_fd(
+                &mut executor,
+                &memory,
+                libc::SYS_dup,
+                [received as u64, 0, 0, 0, 0, 0],
+            );
+            for fd in [received, duplicate] {
                 assert_eq!(
-                    descriptor(&executor, carrier),
+                    descriptor(&executor, fd),
                     Err(FactError::NotProvided),
-                    "{label}"
+                    "{label}, fd {fd}"
                 );
-                send_descriptor(&mut executor, &mut memory, sender, carrier);
-                close(&mut executor, &memory, carrier);
-                let received = receive_descriptor(&mut executor, &mut memory, receiver);
-                let duplicate = new_fd(
-                    &mut executor,
-                    &memory,
-                    libc::SYS_dup,
-                    [received as u64, 0, 0, 0, 0, 0],
-                );
-                for fd in [received, duplicate] {
-                    assert_eq!(
-                        descriptor(&executor, fd),
-                        Err(FactError::NotProvided),
-                        "{label}, fd {fd}"
-                    );
-                }
             }
             let named = memfd(&mut executor, &mut memory, b"reverie-kvm-proc");
             assert_eq!(descriptor(&executor, named), Err(FactError::NotProvided));
@@ -3121,10 +3126,13 @@ mod memory_map_tests {
     }
 
     /// As the image starts, the map lists its stack window, readable and
-    /// writable, as `[stack]`: the range and protection of the one line of
-    /// the executor's own `/proc/self/maps` today. Nothing else is listed,
-    /// and the list is never complete. Growing the break, which leaves the
-    /// window alone, changes nothing.
+    /// writable, as `[stack]`: the range and protection of the one line
+    /// the procfs extension renders for `/proc/self/maps` from this
+    /// same window (its bytes are pinned in the extension's render
+    /// tests and in reverie-kvm's procfs acceptance tests; the core
+    /// itself serves no maps content without the extension). Nothing
+    /// else is listed, and the list is never complete. Growing the
+    /// break, which leaves the window alone, changes nothing.
     #[test]
     fn the_map_lists_the_stack_window_as_the_image_starts_with_it() {
         let directory = Directory::new();
@@ -3132,13 +3140,9 @@ mod memory_map_tests {
         let tid = executor.state.tid;
         assert!(!executor.state.stack_executable);
         assert_eq!(window(executor.memory_map(&memory, tid)), Ok(stack(RW)));
-        let text = String::from_utf8(proc_self_maps_content(&executor.state)).unwrap();
-        assert_eq!(
-            text,
-            format!(
-                "{:012x}-{:012x} rw-p 00000000 00:00 0 [stack]\n",
-                WINDOW.0, WINDOW.1
-            )
+        assert!(
+            synthetic_proc_content(&executor.state, b"/proc/self/maps").is_none(),
+            "the unregistered core must serve no maps content"
         );
         let base = executor.state.mm.heap_base;
         assert_eq!(

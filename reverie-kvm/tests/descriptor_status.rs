@@ -281,6 +281,11 @@ fn a_kvm_guest_reports_descriptor_status_from_its_executor() {
             &directory.0,
         )
         .unwrap();
+    // The standalone composition serves the synthetic proc snapshot
+    // surface (S2-R4 claim move): register the procfs extension.
+    backend
+        .install_extension_table(reverie_linuxemu_ext_procfs::extension_table())
+        .unwrap();
     let (log, code, stdout, stderr) =
         futures::executor::block_on(backend.run_static_elf_with_tool::<FactTool>((), true))
             .unwrap();

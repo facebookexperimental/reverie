@@ -4651,6 +4651,16 @@ impl Drop for TestDirectory {
     }
 }
 
+/// The standalone test composition serves the synthetic proc
+/// snapshot surface: since the S2-R4 claim move, /proc/self/maps
+/// is the procfs extension's claim, so register it on the loaded
+/// image as a standalone composition does.
+fn install_synthetic_proc(backend: &mut KvmBackend) {
+    backend
+        .install_extension_table(reverie_linuxemu_ext_procfs::extension_table())
+        .unwrap();
+}
+
 fn run_host_program_captured(
     program: &str,
     argv: &[&str],
@@ -4663,6 +4673,7 @@ fn run_host_program_captured(
     backend
         .install_static_elf_with_context(&image, argv, &["PATH=/usr/bin:/bin"], cwd)
         .unwrap();
+    install_synthetic_proc(&mut backend);
     let (code, stdout, stderr) = backend.run_static_elf_captured().unwrap();
     assert_eq!(
         code,
@@ -4686,6 +4697,7 @@ fn run_host_program_with_tool_captured(
     backend
         .install_static_elf_with_context(&image, argv, &["PATH=/usr/bin:/bin"], cwd)
         .unwrap();
+    install_synthetic_proc(&mut backend);
     let (_, code, stdout, stderr) =
         futures::executor::block_on(backend.run_static_elf_with_tool::<StraceTool>((), true))
             .unwrap();
@@ -23028,6 +23040,7 @@ fn fstat_and_fstatfs_consume_low_descriptor_words_on_kvm() {
                 &directory.0,
             )
             .unwrap();
+        install_synthetic_proc(&mut backend);
         let (code, stdout, stderr) = if tool_owned {
             let (_, code, stdout, stderr) = futures::executor::block_on(
                 backend.run_static_elf_with_tool::<StraceTool>((), true),

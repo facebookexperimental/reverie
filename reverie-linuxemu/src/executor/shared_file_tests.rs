@@ -691,9 +691,21 @@ mod shared_file_dispatch_tests {
                 let file = std::fs::File::open(&f.path).unwrap();
                 insert_file_with_flags(&mut f.state, file, false, Some(OutputAlias::Stdout))
             } else {
-                let fd = open_readonly(&mut f.memory, &mut f.state, "/proc/self/maps");
+                // A descriptor classified synthetic by its proc_files
+                // entry, as an opened maps snapshot was: no core-served
+                // readable carrier has that shape since S2-R4 (status
+                // is a seq description, refused earlier as ENOSYS; an
+                // O_PATH carrier is EBADF), so classify the fixture's
+                // ordinary backing directly, as the proc-fd access-gate
+                // test does. The predicate under test keys on exactly
+                // this entry.
+                let file = std::fs::File::open(&f.path).unwrap();
+                let fd = insert_file_with_flags(&mut f.state, file, false, None);
                 assert!(fd >= 3);
-                assert!(f.state.proc_files.contains_key(&(fd as i32)));
+                f.state.proc_files.insert(
+                    fd as i32,
+                    crate::proc_mechanics::path_inode(b"/proc/self/status"),
+                );
                 fd
             };
             let before = layout(&f.memory, &f.state);

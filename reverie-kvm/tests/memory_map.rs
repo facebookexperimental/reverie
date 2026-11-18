@@ -396,6 +396,11 @@ fn kvm(directory: &Directory, executable: &Path, args: &[&str]) -> (Listing, BTr
             &directory.0,
         )
         .unwrap();
+    // The standalone composition serves the synthetic proc snapshot
+    // surface (S2-R4 claim move): register the procfs extension.
+    backend
+        .install_extension_table(reverie_linuxemu_ext_procfs::extension_table())
+        .unwrap();
     let (log, code, stdout, stderr) =
         futures::executor::block_on(backend.run_static_elf_with_tool::<FactTool>((), true))
             .unwrap();
@@ -650,6 +655,11 @@ fn a_child_sharing_the_address_space_cannot_leave_the_stack_protected() {
                 &[],
                 &directory.0,
             )
+            .unwrap();
+        // The standalone composition serves the synthetic proc snapshot
+        // surface (S2-R4 claim move): register the procfs extension.
+        backend
+            .install_extension_table(reverie_linuxemu_ext_procfs::extension_table())
             .unwrap();
         let error = match futures::executor::block_on(
             backend.run_static_elf_with_tool::<FactTool>((), true),
@@ -931,6 +941,11 @@ fn a_kvm_guests_mapping_flags_are_linuxs() {
             &[],
             &directory.0,
         )
+        .unwrap();
+    // The standalone composition serves the synthetic proc snapshot
+    // surface (S2-R4 claim move): register the procfs extension.
+    backend
+        .install_extension_table(reverie_linuxemu_ext_procfs::extension_table())
         .unwrap();
     let (log, code, stdout, stderr) =
         futures::executor::block_on(backend.run_static_elf_with_tool::<FactTool>((), true))

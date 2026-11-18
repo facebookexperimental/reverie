@@ -43,8 +43,9 @@ use crate::elf::GuestFileIdentityEntry;
 use crate::elf::IdentityTimestamps;
 use crate::elf::LoadedStaticElf;
 use crate::elf::RegularCreateDirectoryPolicy;
-use crate::elf::STACK_LIMIT;
 use crate::elf::TASK_COMM_LEN;
+#[cfg(test)]
+use crate::elf::STACK_LIMIT;
 #[cfg(any(test, feature = "test-support", feature = "native-test-support"))]
 use crate::elf::initialize_regular_create_directory_policy;
 use crate::elf::load_static_elf_image_of;
@@ -659,9 +660,11 @@ mod tests {
     use std::sync::atomic::AtomicU64;
     use std::sync::atomic::Ordering;
 
-    /// The fixed synthetic /proc/self/maps (the guest stack's one line), the
-    /// regular procfs file these tests open where they need a fixed,
-    /// KVM-rendered snapshot.
+    /// The guest stack's one maps line, as the procfs extension
+    /// renders it. In this unregistered suite it survives only as
+    /// ordinary-file payload for the syncfs same-content controls;
+    /// as served content it is pinned in the extension's render
+    /// tests and reverie-kvm's procfs acceptance tests.
     const SELF_MAPS_CONTENT: &[u8] = b"7fffff800000-7ffffffff000 rw-p 00000000 00:00 0 [stack]\n";
 
     /// An entry records each fact from its first successful probe and reuses
@@ -2352,14 +2355,17 @@ mod tests {
     fn close_range_closes_the_inclusive_descriptor_span() {
         const HIGH_WORD: u64 = 0x5a5a_5a5a_0000_0000;
         let root = TestDir::new();
+        std::fs::write(root.0.join("ordinary"), b"x").unwrap();
         let mut state = test_state(&root.0);
         let mut memory = GuestMemory::new(0, 0x4000).unwrap();
 
-        // Four live guest descriptors: 3, 4, 5, 6.
-        let low = open_readonly(&mut memory, &mut state, "/proc/self/maps");
-        let mid = open_readonly(&mut memory, &mut state, "/proc/self/maps");
-        let high = open_readonly(&mut memory, &mut state, "/proc/self/maps");
-        let direct = open_readonly(&mut memory, &mut state, "/proc/self/maps");
+        // Four live guest descriptors: 3, 4, 5, 6. Ordinary files: the
+        // span arithmetic under test is descriptor-generic (the maps
+        // fixture they replace is extension-served since S2-R4).
+        let low = open_readonly(&mut memory, &mut state, "ordinary");
+        let mid = open_readonly(&mut memory, &mut state, "ordinary");
+        let high = open_readonly(&mut memory, &mut state, "ordinary");
+        let direct = open_readonly(&mut memory, &mut state, "/proc/self/status");
         assert_eq!([low, mid, high, direct], [3, 4, 5, 6]);
 
         // close consumes only the low descriptor word and removes the complete
@@ -2413,11 +2419,12 @@ mod tests {
         const HIGH_WORD: u64 = 0x5a5a_5a5a_0000_0000;
         const CLOSE_RANGE_CLOEXEC: u64 = 1 << 2;
         let root = TestDir::new();
+        std::fs::write(root.0.join("ordinary"), b"x").unwrap();
         let mut state = test_state(&root.0);
         let mut memory = GuestMemory::new(0, 0x4000).unwrap();
 
-        let low = open_readonly(&mut memory, &mut state, "/proc/self/maps");
-        let high = open_readonly(&mut memory, &mut state, "/proc/self/maps");
+        let low = open_readonly(&mut memory, &mut state, "ordinary");
+        let high = open_readonly(&mut memory, &mut state, "ordinary");
         assert_eq!([low, high], [3, 4]);
 
         // Bounds are compared after truncation. Raw u64 ordering says the last
@@ -2530,154 +2537,43 @@ mod tests {
         );
     }
 
+    // The deterministic maps bytes are extension content since
+    // S2-R4: pinned by reverie-linuxemu-ext-procfs's render tests and
+    // served end-to-end by reverie-kvm's procfs acceptance tests
+    // (extension_serves_maps_while_core_serves_status_without_it).
+
     #[test]
-    fn synthetic_proc_files_serve_deterministic_content() {
+    fn synthetic_proc_without_registration_refuses_by_name() {
+        // Acceptance for the S2-R4 claim move: with no procfs
+        // extension registered, extension content serves nothing for
+        // either path. Maps then refuses by name exactly as an
+        // unclaimed synthetic path does (real procfs: EACCES), while
+        // the readable status seq description is core mechanics
+        // (S2-R4 hoist) and still serves.
         let root = TestDir::new();
         let mut state = test_state(&root.0);
+        state.install_extension_table(Arc::new(crate::extension::ExtensionTable::empty()));
         let mut memory = GuestMemory::new(0, 0x4000).unwrap();
-
-        let fd = open_readonly(&mut memory, &mut state, "/proc/self/maps");
-        assert!(fd >= 0, "open /proc/self/maps failed: {fd}");
-        assert_eq!(
-            read_fd_to_end(&mut memory, &mut state, fd),
-            SELF_MAPS_CONTENT
-        );
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_close,
-                [fd as u64, 0, 0, 0, 0, 0]
-            ),
-            0
-        );
-        // The descriptor is no longer tracked once closed.
-        assert!(state.proc_files.is_empty());
-    }
-
-    #[test]
-    fn synthetic_proc_snapshot_has_required_seals_and_readonly_description() {
-        const PATH: u64 = 0x100;
-        const BUFFER: u64 = 0x200;
-
-        let root = TestDir::new();
-        let mut state = test_state(&root.0);
-        let mut memory = GuestMemory::new(0, state.mm.mmap_limit as usize).unwrap();
-        write_c_string(&mut memory, PATH, "/proc/self/maps");
-        let fd = syscall_result(
-            &mut memory,
-            &mut state,
-            libc::SYS_openat,
-            [
-                libc::AT_FDCWD as u64,
-                PATH,
-                (libc::O_RDONLY | libc::O_CLOEXEC) as u64,
-                0,
-                0,
-                0,
-            ],
-        );
-        assert_eq!(fd, 3);
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_fcntl,
-                [fd as u64, libc::F_GETFL as u64, 0, 0, 0, 0],
-            ) & i64::from(libc::O_ACCMODE),
-            i64::from(libc::O_RDONLY)
-        );
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_fcntl,
-                [fd as u64, libc::F_GETFD as u64, 0, 0, 0, 0],
-            ),
-            i64::from(libc::FD_CLOEXEC)
-        );
-        let host_fd = state.files[&(fd as libc::c_int)].as_raw_fd();
-        let mut host_stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
-        assert_eq!(unsafe { libc::fstat(host_fd, host_stat.as_mut_ptr()) }, 0);
-        assert_eq!(unsafe { host_stat.assume_init() }.st_mode & 0o777, 0o444);
-        let required =
-            libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
-        let observed = unsafe { libc::fcntl(host_fd, libc::F_GET_SEALS) };
-        assert!(
-            observed == required || observed == (required | LINUX_F_SEAL_EXEC),
-            "unexpected synthetic proc seal policy: {observed:#x}"
-        );
-
-        memory.write(BUFFER, b"x").unwrap();
-        for (number, args, expected) in [
-            (
-                libc::SYS_write,
-                [fd as u64, BUFFER, 1, 0, 0, 0],
-                negative_errno(libc::EBADF),
-            ),
-            (
-                libc::SYS_pwrite64,
-                [(1_u64 << 32) | fd as u64, BUFFER, 1, 0, 0, 0],
-                negative_errno(libc::ESPIPE),
-            ),
-            (
-                libc::SYS_ftruncate,
-                [(1_u64 << 32) | fd as u64, 0, 0, 0, 0, 0],
-                negative_errno(libc::EINVAL),
-            ),
-            (
-                libc::SYS_fallocate,
-                [fd as u64, 0, 0, 1, 0, 0],
-                negative_errno(libc::EBADF),
-            ),
-        ] {
-            assert_eq!(
-                syscall_result(&mut memory, &mut state, number, args),
-                expected,
-                "syscall {number} unexpectedly accepted the read-only snapshot"
+        for path in ["/proc/self/status", "/proc/self/maps"] {
+            assert!(
+                synthetic_proc_content(&state, path.as_bytes()).is_none(),
+                "unregistered {path} must serve no extension content"
             );
         }
         assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_pwrite64,
-                [fd as u64, u64::MAX, 1, u64::MAX, 0, 0],
-            ),
-            negative_errno(libc::EINVAL),
-            "negative offset validation must precede procfs positioning refusal"
+            open_readonly(&mut memory, &mut state, "/proc/self/maps"),
+            negative_errno(libc::EACCES),
+            "unregistered maps open must refuse by name"
         );
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_mmap,
-                [
-                    0,
-                    PAGE_SIZE,
-                    (libc::PROT_READ | libc::PROT_WRITE) as u64,
-                    libc::MAP_SHARED as u64,
-                    fd as u64,
-                    0,
-                ],
-            ),
-            negative_errno(libc::EACCES)
-        );
-
-        let expected = SELF_MAPS_CONTENT;
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_pread64,
-                [fd as u64, BUFFER, expected.len() as u64, 0, 0, 0],
-            ),
-            expected.len() as i64
-        );
-        let mut actual = vec![0; expected.len()];
-        memory.read(BUFFER, &mut actual).unwrap();
-        assert_eq!(actual, expected);
+        let status = open_readonly(&mut memory, &mut state, "/proc/self/status");
+        assert!(status >= 0, "core status open must serve, got {status}");
+        assert_eq!(close(&mut state, status as u64), 0);
     }
+
+    // The snapshot seal and read-only-description surface is
+    // extension-served since S2-R4: covered at ElfExecutor level by
+    // reverie-kvm's extension_maps_snapshot_identity_seals_and_readonly_refusals.
+    // The pure seal-shape policy stays below.
 
     #[test]
     fn synthetic_proc_seal_policy_accepts_only_supported_kernel_shapes() {
@@ -2764,7 +2660,7 @@ mod tests {
         let root = TestDir::new();
         let mut state = test_state(&root.0);
         let mut memory = GuestMemory::new(0, state.mm.mmap_limit as usize).unwrap();
-        write_c_string(&mut memory, PATH, "/proc/self/maps");
+        write_c_string(&mut memory, PATH, "/proc/self/status");
         let fd = syscall_result(
             &mut memory,
             &mut state,
@@ -2857,7 +2753,7 @@ mod tests {
             libc::O_PATH | libc::O_DIRECTORY,
         ] {
             assert_eq!(
-                open_with_flags(&mut memory, &mut state, "/proc/self/maps", flags),
+                open_with_flags(&mut memory, &mut state, "/proc/self/status", flags),
                 negative_errno(libc::ENOTDIR),
                 "O_DIRECTORY precedence for flags {flags:#x}"
             );
@@ -2867,7 +2763,7 @@ mod tests {
                 open_with_flags(
                     &mut memory,
                     &mut state,
-                    "/proc/self/maps",
+                    "/proc/self/status",
                     access | libc::O_TRUNC,
                 ),
                 negative_errno(libc::EACCES),
@@ -2878,7 +2774,7 @@ mod tests {
             open_with_flags(
                 &mut memory,
                 &mut state,
-                "/proc/self/maps",
+                "/proc/self/status",
                 libc::O_RDONLY | libc::O_DIRECT,
             ),
             negative_errno(libc::EINVAL)
@@ -2888,7 +2784,7 @@ mod tests {
         let fd = open_with_flags(
             &mut memory,
             &mut state,
-            "/proc/self/maps",
+            "/proc/self/status",
             libc::O_RDONLY | retained,
         );
         assert_eq!(fd, 3);
@@ -2904,7 +2800,7 @@ mod tests {
         let fd = open_with_flags(
             &mut memory,
             &mut state,
-            "/proc/self/maps",
+            "/proc/self/status",
             libc::O_RDONLY | libc::O_NOFOLLOW,
         );
         assert_eq!(fd, 3);
@@ -2924,7 +2820,7 @@ mod tests {
         let fd = open_with_flags(
             &mut memory,
             &mut state,
-            "/proc/self/maps",
+            "/proc/self/status",
             libc::O_RDONLY | libc::O_DSYNC,
         );
         assert_eq!(fd, 3);
@@ -2946,7 +2842,7 @@ mod tests {
         let fd = open_with_flags(
             &mut memory,
             &mut state,
-            "/proc/self/maps",
+            "/proc/self/status",
             ignored_with_path,
         );
         assert_eq!(fd, 3);
@@ -2964,7 +2860,7 @@ mod tests {
         let nofollow = open_with_flags(
             &mut memory,
             &mut state,
-            "/proc/self/maps",
+            "/proc/self/status",
             ignored_with_path | libc::O_NOFOLLOW,
         );
         assert_eq!(nofollow, 3);
@@ -3035,7 +2931,7 @@ mod tests {
         let cloexec_nofollow = open_with_flags(
             &mut memory,
             &mut state,
-            "/proc/self/maps",
+            "/proc/self/status",
             libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         );
         assert_eq!(cloexec_nofollow, 5);
@@ -3127,7 +3023,7 @@ mod tests {
         let mut state = test_state(&root.0);
         let mut memory = GuestMemory::new(0, state.mm.mmap_limit as usize).unwrap();
         let ordinary = open_with_flags(&mut memory, &mut state, "ordinary", libc::O_RDONLY);
-        let proc_file = open_readonly(&mut memory, &mut state, "/proc/self/maps");
+        let proc_file = open_readonly(&mut memory, &mut state, "/proc/self/status");
         assert_eq!((ordinary, proc_file), (3, 4));
 
         let private_tmpfile = (libc::O_TMPFILE & !libc::O_DIRECTORY) as libc::c_int;
@@ -3178,7 +3074,7 @@ mod tests {
         }
 
         for path in [
-            "/proc/self/maps".to_owned(),
+            "/proc/self/status".to_owned(),
             format!("/proc/self/fd/{proc_file}"),
         ] {
             for flags in invalid {
@@ -3656,43 +3552,43 @@ mod tests {
         for (policy, path, flags, expected) in [
             (
                 RegularCreateDirectoryPolicy::EarlyEinval,
-                "/proc/self/maps",
+                "/proc/self/status",
                 plain,
                 libc::EINVAL,
             ),
             (
                 RegularCreateDirectoryPolicy::EarlyEinval,
-                "/proc/self/maps",
+                "/proc/self/status",
                 exclusive,
                 libc::EINVAL,
             ),
             (
                 RegularCreateDirectoryPolicy::EarlyEinval,
-                "/proc/self/maps",
+                "/proc/self/status",
                 nofollow,
                 libc::EINVAL,
             ),
             (
                 RegularCreateDirectoryPolicy::LegacyLookup,
-                "/proc/self/maps",
+                "/proc/self/status",
                 plain,
                 libc::ENOTDIR,
             ),
             (
                 RegularCreateDirectoryPolicy::LegacyLookup,
-                "/proc/self/maps",
+                "/proc/self/status",
                 exclusive,
                 libc::EEXIST,
             ),
             (
                 RegularCreateDirectoryPolicy::LegacyLookup,
-                "/proc/self/maps",
+                "/proc/self/status",
                 nofollow,
                 libc::ENOTDIR,
             ),
             (
                 RegularCreateDirectoryPolicy::LegacyLookup,
-                "/proc/self/maps",
+                "/proc/self/status",
                 exclusive | libc::O_NOFOLLOW,
                 libc::EEXIST,
             ),
@@ -3748,7 +3644,7 @@ mod tests {
         state.regular_create_directory_policy = RegularCreateDirectoryPolicy::EarlyEinval;
         let mut memory = GuestMemory::new(0, state.mm.mmap_limit as usize).unwrap();
         let ordinary = open_with_flags(&mut memory, &mut state, "ordinary", libc::O_RDONLY);
-        let proc_file = open_readonly(&mut memory, &mut state, "/proc/self/maps");
+        let proc_file = open_readonly(&mut memory, &mut state, "/proc/self/status");
         assert_eq!((ordinary, proc_file), (3, 4));
 
         let early = [
@@ -3796,7 +3692,7 @@ mod tests {
             );
         }
         for path in [
-            "/proc/self/maps".to_owned(),
+            "/proc/self/status".to_owned(),
             format!("/proc/self/fd/{proc_file}"),
         ] {
             for flags in early {
@@ -3846,9 +3742,10 @@ mod tests {
     #[test]
     fn an_unchanged_file_table_install_keeps_state_and_a_changed_one_restores_it() {
         let root = TestDir::new();
+        std::fs::write(root.0.join("ordinary"), b"x").unwrap();
         let mut state = test_state(&root.0);
         let mut memory = GuestMemory::new(0, state.mm.mmap_limit as usize).unwrap();
-        let fd = open_with_flags(&mut memory, &mut state, "/proc/self/maps", libc::O_PATH);
+        let fd = open_with_flags(&mut memory, &mut state, "ordinary", libc::O_PATH);
         let mut shared = FileTableState::try_from_elf(&state).unwrap();
         assert!(shared.installed_matches(&state));
         // Installing over an equal state keeps every entry and its host fd.
@@ -3918,10 +3815,10 @@ mod tests {
         let marked = open_with_flags(
             &mut memory,
             &mut state,
-            "/proc/self/maps",
+            "/proc/self/status",
             libc::O_PATH | libc::O_NOFOLLOW,
         );
-        let unmarked = open_with_flags(&mut memory, &mut state, "/proc/self/maps", libc::O_PATH);
+        let unmarked = open_with_flags(&mut memory, &mut state, "/proc/self/status", libc::O_PATH);
         assert_eq!((marked, unmarked), (3, 4));
 
         let marked_copy = syscall_result(
@@ -4013,7 +3910,7 @@ mod tests {
         assert!(!state.files.contains_key(&next_fd));
         state.synthetic_proc_nofollow_fds.insert(next_fd);
 
-        let fd = open_with_flags(&mut memory, &mut state, "/proc/self/maps", libc::O_RDONLY);
+        let fd = open_with_flags(&mut memory, &mut state, "/proc/self/status", libc::O_RDONLY);
         assert_eq!(fd, i64::from(next_fd));
         assert!(state.proc_files.contains_key(&next_fd));
         assert!(
@@ -4031,197 +3928,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn synthetic_proc_dup_and_reopen_preserve_description_semantics_and_seals() {
-        const PATH: u64 = 0x100;
-        const BUFFER: u64 = 0x200;
-
-        let root = TestDir::new();
-        let mut state = test_state(&root.0);
-        let mut memory = GuestMemory::new(0, state.mm.mmap_limit as usize).unwrap();
-        write_c_string(&mut memory, PATH, "/proc/self/maps");
-        let fd = syscall_result(
-            &mut memory,
-            &mut state,
-            libc::SYS_openat,
-            [
-                libc::AT_FDCWD as u64,
-                PATH,
-                (libc::O_RDONLY | libc::O_CLOEXEC) as u64,
-                0,
-                0,
-                0,
-            ],
-        );
-        assert_eq!(fd, 3);
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_read,
-                [fd as u64, BUFFER, 4, 0, 0, 0],
-            ),
-            4
-        );
-        let duplicate = syscall_result(
-            &mut memory,
-            &mut state,
-            libc::SYS_dup,
-            [fd as u64, 0, 0, 0, 0, 0],
-        );
-        assert_eq!(duplicate, 4);
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_fcntl,
-                [duplicate as u64, libc::F_GETFD as u64, 0, 0, 0, 0],
-            ),
-            0,
-            "dup must clear the descriptor-local close-on-exec bit"
-        );
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_read,
-                [duplicate as u64, BUFFER, 3, 0, 0, 0],
-            ),
-            3
-        );
-        let mut shared_offset = [0; 3];
-        memory.read(BUFFER, &mut shared_offset).unwrap();
-        assert_eq!(&shared_offset, b"ff8");
-
-        write_c_string(&mut memory, PATH, &format!("/proc/self/fd/{fd}"));
-        let reopened = syscall_result(
-            &mut memory,
-            &mut state,
-            libc::SYS_openat,
-            [
-                libc::AT_FDCWD as u64,
-                PATH,
-                (libc::O_RDONLY | libc::O_CLOEXEC) as u64,
-                0,
-                0,
-                0,
-            ],
-        );
-        assert_eq!(reopened, 5);
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_read,
-                [reopened as u64, BUFFER, 2, 0, 0, 0],
-            ),
-            2
-        );
-        let mut fresh_offset = [0; 2];
-        memory.read(BUFFER, &mut fresh_offset).unwrap();
-        assert_eq!(&fresh_offset, b"7f");
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_fcntl,
-                [reopened as u64, libc::F_GETFD as u64, 0, 0, 0, 0],
-            ),
-            i64::from(libc::FD_CLOEXEC)
-        );
-
-        let inode = state.proc_files[&(fd as libc::c_int)];
-        for alias in [duplicate, reopened] {
-            assert_eq!(state.proc_files.get(&(alias as libc::c_int)), Some(&inode));
-            let host_fd = state.files[&(alias as libc::c_int)].as_raw_fd();
-            let required =
-                libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
-            let observed = unsafe { libc::fcntl(host_fd, libc::F_GET_SEALS) };
-            assert!(
-                observed == required || observed == (required | LINUX_F_SEAL_EXEC),
-                "unexpected alias seal policy: {observed:#x}"
-            );
-            assert_eq!(
-                unsafe { libc::fcntl(host_fd, libc::F_GETFL) } & libc::O_ACCMODE,
-                libc::O_RDONLY
-            );
-        }
-
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_fchmod,
-                [(1_u64 << 32) | fd as u64, 0o666, 0, 0, 0, 0],
-            ),
-            negative_errno(libc::EPERM)
-        );
-        let host_fd = state.files[&(fd as libc::c_int)].as_raw_fd();
-        let mut host_stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
-        assert_eq!(unsafe { libc::fstat(host_fd, host_stat.as_mut_ptr()) }, 0);
-        assert_eq!(unsafe { host_stat.assume_init() }.st_mode & 0o777, 0o444);
-
-        let path_only = syscall_result(
-            &mut memory,
-            &mut state,
-            libc::SYS_openat,
-            [
-                libc::AT_FDCWD as u64,
-                PATH,
-                (libc::O_PATH | libc::O_CLOEXEC) as u64,
-                0,
-                0,
-                0,
-            ],
-        );
-        assert_eq!(path_only, 6);
-        assert_eq!(
-            state.proc_files.get(&(path_only as libc::c_int)),
-            Some(&inode)
-        );
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_fchmod,
-                [path_only as u64, 0o666, 0, 0, 0, 0],
-            ),
-            negative_errno(libc::EBADF),
-            "O_PATH validation must precede the synthetic procfs guard"
-        );
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_close,
-                [path_only as u64, 0, 0, 0, 0, 0],
-            ),
-            0
-        );
-
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_openat,
-                [
-                    libc::AT_FDCWD as u64,
-                    PATH,
-                    (libc::O_RDWR | libc::O_CLOEXEC) as u64,
-                    0,
-                    0,
-                    0,
-                ],
-            ),
-            negative_errno(libc::EACCES),
-            "a proc-fd reopen must preserve the synthetic file's read-only mode"
-        );
-        assert_eq!(
-            state.files.keys().copied().collect::<Vec<_>>(),
-            vec![3, 4, 5],
-            "failed reopen must not allocate a guest descriptor"
-        );
-    }
+    // Dup/reopen description semantics for the snapshot carrier are
+    // extension-served since S2-R4: covered at ElfExecutor level by
+    // reverie-kvm's
+    // extension_maps_dup_and_reopen_preserve_description_semantics_and_seals.
+    // (The core status seq cannot stand in here: reopening a seq
+    // description through /proc/self/fd is ENOSYS by design.)
 
     #[test]
     fn synthetic_proc_procfd_access_gate_is_dac_independent_and_directory_specific() {
@@ -4869,7 +4581,7 @@ mod tests {
             [1, 0, 0, 0, 0, 0],
         );
         assert!(alias >= 3);
-        let proc_file = open_readonly(&mut memory, &mut state, "/proc/self/maps");
+        let proc_file = open_readonly(&mut memory, &mut state, "/proc/self/status");
         // A procfs descriptor the guest holds, as one it inherited: no guest
         // open reaches procfs.
         let proc_root = 9;
@@ -4926,13 +4638,17 @@ mod tests {
                 (stat.st_dev, stat.st_ino),
                 (
                     crate::proc_mechanics::synthetic_dev(SYNTHETIC_DEV_MAJOR, SYNTHETIC_PROC_DEV_MINOR),
-                    crate::proc_mechanics::path_inode(b"/proc/self/maps")
+                    crate::proc_mechanics::path_inode(b"/proc/self/status")
                 )
             );
             assert_eq!(stat.st_mode, libc::S_IFREG | 0o444);
+            // The core status seq reports size zero, as Linux does for
+            // read-time files; the extension maps snapshot's
+            // content-length size is pinned in reverie-kvm's procfs
+            // acceptance tests.
             assert_eq!(
                 (stat.st_size, stat.st_uid, stat.st_gid, stat.st_mtime),
-                (SELF_MAPS_CONTENT.len() as libc::off_t, 0, 0, 0)
+                (0, 0, 0, 0)
             );
 
             let sentinel = [0xa5; std::mem::size_of::<libc::statfs>()];
@@ -5105,7 +4821,7 @@ mod tests {
         let mut memory = GuestMemory::new(0, 0x4000).unwrap();
 
         // fstat of an open synthetic descriptor reports synthesized identity.
-        let fd = open_readonly(&mut memory, &mut state, "/proc/self/maps");
+        let fd = open_readonly(&mut memory, &mut state, "/proc/self/status");
         let stat_address = 0x1000;
         assert_eq!(
             syscall_result(
@@ -5118,17 +4834,19 @@ mod tests {
         );
         let stat: libc::stat = read_struct(&memory, stat_address);
         assert_eq!(stat.st_mode, libc::S_IFREG | 0o444);
-        assert_eq!(stat.st_ino, crate::proc_mechanics::path_inode(b"/proc/self/maps"));
+        assert_eq!(stat.st_ino, crate::proc_mechanics::path_inode(b"/proc/self/status"));
         assert_eq!(
             stat.st_dev,
             crate::proc_mechanics::synthetic_dev(SYNTHETIC_DEV_MAJOR, SYNTHETIC_PROC_DEV_MINOR)
         );
-        assert_eq!(stat.st_size, SELF_MAPS_CONTENT.len() as libc::off_t);
+        // Read-time seq file: size zero (the maps snapshot's
+        // content-length size lives with the extension's coverage).
+        assert_eq!(stat.st_size, 0);
         assert_eq!(stat.st_uid, 0);
         assert_eq!(stat.st_mtime, 0);
 
         // A path-addressed newfstatat yields the identical synthetic identity.
-        write_c_string(&mut memory, 0x100, "/proc/self/maps");
+        write_c_string(&mut memory, 0x100, "/proc/self/status");
         let path_stat_address = 0x1200;
         assert_eq!(
             syscall_result(
@@ -5345,8 +5063,11 @@ mod tests {
         let mut state = test_state(&root.0);
         let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
 
-        // A writable open of a synthetic file is refused.
-        write_c_string(&mut memory, 0x100, "/proc/self/maps");
+        // A writable open of a synthetic file is refused. The core
+        // status seq is the served fixture here since S2-R4; the same
+        // refusals on the extension-served maps snapshot are pinned in
+        // reverie-kvm's procfs acceptance tests.
+        write_c_string(&mut memory, 0x100, "/proc/self/status");
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -5377,11 +5098,13 @@ mod tests {
             negative_errno(libc::EACCES)
         );
 
-        // An unlisted /proc path is not part of the synthesized surface.
+        // An unlisted /proc path is not part of the synthesized surface,
+        // and neither is the unregistered extension claim.
         assert!(synthetic_proc_content(&state, b"/proc/self/smaps").is_none());
         assert!(synthetic_proc_content(&state, b"/etc/passwd").is_none());
+        assert!(synthetic_proc_content(&state, b"/proc/self/maps").is_none());
 
-        let fd = open_readonly(&mut memory, &mut state, "/proc/self/maps");
+        let fd = open_readonly(&mut memory, &mut state, "/proc/self/status");
         assert!(fd >= 0);
         assert_eq!(
             syscall_result(
@@ -5443,8 +5166,12 @@ mod tests {
         let mut state = test_state(&root.0);
         let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
 
-        let path = "/proc/self/maps";
-        let first_byte = proc_self_maps_content(&state)[0];
+        // The core status seq is the served fixture since S2-R4 (its
+        // first byte from the core render oracle); the maps snapshot's
+        // read-only identity is pinned with the extension installed in
+        // reverie-kvm's procfs acceptance tests.
+        let path = "/proc/self/status";
+        let first_byte = proc_self_status_content(&state)[0];
         write_c_string(&mut memory, 0x100, path);
         let writable = syscall_result(
             &mut memory,
@@ -24842,7 +24569,7 @@ mod tests {
             }
         }
 
-        let proc_fd = open_readonly(&mut memory, &mut state, "/proc/self/maps");
+        let proc_fd = open_readonly(&mut memory, &mut state, "/proc/self/status");
         assert!(proc_fd >= 0);
         assert_eq!(
             syscall_result(
@@ -25671,9 +25398,8 @@ mod tests {
 
     #[test]
     fn host_metadata_timestamps_keep_proc_snapshots_fixed_through_every_alias() {
-        const SELF_MAPS_ADDRESS: u64 = 0x180;
+        const CARRIER_ADDRESS: u64 = 0x180;
         const PAIR_FDS: u64 = 0x1c0;
-        const REOPEN_ADDRESS: u64 = 0x340;
         const SEND_SEGMENT: u64 = 0x400;
         const SEND_IOV: u64 = 0x420;
         const SEND_MSG: u64 = 0x460;
@@ -25687,26 +25413,38 @@ mod tests {
         let mut state = test_state(&root.0);
         state.host_metadata_timestamps = true;
         let mut memory = GuestMemory::new(0, 0x4000).unwrap();
-        write_c_string(&mut memory, SELF_MAPS_ADDRESS, "/proc/self/maps");
+        write_c_string(&mut memory, CARRIER_ADDRESS, "/proc/self/status");
 
-        let open = |memory: &mut GuestMemory, state: &mut LoadedStaticElf, path: u64| {
-            let fd = syscall_result(
-                memory,
-                state,
-                libc::SYS_openat,
-                [libc::AT_FDCWD as u64, path, libc::O_RDONLY as u64, 0, 0, 0],
-            );
-            assert!(fd >= 0, "open failed: {fd}");
-            fd as libc::c_int
-        };
-        let self_maps = open(&mut memory, &mut state, SELF_MAPS_ADDRESS);
+        // The snapshot carrier under test: an O_PATH core status
+        // descriptor, built by the same sealed-memfd construction
+        // (open_synthetic_proc, ProcSnapshot identity) as the maps
+        // snapshot it replaces since S2-R4, with no seq description
+        // whose process transfer would register instead. Content is
+        // irrelevant to the timestamp classification proven here; the
+        // readable maps carrier's epoch through receipt is pinned in
+        // reverie-kvm's procfs acceptance tests.
+        let carrier = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_openat,
+            [
+                libc::AT_FDCWD as u64,
+                CARRIER_ADDRESS,
+                libc::O_PATH as u64,
+                0,
+                0,
+                0,
+            ],
+        );
+        assert!(carrier >= 0, "carrier open failed: {carrier}");
+        let carrier = carrier as libc::c_int;
         assert_eq!(
-            state.fd_object_inodes[&self_maps].timestamps,
+            state.fd_object_inodes[&carrier].timestamps,
             IdentityTimestamps::ProcSnapshot
         );
 
         // A synthetic /proc file reports the epoch.
-        let carriers = [(self_maps, 0, "/proc/self/maps")];
+        let carriers = [(carrier, 0, "/proc/self/status O_PATH carrier")];
         let mut aliases = Vec::new();
         for (fd, fixed, name) in carriers {
             assert_fixed_descriptor_timestamps(&mut memory, &mut state, fd, fixed, name);
@@ -25724,16 +25462,13 @@ mod tests {
                 fixed,
                 &format!("{name} dup"),
             );
-            write_c_string(&mut memory, REOPEN_ADDRESS, &format!("/proc/self/fd/{fd}"));
-            let reopened = open(&mut memory, &mut state, REOPEN_ADDRESS);
-            assert_fixed_descriptor_timestamps(
-                &mut memory,
-                &mut state,
-                reopened,
-                fixed,
-                &format!("{name} /proc/self/fd reopen"),
-            );
-            aliases.push((fd, duplicate as libc::c_int, reopened));
+            // No /proc/self/fd reopen leg: reopening this O_PATH
+            // carrier readably is ENOSYS, as reopening the status seq
+            // is; the readable maps carrier's reopen identity and its
+            // fixed timestamps through a readable reopen (host
+            // timestamps on) are pinned in reverie-kvm's
+            // extension_maps_readable_reopen_keeps_epoch_with_host_timestamps.
+            aliases.push((fd, duplicate as libc::c_int));
         }
 
         // A forked child, and the image that child then execs, inherit them.
@@ -25789,7 +25524,7 @@ mod tests {
             write_struct(&mut ProviderMemory(&memory), SEND_IOV, &send_iov),
             0
         );
-        let send_control = rights_control(&[self_maps]);
+        let send_control = rights_control(&[carrier]);
         memory.write(SEND_CONTROL, &send_control).unwrap();
         // SAFETY: libc::msghdr is plain data; a zeroed value is valid.
         let mut send_msg = unsafe { std::mem::zeroed::<libc::msghdr>() };
@@ -25819,8 +25554,8 @@ mod tests {
                 .is_empty(),
             "a /proc snapshot right in flight holds no registration"
         );
-        let (_, maps_duplicate, maps_reopened) = aliases[0];
-        for fd in [self_maps, maps_duplicate, maps_reopened] {
+        let (_, carrier_duplicate) = aliases[0];
+        for fd in [carrier, carrier_duplicate] {
             assert_eq!(
                 syscall_result(
                     &mut memory,
@@ -25873,7 +25608,7 @@ mod tests {
             &mut state,
             received[0],
             0,
-            "/proc/self/maps received after the sender closed",
+            "carrier received after the sender closed",
         );
         let table = state
             .file_identity_table
@@ -26116,14 +25851,14 @@ mod tests {
     /// counted against the limit, so a snapshot and a process /proc
     /// description can both still be sent and received afterwards.
     fn assert_discarded_snapshot_rights_hold_nothing(discard: RightDiscard) {
-        const SELF_MAPS_ADDRESS: u64 = 0x100;
+        const CARRIER_ADDRESS: u64 = 0x100;
         const PROC_STATUS_ADDRESS: u64 = 0x140;
 
         let root = TestDir::new();
         let mut state = test_state(&root.0);
         state.host_metadata_timestamps = true;
         let mut memory = GuestMemory::new(0, 0x4000).unwrap();
-        write_c_string(&mut memory, SELF_MAPS_ADDRESS, "/proc/self/maps");
+        write_c_string(&mut memory, CARRIER_ADDRESS, "/proc/self/status");
         write_c_string(&mut memory, PROC_STATUS_ADDRESS, "/proc/self/status");
         let open = |memory: &mut GuestMemory, state: &mut LoadedStaticElf, path: u64| {
             let fd = syscall_result(
@@ -26135,14 +25870,34 @@ mod tests {
             assert!(fd >= 0, "open failed: {fd}");
             fd as libc::c_int
         };
-        let self_maps = open(&mut memory, &mut state, SELF_MAPS_ADDRESS);
+        // The discarded snapshot right: an O_PATH core status carrier,
+        // the same sealed ProcSnapshot construction as the maps
+        // snapshot it replaces since S2-R4, whose sends register no
+        // process transfer. The readable maps carrier's discard
+        // behaviour follows the same unregistered-send path; its
+        // received epoch is pinned in reverie-kvm's acceptance tests.
+        let carrier = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_openat,
+            [
+                libc::AT_FDCWD as u64,
+                CARRIER_ADDRESS,
+                libc::O_PATH as u64,
+                0,
+                0,
+                0,
+            ],
+        );
+        assert!(carrier >= 0, "carrier open failed: {carrier}");
+        let carrier = carrier as libc::c_int;
 
         for cycle in 0..PROC_TRANSFER_LIMIT + 2 {
             let [sender, receiver] = guest_datagram_pair(&mut memory, &mut state);
             assert_eq!(
-                send_guest_rights(&mut memory, &mut state, sender, &[self_maps]),
+                send_guest_rights(&mut memory, &mut state, sender, &[carrier]),
                 1,
-                "{discard:?} cycle {cycle}: send /proc/self/maps"
+                "{discard:?} cycle {cycle}: send snapshot carrier"
             );
             match discard {
                 RightDiscard::Read => assert_eq!(
@@ -26174,7 +25929,7 @@ mod tests {
 
         let proc_status = open(&mut memory, &mut state, PROC_STATUS_ADDRESS);
         for (fd, what) in [
-            (self_maps, "/proc/self/maps"),
+            (carrier, "/proc/self/status O_PATH carrier"),
             (proc_status, "/proc/self/status"),
         ] {
             let [sender, receiver] = guest_datagram_pair(&mut memory, &mut state);
@@ -26187,13 +25942,13 @@ mod tests {
                 receive_guest_rights(&mut memory, &mut state, receiver, RIGHTS_CONTROL_CAPACITY);
             assert_eq!(result, 1, "{discard:?}: receive {what}");
             assert_eq!(received.len(), 1, "{discard:?}: receive {what}");
-            if fd == self_maps {
+            if fd == carrier {
                 assert_fixed_descriptor_timestamps(
                     &mut memory,
                     &mut state,
                     received[0],
                     0,
-                    "/proc/self/maps received after the discarded rights",
+                    "carrier received after the discarded rights",
                 );
             }
             for fd in [received[0], receiver, sender] {
@@ -26225,141 +25980,10 @@ mod tests {
         assert_discarded_snapshot_rights_hold_nothing(RightDiscard::ReceiverClose);
     }
 
-    #[test]
-    fn host_metadata_timestamps_keep_received_proc_snapshots_at_the_epoch() {
-        const SELF_MAPS_ADDRESS: u64 = 0x100;
-
-        for host_metadata_timestamps in [false, true] {
-            let root = TestDir::new();
-            let mut state = test_state(&root.0);
-            state.host_metadata_timestamps = host_metadata_timestamps;
-            // With the setting on, a synthetic /proc file reports the epoch
-            // through every alias, a received one included. With it off, a
-            // received snapshot is not classified and, like every host object,
-            // reports its carrier's kernel timestamps, which the Tool decides
-            // about.
-            let fixed = host_metadata_timestamps.then_some(0);
-            let setting = if host_metadata_timestamps {
-                "setting on"
-            } else {
-                "setting off"
-            };
-            let mut memory = GuestMemory::new(0, 0x4000).unwrap();
-            write_c_string(&mut memory, SELF_MAPS_ADDRESS, "/proc/self/maps");
-            let self_maps = syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_openat,
-                [
-                    libc::AT_FDCWD as u64,
-                    SELF_MAPS_ADDRESS,
-                    libc::O_RDONLY as u64,
-                    0,
-                    0,
-                    0,
-                ],
-            );
-            assert!(self_maps >= 0, "open /proc/self/maps failed: {self_maps}");
-            let self_maps = self_maps as libc::c_int;
-            let [sender, receiver] = guest_datagram_pair(&mut memory, &mut state);
-
-            // Received while the sender's descriptor is still open.
-            assert_eq!(
-                send_guest_rights(&mut memory, &mut state, sender, &[self_maps]),
-                1
-            );
-            let (result, _, received) =
-                receive_guest_rights(&mut memory, &mut state, receiver, RIGHTS_CONTROL_CAPACITY);
-            assert_eq!(result, 1);
-            assert_eq!(received.len(), 1);
-            assert_descriptor_timestamps(
-                &mut memory,
-                &mut state,
-                received[0],
-                fixed,
-                &format!("{setting}: /proc/self/maps received while the sender is open"),
-            );
-            let duplicate = syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_dup,
-                [received[0] as u64, 0, 0, 0, 0, 0],
-            );
-            assert!(duplicate >= 0, "dup failed: {duplicate}");
-            assert_descriptor_timestamps(
-                &mut memory,
-                &mut state,
-                duplicate as libc::c_int,
-                fixed,
-                &format!("{setting}: a dup of the received /proc/self/maps"),
-            );
-
-            // Received after every other descriptor for it has closed.
-            assert_eq!(
-                send_guest_rights(&mut memory, &mut state, sender, &[self_maps]),
-                1
-            );
-            for fd in [self_maps, received[0], duplicate as libc::c_int] {
-                guest_close(&mut memory, &mut state, fd);
-            }
-            let (result, _, late) =
-                receive_guest_rights(&mut memory, &mut state, receiver, RIGHTS_CONTROL_CAPACITY);
-            assert_eq!(result, 1);
-            assert_eq!(late.len(), 1);
-            assert_descriptor_timestamps(
-                &mut memory,
-                &mut state,
-                late[0],
-                fixed,
-                &format!("{setting}: /proc/self/maps received after the sender closed"),
-            );
-            let mut child = state.try_clone_for_fork(2).unwrap();
-            assert_descriptor_timestamps(
-                &mut memory,
-                &mut child,
-                late[0],
-                fixed,
-                &format!("{setting}: the received /proc/self/maps in a forked child"),
-            );
-
-            // An O_PATH snapshot cannot report its seals itself; received after
-            // its sender closed, it still reports the epoch.
-            let path_only = syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_openat,
-                [
-                    libc::AT_FDCWD as u64,
-                    SELF_MAPS_ADDRESS,
-                    (libc::O_PATH | libc::O_CLOEXEC) as u64,
-                    0,
-                    0,
-                    0,
-                ],
-            );
-            assert!(
-                path_only >= 0,
-                "O_PATH open /proc/self/maps failed: {path_only}"
-            );
-            let path_only = path_only as libc::c_int;
-            assert_eq!(
-                send_guest_rights(&mut memory, &mut state, sender, &[path_only]),
-                1
-            );
-            guest_close(&mut memory, &mut state, path_only);
-            let (result, _, received_path) =
-                receive_guest_rights(&mut memory, &mut state, receiver, RIGHTS_CONTROL_CAPACITY);
-            assert_eq!(result, 1);
-            assert_eq!(received_path.len(), 1);
-            assert_descriptor_timestamps(
-                &mut memory,
-                &mut state,
-                received_path[0],
-                fixed,
-                &format!("{setting}: an O_PATH /proc/self/maps received after the sender closed"),
-            );
-        }
-    }
+    // Received-snapshot epoch behaviour is extension-served since
+    // S2-R4: covered at ElfExecutor level by reverie-kvm's
+    // extension_received_maps_snapshot_keeps_epoch_and_refusals
+    // (fstat spellings, both timestamp settings).
 
     /// Asserts that `fd`, a duplicate of it, and both in a forked child report
     /// the expected metadata times: a fixed time, or with `None` the kernel's
@@ -26581,149 +26205,41 @@ mod tests {
         );
     }
 
-    /// In a run that reports host metadata timestamps, no chmod route changes
-    /// the mode of a backend-made carrier, a received `/proc` snapshot
-    /// included; Linux refuses a mode change on a `/proc` file with EPERM. A
-    /// changed mode would stop the receiver of an O_PATH right for the carrier
-    /// from reopening it to read its seals, and the carrier would lose its
-    /// fixed timestamps. With the setting off, chmod behaves as it always has.
+    /// Without the extension no maps snapshot can be opened at
+    /// all, under either timestamp setting, so no carrier exists
+    /// for a chmod to hide. The received-readable-snapshot chmod
+    /// matrix this test used to carry (EPERM with host timestamps
+    /// on, success with them off) is extension-served since
+    /// S2-R4 and lives in reverie-kvm's
+    /// extension_received_maps_snapshot_chmod_matrix.
     #[test]
-    fn host_metadata_timestamps_refuse_mode_changes_that_would_hide_a_carrier() {
+    fn unregistered_maps_refuses_eacces_under_either_timestamp_setting() {
         const SELF_MAPS_ADDRESS: u64 = 0x180;
-        const EMPTY_ADDRESS: u64 = 0x2c0;
-        const LINK_ADDRESS: u64 = 0x300;
 
         for host_metadata_timestamps in [false, true] {
-            let setting = if host_metadata_timestamps {
-                "setting on"
-            } else {
-                "setting off"
-            };
             let root = TestDir::new();
             let mut state = test_state(&root.0);
             state.host_metadata_timestamps = host_metadata_timestamps;
             let mut memory = GuestMemory::new(0, 0x4000).unwrap();
             write_c_string(&mut memory, SELF_MAPS_ADDRESS, "/proc/self/maps");
-            write_c_string(&mut memory, EMPTY_ADDRESS, "");
-            let open = |memory: &mut GuestMemory,
-                        state: &mut LoadedStaticElf,
-                        path: u64,
-                        flags: libc::c_int| {
-                let fd = syscall_result(
-                    memory,
-                    state,
-                    libc::SYS_openat,
-                    [libc::AT_FDCWD as u64, path, flags as u64, 0, 0, 0],
-                );
-                assert!(fd >= 0, "open failed: {fd}");
-                fd as libc::c_int
-            };
-            let [sender, receiver] = guest_datagram_pair(&mut memory, &mut state);
-
-            // A /proc snapshot received after its sender closed has no
-            // proc_files entry, only its snapshot identity.
-            let self_maps = open(&mut memory, &mut state, SELF_MAPS_ADDRESS, libc::O_RDONLY);
             assert_eq!(
-                send_guest_rights(&mut memory, &mut state, sender, &[self_maps]),
-                1
-            );
-            guest_close(&mut memory, &mut state, self_maps);
-            let (result, _, snapshot) =
-                receive_guest_rights(&mut memory, &mut state, receiver, RIGHTS_CONTROL_CAPACITY);
-            assert_eq!(result, 1);
-            assert_eq!(snapshot.len(), 1);
-            let snapshot = snapshot[0];
-            assert!(!state.proc_files.contains_key(&snapshot));
-
-            for (fd, fixed, what) in [(snapshot, 0, "a received /proc/self/maps")] {
-                if !host_metadata_timestamps {
-                    assert_eq!(
-                        syscall_result(
-                            &mut memory,
-                            &mut state,
-                            libc::SYS_fchmod,
-                            [fd as u64, 0o400, 0, 0, 0, 0],
-                        ),
+                syscall_result(
+                    &mut memory,
+                    &mut state,
+                    libc::SYS_openat,
+                    [
+                        libc::AT_FDCWD as u64,
+                        SELF_MAPS_ADDRESS,
+                        libc::O_RDONLY as u64,
                         0,
-                        "{setting}: {what}: fchmod"
-                    );
-                    continue;
-                }
-                write_c_string(&mut memory, LINK_ADDRESS, &format!("/proc/self/fd/{fd}"));
-                let path_only = open(
-                    &mut memory,
-                    &mut state,
-                    LINK_ADDRESS,
-                    libc::O_PATH | libc::O_CLOEXEC,
-                );
-                for (call, number, args) in [
-                    ("fchmod", libc::SYS_fchmod, [fd as u64, 0, 0, 0, 0, 0]),
-                    (
-                        "empty-path fchmodat2",
-                        libc::SYS_fchmodat2,
-                        [
-                            fd as u64,
-                            EMPTY_ADDRESS,
-                            0,
-                            libc::AT_EMPTY_PATH as u64,
-                            0,
-                            0,
-                        ],
-                    ),
-                    (
-                        "empty-path fchmodat2 on an O_PATH alias",
-                        libc::SYS_fchmodat2,
-                        [
-                            path_only as u64,
-                            EMPTY_ADDRESS,
-                            0,
-                            libc::AT_EMPTY_PATH as u64,
-                            0,
-                            0,
-                        ],
-                    ),
-                ] {
-                    assert_eq!(
-                        syscall_result(&mut memory, &mut state, number, args),
-                        negative_errno(libc::EPERM),
-                        "{setting}: {what}: {call}"
-                    );
-                }
-                assert!(
-                    syscall_result(
-                        &mut memory,
-                        &mut state,
-                        libc::SYS_fchmodat,
-                        [libc::AT_FDCWD as u64, LINK_ADDRESS, 0, 0, 0, 0],
-                    ) < 0,
-                    "{setting}: {what}: chmod through /proc/self/fd"
-                );
-
-                // The O_PATH right, received after every sender alias closed,
-                // is still recognized as the carrier.
-                assert_eq!(
-                    send_guest_rights(&mut memory, &mut state, sender, &[path_only]),
-                    1
-                );
-                guest_close(&mut memory, &mut state, path_only);
-                guest_close(&mut memory, &mut state, fd);
-                let (result, _, late) = receive_guest_rights(
-                    &mut memory,
-                    &mut state,
-                    receiver,
-                    RIGHTS_CONTROL_CAPACITY,
-                );
-                assert_eq!(result, 1);
-                assert_eq!(late.len(), 1);
-                assert_fixed_descriptor_timestamps(
-                    &mut memory,
-                    &mut state,
-                    late[0],
-                    fixed,
-                    &format!("{setting}: {what} received as O_PATH after chmod attempts"),
-                );
-                guest_close(&mut memory, &mut state, late[0]);
-            }
+                        0,
+                        0,
+                    ],
+                ),
+                negative_errno(libc::EACCES),
+                "unregistered maps must refuse under either timestamp setting"
+            );
+            assert!(state.proc_files.is_empty());
         }
     }
 
@@ -27118,7 +26634,7 @@ mod tests {
     fn received_o_path_carriers_keep_their_class_when_descriptors_run_out() {
         const TEST: &str =
             "executor::tests::received_o_path_carriers_keep_their_class_when_descriptors_run_out";
-        const SELF_MAPS_ADDRESS: u64 = 0x180;
+        const STATUS_ADDRESS: u64 = 0x180;
         if !in_descriptor_exhaustion_child(TEST) {
             return;
         }
@@ -27127,14 +26643,14 @@ mod tests {
         let mut state = test_state(&root.0);
         state.host_metadata_timestamps = true;
         let mut memory = GuestMemory::new(0, 0x4000).unwrap();
-        write_c_string(&mut memory, SELF_MAPS_ADDRESS, "/proc/self/maps");
+        write_c_string(&mut memory, STATUS_ADDRESS, "/proc/self/status");
         let fd = syscall_result(
             &mut memory,
             &mut state,
             libc::SYS_openat,
             [
                 libc::AT_FDCWD as u64,
-                SELF_MAPS_ADDRESS,
+                STATUS_ADDRESS,
                 libc::O_RDONLY as u64,
                 0,
                 0,
@@ -38041,7 +37557,7 @@ mod tests {
             (LINK, "link"),
             (MISSING, "missing"),
             (EMPTY, ""),
-            (SYNTHETIC_PROC, "/proc/self/maps"),
+            (SYNTHETIC_PROC, "/proc/self/status"),
         ] {
             write_c_string(&mut memory, address, value);
         }
@@ -38645,7 +38161,7 @@ mod tests {
         // open reaches procfs.
         let proc_directory_fd: i64 = 9;
         state.files.insert(9, std::fs::File::open("/proc").unwrap());
-        let proc_file_fd = open_readonly(&mut memory, &mut state, "/proc/self/maps");
+        let proc_file_fd = open_readonly(&mut memory, &mut state, "/proc/self/status");
         assert!(proc_file_fd >= 0);
         write_c_string(&mut memory, EMPTY, "");
         write_c_string(&mut memory, CHILD, "child/");

@@ -519,8 +519,9 @@ impl ProcFacts {
 impl LoadedStaticElf {
     /// Installs `table` as this task's extension composition and
     /// creates its slots from the factories. Composition installs a
-    /// table on the loaded state before handing it to a backend;
-    /// there is no backend-side extension setter.
+    /// table on the loaded state before handing it to a backend, or
+    /// through a backend setter on its loaded image where the backend
+    /// owns the loading.
     pub fn install_extension_table(&mut self, table: Arc<ExtensionTable>) {
         let slots = table.new_slots();
         self.extension_table = table;
