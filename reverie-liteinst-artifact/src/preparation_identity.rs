@@ -1239,6 +1239,7 @@ mod tests {
             workspace_root: &workspace,
             manifest: &manifest,
             reverie_pin: pin.trim(),
+            consumer: None,
         };
         VerifiedCompiledSources::with_resolved(&expected, &mut runner, |sources| {
             let bytes = transfers_fixture();

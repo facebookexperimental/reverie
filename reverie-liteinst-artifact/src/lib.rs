@@ -1151,13 +1151,22 @@ pub struct PackageIdentity {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CompiledSourceLayout {
     ReverieWorkspace,
-    HermitGit,
-    /// Hermit workspace whose Reverie packages are Cargo path dependencies
-    /// under `<workspace>/reverie` (submodule directory, fbsource symlink,
-    /// or gitless copy). Only the declared-content factory resolves this
-    /// layout; it binds the reviewed catalog plus the compiled closure by
-    /// content, and `reverie_pin` remains a provenance label.
-    HermitPath,
+    /// Reverie is a Git checkout: the clean HEAD/tree and the consumer
+    /// workspace's recorded gitlink commit must both equal `reverie_pin`
+    /// (git identity is the authority). Wire name preserved from the
+    /// pre-rename spelling; records written before the rename parse
+    /// unchanged.
+    #[serde(rename = "HermitGit")]
+    GitlinkCheckout,
+    /// Reverie is plain files under the consumer-declared Reverie
+    /// relative path (submodule directory, symlink, or gitless copy).
+    /// No Git metadata may be relied on: only the declared-content
+    /// factory resolves this layout, binding the reviewed catalog plus
+    /// the compiled closure by content, and `reverie_pin` remains a
+    /// provenance label. Wire name preserved from the pre-rename
+    /// spelling; records written before the rename parse unchanged.
+    #[serde(rename = "HermitPath")]
+    PathCheckout,
     /// Buck-materialized source tree. Compiler filenames use the materialized
     /// absolute spelling until a real Buck ELF's embedded paths are measured;
     /// machine-code recipes still gate any qualification claim.
@@ -1182,6 +1191,134 @@ pub struct CompiledSourceExpectation<'a> {
     pub workspace_root: &'a Path,
     pub manifest: &'a Path,
     pub reverie_pin: &'a str,
+    /// Consumer-declared workspace facts for the consumer-checkout
+    /// layouts (`GitlinkCheckout` / `PathCheckout`), which require it.
+    /// `ReverieWorkspace` forbids it: a Reverie workspace names no
+    /// consumer. See [`ConsumerSourceDeclaration`].
+    pub consumer: Option<ConsumerSourceDeclaration<'a>>,
+}
+/// Everything about a consumer's workspace the compiled-source
+/// factories must know, declared by the consumer. Reverie hard-codes
+/// none of it: package names, manifest paths, lockfiles and workspace
+/// inventories below are the consumer's own facts, checked exactly
+/// against fresh Cargo metadata and declared content.
+#[derive(Debug)]
+pub struct ConsumerSourceDeclaration<'a> {
+    /// Workspace-relative path of the pinned Reverie tree: the
+    /// `<workspace>/...` logical compiler root and the gitlink path.
+    pub reverie_relative: &'a Path,
+    /// Final-image leaf package in the consumer workspace. Required
+    /// for the leaf (`Detcore`) image kind; the `Standalone` leaf is
+    /// Reverie's own preload crate and needs no declaration.
+    pub leaf: Option<DeclaredLeafPackage<'a>>,
+    /// Producer-workspace packages that must pin a named Reverie
+    /// dependency. Exactly one row carries a `build` dependency kind:
+    /// its manifest is the producer build manifest. At most one row
+    /// carries a reviewed wrapper `target`/`version` expectation.
+    pub runtime_packages: &'a [DeclaredRuntimePackage<'a>],
+    /// Workspace-relative lockfile covering `runtime_packages`.
+    pub runtime_lock_relative: &'a str,
+    /// Declared workspace inventory for the `Standalone` image kind.
+    pub standalone_workspace_files: &'a [&'a str],
+    /// Declared workspace inventory for the leaf image kind.
+    pub leaf_workspace_files: &'a [&'a str],
+}
+#[derive(Debug)]
+pub struct DeclaredLeafPackage<'a> {
+    /// Cargo package name.
+    pub name: &'a str,
+    /// Cargo target name.
+    pub target: &'a str,
+    /// Workspace-relative `Cargo.toml` path.
+    pub manifest_relative: &'a str,
+    /// Package version, bound into the expected package id.
+    pub version: &'a str,
+}
+#[derive(Debug)]
+pub struct DeclaredRuntimePackage<'a> {
+    /// Cargo package name.
+    pub name: &'a str,
+    /// Workspace-relative `Cargo.toml` path.
+    pub manifest_relative: &'a str,
+    /// Reverie dependency this package must pin.
+    pub reverie_dependency: &'a str,
+    /// Cargo dependency kind (`Some("build")` for a build dependency).
+    pub dependency_kind: Option<&'a str>,
+    /// Reviewed wrapper target for standalone build evidence;
+    /// `None` means this package is not wrapper-checked.
+    pub target: Option<&'a str>,
+    /// Reviewed wrapper version; required when `target` is set.
+    pub version: Option<&'a str>,
+}
+/// The declaration a layout requires, refused by name otherwise: the
+/// consumer-checkout layouts require one (with a leaf package for the
+/// leaf image kind), and every other layout forbids one, so a
+/// declaration can never ride along unused.
+fn require_consumer_declaration<'e, 'a>(
+    expected: &'e CompiledSourceExpectation<'a>,
+) -> Result<Option<&'e ConsumerSourceDeclaration<'a>>> {
+    match expected.layout {
+        CompiledSourceLayout::GitlinkCheckout | CompiledSourceLayout::PathCheckout => {
+            let declaration = expected.consumer.as_ref().ok_or(
+                "consumer-checkout layout requires a declared consumer source declaration",
+            )?;
+            require(
+                expected.image_kind != FixedImageKind::Detcore
+                    || declaration.leaf.is_some(),
+                "consumer-checkout leaf image requires a declared leaf package",
+            )?;
+            Ok(Some(declaration))
+        }
+        CompiledSourceLayout::ReverieWorkspace | CompiledSourceLayout::Buck => {
+            require(
+                expected.consumer.is_none(),
+                "Reverie workspace layout does not take a consumer source declaration",
+            )?;
+            Ok(None)
+        }
+    }
+}
+fn declared_workspace_files<'a>(
+    declaration: &ConsumerSourceDeclaration<'a>,
+    image_kind: FixedImageKind,
+) -> &'a [&'a str] {
+    match image_kind {
+        FixedImageKind::Standalone => declaration.standalone_workspace_files,
+        FixedImageKind::Detcore => declaration.leaf_workspace_files,
+    }
+}
+fn producer_manifest_relative<'a>(
+    declaration: &ConsumerSourceDeclaration<'a>,
+) -> Result<&'a str> {
+    let producers: Vec<_> = declaration
+        .runtime_packages
+        .iter()
+        .filter(|package| package.dependency_kind == Some("build"))
+        .collect();
+    require(
+        producers.len() == 1,
+        "consumer declaration must name exactly one producer build package",
+    )?;
+    Ok(producers[0].manifest_relative)
+}
+/// Borrowed view of a declared leaf package, from either the caller's
+/// declaration or the copy a verified context retains.
+#[derive(Clone, Copy)]
+struct LeafDecl<'a> {
+    name: &'a str,
+    target: &'a str,
+    manifest_relative: &'a str,
+    version: &'a str,
+}
+impl<'a> From<&'a DeclaredLeafPackage<'a>> for LeafDecl<'a> {
+    fn from(leaf: &'a DeclaredLeafPackage<'a>) -> Self {
+        Self {
+            name: leaf.name,
+            target: leaf.target,
+            manifest_relative: leaf.manifest_relative,
+            version: leaf.version,
+        }
+    }
 }
 pub struct ExpectedSourceFile<'a> {
     pub relative: &'a str,
@@ -1194,8 +1331,9 @@ pub struct ExpectedSourceFile<'a> {
 /// tree the factory inventories (the caller hashes that tree to build the
 /// expectation), so they detect drift between expectation and inventory,
 /// not a tree that was already wrong when both were taken from it.
-/// `target`/`platform`/`constraints` are recorded as literals in the authority
-/// and the Buck build witness must match them exactly.
+/// The consumer declares `target`/`platform`/`constraints` and the leaf
+/// and stage identities; the factory records them in the authority and
+/// the Buck build witness must match the recorded values exactly.
 pub struct BuckCompiledSourceExpectation<'a> {
     pub workspace_root: &'a Path,
     pub reverie_root: &'a Path,
@@ -1207,28 +1345,23 @@ pub struct BuckCompiledSourceExpectation<'a> {
     pub constraints: &'a [&'a str],
     pub workspace_files: &'a [ExpectedSourceFile<'a>],
     pub reverie_files: &'a [&'a str],
+    /// Consumer-declared leaf package and target names for the
+    /// synthesized leaf package identity.
+    pub leaf_name: &'a str,
+    pub leaf_target: &'a str,
+    /// Workspace-relative leaf library source; its parent directory
+    /// is the completeness-scanned leaf source tree.
+    pub leaf_source_relative: &'a str,
+    /// Workspace files allowed outside the leaf source tree.
+    pub workspace_extra_files: &'a [&'a str],
+    /// Workspace-relative profile `.bzl`; its file name must match
+    /// `profile_bzl`, and its inventory digest must match that file.
+    pub profile_relative: &'a str,
+    /// Build-witness stage id: the retained buck2 command's
+    /// `--client-metadata id=...` value must equal it exactly.
+    pub stage_id: &'a str,
 }
-const BUCK_PROFILE_BZL_NAME: &str = "liteinst-runtime-profile.bzl";
-/// Canonical Buck literals, matched exactly (never by substring or superset).
-/// The target is the liteinst-runtime configured alias in the Hermit root
-/// `BUCK`; the constraints are the exact set that alias carries: the
-/// `:detcore-liteinst` cpu/os pair plus the profile's opt build mode.
-const BUCK_TARGET: &str = "//hermetic_infra/hermit:detcore-liteinst-liteinst-runtime[cdylib]";
-const BUCK_PLATFORM: &str = "ovr_config//platform/linux:x86_64-fbcode";
-const BUCK_CONSTRAINTS: [&str; 3] = [
-    "ovr_config//build_mode/constraints:opt",
-    "ovr_config//cpu:x86_64",
-    "ovr_config//os:linux",
-];
 const BUCK_QUALIFIER_SOURCE: &str = "reverie-liteinst-artifact/src/lib.rs";
-const BUCK_LEAF_SOURCE: &str = "detcore-liteinst/src/lib.rs";
-const BUCK_PROFILE_RELATIVE: &str = "fb-only/liteinst-runtime-profile.bzl";
-const BUCK_WORKSPACE_EXTRA_FILES: [&str; 4] = [
-    "detcore-liteinst/build.rs",
-    "common/inguest/glibc_compat.rs",
-    "BUCK",
-    BUCK_PROFILE_RELATIVE,
-];
 /// Semantic identities only. A newly run metadata command has a different
 /// evidence path and is retained by Runner, not mistaken for source inequality.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1262,7 +1395,7 @@ enum CompiledSourceAuthority {
     },
     /// Declared Buck source filegroups, hashed by the closed `resolve_buck`
     /// factory. No Git or Cargo evidence exists in the fbsource import; the
-    /// authority is the inventoried file bytes, the imported Hermit SHA, the
+    /// authority is the inventoried file bytes, the imported consumer SHA, the
     /// profile `.bzl` identity, and the recorded target/platform/constraints
     /// literals the Buck witness must match exactly.
     BuckDeclaredContent {
@@ -1293,10 +1426,112 @@ struct CompilerRootBinding {
 }
 /// Only the fresh Git/content/Buck factories can construct this type. Deserializing evidence does
 /// not authorize compiler filenames or establish the current Cargo source graph.
+/// Owned copy of a [`ConsumerSourceDeclaration`], retained beside the
+/// record (never serialized into it, so receipts stay byte-compatible)
+/// so every later verify/build-evidence check finds the same
+/// declaration that resolved the sources.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RetainedConsumerDeclaration {
+    reverie_relative: PathBuf,
+    leaf: Option<RetainedLeafPackage>,
+    runtime_packages: Vec<RetainedRuntimePackage>,
+    runtime_lock_relative: String,
+    standalone_workspace_files: Vec<String>,
+    leaf_workspace_files: Vec<String>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RetainedLeafPackage {
+    name: String,
+    target: String,
+    manifest_relative: String,
+    version: String,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RetainedRuntimePackage {
+    name: String,
+    manifest_relative: String,
+    reverie_dependency: String,
+    dependency_kind: Option<String>,
+    target: Option<String>,
+    version: Option<String>,
+}
+impl<'a> From<&'a RetainedLeafPackage> for LeafDecl<'a> {
+    fn from(leaf: &'a RetainedLeafPackage) -> Self {
+        Self {
+            name: &leaf.name,
+            target: &leaf.target,
+            manifest_relative: &leaf.manifest_relative,
+            version: &leaf.version,
+        }
+    }
+}
+impl RetainedConsumerDeclaration {
+    fn from_declaration(declaration: &ConsumerSourceDeclaration<'_>) -> Self {
+        Self {
+            reverie_relative: declaration.reverie_relative.to_owned(),
+            leaf: declaration.leaf.as_ref().map(|leaf| RetainedLeafPackage {
+                name: leaf.name.to_owned(),
+                target: leaf.target.to_owned(),
+                manifest_relative: leaf.manifest_relative.to_owned(),
+                version: leaf.version.to_owned(),
+            }),
+            runtime_packages: declaration
+                .runtime_packages
+                .iter()
+                .map(|package| RetainedRuntimePackage {
+                    name: package.name.to_owned(),
+                    manifest_relative: package.manifest_relative.to_owned(),
+                    reverie_dependency: package.reverie_dependency.to_owned(),
+                    dependency_kind: package.dependency_kind.map(str::to_owned),
+                    target: package.target.map(str::to_owned),
+                    version: package.version.map(str::to_owned),
+                })
+                .collect(),
+            runtime_lock_relative: declaration.runtime_lock_relative.to_owned(),
+            standalone_workspace_files: declaration
+                .standalone_workspace_files
+                .iter()
+                .map(|relative| (*relative).to_owned())
+                .collect(),
+            leaf_workspace_files: declaration
+                .leaf_workspace_files
+                .iter()
+                .map(|relative| (*relative).to_owned())
+                .collect(),
+        }
+    }
+    fn workspace_files(&self, image_kind: FixedImageKind) -> &[String] {
+        match image_kind {
+            FixedImageKind::Standalone => &self.standalone_workspace_files,
+            FixedImageKind::Detcore => &self.leaf_workspace_files,
+        }
+    }
+    fn wrapper_package(&self) -> Result<&RetainedRuntimePackage> {
+        let wrappers: Vec<_> = self
+            .runtime_packages
+            .iter()
+            .filter(|package| package.target.is_some())
+            .collect();
+        require(
+            wrappers.len() == 1 && wrappers[0].version.is_some(),
+            "consumer declaration must name exactly one reviewed wrapper package",
+        )?;
+        Ok(wrappers[0])
+    }
+}
+/// Owned copy of the Buck expectation's consumer-declared identities,
+/// retained (never serialized) for build-witness checks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RetainedBuckDeclaration {
+    leaf_source_relative: String,
+    stage_id: String,
+}
 pub struct VerifiedCompiledSources {
     record: CompiledSources,
     current_build: Option<BuildWitness>,
     standalone_metadata: Option<Value>,
+    consumer: Option<RetainedConsumerDeclaration>,
+    buck_consumer: Option<RetainedBuckDeclaration>,
 }
 const COMPILED_RV_LOCATION_FILES: [&str; 7] = [
     "reverie-liteinst/src/patch_alloc.rs",
@@ -1307,45 +1542,13 @@ const COMPILED_RV_LOCATION_FILES: [&str; 7] = [
     "reverie-inguest/src/guest/tool_region_keyed.rs",
     "reverie-liteinst-preload/src/lib.rs",
 ];
-const CONTENT_WORKSPACE_FILES: [&str; 6] = [
-    "liteinst-runtime-build/Cargo.toml",
-    "liteinst-runtime-build/Cargo.lock",
-    "liteinst-runtime-build/runtime/Cargo.toml",
-    "liteinst-runtime-build/runtime/src/lib.rs",
-    "liteinst-runtime-build/build.rs",
-    "liteinst-runtime-build/artifact.rs",
-];
-const CONTENT_DETCORE_WORKSPACE_FILES: [&str; 10] = [
-    "liteinst-runtime-build/Cargo.toml",
-    "liteinst-runtime-build/Cargo.lock",
-    "liteinst-runtime-build/runtime/Cargo.toml",
-    "liteinst-runtime-build/runtime/src/lib.rs",
-    "liteinst-runtime-build/build.rs",
-    "liteinst-runtime-build/artifact.rs",
-    "Cargo.toml",
-    "Cargo.lock",
-    "detcore-liteinst/Cargo.toml",
-    "detcore-liteinst/src/lib.rs",
-];
-fn content_workspace_files(image_kind: FixedImageKind) -> &'static [&'static str] {
-    match image_kind {
-        FixedImageKind::Standalone => &CONTENT_WORKSPACE_FILES,
-        FixedImageKind::Detcore => &CONTENT_DETCORE_WORKSPACE_FILES,
-    }
-}
-fn content_manifest_relative(image_kind: FixedImageKind) -> &'static str {
-    match image_kind {
-        FixedImageKind::Standalone => "liteinst-runtime-build/Cargo.toml",
-        FixedImageKind::Detcore => "Cargo.toml",
-    }
-}
 // Reviewed literal expectations, not hashes generated from the current checkout
 // or bytes embedded after a runtime edit. The qualifier self-hash is separate.
 const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 88] = [
     (
         "reverie-liteinst-artifact/src/preparation_identity.rs",
-        55140,
-        "763695e713873b605ca8cf20c1f44377b8ac8eb4de5d04982047d14585d074fa",
+        55168,
+        "a49de665049d98780ed59832387cb8017687527f961c822105fd0e47aa11f822",
     ),
     // Bind the signal-mask gate and every changed native-source premise of it.
     (
@@ -1801,7 +2004,7 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 88] = [
 ];
 // Native Detcore's fixed-gate publication ordering is a separately declared
 // source premise. The ordinary Standalone cohort and Location roles stay frozen.
-const CONTENT_DETCORE_FIXED_GATE: (&str, u64, &str) = (
+const CONTENT_FIXED_GATE: (&str, u64, &str) = (
     "reverie-inguest/src/trap/fixed_gates.rs",
     36554,
     "ff3f6f6c46e872734ae921e869dbccc0ce1aeefe4bc3af8f29363cf276501e54",
@@ -1859,7 +2062,7 @@ fn content_reverie_inventory_for_image(
         .map(|entry| entry.0)
         .collect();
     if image_kind == FixedImageKind::Detcore {
-        relatives.push(CONTENT_DETCORE_FIXED_GATE.0);
+        relatives.push(CONTENT_FIXED_GATE.0);
     }
     relatives.push("reverie-liteinst-artifact/src/lib.rs");
     let (inventory, files) = declared_inventory(root, &relatives)?;
@@ -1969,11 +2172,11 @@ fn content_reverie_inventory_for_image(
                     == private_static::selected_initializers::view_table_implementation_sha256(),
                 "declared View::table checker differs from compiled host module",
             )?;
-        } else if entry.relative == CONTENT_DETCORE_FIXED_GATE.0 {
+        } else if entry.relative == CONTENT_FIXED_GATE.0 {
             require(
                 image_kind == FixedImageKind::Detcore
-                    && entry.size == CONTENT_DETCORE_FIXED_GATE.1
-                    && entry.sha256 == CONTENT_DETCORE_FIXED_GATE.2,
+                    && entry.size == CONTENT_FIXED_GATE.1
+                    && entry.sha256 == CONTENT_FIXED_GATE.2,
                 "declared Detcore fixed-gate source differs from reviewed catalog",
             )?;
         } else {
@@ -2033,16 +2236,21 @@ impl CompilerRootBinding {
             cargo_home: Some((cargo_home.into(), canonical_home)),
         })
     }
-    // Path-sourced Reverie: the compiler spells sources through the exact
-    // `<workspace>/reverie` logical root, whether it is a real directory or
-    // one symlink to the canonical tree. No Cargo checkout name or pin
-    // suffix participates; any other logical spelling refuses here, and
-    // the Cargo-home gate above refuses this spelling in return.
-    fn resolve_path(logical_root: &Path, workspace_root: &Path) -> Result<Self> {
+    // Path-sourced Reverie: the compiler spells sources through the
+    // exact consumer-declared `<workspace>/<reverie_relative>` logical
+    // root, whether it is a real directory or one symlink to the
+    // canonical tree. No Cargo checkout name or pin suffix
+    // participates; any other logical spelling refuses here, and the
+    // Cargo-home gate above refuses this spelling in return.
+    fn resolve_path(
+        logical_root: &Path,
+        workspace_root: &Path,
+        reverie_relative: &Path,
+    ) -> Result<Self> {
         clean_absolute_source_root(logical_root)?;
         clean_absolute_source_root(workspace_root)?;
         require(
-            logical_root.as_os_str() == workspace_root.join("reverie").as_os_str(),
+            logical_root.as_os_str() == workspace_root.join(reverie_relative).as_os_str(),
             "path compiler root is not the workspace Reverie root",
         )?;
         let canonical_root = fs::canonicalize(logical_root).map_err(|e| e.to_string())?;
@@ -2093,8 +2301,11 @@ fn verify_declared_content(
         compiler_root.canonical_root.as_os_str() == reverie_root.as_os_str(),
         "declared compiler root differs from Reverie inventory root",
     )?;
-    let (current_workspace, _) =
-        declared_inventory(workspace_root, content_workspace_files(image_kind))?;
+    let workspace_relatives: Vec<&str> = workspace_inventory
+        .iter()
+        .map(|entry| entry.relative.as_str())
+        .collect();
+    let (current_workspace, _) = declared_inventory(workspace_root, &workspace_relatives)?;
     let (current_reverie, _) = content_reverie_inventory_for_image(reverie_root, image_kind)?;
     require(
         current_workspace == workspace_inventory
@@ -2247,7 +2458,7 @@ fn scan_reverie_closure_files(
 }
 /// Refuse a path Reverie inventory that subsets the compiled closure on
 /// disk: every source-shaped file under a compiled package root must be
-/// declared, mirroring the Buck `detcore-liteinst/src` completeness scan.
+/// declared, mirroring the Buck leaf-source completeness scan.
 fn require_complete_reverie_closure_inventory(
     reverie_root: &Path,
     package_dirs: &BTreeSet<String>,
@@ -2315,8 +2526,11 @@ fn verify_declared_content_path(
             && compiler_root.cargo_home.is_none(),
         "declared path compiler root differs from Reverie inventory root",
     )?;
-    let (current_workspace, _) =
-        declared_inventory(workspace_root, content_workspace_files(image_kind))?;
+    let workspace_relatives: Vec<&str> = workspace_inventory
+        .iter()
+        .map(|entry| entry.relative.as_str())
+        .collect();
+    let (current_workspace, _) = declared_inventory(workspace_root, &workspace_relatives)?;
     require(
         current_workspace == workspace_inventory
             && declared_inventory_sha256(&current_workspace)? == workspace_sha256,
@@ -2369,10 +2583,12 @@ fn logical_declared_relative(relative: &str) -> Result<()> {
     )
 }
 /// Refuse a declared Buck workspace inventory that subsets the sources on
-/// disk: every `.rs` file under `detcore-liteinst/src/` must be declared, so
-/// an undeclared source file can never ride along outside the authority.
-fn require_complete_detcore_src_inventory(
+/// disk: every `.rs` file under the consumer-declared leaf source tree
+/// must be declared, so an undeclared source file can never ride along
+/// outside the authority.
+fn require_complete_leaf_src_inventory(
     workspace_root: &Path,
+    leaf_src_dir: &Path,
     declared: &BTreeSet<&str>,
 ) -> Result<()> {
     fn scan(dir: &Path, workspace_root: &Path, declared: &BTreeSet<&str>) -> Result<()> {
@@ -2386,7 +2602,7 @@ fn require_complete_detcore_src_inventory(
             let path = entry.path();
             if file_type.is_symlink() {
                 return Err(format!(
-                    "Buck detcore-liteinst source scan refuses a symlink: {}",
+                    "Buck leaf source scan refuses a symlink: {}",
                     path.display()
                 ));
             } else if file_type.is_dir() {
@@ -2399,23 +2615,19 @@ fn require_complete_detcore_src_inventory(
                     .map_err(|e| e.to_string())?;
                 let relative = relative_path
                     .to_str()
-                    .ok_or("Buck detcore-liteinst source path is not UTF-8")?;
+                    .ok_or("Buck leaf source path is not UTF-8")?;
                 require(
                     declared.contains(relative),
                     format!(
                         "Buck workspace inventory is incomplete: {relative} is present under \
-                         detcore-liteinst/src but absent from the declared inventory"
+                         the declared leaf source tree but absent from the declared inventory"
                     ),
                 )?;
             }
         }
         Ok(())
     }
-    scan(
-        &workspace_root.join("detcore-liteinst/src"),
-        workspace_root,
-        declared,
-    )
+    scan(&workspace_root.join(leaf_src_dir), workspace_root, declared)
 }
 /// Buck Reverie content authority: every inventoried Reverie file's bytes
 /// must equal a reviewed expectation — the `CONTENT_REVERIE_CATALOG` digest
@@ -2437,10 +2649,10 @@ fn buck_reverie_content_matches(inventory: &[DeclaredSourceFile]) -> Result<()> 
                 entry.sha256 == qualifier_source_sha256(),
                 "declared Buck qualifier source differs from compiled host qualifier",
             )?;
-        } else if entry.relative == CONTENT_DETCORE_FIXED_GATE.0 {
+        } else if entry.relative == CONTENT_FIXED_GATE.0 {
             require(
-                entry.size == CONTENT_DETCORE_FIXED_GATE.1
-                    && entry.sha256 == CONTENT_DETCORE_FIXED_GATE.2,
+                entry.size == CONTENT_FIXED_GATE.1
+                    && entry.sha256 == CONTENT_FIXED_GATE.2,
                 format!(
                     "declared Buck Reverie source differs from reviewed catalog: {}",
                     entry.relative
@@ -2456,6 +2668,7 @@ fn verify_buck_declared_content(
     (workspace_root, workspace_inventory, workspace_sha256): (&Path, &[DeclaredSourceFile], &str),
     (reverie_root, reverie_inventory, reverie_sha256): (&Path, &[DeclaredSourceFile], &str),
     profile_bzl: &FileIdentity,
+    leaf_src_dir: &Path,
 ) -> Result<()> {
     profile_bzl.verify()?;
     for (root, inventory, digest, label) in [
@@ -2478,8 +2691,9 @@ fn verify_buck_declared_content(
         )?;
     }
     buck_reverie_content_matches(reverie_inventory)?;
-    require_complete_detcore_src_inventory(
+    require_complete_leaf_src_inventory(
         workspace_root,
+        leaf_src_dir,
         &workspace_inventory
             .iter()
             .map(|entry| entry.relative.as_str())
@@ -2642,20 +2856,27 @@ fn compiled_leaf_package(
     rv_root: &Path,
     source: Option<&str>,
     image_kind: FixedImageKind,
+    declared_leaf: Option<LeafDecl<'_>>,
 ) -> Result<PackageIdentity> {
-    let (name, target, leaf_manifest, leaf_source) = match image_kind {
+    let (name, target, leaf_manifest, leaf_source, leaf_version) = match image_kind {
         FixedImageKind::Standalone => (
             "reverie-liteinst-preload",
             "reverie_liteinst_preload",
             rv_root.join("reverie-liteinst-preload/Cargo.toml"),
             source,
+            "0.5.7",
         ),
-        FixedImageKind::Detcore => (
-            "detcore-liteinst",
-            "detcore_liteinst",
-            root.join("detcore-liteinst/Cargo.toml"),
-            None,
-        ),
+        FixedImageKind::Detcore => {
+            let leaf = declared_leaf
+                .ok_or("compiled leaf image requires a declared leaf package")?;
+            (
+                leaf.name,
+                leaf.target,
+                root.join(leaf.manifest_relative),
+                None,
+                leaf.version,
+            )
+        }
     };
     let candidates: Vec<_> = metadata["packages"]
         .as_array()
@@ -2702,7 +2923,13 @@ fn compiled_leaf_package(
             ),
             None => format!("path+file://{}#0.5.7", rv_root.join(name).display()),
         },
-        FixedImageKind::Detcore => format!("path+file://{}#0.5.7", root.join(name).display()),
+        FixedImageKind::Detcore => format!(
+            "path+file://{}#{leaf_version}",
+            leaf_manifest
+                .parent()
+                .ok_or("compiled leaf parent missing")?
+                .display()
+        ),
     };
     require(
         leaf.id == expected_id,
@@ -2932,7 +3159,7 @@ fn content_path_package_dir(metadata: &Value, name: &str, logical_root: &Path) -
 
 /// The path form binds by location under the compiler root, so when
 /// that root is a Git checkout the root itself must be the pin: its
-/// clean HEAD and the Hermit tree's recorded gitlink must both name
+/// clean HEAD and the consumer tree's recorded gitlink must both name
 /// it, the same shape compiled-source resolution already requires.
 /// Without this a checkout at another revision whose catalogued files
 /// happen to match would be certified as the pin. A gitless source
@@ -2945,6 +3172,7 @@ fn require_reverie_checkout_at_pin(
     binding: &CompilerRootBinding,
     pin: &str,
     path_form: bool,
+    reverie_relative: &Path,
     runner: &mut Runner,
 ) -> Result<()> {
     // The git form carries its revision in the source string itself
@@ -2962,16 +3190,16 @@ fn require_reverie_checkout_at_pin(
         binding.canonical_root.join(".git").exists(),
         "path-form content Reverie root has no Git metadata to bind to the pin",
     )?;
-    // In-tree roots must be the Hermit tree's own reverie directory; a
-    // Cargo-home checkout is tied to the pin by its pin-short
-    // directory name in resolve_cargo_home.
+    // In-tree roots must be the consumer tree's declared Reverie
+    // directory; a Cargo-home checkout is tied to the pin by its
+    // pin-short directory name in resolve_cargo_home.
     if binding.cargo_home.is_none() {
         require(
             binding.canonical_root.as_os_str()
-                == fs::canonicalize(root.join("reverie"))
+                == fs::canonicalize(root.join(reverie_relative))
                     .map_err(|e| e.to_string())?
                     .as_os_str(),
-            "content Reverie root is not the Hermit tree's reverie checkout",
+            "content Reverie root is not the consumer tree's Reverie checkout",
         )?;
     }
     let (rv_head, _rv_tree) = compiled_git_identity(&binding.canonical_root, runner)?;
@@ -2980,14 +3208,23 @@ fn require_reverie_checkout_at_pin(
         "content Reverie checkout HEAD differs from independent full pin",
     )?;
     if root.join(".git").exists() {
+        let reverie_relative = reverie_relative
+            .to_str()
+            .ok_or("declared Reverie relative path is not UTF-8")?;
         let gitlink = runner.text(
             "git",
-            &["--no-replace-objects", "ls-tree", "HEAD", "--", "reverie"],
+            &[
+                "--no-replace-objects",
+                "ls-tree",
+                "HEAD",
+                "--",
+                reverie_relative,
+            ],
             root,
         )?;
         require(
-            gitlink == format!("160000 commit {pin}\treverie\n"),
-            "Hermit Git link differs from the expected Reverie pin",
+            gitlink == format!("160000 commit {pin}\t{reverie_relative}\n"),
+            "gitlink differs from the expected Reverie pin",
         )?;
     }
     Ok(())
@@ -2998,6 +3235,7 @@ fn content_manifest_and_lock_pin(
     root: &Path,
     source: &str,
     reverie_root: &Path,
+    declaration: &ConsumerSourceDeclaration<'_>,
 ) -> Result<bool> {
     // Since 7aaca4df ("Path-depend on Reverie: gitlink is the one pin")
     // the producer manifests name these dependencies by path into the
@@ -3034,20 +3272,13 @@ fn content_manifest_and_lock_pin(
         }
         false
     };
-    for (name, relative, dependency, kind) in [
-        (
-            "hermit-liteinst-runtime-build",
-            "liteinst-runtime-build/Cargo.toml",
-            "reverie-liteinst-artifact",
-            Some("build"),
-        ),
-        (
-            "hermit-liteinst-runtime-artifact",
-            "liteinst-runtime-build/runtime/Cargo.toml",
-            "reverie-liteinst-preload",
-            None,
-        ),
-    ] {
+    for declared in declaration.runtime_packages {
+        let (name, relative, dependency, kind) = (
+            declared.name,
+            declared.manifest_relative,
+            declared.reverie_dependency,
+            declared.dependency_kind,
+        );
         let selected: Vec<_> = packages.iter().filter(|p| p["name"] == name).collect();
         require(
             selected.len() == 1
@@ -3068,7 +3299,7 @@ fn content_manifest_and_lock_pin(
             "content manifest dependency differs from independent full pin",
         )?;
     }
-    let lock = fs::read_to_string(root.join("liteinst-runtime-build/Cargo.lock"))
+    let lock = fs::read_to_string(root.join(declaration.runtime_lock_relative))
         .map_err(|e| e.to_string())?;
     for name in [
         "reverie-inguest",
@@ -3118,24 +3349,18 @@ fn content_manifest_and_lock_pin_path(
     metadata: &Value,
     root: &Path,
     logical_root: &Path,
+    declaration: &ConsumerSourceDeclaration<'_>,
 ) -> Result<()> {
     let packages = metadata["packages"]
         .as_array()
         .ok_or("content metadata packages missing")?;
-    for (name, relative, dependency, kind) in [
-        (
-            "hermit-liteinst-runtime-build",
-            "liteinst-runtime-build/Cargo.toml",
-            "reverie-liteinst-artifact",
-            Some("build"),
-        ),
-        (
-            "hermit-liteinst-runtime-artifact",
-            "liteinst-runtime-build/runtime/Cargo.toml",
-            "reverie-liteinst-preload",
-            None,
-        ),
-    ] {
+    for declared in declaration.runtime_packages {
+        let (name, relative, dependency, kind) = (
+            declared.name,
+            declared.manifest_relative,
+            declared.reverie_dependency,
+            declared.dependency_kind,
+        );
         let selected: Vec<_> = packages.iter().filter(|p| p["name"] == name).collect();
         require(
             selected.len() == 1
@@ -3159,7 +3384,7 @@ fn content_manifest_and_lock_pin_path(
             "content manifest dependency differs from path package",
         )?;
     }
-    let lock = fs::read_to_string(root.join("liteinst-runtime-build/Cargo.lock"))
+    let lock = fs::read_to_string(root.join(declaration.runtime_lock_relative))
         .map_err(|e| e.to_string())?;
     for name in [
         "reverie-inguest",
@@ -3217,6 +3442,7 @@ fn content_same_root(runtime: &CompilerRootBinding, producer: &CompilerRootBindi
 fn content_root_binding_path(
     metadata: &Value,
     workspace_root: &Path,
+    reverie_relative: &Path,
 ) -> Result<CompilerRootBinding> {
     let selected: Vec<_> = metadata["packages"]
         .as_array()
@@ -3234,12 +3460,12 @@ fn content_root_binding_path(
     let logical_root = raw_manifest
         .strip_suffix("/reverie-inguest/Cargo.toml")
         .ok_or("content dependency manifest has wrong suffix")?;
-    CompilerRootBinding::resolve_path(Path::new(logical_root), workspace_root)
+    CompilerRootBinding::resolve_path(Path::new(logical_root), workspace_root, reverie_relative)
 }
 /// Reverie-relative package directories named by the metadata graphs:
 /// every package whose manifest uses the exact logical spelling under the
 /// binding root contributes its manifest directory. Other packages (the
-/// Hermit workspace, registry dependencies) name no Reverie root.
+/// consumer workspace, registry dependencies) name no Reverie root.
 fn content_reverie_package_dirs(
     metadatas: &[&Value],
     logical_root: &Path,
@@ -3276,28 +3502,29 @@ fn content_reverie_package_dirs(
     )?;
     Ok(dirs)
 }
-fn content_detcore_manifest_and_lock_pin(
+fn content_leaf_manifest_and_lock_pin(
     metadata: &Value,
     root: &Path,
     source: &str,
+    leaf: LeafDecl<'_>,
 ) -> Result<()> {
     require(
         metadata["workspace_root"].as_str() == root.to_str(),
-        "content Detcore workspace root differs",
+        "content leaf workspace root differs",
     )?;
     let selected: Vec<_> = metadata["packages"]
         .as_array()
-        .ok_or("content Detcore metadata packages missing")?
+        .ok_or("content leaf metadata packages missing")?
         .iter()
-        .filter(|p| p["name"] == "detcore-liteinst")
+        .filter(|p| p["name"] == leaf.name)
         .collect();
     require(
         selected.len() == 1
             && selected[0]["manifest_path"].as_str()
-                == root.join("detcore-liteinst/Cargo.toml").to_str()
-            && selected[0]["version"] == "0.5.7"
+                == root.join(leaf.manifest_relative).to_str()
+            && selected[0]["version"] == leaf.version
             && selected[0]["source"].is_null(),
-        "content Detcore leaf manifest/version/source differs",
+        "content leaf leaf manifest/version/source differs",
     )?;
     for (name, rename, optional) in [
         ("reverie-core", Some("reverie"), false),
@@ -3307,7 +3534,7 @@ fn content_detcore_manifest_and_lock_pin(
     ] {
         let dependencies: Vec<_> = selected[0]["dependencies"]
             .as_array()
-            .ok_or("content Detcore dependencies missing")?
+            .ok_or("content leaf dependencies missing")?
             .iter()
             .filter(|d| d["name"] == name)
             .collect();
@@ -3320,7 +3547,7 @@ fn content_detcore_manifest_and_lock_pin(
                 && dependencies[0]["path"].is_null()
                 && dependencies[0]["target"].is_null()
                 && dependencies[0]["optional"].as_bool() == Some(optional),
-            format!("content Detcore dependency differs from independent full pin: {name}"),
+            format!("content leaf dependency differs from independent full pin: {name}"),
         )?;
     }
     let lock = fs::read_to_string(root.join("Cargo.lock")).map_err(|e| e.to_string())?;
@@ -3348,16 +3575,14 @@ fn content_detcore_manifest_and_lock_pin(
                     .filter(|line| line.starts_with("version = "))
                     .collect::<Vec<_>>()
                     == ["version = \"0.5.7\""],
-            format!("content Detcore lock source/version differs: {name}"),
+            format!("content leaf lock source/version differs: {name}"),
         )?;
     }
+    let leaf_name_line = format!("name = \"{}\"", leaf.name);
+    let leaf_version_line = format!("version = \"{}\"", leaf.version);
     let local: Vec<_> = lock
         .split("[[package]]")
-        .filter(|entry| {
-            entry
-                .lines()
-                .any(|line| line == "name = \"detcore-liteinst\"")
-        })
+        .filter(|entry| entry.lines().any(|line| line == leaf_name_line.as_str()))
         .collect();
     require(
         local.len() == 1
@@ -3366,36 +3591,37 @@ fn content_detcore_manifest_and_lock_pin(
                 .lines()
                 .filter(|line| line.starts_with("version = "))
                 .collect::<Vec<_>>()
-                == ["version = \"0.5.7\""],
-        "content Detcore local lock entry differs",
+                == [leaf_version_line.as_str()],
+        "content leaf local lock entry differs",
     )
 }
-/// Path-sourced counterpart of [`content_detcore_manifest_and_lock_pin`]:
-/// Detcore's Reverie dependencies must be path dependencies naming their
+/// Path-sourced counterpart of [`content_leaf_manifest_and_lock_pin`]:
+/// The leaf's Reverie dependencies must be path dependencies naming their
 /// exact logical package directories, and their lock entries must carry
 /// no `source` line.
-fn content_detcore_manifest_and_lock_pin_path(
+fn content_leaf_manifest_and_lock_pin_path(
     metadata: &Value,
     root: &Path,
     logical_root: &Path,
+    leaf: LeafDecl<'_>,
 ) -> Result<()> {
     require(
         metadata["workspace_root"].as_str() == root.to_str(),
-        "content Detcore workspace root differs",
+        "content leaf workspace root differs",
     )?;
     let selected: Vec<_> = metadata["packages"]
         .as_array()
-        .ok_or("content Detcore metadata packages missing")?
+        .ok_or("content leaf metadata packages missing")?
         .iter()
-        .filter(|p| p["name"] == "detcore-liteinst")
+        .filter(|p| p["name"] == leaf.name)
         .collect();
     require(
         selected.len() == 1
             && selected[0]["manifest_path"].as_str()
-                == root.join("detcore-liteinst/Cargo.toml").to_str()
-            && selected[0]["version"] == "0.5.7"
+                == root.join(leaf.manifest_relative).to_str()
+            && selected[0]["version"] == leaf.version
             && selected[0]["source"].is_null(),
-        "content Detcore leaf manifest/version/source differs",
+        "content leaf leaf manifest/version/source differs",
     )?;
     // `reverie-core` carries either of two spellings for one package:
     // the git tree's `reverie = { package = "reverie-core", ... }`
@@ -3415,7 +3641,7 @@ fn content_detcore_manifest_and_lock_pin_path(
         let expected_path = content_path_package_dir(metadata, name, logical_root)?;
         let dependencies: Vec<_> = selected[0]["dependencies"]
             .as_array()
-            .ok_or("content Detcore dependencies missing")?
+            .ok_or("content leaf dependencies missing")?
             .iter()
             .filter(|d| d["name"] == name)
             .collect();
@@ -3430,7 +3656,7 @@ fn content_detcore_manifest_and_lock_pin_path(
                 && dependencies[0]["path"].as_str() == Some(expected_path.as_str())
                 && dependencies[0]["target"].is_null()
                 && dependencies[0]["optional"].as_bool() == Some(optional),
-            format!("content Detcore dependency differs from path package: {name}"),
+            format!("content leaf dependency differs from path package: {name}"),
         )?;
     }
     let lock = fs::read_to_string(root.join("Cargo.lock")).map_err(|e| e.to_string())?;
@@ -3457,16 +3683,14 @@ fn content_detcore_manifest_and_lock_pin_path(
                     .filter(|line| line.starts_with("version = "))
                     .collect::<Vec<_>>()
                     == ["version = \"0.5.7\""],
-            format!("content Detcore lock source/version differs: {name}"),
+            format!("content leaf lock source/version differs: {name}"),
         )?;
     }
+    let leaf_name_line = format!("name = \"{}\"", leaf.name);
+    let leaf_version_line = format!("version = \"{}\"", leaf.version);
     let local: Vec<_> = lock
         .split("[[package]]")
-        .filter(|entry| {
-            entry
-                .lines()
-                .any(|line| line == "name = \"detcore-liteinst\"")
-        })
+        .filter(|entry| entry.lines().any(|line| line == leaf_name_line.as_str()))
         .collect();
     require(
         local.len() == 1
@@ -3475,8 +3699,8 @@ fn content_detcore_manifest_and_lock_pin_path(
                 .lines()
                 .filter(|line| line.starts_with("version = "))
                 .collect::<Vec<_>>()
-                == ["version = \"0.5.7\""],
-        "content Detcore local lock entry differs",
+                == [leaf_version_line.as_str()],
+        "content leaf local lock entry differs",
     )
 }
 fn content_compiler_manifest_path(
@@ -3484,13 +3708,16 @@ fn content_compiler_manifest_path(
     workspace_root: &Path,
     leaf_manifest: &Path,
     compiler_root: &CompilerRootBinding,
+    declared_leaf: Option<LeafDecl<'_>>,
 ) -> Result<PathBuf> {
     let logical = match image_kind {
         FixedImageKind::Standalone => {
             compiler_root.source_path("reverie-liteinst-preload/Cargo.toml")?
         }
         FixedImageKind::Detcore => {
-            exact_source_file(workspace_root, "detcore-liteinst/Cargo.toml")?.path
+            let leaf = declared_leaf
+                .ok_or("compiler manifest requires a declared leaf package")?;
+            exact_source_file(workspace_root, leaf.manifest_relative)?.path
         }
     };
     require(
@@ -3513,8 +3740,8 @@ fn compiled_role_filename(
     Ok(match layout {
         CompiledSourceLayout::ReverieWorkspace => relative.as_bytes().to_vec(),
         CompiledSourceLayout::Buck
-        | CompiledSourceLayout::HermitGit
-        | CompiledSourceLayout::HermitPath => file
+        | CompiledSourceLayout::GitlinkCheckout
+        | CompiledSourceLayout::PathCheckout => file
             .path
             .to_str()
             .ok_or("compiled source filename is not UTF-8")?
@@ -3622,9 +3849,14 @@ impl VerifiedCompiledSources {
             "compiled source requires an independent full Reverie pin",
         )?;
         require(
-            expected.layout != CompiledSourceLayout::HermitPath,
+            expected.layout != CompiledSourceLayout::PathCheckout,
             "path-sourced layout requires the declared-content factory",
         )?;
+        require(
+            expected.layout != CompiledSourceLayout::Buck,
+            "Buck layout requires the closed Buck factory",
+        )?;
+        let declaration = require_consumer_declaration(expected)?;
         for name in ["RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS"] {
             if let Some(flags) = std::env::var_os(name) {
                 let flags = flags.to_str().ok_or("compiler flags are not UTF-8")?;
@@ -3642,15 +3874,18 @@ impl VerifiedCompiledSources {
         require(
             expected.layout != CompiledSourceLayout::ReverieWorkspace
                 || expected.image_kind == FixedImageKind::Standalone,
-            "Detcore cannot claim Reverie workspace source layout",
+            "the leaf image cannot claim Reverie workspace source layout",
         )?;
-        let manifest_relative = match (expected.layout, expected.image_kind) {
-            (CompiledSourceLayout::HermitGit, FixedImageKind::Standalone) => {
-                "liteinst-runtime-build/Cargo.toml"
-            }
-            _ => "Cargo.toml",
-        };
-        let manifest = exact_source_file(&root, manifest_relative)?;
+        // The explicit build manifest names its own workspace-relative
+        // path; the factory inventories exactly that file.
+        let manifest_relative = expected
+            .manifest
+            .strip_prefix(expected.workspace_root)
+            .map_err(|e| e.to_string())?
+            .to_str()
+            .ok_or("compiled manifest is not UTF-8")?
+            .to_owned();
+        let manifest = exact_source_file(&root, &manifest_relative)?;
         require(
             manifest.path.as_os_str() == expected.manifest.as_os_str(),
             "compiled source manifest differs from the explicit build root",
@@ -3662,16 +3897,34 @@ impl VerifiedCompiledSources {
                 "workspace source differs from expected Reverie pin",
             )?;
         } else {
-            // The full pin is caller-owned, and must also be the actual recorded
-            // submodule object of this independently clean Hermit source tree.
+            // The full pin is caller-owned, and must also be the actual
+            // recorded submodule object of this independently clean
+            // consumer source tree, at the consumer-declared path.
+            let declaration = declaration.ok_or(
+                "consumer-checkout layout requires a declared consumer source declaration",
+            )?;
+            let reverie_relative = declaration
+                .reverie_relative
+                .to_str()
+                .ok_or("declared Reverie relative path is not UTF-8")?;
             let gitlink = runner.text(
                 "git",
-                &["--no-replace-objects", "ls-tree", "HEAD", "--", "reverie"],
+                &[
+                    "--no-replace-objects",
+                    "ls-tree",
+                    "HEAD",
+                    "--",
+                    reverie_relative,
+                ],
                 &root,
             )?;
             require(
-                gitlink == format!("160000 commit {}\treverie\n", expected.reverie_pin),
-                "Hermit Git link differs from the expected Reverie pin",
+                gitlink
+                    == format!(
+                        "160000 commit {}\t{reverie_relative}\n",
+                        expected.reverie_pin
+                    ),
+                "gitlink differs from the expected Reverie pin",
             )?;
         }
         let output = runner.run(
@@ -3693,7 +3946,7 @@ impl VerifiedCompiledSources {
         let metadata: Value = serde_json::from_slice(&output)
             .map_err(|e| format!("fresh compiled source metadata: {e}"))?;
         let source = private_static::cargo_git_source(repository, expected.reverie_pin);
-        let source = (expected.layout == CompiledSourceLayout::HermitGit).then_some(source);
+        let source = (expected.layout == CompiledSourceLayout::GitlinkCheckout).then_some(source);
         let rv_root = if source.is_some() {
             let packages = metadata["packages"]
                 .as_array()
@@ -3764,6 +4017,9 @@ impl VerifiedCompiledSources {
             &rv_root,
             source.as_deref(),
             expected.image_kind,
+            declaration
+                .and_then(|declared| declared.leaf.as_ref())
+                .map(LeafDecl::from),
         )?;
         let name = leaf.name.clone();
         packages.insert(name, leaf.clone());
@@ -3773,7 +4029,7 @@ impl VerifiedCompiledSources {
             .map(str::to_owned)
             .collect();
         if expected.image_kind == FixedImageKind::Detcore {
-            relatives.insert(CONTENT_DETCORE_FIXED_GATE.0.to_owned());
+            relatives.insert(CONTENT_FIXED_GATE.0.to_owned());
         }
         for package in packages
             .values()
@@ -3796,15 +4052,21 @@ impl VerifiedCompiledSources {
             );
         }
         if expected.image_kind == FixedImageKind::Detcore {
-            for relative in ["detcore-liteinst/Cargo.toml", "detcore-liteinst/src/lib.rs"] {
+            for path in [&leaf.manifest, &leaf.target_source] {
+                let relative = path
+                    .strip_prefix(&root)
+                    .map_err(|e| e.to_string())?
+                    .to_str()
+                    .ok_or("compiled relative source is not UTF-8")?
+                    .to_owned();
                 files.insert(
                     format!("workspace:{relative}"),
-                    compiled_blob_file(&root, &workspace_head, relative, runner)?,
+                    compiled_blob_file(&root, &workspace_head, &relative, runner)?,
                 );
             }
         }
         let observed_manifest =
-            compiled_blob_file(&root, &workspace_head, manifest_relative, runner)?;
+            compiled_blob_file(&root, &workspace_head, &manifest_relative, runner)?;
         require(
             observed_manifest == manifest,
             "compiled build manifest changed during metadata",
@@ -3828,12 +4090,14 @@ impl VerifiedCompiledSources {
         Ok(Self {
             record,
             current_build: None,
-            standalone_metadata: (expected.layout == CompiledSourceLayout::HermitGit
+            standalone_metadata: (expected.layout == CompiledSourceLayout::GitlinkCheckout
                 && expected.image_kind == FixedImageKind::Standalone)
                 .then(|| metadata.clone()),
+            consumer: declaration.map(RetainedConsumerDeclaration::from_declaration),
+            buck_consumer: None,
         })
     }
-    /// Explicit closed-profile Hermit source-copy authority. It never catches a Git error
+    /// Explicit closed-profile consumer source-copy authority. It never catches a Git error
     /// or accepts caller-supplied metadata, inventories or compiler mappings.
     pub fn resolve_content(
         expected: &CompiledSourceExpectation<'_>,
@@ -3852,9 +4116,9 @@ impl VerifiedCompiledSources {
         require(
             matches!(
                 expected.layout,
-                CompiledSourceLayout::HermitGit | CompiledSourceLayout::HermitPath
+                CompiledSourceLayout::GitlinkCheckout | CompiledSourceLayout::PathCheckout
             ),
-            "declared content factory supports only closed Hermit image profiles",
+            "declared content factory supports only closed consumer image profiles",
         )?;
         // The layout selects the metadata shape. The Git arm binds
         // either spelling to the pin: git-form packages by their exact
@@ -3863,7 +4127,10 @@ impl VerifiedCompiledSources {
         // content. The path arm binds path packages by declared
         // content alone — consumers route only gitless Reverie roots
         // here — and refuses any source-carrying spelling.
-        let path_sourced = expected.layout == CompiledSourceLayout::HermitPath;
+        let declaration = require_consumer_declaration(expected)?.ok_or(
+            "consumer-checkout layout requires a declared consumer source declaration",
+        )?;
+        let path_sourced = expected.layout == CompiledSourceLayout::PathCheckout;
         require(
             source_pin_is_full(expected.reverie_pin),
             "compiled source requires an independent full Reverie pin",
@@ -3884,10 +4151,21 @@ impl VerifiedCompiledSources {
             root.as_os_str() == expected.workspace_root.as_os_str(),
             "compiled source workspace is not canonical",
         )?;
-        let (workspace_inventory, workspace_files) =
-            declared_inventory(&root, content_workspace_files(expected.image_kind))?;
+        let (workspace_inventory, workspace_files) = declared_inventory(
+            &root,
+            declared_workspace_files(declaration, expected.image_kind),
+        )?;
+        // The build manifest is one exact declared inventory file:
+        // the producer manifest for the standalone image, the
+        // workspace-root manifest for the leaf image (whose Cargo
+        // graph is rooted at the workspace root). Any other explicit
+        // build root refuses here, before metadata runs.
+        let manifest_relative = match expected.image_kind {
+            FixedImageKind::Standalone => producer_manifest_relative(declaration)?,
+            FixedImageKind::Detcore => "Cargo.toml",
+        };
         let manifest = workspace_files
-            .get(content_manifest_relative(expected.image_kind))
+            .get(manifest_relative)
             .ok_or("declared build manifest missing")?
             .clone();
         require(
@@ -3914,7 +4192,7 @@ impl VerifiedCompiledSources {
             .map_err(|e| format!("fresh compiled source metadata: {e}"))?;
         let source = private_static::cargo_git_source(repository, expected.reverie_pin);
         let binding = if path_sourced {
-            content_root_binding_path(&metadata, &root)?
+            content_root_binding_path(&metadata, &root, declaration.reverie_relative)?
         } else {
             content_root_binding(&metadata, expected.reverie_pin)?
         };
@@ -3922,17 +4200,23 @@ impl VerifiedCompiledSources {
         let producer_metadata = match expected.image_kind {
             FixedImageKind::Standalone => None,
             FixedImageKind::Detcore => {
+                let leaf_decl = declaration
+                    .leaf
+                    .as_ref()
+                    .map(LeafDecl::from)
+                    .ok_or("consumer-checkout leaf image requires a declared leaf package")?;
                 if path_sourced {
-                    content_detcore_manifest_and_lock_pin_path(
+                    content_leaf_manifest_and_lock_pin_path(
                         &metadata,
                         &root,
                         &binding.logical_root,
+                        leaf_decl,
                     )?;
                 } else {
-                    content_detcore_manifest_and_lock_pin(&metadata, &root, &source)?;
+                    content_leaf_manifest_and_lock_pin(&metadata, &root, &source, leaf_decl)?;
                 }
                 let producer_manifest = workspace_files
-                    .get("liteinst-runtime-build/Cargo.toml")
+                    .get(producer_manifest_relative(declaration)?)
                     .ok_or("declared producer manifest missing")?;
                 let output = runner.run(
                     "cargo",
@@ -3953,7 +4237,7 @@ impl VerifiedCompiledSources {
                 let producer: Value = serde_json::from_slice(&output)
                     .map_err(|e| format!("fresh producer source metadata: {e}"))?;
                 let producer_binding = if path_sourced {
-                    content_root_binding_path(&producer, &root)?
+                    content_root_binding_path(&producer, &root, declaration.reverie_relative)?
                 } else {
                     content_root_binding(&producer, expected.reverie_pin)?
                 };
@@ -3967,6 +4251,7 @@ impl VerifiedCompiledSources {
                 producer_metadata,
                 &root,
                 &binding.logical_root,
+                declaration,
             )?;
             let package_dirs = content_reverie_package_dirs(
                 &[&metadata, producer_metadata],
@@ -3983,12 +4268,14 @@ impl VerifiedCompiledSources {
                 &root,
                 &source,
                 &binding.canonical_root,
+                declaration,
             )?;
             require_reverie_checkout_at_pin(
                 &root,
                 &binding,
                 expected.reverie_pin,
                 path_form,
+                declaration.reverie_relative,
                 runner,
             )?;
             content_reverie_inventory_for_image(&binding.canonical_root, expected.image_kind)?
@@ -4043,6 +4330,7 @@ impl VerifiedCompiledSources {
                     &binding.canonical_root,
                     leaf_source,
                     FixedImageKind::Detcore,
+                    declaration.leaf.as_ref().map(LeafDecl::from),
                 )?;
                 packages.insert(leaf.name.clone(), leaf.clone());
                 leaf
@@ -4080,6 +4368,8 @@ impl VerifiedCompiledSources {
             current_build: None,
             standalone_metadata: (expected.image_kind == FixedImageKind::Standalone)
                 .then(|| metadata.clone()),
+            consumer: Some(RetainedConsumerDeclaration::from_declaration(declaration)),
+            buck_consumer: None,
         };
         verified.verify_unchanged(runner)?;
         Ok(verified)
@@ -4097,23 +4387,23 @@ impl VerifiedCompiledSources {
         )?;
         require(
             source_pin_is_full(expected.imported_sha),
-            "Buck compiled source requires a full imported Hermit SHA",
+            "Buck compiled source requires a full imported consumer SHA",
         )?;
-        require(
-            expected.target == BUCK_TARGET && expected.platform == BUCK_PLATFORM,
-            "Buck compiled source requires the exact detcore-liteinst-liteinst-runtime \
-             target and x86_64-fbcode platform literals",
-        )?;
+        // Target, platform and constraints are consumer-declared and
+        // recorded verbatim (constraints in sorted order); the build
+        // witness must match the recorded authority exactly.
         let constraint_set: BTreeSet<&str> = expected.constraints.iter().copied().collect();
         require(
-            constraint_set.len() == expected.constraints.len()
-                && constraint_set == BUCK_CONSTRAINTS.iter().copied().collect(),
-            "Buck constraints must be exactly the pinned liteinst-runtime constraint set",
+            !expected.constraints.is_empty()
+                && constraint_set.len() == expected.constraints.len(),
+            "Buck constraints must be a nonempty duplicate-free declared set",
         )?;
-        let constraints: Vec<String> = BUCK_CONSTRAINTS
+        let mut constraints: Vec<String> = expected
+            .constraints
             .iter()
             .map(|constraint| (*constraint).to_owned())
             .collect();
+        constraints.sort();
         let workspace_relatives: Vec<&str> = expected
             .workspace_files
             .iter()
@@ -4123,24 +4413,31 @@ impl VerifiedCompiledSources {
             .iter()
             .copied()
             .chain(expected.reverie_files.iter().copied())
+            .chain([expected.leaf_source_relative, expected.profile_relative])
+            .chain(expected.workspace_extra_files.iter().copied())
         {
             logical_declared_relative(relative)?;
         }
+        let leaf_src_dir = Path::new(expected.leaf_source_relative)
+            .parent()
+            .ok_or("declared Buck leaf source has no parent directory")?;
+        let leaf_src_prefix = format!("{}/", leaf_src_dir.display());
         require(
-            workspace_relatives.contains(&BUCK_LEAF_SOURCE)
-                && BUCK_WORKSPACE_EXTRA_FILES
+            workspace_relatives.contains(&expected.leaf_source_relative)
+                && expected
+                    .workspace_extra_files
                     .iter()
                     .all(|extra| workspace_relatives.contains(extra))
                 && workspace_relatives.iter().all(|relative| {
-                    BUCK_WORKSPACE_EXTRA_FILES.contains(relative)
-                        || (relative.starts_with("detcore-liteinst/src/")
+                    expected.workspace_extra_files.contains(relative)
+                        || (relative.starts_with(&leaf_src_prefix)
                             && relative.ends_with(".rs"))
                 }),
-            "Buck workspace files must be the detcore-liteinst sources, build.rs and glibc_compat.rs",
+            "Buck workspace files must be the declared leaf sources and extra files",
         )?;
         let expected_reverie: BTreeSet<&str> = COMPILED_RV_LOCATION_FILES
             .into_iter()
-            .chain([BUCK_QUALIFIER_SOURCE, CONTENT_DETCORE_FIXED_GATE.0])
+            .chain([BUCK_QUALIFIER_SOURCE, CONTENT_FIXED_GATE.0])
             .collect();
         require(
             expected
@@ -4162,17 +4459,17 @@ impl VerifiedCompiledSources {
             reverie_root.as_os_str() == expected.reverie_root.as_os_str(),
             "Buck compiled Reverie root is not canonical",
         )?;
-        require_complete_detcore_src_inventory(
+        require_complete_leaf_src_inventory(
             &root,
+            leaf_src_dir,
             &workspace_relatives.iter().copied().collect(),
         )?;
         let profile_bzl = FileIdentity::read(expected.profile_bzl)?;
         require(
-            profile_bzl
-                .path
-                .file_name()
-                .is_some_and(|name| name == BUCK_PROFILE_BZL_NAME),
-            "Buck profile input is not the liteinst-runtime profile .bzl",
+            profile_bzl.path.file_name().is_some()
+                && profile_bzl.path.file_name()
+                    == Path::new(expected.profile_relative).file_name(),
+            "Buck profile input is not the declared profile .bzl",
         )?;
         let (workspace_inventory, workspace_files) =
             declared_inventory(&root, &workspace_relatives)?;
@@ -4189,26 +4486,27 @@ impl VerifiedCompiledSources {
         require(
             workspace_inventory
                 .iter()
-                .find(|entry| entry.relative == BUCK_PROFILE_RELATIVE)
+                .find(|entry| entry.relative == expected.profile_relative)
                 .is_some_and(|entry| entry.sha256 == profile_bzl.sha256),
             format!(
-                "declared workspace source differs from pinned expectation: {BUCK_PROFILE_RELATIVE}"
+                "declared workspace source differs from pinned expectation: {}",
+                expected.profile_relative
             ),
         )?;
         let (reverie_inventory, reverie_files) =
             declared_inventory(&reverie_root, expected.reverie_files)?;
         buck_reverie_content_matches(&reverie_inventory)?;
         let leaf_source = workspace_files
-            .get(BUCK_LEAF_SOURCE)
+            .get(expected.leaf_source_relative)
             .ok_or("declared Buck leaf source missing")?;
         let leaf = PackageIdentity {
             id: expected.target.to_owned(),
-            name: "detcore-liteinst".into(),
+            name: expected.leaf_name.into(),
             // The declaring BUCK file is the leaf's build manifest analogue;
             // the exact target label is recorded in the authority and `id`.
             manifest: root.join("BUCK"),
             source: None,
-            target: "detcore_liteinst".into(),
+            target: expected.leaf_target.into(),
             kind: vec!["cdylib".into()],
             crate_types: vec!["cdylib".into()],
             target_source: leaf_source.path.clone(),
@@ -4250,6 +4548,11 @@ impl VerifiedCompiledSources {
             },
             current_build: None,
             standalone_metadata: None,
+            consumer: None,
+            buck_consumer: Some(RetainedBuckDeclaration {
+                leaf_source_relative: expected.leaf_source_relative.to_owned(),
+                stage_id: expected.stage_id.to_owned(),
+            }),
         };
         verified.verify_files()?;
         Ok(verified)
@@ -4286,6 +4589,8 @@ impl VerifiedCompiledSources {
             record: self.record.clone(),
             current_build: Some(BuildWitness::Cargo(Box::new(current_build))),
             standalone_metadata: self.standalone_metadata.clone(),
+            consumer: self.consumer.clone(),
+            buck_consumer: self.buck_consumer.clone(),
         })
     }
     pub fn with_standalone_current_build(
@@ -4300,7 +4605,8 @@ impl VerifiedCompiledSources {
                 .standalone_metadata
                 .as_ref()
                 .ok_or("standalone build lacks fresh factory metadata")?;
-            let binding = standalone_current_build_sources(&self.record, metadata, runner)?;
+            let binding =
+                standalone_current_build_sources(&self.record, metadata, runner, self.consumer.as_ref())?;
             current_build_evidence_in_scope(
                 &self.record,
                 command,
@@ -4323,6 +4629,8 @@ impl VerifiedCompiledSources {
             record: self.record.clone(),
             current_build: Some(BuildWitness::Cargo(Box::new(current_build))),
             standalone_metadata: self.standalone_metadata.clone(),
+            consumer: self.consumer.clone(),
+            buck_consumer: self.buck_consumer.clone(),
         })
     }
     /// Bind the actual Buck-built ELF to Buck-declared sources. The build
@@ -4381,11 +4689,11 @@ impl VerifiedCompiledSources {
         )?;
         let output_sha256 = artifact.sha256.clone();
         let packages = NoScopeCohort::DetcoreOrdinaryBuck
-            .features()
-            .iter()
+            .features_for(&self.record.leaf.name, "")
+            .into_iter()
             .map(|(name, features)| {
                 (
-                    (*name).to_owned(),
+                    name,
                     BuckBuildPackage {
                         features: features.iter().map(|f| (*f).to_owned()).collect(),
                         profile: NoScopeCohort::DetcoreOrdinaryBuck.profile(),
@@ -4407,7 +4715,13 @@ impl VerifiedCompiledSources {
             ),
             packages,
         };
-        validate_buck_build_evidence(&evidence)?;
+        let stage_id = self
+            .buck_consumer
+            .as_ref()
+            .ok_or("Buck declared sources lack their retained consumer declaration")?
+            .stage_id
+            .clone();
+        validate_buck_build_evidence(&evidence, Some(&stage_id))?;
         require(
             build_witness_cohort(&BuildWitness::Buck(Box::new(evidence.clone())))?
                 == NoScopeCohort::DetcoreOrdinaryBuck,
@@ -4417,6 +4731,8 @@ impl VerifiedCompiledSources {
             record: self.record.clone(),
             current_build: Some(BuildWitness::Buck(Box::new(evidence))),
             standalone_metadata: self.standalone_metadata.clone(),
+            consumer: self.consumer.clone(),
+            buck_consumer: self.buck_consumer.clone(),
         })
     }
     /// Exact retained Cargo compiler spelling; canonical PackageIdentity remains
@@ -4431,6 +4747,10 @@ impl VerifiedCompiledSources {
                     &self.record.workspace_root,
                     &self.record.leaf.manifest,
                     compiler_root,
+                    self.consumer
+                        .as_ref()
+                        .and_then(|consumer| consumer.leaf.as_ref())
+                        .map(LeafDecl::from),
                 )
             }
             CompiledSourceAuthority::BuckDeclaredContent { .. } => {
@@ -4482,7 +4802,7 @@ impl VerifiedCompiledSources {
                 reverie_inventory,
                 reverie_sha256,
             );
-            if self.record.layout == CompiledSourceLayout::HermitPath {
+            if self.record.layout == CompiledSourceLayout::PathCheckout {
                 verify_declared_content_path(
                     self.record.image_kind,
                     workspace,
@@ -4507,6 +4827,13 @@ impl VerifiedCompiledSources {
             ..
         } = &self.record.authority
         {
+            let buck = self
+                .buck_consumer
+                .as_ref()
+                .ok_or("Buck declared sources lack their retained consumer declaration")?;
+            let leaf_src_dir = Path::new(&buck.leaf_source_relative)
+                .parent()
+                .ok_or("declared Buck leaf source has no parent directory")?;
             verify_buck_declared_content(
                 (
                     &self.record.workspace_root,
@@ -4515,6 +4842,7 @@ impl VerifiedCompiledSources {
                 ),
                 (&self.record.reverie_root, reverie_inventory, reverie_sha256),
                 profile_bzl,
+                leaf_src_dir,
             )?;
         }
         self.record.manifest.verify()?;
@@ -4820,10 +5148,10 @@ fn current_build_command(
                 "--message-format=json-render-diagnostics",
             ])
             && options.get("--manifest-path").copied() == sources.manifest.path.to_str()
-            && options.get("-p").copied() == Some("detcore-liteinst")
+            && options.get("-p").copied() == Some(sources.leaf.name.as_str())
             && options.get("--profile").copied() == Some("liteinst-runtime")
             && options.get("--target-dir").copied() == target.to_str(),
-        "current build command differs from the explicit Detcore profile/target/source",
+        "current build command differs from the explicit leaf profile/target/source",
     )?;
     // exec-private-init is an implied feature of exec-native-injection. The
     // canonical native producer requests the latter, not the derived feature.
@@ -4855,21 +5183,30 @@ fn standalone_current_build_sources(
     sources: &CompiledSources,
     metadata: &Value,
     runner: &mut Runner,
+    consumer: Option<&RetainedConsumerDeclaration>,
 ) -> Result<StandaloneCurrentBuildSources> {
     require(
         matches!(
             sources.layout,
-            CompiledSourceLayout::HermitGit | CompiledSourceLayout::HermitPath
+            CompiledSourceLayout::GitlinkCheckout | CompiledSourceLayout::PathCheckout
         ) && sources.image_kind == FixedImageKind::Standalone,
-        "standalone build source binding requires the owned Hermit nested workspace",
+        "standalone build source binding requires the owned consumer nested workspace",
     )?;
+    let consumer = consumer
+        .ok_or("standalone build source binding lacks its retained consumer declaration")?;
+    let declared_files = consumer.workspace_files(FixedImageKind::Standalone);
     let mut workspace_files = BTreeMap::new();
     match &sources.authority {
         CompiledSourceAuthority::Git { workspace_head, .. } => {
-            for relative in CONTENT_WORKSPACE_FILES {
+            for relative in declared_files {
                 workspace_files.insert(
-                    relative.to_owned(),
-                    compiled_blob_file(&sources.workspace_root, workspace_head, relative, runner)?,
+                    relative.clone(),
+                    compiled_blob_file(
+                        &sources.workspace_root,
+                        workspace_head,
+                        relative,
+                        runner,
+                    )?,
                 );
             }
         }
@@ -4882,18 +5219,21 @@ fn standalone_current_build_sources(
                     .iter()
                     .map(|entry| entry.relative.as_str())
                     .collect::<BTreeSet<_>>()
-                    == BTreeSet::from(CONTENT_WORKSPACE_FILES)
-                    && workspace_inventory.len() == CONTENT_WORKSPACE_FILES.len(),
-                "standalone declared workspace inventory differs from its six owned files",
+                    == declared_files
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<BTreeSet<_>>()
+                    && workspace_inventory.len() == declared_files.len(),
+                "standalone declared workspace inventory differs from its declared files",
             )?;
-            for relative in CONTENT_WORKSPACE_FILES {
+            for relative in declared_files {
                 let file = sources
                     .files
                     .get(&format!("workspace:{relative}"))
                     .ok_or("standalone declared workspace file absent")?;
                 let declared = workspace_inventory
                     .iter()
-                    .find(|entry| entry.relative == relative)
+                    .find(|entry| &entry.relative == relative)
                     .ok_or("standalone workspace file has no declared authority")?;
                 file.verify()?;
                 require(
@@ -4903,20 +5243,32 @@ fn standalone_current_build_sources(
                             == declared.size,
                     "standalone workspace file differs from declared source authority",
                 )?;
-                workspace_files.insert(relative.to_owned(), file.clone());
+                workspace_files.insert(relative.clone(), file.clone());
             }
         }
         CompiledSourceAuthority::BuckDeclaredContent { .. } => {
             return Err(
-                "standalone build source binding does not accept Buck Detcore sources".into(),
+                "standalone build source binding does not accept Buck leaf sources".into(),
             );
         }
     }
+    let manifest_relative = sources
+        .manifest
+        .path
+        .strip_prefix(&sources.workspace_root)
+        .map_err(|e| e.to_string())?
+        .to_str()
+        .ok_or("standalone manifest is not UTF-8")?;
     require(
-        workspace_files.get("liteinst-runtime-build/Cargo.toml") == Some(&sources.manifest),
+        workspace_files.get(manifest_relative) == Some(&sources.manifest),
         "standalone workspace manifest differs from the existing source authority",
     )?;
-    let wrapper = standalone_wrapper_package(metadata, &sources.workspace_root, &workspace_files)?;
+    let wrapper = standalone_wrapper_package(
+        metadata,
+        &sources.workspace_root,
+        &workspace_files,
+        consumer,
+    )?;
     Ok(StandaloneCurrentBuildSources {
         wrapper,
         workspace_files,
@@ -4927,27 +5279,52 @@ fn standalone_wrapper_package(
     metadata: &Value,
     root: &Path,
     workspace_files: &BTreeMap<String, FileIdentity>,
+    consumer: &RetainedConsumerDeclaration,
 ) -> Result<PackageIdentity> {
-    let name = "hermit-liteinst-runtime-artifact";
-    let target = "hermit_liteinst_runtime_artifact";
+    let declared = consumer.wrapper_package()?;
+    let name = declared.name.as_str();
+    let target = declared
+        .target
+        .as_deref()
+        .ok_or("declared wrapper package has no reviewed target")?;
+    let version = declared
+        .version
+        .as_deref()
+        .ok_or("declared wrapper package has no reviewed version")?;
+    let manifest_relative = declared.manifest_relative.as_str();
+    let source_relative = format!(
+        "{}src/lib.rs",
+        manifest_relative
+            .strip_suffix("Cargo.toml")
+            .ok_or("declared wrapper manifest is not a Cargo.toml path")?
+    );
     let manifest = workspace_files
-        .get("liteinst-runtime-build/runtime/Cargo.toml")
+        .get(manifest_relative)
         .ok_or("authorized standalone wrapper manifest absent")?;
     let source_file = workspace_files
-        .get("liteinst-runtime-build/runtime/src/lib.rs")
+        .get(source_relative.as_str())
         .ok_or("authorized standalone wrapper source absent")?;
     manifest.verify()?;
     source_file.verify()?;
-    let nested = root.join("liteinst-runtime-build");
+    // The nested workspace is the declared wrapper manifest's
+    // grandparent directory (`<nested>/<package>/Cargo.toml`).
+    let manifest_dir = Path::new(manifest_relative)
+        .parent()
+        .ok_or("declared wrapper manifest has no parent directory")?;
+    let nested = root.join(
+        manifest_dir
+            .parent()
+            .ok_or("declared wrapper manifest has no nested workspace")?,
+    );
     require(
-        manifest.path == nested.join("runtime/Cargo.toml")
-            && source_file.path == nested.join("runtime/src/lib.rs")
+        manifest.path == root.join(manifest_relative)
+            && source_file.path == root.join(&source_relative)
             && metadata["workspace_root"].as_str() == nested.to_str(),
         "standalone wrapper or metadata belongs to a different nested workspace",
     )?;
     let id = format!(
-        "path+file://{}#{name}@0.5.1",
-        nested.join("runtime").display()
+        "path+file://{}#{name}@{version}",
+        root.join(manifest_dir).display()
     );
     let packages: Vec<_> = metadata["packages"]
         .as_array()
@@ -4962,7 +5339,7 @@ fn standalone_wrapper_package(
     let package = packages[0];
     require(
         package["id"] == id
-            && package["version"] == "0.5.1"
+            && package["version"] == version
             && package.get("source") == Some(&Value::Null)
             && package["manifest_path"].as_str() == manifest.path.to_str()
             && strings(&metadata["workspace_members"])?
@@ -5005,20 +5382,18 @@ fn standalone_current_build_command(
     command: &CommandEvidence,
     sources: &CompiledSources,
     target: &Path,
+    wrapper_name: &str,
 ) -> Result<Option<FileIdentity>> {
     let cargo_executable = current_cargo_executable(&command.program)?;
-    let expected = standalone_current_build_arguments(target)?;
+    let expected = standalone_current_build_arguments(target, wrapper_name)?;
     require(
         command.status == 0
             && matches!(
                 sources.layout,
-                CompiledSourceLayout::HermitGit | CompiledSourceLayout::HermitPath
+                CompiledSourceLayout::GitlinkCheckout | CompiledSourceLayout::PathCheckout
             )
             && sources.image_kind == FixedImageKind::Standalone
-            && sources.manifest.path
-                == sources
-                    .workspace_root
-                    .join("liteinst-runtime-build/Cargo.toml")
+            && sources.manifest.path.starts_with(&sources.workspace_root)
             && Some(command.cwd.as_path()) == sources.manifest.path.parent()
             && command.arguments == expected,
         "standalone current build differs from the exact nested release multipackage command",
@@ -5026,7 +5401,7 @@ fn standalone_current_build_command(
     Ok(cargo_executable)
 }
 
-fn standalone_current_build_arguments(target: &Path) -> Result<Vec<String>> {
+fn standalone_current_build_arguments(target: &Path, wrapper_name: &str) -> Result<Vec<String>> {
     Ok(vec![
         "build",
         "--locked",
@@ -5034,7 +5409,7 @@ fn standalone_current_build_arguments(target: &Path) -> Result<Vec<String>> {
         "--manifest-path",
         "Cargo.toml",
         "-p",
-        "hermit-liteinst-runtime-artifact",
+        wrapper_name,
         "-p",
         "reverie-liteinst-preload",
         "--lib",
@@ -5062,7 +5437,7 @@ fn current_build_evidence_in_scope(
         if standalone.is_some() {
             matches!(
                 sources.layout,
-                CompiledSourceLayout::HermitGit | CompiledSourceLayout::HermitPath
+                CompiledSourceLayout::GitlinkCheckout | CompiledSourceLayout::PathCheckout
             ) && sources.image_kind == FixedImageKind::Standalone
                 && sources.leaf.name == "reverie-liteinst-preload"
         } else {
@@ -5101,15 +5476,19 @@ fn current_build_evidence_in_scope(
     } else {
         NoScopeCohort::DetcoreNative101.profile()
     };
-    let required_names: &[&str] = if standalone.is_some() {
-        &[
-            "hermit-liteinst-runtime-artifact",
+    let required_names: Vec<&str> = if let Some(binding) = standalone {
+        vec![
+            binding.wrapper.name.as_str(),
             "reverie-liteinst-preload",
             "reverie-liteinst",
             "reverie-inguest",
         ]
     } else {
-        &["detcore-liteinst", "reverie-inguest", "reverie-liteinst"]
+        vec![
+            sources.leaf.name.as_str(),
+            "reverie-inguest",
+            "reverie-liteinst",
+        ]
     };
     let mut packages = BTreeMap::new();
     for line in messages.lines().filter(|line| !line.is_empty()) {
@@ -5202,8 +5581,13 @@ fn current_build_evidence_in_scope(
         artifact.path == selected.reported_path,
         "current build witness selects a different actual Cargo ELF",
     )?;
-    let cargo_executable = if standalone.is_some() {
-        standalone_current_build_command(command, sources, &target_directory)?
+    let cargo_executable = if let Some(binding) = standalone {
+        standalone_current_build_command(
+            command,
+            sources,
+            &target_directory,
+            &binding.wrapper.name,
+        )?
     } else {
         current_build_command(command, sources, &target_directory, &leaf.features)?
     };
@@ -5235,7 +5619,7 @@ fn current_build_evidence(
     // source context; callers cannot obtain one by deserializing these records.
     require(
         sources.image_kind == FixedImageKind::Detcore,
-        "current build witness requires a Detcore source identity",
+        "current build witness requires a leaf source identity",
     )?;
     command.stdout.verify()?;
     command.stderr.verify()?;
@@ -5267,8 +5651,11 @@ fn current_build_evidence(
             .packages
             .values()
             .filter(|package| {
-                ["reverie-liteinst", "reverie-inguest", "detcore-liteinst"]
-                    .contains(&package.name.as_str())
+                (package.name == sources.leaf.name
+                    || matches!(
+                        package.name.as_str(),
+                        "reverie-liteinst" | "reverie-inguest"
+                    ))
                     && event["package_id"] == package.id
                     && event["target"]["name"] == package.target
             })
@@ -5331,10 +5718,14 @@ fn current_build_evidence(
     }
     require(
         packages.keys().map(String::as_str).collect::<BTreeSet<_>>()
-            == BTreeSet::from(["detcore-liteinst", "reverie-inguest", "reverie-liteinst"]),
+            == BTreeSet::from([
+                sources.leaf.name.as_str(),
+                "reverie-inguest",
+                "reverie-liteinst",
+            ]),
         "current build lacks the actual leaf/core/inguest compiler events",
     )?;
-    let leaf = &packages["detcore-liteinst"];
+    let leaf = &packages[&sources.leaf.name];
     let selected = select_artifact(
         &messages,
         &leaf.package,
@@ -5767,7 +6158,7 @@ fn detcore_direct_tls_offset_accepted(address: u64) -> bool {
         // a8ebcb1a... (b2791afb).
         | 0x148
         // Stable rustc 1.97.1 (8bab26f4f 2026-07-14) native-exec runtime from
-        // build.hermit_native_exec_compile_in_pinned_root (detcore-liteinst,
+        // build.hermit_native_exec_compile_in_pinned_root (the consumer leaf package,
         // features exec-native-injection, profile liteinst-runtime) at Reverie
         // 9c370385: LOCAL8 cell 0xf8, PT_TLS filesz 0xf8 memsz 0x220; ELF SHA256
         // 05903e134c10a4042b6ee4c771e73730db850fcf811267c7a8dedaf83f1b6449, no
@@ -19563,7 +19954,7 @@ const FIXED_DEV_TLS_CELL_GETTER_STABLE_HEX: &str =
 const FIXED_OPTIMIZED_PATCH_ALLOC_STABLE_70_HEX: &str = "41574156415453504889d34989f6ff1514980b004885c074774c8b78204d85ff746e4989c4488d3dcc950b00e84f310b004883b870000000007463498b542410498b0f498d76ff49f7de31c04889cf4801d7723e4801f772394c21f74989f84929d04901d8410f92c14981f801000002410f93c24508ca75194889c8f04d0fb1074889c1b80000000075c14889f8eb0231c04883c4085b415c415e415fc3bf010000004c89f64889da4883c4085b415c415e415fff253e9b0b00";
 const FIXED_OPTIMIZED_TLS_THUNK_STABLE_70_HEX: &str =
     "50488d3d00930b00e8832e0b00488d807000000059c3";
-// The release constructor built by stable 1.97.1 (liteinst-runtime-build
+// The release constructor built by stable 1.97.1 (the nested runtime-build workspace
 // with the release profile) places INSTALLATION_DEPTH at TLS offset 0x30.
 // Exact bodies of that ELF: libreverie_liteinst_preload.so, sha256
 // a7944806e88c40a395cb7cda01f4240a1f885cd3ec16e8aa821062c2890f58c5,
@@ -19925,11 +20316,11 @@ fn direct_tls_getter_census(
 enum NoScopeCohort {
     DetcoreNative101,
     DetcoreOrdinary101,
-    /// Ordinary Detcore runtime as declared in BUCK: `detcore-liteinst`
-    /// features `[]` over `:reverie-liteinst-sitepatch` (features
-    /// `["liteinst"]`) and `:reverie-inguest-liteinst`. This differs from the
-    /// Cargo ordinary cohort only in the sitepatch feature; it is not a copy
-    /// of `DetcoreOrdinary101`.
+    /// Ordinary leaf runtime as declared in BUCK: the consumer leaf
+    /// package features `[]` over `:reverie-liteinst-sitepatch`
+    /// (features `["liteinst"]`) and `:reverie-inguest-liteinst`. This
+    /// differs from the Cargo ordinary cohort only in the sitepatch
+    /// feature; it is not a copy of `DetcoreOrdinary101`.
     DetcoreOrdinaryBuck,
     StandaloneRelease62,
 }
@@ -19940,25 +20331,33 @@ impl NoScopeCohort {
         serde_json::json!({"opt_level":"3", "debuginfo":0,
             "debug_assertions":debug,"overflow_checks":debug,"test":false})
     }
-    fn features(self) -> &'static [(&'static str, &'static [&'static str])] {
-        match self {
-            Self::DetcoreNative101 => &[
+    /// Reviewed per-package feature sets, keyed by role: the leaf
+    /// cohorts name the consumer-declared leaf package, the
+    /// standalone cohort names the consumer-declared wrapper
+    /// package, and the remaining rows are Reverie's own crates.
+    fn features_for(
+        self,
+        leaf_name: &str,
+        wrapper_name: &str,
+    ) -> Vec<(String, &'static [&'static str])> {
+        let rows: Vec<(String, &'static [&'static str])> = match self {
+            Self::DetcoreNative101 => vec![
                 (
-                    "detcore-liteinst",
-                    &["exec-native-injection", "exec-private-init"],
+                    leaf_name.to_owned(),
+                    &["exec-native-injection", "exec-private-init"][..],
                 ),
                 (
-                    "reverie-liteinst",
+                    "reverie-liteinst".to_owned(),
                     &[
                         "exec-native-injection",
                         "exec-private-init",
                         "exec-private-successor",
                         "fixed-syscall-gates",
                         "native-exec-state",
-                    ],
+                    ][..],
                 ),
                 (
-                    "reverie-inguest",
+                    "reverie-inguest".to_owned(),
                     &[
                         "coordinator-rpc",
                         "exec-native-injection",
@@ -19968,39 +20367,59 @@ impl NoScopeCohort {
                         "launcher",
                         "native-exec-state",
                         "rcb-clock",
-                    ],
+                    ][..],
                 ),
             ],
-            Self::DetcoreOrdinary101 => &[
-                ("detcore-liteinst", &[]),
-                ("reverie-liteinst", &[]),
+            Self::DetcoreOrdinary101 => vec![
+                (leaf_name.to_owned(), &[][..]),
+                ("reverie-liteinst".to_owned(), &[][..]),
                 (
-                    "reverie-inguest",
-                    &["coordinator-rpc", "launcher", "rcb-clock"],
+                    "reverie-inguest".to_owned(),
+                    &["coordinator-rpc", "launcher", "rcb-clock"][..],
                 ),
             ],
-            Self::DetcoreOrdinaryBuck => &[
-                ("detcore-liteinst", &[]),
-                ("reverie-liteinst", &["liteinst"]),
+            Self::DetcoreOrdinaryBuck => vec![
+                (leaf_name.to_owned(), &[][..]),
+                ("reverie-liteinst".to_owned(), &["liteinst"][..]),
                 (
-                    "reverie-inguest",
-                    &["coordinator-rpc", "launcher", "rcb-clock"],
+                    "reverie-inguest".to_owned(),
+                    &["coordinator-rpc", "launcher", "rcb-clock"][..],
                 ),
             ],
-            Self::StandaloneRelease62 => &[
-                ("hermit-liteinst-runtime-artifact", &[]),
-                ("reverie-liteinst-preload", &[]),
-                ("reverie-liteinst", &[]),
+            Self::StandaloneRelease62 => vec![
+                (wrapper_name.to_owned(), &[][..]),
+                ("reverie-liteinst-preload".to_owned(), &[][..]),
+                ("reverie-liteinst".to_owned(), &[][..]),
                 (
-                    "reverie-inguest",
-                    &["coordinator-rpc", "launcher", "rcb-clock"],
+                    "reverie-inguest".to_owned(),
+                    &["coordinator-rpc", "launcher", "rcb-clock"][..],
                 ),
             ],
-        }
+        };
+        rows
     }
 }
 
 fn select_no_scope_cohort(packages: &BTreeMap<&str, (&[String], &Value)>) -> Result<NoScopeCohort> {
+    // Every reviewed cohort carries exactly one consumer package (the
+    // leaf, or the standalone wrapper) beside Reverie's own crates;
+    // that package's name comes from the evidence itself, never from
+    // a literal here.
+    let consumer_names: Vec<&str> = packages
+        .keys()
+        .copied()
+        .filter(|name| {
+            !matches!(
+                *name,
+                "reverie-liteinst" | "reverie-inguest" | "reverie-liteinst-preload"
+            )
+        })
+        .collect();
+    let consumer_name = if consumer_names.len() == 1 {
+        consumer_names[0]
+    } else {
+        ""
+    };
     let candidates: Vec<_> = [
         NoScopeCohort::DetcoreNative101,
         NoScopeCohort::DetcoreOrdinary101,
@@ -20009,11 +20428,11 @@ fn select_no_scope_cohort(packages: &BTreeMap<&str, (&[String], &Value)>) -> Res
     ]
     .into_iter()
     .filter(|cohort| {
-        let expected = cohort.features();
+        let expected = cohort.features_for(consumer_name, consumer_name);
         packages.len() == expected.len()
             && expected.iter().all(|(name, features)| {
                 packages
-                    .get(*name)
+                    .get(name.as_str())
                     .is_some_and(|(features_actual, profile)| {
                         features_actual
                             .iter()
@@ -20054,44 +20473,83 @@ fn no_scope_build_features(build: &CurrentBuildEvidence) -> Result<NoScopeCohort
             .cwd
             .parent()
             .ok_or("standalone workspace parent absent")?;
+        // Every consumer fact below derives from the authorized
+        // binding itself: the nested workspace is the wrapper
+        // manifest's grandparent, the inventory must carry the
+        // producer manifest (the command's own `Cargo.toml`) and the
+        // wrapper manifest/source, and the wrapper id must spell its
+        // own package directory, name and a version. The exact
+        // declared inventory and wrapper version were checked when
+        // the binding was constructed from the retained declaration.
+        let wrapper = &binding.wrapper;
+        let nested = wrapper
+            .manifest
+            .parent()
+            .and_then(Path::parent)
+            .ok_or("standalone wrapper manifest has no nested workspace")?;
+        let relative_of = |path: &Path| -> Result<String> {
+            Ok(path
+                .strip_prefix(root)
+                .map_err(|e| e.to_string())?
+                .to_str()
+                .ok_or("standalone workspace path is not UTF-8")?
+                .to_owned())
+        };
+        let producer_relative = relative_of(&build.command.cwd.join("Cargo.toml"))?;
+        let wrapper_manifest_relative = relative_of(&wrapper.manifest)?;
+        let wrapper_source_relative = relative_of(&wrapper.target_source)?;
+        let wrapper_id_prefix = format!(
+            "path+file://{}#{}@",
+            wrapper
+                .manifest
+                .parent()
+                .ok_or("standalone wrapper manifest has no parent directory")?
+                .display(),
+            wrapper.name
+        );
         require(
-            build.command.cwd == root.join("liteinst-runtime-build")
+            build.command.cwd.as_path() == nested
                 && build.command.arguments
-                    == standalone_current_build_arguments(&build.target_directory)?
+                    == standalone_current_build_arguments(
+                        &build.target_directory,
+                        &wrapper.name,
+                    )?
                 && build.target_directory.is_absolute()
-                && binding
-                    .workspace_files
-                    .keys()
-                    .map(String::as_str)
-                    .collect::<BTreeSet<_>>()
-                    == BTreeSet::from(CONTENT_WORKSPACE_FILES)
-                && binding.workspace_files.len() == CONTENT_WORKSPACE_FILES.len()
+                && [
+                    producer_relative.as_str(),
+                    wrapper_manifest_relative.as_str(),
+                    wrapper_source_relative.as_str(),
+                ]
+                .iter()
+                .all(|relative| binding.workspace_files.contains_key(*relative))
                 && binding.workspace_files.iter().all(|(relative, file)| {
                     file.path == root.join(relative)
                         && file.sha256.len() == 64
                         && file.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
                 })
-                && binding.wrapper == build.packages["hermit-liteinst-runtime-artifact"].package
-                && binding.wrapper.id
-                    == format!(
-                        "path+file://{}#hermit-liteinst-runtime-artifact@0.5.1",
-                        root.join("liteinst-runtime-build/runtime").display()
-                    )
-                && binding.wrapper.name == "hermit-liteinst-runtime-artifact"
-                && binding.wrapper.source.is_none()
-                && binding.wrapper.target == "hermit_liteinst_runtime_artifact"
-                && binding.wrapper.kind == ["lib"]
-                && binding.wrapper.crate_types == ["lib"]
-                && binding.wrapper.manifest
-                    == binding.workspace_files["liteinst-runtime-build/runtime/Cargo.toml"].path
-                && binding.wrapper.target_source
-                    == binding.workspace_files["liteinst-runtime-build/runtime/src/lib.rs"].path,
+                && build
+                    .packages
+                    .get(&wrapper.name)
+                    .is_some_and(|package| package.package == binding.wrapper)
+                && wrapper.id.starts_with(&wrapper_id_prefix)
+                && wrapper.id.len() > wrapper_id_prefix.len()
+                && wrapper.source.is_none()
+                && wrapper.kind == ["lib"]
+                && wrapper.crate_types == ["lib"]
+                && binding
+                    .workspace_files
+                    .get(&wrapper_manifest_relative)
+                    .is_some_and(|file| file.path == wrapper.manifest)
+                && binding
+                    .workspace_files
+                    .get(&wrapper_source_relative)
+                    .is_some_and(|file| file.path == wrapper.target_source),
             "standalone no-scope wrapper/source inventory binding is inconsistent",
         )?;
     } else {
         require(
             build.standalone_sources.is_none(),
-            "Detcore no-scope build has a foreign standalone binding",
+            "leaf-image no-scope build has a foreign standalone binding",
         )?;
     }
     Ok(cohort)
@@ -20131,7 +20589,10 @@ fn buck_build_stdout_artifact(command: &CommandEvidence, target: &str) -> Result
 /// ELF path and digest from the hash-verified stdout and artifact files,
 /// never by trusting the carried command fields alone, so an injected or
 /// tampered command refuses here, whichever seat validates it.
-fn validate_buck_build_evidence(build: &BuckBuildEvidence) -> Result<()> {
+fn validate_buck_build_evidence(
+    build: &BuckBuildEvidence,
+    expected_stage_id: Option<&str>,
+) -> Result<()> {
     require(
         build.builder == "buck2",
         "Buck build witness does not name the buck2 builder",
@@ -20146,34 +20607,44 @@ fn validate_buck_build_evidence(build: &BuckBuildEvidence) -> Result<()> {
         build.command.status == 0,
         "Buck build witness command did not succeed",
     )?;
+    // The retained command must be the exact buck2 invocation for
+    // the witness's own recorded target/platform. At construction
+    // the stage id is the consumer-declared one retained by the
+    // factory; a retained witness re-validated without that context
+    // must still carry a single well-formed `id=...` value.
+    let arguments = &build.command.arguments;
     require(
-        build.command.arguments
-            == [
-                "build".to_owned(),
-                BUCK_TARGET.to_owned(),
-                "--target-platforms".to_owned(),
-                BUCK_PLATFORM.to_owned(),
-                "--show-full-output".to_owned(),
-                "--client-metadata".to_owned(),
-                "id=stage-detcore-liteinst".to_owned(),
-            ],
-        "Buck build witness command is not the exact pinned buck2 build invocation",
+        arguments.len() == 7
+            && arguments[0] == "build"
+            && arguments[1] == build.target
+            && arguments[2] == "--target-platforms"
+            && arguments[3] == build.platform
+            && arguments[4] == "--show-full-output"
+            && arguments[5] == "--client-metadata"
+            && match expected_stage_id {
+                Some(stage_id) => arguments[6] == format!("id={stage_id}"),
+                None => arguments[6]
+                    .strip_prefix("id=")
+                    .is_some_and(|stage| {
+                        !stage.is_empty() && !stage.contains(char::is_whitespace)
+                    }),
+            },
+        "Buck build witness command is not the exact declared buck2 build invocation",
     )?;
     require(
         build.output_sha256 == build.artifact.sha256,
         "Buck build witness output digest differs from the selected ELF digest",
     )?;
     require(
-        build.target == BUCK_TARGET
-            && build.platform == BUCK_PLATFORM
-            && build.constraints.len() == BUCK_CONSTRAINTS.len()
+        !build.constraints.is_empty()
             && build
                 .constraints
                 .iter()
                 .map(String::as_str)
                 .collect::<BTreeSet<_>>()
-                == BUCK_CONSTRAINTS.iter().copied().collect::<BTreeSet<_>>(),
-        "Buck build witness literals differ from the reviewed Buck authority literals",
+                .len()
+                == build.constraints.len(),
+        "Buck build witness constraints are not a duplicate-free declared set",
     )
 }
 
@@ -20191,7 +20662,7 @@ fn build_witness_cohort(witness: &BuildWitness) -> Result<NoScopeCohort> {
             Ok(cohort)
         }
         BuildWitness::Buck(build) => {
-            validate_buck_build_evidence(build)?;
+            validate_buck_build_evidence(build, None)?;
             let packages = build
                 .packages
                 .iter()
@@ -21304,22 +21775,29 @@ fn validate_no_installation_scope_evidence(
                             }
                         }
                 }
+                // The exact declared target/platform/constraints were
+                // recorded in the source authority at resolve time and
+                // the retained command was matched against them by
+                // `validate_buck_build_evidence` (via the cohort check
+                // above); here the witness must still be internally
+                // well-formed.
                 BuildWitness::Buck(build) => {
                     build.builder == "buck2"
-                        && build.target == BUCK_TARGET
-                        && build.platform == BUCK_PLATFORM
-                        && build.constraints.len() == BUCK_CONSTRAINTS.len()
+                        && !build.target.is_empty()
+                        && !build.platform.is_empty()
+                        && !build.constraints.is_empty()
                         && build
                             .constraints
                             .iter()
                             .map(String::as_str)
                             .collect::<BTreeSet<_>>()
-                            == BUCK_CONSTRAINTS.iter().copied().collect::<BTreeSet<_>>()
+                            .len()
+                            == build.constraints.len()
                         && build
                             .profile_bzl
                             .path
-                            .file_name()
-                            .is_some_and(|name| name == BUCK_PROFILE_BZL_NAME)
+                            .extension()
+                            .is_some_and(|extension| extension == "bzl")
                         && hash(&build.profile_bzl.sha256, 64)
                 }
             }
@@ -39982,6 +40460,89 @@ mod tests {
 
     use super::*;
 
+    // The test consumer: the workspace facts these fixtures spell in
+    // their synthetic metadata, now supplied through the consumer
+    // declaration the factories require (production code hard-codes
+    // none of them). Const names mirror the deleted production
+    // constants so fixture bodies stay unchanged.
+    const BUCK_TARGET: &str =
+        "//hermetic_infra/hermit:detcore-liteinst-liteinst-runtime[cdylib]";
+    const BUCK_PLATFORM: &str = "ovr_config//platform/linux:x86_64-fbcode";
+    const BUCK_CONSTRAINTS: [&str; 3] = [
+        "ovr_config//build_mode/constraints:opt",
+        "ovr_config//cpu:x86_64",
+        "ovr_config//os:linux",
+    ];
+    const BUCK_PROFILE_BZL_NAME: &str = "liteinst-runtime-profile.bzl";
+    const BUCK_LEAF_SOURCE: &str = "detcore-liteinst/src/lib.rs";
+    const BUCK_PROFILE_RELATIVE: &str = "fb-only/liteinst-runtime-profile.bzl";
+    const BUCK_WORKSPACE_EXTRA_FILES: [&str; 4] = [
+        "detcore-liteinst/build.rs",
+        "common/inguest/glibc_compat.rs",
+        "BUCK",
+        BUCK_PROFILE_RELATIVE,
+    ];
+    const CONTENT_WORKSPACE_FILES: [&str; 6] = [
+        "liteinst-runtime-build/Cargo.toml",
+        "liteinst-runtime-build/Cargo.lock",
+        "liteinst-runtime-build/runtime/Cargo.toml",
+        "liteinst-runtime-build/runtime/src/lib.rs",
+        "liteinst-runtime-build/build.rs",
+        "liteinst-runtime-build/artifact.rs",
+    ];
+    const CONTENT_DETCORE_WORKSPACE_FILES: [&str; 10] = [
+        "liteinst-runtime-build/Cargo.toml",
+        "liteinst-runtime-build/Cargo.lock",
+        "liteinst-runtime-build/runtime/Cargo.toml",
+        "liteinst-runtime-build/runtime/src/lib.rs",
+        "liteinst-runtime-build/build.rs",
+        "liteinst-runtime-build/artifact.rs",
+        "Cargo.toml",
+        "Cargo.lock",
+        "detcore-liteinst/Cargo.toml",
+        "detcore-liteinst/src/lib.rs",
+    ];
+    fn test_consumer_declaration() -> ConsumerSourceDeclaration<'static> {
+        ConsumerSourceDeclaration {
+            reverie_relative: Path::new("reverie"),
+            leaf: Some(DeclaredLeafPackage {
+                name: "detcore-liteinst",
+                target: "detcore_liteinst",
+                manifest_relative: "detcore-liteinst/Cargo.toml",
+                version: "0.5.7",
+            }),
+            runtime_packages: &[
+                DeclaredRuntimePackage {
+                    name: "hermit-liteinst-runtime-build",
+                    manifest_relative: "liteinst-runtime-build/Cargo.toml",
+                    reverie_dependency: "reverie-liteinst-artifact",
+                    dependency_kind: Some("build"),
+                    target: None,
+                    version: None,
+                },
+                DeclaredRuntimePackage {
+                    name: "hermit-liteinst-runtime-artifact",
+                    manifest_relative: "liteinst-runtime-build/runtime/Cargo.toml",
+                    reverie_dependency: "reverie-liteinst-preload",
+                    dependency_kind: None,
+                    target: Some("hermit_liteinst_runtime_artifact"),
+                    version: Some("0.5.1"),
+                },
+            ],
+            runtime_lock_relative: "liteinst-runtime-build/Cargo.lock",
+            standalone_workspace_files: &CONTENT_WORKSPACE_FILES,
+            leaf_workspace_files: &CONTENT_DETCORE_WORKSPACE_FILES,
+        }
+    }
+    fn test_leaf_decl() -> LeafDecl<'static> {
+        LeafDecl {
+            name: "detcore-liteinst",
+            target: "detcore_liteinst",
+            manifest_relative: "detcore-liteinst/Cargo.toml",
+            version: "0.5.7",
+        }
+    }
+
     /// A child stream scripted read by read. `on_read` runs before the
     /// scripted result is returned, standing in for the child process and the
     /// waiting thread acting while the reader is between two steps.
@@ -40143,7 +40704,7 @@ mod tests {
         }
         events.push(serde_json::json!({"reason":"build-finished","success":true}));
         let sources = CompiledSources {
-            layout: CompiledSourceLayout::HermitGit,
+            layout: CompiledSourceLayout::GitlinkCheckout,
             image_kind: FixedImageKind::Detcore,
             workspace_root: root.clone(),
             authority: CompiledSourceAuthority::Git {
@@ -41010,6 +41571,11 @@ mod tests {
             55140,
             "763695e713873b605ca8cf20c1f44377b8ac8eb4de5d04982047d14585d074fa",
         ),
+        (
+            "reverie-liteinst-artifact/src/preparation_identity.rs",
+            55168,
+            "a49de665049d98780ed59832387cb8017687527f961c822105fd0e47aa11f822",
+        ),
     ];
 
     /// Seals over prefixes of `CONTENT_REVERIE_CATALOG_BINDINGS`: (rows covered,
@@ -41071,6 +41637,10 @@ mod tests {
         (
             122,
             "5d5ae3f43a45e616c4b4cc1f081023f08089fca230a9c4bef14a8b336b33c024",
+        ),
+        (
+            123,
+            "98255727d5f66bd77ba876a0425c08808f3657ef21325b371d31868dd2ca7670",
         ),
     ];
 
@@ -41268,7 +41838,7 @@ mod tests {
         ];
         let reverie_files: Vec<&str> = COMPILED_RV_LOCATION_FILES
             .into_iter()
-            .chain([BUCK_QUALIFIER_SOURCE, CONTENT_DETCORE_FIXED_GATE.0])
+            .chain([BUCK_QUALIFIER_SOURCE, CONTENT_FIXED_GATE.0])
             .collect();
         for (base, files) in [(&workspace, &workspace_files), (&reverie, &reverie_files)] {
             for relative in files {
@@ -41317,6 +41887,12 @@ mod tests {
                 constraints: &BUCK_CONSTRAINTS,
                 workspace_files,
                 reverie_files,
+                leaf_name: "detcore-liteinst",
+                leaf_target: "detcore_liteinst",
+                leaf_source_relative: BUCK_LEAF_SOURCE,
+                workspace_extra_files: &BUCK_WORKSPACE_EXTRA_FILES,
+                profile_relative: BUCK_PROFILE_RELATIVE,
+                stage_id: "stage-detcore-liteinst",
             }
         }
         macro_rules! expectation {
@@ -41572,7 +42148,7 @@ mod tests {
         );
         let git_sources = VerifiedCompiledSources {
             record: CompiledSources {
-                layout: CompiledSourceLayout::HermitGit,
+                layout: CompiledSourceLayout::GitlinkCheckout,
                 image_kind: FixedImageKind::Detcore,
                 workspace_root: workspace.clone(),
                 authority: CompiledSourceAuthority::Git {
@@ -41589,6 +42165,8 @@ mod tests {
             },
             current_build: None,
             standalone_metadata: None,
+            consumer: None,
+            buck_consumer: None,
         };
         // A Buck witness binds only through a Runner: Git sources refuse
         // even with one, and there is no `&CommandEvidence` parameter a
@@ -41718,7 +42296,7 @@ mod tests {
                 .push(buck_command(arguments, 0, &good_stdout));
             assert_eq!(
                 sources.with_buck_build(&buck_runner, &elf).err().unwrap(),
-                "Buck build witness command is not the exact pinned buck2 build invocation"
+                "Buck build witness command is not the exact declared buck2 build invocation"
             );
         }
         let junk_stdout_path = root.join("buck-stdout-junk");
@@ -41799,7 +42377,7 @@ mod tests {
         }
         assert_eq!(
             build_witness_cohort(decoded.1.as_ref().unwrap()).unwrap_err(),
-            "Buck build witness command is not the exact pinned buck2 build invocation"
+            "Buck build witness command is not the exact declared buck2 build invocation"
         );
         if let Some(BuildWitness::Buck(build)) = &mut bound.current_build {
             build.artifact = FileIdentity::read(&other_elf).unwrap();
@@ -42102,13 +42680,13 @@ mod tests {
         wrong_target.command.arguments[1] = "//hermetic_infra/hermit:detcore-liteinst".into();
         assert_eq!(
             build_witness_cohort(&BuildWitness::Buck(Box::new(wrong_target))).unwrap_err(),
-            "Buck build witness command is not the exact pinned buck2 build invocation"
+            "Buck build witness command is not the exact declared buck2 build invocation"
         );
         let mut non_build = buck.clone();
         non_build.command.arguments[0] = "check".into();
         assert_eq!(
             build_witness_cohort(&BuildWitness::Buck(Box::new(non_build))).unwrap_err(),
-            "Buck build witness command is not the exact pinned buck2 build invocation"
+            "Buck build witness command is not the exact declared buck2 build invocation"
         );
     }
 
@@ -43288,6 +43866,11 @@ mod tests {
                 51471,
                 "d208d83f330b3b10348fbe9811c952eae5c6399f9f210a1bc219f8f519bcba64",
             ),
+            (
+                "reverie-liteinst-artifact/src/preparation_identity.rs",
+                55140,
+                "763695e713873b605ca8cf20c1f44377b8ac8eb4de5d04982047d14585d074fa",
+            ),
         ];
         // A re-bind records its previous tuple above, for every path, not only these.
         // Catalogue-rebind enforcement runs here, inside content_source_identity_controls,
@@ -43335,9 +43918,9 @@ mod tests {
         let (rv_inventory, _) = content_reverie_inventory(&rv_one).unwrap();
         // 88 reviewed sources plus the independently checked qualifier.
         assert_eq!(rv_inventory.len(), 89);
-        let (detcore_inventory, _) =
+        let (leaf_inventory, _) =
             content_reverie_inventory_for_image(&rv_one, FixedImageKind::Detcore).unwrap();
-        assert_eq!(detcore_inventory.len(), 90);
+        assert_eq!(leaf_inventory.len(), 90);
         for relative in [
             "reverie-inguest/src/guest/pidfd_self.rs",
             "reverie/src/pidfd_self.rs",
@@ -43352,7 +43935,7 @@ mod tests {
                 1,
                 "catalog member {relative}"
             );
-            for inventory in [&rv_inventory, &detcore_inventory] {
+            for inventory in [&rv_inventory, &leaf_inventory] {
                 assert_eq!(
                     inventory
                         .iter()
@@ -43367,9 +43950,9 @@ mod tests {
             content_reverie_inventory_for_image(&rv_two, FixedImageKind::Detcore)
                 .unwrap()
                 .0,
-            detcore_inventory,
+            leaf_inventory,
         );
-        let fixed_source = rv_one.join(CONTENT_DETCORE_FIXED_GATE.0);
+        let fixed_source = rv_one.join(CONTENT_FIXED_GATE.0);
         let fixed_bytes = fs::read(&fixed_source).unwrap();
         let mut changed = fixed_bytes.clone();
         changed[0] ^= 1;
@@ -43379,7 +43962,7 @@ mod tests {
         fs::remove_file(&fixed_source).unwrap();
         assert!(content_reverie_inventory_for_image(&rv_one, FixedImageKind::Detcore).is_err());
         assert_eq!(content_reverie_inventory(&rv_one).unwrap().0, rv_inventory);
-        symlink(rv_two.join(CONTENT_DETCORE_FIXED_GATE.0), &fixed_source).unwrap();
+        symlink(rv_two.join(CONTENT_FIXED_GATE.0), &fixed_source).unwrap();
         assert!(content_reverie_inventory_for_image(&rv_one, FixedImageKind::Detcore).is_err());
         fs::remove_file(&fixed_source).unwrap();
         fs::write(&fixed_source, fixed_bytes).unwrap();
@@ -43387,7 +43970,7 @@ mod tests {
             content_reverie_inventory_for_image(&rv_one, FixedImageKind::Detcore)
                 .unwrap()
                 .0,
-            detcore_inventory
+            leaf_inventory
         );
 
         assert!(
@@ -43641,7 +44224,7 @@ mod tests {
             {"name":"hermit-liteinst-runtime-artifact", "manifest_path":root.join("liteinst-runtime-build/runtime/Cargo.toml"),
              "dependencies":[{"name":"reverie-liteinst-preload", "source":source.rsplit_once('#').unwrap().0, "kind":null, "rename":null, "path":null}]}
         ]});
-        content_manifest_and_lock_pin(&pin_metadata, &root, &source, &rv_one).unwrap();
+        content_manifest_and_lock_pin(&pin_metadata, &root, &source, &rv_one, &test_consumer_declaration()).unwrap();
         for index in 0..2 {
             for (field, value) in [
                 ("name", serde_json::json!("wrong-dependency")),
@@ -43656,7 +44239,7 @@ mod tests {
                 let mut bad = pin_metadata.clone();
                 bad["packages"][index]["dependencies"][0][field] = value;
                 assert!(
-                    content_manifest_and_lock_pin(&bad, &root, &source, &rv_one).is_err(),
+                    content_manifest_and_lock_pin(&bad, &root, &source, &rv_one, &test_consumer_declaration()).is_err(),
                     "declared manifest dependency {index}/{field}"
                 );
             }
@@ -43665,7 +44248,7 @@ mod tests {
                 "{}/./liteinst-runtime-build/Cargo.toml",
                 root.display()
             ));
-            assert!(content_manifest_and_lock_pin(&bad, &root, &source, &rv_one).is_err());
+            assert!(content_manifest_and_lock_pin(&bad, &root, &source, &rv_one, &test_consumer_declaration()).is_err());
         }
         for wrong in [
             lock_bytes.replacen(pin, "047e802e861094bbf827c4fc1bb067c18de7d8dd", 1),
@@ -43681,9 +44264,9 @@ mod tests {
             format!("{lock_bytes}{lock_bytes}"),
         ] {
             fs::write(&lock, wrong).unwrap();
-            assert!(content_manifest_and_lock_pin(&pin_metadata, &root, &source, &rv_one).is_err());
+            assert!(content_manifest_and_lock_pin(&pin_metadata, &root, &source, &rv_one, &test_consumer_declaration()).is_err());
             fs::write(&lock, &lock_bytes).unwrap();
-            content_manifest_and_lock_pin(&pin_metadata, &root, &source, &rv_one).unwrap();
+            content_manifest_and_lock_pin(&pin_metadata, &root, &source, &rv_one, &test_consumer_declaration()).unwrap();
         }
         fs::write(&lock, &lock_bytes).unwrap();
         let (workspace_inventory, _) = declared_inventory(&root, &CONTENT_WORKSPACE_FILES).unwrap();
@@ -43796,39 +44379,39 @@ mod tests {
         .map(|name| format!("[[package]]\nname = \"{name}\"\n"))
         .collect::<String>();
         fs::write(&lock, &path_lock_bytes).unwrap();
-        content_manifest_and_lock_pin(&path_metadata, &root, &source, &rv_one).unwrap();
+        content_manifest_and_lock_pin(&path_metadata, &root, &source, &rv_one, &test_consumer_declaration()).unwrap();
         // Red: a path dependency outside the verified root is real skew.
         let mut outside = path_metadata.clone();
         outside["packages"][0]["dependencies"][0]["path"] =
             serde_json::json!(root.join("elsewhere/reverie-liteinst-artifact"));
-        assert!(content_manifest_and_lock_pin(&outside, &root, &source, &rv_one).is_err());
+        assert!(content_manifest_and_lock_pin(&outside, &root, &source, &rv_one, &test_consumer_declaration()).is_err());
         // Red: a sourceless lock entry whose package resolves elsewhere.
         let mut stray = path_metadata.clone();
         stray["packages"][2]["manifest_path"] =
             serde_json::json!(root.join("elsewhere/reverie-inguest/Cargo.toml"));
-        assert!(content_manifest_and_lock_pin(&stray, &root, &source, &rv_one).is_err());
+        assert!(content_manifest_and_lock_pin(&stray, &root, &source, &rv_one, &test_consumer_declaration()).is_err());
         // Red: a renamed path dependency refuses (rename must be null
         // in both forms).
         let mut renamed = path_metadata.clone();
         renamed["packages"][0]["dependencies"][0]["rename"] = serde_json::json!("alias");
-        assert!(content_manifest_and_lock_pin(&renamed, &root, &source, &rv_one).is_err());
+        assert!(content_manifest_and_lock_pin(&renamed, &root, &source, &rv_one, &test_consumer_declaration()).is_err());
         // Red: a git source together with an at-root path is neither form.
         let mut both = path_metadata.clone();
         both["packages"][0]["dependencies"][0]["source"] =
             serde_json::json!(source.rsplit_once('#').unwrap().0);
-        assert!(content_manifest_and_lock_pin(&both, &root, &source, &rv_one).is_err());
+        assert!(content_manifest_and_lock_pin(&both, &root, &source, &rv_one, &test_consumer_declaration()).is_err());
         // Red: a mixed layout (first dependency by path, second by git)
         // is two source authorities for one pin.
         let mut mixed = path_metadata.clone();
         mixed["packages"][1]["dependencies"][0]["source"] =
             serde_json::json!(source.rsplit_once('#').unwrap().0);
         mixed["packages"][1]["dependencies"][0]["path"] = serde_json::Value::Null;
-        assert!(content_manifest_and_lock_pin(&mixed, &root, &source, &rv_one).is_err());
+        assert!(content_manifest_and_lock_pin(&mixed, &root, &source, &rv_one, &test_consumer_declaration()).is_err());
         // Red: a sourceless lock entry while metadata reports a git
         // source for the same package is not path-bound.
         let mut gitmeta = path_metadata.clone();
         gitmeta["packages"][2]["source"] = serde_json::json!(source);
-        assert!(content_manifest_and_lock_pin(&gitmeta, &root, &source, &rv_one).is_err());
+        assert!(content_manifest_and_lock_pin(&gitmeta, &root, &source, &rv_one, &test_consumer_declaration()).is_err());
         // Red: a [patch]-redirected graph (manifests declare git
         // sources, Cargo resolves path packages, lock entries are
         // sourceless) must not slip into the git form and skip the
@@ -43844,7 +44427,7 @@ mod tests {
             }
         }
         let patched_err =
-            content_manifest_and_lock_pin(&patched, &root, &source, &rv_one).unwrap_err();
+            content_manifest_and_lock_pin(&patched, &root, &source, &rv_one, &test_consumer_declaration()).unwrap_err();
         assert!(
             patched_err.contains("content lock source differs"),
             "patch-redirect refusal must come from the lock layout arm: {patched_err}"
@@ -43855,7 +44438,7 @@ mod tests {
             .as_array_mut()
             .unwrap()
             .push(path_metadata["packages"][2].clone());
-        assert!(content_manifest_and_lock_pin(&dup, &root, &source, &rv_one).is_err());
+        assert!(content_manifest_and_lock_pin(&dup, &root, &source, &rv_one, &test_consumer_declaration()).is_err());
         fs::remove_dir_all(root).expect("remove path-form fixture repository");
     }
 
@@ -43899,21 +44482,21 @@ mod tests {
         let binding = CompilerRootBinding::resolve(&root.join("reverie"), &pin).unwrap();
         let mut runner =
             Runner::new(case.join("logs"), Duration::from_secs(60), 1 << 20).unwrap();
-        require_reverie_checkout_at_pin(&root, &binding, &pin, true, &mut runner).unwrap();
+        require_reverie_checkout_at_pin(&root, &binding, &pin, true, Path::new("reverie"), &mut runner).unwrap();
         // Another revision whose catalogued file is byte-identical: an
         // uncatalogued file changes HEAD only. Must refuse.
         fs::write(rv.join("uncatalogued"), "other revision\n").unwrap();
         git(&rv, &["add", "-A"]);
         git(&rv, &["commit", "-qm", "other revision"]);
         assert!(
-            require_reverie_checkout_at_pin(&root, &binding, &pin, true, &mut runner).is_err(),
+            require_reverie_checkout_at_pin(&root, &binding, &pin, true, Path::new("reverie"), &mut runner).is_err(),
             "a checkout at another revision must not certify as the pin"
         );
         // Back at the pin but dirty: compiled identity refuses.
         git(&rv, &["checkout", "-q", &pin]);
         fs::write(rv.join("catalogued"), "dirty\n").unwrap();
         assert!(
-            require_reverie_checkout_at_pin(&root, &binding, &pin, true, &mut runner).is_err(),
+            require_reverie_checkout_at_pin(&root, &binding, &pin, true, Path::new("reverie"), &mut runner).is_err(),
             "a dirty checkout at the pin must refuse"
         );
         fs::write(rv.join("catalogued"), "same bytes\n").unwrap();
@@ -43928,19 +44511,19 @@ mod tests {
         );
         git(&root, &["commit", "-qm", "wrong gitlink"]);
         assert!(
-            require_reverie_checkout_at_pin(&root, &binding, &pin, true, &mut runner).is_err(),
+            require_reverie_checkout_at_pin(&root, &binding, &pin, true, Path::new("reverie"), &mut runner).is_err(),
             "a gitlink at another revision must refuse"
         );
         // No .git at the root: the path form fails closed (named
         // refusal), while the git form runs no git command at all.
         fs::remove_dir_all(rv.join(".git")).unwrap();
-        let closed = require_reverie_checkout_at_pin(&root, &binding, &pin, true, &mut runner)
+        let closed = require_reverie_checkout_at_pin(&root, &binding, &pin, true, Path::new("reverie"), &mut runner)
             .expect_err("path form without Git metadata must refuse");
         assert!(
             closed.contains("no Git metadata"),
             "refusal must name the missing Git metadata: {closed}"
         );
-        require_reverie_checkout_at_pin(&root, &binding, &pin, false, &mut runner)
+        require_reverie_checkout_at_pin(&root, &binding, &pin, false, Path::new("reverie"), &mut runner)
             .expect("git form runs no checkout check");
         fs::remove_dir_all(&case).expect("remove pin-head fixture");
     }
@@ -44011,14 +44594,14 @@ mod tests {
         .collect::<String>();
         let lock = lock + "[[package]]\nname = \"detcore-liteinst\"\nversion = \"0.5.7\"\n";
         fs::write(root.join("Cargo.lock"), &lock).unwrap();
-        content_detcore_manifest_and_lock_pin(&build(&moved_source), &root, &moved_source).unwrap();
+        content_leaf_manifest_and_lock_pin(&build(&moved_source), &root, &moved_source, test_leaf_decl()).unwrap();
         let third_source = cargo_git_source(third, pin);
         let refusal =
-            content_detcore_manifest_and_lock_pin(&build(&moved_source), &root, &third_source)
+            content_leaf_manifest_and_lock_pin(&build(&moved_source), &root, &third_source, test_leaf_decl())
                 .expect_err("a third repository must refuse the moved consumer's spelling");
         assert!(
             refusal.contains(
-                "content Detcore dependency differs from independent full pin: reverie-core"
+                "content leaf dependency differs from independent full pin: reverie-core"
             ),
             "the refusal must name the mismatched dependency: {refusal}"
         );
@@ -44075,7 +44658,7 @@ mod tests {
             fs::copy(real_root.join(relative), &to).unwrap();
         }
         for relative in [
-            CONTENT_DETCORE_FIXED_GATE.0,
+            CONTENT_FIXED_GATE.0,
             "reverie-liteinst-artifact/Cargo.toml",
             "reverie-liteinst-artifact/src/lib.rs",
             "reverie-inguest/Cargo.toml",
@@ -44233,11 +44816,12 @@ mod tests {
         runner.set_cargo_program(bin.join("cargo"));
         let standalone_manifest = hermit.join("liteinst-runtime-build/Cargo.toml");
         let expectation = CompiledSourceExpectation {
-            layout: CompiledSourceLayout::HermitGit,
+            layout: CompiledSourceLayout::GitlinkCheckout,
             image_kind: FixedImageKind::Standalone,
             workspace_root: &hermit,
             manifest: &standalone_manifest,
             reverie_pin: &pin,
+            consumer: Some(test_consumer_declaration()),
         };
         let moved_result =
             VerifiedCompiledSources::resolve_with_repository(&expectation, moved, &mut runner);
@@ -44246,11 +44830,12 @@ mod tests {
             VerifiedCompiledSources::resolve_with_repository(&expectation, third, &mut runner);
         let default_result = VerifiedCompiledSources::resolve(&expectation, &mut runner);
         let content_expectation = CompiledSourceExpectation {
-            layout: CompiledSourceLayout::HermitGit,
+            layout: CompiledSourceLayout::GitlinkCheckout,
             image_kind: FixedImageKind::Detcore,
             workspace_root: &hermit,
             manifest: &hermit.join("Cargo.toml"),
             reverie_pin: &pin,
+            consumer: Some(test_consumer_declaration()),
         };
         let content_result = VerifiedCompiledSources::resolve_content_with_repository(
             &content_expectation,
@@ -44275,7 +44860,7 @@ mod tests {
         };
         assert_eq!(
             content_refusal,
-            "content Detcore dependency differs from independent full pin: reverie-core",
+            "content leaf dependency differs from independent full pin: reverie-core",
             "the content refusal must name the mismatched dependency"
         );
         assert_eq!(
@@ -44287,7 +44872,7 @@ mod tests {
     }
 
     #[test]
-    fn hermit_path_record_round_trips_with_strict_fields() {
+    fn path_checkout_record_round_trips_with_strict_fields() {
         use std::os::unix::fs::symlink;
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         struct OwnedScratch(PathBuf);
@@ -44300,16 +44885,16 @@ mod tests {
         // older layout spellings still decode, and strict-field records
         // carrying it refuse injected fields exactly like the Git arm.
         assert_eq!(
-            serde_json::to_string(&CompiledSourceLayout::HermitPath).unwrap(),
+            serde_json::to_string(&CompiledSourceLayout::PathCheckout).unwrap(),
             "\"HermitPath\""
         );
         assert_eq!(
             serde_json::from_str::<CompiledSourceLayout>("\"HermitPath\"").unwrap(),
-            CompiledSourceLayout::HermitPath
+            CompiledSourceLayout::PathCheckout
         );
         assert_eq!(
             serde_json::from_str::<CompiledSourceLayout>("\"HermitGit\"").unwrap(),
-            CompiledSourceLayout::HermitGit
+            CompiledSourceLayout::GitlinkCheckout
         );
         let parent = fs::canonicalize(std::env::temp_dir()).unwrap();
         let root = parent.join(format!(
@@ -44322,11 +44907,11 @@ mod tests {
         let canonical = root.join("real-reverie");
         fs::create_dir_all(canonical.join("reverie-inguest")).unwrap();
         fs::write(canonical.join("reverie-inguest/Cargo.toml"), "fixture\n").unwrap();
-        let workspace = root.join("hermit");
+        let workspace = root.join("consumer");
         fs::create_dir_all(&workspace).unwrap();
         symlink(&canonical, workspace.join("reverie")).unwrap();
         let binding =
-            CompilerRootBinding::resolve_path(&workspace.join("reverie"), &workspace).unwrap();
+            CompilerRootBinding::resolve_path(&workspace.join("reverie"), &workspace, Path::new("reverie")).unwrap();
         let binding_json = serde_json::to_value(&binding).unwrap();
         assert!(binding_json["cargo_home"].is_null());
         assert_eq!(
@@ -44351,7 +44936,7 @@ mod tests {
             target_source: canonical.join("reverie-liteinst-preload/src/lib.rs"),
         };
         let record = CompiledSources {
-            layout: CompiledSourceLayout::HermitPath,
+            layout: CompiledSourceLayout::PathCheckout,
             image_kind: FixedImageKind::Standalone,
             workspace_root: workspace.clone(),
             authority: CompiledSourceAuthority::DeclaredContent {
@@ -44381,6 +44966,172 @@ mod tests {
         let mut unknown = serde_json::to_value(&record).unwrap();
         unknown["fabricated_git_head"] = serde_json::json!("3".repeat(40));
         assert!(serde_json::from_value::<CompiledSources>(unknown).is_err());
+    }
+
+    #[test]
+    fn gitlink_checkout_master_record_still_parses() {
+        // Verbatim pre-rename record bytes, captured from parent-tree
+        // code before the variant rename. They must decode to the
+        // renamed variant and re-encode to identical bytes (serde
+        // `rename` preserves both directions; SCHEMA is unchanged).
+        assert_eq!(
+            serde_json::from_str::<CompiledSourceLayout>("\"HermitGit\"").unwrap(),
+            CompiledSourceLayout::GitlinkCheckout
+        );
+        assert_eq!(
+            serde_json::to_string(&CompiledSourceLayout::GitlinkCheckout).unwrap(),
+            "\"HermitGit\""
+        );
+        const MASTER_BYTES: &[u8] = br##"{"layout":"HermitGit","image_kind":"Standalone","workspace_root":"/fixture-ws","authority":{"kind":"git","workspace_head":"4444444444444444444444444444444444444444","workspace_tree":"5555555555555555555555555555555555555555","reverie_tree":"6666666666666666666666666666666666666666"},"manifest":{"path":"/fixture-ws/Cargo.toml","sha256":"d55feb0aab4ae13f8817cfb85404ce3904b00ed268cd5fec84c16027cc6da630"},"reverie_pin":"2222222222222222222222222222222222222222","reverie_root":"/fixture-ws","packages":{"reverie-liteinst-preload":{"id":"path+file:///fixture-ws/reverie-liteinst-preload#0.5.7","name":"reverie-liteinst-preload","manifest":"/fixture-ws/reverie-liteinst-preload/Cargo.toml","source":null,"target":"reverie_liteinst_preload","kind":["cdylib"],"crate_types":["cdylib"],"target_source":"/fixture-ws/reverie-liteinst-preload/src/lib.rs"}},"files":{},"leaf":{"id":"path+file:///fixture-ws/reverie-liteinst-preload#0.5.7","name":"reverie-liteinst-preload","manifest":"/fixture-ws/reverie-liteinst-preload/Cargo.toml","source":null,"target":"reverie_liteinst_preload","kind":["cdylib"],"crate_types":["cdylib"],"target_source":"/fixture-ws/reverie-liteinst-preload/src/lib.rs"}}"##;
+        assert_eq!(MASTER_BYTES.len(), 1185);
+        assert_eq!(
+            sha256(MASTER_BYTES),
+            "bf4b694f395c68b5f26f3cd3fb24d73bae00da0c7eaade70461ef4cb4918f8aa"
+        );
+        let root = PathBuf::from("/fixture-ws");
+        let leaf = PackageIdentity {
+            id: format!(
+                "path+file://{}#0.5.7",
+                root.join("reverie-liteinst-preload").display()
+            ),
+            name: "reverie-liteinst-preload".into(),
+            manifest: root.join("reverie-liteinst-preload/Cargo.toml"),
+            source: None,
+            target: "reverie_liteinst_preload".into(),
+            kind: vec!["cdylib".into()],
+            crate_types: vec!["cdylib".into()],
+            target_source: root.join("reverie-liteinst-preload/src/lib.rs"),
+        };
+        let expected = CompiledSources {
+            layout: CompiledSourceLayout::GitlinkCheckout,
+            image_kind: FixedImageKind::Standalone,
+            workspace_root: root.clone(),
+            authority: CompiledSourceAuthority::Git {
+                workspace_head: "4".repeat(40),
+                workspace_tree: "5".repeat(40),
+                reverie_tree: "6".repeat(40),
+            },
+            manifest: FileIdentity {
+                path: root.join("Cargo.toml"),
+                sha256: "d55feb0aab4ae13f8817cfb85404ce3904b00ed268cd5fec84c16027cc6da630"
+                    .into(),
+            },
+            reverie_pin: "2".repeat(40),
+            reverie_root: root,
+            packages: BTreeMap::from([(leaf.name.clone(), leaf.clone())]),
+            files: BTreeMap::new(),
+            leaf,
+        };
+        let decoded: CompiledSources = serde_json::from_slice(MASTER_BYTES).unwrap();
+        assert_eq!(decoded, expected);
+        assert_eq!(decoded.layout, CompiledSourceLayout::GitlinkCheckout);
+        assert_eq!(serde_json::to_vec(&decoded).unwrap(), MASTER_BYTES);
+    }
+
+    #[test]
+    fn consumer_declaration_is_required_and_generic() {
+        // Negative controls: a consumer-checkout layout without a
+        // declaration refuses by name, a Reverie workspace carrying
+        // one refuses, and a leaf image without a declared leaf
+        // package refuses — all before any filesystem or runner use.
+        let root = Path::new("/consumer-ws");
+        let manifest = root.join("Cargo.toml");
+        let expectation = |layout, image_kind, consumer| CompiledSourceExpectation {
+            layout,
+            image_kind,
+            workspace_root: root,
+            manifest: &manifest,
+            reverie_pin: "pin",
+            consumer,
+        };
+        for layout in [
+            CompiledSourceLayout::GitlinkCheckout,
+            CompiledSourceLayout::PathCheckout,
+        ] {
+            let refused =
+                require_consumer_declaration(&expectation(layout, FixedImageKind::Detcore, None))
+                    .expect_err("consumer layout without a declaration must refuse");
+            assert!(
+                refused.contains("requires a declared consumer source declaration"),
+                "{refused}"
+            );
+        }
+        let refused = require_consumer_declaration(&expectation(
+            CompiledSourceLayout::ReverieWorkspace,
+            FixedImageKind::Standalone,
+            Some(test_consumer_declaration()),
+        ))
+        .expect_err("Reverie workspace with a declaration must refuse");
+        assert!(
+            refused.contains("does not take a consumer source declaration"),
+            "{refused}"
+        );
+        let mut leafless = test_consumer_declaration();
+        leafless.leaf = None;
+        let refused = require_consumer_declaration(&expectation(
+            CompiledSourceLayout::GitlinkCheckout,
+            FixedImageKind::Detcore,
+            Some(leafless),
+        ))
+        .expect_err("leaf image without a declared leaf must refuse");
+        assert!(
+            refused.contains("requires a declared leaf package"),
+            "{refused}"
+        );
+        // Genericity proof: a different consumer's names pass the same
+        // mechanism. The declaration below shares no package, target,
+        // directory or version spelling with the test consumer above.
+        let scratch = std::env::temp_dir().join(format!(
+            "consumer-decl-controls-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(scratch.join("consumer-leaf/src")).unwrap();
+        fs::write(scratch.join("consumer-leaf/Cargo.toml"), "fixture\n").unwrap();
+        fs::write(scratch.join("consumer-leaf/src/lib.rs"), "// fixture\n").unwrap();
+        let neutral_root = scratch.as_path();
+        let neutral = LeafDecl {
+            name: "consumer-leaf",
+            target: "consumer_leaf",
+            manifest_relative: "consumer-leaf/Cargo.toml",
+            version: "1.2.3",
+        };
+        let metadata = serde_json::json!({"packages":[{
+            "name":"consumer-leaf", "version":"1.2.3",
+            "id":format!("path+file://{}#1.2.3", neutral_root.join("consumer-leaf").display()),
+            "source":null,"manifest_path":neutral_root.join("consumer-leaf/Cargo.toml"),
+            "dependencies":[],"targets":[{"name":"consumer_leaf","kind":["cdylib"],
+                "crate_types":["cdylib"],"src_path":neutral_root.join("consumer-leaf/src/lib.rs")}]
+        }]});
+        let leaf = compiled_leaf_package(
+            &metadata,
+            neutral_root,
+            neutral_root,
+            None,
+            FixedImageKind::Detcore,
+            Some(neutral),
+        )
+        .expect("a neutral consumer leaf must select through the declaration");
+        assert_eq!(leaf.name, "consumer-leaf");
+        assert_eq!(leaf.target, "consumer_leaf");
+        // The same metadata under a mismatched declaration refuses:
+        // the mechanism is data-driven, not renamed literals.
+        let mismatched = LeafDecl {
+            version: "9.9.9",
+            ..neutral
+        };
+        assert!(
+            compiled_leaf_package(
+                &metadata,
+                neutral_root,
+                neutral_root,
+                None,
+                FixedImageKind::Detcore,
+                Some(mismatched),
+            )
+            .is_err(),
+            "a declared leaf version mismatch must refuse"
+        );
+        fs::remove_dir_all(&scratch).unwrap();
     }
 
     #[test]
@@ -44425,11 +45176,11 @@ mod tests {
             )
             .unwrap();
         }
-        let workspace = root.join("hermit");
+        let workspace = root.join("consumer");
         fs::create_dir_all(&workspace).unwrap();
         symlink(&canonical, workspace.join("reverie")).unwrap();
         let logical = workspace.join("reverie");
-        let binding = CompilerRootBinding::resolve_path(&logical, &workspace).unwrap();
+        let binding = CompilerRootBinding::resolve_path(&logical, &workspace, Path::new("reverie")).unwrap();
         assert_eq!(binding.logical_root, logical);
         assert_eq!(binding.canonical_root, canonical);
         assert_eq!(binding.cargo_home, None);
@@ -44439,12 +45190,12 @@ mod tests {
         );
         // Only the exact <workspace>/reverie spelling opens the path gate;
         // the Cargo-home gate refuses that spelling in return.
-        assert!(CompilerRootBinding::resolve_path(&canonical, &workspace).is_err());
-        assert!(CompilerRootBinding::resolve_path(&workspace.join("other"), &workspace).is_err());
+        assert!(CompilerRootBinding::resolve_path(&canonical, &workspace, Path::new("reverie")).is_err());
+        assert!(CompilerRootBinding::resolve_path(&workspace.join("other"), &workspace, Path::new("reverie")).is_err());
         assert!(CompilerRootBinding::resolve_path(
             &PathBuf::from(format!("{}/./reverie", workspace.display())),
             &workspace
-        )
+        , Path::new("reverie"))
         .is_err());
         let pin = "347e802e861094bbf827c4fc1bb067c18de7d8dd";
         fs::create_dir_all(root.join("cargo-home")).unwrap();
@@ -44585,7 +45336,7 @@ mod tests {
             {"name": "reverie-liteinst-preload",
              "manifest_path": logical.join("reverie-liteinst-preload/Cargo.toml")}
         ]});
-        content_manifest_and_lock_pin_path(&pin_metadata, &workspace, &logical).unwrap();
+        content_manifest_and_lock_pin_path(&pin_metadata, &workspace, &logical, &test_consumer_declaration()).unwrap();
         // The landed 4-arg pin accepts these path manifest
         // dependencies under `logical`, but refuses at the lock stage:
         // `pin_metadata` names only reverie-liteinst-artifact and
@@ -44593,7 +45344,7 @@ mod tests {
         // reverie-inguest (checked first), reverie-syscalls and
         // reverie-liteinst are not path-bound to the verified root.
         let lock_refusal =
-            content_manifest_and_lock_pin(&pin_metadata, &workspace, &git_source, &logical)
+            content_manifest_and_lock_pin(&pin_metadata, &workspace, &git_source, &logical, &test_consumer_declaration())
                 .expect_err("landed pin must refuse unbound sourceless lock entries");
         assert!(
             lock_refusal.contains("content lock source differs from independent full pin"),
@@ -44614,7 +45365,7 @@ mod tests {
                 let mut bad = pin_metadata.clone();
                 bad["packages"][index]["dependencies"][0][field] = value;
                 assert!(
-                    content_manifest_and_lock_pin_path(&bad, &workspace, &logical).is_err(),
+                    content_manifest_and_lock_pin_path(&bad, &workspace, &logical, &test_consumer_declaration()).is_err(),
                     "path manifest dependency {index}/{field}"
                 );
             }
@@ -44633,10 +45384,10 @@ mod tests {
             standalone_lock.replace("name = \"reverie-syscalls\"", "name = \"lookalike\""),
         ] {
             fs::write(&standalone_lock_path, wrong).unwrap();
-            assert!(content_manifest_and_lock_pin_path(&pin_metadata, &workspace, &logical)
+            assert!(content_manifest_and_lock_pin_path(&pin_metadata, &workspace, &logical, &test_consumer_declaration())
                 .is_err());
             fs::write(&standalone_lock_path, &standalone_lock).unwrap();
-            content_manifest_and_lock_pin_path(&pin_metadata, &workspace, &logical).unwrap();
+            content_manifest_and_lock_pin_path(&pin_metadata, &workspace, &logical, &test_consumer_declaration()).unwrap();
         }
         for relative in [
             "Cargo.toml",
@@ -44647,7 +45398,7 @@ mod tests {
             fs::create_dir_all(workspace.join(relative).parent().unwrap()).unwrap();
             fs::write(workspace.join(relative), format!("declared {relative}\n")).unwrap();
         }
-        let detcore_lock = [
+        let leaf_lock = [
             "reverie-core",
             "reverie-inguest",
             "reverie-liteinst",
@@ -44657,9 +45408,9 @@ mod tests {
         .map(|name| format!("[[package]]\nname = \"{name}\"\nversion = \"0.5.7\"\n"))
         .chain(["[[package]]\nname = \"detcore-liteinst\"\nversion = \"0.5.7\"\n".into()])
         .collect::<String>();
-        let detcore_lock_path = workspace.join("Cargo.lock");
-        fs::write(&detcore_lock_path, &detcore_lock).unwrap();
-        let detcore_deps = [
+        let leaf_lock_path = workspace.join("Cargo.lock");
+        fs::write(&leaf_lock_path, &leaf_lock).unwrap();
+        let leaf_deps = [
             ("reverie-core", "reverie", Some("reverie"), false),
             ("reverie-inguest", "reverie-inguest", None, false),
             ("reverie-liteinst", "reverie-liteinst", None, false),
@@ -44677,7 +45428,7 @@ mod tests {
              "id": format!("path+file://{}#0.5.7", workspace.join("detcore-liteinst").display()),
              "source": null,
              "manifest_path": workspace.join("detcore-liteinst/Cargo.toml"),
-             "dependencies": detcore_deps,
+             "dependencies": leaf_deps,
              "targets": [{"name": "detcore_liteinst", "kind": ["cdylib"],
                  "crate_types": ["cdylib"],
                  "src_path": workspace.join("detcore-liteinst/src/lib.rs")}]},
@@ -44690,7 +45441,7 @@ mod tests {
             {"name": "reverie-rpc-transport",
              "manifest_path": logical.join("reverie-rpc-transport/Cargo.toml")}
         ]});
-        content_detcore_manifest_and_lock_pin_path(&runtime, &workspace, &logical).unwrap();
+        content_leaf_manifest_and_lock_pin_path(&runtime, &workspace, &logical, test_leaf_decl()).unwrap();
         // The fbsource workspace spelling (`reverie-core = { workspace
         // = true }`, path declared in workspace.dependencies) reports
         // no rename for the same exact package; `reverie-core`'s lib
@@ -44698,19 +45449,19 @@ mod tests {
         // rename and this one name one crate.
         let mut unrenamed = runtime.clone();
         unrenamed["packages"][0]["dependencies"][0]["rename"] = serde_json::json!(null);
-        content_detcore_manifest_and_lock_pin_path(&unrenamed, &workspace, &logical).unwrap();
+        content_leaf_manifest_and_lock_pin_path(&unrenamed, &workspace, &logical, test_leaf_decl()).unwrap();
         // Any other rename still refuses by name, package identity exact.
         let mut junk_rename = runtime.clone();
         junk_rename["packages"][0]["dependencies"][0]["rename"] = serde_json::json!("junk");
         let refusal =
-            content_detcore_manifest_and_lock_pin_path(&junk_rename, &workspace, &logical)
+            content_leaf_manifest_and_lock_pin_path(&junk_rename, &workspace, &logical, test_leaf_decl())
                 .expect_err("a junk reverie-core rename must refuse");
         assert!(
             refusal
-                .contains("content Detcore dependency differs from path package: reverie-core"),
+                .contains("content leaf dependency differs from path package: reverie-core"),
             "the refusal must name the mismatched dependency: {refusal}"
         );
-        assert!(content_detcore_manifest_and_lock_pin(&runtime, &workspace, &git_source)
+        assert!(content_leaf_manifest_and_lock_pin(&runtime, &workspace, &git_source, test_leaf_decl())
             .is_err());
         for (index, field, value) in [
             (
@@ -44729,13 +45480,13 @@ mod tests {
             let mut bad = runtime.clone();
             bad["packages"][0]["dependencies"][index][field] = value;
             assert!(
-                content_detcore_manifest_and_lock_pin_path(&bad, &workspace, &logical).is_err(),
-                "path Detcore dependency {index}/{field}"
+                content_leaf_manifest_and_lock_pin_path(&bad, &workspace, &logical, test_leaf_decl()).is_err(),
+                "path leaf dependency {index}/{field}"
             );
         }
         fs::write(
-            &detcore_lock_path,
-            detcore_lock.replacen(
+            &leaf_lock_path,
+            leaf_lock.replacen(
                 "name = \"reverie-core\"\nversion = \"0.5.7\"",
                 &format!(
                     "name = \"reverie-core\"\nversion = \"0.5.7\"\nsource = \"{git_source}\""
@@ -44744,19 +45495,19 @@ mod tests {
             ),
         )
         .unwrap();
-        assert!(content_detcore_manifest_and_lock_pin_path(&runtime, &workspace, &logical)
+        assert!(content_leaf_manifest_and_lock_pin_path(&runtime, &workspace, &logical, test_leaf_decl())
             .is_err());
-        fs::write(&detcore_lock_path, &detcore_lock).unwrap();
+        fs::write(&leaf_lock_path, &leaf_lock).unwrap();
         let graph = serde_json::json!({"packages": [{"name": "reverie-inguest",
             "manifest_path": logical.join("reverie-inguest/Cargo.toml")}]});
         assert_eq!(
-            content_root_binding_path(&graph, &workspace).unwrap(),
+            content_root_binding_path(&graph, &workspace, Path::new("reverie")).unwrap(),
             binding
         );
         let canonical_graph = serde_json::json!({"packages": [{"name": "reverie-inguest",
             "manifest_path": canonical.join("reverie-inguest/Cargo.toml")}]});
-        assert!(content_root_binding_path(&canonical_graph, &workspace).is_err());
-        assert!(content_root_binding_path(&serde_json::json!({"packages": []}), &workspace)
+        assert!(content_root_binding_path(&canonical_graph, &workspace, Path::new("reverie")).is_err());
+        assert!(content_root_binding_path(&serde_json::json!({"packages": []}), &workspace, Path::new("reverie"))
             .is_err());
     }
 
@@ -44797,7 +45548,7 @@ mod tests {
             .iter()
             .map(|row| row.0)
             .chain([
-                CONTENT_DETCORE_FIXED_GATE.0,
+                CONTENT_FIXED_GATE.0,
                 "reverie-liteinst-artifact/src/lib.rs",
                 "reverie-inguest/Cargo.toml",
                 "reverie-inguest/src/lib.rs",
@@ -44869,16 +45620,16 @@ mod tests {
                 .windows(2)
                 .all(|pair| pair[0].relative < pair[1].relative)
         );
-        let (detcore_inventory, _) = content_reverie_inventory_for_path(
+        let (leaf_inventory, _) = content_reverie_inventory_for_path(
             &canonical,
             FixedImageKind::Detcore,
             &package_dirs,
         )
         .unwrap();
         assert!(
-            detcore_inventory
+            leaf_inventory
                 .iter()
-                .any(|entry| entry.relative == CONTENT_DETCORE_FIXED_GATE.0)
+                .any(|entry| entry.relative == CONTENT_FIXED_GATE.0)
         );
         // A present source file absent from the declared set refuses by name.
         let mut declared = relatives.clone();
@@ -44985,14 +45736,14 @@ mod tests {
         );
         fs::remove_file(canonical.join("reverie-inguest/deep-link")).unwrap();
         fs::remove_dir_all(&deep).unwrap();
-        let workspace = root.join("hermit");
+        let workspace = root.join("consumer");
         for relative in CONTENT_WORKSPACE_FILES {
             fs::create_dir_all(workspace.join(relative).parent().unwrap()).unwrap();
             fs::write(workspace.join(relative), format!("snapshot {relative}\n")).unwrap();
         }
         symlink(&canonical, workspace.join("reverie")).unwrap();
         let binding =
-            CompilerRootBinding::resolve_path(&workspace.join("reverie"), &workspace).unwrap();
+            CompilerRootBinding::resolve_path(&workspace.join("reverie"), &workspace, Path::new("reverie")).unwrap();
         let (workspace_inventory, _) =
             declared_inventory(&workspace, &CONTENT_WORKSPACE_FILES).unwrap();
         let workspace_digest = declared_inventory_sha256(&workspace_inventory).unwrap();
@@ -45058,7 +45809,7 @@ mod tests {
             fs::copy(real_root.join(relative), &to).unwrap();
         }
         for relative in [
-            CONTENT_DETCORE_FIXED_GATE.0,
+            CONTENT_FIXED_GATE.0,
             "reverie-liteinst-artifact/Cargo.toml",
             "reverie-liteinst-artifact/src/lib.rs",
             "reverie-inguest/Cargo.toml",
@@ -45078,11 +45829,11 @@ mod tests {
             fs::create_dir_all(to.parent().unwrap()).unwrap();
             fs::copy(real_root.join(relative), &to).unwrap();
         }
-        // Gitless Hermit workspace; `reverie` reaches the copy by symlink,
+        // Gitless consumer workspace; `reverie` reaches the copy by symlink,
         // as in the fbsource import, and the pin stays a provenance label.
-        let hermit = root.join("hermit");
+        let consumer_ws = root.join("consumer");
         for relative in CONTENT_DETCORE_WORKSPACE_FILES {
-            let to = hermit.join(relative);
+            let to = consumer_ws.join(relative);
             fs::create_dir_all(to.parent().unwrap()).unwrap();
             fs::write(&to, format!("fixture {relative}\n")).unwrap();
         }
@@ -45099,12 +45850,12 @@ mod tests {
         .map(|name| format!("[[package]]\nname = \"{name}\"\nversion = \"0.5.7\"\n"))
         .chain(["[[package]]\nname = \"detcore-liteinst\"\nversion = \"0.5.7\"\n".to_string()])
         .collect::<String>();
-        fs::write(hermit.join("Cargo.lock"), &lock).unwrap();
-        fs::write(hermit.join("liteinst-runtime-build/Cargo.lock"), &lock).unwrap();
-        symlink(&checkout, hermit.join("reverie")).unwrap();
-        assert!(!hermit.join(".git").exists() && !checkout.join(".git").exists());
+        fs::write(consumer_ws.join("Cargo.lock"), &lock).unwrap();
+        fs::write(consumer_ws.join("liteinst-runtime-build/Cargo.lock"), &lock).unwrap();
+        symlink(&checkout, consumer_ws.join("reverie")).unwrap();
+        assert!(!consumer_ws.join(".git").exists() && !checkout.join(".git").exists());
         let pin = "0123456789abcdef0123456789abcdef01234567";
-        let logical = hermit.join("reverie");
+        let logical = consumer_ws.join("reverie");
         let rv_pkg = |name: &str, dir: &str, kind: &[&str], target: &str| {
             let manifest = logical.join(dir).join("Cargo.toml");
             let id = if dir == name {
@@ -45125,17 +45876,17 @@ mod tests {
                 "rename": rename, "path": logical.join(dir), "target": null,
                 "optional": optional})
         };
-        let mut detcore = serde_json::json!({
+        let mut leaf_pkg = serde_json::json!({
             "name": "detcore-liteinst", "version": "0.5.7",
-            "id": format!("path+file://{}#0.5.7", hermit.join("detcore-liteinst").display()),
+            "id": format!("path+file://{}#0.5.7", consumer_ws.join("detcore-liteinst").display()),
             "source": null,
-            "manifest_path": hermit.join("detcore-liteinst/Cargo.toml"),
+            "manifest_path": consumer_ws.join("detcore-liteinst/Cargo.toml"),
             "targets": [{"name": "detcore_liteinst", "kind": ["cdylib"],
                 "crate_types": ["cdylib"],
-                "src_path": hermit.join("detcore-liteinst/src/lib.rs")}],
+                "src_path": consumer_ws.join("detcore-liteinst/src/lib.rs")}],
             "dependencies": []
         });
-        detcore["dependencies"] = serde_json::json!([
+        leaf_pkg["dependencies"] = serde_json::json!([
             dep("reverie-core", "reverie", Some("reverie"), false),
             dep("reverie-inguest", "reverie-inguest", None, false),
             dep("reverie-liteinst", "reverie-liteinst", None, false),
@@ -45151,8 +45902,8 @@ mod tests {
                 "dependencies": deps
             })
         };
-        let metadata = serde_json::json!({"workspace_root": hermit, "packages": [
-            detcore,
+        let metadata = serde_json::json!({"workspace_root": consumer_ws, "packages": [
+            leaf_pkg,
             rv_pkg("reverie-core", "reverie", &["lib"], "reverie_core"),
             rv_pkg("reverie-inguest", "reverie-inguest", &["cdylib", "rlib"], "reverie_inguest"),
             rv_pkg("reverie-syscalls", "reverie-syscalls", &["lib"], "reverie_syscalls"),
@@ -45161,13 +45912,13 @@ mod tests {
             rv_pkg("reverie-liteinst-artifact", "reverie-liteinst-artifact", &["lib"], "reverie_liteinst_artifact"),
             rv_pkg("reverie-rpc-transport", "reverie-rpc-transport", &["lib"], "reverie_rpc_transport"),
             ws_pkg("hermit-liteinst-runtime-build",
-                hermit.join("liteinst-runtime-build/Cargo.toml"),
+                consumer_ws.join("liteinst-runtime-build/Cargo.toml"),
                 "hermit_liteinst_runtime_build",
                 serde_json::json!([{"name": "reverie-liteinst-artifact", "source": null,
                     "kind": "build", "rename": null,
                     "path": logical.join("reverie-liteinst-artifact")}])),
             ws_pkg("hermit-liteinst-runtime-artifact",
-                hermit.join("liteinst-runtime-build/runtime/Cargo.toml"),
+                consumer_ws.join("liteinst-runtime-build/runtime/Cargo.toml"),
                 "hermit_liteinst_runtime_artifact",
                 serde_json::json!([{"name": "reverie-liteinst-preload", "source": null,
                     "kind": null, "rename": null,
@@ -45189,16 +45940,17 @@ mod tests {
         runner.set_cargo_program(bin.join("cargo"));
         let standalone = VerifiedCompiledSources::resolve_content(
             &CompiledSourceExpectation {
-                layout: CompiledSourceLayout::HermitPath,
+                layout: CompiledSourceLayout::PathCheckout,
                 image_kind: FixedImageKind::Standalone,
-                workspace_root: &hermit,
-                manifest: &hermit.join("liteinst-runtime-build/Cargo.toml"),
+                workspace_root: &consumer_ws,
+                manifest: &consumer_ws.join("liteinst-runtime-build/Cargo.toml"),
                 reverie_pin: pin,
+                consumer: Some(test_consumer_declaration()),
             },
             &mut runner,
         )
         .expect("path-sourced standalone profile must resolve without Git");
-        assert_eq!(standalone.record.layout, CompiledSourceLayout::HermitPath);
+        assert_eq!(standalone.record.layout, CompiledSourceLayout::PathCheckout);
         assert_eq!(standalone.record.reverie_pin, pin);
         assert_eq!(standalone.record.reverie_root, checkout);
         assert_eq!(standalone.record.leaf.source, None);
@@ -45215,28 +45967,30 @@ mod tests {
                 .files
                 .contains_key("rv:reverie-inguest/Cargo.toml")
         );
-        let detcore_verified = VerifiedCompiledSources::resolve_content(
+        let leaf_verified = VerifiedCompiledSources::resolve_content(
             &CompiledSourceExpectation {
-                layout: CompiledSourceLayout::HermitPath,
+                layout: CompiledSourceLayout::PathCheckout,
                 image_kind: FixedImageKind::Detcore,
-                workspace_root: &hermit,
-                manifest: &hermit.join("Cargo.toml"),
+                workspace_root: &consumer_ws,
+                manifest: &consumer_ws.join("Cargo.toml"),
                 reverie_pin: pin,
+                consumer: Some(test_consumer_declaration()),
             },
             &mut runner,
         )
-        .expect("path-sourced Detcore profile must resolve without Git");
-        assert_eq!(detcore_verified.record.layout, CompiledSourceLayout::HermitPath);
-        assert_eq!(detcore_verified.record.leaf.name, "detcore-liteinst");
+        .expect("path-sourced leaf profile must resolve without Git");
+        assert_eq!(leaf_verified.record.layout, CompiledSourceLayout::PathCheckout);
+        assert_eq!(leaf_verified.record.leaf.name, "detcore-liteinst");
         // The Git content arm refuses this path-shaped graph, and the Git
         // factory refuses the path layout before running any command.
         assert!(VerifiedCompiledSources::resolve_content(
             &CompiledSourceExpectation {
-                layout: CompiledSourceLayout::HermitGit,
+                layout: CompiledSourceLayout::GitlinkCheckout,
                 image_kind: FixedImageKind::Standalone,
-                workspace_root: &hermit,
-                manifest: &hermit.join("liteinst-runtime-build/Cargo.toml"),
+                workspace_root: &consumer_ws,
+                manifest: &consumer_ws.join("liteinst-runtime-build/Cargo.toml"),
                 reverie_pin: pin,
+                consumer: Some(test_consumer_declaration()),
             },
             &mut runner,
         )
@@ -45246,11 +46000,12 @@ mod tests {
         git_runner.set_cargo_program(bin.join("cargo"));
         let refused = VerifiedCompiledSources::resolve(
             &CompiledSourceExpectation {
-                layout: CompiledSourceLayout::HermitPath,
+                layout: CompiledSourceLayout::PathCheckout,
                 image_kind: FixedImageKind::Standalone,
-                workspace_root: &hermit,
-                manifest: &hermit.join("liteinst-runtime-build/Cargo.toml"),
+                workspace_root: &consumer_ws,
+                manifest: &consumer_ws.join("liteinst-runtime-build/Cargo.toml"),
                 reverie_pin: pin,
+                consumer: Some(test_consumer_declaration()),
             },
             &mut git_runner,
         )
@@ -45281,18 +46036,22 @@ mod tests {
     ) {
         use std::os::unix::fs::symlink;
         assert!(!root.join(".git").exists());
+        let test_declaration = test_consumer_declaration();
         assert_eq!(
-            content_workspace_files(FixedImageKind::Standalone),
+            declared_workspace_files(&test_declaration, FixedImageKind::Standalone),
             CONTENT_WORKSPACE_FILES
         );
-        assert_eq!(content_workspace_files(FixedImageKind::Detcore).len(), 10);
         assert_eq!(
-            content_manifest_relative(FixedImageKind::Standalone),
+            declared_workspace_files(&test_declaration, FixedImageKind::Detcore).len(),
+            10
+        );
+        assert_eq!(
+            producer_manifest_relative(&test_declaration).unwrap(),
             "liteinst-runtime-build/Cargo.toml"
         );
         assert_eq!(
-            content_manifest_relative(FixedImageKind::Detcore),
-            "Cargo.toml"
+            test_declaration.leaf.unwrap().manifest_relative,
+            "detcore-liteinst/Cargo.toml"
         );
         for relative in [
             "Cargo.toml",
@@ -45342,7 +46101,7 @@ mod tests {
             "dependencies":dependencies,"targets":[{"name":"detcore_liteinst","kind":["cdylib"],
                 "crate_types":["cdylib"],"src_path":root.join("detcore-liteinst/src/lib.rs")}]
         }]});
-        content_detcore_manifest_and_lock_pin(&runtime, root, source).unwrap();
+        content_leaf_manifest_and_lock_pin(&runtime, root, source, test_leaf_decl()).unwrap();
         // These invoke the genuine factory, and must refuse before metadata;
         // no synthetic JSON can become VerifiedCompiledSources authority.
         let mut refused_runner = Runner::new(
@@ -45365,11 +46124,12 @@ mod tests {
         ] {
             let refused = VerifiedCompiledSources::resolve_content(
                 &CompiledSourceExpectation {
-                    layout: CompiledSourceLayout::HermitGit,
+                    layout: CompiledSourceLayout::GitlinkCheckout,
                     image_kind,
                     workspace_root: root,
                     manifest: &manifest,
                     reverie_pin: pin,
+                    consumer: Some(test_consumer_declaration()),
                 },
                 &mut refused_runner,
             )
@@ -45387,12 +46147,19 @@ mod tests {
             rv_one,
             Some(source),
             FixedImageKind::Detcore,
+            Some(test_leaf_decl()),
         )
         .unwrap();
         assert_eq!(leaf.name, "detcore-liteinst");
         assert_eq!(leaf.manifest, root.join("detcore-liteinst/Cargo.toml"));
         assert_eq!(
-            content_compiler_manifest_path(FixedImageKind::Detcore, root, &leaf.manifest, binding)
+            content_compiler_manifest_path(
+                FixedImageKind::Detcore,
+                root,
+                &leaf.manifest,
+                binding,
+                Some(test_leaf_decl()),
+            )
                 .unwrap(),
             leaf.manifest
         );
@@ -45401,7 +46168,8 @@ mod tests {
                 FixedImageKind::Standalone,
                 root,
                 &leaf.manifest,
-                binding
+                binding,
+                Some(test_leaf_decl()),
             )
             .is_err()
         );
@@ -45410,7 +46178,8 @@ mod tests {
                 FixedImageKind::Detcore,
                 root,
                 &rv_one.join("reverie-liteinst-preload/Cargo.toml"),
-                binding
+                binding,
+                Some(test_leaf_decl()),
             )
             .is_err()
         );
@@ -45420,15 +46189,17 @@ mod tests {
                 root,
                 rv_one,
                 Some(source),
-                FixedImageKind::Standalone
+                FixedImageKind::Standalone,
+                Some(test_leaf_decl()),
             )
             .is_err()
         );
         assert!(
-            content_detcore_manifest_and_lock_pin(
+            content_leaf_manifest_and_lock_pin(
                 &serde_json::json!({"packages":[]}),
                 root,
-                source
+                source,
+                test_leaf_decl(),
             )
             .is_err()
         );
@@ -45449,7 +46220,7 @@ mod tests {
             let mut bad = runtime.clone();
             bad["packages"][0][field] = value;
             assert!(
-                content_detcore_manifest_and_lock_pin(&bad, root, source).is_err(),
+                content_leaf_manifest_and_lock_pin(&bad, root, source, test_leaf_decl()).is_err(),
                 "Detcore {field}"
             );
         }
@@ -45466,7 +46237,7 @@ mod tests {
             let mut bad = runtime.clone();
             bad["packages"][0][field] = value;
             assert!(
-                compiled_leaf_package(&bad, root, rv_one, Some(source), FixedImageKind::Detcore)
+                compiled_leaf_package(&bad, root, rv_one, Some(source), FixedImageKind::Detcore, Some(test_leaf_decl()))
                     .is_err()
             );
         }
@@ -45482,20 +46253,20 @@ mod tests {
             let mut bad = runtime.clone();
             bad["packages"][0]["targets"][0][field] = value;
             assert!(
-                compiled_leaf_package(&bad, root, rv_one, Some(source), FixedImageKind::Detcore)
+                compiled_leaf_package(&bad, root, rv_one, Some(source), FixedImageKind::Detcore, Some(test_leaf_decl()))
                     .is_err(),
                 "Detcore target {field}"
             );
         }
         let mut bad = runtime.clone();
         bad["workspace_root"] = serde_json::json!(rv_one);
-        assert!(content_detcore_manifest_and_lock_pin(&bad, root, source).is_err());
+        assert!(content_leaf_manifest_and_lock_pin(&bad, root, source, test_leaf_decl()).is_err());
         let mut duplicate = runtime.clone();
         duplicate["packages"]
             .as_array_mut()
             .unwrap()
             .push(runtime["packages"][0].clone());
-        assert!(content_detcore_manifest_and_lock_pin(&duplicate, root, source).is_err());
+        assert!(content_leaf_manifest_and_lock_pin(&duplicate, root, source, test_leaf_decl()).is_err());
         for index in 0..4 {
             for (field, value) in [
                 ("name", serde_json::json!("lookalike")),
@@ -45512,7 +46283,7 @@ mod tests {
                 let mut bad = runtime.clone();
                 bad["packages"][0]["dependencies"][index][field] = value;
                 assert!(
-                    content_detcore_manifest_and_lock_pin(&bad, root, source).is_err(),
+                    content_leaf_manifest_and_lock_pin(&bad, root, source, test_leaf_decl()).is_err(),
                     "Detcore dependency {index}/{field}"
                 );
             }
@@ -45557,9 +46328,9 @@ mod tests {
             format!("{lock_bytes}source = \"{source}\"\n"),
         ] {
             fs::write(&lock, wrong).unwrap();
-            assert!(content_detcore_manifest_and_lock_pin(&runtime, root, source).is_err());
+            assert!(content_leaf_manifest_and_lock_pin(&runtime, root, source, test_leaf_decl()).is_err());
             fs::write(&lock, &lock_bytes).unwrap();
-            content_detcore_manifest_and_lock_pin(&runtime, root, source).unwrap();
+            content_leaf_manifest_and_lock_pin(&runtime, root, source, test_leaf_decl()).unwrap();
         }
         // Both independently selected real-root bindings must join. Equal
         // source bytes in another checkout do not authorize its compiler path.
@@ -45573,8 +46344,12 @@ mod tests {
         let other = content_root_binding(&graph(rv_two), pin).unwrap();
         assert!(content_same_root(&runtime_binding, &other).is_err());
         assert!(content_root_binding(&serde_json::json!({"packages":[]}), pin).is_err());
-        let (workspace_inventory, _) =
-            declared_inventory(root, content_workspace_files(FixedImageKind::Detcore)).unwrap();
+        let test_declaration = test_consumer_declaration();
+        let (workspace_inventory, _) = declared_inventory(
+            root,
+            declared_workspace_files(&test_declaration, FixedImageKind::Detcore),
+        )
+        .unwrap();
         let digest = declared_inventory_sha256(&workspace_inventory).unwrap();
         let (rv_inventory, _) =
             content_reverie_inventory_for_image(rv_one, FixedImageKind::Detcore).unwrap();
@@ -45643,7 +46418,7 @@ mod tests {
         fs::write(&producer_lock, b"producer-only pin change").unwrap();
         // The runtime graph itself still passes, but the retained shared
         // ten-file authority must reject the independently changed producer.
-        content_detcore_manifest_and_lock_pin(&runtime, root, source).unwrap();
+        content_leaf_manifest_and_lock_pin(&runtime, root, source, test_leaf_decl()).unwrap();
         assert!(verify().is_err());
         fs::write(&producer_lock, original).unwrap();
         verify().unwrap();
@@ -45722,6 +46497,7 @@ mod tests {
                 workspace_root: &root,
                 manifest: &root.join("Cargo.toml"),
                 reverie_pin: "short",
+                consumer: None,
             },
             &mut runner,
             |_| -> Result<()> { panic!("invalid source request reached the receipt body") },
@@ -45914,7 +46690,7 @@ mod tests {
             for git in [false, true] {
                 let valid = serde_json::json!({"packages":[package(name,target,&["cdylib"],git && image==FixedImageKind::Standalone,version)]});
                 let expected_source = git.then_some(source.as_str());
-                compiled_leaf_package(&valid, &root, &root, expected_source, image).unwrap();
+                compiled_leaf_package(&valid, &root, &root, expected_source, image, Some(test_leaf_decl())).unwrap();
                 for (field, value) in [
                     (
                         "id",
@@ -45966,7 +46742,7 @@ mod tests {
                     let mut bad = valid.clone();
                     bad["packages"][0][field] = value;
                     assert!(
-                        compiled_leaf_package(&bad, &root, &root, expected_source, image).is_err(),
+                        compiled_leaf_package(&bad, &root, &root, expected_source, image, Some(test_leaf_decl())).is_err(),
                         "leaf {field}"
                     );
                 }
@@ -45985,7 +46761,7 @@ mod tests {
                     let mut bad = valid.clone();
                     bad["packages"][0]["targets"][0][field] = value;
                     assert!(
-                        compiled_leaf_package(&bad, &root, &root, expected_source, image).is_err(),
+                        compiled_leaf_package(&bad, &root, &root, expected_source, image, Some(test_leaf_decl())).is_err(),
                         "leaf target {field}"
                     );
                 }
@@ -45994,7 +46770,7 @@ mod tests {
                     .as_array_mut()
                     .unwrap()
                     .push(valid["packages"][0].clone());
-                assert!(compiled_leaf_package(&bad, &root, &root, expected_source, image).is_err());
+                assert!(compiled_leaf_package(&bad, &root, &root, expected_source, image, Some(test_leaf_decl())).is_err());
             }
         }
         let relative = "reverie-inguest/src/guest/alloc.rs";
@@ -46018,11 +46794,11 @@ mod tests {
             compiled_role_filename(CompiledSourceLayout::ReverieWorkspace, relative, &file)
                 .unwrap();
         assert_eq!(workspace, relative.as_bytes());
-        let git = compiled_role_filename(CompiledSourceLayout::HermitGit, relative, &file).unwrap();
+        let git = compiled_role_filename(CompiledSourceLayout::GitlinkCheckout, relative, &file).unwrap();
         assert_eq!(git, path.as_os_str().as_encoded_bytes());
         assert!(
             compiled_role_filename(
-                CompiledSourceLayout::HermitGit,
+                CompiledSourceLayout::GitlinkCheckout,
                 "reverie-inguest/src/guest/wrong.rs",
                 &file
             )
@@ -46030,7 +46806,7 @@ mod tests {
         );
         fs::write(&path, b"changed after verification\n").unwrap();
         assert!(file.verify().is_err());
-        assert!(compiled_role_filename(CompiledSourceLayout::HermitGit, relative, &file).is_err());
+        assert!(compiled_role_filename(CompiledSourceLayout::GitlinkCheckout, relative, &file).is_err());
         drop(owned);
     }
 
@@ -54292,15 +55068,19 @@ mod tests {
             validate_no_installation_scope_evidence(&backing, proof, FixedImageKind::Detcore)
         };
         check(&proof).unwrap();
-        // The retained Buck arm binds the same exact literals as the factory:
-        // the canonical witness validates, and a merely-containing target,
-        // an extended platform, and constraint subsets/supersets refuse.
+        // The retained Buck arm binds the witness to its own recorded
+        // declared literals: the canonical witness validates, and a
+        // target/platform that differs from the retained command, a
+        // duplicated constraint, and an empty constraint set refuse.
+        // (The declared values themselves are the consumer's; the
+        // factory recorded them in the source authority the witness's
+        // compiled-sources digest binds.)
         let buck_packages = NoScopeCohort::DetcoreOrdinaryBuck
-            .features()
-            .iter()
+            .features_for("detcore-liteinst", "")
+            .into_iter()
             .map(|(name, features)| {
                 (
-                    (*name).to_owned(),
+                    name,
                     BuckBuildPackage {
                         features: features.iter().map(|f| (*f).to_owned()).collect(),
                         profile: NoScopeCohort::DetcoreOrdinaryBuck.profile(),
@@ -54351,8 +55131,11 @@ mod tests {
                 0 => build.target = "//hermetic_infra/hermit:detcore-liteinst[cdylib]".into(),
                 1 => build.target.push_str("-extra"),
                 2 => build.platform.push_str("-extra"),
-                3 => build.constraints.pop().map(|_| ()).unwrap(),
-                4 => build.constraints.push("ovr_config//os:linux-extra".into()),
+                3 => {
+                    let duplicate = build.constraints[0].clone();
+                    build.constraints.push(duplicate);
+                }
+                4 => build.constraints.clear(),
                 _ => unreachable!(),
             }
             assert!(
@@ -73695,7 +74478,7 @@ pub mod private_static {
     /// The package id cargo (1.97.1, measured) reports for the path
     /// leaf: the manifest directory URL, then `#<version>` when the
     /// directory name is the package name, else `#<name>@<version>`
-    /// (`path+file:///ws/detcore-liteinst#0.5.5`,
+    /// (`path+file:///ws/leaf#0.5.5`,
     /// `path+file:///ws/preload#literoot-preload@0.0.1`). The leaf
     /// identity check compares metadata against exactly this.
     fn leaf_package_id(

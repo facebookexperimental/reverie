@@ -124,7 +124,7 @@ reverie-linuxemu/src/process_signal_publication.rs -- 4 -- pre-check baseline 20
 reverie-linuxemu/src/provider.rs -- 6 -- pre-check baseline 2026-11-17, classify me
 reverie-linuxemu/src/signal.rs -- 1 -- pre-check baseline 2026-11-17, classify me
 reverie-liteinst-artifact/Cargo.toml -- 1 -- pre-check baseline 2026-11-17, classify me
-reverie-liteinst-artifact/src/lib.rs -- 2557 -- pre-check baseline 2026-11-17, classify me
+reverie-liteinst-artifact/src/lib.rs -- 2492 -- residual baseline after dh-c433nq: Detcore image/recipe machinery, cross-repository ABI names, generated recipe provenance, consumer-named test fixtures
 reverie-liteinst-artifact/src/preparation_identity.rs -- 1 -- pre-check baseline 2026-11-17, classify me
 reverie-liteinst-artifact/src/private_static/selected_initializers.rs -- 102 -- pre-check baseline 2026-11-17, classify me
 reverie-liteinst-artifact/src/private_static/selected_initializers/ordinary_gate.rs -- 2 -- pre-check baseline 2026-11-17, classify me

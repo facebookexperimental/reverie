@@ -339,6 +339,7 @@ fn qualify_runtime() -> Result<QualifiedRuntime, String> {
                 workspace_root: &source.root,
                 manifest: &manifest,
                 reverie_pin: &source.head,
+                consumer: None,
             },
             &mut source_runner,
             |compiled_sources| {

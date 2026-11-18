@@ -392,6 +392,7 @@ fn produce(
             workspace_root: &root,
             manifest: &manifest,
             reverie_pin: &before.head,
+            consumer: None,
         },
         &mut runner,
     )?;
