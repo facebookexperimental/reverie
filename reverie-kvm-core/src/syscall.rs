@@ -272,18 +272,26 @@ mod tests {
 
     #[test]
     fn decode_keeps_an_unknown_number_raw() {
-        // No Sysno in the x86_64 table (it ends at 461), as the guest
-        // issued it: number and arguments survive untruncated.
-        let request = SyscallRequest::new(463, [1, 2, 3, 4, 5, 6]);
+        // One past the last row of the x86_64 table Reverie is built with,
+        // so no Sysno names it however far the table grows; a fixed number
+        // goes stale once a kernel release assigns it, as 463 became
+        // setxattrat. As the guest issued it: number and arguments survive
+        // untruncated.
+        const UNKNOWN_NR: u64 = Sysno::last().id() as u64 + 1;
+        assert_eq!(Sysno::new(UNKNOWN_NR as usize), None);
+        let request = SyscallRequest::new(UNKNOWN_NR, [1, 2, 3, 4, 5, 6]);
         assert_eq!(
             request.decode(),
-            DecodedSyscall::Unknown(RawSyscall::new(463, SyscallArgs::new(1, 2, 3, 4, 5, 6),))
+            DecodedSyscall::Unknown(RawSyscall::new(
+                UNKNOWN_NR,
+                SyscallArgs::new(1, 2, 3, 4, 5, 6)
+            ))
         );
-        assert_eq!(request.raw().nr, 463);
+        assert_eq!(request.raw().nr, UNKNOWN_NR);
         // The rejecting decode reports the same number.
         assert!(matches!(
             request.into_syscall().unwrap_err(),
-            Error::InvalidSyscallNumber(463)
+            Error::InvalidSyscallNumber(UNKNOWN_NR)
         ));
         // A known number still decodes typed.
         match SyscallRequest::new(Sysno::getpid.id() as u64, [0; 6]).decode() {
