@@ -36,16 +36,12 @@
 //! a copy adopting into the copied queue would wait forever for
 //! workers that are not there.
 //!
-//! The reaper's consumer is the claude-multiverse timelines lane
-//! (minibeads epic `dh-wibks8`; archive `rrnewton/hermit
-//! archive/multiverse-20261118`): its long-lived template processes
-//! host-fork paused copies whose guest children exit inside the copy
-//! and would otherwise pay a grace period per child exit on the
-//! dropping thread. The Hermit CLI itself does not use the reaper —
-//! it installs a helper-process sink, because a process that is about
-//! to exit gains nothing from in-process threads — so until the
-//! multiverse lane wires the reaper into its template lifecycle, the
-//! fork-recovery paths here are exercised by this module's tests.
+//! The reaper is meant for a long-lived process that host-forks paused
+//! copies whose guest children exit inside the copy: without it, each
+//! such exit would pay a grace period on the dropping thread. A process
+//! that is about to exit gains nothing from in-process threads and can
+//! install a helper-process sink instead. The fork-recovery paths here
+//! are exercised by this module's tests.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
