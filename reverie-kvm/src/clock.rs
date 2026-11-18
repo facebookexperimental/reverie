@@ -276,6 +276,14 @@ impl CountedVcpu {
         })
     }
 
+    /// The vCPU descriptor, for duplicating at teardown
+    /// (`crate::teardown`). Unlike [`Deref`], this does not clear the
+    /// synced-register state: teardown runs no further entries, and the
+    /// duplicate is only ever closed.
+    pub(crate) fn teardown_raw_fd(&self) -> std::os::fd::RawFd {
+        self.fd.as_raw_fd()
+    }
+
     #[cfg(test)]
     pub(crate) fn set_run_probe(&mut self, probe: std::sync::Arc<RunProbe>) {
         self.participant.set_prepare_probe(probe.prepare.clone());

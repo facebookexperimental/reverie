@@ -2204,6 +2204,13 @@ pub struct KvmBackend {
     /// back to the parent (`release_vfork_parent`), or dropped with this
     /// backend, so every end of the child releases the parent once.
     vfork_release: Option<futures::channel::oneshot::Sender<()>>,
+    /// Where this backend's vCPU and VM descriptors are duplicated to at
+    /// drop so their kernel destroy runs off the dropping thread
+    /// (`crate::teardown`). `None` destroys the VM in the field drops, on
+    /// the dropping thread. Installed on a root backend by the embedder
+    /// and inherited by every fork and thread child, like
+    /// `exit_collector`.
+    teardown_sink: Option<Arc<dyn crate::teardown::VmTeardownSink>>,
 }
 
 /// RFLAGS' trap flag.
@@ -2603,6 +2610,7 @@ impl KvmBackend {
             trampoline_return: None,
             stepped_fault: Default::default(),
             vfork_release: None,
+            teardown_sink: None,
         })
     }
 
@@ -2657,6 +2665,17 @@ impl KvmBackend {
     /// Returns whether this process tree is collecting KVM exit statistics.
     pub fn backend_stats_request(&self) -> BackendStatsRequest {
         BackendStatsRequest::new(self.exit_collector.is_some())
+    }
+
+    /// Installs where this backend's VM is physically destroyed at drop
+    /// (`crate::teardown`), or clears it with `None`.
+    ///
+    /// Call this once before entering the guest. Every later fork and
+    /// `CLONE_THREAD` child inherits the sink. With no sink, dropping a
+    /// backend destroys its VM on the dropping thread, which waits out
+    /// the kernel's RCU grace period there.
+    pub fn set_vm_teardown_sink(&mut self, sink: Option<Arc<dyn crate::teardown::VmTeardownSink>>) {
+        self.teardown_sink = sink;
     }
 
     /// Records one vCPU exit in the shared process-tree collector, when enabled.
@@ -3846,6 +3865,7 @@ impl KvmBackend {
             child_executor.bind_address_space(&child.memory);
         }
         child.exit_collector = self.exit_collector.clone();
+        child.teardown_sink = self.teardown_sink.clone();
         if !shared_file_snapshot {
             write_tid_best_effort(&mut child.memory, child_tid, child_pid);
         }
@@ -4217,6 +4237,7 @@ impl KvmBackend {
                         .map(|failure| failure.for_thread(Pid::from_raw(child_tid))),
                 );
                 child.exit_collector = self.exit_collector.clone();
+                child.teardown_sink = self.teardown_sink.clone();
                 child
                     .memory
                     .write_raw(child.syscall_frame_address, &parent_syscall_frame)?;
@@ -5077,6 +5098,7 @@ impl KvmBackend {
                 child.thread_ownership = self.thread_ownership;
                 child.set_tool_failure(self.tool_failure.clone());
                 child.exit_collector = self.exit_collector.clone();
+                child.teardown_sink = self.teardown_sink.clone();
                 child
                     .memory
                     .write_raw(child.syscall_frame_address, &parent_syscall_frame)?;
@@ -7597,6 +7619,59 @@ impl Drop for KvmBackend {
             if !AbandonedRuns::retire(&self.abandoned_runs, &self.thread_group) {
                 self.thread_group.join_workers();
             }
+        }
+        self.defer_vm_destroy();
+    }
+}
+
+impl KvmBackend {
+    /// Hands duplicates of the vCPU and VM descriptors to the installed
+    /// teardown sink, so the field drops that follow only drop file
+    /// references and the sink's closes run the kernel VM destroy
+    /// (`crate::teardown`). Every guest-visible effect of this backend's
+    /// exit was published before drop; only the host descriptors remain.
+    ///
+    /// Without a sink, or if a duplicate cannot be made, nothing happens
+    /// here and the fields destroy the VM on this thread as they always
+    /// have. A sink panic is contained the same way: the duplicates close
+    /// as the sink's frame unwinds, and the originals then close in the
+    /// field drops, destroying the VM here.
+    fn defer_vm_destroy(&mut self) {
+        let Some(sink) = self.teardown_sink.clone() else {
+            return;
+        };
+        let vcpu = match crate::teardown::dup_cloexec(self.vcpu.teardown_raw_fd()) {
+            Ok(vcpu) => vcpu,
+            Err(error) => {
+                tracing::warn!(
+                    "reverie-kvm VM teardown could not duplicate the vCPU fd ({error}); \
+                     destroying the VM on the dropping thread"
+                );
+                return;
+            }
+        };
+        let vm = match crate::teardown::dup_cloexec(self.vm.as_raw_fd()) {
+            Ok(vm) => vm,
+            Err(error) => {
+                tracing::warn!(
+                    "reverie-kvm VM teardown could not duplicate the VM fd ({error}); \
+                     destroying the VM on the dropping thread"
+                );
+                return;
+            }
+        };
+        // The memory clone rides along as the hold: dropped by the sink
+        // only after both closes complete, so this process's unmapping
+        // of the guest memory (when the fields below drop their last
+        // other clones) cannot zap a still-live VM on this thread.
+        let hold = Box::new(self.memory.clone());
+        let adopted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            sink.adopt_vm_with_hold(vcpu, vm, hold);
+        }));
+        if adopted.is_err() {
+            tracing::warn!(
+                "reverie-kvm VM teardown sink panicked; destroying the VM on the dropping thread"
+            );
         }
     }
 }

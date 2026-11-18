@@ -785,6 +785,7 @@ rust_library(
         "fbsource//third-party/rust:perf-event-open-sys",
         "fbsource//third-party/rust:serde",
         "fbsource//third-party/rust:thiserror",
+        "fbsource//third-party/rust:tracing",
         ":reverie-kvm-core",
         ":reverie-linuxemu",
     ],
@@ -894,6 +895,7 @@ rust_unittest(
         "fbsource//third-party/rust:perf-event-open-sys",
         "fbsource//third-party/rust:serde",
         "fbsource//third-party/rust:thiserror",
+        "fbsource//third-party/rust:tracing",
         ":reverie-kvm-core-test-support",  # @manual name:reverie_kvm_core
         ":reverie-linuxemu-test-support",
     ],
