@@ -2111,6 +2111,95 @@ fn verify_declared_content(
 // Compiled-closure source shapes for path-sourced Reverie. `build.rs`
 // needs no separate entry: it carries the `rs` extension.
 const CLOSURE_SOURCE_EXTENSIONS: [&str; 6] = ["rs", "toml", "c", "h", "S", "ld"];
+/// Entry budget for one symlink-subtree scan. The tracked in-tree
+/// link subtrees (documentation skill directories) measure in the
+/// tens of entries; this bound is two orders of magnitude above
+/// that. It is a work bound, not a correctness bound: a subtree
+/// past it refuses by name instead of enumerating without limit,
+/// so a link to a large off-root tree cannot make the completeness
+/// scan unbounded.
+const SYMLINK_SCAN_ENTRY_BUDGET: usize = 4096;
+
+fn has_closure_source_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| CLOSURE_SOURCE_EXTENSIONS.contains(&extension))
+}
+
+/// Whether the subtree a symlink reaches contains a source-shaped
+/// file. Tracked non-source links (documentation skill directories)
+/// cannot hide a compiled input; a link that could is refused by the
+/// caller, exactly like an undeclared real file. A symlinked file is
+/// source-shaped when either its link name or its resolved target
+/// carries a source extension: the compiler opens the link name
+/// (`mod evil;` loads `evil.rs` whatever its target is called), and
+/// an extensionless link can equally reach a source file. Depth
+/// counts every descent, through plain directories as well as symlink
+/// hops, and `budget` bounds the total entries visited, so neither a
+/// deep plain-directory chain nor a wide off-root tree scans unbounded.
+fn symlink_reaches_closure_source(path: &Path, depth: usize, budget: &mut usize) -> Result<bool> {
+    if depth > 8 {
+        return Err(format!(
+            "path Reverie closure scan refuses a symlink chain: {}",
+            path.display()
+        ));
+    }
+    if *budget == 0 {
+        return Err(format!(
+            "path Reverie closure scan refuses a symlink subtree past {SYMLINK_SCAN_ENTRY_BUDGET} entries: {}",
+            path.display()
+        ));
+    }
+    *budget -= 1;
+    let metadata = fs::metadata(path).map_err(|e| {
+        format!(
+            "path Reverie closure scan refuses an unresolvable symlink: {}: {e}",
+            path.display()
+        )
+    })?;
+    if metadata.is_file() {
+        // Source-ness follows either name: the link name the
+        // compiler opens, or the resolved target (`fs::metadata`
+        // above already followed the link for the file-type test,
+        // so name the target the same way). Judging by only one
+        // side lets the other spelling hide a compiled input.
+        let target = fs::canonicalize(path).map_err(|e| {
+            format!(
+                "path Reverie closure scan refuses an unresolvable symlink: {}: {e}",
+                path.display()
+            )
+        })?;
+        return Ok(
+            has_closure_source_extension(path) || has_closure_source_extension(&target),
+        );
+    }
+    if !metadata.is_dir() {
+        return Ok(false);
+    }
+    for entry in fs::read_dir(path).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        // Every visited entry spends budget, files included, so a
+        // single very wide directory is bounded too.
+        if *budget == 0 {
+            return Err(format!(
+                "path Reverie closure scan refuses a symlink subtree past {SYMLINK_SCAN_ENTRY_BUDGET} entries: {}",
+                path.display()
+            ));
+        }
+        *budget -= 1;
+        let entry_path = entry.path();
+        let file_type = entry.file_type().map_err(|e| e.to_string())?;
+        let reaches = if file_type.is_symlink() || file_type.is_dir() {
+            symlink_reaches_closure_source(&entry_path, depth + 1, budget)?
+        } else {
+            file_type.is_file() && has_closure_source_extension(&entry_path)
+        };
+        if reaches {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
 fn scan_closure_package_dir(
     dir: &Path,
     reverie_root: &Path,
@@ -2125,18 +2214,16 @@ fn scan_closure_package_dir(
         let file_type = entry.file_type().map_err(|e| e.to_string())?;
         let path = entry.path();
         if file_type.is_symlink() {
-            return Err(format!(
-                "path Reverie closure scan refuses a symlink: {}",
-                path.display()
-            ));
+            let mut budget = SYMLINK_SCAN_ENTRY_BUDGET;
+            if symlink_reaches_closure_source(&path, 0, &mut budget)? {
+                return Err(format!(
+                    "path Reverie closure scan refuses a symlink: {}",
+                    path.display()
+                ));
+            }
         } else if file_type.is_dir() {
             scan_closure_package_dir(&path, reverie_root, found)?;
-        } else if file_type.is_file()
-            && path
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .is_some_and(|extension| CLOSURE_SOURCE_EXTENSIONS.contains(&extension))
-        {
+        } else if file_type.is_file() && has_closure_source_extension(&path) {
             let relative = path
                 .strip_prefix(reverie_root)
                 .map_err(|e| e.to_string())?
@@ -3769,9 +3856,13 @@ impl VerifiedCompiledSources {
             ),
             "declared content factory supports only closed Hermit image profiles",
         )?;
-        // The layout selects the metadata shape: Git-checkout packages bind
-        // to the full Git source, path packages bind by declared content.
-        // Neither arm accepts the other's shape.
+        // The layout selects the metadata shape. The Git arm binds
+        // either spelling to the pin: git-form packages by their exact
+        // source string, path-form packages by the checkout pin proof
+        // below (HEAD and gitlink), each then also bound by declared
+        // content. The path arm binds path packages by declared
+        // content alone — consumers route only gitless Reverie roots
+        // here — and refuses any source-carrying spelling.
         let path_sourced = expected.layout == CompiledSourceLayout::HermitPath;
         require(
             source_pin_is_full(expected.reverie_pin),
@@ -44413,14 +44504,16 @@ mod tests {
                 serde_json::json!(outside.join("Cargo.toml"));
             outside_meta["packages"][0]["id"] =
                 serde_json::json!(format!("path+file://{}#0.5.7", outside.display()));
-            assert!(
+            assert_eq!(
                 content_package(&outside_meta, name, target, kind, &binding, &git_source)
-                    .is_err(),
-                "content predicate must refuse path {name} outside verified root"
+                    .unwrap_err(),
+                "content metadata manifest differs from exact compiler spelling",
+                "content predicate must refuse path {name} outside verified root by name",
             );
-            assert!(
-                content_package_path(&outside_meta, name, target, kind, &binding).is_err(),
-                "path predicate must refuse path {name} outside verified root"
+            assert_eq!(
+                content_package_path(&outside_meta, name, target, kind, &binding).unwrap_err(),
+                "content metadata manifest differs from exact compiler spelling",
+                "path predicate must refuse path {name} outside verified root by name",
             );
             for (field, value) in [
                 ("source", serde_json::json!(git_source)),
@@ -44808,6 +44901,90 @@ mod tests {
         )
         .is_err());
         fs::remove_file(&alias).unwrap();
+        // Source-ness follows either name (target side here): an
+        // extensionless link directly to a source file refuses too.
+        let bare_alias = canonical.join("reverie-inguest/src/bare_alias");
+        symlink(
+            canonical.join("reverie-inguest/src/extra_closure.rs"),
+            &bare_alias,
+        )
+        .unwrap();
+        let bare_refusal = match content_reverie_inventory_for_path(
+            &canonical,
+            FixedImageKind::Standalone,
+            &package_dirs,
+        ) {
+            Ok(_) => panic!("extensionless symlink to a source file was accepted"),
+            Err(error) => error,
+        };
+        assert!(
+            bare_refusal.contains("closure scan refuses a symlink"),
+            "{bare_refusal}"
+        );
+        fs::remove_file(&bare_alias).unwrap();
+        // Source-ness also follows the link name: the name is what
+        // the compiler opens (`mod evil;` loads `evil.rs` whatever
+        // its target is called), so a source-named link to a
+        // non-source file refuses too.
+        let evil_alias = canonical.join("reverie-inguest/src/evil.rs");
+        symlink(canonical.join("reverie-inguest/notes.txt"), &evil_alias).unwrap();
+        let evil_refusal = match content_reverie_inventory_for_path(
+            &canonical,
+            FixedImageKind::Standalone,
+            &package_dirs,
+        ) {
+            Ok(_) => panic!("source-named symlink to a non-source file was accepted"),
+            Err(error) => error,
+        };
+        assert!(
+            evil_refusal.contains("closure scan refuses a symlink"),
+            "{evil_refusal}"
+        );
+        fs::remove_file(&evil_alias).unwrap();
+        // A link reaching only non-source files (the tracked
+        // documentation skill directories) cannot hide a compiled
+        // input and does not refuse the scan; a link reaching a
+        // source-shaped file still does.
+        let docs = canonical.join("reverie-inguest/docs");
+        fs::create_dir_all(&docs).unwrap();
+        fs::write(docs.join("SKILL.md"), "docs\n").unwrap();
+        symlink(&docs, canonical.join("reverie-inguest/docs-link")).unwrap();
+        content_reverie_inventory_for_path(&canonical, FixedImageKind::Standalone, &package_dirs)
+            .unwrap();
+        fs::write(docs.join("hidden.rs"), "hidden\n").unwrap();
+        assert!(content_reverie_inventory_for_path(
+            &canonical,
+            FixedImageKind::Standalone,
+            &package_dirs
+        )
+        .is_err());
+        fs::remove_dir_all(&docs).unwrap();
+        fs::remove_file(canonical.join("reverie-inguest/docs-link")).unwrap();
+        // Depth counts plain-directory descent too, so a link to a
+        // deep non-source tree refuses by name instead of enumerating
+        // it without bound.
+        let deep = canonical.join("reverie-inguest/deep");
+        let mut bottom = deep.clone();
+        for _ in 0..10 {
+            bottom = bottom.join("a");
+        }
+        fs::create_dir_all(&bottom).unwrap();
+        fs::write(bottom.join("SKILL.md"), "deep docs\n").unwrap();
+        symlink(&deep, canonical.join("reverie-inguest/deep-link")).unwrap();
+        let deep_refusal = match content_reverie_inventory_for_path(
+            &canonical,
+            FixedImageKind::Standalone,
+            &package_dirs,
+        ) {
+            Ok(_) => panic!("deep symlink subtree was scanned without bound"),
+            Err(error) => error,
+        };
+        assert!(
+            deep_refusal.contains("closure scan refuses a symlink chain"),
+            "{deep_refusal}"
+        );
+        fs::remove_file(canonical.join("reverie-inguest/deep-link")).unwrap();
+        fs::remove_dir_all(&deep).unwrap();
         let workspace = root.join("hermit");
         for relative in CONTENT_WORKSPACE_FILES {
             fs::create_dir_all(workspace.join(relative).parent().unwrap()).unwrap();
