@@ -393,13 +393,13 @@ fn open_file(
             .expect("a synthesized /proc path always normalizes");
         if let Some(file) = process_file {
             if !path_only {
-                return open_process_proc(state, &normalized, file, flags, close_on_exec);
+                return open_process_proc(state, normalized, file, flags, close_on_exec);
             }
             // An O_PATH handle has no content. Keep its backing empty, like
             // the readable description's, so fstat agrees with path stat.
             return open_synthetic_proc(
                 state,
-                &normalized,
+                normalized,
                 b"",
                 close_on_exec,
                 true,
@@ -408,7 +408,7 @@ fn open_file(
         }
         return open_synthetic_proc(
             state,
-            &normalized,
+            normalized,
             &content,
             close_on_exec,
             path_only,
