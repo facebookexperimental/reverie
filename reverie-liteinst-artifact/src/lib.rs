@@ -3419,6 +3419,36 @@ fn content_manifest_and_lock_pin_path(
     }
     Ok(())
 }
+/// The spelling one fresh graph uses for its pinned packages,
+/// observed from the single compiled inguest package the root
+/// bindings below also select: no source string is the path form,
+/// a git source string is the git form, and any other source
+/// refuses here instead of selecting a binding family. The
+/// spelling only selects which metadata predicates run; the git
+/// form's exact source string is still judged by those predicates,
+/// never by this observation.
+fn content_graph_path_sourced(metadata: &Value) -> Result<bool> {
+    let selected: Vec<_> = metadata["packages"]
+        .as_array()
+        .ok_or("content metadata packages missing")?
+        .iter()
+        .filter(|p| p["name"] == "reverie-inguest")
+        .collect();
+    require(
+        selected.len() == 1,
+        "one compiled reverie-inguest source required",
+    )?;
+    if selected[0]["source"].is_null() {
+        return Ok(true);
+    }
+    require(
+        selected[0]["source"]
+            .as_str()
+            .is_some_and(|source| source.starts_with("git+")),
+        "content graph package source is neither a git source nor a path package",
+    )?;
+    Ok(false)
+}
 // Runtime and producer are separate locked Cargo graphs. Neither may stand
 // in for the other, and they must identify the same actual compiler checkout.
 fn content_root_binding(metadata: &Value, pin: &str) -> Result<CompilerRootBinding> {
@@ -4129,17 +4159,21 @@ impl VerifiedCompiledSources {
             ),
             "declared content factory supports only closed consumer image profiles",
         )?;
-        // The layout selects the metadata shape. The Git arm binds
-        // either spelling to the pin: git-form packages by their exact
-        // source string, path-form packages by the checkout pin proof
-        // below (HEAD and gitlink), each then also bound by declared
-        // content. The path arm binds path packages by declared
-        // content alone — consumers route only gitless Reverie roots
-        // here — and refuses any source-carrying spelling.
+        // Two independent facts route this factory, and neither is
+        // derived from the other. The graph spelling, observed from
+        // the fresh metadata below, selects the metadata predicates:
+        // git-form packages bind by their exact source string,
+        // path-form packages by their logical paths, each then also
+        // bound by declared content. The layout selects the pin
+        // proof and the recorded inventory: the Git checkout layout
+        // runs the checkout pin proof (HEAD and gitlink) for the
+        // path form and records the reviewed catalog, while the
+        // path layout — path spelling only, refused below for any
+        // source-carrying graph — records the compiled closure and
+        // runs no proof.
         let declaration = require_consumer_declaration(expected)?.ok_or(
             "consumer-checkout layout requires a declared consumer source declaration",
         )?;
-        let path_sourced = expected.layout == CompiledSourceLayout::PathCheckout;
         require(
             source_pin_is_full(expected.reverie_pin),
             "compiled source requires an independent full Reverie pin",
@@ -4200,12 +4234,16 @@ impl VerifiedCompiledSources {
         let metadata: Value = serde_json::from_slice(&output)
             .map_err(|e| format!("fresh compiled source metadata: {e}"))?;
         let source = private_static::cargo_git_source(repository, expected.reverie_pin);
+        let path_sourced = content_graph_path_sourced(&metadata)?;
+        require(
+            expected.layout != CompiledSourceLayout::PathCheckout || path_sourced,
+            "path layout requires path-sourced packages; this graph is git-sourced",
+        )?;
         let binding = if path_sourced {
             content_root_binding_path(&metadata, &root, declaration.reverie_relative)?
         } else {
             content_root_binding(&metadata, expected.reverie_pin)?
         };
-        // (pin binding for the path form runs below, once the layout is known)
         let producer_metadata = match expected.image_kind {
             FixedImageKind::Standalone => None,
             FixedImageKind::Detcore => {
@@ -4245,6 +4283,10 @@ impl VerifiedCompiledSources {
                 )?;
                 let producer: Value = serde_json::from_slice(&output)
                     .map_err(|e| format!("fresh producer source metadata: {e}"))?;
+                require(
+                    content_graph_path_sourced(&producer)? == path_sourced,
+                    "runtime and producer graphs spell their pinned packages differently",
+                )?;
                 let producer_binding = if path_sourced {
                     content_root_binding_path(&producer, &root, declaration.reverie_relative)?
                 } else {
@@ -4255,40 +4297,50 @@ impl VerifiedCompiledSources {
             }
         };
         let producer_metadata = producer_metadata.as_ref().unwrap_or(&metadata);
-        let (reverie_inventory, reverie_files) = if path_sourced {
-            content_manifest_and_lock_pin_path(
-                producer_metadata,
-                &root,
-                &binding.logical_root,
-                declaration,
-            )?;
-            let package_dirs = content_reverie_package_dirs(
-                &[&metadata, producer_metadata],
-                &binding.logical_root,
-            )?;
-            content_reverie_inventory_for_path(
-                &binding.canonical_root,
-                expected.image_kind,
-                &package_dirs,
-            )?
-        } else {
-            let path_form = content_manifest_and_lock_pin(
-                producer_metadata,
-                &root,
-                &source,
-                &binding.canonical_root,
-                declaration,
-            )?;
-            require_reverie_checkout_at_pin(
-                &root,
-                &binding,
-                expected.reverie_pin,
-                path_form,
-                declaration.reverie_relative,
-                runner,
-            )?;
-            content_reverie_inventory_for_image(&binding.canonical_root, expected.image_kind)?
-        };
+        // The pin proof and the recorded inventory follow the layout,
+        // never the spelling: re-dispatching this branch on the
+        // spelling would silently stop the proof for a path-spelled
+        // Git checkout and record an inventory the close check does
+        // not re-derive for its layout.
+        let (reverie_inventory, reverie_files) =
+            if expected.layout == CompiledSourceLayout::PathCheckout {
+                content_manifest_and_lock_pin_path(
+                    producer_metadata,
+                    &root,
+                    &binding.logical_root,
+                    declaration,
+                )?;
+                let package_dirs = content_reverie_package_dirs(
+                    &[&metadata, producer_metadata],
+                    &binding.logical_root,
+                )?;
+                content_reverie_inventory_for_path(
+                    &binding.canonical_root,
+                    expected.image_kind,
+                    &package_dirs,
+                )?
+            } else {
+                let path_form = content_manifest_and_lock_pin(
+                    producer_metadata,
+                    &root,
+                    &source,
+                    &binding.canonical_root,
+                    declaration,
+                )?;
+                require(
+                    path_form == path_sourced,
+                    "producer graph spelling differs from the bound graph spelling",
+                )?;
+                require_reverie_checkout_at_pin(
+                    &root,
+                    &binding,
+                    expected.reverie_pin,
+                    path_form,
+                    declaration.reverie_relative,
+                    runner,
+                )?;
+                content_reverie_inventory_for_image(&binding.canonical_root, expected.image_kind)?
+            };
         let mut packages = BTreeMap::new();
         for (name, target, kind) in [
             (
@@ -40551,6 +40603,68 @@ mod tests {
             version: "0.5.7",
         }
     }
+    fn resolve_content_image(
+        layout: CompiledSourceLayout,
+        image_kind: FixedImageKind,
+        workspace_root: &Path,
+        manifest: &Path,
+        pin: &str,
+        runner: &mut Runner,
+    ) -> Result<VerifiedCompiledSources> {
+        VerifiedCompiledSources::resolve_content(
+            &CompiledSourceExpectation {
+                layout,
+                image_kind,
+                workspace_root,
+                manifest,
+                reverie_pin: pin,
+                consumer: Some(test_consumer_declaration()),
+            },
+            runner,
+        )
+    }
+    fn resolve_content_leaf_image(
+        layout: CompiledSourceLayout,
+        workspace_root: &Path,
+        pin: &str,
+        runner: &mut Runner,
+    ) -> Result<VerifiedCompiledSources> {
+        resolve_content_image(
+            layout,
+            FixedImageKind::Detcore,
+            workspace_root,
+            &workspace_root.join("Cargo.toml"),
+            pin,
+            runner,
+        )
+    }
+    fn resolve_content_standalone_image(
+        layout: CompiledSourceLayout,
+        workspace_root: &Path,
+        pin: &str,
+        runner: &mut Runner,
+    ) -> Result<VerifiedCompiledSources> {
+        let producer = test_consumer_declaration()
+            .runtime_packages
+            .iter()
+            .find(|package| package.dependency_kind == Some("build"))
+            .expect("the declaration names one producer build package")
+            .manifest_relative;
+        resolve_content_image(
+            layout,
+            FixedImageKind::Standalone,
+            workspace_root,
+            &workspace_root.join(producer),
+            pin,
+            runner,
+        )
+    }
+    struct ContentFixtureCleanup(PathBuf);
+    impl Drop for ContentFixtureCleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     /// A child stream scripted read by read. `on_read` runs before the
     /// scripted result is returned, standing in for the child process and the
@@ -45989,15 +46103,10 @@ mod tests {
         let mut runner =
             Runner::new(root.join("logs"), Duration::from_secs(120), 64 << 20).unwrap();
         runner.set_cargo_program(bin.join("cargo"));
-        let standalone = VerifiedCompiledSources::resolve_content(
-            &CompiledSourceExpectation {
-                layout: CompiledSourceLayout::PathCheckout,
-                image_kind: FixedImageKind::Standalone,
-                workspace_root: &consumer_ws,
-                manifest: &consumer_ws.join("liteinst-runtime-build/Cargo.toml"),
-                reverie_pin: pin,
-                consumer: Some(test_consumer_declaration()),
-            },
+        let standalone = resolve_content_standalone_image(
+            CompiledSourceLayout::PathCheckout,
+            &consumer_ws,
+            pin,
             &mut runner,
         )
         .expect("path-sourced standalone profile must resolve without Git");
@@ -46018,34 +46127,33 @@ mod tests {
                 .files
                 .contains_key("rv:reverie-inguest/Cargo.toml")
         );
-        let leaf_verified = VerifiedCompiledSources::resolve_content(
-            &CompiledSourceExpectation {
-                layout: CompiledSourceLayout::PathCheckout,
-                image_kind: FixedImageKind::Detcore,
-                workspace_root: &consumer_ws,
-                manifest: &consumer_ws.join("Cargo.toml"),
-                reverie_pin: pin,
-                consumer: Some(test_consumer_declaration()),
-            },
+        let leaf_verified = resolve_content_leaf_image(
+            CompiledSourceLayout::PathCheckout,
+            &consumer_ws,
+            pin,
             &mut runner,
         )
         .expect("path-sourced leaf profile must resolve without Git");
         assert_eq!(leaf_verified.record.layout, CompiledSourceLayout::PathCheckout);
         assert_eq!(leaf_verified.record.leaf.name, "detcore-liteinst");
-        // The Git content arm refuses this path-shaped graph, and the Git
-        // factory refuses the path layout before running any command.
-        assert!(VerifiedCompiledSources::resolve_content(
-            &CompiledSourceExpectation {
-                layout: CompiledSourceLayout::GitlinkCheckout,
-                image_kind: FixedImageKind::Standalone,
-                workspace_root: &consumer_ws,
-                manifest: &consumer_ws.join("liteinst-runtime-build/Cargo.toml"),
-                reverie_pin: pin,
-                consumer: Some(test_consumer_declaration()),
-            },
+        // The Git checkout layout binds this path-shaped graph by its
+        // path predicates, but its producer pin binds dependency
+        // paths to the canonical root: this fixture spells them
+        // through the symlink, so the layout refuses by name before
+        // its pin proof. The Git factory refuses the path layout
+        // before running any command.
+        let pin_refusal = resolve_content_standalone_image(
+            CompiledSourceLayout::GitlinkCheckout,
+            &consumer_ws,
+            pin,
             &mut runner,
         )
-        .is_err());
+        .err()
+        .expect("the Git checkout layout must refuse this symlinked graph");
+        assert!(
+            pin_refusal.contains("content manifest dependency differs from independent full pin"),
+            "{pin_refusal}"
+        );
         let mut git_runner =
             Runner::new(root.join("git-logs"), Duration::from_secs(120), 64 << 20).unwrap();
         git_runner.set_cargo_program(bin.join("cargo"));
@@ -46073,6 +46181,352 @@ mod tests {
         assert!(refusal.contains("late_closure.rs"), "{refusal}");
         fs::remove_file(&late).unwrap();
         standalone.verify_unchanged(&mut runner).unwrap();
+    }
+
+    /// A path-spelled consumer workspace whose pinned tree is a real
+    /// Git checkout at the returned pin, recorded by an equal gitlink
+    /// in the consumer's own repository, plus a runner whose cargo
+    /// serves one path-spelled metadata document for every graph.
+    /// Git itself is never faked: the checkout pin proof runs against
+    /// these real repositories.
+    fn gitlink_path_spelled_fixture(
+        label: &str,
+    ) -> (ContentFixtureCleanup, PathBuf, String, Runner) {
+        use std::io::Write as _;
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let parent = fs::canonicalize(std::env::temp_dir()).unwrap();
+        let root = parent.join(format!(
+            "{label}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let cleanup = ContentFixtureCleanup(root.clone());
+        let git = |dir: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_NAME", "fixture")
+                .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+                .env("GIT_COMMITTER_NAME", "fixture")
+                .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap().trim().to_owned()
+        };
+        // Pinned tree at the reviewed catalog bytes, as a real Git
+        // checkout: its HEAD is the independent pin.
+        let checkout = root.join("checkout");
+        let real_root = reverie_workspace_root();
+        for relative in CONTENT_REVERIE_CATALOG.iter().map(|row| row.0) {
+            let to = checkout.join(relative);
+            fs::create_dir_all(to.parent().unwrap()).unwrap();
+            fs::copy(real_root.join(relative), &to).unwrap();
+        }
+        for relative in [
+            CONTENT_FIXED_GATE.0,
+            "reverie-liteinst-artifact/Cargo.toml",
+            "reverie-liteinst-artifact/src/lib.rs",
+            "reverie-inguest/Cargo.toml",
+            "reverie-inguest/src/lib.rs",
+            "reverie-syscalls/Cargo.toml",
+            "reverie-syscalls/src/lib.rs",
+            "reverie-liteinst/Cargo.toml",
+            "reverie-liteinst/src/lib.rs",
+            "reverie-liteinst-preload/Cargo.toml",
+            "reverie-liteinst-preload/src/lib.rs",
+            "reverie/Cargo.toml",
+            "reverie/src/lib.rs",
+            "reverie-rpc-transport/Cargo.toml",
+            "reverie-rpc-transport/src/lib.rs",
+        ] {
+            let to = checkout.join(relative);
+            fs::create_dir_all(to.parent().unwrap()).unwrap();
+            fs::copy(real_root.join(relative), &to).unwrap();
+        }
+        git(&checkout, &["init", "-q", "."]);
+        git(&checkout, &["add", "-A"]);
+        git(&checkout, &["commit", "-qm", "fixture checkout"]);
+        let pin = git(&checkout, &["rev-parse", "HEAD"]);
+        // Consumer workspace: its pinned tree is a clone of that
+        // checkout at the pin, a real directory and never a symlink
+        // (a symlink would mask the leaf route behind root binding),
+        // recorded by an equal gitlink. Every lock stays path-form:
+        // no pinned package carries a source line.
+        let leaf_decl = test_leaf_decl();
+        let declaration = test_consumer_declaration();
+        let consumer_ws = root.join("consumer");
+        for relative in declaration.leaf_workspace_files {
+            let to = consumer_ws.join(relative);
+            fs::create_dir_all(to.parent().unwrap()).unwrap();
+            fs::write(&to, format!("fixture {relative}\n")).unwrap();
+        }
+        let mut lock = [
+            "reverie-core",
+            "reverie-inguest",
+            "reverie-syscalls",
+            "reverie-liteinst",
+            "reverie-liteinst-preload",
+            "reverie-liteinst-artifact",
+            "reverie-rpc-transport",
+        ]
+        .into_iter()
+        .map(|name| format!("[[package]]\nname = \"{name}\"\nversion = \"0.5.7\"\n"))
+        .collect::<String>();
+        lock.push_str(&format!(
+            "[[package]]\nname = \"{}\"\nversion = \"0.5.7\"\n",
+            leaf_decl.name
+        ));
+        fs::write(consumer_ws.join("Cargo.lock"), &lock).unwrap();
+        fs::write(consumer_ws.join(declaration.runtime_lock_relative), &lock).unwrap();
+        git(
+            &root,
+            &[
+                "clone",
+                "-q",
+                checkout.to_str().unwrap(),
+                consumer_ws
+                    .join(declaration.reverie_relative)
+                    .to_str()
+                    .unwrap(),
+            ],
+        );
+        git(&consumer_ws, &["init", "-q", "."]);
+        git(&consumer_ws, &["add", "-A"]);
+        git(
+            &consumer_ws,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!(
+                    "160000,{pin},{}",
+                    declaration.reverie_relative.display()
+                ),
+            ],
+        );
+        git(&consumer_ws, &["commit", "-qm", "fixture consumer"]);
+        // Fresh metadata in path spelling: source null everywhere,
+        // rename null (the core package included), paths naming the
+        // logical package directories under the pinned tree.
+        let logical = consumer_ws.join(declaration.reverie_relative);
+        let leaf_dir = Path::new(leaf_decl.manifest_relative)
+            .parent()
+            .expect("the leaf manifest names its package directory");
+        let rv_pkg = |name: &str, dir: &str, kind: &[&str], target: &str| {
+            let id = if dir == name {
+                format!("path+file://{}#0.5.7", logical.join(dir).display())
+            } else {
+                format!("path+file://{}#{name}@0.5.7", logical.join(dir).display())
+            };
+            serde_json::json!({
+                "name": name, "version": "0.5.7", "id": id, "source": null,
+                "manifest_path": logical.join(dir).join("Cargo.toml"),
+                "targets": [{"name": target, "kind": kind, "crate_types": kind,
+                    "src_path": logical.join(dir).join("src/lib.rs")}],
+                "dependencies": []
+            })
+        };
+        let dep = |name: &str, dir: &str, rename: Option<&str>, optional: bool| {
+            serde_json::json!({"name": name, "source": null, "kind": null,
+                "rename": rename, "path": logical.join(dir), "target": null,
+                "optional": optional})
+        };
+        let mut leaf_pkg = serde_json::json!({
+            "name": leaf_decl.name, "version": "0.5.7",
+            "id": format!("path+file://{}#0.5.7", consumer_ws.join(leaf_dir).display()),
+            "source": null,
+            "manifest_path": consumer_ws.join(leaf_decl.manifest_relative),
+            "targets": [{"name": leaf_decl.target, "kind": ["cdylib"],
+                "crate_types": ["cdylib"],
+                "src_path": consumer_ws.join(leaf_dir).join("src/lib.rs")}],
+            "dependencies": []
+        });
+        leaf_pkg["dependencies"] = serde_json::json!([
+            dep("reverie-core", "reverie", None, false),
+            dep("reverie-inguest", "reverie-inguest", None, false),
+            dep("reverie-liteinst", "reverie-liteinst", None, false),
+            dep("reverie-rpc-transport", "reverie-rpc-transport", None, true)
+        ]);
+        let ws_pkg = |name: &str, manifest: PathBuf, target: &str, deps: Value| {
+            serde_json::json!({
+                "name": name, "version": "0.5.7",
+                "id": format!("path+file://{}#0.5.7", manifest.parent().unwrap().display()),
+                "source": null, "manifest_path": manifest,
+                "targets": [{"name": target, "kind": ["lib"], "crate_types": ["lib"],
+                    "src_path": manifest.parent().unwrap().join("src/lib.rs")}],
+                "dependencies": deps
+            })
+        };
+        let producer_pkg = &declaration.runtime_packages[0];
+        let wrapper_pkg = &declaration.runtime_packages[1];
+        let metadata = serde_json::json!({"workspace_root": consumer_ws, "packages": [
+            leaf_pkg,
+            rv_pkg("reverie-core", "reverie", &["lib"], "reverie_core"),
+            rv_pkg("reverie-inguest", "reverie-inguest", &["cdylib", "rlib"], "reverie_inguest"),
+            rv_pkg("reverie-syscalls", "reverie-syscalls", &["lib"], "reverie_syscalls"),
+            rv_pkg("reverie-liteinst", "reverie-liteinst", &["rlib"], "reverie_liteinst"),
+            rv_pkg("reverie-liteinst-preload", "reverie-liteinst-preload", &["cdylib"], "reverie_liteinst_preload"),
+            rv_pkg("reverie-liteinst-artifact", "reverie-liteinst-artifact", &["lib"], "reverie_liteinst_artifact"),
+            rv_pkg("reverie-rpc-transport", "reverie-rpc-transport", &["lib"], "reverie_rpc_transport"),
+            ws_pkg(producer_pkg.name,
+                consumer_ws.join(producer_pkg.manifest_relative),
+                "runtime_build",
+                serde_json::json!([{"name": producer_pkg.reverie_dependency, "source": null,
+                    "kind": "build", "rename": null,
+                    "path": logical.join(producer_pkg.reverie_dependency)}])),
+            ws_pkg(wrapper_pkg.name,
+                consumer_ws.join(wrapper_pkg.manifest_relative),
+                wrapper_pkg.target.expect("the wrapper row names its target"),
+                serde_json::json!([{"name": wrapper_pkg.reverie_dependency, "source": null,
+                    "kind": null, "rename": null,
+                    "path": logical.join(wrapper_pkg.reverie_dependency)}]))
+        ]});
+        let bin = root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let json_path = root.join("metadata.json");
+        fs::write(&json_path, serde_json::to_string(&metadata).unwrap()).unwrap();
+        let cargo_path = bin.join("cargo");
+        {
+            let mut f = fs::File::create(&cargo_path).unwrap();
+            writeln!(f, "#!/bin/sh\ncat {}", json_path.display()).unwrap();
+        }
+        #[cfg(unix)]
+        fs::set_permissions(&cargo_path, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut runner =
+            Runner::new(root.join("logs"), Duration::from_secs(120), 64 << 20).unwrap();
+        runner.set_cargo_program(bin.join("cargo"));
+        (cleanup, consumer_ws, pin, runner)
+    }
+
+    #[test]
+    fn gitlink_checkout_content_factory_binds_path_spelled_graph_at_pin() {
+        let (_cleanup, consumer_ws, pin, mut runner) =
+            gitlink_path_spelled_fixture("gitlink-path-content");
+        // The Git checkout layout asks for the checkout pin proof;
+        // the path spelling still binds by its path predicates.
+        let resolved = resolve_content_leaf_image(
+            CompiledSourceLayout::GitlinkCheckout,
+            &consumer_ws,
+            &pin,
+            &mut runner,
+        )
+        .expect("path-spelled Git checkout must resolve under the Git checkout layout");
+        assert_eq!(resolved.record.layout, CompiledSourceLayout::GitlinkCheckout);
+        assert_eq!(resolved.record.leaf.name, test_leaf_decl().name);
+        assert_eq!(resolved.record.leaf.source, None);
+        assert_eq!(
+            resolved.record.reverie_root,
+            consumer_ws.join(test_consumer_declaration().reverie_relative)
+        );
+        assert!(
+            runner.commands().iter().any(|command| {
+                command.program == "git"
+                    && command.arguments.iter().any(|arg| arg == "ls-tree")
+            }),
+            "the gitlink pin proof must run for the Git checkout layout"
+        );
+        resolved.verify_unchanged(&mut runner).unwrap();
+    }
+
+    #[test]
+    fn gitlink_checkout_content_factory_refuses_advanced_head_at_pin_proof() {
+        let (_cleanup, consumer_ws, pin, mut runner) =
+            gitlink_path_spelled_fixture("gitlink-path-wrong-head");
+        // Advance the checkout HEAD past the pin while the gitlink
+        // still records the pin: the path predicates still bind, so
+        // the refusal must come from the pin proof itself.
+        let pinned = consumer_ws.join(test_consumer_declaration().reverie_relative);
+        let out = std::process::Command::new("git")
+            .args(["commit", "-q", "--allow-empty", "-m", "advance"])
+            .current_dir(&pinned)
+            .env("GIT_AUTHOR_NAME", "fixture")
+            .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+            .env("GIT_COMMITTER_NAME", "fixture")
+            .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "advance HEAD: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let refusal = resolve_content_leaf_image(
+            CompiledSourceLayout::GitlinkCheckout,
+            &consumer_ws,
+            &pin,
+            &mut runner,
+        )
+        .err()
+        .expect("an advanced checkout HEAD must refuse at the pin proof");
+        assert!(
+            refusal.contains("checkout HEAD differs from independent full pin"),
+            "{refusal}"
+        );
+    }
+
+    #[test]
+    fn path_layout_refuses_git_spelled_graph() {
+        use std::io::Write as _;
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let parent = fs::canonicalize(std::env::temp_dir()).unwrap();
+        let root = parent.join(format!(
+            "path-layout-git-graph-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let _cleanup = ContentFixtureCleanup(root.clone());
+        let consumer_ws = root.join("consumer");
+        for relative in test_consumer_declaration().standalone_workspace_files {
+            let to = consumer_ws.join(relative);
+            fs::create_dir_all(to.parent().unwrap()).unwrap();
+            fs::write(&to, format!("fixture {relative}\n")).unwrap();
+        }
+        // One pinned package carrying the exact pinned git source:
+        // the graph is git-spelled, and the path layout refuses by
+        // name before any binding runs.
+        let pin = "0123456789abcdef0123456789abcdef01234567";
+        let logical = consumer_ws.join(test_consumer_declaration().reverie_relative);
+        let source = private_static::cargo_git_source(compiled_default_repository(), pin);
+        let metadata = serde_json::json!({"workspace_root": consumer_ws, "packages": [{
+            "name": "reverie-inguest", "version": "0.5.7",
+            "id": format!("{}#reverie-inguest@0.5.7", source.rsplit_once('#').unwrap().0),
+            "source": source,
+            "manifest_path": logical.join("reverie-inguest/Cargo.toml"),
+            "targets": [], "dependencies": []
+        }]});
+        let bin = root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let json_path = root.join("metadata.json");
+        fs::write(&json_path, serde_json::to_string(&metadata).unwrap()).unwrap();
+        let cargo_path = bin.join("cargo");
+        {
+            let mut f = fs::File::create(&cargo_path).unwrap();
+            writeln!(f, "#!/bin/sh\ncat {}", json_path.display()).unwrap();
+        }
+        #[cfg(unix)]
+        fs::set_permissions(&cargo_path, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut runner =
+            Runner::new(root.join("logs"), Duration::from_secs(120), 64 << 20).unwrap();
+        runner.set_cargo_program(bin.join("cargo"));
+        let refusal = resolve_content_standalone_image(
+            CompiledSourceLayout::PathCheckout,
+            &consumer_ws,
+            pin,
+            &mut runner,
+        )
+        .err()
+        .expect("the path layout must refuse a git-spelled graph");
+        assert!(
+            refusal.contains("path layout requires path-sourced packages"),
+            "{refusal}"
+        );
     }
 
     // Data controls on an actual gitless source-copy fixture. Metadata shapes
