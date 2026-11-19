@@ -14,7 +14,7 @@
 //! the same point, before the guest runs again. At every point that names a
 //! live guest thread, the guest's own, a sibling thread's and a child
 //! process's, the fact is the text the guest read, mapping for mapping; an
-//! exited child, as a zombie (whose map Linux prints empty) and once reaped,
+//! exited child, as a zombie (whose map lists nothing) and once reaped,
 //! the guest's parent (the tracer's process), a number no task has, zero and
 //! a negative number are `ESRCH`, and so is a task this process traces
 //! outside the session.
@@ -268,7 +268,7 @@ fn a_traced_guest_reports_the_maps_linux_shows() {
     );
 
     // Numbers that name no live guest thread: the exited child, as a zombie,
-    // whose map Linux prints empty, and once reaped; the guest's parent, the
+    // whose map lists nothing, and once reaped; the guest's parent, the
     // tracer's process, a host task that exists; a number no task has, zero
     // and -1.
     for point in [
@@ -285,7 +285,20 @@ fn a_traced_guest_reports_the_maps_linux_shows() {
             "point {point}"
         );
     }
-    assert_eq!(traced.reads[&ZOMBIE_CHILD], Ok(Vec::new()));
+    // A zombie has no address space. Linux v6.12.9 opens its map anyway and
+    // reads nothing: `mm_access` finds no mm (kernel/fork.c:1563),
+    // `proc_mem_open` hands that on (fs/proc/base.c:838-849) and `m_start`
+    // ends the read at once (fs/proc/task_mmu.c:160-163). v7.3 reads nothing
+    // too: `proc_mem_open` turns `mm_access`'s ESRCH back into none
+    // (fs/proc/base.c:829-830), which `proc_maps_open` lets through
+    // (fs/proc/task_mmu.c:386). v6.16 through v6.16.3 refuse the open with
+    // ESRCH instead: their `proc_maps_open` refuses a missing mm too
+    // (`IS_ERR_OR_NULL`), until v6.16.4 checks `IS_ERR` alone again. Either
+    // way the zombie's map lists nothing.
+    match &traced.reads[&ZOMBIE_CHILD] {
+        Ok(text) => assert!(text.is_empty(), "{}", String::from_utf8_lossy(text)),
+        Err(errno) => assert_eq!(*errno, libc::ESRCH),
+    }
     for point in [REAPED_CHILD, NO_TASK, ZERO, NEGATIVE] {
         assert_eq!(traced.reads[&point], Err(libc::ENOENT), "point {point}");
     }

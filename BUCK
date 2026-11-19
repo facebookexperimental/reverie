@@ -529,6 +529,84 @@ gated_test(
     test = "//hermetic_infra/reverie:reverie-ptrace-unittest",
 )
 
+# reverie-ptrace's Cargo integration tests (tests/*.rs), one target each,
+# with the dependencies they use from the crate's dependencies and
+# dev-dependencies. No test uses reverie's `perf-fixture` API, so they link
+# :reverie, as :reverie-ptrace does. They trace guests with ptrace, so they run
+# through gated tests (fb-only/gated_tests).
+_PTRACE_TESTS = [
+    f.removeprefix("reverie-ptrace/tests/").removesuffix(".rs")
+    for f in glob(
+        ["reverie-ptrace/tests/*.rs"],
+        # aarch64-only (#![cfg(target_arch = "aarch64")]): they define no case
+        # on x86_64, where Cargo CI and the gated tests run.
+        exclude = [
+            "reverie-ptrace/tests/branch_step.rs",
+            "reverie-ptrace/tests/branch_step_fallback.rs",
+            "reverie-ptrace/tests/exclusive_step.rs",
+        ],
+    )
+]
+
+# Sources outside reverie-ptrace/tests that a test includes.
+_PTRACE_TEST_EXTRA_SRCS = {
+    # link_path.rs include_str!s reverie-kvm's guest source.
+    "link_path": ["reverie-kvm/tests/fixtures/link_path.c"],
+}
+
+[
+    rust_unittest(
+        name = "reverie-ptrace-{}-test".format(test.replace("_", "-")),
+        srcs = ["reverie-ptrace/tests/{}.rs".format(test)] + glob(["reverie-ptrace/tests/*/**"]) + _PTRACE_TEST_EXTRA_SRCS.get(test, []),
+        # Linked as in the Cargo build: with the system allocator, since
+        # fbcode's default jemalloc starts a background thread in a guest,
+        # whose creation under Reverie resets the guest's SIGTRAP handler
+        # (injected_syscall_group_stop.rs); and statically, since
+        # launch_descriptor_window.rs finds reverie-process's launch lock in
+        # the executable's own symbol table.
+        allocator = "malloc",
+        autocargo = {"ignore_rule": True},
+        crate = test,
+        crate_root = "reverie-ptrace/tests/{}.rs".format(test),
+        env = {"CARGO_MANIFEST_DIR": "$(location :ptrace-test-fixtures)"},
+        # The library's features, which Cargo gives the package's test crates.
+        features = ["nightly"],
+        labels = run_gated_only(),
+        link_style = "static",
+        named_deps = {"reverie": ":reverie"},
+        resources = [":ptrace-test-fixtures"],
+        # As :reverie-ptrace-unittest: keeps env! paths project-relative.
+        rustc_flags = ["--env-set=CARGO_MANIFEST_DIR=$(location :ptrace-test-fixtures)"],
+        target_compatible_with = [
+            "ovr_config//cpu:x86_64",
+            "ovr_config//os:linux",
+        ],
+        deps = [
+            "fbsource//third-party/rust:anyhow",
+            "fbsource//third-party/rust:goblin",
+            "fbsource//third-party/rust:libc",
+            "fbsource//third-party/rust:procfs",
+            "fbsource//third-party/rust:serde",
+            "fbsource//third-party/rust:test-case",
+            "fbsource//third-party/rust:tokio",
+            "fbsource//third-party/rust:tracing",
+            "fbsource//third-party/rust:tracing-subscriber",
+            ":reverie-ptrace",
+        ],
+    )
+    for test in _PTRACE_TESTS
+]
+
+[
+    gated_test(
+        name = "reverie-ptrace-{}-test-gated".format(test.replace("_", "-")),
+        env = {"CARGO_MANIFEST_DIR": "$(location :ptrace-test-fixtures)"},
+        labels = ["buck2_run_from_project_root"],
+        test = "//hermetic_infra/reverie:reverie-ptrace-{}-test".format(test.replace("_", "-")),
+    )
+    for test in _PTRACE_TESTS
+]
+
 rust_library(
     name = "reverie-syscalls",
     srcs = glob(["reverie-syscalls/src/**/*.rs"]),
