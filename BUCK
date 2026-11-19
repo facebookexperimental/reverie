@@ -2348,3 +2348,317 @@ buck_sh_test(
     target_compatible_with = ["fbcode//opensource/macros:broken-in-oss"],
     test = "fb-only/check_layering_test.sh",
 )
+
+# The reverie-examples features our Cargo CI tests the crate with
+# (STABLE_FEATURES), which Cargo enables on each of its targets.
+_EXAMPLES_FEATURES = [
+    "conformance-tools",
+    "host",
+    "runtime",
+    "test-support",
+]
+
+# The reverie-examples library: the example Tools, the shared host API and the
+# example preload (its cdylib, libreverie_examples.so). It is built here for
+# the crate's Cargo integration tests below; Cargo runs its unit tests.
+rust_library(
+    name = "reverie-examples",
+    srcs = glob(
+        ["reverie-examples/**/*.rs"],
+        exclude = [
+            "reverie-examples/e2e/**",
+            "reverie-examples/tests/**",
+        ],
+    ),
+    autocargo = {"ignore_rule": True},
+    crate = "reverie_examples",
+    crate_root = "reverie-examples/src/lib.rs",
+    features = _EXAMPLES_FEATURES,
+    # src/lib.rs path-includes the generic conformance Tools and guests.
+    mapped_srcs = {"//hermetic_infra/reverie/tests:reverie-examples-srcs": "tests"},
+    rustc_flags = sanitized_feature,
+    target_compatible_with = [
+        "ovr_config//cpu:x86_64",
+        "ovr_config//os:linux",
+    ],
+    unittests = False,
+    deps = [
+        "fbsource//third-party/rust:anyhow",
+        "fbsource//third-party/rust:clap",
+        "fbsource//third-party/rust:libc",
+        "fbsource//third-party/rust:nix",
+        "fbsource//third-party/rust:serde",
+        "fbsource//third-party/rust:serde_json",
+        "fbsource//third-party/rust:syscalls",
+        "fbsource//third-party/rust:tokio",
+        "fbsource//third-party/rust:tracing",
+        ":reverie",
+        ":reverie-kvm",
+        ":reverie-linuxemu-ext-procfs",
+        ":reverie-liteinst-sitepatch",  # @manual name:reverie_liteinst
+        ":reverie-ptrace",
+        ":reverie-util",
+    ],
+)
+
+# The Cargo [[bin]]s reverie-examples' integration tests run, by Cargo name:
+# (crate root, dependencies beyond the ones every launcher uses). They use
+# the system allocator and link statically, as their Cargo builds do; a copy
+# of one runs from :reverie-examples-bins.
+_EXAMPLES_BINS = {
+    "chaos": ("reverie-examples/chaos_launcher.rs", [":reverie-linuxemu-ext-procfs"]),
+    "chrome_trace": (
+        "reverie-examples/chrome-trace/launcher.rs",
+        [
+            "fbsource//third-party/rust:serde",
+            "fbsource//third-party/rust:serde_json",
+            "fbsource//third-party/rust:syscalls",
+            ":reverie-linuxemu-ext-procfs",
+        ],
+    ),
+    "chunky_print": (
+        "reverie-examples/chunky_print_launcher.rs",
+        [
+            "fbsource//third-party/rust:serde",
+            "fbsource//third-party/rust:syscalls",
+            "fbsource//third-party/rust:tracing",
+            ":reverie-linuxemu-ext-procfs",
+        ],
+    ),
+    "counter1": (
+        "reverie-examples/counter1.rs",
+        [
+            "fbsource//third-party/rust:serde",
+            "fbsource//third-party/rust:syscalls",
+            "fbsource//third-party/rust:tracing",
+            ":reverie-linuxemu-ext-procfs",
+        ],
+    ),
+    "counter2": (
+        "reverie-examples/counter2.rs",
+        [
+            "fbsource//third-party/rust:serde",
+            "fbsource//third-party/rust:syscalls",
+            "fbsource//third-party/rust:tracing",
+            ":reverie-linuxemu-ext-procfs",
+        ],
+    ),
+    "debug": ("reverie-examples/debug_launcher.rs", [":reverie-linuxemu-ext-procfs"]),
+    "noop": (
+        "reverie-examples/noop.rs",
+        [
+            "fbsource//third-party/rust:syscalls",
+            ":reverie-linuxemu-ext-procfs",
+        ],
+    ),
+    "recorder": ("reverie-examples/recorder.rs", [":reverie-linuxemu-ext-procfs"]),
+    "reverie-liteinst-env-guest": ("reverie-examples/liteinst_env_guest.rs", []),
+    "reverie-liteinst-examples": (
+        "reverie-examples/liteinst.rs",
+        [
+            "fbsource//third-party/rust:serde",
+            "fbsource//third-party/rust:serde_json",
+            "fbsource//third-party/rust:syscalls",
+            "fbsource//third-party/rust:tracing",
+            ":reverie-linuxemu-ext-procfs",
+        ],
+    ),
+    "strace": (
+        "reverie-examples/strace/main.rs",
+        [
+            "fbsource//third-party/rust:serde",
+            "fbsource//third-party/rust:syscalls",
+            ":reverie-linuxemu-ext-procfs",
+        ],
+    ),
+    "strace_minimal": (
+        "reverie-examples/strace_minimal_launcher.rs",
+        [
+            "fbsource//third-party/rust:syscalls",
+            ":reverie-linuxemu-ext-procfs",
+        ],
+    ),
+}
+
+[
+    rust_binary(
+        name = "reverie-examples-{}".format(bin.replace("_", "-")),
+        srcs = glob(
+            ["reverie-examples/**/*.rs"],
+            exclude = [
+                "reverie-examples/e2e/**",
+                "reverie-examples/tests/**",
+            ],
+        ),
+        allocator = "malloc",
+        autocargo = {"ignore_rule": True},
+        crate = bin.replace("-", "_"),
+        crate_root = crate_root,
+        features = _EXAMPLES_FEATURES,
+        link_style = "static",
+        target_compatible_with = [
+            "ovr_config//cpu:x86_64",
+            "ovr_config//os:linux",
+        ],
+        unittests = False,
+        deps = [
+            "fbsource//third-party/rust:anyhow",
+            "fbsource//third-party/rust:clap",
+            "fbsource//third-party/rust:libc",
+            "fbsource//third-party/rust:tokio",
+            ":reverie",
+            ":reverie-examples",
+            ":reverie-kvm",
+            ":reverie-liteinst-sitepatch",  # @manual name:reverie_liteinst
+            ":reverie-ptrace",
+            ":reverie-util",
+        ]
+        + extra_deps,
+    )
+    for bin, (crate_root, extra_deps) in _EXAMPLES_BINS.items()
+]
+
+rust_binary(
+    name = "reverie-examples-parallel-tasks",
+    allocator = "malloc",
+    autocargo = {"ignore_rule": True},
+    crate = "parallel_tasks",
+    crate_root = "tests/standalone/parallel_tasks.rs",
+    link_style = "static",
+    mapped_srcs = {"//hermetic_infra/reverie/tests:reverie-examples-srcs": "tests"},
+    target_compatible_with = [
+        "ovr_config//cpu:x86_64",
+        "ovr_config//os:linux",
+    ],
+    unittests = False,
+    deps = [
+        "fbsource//third-party/rust:tokio",
+        ":reverie",
+        ":reverie-ptrace",
+    ],
+)
+
+# The launchers whose in-guest backends the tests run, beside the example
+# preload, as Cargo lays out its target directory: a launcher hosts those
+# backends' tools in the libreverie_examples.so beside its own executable
+# (backend.rs).
+_EXAMPLES_PRELOAD_LAUNCHERS = [
+    "counter1",
+    "noop",
+    "recorder",
+    "strace_minimal",
+]
+
+buck_filegroup(
+    name = "reverie-examples-bins",
+    srcs = {bin: ":reverie-examples-{}".format(bin.replace("_", "-")) for bin in _EXAMPLES_PRELOAD_LAUNCHERS}
+    | {"libreverie_examples.so": ":reverie-examples[cdylib]"},
+    target_compatible_with = [
+        "ovr_config//cpu:x86_64",
+        "ovr_config//os:linux",
+    ],
+)
+
+# reverie-examples/tests laid out as under CARGO_MANIFEST_DIR.
+buck_filegroup(
+    name = "examples-test-fixtures",
+    srcs = {src.removeprefix("reverie-examples/"): src for src in glob(["reverie-examples/tests/fixtures/**"])},
+)
+
+# reverie-examples' Cargo integration tests (tests/*.rs), one target each, with
+# the dependencies they use from the crate's dependencies and
+# dev-dependencies. As in Cargo, each test sees the [[bin]]s as
+# CARGO_BIN_EXE_<name> and a CARGO_MANIFEST_DIR. They run tools on guests on
+# every first-party backend, so they run through gated tests
+# (fb-only/gated_tests). As in our Cargo CI's host-dependent job, they require
+# /dev/kvm (REVERIE_REQUIRE_KVM) rather than pass without it.
+_EXAMPLES_TESTS = [f.removeprefix("reverie-examples/tests/").removesuffix(".rs") for f in glob(["reverie-examples/tests/*.rs"])]
+
+# Tests that find libreverie_examples.so beside their own executable (Cargo's
+# target/<profile>/deps), which a Buck test executable never has: their gated
+# tests run a copy placed beside it (fb-only/defs.bzl).
+_EXAMPLES_COPIED_TESTS = ["liteinst"]
+
+# tests/liteinst.rs uses reverie-liteinst but not the library. reverie-liteinst's
+# exported entry points reference the allocator-backing descriptor a final
+# image declares (allocator_backing.rs); the test declares none, and lld
+# refuses the undefined hidden reference although no live code uses it
+# (--gc-sections does not drop it). The library declares it, so `force` links
+# the library although the test does not name it.
+_EXAMPLES_TEST_FLAGGED_DEPS = {"liteinst": [(":reverie-examples", ["force"])]}
+
+_EXAMPLES_TEST_DEPS = {
+    "liteinst": [
+        "fbsource//third-party/rust:libc",
+        "fbsource//third-party/rust:serde",
+        "fbsource//third-party/rust:serde_json",
+        "fbsource//third-party/rust:tempfile",
+        ":reverie-liteinst-sitepatch",  # @manual name:reverie_liteinst
+    ],
+}
+
+_EXAMPLES_TEST_PATHS = dict(
+    {
+        "CARGO_BIN_EXE_" + bin: (
+            "$(location :reverie-examples-bins)/" + bin
+            if bin in _EXAMPLES_PRELOAD_LAUNCHERS
+            else "$(location :reverie-examples-{})".format(bin.replace("_", "-"))
+        )
+        for bin in _EXAMPLES_BINS
+    },
+    CARGO_BIN_EXE_parallel_tasks = "$(location :reverie-examples-parallel-tasks)",
+    CARGO_MANIFEST_DIR = "$(location :examples-test-fixtures)",
+    # Cargo's target/tmp, beside CARGO_MANIFEST_DIR as target/ is beside the
+    # crate directory.
+    CARGO_TARGET_TMPDIR = "$(location :examples-test-fixtures)/../target/tmp",
+)
+
+[
+    rust_unittest(
+        name = "reverie-examples-{}-test".format(test.replace("_", "-")),
+        srcs = ["reverie-examples/tests/{}.rs".format(test)] + glob(["reverie-examples/tests/*/**"]),
+        autocargo = {"ignore_rule": True},
+        crate = test,
+        crate_root = "reverie-examples/tests/{}.rs".format(test),
+        env = dict(_EXAMPLES_TEST_PATHS, REVERIE_REQUIRE_KVM = "1"),
+        flagged_deps = _EXAMPLES_TEST_FLAGGED_DEPS.get(test, []),
+        labels = run_gated_only(),
+        # A dev-mode shared link keeps reverie-liteinst's selected_backing(),
+        # which needs the per-image allocator declaration (allocator_backing.rs)
+        # these images do not make; a static link, as Cargo's, drops it.
+        link_style = "static",
+        resources = [
+            ":examples-test-fixtures",
+            ":reverie-examples-bins",
+            ":reverie-examples-parallel-tasks",
+        ]
+        + [":reverie-examples-{}".format(bin.replace("_", "-")) for bin in _EXAMPLES_BINS],
+        # Keep the env! paths project-relative across remote compilation.
+        rustc_flags = ["--env-set={}={}".format(k, v) for k, v in _EXAMPLES_TEST_PATHS.items()],
+        target_compatible_with = [
+            "ovr_config//cpu:x86_64",
+            "ovr_config//os:linux",
+        ],
+        deps = _EXAMPLES_TEST_DEPS.get(
+            test,
+            [
+                "fbsource//third-party/rust:libc",
+                "fbsource//third-party/rust:serde_json",
+                "fbsource//third-party/rust:tempfile",
+                ":reverie-examples",
+            ],
+        ),
+    )
+    for test in _EXAMPLES_TESTS
+]
+
+[
+    gated_test(
+        name = "reverie-examples-{}-test-gated".format(test.replace("_", "-")),
+        env = dict(_EXAMPLES_TEST_PATHS, REVERIE_REQUIRE_KVM = "1"),
+        labels = ["buck2_run_from_project_root"],
+        test = "//hermetic_infra/reverie:reverie-examples-{}-test".format(test.replace("_", "-")),
+    )
+    for test in _EXAMPLES_TESTS
+    if test not in _EXAMPLES_COPIED_TESTS
+]

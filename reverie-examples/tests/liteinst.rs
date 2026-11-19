@@ -1152,7 +1152,10 @@ fn counter2_captured_environment_controls(backend: &str) {
         std::os::unix::fs::symlink(target, &link).unwrap();
         assert_eq!(std::fs::canonicalize(&link).unwrap(), *target);
     }
-    let program = Path::new(env!("CARGO_BIN_EXE_counter2"));
+    // The program runs from another working directory, so its path must not
+    // depend on this one; a build may give the path relative to it.
+    let program = std::path::absolute(env!("CARGO_BIN_EXE_counter2"))
+        .expect("CARGO_BIN_EXE_counter2 should resolve against the working directory");
     assert!(program.is_absolute());
     let controller = BTreeMap::from([
         (OsString::from("PATH"), OsString::from("/bin:/usr/bin")),
@@ -1240,7 +1243,7 @@ fn counter2_captured_environment_controls(backend: &str) {
             expected.insert("ASAN_OPTIONS".into(), "detect_leaks=0".into());
             expected.insert("LSAN_OPTIONS".into(), "detect_leaks=0".into());
         }
-        let mut command = Command::new(program);
+        let mut command = Command::new(&program);
         command
             .env_clear()
             .envs(&environment)

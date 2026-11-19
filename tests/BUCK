@@ -600,10 +600,24 @@ buck_sh_binary(
     for base in reverie_tests
 ]
 
-# The reverie-examples tools (noop, strace, counter1/2, chunky_print) are not
-# built in fbsource since the 0.5 import: upstream's shared examples backend
-# links the DynamoRIO and e9patch backends, whose vendored trees fbsource
-# excludes from its import.
+# The sources reverie-examples (//hermetic_infra/reverie:reverie-examples)
+# path-includes from here, and the program its parallel_tasks [[bin]] builds,
+# laid out as under tests/.
+buck_filegroup(
+    name = "reverie-examples-srcs",
+    srcs = {
+        src: src
+        for src in glob([
+            "support/*_rust_guest.rs",
+            "tool_fixtures/*.rs",
+        ])
+        + [
+            "standalone/parallel_tasks.rs",
+            "support/thread_start_guest.rs",
+        ]
+    },
+    visibility = ["//hermetic_infra/reverie:"],
+)
 
 buck_sh_test(
     name = "sh-test-at-random",
