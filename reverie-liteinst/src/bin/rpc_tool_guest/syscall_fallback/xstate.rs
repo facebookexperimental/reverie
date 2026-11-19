@@ -189,11 +189,17 @@ pub(super) fn run_pkey(path: &Path) {
     // unregister the fixture's own area before BOTH native and Tool controls.
     let offset = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"__rseq_offset".as_ptr()) };
     let size = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"__rseq_size".as_ptr()) };
-    assert!(
-        !offset.is_null() && !size.is_null(),
-        "glibc rseq metadata unavailable"
+    // glibc before 2.35 exports neither symbol and registers no rseq area.
+    assert_eq!(
+        offset.is_null(),
+        size.is_null(),
+        "glibc exports only one of its rseq symbols"
     );
-    let size = unsafe { *size.cast::<u32>() };
+    let size = if size.is_null() {
+        0
+    } else {
+        unsafe { *size.cast::<u32>() }
+    };
     let mut rseq_area = None;
     if size != 0 {
         // __rseq_size is the supported feature size (20 on glibc here), not

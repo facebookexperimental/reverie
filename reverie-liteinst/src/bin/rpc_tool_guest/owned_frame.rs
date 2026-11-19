@@ -139,7 +139,11 @@ fn protect(address: *mut u8, bytes: usize, protection: i32) {
 fn unregister_rseq() -> Option<usize> {
     let offset = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"__rseq_offset".as_ptr()) };
     let size = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"__rseq_size".as_ptr()) };
-    assert!(!offset.is_null() && !size.is_null());
+    // glibc before 2.35 exports neither symbol and registers no rseq area.
+    assert_eq!(offset.is_null(), size.is_null());
+    if size.is_null() {
+        return None;
+    }
     let size = unsafe { *size.cast::<u32>() };
     if size == 0 {
         return None;

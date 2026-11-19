@@ -1922,6 +1922,248 @@ rust_unittest(
     ],
 )
 
+# reverie-inguest with the features its Cargo integration tests are built with:
+# the default `preload-constructor` and the package's stable features
+# (scripts/stable-features.sh), except `allocator-fixture`, whose variants stay
+# gated off (above). Only the integration tests, their helper binaries and the
+# preload below link it; each image holds this one reverie_inguest.
+_INGUEST_TEST_FEATURES = [
+    "coordinator-rpc",
+    "exec-native-injection",
+    "exec-private-init",
+    "exec-private-successor",
+    "exec-stop",
+    "exec-stop-producer",
+    "fixed-syscall-gates",
+    "launcher",
+    "loader-private-runtime",
+    "native-entry-observer",
+    "native-exec-state",
+    "native-exec-state-fixture",
+    "preload-constructor",
+    "rcb-clock",
+    "rpc-io-fixture",
+    "stage1a-probe",
+    "test-thread-admission",
+]
+
+# The other sources that reverie-inguest's native-exec and exec-stop features
+# embed with include_bytes!.
+_INGUEST_EMBEDDED_SRCS = glob([
+    "reverie-inguest/native_exec/**",
+    "reverie-liteinst/src/**/*.rs",
+    "reverie-process/src/**/*.rs",
+    "reverie-rpc-transport/src/**/*.rs",
+    "reverie/src/**/*.rs",
+])
+
+rust_library(
+    name = "reverie-inguest-test-features",
+    srcs = glob(["reverie-inguest/src/**/*.rs"]) + ["reverie-inguest/src/guest/tool_region_keyed_oracle_probe.S"] + _INGUEST_EMBEDDED_SRCS,
+    autocargo = {"ignore_rule": True},
+    crate = "reverie_inguest",
+    crate_root = "reverie-inguest/src/lib.rs",
+    features = _INGUEST_TEST_FEATURES,
+    named_deps = {"reverie": ":reverie"},
+    # Its per-image symbols need a static link, as :reverie-inguest-liteinst's
+    # do: every consumer below links statically, and smoke.rs preloads its
+    # [cdylib].
+    target_compatible_with = [
+        "ovr_config//cpu:x86_64",
+        "ovr_config//os:linux",
+    ],
+    unittests = False,
+    deps = [
+        "fbsource//third-party/rust:bincode",
+        "fbsource//third-party/rust:iced-x86",
+        "fbsource//third-party/rust:libc",
+        "fbsource//third-party/rust:nix",
+        "fbsource//third-party/rust:serde",
+        "fbsource//third-party/rust:serde_json",
+        "fbsource//third-party/rust:sha2-010",
+        "fbsource//third-party/rust:syscalls",
+        "fbsource//third-party/rust:tempfile",
+        "fbsource//third-party/rust:tokio",
+        "fbsource//third-party/rust:tracing",
+        ":reverie-loader",
+        ":reverie-memory",
+        ":reverie-rpc-transport",
+        ":reverie-syscalls",
+        ":safeptrace",
+    ],
+)
+
+# reverie-inguest's Cargo [[bin]]s, which its integration tests run. As in the
+# Cargo build, they use the system allocator: fbcode's default jemalloc starts a
+# background thread that the SIGSYS filters under test kill.
+[
+    rust_binary(
+        name = name,
+        srcs = ["reverie-inguest/src/bin/{}".format(src)] + glob(["reverie-inguest/src/bin/{}/**".format(src.removesuffix(".rs"))]),
+        allocator = "malloc",
+        autocargo = {"ignore_rule": True},
+        crate_root = "reverie-inguest/src/bin/{}".format(src),
+        link_style = "static",
+        target_compatible_with = [
+            "ovr_config//cpu:x86_64",
+            "ovr_config//os:linux",
+        ],
+        unittests = False,
+        deps = ["fbsource//third-party/rust:libc"] + ([":reverie-inguest-test-features"] if inguest else []),  # @manual name:reverie_inguest
+    )
+    for name, src, inguest in [
+        ("reverie-inguest-native-syscall-result", "native_syscall_result.rs", True),
+        ("reverie-inguest-pkey-buffers", "pkey_buffers.rs", True),
+        ("reverie-inguest-probe", "preload_probe.rs", False),
+    ]
+]
+
+rust_binary(
+    name = "reverie-loader-stage1a-probe",
+    srcs = glob(["reverie-inguest/src/bin/stage1a_probe/**/*.rs"]) + ["reverie-inguest/tests/fixtures/probe_protocol.rs"],
+    allocator = "malloc",
+    autocargo = {"ignore_rule": True},
+    crate_root = "reverie-inguest/src/bin/stage1a_probe/main.rs",
+    features = _INGUEST_TEST_FEATURES,
+    link_style = "static",
+    target_compatible_with = [
+        "ovr_config//cpu:x86_64",
+        "ovr_config//os:linux",
+    ],
+    unittests = False,
+    deps = [
+        "fbsource//third-party/rust:libc",
+        "fbsource//third-party/rust:nix",
+        "fbsource//third-party/rust:serde_json",
+        "fbsource//third-party/rust:sha2-010",
+        ":reverie-inguest-test-features",  # @manual name:reverie_inguest
+        ":reverie-loader",
+        ":reverie-memory",
+        ":safeptrace",
+    ],
+)
+
+# smoke.rs preloads the libreverie_inguest.so that Cargo builds beside the
+# reverie-inguest-probe binary.
+buck_filegroup(
+    name = "inguest-preload-probe",
+    srcs = {
+        "libreverie_inguest.so": ":reverie-inguest-test-features[cdylib]",
+        "reverie-inguest-probe": ":reverie-inguest-probe",
+    },
+    target_compatible_with = [
+        "ovr_config//cpu:x86_64",
+        "ovr_config//os:linux",
+    ],
+)
+
+# The files reverie-inguest's integration tests read through
+# CARGO_MANIFEST_DIR, laid out as in the source tree; exec_stop.rs also reads
+# reverie-loader's fixtures beside it.
+buck_filegroup(
+    name = "inguest-test-fixtures",
+    srcs = glob([
+        "reverie-inguest/native_exec/**",
+        "reverie-inguest/tests/fixtures/**",
+        "reverie-loader/tests/fixtures/**",
+    ]),
+)
+
+_INGUEST_BIN_EXE = {
+    "CARGO_BIN_EXE_reverie-inguest-native-syscall-result": "$(location :reverie-inguest-native-syscall-result)",
+    "CARGO_BIN_EXE_reverie-inguest-pkey-buffers": "$(location :reverie-inguest-pkey-buffers)",
+    "CARGO_BIN_EXE_reverie-inguest-probe": "$(location :inguest-preload-probe)/reverie-inguest-probe",
+    "CARGO_BIN_EXE_reverie-loader-stage1a-probe": "$(location :reverie-loader-stage1a-probe)",
+}
+
+# reverie-inguest's Cargo integration tests (tests/*.rs), one target each,
+# built with the package's test features, with the system allocator and a
+# static link as :reverie-inguest-unittest. Most launch guests under seccomp
+# filters and SIGSYS handlers, so they run through gated tests
+# (fb-only/gated_tests); these only compute (on x86_64,
+# aarch64_trap_probe.rs builds only its parser tests and
+# ordinary_musl_private_runtime.rs, a musl-only file, builds no test).
+_INGUEST_PURE_TESTS = [
+    "aarch64_trap_probe",
+    "mapped_scalar_host",
+    "ordinary_musl_private_runtime",
+]
+
+# These link fixture images at test time with `$RUSTC` (else rustc from PATH):
+# downstream_source_exports() defines their gated tests, with a rustc.
+_INGUEST_RUSTC_TESTS = [
+    "counter_inguest",
+    "exec_stop",
+]
+
+_INGUEST_TESTS = [f.removeprefix("reverie-inguest/tests/").removesuffix(".rs") for f in glob(["reverie-inguest/tests/*.rs"])]
+
+[
+    rust_unittest(
+        name = "reverie-inguest-{}-test".format(test.replace("_", "-")),
+        srcs = [
+            "reverie-inguest/tests/{}.rs".format(test),
+            "reverie-rpc-transport/tests/fixtures/owned_lifecycle.rs",
+        ]
+        + glob([
+            "reverie-inguest/src/**",
+            "reverie-inguest/tests/fixtures/**",
+        ]),
+        allocator = "malloc",
+        autocargo = {"ignore_rule": True},
+        crate = test,
+        crate_root = "reverie-inguest/tests/{}.rs".format(test),
+        features = _INGUEST_TEST_FEATURES,
+        labels = [] if test in _INGUEST_PURE_TESTS else run_gated_only(),
+        link_style = "static",
+        resources = [
+            ":inguest-preload-probe",
+            ":inguest-test-fixtures",
+            ":reverie-inguest-native-syscall-result",
+            ":reverie-inguest-pkey-buffers",
+            ":reverie-loader-stage1a-probe",
+        ],
+        # Compile-time env! paths, kept project-relative as in
+        # :reverie-ptrace-unittest. CARGO_TARGET_TMPDIR stays unset: the tests
+        # then take their scratch space from TMPDIR at run time.
+        rustc_flags = [
+            "--env-set=CARGO_MANIFEST_DIR=$(location :inguest-test-fixtures)/reverie-inguest",
+        ]
+        + ["--env-set={}={}".format(k, v) for k, v in _INGUEST_BIN_EXE.items()],
+        target_compatible_with = [
+            "ovr_config//cpu:x86_64",
+            "ovr_config//os:linux",
+        ],
+        deps = [
+            "fbsource//third-party/rust:iced-x86",
+            "fbsource//third-party/rust:libc",
+            "fbsource//third-party/rust:nix",
+            "fbsource//third-party/rust:object",
+            "fbsource//third-party/rust:serde_json",
+            "fbsource//third-party/rust:syscalls",
+            ":reverie",
+            ":reverie-inguest-test-features",  # @manual name:reverie_inguest
+            ":reverie-loader",
+        ],
+    )
+    for test in _INGUEST_TESTS
+]
+
+[
+    gated_test(
+        name = "reverie-inguest-{}-test-gated".format(test.replace("_", "-")),
+        # The fixture-compiling tests require a caller-set TMPDIR, which
+        # scripts/run-percrate-tests.sh creates per run and the test runner
+        # does not set. The gated runner gives each case one inside the case's
+        # own scratch directory, and removes it with the case.
+        env = {"GATED_TEST_CASE_TMPDIR": "1"},
+        labels = ["buck2_run_from_project_root"],
+        test = "//hermetic_infra/reverie:reverie-inguest-{}-test".format(test.replace("_", "-")),
+    )
+    for test in _INGUEST_TESTS
+    if test not in _INGUEST_PURE_TESTS + _INGUEST_RUSTC_TESTS
+]
+
 rpc_transport_library(
     name = "reverie-rpc-transport",
     srcs = glob(["reverie-rpc-transport/src/**/*.rs"]),
@@ -2238,6 +2480,292 @@ rust_unittest(
         ":reverie-rpc-transport",
     ],
 )
+
+# reverie-inguest and reverie-liteinst with the features Cargo builds
+# reverie-liteinst's integration tests with: the package's default `liteinst`
+# and its stable features (scripts/stable-features.sh), forwarded to
+# reverie-inguest with the dev-dependency's `native-exec-state-fixture`.
+# `allocator-fixture` stays off, as its variants above do. Only the
+# integration tests and their guest binaries below link these; each image holds
+# this one reverie_inguest and reverie_liteinst.
+_LITEINST_TEST_FEATURES = [
+    "exec-native-injection",
+    "exec-private-init",
+    "exec-private-successor",
+    "fixed-syscall-gates",
+    "liteinst",
+    "loader-private-runtime",
+    "native-exec-state",
+    "preload-constructor",
+    "rpc-io-fixture",
+]
+
+rust_library(
+    name = "reverie-inguest-liteinst-test-features",
+    srcs = glob(["reverie-inguest/src/**/*.rs"]) + ["reverie-inguest/src/guest/tool_region_keyed_oracle_probe.S"] + _INGUEST_EMBEDDED_SRCS,
+    autocargo = {"ignore_rule": True},
+    crate = "reverie_inguest",
+    crate_root = "reverie-inguest/src/lib.rs",
+    features = [
+        "coordinator-rpc",
+        "exec-native-injection",
+        "exec-private-init",
+        "exec-private-successor",
+        "fixed-syscall-gates",
+        "launcher",
+        "loader-private-runtime",
+        "native-exec-state",
+        "native-exec-state-fixture",
+        "rcb-clock",
+        "rpc-io-fixture",
+    ],
+    named_deps = {"reverie": ":reverie"},
+    # Linked statically into each final image, as :reverie-inguest-liteinst
+    # is: its generic entry and installed-callback symbols are hidden
+    # per-image contracts that a shared object cannot provide.
+    preferred_linkage = "static",
+    target_compatible_with = [
+        "ovr_config//cpu:x86_64",
+        "ovr_config//os:linux",
+    ],
+    unittests = False,
+    deps = [
+        "fbsource//third-party/rust:bincode",
+        "fbsource//third-party/rust:libc",
+        "fbsource//third-party/rust:serde",
+        "fbsource//third-party/rust:sha2-010",
+        "fbsource//third-party/rust:syscalls",
+        "fbsource//third-party/rust:tempfile",
+        "fbsource//third-party/rust:tokio",
+        "fbsource//third-party/rust:tracing",
+        ":reverie-loader",
+        ":reverie-rpc-transport",
+        ":reverie-syscalls",
+    ],
+)
+
+rust_library(
+    name = "reverie-liteinst-test-features",
+    srcs = glob(["reverie-liteinst/src/**/*.rs"]),
+    autocargo = {"ignore_rule": True},
+    crate = "reverie_liteinst",
+    crate_root = "reverie-liteinst/src/lib.rs",
+    features = _LITEINST_TEST_FEATURES,
+    # Linked statically into each consumer, as :reverie-liteinst is:
+    # selected_backing() reads a hidden descriptor that the final image
+    # defines, which a shared link of this library alone cannot resolve.
+    preferred_linkage = "static",
+    target_compatible_with = [
+        "ovr_config//cpu:x86_64",
+        "ovr_config//os:linux",
+    ],
+    unittests = False,
+    deps = [
+        "fbsource//third-party/rust:bincode",
+        "fbsource//third-party/rust:iced-x86",
+        "fbsource//third-party/rust:libc",
+        "fbsource//third-party/rust:liteinst",
+        "fbsource//third-party/rust:serde",
+        "fbsource//third-party/rust:tempfile",
+        "fbsource//third-party/rust:tokio",
+        "fbsource//third-party/rust:tracing",
+        ":reverie",
+        ":reverie-inguest-liteinst-test-features",  # @manual name:reverie_inguest
+        ":reverie-rpc-transport",
+    ],
+)
+
+# reverie-liteinst's Cargo [[bin]]s that its integration tests run, with the
+# system allocator as in the Cargo build: fbcode's default jemalloc starts a
+# background thread that the SIGSYS filters under test kill.
+_LITEINST_TEST_BINARIES = [
+    "exec_guest",
+    "fork_guest",
+    "grouped_admission_spike",
+    "lifecycle_guest",
+    "rpc_tool_guest",
+    "spoof_guest",
+    "strace",
+    "trap_count_guest",
+]
+
+[
+    rust_binary(
+        name = "reverie-liteinst-{}".format(src.replace("_", "-")),
+        srcs = ["reverie-liteinst/src/bin/{}.rs".format(src)]
+        + glob([
+            "reverie-liteinst/src/bin/{}/**".format(src),
+            "reverie-liteinst/src/bin/real_bodies/*.rs",
+        ]),
+        allocator = "malloc",
+        autocargo = {"ignore_rule": True},
+        crate_root = "reverie-liteinst/src/bin/{}.rs".format(src),
+        features = _LITEINST_TEST_FEATURES,
+        link_style = "static",
+        # Export no symbols, as Cargo's executable link: fbcode's default
+        # --export-dynamic keeps the library's C entry points live, and they read
+        # the allocator backing descriptor that the guests declaring no backing
+        # lack (an undefined hidden reverie_liteinst_allocator_backing_v1).
+        linker_flags = ["-Wl,--no-export-dynamic"],
+        target_compatible_with = [
+            "ovr_config//cpu:x86_64",
+            "ovr_config//os:linux",
+        ],
+        unittests = False,
+        deps = [
+            "fbsource//third-party/rust:libc",
+            "fbsource//third-party/rust:serde",
+            "fbsource//third-party/rust:syscalls",
+            "fbsource//third-party/rust:tokio",
+            ":reverie",
+            ":reverie-inguest-liteinst-test-features",  # @manual name:reverie_inguest
+            ":reverie-liteinst-test-features",  # @manual name:reverie_liteinst
+            ":reverie-rpc-transport",
+        ],
+    )
+    for src in _LITEINST_TEST_BINARIES
+]
+
+# The Reverie files reverie-liteinst's integration tests read, laid out as in
+# the source tree: their fixtures, and the sources and manifests
+# tests/support/liteinst_runtime.rs path-includes reverie-liteinst-artifact to
+# pin, which its unit tests embed or read through CARGO_MANIFEST_DIR's parent.
+_LITEINST_TEST_TREE = glob([
+    "**/Cargo.toml",
+    "reverie-inguest/src/**",
+    "reverie-liteinst-artifact/src/**",
+    "reverie-liteinst-artifact/tests/fixtures/**",
+    "reverie-liteinst-preload/src/**",
+    "reverie-liteinst/src/**",
+    "reverie-liteinst/tests/fixtures/**",
+    "reverie-loader/src/**",
+    "reverie-rpc-transport/src/**",
+    "reverie-syscalls/src/**",
+    "reverie/src/**",
+]) + [
+    "Cargo.toml",
+    "scripts/m1_contract.rs",
+]
+
+# With every workspace member's manifest (experimental/ is its own package), as
+# the artifact tests that read the workspace through the run-time
+# CARGO_MANIFEST_DIR expect.
+buck_filegroup(
+    name = "liteinst-test-tree",
+    srcs = {"experimental": "//hermetic_infra/reverie/experimental:cargo-manifests"} | {src: src for src in _LITEINST_TEST_TREE},
+)
+
+_LITEINST_BIN_EXE = {
+    "CARGO_BIN_EXE_reverie-liteinst-{}".format(src.replace("_", "-")): "$(location :reverie-liteinst-{})".format(src.replace("_", "-"))
+    for src in _LITEINST_TEST_BINARIES
+}
+
+# reverie-liteinst's Cargo integration tests (tests/*.rs), one target each,
+# built with the package's test features, with the system allocator and a
+# static link as :reverie-liteinst-unittest. Most launch guests under seccomp
+# filters and SIGSYS handlers, so they run through gated tests
+# (fb-only/gated_tests); the pure ones patch only their own code. Left out: the
+# `allocator-fixture` tests (Cargo required-features), which need the
+# allocator-fixture variants that stay gated off above.
+_LITEINST_PURE_TESTS = [
+    "concurrent_patching",
+    "nop_window",
+]
+
+_LITEINST_ALLOCATOR_FIXTURE_TESTS = [
+    "allocator_contract",
+    "fixed_arena",
+    "generic_bootstrap",
+    "mapping_integrity",
+    "region_stacks",
+    "standalone_constructor",
+    "tool_tls",
+]
+
+_LITEINST_TESTS = [
+    f.removeprefix("reverie-liteinst/tests/").removesuffix(".rs")
+    for f in glob(
+        ["reverie-liteinst/tests/*.rs"],
+        exclude = ["reverie-liteinst/tests/{}.rs".format(test) for test in _LITEINST_ALLOCATOR_FIXTURE_TESTS]
+        + [
+            # Its one case is aarch64-only (#[cfg(target_arch = "aarch64")]): it
+            # defines no case on x86_64, where these targets build and run.
+            "reverie-liteinst/tests/aarch64_trap_install.rs",
+        ],
+    )
+]
+
+[
+    rust_unittest(
+        name = "reverie-liteinst-{}-test".format(test.replace("_", "-")),
+        srcs = ["reverie-liteinst/tests/{}.rs".format(test)]
+        + _LITEINST_TEST_TREE
+        + glob([
+            "reverie-liteinst/tests/lifecycle/**/*.rs",
+            "reverie-liteinst/tests/support/**/*.rs",
+        ]),
+        allocator = "malloc",
+        autocargo = {"ignore_rule": True},
+        crate = test,
+        crate_root = "reverie-liteinst/tests/{}.rs".format(test),
+        env = {
+            # As Cargo sets it when it runs a test; the artifact tests read the
+            # workspace through it at run time.
+            "CARGO_MANIFEST_DIR": "$(location :liteinst-test-tree)/reverie-liteinst",
+            # The runtime the tests preload into compatibility guests. Cargo CI
+            # names its allocator-fixture build, whose variant stays gated off.
+            "REVERIE_LITEINST_PRELOAD": "$(location :reverie-liteinst-preload[cdylib])",
+        },
+        features = _LITEINST_TEST_FEATURES,
+        labels = [] if test in _LITEINST_PURE_TESTS else run_gated_only(),
+        link_style = "static",
+        # As the guest binaries above.
+        linker_flags = ["-Wl,--no-export-dynamic"],
+        resources = [":liteinst-test-tree"] + [":reverie-liteinst-{}".format(src.replace("_", "-")) for src in _LITEINST_TEST_BINARIES],
+        # Compile-time env! paths, kept project-relative as in
+        # :reverie-ptrace-unittest.
+        rustc_flags = [
+            # Cargo sets this to its own path.
+            "--env-set=CARGO=cargo",
+            "--env-set=CARGO_MANIFEST_DIR=$(location :liteinst-test-tree)/reverie-liteinst",
+        ]
+        + ["--env-set={}={}".format(k, v) for k, v in _LITEINST_BIN_EXE.items()],
+        target_compatible_with = [
+            "ovr_config//cpu:x86_64",
+            "ovr_config//os:linux",
+        ],
+        deps = [
+            "fbsource//third-party/rust:goblin",
+            "fbsource//third-party/rust:libc",
+            "fbsource//third-party/rust:liteinst",
+            "fbsource//third-party/rust:serde",
+            "fbsource//third-party/rust:serde_json",
+            "fbsource//third-party/rust:sha2-010",
+            "fbsource//third-party/rust:syscalls",
+            "fbsource//third-party/rust:tempfile",
+            "fbsource//third-party/rust:tokio",
+            ":reverie",
+            ":reverie-inguest-liteinst-test-features",  # @manual name:reverie_inguest
+            ":reverie-liteinst-test-features",  # @manual name:reverie_liteinst
+            ":reverie-rpc-transport",
+        ],
+    )
+    for test in _LITEINST_TESTS
+]
+
+[
+    gated_test(
+        name = "reverie-liteinst-{}-test-gated".format(test.replace("_", "-")),
+        env = {
+            "CARGO_MANIFEST_DIR": "$(location :liteinst-test-tree)/reverie-liteinst",
+            "REVERIE_LITEINST_PRELOAD": "$(location :reverie-liteinst-preload[cdylib])",
+        },
+        labels = ["buck2_run_from_project_root"],
+        test = "//hermetic_infra/reverie:reverie-liteinst-{}-test".format(test.replace("_", "-")),
+    )
+    for test in _LITEINST_TESTS
+    if test not in _LITEINST_PURE_TESTS
+]
 
 # reverie-liteinst built against :reverie-inguest-exec-stop, for the same
 # downstream test build only, so each of its test binaries holds the single

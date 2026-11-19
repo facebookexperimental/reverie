@@ -93,7 +93,11 @@ mod real {
             unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"__rseq_offset".as_ptr()).cast::<isize>() };
         let size =
             unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"__rseq_size".as_ptr()).cast::<u32>() };
-        assert!(!offset.is_null() && !size.is_null());
+        // glibc before 2.35 exports neither symbol and registers no rseq area.
+        assert_eq!(offset.is_null(), size.is_null());
+        if size.is_null() {
+            return None;
+        }
         let size = unsafe { *size };
         // glibc exports the supported feature length (20 on this host), while its
         // original Linux registration used the 32-byte ABI structure. Unregister

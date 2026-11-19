@@ -9,8 +9,8 @@
 //! Deliberately dependency-free (no goblin/tempfile dev-deps):
 //! `reverie-inguest/Cargo.toml` is pinned by size and sha256 in
 //! `CONTENT_REVERIE_CATALOG`, so this test uses
-//! `CARGO_TARGET_TMPDIR` scratch space and a minimal ELF64
-//! symbol/section lookup instead.
+//! `CARGO_TARGET_TMPDIR` scratch space (`TMPDIR` where the build sets no
+//! `CARGO_TARGET_TMPDIR`) and a minimal ELF64 symbol/section lookup instead.
 
 #![cfg(target_arch = "x86_64")]
 
@@ -22,7 +22,8 @@ const SHF_EXECINSTR: u64 = 0x4;
 const SHT_SYMTAB: u32 = 2;
 
 fn assemble(label: &str, source: String) -> Vec<u8> {
-    let directory = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+    let directory = option_env!("CARGO_TARGET_TMPDIR")
+        .map_or_else(std::env::temp_dir, PathBuf::from)
         .join(format!("gnu-stack-tails-{label}-{}", std::process::id()));
     fs::create_dir_all(&directory).unwrap();
     let input = directory.join("concat.s");

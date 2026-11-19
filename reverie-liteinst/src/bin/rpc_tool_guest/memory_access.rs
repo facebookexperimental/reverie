@@ -140,8 +140,13 @@ pub(super) fn run(path: &Path) {
     // before denying key0, then restore it after the original PKRU is restored.
     let offset = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"__rseq_offset".as_ptr()) };
     let size = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"__rseq_size".as_ptr()) };
-    assert!(!offset.is_null() && !size.is_null());
-    let size = unsafe { *size.cast::<u32>() };
+    // glibc before 2.35 exports neither symbol and registers no rseq area.
+    assert_eq!(offset.is_null(), size.is_null());
+    let size = if size.is_null() {
+        0
+    } else {
+        unsafe { *size.cast::<u32>() }
+    };
     let rseq = if size != 0 {
         assert!(size <= 32);
         let mut fs = 0usize;

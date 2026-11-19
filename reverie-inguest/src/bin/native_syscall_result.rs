@@ -308,15 +308,21 @@ mod real {
             unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"__rseq_offset".as_ptr()).cast::<isize>() };
         let size =
             unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"__rseq_size".as_ptr()).cast::<u32>() };
-        assert!(!offset.is_null() && !size.is_null());
-        assert!(unsafe { *size } <= 32);
+        // glibc before 2.35 exports neither symbol and registers no rseq area.
+        assert_eq!(offset.is_null(), size.is_null());
+        let size = if size.is_null() { 0 } else { unsafe { *size } };
+        assert!(size <= 32);
+        let registered = size != 0;
         let mut fs = 0_usize;
         assert_eq!(
             unsafe { libc::syscall(libc::SYS_arch_prctl, 0x1003, &raw mut fs) },
             0
         );
-        let area = fs.wrapping_add_signed(unsafe { *offset }) as *mut libc::c_void;
-        let registered = unsafe { *size } != 0;
+        let area = if registered {
+            fs.wrapping_add_signed(unsafe { *offset }) as *mut libc::c_void
+        } else {
+            std::ptr::null_mut()
+        };
         if registered {
             assert_eq!(
                 unsafe { libc::syscall(libc::SYS_rseq, area, 32, 1, 0x5305_3053_u32) },

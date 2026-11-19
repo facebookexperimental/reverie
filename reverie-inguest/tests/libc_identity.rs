@@ -302,7 +302,10 @@ fn libc_identity_follows_the_loader_not_file_names_or_interposers() {
     // LD_PRELOAD separates entries with spaces and colons, so the copies must
     // live where neither appears; refuse rather than run cases the loader
     // would silently ignore.
-    let directory = Path::new(env!("CARGO_TARGET_TMPDIR"))
+    // Cargo's integration-test scratch directory; TMPDIR where the build sets
+    // no CARGO_TARGET_TMPDIR.
+    let directory = option_env!("CARGO_TARGET_TMPDIR")
+        .map_or_else(std::env::temp_dir, PathBuf::from)
         .join(format!("libc-identity-{}", std::process::id()));
     let spelled = directory.to_str().expect("a UTF-8 scratch path");
     assert!(
