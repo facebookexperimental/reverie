@@ -1,6 +1,7 @@
 load(
     "@fbcode//hermetic_infra/reverie/fb-only:defs.bzl",
     "DOWNSTREAM_TEST_VISIBILITY",
+    "REVERIE_ONCALL",
     "REVERIE_SOURCE_ROOT",
     "downstream_source_exports",
     "excluded_paths_test",
@@ -17,7 +18,7 @@ load("@fbsource//tools/build_defs:rust_unittest.bzl", "rust_unittest")
 load("@fbsource//tools/build_defs:selects.bzl", "selects")
 load("@fbsource//tools/target_determinator/macros:ci.bzl", "ci")
 
-oncall("hermit")
+oncall(REVERIE_ONCALL)
 
 # Fails if an upstream path that is never imported (see the list) is present.
 excluded_paths_test()
@@ -34,6 +35,7 @@ buck_filegroup(
     name = "cargo-manifests",
     srcs = {
         "experimental": "//hermetic_infra/reverie/experimental:cargo-manifests",
+        "reverie-signal": "//hermetic_infra/reverie/reverie-signal:cargo-manifests",
     }
     | {
         src: src
@@ -977,13 +979,13 @@ rust_library(
     deps = [
         "fbsource//third-party/rust:futures",
         "fbsource//third-party/rust:goblin",
-        "fbsource//third-party/rust:kvm-bindings",
         "fbsource//third-party/rust:libc",
         "fbsource//third-party/rust:thiserror",
         "fbsource//third-party/rust:tracing",
         ":reverie-kvm-core",
         ":reverie-linuxemu-terminal-read",
         ":reverie-proc-grammar",
+        "//hermetic_infra/reverie/reverie-signal:reverie-signal",
     ],
 )
 
@@ -1104,13 +1106,13 @@ rust_library(
     deps = [
         "fbsource//third-party/rust:futures",
         "fbsource//third-party/rust:goblin",
-        "fbsource//third-party/rust:kvm-bindings",
         "fbsource//third-party/rust:libc",
         "fbsource//third-party/rust:thiserror",
         "fbsource//third-party/rust:tracing",
         ":reverie-kvm-core-test-support",  # @manual name:reverie_kvm_core
         ":reverie-linuxemu-terminal-read",
         ":reverie-proc-grammar",
+        "//hermetic_infra/reverie/reverie-signal:reverie-signal",
     ],
 )
 
@@ -1216,6 +1218,7 @@ rust_unittest(
         ":reverie-kvm-core-test-support",  # @manual name:reverie_kvm_core
         ":reverie-linuxemu-terminal-read",
         ":reverie-proc-grammar",
+        "//hermetic_infra/reverie/reverie-signal:reverie-signal",
     ],
 )
 
@@ -1410,13 +1413,13 @@ rust_library(
     deps = [
         "fbsource//third-party/rust:futures",
         "fbsource//third-party/rust:goblin",
-        "fbsource//third-party/rust:kvm-bindings",
         "fbsource//third-party/rust:libc",
         "fbsource//third-party/rust:thiserror",
         "fbsource//third-party/rust:tracing",
         ":reverie-kvm-core-native-test-support",  # @manual name:reverie_kvm_core
         ":reverie-linuxemu-terminal-read",
         ":reverie-proc-grammar",
+        "//hermetic_infra/reverie/reverie-signal:reverie-signal",
     ],
 )
 
@@ -2191,7 +2194,8 @@ rust_library(
 # so its manifests come from there.
 buck_filegroup(
     name = "liteinst-workspace-manifests",
-    srcs = {"experimental": "//hermetic_infra/reverie/experimental:cargo-manifests"} | {src: src for src in glob(["**/Cargo.toml"])},
+    srcs = {"experimental": "//hermetic_infra/reverie/experimental:cargo-manifests", "reverie-signal": "//hermetic_infra/reverie/reverie-signal:cargo-manifests"}
+    | {src: src for src in glob(["**/Cargo.toml"])},
 )
 
 # The library's unit tests, linked as in the Cargo build. Under the trusted-gate
@@ -2537,6 +2541,7 @@ buck_filegroup(
         "experimental": "//hermetic_infra/reverie/experimental:layering-files",
         "fb-only/experiments": "//hermetic_infra/reverie/fb-only/experiments:layering-files",
         "fb-only/rpc_compat": "//hermetic_infra/reverie/fb-only/rpc_compat:layering-files",
+        "reverie-signal": "//hermetic_infra/reverie/reverie-signal:layering-files",
         "tests": "//hermetic_infra/reverie/tests:layering-files",
     }
     | {src: src for src in glob(["**", ".*", ".*/**", "**/.*", "**/.*/**", ".*/**/.*", ".*/**/.*/**"])},

@@ -1,0 +1,95 @@
+load("@fbcode//hermetic_infra/reverie/fb-only:defs.bzl", "REVERIE_ONCALL")
+load("@fbcode_macros//build_defs:native_rules.bzl", "buck_filegroup")
+load("@fbsource//tools/build_defs:rust_library.bzl", "rust_library")
+load("@fbsource//tools/build_defs:rust_unittest.bzl", "rust_unittest")
+
+oncall(REVERIE_ONCALL)
+
+# This crate is its OWN Buck package so the library visibility below is
+# a real boundary: Buck same-package visibility bypasses restrictions,
+# so in the parent package most of Reverie could depend on it freely.
+
+buck_filegroup(
+    name = "layering-files",
+    srcs = {src: src for src in glob(["**", ".*", ".*/**", "**/.*", "**/.*/**", ".*/**/.*", ".*/**/.*/**"])},
+    target_compatible_with = ["fbcode//opensource/macros:broken-in-oss"],
+)
+
+# Linux x86-64 signal frame construction and rt_sigreturn restore,
+# lifted from LinuxEmu and shared by every backend.
+rust_library(
+    name = "reverie-signal",
+    srcs = glob(["src/**/*.rs"]),
+    autocargo = {
+        # Cargo keeps running the lib tests; Buck runs them in
+        # :reverie-signal-unittest.
+        "cargo_target_config": {
+            "doctest": True,
+            "test": True,
+        },
+        "cargo_toml_config": {
+            "package": {
+                "description": "Shared Linux x86-64 signal frame construction and rt_sigreturn restore for Reverie backends.",
+                "documentation": "https://docs.rs/reverie-signal",
+                "keywords": ["linux", "instrumentation", "signals"],
+                "readme": "README.md",
+            },
+        },
+    },
+    target_compatible_with = [
+        "ovr_config//cpu:x86_64",
+        "ovr_config//os:linux",
+    ],
+    unittests = False,
+    visibility = [
+        "//hermetic_infra/reverie:reverie-linuxemu",
+        "//hermetic_infra/reverie:reverie-linuxemu-native-test-support",
+        "//hermetic_infra/reverie:reverie-linuxemu-test-support",
+        "//hermetic_infra/reverie:reverie-linuxemu-unittest",
+    ],
+    deps = [
+        "fbsource//third-party/rust:kvm-bindings",
+        "fbsource//third-party/rust:libc",
+        "fbsource//third-party/rust:thiserror",
+    ],
+)
+
+# Sources + fixtures laid out as under CARGO_MANIFEST_DIR for the
+# kernel-header ABI test, which compiles its C probes at test time.
+buck_filegroup(
+    name = "signal-test-fixtures",
+    srcs = {
+        src: src
+        for src in glob([
+            "src/**",
+            "tests/fixtures/**",
+        ])
+    },
+)
+
+rust_unittest(
+    name = "reverie-signal-unittest",
+    srcs = glob(["src/**/*.rs"]),
+    autocargo = {"ignore_rule": True},
+    crate = "reverie_signal",
+    crate_root = "src/lib.rs",
+    env = {
+        "CARGO_MANIFEST_DIR": "$(location :signal-test-fixtures)",
+    },
+    resources = [":signal-test-fixtures"],
+    target_compatible_with = [
+        "ovr_config//cpu:x86_64",
+        "ovr_config//os:linux",
+    ],
+    deps = [
+        "fbsource//third-party/rust:kvm-bindings",
+        "fbsource//third-party/rust:libc",
+        "fbsource//third-party/rust:thiserror",
+    ],
+)
+
+# This package's Cargo manifests, for the root cargo-manifests group.
+buck_filegroup(
+    name = "cargo-manifests",
+    srcs = {"Cargo.toml": "Cargo.toml"},
+)

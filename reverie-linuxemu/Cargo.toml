@@ -22,15 +22,16 @@ test-support = ["broker-metadata-skip", "reverie-kvm-core/test-support"]
 [dependencies]
 futures = { version = "0.3.31", features = ["async-await"] }
 goblin = { version = "0.10.7", features = ["elf32", "elf64", "endian_fd"] }
-kvm-bindings = "0.14.1"
 libc = "0.2.186"
 reverie = { version = "0.5.7", path = "../reverie", package = "reverie-core" }
 reverie-kvm-core = { version = "0.5.7", path = "../reverie-kvm-core" }
 reverie-proc-grammar = { version = "0.5.7", path = "../reverie-proc-grammar" }
+reverie-signal = { version = "0.5.7", path = "../reverie-signal" }
 thiserror = "2.0.18"
 tracing = "0.1.41"
 
 [dev-dependencies]
+kvm-bindings = "0.14.1"
 reverie-kvm-core = { version = "0.5.7", path = "../reverie-kvm-core", features = ["test-support"] }
 
 [build-dependencies]

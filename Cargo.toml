@@ -22,6 +22,7 @@ members = [
     "reverie-linuxemu-ext-procfs",
     "reverie-ptrace",
     "reverie-rpc-transport",
+    "reverie-signal",
     "reverie-syscalls",
     "reverie-test-support",
     "reverie-util",

@@ -1403,6 +1403,7 @@ dependencies = [
  "reverie-core",
  "reverie-kvm-core",
  "reverie-proc-grammar",
+ "reverie-signal",
  "thiserror",
  "tracing",
 ]
@@ -1570,6 +1571,15 @@ dependencies = [
  "sha2",
  "thiserror",
  "tokio",
+]
+
+[[package]]
+name = "reverie-signal"
+version = "0.5.7"
+dependencies = [
+ "kvm-bindings",
+ "libc",
+ "thiserror",
 ]
 
 [[package]]

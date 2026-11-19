@@ -1,5 +1,5 @@
 load("@bazel_skylib//lib:paths.bzl", "paths")
-load("@fbcode//hermetic_infra/reverie/fb-only:defs.bzl", "gated_test", "run_gated_only")
+load("@fbcode//hermetic_infra/reverie/fb-only:defs.bzl", "REVERIE_ONCALL", "gated_test", "run_gated_only")
 load("@fbcode_macros//build_defs:cpp_binary.bzl", "cpp_binary")
 load("@fbcode_macros//build_defs:custom_rule.bzl", "custom_rule")
 load("@fbcode_macros//build_defs:native_rules.bzl", "buck_filegroup", "buck_sh_binary", "buck_sh_test")
@@ -9,7 +9,7 @@ load("@fbsource//tools/build_defs:rust_binary.bzl", "rust_binary")
 load("@fbsource//tools/build_defs:rust_unittest.bzl", "rust_unittest")
 load("@fbsource//tools/build_defs:selects.bzl", "selects")
 
-oncall("hermit")
+oncall(REVERIE_ONCALL)
 
 # Some tests don't work when a sanitizer is in use (i.e., with @mode/dev). This
 # makes it easy to conditionally compile them with `#[cfg(not(sanitized))]`.
