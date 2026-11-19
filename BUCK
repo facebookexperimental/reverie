@@ -1792,6 +1792,131 @@ rpc_transport_library(
     ],
 )
 
+# reverie-rpc-transport's Cargo [[bin]]s, which its integration tests spawn
+# through CARGO_BIN_EXE_<name>. They use the system allocator, as their Cargo
+# builds do: they assert that they are single-threaded before they fork, and
+# fbcode's default jemalloc starts a background thread.
+rust_binary(
+    name = "reverie-rpc-transport-mapped-rpc-fork-fixture",
+    srcs = ["reverie-rpc-transport/tests/fixtures/mapped_rpc_fork_fixture.rs"],
+    allocator = "malloc",
+    autocargo = {"ignore_rule": True},
+    crate_root = "reverie-rpc-transport/tests/fixtures/mapped_rpc_fork_fixture.rs",
+    # Its #[global_allocator] tracks an allocation the library makes
+    # (mapped_rpc_fork_fixture.rs:378); in a dev-mode shared link that
+    # allocation does not reach it.
+    link_style = "static",
+    target_compatible_with = [
+        "ovr_config//cpu:x86_64",
+        "ovr_config//os:linux",
+    ],
+    unittests = False,
+    deps = [
+        "fbsource//third-party/rust:async-trait",
+        "fbsource//third-party/rust:libc",
+        "fbsource//third-party/rust:serde",
+        "fbsource//third-party/rust:tokio",
+        ":reverie",
+        ":reverie-rpc-transport",
+    ],
+)
+
+rust_binary(
+    name = "reverie-rpc-transport-guest-log-lifecycle-fixture",
+    srcs = [
+        "reverie-rpc-transport/tests/fixtures/guest_log_lifecycle_fixture.rs",
+        "reverie-rpc-transport/tests/fixtures/owned_lifecycle.rs",
+    ],
+    allocator = "malloc",
+    autocargo = {"ignore_rule": True},
+    crate_root = "reverie-rpc-transport/tests/fixtures/guest_log_lifecycle_fixture.rs",
+    target_compatible_with = [
+        "ovr_config//cpu:x86_64",
+        "ovr_config//os:linux",
+    ],
+    unittests = False,
+    deps = [
+        "fbsource//third-party/rust:async-trait",
+        "fbsource//third-party/rust:libc",
+        "fbsource//third-party/rust:serde",
+        "fbsource//third-party/rust:tokio",
+        ":reverie",
+        ":reverie-rpc-transport",
+    ],
+)
+
+# reverie-rpc-transport/tests laid out as under CARGO_MANIFEST_DIR.
+buck_filegroup(
+    name = "rpc-transport-test-fixtures",
+    srcs = {src.removeprefix("reverie-rpc-transport/"): src for src in glob(["reverie-rpc-transport/tests/**"])},
+)
+
+# reverie-rpc-transport's Cargo integration tests (tests/*.rs), one target each,
+# with the dependencies they use from the crate's dependencies and
+# dev-dependencies. None uses the API of the `test-guest-log` feature, so they
+# link the library above. As in Cargo, each test sees every [[bin]] as
+# CARGO_BIN_EXE_<name> and a CARGO_MANIFEST_DIR, whose ../target mapped_rpc
+# writes its children's output to. The tests that spawn fixture processes
+# (namespaces, io_uring, pidfds, /proc of their children) run through gated
+# tests (fb-only/gated_tests).
+_RPC_TRANSPORT_TESTS = [f.removeprefix("reverie-rpc-transport/tests/").removesuffix(".rs") for f in glob(["reverie-rpc-transport/tests/*.rs"])]
+
+_RPC_TRANSPORT_GATED_TESTS = [
+    "guest_log_lifecycle",
+    "inherited_client",
+    "mapped_rpc",
+    "split_capture_lifecycle",
+]
+
+_RPC_TRANSPORT_TEST_ENV = {
+    "CARGO_BIN_EXE_guest_log_lifecycle_fixture": "$(location :reverie-rpc-transport-guest-log-lifecycle-fixture)",
+    "CARGO_BIN_EXE_mapped_rpc_fork_fixture": "$(location :reverie-rpc-transport-mapped-rpc-fork-fixture)",
+    "CARGO_MANIFEST_DIR": "$(location :rpc-transport-test-fixtures)",
+}
+
+[
+    rust_unittest(
+        name = "reverie-rpc-transport-{}-test".format(test.replace("_", "-")),
+        srcs = ["reverie-rpc-transport/tests/{}.rs".format(test)] + glob(["reverie-rpc-transport/tests/*/**/*.rs"]),
+        autocargo = {"ignore_rule": True},
+        crate = test,
+        crate_root = "reverie-rpc-transport/tests/{}.rs".format(test),
+        env = _RPC_TRANSPORT_TEST_ENV,
+        labels = run_gated_only() if test in _RPC_TRANSPORT_GATED_TESTS else [],
+        resources = [
+            ":reverie-rpc-transport-guest-log-lifecycle-fixture",
+            ":reverie-rpc-transport-mapped-rpc-fork-fixture",
+            ":rpc-transport-test-fixtures",
+        ],
+        # Keep the env! paths project-relative across remote compilation.
+        rustc_flags = ["--env-set={}={}".format(k, v) for k, v in _RPC_TRANSPORT_TEST_ENV.items()],
+        target_compatible_with = [
+            "ovr_config//cpu:x86_64",
+            "ovr_config//os:linux",
+        ],
+        deps = [
+            "fbsource//third-party/rust:async-trait",
+            "fbsource//third-party/rust:libc",
+            "fbsource//third-party/rust:serde",
+            "fbsource//third-party/rust:sha2-010",
+            "fbsource//third-party/rust:tokio",
+            ":reverie",
+            ":reverie-rpc-transport",
+        ],
+    )
+    for test in _RPC_TRANSPORT_TESTS
+]
+
+[
+    gated_test(
+        name = "reverie-rpc-transport-{}-test-gated".format(test.replace("_", "-")),
+        env = _RPC_TRANSPORT_TEST_ENV,
+        labels = ["buck2_run_from_project_root"],
+        test = "//hermetic_infra/reverie:reverie-rpc-transport-{}-test".format(test.replace("_", "-")),
+    )
+    for test in _RPC_TRANSPORT_GATED_TESTS
+]
+
 rust_library(
     name = "reverie-liteinst",
     srcs = glob(["reverie-liteinst/src/**/*.rs"]),
