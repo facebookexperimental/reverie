@@ -65,6 +65,19 @@ fn run(tool: &str, extra: &[&str], guest: &[&str]) -> Output {
     output_with_timeout(&mut command)
 }
 
+/// An example tool's command line, with the tool's own `tracing` log sent to
+/// a file of its own (`--log-file`) in the returned directory, not to the
+/// standard error it shares with the guest, which these tests check: a
+/// backend diagnostic, such as reverie-ptrace's PMU validation error on some
+/// AMD hosts, never reads as guest output. Keep the directory until the tool
+/// has exited.
+fn tool_command(binary: impl AsRef<OsStr>) -> (Command, tempfile::TempDir) {
+    let logs = tempfile::tempdir().unwrap();
+    let mut command = Command::new(binary);
+    command.arg("--log-file").arg(logs.path().join("tool.log"));
+    (command, logs)
+}
+
 fn output_with_timeout(command: &mut Command) -> Output {
     output_with_timeout_duration(command, Duration::from_secs(10))
 }
@@ -891,7 +904,7 @@ fn assert_one_counter1_allocator_summary(output: &Output) {
 }
 
 fn counter1_allocator_on(backend: &str) {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_counter1"));
+    let (mut command, _logs) = tool_command(env!("CARGO_BIN_EXE_counter1"));
     command
         .env(
             STRADDLER_STALENESS_TICKS_ENV,
@@ -993,7 +1006,7 @@ fn exact_counter1_tool_registers_no_thread_exit_destructor_through_main() {
 
 #[test]
 fn exact_counter1_tool_registers_no_thread_exit_destructor_through_main_on_in_guest_trap() {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_counter1"));
+    let (mut command, _logs) = tool_command(env!("CARGO_BIN_EXE_counter1"));
     command
         .env(
             STRADDLER_STALENESS_TICKS_ENV,
@@ -1031,7 +1044,7 @@ fn exact_counter2_tool_reports_process_and_thread_totals() {
 }
 
 fn counter2_reports_exit_after_echo_closes_stdio(backend: &str) {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_counter2"));
+    let (mut command, _logs) = tool_command(env!("CARGO_BIN_EXE_counter2"));
     command.args(["--backend", backend, "--", "/bin/echo", "hello"]);
     let output = output_with_timeout(&mut command);
 
@@ -1243,7 +1256,7 @@ fn counter2_captured_environment_controls(backend: &str) {
             expected.insert("ASAN_OPTIONS".into(), "detect_leaks=0".into());
             expected.insert("LSAN_OPTIONS".into(), "detect_leaks=0".into());
         }
-        let mut command = Command::new(&program);
+        let (mut command, _logs) = tool_command(&program);
         command
             .env_clear()
             .envs(&environment)
@@ -1411,7 +1424,7 @@ fn assert_chunky_print_causal_order(stdout: &str) {
 }
 
 fn chunky_print_preserves_buffering_and_causal_order(backend: &str) {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_chunky_print"));
+    let (mut command, _logs) = tool_command(env!("CARGO_BIN_EXE_chunky_print"));
     command
         .args(["--backend", backend, "--preload"])
         .arg(preload())
@@ -1646,8 +1659,8 @@ fn chrome_trace_rejects_missing_payload_event() {
     assert_chrome_trace_events(&trace, true);
 }
 
-fn chrome_trace_command(backend: &str, trace_path: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_chrome_trace"));
+fn chrome_trace_command(backend: &str, trace_path: &Path) -> (Command, tempfile::TempDir) {
+    let (mut command, logs) = tool_command(env!("CARGO_BIN_EXE_chrome_trace"));
     command
         .arg("--backend")
         .arg(backend)
@@ -1655,7 +1668,7 @@ fn chrome_trace_command(backend: &str, trace_path: &Path) -> Command {
         .arg(preload())
         .arg("--out")
         .arg(trace_path);
-    command
+    (command, logs)
 }
 
 fn chrome_trace_writes_process_and_syscall_events(backend: &str, identity: &str) {
@@ -1664,7 +1677,7 @@ fn chrome_trace_writes_process_and_syscall_events(backend: &str, identity: &str)
         std::process::id()
     ));
     let _ = std::fs::remove_file(&trace_path);
-    let mut command = chrome_trace_command(backend, &trace_path);
+    let (mut command, _logs) = chrome_trace_command(backend, &trace_path);
     command.args(["--", "/bin/echo", "hello"]);
     let output = output_with_timeout(&mut command);
 
@@ -1691,7 +1704,7 @@ fn ptrace_chrome_trace_oracle_rejects_missing_events() {
         std::process::id()
     ));
     let _ = std::fs::remove_file(&trace_path);
-    let mut command = chrome_trace_command("ptrace", &trace_path);
+    let (mut command, _logs) = chrome_trace_command("ptrace", &trace_path);
     command.args(["--", "/bin/echo", "hello"]);
     let output = output_with_timeout(&mut command);
     assert_chrome_trace_guest_output(&output);
@@ -1733,7 +1746,7 @@ fn chrome_trace_preserves_stdin_and_writes_events(backend: &str, identity: &str)
     let (reader, mut writer) = std::io::pipe().unwrap();
     writer.write_all(b"hello\n").unwrap();
     drop(writer);
-    let mut command = chrome_trace_command(backend, &trace_path);
+    let (mut command, _logs) = chrome_trace_command(backend, &trace_path);
     command.stdin(reader).args(["--", "/bin/cat"]);
     let output = output_with_timeout(&mut command);
     eprintln!("Chrome trace cat output: {output:?}");
@@ -1766,7 +1779,7 @@ fn exact_strace_tool_observes_filtered_write() {
 }
 
 fn run_strace(backend: &str, extra: &[&str], guest: &[&str]) -> Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_strace"));
+    let (mut command, _logs) = tool_command(env!("CARGO_BIN_EXE_strace"));
     command
         .arg("--backend")
         .arg(backend)
@@ -1836,7 +1849,7 @@ fn assert_strace_minimal_write(output: Output) {
 }
 
 fn strace_minimal_tool_observes_write(backend: &str) {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_strace_minimal"));
+    let (mut command, _logs) = tool_command(env!("CARGO_BIN_EXE_strace_minimal"));
     command
         .args(["--backend", backend, "--preload"])
         .arg(preload())
@@ -1877,7 +1890,7 @@ fn exact_strace_tool_observes_thread_and_process_exit() {
 }
 
 fn run_public_chaos(backend: &str, extra: &[&str], mode: &str) -> Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_chaos"));
+    let (mut command, _logs) = tool_command(env!("CARGO_BIN_EXE_chaos"));
     command
         .args(["--backend", backend, "--preload"])
         .arg(preload())
@@ -1983,7 +1996,7 @@ fn chaos_raw_interrupts_then_limits_retry(backend: &str) {
     // evidence reader can hash these bytes even after the temporary path goes.
     let image = std::fs::read(&guest).unwrap();
     eprintln!("chaos raw guest path: {guest:?}; image bytes: {image:?}");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_chaos"));
+    let (mut command, _logs) = tool_command(env!("CARGO_BIN_EXE_chaos"));
     command
         .args(["--backend", backend, "--preload"])
         .arg(preload())

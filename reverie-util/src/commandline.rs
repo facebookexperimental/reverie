@@ -154,7 +154,11 @@ impl CommonToolArguments {
                     // TODO: Is this async logging?
                     let (file_writer, guard) = tracing_appender::non_blocking(file_writer);
 
-                    eprintln!(" [reverie] Logging to file at {:?}", parent.join(&filename));
+                    // The tool's standard error is the traced program's too, so
+                    // name the file there only when it is not the one asked for.
+                    if filename != orig_filename {
+                        eprintln!(" [reverie] Logging to file at {:?}", parent.join(&filename));
+                    }
                     set_subscriber_with_writer(file_writer, self.trace_syscalls);
                     Some(guard)
                 }

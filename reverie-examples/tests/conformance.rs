@@ -113,12 +113,74 @@ fn kvm_available() -> bool {
     }
 }
 
-fn run(binary: &str, backend: &str, program: &[&str]) -> Output {
-    tool_command(binary)
+/// An example tool's run of a program: the program's exit status and
+/// streams as the tool left them (through `Deref`), and the directory of
+/// the tool's own log. If the test fails while the run is in scope, the
+/// log is kept and printed, so a failing comparison still shows it.
+struct ToolRun {
+    output: Output,
+    logs: Option<tempfile::TempDir>,
+}
+
+const TOOL_LOG: &str = "tool.log";
+
+impl std::ops::Deref for ToolRun {
+    type Target = Output;
+
+    fn deref(&self) -> &Output {
+        &self.output
+    }
+}
+
+impl ToolRun {
+    /// The tool's own log, as far as the run wrote it.
+    fn log(&self) -> String {
+        let logs = self
+            .logs
+            .as_ref()
+            .expect("the log directory is kept until drop");
+        std::fs::read_to_string(logs.path().join(TOOL_LOG)).unwrap_or_default()
+    }
+}
+
+impl Drop for ToolRun {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            return;
+        }
+        let Some(logs) = self.logs.take() else {
+            return;
+        };
+        let path = logs.keep().join(TOOL_LOG);
+        let log = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| format!("<not readable: {error}>"));
+        eprintln!("tool log, kept at {}:\n{log}", path.display());
+    }
+}
+
+/// Run `program` under an example tool. The tool's own `tracing` log goes
+/// to a file of its own (`--log-file`), not to the standard error it
+/// shares with the program, so the streams the tests compare are the
+/// program's alone: a backend diagnostic, such as reverie-ptrace's PMU
+/// validation error on some AMD hosts, never reads as program output.
+fn run(binary: &str, backend: &str, program: &[&str]) -> ToolRun {
+    run_tool(tool_command(binary), backend, program)
+}
+
+/// [`run`], with the tool started by `command`.
+fn run_tool(mut command: Command, backend: &str, program: &[&str]) -> ToolRun {
+    let logs = tempfile::tempdir().unwrap();
+    let output = command
+        .arg("--log-file")
+        .arg(logs.path().join(TOOL_LOG))
         .args(["--backend", backend, "--"])
         .args(program)
         .output()
-        .expect("run the tool launcher")
+        .expect("run the tool launcher");
+    ToolRun {
+        output,
+        logs: Some(logs),
+    }
 }
 
 fn run_direct(program: &[&str]) -> Output {
@@ -968,10 +1030,73 @@ fn tools_agree_with_the_recorder(backend: &str) {
         );
 
         let noop = run(env!("CARGO_BIN_EXE_noop"), backend, program);
-        assert_eq!(noop.status.code(), Some(exit), "{backend} {program:?}");
-        assert_eq!(noop.stdout, direct.stdout, "{backend} {program:?}");
-        assert_eq!(noop.stderr, direct.stderr, "{backend} {program:?}");
+        assert_noop_is_direct(&noop, &direct, backend, program);
     }
+}
+
+/// `noop` changes nothing a program shows: its exit status and both of its
+/// streams are the direct run's, byte for byte.
+fn assert_noop_is_direct(noop: &Output, direct: &Output, backend: &str, program: &[&str]) {
+    assert_eq!(
+        noop.status.code(),
+        direct.status.code(),
+        "{backend} {program:?}"
+    );
+    assert_eq!(noop.stdout, direct.stdout, "{backend} {program:?}");
+    assert_eq!(noop.stderr, direct.stderr, "{backend} {program:?}");
+}
+
+/// With the tool's own logging at its most verbose (`RUST_LOG=trace`), the
+/// log goes to the tool's log file, and the program's streams under `noop`
+/// are still the direct run's.
+#[test]
+fn a_tool_logging_at_trace_level_leaves_the_program_s_streams_unchanged() {
+    let program = ["/bin/sh", "-c", "echo out; echo err >&2; exit 3"];
+    let direct = run_direct(&program);
+    assert_eq!(direct.status.code(), Some(3));
+    let mut command = tool_command(env!("CARGO_BIN_EXE_noop"));
+    command.env("RUST_LOG", "trace");
+    let noop = run_tool(command, "ptrace", &program);
+    assert_noop_is_direct(&noop, &direct, "ptrace", &program);
+    let log = noop.log();
+    assert!(
+        log.contains("TRACE"),
+        "the tool logged nothing at trace level: {} bytes",
+        log.len()
+    );
+}
+
+/// The `noop` comparison is exact: the tool's log is kept out of the
+/// program's standard error, not filtered from it. A program that writes
+/// reverie-ptrace's PMU validation error line itself, here only while it
+/// is traced, still makes the two runs' standard error differ.
+#[test]
+fn a_program_writing_the_tracer_s_error_line_still_differs_from_direct() {
+    // The line as reverie-ptrace emitted it on such a host, colours aside.
+    const LINE: &str = "2026-11-17T20:34:14.125889Z ERROR reverie_ptrace::perf: PMU validation failed; \
+                        RCB timers may be unreliable error=AmdSpecLockMapShouldBeDisabled \
+                        { speclockmap_commits: 88629, locked_instructions: Measured(88632) }";
+    let script = format!(
+        "while read -r key value; do \
+         if [ \"$key\" = TracerPid: ] && [ \"$value\" != 0 ]; then echo '{LINE}' >&2; fi; \
+         done < /proc/self/status"
+    );
+    let program = ["/bin/sh", "-c", script.as_str()];
+    let direct = run_direct(&program);
+    let noop = run(env!("CARGO_BIN_EXE_noop"), "ptrace", &program);
+    assert_eq!(direct.stderr, b"");
+    assert_eq!(noop.stderr, format!("{LINE}\n").into_bytes());
+    // Status and stdout agree, so only the comparison of standard error can
+    // fail below.
+    assert_eq!(noop.status.code(), direct.status.code());
+    assert_eq!(noop.stdout, direct.stdout);
+    let compared = std::panic::catch_unwind(|| {
+        assert_noop_is_direct(&noop, &direct, "ptrace", &program);
+    });
+    assert!(
+        compared.is_err(),
+        "the comparison let the tracer's line through"
+    );
 }
 
 #[test]
