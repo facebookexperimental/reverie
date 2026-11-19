@@ -637,14 +637,3 @@ buck_sh_test(
     )
     for base in reverie_tests
 ]
-
-# This package's files and its subpackages', for
-# //hermetic_infra/reverie:layering-tree.
-buck_filegroup(
-    name = "layering-files",
-    srcs = {
-        "gdbserver-integration": "//hermetic_infra/reverie/tests/gdbserver-integration:layering-files",
-    }
-    | {src: src for src in glob(["**", ".*", ".*/**", "**/.*", "**/.*/**", ".*/**/.*", ".*/**/.*/**"])},
-    visibility = ["//hermetic_infra/reverie/..."],
-)

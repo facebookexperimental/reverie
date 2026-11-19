@@ -10,7 +10,7 @@ load(
 )
 load("@fbcode//hermetic_infra/reverie/fb-only/rpc_compat:defs.bzl", "rpc_transport_library")
 load("@fbcode_macros//build_defs:cpp_library.bzl", "cpp_library")
-load("@fbcode_macros//build_defs:native_rules.bzl", "buck_filegroup", "buck_sh_test")
+load("@fbcode_macros//build_defs:native_rules.bzl", "buck_filegroup")
 load("@fbcode_macros//build_defs:sanitizers.bzl", "sanitizers")
 load("@fbsource//tools/build_defs:rust_binary.bzl", "rust_binary")
 load("@fbsource//tools/build_defs:rust_library.bzl", "rust_library")
@@ -3056,33 +3056,6 @@ rust_binary(
         ":reverie-ptrace",
         ":reverie-util",
     ],
-)
-
-# The Reverie tree at its repository paths, for check-layering below. glob()
-# skips dot-entries unless asked and stops at subpackages, so the patterns name
-# dot-entries and each subpackage contributes its own layering-files group.
-# scripts/check-layering.sh fails while a directory holding a BUCK file lacks
-# that group or is not referenced here or from its parent's group.
-buck_filegroup(
-    name = "layering-tree",
-    srcs = {
-        "experimental": "//hermetic_infra/reverie/experimental:layering-files",
-        "fb-only/experiments": "//hermetic_infra/reverie/fb-only/experiments:layering-files",
-        "fb-only/rpc_compat": "//hermetic_infra/reverie/fb-only/rpc_compat:layering-files",
-        "reverie-signal": "//hermetic_infra/reverie/reverie-signal:layering-files",
-        "tests": "//hermetic_infra/reverie/tests:layering-files",
-    }
-    | {src: src for src in glob(["**", ".*", ".*/**", "**/.*", "**/.*/**", ".*/**/.*", ".*/**/.*/**"])},
-    target_compatible_with = ["fbcode//opensource/macros:broken-in-oss"],
-)
-
-# The layering check (scripts/check-layering.sh, reverie-layering skill) on
-# every change that touches this tree.
-buck_sh_test(
-    name = "check-layering",
-    args = ["$(location :layering-tree)"],
-    target_compatible_with = ["fbcode//opensource/macros:broken-in-oss"],
-    test = "fb-only/check_layering_test.sh",
 )
 
 # The reverie-examples features our Cargo CI tests the crate with

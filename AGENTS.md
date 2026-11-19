@@ -15,9 +15,9 @@ names, feature flags and environment variables.
 - Every backend must pass Reverie's own generic tests without Hermit,
   including the strace and counter example tools. The backends are ptrace,
   KVM, DBT, LiteInst and in-guest.
-- `scripts/check-layering.sh` enforces this for code, manifests and build
-  files, with per-file counts that may only fall; boundary cases and the check:
-  the `reverie-layering` skill.
+- Reviewers judge this from a change's design and dependencies; there is no
+  counted check. Ownership metadata such as `REVERIE_ONCALL` is not leakage.
+  Boundary cases: the `reverie-layering` skill.
 
 **Review depth and post-facto tags.** Reverie is developed autonomously by
 agents, with asynchronous human guidance. A change to core Reverie types

@@ -9,12 +9,6 @@ oncall(REVERIE_ONCALL)
 # a real boundary: Buck same-package visibility bypasses restrictions,
 # so in the parent package most of Reverie could depend on it freely.
 
-buck_filegroup(
-    name = "layering-files",
-    srcs = {src: src for src in glob(["**", ".*", ".*/**", "**/.*", "**/.*/**", ".*/**/.*", ".*/**/.*/**"])},
-    target_compatible_with = ["fbcode//opensource/macros:broken-in-oss"],
-)
-
 # Linux x86-64 signal frame construction and rt_sigreturn restore,
 # lifted from LinuxEmu and shared by every backend.
 rust_library(

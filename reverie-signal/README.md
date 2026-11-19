@@ -12,6 +12,5 @@ existing `reverie_linuxemu::signal` paths.
 
 The frame tests compile two small C ABI probes at test time
 (`tests/fixtures/signal_abi_*.c`, needs `cc`). Internal (Buck) targets
-for this crate must declare those fixtures as resources and keep the
-test wired into the layering tree; the Cargo DAG already selects this
-package in its core test node.
+for this crate must declare those fixtures as resources; the Cargo DAG
+already selects this package in its core test node.
