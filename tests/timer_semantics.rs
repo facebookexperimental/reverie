@@ -736,11 +736,45 @@ mod tests {
                 .into_inner(),
             0
         );
+        // Retries are the runner's, not this case's: the counted runner
+        // (scripts/libtest-counts.rs) and the gated runner
+        // (run_gated.py --counted-retries) rerun a failed case a
+        // counted number of times and record a pass on retry as
+        // REVERIE_FLAKY. No lane is assumed quiet. What this case
+        // adds is the evidence a retry is judged by: the skid
+        // witnesses taken over the run, in the assertion message in
+        // the form run_gated.py parses. A contention miss (the
+        // overflow handled after the guest passed the delivery
+        // point) leaves one Missed detail, notification queued at
+        // past_target 0, per undelivered event, so counted +
+        // qualifying == ITERS with witnesses == qualifying; a short
+        // count without them is a product failure no runner may
+        // retry. The counters are process-global: sanctioned runners
+        // execute one case at a time in a process (--test-threads=1,
+        // nextest, run_gated), which is what attributes them here.
+        let _ = reverie::take_skid_overshoot_count();
+        let _ = reverie::take_skid_overshoot_details();
+        let counted = loop_with_branch_ct(rcbs, rcbm1, ITERS, schedule_timer)
+            .num_timer_evts
+            .into_inner();
+        let witnesses = reverie::take_skid_overshoot_count();
+        let details = reverie::take_skid_overshoot_details();
+        let qualifying = details
+            .iter()
+            .filter(|detail| {
+                matches!(
+                    detail.kind,
+                    reverie::SkidOvershootKind::Missed {
+                        notification_queued: true,
+                        ..
+                    }
+                ) && detail.past_target() == 0
+            })
+            .count();
         assert_eq!(
-            loop_with_branch_ct(rcbs, rcbm1, ITERS, schedule_timer)
-                .num_timer_evts
-                .into_inner(),
-            ITERS
+            counted, ITERS,
+            "precise timer counted {counted} of {ITERS}; skid witnesses \
+             {witnesses}, qualifying {qualifying}: {details:?}"
         );
     }
 

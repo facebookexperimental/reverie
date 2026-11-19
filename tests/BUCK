@@ -72,6 +72,11 @@ GATED_TESTS = ["cpuid.rs", "timer_semantics.rs"]
 [
     gated_test(
         name = paths.replace_extension(test, "") + "-gated",
+        # RE is not shown quiet, so the precise timer cases get the same
+        # counted witnessed-miss retries as the counted runner here (see
+        # precise_deterministic_loop); run_gated records any pass on
+        # retry as REVERIE_FLAKY with every miss named.
+        counted_retries = 2 if test == "timer_semantics.rs" else 0,
         test = "//hermetic_infra/reverie/tests:" + paths.replace_extension(test, ""),
     )
     for test in GATED_TESTS
