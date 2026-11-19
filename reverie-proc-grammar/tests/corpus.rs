@@ -491,6 +491,26 @@ fn mountinfo_rows_round_trip_and_peer_groups() {
 }
 
 #[test]
+fn mountinfo_empty_source_is_accepted_and_round_trips() {
+    // The kernel prints an empty mount source as nothing between
+    // its two spaces (mount -t tmpfs "" /x). Only that field may
+    // be empty; every other empty field still refuses.
+    let bytes = b"40 37 0:60 / /tmp rw,relatime - tmpfs  rw,inode64\n";
+    let rows = parse_mountinfo(bytes).expect("empty source refused");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].source, b"", "empty source is the empty bytes");
+    assert_eq!(render_mountinfo(&rows), bytes, "double space round-trips");
+    assert!(
+        parse_mountinfo(b"40 37 0:60  /tmp rw - tmpfs src rw\n").is_err(),
+        "empty root field still refuses"
+    );
+    assert!(
+        parse_mountinfo(b"40 37 0:60 / /tmp rw - tmpfs src \n").is_err(),
+        "empty super options still refuse"
+    );
+}
+
+#[test]
 fn mountinfo_refuses_noncanonical_and_unknown_numeric_fields() {
     let row = b"37 1 8:1 / / rw shared:9 - ext4 /dev/root rw\n";
     assert!(parse_mountinfo(b"\n").is_err(), "a sole newline is one empty row");

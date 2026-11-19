@@ -124,13 +124,21 @@ fn has_numeric_tag_value(field: &[u8]) -> bool {
 
 fn parse_row(input: &[u8], line: &[u8]) -> Result<MountInfoRow, ProcParseError> {
     let fields: Vec<&[u8]> = line.split(|byte| *byte == b' ').collect();
-    if fields.iter().any(|field| field.is_empty()) {
-        return Err(bad_shape(input, line));
-    }
     let Some(separator) = fields.iter().position(|field| *field == b"-") else {
         return Err(bad_shape(input, line));
     };
     if separator < 6 || separator + 4 != fields.len() {
+        return Err(bad_shape(input, line));
+    }
+    // Exactly one field may be empty: the mount source. The kernel
+    // prints an empty source string as nothing between its two
+    // spaces (`- tmpfs  rw,...` from `mount -t tmpfs "" /x`), and
+    // refusing it fails the whole snapshot for every consumer.
+    if fields
+        .iter()
+        .enumerate()
+        .any(|(index, field)| field.is_empty() && index != separator + 2)
+    {
         return Err(bad_shape(input, line));
     }
     let mut device = fields[2].split(|byte| *byte == b':');
