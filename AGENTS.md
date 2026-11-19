@@ -42,16 +42,31 @@ the raw size and sha256 of every source file listed in
   and sha256), must update its pinned tuple in the same change and run
   `cargo test -p reverie-liteinst-artifact` at the exact head before
   submitting.
-- Update every occurrence of the old sha256, not only the catalog row. Some
-  files are pinned again elsewhere in `reverie-liteinst-artifact/src/`, for
-  example in `private_static/tls_sources.rs`,
-  `private_static/selected_initializers/native_leaves.rs` and `lib.rs`'s
-  `NO_INSTALLATION_SCOPE_SOURCE`. Grep that directory for the old sha256 to
-  find them all.
-- When a catalog row changes, add the replaced tuple to the test module's
-  list of rejected prior tuples (after the `CONTENT_REVERIE_CATALOG.len()`
-  assertion), as earlier row updates did. The test then proves the catalog
-  refuses the old content.
+- A catalog rebind is append-only history. Two enforcers divide it:
+  `scripts/check-catalog-bindings-append-only.rs` checks the three history
+  tables across revisions (every BASE row of
+  `CONTENT_REVERIE_CATALOG_BINDINGS`, `CONTENT_REVERIE_CATALOG_BINDING_SEALS`
+  and `rejected_prior` must survive unchanged at HEAD; a missing or emptied
+  table is refused), and the crate test in
+  `reverie-liteinst-artifact/src/lib.rs` (`binding_seals_hold` and
+  `catalogue_rebinds_recorded`) checks the seal and the rejected record
+  within one revision. When a pinned source changes: update its
+  `CONTENT_REVERIE_CATALOG` row; APPEND the new binding tuple to
+  `CONTENT_REVERIE_CATALOG_BINDINGS`, keeping the old tuple; append ONE
+  seal covering every binding to `CONTENT_REVERIE_CATALOG_BINDING_SEALS`;
+  and add the old tuple to the test module's `rejected_prior` list. Never
+  remove or modify an existing history row. Run
+  `scripts/check-catalog-bindings-append-only.rs` against the merge-base
+  before submitting: its default BASE is the merge-base with
+  `origin/<landing branch>`, which needs a git checkout; without git use
+  `--base REV` in a git export or `--base-file`/`--head-file`, and an
+  unresolvable BASE exits 2, which is a failure, never a pass.
+- Current-value pins are not history rows and still move with the source:
+  update the catalog row AND every other current-value pin of the old
+  tuple (grep `reverie-liteinst-artifact/src/` for the old sha256; for
+  example `NO_INSTALLATION_SCOPE_SOURCE` in `lib.rs`, which pins
+  `reverie-liteinst/src/patch_alloc.rs` against its live sha256). Never
+  apply that update to a history row, where the old tuple must stay.
 - Run that test in a git checkout of the head: some of its tests run
   `git rev-parse HEAD`, so a copy without `.git` fails them.
 - The tests for what a change touches include this one for every pinned file
