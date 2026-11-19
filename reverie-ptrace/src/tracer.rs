@@ -11910,10 +11910,36 @@ mod tests {
         // status pipe, which it would otherwise hold open, never exec'ing,
         // and the spawn would wait on it forever: where `close_range` fails,
         // it closes each descriptor up to its limit.
+        //
+        // It forks with the raw system call, not libc's `fork`. The root is a
+        // raw clone of this multithreaded test process, so no
+        // `pthread_atfork` handler ran for it: a malloc arena lock another
+        // test thread held at that clone stays held in the root, and glibc's
+        // `fork` takes every arena lock first, so it would wait for ever and
+        // the spawn with it. `clone(SIGCHLD)` with no stack is `fork` without
+        // those handlers; the flags come first on every architecture, and the
+        // zero arguments make the per-architecture order of the rest
+        // irrelevant.
+        //
+        // The raw clone is as sound as `fork` while the child stays as it is:
+        // - The flags hold only the exit signal, SIGCHLD. The call returns 0
+        //   in the child and the child's pid in the root, as `fork` does, and
+        //   the child's exit reaches the root by SIGCHLD and `waitpid`, as a
+        //   forked child's does.
+        // - There is no CLONE_VM: the child gets a copy-on-write copy of the
+        //   root's memory, as with `fork`. With a zero stack it resumes on its
+        //   own copy of the root's stack, where these frames already exist.
+        // - There is no CLONE_SETTLS, and libc does not set the child up as
+        //   its `fork` would. So until `pause` or `_exit` the child may only
+        //   make system calls, directly or through libc's thin wrappers:
+        //   nothing that allocates, uses stdio or can panic.
+        // - There is no CLONE_FILES: the child gets a copy of the descriptor
+        //   table, each descriptor with its close-on-exec flag, as with
+        //   `fork`. It never execs, so it closes them itself, as above.
         unsafe {
             command.pre_exec(|| {
                 let parent = libc::getpid();
-                if libc::fork() == 0 {
+                if libc::syscall(libc::SYS_clone, libc::SIGCHLD as libc::c_long, 0, 0, 0, 0) == 0 {
                     // Untraced: dies with its parent, so a failed spawn does
                     // not leave it paused for ever.
                     if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0
