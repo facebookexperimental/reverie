@@ -737,6 +737,12 @@ fn loader_host_resource_errors_are_told_apart_from_image_errors() {
 /// new one falls back to the fixed diagnostic, and a kept one is still found.
 #[test]
 fn host_resources_diagnostics_are_kept_once_each_up_to_the_bound() {
+    // The store under test leaks each text intentionally; hold it in
+    // a static at the end so the leaked texts stay reachable at
+    // process exit (as production's static store does) and
+    // LeakSanitizer reports nothing.
+    static FINISHED: std::sync::Mutex<Vec<Vec<&'static str>>> =
+        std::sync::Mutex::new(Vec::new());
     let mut kept = Vec::new();
     let first = keep_host_resources_diagnostic(&mut kept, "first".to_owned());
     assert!(std::ptr::eq(
@@ -757,4 +763,8 @@ fn host_resources_diagnostics_are_kept_once_each_up_to_the_bound() {
         first,
         keep_host_resources_diagnostic(&mut kept, "first".to_owned())
     ));
+    FINISHED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(kept);
 }

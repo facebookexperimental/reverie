@@ -90,6 +90,16 @@ pub(super) fn intern_host_resources_diagnostic(text: String) -> &'static str {
 }
 
 /// [`intern_host_resources_diagnostic`], with `kept` the texts kept so far.
+///
+/// Invariant the returned references rely on: the store only ever
+/// appends - it exposes no remove, clear, replace or Drop path, and
+/// it lives in a `static` that is never torn down - so a leaked text
+/// is never freed, moved, or mutated for the process lifetime. The
+/// leak itself is intentional and bounded (at most
+/// [`MAX_HOST_RESOURCES_DIAGNOSTICS`] distinct texts); the bound
+/// test keeps its store reachable from a static at exit so
+/// LeakSanitizer reports nothing, exactly as production's static
+/// store stays reachable.
 pub(super) fn keep_host_resources_diagnostic(
     kept: &mut Vec<&'static str>,
     text: String,
@@ -100,6 +110,8 @@ pub(super) fn keep_host_resources_diagnostic(
     if kept.len() >= MAX_HOST_RESOURCES_DIAGNOSTICS {
         return HOST_RESOURCES_REFUSAL;
     }
+    // Intentional bounded leak (see the invariant above): diagnostics
+    // are kept once each up to the bound for the process lifetime.
     let text: &'static str = Box::leak(text.into_boxed_str());
     kept.push(text);
     text
