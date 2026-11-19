@@ -47,6 +47,7 @@ pub struct Mount {
     data: Option<CString>,
     touch_target: bool,
     allow_readonly_fallback: bool,
+    optional: bool,
     pinned_source: Option<PinnedMountSource>,
     /// A path, fstype or data string that could not be represented as a C
     /// string, recorded at BUILD time and reported at [`Mount::mount`] time.
@@ -111,6 +112,7 @@ impl Mount {
             data: None,
             touch_target: false,
             allow_readonly_fallback: false,
+            optional: false,
             pinned_source: None,
         }
     }
@@ -298,6 +300,31 @@ impl Mount {
     /// remounts, bind mounts, moves, or propagation changes.
     pub fn allow_readonly_fallback(mut self) -> Self {
         self.allow_readonly_fallback = true;
+        self
+    }
+
+    /// Skips this bind mount when its source no longer exists at install
+    /// time (`ENOENT`), instead of failing container setup. Only bind
+    /// mounts skip: an optional non-bind mount refuses every failure as
+    /// usual. A bind whose source still exists is never skipped either:
+    /// any other `ENOENT` (for example a missing target) refuses as usual.
+    ///
+    /// For mounts assembled from a directory snapshot taken before the
+    /// clone: an entry that vanishes in between is then absent, as it
+    /// would have been had the snapshot run a moment later. A skipped
+    /// bind mount DELETES its target where `lstat` proves it is only a
+    /// placeholder (an empty regular file, or a directory `rmdir` finds
+    /// empty), so no empty placeholder remains where the entry would
+    /// have been; any other target is left intact and still refuses
+    /// setup. That check-then-delete is sound only where no one else can
+    /// swap the target between the two calls: the target's parent
+    /// directory has to be private to the caller. Every other failure
+    /// still refuses setup. This has no effect
+    /// on a pinned bind ([`Mount::bind_pinned`]), whose checked identity
+    /// refusal is the point: a vanished pinned source reports
+    /// `ENOENT`/`ESTALE` as before.
+    pub fn optional(mut self) -> Self {
+        self.optional = true;
         self
     }
 
@@ -647,7 +674,16 @@ impl Mount {
             // destination directories won't work because they'll get created in
             // a different tmpfs.
             if let Some(src) = &self.source {
-                if FileType::new(src.as_ptr())?.is_dir() {
+                let is_dir = match FileType::new(src.as_ptr()) {
+                    Ok(file_type) => file_type.is_dir(),
+                    Err(Errno::ENOENT)
+                        if self.optional && self.flags.contains(MountFlags::MS_BIND) =>
+                    {
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error),
+                };
+                if is_dir {
                     create_dir_all(&self.target, 0o777)?;
                 } else {
                     touch_path(&self.target, 0o666, 0o777)?;
@@ -656,6 +692,58 @@ impl Mount {
         }
 
         match self.mount_with_flags(self.flags) {
+            Err(Errno::ENOENT) if self.optional && self.flags.contains(MountFlags::MS_BIND) => {
+                // Only a vanished source may skip: with the source still
+                // present, the ENOENT names something else (a missing
+                // target or parent), which refuses as usual.
+                if let Some(source) = &self.source {
+                    // SAFETY: `source` is a live NUL-terminated buffer
+                    // owned by `self`, and the stat buffer is caller-owned.
+                    let source_missing = unsafe {
+                        let mut stat = MaybeUninit::<libc::stat>::uninit();
+                        libc::lstat(source.as_ptr(), stat.as_mut_ptr()) != 0
+                            && Errno::last() == Errno::ENOENT
+                    };
+                    if !source_missing {
+                        return Err(Errno::ENOENT);
+                    }
+                }
+                // A skipped bind leaves no entry behind: remove its
+                // target only where `lstat` proves it is a placeholder
+                // (an empty regular file, or a directory `rmdir` finds
+                // empty), so the path is absent rather than an empty
+                // placeholder. Anything else at the target -- a non-empty
+                // or special file, a symbolic link, a directory with
+                // contents -- is real data this skip must never delete:
+                // it still refuses setup with the original `ENOENT`, the
+                // target intact.
+                if self.flags.contains(MountFlags::MS_BIND) {
+                    // SAFETY: `target_ptr` is a live NUL-terminated buffer
+                    // owned by `self`, and both calls write only into the
+                    // caller-owned stat buffer.
+                    let removed = unsafe {
+                        let mut stat = MaybeUninit::<libc::stat>::uninit();
+                        if libc::lstat(self.target_ptr(), stat.as_mut_ptr()) != 0 {
+                            // Already absent is the skipped state itself.
+                            Errno::last() == Errno::ENOENT
+                        } else {
+                            let stat = stat.assume_init();
+                            let kind = stat.st_mode & libc::S_IFMT;
+                            if kind == libc::S_IFREG && stat.st_size == 0 {
+                                libc::unlink(self.target_ptr()) == 0
+                            } else if kind == libc::S_IFDIR {
+                                libc::rmdir(self.target_ptr()) == 0
+                            } else {
+                                false
+                            }
+                        }
+                    };
+                    if !removed {
+                        return Err(Errno::ENOENT);
+                    }
+                }
+                return Ok(());
+            }
             Err(error) => match self.readonly_proc_fallback(error) {
                 Some(flags) => self.mount_with_flags(flags),
                 None => Err(error),
@@ -729,6 +817,7 @@ impl From<Bind> for Mount {
             data: None,
             touch_target: false,
             allow_readonly_fallback: false,
+            optional: false,
             pinned_source: None,
             // A Bind built from a path that was not representable as a C string
             // holds an EMPTY CString (see `checked_cstring`). Empty source or

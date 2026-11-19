@@ -835,6 +835,178 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mount_optional_skips_a_missing_source() {
+        if crate::test_runs_in_own_process() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        fs::create_dir(&target).unwrap();
+        let missing = temp.path().join("missing");
+
+        // List the parent: a skipped bind removes its placeholder target,
+        // so the entry is absent rather than an empty directory.
+        let output = Command::new("ls")
+            .arg(temp.path())
+            .map_root()
+            .mount(Mount::bind(&missing, &target).optional())
+            .output()
+            .await
+            .unwrap();
+        assert_eq!(output.status, ExitStatus::Exited(0));
+        assert_eq!(output.stdout, b"");
+
+        // Recreate the placeholder the skip removed, so the control below
+        // refuses for the missing SOURCE, not the missing target.
+        fs::create_dir(&target).unwrap();
+        let refused = Command::new("ls")
+            .arg(&target)
+            .map_root()
+            .mount(Mount::bind(&missing, &target))
+            .output()
+            .await;
+        assert!(
+            refused.is_err(),
+            "the same bind without optional must refuse setup: {refused:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mount_optional_pinned_bind_still_refuses_a_missing_source() {
+        if crate::test_runs_in_own_process() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let target = temp.path().join("target");
+        fs::write(&source, "pinned").unwrap();
+        let pinned = crate::PinnedMountSource::open(&source).unwrap();
+        fs::remove_file(&source).unwrap();
+
+        let refused = Command::new("ls")
+            .arg(&target)
+            .map_root()
+            .mount(
+                Mount::bind_pinned(&pinned, &target)
+                    .optional()
+                    .touch_target(),
+            )
+            .output()
+            .await;
+        match refused {
+            Err(error) => assert_eq!(
+                error.raw_os_error(),
+                Some(libc::ENOENT),
+                "expected pinned mount refusal ENOENT, received {error:?}"
+            ),
+            other => panic!("expected pinned mount refusal ENOENT, received {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mount_optional_still_refuses_other_errors() {
+        if crate::test_runs_in_own_process() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        // The target's parent is a regular file: installing the bind
+        // fails ENOTDIR, which optional must not tolerate.
+        let blocker = temp.path().join("blocker");
+        fs::write(&blocker, "file").unwrap();
+        let target = blocker.join("target");
+
+        let refused = Command::new("ls")
+            .arg(&target)
+            .map_root()
+            .mount(Mount::bind(&source, &target).optional())
+            .output()
+            .await;
+        assert!(
+            refused.is_err(),
+            "optional must refuse a non-ENOENT failure: {refused:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mount_optional_never_deletes_a_real_target() {
+        if crate::test_runs_in_own_process() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing");
+        // Real targets the skip must refuse over, intact: a non-empty
+        // regular file and a non-empty directory.
+        let file_target = temp.path().join("file-target");
+        fs::write(&file_target, "real data").unwrap();
+        let dir_target = temp.path().join("dir-target");
+        fs::create_dir(&dir_target).unwrap();
+        fs::write(dir_target.join("kept"), "real data").unwrap();
+
+        for target in [&file_target, &dir_target] {
+            let refused = Command::new("ls")
+                .arg(target)
+                .map_root()
+                .mount(Mount::bind(&missing, target).optional())
+                .output()
+                .await;
+            assert!(
+                refused.is_err(),
+                "optional must refuse over a real target {target:?}: {refused:?}"
+            );
+        }
+        assert_eq!(fs::read(&file_target).unwrap(), b"real data");
+        assert_eq!(fs::read(dir_target.join("kept")).unwrap(), b"real data");
+    }
+
+    #[tokio::test]
+    async fn mount_optional_refuses_when_only_the_target_is_missing() {
+        if crate::test_runs_in_own_process() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        // The source exists; only the target is missing. Optional must
+        // not skip: the ENOENT names the target, not a vanished entry.
+        let target = temp.path().join("no-such-parent/target");
+
+        let refused = Command::new("ls")
+            .arg(&target)
+            .map_root()
+            .mount(Mount::bind(&source, &target).optional())
+            .output()
+            .await;
+        assert!(
+            refused.is_err(),
+            "optional must refuse when the source still exists: {refused:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mount_optional_non_bind_mount_never_skips() {
+        if crate::test_runs_in_own_process() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        // A missing target for an optional tmpfs mount: only bind mounts
+        // may skip, so this refuses like any other failed mount.
+        let target = temp.path().join("no-such-parent/target");
+
+        let refused = Command::new("ls")
+            .arg(&target)
+            .map_root()
+            .mount(Mount::tmpfs(&target).optional())
+            .output()
+            .await;
+        assert!(
+            refused.is_err(),
+            "optional must not skip a non-bind mount: {refused:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn local_networking_ping() {
         if crate::test_runs_in_own_process() {
             return;
