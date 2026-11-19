@@ -504,13 +504,17 @@ impl SignalFrameLayout {
                 .ok_or(SignalFrameError::AddressOverflow)?,
             XSAVE_ALIGNMENT,
         );
-        let frame_address = align_down_with_remainder(
+        // Linux x86-64 get_sigframe rounds the end of the rt_sigframe down
+        // to a 16-byte boundary and then subtracts 8. With an XSAVE address
+        // aligned to 64 bytes and a 440-byte rt_sigframe, that is 16 bytes
+        // below the first 8-mod-16 address at or below the XSAVE prefix end.
+        let frame_address = align_down(
             xsave_address
                 .checked_sub(RT_SIGFRAME_SIZE as u64)
                 .ok_or(SignalFrameError::AddressOverflow)?,
             SIGNAL_STACK_ALIGNMENT,
-            8,
         )
+        .checked_sub(8)
         .ok_or(SignalFrameError::AddressOverflow)?;
         Ok(Self {
             frame_address,
@@ -842,11 +846,6 @@ fn align_down(value: u64, alignment: u64) -> u64 {
     value & !(alignment - 1)
 }
 
-fn align_down_with_remainder(value: u64, alignment: u64, remainder: u64) -> Option<u64> {
-    let base = value.checked_sub(remainder)? & !(alignment - 1);
-    base.checked_add(remainder)
-}
-
 fn read_u16(bytes: &[u8], offset: usize) -> u16 {
     u16::from_le_bytes(bytes[offset..offset + 2].try_into().expect("u16 bytes"))
 }
@@ -993,6 +992,25 @@ mod tests {
         assert!(nested.fits_above(nested.frame_address - 1));
         assert!(!nested.fits_above(nested.frame_address));
         assert!(!nested.fits_above(nested.frame_address + 1));
+    }
+
+    #[test]
+    fn frame_layout_uses_linux_get_sigframe_placement_at_altstack_boundary() {
+        // Seat boundary case (dh-nx4otc): alternate-stack base 0x10000 and
+        // nested stack pointer 0x10590. Linux x86-64 get_sigframe places
+        // the rt_sigframe at round_down(xsave_address - 440, 16) - 8, not
+        // at the first 8-mod-16 address at or below xsave_address - 440.
+        let layout = SignalFrameLayout::below(0x1_0590, true).unwrap();
+        assert_eq!(layout.xsave_address, 0x1_01c0);
+        assert_eq!(layout.frame_address, 0xfff8);
+        assert_eq!(
+            layout.xsave_address - (layout.frame_address + RT_SIGFRAME_SIZE as u64),
+            16,
+        );
+        assert!(
+            !layout.fits_above(0x1_0000),
+            "Linux placement puts this boundary frame below the alternate stack base",
+        );
     }
 
     #[test]

@@ -6712,10 +6712,11 @@ static void outer_handler(int signo) {
   if (signo != SIGUSR1) _exit(40);
   long pid = syscall(SYS_getpid);
   long tid = syscall(SYS_gettid);
-  // For lower % 64 == 8, this interrupted RSP makes the nested frame begin
-  // exactly at lower: xsave=lower+440, frame=xsave-440, with a 128-byte
-  // red zone ending at the chosen RSP.
-  uintptr_t target = alt_lower + 1404 - (mode != 1);
+  // For lower % 64 == 56, this interrupted RSP makes the nested frame
+  // begin exactly at lower under Linux get_sigframe placement:
+  // xsave=lower+456 and frame=round_down(xsave-440, 16)-8 = xsave-456,
+  // with a 128-byte red zone ending at the chosen RSP.
+  uintptr_t target = alt_lower + 1420 - (mode != 1);
   volatile unsigned char *red_zone = (volatile unsigned char *)(target - 128);
   for (unsigned i = 0; i < 128; ++i) red_zone[i] = (unsigned char)(i ^ 0xa5);
 
@@ -6750,11 +6751,12 @@ int main(int argc, char **argv) {
 
   if (strcmp(argv[1], "fresh") == 0) {
     // The configured stack straddles a PROT_NONE guard, but the exact fresh
-    // frame starts at middle+8. Reserving an erroneous second red zone would
-    // start the frame 128 bytes lower in the guard.
+    // frame starts at middle+56 under Linux placement (XSAVE at
+    // middle+512, frame at XSAVE-456). Reserving an erroneous second red
+    // zone would start the frame 128 bytes lower, at middle-72 in the guard.
     if (mprotect(mapping, (size_t)page, PROT_NONE) != 0) return 22;
     stack_t stack = {
-      .ss_sp = middle - 764,
+      .ss_sp = middle - 700,
       .ss_size = 2048,
       .ss_flags = 0,
     };
@@ -6768,10 +6770,10 @@ int main(int argc, char **argv) {
     return 26;
   }
 
-  alt_lower = (uintptr_t)middle + 8;
+  alt_lower = (uintptr_t)middle + 56;
   stack_t stack = {
     .ss_sp = (void *)alt_lower,
-    .ss_size = (size_t)page - 8,
+    .ss_size = (size_t)page - 56,
     .ss_flags = 0,
   };
   if (sigaltstack(&stack, 0) != 0) return 27;
@@ -6802,7 +6804,7 @@ int main(int argc, char **argv) {
     // the base excluded
     // (https://github.com/gregkh/linux/blob/v7.1.3/arch/x86/kernel/signal.c#L150-L158,
     // https://github.com/gregkh/linux/blob/v7.1.3/include/linux/sched/signal.h#L574-L583):
-    // SIGSEGV, as for the frame 16 bytes lower. timer_events.rs compares
+    // SIGSEGV, as for the frame 64 bytes lower. timer_events.rs compares
     // that case with native Linux
     // (a_frame_that_would_start_at_the_alternate_stacks_base_is_refused_as_on_linux).
     for (mode, expected) in [
