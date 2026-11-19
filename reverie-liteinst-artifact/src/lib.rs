@@ -43095,7 +43095,8 @@ mod tests {
                 include_bytes!("lib.rs"),
             ),
         ];
-        // These reviewed sources changed for startup or returning-injection contracts.
+        // These reviewed sources changed for startup or returning-injection contracts,
+        // or (Cargo.toml) for workspace membership.
         // Keep the fixed catalog authoritative and reject their prior tuples.
         assert_eq!(CONTENT_REVERIE_CATALOG.len(), 88);
         let rejected_prior = [
@@ -76729,11 +76730,19 @@ pub mod private_static {
             .unwrap();
             // Never run before the metadata call; only its identity is read.
             fs::write(tools.join("rustc"), b"fixture compiler identity\n").unwrap();
-            let child = "private_static::tests::with_resolved_from_lock_check_child_process";
+            // The child's libtest name is this module's path without the crate
+            // name, which differs where another test crate includes this file.
+            let child = format!(
+                "{}::with_resolved_from_lock_check_child_process",
+                module_path!()
+                    .split_once("::")
+                    .expect("a test module inside a crate")
+                    .1
+            );
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
-                    child,
+                    child.as_str(),
                     "--ignored",
                     "--test-threads=1",
                     "--nocapture",
