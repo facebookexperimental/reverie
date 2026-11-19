@@ -2066,7 +2066,16 @@ fn content_reverie_inventory_for_image(
     }
     relatives.push("reverie-liteinst-artifact/src/lib.rs");
     let (inventory, files) = declared_inventory(root, &relatives)?;
-    for entry in &inventory {
+    check_content_inventory(&inventory, image_kind)?;
+    Ok((inventory, files))
+}
+/// Checks each declared source of a content inventory against its reviewed
+/// identity for `image_kind`; the files were already read and hashed.
+fn check_content_inventory(
+    inventory: &[DeclaredSourceFile],
+    image_kind: FixedImageKind,
+) -> Result<()> {
+    for entry in inventory {
         if entry.relative == "reverie-liteinst-artifact/src/lib.rs" {
             require(
                 entry.sha256 == qualifier_source_sha256(),
@@ -2183,7 +2192,7 @@ fn content_reverie_inventory_for_image(
             content_catalog_matches(&entry.relative, entry.size, &entry.sha256)?;
         }
     }
-    Ok((inventory, files))
+    Ok(())
 }
 #[cfg(test)]
 fn content_reverie_inventory(
@@ -44008,14 +44017,41 @@ mod tests {
             let mut changed = bytes.clone();
             changed[0] ^= 1;
             fs::write(rv_one.join(relative), &changed).unwrap();
-            let refusal = content_reverie_inventory(&rv_one).unwrap_err();
+            // Read and hash only the changed source, as the inventory reads
+            // each one, and check the whole inventory with it in place of the
+            // reviewed entry. Every other entry is the one rv_inventory holds,
+            // so this does not rehash all the sources once per entry.
+            let (rehashed, _) = declared_inventory(&rv_one, &[relative]).unwrap();
+            let mut mutated = rv_inventory.clone();
+            let slot = mutated
+                .iter_mut()
+                .find(|entry| entry.relative == relative)
+                .unwrap();
+            assert_ne!(*slot, rehashed[0], "{relative}");
+            *slot = rehashed[0].clone();
+            let refusal =
+                check_content_inventory(&mutated, FixedImageKind::Standalone).unwrap_err();
             assert!(
                 refusal.contains("differs from reviewed catalog"),
                 "{relative}: {refusal}"
             );
             fs::write(rv_one.join(relative), &bytes).unwrap();
-            content_reverie_inventory(&rv_one).unwrap();
         }
+        // The same checks pass on the unchanged inventory, every changed
+        // source was restored, and the whole path still refuses a change.
+        check_content_inventory(&rv_inventory, FixedImageKind::Standalone).unwrap();
+        assert_eq!(content_reverie_inventory(&rv_one).unwrap().0, rv_inventory);
+        let (relative, _, _) = CONTENT_REVERIE_CATALOG[0];
+        let bytes = fs::read(rv_one.join(relative)).unwrap();
+        let mut changed = bytes.clone();
+        changed[0] ^= 1;
+        fs::write(rv_one.join(relative), &changed).unwrap();
+        let refusal = content_reverie_inventory(&rv_one).unwrap_err();
+        assert!(
+            refusal.contains("differs from reviewed catalog"),
+            "{relative}: {refusal}"
+        );
+        fs::write(rv_one.join(relative), &bytes).unwrap();
         let helper = rv_one.join("reverie-liteinst-artifact/src/lib.rs");
         let bytes = fs::read(&helper).unwrap();
         fs::write(&helper, b"changed qualifier before resolution").unwrap();
