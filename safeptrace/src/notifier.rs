@@ -10000,14 +10000,37 @@ mod test {
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         let test_binary = env::current_exe()?;
         let mut command = if pid_namespace {
+            // A fresh proc of the new PID namespace either way: directly,
+            // where this process already holds CAP_SYS_ADMIN in its user
+            // namespace, else through a user namespace of its own. The
+            // direct form also works where the host masks /proc entries
+            // with overmounts, which lock into descendant user namespaces
+            // and refuse every fresh proc mount there
+            // (`mount_too_revealing`); the inner test's ptrace ownership
+            // proofs require the aligned proc, so no inherited mount
+            // substitutes. Probed once with the direct form itself.
+            static PRIVILEGED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let privileged = *PRIVILEGED.get_or_init(|| {
+                Command::new("unshare")
+                    .args(["--pid", "--fork", "--mount-proc", "true"])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .is_ok_and(|status| status.success())
+            });
             let mut command = Command::new("unshare");
-            command.args([
-                "--user",
-                "--map-root-user",
-                "--pid",
-                "--fork",
-                "--mount-proc",
-            ]);
+            if privileged {
+                command.args(["--pid", "--fork", "--mount-proc"]);
+            } else {
+                command.args([
+                    "--user",
+                    "--map-root-user",
+                    "--pid",
+                    "--fork",
+                    "--mount-proc",
+                ]);
+            }
             command.arg(test_binary);
             command
         } else {
