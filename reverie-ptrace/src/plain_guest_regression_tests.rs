@@ -1536,7 +1536,6 @@ fn first_exec_guests() -> &'static [FirstExecGuest] {
                     .fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
                         (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
                     });
-                let output = directory.join(format!("reverie-first-exec-{hash:016x}"));
                 let staging = directory.join(format!(
                     "reverie-first-exec-{hash:016x}.{}.tmp",
                     std::process::id()
@@ -1550,7 +1549,56 @@ fn first_exec_guests() -> &'static [FirstExecGuest] {
                     .status()
                     .expect("compile the first-exec ELF");
                 assert!(status.success(), "compile first-exec {name}: {status}");
-                std::fs::rename(&staging, &output).expect("publish the first-exec ELF");
+                // Unlike the other fixtures, a published first-exec ELF must
+                // never be replaced: these tests authenticate a stopped guest
+                // by its /proc/<pid>/exe path, and a rename onto the shared
+                // name while another test process's guest runs it turns that
+                // guest's link into "<path> (deleted)". So the shared name is
+                // content-addressed: its key also folds in the built bytes, and
+                // a different build (say, a new cc, as or ld) gets a new name
+                // instead of meeting a stale file. A hard link publishes
+                // without replacing (it fails if the name exists), and an
+                // existing file is reused only if its bytes are identical.
+                let staged = std::fs::read(&staging).expect("read the staged first-exec ELF");
+                let mut key = hash;
+                for byte in &staged {
+                    key = (key ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3);
+                }
+                let output = directory.join(format!("reverie-first-exec-{key:016x}"));
+                // Only a failed link, or a key collision with different bytes,
+                // makes this process keep its own copy, under its pid. Nothing
+                // ever removes that copy, so taking this path is reported.
+                let unshared = match std::fs::hard_link(&staging, &output) {
+                    Ok(()) => None,
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        let published =
+                            std::fs::read(&output).expect("read the shared first-exec ELF");
+                        (published != staged).then(|| format!("{error}, with different bytes"))
+                    }
+                    Err(error) => Some(error.to_string()),
+                };
+                let output = match unshared {
+                    None => {
+                        std::fs::remove_file(&staging).expect("drop the first-exec staging name");
+                        output
+                    }
+                    Some(why) => {
+                        use std::io::Write as _;
+                        let own = directory.join(format!(
+                            "reverie-first-exec-{key:016x}.{}",
+                            std::process::id()
+                        ));
+                        // The real stderr, not eprintln!: the test harness
+                        // captures the print macros, so eprintln! would hide
+                        // this report in a passing run.
+                        let (shared, kept) = (output.display(), own.display());
+                        let _ = writeln!(std::io::stderr(), "{shared}: {why}; keeping {kept}");
+                        if let Err(error) = std::fs::rename(&staging, &own) {
+                            panic!("keep {}: {error} (after {why})", own.display());
+                        }
+                        own
+                    }
+                };
                 let path = std::fs::canonicalize(&output).expect("resolve the first-exec ELF");
                 let image = std::fs::read(&path).expect("read the first-exec ELF");
                 let elf = goblin::elf::Elf::parse(&image).expect("parse the first-exec ELF");
