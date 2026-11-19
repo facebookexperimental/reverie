@@ -11,7 +11,8 @@
 //! Each test installs a small real-mode guest that issues syscalls through the
 //! `vmcall` transport, runs [`StraceTool`] via `run_with_tool`, and checks the
 //! recorded syscall-name trace. These require a working `/dev/kvm`; when it is
-//! unavailable the test prints a skip notice and returns (matching `vmcall.rs`).
+//! unavailable the test prints a skip notice and returns, unless
+//! `REVERIE_REQUIRE_KVM` is set (matching `vmcall.rs`).
 
 #![cfg(target_arch = "x86_64")]
 
@@ -39,6 +40,9 @@ fn kvm_available(test: &str) -> bool {
     match Kvm::new() {
         Ok(_) => true,
         Err(error) if kvm_is_unavailable(&error) => {
+            if std::env::var_os("REVERIE_REQUIRE_KVM").is_some() {
+                panic!("{test} requires usable /dev/kvm: {error}");
+            }
             eprintln!("skipping {test}: cannot open /dev/kvm: {error}");
             false
         }

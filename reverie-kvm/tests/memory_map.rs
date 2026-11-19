@@ -909,24 +909,9 @@ fn mnemonics(vm_flags: u64) -> String {
 fn a_kvm_guests_mapping_flags_are_linuxs() {
     Kvm::new().expect("vm_flags test requires usable /dev/kvm");
     let directory = Directory::new();
-    let executable = compile(
-        &directory,
-        "vm_flags",
-        include_str!("fixtures/vm_flags.c"),
-        &[],
-    );
-    let native_files = directory.0.join("native");
+    let (executable, native) = vm_flags_natively(&directory);
     let kvm_files = directory.0.join("kvm");
-    std::fs::create_dir(&native_files).unwrap();
     std::fs::create_dir(&kvm_files).unwrap();
-    let run = std::process::Command::new(&executable)
-        .arg("native")
-        .arg(&native_files)
-        .env_clear()
-        .output()
-        .unwrap();
-    assert!(run.status.success(), "native: {run:?}");
-    let native = flag_listing(&run.stdout);
 
     let argv = [
         executable.to_str().unwrap(),
@@ -990,15 +975,112 @@ fn a_kvm_guests_mapping_flags_are_linuxs() {
     assert!(linux(1, "hugetlb").split(' ').any(|flag| flag == "ht"));
     assert_eq!(linux(1, "stack"), "rd wr mr mw me ac nh");
     assert_eq!(linux(1, "glibc-stack"), "rd wr mr mw me ac nh");
-    assert_eq!(
-        linux(1, "guard-merged-then-unmapped"),
-        "rd wr mr mw me gu ac"
-    );
-    assert_eq!(linux(1, "guard-split-last"), "rd mr mw me gu ac");
     assert_eq!(linux(1, "file-read-only"), "rd mr mw me ac");
-    assert_eq!(linux(1, "guarded-read-only"), "rd mr mw me gu ac");
     assert_eq!(linux(1, "shared-file-read-only"), "rd mr me ms");
     assert_eq!(linux(1, "locked"), "rd wr mr mw me lo ac");
     assert_eq!(linux(2, "locked"), "rd wr mr mw me ac");
-    assert_eq!(linux(2, "guard-split-first"), "rd wr mr mw me gu ac");
+    assert_guarded_answers(&native);
+}
+
+/// Compiles `fixtures/vm_flags.c` in `directory` and runs it natively,
+/// writing its files under `directory`'s `native`.
+fn vm_flags_natively(directory: &Directory) -> (PathBuf, FlagListing) {
+    let executable = compile(
+        directory,
+        "vm_flags",
+        include_str!("fixtures/vm_flags.c"),
+        &[],
+    );
+    let native_files = directory.0.join("native");
+    std::fs::create_dir(&native_files).unwrap();
+    let run = std::process::Command::new(&executable)
+        .arg("native")
+        .arg(&native_files)
+        .env_clear()
+        .output()
+        .unwrap();
+    assert!(run.status.success(), "native: {run:?}");
+    (executable, flag_listing(&run.stdout))
+}
+
+/// Linux's own `VmFlags` for the fixture's guarded mappings, run natively,
+/// are the answers `a_kvm_guests_mapping_flags_are_linuxs` records for this
+/// kernel. It needs no KVM, so the guard-flag probe's choice is checked on
+/// every host.
+#[test]
+fn linux_prints_the_guard_flags_the_probe_expects() {
+    let directory = Directory::new();
+    let (_, native) = vm_flags_natively(&directory);
+    assert_guarded_answers(&native);
+}
+
+/// A kernel that marks a mapping a guard was installed in (VM_MAYBE_GUARD)
+/// prints `gu` for it; an older one prints nothing for the guard. The
+/// backend's lines follow the host's either way.
+fn assert_guarded_answers(native: &FlagListing) {
+    let linux = |point: u64, name: &str| native.flags[&(point, name.to_owned())].as_str();
+    let [guarded_read_write, guarded_read_only] = if host_prints_guard_flag() {
+        ["rd wr mr mw me gu ac", "rd mr mw me gu ac"]
+    } else {
+        ["rd wr mr mw me ac", "rd mr mw me ac"]
+    };
+    assert_eq!(linux(1, "guard-merged-then-unmapped"), guarded_read_write);
+    assert_eq!(linux(1, "guard-split-last"), guarded_read_only);
+    assert_eq!(linux(1, "guarded-read-only"), guarded_read_only);
+    assert_eq!(linux(2, "guard-split-first"), guarded_read_write);
+}
+
+/// Whether this host's kernel prints `gu` in `VmFlags` for a mapping a guard
+/// was installed in, read from the host itself rather than through the
+/// backend under test. The guarded page is the middle one of three, between
+/// two inaccessible pages of the same mapping, so that it merges with no
+/// other mapping.
+fn host_prints_guard_flag() -> bool {
+    const PAGE: usize = 4096;
+    const MADV_GUARD_INSTALL: libc::c_int = 102;
+    // SAFETY: a new private anonymous mapping at an address the kernel chooses.
+    let start = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            3 * PAGE,
+            libc::PROT_NONE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    assert_ne!(
+        start,
+        libc::MAP_FAILED,
+        "mmap: {}",
+        std::io::Error::last_os_error()
+    );
+    let middle = start.wrapping_byte_add(PAGE);
+    // SAFETY: the middle page belongs to the mapping above.
+    let protected = unsafe { libc::mprotect(middle, PAGE, libc::PROT_READ | libc::PROT_WRITE) };
+    assert_eq!(
+        protected,
+        0,
+        "mprotect: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: as above.
+    let guarded = unsafe { libc::madvise(middle, PAGE, MADV_GUARD_INSTALL) };
+    assert_eq!(
+        guarded,
+        0,
+        "MADV_GUARD_INSTALL: {}",
+        std::io::Error::last_os_error()
+    );
+    let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
+    let header = format!("{:x}-", middle as usize);
+    let flags = smaps
+        .lines()
+        .skip_while(|line| !line.starts_with(&header))
+        .find_map(|line| line.strip_prefix("VmFlags:"))
+        .unwrap_or_else(|| panic!("no VmFlags line for the mapping at {header}"))
+        .to_owned();
+    // SAFETY: the mapping is this function's own.
+    unsafe { libc::munmap(start, 3 * PAGE) };
+    flags.split_ascii_whitespace().any(|flag| flag == "gu")
 }

@@ -1354,6 +1354,209 @@ gated_test(
     test = "//hermetic_infra/reverie:reverie-kvm-static-elf-test",
 )
 
+# reverie-kvm as Cargo builds it for its integration tests: our Cargo CI enables
+# `native-test-support` in it, reverie-kvm-core and reverie-linuxemu
+# (scripts/stable-features.sh), and reverie-kvm's dev-dependencies turn on
+# `test-support` in the latter two. Only the tests/*.rs targets below link
+# these variants; a test binary holds one variant of each crate.
+rust_library(
+    name = "reverie-kvm-core-native-test-support",
+    srcs = glob([
+        "reverie-kvm-core/src/**/*.rs",
+        "reverie-kvm-core/tests/**",
+    ]),
+    autocargo = {"ignore_rule": True},
+    crate = "reverie_kvm_core",
+    crate_root = "reverie-kvm-core/src/lib.rs",
+    features = [
+        "native-test-support",
+        "test-support",
+    ],
+    named_deps = {"reverie": ":reverie"},
+    target_compatible_with = [
+        "ovr_config//cpu:x86_64",
+        "ovr_config//os:linux",
+    ],
+    unittests = False,
+    deps = [
+        "fbsource//third-party/rust:futures",
+        "fbsource//third-party/rust:goblin",
+        "fbsource//third-party/rust:kvm-bindings",
+        "fbsource//third-party/rust:kvm-ioctls",
+        "fbsource//third-party/rust:libc",
+        "fbsource//third-party/rust:thiserror",
+    ],
+)
+
+rust_library(
+    name = "reverie-linuxemu-native-test-support",
+    srcs = glob([
+        "reverie-linuxemu/src/**/*.rs",
+        "reverie-linuxemu/tests/support/**/*.rs",
+    ]),
+    autocargo = {"ignore_rule": True},
+    crate = "reverie_linuxemu",
+    crate_root = "reverie-linuxemu/src/lib.rs",
+    features = [
+        "native-test-support",
+        "test-support",
+    ],
+    named_deps = {"reverie": ":reverie"},
+    target_compatible_with = [
+        "ovr_config//cpu:x86_64",
+        "ovr_config//os:linux",
+    ],
+    unittests = False,
+    deps = [
+        "fbsource//third-party/rust:futures",
+        "fbsource//third-party/rust:goblin",
+        "fbsource//third-party/rust:kvm-bindings",
+        "fbsource//third-party/rust:libc",
+        "fbsource//third-party/rust:thiserror",
+        "fbsource//third-party/rust:tracing",
+        ":reverie-kvm-core-native-test-support",  # @manual name:reverie_kvm_core
+        ":reverie-linuxemu-terminal-read",
+        ":reverie-proc-grammar",
+    ],
+)
+
+# reverie-linuxemu-ext-procfs over the variant above, for the tests that
+# register it on a guest: an extension table is typed by the reverie-linuxemu
+# it is built against, so it must be the one the test binary links.
+rust_library(
+    name = "reverie-linuxemu-ext-procfs-native-test-support",
+    srcs = glob([
+        "reverie-linuxemu-ext-procfs/src/**/*.rs",
+        "reverie-linuxemu-ext-procfs/src/tables/*.txt",
+    ]),
+    autocargo = {"ignore_rule": True},
+    crate = "reverie_linuxemu_ext_procfs",
+    crate_root = "reverie-linuxemu-ext-procfs/src/lib.rs",
+    target_compatible_with = [
+        "ovr_config//cpu:x86_64",
+        "ovr_config//os:linux",
+    ],
+    unittests = False,
+    deps = [
+        "fbsource//third-party/rust:libc",
+        "fbsource//third-party/rust:serde",
+        "fbsource//third-party/rust:tracing",
+        ":reverie-linuxemu-native-test-support",  # @manual name:reverie_linuxemu
+        ":reverie-proc-grammar",
+    ],
+)
+
+rust_library(
+    name = "reverie-kvm-native-test-support",
+    srcs = glob([
+        "reverie-kvm/src/**/*.rs",
+        "reverie-linuxemu/tests/support/**/*.rs",
+    ]),
+    autocargo = {"ignore_rule": True},
+    crate = "reverie_kvm",
+    crate_root = "reverie-kvm/src/lib.rs",
+    features = ["native-test-support"],
+    named_deps = {"reverie": ":reverie"},
+    target_compatible_with = [
+        "ovr_config//cpu:x86_64",
+        "ovr_config//os:linux",
+    ],
+    unittests = False,
+    deps = [
+        "fbsource//third-party/rust:futures",
+        "fbsource//third-party/rust:iced-x86",
+        "fbsource//third-party/rust:kvm-bindings",
+        "fbsource//third-party/rust:kvm-ioctls",
+        "fbsource//third-party/rust:libc",
+        "fbsource//third-party/rust:perf-event-open-sys",
+        "fbsource//third-party/rust:serde",
+        "fbsource//third-party/rust:tracing",
+        ":reverie-kvm-core-native-test-support",  # @manual name:reverie_kvm_core
+        ":reverie-linuxemu-native-test-support",  # @manual name:reverie_linuxemu
+    ],
+)
+
+# reverie-kvm's other Cargo integration tests (tests/*.rs), one target each,
+# with the dependencies they use from the crate's dependencies and
+# dev-dependencies and the crate feature our Cargo CI enables. They run guests
+# in KVM and compile their C fixtures with the host's gcc, so they run through
+# gated tests (fb-only/gated_tests), as static_elf does.
+_KVM_TESTS = [
+    f.removeprefix("reverie-kvm/tests/").removesuffix(".rs")
+    for f in glob(
+        ["reverie-kvm/tests/*.rs"],
+        exclude = ["reverie-kvm/tests/static_elf.rs"],
+    )
+]
+
+# The tests that register the procfs extension on their guests.
+_KVM_TESTS_WITH_PROCFS_EXTENSION = [
+    "descriptor_status",
+    "link_path",
+    "memory_map",
+]
+
+[
+    rust_unittest(
+        name = "reverie-kvm-{}-test".format(test.replace("_", "-")),
+        srcs = [
+            "reverie-kvm/src/terminal_read.c",
+            "reverie-kvm/src/terminal_read.h",
+            "reverie-kvm/tests/{}.rs".format(test),
+        ]
+        + glob([
+            "reverie-kvm/tests/*.c",
+            "reverie-kvm/tests/fixtures/**",
+            "reverie-kvm/tests/support/**/*.rs",
+        ]),
+        autocargo = {"ignore_rule": True},
+        crate = test,
+        crate_root = "reverie-kvm/tests/{}.rs".format(test),
+        features = ["native-test-support"],
+        labels = run_gated_only(),
+        named_deps = {"reverie": ":reverie"},
+        run_env = {
+            # As for static_elf: no jemalloc background threads, which the
+            # Cargo build's system allocator never starts.
+            "MALLOC_CONF": "background_thread:false",
+            "REVERIE_REQUIRE_KVM": "1",
+        },
+        target_compatible_with = [
+            "ovr_config//cpu:x86_64",
+            "ovr_config//os:linux",
+        ],
+        deps = [
+            "fbsource//third-party/rust:futures",
+            "fbsource//third-party/rust:goblin",
+            "fbsource//third-party/rust:kvm-ioctls",
+            "fbsource//third-party/rust:libc",
+            "fbsource//third-party/rust:serde",
+            "fbsource//third-party/rust:tokio",
+            ":reverie-kvm-native-test-support",  # @manual name:reverie_kvm
+            ":reverie-linuxemu-native-test-support",  # @manual name:reverie_linuxemu
+            ":reverie-ptrace",
+        ]
+        + (
+            [":reverie-linuxemu-ext-procfs-native-test-support"]  # @manual name:reverie_linuxemu_ext_procfs
+            if test in _KVM_TESTS_WITH_PROCFS_EXTENSION
+            else []
+        ),
+    )
+    for test in _KVM_TESTS
+]
+
+[
+    gated_test(
+        name = "reverie-kvm-{}-test-gated".format(test.replace("_", "-")),
+        env = {
+            "MALLOC_CONF": "background_thread:false",
+            "REVERIE_REQUIRE_KVM": "1",
+        },
+        test = "//hermetic_infra/reverie:reverie-kvm-{}-test".format(test.replace("_", "-")),
+    )
+    for test in _KVM_TESTS
+]
+
 rust_library(
     name = "reverie-loader",
     srcs = glob(["reverie-loader/src/**/*.rs"]),

@@ -166,6 +166,9 @@ fn kvm_available() -> bool {
     match Kvm::new() {
         Ok(_) => true,
         Err(error) if matches!(error.errno(), libc::ENOENT | libc::EACCES | libc::EPERM) => {
+            if std::env::var_os("REVERIE_REQUIRE_KVM").is_some() {
+                panic!("{TEST} requires usable /dev/kvm: {error}");
+            }
             eprintln!("skipping {TEST}: cannot open /dev/kvm: {error}");
             false
         }

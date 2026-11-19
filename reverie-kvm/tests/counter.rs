@@ -14,7 +14,8 @@
 //! Each test installs a small real-mode guest that issues a known sequence of
 //! syscalls through the `vmcall` transport, runs the tool via `run_with_tool`,
 //! and asserts the counted totals. Like `strace.rs`, these require a working
-//! `/dev/kvm`; when it is unavailable the test prints a skip notice and returns.
+//! `/dev/kvm`; when it is unavailable the test prints a skip notice and returns,
+//! unless `REVERIE_REQUIRE_KVM` is set (matching `vmcall.rs`).
 //!
 //! Note on the ptrace baseline: `counter1` reports 114 syscalls for
 //! `/bin/echo`. That figure comes from running a *dynamically linked* ELF
@@ -48,6 +49,9 @@ fn kvm_available(test: &str) -> bool {
     match Kvm::new() {
         Ok(_) => true,
         Err(error) if kvm_is_unavailable(&error) => {
+            if std::env::var_os("REVERIE_REQUIRE_KVM").is_some() {
+                panic!("{test} requires usable /dev/kvm: {error}");
+            }
             eprintln!("skipping {test}: cannot open /dev/kvm: {error}");
             false
         }
