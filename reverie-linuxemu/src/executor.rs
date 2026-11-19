@@ -14811,18 +14811,29 @@ mod tests {
         entry.msg_hdr.msg_iov = std::ptr::from_mut(&mut iov);
         entry.msg_hdr.msg_iovlen = 1;
         // SAFETY: entry and iov are live for the call, and the payload buffer
-        // is entry's own msg_name field.
+        // is entry's own msg_name field. Raw syscalls, not the libc
+        // wrappers: AddressSanitizer's recvmsg interceptor re-reads
+        // msg_name after the call and memsets msg_namelen bytes at it -
+        // here that pointer by then holds the payload bytes themselves,
+        // so the interceptor crashes on a wild pointer before any test
+        // assertion runs. The kernel semantics are identical.
         let result = unsafe {
             if batch {
-                libc::recvmmsg(
+                libc::syscall(
+                    libc::SYS_recvmmsg,
                     pair[1],
                     &mut entry,
                     1,
                     libc::MSG_DONTWAIT,
-                    std::ptr::null_mut(),
+                    std::ptr::null_mut::<libc::timespec>(),
                 ) as isize
             } else {
-                libc::recvmsg(pair[1], &mut entry.msg_hdr, libc::MSG_DONTWAIT)
+                libc::syscall(
+                    libc::SYS_recvmsg,
+                    pair[1],
+                    &mut entry.msg_hdr,
+                    libc::MSG_DONTWAIT,
+                ) as isize
             }
         };
         assert_eq!(result, if batch { 1 } else { 8 });
@@ -15029,18 +15040,27 @@ mod tests {
         entry.msg_hdr.msg_controllen = std::mem::size_of::<libc::msghdr>();
         let own = (&raw const entry.msg_hdr) as usize as u64;
         // SAFETY: entry, iov and payload are live for the call; the control
-        // buffer is entry's own header.
+        // buffer is entry's own header. Raw syscalls as in
+        // native_header_after_receive_over_name: the ASan recvmsg
+        // interceptor processes the control buffer after the call and
+        // cannot be trusted where it overlaps the header itself.
         let result = unsafe {
             if batch {
-                libc::recvmmsg(
+                libc::syscall(
+                    libc::SYS_recvmmsg,
                     pair[1],
                     &mut entry,
                     1,
                     libc::MSG_DONTWAIT,
-                    std::ptr::null_mut(),
+                    std::ptr::null_mut::<libc::timespec>(),
                 ) as isize
             } else {
-                libc::recvmsg(pair[1], &mut entry.msg_hdr, libc::MSG_DONTWAIT)
+                libc::syscall(
+                    libc::SYS_recvmsg,
+                    pair[1],
+                    &mut entry.msg_hdr,
+                    libc::MSG_DONTWAIT,
+                ) as isize
             }
         };
         assert_eq!(result, if batch { 1 } else { 8 });
