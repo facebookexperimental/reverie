@@ -132,6 +132,46 @@ gated_test(
     test = "//hermetic_infra/reverie:reverie-unittest",
 )
 
+# The reverie crate's Cargo integration tests (reverie/tests/*.rs), one target
+# each, with the dependencies they use from the crate's dependencies and
+# dev-dependencies, and the files each includes at compile time.
+_REVERIE_TESTS = [f.removeprefix("reverie/tests/").removesuffix(".rs") for f in glob(["reverie/tests/*.rs"])]
+
+_REVERIE_TEST_SRCS = {
+    # The repository files whose CI wiring it checks.
+    "validate_script_source": [
+        ".github/workflows/ci.yml",
+        ".github/workflows/extended.yml",
+        "ci/dag/validate.json",
+        "reverie-examples/e2e/run.sh",
+        "reverie-liteinst/Cargo.toml",
+        "reverie-liteinst/tests/allocator_contract.rs",
+        "scripts/liteinst-aarch64-counts.json",
+        "scripts/run-liteinst-aarch64-counts.py",
+        "scripts/run-percrate-tests.sh",
+        "validate.sh",
+    ],
+    "vdso_symbols": glob(["reverie/tests/vdso/*.txt"]),
+}
+
+[
+    rust_unittest(
+        name = "reverie-{}-test".format(test.replace("_", "-")),
+        srcs = ["reverie/tests/{}.rs".format(test)] + _REVERIE_TEST_SRCS.get(test, []),
+        autocargo = {"ignore_rule": True},
+        crate = test,
+        crate_root = "reverie/tests/{}.rs".format(test),
+        deps = [
+            "fbsource//third-party/rust:libc",
+            "fbsource//third-party/rust:object",
+            "fbsource//third-party/rust:procfs",
+            "fbsource//third-party/rust:serde_json",
+            ":reverie",
+        ],
+    )
+    for test in _REVERIE_TESTS
+]
+
 # reverie with upstream's `perf-fixture` feature, as reverie-ptrace's Cargo
 # dev-dependency declares it. Only :reverie-ptrace-unittest uses it.
 rust_library(
@@ -235,6 +275,40 @@ gated_test(
     env = {},
     test = "//hermetic_infra/reverie:reverie-process-unittest",
 )
+
+# reverie-process's Cargo integration tests (tests/*.rs), one target each,
+# with the dependencies they use from the crate's dependencies and
+# dev-dependencies. They launch processes under seccomp filters, so they run
+# through gated tests (fb-only/gated_tests).
+_PROCESS_TESTS = [f.removeprefix("reverie-process/tests/").removesuffix(".rs") for f in glob(["reverie-process/tests/*.rs"])]
+
+[
+    rust_unittest(
+        name = "reverie-process-{}-test".format(test.replace("_", "-")),
+        srcs = ["reverie-process/tests/{}.rs".format(test)] + glob(["reverie-process/tests/support/**/*.rs"]),
+        autocargo = {"ignore_rule": True},
+        crate = test,
+        crate_root = "reverie-process/tests/{}.rs".format(test),
+        labels = run_gated_only(),
+        target_compatible_with = [
+            "ovr_config//cpu:x86_64",
+            "ovr_config//os:linux",
+        ],
+        deps = [
+            "fbsource//third-party/rust:libc",
+            ":reverie-process",
+        ],
+    )
+    for test in _PROCESS_TESTS
+]
+
+[
+    gated_test(
+        name = "reverie-process-{}-test-gated".format(test.replace("_", "-")),
+        test = "//hermetic_infra/reverie:reverie-process-{}-test".format(test.replace("_", "-")),
+    )
+    for test in _PROCESS_TESTS
+]
 
 # Command helpers for Reverie's generic conformance tests (tests/BUCK).
 rust_library(
@@ -569,6 +643,27 @@ rust_library(
     ],
 )
 
+# reverie-linuxemu-ext-procfs's sources laid out as under CARGO_MANIFEST_DIR,
+# for tests/purity.rs, which scans them.
+buck_filegroup(
+    name = "linuxemu-ext-procfs-sources",
+    srcs = {src.removeprefix("reverie-linuxemu-ext-procfs/"): src for src in glob(["reverie-linuxemu-ext-procfs/src/**"])},
+)
+
+rust_unittest(
+    name = "reverie-linuxemu-ext-procfs-purity-test",
+    srcs = ["reverie-linuxemu-ext-procfs/tests/purity.rs"],
+    autocargo = {"ignore_rule": True},
+    crate = "purity",
+    crate_root = "reverie-linuxemu-ext-procfs/tests/purity.rs",
+    resources = [":linuxemu-ext-procfs-sources"],
+    # The test reads the compile-time CARGO_MANIFEST_DIR (env!). Keep it
+    # project-relative across remote compilation, as :reverie-ptrace-unittest
+    # does.
+    rustc_flags = ["--env-set=CARGO_MANIFEST_DIR=$(location :linuxemu-ext-procfs-sources)"],
+    deps = ["fbsource//third-party/rust:syn"],
+)
+
 # Grammar-backed parsers/renderers for the /proc per-task files. A pure
 # leaf: no dependencies, no policy (consumers own every rewrite).
 rust_library(
@@ -645,6 +740,26 @@ gated_test(
     test = "//hermetic_infra/reverie:reverie-proc-grammar-kernel-oracle-test",
 )
 
+# The crate's sources laid out as under CARGO_MANIFEST_DIR, for
+# tests/purity.rs, which scans them.
+buck_filegroup(
+    name = "proc-grammar-sources",
+    srcs = {src.removeprefix("reverie-proc-grammar/"): src for src in glob(["reverie-proc-grammar/src/**"])},
+)
+
+rust_unittest(
+    name = "reverie-proc-grammar-purity-test",
+    srcs = ["reverie-proc-grammar/tests/purity.rs"],
+    autocargo = {"ignore_rule": True},
+    crate = "purity",
+    crate_root = "reverie-proc-grammar/tests/purity.rs",
+    env = {
+        "CARGO_MANIFEST_DIR": "$(location :proc-grammar-sources)",
+    },
+    resources = [":proc-grammar-sources"],
+    deps = ["fbsource//third-party/rust:syn"],
+)
+
 rust_library(
     name = "safeptrace",
     srcs = glob(["safeptrace/src/**/*.rs"]) + ["safeptrace/src/retired_tid_fixture.c"],
@@ -699,6 +814,44 @@ gated_test(
     env = {},
     test = "//hermetic_infra/reverie:safeptrace-unittest",
 )
+
+# safeptrace's Cargo integration tests (tests/*.rs), one target each, compiled
+# with the crate's features, as Cargo compiles them. They trace child
+# processes, so they run through gated tests (fb-only/gated_tests).
+_SAFEPTRACE_TESTS = [f.removeprefix("safeptrace/tests/").removesuffix(".rs") for f in glob(["safeptrace/tests/*.rs"])]
+
+[
+    rust_unittest(
+        name = "safeptrace-{}-test".format(test.replace("_", "-")),
+        srcs = ["safeptrace/tests/{}.rs".format(test)],
+        autocargo = {"ignore_rule": True},
+        crate = test,
+        crate_root = "safeptrace/tests/{}.rs".format(test),
+        features = [
+            "notifier",
+            "memory",
+        ],
+        labels = run_gated_only(),
+        target_compatible_with = [
+            "ovr_config//cpu:x86_64",
+            "ovr_config//os:linux",
+        ],
+        deps = [
+            "fbsource//third-party/rust:libc",
+            "fbsource//third-party/rust:tokio",
+            ":safeptrace",
+        ],
+    )
+    for test in _SAFEPTRACE_TESTS
+]
+
+[
+    gated_test(
+        name = "safeptrace-{}-test-gated".format(test.replace("_", "-")),
+        test = "//hermetic_infra/reverie:safeptrace-{}-test".format(test.replace("_", "-")),
+    )
+    for test in _SAFEPTRACE_TESTS
+]
 
 cpp_library(
     name = "reverie-linuxemu-terminal-read",
@@ -1819,6 +1972,64 @@ rust_library(
         ":reverie",
         ":reverie-liteinst-sitepatch",  # @manual name:reverie_liteinst
     ],
+)
+
+# Cargo's reverie-liteinst-glibc-compat-guest bin: the non-PIE subject of
+# tests/glibc_compat.rs. As build.rs links it: non-PIE, with the unwinder from
+# libgcc_eh.a rather than libgcc_s.so.1. The archive is the platform toolchain's
+# GCC's: the -L directory precedes the build host's own GCC directories, which
+# the compiler driver also searches.
+rust_binary(
+    name = "reverie-liteinst-glibc-compat-guest",
+    srcs = [
+        "reverie-liteinst-preload/src/bin/glibc_compat_guest.rs",
+        "reverie-liteinst-preload/src/glibc_compat.rs",
+    ],
+    autocargo = {"ignore_rule": True},
+    crate_root = "reverie-liteinst-preload/src/bin/glibc_compat_guest.rs",
+    link_style = "static",
+    linker_flags = [
+        "-no-pie",
+        "-Wl,-u,_Unwind_RaiseException",
+        "-L$(location fbcode//third-party-buck/platform010/tools/gcc:lib/gcc/x86_64-redhat-linux-gnu/trunk)",
+        "-lgcc_eh",
+    ],
+    target_compatible_with = [
+        "ovr_config//cpu:x86_64",
+        "ovr_config//os:linux",
+    ],
+    # As Cargo's `test = false`: glibc_compat.rs's unit tests run in the
+    # preload's library.
+    unittests = False,
+    deps = [
+        "fbsource//third-party/rust:libc",
+        ":reverie",
+    ],
+)
+
+# reverie-liteinst-preload's Cargo integration test. It compiles a shared
+# object with the host's cc, so it runs through a gated test
+# (fb-only/gated_tests).
+rust_unittest(
+    name = "reverie-liteinst-preload-glibc-compat-test",
+    srcs = ["reverie-liteinst-preload/tests/glibc_compat.rs"],
+    autocargo = {"ignore_rule": True},
+    crate = "glibc_compat",
+    crate_root = "reverie-liteinst-preload/tests/glibc_compat.rs",
+    labels = run_gated_only(),
+    resources = [":reverie-liteinst-glibc-compat-guest"],
+    rustc_flags = ["--env-set=CARGO_BIN_EXE_reverie-liteinst-glibc-compat-guest=$(location :reverie-liteinst-glibc-compat-guest)"],
+    target_compatible_with = [
+        "ovr_config//cpu:x86_64",
+        "ovr_config//os:linux",
+    ],
+    deps = ["fbsource//third-party/rust:tempfile"],
+)
+
+gated_test(
+    name = "reverie-liteinst-preload-glibc-compat-test-gated",
+    labels = ["buck2_run_from_project_root"],
+    test = "//hermetic_infra/reverie:reverie-liteinst-preload-glibc-compat-test",
 )
 
 # :reverie-liteinst-preload over the allocator-fixture sitepatch variant
