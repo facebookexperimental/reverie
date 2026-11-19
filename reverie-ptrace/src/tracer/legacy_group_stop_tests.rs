@@ -167,6 +167,16 @@ fn block_fixture_sigcont() {
     );
 }
 
+/// The (device, inode) identity of an open descriptor, or None when it is not open.
+fn fd_identity(fd: libc::c_int) -> Option<(libc::dev_t, libc::ino_t)> {
+    let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(fd, st.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    let st = unsafe { st.assume_init() };
+    Some((st.st_dev, st.st_ino))
+}
+
 /// A failed fixture initialization (the child exits before its readiness
 /// byte, or never sends it) closes the parent's pipe ends and leaves no child:
 /// it is killed and reaped within the bound.
@@ -205,6 +215,10 @@ fn unready_fixture_failure_closes_its_pipes_and_reaps_its_child() {
             start: start[1],
             armed: true,
         };
+        let ready_ident =
+            fd_identity(ready[0]).expect("the readiness pipe end is open before the drop");
+        let start_ident =
+            fd_identity(start[1]).expect("the start pipe end is open before the drop");
         let deadline = Instant::now() + Duration::from_millis(200);
         let error = unready.await_ready(deadline).unwrap_err();
         assert!(
@@ -220,8 +234,20 @@ fn unready_fixture_failure_closes_its_pipes_and_reaps_its_child() {
             "{error}"
         );
         drop(unready);
-        assert_eq!(unsafe { libc::fcntl(ready[0], libc::F_GETFD) }, -1);
-        assert_eq!(unsafe { libc::fcntl(start[1], libc::F_GETFD) }, -1);
+        // The numbers may already name other threads' new descriptors (the
+        // process shares one fd table); what must be gone is this pipe's end.
+        assert_ne!(
+            fd_identity(ready[0]),
+            Some(ready_ident),
+            "the drop left the readiness pipe end {} open",
+            ready[0]
+        );
+        assert_ne!(
+            fd_identity(start[1]),
+            Some(start_ident),
+            "the drop left the start pipe end {} open",
+            start[1]
+        );
         assert_eq!(
             unsafe { libc::waitpid(pid.as_raw(), std::ptr::null_mut(), libc::WNOHANG) },
             -1,
