@@ -240,11 +240,11 @@
       "group": "test",
       "job": "liteinst_a",
       "desc": "Tests: LiteInst binaries A",
-      "description": "Counted nextest over reverie-liteinst binaries strace, generic_bootstrap, standalone_constructor, tool_tls, fixed_arena, the lib tests, and the zero-case guest binaries. Binary lists in the two LiteInst nodes partition the package; validate.sh refuses if node totals drift from the workspace list.",
+      "description": "Counted nextest over reverie-liteinst binaries strace, generic_bootstrap, standalone_constructor, aarch64_trap_install (zero cases off aarch64), tool_tls, fixed_arena, the lib tests, and the zero-case guest binaries. Binary lists in the two LiteInst nodes partition the package; validate.sh refuses if node totals drift from the workspace list.",
       "labels": [
         "full"
       ],
-      "cmd": "source target/validate/liteinst-fixtures/bundle/fixture.env && ./scripts/libtest-counts.rs run-nextest target/validate/counts-test-liteinst_a.json -- cargo nextest run --binaries-metadata target/validate/binaries-metadata.json -E \"(package(reverie-liteinst) & (binary(=strace) | binary(=generic_bootstrap) | binary(=standalone_constructor) | binary(=tool_tls) | binary(=fixed_arena) | binary(=reverie_liteinst) | binary(=reverie-liteinst-trap-count-guest) | binary(=reverie-liteinst-strace) | binary(=reverie-liteinst-spoof-guest) | binary(=reverie-liteinst-rpc-tool-guest) | binary(=reverie-liteinst-lifecycle-guest))) & $REVERIE_NEXTEST_SKIP_FILTER\"",
+      "cmd": "source target/validate/liteinst-fixtures/bundle/fixture.env && ./scripts/libtest-counts.rs run-nextest target/validate/counts-test-liteinst_a.json -- cargo nextest run --binaries-metadata target/validate/binaries-metadata.json -E \"(package(reverie-liteinst) & (binary(=strace) | binary(=generic_bootstrap) | binary(=standalone_constructor) | binary(=aarch64_trap_install) | binary(=tool_tls) | binary(=fixed_arena) | binary(=reverie_liteinst) | binary(=reverie-liteinst-trap-count-guest) | binary(=reverie-liteinst-strace) | binary(=reverie-liteinst-spoof-guest) | binary(=reverie-liteinst-rpc-tool-guest) | binary(=reverie-liteinst-lifecycle-guest))) & $REVERIE_NEXTEST_SKIP_FILTER\"",
       "deps": [
         "build.test_binaries",
         "fixtures.liteinst"
@@ -273,11 +273,11 @@
       "group": "test",
       "job": "liteinst_b",
       "desc": "Tests: LiteInst binaries B",
-      "description": "Counted nextest over the remaining reverie-liteinst binaries (allocator, mapping, region, rpc_tool, lifecycle and guest controls).",
+      "description": "Counted nextest over the remaining reverie-liteinst binaries (allocator, mapping, region, rpc_tool, lifecycle, grouped admission and its spike binary, and guest controls).",
       "labels": [
         "full"
       ],
-      "cmd": "./scripts/libtest-counts.rs run-nextest target/validate/counts-test-liteinst_b.json -- cargo nextest run --binaries-metadata target/validate/binaries-metadata.json -E \"(package(reverie-liteinst) & (binary(=native_unpublished) | binary(=allocator_contract) | binary(=region_stacks) | binary(=mapping_integrity) | binary(=lifecycle) | binary(=rpc_tool) | binary(=fixed_gates) | binary(=private_prepare) | binary(=grouped_admission) | binary(=concurrent_patching) | binary(=nop_window) | binary(=reverie-liteinst-fork-guest) | binary(=reverie-liteinst-exec-guest) | binary(=reverie-liteinst-allocator-private-control) | binary(=reverie-liteinst-allocator-install-control) | binary(=reverie-liteinst-allocator-host-control))) & $REVERIE_NEXTEST_SKIP_FILTER\"",
+      "cmd": "./scripts/libtest-counts.rs run-nextest target/validate/counts-test-liteinst_b.json -- cargo nextest run --binaries-metadata target/validate/binaries-metadata.json -E \"(package(reverie-liteinst) & (binary(=native_unpublished) | binary(=allocator_contract) | binary(=region_stacks) | binary(=mapping_integrity) | binary(=lifecycle) | binary(=rpc_tool) | binary(=fixed_gates) | binary(=private_prepare) | binary(=grouped_admission) | binary(=reverie-liteinst-grouped-admission-spike) | binary(=concurrent_patching) | binary(=nop_window) | binary(=reverie-liteinst-fork-guest) | binary(=reverie-liteinst-exec-guest) | binary(=reverie-liteinst-allocator-private-control) | binary(=reverie-liteinst-allocator-install-control) | binary(=reverie-liteinst-allocator-host-control))) & $REVERIE_NEXTEST_SKIP_FILTER\"",
       "deps": [
         "build.test_binaries",
         "fixtures.liteinst"
@@ -511,11 +511,11 @@
       "group": "test",
       "job": "core",
       "desc": "Tests: core + transport + support crates",
-      "description": "Counted nextest over the remaining workspace packages (core, safeptrace, rpc-transport, process, loader, memory, syscalls, test-support, util, and the zero-test experimental packages, whose listings keep the node totals exact).",
+      "description": "Counted nextest over the remaining workspace packages (core, safeptrace, rpc-transport, process, loader, memory, syscalls, test-support, util, proc-grammar, and the zero-test experimental packages, whose listings keep the node totals exact).",
       "labels": [
         "full"
       ],
-      "cmd": "./scripts/libtest-counts.rs run-nextest target/validate/counts-test-core.json -- cargo nextest run --binaries-metadata target/validate/binaries-metadata.json -E \"(package(safeptrace) | package(reverie-core) | package(reverie-rpc-transport) | package(reverie-process) | package(reverie-linuxemu-ext-procfs) | package(reverie-loader) | package(reverie-test-support) | package(reverie-syscalls) | package(reverie-memory) | package(reverie-util) | package(reverie-signal) | package(nostd-print) | package(reverie-linux-provider) | package(reverie-rpc) | package(riptrace-rpc)) & $REVERIE_NEXTEST_SKIP_FILTER\"",
+      "cmd": "./scripts/libtest-counts.rs run-nextest target/validate/counts-test-core.json -- cargo nextest run --binaries-metadata target/validate/binaries-metadata.json -E \"(package(safeptrace) | package(reverie-core) | package(reverie-rpc-transport) | package(reverie-process) | package(reverie-linuxemu-ext-procfs) | package(reverie-loader) | package(reverie-test-support) | package(reverie-syscalls) | package(reverie-memory) | package(reverie-util) | package(reverie-signal) | package(nostd-print) | package(reverie-linux-provider) | package(reverie-rpc) | package(riptrace-rpc) | package(reverie-proc-grammar)) & $REVERIE_NEXTEST_SKIP_FILTER\"",
       "deps": [
         "build.test_binaries",
         "fixtures.liteinst"
