@@ -8,6 +8,8 @@
 
 use std::io;
 use std::io::Write;
+use std::os::unix::io::AsRawFd;
+use std::os::unix::io::FromRawFd;
 
 use syscalls::Errno;
 
@@ -57,16 +59,22 @@ impl Command {
 
         // Create a pipe to send back errors to the parent process if `execve`
         // fails.
-        let (reader, mut writer) = launch.allocate(pipe, Errno::into_raw)?;
+        let (reader, writer) = launch.allocate(pipe, Errno::into_raw)?;
 
-        let child = self.spawn_launched(prepared, launch, |err| {
-            send_error(&mut writer, err);
+        // The child writes an error to its own copy of the writer, by number.
+        // The parent's copy is closed under the launch lock, as soon as clone
+        // returns (`spawn_launched`). Closed only after the lock, a launch
+        // that another thread began in between could clone a child that
+        // inherits it; that child holds it until its own exec or exit, and
+        // the read below waits for every copy to close.
+        let writer_fd = writer.as_raw_fd();
+        let child = self.spawn_launched(prepared, launch, Some(writer), move |err| {
+            // SAFETY: the child's copy of the writer is open at `writer_fd`;
+            // it is not closed here, as the child exits next.
+            let mut fd = std::mem::ManuallyDrop::new(unsafe { Fd::from_raw_fd(writer_fd) });
+            send_error(&mut fd, err);
             1
         })?;
-
-        // Close the writer end. Otherwise, the following read will hang
-        // forever.
-        drop(writer);
 
         recv_error(reader)?;
 
@@ -84,7 +92,7 @@ impl Command {
         self.container.validate_pinned_clone()?;
         self.validate_requested_pid()?;
         let prepared = self.prepare();
-        self.spawn_launched(prepared, Launch::begin(), onfail)
+        self.spawn_launched(prepared, Launch::begin(), None, onfail)
     }
 
     /// Refuses a requested process ID beside a namespace (`Command::pid`),
@@ -108,10 +116,15 @@ impl Command {
         }
     }
 
+    /// `close_after_clone`, if any, is the parent's copy of a descriptor the
+    /// child alone keeps: it is closed while the launch lock is still held,
+    /// right after clone returns, so no other thread's launch can clone a
+    /// child that inherits it.
     fn spawn_launched<F>(
         &mut self,
         prepared: Prepared,
         launch: Launch,
+        close_after_clone: Option<Fd>,
         mut onfail: F,
     ) -> Result<Child, Error>
     where
@@ -172,6 +185,7 @@ impl Command {
         // The child exists, so it cannot inherit what the parent opens from
         // here on. The waits below for the child's startup must not hold the
         // lock: the child's setup may wait on a thread that needs it.
+        drop(close_after_clone);
         drop(launch);
         let (pid, [stdin, stdout, stderr], [child_stdin, child_stdout, child_stderr], seccomp_fd) =
             launched?;

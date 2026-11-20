@@ -12,6 +12,8 @@ use std::io::Seek;
 use std::io::Write;
 use std::os::unix::fs::MetadataExt;
 
+use syscalls::Errno;
+
 use crate::Command;
 use crate::ExitStatus;
 use crate::Stdio;
@@ -216,4 +218,139 @@ async fn spawn_with_routes_distinct_files() {
         return;
     }
     check_routes(Mode::File, Mode::File, Entry::SpawnWith).await;
+}
+
+/// A pipe's two ends, both close-on-exec: (read, write).
+fn cloexec_pipe() -> (libc::c_int, libc::c_int) {
+    let mut fds = [0; 2];
+    // SAFETY: `fds` has room for the two descriptors.
+    assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+    (fds[0], fds[1])
+}
+
+fn write_byte(fd: libc::c_int) {
+    // SAFETY: writes one byte from a live buffer.
+    assert_eq!(unsafe { libc::write(fd, b"!".as_ptr().cast(), 1) }, 1);
+}
+
+fn read_byte(fd: libc::c_int) {
+    let mut byte = [0u8; 1];
+    // SAFETY: reads one byte into a live buffer.
+    assert_eq!(unsafe { libc::read(fd, byte.as_mut_ptr().cast(), 1) }, 1);
+}
+
+/// A `pre_exec` callback that reports the child has reached it, on `ready`,
+/// and holds the child there until a byte arrives on `gate`. It makes only
+/// system calls, as a callback in a cloned child must.
+fn report_then_hold(
+    ready: libc::c_int,
+    gate: libc::c_int,
+) -> impl FnMut() -> Result<(), Errno> + Send + Sync + 'static {
+    move || {
+        let mut byte = [0u8; 1];
+        // SAFETY: one-byte write and read on descriptors the child inherited.
+        unsafe {
+            if libc::write(ready, b"r".as_ptr().cast(), 1) != 1
+                || libc::read(gate, byte.as_mut_ptr().cast(), 1) != 1
+            {
+                return Err(Errno::EIO);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A spawn's exec-status pipe is not held open by a child another thread's
+/// launch clones. `Command::spawn` waits until every copy of that pipe's
+/// writer is closed, and a child cloned while the parent still has its copy
+/// inherits one and keeps it until its own exec or exit.
+///
+/// Launch X asks for a seccomp listener, so after its clone it waits in
+/// `spawn_launched`, with the launch lock released, until its child publishes
+/// the listener; X's child is held in its `pre_exec` first. Launch Y then
+/// clones a child that is held in its `pre_exec` and never closes what it
+/// inherited. When X's child is let go, X's spawn must return while Y's child
+/// is still held.
+#[test]
+fn a_sibling_child_held_before_exec_does_not_hold_a_spawns_status_pipe() {
+    if crate::test_runs_in_own_process() {
+        return;
+    }
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use syscalls::Sysno;
+
+    use crate::seccomp::Action;
+    use crate::seccomp::FilterBuilder;
+
+    /// Hang backstop for X's spawn, not a latency bound.
+    const BACKSTOP: Duration = Duration::from_secs(20);
+
+    let (x_ready_r, x_ready_w) = cloexec_pipe();
+    let (x_gate_r, x_gate_w) = cloexec_pipe();
+    let (y_ready_r, y_ready_w) = cloexec_pipe();
+    let (y_gate_r, y_gate_w) = cloexec_pipe();
+
+    // X's spawn receives a seccomp listener, which the parent registers with
+    // a tokio reactor. This runtime provides it; it is not driven, and it
+    // outlives X's child, which owns that registration.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .build()
+        .expect("a current-thread runtime with I/O");
+    let handle = runtime.handle().clone();
+
+    let (x_done, x_result) = mpsc::channel();
+    let x = std::thread::spawn(move || {
+        let _reactor = handle.enter();
+        // A listener for one call /bin/true never makes; every other call
+        // runs.
+        let filter = FilterBuilder::new()
+            .default_action(Action::Allow)
+            .syscalls([(Sysno::syslog, Action::Notify)])
+            .build();
+        let mut command = Command::new("/bin/true");
+        command.seccomp(filter).seccomp_notify();
+        // SAFETY: the callback makes only system calls.
+        unsafe { command.pre_exec(report_then_hold(x_ready_w, x_gate_r)) };
+        let spawned = command.spawn();
+        let _ = x_done.send(());
+        spawned
+    });
+    // X's child exists and is held in its pre_exec; X's parent is in, or
+    // about to enter, its wait for the listener.
+    read_byte(x_ready_r);
+
+    let y = std::thread::spawn(move || {
+        let mut command = Command::new("/bin/true");
+        // SAFETY: the callback makes only system calls.
+        unsafe { command.pre_exec(report_then_hold(y_ready_w, y_gate_r)) };
+        command.spawn()
+    });
+    // Y's child exists and is held before its exec.
+    read_byte(y_ready_r);
+
+    write_byte(x_gate_w);
+    let x_returned = x_result.recv_timeout(BACKSTOP).is_ok();
+
+    // Let Y's child go either way, so nothing is left held.
+    write_byte(y_gate_w);
+    let mut x_child = x.join().unwrap().expect("spawn X");
+    let mut y_child = y.join().unwrap().expect("spawn Y");
+    assert_eq!(x_child.wait_blocking().unwrap(), ExitStatus::Exited(0));
+    assert_eq!(y_child.wait_blocking().unwrap(), ExitStatus::Exited(0));
+    for fd in [
+        x_ready_r, x_ready_w, x_gate_r, x_gate_w, y_ready_r, y_ready_w, y_gate_r, y_gate_w,
+    ] {
+        // SAFETY: each is a descriptor this test opened and still owns.
+        unsafe { libc::close(fd) };
+    }
+
+    assert!(
+        x_returned,
+        "spawn X did not return within {BACKSTOP:?} of its child's release while a sibling \
+         child, cloned during X's spawn, was held before exec: that child holds X's \
+         exec-status pipe open"
+    );
 }
