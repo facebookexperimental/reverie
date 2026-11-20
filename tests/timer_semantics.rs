@@ -60,6 +60,17 @@ use serde::Serialize;
 struct GlobalState {
     num_timer_evts: AtomicU64,
     num_signals: AtomicU64,
+    /// Imprecise timers (`Guest::set_timer`) the tool armed.
+    imprecise_arms: AtomicU64,
+    /// Timer events that came while the latest timer armed was imprecise.
+    imprecise_evts: AtomicU64,
+    /// Of those, the events that came short of their arm's budget.
+    imprecise_early: AtomicU64,
+    /// Of those, the events after the first for the same arm.
+    imprecise_repeat: AtomicU64,
+    /// Timer events that came for an imprecise arm after the stop that
+    /// cancelled it: the first stop the tool observed after the arm.
+    imprecise_late: AtomicU64,
 }
 
 #[cfg(all(not(sanitized), test))]
@@ -71,6 +82,16 @@ struct LocalState;
 enum IncrMsg {
     Timer,
     Signal,
+    /// The tool armed an imprecise timer.
+    ImpreciseArm,
+    /// A timer event for an imprecise arm: whether it came short of the arm's
+    /// budget, and whether that arm had already delivered one.
+    ImpreciseTimer {
+        early: bool,
+        repeat: bool,
+    },
+    /// A timer event for an imprecise arm after the stop that cancelled it.
+    ImpreciseLate,
 }
 
 #[cfg(all(not(sanitized), test))]
@@ -89,6 +110,16 @@ struct ThreadClockState {
     last_tick: u64,
     /// offset from baseline to assert at a timer event
     timer_assertion: Option<u64>,
+    /// While the latest timer armed is imprecise, the earliest clock its
+    /// event may come at: the clock at the arm plus its budget.
+    imprecise_min: Option<u64>,
+    /// Whether the latest imprecise arm has delivered an event.
+    imprecise_delivered: bool,
+    /// Whether a stop the tool observed has followed the latest arm, which
+    /// was imprecise, delivered or not: until the next arm, a timer event is
+    /// a late one (a second event after such a stop counts as late, not as
+    /// a repeat; both must be zero).
+    imprecise_cancelled: bool,
 }
 
 #[cfg(all(not(sanitized), test))]
@@ -102,6 +133,11 @@ impl GlobalTool for GlobalState {
         GlobalState {
             num_timer_evts: AtomicU64::new(0),
             num_signals: AtomicU64::new(0),
+            imprecise_arms: AtomicU64::new(0),
+            imprecise_evts: AtomicU64::new(0),
+            imprecise_early: AtomicU64::new(0),
+            imprecise_repeat: AtomicU64::new(0),
+            imprecise_late: AtomicU64::new(0),
         }
     }
 
@@ -109,6 +145,15 @@ impl GlobalTool for GlobalState {
         match msg {
             IncrMsg::Timer => self.num_timer_evts.fetch_add(1, Ordering::SeqCst),
             IncrMsg::Signal => self.num_signals.fetch_add(1, Ordering::SeqCst),
+            IncrMsg::ImpreciseArm => self.imprecise_arms.fetch_add(1, Ordering::SeqCst),
+            IncrMsg::ImpreciseTimer { early, repeat } => {
+                self.imprecise_early
+                    .fetch_add(u64::from(early), Ordering::SeqCst);
+                self.imprecise_repeat
+                    .fetch_add(u64::from(repeat), Ordering::SeqCst);
+                self.imprecise_evts.fetch_add(1, Ordering::SeqCst)
+            }
+            IncrMsg::ImpreciseLate => self.imprecise_late.fetch_add(1, Ordering::SeqCst),
         };
     }
 }
@@ -143,31 +188,39 @@ impl Tool for LocalState {
         guest: &mut T,
         syscall: Syscall,
     ) -> Result<i64, Error> {
+        note_stop(guest);
         let timeout = TimerSchedule::Rcbs(guest.config().timeout_rcbs);
         let alt_timeout = TimerSchedule::Rcbs(guest.config().timeout_rcbs_alternate);
+        let imprecise_budget = guest.config().timeout_rcbs;
         let (no, args) = syscall.into_parts();
         match no {
             Sysno::clock_getres => {
                 guest.set_timer_precise(timeout).unwrap();
+                note_precise_arm(guest);
             }
             Sysno::msgrcv => {
                 guest.set_timer_precise(alt_timeout).unwrap();
+                note_precise_arm(guest);
             }
             Sysno::timer_getoverrun => {
                 guest.set_timer(timeout).unwrap();
+                note_imprecise_arm(guest, imprecise_budget).await;
             }
             Sysno::fanotify_init => {
                 guest.set_timer_precise(timeout).unwrap();
+                note_precise_arm(guest);
                 let kill_call = raise_sigwinch(guest).await;
                 guest.tail_inject(kill_call).await
             }
             Sysno::fanotify_mark => {
                 guest.set_timer(timeout).unwrap();
+                note_imprecise_arm(guest, imprecise_budget).await;
                 let kill_call = raise_sigwinch(guest).await;
                 guest.tail_inject(kill_call).await
             }
             Sysno::msgctl => {
                 guest.set_timer_precise(timeout).unwrap();
+                note_precise_arm(guest);
                 for _ in 0..BULK_INJECTION_COUNT {
                     guest.inject(Getpid::new()).await.unwrap();
                 }
@@ -175,6 +228,7 @@ impl Tool for LocalState {
             }
             Sysno::msgget => {
                 guest.set_timer(timeout).unwrap();
+                note_imprecise_arm(guest, imprecise_budget).await;
                 for _ in 0..BULK_INJECTION_COUNT {
                     guest.inject(Getpid::new()).await.unwrap();
                 }
@@ -204,6 +258,16 @@ impl Tool for LocalState {
     async fn handle_timer_event<T: Guest<Self>>(&self, guest: &mut T) {
         guest.send_rpc(IncrMsg::Timer).await;
         let clock_value = guest.read_clock().unwrap();
+        let ts = guest.thread_state_mut();
+        if let Some(min) = ts.imprecise_min {
+            let repeat = std::mem::replace(&mut ts.imprecise_delivered, true);
+            let early = clock_value < min;
+            guest
+                .send_rpc(IncrMsg::ImpreciseTimer { early, repeat })
+                .await;
+        } else if ts.imprecise_cancelled {
+            guest.send_rpc(IncrMsg::ImpreciseLate).await;
+        }
         let ts = guest.thread_state();
         if let Some(val) = ts.timer_assertion {
             assert_eq!(ts.last_tick + val, clock_value);
@@ -215,6 +279,7 @@ impl Tool for LocalState {
         guest: &mut T,
         signal: Signal,
     ) -> Result<Option<Signal>, Errno> {
+        note_stop(guest);
         guest.send_rpc(IncrMsg::Signal).await;
         Ok(Some(signal))
     }
@@ -228,6 +293,41 @@ async fn raise_sigwinch<T: Guest<LocalState>>(guest: &mut T) -> Tgkill {
         .with_tgid(pid as _)
         .with_tid(tid as _)
         .with_sig(libc::SIGWINCH)
+}
+
+/// Records an imprecise timer of `budget` RCBs, just armed with
+/// `Guest::set_timer`: until the next arm, a timer event is this arm's.
+#[cfg(all(not(sanitized), test))]
+async fn note_imprecise_arm<T: Guest<LocalState>>(guest: &mut T, budget: u64) {
+    let clock_value = guest.read_clock().unwrap();
+    let ts = guest.thread_state_mut();
+    ts.imprecise_min = Some(clock_value + budget);
+    ts.imprecise_delivered = false;
+    ts.imprecise_cancelled = false;
+    guest.send_rpc(IncrMsg::ImpreciseArm).await;
+}
+
+/// Records a precise timer, just armed with `Guest::set_timer_precise`: until
+/// the next arm, a timer event is not an imprecise arm's.
+#[cfg(all(not(sanitized), test))]
+fn note_precise_arm<T: Guest<LocalState>>(guest: &mut T) {
+    let ts = guest.thread_state_mut();
+    ts.imprecise_min = None;
+    ts.imprecise_cancelled = false;
+}
+
+/// Records a stop the tool observes (a syscall or a signal), called before
+/// the stop's handler arms anything. The first stop the tool observes after
+/// an arm decides its event (reverie-ptrace's `TimerImpl::observe_event`: "a
+/// stop by this timer's signal delivers it, and any other stop cancels
+/// it"), so an imprecise arm still pending here is cancelled: until the next
+/// arm, an event for it is late.
+#[cfg(all(not(sanitized), test))]
+fn note_stop<T: Guest<LocalState>>(guest: &mut T) {
+    let ts = guest.thread_state_mut();
+    if ts.imprecise_min.take().is_some() {
+        ts.imprecise_cancelled = true;
+    }
 }
 
 #[cfg(all(not(sanitized), test))]
@@ -436,6 +536,89 @@ mod tests {
     const MANY_RCBS: u64 = 10000; // Normal perf signaling
     const LESS_RCBS: u64 = 15; // Low enough to use artificial signaling
 
+    /// Whether a run is held to the imprecise timer's contract instead of to
+    /// exact event counts: a `LESS_RCBS` run in which the tool armed an
+    /// imprecise timer. Every `MANY_RCBS` run, and every run with only precise
+    /// timers, keeps its exact count; so does a run whose imprecise arms the
+    /// tool did not record.
+    fn less_rcbs_imprecise(rcbs: u64, gs: &GlobalState) -> bool {
+        rcbs == LESS_RCBS && gs.imprecise_arms.load(Ordering::SeqCst) > 0
+    }
+
+    /// Asserts a `LESS_RCBS` run's timer events against the contract of an
+    /// imprecise timer (`Guest::set_timer`; reverie-ptrace's
+    /// `TimerEventRequest::Imprecise`). Its event comes after at least its
+    /// budget of RCBs and before the next stop: the first stop after the arm
+    /// decides the event, delivering it if it is the timer's own signal and
+    /// cancelling it otherwise. That stop is the bound on how late the event
+    /// may come; no bound in RCBs past the budget exists, since that is the
+    /// PMU's skid. At `LESS_RCBS` an imprecise event often comes later than
+    /// the next stop, so it is not delivered. Each imprecise arm in these
+    /// cases is followed by a stop: the next timer or clock syscall, a
+    /// signal, or the guest's exit.
+    ///
+    /// So the run has exactly `precise` precise events, and at most
+    /// `imprecise_max` imprecise events, where `imprecise_max` is the count
+    /// the case asserts for those arms when they are precise. No imprecise
+    /// event comes short of its arm's budget, no arm delivers twice, and no
+    /// event comes for an arm after the stop that cancelled it, until the
+    /// next arm. The tool marks the arm cancelled at the first stop it
+    /// observes in its syscall and signal handlers after the arm; a stop
+    /// at a trapped instruction goes to the default handler and is not
+    /// marked. The `<=` on imprecise events stands only with that bound:
+    /// without it, an event any later than its cancelling stop would pass.
+    ///
+    /// `context` labels the failure messages.
+    fn assert_less_rcbs_imprecise(
+        gs: &GlobalState,
+        precise: u64,
+        imprecise_max: u64,
+        context: &str,
+    ) {
+        let total = gs.num_timer_evts.load(Ordering::SeqCst);
+        let imprecise = gs.imprecise_evts.load(Ordering::SeqCst);
+        assert!(
+            imprecise <= total,
+            "{}: {} imprecise of {} events",
+            context,
+            imprecise,
+            total
+        );
+        // Checked before the precise count, which would otherwise take a late
+        // event for a precise one: a late event is not counted as imprecise.
+        assert_eq!(
+            gs.imprecise_late.load(Ordering::SeqCst),
+            0,
+            "{}: imprecise timer events after their cancelling stop",
+            context
+        );
+        assert_eq!(
+            total - imprecise,
+            precise,
+            "{}: precise timer events",
+            context
+        );
+        assert!(
+            imprecise <= imprecise_max,
+            "{}: imprecise timer events: {} > {}",
+            context,
+            imprecise,
+            imprecise_max
+        );
+        assert_eq!(
+            gs.imprecise_early.load(Ordering::SeqCst),
+            0,
+            "{}: imprecise timer events short of their budget",
+            context
+        );
+        assert_eq!(
+            gs.imprecise_repeat.load(Ordering::SeqCst),
+            0,
+            "{}: imprecise timer events repeated for one arm",
+            context
+        );
+    }
+
     #[test_case(MANY_RCBS, sched_precise)]
     #[test_case(MANY_RCBS, sched_imprecise)]
     #[test_case(LESS_RCBS, sched_precise)]
@@ -454,6 +637,12 @@ mod tests {
             schedule_timer();
             do_branches(rcbx2);
         });
+        if less_rcbs_imprecise(rcbs, &gs) {
+            // Only the last arm's window reaches its budget: an event from
+            // one of the first three would come short of it.
+            assert_less_rcbs_imprecise(&gs, 0, 1, "timer_delays_timer");
+            return;
+        }
         assert_eq!(gs.num_timer_evts.into_inner(), 1);
     }
 
@@ -473,6 +662,10 @@ mod tests {
             schedule_timer();
             do_branches(rcbx20);
         });
+        if less_rcbs_imprecise(rcbs, &gs) {
+            assert_less_rcbs_imprecise(&gs, 0, 3, "timer_is_single");
+            return;
+        }
         assert_eq!(gs.num_timer_evts.into_inner(), 3);
     }
 
@@ -579,6 +772,15 @@ mod tests {
                 fun();
                 do_branches(rcbx2);
             });
+            // `fun` armed an imprecise timer: the run has an imprecise arm
+            // beyond any that `schedule_timer` made. `schedule_timer`'s arm
+            // stops short of its budget either way and must not deliver.
+            let fun_imprecise = gs.imprecise_arms.load(Ordering::SeqCst)
+                > u64::from(timer_kind == TimerKind::Imprecise);
+            if rcbs == LESS_RCBS && fun_imprecise {
+                assert_less_rcbs_imprecise(&gs, 0, additional_evts, &format!("iter: {}", e));
+                continue;
+            }
             assert_eq!(
                 gs.num_timer_evts.into_inner(),
                 additional_evts,
@@ -597,6 +799,12 @@ mod tests {
                 fun();
                 do_branches(rcbx2);
             });
+            if less_rcbs_imprecise(rcbs, &gs) {
+                // Only `fun` arms an imprecise timer here. The precise event
+                // at the budget stays exact.
+                assert_less_rcbs_imprecise(&gs, 1, additional_evts, "let pass");
+                return;
+            }
             assert_eq!(gs.num_timer_evts.into_inner(), 1 + additional_evts);
         }
     }
@@ -660,6 +868,13 @@ mod tests {
             schedule_timer();
             do_branches(rcbx2);
         });
+        if less_rcbs_imprecise(rcbs, &gs) {
+            assert_eq!(gs.num_signals.load(Ordering::SeqCst), 0); // defensive
+            // The first arm's window stops short of its budget; the other two
+            // reach theirs.
+            assert_less_rcbs_imprecise(&gs, 0, 2, "signals_cancel_timers");
+            return;
+        }
         assert_eq!(gs.num_signals.into_inner(), 0); // defensive
         assert_eq!(gs.num_timer_evts.into_inner(), 2);
     }
@@ -698,6 +913,10 @@ mod tests {
             },
             true,
         );
+        if less_rcbs_imprecise(rcbs, &gs) {
+            assert_less_rcbs_imprecise(&gs, 0, 1, "not_subscribed_doesnt_cancel");
+            return;
+        }
         assert_eq!(gs.num_timer_evts.into_inner(), 1);
     }
 
@@ -908,6 +1127,12 @@ mod tests {
             do_branches(c);
             assert_clock(d); // timer outstanding
         });
+        if less_rcbs_imprecise(rcbs, &gs) {
+            // The first arm's event may not come before `assert_clock(b)`
+            // cancels it; the second arm's window stops short of its budget.
+            assert_less_rcbs_imprecise(&gs, 0, 1, "clock_with_timer");
+            return;
+        }
         assert_eq!(gs.num_timer_evts.into_inner(), 1);
     }
 
