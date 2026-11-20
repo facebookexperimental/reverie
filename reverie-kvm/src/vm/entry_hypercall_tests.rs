@@ -782,4 +782,24 @@ mod entry_hypercall_tests {
     fn host_written_response_poison_avoids_completion_entry() {
         host_case(true);
     }
+
+    #[test]
+    fn raw_run_answers_unknown_syscall_with_enosys_in_rax() {
+        // One past the last row of the table Reverie is built with, so
+        // no Sysno names it however far the table grows.
+        let unknown = reverie::syscalls::Sysno::last().id() as u64 + 1;
+        let mut backend = KvmBackend::new(16 * 1024 * 1024).expect("actual KVM is mandatory");
+        backend
+            .install_syscall(0x1000, 0x2000, SyscallRequest::new(unknown, [0; 6]))
+            .unwrap();
+        backend
+            .run(|_, _| panic!("typed handler invoked for an unknown syscall number"))
+            .unwrap();
+        // The transport stub loads the result into eax, zero-extending
+        // it: the guest-visible word is the low 32 bits.
+        assert_eq!(
+            backend.vcpu.get_regs().unwrap().rax as u32 as i32,
+            -libc::ENOSYS
+        );
+    }
 }

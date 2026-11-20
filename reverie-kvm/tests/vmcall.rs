@@ -97,6 +97,33 @@ fn guest_write_syscall_is_intercepted_via_vmcall() {
 }
 
 #[test]
+fn guest_unknown_syscall_does_not_fail_the_run_via_vmcall() {
+    if !kvm_available("guest_unknown_syscall_does_not_fail_the_run_via_vmcall") {
+        return;
+    }
+
+    // One past the last row of the table Reverie is built with, so no
+    // Sysno names it however far the table grows.
+    let unknown = Sysno::last().id() as u64 + 1;
+    let mut backend = KvmBackend::new(MEMORY_SIZE).unwrap();
+    backend
+        .install_syscall(
+            ENTRY_POINT,
+            FRAME_ADDRESS,
+            SyscallRequest::new(unknown, [0; 6]),
+        )
+        .unwrap();
+
+    // The typed handler must not run for a number it cannot name; the
+    // run completes instead of failing the VM. (The -ENOSYS result
+    // value in rax is asserted by the in-crate entry_hypercall test;
+    // this stub guest discards it.)
+    backend
+        .run(|_, _| panic!("typed handler invoked for an unknown syscall number"))
+        .unwrap();
+}
+
+#[test]
 fn guest_program_routes_required_syscalls_via_vmcall() {
     if !kvm_available("guest_program_routes_required_syscalls_via_vmcall") {
         return;

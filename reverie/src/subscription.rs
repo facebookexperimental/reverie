@@ -39,8 +39,15 @@ pub enum UnknownSyscallPolicy {
     /// implement the number either). No stop is generated, so the call is
     /// not observable; if the guest's own filter nevertheless traces it,
     /// the tracer keeps its legacy behavior of failing the stop with an
-    /// error. On the KVM backend the number fails to decode and the run
-    /// aborts, as it did before this policy existed.
+    /// error. On the KVM backend there is no host kernel to allow the
+    /// call natively against, so each entry point answers at its own
+    /// layer instead of failing the run: the direct Tool loop runs the
+    /// raw request through the caller-supplied syscall executor, whose
+    /// contract supplies the answer; the ELF Tool loop runs it through
+    /// the LinuxEmu executor, whose dispatch answers an unmodelled
+    /// number with `-ENOSYS`, or through a registered extension that
+    /// claims it; and the raw `run` interface, which has no executor,
+    /// answers `-ENOSYS` itself.
     #[default]
     AllowNative,
 

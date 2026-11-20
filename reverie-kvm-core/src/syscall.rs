@@ -184,12 +184,15 @@ pub enum DecodedSyscall {
 /// cannot name, per the Tool's [`UnknownSyscallPolicy`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UnknownSyscallDisposition {
-    /// Keep the legacy behavior: fail the run with
-    /// [`Error::InvalidSyscallNumber`].
-    Abort,
     /// Write this result to the guest's frame and continue, with no Tool
     /// callback.
     Answer(i64),
+    /// Run the raw request through the backend's syscall executor,
+    /// with no Tool callback. The executor supplies Linux syscall
+    /// semantics; the in-tree LinuxEmu dispatch answers an
+    /// unmodelled number with `ENOSYS` from its catch-all, while a
+    /// caller-supplied executor answers by its own contract.
+    Execute,
     /// Call the Tool's unknown-syscall hook and write its result.
     AskTool,
 }
@@ -197,10 +200,15 @@ pub enum UnknownSyscallDisposition {
 /// Maps an [`UnknownSyscallPolicy`] to this backend's handling of an
 /// unknown number. `EnosysFast` has no in-kernel filter to be fast with
 /// here, so it answers exactly as `Enosys` does; the guest cannot tell
-/// them apart.
+/// them apart. `AllowNative` cannot run the call on the host kernel
+/// from a KVM guest, so it executes through the backend's syscall
+/// executor instead, rather than failing the run before dispatch:
+/// the in-tree LinuxEmu dispatch answers an unmodelled number with
+/// `ENOSYS` from its catch-all, while a caller-supplied executor
+/// answers by its own contract.
 pub fn unknown_syscall_disposition(policy: UnknownSyscallPolicy) -> UnknownSyscallDisposition {
     match policy {
-        UnknownSyscallPolicy::AllowNative => UnknownSyscallDisposition::Abort,
+        UnknownSyscallPolicy::AllowNative => UnknownSyscallDisposition::Execute,
         UnknownSyscallPolicy::Enosys | UnknownSyscallPolicy::EnosysFast => {
             UnknownSyscallDisposition::Answer(-(libc::ENOSYS as i64))
         }
@@ -304,7 +312,7 @@ mod tests {
     fn policy_maps_to_the_backend_disposition() {
         assert_eq!(
             unknown_syscall_disposition(UnknownSyscallPolicy::AllowNative),
-            UnknownSyscallDisposition::Abort
+            UnknownSyscallDisposition::Execute
         );
         assert_eq!(
             unknown_syscall_disposition(UnknownSyscallPolicy::Enosys),

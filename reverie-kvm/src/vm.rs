@@ -119,6 +119,7 @@ use crate::signal::XsaveImage;
 use crate::stats::KvmBackendStats;
 use crate::stats::KvmExitCollector;
 use crate::step_filter::StepClass;
+use crate::syscall::DecodedSyscall;
 use crate::syscall::FRAME_SIZE;
 use crate::syscall::RETURN_FLAGS_WORD;
 use crate::syscall::RETURN_RIP_WORD;
@@ -7589,9 +7590,15 @@ impl KvmBackend {
                     if exit.nr != VMCALL_SYSCALL_TRANSPORT {
                         return Err(Error::UnexpectedHypercall(exit.nr));
                     }
-                    let syscall =
-                        SyscallRequest::read_from(&self.memory, exit.args[0])?.into_syscall()?;
-                    let result = handler(syscall, &self.memory);
+                    // A number the syscall table cannot name gets the
+                    // Linux answer for an unknown syscall (ENOSYS), not
+                    // a failed run: this raw handler interface can only
+                    // receive typed syscalls.
+                    let request = SyscallRequest::read_from(&self.memory, exit.args[0])?;
+                    let result = match request.decode() {
+                        DecodedSyscall::Known(syscall) => handler(syscall, &self.memory),
+                        DecodedSyscall::Unknown(_) => -(libc::ENOSYS as i64),
+                    };
                     self.memory
                         .entry_gate()
                         .admit_operation()

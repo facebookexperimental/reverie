@@ -150,4 +150,59 @@ mod cpuid_runtime_controls {
             assert_disarmed(&backend);
         }
     }
+
+    static UNKNOWN_HOOK_CALLED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    #[derive(Default)]
+    struct UnknownRoutingTool;
+
+    #[reverie::tool]
+    impl reverie::Tool for UnknownRoutingTool {
+        type GlobalState = ();
+        type ThreadState = ();
+        fn subscriptions(_: &()) -> reverie::Subscription {
+            // Subscription::none() leaves the unknown-syscall policy at
+            // its AllowNative default.
+            reverie::Subscription::none()
+        }
+        async fn handle_unknown_syscall<G: reverie::Guest<Self>>(
+            &self,
+            _guest: &mut G,
+            _raw: reverie::syscalls::RawSyscall,
+        ) -> std::result::Result<i64, reverie::Error> {
+            UNKNOWN_HOOK_CALLED.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(12345)
+        }
+    }
+
+    #[test]
+    fn tool_loop_routes_unknown_syscall_to_the_executor_under_allow_native() {
+        UNKNOWN_HOOK_CALLED.store(false, std::sync::atomic::Ordering::SeqCst);
+        // One past the last row of the table Reverie is built with.
+        let unknown = reverie::syscalls::Sysno::last().id() as u64 + 1;
+        let request = SyscallRequest::new(unknown, [1, 2, 3, 4, 5, 6]);
+        let mut backend = KvmBackend::new(16 * 1024 * 1024).expect("actual KVM is mandatory");
+        backend.install_syscall(0x1000, 0x2000, request).unwrap();
+        let mut executed = Vec::new();
+        futures::executor::block_on(backend.run_with_tool::<UnknownRoutingTool, _>(
+            (),
+            |actual: &SyscallRequest, _: &GuestMemory| {
+                executed.push(*actual);
+                -(libc::ENOSYS as i64)
+            },
+        ))
+        .unwrap();
+        assert_eq!(executed, vec![request]);
+        assert!(
+            !UNKNOWN_HOOK_CALLED.load(std::sync::atomic::Ordering::SeqCst),
+            "AllowNative must reach the executor, not the Tool unknown hook"
+        );
+        // The transport stub loads the result into eax, zero-extending
+        // it: the guest-visible word is the low 32 bits.
+        assert_eq!(
+            backend.vcpu.get_regs().unwrap().rax as u32 as i32,
+            -libc::ENOSYS
+        );
+    }
 }
