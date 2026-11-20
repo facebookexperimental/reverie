@@ -10,7 +10,9 @@ use crate::broker_library_tests::report_skip;
 /// (EOPNOTSUPP, as on Eden/FUSE checkouts; CI hosts cover these cases).
 fn broker_host_skip(stderr: &str) -> Option<&'static str> {
     if stderr.contains("ambient mount absent from bootstrap mountinfo") {
-        Some("broker ambient mount absent from bootstrap mountinfo on this host (https://github.com/facebookexperimental/reverie/issues/96)")
+        Some(
+            "broker ambient mount absent from bootstrap mountinfo on this host (https://github.com/facebookexperimental/reverie/issues/96)",
+        )
     } else if stderr.contains("unproved ambient filesystem metadata-query class") {
         Some(
             "broker ambient metadata-query unsupported on this filesystem \
@@ -72,8 +74,7 @@ fn bootstrap_case(test: &str, case: &str, expected: &str, accepted: bool) {
     // (EOPNOTSUPP) signature deliberately does NOT: the procfs-reject
     // case's expected outcome is itself an EOPNOTSUPP rejection, so
     // skipping on that signature would mask its regression.
-    if !output.status.success()
-        && stderr.contains("ambient mount absent from bootstrap mountinfo")
+    if !output.status.success() && stderr.contains("ambient mount absent from bootstrap mountinfo")
     {
         report_skip(
             test,

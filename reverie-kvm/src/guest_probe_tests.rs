@@ -719,8 +719,7 @@ fn report_skip(test: &str, reason: &str) {
     let mut rest = line.as_bytes();
     while !rest.is_empty() {
         // SAFETY: writes only the buffer above to this process's stderr.
-        let written =
-            unsafe { libc::write(libc::STDERR_FILENO, rest.as_ptr().cast(), rest.len()) };
+        let written = unsafe { libc::write(libc::STDERR_FILENO, rest.as_ptr().cast(), rest.len()) };
         assert!(
             written > 0,
             "write the named skip for {test}: {}",
@@ -755,10 +754,7 @@ fn only_the_issue_307_signature_skips_the_stable_xstate_test() {
 
     let report = |kind, unstable, first_image_difference| FixedXstateQualification {
         guest_xcr0: crate::bootstrap::FIXED_GUEST_XCR0,
-        xss: XssOutcome {
-            kind,
-            read_back: 0,
-        },
+        xss: XssOutcome { kind, read_back: 0 },
         host_cpuid_d_1_eax: 15,
         comparisons: 6,
         unstable,

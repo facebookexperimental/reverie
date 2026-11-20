@@ -113,7 +113,9 @@ pub(crate) fn selected_child_without(test: &str, removed: &[&str]) -> Option<Bro
     // never skip on it.
     if !output.status.success() {
         let skip_reason = if stderr.contains("ambient mount absent from bootstrap mountinfo") {
-            Some("broker ambient mount absent from bootstrap mountinfo on this host (https://github.com/facebookexperimental/reverie/issues/96)")
+            Some(
+                "broker ambient mount absent from bootstrap mountinfo on this host (https://github.com/facebookexperimental/reverie/issues/96)",
+            )
         } else if cfg!(feature = "broker-metadata-skip")
             && stderr.contains("unproved ambient filesystem metadata-query class")
         {

@@ -1263,8 +1263,7 @@ fn require_consumer_declaration<'e, 'a>(
                 "consumer-checkout layout requires a declared consumer source declaration",
             )?;
             require(
-                expected.image_kind != FixedImageKind::Detcore
-                    || declaration.leaf.is_some(),
+                expected.image_kind != FixedImageKind::Detcore || declaration.leaf.is_some(),
                 "consumer-checkout leaf image requires a declared leaf package",
             )?;
             Ok(Some(declaration))
@@ -1287,9 +1286,7 @@ fn declared_workspace_files<'a>(
         FixedImageKind::Detcore => declaration.leaf_workspace_files,
     }
 }
-fn producer_manifest_relative<'a>(
-    declaration: &ConsumerSourceDeclaration<'a>,
-) -> Result<&'a str> {
+fn producer_manifest_relative<'a>(declaration: &ConsumerSourceDeclaration<'a>) -> Result<&'a str> {
     let producers: Vec<_> = declaration
         .runtime_packages
         .iter()
@@ -1572,8 +1569,8 @@ const COMPILED_RV_LOCATION_FILES: [&str; 7] = [
 const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 88] = [
     (
         "reverie-liteinst-artifact/src/preparation_identity.rs",
-        55168,
-        "a49de665049d98780ed59832387cb8017687527f961c822105fd0e47aa11f822",
+        55154,
+        "ba2d1a6486e17762199053fa44e5f51ddd4b8da1a9c13e957ab331cca3234006",
     ),
     // Bind the signal-mask gate and every changed native-source premise of it.
     (
@@ -1818,8 +1815,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 88] = [
     ),
     (
         "reverie-liteinst/src/lib.rs",
-        40823,
-        "4017332b6de2a6e32bb31b816dfc2b72f16b69200916cdfedde3ed978d17cf0e",
+        40843,
+        "27053ebd4996230b8fb19bfb21e0a56c431e73317efea7dae7591e84443d774b",
     ),
     (
         "reverie-liteinst-preload/Cargo.toml",
@@ -1934,7 +1931,7 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 88] = [
     (
         "reverie/src/pmu.rs",
         8462,
-        "de1fc186e000181ab776086b8266a4c668f626cc1d63dc5c9c1c5066d6d062d8",
+        "88754c17f24ed582aa24bbc485c8eca5ee0b5a25ad191b2811107c918eecee39",
     ),
     (
         "reverie-inguest/src/guest/clock.rs",
@@ -2465,9 +2462,7 @@ fn symlink_reaches_closure_source(path: &Path, depth: usize, budget: &mut usize)
                 path.display()
             )
         })?;
-        return Ok(
-            has_closure_source_extension(path) || has_closure_source_extension(&target),
-        );
+        return Ok(has_closure_source_extension(path) || has_closure_source_extension(&target));
     }
     if !metadata.is_dir() {
         return Ok(false);
@@ -2568,8 +2563,7 @@ fn content_reverie_inventory_for_path(
     image_kind: FixedImageKind,
     package_dirs: &BTreeSet<String>,
 ) -> Result<(Vec<DeclaredSourceFile>, BTreeMap<String, FileIdentity>)> {
-    let (catalog_inventory, catalog_files) =
-        content_reverie_inventory_for_image(root, image_kind)?;
+    let (catalog_inventory, catalog_files) = content_reverie_inventory_for_image(root, image_kind)?;
     let closure = scan_reverie_closure_files(root, package_dirs)?;
     let mut inventory: BTreeMap<String, DeclaredSourceFile> = catalog_inventory
         .into_iter()
@@ -2736,8 +2730,7 @@ fn buck_reverie_content_matches(inventory: &[DeclaredSourceFile]) -> Result<()> 
             )?;
         } else if entry.relative == CONTENT_FIXED_GATE.0 {
             require(
-                entry.size == CONTENT_FIXED_GATE.1
-                    && entry.sha256 == CONTENT_FIXED_GATE.2,
+                entry.size == CONTENT_FIXED_GATE.1 && entry.sha256 == CONTENT_FIXED_GATE.2,
                 format!(
                     "declared Buck Reverie source differs from reviewed catalog: {}",
                     entry.relative
@@ -2952,8 +2945,8 @@ fn compiled_leaf_package(
             "0.5.7",
         ),
         FixedImageKind::Detcore => {
-            let leaf = declared_leaf
-                .ok_or("compiled leaf image requires a declared leaf package")?;
+            let leaf =
+                declared_leaf.ok_or("compiled leaf image requires a declared leaf package")?;
             (
                 leaf.name,
                 leaf.target,
@@ -3603,9 +3596,9 @@ fn content_reverie_package_dirs(
             };
             require(
                 !relative.is_empty()
-                    && Path::new(relative).components().all(|component| {
-                        matches!(component, std::path::Component::Normal(_))
-                    }),
+                    && Path::new(relative)
+                        .components()
+                        .all(|component| matches!(component, std::path::Component::Normal(_))),
                 "content Reverie package directory is not a logical relative path",
             )?;
             dirs.insert(relative.to_owned());
@@ -3635,8 +3628,7 @@ fn content_leaf_manifest_and_lock_pin(
         .collect();
     require(
         selected.len() == 1
-            && selected[0]["manifest_path"].as_str()
-                == root.join(leaf.manifest_relative).to_str()
+            && selected[0]["manifest_path"].as_str() == root.join(leaf.manifest_relative).to_str()
             && selected[0]["version"] == leaf.version
             && selected[0]["source"].is_null(),
         "content leaf leaf manifest/version/source differs",
@@ -3732,8 +3724,7 @@ fn content_leaf_manifest_and_lock_pin_path(
         .collect();
     require(
         selected.len() == 1
-            && selected[0]["manifest_path"].as_str()
-                == root.join(leaf.manifest_relative).to_str()
+            && selected[0]["manifest_path"].as_str() == root.join(leaf.manifest_relative).to_str()
             && selected[0]["version"] == leaf.version
             && selected[0]["source"].is_null(),
         "content leaf leaf manifest/version/source differs",
@@ -3830,8 +3821,7 @@ fn content_compiler_manifest_path(
             compiler_root.source_path("reverie-liteinst-preload/Cargo.toml")?
         }
         FixedImageKind::Detcore => {
-            let leaf = declared_leaf
-                .ok_or("compiler manifest requires a declared leaf package")?;
+            let leaf = declared_leaf.ok_or("compiler manifest requires a declared leaf package")?;
             exact_source_file(workspace_root, leaf.manifest_relative)?.path
         }
     };
@@ -4247,9 +4237,8 @@ impl VerifiedCompiledSources {
         // path layout — path spelling only, refused below for any
         // source-carrying graph — records the compiled closure and
         // runs no proof.
-        let declaration = require_consumer_declaration(expected)?.ok_or(
-            "consumer-checkout layout requires a declared consumer source declaration",
-        )?;
+        let declaration = require_consumer_declaration(expected)?
+            .ok_or("consumer-checkout layout requires a declared consumer source declaration")?;
         require(
             source_pin_is_full(expected.reverie_pin),
             "compiled source requires an independent full Reverie pin",
@@ -4456,11 +4445,7 @@ impl VerifiedCompiledSources {
                 .ok_or("content leaf missing")?
                 .clone(),
             FixedImageKind::Detcore => {
-                let leaf_source: Option<&str> = if path_sourced {
-                    None
-                } else {
-                    Some(&source)
-                };
+                let leaf_source: Option<&str> = if path_sourced { None } else { Some(&source) };
                 let leaf = compiled_leaf_package(
                     &metadata,
                     &root,
@@ -4531,8 +4516,7 @@ impl VerifiedCompiledSources {
         // witness must match the recorded authority exactly.
         let constraint_set: BTreeSet<&str> = expected.constraints.iter().copied().collect();
         require(
-            !expected.constraints.is_empty()
-                && constraint_set.len() == expected.constraints.len(),
+            !expected.constraints.is_empty() && constraint_set.len() == expected.constraints.len(),
             "Buck constraints must be a nonempty duplicate-free declared set",
         )?;
         let mut constraints: Vec<String> = expected
@@ -4567,8 +4551,7 @@ impl VerifiedCompiledSources {
                     .all(|extra| workspace_relatives.contains(extra))
                 && workspace_relatives.iter().all(|relative| {
                     expected.workspace_extra_files.contains(relative)
-                        || (relative.starts_with(&leaf_src_prefix)
-                            && relative.ends_with(".rs"))
+                        || (relative.starts_with(&leaf_src_prefix) && relative.ends_with(".rs"))
                 }),
             "Buck workspace files must be the declared leaf sources and extra files",
         )?;
@@ -4604,8 +4587,7 @@ impl VerifiedCompiledSources {
         let profile_bzl = FileIdentity::read(expected.profile_bzl)?;
         require(
             profile_bzl.path.file_name().is_some()
-                && profile_bzl.path.file_name()
-                    == Path::new(expected.profile_relative).file_name(),
+                && profile_bzl.path.file_name() == Path::new(expected.profile_relative).file_name(),
             "Buck profile input is not the declared profile .bzl",
         )?;
         let (workspace_inventory, workspace_files) =
@@ -4742,8 +4724,12 @@ impl VerifiedCompiledSources {
                 .standalone_metadata
                 .as_ref()
                 .ok_or("standalone build lacks fresh factory metadata")?;
-            let binding =
-                standalone_current_build_sources(&self.record, metadata, runner, self.consumer.as_ref())?;
+            let binding = standalone_current_build_sources(
+                &self.record,
+                metadata,
+                runner,
+                self.consumer.as_ref(),
+            )?;
             current_build_evidence_in_scope(
                 &self.record,
                 command,
@@ -4934,11 +4920,8 @@ impl VerifiedCompiledSources {
                 workspace_inventory,
                 workspace_sha256,
             );
-            let reverie: (&Path, &[DeclaredSourceFile], &str) = (
-                &self.record.reverie_root,
-                reverie_inventory,
-                reverie_sha256,
-            );
+            let reverie: (&Path, &[DeclaredSourceFile], &str) =
+                (&self.record.reverie_root, reverie_inventory, reverie_sha256);
             if self.record.layout == CompiledSourceLayout::PathCheckout {
                 verify_declared_content_path(
                     self.record.image_kind,
@@ -4947,12 +4930,7 @@ impl VerifiedCompiledSources {
                     compiler_root,
                 )?;
             } else {
-                verify_declared_content(
-                    self.record.image_kind,
-                    workspace,
-                    reverie,
-                    compiler_root,
-                )?;
+                verify_declared_content(self.record.image_kind, workspace, reverie, compiler_root)?;
             }
         }
         if let CompiledSourceAuthority::BuckDeclaredContent {
@@ -5338,12 +5316,7 @@ fn standalone_current_build_sources(
             for relative in declared_files {
                 workspace_files.insert(
                     relative.clone(),
-                    compiled_blob_file(
-                        &sources.workspace_root,
-                        workspace_head,
-                        relative,
-                        runner,
-                    )?,
+                    compiled_blob_file(&sources.workspace_root, workspace_head, relative, runner)?,
                 );
             }
         }
@@ -5384,9 +5357,7 @@ fn standalone_current_build_sources(
             }
         }
         CompiledSourceAuthority::BuckDeclaredContent { .. } => {
-            return Err(
-                "standalone build source binding does not accept Buck leaf sources".into(),
-            );
+            return Err("standalone build source binding does not accept Buck leaf sources".into());
         }
     }
     let manifest_relative = sources
@@ -20647,10 +20618,7 @@ fn no_scope_build_features(build: &CurrentBuildEvidence) -> Result<NoScopeCohort
         require(
             build.command.cwd.as_path() == nested
                 && build.command.arguments
-                    == standalone_current_build_arguments(
-                        &build.target_directory,
-                        &wrapper.name,
-                    )?
+                    == standalone_current_build_arguments(&build.target_directory, &wrapper.name)?
                 && build.target_directory.is_absolute()
                 && [
                     producer_relative.as_str(),
@@ -20762,9 +20730,7 @@ fn validate_buck_build_evidence(
                 Some(stage_id) => arguments[6] == format!("id={stage_id}"),
                 None => arguments[6]
                     .strip_prefix("id=")
-                    .is_some_and(|stage| {
-                        !stage.is_empty() && !stage.contains(char::is_whitespace)
-                    }),
+                    .is_some_and(|stage| !stage.is_empty() && !stage.contains(char::is_whitespace)),
             },
         "Buck build witness command is not the exact declared buck2 build invocation",
     )?;
@@ -24899,9 +24865,7 @@ fn location_data_differs(
         }
         None => format!("expected={line}:{column}"),
     };
-    format!(
-        "whole physical Detcore readonly data differs: key={key} {detail} address={address:#x}"
-    )
+    format!("whole physical Detcore readonly data differs: key={key} {detail} address={address:#x}")
 }
 
 // Caller enters this binder only after canonical loader authentication and
@@ -40647,8 +40611,7 @@ mod tests {
     // declaration the factories require (production code hard-codes
     // none of them). Const names mirror the deleted production
     // constants so fixture bodies stay unchanged.
-    const BUCK_TARGET: &str =
-        "//hermetic_infra/hermit:detcore-liteinst-liteinst-runtime[cdylib]";
+    const BUCK_TARGET: &str = "//hermetic_infra/hermit:detcore-liteinst-liteinst-runtime[cdylib]";
     const BUCK_PLATFORM: &str = "ovr_config//platform/linux:x86_64-fbcode";
     const BUCK_CONSTRAINTS: [&str; 3] = [
         "ovr_config//build_mode/constraints:opt",
@@ -41840,6 +41803,21 @@ mod tests {
             8462,
             "de1fc186e000181ab776086b8266a4c668f626cc1d63dc5c9c1c5066d6d062d8",
         ),
+        (
+            "reverie-liteinst/src/lib.rs",
+            40843,
+            "27053ebd4996230b8fb19bfb21e0a56c431e73317efea7dae7591e84443d774b",
+        ),
+        (
+            "reverie-liteinst-artifact/src/preparation_identity.rs",
+            55154,
+            "ba2d1a6486e17762199053fa44e5f51ddd4b8da1a9c13e957ab331cca3234006",
+        ),
+        (
+            "reverie/src/pmu.rs",
+            8462,
+            "88754c17f24ed582aa24bbc485c8eca5ee0b5a25ad191b2811107c918eecee39",
+        ),
     ];
 
     /// Seals over prefixes of `CONTENT_REVERIE_CATALOG_BINDINGS`: (rows covered,
@@ -41917,6 +41895,10 @@ mod tests {
         (
             127,
             "96c519432b88b8bc36cd3c43f9acbe09d0465ffb6958325e6559088d13768719",
+        ),
+        (
+            130,
+            "a6853a704331cf5fb2bb2976d5d272989327279d873796d5763babbeddb64dbe",
         ),
     ];
 
@@ -42133,7 +42115,11 @@ mod tests {
         fs::write(&profile, b"data-only profile flags").unwrap();
         let mut workspace_shas: Vec<String> = workspace_files
             .iter()
-            .map(|relative| FileIdentity::read(&workspace.join(relative)).unwrap().sha256)
+            .map(|relative| {
+                FileIdentity::read(&workspace.join(relative))
+                    .unwrap()
+                    .sha256
+            })
             .collect();
         let workspace_expected: Vec<ExpectedSourceFile<'_>> = workspace_files
             .iter()
@@ -42263,12 +42249,11 @@ mod tests {
         fs::remove_dir(nested.parent().unwrap()).unwrap();
         // Junk Reverie content refuses by name against the reviewed
         // catalogue digests: declared presence alone never authorizes bytes.
-        let junk_error = match VerifiedCompiledSources::resolve_buck(&expectation!(
-            &pin, &reverie_files
-        )) {
-            Ok(_) => panic!("junk Reverie content must refuse"),
-            Err(error) => error,
-        };
+        let junk_error =
+            match VerifiedCompiledSources::resolve_buck(&expectation!(&pin, &reverie_files)) {
+                Ok(_) => panic!("junk Reverie content must refuse"),
+                Err(error) => error,
+            };
         assert!(
             junk_error.contains("reviewed catalog"),
             "junk Reverie content must refuse by name: {junk_error}"
@@ -42290,8 +42275,7 @@ mod tests {
             ),
             (
                 "reverie-inguest/src/guest/tool_region_arena.rs",
-                include_bytes!("../../reverie-inguest/src/guest/tool_region_arena.rs")
-                    .as_slice(),
+                include_bytes!("../../reverie-inguest/src/guest/tool_region_arena.rs").as_slice(),
             ),
             (
                 "reverie-inguest/src/guest/tool_region.rs",
@@ -42299,8 +42283,7 @@ mod tests {
             ),
             (
                 "reverie-inguest/src/guest/tool_region_keyed.rs",
-                include_bytes!("../../reverie-inguest/src/guest/tool_region_keyed.rs")
-                    .as_slice(),
+                include_bytes!("../../reverie-inguest/src/guest/tool_region_keyed.rs").as_slice(),
             ),
             (
                 "reverie-liteinst-preload/src/lib.rs",
@@ -42604,12 +42587,7 @@ mod tests {
             .push(buck_command(good_args(), 0, &link_stdout));
         let link_bound = sources.with_buck_build(&buck_runner, &elf).unwrap();
         assert_eq!(
-            link_bound
-                .current_build
-                .as_ref()
-                .unwrap()
-                .artifact()
-                .path,
+            link_bound.current_build.as_ref().unwrap().artifact().path,
             FileIdentity::read(&elf).unwrap().path,
             "stdout-derived symlink canonicalizes to the real ELF"
         );
@@ -42673,7 +42651,11 @@ mod tests {
         drop(workspace_expected);
         workspace_shas = workspace_files
             .iter()
-            .map(|relative| FileIdentity::read(&workspace.join(relative)).unwrap().sha256)
+            .map(|relative| {
+                FileIdentity::read(&workspace.join(relative))
+                    .unwrap()
+                    .sha256
+            })
             .collect();
         let workspace_expected_changed: Vec<ExpectedSourceFile<'_>> = workspace_files
             .iter()
@@ -44168,6 +44150,21 @@ mod tests {
                 8175,
                 "9ca37a8ef80bc02e2282f8f823fba954ad9d86a7be26aa5968347cd44305cba6",
             ),
+            (
+                "reverie-liteinst/src/lib.rs",
+                40823,
+                "4017332b6de2a6e32bb31b816dfc2b72f16b69200916cdfedde3ed978d17cf0e",
+            ),
+            (
+                "reverie-liteinst-artifact/src/preparation_identity.rs",
+                55168,
+                "a49de665049d98780ed59832387cb8017687527f961c822105fd0e47aa11f822",
+            ),
+            (
+                "reverie/src/pmu.rs",
+                8462,
+                "de1fc186e000181ab776086b8266a4c668f626cc1d63dc5c9c1c5066d6d062d8",
+            ),
         ];
         // A re-bind records its previous tuple above, for every path, not only these.
         // Catalogue-rebind enforcement runs here, inside content_source_identity_controls,
@@ -44548,7 +44545,14 @@ mod tests {
             {"name":"hermit-liteinst-runtime-artifact", "manifest_path":root.join("liteinst-runtime-build/runtime/Cargo.toml"),
              "dependencies":[{"name":"reverie-liteinst-preload", "source":source.rsplit_once('#').unwrap().0, "kind":null, "rename":null, "path":null}]}
         ]});
-        content_manifest_and_lock_pin(&pin_metadata, &root, &source, &rv_one, &test_consumer_declaration()).unwrap();
+        content_manifest_and_lock_pin(
+            &pin_metadata,
+            &root,
+            &source,
+            &rv_one,
+            &test_consumer_declaration(),
+        )
+        .unwrap();
         for index in 0..2 {
             for (field, value) in [
                 ("name", serde_json::json!("wrong-dependency")),
@@ -44563,7 +44567,14 @@ mod tests {
                 let mut bad = pin_metadata.clone();
                 bad["packages"][index]["dependencies"][0][field] = value;
                 assert!(
-                    content_manifest_and_lock_pin(&bad, &root, &source, &rv_one, &test_consumer_declaration()).is_err(),
+                    content_manifest_and_lock_pin(
+                        &bad,
+                        &root,
+                        &source,
+                        &rv_one,
+                        &test_consumer_declaration()
+                    )
+                    .is_err(),
                     "declared manifest dependency {index}/{field}"
                 );
             }
@@ -44572,7 +44583,16 @@ mod tests {
                 "{}/./liteinst-runtime-build/Cargo.toml",
                 root.display()
             ));
-            assert!(content_manifest_and_lock_pin(&bad, &root, &source, &rv_one, &test_consumer_declaration()).is_err());
+            assert!(
+                content_manifest_and_lock_pin(
+                    &bad,
+                    &root,
+                    &source,
+                    &rv_one,
+                    &test_consumer_declaration()
+                )
+                .is_err()
+            );
         }
         for wrong in [
             lock_bytes.replacen(pin, "047e802e861094bbf827c4fc1bb067c18de7d8dd", 1),
@@ -44588,9 +44608,25 @@ mod tests {
             format!("{lock_bytes}{lock_bytes}"),
         ] {
             fs::write(&lock, wrong).unwrap();
-            assert!(content_manifest_and_lock_pin(&pin_metadata, &root, &source, &rv_one, &test_consumer_declaration()).is_err());
+            assert!(
+                content_manifest_and_lock_pin(
+                    &pin_metadata,
+                    &root,
+                    &source,
+                    &rv_one,
+                    &test_consumer_declaration()
+                )
+                .is_err()
+            );
             fs::write(&lock, &lock_bytes).unwrap();
-            content_manifest_and_lock_pin(&pin_metadata, &root, &source, &rv_one, &test_consumer_declaration()).unwrap();
+            content_manifest_and_lock_pin(
+                &pin_metadata,
+                &root,
+                &source,
+                &rv_one,
+                &test_consumer_declaration(),
+            )
+            .unwrap();
         }
         fs::write(&lock, &lock_bytes).unwrap();
         let (workspace_inventory, _) = declared_inventory(&root, &CONTENT_WORKSPACE_FILES).unwrap();
@@ -44703,39 +44739,100 @@ mod tests {
         .map(|name| format!("[[package]]\nname = \"{name}\"\n"))
         .collect::<String>();
         fs::write(&lock, &path_lock_bytes).unwrap();
-        content_manifest_and_lock_pin(&path_metadata, &root, &source, &rv_one, &test_consumer_declaration()).unwrap();
+        content_manifest_and_lock_pin(
+            &path_metadata,
+            &root,
+            &source,
+            &rv_one,
+            &test_consumer_declaration(),
+        )
+        .unwrap();
         // Red: a path dependency outside the verified root is real skew.
         let mut outside = path_metadata.clone();
         outside["packages"][0]["dependencies"][0]["path"] =
             serde_json::json!(root.join("elsewhere/reverie-liteinst-artifact"));
-        assert!(content_manifest_and_lock_pin(&outside, &root, &source, &rv_one, &test_consumer_declaration()).is_err());
+        assert!(
+            content_manifest_and_lock_pin(
+                &outside,
+                &root,
+                &source,
+                &rv_one,
+                &test_consumer_declaration()
+            )
+            .is_err()
+        );
         // Red: a sourceless lock entry whose package resolves elsewhere.
         let mut stray = path_metadata.clone();
         stray["packages"][2]["manifest_path"] =
             serde_json::json!(root.join("elsewhere/reverie-inguest/Cargo.toml"));
-        assert!(content_manifest_and_lock_pin(&stray, &root, &source, &rv_one, &test_consumer_declaration()).is_err());
+        assert!(
+            content_manifest_and_lock_pin(
+                &stray,
+                &root,
+                &source,
+                &rv_one,
+                &test_consumer_declaration()
+            )
+            .is_err()
+        );
         // Red: a renamed path dependency refuses (rename must be null
         // in both forms).
         let mut renamed = path_metadata.clone();
         renamed["packages"][0]["dependencies"][0]["rename"] = serde_json::json!("alias");
-        assert!(content_manifest_and_lock_pin(&renamed, &root, &source, &rv_one, &test_consumer_declaration()).is_err());
+        assert!(
+            content_manifest_and_lock_pin(
+                &renamed,
+                &root,
+                &source,
+                &rv_one,
+                &test_consumer_declaration()
+            )
+            .is_err()
+        );
         // Red: a git source together with an at-root path is neither form.
         let mut both = path_metadata.clone();
         both["packages"][0]["dependencies"][0]["source"] =
             serde_json::json!(source.rsplit_once('#').unwrap().0);
-        assert!(content_manifest_and_lock_pin(&both, &root, &source, &rv_one, &test_consumer_declaration()).is_err());
+        assert!(
+            content_manifest_and_lock_pin(
+                &both,
+                &root,
+                &source,
+                &rv_one,
+                &test_consumer_declaration()
+            )
+            .is_err()
+        );
         // Red: a mixed layout (first dependency by path, second by git)
         // is two source authorities for one pin.
         let mut mixed = path_metadata.clone();
         mixed["packages"][1]["dependencies"][0]["source"] =
             serde_json::json!(source.rsplit_once('#').unwrap().0);
         mixed["packages"][1]["dependencies"][0]["path"] = serde_json::Value::Null;
-        assert!(content_manifest_and_lock_pin(&mixed, &root, &source, &rv_one, &test_consumer_declaration()).is_err());
+        assert!(
+            content_manifest_and_lock_pin(
+                &mixed,
+                &root,
+                &source,
+                &rv_one,
+                &test_consumer_declaration()
+            )
+            .is_err()
+        );
         // Red: a sourceless lock entry while metadata reports a git
         // source for the same package is not path-bound.
         let mut gitmeta = path_metadata.clone();
         gitmeta["packages"][2]["source"] = serde_json::json!(source);
-        assert!(content_manifest_and_lock_pin(&gitmeta, &root, &source, &rv_one, &test_consumer_declaration()).is_err());
+        assert!(
+            content_manifest_and_lock_pin(
+                &gitmeta,
+                &root,
+                &source,
+                &rv_one,
+                &test_consumer_declaration()
+            )
+            .is_err()
+        );
         // Red: a [patch]-redirected graph (manifests declare git
         // sources, Cargo resolves path packages, lock entries are
         // sourceless) must not slip into the git form and skip the
@@ -44745,13 +44842,18 @@ mod tests {
         let mut patched = path_metadata.clone();
         for package in patched["packages"].as_array_mut().unwrap() {
             for dependency in package["dependencies"].as_array_mut().into_iter().flatten() {
-                dependency["source"] =
-                    serde_json::json!(source.rsplit_once('#').unwrap().0);
+                dependency["source"] = serde_json::json!(source.rsplit_once('#').unwrap().0);
                 dependency["path"] = serde_json::Value::Null;
             }
         }
-        let patched_err =
-            content_manifest_and_lock_pin(&patched, &root, &source, &rv_one, &test_consumer_declaration()).unwrap_err();
+        let patched_err = content_manifest_and_lock_pin(
+            &patched,
+            &root,
+            &source,
+            &rv_one,
+            &test_consumer_declaration(),
+        )
+        .unwrap_err();
         assert!(
             patched_err.contains("content lock source differs"),
             "patch-redirect refusal must come from the lock layout arm: {patched_err}"
@@ -44762,7 +44864,16 @@ mod tests {
             .as_array_mut()
             .unwrap()
             .push(path_metadata["packages"][2].clone());
-        assert!(content_manifest_and_lock_pin(&dup, &root, &source, &rv_one, &test_consumer_declaration()).is_err());
+        assert!(
+            content_manifest_and_lock_pin(
+                &dup,
+                &root,
+                &source,
+                &rv_one,
+                &test_consumer_declaration()
+            )
+            .is_err()
+        );
         fs::remove_dir_all(root).expect("remove path-form fixture repository");
     }
 
@@ -44800,27 +44911,55 @@ mod tests {
         git(&root, &["add", "-A"]);
         git(
             &root,
-            &["update-index", "--add", "--cacheinfo", &format!("160000,{pin},reverie")],
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{pin},reverie"),
+            ],
         );
         git(&root, &["commit", "-qm", "fixture hermit"]);
         let binding = CompilerRootBinding::resolve(&root.join("reverie"), &pin).unwrap();
-        let mut runner =
-            Runner::new(case.join("logs"), Duration::from_secs(60), 1 << 20).unwrap();
-        require_reverie_checkout_at_pin(&root, &binding, &pin, true, Path::new("reverie"), &mut runner).unwrap();
+        let mut runner = Runner::new(case.join("logs"), Duration::from_secs(60), 1 << 20).unwrap();
+        require_reverie_checkout_at_pin(
+            &root,
+            &binding,
+            &pin,
+            true,
+            Path::new("reverie"),
+            &mut runner,
+        )
+        .unwrap();
         // Another revision whose catalogued file is byte-identical: an
         // uncatalogued file changes HEAD only. Must refuse.
         fs::write(rv.join("uncatalogued"), "other revision\n").unwrap();
         git(&rv, &["add", "-A"]);
         git(&rv, &["commit", "-qm", "other revision"]);
         assert!(
-            require_reverie_checkout_at_pin(&root, &binding, &pin, true, Path::new("reverie"), &mut runner).is_err(),
+            require_reverie_checkout_at_pin(
+                &root,
+                &binding,
+                &pin,
+                true,
+                Path::new("reverie"),
+                &mut runner
+            )
+            .is_err(),
             "a checkout at another revision must not certify as the pin"
         );
         // Back at the pin but dirty: compiled identity refuses.
         git(&rv, &["checkout", "-q", &pin]);
         fs::write(rv.join("catalogued"), "dirty\n").unwrap();
         assert!(
-            require_reverie_checkout_at_pin(&root, &binding, &pin, true, Path::new("reverie"), &mut runner).is_err(),
+            require_reverie_checkout_at_pin(
+                &root,
+                &binding,
+                &pin,
+                true,
+                Path::new("reverie"),
+                &mut runner
+            )
+            .is_err(),
             "a dirty checkout at the pin must refuse"
         );
         fs::write(rv.join("catalogued"), "same bytes\n").unwrap();
@@ -44835,20 +44974,42 @@ mod tests {
         );
         git(&root, &["commit", "-qm", "wrong gitlink"]);
         assert!(
-            require_reverie_checkout_at_pin(&root, &binding, &pin, true, Path::new("reverie"), &mut runner).is_err(),
+            require_reverie_checkout_at_pin(
+                &root,
+                &binding,
+                &pin,
+                true,
+                Path::new("reverie"),
+                &mut runner
+            )
+            .is_err(),
             "a gitlink at another revision must refuse"
         );
         // No .git at the root: the path form fails closed (named
         // refusal), while the git form runs no git command at all.
         fs::remove_dir_all(rv.join(".git")).unwrap();
-        let closed = require_reverie_checkout_at_pin(&root, &binding, &pin, true, Path::new("reverie"), &mut runner)
-            .expect_err("path form without Git metadata must refuse");
+        let closed = require_reverie_checkout_at_pin(
+            &root,
+            &binding,
+            &pin,
+            true,
+            Path::new("reverie"),
+            &mut runner,
+        )
+        .expect_err("path form without Git metadata must refuse");
         assert!(
             closed.contains("no Git metadata"),
             "refusal must name the missing Git metadata: {closed}"
         );
-        require_reverie_checkout_at_pin(&root, &binding, &pin, false, Path::new("reverie"), &mut runner)
-            .expect("git form runs no checkout check");
+        require_reverie_checkout_at_pin(
+            &root,
+            &binding,
+            &pin,
+            false,
+            Path::new("reverie"),
+            &mut runner,
+        )
+        .expect("git form runs no checkout check");
         fs::remove_dir_all(&case).expect("remove pin-head fixture");
     }
 
@@ -44918,11 +45079,21 @@ mod tests {
         .collect::<String>();
         let lock = lock + "[[package]]\nname = \"detcore-liteinst\"\nversion = \"0.5.7\"\n";
         fs::write(root.join("Cargo.lock"), &lock).unwrap();
-        content_leaf_manifest_and_lock_pin(&build(&moved_source), &root, &moved_source, test_leaf_decl()).unwrap();
+        content_leaf_manifest_and_lock_pin(
+            &build(&moved_source),
+            &root,
+            &moved_source,
+            test_leaf_decl(),
+        )
+        .unwrap();
         let third_source = cargo_git_source(third, pin);
-        let refusal =
-            content_leaf_manifest_and_lock_pin(&build(&moved_source), &root, &third_source, test_leaf_decl())
-                .expect_err("a third repository must refuse the moved consumer's spelling");
+        let refusal = content_leaf_manifest_and_lock_pin(
+            &build(&moved_source),
+            &root,
+            &third_source,
+            test_leaf_decl(),
+        )
+        .expect_err("a third repository must refuse the moved consumer's spelling");
         assert!(
             refusal.contains(
                 "content leaf dependency differs from independent full pin: reverie-core"
@@ -45234,8 +45405,12 @@ mod tests {
         let workspace = root.join("consumer");
         fs::create_dir_all(&workspace).unwrap();
         symlink(&canonical, workspace.join("reverie")).unwrap();
-        let binding =
-            CompilerRootBinding::resolve_path(&workspace.join("reverie"), &workspace, Path::new("reverie")).unwrap();
+        let binding = CompilerRootBinding::resolve_path(
+            &workspace.join("reverie"),
+            &workspace,
+            Path::new("reverie"),
+        )
+        .unwrap();
         let binding_json = serde_json::to_value(&binding).unwrap();
         assert!(binding_json["cargo_home"].is_null());
         assert_eq!(
@@ -45337,8 +45512,7 @@ mod tests {
             },
             manifest: FileIdentity {
                 path: root.join("Cargo.toml"),
-                sha256: "d55feb0aab4ae13f8817cfb85404ce3904b00ed268cd5fec84c16027cc6da630"
-                    .into(),
+                sha256: "d55feb0aab4ae13f8817cfb85404ce3904b00ed268cd5fec84c16027cc6da630".into(),
             },
             reverie_pin: "2".repeat(40),
             reverie_root: root,
@@ -45360,8 +45534,7 @@ mod tests {
         // to identical bytes; only the path-spelled form emits the
         // field, so previously valid git-spelled records and their
         // hashes are unchanged.
-        const PARENT_BYTES: &[u8] =
-            include_bytes!("declared_content_parent_record.json");
+        const PARENT_BYTES: &[u8] = include_bytes!("declared_content_parent_record.json");
         assert_eq!(PARENT_BYTES.len(), 1589);
         assert_eq!(
             sha256(PARENT_BYTES),
@@ -45409,8 +45582,7 @@ mod tests {
             },
             manifest: FileIdentity {
                 path: root.join("Cargo.toml"),
-                sha256: "d55feb0aab4ae13f8817cfb85404ce3904b00ed268cd5fec84c16027cc6da630"
-                    .into(),
+                sha256: "d55feb0aab4ae13f8817cfb85404ce3904b00ed268cd5fec84c16027cc6da630".into(),
             },
             reverie_pin: "2".repeat(40),
             reverie_root: checkout,
@@ -45502,10 +45674,8 @@ mod tests {
         // Genericity proof: a different consumer's names pass the same
         // mechanism. The declaration below shares no package, target,
         // directory or version spelling with the test consumer above.
-        let scratch = std::env::temp_dir().join(format!(
-            "consumer-decl-controls-{}",
-            std::process::id()
-        ));
+        let scratch =
+            std::env::temp_dir().join(format!("consumer-decl-controls-{}", std::process::id()));
         fs::create_dir_all(scratch.join("consumer-leaf/src")).unwrap();
         fs::write(scratch.join("consumer-leaf/Cargo.toml"), "fixture\n").unwrap();
         fs::write(scratch.join("consumer-leaf/src/lib.rs"), "// fixture\n").unwrap();
@@ -45601,7 +45771,8 @@ mod tests {
         fs::create_dir_all(&workspace).unwrap();
         symlink(&canonical, workspace.join("reverie")).unwrap();
         let logical = workspace.join("reverie");
-        let binding = CompilerRootBinding::resolve_path(&logical, &workspace, Path::new("reverie")).unwrap();
+        let binding =
+            CompilerRootBinding::resolve_path(&logical, &workspace, Path::new("reverie")).unwrap();
         assert_eq!(binding.logical_root, logical);
         assert_eq!(binding.canonical_root, canonical);
         assert_eq!(binding.cargo_home, None);
@@ -45611,24 +45782,39 @@ mod tests {
         );
         // Only the exact <workspace>/reverie spelling opens the path gate;
         // the Cargo-home gate refuses that spelling in return.
-        assert!(CompilerRootBinding::resolve_path(&canonical, &workspace, Path::new("reverie")).is_err());
-        assert!(CompilerRootBinding::resolve_path(&workspace.join("other"), &workspace, Path::new("reverie")).is_err());
-        assert!(CompilerRootBinding::resolve_path(
-            &PathBuf::from(format!("{}/./reverie", workspace.display())),
-            &workspace
-        , Path::new("reverie"))
-        .is_err());
+        assert!(
+            CompilerRootBinding::resolve_path(&canonical, &workspace, Path::new("reverie"))
+                .is_err()
+        );
+        assert!(
+            CompilerRootBinding::resolve_path(
+                &workspace.join("other"),
+                &workspace,
+                Path::new("reverie")
+            )
+            .is_err()
+        );
+        assert!(
+            CompilerRootBinding::resolve_path(
+                &PathBuf::from(format!("{}/./reverie", workspace.display())),
+                &workspace,
+                Path::new("reverie")
+            )
+            .is_err()
+        );
         let pin = "347e802e861094bbf827c4fc1bb067c18de7d8dd";
         fs::create_dir_all(root.join("cargo-home")).unwrap();
-        assert!(CompilerRootBinding::resolve_cargo_home(
-            &logical,
-            pin,
-            &root.join("cargo-home")
-        )
-        .is_err());
+        assert!(
+            CompilerRootBinding::resolve_cargo_home(&logical, pin, &root.join("cargo-home"))
+                .is_err()
+        );
         let git_source = format!("git+https://github.com/rrnewton/reverie.git?rev={pin}#{pin}");
         for (name, target, kind) in [
-            ("reverie-inguest", "reverie_inguest", &["cdylib", "rlib"][..]),
+            (
+                "reverie-inguest",
+                "reverie_inguest",
+                &["cdylib", "rlib"][..],
+            ),
             ("reverie-syscalls", "reverie_syscalls", &["lib"][..]),
             ("reverie-liteinst", "reverie_liteinst", &["rlib"][..]),
             (
@@ -45757,16 +45943,27 @@ mod tests {
             {"name": "reverie-liteinst-preload",
              "manifest_path": logical.join("reverie-liteinst-preload/Cargo.toml")}
         ]});
-        content_manifest_and_lock_pin_path(&pin_metadata, &workspace, &logical, &test_consumer_declaration()).unwrap();
+        content_manifest_and_lock_pin_path(
+            &pin_metadata,
+            &workspace,
+            &logical,
+            &test_consumer_declaration(),
+        )
+        .unwrap();
         // The landed 4-arg pin accepts these path manifest
         // dependencies under `logical`, but refuses at the lock stage:
         // `pin_metadata` names only reverie-liteinst-artifact and
         // reverie-liteinst-preload, so the sourceless lock entries for
         // reverie-inguest (checked first), reverie-syscalls and
         // reverie-liteinst are not path-bound to the verified root.
-        let lock_refusal =
-            content_manifest_and_lock_pin(&pin_metadata, &workspace, &git_source, &logical, &test_consumer_declaration())
-                .expect_err("landed pin must refuse unbound sourceless lock entries");
+        let lock_refusal = content_manifest_and_lock_pin(
+            &pin_metadata,
+            &workspace,
+            &git_source,
+            &logical,
+            &test_consumer_declaration(),
+        )
+        .expect_err("landed pin must refuse unbound sourceless lock entries");
         assert!(
             lock_refusal.contains("content lock source differs from independent full pin"),
             "refusal must be at the lock stage: {lock_refusal}"
@@ -45786,7 +45983,13 @@ mod tests {
                 let mut bad = pin_metadata.clone();
                 bad["packages"][index]["dependencies"][0][field] = value;
                 assert!(
-                    content_manifest_and_lock_pin_path(&bad, &workspace, &logical, &test_consumer_declaration()).is_err(),
+                    content_manifest_and_lock_pin_path(
+                        &bad,
+                        &workspace,
+                        &logical,
+                        &test_consumer_declaration()
+                    )
+                    .is_err(),
                     "path manifest dependency {index}/{field}"
                 );
             }
@@ -45805,10 +46008,23 @@ mod tests {
             standalone_lock.replace("name = \"reverie-syscalls\"", "name = \"lookalike\""),
         ] {
             fs::write(&standalone_lock_path, wrong).unwrap();
-            assert!(content_manifest_and_lock_pin_path(&pin_metadata, &workspace, &logical, &test_consumer_declaration())
-                .is_err());
+            assert!(
+                content_manifest_and_lock_pin_path(
+                    &pin_metadata,
+                    &workspace,
+                    &logical,
+                    &test_consumer_declaration()
+                )
+                .is_err()
+            );
             fs::write(&standalone_lock_path, &standalone_lock).unwrap();
-            content_manifest_and_lock_pin_path(&pin_metadata, &workspace, &logical, &test_consumer_declaration()).unwrap();
+            content_manifest_and_lock_pin_path(
+                &pin_metadata,
+                &workspace,
+                &logical,
+                &test_consumer_declaration(),
+            )
+            .unwrap();
         }
         for relative in [
             "Cargo.toml",
@@ -45862,7 +46078,8 @@ mod tests {
             {"name": "reverie-rpc-transport",
              "manifest_path": logical.join("reverie-rpc-transport/Cargo.toml")}
         ]});
-        content_leaf_manifest_and_lock_pin_path(&runtime, &workspace, &logical, test_leaf_decl()).unwrap();
+        content_leaf_manifest_and_lock_pin_path(&runtime, &workspace, &logical, test_leaf_decl())
+            .unwrap();
         // The fbsource workspace spelling (`reverie-core = { workspace
         // = true }`, path declared in workspace.dependencies) reports
         // no rename for the same exact package; `reverie-core`'s lib
@@ -45870,38 +46087,50 @@ mod tests {
         // rename and this one name one crate.
         let mut unrenamed = runtime.clone();
         unrenamed["packages"][0]["dependencies"][0]["rename"] = serde_json::json!(null);
-        content_leaf_manifest_and_lock_pin_path(&unrenamed, &workspace, &logical, test_leaf_decl()).unwrap();
+        content_leaf_manifest_and_lock_pin_path(&unrenamed, &workspace, &logical, test_leaf_decl())
+            .unwrap();
         // Any other rename still refuses by name, package identity exact.
         let mut junk_rename = runtime.clone();
         junk_rename["packages"][0]["dependencies"][0]["rename"] = serde_json::json!("junk");
-        let refusal =
-            content_leaf_manifest_and_lock_pin_path(&junk_rename, &workspace, &logical, test_leaf_decl())
-                .expect_err("a junk reverie-core rename must refuse");
+        let refusal = content_leaf_manifest_and_lock_pin_path(
+            &junk_rename,
+            &workspace,
+            &logical,
+            test_leaf_decl(),
+        )
+        .expect_err("a junk reverie-core rename must refuse");
         assert!(
-            refusal
-                .contains("content leaf dependency differs from path package: reverie-core"),
+            refusal.contains("content leaf dependency differs from path package: reverie-core"),
             "the refusal must name the mismatched dependency: {refusal}"
         );
-        assert!(content_leaf_manifest_and_lock_pin(&runtime, &workspace, &git_source, test_leaf_decl())
-            .is_err());
+        assert!(
+            content_leaf_manifest_and_lock_pin(&runtime, &workspace, &git_source, test_leaf_decl())
+                .is_err()
+        );
         for (index, field, value) in [
-            (
-                0,
-                "path",
-                serde_json::json!(logical.join("reverie-core")),
-            ),
+            (0, "path", serde_json::json!(logical.join("reverie-core"))),
             (
                 0,
                 "source",
                 serde_json::json!(git_source.rsplit_once('#').unwrap().0),
             ),
-            (1, "path", serde_json::json!(canonical.join("reverie-inguest"))),
+            (
+                1,
+                "path",
+                serde_json::json!(canonical.join("reverie-inguest")),
+            ),
             (3, "optional", serde_json::json!(false)),
         ] {
             let mut bad = runtime.clone();
             bad["packages"][0]["dependencies"][index][field] = value;
             assert!(
-                content_leaf_manifest_and_lock_pin_path(&bad, &workspace, &logical, test_leaf_decl()).is_err(),
+                content_leaf_manifest_and_lock_pin_path(
+                    &bad,
+                    &workspace,
+                    &logical,
+                    test_leaf_decl()
+                )
+                .is_err(),
                 "path leaf dependency {index}/{field}"
             );
         }
@@ -45909,15 +46138,20 @@ mod tests {
             &leaf_lock_path,
             leaf_lock.replacen(
                 "name = \"reverie-core\"\nversion = \"0.5.7\"",
-                &format!(
-                    "name = \"reverie-core\"\nversion = \"0.5.7\"\nsource = \"{git_source}\""
-                ),
+                &format!("name = \"reverie-core\"\nversion = \"0.5.7\"\nsource = \"{git_source}\""),
                 1,
             ),
         )
         .unwrap();
-        assert!(content_leaf_manifest_and_lock_pin_path(&runtime, &workspace, &logical, test_leaf_decl())
-            .is_err());
+        assert!(
+            content_leaf_manifest_and_lock_pin_path(
+                &runtime,
+                &workspace,
+                &logical,
+                test_leaf_decl()
+            )
+            .is_err()
+        );
         fs::write(&leaf_lock_path, &leaf_lock).unwrap();
         let graph = serde_json::json!({"packages": [{"name": "reverie-inguest",
             "manifest_path": logical.join("reverie-inguest/Cargo.toml")}]});
@@ -45927,9 +46161,17 @@ mod tests {
         );
         let canonical_graph = serde_json::json!({"packages": [{"name": "reverie-inguest",
             "manifest_path": canonical.join("reverie-inguest/Cargo.toml")}]});
-        assert!(content_root_binding_path(&canonical_graph, &workspace, Path::new("reverie")).is_err());
-        assert!(content_root_binding_path(&serde_json::json!({"packages": []}), &workspace, Path::new("reverie"))
-            .is_err());
+        assert!(
+            content_root_binding_path(&canonical_graph, &workspace, Path::new("reverie")).is_err()
+        );
+        assert!(
+            content_root_binding_path(
+                &serde_json::json!({"packages": []}),
+                &workspace,
+                Path::new("reverie")
+            )
+            .is_err()
+        );
     }
 
     // The Reverie workspace root is the parent of the run-time
@@ -45937,9 +46179,11 @@ mod tests {
     // test target points it into staged sources. Reading it at run time
     // (not env!) keeps the compiling machine's path out of the test.
     fn reverie_workspace_root() -> PathBuf {
-        PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect(
-            "CARGO_MANIFEST_DIR names reverie-liteinst-artifact's directory at run time",
-        ))
+        PathBuf::from(
+            std::env::var_os("CARGO_MANIFEST_DIR").expect(
+                "CARGO_MANIFEST_DIR names reverie-liteinst-artifact's directory at run time",
+            ),
+        )
         .parent()
         .expect("crate directory has a parent")
         .to_path_buf()
@@ -45965,22 +46209,18 @@ mod tests {
         let _owned = OwnedScratch(root.clone());
         let real_root = reverie_workspace_root();
         let canonical = root.join("real-reverie");
-        for relative in CONTENT_REVERIE_CATALOG
-            .iter()
-            .map(|row| row.0)
-            .chain([
-                CONTENT_FIXED_GATE.0,
-                "reverie-liteinst-artifact/src/lib.rs",
-                "reverie-inguest/Cargo.toml",
-                "reverie-inguest/src/lib.rs",
-                "reverie-syscalls/Cargo.toml",
-                "reverie-syscalls/src/lib.rs",
-                "reverie-liteinst/Cargo.toml",
-                "reverie-liteinst/src/lib.rs",
-                "reverie-liteinst-preload/Cargo.toml",
-                "reverie-liteinst-preload/src/lib.rs",
-            ])
-        {
+        for relative in CONTENT_REVERIE_CATALOG.iter().map(|row| row.0).chain([
+            CONTENT_FIXED_GATE.0,
+            "reverie-liteinst-artifact/src/lib.rs",
+            "reverie-inguest/Cargo.toml",
+            "reverie-inguest/src/lib.rs",
+            "reverie-syscalls/Cargo.toml",
+            "reverie-syscalls/src/lib.rs",
+            "reverie-liteinst/Cargo.toml",
+            "reverie-liteinst/src/lib.rs",
+            "reverie-liteinst-preload/Cargo.toml",
+            "reverie-liteinst-preload/src/lib.rs",
+        ]) {
             let to = canonical.join(relative);
             fs::create_dir_all(to.parent().unwrap()).unwrap();
             fs::copy(real_root.join(relative), &to).unwrap();
@@ -46041,12 +46281,9 @@ mod tests {
                 .windows(2)
                 .all(|pair| pair[0].relative < pair[1].relative)
         );
-        let (leaf_inventory, _) = content_reverie_inventory_for_path(
-            &canonical,
-            FixedImageKind::Detcore,
-            &package_dirs,
-        )
-        .unwrap();
+        let (leaf_inventory, _) =
+            content_reverie_inventory_for_path(&canonical, FixedImageKind::Detcore, &package_dirs)
+                .unwrap();
         assert!(
             leaf_inventory
                 .iter()
@@ -46062,16 +46299,21 @@ mod tests {
             refusal.contains("reverie-inguest/src/extra_closure.rs"),
             "{refusal}"
         );
-        require_complete_reverie_closure_inventory(&canonical, &package_dirs, &relatives)
-            .unwrap();
+        require_complete_reverie_closure_inventory(&canonical, &package_dirs, &relatives).unwrap();
         let alias = canonical.join("reverie-inguest/src/alias_closure.rs");
-        symlink(canonical.join("reverie-inguest/src/extra_closure.rs"), &alias).unwrap();
-        assert!(content_reverie_inventory_for_path(
-            &canonical,
-            FixedImageKind::Standalone,
-            &package_dirs
+        symlink(
+            canonical.join("reverie-inguest/src/extra_closure.rs"),
+            &alias,
         )
-        .is_err());
+        .unwrap();
+        assert!(
+            content_reverie_inventory_for_path(
+                &canonical,
+                FixedImageKind::Standalone,
+                &package_dirs
+            )
+            .is_err()
+        );
         fs::remove_file(&alias).unwrap();
         // Source-ness follows either name (target side here): an
         // extensionless link directly to a source file refuses too.
@@ -46124,12 +46366,14 @@ mod tests {
         content_reverie_inventory_for_path(&canonical, FixedImageKind::Standalone, &package_dirs)
             .unwrap();
         fs::write(docs.join("hidden.rs"), "hidden\n").unwrap();
-        assert!(content_reverie_inventory_for_path(
-            &canonical,
-            FixedImageKind::Standalone,
-            &package_dirs
-        )
-        .is_err());
+        assert!(
+            content_reverie_inventory_for_path(
+                &canonical,
+                FixedImageKind::Standalone,
+                &package_dirs
+            )
+            .is_err()
+        );
         fs::remove_dir_all(&docs).unwrap();
         fs::remove_file(canonical.join("reverie-inguest/docs-link")).unwrap();
         // Depth counts plain-directory descent too, so a link to a
@@ -46163,8 +46407,12 @@ mod tests {
             fs::write(workspace.join(relative), format!("snapshot {relative}\n")).unwrap();
         }
         symlink(&canonical, workspace.join("reverie")).unwrap();
-        let binding =
-            CompilerRootBinding::resolve_path(&workspace.join("reverie"), &workspace, Path::new("reverie")).unwrap();
+        let binding = CompilerRootBinding::resolve_path(
+            &workspace.join("reverie"),
+            &workspace,
+            Path::new("reverie"),
+        )
+        .unwrap();
         let (workspace_inventory, _) =
             declared_inventory(&workspace, &CONTENT_WORKSPACE_FILES).unwrap();
         let workspace_digest = declared_inventory_sha256(&workspace_inventory).unwrap();
@@ -46193,13 +46441,15 @@ mod tests {
         verify().unwrap();
         // The Git-arm verifier re-derives only the reviewed catalog, so it
         // must refuse this wider path inventory rather than vouch for it.
-        assert!(verify_declared_content(
-            FixedImageKind::Standalone,
-            (&workspace, &workspace_inventory, &workspace_digest),
-            (&canonical, &inventory, &reverie_digest),
-            &binding,
-        )
-        .is_err());
+        assert!(
+            verify_declared_content(
+                FixedImageKind::Standalone,
+                (&workspace, &workspace_inventory, &workspace_digest),
+                (&canonical, &inventory, &reverie_digest),
+                &binding,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -46390,7 +46640,10 @@ mod tests {
             &mut runner,
         )
         .expect("path-sourced leaf profile must resolve without Git");
-        assert_eq!(leaf_verified.record.layout, CompiledSourceLayout::PathCheckout);
+        assert_eq!(
+            leaf_verified.record.layout,
+            CompiledSourceLayout::PathCheckout
+        );
         assert_eq!(leaf_verified.record.leaf.name, "detcore-liteinst");
         // Path-spelled sources embed workspace-relative compiler
         // filenames: the declared relative root plus the file role.
@@ -46573,10 +46826,7 @@ mod tests {
                 "update-index",
                 "--add",
                 "--cacheinfo",
-                &format!(
-                    "160000,{pin},{}",
-                    declaration.reverie_relative.display()
-                ),
+                &format!("160000,{pin},{}", declaration.reverie_relative.display()),
             ],
         );
         git(&consumer_ws, &["commit", "-qm", "fixture consumer"]);
@@ -46686,7 +46936,10 @@ mod tests {
             &mut runner,
         )
         .expect("path-spelled Git checkout must resolve under the Git checkout layout");
-        assert_eq!(resolved.record.layout, CompiledSourceLayout::GitlinkCheckout);
+        assert_eq!(
+            resolved.record.layout,
+            CompiledSourceLayout::GitlinkCheckout
+        );
         assert_eq!(resolved.record.leaf.name, test_leaf_decl().name);
         assert_eq!(resolved.record.leaf.source, None);
         assert_eq!(
@@ -46695,8 +46948,7 @@ mod tests {
         );
         assert!(
             runner.commands().iter().any(|command| {
-                command.program == "git"
-                    && command.arguments.iter().any(|arg| arg == "ls-tree")
+                command.program == "git" && command.arguments.iter().any(|arg| arg == "ls-tree")
             }),
             "the gitlink pin proof must run for the Git checkout layout"
         );
@@ -46948,7 +47200,7 @@ mod tests {
                 binding,
                 Some(test_leaf_decl()),
             )
-                .unwrap(),
+            .unwrap(),
             leaf.manifest
         );
         assert!(
@@ -47025,8 +47277,15 @@ mod tests {
             let mut bad = runtime.clone();
             bad["packages"][0][field] = value;
             assert!(
-                compiled_leaf_package(&bad, root, rv_one, Some(source), FixedImageKind::Detcore, Some(test_leaf_decl()))
-                    .is_err()
+                compiled_leaf_package(
+                    &bad,
+                    root,
+                    rv_one,
+                    Some(source),
+                    FixedImageKind::Detcore,
+                    Some(test_leaf_decl())
+                )
+                .is_err()
             );
         }
         for (field, value) in [
@@ -47041,8 +47300,15 @@ mod tests {
             let mut bad = runtime.clone();
             bad["packages"][0]["targets"][0][field] = value;
             assert!(
-                compiled_leaf_package(&bad, root, rv_one, Some(source), FixedImageKind::Detcore, Some(test_leaf_decl()))
-                    .is_err(),
+                compiled_leaf_package(
+                    &bad,
+                    root,
+                    rv_one,
+                    Some(source),
+                    FixedImageKind::Detcore,
+                    Some(test_leaf_decl())
+                )
+                .is_err(),
                 "Detcore target {field}"
             );
         }
@@ -47054,7 +47320,9 @@ mod tests {
             .as_array_mut()
             .unwrap()
             .push(runtime["packages"][0].clone());
-        assert!(content_leaf_manifest_and_lock_pin(&duplicate, root, source, test_leaf_decl()).is_err());
+        assert!(
+            content_leaf_manifest_and_lock_pin(&duplicate, root, source, test_leaf_decl()).is_err()
+        );
         for index in 0..4 {
             for (field, value) in [
                 ("name", serde_json::json!("lookalike")),
@@ -47071,7 +47339,8 @@ mod tests {
                 let mut bad = runtime.clone();
                 bad["packages"][0]["dependencies"][index][field] = value;
                 assert!(
-                    content_leaf_manifest_and_lock_pin(&bad, root, source, test_leaf_decl()).is_err(),
+                    content_leaf_manifest_and_lock_pin(&bad, root, source, test_leaf_decl())
+                        .is_err(),
                     "Detcore dependency {index}/{field}"
                 );
             }
@@ -47116,7 +47385,10 @@ mod tests {
             format!("{lock_bytes}source = \"{source}\"\n"),
         ] {
             fs::write(&lock, wrong).unwrap();
-            assert!(content_leaf_manifest_and_lock_pin(&runtime, root, source, test_leaf_decl()).is_err());
+            assert!(
+                content_leaf_manifest_and_lock_pin(&runtime, root, source, test_leaf_decl())
+                    .is_err()
+            );
             fs::write(&lock, &lock_bytes).unwrap();
             content_leaf_manifest_and_lock_pin(&runtime, root, source, test_leaf_decl()).unwrap();
         }
@@ -47478,7 +47750,15 @@ mod tests {
             for git in [false, true] {
                 let valid = serde_json::json!({"packages":[package(name,target,&["cdylib"],git && image==FixedImageKind::Standalone,version)]});
                 let expected_source = git.then_some(source.as_str());
-                compiled_leaf_package(&valid, &root, &root, expected_source, image, Some(test_leaf_decl())).unwrap();
+                compiled_leaf_package(
+                    &valid,
+                    &root,
+                    &root,
+                    expected_source,
+                    image,
+                    Some(test_leaf_decl()),
+                )
+                .unwrap();
                 for (field, value) in [
                     (
                         "id",
@@ -47530,7 +47810,15 @@ mod tests {
                     let mut bad = valid.clone();
                     bad["packages"][0][field] = value;
                     assert!(
-                        compiled_leaf_package(&bad, &root, &root, expected_source, image, Some(test_leaf_decl())).is_err(),
+                        compiled_leaf_package(
+                            &bad,
+                            &root,
+                            &root,
+                            expected_source,
+                            image,
+                            Some(test_leaf_decl())
+                        )
+                        .is_err(),
                         "leaf {field}"
                     );
                 }
@@ -47549,7 +47837,15 @@ mod tests {
                     let mut bad = valid.clone();
                     bad["packages"][0]["targets"][0][field] = value;
                     assert!(
-                        compiled_leaf_package(&bad, &root, &root, expected_source, image, Some(test_leaf_decl())).is_err(),
+                        compiled_leaf_package(
+                            &bad,
+                            &root,
+                            &root,
+                            expected_source,
+                            image,
+                            Some(test_leaf_decl())
+                        )
+                        .is_err(),
                         "leaf target {field}"
                     );
                 }
@@ -47558,7 +47854,17 @@ mod tests {
                     .as_array_mut()
                     .unwrap()
                     .push(valid["packages"][0].clone());
-                assert!(compiled_leaf_package(&bad, &root, &root, expected_source, image, Some(test_leaf_decl())).is_err());
+                assert!(
+                    compiled_leaf_package(
+                        &bad,
+                        &root,
+                        &root,
+                        expected_source,
+                        image,
+                        Some(test_leaf_decl())
+                    )
+                    .is_err()
+                );
             }
         }
         let relative = "reverie-inguest/src/guest/alloc.rs";
@@ -47582,7 +47888,8 @@ mod tests {
             compiled_role_filename(CompiledSourceLayout::ReverieWorkspace, relative, &file)
                 .unwrap();
         assert_eq!(workspace, relative.as_bytes());
-        let git = compiled_role_filename(CompiledSourceLayout::GitlinkCheckout, relative, &file).unwrap();
+        let git =
+            compiled_role_filename(CompiledSourceLayout::GitlinkCheckout, relative, &file).unwrap();
         assert_eq!(git, path.as_os_str().as_encoded_bytes());
         assert!(
             compiled_role_filename(
@@ -47594,7 +47901,9 @@ mod tests {
         );
         fs::write(&path, b"changed after verification\n").unwrap();
         assert!(file.verify().is_err());
-        assert!(compiled_role_filename(CompiledSourceLayout::GitlinkCheckout, relative, &file).is_err());
+        assert!(
+            compiled_role_filename(CompiledSourceLayout::GitlinkCheckout, relative, &file).is_err()
+        );
         drop(owned);
     }
 
@@ -47653,7 +47962,6 @@ mod tests {
             logical.as_os_str().as_encoded_bytes()
         );
     }
-
 
     #[test]
     fn compiler_filename_git_spelled_inside_workspace_stays_absolute() {
@@ -47733,7 +48041,9 @@ mod tests {
             CompilerRootBinding::resolve_path(&pinned, &workspace, Path::new("pinned")).unwrap();
         let logical = binding.source_path(relative).unwrap();
         assert!(
-            binding.compiler_filename(&pinned, &logical, relative).is_err(),
+            binding
+                .compiler_filename(&pinned, &logical, relative)
+                .is_err(),
             "empty stem must refuse derivation"
         );
         // A binding deserialized without a spelling (evidence written
@@ -47820,13 +48130,17 @@ mod tests {
             0x1234,
         );
         assert!(by_pointer.contains("pointer slot differs"), "{by_pointer}");
-        assert!(by_pointer.contains("tool_region_constructor.rs"), "{by_pointer}");
+        assert!(
+            by_pointer.contains("tool_region_constructor.rs"),
+            "{by_pointer}"
+        );
         assert!(by_pointer.contains("expected=841:14"), "{by_pointer}");
         // No filename, or a row that is not a 24-byte location: the
         // previous message, byte-for-byte. The expected text is split
         // so this test adds no consumer-name line of its own.
         let plain = concat!(
-            "whole physical Det", "core readonly data differs: ",
+            "whole physical Det",
+            "core readonly data differs: ",
             "key=fixed_naked_constructor_record_location expected=841:14 address=0x1234"
         );
         assert_eq!(
@@ -78752,9 +79066,8 @@ pub mod private_static {
             // any shape this reader does not understand fails by name
             // rather than guessing. Absence fails; no skip.
             let workspace = PathBuf::from(
-                std::env::var_os("CARGO_MANIFEST_DIR").expect(
-                    "closed workspace-package check needs CARGO_MANIFEST_DIR at run time",
-                ),
+                std::env::var_os("CARGO_MANIFEST_DIR")
+                    .expect("closed workspace-package check needs CARGO_MANIFEST_DIR at run time"),
             )
             .parent()
             .expect("crate directory has a parent")
@@ -78781,7 +79094,10 @@ pub mod private_static {
                 .into_iter()
                 .filter(|member| !excluded.contains(member))
                 .collect();
-            assert!(!members.is_empty(), "workspace root manifest lists no members");
+            assert!(
+                !members.is_empty(),
+                "workspace root manifest lists no members"
+            );
             let mut actual = BTreeSet::new();
             for member in &members {
                 assert!(

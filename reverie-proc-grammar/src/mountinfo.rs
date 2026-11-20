@@ -224,7 +224,10 @@ pub fn render_mountinfo(rows: &[MountInfoRow]) -> Vec<u8> {
         out.extend_from_slice(
             alloc::format!(
                 "{} {} {}:{} ",
-                row.mount_id, row.parent_id, row.device_major, row.device_minor
+                row.mount_id,
+                row.parent_id,
+                row.device_major,
+                row.device_minor
             )
             .as_bytes(),
         );
@@ -267,9 +270,7 @@ pub fn parse_fdinfo_mount_id(contents: &[u8]) -> Option<u64> {
         let value = value
             .strip_prefix(b"\t")
             .or_else(|| value.strip_prefix(b" "))?;
-        if value.is_empty()
-            || value.iter().any(|byte| !byte.is_ascii_digit())
-            || mount_id.is_some()
+        if value.is_empty() || value.iter().any(|byte| !byte.is_ascii_digit()) || mount_id.is_some()
         {
             return None;
         }

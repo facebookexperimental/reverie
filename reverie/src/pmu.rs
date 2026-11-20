@@ -82,7 +82,7 @@ impl PmuProfile {
                 0x4E | 0x55 | 0x5E => (0x5101c4, 100),        // Intel Skylake
                 0x8E | 0x9E => (0x5101c4, 100),               // Intel Kabylake
                 0xA5 | 0xA6 => (0x5101c4, 100),               // Intel Cometlake
-                0x8D => (0x5111c4, 100), // Intel Tiger Lake
+                0x8D => (0x5111c4, 100),                      // Intel Tiger Lake
                 // Intel client hybrid models (Alder Lake 0x97/0x9A and
                 // Raptor Lake 0xB7/0xBA/0xBF) are deliberately absent:
                 // their performance and efficiency cores encode
@@ -91,7 +91,7 @@ impl PmuProfile {
                 // the same named unsupported-CPU refusal as any other
                 // model with no profile.
                 0x8F => (0x5111c4, 125), // Intel Sapphire Rapids
-                0x86 => (0x5101c4, 100),                      // Intel Icelake
+                0x86 => (0x5101c4, 100), // Intel Icelake
                 // Intel Emerald Rapids (Raptor Cove; Linux INTEL_EMERALDRAPIDS_X).
                 // Intel's perfmon tables encode BR_INST_RETIRED as Sapphire
                 // Rapids does (EMR emeraldrapids_core.json v1.25 and SPR

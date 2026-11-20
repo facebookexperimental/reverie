@@ -43,9 +43,9 @@ use crate::elf::GuestFileIdentityEntry;
 use crate::elf::IdentityTimestamps;
 use crate::elf::LoadedStaticElf;
 use crate::elf::RegularCreateDirectoryPolicy;
-use crate::elf::TASK_COMM_LEN;
 #[cfg(test)]
 use crate::elf::STACK_LIMIT;
+use crate::elf::TASK_COMM_LEN;
 #[cfg(any(test, feature = "test-support", feature = "native-test-support"))]
 use crate::elf::initialize_regular_create_directory_policy;
 use crate::elf::load_static_elf_image_of;
@@ -1313,7 +1313,11 @@ mod tests {
             guest_message.msg_control = 0x800_usize as *mut libc::c_void;
             guest_message.msg_controllen = 128;
             assert_eq!(
-                write_struct(&mut ProviderMemory(&memory), 0x100, &GuestMsghdr::from(&guest_message)),
+                write_struct(
+                    &mut ProviderMemory(&memory),
+                    0x100,
+                    &GuestMsghdr::from(&guest_message)
+                ),
                 0
             );
             let mut expected = [0; 0x1000];
@@ -4637,7 +4641,10 @@ mod tests {
             assert_eq!(
                 (stat.st_dev, stat.st_ino),
                 (
-                    crate::proc_mechanics::synthetic_dev(SYNTHETIC_DEV_MAJOR, SYNTHETIC_PROC_DEV_MINOR),
+                    crate::proc_mechanics::synthetic_dev(
+                        SYNTHETIC_DEV_MAJOR,
+                        SYNTHETIC_PROC_DEV_MINOR
+                    ),
                     crate::proc_mechanics::path_inode(b"/proc/self/status")
                 )
             );
@@ -4834,7 +4841,10 @@ mod tests {
         );
         let stat: libc::stat = read_struct(&memory, stat_address);
         assert_eq!(stat.st_mode, libc::S_IFREG | 0o444);
-        assert_eq!(stat.st_ino, crate::proc_mechanics::path_inode(b"/proc/self/status"));
+        assert_eq!(
+            stat.st_ino,
+            crate::proc_mechanics::path_inode(b"/proc/self/status")
+        );
         assert_eq!(
             stat.st_dev,
             crate::proc_mechanics::synthetic_dev(SYNTHETIC_DEV_MAJOR, SYNTHETIC_PROC_DEV_MINOR)
@@ -7061,7 +7071,10 @@ mod tests {
             // zero, so translation must not pass a caller's stale value.
             l_pid: 1234,
         };
-        assert_eq!(write_struct(&mut ProviderMemory(&memory), LOCK, &GuestFlock::from(&lock)), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), LOCK, &GuestFlock::from(&lock)),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -7072,7 +7085,10 @@ mod tests {
             0
         );
         lock.l_pid = 0;
-        assert_eq!(write_struct(&mut ProviderMemory(&memory), LOCK, &GuestFlock::from(&lock)), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), LOCK, &GuestFlock::from(&lock)),
+            0
+        );
         let conflict = syscall_result(
             &mut memory,
             &mut state,
@@ -7085,7 +7101,10 @@ mod tests {
         );
 
         lock.l_type = libc::F_UNLCK as libc::c_short;
-        assert_eq!(write_struct(&mut ProviderMemory(&memory), LOCK, &GuestFlock::from(&lock)), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), LOCK, &GuestFlock::from(&lock)),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -14305,7 +14324,11 @@ mod tests {
         message.msg_iov = IOV as usize as *mut libc::iovec;
         message.msg_iovlen = 1;
         assert_eq!(
-            write_struct(&mut ProviderMemory(&memory), MESSAGE, &GuestMsghdr::from(&message)),
+            write_struct(
+                &mut ProviderMemory(&memory),
+                MESSAGE,
+                &GuestMsghdr::from(&message)
+            ),
             0
         );
         assert_eq!(
@@ -14721,7 +14744,11 @@ mod tests {
                                 message.msg_iov = IOV as usize as *mut libc::iovec;
                                 message.msg_iovlen = 1;
                                 assert_eq!(
-                                    write_struct(&mut ProviderMemory(memory), MESSAGE, &GuestMsghdr::from(&message)),
+                                    write_struct(
+                                        &mut ProviderMemory(memory),
+                                        MESSAGE,
+                                        &GuestMsghdr::from(&message)
+                                    ),
                                     0
                                 );
                                 syscall_result(
@@ -14905,7 +14932,11 @@ mod tests {
             sent.msg_iov = IOV as usize as *mut libc::iovec;
             sent.msg_iovlen = 1;
             assert_eq!(
-                write_struct(&mut ProviderMemory(&memory), MESSAGE, &GuestMsghdr::from(&sent)),
+                write_struct(
+                    &mut ProviderMemory(&memory),
+                    MESSAGE,
+                    &GuestMsghdr::from(&sent)
+                ),
                 0
             );
             assert_eq!(
@@ -14931,7 +14962,11 @@ mod tests {
             entry.msg_hdr.msg_iov = IOV as usize as *mut libc::iovec;
             entry.msg_hdr.msg_iovlen = 1;
             assert_eq!(
-                write_struct(&mut ProviderMemory(&memory), MESSAGE, &GuestMmsghdr::from(&entry)),
+                write_struct(
+                    &mut ProviderMemory(&memory),
+                    MESSAGE,
+                    &GuestMmsghdr::from(&entry)
+                ),
                 0
             );
             let result = if batch {
@@ -15139,7 +15174,11 @@ mod tests {
             entry.msg_hdr.msg_control = MESSAGE as usize as *mut libc::c_void;
             entry.msg_hdr.msg_controllen = std::mem::size_of::<libc::msghdr>();
             assert_eq!(
-                write_struct(&mut ProviderMemory(&memory), MESSAGE, &GuestMmsghdr::from(&entry)),
+                write_struct(
+                    &mut ProviderMemory(&memory),
+                    MESSAGE,
+                    &GuestMmsghdr::from(&entry)
+                ),
                 0
             );
             let result = if batch {
@@ -19484,7 +19523,14 @@ mod tests {
                         send.msg_control = SEND_CONTROL as usize as *mut _;
                         send.msg_controllen = control.len();
                     }
-                    assert_eq!(write_struct(&mut ProviderMemory(&memory), SEND, &GuestMsghdr::from(&send)), 0);
+                    assert_eq!(
+                        write_struct(
+                            &mut ProviderMemory(&memory),
+                            SEND,
+                            &GuestMsghdr::from(&send)
+                        ),
+                        0
+                    );
                     assert_eq!(
                         syscall_result(
                             &mut memory,
@@ -19533,7 +19579,11 @@ mod tests {
                         let address =
                             MESSAGES + index * std::mem::size_of::<libc::mmsghdr>() as u64;
                         assert_eq!(
-                            write_struct(&mut ProviderMemory(&memory), address, &GuestMmsghdr::from(&message)),
+                            write_struct(
+                                &mut ProviderMemory(&memory),
+                                address,
+                                &GuestMmsghdr::from(&message)
+                            ),
                             0
                         );
                         if index == 2 {
@@ -19943,7 +19993,11 @@ mod tests {
         send_msg.msg_control = SEND_CONTROL as usize as *mut libc::c_void;
         send_msg.msg_controllen = send_control.len();
         assert_eq!(
-            write_struct(&mut ProviderMemory(&memory), SEND_MSG, &GuestMsghdr::from(&send_msg)),
+            write_struct(
+                &mut ProviderMemory(&memory),
+                SEND_MSG,
+                &GuestMsghdr::from(&send_msg)
+            ),
             0
         );
 
@@ -19986,7 +20040,11 @@ mod tests {
         recv_msg.msg_control = RECV_CONTROL as usize as *mut libc::c_void;
         recv_msg.msg_controllen = 64;
         assert_eq!(
-            write_struct(&mut ProviderMemory(&memory), RECV_MSG, &GuestMsghdr::from(&recv_msg)),
+            write_struct(
+                &mut ProviderMemory(&memory),
+                RECV_MSG,
+                &GuestMsghdr::from(&recv_msg)
+            ),
             0
         );
 
@@ -20139,7 +20197,11 @@ mod tests {
         memory.write(SEND_CONTROL, &invalid_right).unwrap();
         send_message.msg_controllen = invalid_right.len();
         assert_eq!(
-            write_struct(&mut ProviderMemory(&memory), SEND_MSG, &GuestMsghdr::from(&send_message)),
+            write_struct(
+                &mut ProviderMemory(&memory),
+                SEND_MSG,
+                &GuestMsghdr::from(&send_message)
+            ),
             0
         );
         assert_eq!(
@@ -20156,7 +20218,11 @@ mod tests {
         memory.write(SEND_CONTROL, &malformed_right).unwrap();
         send_message.msg_controllen = malformed_right.len();
         assert_eq!(
-            write_struct(&mut ProviderMemory(&memory), SEND_MSG, &GuestMsghdr::from(&send_message)),
+            write_struct(
+                &mut ProviderMemory(&memory),
+                SEND_MSG,
+                &GuestMsghdr::from(&send_message)
+            ),
             0
         );
         assert_eq!(
@@ -20177,7 +20243,11 @@ mod tests {
         memory.write(SEND_CONTROL, &credentials).unwrap();
         send_message.msg_controllen = credentials.len();
         assert_eq!(
-            write_struct(&mut ProviderMemory(&memory), SEND_MSG, &GuestMsghdr::from(&send_message)),
+            write_struct(
+                &mut ProviderMemory(&memory),
+                SEND_MSG,
+                &GuestMsghdr::from(&send_message)
+            ),
             0
         );
         assert_eq!(
@@ -20217,7 +20287,11 @@ mod tests {
             memory.write(SEND_CONTROL, &control).unwrap();
             send_message.msg_controllen = control.len();
             assert_eq!(
-                write_struct(&mut ProviderMemory(&memory), SEND_MSG, &GuestMsghdr::from(&send_message)),
+                write_struct(
+                    &mut ProviderMemory(&memory),
+                    SEND_MSG,
+                    &GuestMsghdr::from(&send_message)
+                ),
                 0
             );
             let files_before = state.files.keys().copied().collect::<Vec<_>>();
@@ -20263,7 +20337,11 @@ mod tests {
         recv_message.msg_iov = RECV_IOV as usize as *mut libc::iovec;
         recv_message.msg_iovlen = 1;
         assert_eq!(
-            write_struct(&mut ProviderMemory(&memory), RECV_MSG, &GuestMsghdr::from(&recv_message)),
+            write_struct(
+                &mut ProviderMemory(&memory),
+                RECV_MSG,
+                &GuestMsghdr::from(&recv_message)
+            ),
             0
         );
         assert_eq!(
@@ -20443,7 +20521,11 @@ mod tests {
         recv_message.msg_control = RECV_CONTROL as usize as *mut libc::c_void;
         recv_message.msg_controllen = 256;
         assert_eq!(
-            write_struct(&mut ProviderMemory(&memory), RECV_MSG, &GuestMsghdr::from(&recv_message)),
+            write_struct(
+                &mut ProviderMemory(&memory),
+                RECV_MSG,
+                &GuestMsghdr::from(&recv_message)
+            ),
             0
         );
         assert_eq!(
@@ -20543,7 +20625,11 @@ mod tests {
         send_message.msg_control = SEND_CONTROL as usize as *mut libc::c_void;
         send_message.msg_controllen = send_control.len();
         assert_eq!(
-            write_struct(&mut ProviderMemory(&memory), SEND_MSG, &GuestMsghdr::from(&send_message)),
+            write_struct(
+                &mut ProviderMemory(&memory),
+                SEND_MSG,
+                &GuestMsghdr::from(&send_message)
+            ),
             0
         );
         assert_eq!(
@@ -20572,7 +20658,11 @@ mod tests {
         recv_message.msg_controllen = cmsg_align(std::mem::size_of::<libc::cmsghdr>()).unwrap()
             + std::mem::size_of::<libc::c_int>();
         assert_eq!(
-            write_struct(&mut ProviderMemory(&memory), RECV_MSG, &GuestMsghdr::from(&recv_message)),
+            write_struct(
+                &mut ProviderMemory(&memory),
+                RECV_MSG,
+                &GuestMsghdr::from(&recv_message)
+            ),
             0
         );
         let files_before = state.files.len();
@@ -22277,7 +22367,11 @@ mod tests {
             message.msg_control = 0x500_usize as *mut libc::c_void;
             message.msg_controllen = control.len();
             assert_eq!(
-                write_struct(&mut ProviderMemory(&f.memory), 0x800, &GuestMsghdr::from(&message)),
+                write_struct(
+                    &mut ProviderMemory(&f.memory),
+                    0x800,
+                    &GuestMsghdr::from(&message)
+                ),
                 0
             );
             assert_eq!(
@@ -25634,7 +25728,11 @@ mod tests {
         send_msg.msg_control = SEND_CONTROL as usize as *mut libc::c_void;
         send_msg.msg_controllen = send_control.len();
         assert_eq!(
-            write_struct(&mut ProviderMemory(&memory), SEND_MSG, &GuestMsghdr::from(&send_msg)),
+            write_struct(
+                &mut ProviderMemory(&memory),
+                SEND_MSG,
+                &GuestMsghdr::from(&send_msg)
+            ),
             0
         );
         assert_eq!(
@@ -25683,7 +25781,11 @@ mod tests {
         recv_msg.msg_control = RECV_CONTROL as usize as *mut libc::c_void;
         recv_msg.msg_controllen = 64;
         assert_eq!(
-            write_struct(&mut ProviderMemory(&memory), RECV_MSG, &GuestMsghdr::from(&recv_msg)),
+            write_struct(
+                &mut ProviderMemory(&memory),
+                RECV_MSG,
+                &GuestMsghdr::from(&recv_msg)
+            ),
             0
         );
         assert_eq!(
@@ -25787,7 +25889,11 @@ mod tests {
         message.msg_control = RIGHTS_CONTROL as usize as *mut libc::c_void;
         message.msg_controllen = control.len();
         assert_eq!(
-            write_struct(&mut ProviderMemory(memory), RIGHTS_MSG, &GuestMsghdr::from(&message)),
+            write_struct(
+                &mut ProviderMemory(memory),
+                RIGHTS_MSG,
+                &GuestMsghdr::from(&message)
+            ),
             0
         );
         syscall_result(
@@ -25828,7 +25934,11 @@ mod tests {
         }
         message.msg_controllen = capacity;
         assert_eq!(
-            write_struct(&mut ProviderMemory(memory), RIGHTS_MSG, &GuestMsghdr::from(&message)),
+            write_struct(
+                &mut ProviderMemory(memory),
+                RIGHTS_MSG,
+                &GuestMsghdr::from(&message)
+            ),
             0
         );
         let result = syscall_result(

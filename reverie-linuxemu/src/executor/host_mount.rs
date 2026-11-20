@@ -271,15 +271,17 @@ struct MountInfoRow {
 /// (`show_mountinfo`, `fs/proc_namespace.c`), so no live answer
 /// changes.
 fn parse_mountinfo(contents: &[u8]) -> Option<Vec<MountInfoRow>> {
-    reverie_proc_grammar::parse_mountinfo(contents).ok().map(|rows| {
-        rows.into_iter()
-            .map(|row| MountInfoRow {
-                raw_mount_id: row.mount_id,
-                raw_device: libc::makedev(row.device_major, row.device_minor),
-                super_options: row.super_options,
-            })
-            .collect()
-    })
+    reverie_proc_grammar::parse_mountinfo(contents)
+        .ok()
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| MountInfoRow {
+                    raw_mount_id: row.mount_id,
+                    raw_device: libc::makedev(row.device_major, row.device_minor),
+                    super_options: row.super_options,
+                })
+                .collect()
+        })
 }
 
 /// The calling thread's `mountinfo` as it is now, with the descriptor it

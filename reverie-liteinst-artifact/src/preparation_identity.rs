@@ -1077,9 +1077,8 @@ mod tests {
         // points it into staged sources). Missing prerequisites fail by
         // name; no skip.
         let source_root = PathBuf::from(
-            std::env::var_os("CARGO_MANIFEST_DIR").expect(
-                "preparation identity test needs CARGO_MANIFEST_DIR at run time",
-            ),
+            std::env::var_os("CARGO_MANIFEST_DIR")
+                .expect("preparation identity test needs CARGO_MANIFEST_DIR at run time"),
         )
         .parent()
         .expect("preparation identity test crate directory has a parent")

@@ -812,7 +812,8 @@ mod tests {
                     continue;
                 }
                 assert_eq!(
-                    manifest, &own,
+                    manifest,
+                    &own,
                     "{} names the test-only feature: {line}",
                     manifest.display()
                 );

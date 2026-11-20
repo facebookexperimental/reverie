@@ -300,15 +300,17 @@ fn exec_lookup(state: &LoadedStaticElf, path: &[u8]) -> Result<ExecLookup, i64> 
         let segment = &rest[..segment_end];
         let segment = segment.strip_suffix(b"/").unwrap_or(segment);
         let spelling = base_path.map(|base_path| exec_join(&base_path, segment));
-        let link = spelling
-            .as_deref()
-            .and_then(|spelling| crate::proc_mechanics::parse_fd_link(spelling, state.pid, state.tid));
+        let link = spelling.as_deref().and_then(|spelling| {
+            crate::proc_mechanics::parse_fd_link(spelling, state.pid, state.tid)
+        });
         if let Some(link) = link {
             let after = exec_strip_leading_slashes(&rest[segment_end..]).to_vec();
             let (guest_fd, below) = match link {
                 crate::proc_mechanics::FdLinkPath::Exact(guest_fd) => (guest_fd, Vec::new()),
                 crate::proc_mechanics::FdLinkPath::Below { fd, rest } => (fd, rest.to_vec()),
-                crate::proc_mechanics::FdLinkPath::OtherTask => return Err(negative_errno(libc::ENOENT)),
+                crate::proc_mechanics::FdLinkPath::OtherTask => {
+                    return Err(negative_errno(libc::ENOENT));
+                }
             };
             if state.proc_files.contains_key(&guest_fd)
                 || state.fdinfo_files.contains_key(&guest_fd)
@@ -626,7 +628,9 @@ pub(super) fn resolve_guest_exec_image(
     let lookup =
         exec_lookup(state, &path).map_err(|errno| exec_open_errno(errno, OPENING, refusal))?;
     let exe_link = lookup.spelling.as_deref().and_then(|spelling| {
-        crate::proc_mechanics::classify_exe_path(spelling, &|tid| live_thread_in_process(state, tid))
+        crate::proc_mechanics::classify_exe_path(spelling, &|tid| {
+            live_thread_in_process(state, tid)
+        })
     });
     match exe_link {
         Some(true) => {

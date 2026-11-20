@@ -513,7 +513,10 @@ fn mountinfo_empty_source_is_accepted_and_round_trips() {
 #[test]
 fn mountinfo_refuses_noncanonical_and_unknown_numeric_fields() {
     let row = b"37 1 8:1 / / rw shared:9 - ext4 /dev/root rw\n";
-    assert!(parse_mountinfo(b"\n").is_err(), "a sole newline is one empty row");
+    assert!(
+        parse_mountinfo(b"\n").is_err(),
+        "a sole newline is one empty row"
+    );
     assert!(
         parse_mountinfo(b"37 1 8:1 / / rw - ext4 /dev/root rw").is_err(),
         "missing final newline"
@@ -564,7 +567,10 @@ fn fdinfo_mount_id_extractor_keeps_its_tolerances() {
     // a tab or a space after the colon, and no final newline needed.
     assert_eq!(parse_fdinfo_mount_id(b"pos:\t0\nmnt_id:\t37\n"), Some(37));
     assert_eq!(parse_fdinfo_mount_id(b"mnt_id: 0"), Some(0));
-    assert_eq!(parse_fdinfo_mount_id(b"SqMask:\t0xff\nmnt_id:\t3\n"), Some(3));
+    assert_eq!(
+        parse_fdinfo_mount_id(b"SqMask:\t0xff\nmnt_id:\t3\n"),
+        Some(3)
+    );
     for malformed in [
         b"pos:\t0\n".as_slice(),
         b"mnt_id:\t37\nmnt_id:\t38\n".as_slice(),

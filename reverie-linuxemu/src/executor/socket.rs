@@ -2934,11 +2934,10 @@ pub(super) fn recvmmsg(
         return negative_errno(libc::EINVAL);
     }
     if args[4] != 0 {
-        let timeout: libc::timespec =
-            match read_guest_struct(&ProviderMemory(memory), args[4]) {
-                Ok(timeout) => timeout,
-                Err(error) => return error,
-            };
+        let timeout: libc::timespec = match read_guest_struct(&ProviderMemory(memory), args[4]) {
+            Ok(timeout) => timeout,
+            Err(error) => return error,
+        };
         if timeout.tv_sec < 0 || !(0..1_000_000_000).contains(&timeout.tv_nsec) {
             return negative_errno(libc::EINVAL);
         }

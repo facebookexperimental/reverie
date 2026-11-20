@@ -70,7 +70,10 @@ fn aarch64_bootstrap_install_reaches_coordinator_connect() {
                 })
                 .collect()
         };
-        assert_eq!(differing(&before.sa_mask, &after.sa_mask), Vec::<libc::c_int>::new());
+        assert_eq!(
+            differing(&before.sa_mask, &after.sa_mask),
+            Vec::<libc::c_int>::new()
+        );
         // Control: the comparison sees a one-signal change.
         let mut toggled = before.sa_mask;
         // SAFETY: an initialized set and a valid signal number.

@@ -190,7 +190,9 @@ fn fstatat_impl(
         );
     }
     let executable = if flags & libc::AT_SYMLINK_NOFOLLOW == 0 {
-        match crate::proc_mechanics::classify_exe_path(&path, &|tid| live_thread_in_process(state, tid)) {
+        match crate::proc_mechanics::classify_exe_path(&path, &|tid| {
+            live_thread_in_process(state, tid)
+        }) {
             Some(true) => match state.executable_file.as_ref() {
                 Some(file) => Some(file.as_raw_fd()),
                 None => return negative_errno(libc::ENOENT),

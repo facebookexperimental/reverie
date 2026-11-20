@@ -559,10 +559,7 @@ mod tests {
     #[test]
     fn a_libc_with_one_hash_table_is_searched_through_it() {
         let (gnu, sysv) = libc_tables();
-        for (name, version) in [
-            ("_dl_find_object", "GLIBC_2.35"),
-            ("realpath", BASE),
-        ] {
+        for (name, version) in [("_dl_find_object", "GLIBC_2.35"), ("realpath", BASE)] {
             let expected = dlvsym(name, version);
             for (keep_gnu, keep_sysv) in [(true, false), (false, true)] {
                 let found = with_libc(|object| {

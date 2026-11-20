@@ -2547,8 +2547,7 @@ impl ElfExecutor {
             // failure did not cause it.
             self.forced_exit = false;
         }
-        if self.forced_exit && family_status == Some(own_status) && (!own_group || group_started)
-        {
+        if self.forced_exit && family_status == Some(own_status) && (!own_group || group_started) {
             // This task's frame failure caused the committed process
             // status: carry the provenance to the leader's publication,
             // which may be reported by another thread's executor.

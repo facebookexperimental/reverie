@@ -14517,7 +14517,9 @@ mod test {
             let writer = unsafe { OwnedFd::from_raw_fd(descriptors[1]) };
             if mode == "full" {
                 assert_eq!(
-                    unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_SETPIPE_SZ, page as libc::c_int) },
+                    unsafe {
+                        libc::fcntl(writer.as_raw_fd(), libc::F_SETPIPE_SZ, page as libc::c_int)
+                    },
                     page as libc::c_int
                 );
                 let fill = vec![b'x'; page];

@@ -492,7 +492,10 @@ mod tests {
 
     #[test]
     fn struct_bytes_cover_the_whole_abi_struct() {
-        let value = libc::timespec { tv_sec: 1, tv_nsec: 2 };
+        let value = libc::timespec {
+            tv_sec: 1,
+            tv_nsec: 2,
+        };
         let bytes = struct_bytes(&value);
         assert_eq!(
             bytes.len(),

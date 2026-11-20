@@ -616,7 +616,10 @@ pub(crate) fn validate_site_patching(enabled: bool) -> io::Result<bool> {
 /// that feature (`no_manifest_enables_the_aarch64_test_selector` in lib.rs).
 const fn site_patching_requestable() -> bool {
     cfg!(all(feature = "liteinst", target_arch = "x86_64"))
-        || cfg!(all(feature = "aarch64-trap-and-patch-test", target_arch = "aarch64"))
+        || cfg!(all(
+            feature = "aarch64-trap-and-patch-test",
+            target_arch = "aarch64"
+        ))
 }
 
 pub fn site_patching_enabled() -> bool {

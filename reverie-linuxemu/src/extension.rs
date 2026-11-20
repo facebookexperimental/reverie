@@ -239,10 +239,7 @@ impl ExtensionTable {
         self.syscalls.get(&number).copied()
     }
 
-    pub(crate) fn proc_claim(
-        &self,
-        path: &[u8],
-    ) -> Option<(ExtensionSlotId, ExtensionProcRender)> {
+    pub(crate) fn proc_claim(&self, path: &[u8]) -> Option<(ExtensionSlotId, ExtensionProcRender)> {
         self.proc_claims.get(path).copied()
     }
 }
@@ -698,7 +695,10 @@ mod tests {
         let state = native_loaded_state(Path::new("/"));
         assert!(state.extension_table.is_empty(), "default table is empty");
         assert!(state.extensions.is_empty(), "empty table makes no slots");
-        assert_eq!(state.extension_proc_content(b"/proc/self/test-extension"), None);
+        assert_eq!(
+            state.extension_proc_content(b"/proc/self/test-extension"),
+            None
+        );
     }
 
     #[test]
@@ -754,7 +754,10 @@ mod tests {
             .as_any()
             .downcast_ref::<TestState>()
             .expect("parent slot holds the test state");
-        assert_eq!(parent_state.value, 7, "child slots never alias the parent's");
+        assert_eq!(
+            parent_state.value, 7,
+            "child slots never alias the parent's"
+        );
     }
 
     #[test]
@@ -826,7 +829,3 @@ mod tests {
         );
     }
 }
-
-
-
-

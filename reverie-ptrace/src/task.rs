@@ -1320,7 +1320,6 @@ fn next_carrier_cookie() -> u64 {
     high | (NEXT.fetch_add(1, Ordering::Relaxed) & 0xffff_ffff)
 }
 
-
 /// `PTRACE_GETSIGMASK`, with an error from a tracee that died passed
 /// through `dead_or`, so that the paths that handle a killed tracee take it.
 fn sigmask(task: &Stopped) -> Result<u64, TraceError> {
@@ -9978,7 +9977,9 @@ impl<L: Tool + 'static> TracedTask<L> {
             // Tool's verdict, for a restart code returned below.
             #[cfg(target_arch = "aarch64")]
             let held_record = held.map(|sig| {
-                let taken = self.pending_signal_taken.filter(|taken| taken.signal == sig);
+                let taken = self
+                    .pending_signal_taken
+                    .filter(|taken| taken.signal == sig);
                 (sig, taken.map(|taken| taken.bytes))
             });
             let resume = self.report_held_signal(&task, None, held).await?;
@@ -12552,14 +12553,24 @@ impl<L: Tool + 'static> TracedTask<L> {
         };
         if thread_may_be_seccomp_filtered() {
             return self
-                .unresolved_restart(task, nr, code, reverie::UnresolvedRestart::TracerMayBeFiltered)
+                .unresolved_restart(
+                    task,
+                    nr,
+                    code,
+                    reverie::UnresolvedRestart::TracerMayBeFiltered,
+                )
                 .await;
         }
         if !in_place_seccomp_baseline_admitted(self.global_state.seccomp_filter_baseline)
             || self.guest_has_own_seccomp_filter(task.pid())
         {
             return self
-                .unresolved_restart(task, nr, code, reverie::UnresolvedRestart::GuestSeccompFilter)
+                .unresolved_restart(
+                    task,
+                    nr,
+                    code,
+                    reverie::UnresolvedRestart::GuestSeccompFilter,
+                )
                 .await;
         }
         let mask = sigmask(&task)?;
@@ -13944,7 +13955,10 @@ impl<L: Tool + 'static> TracedTask<L> {
             if sig == Signal::SIGTRAP {
                 step_end(&stopped)?;
                 lift_requeued(&stopped, requeued)?;
-                return Ok((Wait::Stopped(stopped, Event::from_signal(sig)), seccomp_trapped));
+                return Ok((
+                    Wait::Stopped(stopped, Event::from_signal(sig)),
+                    seccomp_trapped,
+                ));
             }
             if is_group_stop(&stopped, sig)? {
                 running = self.sysemu_step_stopped_any_input(stopped, None, input)?;
@@ -13987,7 +14001,10 @@ impl<L: Tool + 'static> TracedTask<L> {
                 );
                 step_end(&stopped)?;
                 lift_requeued(&stopped, requeued)?;
-                return Ok((Wait::Stopped(stopped, Event::from_signal(sig)), seccomp_trapped));
+                return Ok((
+                    Wait::Stopped(stopped, Event::from_signal(sig)),
+                    seccomp_trapped,
+                ));
             }
         }
     }
@@ -21489,7 +21506,10 @@ mod aarch64_syscall_stop_exit_tests {
             Ran,
             "a result equal to the first argument with no SIGSYS pending ran"
         );
-        assert_eq!(classify_rolled_back_syscall_exit(true, Some(true)), Unproven);
+        assert_eq!(
+            classify_rolled_back_syscall_exit(true, Some(true)),
+            Unproven
+        );
         assert_eq!(
             classify_rolled_back_syscall_exit(true, None),
             Unproven,
@@ -21528,7 +21548,11 @@ mod restart_decision_tests {
     #[test]
     fn a_carrier_stop_is_the_tracers_only_with_its_code_and_cookie() {
         let cookie = 0x1234_5678_0000_0007;
-        assert!(carrier_instance_is_the_tracers(libc::SI_QUEUE, cookie, cookie));
+        assert!(carrier_instance_is_the_tracers(
+            libc::SI_QUEUE,
+            cookie,
+            cookie
+        ));
         assert!(
             !carrier_instance_is_the_tracers(libc::SI_QUEUE, cookie + 1, cookie),
             "a guest's sigqueue of the same number with another value"
