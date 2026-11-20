@@ -15,6 +15,14 @@
 //! `passthrough` proves syscalls are trapped and correctly forwarded (the guest
 //! behaves normally); `spoof-getpid` proves the trap can *mutate* a result; and
 //! a `fork` guest proves the filter is inherited by children.
+//!
+//! Every test here needs the cdylib's `.init_array` constructor, which only the
+//! `preload-constructor` feature (a default) builds. Without it the cdylib
+//! loads but installs nothing: the passthrough tests would pass vacuously and
+//! `spoof_getpid_proves_result_mutation` would fail with the real pid. Such a
+//! build runs one test instead, which fails by name.
+
+#![cfg_attr(not(feature = "preload-constructor"), allow(dead_code, unused_imports))]
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -47,6 +55,7 @@ fn run(program: &str, args: &[&str], tool: BuiltinTool) -> Output {
     command.output().unwrap()
 }
 
+#[cfg(feature = "preload-constructor")]
 #[test]
 fn passthrough_traps_and_forwards_echo() {
     let output = run("/bin/echo", &["hello"], BuiltinTool::Passthrough);
@@ -61,6 +70,7 @@ fn passthrough_traps_and_forwards_echo() {
     assert_eq!(output.stdout, b"hello\n");
 }
 
+#[cfg(feature = "preload-constructor")]
 #[test]
 fn spoof_getpid_proves_result_mutation() {
     let probe = env!("CARGO_BIN_EXE_reverie-inguest-probe");
@@ -79,6 +89,7 @@ fn spoof_getpid_proves_result_mutation() {
     );
 }
 
+#[cfg(feature = "preload-constructor")]
 #[test]
 fn passthrough_probe_reports_real_pid() {
     // Control: under passthrough the same probe must NOT see the spoof value.
@@ -90,6 +101,7 @@ fn passthrough_probe_reports_real_pid() {
     assert!(stdout.trim().starts_with("getpid="));
 }
 
+#[cfg(feature = "preload-constructor")]
 #[test]
 fn fork_child_inherits_the_filter() {
     // A shell that forks a child (subshell) and both write output. If the child
@@ -108,4 +120,13 @@ fn fork_child_inherits_the_filter() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(output.stdout, b"child\nparent\n");
+}
+
+#[cfg(not(feature = "preload-constructor"))]
+#[test]
+fn smoke_tests_need_the_preload_constructor_feature() {
+    panic!(
+        "smoke tests need reverie-inguest's preload-constructor feature: without it the \
+         cdylib has no constructor, so nothing is trapped and these tests would prove nothing"
+    );
 }
