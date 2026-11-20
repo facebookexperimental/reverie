@@ -1,3 +1,4 @@
+load("@fbcode//hermetic_infra/reverie/constraints:liteinst-runtime-flags.bzl", "LITEINST_RUNTIME_FLAGS_CONSTRAINT", "LITEINST_RUNTIME_SELECT_RUSTC_FLAGS")
 load(
     "@fbcode//hermetic_infra/reverie/fb-only:defs.bzl",
     "DOWNSTREAM_TEST_VISIBILITY",
@@ -97,6 +98,10 @@ rust_library(
         },
         "cargo_toml_dir": "reverie",
     },
+    rustc_flags = select({
+        "DEFAULT": [],
+        LITEINST_RUNTIME_FLAGS_CONSTRAINT: LITEINST_RUNTIME_SELECT_RUSTC_FLAGS,
+    }),
     test_deps = [
         "fbsource//third-party/rust:serde_json",
         "fbsource//third-party/rust:tracing-subscriber",
@@ -251,6 +256,10 @@ rust_library(
         "edge_features": [],
     },
     features = ["nightly"],
+    rustc_flags = select({
+        "DEFAULT": [],
+        LITEINST_RUNTIME_FLAGS_CONSTRAINT: LITEINST_RUNTIME_SELECT_RUSTC_FLAGS,
+    }),
     test_deps = [
         "fbsource//third-party/rust:num_cpus",
         "fbsource//third-party/rust:raw-cpuid",
@@ -637,6 +646,10 @@ rust_library(
         },
         "cargo_toml_dir": "reverie-syscalls",
     },
+    rustc_flags = select({
+        "DEFAULT": [],
+        LITEINST_RUNTIME_FLAGS_CONSTRAINT: LITEINST_RUNTIME_SELECT_RUSTC_FLAGS,
+    }),
     deps = [
         "fbsource//third-party/rust:bitflags",
         "fbsource//third-party/rust:derive_more",
@@ -661,6 +674,10 @@ rust_library(
         },
         "cargo_toml_dir": "reverie-memory",
     },
+    rustc_flags = select({
+        "DEFAULT": [],
+        LITEINST_RUNTIME_FLAGS_CONSTRAINT: LITEINST_RUNTIME_SELECT_RUSTC_FLAGS,
+    }),
     test_deps = ["fbsource//third-party/rust:libc"],
     deps = [
         "fbsource//third-party/rust:syscalls",
@@ -758,6 +775,10 @@ rust_library(
         },
         "cargo_toml_dir": "reverie-proc-grammar",
     },
+    rustc_flags = select({
+        "DEFAULT": [],
+        LITEINST_RUNTIME_FLAGS_CONSTRAINT: LITEINST_RUNTIME_SELECT_RUSTC_FLAGS,
+    }),
     deps = [],
 )
 
@@ -1935,6 +1956,10 @@ rust_library(
     # contracts (guest/tool_region_constructor.rs), so a shared object of this
     # library cannot provide them; link it statically into each final image.
     preferred_linkage = "static",
+    rustc_flags = select({
+        "DEFAULT": [],
+        LITEINST_RUNTIME_FLAGS_CONSTRAINT: LITEINST_RUNTIME_SELECT_RUSTC_FLAGS,
+    }),
     unittests = False,
     deps = [
         "fbsource//third-party/rust:bincode",
@@ -2338,6 +2363,10 @@ rpc_transport_library(
     env = {"CARGO_CRATE_NAME": "reverie_rpc_transport"},
     features = [],
     named_deps = {"reverie": ":reverie"},
+    rustc_flags = select({
+        "DEFAULT": [],
+        LITEINST_RUNTIME_FLAGS_CONSTRAINT: LITEINST_RUNTIME_SELECT_RUSTC_FLAGS,
+    }),
     test_deps = [
         "fbsource//third-party/rust:tokio",
     ],
@@ -2929,6 +2958,10 @@ rust_library(
     features = ["liteinst"],
     # As :reverie-liteinst: selected_backing() needs the final image's link.
     preferred_linkage = "static",
+    rustc_flags = select({
+        "DEFAULT": [],
+        LITEINST_RUNTIME_FLAGS_CONSTRAINT: LITEINST_RUNTIME_SELECT_RUSTC_FLAGS,
+    }),
     target_compatible_with = [
         "ovr_config//cpu:x86_64",
         "ovr_config//os:linux",
