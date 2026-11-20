@@ -8,6 +8,8 @@
 
 use std::cell::UnsafeCell;
 use std::env;
+use std::io;
+use std::io::Write;
 use std::sync::Arc;
 use std::sync::Barrier;
 use std::sync::atomic::AtomicUsize;
@@ -16,6 +18,7 @@ use std::thread;
 
 use reverie::Error;
 use reverie::Tool;
+use reverie::process::Stdio;
 
 #[derive(Debug, Default, Clone)]
 struct TestTool {}
@@ -122,18 +125,39 @@ fn guest_mode() {
     }
 }
 
+/// The count the guest prints after both workers joined, its only stdout line.
+fn switch_points(stdout: &[u8]) -> Option<usize> {
+    let text = std::str::from_utf8(stdout).ok()?;
+    let lines: Vec<&str> = text.lines().collect();
+    let [line] = lines.as_slice() else {
+        return None;
+    };
+    line.strip_prefix("Switch points: ")?.parse().ok()
+}
+
 async fn host_mode(thisprog: &str) -> Result<i32, Error> {
     println!("Running in HOST mode (ReverieTool)");
 
     let mut command = reverie::process::Command::new(thisprog);
-    command.arg("guest");
+    command.arg("guest").stdout(Stdio::piped());
 
     let tracer = reverie_ptrace::TracerBuilder::<TestTool>::new(command)
         .spawn()
         .await?;
-    let (status, _) = tracer.wait().await?;
+    let (output, _) = tracer.wait_with_output().await?;
+    io::stdout().write_all(&output.stdout)?;
 
-    Ok(status.code().unwrap_or(1))
+    let status = output.status.code().unwrap_or(1);
+    if status != 0 {
+        return Ok(status);
+    }
+    match switch_points(&output.stdout) {
+        Some(count) if count > 1 => Ok(0),
+        count => {
+            eprintln!("The guest reported {count:?} switch points; expected more than 1");
+            Ok(1)
+        }
+    }
 }
 
 #[tokio::main]

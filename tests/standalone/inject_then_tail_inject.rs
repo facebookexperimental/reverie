@@ -7,8 +7,12 @@
  */
 
 use std::env;
+use std::io;
+use std::io::Write;
 
+use nix::unistd;
 use reverie::Error;
+use reverie::process::Stdio;
 
 #[path = "../tool_fixtures/inject_then_tail.rs"]
 mod inject_then_tail_tool;
@@ -21,19 +25,94 @@ mod rust_guest;
 
 use rust_guest::guest_mode;
 
+/// The IDs the guest prints, in its `Read IDs:` line order.
+#[derive(Debug, PartialEq, Eq)]
+struct Ids {
+    tid: i64,
+    pid: i64,
+    gid: i64,
+    ppid: i64,
+    pgid: i64,
+    sid: i64,
+}
+
+impl Ids {
+    /// What the guest must read, from the tracer's side: the guest is this
+    /// process's child, in its process group and session, with its group ID,
+    /// and it reads its thread ID on its main thread.
+    fn expected(guest_pid: i64) -> Result<Self, Error> {
+        let pgid = unistd::getpgid(None).map_err(io::Error::from)?;
+        let sid = unistd::getsid(None).map_err(io::Error::from)?;
+        Ok(Self {
+            tid: guest_pid,
+            pid: guest_pid,
+            gid: unistd::getgid().as_raw().into(),
+            ppid: unistd::getpid().as_raw().into(),
+            pgid: pgid.as_raw().into(),
+            sid: sid.as_raw().into(),
+        })
+    }
+
+    /// Parses the guest's whole stdout: its start line, its
+    /// `Read IDs: t {}, p {}, g {}, pp {}, pg {}, s{}` line and the random number
+    /// it prints last. A guest that stopped early has no IDs.
+    fn printed(stdout: &[u8]) -> Option<Self> {
+        let text = std::str::from_utf8(stdout).ok()?;
+        let lines: Vec<&str> = text.lines().collect();
+        let ["Running in guest mode (actual test).", ids, random] = lines.as_slice() else {
+            return None;
+        };
+        random
+            .strip_prefix("Generated random number: ")?
+            .parse::<u64>()
+            .ok()?;
+        let fields: Vec<&str> = ids.strip_prefix("Read IDs: ")?.split(", ").collect();
+        let [t, p, g, pp, pg, s] = fields.as_slice() else {
+            return None;
+        };
+        let value = |field: &str, prefix: &str| field.strip_prefix(prefix)?.parse::<i64>().ok();
+        Some(Self {
+            tid: value(t, "t ")?,
+            pid: value(p, "p ")?,
+            gid: value(g, "g ")?,
+            ppid: value(pp, "pp ")?,
+            pgid: value(pg, "pg ")?,
+            sid: value(s, "s")?,
+        })
+    }
+}
+
 async fn host_mode(thisprog: &str) -> Result<i32, Error> {
     println!("Running in HOST mode (ReverieTool)");
 
     let mut command = reverie::process::Command::new(thisprog);
-    command.arg("guest");
+    command.arg("guest").stdout(Stdio::piped());
 
     let tracer = reverie_ptrace::TracerBuilder::<TestTool>::new(command)
         .config(NUM_REPS)
         .spawn()
         .await?;
-    let (status, _) = tracer.wait().await?;
+    let guest_pid = tracer.guest_pid().as_raw().into();
+    let (output, _) = tracer.wait_with_output().await?;
+    io::stdout().write_all(&output.stdout)?;
 
-    Ok(status.code().unwrap_or(1))
+    let status = output.status.code().unwrap_or(1);
+    if status != 0 {
+        return Ok(status);
+    }
+
+    let expected = Ids::expected(guest_pid)?;
+    match Ids::printed(&output.stdout) {
+        Some(printed) if printed == expected => Ok(0),
+        Some(printed) => {
+            eprintln!("The guest read {printed:?}; the tracer expected {expected:?}");
+            Ok(1)
+        }
+        None => {
+            eprintln!("The guest did not print its three lines to the end");
+            Ok(1)
+        }
+    }
 }
 
 #[tokio::main]

@@ -506,8 +506,6 @@ rust_binary(
     deps = [
         "fbsource//third-party/rust:libc",
         "fbsource//third-party/rust:nix",
-        "fbsource//third-party/rust:serde",
-        "fbsource//third-party/rust:syscalls",
         "fbsource//third-party/rust:tokio",
         "fbsource//third-party/rust:tracing",
         "//hermetic_infra/reverie:reverie",
@@ -521,7 +519,6 @@ rust_binary(
     crate_root = "standalone/parallel_tasks.rs",
     unittests = False,
     deps = [
-        "fbsource//third-party/rust:serde",
         "fbsource//third-party/rust:tokio",
         "//hermetic_infra/reverie:reverie",
         "//hermetic_infra/reverie:reverie-ptrace",
