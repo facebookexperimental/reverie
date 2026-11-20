@@ -1,0 +1,23 @@
+# The purity rule: this crate decides from caller-supplied values
+# only. Nothing in it may read a clock, the filesystem, the
+# environment, or a randomness source, spawn threads or processes,
+# or touch the network — its output must depend only on its inputs
+# and the injected traits. The library is `no_std` with no
+# dependencies, so most of these paths cannot resolve at all; the
+# bans keep it that way if the crate ever grows a dependency.
+# tests/dependency_guard.rs is the second layer.
+disallowed-types = [
+    { path = "std::time::SystemTime", reason = "purity: no wall clock; time is injected (Clock)" },
+    { path = "std::time::Instant", reason = "purity: no monotonic clock; time is injected (Clock)" },
+    { path = "std::fs::File", reason = "purity: no filesystem access; facts are injected" },
+    { path = "std::path::PathBuf", reason = "purity: no filesystem paths; operands arrive as bytes" },
+    { path = "std::process::Command", reason = "purity: no process spawning" },
+    { path = "std::process::Child", reason = "purity: no process spawning" },
+]
+disallowed-methods = [
+    { path = "std::time::SystemTime::now", reason = "purity: no wall clock" },
+    { path = "std::time::Instant::now", reason = "purity: no monotonic clock" },
+    { path = "std::env::var", reason = "purity: no environment reads" },
+    { path = "std::env::var_os", reason = "purity: no environment reads" },
+    { path = "std::thread::spawn", reason = "purity: no thread spawning" },
+]

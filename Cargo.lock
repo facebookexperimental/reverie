@@ -847,6 +847,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "linux-ns-model"
+version = "0.5.7"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

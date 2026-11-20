@@ -11,6 +11,7 @@ load(
 load("@fbcode//hermetic_infra/reverie/fb-only/rpc_compat:defs.bzl", "rpc_transport_library")
 load("@fbcode_macros//build_defs:cpp_library.bzl", "cpp_library")
 load("@fbcode_macros//build_defs:native_rules.bzl", "buck_filegroup")
+load("@fbcode_macros//build_defs:python_binary.bzl", "python_binary")
 load("@fbcode_macros//build_defs:sanitizers.bzl", "sanitizers")
 load("@fbsource//tools/build_defs:rust_binary.bzl", "rust_binary")
 load("@fbsource//tools/build_defs:rust_library.bzl", "rust_library")
@@ -838,6 +839,117 @@ rust_unittest(
     },
     resources = [":proc-grammar-sources"],
     deps = ["fbsource//third-party/rust:syn"],
+)
+
+# Pure model of Linux mount namespaces and mount tables. A leaf:
+# no dependencies, no I/O; identity, time, presentation, and host
+# performance are injected by its consumers. Its dependency guards
+# (linux-ns-model/tests/dependency_guard.rs and
+# scripts/check-linux-ns-model-deps.py) keep it that way.
+rust_library(
+    name = "linux-ns-model",
+    srcs = glob(["linux-ns-model/src/**/*.rs"]),
+    autocargo = {
+        "cargo_toml_config": {
+            "package": {
+                "description": "Pure model of Linux mount namespaces and mount tables: bind and unmount admission, propagation, and rendering, with identity, time, presentation, and host performance injected by the consumer.",
+            },
+        },
+        "cargo_toml_dir": "linux-ns-model",
+    },
+    deps = [],
+)
+
+rust_unittest(
+    name = "linux-ns-model-bind-umount-cases-test",
+    srcs = [
+        "linux-ns-model/tests/bind_umount_cases.rs",
+        "linux-ns-model/tests/common/mod.rs",
+    ],
+    autocargo = {"ignore_rule": True},
+    crate = "bind_umount_cases",
+    crate_root = "linux-ns-model/tests/bind_umount_cases.rs",
+    deps = [
+        ":linux-ns-model",
+    ],
+)
+
+rust_unittest(
+    name = "linux-ns-model-transition-contract-test",
+    srcs = [
+        "linux-ns-model/tests/common/mod.rs",
+        "linux-ns-model/tests/transition_contract.rs",
+    ],
+    autocargo = {"ignore_rule": True},
+    crate = "transition_contract",
+    crate_root = "linux-ns-model/tests/transition_contract.rs",
+    deps = [
+        ":linux-ns-model",
+    ],
+)
+
+# The crate's sources (and manifest) laid out as under
+# CARGO_MANIFEST_DIR, for tests/dependency_guard.rs, which scans
+# them.
+buck_filegroup(
+    name = "linux-ns-model-sources",
+    srcs = {src.removeprefix("linux-ns-model/"): src for src in glob(["linux-ns-model/src/**"])}
+    | {
+        "Cargo.toml": "linux-ns-model/Cargo.toml",
+        "README.md": "linux-ns-model/README.md",
+    },
+)
+
+rust_unittest(
+    name = "linux-ns-model-dependency-guard-test",
+    srcs = ["linux-ns-model/tests/dependency_guard.rs"],
+    autocargo = {"ignore_rule": True},
+    crate = "dependency_guard",
+    crate_root = "linux-ns-model/tests/dependency_guard.rs",
+    env = {
+        "CARGO_MANIFEST_DIR": "$(location :linux-ns-model-sources)",
+    },
+    resources = [":linux-ns-model-sources"],
+    deps = [],
+)
+
+# Runs the same bind/unmount sequences on the real kernel in a
+# rootless user namespace; gated like the other host-dependent
+# suites.
+rust_unittest(
+    name = "linux-ns-model-kernel-differential-test",
+    srcs = [
+        "linux-ns-model/tests/common/mod.rs",
+        "linux-ns-model/tests/kernel_differential.rs",
+    ],
+    autocargo = {"ignore_rule": True},
+    crate = "kernel_differential",
+    crate_root = "linux-ns-model/tests/kernel_differential.rs",
+    # Run by :linux-ns-model-kernel-differential-test-gated (fb-only/gated_tests).
+    labels = run_gated_only(),
+    target_compatible_with = [
+        "ovr_config//cpu:x86_64",
+        "ovr_config//os:linux",
+    ],
+    deps = [
+        "fbsource//third-party/rust:libc",
+        ":linux-ns-model",
+    ],
+)
+
+gated_test(
+    name = "linux-ns-model-kernel-differential-test-gated",
+    test = "//hermetic_infra/reverie:linux-ns-model-kernel-differential-test",
+)
+
+# The workspace-wide half of the dependency guards (forward
+# closure + incoming edges), run by hand in a git checkout; in
+# fbsource the cquery forms quoted in the script are the guard.
+python_binary(
+    name = "check-linux-ns-model-deps",
+    srcs = ["scripts/check-linux-ns-model-deps.py"],
+    labels = ["autodeps2_generated"],
+    main_module = "hermetic_infra.reverie.scripts.check-linux-ns-model-deps",
 )
 
 rust_library(

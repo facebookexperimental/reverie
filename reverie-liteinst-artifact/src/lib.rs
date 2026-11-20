@@ -1,3 +1,11 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
 //! Shared, fail-closed constructor and diagnostic artifact qualification.
 //! No Cargo invocation is implicit in consumer verification. Producer commands
 //! are bounded separately from the enclosing validation DAG's CPU/memory/PID containment.
@@ -1655,8 +1663,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 88] = [
     ),
     (
         "Cargo.toml",
-        769,
-        "e81be8f287b2e40d783525204fbca6c4dec2c8cb9f6817ff7dbed2ba53c6fd11",
+        791,
+        "f4c2f3f57486b4e023b61bf1a695a16677e7144d8da7d8ff2ccbff8967ab87f8",
     ),
     (
         "reverie-liteinst-artifact/Cargo.toml",
@@ -41818,6 +41826,11 @@ mod tests {
             8462,
             "88754c17f24ed582aa24bbc485c8eca5ee0b5a25ad191b2811107c918eecee39",
         ),
+        (
+            "Cargo.toml",
+            791,
+            "f4c2f3f57486b4e023b61bf1a695a16677e7144d8da7d8ff2ccbff8967ab87f8",
+        ),
     ];
 
     /// Seals over prefixes of `CONTENT_REVERIE_CATALOG_BINDINGS`: (rows covered,
@@ -41899,6 +41912,10 @@ mod tests {
         (
             130,
             "a6853a704331cf5fb2bb2976d5d272989327279d873796d5763babbeddb64dbe",
+        ),
+        (
+            131,
+            "2e7b53d03ae842ca4e75e746169177a3da0118bd9d267342b9dd3fe3a2797b8d",
         ),
     ];
 
@@ -44164,6 +44181,11 @@ mod tests {
                 "reverie/src/pmu.rs",
                 8462,
                 "de1fc186e000181ab776086b8266a4c668f626cc1d63dc5c9c1c5066d6d062d8",
+            ),
+            (
+                "Cargo.toml",
+                769,
+                "e81be8f287b2e40d783525204fbca6c4dec2c8cb9f6817ff7dbed2ba53c6fd11",
             ),
         ];
         // A re-bind records its previous tuple above, for every path, not only these.
@@ -75860,6 +75882,7 @@ pub mod private_static {
     // workspace's manifests, so additions and removals require a reviewed
     // update.
     const REVERIE_WORKSPACE_PACKAGES: &[&str] = &[
+        "linux-ns-model",
         "nostd-print",
         "reverie-core",
         "reverie-examples",

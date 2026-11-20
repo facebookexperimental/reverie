@@ -5,6 +5,7 @@ members = [
     "experimental/reverie-rpc-macros",
     "experimental/reverie-rpc",
     "experimental/riptrace/rpc",
+    "linux-ns-model",
     "reverie",
     "reverie-inguest",
     "reverie-examples",

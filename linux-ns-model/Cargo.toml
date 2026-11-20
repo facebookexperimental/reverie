@@ -1,0 +1,19 @@
+[package]
+name = "linux-ns-model"
+description = "Pure model of Linux mount namespaces and mount tables: bind and unmount admission, propagation, and rendering, with identity, time, presentation, and host performance injected by the consumer."
+version = "0.5.7"
+authors = ["Meta Platforms"]
+edition = "2024"
+repository = "https://github.com/facebookexperimental/reverie"
+license = "BSD-2-Clause"
+readme = "README.md"
+documentation = "https://docs.rs/linux-ns-model"
+keywords = ["linux", "namespaces", "mount"]
+categories = ["os::linux-apis"]
+
+# A pure leaf: the library has no dependencies at all (normal or build).
+# The single dev-dependency below serves only the kernel differential
+# test, which makes real mount calls in a user namespace and compares
+# the kernel's mount table with the model's.
+[dev-dependencies]
+libc = "0.2.186"
