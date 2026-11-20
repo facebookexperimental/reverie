@@ -1,6 +1,6 @@
 ---
 name: reverie-layering
-description: "Reverie is an independent product that must make sense without Hermit, its main consumer: keep Hermit and Detcore implementation logic out of Reverie by adding generic mechanisms, and judge independence in review from the design and dependencies. Use when designing or reviewing a Reverie API, hook, flag, build target, test or dependency."
+description: "Reverie is an independent product that must make sense without Hermit, its main consumer: keep Hermit and Detcore implementation logic out of Reverie by adding generic mechanisms, and judge independence in review from the design and dependencies; fix a backend compatibility gap at the layer that owns the behaviour. Use when designing or reviewing a Reverie API, hook, flag, build target, test or dependency, or a backend compatibility fix."
 ---
 
 # Reverie layering
@@ -32,3 +32,19 @@ Boundary cases:
 - A cross-repository ABI name (a symbol a consumer defines that Reverie calls,
   or the reverse) is renamed only together with the other side, never as a
   drive-by edit.
+
+## Backend compatibility
+
+Fix a compatibility gap at the layer that owns the behaviour (owner,
+2026-11-19):
+
+- A backend supplies mechanism only: how an event is hooked, trapped and
+  routed to the tool. Semantics are written once, above the backend in code
+  every backend shares, or beneath it in the Linux provider that
+  `Guest::inject` reaches.
+- Before fixing a gap, reproduce it on every backend it could touch.
+- A gap on one backend is fixed by making the shared path serve that backend,
+  or by making that backend's Linux provider agree with Linux; never by a
+  backend-specific semantic patch.
+- Where the ptrace backend passes a test, its behaviour is the reference the
+  other backends match.
