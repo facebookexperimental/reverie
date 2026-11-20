@@ -808,6 +808,73 @@ impl<T: Tool, R: HostRuntime> ToolHost<T, R> {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+const EXPECTED_SYSNO_COUNT: usize = 383;
+#[cfg(target_arch = "aarch64")]
+const EXPECTED_SYSNO_COUNT: usize = 345;
+
+// Pin the syscall table the decode gate in `dispatch` relies on.
+// `Sysno` is externally `#[non_exhaustive]`: these assertions make
+// additions, removals, renumbering, or a changed table endpoint
+// fail at compile time instead of silently widening what the gate
+// admits. The per-variant asserts cover the additions that named
+// 462-469, plus `uretprobe`/`uprobe` on x86_64 (ten additions
+// there, the eight on aarch64): each newly named number must be
+// deliberately placed in or out of the gate's refuse-set.
+// `uretprobe`/`uprobe` are refused below like 462-469.
+const _: () = {
+    assert!(Sysno::count() == EXPECTED_SYSNO_COUNT);
+    assert!(Sysno::last().id() == 469);
+    assert!(Sysno::mseal.id() == 462);
+    assert!(Sysno::setxattrat.id() == 463);
+    assert!(Sysno::getxattrat.id() == 464);
+    assert!(Sysno::listxattrat.id() == 465);
+    assert!(Sysno::removexattrat.id() == 466);
+    assert!(Sysno::open_tree_attr.id() == 467);
+    assert!(Sysno::file_getattr.id() == 468);
+    assert!(Sysno::file_setattr.id() == 469);
+};
+#[cfg(target_arch = "x86_64")]
+const _: () = {
+    assert!(Sysno::uretprobe.id() == 335);
+    assert!(Sysno::uprobe.id() == 336);
+};
+
+/// Whether `dispatch` must refuse `sysno` locally with `-ENOSYS`
+/// instead of delivering it to the Tool or forwarding it.
+///
+/// The admission boundary is subscription by a classifying Tool:
+/// a number the Tool subscribes to is delivered to the Tool, which
+/// owns its semantics (for example Detcore answers
+/// `open_tree_attr` (467) with `-EPERM` on the ptrace backend and,
+/// when subscribed, in-guest alike, so backends do not diverge).
+/// Only an unreviewed number no Tool subscribes to is refused here;
+/// an unreviewed, unsubscribed number never forwards to the host
+/// kernel. The refuse-set is 462-469 plus, on x86_64, 335/336.
+fn should_refuse_unreviewed(sysno: Sysno, subscribed: bool) -> bool {
+    if subscribed {
+        return false;
+    }
+    if matches!(
+        sysno,
+        Sysno::mseal
+            | Sysno::setxattrat
+            | Sysno::getxattrat
+            | Sysno::listxattrat
+            | Sysno::removexattrat
+            | Sysno::open_tree_attr
+            | Sysno::file_getattr
+            | Sysno::file_setattr
+    ) {
+        return true;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if matches!(sysno, Sysno::uretprobe | Sysno::uprobe) {
+        return true;
+    }
+    false
+}
+
 impl<T, R> ToolHost<T, R>
 where
     T: Tool + 'static,
@@ -1794,6 +1861,26 @@ where
             guest.event.result = -i64::from(libc::ENOSYS);
             return;
         };
+        // Admission boundary: subscription by a classifying Tool.
+        // A subscribed number is delivered to the Tool below, which
+        // owns its semantics (Detcore answers `open_tree_attr`
+        // (467) with `-EPERM` on the ptrace backend and, when
+        // subscribed, in-guest alike, so backends do not diverge
+        // under directive 7166). Only an unreviewed, unsubscribed
+        // number is refused here with `-ENOSYS` (neither forwarded
+        // nor delivered); naming a number alone must not admit it.
+        // `uretprobe` (335, named in syscalls 0.7.0) and `uprobe`
+        // (336, named in 0.8.1) follow the same rule: they refuse
+        // only when unsubscribed, which is the reviewed case today
+        // (no forwarding review), so in practice they still refuse.
+        // Precedence: for a direct typed `mseal` on an owner page
+        // this `-ENOSYS` refusal (when unsubscribed) precedes the
+        // owner `-EPERM` guard; the nested path is untouched. When
+        // subscribed, the Tool decides, as on the ptrace backend.
+        if should_refuse_unreviewed(number, self.subscriptions.contains(&number)) {
+            guest.event.result = -i64::from(libc::ENOSYS);
+            return;
+        }
         if !self.subscriptions.contains(&number) {
             let number = guest.event.number;
             let args = guest.event.args;
@@ -9965,5 +10052,63 @@ mod tests {
         let observed = unsafe { *(counts as *const [u64; 2]) };
         unsafe { libc::munmap(counts, 4096) };
         assert_eq!(observed, [0, 0], "no hook may run for resolve(0)");
+    }
+
+    /// Subscribed 467 routes to the Tool (Detcore `-EPERM` parity);
+    /// the pre-exemption gate refused it unconditionally, so this
+    /// assertion is red on that gate.
+    #[test]
+    fn subscribed_open_tree_attr_is_not_locally_refused() {
+        assert!(
+            !should_refuse_unreviewed(Sysno::open_tree_attr, true),
+            "subscribed open_tree_attr must be delivered to the Tool, not refused locally"
+        );
+    }
+
+    /// Unsubscribed members of the refuse-set still refuse locally.
+    #[test]
+    fn unsubscribed_unreviewed_numbers_refuse_locally() {
+        assert!(
+            should_refuse_unreviewed(Sysno::mseal, false),
+            "unsubscribed mseal (462) must refuse locally with -ENOSYS"
+        );
+        assert!(
+            should_refuse_unreviewed(Sysno::open_tree_attr, false),
+            "unsubscribed open_tree_attr (467) must refuse locally with -ENOSYS"
+        );
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert!(
+                should_refuse_unreviewed(Sysno::uretprobe, false),
+                "unsubscribed uretprobe (335) must refuse locally with -ENOSYS"
+            );
+            assert!(
+                should_refuse_unreviewed(Sysno::uprobe, false),
+                "unsubscribed uprobe (336) must refuse locally with -ENOSYS"
+            );
+        }
+    }
+
+    /// The exemption is by subscription, not by number: a subscribed
+    /// refuse-set member routes, and other numbers never refuse here.
+    #[test]
+    fn refuse_predicate_is_subscription_gated() {
+        assert!(
+            !should_refuse_unreviewed(Sysno::mseal, true),
+            "subscribed mseal must be delivered to the Tool, not refused locally"
+        );
+        #[cfg(target_arch = "x86_64")]
+        assert!(
+            !should_refuse_unreviewed(Sysno::uretprobe, true),
+            "subscribed uretprobe must be delivered to the Tool, not refused locally"
+        );
+        assert!(
+            !should_refuse_unreviewed(Sysno::getpid, false),
+            "getpid is outside the refuse-set and must never refuse here"
+        );
+        assert!(
+            !should_refuse_unreviewed(Sysno::getpid, true),
+            "getpid is outside the refuse-set and must never refuse here"
+        );
     }
 }
