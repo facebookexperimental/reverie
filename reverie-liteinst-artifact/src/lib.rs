@@ -1923,8 +1923,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 88] = [
     // at its target, with any instruction offset, as a late delivery.
     (
         "reverie/src/pmu_config.rs",
-        79136,
-        "58f6a6e0fdaa52173cbd4e252574e5868e8e2973712621f93b98e36eec1a7649",
+        80031,
+        "bcbe9c0182cec89f26761b4aaa261b1463335cc1179ccd5a83acab72316bdec6",
     ),
     (
         "reverie/src/in_guest_rcb.rs",
@@ -1933,8 +1933,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 88] = [
     ),
     (
         "reverie/src/pmu.rs",
-        8175,
-        "9ca37a8ef80bc02e2282f8f823fba954ad9d86a7be26aa5968347cd44305cba6",
+        8462,
+        "de1fc186e000181ab776086b8266a4c668f626cc1d63dc5c9c1c5066d6d062d8",
     ),
     (
         "reverie-inguest/src/guest/clock.rs",
@@ -41830,6 +41830,16 @@ mod tests {
             769,
             "e81be8f287b2e40d783525204fbca6c4dec2c8cb9f6817ff7dbed2ba53c6fd11",
         ),
+        (
+            "reverie/src/pmu_config.rs",
+            80031,
+            "bcbe9c0182cec89f26761b4aaa261b1463335cc1179ccd5a83acab72316bdec6",
+        ),
+        (
+            "reverie/src/pmu.rs",
+            8462,
+            "de1fc186e000181ab776086b8266a4c668f626cc1d63dc5c9c1c5066d6d062d8",
+        ),
     ];
 
     /// Seals over prefixes of `CONTENT_REVERIE_CATALOG_BINDINGS`: (rows covered,
@@ -41903,6 +41913,10 @@ mod tests {
         (
             125,
             "9af856c6a23ccd4bc9c816735b4c4e34994cba0c5a4d89b3f4318a0a67d89d2a",
+        ),
+        (
+            127,
+            "96c519432b88b8bc36cd3c43f9acbe09d0465ffb6958325e6559088d13768719",
         ),
     ];
 
@@ -44143,6 +44157,16 @@ mod tests {
                 "Cargo.toml",
                 747,
                 "1e5c2f2b861c13ab08a1ef5f64827eedfdfa7929b3075711bbb01622aa56d986",
+            ),
+            (
+                "reverie/src/pmu_config.rs",
+                79136,
+                "58f6a6e0fdaa52173cbd4e252574e5868e8e2973712621f93b98e36eec1a7649",
+            ),
+            (
+                "reverie/src/pmu.rs",
+                8175,
+                "9ca37a8ef80bc02e2282f8f823fba954ad9d86a7be26aa5968347cd44305cba6",
             ),
         ];
         // A re-bind records its previous tuple above, for every path, not only these.

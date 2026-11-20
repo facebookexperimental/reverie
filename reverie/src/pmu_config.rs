@@ -1584,10 +1584,46 @@ mod clock_state_tests {
             (
                 "GenuineIntel",
                 0x06,
+                0x97,
+                ModelNotInTable {
+                    family: 0x06,
+                    model: 0x97,
+                },
+            ),
+            (
+                "GenuineIntel",
+                0x06,
                 0x9A,
-                MetricNotEstablished {
+                ModelNotInTable {
                     family: 0x06,
                     model: 0x9A,
+                },
+            ),
+            (
+                "GenuineIntel",
+                0x06,
+                0xB7,
+                ModelNotInTable {
+                    family: 0x06,
+                    model: 0xB7,
+                },
+            ),
+            (
+                "GenuineIntel",
+                0x06,
+                0xBA,
+                ModelNotInTable {
+                    family: 0x06,
+                    model: 0xBA,
+                },
+            ),
+            (
+                "GenuineIntel",
+                0x06,
+                0xBF,
+                ModelNotInTable {
+                    family: 0x06,
+                    model: 0xBF,
                 },
             ),
             (

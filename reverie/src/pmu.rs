@@ -82,9 +82,15 @@ impl PmuProfile {
                 0x4E | 0x55 | 0x5E => (0x5101c4, 100),        // Intel Skylake
                 0x8E | 0x9E => (0x5101c4, 100),               // Intel Kabylake
                 0xA5 | 0xA6 => (0x5101c4, 100),               // Intel Cometlake
-                0x8D => (0x5111c4, 100),                      // Intel Tiger Lake
-                0x9A => (0x5101c4, 125),                      // Intel Alder Lake
-                0x8F => (0x5111c4, 125),                      // Intel Sapphire Rapids
+                0x8D => (0x5111c4, 100), // Intel Tiger Lake
+                // Intel client hybrid models (Alder Lake 0x97/0x9A and
+                // Raptor Lake 0xB7/0xBA/0xBF) are deliberately absent:
+                // their performance and efficiency cores encode
+                // BR_INST_RETIRED differently, and this table has no
+                // core-type-aware profile for them. They therefore take
+                // the same named unsupported-CPU refusal as any other
+                // model with no profile.
+                0x8F => (0x5111c4, 125), // Intel Sapphire Rapids
                 0x86 => (0x5101c4, 100),                      // Intel Icelake
                 // Intel Emerald Rapids (Raptor Cove; Linux INTEL_EMERALDRAPIDS_X).
                 // Intel's perfmon tables encode BR_INST_RETIRED as Sapphire
@@ -134,10 +140,10 @@ impl PmuProfile {
         // on every Intel family-6 entry above through Comet Lake and C4/11 as
         // BR_INST_RETIRED.COND from Ice Lake on; Linux perf 5b0764a53235
         // defines AMD D1 as retired conditional branches on Zen 1 to 6.
-        // Alder Lake is hybrid (its E-cores count C4/7E) and 0x86 has no
-        // C4/01 definition, so what their selectors count is not established.
+        // Model 0x86 has no C4/01 definition, so what its selector
+        // counts is not established.
         let metric = match (family_id, model_id) {
-            (0x06, 0x9A | 0x86) => None,
+            (0x06, 0x86) => None,
             _ => Some(RcbMetric::ConditionalBranchesRetiredUserV1),
         };
 

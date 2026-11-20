@@ -8913,9 +8913,10 @@ mod tests {
 
     // Umask 01 already counts every conditional branch on these cores
     // (perfmon skylake_core.json, skylakex_core.json, cascadelakex_core.json).
-    // Alder Lake (hybrid) and model 0x86 keep their entries; that is the scope
-    // of https://github.com/rrnewton/reverie/issues/965, not a claim that
-    // their counting is right.
+    // Model 0x86 keeps its entry; that is the scope of
+    // https://github.com/rrnewton/reverie/issues/965, not a claim that
+    // its counting is right. Intel client hybrid models have no profile
+    // and are refused by the no-profile test below.
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn models_outside_the_umask_11_correction_keep_their_event() {
@@ -8927,7 +8928,6 @@ mod tests {
             (0x9E, 100),
             (0xA5, 100),
             (0xA6, 100),
-            (0x9A, 125),
             (0x86, 100),
         ] {
             let config = PmuConfig::from_family_model(0x06, model);
@@ -8940,13 +8940,20 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn a_cpu_with_no_profile_is_refused_with_its_family_and_model() {
-        assert!(matches!(
-            PmuConfig::for_family_model(0x06, 0x01),
-            Err(crate::validation::PmuValidationError::UnsupportedCpu {
-                family: 0x06,
-                model: 0x01
-            })
-        ));
+        // Every Intel client hybrid model refuses the same way until a
+        // core-type-aware profile exists.
+        for model in [0x01, 0x97, 0x9A, 0xB7, 0xBA, 0xBF] {
+            assert!(
+                matches!(
+                    PmuConfig::for_family_model(0x06, model),
+                    Err(crate::validation::PmuValidationError::UnsupportedCpu {
+                        family: 0x06,
+                        model: refused
+                    }) if refused == model
+                ),
+                "model {model:#x}"
+            );
+        }
         assert!(PmuConfig::for_family_model(0x1A, 0x11).is_ok());
     }
 
