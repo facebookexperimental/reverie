@@ -57,8 +57,10 @@ use reverie::syscalls::Sysno;
 use reverie_ptrace::PmuConfig;
 use reverie_ptrace::ret_without_perf;
 use reverie_ptrace::testing::KeptTimerProgrammingChecks;
+use reverie_ptrace::testing::SkidWitnesses;
 use reverie_ptrace::testing::assert_at_target_unless_witnessed;
 use reverie_ptrace::testing::check_fn_with_config;
+use reverie_ptrace::testing::take_skid_witnesses;
 use serde::Deserialize;
 use serde::Serialize;
 use test_case::test_case;
@@ -272,7 +274,7 @@ static WITNESS: Mutex<()> = Mutex::new(());
 struct Run {
     clocks: Vec<u64>,
     places: Vec<Place>,
-    witnesses: u64,
+    witnesses: SkidWitnesses,
     /// The traps that kept the event while it waited for its PMU
     /// notification, each of which must have left its programming as the
     /// request made it, at the trap and, unless it handed the event on, at
@@ -307,11 +309,11 @@ impl Run {
         if rcbs == LESS_RCBS {
             assert_eq!(self.clocks, [rcbs], "the timer must fire {what}");
             assert_eq!(
-                self.witnesses, 0,
+                self.witnesses.count, 0,
                 "steps from the request cannot pass the target"
             );
         } else {
-            assert_at_target_unless_witnessed(&self.clocks, rcbs, self.witnesses);
+            assert_at_target_unless_witnessed(&self.clocks, rcbs, &self.witnesses);
         }
     }
 }
@@ -321,14 +323,14 @@ fn run(guest: impl FnOnce() + Send + 'static, schedule: Schedule) -> Run {
     let _owner = WITNESS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let _ = reverie::take_skid_overshoot_count();
+    let _ = take_skid_witnesses();
     let checks = KeptTimerProgrammingChecks::start();
     let events = check_fn_with_config::<PreciseTimerTool, _>(guest, schedule, true);
     let (keeps, handed_on) = checks.keeps_and_handed_on();
     Run {
         clocks: events.0.into_inner().unwrap(),
         places: events.1.into_inner().unwrap(),
-        witnesses: reverie::take_skid_overshoot_count(),
+        witnesses: take_skid_witnesses(),
         keeps,
         handed_on,
     }
@@ -531,7 +533,7 @@ fn an_observed_stop_cancels_the_timer_in_a_loop_that_traps_in_every_round(getppi
         "the cancelled timer must not fire"
     );
     assert_eq!(
-        run.witnesses, 0,
+        run.witnesses.count, 0,
         "the event was cancelled before it was due"
     );
     run.assert_kept(0);

@@ -33,6 +33,7 @@ use reverie_ptrace::testing::assert_at_target_unless_witnessed;
 use reverie_ptrace::testing::check_fn_with_config;
 use reverie_ptrace::testing::do_branches;
 use reverie_ptrace::testing::precise_timer_second_stages_armed;
+use reverie_ptrace::testing::take_skid_witnesses;
 
 /// Far beyond the largest skid margin in Reverie's PMU table, so the event is
 /// staged wherever staging applies.
@@ -119,7 +120,7 @@ fn a_staged_event_fires_once_at_its_target() {
     let staged = PmuConfig::new()
         .expect("this host has a PMU profile")
         .stages(PERF_RCBS);
-    let _ = reverie::take_skid_overshoot_count();
+    let _ = take_skid_witnesses();
     let second_stages = precise_timer_second_stages_armed();
     let events = check_fn_with_config::<PreciseTimerTool, _>(
         || {
@@ -132,14 +133,14 @@ fn a_staged_event_fires_once_at_its_target() {
         true,
     );
     let second_stages = precise_timer_second_stages_armed() - second_stages;
-    let witnesses = reverie::take_skid_overshoot_count();
+    let witnesses = take_skid_witnesses();
     let events = events.0.into_inner().unwrap();
     assert_eq!(
         events.len() as u64,
         ROUNDS,
         "each timer must fire once: {events:?}"
     );
-    assert_at_target_unless_witnessed(&events, PERF_RCBS, witnesses);
+    assert_at_target_unless_witnessed(&events, PERF_RCBS, &witnesses);
     if staged {
         // A first stage notification later than about the first stage
         // margin less the second's is stepped from, so not every event need
@@ -151,5 +152,8 @@ fn a_staged_event_fires_once_at_its_target() {
     } else {
         assert_eq!(second_stages, 0, "no event is staged here");
     }
-    eprintln!("staged={staged} second_stages={second_stages} witnesses={witnesses}");
+    eprintln!(
+        "staged={staged} second_stages={second_stages} witnesses={}",
+        witnesses.count
+    );
 }

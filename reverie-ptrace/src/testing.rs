@@ -13,6 +13,8 @@ use reverie::Error;
 use reverie::ExitStatus;
 use reverie::GlobalTool;
 use reverie::Pid;
+use reverie::SkidOvershootDetail;
+use reverie::SkidOvershootKind;
 use reverie::Tool;
 use reverie::process::Command;
 use reverie::process::Output;
@@ -320,37 +322,103 @@ impl KeptTimerProgrammingChecks {
     }
 }
 
-/// Checks that each of a run's precise timer events that a PMU notification
-/// delivered fired at its target, `target` RCBs past its request, except
-/// where Reverie witnessed a skid overshoot: `witnesses` is the change in
-/// `reverie::take_skid_overshoot_count` over the run.
+/// The skid overshoots Reverie witnessed over a run, from both of its records
+/// of them, taken together by [`take_skid_witnesses`]: their count and the
+/// details that the detection sites recorded with them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SkidWitnesses {
+    /// How many overshoots were witnessed (`reverie::take_skid_overshoot_count`).
+    pub count: u64,
+    /// Their details, in detection order (`reverie::take_skid_overshoot_details`).
+    /// A site may count an overshoot without recording a detail, and only the
+    /// first `reverie::SKID_OVERSHOOT_DETAILS_KEPT` are kept, so there can be
+    /// fewer details than `count`.
+    pub details: Vec<SkidOvershootDetail>,
+}
+
+impl SkidWitnesses {
+    /// How many of the details are late deliveries whose notification found
+    /// the thread exactly at the event's target.
+    pub fn delivered_at_target(&self) -> u64 {
+        self.details
+            .iter()
+            .filter(|detail| {
+                detail.kind == SkidOvershootKind::DeliveredLate
+                    && detail.rcb_actual == detail.rcb_target
+            })
+            .count() as u64
+    }
+}
+
+/// Takes the skid overshoots Reverie witnessed since the last take, and
+/// starts both records anew. Call it before a run, to drop what came before
+/// the run, and after it, to read the run's own.
+pub fn take_skid_witnesses() -> SkidWitnesses {
+    SkidWitnesses {
+        count: reverie::take_skid_overshoot_count(),
+        details: reverie::take_skid_overshoot_details(),
+    }
+}
+
+/// Checks, on counts, that a run's precise timer events that a PMU
+/// notification delivered fired at their target, `target` RCBs past the
+/// request, or past it as often as Reverie witnessed a skid overshoot:
+/// `witnesses` are the run's, from [`take_skid_witnesses`].
 ///
 /// A precise event is delivered by single steps that start when its PMU
 /// notification arrives, a skid margin before the target. The processor's
 /// interrupt latency occasionally exceeds the margin, and then the guest has
-/// passed the target when the notification arrives. Reverie delivers the
-/// event late and counts it as a skid overshoot, and prints the
-/// `HERMIT_SKID_OVERSHOOT` marker, by which Hermit refuses such a run as
-/// nondeterministic.
+/// reached or passed the target when the notification arrives. Reverie then
+/// delivers the event at the observed counter, counts it as a skid overshoot,
+/// records a late-delivery detail, and prints the `SKID_OVERSHOOT_MARKER`
+/// line. A notification found exactly at the target is witnessed as well,
+/// because the counter cannot show how many instructions ran past the target
+/// branch (`PmuConfig::record_offset_notification_at_or_past_target`), even
+/// though its event fires at the target.
 ///
-/// So an event may fire past its target only if Reverie witnessed it, once:
-/// the number of events past the target must equal `witnesses`. The caller
-/// must also check how many events fired, since an event cancelled past its
-/// target would be witnessed too. Never before the target. Prints the
+/// With `late` events past the target and `at_target` late deliveries
+/// recorded exactly at it, counted from the details and never from the
+/// events, the check is `witnesses.count == late + at_target`, and
+/// `at_target` may not exceed the events at the target. Every detail is
+/// recorded after its own count, but a site may count an overshoot without a
+/// detail, and only the first `reverie::SKID_OVERSHOOT_DETAILS_KEPT` are
+/// kept, so the details can undercount the witnesses, which fails the check,
+/// and never overcount them. These are aggregate counts, which attribute no
+/// witness to an event. Any other witness, such as one of an event cancelled
+/// at or past its target, fails the check, so the caller must also check how
+/// many events fired. No event may fire before its target. Prints the
 /// overshoots of the late events, if any.
 ///
-/// The count is process global, so the tests of a process that use this must
-/// run one at a time (`--test-threads=1`).
-pub fn assert_at_target_unless_witnessed(events: &[u64], target: u64, witnesses: u64) {
+/// A limit shared with any count bound, such as
+/// `late <= witnesses.count <= late + at_target`: a block step that reaches
+/// the target (`block_step_reached_target` in reverie-ptrace's `timer.rs`,
+/// after a step in `TimerImpl::attempt_single_step`) counts a witness and
+/// records no detail, so an event it delivers at the target fails the check
+/// closed (reverie#164). It never passes silently.
+///
+/// The records are process global, so the tests of a process that use this
+/// must run one at a time (`--test-threads=1`).
+pub fn assert_at_target_unless_witnessed(events: &[u64], target: u64, witnesses: &SkidWitnesses) {
     assert!(
         events.iter().all(|&event| event >= target),
         "no event may fire before its target {target}: {events:?}"
     );
     let late = events.iter().filter(|&&event| event > target).count() as u64;
+    let fired_at_target = events.iter().filter(|&&event| event == target).count() as u64;
+    let at_target = witnesses.delivered_at_target();
+    assert!(
+        at_target <= fired_at_target,
+        "{at_target} late deliveries were recorded at the target {target}, more than the \
+         {fired_at_target} events that fired there: {events:?} {:?}",
+        witnesses.details
+    );
     assert_eq!(
-        late, witnesses,
-        "every event past its target {target}, and nothing else, must be a witnessed skid \
-         overshoot: {events:?}"
+        witnesses.count,
+        late + at_target,
+        "the witnesses must number the events past the target {target} plus the late \
+         deliveries recorded at it: {late} events past it, {at_target} deliveries recorded at \
+         it: {events:?} {:?}",
+        witnesses.details
     );
     if late > 0 {
         let overshoots: Vec<u64> = events
@@ -359,9 +427,10 @@ pub fn assert_at_target_unless_witnessed(events: &[u64], target: u64, witnesses:
             .map(|&event| event - target)
             .collect();
         eprintln!(
-            "{late} of {} events fired past the target {target} with a witnessed skid \
-             overshoot of {overshoots:?}",
-            events.len()
+            "{late} of {} events fired past the target {target}, by {overshoots:?}, with {} \
+             witnessed skid overshoots",
+            events.len(),
+            witnesses.count
         );
     }
 }
@@ -662,5 +731,168 @@ mod tests {
                 "{rust_log}"
             );
         }
+    }
+
+    const TARGET: u64 = 30_000;
+    /// Reverie's counter value at the target, which the details record.
+    const RCB_TARGET: u64 = 30_108;
+
+    fn detail(kind: SkidOvershootKind, past_target: u64) -> SkidOvershootDetail {
+        SkidOvershootDetail {
+            tid: Pid::from_raw(7),
+            kind,
+            rcb_actual: RCB_TARGET + past_target,
+            rcb_target: RCB_TARGET,
+            overflow_point: Some(RCB_TARGET - 100),
+            overflow_recorded: None,
+            sample_age_ns: None,
+        }
+    }
+
+    fn delivered_late(past_target: u64) -> SkidOvershootDetail {
+        detail(SkidOvershootKind::DeliveredLate, past_target)
+    }
+
+    fn missed(past_target: u64) -> SkidOvershootDetail {
+        detail(
+            SkidOvershootKind::Missed {
+                by: "Signal(SIGTRAP) stop".to_owned(),
+                notification_queued: false,
+            },
+            past_target,
+        )
+    }
+
+    fn witnesses(count: u64, details: Vec<SkidOvershootDetail>) -> SkidWitnesses {
+        SkidWitnesses { count, details }
+    }
+
+    #[test]
+    fn counts_within_the_bound_pass() {
+        for (events, witnessed) in [
+            (vec![], witnesses(0, vec![])),
+            (vec![TARGET], witnesses(0, vec![])),
+            // A notification found the thread at the target: witnessed late,
+            // though the event fired there.
+            (vec![TARGET], witnesses(1, vec![delivered_late(0)])),
+            (vec![TARGET + 59], witnesses(1, vec![delivered_late(59)])),
+            // A site may count an overshoot without recording its detail.
+            (vec![TARGET + 59], witnesses(1, vec![])),
+            (
+                vec![TARGET, TARGET, TARGET + 6],
+                witnesses(2, vec![delivered_late(0), delivered_late(6)]),
+            ),
+        ] {
+            assert_at_target_unless_witnessed(&events, TARGET, &witnessed);
+        }
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "the witnesses must number the events past the target 30000 plus the late"
+    )]
+    fn a_late_event_without_a_witness_fails() {
+        assert_at_target_unless_witnessed(&[TARGET + 5], TARGET, &witnesses(0, vec![]));
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "the witnesses must number the events past the target 30000 plus the late"
+    )]
+    fn witnesses_above_late_and_at_target_fail() {
+        assert_at_target_unless_witnessed(
+            &[TARGET],
+            TARGET,
+            &witnesses(2, vec![delivered_late(0)]),
+        );
+    }
+
+    /// A past-target event with an at-target record and no at-target event:
+    /// the record needs an event at the target.
+    #[test]
+    #[should_panic(
+        expected = "1 late deliveries were recorded at the target 30000, more than the 0 events"
+    )]
+    fn a_past_target_event_with_an_at_target_record_and_no_at_target_event_fails() {
+        assert_at_target_unless_witnessed(
+            &[TARGET + 5],
+            TARGET,
+            &witnesses(1, vec![delivered_late(0)]),
+        );
+    }
+
+    /// As above, with a witness for each: the counts match, but the record
+    /// still needs an event at the target.
+    #[test]
+    #[should_panic(
+        expected = "1 late deliveries were recorded at the target 30000, more than the 0 events"
+    )]
+    fn an_at_target_record_without_an_at_target_event_fails() {
+        assert_at_target_unless_witnessed(
+            &[TARGET + 5],
+            TARGET,
+            &witnesses(2, vec![delivered_late(0)]),
+        );
+    }
+
+    /// Two events, at and past the target, and one witness, recorded at the
+    /// target: one witness too few for the two.
+    #[test]
+    #[should_panic(
+        expected = "the witnesses must number the events past the target 30000 plus the late"
+    )]
+    fn a_past_target_event_with_only_an_at_target_witness_fails() {
+        assert_at_target_unless_witnessed(
+            &[TARGET, TARGET + 5],
+            TARGET,
+            &witnesses(1, vec![delivered_late(0)]),
+        );
+    }
+
+    /// The allowance at the target comes only from recorded late deliveries,
+    /// never from the events' clocks.
+    #[test]
+    #[should_panic(
+        expected = "the witnesses must number the events past the target 30000 plus the late"
+    )]
+    fn a_witness_without_an_at_target_delivery_fails() {
+        assert_at_target_unless_witnessed(&[TARGET], TARGET, &witnesses(1, vec![]));
+    }
+
+    /// The limit shared with any count bound: a block step that reaches the
+    /// target counts a witness without a detail, and its event at the target
+    /// fails closed (reverie#164).
+    #[test]
+    #[should_panic(
+        expected = "the witnesses must number the events past the target 30000 plus the late"
+    )]
+    fn shared_limit_a_block_step_delivery_at_the_target_without_a_record_fails_closed() {
+        assert_at_target_unless_witnessed(&[TARGET], TARGET, &witnesses(1, vec![]));
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "the witnesses must number the events past the target 30000 plus the late"
+    )]
+    fn a_witness_of_an_event_missed_at_its_target_fails() {
+        assert_at_target_unless_witnessed(&[TARGET], TARGET, &witnesses(1, vec![missed(0)]));
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "the witnesses must number the events past the target 30000 plus the late"
+    )]
+    fn a_delivery_recorded_past_the_target_does_not_count_at_it() {
+        assert_at_target_unless_witnessed(
+            &[TARGET],
+            TARGET,
+            &witnesses(1, vec![delivered_late(59)]),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "no event may fire before its target 30000")]
+    fn an_event_before_its_target_fails() {
+        assert_at_target_unless_witnessed(&[TARGET - 1], TARGET, &witnesses(0, vec![]));
     }
 }

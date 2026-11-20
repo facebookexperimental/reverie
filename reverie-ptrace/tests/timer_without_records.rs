@@ -39,12 +39,14 @@ use reverie::syscalls::Sysno;
 use reverie_ptrace::PmuConfig;
 use reverie_ptrace::ret_without_perf;
 use reverie_ptrace::testing::KeptTimerProgrammingChecks;
+use reverie_ptrace::testing::SkidWitnesses;
 use reverie_ptrace::testing::assert_at_target_unless_witnessed;
 use reverie_ptrace::testing::check_fn_with_config;
 use reverie_ptrace::testing::disable_timer_overflow_records;
 use reverie_ptrace::testing::do_branches;
 use reverie_ptrace::testing::rerun_at_skid_margin;
 use reverie_ptrace::testing::rerun_skid_margin;
+use reverie_ptrace::testing::take_skid_witnesses;
 
 /// Above the largest skid margin in Reverie's PMU table, so the request
 /// programs a real PMU notification on every host in the table.
@@ -112,22 +114,18 @@ static WITNESS: Mutex<()> = Mutex::new(());
 /// traps that kept the event, each of which must have left its programming
 /// as the request made it, at the trap and at the thread's next stop (see
 /// `KeptTimerProgrammingChecks`).
-fn run(guest: impl FnOnce() + Send + 'static) -> (Vec<u64>, u64, u64) {
+fn run(guest: impl FnOnce() + Send + 'static) -> (Vec<u64>, SkidWitnesses, u64) {
     // Checks that a re-run's skid margin override is in effect.
     let _ = rerun_skid_margin();
     disable_timer_overflow_records();
     let _owner = WITNESS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let _ = reverie::take_skid_overshoot_count();
+    let _ = take_skid_witnesses();
     let checks = KeptTimerProgrammingChecks::start();
     let events = check_fn_with_config::<PreciseTimerTool, _>(guest, (), true);
     let keeps = checks.keeps();
-    (
-        events.0.into_inner().unwrap(),
-        reverie::take_skid_overshoot_count(),
-        keeps,
-    )
+    (events.0.into_inner().unwrap(), take_skid_witnesses(), keeps)
 }
 
 /// The `clock_getres` at which the Tool requests the timer, with no
@@ -203,7 +201,7 @@ fn a_trap_before_the_period_does_not_cancel_the_timer() {
         "the trap must keep the event, with its programming unchanged"
     );
     assert_eq!(events.len(), 1, "the timer must fire once: {events:?}");
-    assert_at_target_unless_witnessed(&events, PERF_RCBS, witnesses);
+    assert_at_target_unless_witnessed(&events, PERF_RCBS, &witnesses);
 }
 
 // The guest holds the notification back until after a trap past the target,
@@ -229,7 +227,7 @@ fn a_trap_past_the_target_cancels_the_timer() {
         Vec::<u64>::new(),
         "the cancelled timer must not fire"
     );
-    assert_eq!(witnesses, 1, "the trap overtook the due event");
+    assert_eq!(witnesses.count, 1, "the trap overtook the due event");
 }
 
 // The same with the trap past the period but before the target. The
@@ -253,7 +251,7 @@ fn a_trap_past_the_period_cancels_the_timer() {
         Vec::<u64>::new(),
         "the cancelled timer must not fire"
     );
-    assert_eq!(witnesses, 0, "the event was not due at the trap");
+    assert_eq!(witnesses.count, 0, "the event was not due at the trap");
 }
 
 // The same trap with the notification free to arrive. It arrives within a
@@ -279,7 +277,7 @@ fn a_trap_among_the_single_steps_cancels_the_timer() {
         Vec::<u64>::new(),
         "the cancelled timer must not fire"
     );
-    assert_eq!(witnesses, 0, "the event was not due at the trap");
+    assert_eq!(witnesses.count, 0, "the event was not due at the trap");
 }
 
 // The guest traps in every round of a loop that runs across the target, where
@@ -304,7 +302,10 @@ fn the_first_trap_near_the_target_cancels_the_timer_in_a_loop_that_traps_in_ever
         Vec::<u64>::new(),
         "the cancelled timer must not fire"
     );
-    assert_eq!(witnesses, 0, "the event was cancelled before it was due");
+    assert_eq!(
+        witnesses.count, 0,
+        "the event was cancelled before it was due"
+    );
 }
 
 /// The clock from the request at and after which a trap without records
@@ -344,7 +345,7 @@ fn a_trap_just_past_the_keep_point_cancels_the_timer() {
         Vec::<u64>::new(),
         "the cancelled timer must not fire"
     );
-    assert_eq!(witnesses, 0, "the event was not due at the trap");
+    assert_eq!(witnesses.count, 0, "the event was not due at the trap");
 }
 
 // A trap without records just short of the keep point leaves the event as it
@@ -365,7 +366,7 @@ fn a_trap_just_short_of_the_keep_point_keeps_the_timer() {
         "the trap must keep the event, with its programming unchanged"
     );
     assert_eq!(events.len(), 1, "the timer must fire once: {events:?}");
-    assert_at_target_unless_witnessed(&events, PERF_RCBS, witnesses);
+    assert_at_target_unless_witnessed(&events, PERF_RCBS, &witnesses);
 }
 
 /// This test's name, which its re-runs skip.
