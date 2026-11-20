@@ -21,6 +21,11 @@ of those execution paths.
   them the host advertises, so its answers can disagree with the instructions
   available to the guest (every Hermit table that runs under KVM hides all
   four) (https://github.com/rrnewton/hermit/issues/5478).
+- reverie-proc-grammar: an inotify watch line printed without a file handle
+  (`show_mark_fhandle` returns before printing one, fs/notify/fdinfo.c) now
+  parses and renders byte for byte instead of being refused. The
+  `fhandle_bytes`, `fhandle_type` and `f_handle` fields of `InotifyWatch`
+  move into `fhandle: Option<InotifyFileHandle>`.
 
 ## 0.5.7
 

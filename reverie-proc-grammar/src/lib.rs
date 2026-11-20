@@ -51,6 +51,7 @@ pub use fdinfo::EpollTarget;
 pub use fdinfo::Fdinfo;
 pub use fdinfo::FdinfoKind;
 pub use fdinfo::FdinfoLock;
+pub use fdinfo::InotifyFileHandle;
 pub use fdinfo::InotifyWatch;
 pub use fdinfo::LockAccess;
 pub use fdinfo::LockKind;

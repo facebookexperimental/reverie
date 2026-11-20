@@ -340,6 +340,99 @@ fn fdinfo_refuses_unmodelled_kinds() {
     assert!(parse_fdinfo(&uring).is_err());
 }
 
+#[test]
+fn fdinfo_inotify_watch_with_and_without_a_file_handle() {
+    // fs/notify/fdinfo.c in v7.1.3: inotify_fdinfo prints
+    // "inotify wd:%x ino:%llx sdev:%x mask:%x ignored_mask:0 " (:87),
+    // then show_mark_fhandle prints "fhandle-bytes:%x fhandle-type:%x
+    // f_handle:" and "%02x" per handle byte (:62-66) unless it returns
+    // first (:50-57), then the newline (:91). The long line below was
+    // read live; the short line is another live watch's prefix, the
+    // spelling the kernel prints when show_mark_fhandle returns first.
+    let header: &[u8] = b"pos:\t0\nflags:\t00\nmnt_id:\t18\nino:\t10249\n";
+    let long_line: &[u8] = b"inotify wd:1 ino:19c05e7fa sdev:2c mask:400 ignored_mask:0 \
+        fhandle-bytes:14 fhandle-type:4d f_handle:fae7059c0100000005000000000000001cd11c00\n";
+    let short_line: &[u8] = b"inotify wd:2 ino:13b12d910 sdev:2c mask:c06 ignored_mask:0 \n";
+
+    // The short line parses with no file handle and round-trips.
+    let short = [header, short_line].concat();
+    let parsed = parse_fdinfo(&short).expect("the short inotify line parses");
+    let FdinfoKind::Inotify(watches) = &parsed.kind else {
+        panic!("short line kind: {:?}", parsed.kind);
+    };
+    assert_eq!(
+        watches.as_slice(),
+        [InotifyWatch {
+            wd: 2,
+            ino: 0x13b12d910,
+            sdev: 0x2c,
+            mask: 0xc06,
+            ignored_mask: 0,
+            fhandle: None,
+        }]
+    );
+    assert_eq!(render_fdinfo(&parsed), short);
+
+    // The long line keeps its handle and round-trips.
+    let long = [header, long_line].concat();
+    let parsed = parse_fdinfo(&long).expect("the long inotify line parses");
+    let FdinfoKind::Inotify(watches) = &parsed.kind else {
+        panic!("long line kind: {:?}", parsed.kind);
+    };
+    let fhandle = watches[0].fhandle.as_ref().expect("the long line's handle");
+    assert_eq!((fhandle.fhandle_bytes, fhandle.fhandle_type), (0x14, 0x4d));
+    assert_eq!(fhandle.f_handle.len(), 0x14);
+    assert_eq!(render_fdinfo(&parsed), long);
+
+    // One file may hold both, in either order.
+    for (first, second) in [(long_line, short_line), (short_line, long_line)] {
+        let mixed = [header, first, second].concat();
+        let parsed = parse_fdinfo(&mixed).expect("mixed inotify lines parse");
+        assert_eq!(render_fdinfo(&parsed), mixed);
+    }
+
+    // Clearing the handle renders the short spelling of the same watch.
+    let mut parsed = parse_fdinfo(&long).unwrap();
+    let FdinfoKind::Inotify(watches) = &mut parsed.kind else {
+        unreachable!("parsed above");
+    };
+    watches[0].fhandle = None;
+    assert_eq!(
+        render_fdinfo(&parsed),
+        [
+            header,
+            b"inotify wd:1 ino:19c05e7fa sdev:2c mask:400 ignored_mask:0 \n"
+        ]
+        .concat()
+    );
+
+    // Only the exact short spelling is accepted.
+    for malformed in [
+        // No space after ignored_mask, or two.
+        &b"inotify wd:2 ino:13b12d910 sdev:2c mask:c06 ignored_mask:0\n"[..],
+        b"inotify wd:2 ino:13b12d910 sdev:2c mask:c06 ignored_mask:0  \n",
+        // A missing field.
+        b"inotify wd:2 ino:13b12d910 sdev:2c ignored_mask:0 \n",
+        b"inotify wd:2 ino:13b12d910 sdev:2c mask:c06  \n",
+        // A partial file handle.
+        b"inotify wd:2 ino:13b12d910 sdev:2c mask:c06 ignored_mask:0 fhandle-bytes:14\n",
+        b"inotify wd:2 ino:13b12d910 sdev:2c mask:c06 ignored_mask:0 fhandle-bytes:14 \
+          fhandle-type:4d\n",
+        b"inotify wd:2 ino:13b12d910 sdev:2c mask:c06 ignored_mask:0 fhandle-bytes:14 \
+          fhandle-type:4d f_handle:fa \n",
+        // Numbers the kernel never spells this way.
+        b"inotify wd:02 ino:13b12d910 sdev:2c mask:c06 ignored_mask:0 \n",
+        b"inotify wd:2 ino:13B12D910 sdev:2c mask:c06 ignored_mask:0 \n",
+    ] {
+        let bytes = [header, malformed].concat();
+        assert!(
+            parse_fdinfo(&bytes).is_err(),
+            "accepted {:?}",
+            String::from_utf8_lossy(malformed)
+        );
+    }
+}
+
 /// One canonical kernel sched field line (`%-45s:` + `%21Ld` or
 /// `%14Ld.%06ld`).
 fn sched_int(label: &str, value: i64) -> String {

@@ -162,7 +162,8 @@ pub enum FdinfoKind {
     /// (`ep_show_fdinfo`, `fs/eventpoll.c`).
     Epoll(Vec<EpollTarget>),
     /// inotify instance: one `inotify wd:` line per watch
-    /// (`inotify_fdinfo`, `fs/notify/inotify/inotify_user.c`).
+    /// (`inotify_fdinfo`, `fs/notify/fdinfo.c`), with or without the
+    /// watched inode's file handle (see [`InotifyWatch::fhandle`]).
     Inotify(Vec<InotifyWatch>),
     /// FUSE device: `fuse_connection:` number (`fs/fuse/dev.c`).
     Fuse {
@@ -188,7 +189,8 @@ pub struct EpollTarget {
     pub sdev: u64,
 }
 
-/// One inotify watch line. Fields print hexadecimal.
+/// One inotify watch line (`inotify_fdinfo`, fs/notify/fdinfo.c:76-94
+/// in v7.1.3). Fields print hexadecimal.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InotifyWatch {
     /// Watch descriptor.
@@ -201,6 +203,19 @@ pub struct InotifyWatch {
     pub mask: u32,
     /// Ignored-event mask.
     pub ignored_mask: u32,
+    /// The watched inode's file handle. `None` is the short line the
+    /// kernel prints when `show_mark_fhandle` returns before printing
+    /// anything: `super_trylock_shared` or `exportfs_encode_fid`
+    /// failed (fs/notify/fdinfo.c:50-57), or the kernel lacks
+    /// `CONFIG_EXPORTFS` (:68-72). That line ends with the space after
+    /// `ignored_mask:` and nothing else before its newline.
+    pub fhandle: Option<InotifyFileHandle>,
+}
+
+/// An inotify watch's file handle, as `show_mark_fhandle` prints it
+/// (fs/notify/fdinfo.c:62-66 in v7.1.3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InotifyFileHandle {
     /// File-handle byte count (hex as printed).
     pub fhandle_bytes: u32,
     /// File-handle type (hex as printed).
@@ -661,10 +676,20 @@ fn parse_epoll_target(line: &[u8], input: &[u8]) -> Result<EpollTarget, ProcPars
 }
 
 fn parse_inotify_watch(line: &[u8], input: &[u8]) -> Result<InotifyWatch, ProcParseError> {
-    // `inotify wd:%x ino:%lx sdev:%lx mask:%x ignored_mask:%x
-    //  fhandle-bytes:%x fhandle-type:%x f_handle:%s`
+    // `inotify wd:%x ino:%llx sdev:%x mask:%x ignored_mask:0 `
+    // (fs/notify/fdinfo.c:87 in v7.1.3; older kernels print
+    // `ignored_mask:%x `), then from `show_mark_fhandle` either
+    // `fhandle-bytes:%x fhandle-type:%x f_handle:` and `%02x` per
+    // handle byte (:62-66) or nothing (:50-57, :68-72), then the
+    // newline (:91). Split on single spaces, the long line is nine
+    // tokens; the short line is seven, the last one empty.
     let tokens: Vec<&[u8]> = line.split(|b| *b == b' ').collect();
-    if tokens.len() != 9 || tokens[0] != b"inotify" {
+    let has_fhandle = match tokens.len() {
+        9 => true,
+        7 if tokens[6].is_empty() => false,
+        _ => return Err(bad_shape(input, line)),
+    };
+    if tokens[0] != b"inotify" {
         return Err(bad_shape(input, line));
     }
     let wd_token = field_prefixed(tokens[1], b"wd:", line, input)?;
@@ -690,17 +715,41 @@ fn parse_inotify_watch(line: &[u8], input: &[u8]) -> Result<InotifyWatch, ProcPa
         input,
         "ignored_mask",
     )?;
+    let fhandle = if has_fhandle {
+        Some(parse_inotify_fhandle(&tokens[6..], line, input)?)
+    } else {
+        None
+    };
+    Ok(InotifyWatch {
+        wd,
+        ino,
+        sdev,
+        mask,
+        ignored_mask,
+        fhandle,
+    })
+}
+
+/// The three `show_mark_fhandle` tokens of a long inotify line.
+fn parse_inotify_fhandle(
+    tokens: &[&[u8]],
+    line: &[u8],
+    input: &[u8],
+) -> Result<InotifyFileHandle, ProcParseError> {
+    let [bytes_token, type_token, handle_token] = tokens else {
+        return Err(bad_shape(input, line));
+    };
     let fhandle_bytes = hex32_var(
-        field_prefixed(tokens[6], b"fhandle-bytes:", line, input)?,
+        field_prefixed(bytes_token, b"fhandle-bytes:", line, input)?,
         input,
         "fhandle-bytes",
     )?;
     let fhandle_type = hex32_var(
-        field_prefixed(tokens[7], b"fhandle-type:", line, input)?,
+        field_prefixed(type_token, b"fhandle-type:", line, input)?,
         input,
         "fhandle-type",
     )?;
-    let handle_token = field_prefixed(tokens[8], b"f_handle:", line, input)?;
+    let handle_token = field_prefixed(handle_token, b"f_handle:", line, input)?;
     let (handle_pairs, handle_rem) = handle_token.as_chunks::<2>();
     if !handle_rem.is_empty()
         || handle_token
@@ -721,12 +770,7 @@ fn parse_inotify_watch(line: &[u8], input: &[u8]) -> Result<InotifyWatch, ProcPa
             .map_err(|_| bad_shape(input, line))?,
         );
     }
-    Ok(InotifyWatch {
-        wd,
-        ino,
-        sdev,
-        mask,
-        ignored_mask,
+    Ok(InotifyFileHandle {
         fhandle_bytes,
         fhandle_type,
         f_handle,
@@ -875,25 +919,30 @@ pub fn render_fdinfo(fdinfo: &Fdinfo) -> Vec<u8> {
         FdinfoKind::Inotify(watches) => {
             let mut text = Vec::new();
             for watch in watches {
-                let handle: Vec<alloc::string::String> = watch
-                    .f_handle
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect();
                 text.extend_from_slice(
                     format!(
-                        "inotify wd:{:x} ino:{:x} sdev:{:x} mask:{:x} ignored_mask:{:x} fhandle-bytes:{:x} fhandle-type:{:x} f_handle:{}\n",
-                        watch.wd,
-                        watch.ino,
-                        watch.sdev,
-                        watch.mask,
-                        watch.ignored_mask,
-                        watch.fhandle_bytes,
-                        watch.fhandle_type,
-                        handle.concat()
+                        "inotify wd:{:x} ino:{:x} sdev:{:x} mask:{:x} ignored_mask:{:x} ",
+                        watch.wd, watch.ino, watch.sdev, watch.mask, watch.ignored_mask,
                     )
                     .as_bytes(),
                 );
+                if let Some(fhandle) = &watch.fhandle {
+                    let handle: Vec<alloc::string::String> = fhandle
+                        .f_handle
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect();
+                    text.extend_from_slice(
+                        format!(
+                            "fhandle-bytes:{:x} fhandle-type:{:x} f_handle:{}",
+                            fhandle.fhandle_bytes,
+                            fhandle.fhandle_type,
+                            handle.concat()
+                        )
+                        .as_bytes(),
+                    );
+                }
+                text.push(b'\n');
             }
             text
         }
