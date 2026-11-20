@@ -2645,6 +2645,10 @@ _LITEINST_TEST_TREE = glob([
 ]) + [
     "Cargo.toml",
     "scripts/m1_contract.rs",
+    # In its own Buck package (reverie-signal/BUCK), so the glob above
+    # does not stage its manifest; the workspace root Cargo.toml names
+    # it as a member, and the artifact tests read every member manifest.
+    "reverie-signal/Cargo.toml",
 ]
 
 # With every workspace member's manifest (experimental/ is its own package), as
