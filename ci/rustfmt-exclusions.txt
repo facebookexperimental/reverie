@@ -1,0 +1,21 @@
+# Files the Rustfmt gate leaves alone, one per line: PATH REASON.
+#
+# PATH is a repository-relative .rs path containing a `/`, written up to the
+# first space. REASON, the rest of the line, must read `sha256-pinned in FILE[
+# and FILE...]`, each FILE a repository-relative path that contains PATH's
+# sha256 as lowercase hex: a hash pin is the only reason a file's bytes cannot
+# change, and a file nothing pins is formatted instead. Separate the fields with
+# spaces, never a tab. scripts/rustfmt-gate.sh passes exactly these paths to
+# rustfmt as its `ignore` list, and refuses to run (exit 2) when a line has a
+# tab, an entry has no reason or another reason, a named FILE lacks the sha256,
+# a path is listed twice or names no file, or the generated `ignore` list
+# differs from this file. `scripts/rustfmt-gate.sh --check-exclusions` runs
+# those checks alone.
+#
+# Only files the gate reaches belong here. Formatting a listed file means
+# re-deriving whatever pins its bytes in the same change, then deleting its
+# line.
+reverie-inguest/src/guest/isa/x86_64.rs  sha256-pinned in reverie-liteinst-artifact/src/lib.rs
+reverie-liteinst/src/patch_alloc.rs  sha256-pinned in reverie-liteinst-artifact/src/lib.rs
+reverie-liteinst/src/tool_host.rs  sha256-pinned in reverie-liteinst-artifact/src/lib.rs
+reverie-inguest/src/private_runtime/tls/abi.rs  sha256-pinned in reverie-liteinst-artifact/src/private_static/tls_sources.rs

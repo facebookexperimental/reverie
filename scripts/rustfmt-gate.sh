@@ -16,13 +16,143 @@
 # nightly GitHub workflow's format step. Keep all three on this script
 # so the copies cannot drift. The edition is reverie-liteinst's
 # edition in its Cargo.toml, read there, not a second copy.
+#
+# Files whose bytes cannot change yet (another file pins their sha256)
+# are listed in ci/rustfmt-exclusions.txt, one
+# `PATH REASON` per line, and both passes skip exactly those. rustfmt
+# takes `ignore` only from a configuration file and resolves its entries
+# against that file's directory, so the gate writes
+# .tmp-rustfmt-gate-PID.toml into the repository root (gitignored,
+# removed on exit): rustfmt.toml unchanged plus an `ignore` list of the
+# listed paths, passed to both passes as --config-path. Before checking,
+# the list must parse (each entry a repository-relative .rs path, listed
+# once, with the reason `sha256-pinned in FILE[ and FILE...]`), every
+# listed path must be a file whose sha256 each FILE contains (an entry
+# nothing pins is refused: format that file instead), rustfmt.toml must
+# set no `ignore` of its own, and the `ignore` list read back from the
+# written file must be exactly the list; any failure exits 2 before
+# anything is checked. `rustfmt-gate.sh --check-exclusions` runs those
+# checks alone.
 set -u
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT" || exit 1
 
+EXCLUSIONS=ci/rustfmt-exclusions.txt
+refuse() {
+    echo "rustfmt gate: $*" >&2
+    exit 2
+}
+
+# The exclusion list: `PATH REASON` lines, PATH the first
+# whitespace-delimited field and REASON the rest of the line, trimmed;
+# `#` comment lines and blank lines are skipped. A line with a tab is
+# refused, comment lines included: fbsource's linter refuses tabs in text
+# files. rustfmt reads `ignore` entries as gitignore patterns, so a path
+# with a pattern character, or with no `/` (which gitignore matches by
+# name in every directory), would exclude more than one file.
+[[ -f $EXCLUSIONS ]] || refuse "no $EXCLUSIONS"
+pattern_chars='[][[:space:]*?!#"\]'
+excluded=()
+declare -A listed=()
+number=0
+while IFS= read -r line || [[ -n $line ]]; do
+    number=$((number + 1))
+    if [[ $line == *$'\t'* ]]; then
+        refuse "$EXCLUSIONS:$number: has a tab; separate PATH and REASON with spaces (fbsource's linter refuses tabs in text files)"
+    fi
+    [[ $line == \#* || -z ${line//[[:space:]]/} ]] && continue
+    if [[ $line == [[:space:]]* ]]; then
+        refuse "$EXCLUSIONS:$number: starts with whitespace (expected PATH REASON)"
+    fi
+    path=${line%%[[:space:]]*}
+    reason=${line#"$path"}
+    reason=${reason#"${reason%%[![:space:]]*}"}
+    reason=${reason%"${reason##*[![:space:]]}"}
+    if [[ -z $reason ]]; then
+        refuse "$EXCLUSIONS:$number: \`$path\` has no reason (expected PATH REASON)"
+    fi
+    if [[ $path != */* ]]; then
+        refuse "$EXCLUSIONS:$number: \`$path\` has no \`/\`; rustfmt would read it as a pattern matching that name in every directory"
+    fi
+    if [[ $path != *.rs || $path == /* || /$path/ == *//* || /$path/ == */./* ||
+        /$path/ == */../* || $path =~ $pattern_chars ]]; then
+        refuse "$EXCLUSIONS:$number: \`$path\` is not a repository-relative .rs path free of gitignore pattern characters"
+    fi
+    if [[ -n ${listed[$path]:-} ]]; then
+        refuse "$EXCLUSIONS:$number: \`$path\` is listed twice"
+    fi
+    listed[$path]=1
+    if [[ ! -f $path || -L $path ]]; then
+        refuse "$EXCLUSIONS:$number: \`$path\` is missing or not a regular file"
+    fi
+    # The one reason an entry may give: the files holding its sha256.
+    pinned_in=${reason#sha256-pinned in }
+    if [[ $pinned_in == "$reason" || -z $pinned_in ]]; then
+        refuse "$EXCLUSIONS:$number: \`$path\`'s reason \`$reason\` is not \`sha256-pinned in FILE[ and FILE...]\`"
+    fi
+    pins=()
+    while :; do
+        pins+=("${pinned_in%% and *}")
+        [[ $pinned_in == *" and "* ]] || break
+        pinned_in=${pinned_in#* and }
+    done
+    digest=$(sha256sum -- "$path") || refuse "$EXCLUSIONS:$number: sha256sum $path failed"
+    digest=${digest%% *}
+    [[ $digest =~ ^[0-9a-f]{64}$ ]] || refuse "$EXCLUSIONS:$number: sha256sum $path printed no digest"
+    for pin in "${pins[@]}"; do
+        if [[ -z $pin || $pin =~ [[:space:]] || $pin == /* || /$pin/ == *//* ||
+            /$pin/ == */./* || /$pin/ == */../* ]]; then
+            refuse "$EXCLUSIONS:$number: \`$path\`'s reason \`$reason\` names a FILE that is not a repository-relative path"
+        fi
+        if [[ ! -f $pin || -L $pin ]]; then
+            refuse "$EXCLUSIONS:$number: \`$path\`'s reason names \`$pin\`, which is missing or not a regular file"
+        fi
+        if ! grep -qF -- "$digest" "$pin"; then
+            refuse "$EXCLUSIONS:$number: \`$path\`'s sha256 $digest is not in \`$pin\`, so its reason does not hold; format the file and delete its entry instead"
+        fi
+    done
+    excluded+=("$path")
+done < "$EXCLUSIONS"
+
+# The configuration both passes use: rustfmt.toml unchanged plus an
+# `ignore` list of exactly the listed paths.
+[[ -f rustfmt.toml ]] || refuse "no rustfmt.toml in $ROOT"
+if grep -Eq '^[[:space:]]*ignore[[:space:]]*=' rustfmt.toml; then
+    refuse "rustfmt.toml sets \`ignore\`; the only files the gate may skip are $EXCLUSIONS's"
+fi
+config=$ROOT/.tmp-rustfmt-gate-$$.toml
+trap 'rm -f -- "$config"' EXIT
+{
+    cat rustfmt.toml
+    [[ -z $(tail -c 1 rustfmt.toml) ]] || echo
+    printf '\n# Generated by scripts/rustfmt-gate.sh from %s.\nignore = [\n' "$EXCLUSIONS"
+    for path in "${excluded[@]}"; do
+        printf '    "%s",\n' "$path"
+    done
+    printf ']\n'
+} > "$config" || refuse "cannot write $config"
+# Read the written file back: one `ignore` key, its entries exactly the
+# list, and rustfmt.toml unchanged before it.
+keys=$(grep -Ec '^[[:space:]]*ignore[[:space:]]*=' "$config")
+ignored=$(sed -n '/^ignore = \[$/,/^\]$/s/^    "\(.*\)",$/\1/p' "$config")
+expected=
+if ((${#excluded[@]} > 0)); then
+    expected=$(printf '%s\n' "${excluded[@]}")
+fi
+if [[ $keys != 1 || $ignored != "$expected" ]]; then
+    refuse "$config ignores [${ignored//$'\n'/ }], but $EXCLUSIONS lists [${excluded[*]}]"
+fi
+if ! cmp -s -n "$(wc -c < rustfmt.toml)" rustfmt.toml "$config"; then
+    refuse "$config does not start with rustfmt.toml unchanged"
+fi
+if [[ ${1:-} == --check-exclusions ]]; then
+    echo "rustfmt gate: $EXCLUSIONS is consistent: ${#excluded[@]} excluded file(s), each a file with a reason, and exactly those in the generated \`ignore\` list"
+    exit 0
+fi
+
 rc=0
-cargo fmt --all -- --check || rc=$?
+cargo fmt --all -- --check --config-path "$config" || rc=$?
 
 edition=$(sed -n 's/^edition = "\([0-9]*\)".*/\1/p' reverie-liteinst/Cargo.toml | head -n 1)
 if [[ -z $edition ]]; then
@@ -63,7 +193,7 @@ if ((${#targets[@]} == 0)); then
     exit 1
 fi
 
-rustfmt --edition "$edition" --check "${targets[@]}" || {
+rustfmt --edition "$edition" --check --config-path "$config" "${targets[@]}" || {
     status=$?
     if ((rc == 0)); then
         rc=$status
