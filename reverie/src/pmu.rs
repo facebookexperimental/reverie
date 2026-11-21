@@ -117,13 +117,15 @@ impl PmuProfile {
             // Traced 2026-10-16, one guest at a time at host load ~270, the
             // skid past a programmed notification was 23-114 RCBs at the
             // median and at most 816 over ~7,000 notifications. Under full
-            // validation load, though, the 1K margin was overrun by 15-881
-            // RCBs 17 times in 7 days, a skid of up to ~1,881. 2K covers
-            // those with ~6% headroom. Block steps make the margin cheap to
-            // step: on a chaos spin guest each event costs ~2.9 stops per
-            // margin RCB, so 2K steps ~5,800 stops (134 ms) against 2,900
-            // (68 ms) at 1K. Rarer larger overshoots are reported and
-            // delivered at the observed counter.
+            // validation load, though, 7 days of logs showed the 1K margin
+            // overrun 19 times. 17 of them were by 15-881 RCBs, a skid of up
+            // to ~1,881, which 2K covers with ~6% headroom. The other 2 were
+            // by 2,704 and 7,327 RCBs, notifications about 16 µs late; 2K
+            // does not cover them, and they need their own investigation.
+            // Block steps make the margin cheap to step: on a chaos spin
+            // guest each event costs ~2.9 stops per margin RCB, so 2K steps
+            // ~5,800 stops (134 ms) against 2,900 (68 ms) at 1K. Rarer larger
+            // overshoots are reported and delivered at the observed counter.
             0x1A if model_id == 0x11 => (AMD_RCB_EVENT, AMD_EPYC_9D85_SKID_MARGIN),
             // Family 19h model A0h uses the same 1K margin. Under the 10K guard, one
             // chaos run with a 1 ms timeslice spent 48 CPU-s single stepping in a
