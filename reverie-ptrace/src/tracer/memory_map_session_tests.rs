@@ -9,7 +9,10 @@
 mod memory_map_session_tests {
     use super::*;
 
-    fn memory_map(session: &FatalSession, tid: Pid) -> Result<reverie::MemoryMap, reverie::FactError> {
+    fn memory_map(
+        session: &FatalSession,
+        tid: Pid,
+    ) -> Result<reverie::MemoryMap, reverie::FactError> {
         crate::memory_map::read(tid, |tid| session.traced_directories(tid))
     }
 

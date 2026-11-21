@@ -58,7 +58,6 @@ pub mod child_wait;
 
 #[path = "pidfd_shadow.rs"]
 mod pidfd_shadow;
-pub(crate) use pidfd_shadow::PidfdTargetState;
 use std::sync::Condvar;
 
 pub use child_wait::ChildWaitContext;
@@ -68,6 +67,7 @@ pub use child_wait::ChildWaitSelection;
 pub(crate) use child_wait::TestChildCompletion;
 use child_wait::WaitPhase;
 use child_wait::WaitPublication;
+pub(crate) use pidfd_shadow::PidfdTargetState;
 
 /// A test hook: a closure a test installs on one thread.
 #[cfg(test)]

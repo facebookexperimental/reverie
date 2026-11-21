@@ -224,7 +224,12 @@ fn read_zero_alias_blocked_disposal(observer_panic: bool) {
             .assert_retired(&registry);
         before.assert_unchanged(&executor.state, fd);
         assert!(Arc::ptr_eq(
-            executor.file_table.lock().unwrap().entry_id(fd).expect("entry identity"),
+            executor
+                .file_table
+                .lock()
+                .unwrap()
+                .entry_id(fd)
+                .expect("entry identity"),
             &before.entry
         ));
         assert_eq!(
@@ -402,7 +407,12 @@ fn read_zero_count_alias_test_admission_restore_does_not_resurrect_sibling_repla
     let replacement = replaced_entry.lock().unwrap().take().unwrap();
     assert!(!Arc::ptr_eq(&before.entry, &replacement));
     assert!(Arc::ptr_eq(
-        executor.file_table.lock().unwrap().entry_id(fd).expect("entry identity"),
+        executor
+            .file_table
+            .lock()
+            .unwrap()
+            .entry_id(fd)
+            .expect("entry identity"),
         &replacement
     ));
     // The following install must take the sibling's new entry, not republish

@@ -575,7 +575,12 @@ fn fcntl_owner_fork_keeps_permanent_guards_after_creator_is_dropped() {
         flags
     );
     assert_eq!(
-        translate_outgoing_rights(&mut rights_control(&[fd]), &mut child, &mut RightTransfers::default(), -1),
+        translate_outgoing_rights(
+            &mut rights_control(&[fd]),
+            &mut child,
+            &mut RightTransfers::default(),
+            -1
+        ),
         Err(negative_errno(libc::ENOSYS))
     );
     let [independent, _] = owner_test_pipe(&mut child);
@@ -692,7 +697,12 @@ fn fcntl_owner_failed_export_poison_is_shared_but_managed_export_delivers_nothin
         [fresh as u64, 0, 0, 0, 0, 0],
     ) as i32;
     assert_eq!(
-        translate_outgoing_rights(&mut rights_control(&[fresh, -1]), &mut state, &mut RightTransfers::default(), -1),
+        translate_outgoing_rights(
+            &mut rights_control(&[fresh, -1]),
+            &mut state,
+            &mut RightTransfers::default(),
+            -1
+        ),
         Err(negative_errno(libc::EBADF))
     );
     for fd in [fresh, alias] {
@@ -724,7 +734,14 @@ fn fcntl_owner_failed_export_poison_is_shared_but_managed_export_delivers_nothin
     message.msg_iovlen = 1;
     message.msg_control = 0x300_usize as *mut libc::c_void;
     message.msg_controllen = control.len();
-    assert_eq!(write_struct(&mut ProviderMemory(&memory), 0x100, &GuestMsghdr::from(&message)), 0);
+    assert_eq!(
+        write_struct(
+            &mut ProviderMemory(&memory),
+            0x100,
+            &GuestMsghdr::from(&message)
+        ),
+        0
+    );
     assert_eq!(
         syscall_result(
             &mut memory,

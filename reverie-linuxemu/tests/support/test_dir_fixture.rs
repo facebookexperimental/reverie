@@ -100,8 +100,8 @@ fn test_dir_skips_stale_leaked_directories() {
         .0
         .iter()
         .map(|path| {
-            let metadata =
-                std::fs::metadata(path).unwrap_or_else(|error| panic!("stat seed {path:?}: {error}"));
+            let metadata = std::fs::metadata(path)
+                .unwrap_or_else(|error| panic!("stat seed {path:?}: {error}"));
             (metadata.ino(), metadata.mode())
         })
         .collect();

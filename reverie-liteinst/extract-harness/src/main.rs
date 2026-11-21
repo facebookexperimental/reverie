@@ -3,12 +3,16 @@
 #[path = "../../src/lazy_promote.rs"]
 mod lazy_promote;
 
-use lazy_promote::{LazyPromoter, PromoteOutcome};
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+
+use lazy_promote::LazyPromoter;
+use lazy_promote::PromoteOutcome;
 use liteinst_aarch64_patch::PatchError;
 use liteinst_aarch64_patch::Patcher;
-use liteinst_aarch64_patch::site::{ResumeState, StopControl};
+use liteinst_aarch64_patch::site::ResumeState;
+use liteinst_aarch64_patch::site::StopControl;
 use liteinst_aarch64_patch::store::SiteStore;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 struct SingleThreadStop {
     resume_failures: u32,
@@ -596,8 +600,7 @@ fn scenario_drain_table_real_trap() {
             // Pid through the gate only: std::process::id() issues
             // its own libc SVC, which would trap and be recorded
             // as a brand-new candidate site.
-            let pid =
-                unsafe { reverie_inguest::trap::raw_syscall6(libc::SYS_getpid, [0; 6]) };
+            let pid = unsafe { reverie_inguest::trap::raw_syscall6(libc::SYS_getpid, [0; 6]) };
             let a = unsafe { call_getpid_site(site) };
             let b = unsafe { call_getpid_site(site) };
             if a != pid || b != a {
@@ -625,10 +628,7 @@ fn scenario_drain_table_real_trap() {
         // filter traps libc's own _exit SVC, the handler would
         // spoof it, and glibc's fallthrough then traps fatally.
         unsafe {
-            reverie_inguest::trap::raw_syscall6(
-                libc::SYS_exit_group,
-                [code as u64, 0, 0, 0, 0, 0],
-            );
+            reverie_inguest::trap::raw_syscall6(libc::SYS_exit_group, [code as u64, 0, 0, 0, 0, 0]);
         }
         unreachable!("exit_group through the gate returned");
     }

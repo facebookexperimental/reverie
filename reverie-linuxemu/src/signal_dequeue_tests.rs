@@ -783,7 +783,10 @@ fn an_empty_signal_boundary_selects_and_changes_nothing() {
     assert!(!executor.signal_boundary_is_empty());
 
     // A journaled dequeue of this thread's must be flushed by the boundary.
-    let taken = executor.take_pending_signal_for_delivery().unwrap().unwrap();
+    let taken = executor
+        .take_pending_signal_for_delivery()
+        .unwrap()
+        .unwrap();
     assert_eq!(taken.event.signal(), libc::SIGALRM);
     let effect = executor.signal_dequeue_front().unwrap();
     assert!(!executor.has_eligible_pending_signal());
@@ -847,7 +850,10 @@ fn settled_signal_effects_agree_with_the_injection_flush() {
         reverie::ProcessAlarmSignalOutcome::Accepted(_)
     ));
     assert_agrees(&executor, true);
-    let taken = executor.take_pending_signal_for_delivery().unwrap().unwrap();
+    let taken = executor
+        .take_pending_signal_for_delivery()
+        .unwrap()
+        .unwrap();
     assert_eq!(taken.event.signal(), libc::SIGALRM);
     assert_agrees(&executor, false);
     let effect = executor.signal_dequeue_front().unwrap();
@@ -886,7 +892,10 @@ fn an_empty_boundary_reports_whether_a_mask_is_saved() {
     let mut temporary = own;
     temporary.insert(libc::SIGUSR1);
     install_temporary_mask_for_delivery(&executor.state, temporary);
-    assert_eq!(executor.state.thread_signals.lock().saved_sigmask, Some(own));
+    assert_eq!(
+        executor.state.thread_signals.lock().saved_sigmask,
+        Some(own)
+    );
     assert_eq!(
         executor.signal_boundary_emptiness(),
         SignalBoundaryEmptiness::Empty { mask_saved: true }

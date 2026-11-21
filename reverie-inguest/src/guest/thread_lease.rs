@@ -286,9 +286,10 @@ impl<S> Drop for Lease<'_, S> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::Arc;
     use std::sync::Barrier;
+
+    use super::*;
 
     #[test]
     fn checkout_creates_once_then_reuses() {

@@ -389,13 +389,21 @@ fn check_policy_files(host: &Path, root: &Path) -> Result<&'static str, String> 
         }
         _ => {
             require_real_file(&agents, root)?;
-            let meta = fs::symlink_metadata(&claude).map_err(|e| format!("inspect {}: {e}", claude.display()))?;
+            let meta = fs::symlink_metadata(&claude)
+                .map_err(|e| format!("inspect {}: {e}", claude.display()))?;
             if meta.file_type().is_symlink() {
-                return Err(format!("{}: CLAUDE.md must not be a symlink; Claude Code reads AGENTS.md natively", claude.display()));
+                return Err(format!(
+                    "{}: CLAUDE.md must not be a symlink; Claude Code reads AGENTS.md natively",
+                    claude.display()
+                ));
             }
-            let text = fs::read_to_string(&claude).map_err(|e| format!("read {}: {e}", claude.display()))?;
+            let text = fs::read_to_string(&claude)
+                .map_err(|e| format!("read {}: {e}", claude.display()))?;
             if text.lines().next() != Some("@AGENTS.md") {
-                return Err(format!("{}: a regular CLAUDE.md must start with @AGENTS.md", claude.display()));
+                return Err(format!(
+                    "{}: a regular CLAUDE.md must start with @AGENTS.md",
+                    claude.display()
+                ));
             }
             Ok("AGENTS.md with optional CLAUDE.md alias")
         }
@@ -794,7 +802,8 @@ fn discovery_regression_tests() -> Result<(), String> {
     fs::create_dir_all(root.join(".llms")).map_err(|error| format!("cannot create: {error}"))?;
     fs::write(root.join("AGENTS.md"), "fixture policy\n")
         .map_err(|error| format!("cannot write fixture: {error}"))?;
-    fs::write(root.join("CLAUDE.md"), "@AGENTS.md\n").map_err(|error| format!("cannot write fixture: {error}"))?;
+    fs::write(root.join("CLAUDE.md"), "@AGENTS.md\n")
+        .map_err(|error| format!("cannot write fixture: {error}"))?;
     link("../.claude/skills", &root.join(".llms/skills"))?;
     fs::write(a_canonical.join(README), "# canonical fixture\n")
         .map_err(|error| format!("cannot write fixture: {error}"))?;
@@ -977,19 +986,32 @@ fn discovery_regression_tests() -> Result<(), String> {
     fs::remove_file(&claude).map_err(|error| format!("cannot mutate fixture: {error}"))?;
     fs::write(&claude, "fixture alias without the import\n")
         .map_err(|error| format!("cannot mutate fixture: {error}"))?;
-    expect_refusal_containing(&root, "has a CLAUDE.md that does not import AGENTS.md", "must start with @AGENTS.md")?;
-    fs::write(&claude, "@AGENTS.md\n").map_err(|error| format!("cannot mutate fixture: {error}"))?;
+    expect_refusal_containing(
+        &root,
+        "has a CLAUDE.md that does not import AGENTS.md",
+        "must start with @AGENTS.md",
+    )?;
+    fs::write(&claude, "@AGENTS.md\n")
+        .map_err(|error| format!("cannot mutate fixture: {error}"))?;
     fs::remove_file(&agents).map_err(|error| format!("cannot mutate fixture: {error}"))?;
     expect_refusal_containing(&root, "has a CLAUDE.md alias but no AGENTS.md", "AGENTS.md")?;
     // Without the alias, AGENTS.md must still be a real file, not a symlink.
     fs::remove_file(&claude).map_err(|error| format!("cannot mutate fixture: {error}"))?;
-    fs::write(root.join("policy.md"), "fixture policy\n").map_err(|error| format!("cannot mutate fixture: {error}"))?;
+    fs::write(root.join("policy.md"), "fixture policy\n")
+        .map_err(|error| format!("cannot mutate fixture: {error}"))?;
     link("policy.md", &agents)?;
-    expect_refusal_containing(&root, "has a symlinked AGENTS.md and no CLAUDE.md alias", "AGENTS.md must be a regular file")?;
+    expect_refusal_containing(
+        &root,
+        "has a symlinked AGENTS.md and no CLAUDE.md alias",
+        "AGENTS.md must be a regular file",
+    )?;
     fs::remove_file(&agents).map_err(|error| format!("cannot restore fixture: {error}"))?;
-    fs::remove_file(root.join("policy.md")).map_err(|error| format!("cannot restore fixture: {error}"))?;
-    fs::write(&claude, "@AGENTS.md\n").map_err(|error| format!("cannot restore fixture: {error}"))?;
-    fs::write(&agents, "fixture policy\n").map_err(|error| format!("cannot restore fixture: {error}"))?;
+    fs::remove_file(root.join("policy.md"))
+        .map_err(|error| format!("cannot restore fixture: {error}"))?;
+    fs::write(&claude, "@AGENTS.md\n")
+        .map_err(|error| format!("cannot restore fixture: {error}"))?;
+    fs::write(&agents, "fixture policy\n")
+        .map_err(|error| format!("cannot restore fixture: {error}"))?;
 
     // And a tree with no client directories at all.
     let bare = fixture_root("bare")?;

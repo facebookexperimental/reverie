@@ -240,7 +240,10 @@ fn wait_after_sigkill_waits_for_retirement_after_terminal_status() {
         observed,
         Ok(Some(crate::ExitStatus::Signaled(Signal::SIGKILL, _)))
     ));
-    assert!(pending_empty, "a nonterminal status was queued after SIGKILL");
+    assert!(
+        pending_empty,
+        "a nonterminal status was queued after SIGKILL"
+    );
     assert!(!early_ack, "DONE was published while the worker was paused");
     assert!(
         result.is_ok(),

@@ -87,9 +87,8 @@ mod entry_construction_tests {
         let memory = parent.memory.clone();
         let (send, receive) = mpsc::channel();
         let worker = std::thread::spawn(move || {
-            let result = KvmBackend::from_thread_state(
-                memory, registers, xsave, None, CHILD_TID, group,
-            );
+            let result =
+                KvmBackend::from_thread_state(memory, registers, xsave, None, CHILD_TID, group);
             let _ = send.send(result);
         });
         let host_thread = worker.thread().id();

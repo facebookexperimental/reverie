@@ -37,7 +37,8 @@ mod descriptor_check_order_tests {
         assert!(inotify >= 0);
         // SAFETY: the descriptor was just created and is owned here.
         let inotify = unsafe { std::fs::File::from_raw_fd(inotify) };
-        let link = std::ffi::CString::new(format!("/proc/self/fd/{}", inotify.as_raw_fd())).unwrap();
+        let link =
+            std::ffi::CString::new(format!("/proc/self/fd/{}", inotify.as_raw_fd())).unwrap();
         open_fixture(&link, libc::O_PATH)
     }
 
@@ -110,7 +111,10 @@ mod descriptor_check_order_tests {
                 [99, 0x300, 1, flags, timeout, 0],
             )
         };
-        assert_eq!(recvmmsg(&mut memory, &mut state, MSG_CMSG_COMPAT, 0), einval);
+        assert_eq!(
+            recvmmsg(&mut memory, &mut state, MSG_CMSG_COMPAT, 0),
+            einval
+        );
         assert_eq!(recvmmsg(&mut memory, &mut state, 0, 0), ebadf);
         assert_eq!(
             recvmmsg(&mut memory, &mut state, 0, READ_ZERO_PROTECTED),

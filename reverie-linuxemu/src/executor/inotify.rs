@@ -193,7 +193,11 @@ fn inotify_add_watch_preflight(host_fd: RawFd, mask: u32, valid: libc::c_int) ->
     }
 }
 
-pub(super) fn inotify_add_watch(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
+pub(super) fn inotify_add_watch(
+    memory: &GuestMemory,
+    state: &LoadedStaticElf,
+    args: &[u64; 6],
+) -> i64 {
     let guest_fd = args[0] as libc::c_int;
     let mask = args[2] as u32;
     // The mask is validated before the descriptor. Use the host kernel's exact

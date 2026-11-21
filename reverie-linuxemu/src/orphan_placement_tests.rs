@@ -234,7 +234,11 @@ mod orphan_placement_tests {
             OrphanPlacementResult::RejectedBeforeCommit(Errno::EINVAL),
             "a child the exit did not leave is refused",
         );
-        assert_eq!(awaiting(&root, root_id), Some(vec![2, 3]), "refusals move nothing");
+        assert_eq!(
+            awaiting(&root, root_id),
+            Some(vec![2, 3]),
+            "refusals move nothing"
+        );
         let result = place(&root, root_id, &[]);
         assert_eq!(
             committed(result.clone()),
@@ -298,7 +302,9 @@ mod orphan_placement_tests {
         assert_eq!(getppid(&mut grandchild), 2);
         grandchild.retire_current_thread(reverie::ExitStatus::Exited(3), false);
         assert!(matches!(
-            grandchild.signal_registry.process_family_exit(grandchild_id),
+            grandchild
+                .signal_registry
+                .process_family_exit(grandchild_id),
             Some(ProcessFamilyExit::RunTeardownChild {
                 status: reverie::ExitStatus::Exited(3)
             })

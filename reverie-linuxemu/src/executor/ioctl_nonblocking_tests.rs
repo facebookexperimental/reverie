@@ -309,7 +309,11 @@ fn ioctl_fionbio_keeps_virtual_signalfd_physically_nonblocking() {
             libc::SYS_fcntl,
             [observed as u64, libc::F_GETFL as u64, 0, 0, 0, 0],
         );
-        assert_eq!(guest, i64::from(before & !libc::O_NONBLOCK), "guest flags of {observed}");
+        assert_eq!(
+            guest,
+            i64::from(before & !libc::O_NONBLOCK),
+            "guest flags of {observed}"
+        );
         let physical =
             fd_status_flags(host_fd(&f.executor.state, observed as i32).unwrap()).unwrap();
         assert_eq!(physical, before, "physical flags of {observed}");

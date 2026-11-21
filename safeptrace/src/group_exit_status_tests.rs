@@ -114,7 +114,8 @@ mod group_exit_status {
         let mut status = 0;
         assert_eq!(unsafe { libc::waitpid(leader, &mut status, 0) }, leader);
         assert!(libc::WIFSTOPPED(status) && libc::WSTOPSIG(status) == libc::SIGTRAP);
-        let options = libc::PTRACE_O_TRACECLONE | libc::PTRACE_O_TRACEEXIT | libc::PTRACE_O_EXITKILL;
+        let options =
+            libc::PTRACE_O_TRACECLONE | libc::PTRACE_O_TRACEEXIT | libc::PTRACE_O_EXITKILL;
         assert_eq!(
             unsafe { libc::ptrace(libc::PTRACE_SETOPTIONS, leader, 0, options) },
             0
@@ -123,15 +124,17 @@ mod group_exit_status {
 
         let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
         std::thread::scope(|scope| {
-            let reader = scope.spawn(move || loop {
-                let mut line = String::new();
-                assert_ne!(
-                    std::io::BufRead::read_line(&mut stdout, &mut line).unwrap(),
-                    0,
-                    "the guest wrote no TIDs"
-                );
-                if let Some((_, ids)) = line.split_once(TIDS) {
-                    break ids.trim().to_owned();
+            let reader = scope.spawn(move || {
+                loop {
+                    let mut line = String::new();
+                    assert_ne!(
+                        std::io::BufRead::read_line(&mut stdout, &mut line).unwrap(),
+                        0,
+                        "the guest wrote no TIDs"
+                    );
+                    if let Some((_, ids)) = line.split_once(TIDS) {
+                        break ids.trim().to_owned();
+                    }
                 }
             });
             // Resume every stop until the helper's zombie is reported. A
@@ -160,7 +163,11 @@ mod group_exit_status {
             // stop: exit_group sets SIGNAL_GROUP_EXIT before the caller exits.
             child.stdin.take().unwrap().write_all(b"x").unwrap();
             loop {
-                let info = waitid(group, libc::P_PGID, libc::WSTOPPED | libc::WNOWAIT | libc::__WALL);
+                let info = waitid(
+                    group,
+                    libc::P_PGID,
+                    libc::WSTOPPED | libc::WNOWAIT | libc::__WALL,
+                );
                 let pid = unsafe { info.si_pid() };
                 let event = unsafe { info.si_status() } >> 8;
                 if pid == caller && event == libc::PTRACE_EVENT_EXIT {
@@ -169,7 +176,11 @@ mod group_exit_status {
                 resume_stop(pid);
             }
 
-            let reaped = waitid(helper as libc::id_t, libc::P_PID, libc::WEXITED | libc::__WALL);
+            let reaped = waitid(
+                helper as libc::id_t,
+                libc::P_PID,
+                libc::WEXITED | libc::__WALL,
+            );
             assert_eq!(
                 exit_code(&reaped),
                 Some(11),

@@ -174,8 +174,9 @@ mod timer_signal_deferral_tests {
         backend
             .install_static_elf_with_context(&image, &[program], &[], &directory)
             .unwrap();
-        let result =
-            futures::executor::block_on(backend.run_static_elf_with_tool::<DeferralTool>(rdtsc, true));
+        let result = futures::executor::block_on(
+            backend.run_static_elf_with_tool::<DeferralTool>(rdtsc, true),
+        );
         let _ = std::fs::remove_dir_all(&directory);
         let (log, status, stdout, stderr) = result.unwrap();
         let events = log.0.into_inner().unwrap();
@@ -205,7 +206,10 @@ mod timer_signal_deferral_tests {
         let context = format!("{events:?} {record:x?}");
         let signals: Vec<i32> = events.iter().map(|(signal, _)| *signal).collect();
         assert_eq!(signals, [0, libc::SIGILL, libc::SIGUSR1], "{context}");
-        assert!(events.iter().all(|(_, clock)| *clock == events[0].1), "{context}");
+        assert!(
+            events.iter().all(|(_, clock)| *clock == events[0].1),
+            "{context}"
+        );
         assert_eq!(record[0], 1, "SIGILL's handler ran first: {context}");
         assert_eq!((record[1], record[2]), (record[3], 1), "{context}");
     }
@@ -219,7 +223,10 @@ mod timer_signal_deferral_tests {
         let context = format!("{events:?} {record:x?}");
         let signals: Vec<i32> = events.iter().map(|(signal, _)| *signal).collect();
         assert_eq!(signals, [0, RDTSC, libc::SIGUSR1], "{context}");
-        assert!(events.iter().all(|(_, clock)| *clock == events[0].1), "{context}");
+        assert!(
+            events.iter().all(|(_, clock)| *clock == events[0].1),
+            "{context}"
+        );
         assert_eq!((record[1], record[2]), (record[3], 1), "{context}");
     }
 }

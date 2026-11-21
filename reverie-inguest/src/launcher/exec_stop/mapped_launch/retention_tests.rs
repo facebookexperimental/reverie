@@ -10,10 +10,6 @@
 use std::fs::File;
 use std::os::fd::AsFd;
 
-use crate::launcher::exec_stop::CleanupReceipt;
-use crate::launcher::exec_stop::ExecStop;
-use crate::launcher::exec_stop::PreparedExec;
-use crate::launcher::exec_stop::physical::Preparation;
 use reverie_loader::handoff::Extent;
 
 use super::RetainedPhysical;
@@ -21,6 +17,10 @@ use super::RetirementStep;
 use super::cleanup_all;
 use super::guarded_retirement;
 use super::retain_unwind;
+use crate::launcher::exec_stop::CleanupReceipt;
+use crate::launcher::exec_stop::ExecStop;
+use crate::launcher::exec_stop::PreparedExec;
+use crate::launcher::exec_stop::physical::Preparation;
 
 fn true_request<'fd>() -> PreparedExec<'fd> {
     PreparedExec::new(

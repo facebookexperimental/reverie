@@ -66,8 +66,7 @@ mod empty_signal_boundary_tests {
             &self,
             control: Option<BackendSignalControl>,
         ) -> std::result::Result<BackendSignalControlMode, reverie::Error> {
-            *self.control.lock().unwrap() =
-                Some(control.ok_or(reverie::syscalls::Errno::ENOSYS)?);
+            *self.control.lock().unwrap() = Some(control.ok_or(reverie::syscalls::Errno::ENOSYS)?);
             Ok(BackendSignalControlMode::ToolControlled)
         }
 
@@ -136,14 +135,15 @@ mod empty_signal_boundary_tests {
     }
 
     fn run(mode: u8, code: &[u8]) -> (BoundaryGlobal, i32) {
-        let mut backend =
-            KvmBackend::new(16 * 1024 * 1024).expect("empty signal boundary test requires /dev/kvm");
+        let mut backend = KvmBackend::new(16 * 1024 * 1024)
+            .expect("empty signal boundary test requires /dev/kvm");
         backend
             .install_static_elf(&minimal_test_elf(code), "/bin/empty-signal-boundary")
             .unwrap();
-        let (global, status, _, _) =
-            futures::executor::block_on(backend.run_static_elf_with_tool::<BoundaryTool>(mode, true))
-                .unwrap();
+        let (global, status, _, _) = futures::executor::block_on(
+            backend.run_static_elf_with_tool::<BoundaryTool>(mode, true),
+        )
+        .unwrap();
         (global, status)
     }
 
@@ -253,13 +253,14 @@ mod empty_signal_boundary_tests {
 
     fn observe(mode: u8, code: &[u8], full_path: bool, hook: Option<Hook>) -> Observed {
         let scope = Scope::new(full_path, hook);
-        let mut backend =
-            KvmBackend::new(16 * 1024 * 1024).expect("empty signal boundary test requires /dev/kvm");
+        let mut backend = KvmBackend::new(16 * 1024 * 1024)
+            .expect("empty signal boundary test requires /dev/kvm");
         backend
             .install_static_elf(&minimal_test_elf(code), "/bin/empty-signal-boundary")
             .unwrap();
-        let result =
-            futures::executor::block_on(backend.run_static_elf_with_tool::<BoundaryTool>(mode, true));
+        let result = futures::executor::block_on(
+            backend.run_static_elf_with_tool::<BoundaryTool>(mode, true),
+        );
         let (status, global) = match result {
             Ok((global, status, _, _)) => (Ok(status), Some(global)),
             Err(error) => (Err(error.to_string()), None),
@@ -287,11 +288,7 @@ mod empty_signal_boundary_tests {
 
     /// Runs `code` on both paths, asserts that every decision agrees, and
     /// returns (synchronous, full).
-    fn both_paths(
-        mode: u8,
-        code: &[u8],
-        hook: impl Fn() -> Option<Hook>,
-    ) -> (Observed, Observed) {
+    fn both_paths(mode: u8, code: &[u8], hook: impl Fn() -> Option<Hook>) -> (Observed, Observed) {
         let fast = observe(mode, code, false, hook());
         let full = observe(mode, code, true, hook());
         assert_eq!(fast.decisions(), full.decisions(), "{fast:#?}\n{full:#?}");
@@ -315,7 +312,10 @@ mod empty_signal_boundary_tests {
                 .process
                 .publish_alarm(task.process, alarm(task.process.tgid));
             assert!(
-                matches!(outcome, reverie::ProcessSignalPublicationResult::Committed(_)),
+                matches!(
+                    outcome,
+                    reverie::ProcessSignalPublicationResult::Committed(_)
+                ),
                 "{outcome:?}"
             );
         }))
@@ -386,7 +386,18 @@ mod empty_signal_boundary_tests {
         code.extend([0x48, 0xc7, 0x44, 0x24, 0x10, 0, 0, 0, 0]);
         code.extend([0x48, 0xc7, 0x44, 0x24, 0x18, 0, 0, 0, 0]);
         // rt_sigaction(SIGALRM, rsp, NULL, 8)
-        code.extend([0xbf, libc::SIGALRM as u8, 0, 0, 0, 0x48, 0x89, 0xe6, 0x31, 0xd2]);
+        code.extend([
+            0xbf,
+            libc::SIGALRM as u8,
+            0,
+            0,
+            0,
+            0x48,
+            0x89,
+            0xe6,
+            0x31,
+            0xd2,
+        ]);
         code.extend([0x41, 0xba, 8, 0, 0, 0, 0xb8, 13, 0, 0, 0, 0x0f, 0x05]);
         // getpid; kill(pid, SIGALRM); getpid; exit(0)
         code.extend(GETPID);
@@ -599,12 +610,7 @@ mod empty_signal_boundary_tests {
     /// then reads SIGUSR1 blocked (exit 1), on both paths.
     #[test]
     fn a_skipped_boundary_restores_a_saved_mask_on_both_paths() {
-        let code = temporary_mask_program(
-            ALARM_BIT | USR1_BIT,
-            true,
-            0,
-            (libc::SIGUSR1 - 1) as u8,
-        );
+        let code = temporary_mask_program(ALARM_BIT | USR1_BIT, true, 0, (libc::SIGUSR1 - 1) as u8);
         let hook = || -> Option<Hook> {
             Some(Box::new(|point: HookPoint, executor: &ElfExecutor| {
                 if point == HookPoint::BeforeSelectionStart {
@@ -634,7 +640,10 @@ mod empty_signal_boundary_tests {
             ("filter_one", read(&sizes::FILTER_ONE)),
             ("filter_next", read(&sizes::FILTER_NEXT)),
             ("finish_signal_boundary", read(&sizes::FINISH_BOUNDARY)),
-            ("finish_signal_boundary_with_permit", read(&sizes::FINISH_WITH_PERMIT)),
+            (
+                "finish_signal_boundary_with_permit",
+                read(&sizes::FINISH_WITH_PERMIT),
+            ),
             ("complete_signal_effects", read(&sizes::COMPLETE_EFFECTS)),
         ];
         eprintln!("signal boundary future sizes: {measured:?}");

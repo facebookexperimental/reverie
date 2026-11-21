@@ -48,15 +48,20 @@
 //! claim of skipped SIGSYS is made anywhere.
 
 use liteinst_aarch64::emit::svc_island_words;
+use liteinst_aarch64_patch::PatchError;
+use liteinst_aarch64_patch::Patcher;
 use liteinst_aarch64_patch::flip::FlipRequest;
-use liteinst_aarch64_patch::gate::{GateSyscall, gate6};
+use liteinst_aarch64_patch::gate::GateSyscall;
+use liteinst_aarch64_patch::gate::gate6;
 use liteinst_aarch64_patch::island::Island;
-use liteinst_aarch64_patch::mapping::{MappingFacts, qualify_mapping};
-use liteinst_aarch64_patch::site::{
-    FallbackPermission, Site, SiteState, StopControl, StrategyPreference,
-};
+use liteinst_aarch64_patch::mapping::MappingFacts;
+use liteinst_aarch64_patch::mapping::qualify_mapping;
+use liteinst_aarch64_patch::site::FallbackPermission;
+use liteinst_aarch64_patch::site::Site;
+use liteinst_aarch64_patch::site::SiteState;
+use liteinst_aarch64_patch::site::StopControl;
+use liteinst_aarch64_patch::site::StrategyPreference;
 use liteinst_aarch64_patch::store::SiteStore;
-use liteinst_aarch64_patch::{PatchError, Patcher};
 
 /// `PROT_BTI` (arm64). `mprotect` clears `VM_ARM64_BTI` unless the
 /// flag is present in BOTH the window and the restore protections,
@@ -1102,9 +1107,10 @@ impl Drop for LazyPromoter {
 #[cfg(test)]
 #[allow(unexpected_cfgs)]
 mod tests {
-    use super::*;
     use liteinst_aarch64_patch::mapping::Provenance;
     use liteinst_aarch64_patch::site::ResumeState;
+
+    use super::*;
 
     fn facts(page_base: u64, provenance: Provenance) -> MappingFacts {
         let page = liteinst_aarch64_patch::page_size().unwrap();
@@ -2429,7 +2435,8 @@ mod tests {
     #[test]
     fn settled_unpatched_site_leaves_custody_and_ranges() {
         use liteinst_aarch64_patch::flip::FlipRequest;
-        use liteinst_aarch64_patch::site::{StrategyPreference, TrapRoute};
+        use liteinst_aarch64_patch::site::StrategyPreference;
+        use liteinst_aarch64_patch::site::TrapRoute;
         let _serial = promoter_test_serial();
         struct FailStore {
             word: *mut u32,
@@ -2633,7 +2640,8 @@ mod tests {
             // releases only site custody would reopen the gate
             // while the site's page may be unsynced/RWX).
             use liteinst_aarch64_patch::flip::FlipRequest;
-            use liteinst_aarch64_patch::site::{StrategyPreference, TrapRoute};
+            use liteinst_aarch64_patch::site::StrategyPreference;
+            use liteinst_aarch64_patch::site::TrapRoute;
             struct FailStore {
                 word: *mut u32,
             }

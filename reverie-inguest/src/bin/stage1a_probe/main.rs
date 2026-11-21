@@ -1146,9 +1146,10 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use reverie_loader::manifest::InitContract;
     use reverie_loader::manifest::PROBE_RUNTIME_MANIFEST;
+
+    use super::*;
 
     fn dummy_ready() -> ToolReady<u32> {
         Mapped::from_mapped_stop(7_u32)

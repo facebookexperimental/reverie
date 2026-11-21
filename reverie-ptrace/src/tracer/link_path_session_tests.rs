@@ -60,7 +60,9 @@ mod link_path_session_tests {
         session.capture_for_group_stop_test(root, ChildOp::Fork, &child);
         let own = |link: &str| {
             let path = std::fs::read_link(format!("/proc/self/{link}")).unwrap();
-            Ok(reverie::LinkPath::Path(path.as_os_str().as_bytes().to_vec()))
+            Ok(reverie::LinkPath::Path(
+                path.as_os_str().as_bytes().to_vec(),
+            ))
         };
         assert_eq!(
             link_path(&session, child_tid, reverie::PathLink::Executable),

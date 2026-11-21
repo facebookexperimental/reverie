@@ -5,7 +5,12 @@
 // tests/descriptor_access.rs and tests/descriptor_identity.rs compare the
 // same operations with native runs.
 
-const DESCRIPTOR_DEVICES: [&str; 4] = ["/dev/random", "/dev/urandom", "/dev//random", "/dev/./urandom"];
+const DESCRIPTOR_DEVICES: [&str; 4] = [
+    "/dev/random",
+    "/dev/urandom",
+    "/dev//random",
+    "/dev/./urandom",
+];
 
 /// Creates an ordinary file named `name` in `root` holding 8192 known bytes.
 fn descriptor_regular_file(root: &TestDir, name: &str) -> String {
@@ -132,7 +137,12 @@ fn descriptor_vector_writes_take_the_low_32_bit_count() {
 /// `count - readable` bytes are on a PROT_NONE page, with `number`
 /// (write, pwrite64 at offset 101, or writev of three vectors with the
 /// middle one unreadable), to a fresh descriptor for `path`.
-fn descriptor_native_prefix_write(path: &std::path::Path, number: libc::c_long, readable: usize, count: usize) -> i64 {
+fn descriptor_native_prefix_write(
+    path: &std::path::Path,
+    number: libc::c_long,
+    readable: usize,
+    count: usize,
+) -> i64 {
     let page = PAGE_SIZE as usize;
     // SAFETY: an anonymous private mapping owned until the munmap below.
     let mapping = unsafe {
@@ -150,7 +160,10 @@ fn descriptor_native_prefix_write(path: &std::path::Path, number: libc::c_long, 
     // SAFETY: the first two pages are writable and the third is ours.
     unsafe {
         std::ptr::write_bytes(base, 0x61, 2 * page);
-        assert_eq!(libc::mprotect(base.add(2 * page).cast(), page, libc::PROT_NONE), 0);
+        assert_eq!(
+            libc::mprotect(base.add(2 * page).cast(), page, libc::PROT_NONE),
+            0
+        );
     }
     let path = CString::new(path.as_os_str().as_bytes()).unwrap();
     // SAFETY: path is NUL-terminated; the descriptor is closed below.
@@ -166,9 +179,18 @@ fn descriptor_native_prefix_write(path: &std::path::Path, number: libc::c_long, 
             }
             _ => {
                 let vectors = [
-                    libc::iovec { iov_base: base.add(0x400).cast(), iov_len: 7 },
-                    libc::iovec { iov_base: base.add(2 * page).cast(), iov_len: 8 },
-                    libc::iovec { iov_base: base.add(0x500).cast(), iov_len: 9 },
+                    libc::iovec {
+                        iov_base: base.add(0x400).cast(),
+                        iov_len: 7,
+                    },
+                    libc::iovec {
+                        iov_base: base.add(2 * page).cast(),
+                        iov_len: 8,
+                    },
+                    libc::iovec {
+                        iov_base: base.add(0x500).cast(),
+                        iov_len: 9,
+                    },
                 ];
                 libc::writev(fd, vectors.as_ptr(), 3) as i64
             }
@@ -207,7 +229,10 @@ fn descriptor_write_admission_and_partially_readable_buffers() {
     for (path, native_path) in [
         ("/dev/random", "/dev/random".to_owned()),
         ("/dev/urandom", "/dev/urandom".to_owned()),
-        (regular.as_str(), root.0.join("native-regular").to_str().unwrap().to_owned()),
+        (
+            regular.as_str(),
+            root.0.join("native-regular").to_str().unwrap().to_owned(),
+        ),
     ] {
         let native_path = std::path::Path::new(&native_path);
         let device = path.starts_with("/dev/");
@@ -257,7 +282,8 @@ fn descriptor_write_admission_and_partially_readable_buffers() {
         }
         if !device {
             // Only the scalar write moved the offset, by what it wrote.
-            let written = descriptor_native_prefix_write(native_path, libc::SYS_write, 7, 15).max(0);
+            let written =
+                descriptor_native_prefix_write(native_path, libc::SYS_write, 7, 15).max(0);
             assert_eq!(
                 syscall_result(
                     &mut memory,
@@ -293,7 +319,12 @@ fn descriptor_write_admission_and_partially_readable_buffers() {
         assert!(fd >= 0, "{path}: {fd}");
         for number in [libc::SYS_write, libc::SYS_pwrite64] {
             assert_eq!(
-                syscall_result(&mut memory, &mut state, number, [fd as u64, 0x400, 0, 0, 0, 0]),
+                syscall_result(
+                    &mut memory,
+                    &mut state,
+                    number,
+                    [fd as u64, 0x400, 0, 0, 0, 0]
+                ),
                 negative_errno(libc::EBADF),
                 "{path} syscall {number}: access mode 3"
             );
@@ -394,7 +425,12 @@ fn descriptor_flock_takes_the_common_refusal_and_validation() {
                         "{path} mode {mode:#x} fd {guest_fd} operation {operation:#x}"
                     );
                 }
-                for operation in [0, libc::LOCK_SH | libc::LOCK_EX, LOCK_MAND, LOCK_MAND | libc::LOCK_EX] {
+                for operation in [
+                    0,
+                    libc::LOCK_SH | libc::LOCK_EX,
+                    LOCK_MAND,
+                    LOCK_MAND | libc::LOCK_EX,
+                ] {
                     // SAFETY: fd -1 names no description.
                     let expected = zero_or_errno(unsafe { libc::flock(-1, operation) });
                     assert_eq!(
@@ -622,7 +658,13 @@ fn descriptor_mmap_invalid_type_follows_address_and_overflow() {
             0,
             libc::EEXIST,
         ),
-        (u64::MAX - PAGE_SIZE + 1, PAGE_SIZE, libc::MAP_FIXED, 0, libc::ENOMEM),
+        (
+            u64::MAX - PAGE_SIZE + 1,
+            PAGE_SIZE,
+            libc::MAP_FIXED,
+            0,
+            libc::ENOMEM,
+        ),
         (
             BOOT_RESERVED_END + PAGE_SIZE,
             PAGE_SIZE,
@@ -956,7 +998,14 @@ fn descriptor_mmap_ignores_unknown_protection_bits() {
         ] {
             // SAFETY: a kernel-placed mapping of a live descriptor, unmapped below.
             let mapped = unsafe {
-                libc::mmap(std::ptr::null_mut(), PAGE_SIZE as usize, prot, libc::MAP_PRIVATE, native, 0)
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    PAGE_SIZE as usize,
+                    prot,
+                    libc::MAP_PRIVATE,
+                    native,
+                    0,
+                )
             };
             let expected = if mapped == libc::MAP_FAILED {
                 io_error(std::io::Error::last_os_error())
@@ -969,14 +1018,26 @@ fn descriptor_mmap_ignores_unknown_protection_bits() {
                 &mut memory,
                 &mut state,
                 libc::SYS_mmap,
-                [0, PAGE_SIZE, prot as u32 as u64, libc::MAP_PRIVATE as u64, fd as u64, 0],
+                [
+                    0,
+                    PAGE_SIZE,
+                    prot as u32 as u64,
+                    libc::MAP_PRIVATE as u64,
+                    fd as u64,
+                    0,
+                ],
             );
             if expected < 0 {
                 assert_eq!(result, expected, "{path} prot={prot:#x}");
             } else {
                 assert!(result > 0, "{path} prot={prot:#x}: {result}");
                 assert_eq!(
-                    syscall_result(&mut memory, &mut state, libc::SYS_munmap, [result as u64, PAGE_SIZE, 0, 0, 0, 0]),
+                    syscall_result(
+                        &mut memory,
+                        &mut state,
+                        libc::SYS_munmap,
+                        [result as u64, PAGE_SIZE, 0, 0, 0, 0]
+                    ),
                     0
                 );
             }
@@ -997,7 +1058,12 @@ fn descriptor_pwrite64_seekability_precedes_buffer_checks() {
     let mut state = test_state(&root.0);
     let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
     assert_eq!(
-        syscall_result(&mut memory, &mut state, libc::SYS_pipe2, [0x300, 0, 0, 0, 0, 0]),
+        syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_pipe2,
+            [0x300, 0, 0, 0, 0, 0]
+        ),
         0
     );
     let mut pipe = [0_u8; 8];
@@ -1008,7 +1074,14 @@ fn descriptor_pwrite64_seekability_precedes_buffer_checks() {
             &mut memory,
             &mut state,
             libc::SYS_socketpair,
-            [libc::AF_UNIX as u64, libc::SOCK_STREAM as u64, 0, 0x310, 0, 0]
+            [
+                libc::AF_UNIX as u64,
+                libc::SOCK_STREAM as u64,
+                0,
+                0x310,
+                0,
+                0
+            ]
         ),
         0
     );
@@ -1021,12 +1094,20 @@ fn descriptor_pwrite64_seekability_precedes_buffer_checks() {
     unsafe {
         assert_eq!(libc::pipe2(native_pipe.as_mut_ptr(), libc::O_CLOEXEC), 0);
         assert_eq!(
-            libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0, native_sockets.as_mut_ptr()),
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+                0,
+                native_sockets.as_mut_ptr()
+            ),
             0
         );
     }
     let buffer = [0x5a_u8; 64];
-    for (label, guest, native) in [("pipe", pipe_write, native_pipe[1]), ("socket", socket, native_sockets[0])] {
+    for (label, guest, native) in [
+        ("pipe", pipe_write, native_pipe[1]),
+        ("socket", socket, native_sockets[0]),
+    ] {
         for (address, native_address, count) in [
             (0x200_u64, buffer.as_ptr() as usize, u64::MAX),
             (u64::MAX, usize::MAX, 0),
@@ -1123,13 +1204,27 @@ fn descriptor_o_path_admission_precedes_range_and_namespace_checks() {
                 format!("fsetxattr {label}"),
                 libc::SYS_fsetxattr,
                 [fd as u64, 0x100, 0x180, 1, 0, 0],
-                [native as usize, native_name, value.as_ptr() as usize, 1, 0, 0],
+                [
+                    native as usize,
+                    native_name,
+                    value.as_ptr() as usize,
+                    1,
+                    0,
+                    0,
+                ],
             ));
             cases.push((
                 format!("fsetxattr {label} bad flags"),
                 libc::SYS_fsetxattr,
                 [fd as u64, 0x100, 0x180, 1, 0x10, 0],
-                [native as usize, native_name, value.as_ptr() as usize, 1, 0x10, 0],
+                [
+                    native as usize,
+                    native_name,
+                    value.as_ptr() as usize,
+                    1,
+                    0x10,
+                    0,
+                ],
             ));
             cases.push((
                 format!("fsetxattr {label} bad value"),
@@ -1164,7 +1259,12 @@ fn descriptor_o_path_admission_precedes_range_and_namespace_checks() {
         });
         assert_eq!(expected, negative_errno(libc::EFAULT));
         assert_eq!(
-            syscall_result(&mut memory, &mut state, libc::SYS_fgetxattr, [fd as u64, u64::MAX, 0, 0, 0, 0]),
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_fgetxattr,
+                [fd as u64, u64::MAX, 0, 0, 0, 0]
+            ),
             expected,
             "{path} fgetxattr bad name"
         );
@@ -1199,8 +1299,18 @@ fn descriptor_mmap_object_probe_errors_are_final() {
     assert!(fd >= 0);
     let status = |memory: &mut GuestMemory, state: &mut LoadedStaticElf| {
         (
-            syscall_result(memory, state, libc::SYS_fcntl, [fd as u64, libc::F_GETFL as u64, 0, 0, 0, 0]),
-            syscall_result(memory, state, libc::SYS_lseek, [fd as u64, 0, libc::SEEK_CUR as u64, 0, 0, 0]),
+            syscall_result(
+                memory,
+                state,
+                libc::SYS_fcntl,
+                [fd as u64, libc::F_GETFL as u64, 0, 0, 0, 0],
+            ),
+            syscall_result(
+                memory,
+                state,
+                libc::SYS_lseek,
+                [fd as u64, 0, libc::SEEK_CUR as u64, 0, 0, 0],
+            ),
         )
     };
     let before = status(&mut memory, &mut state);
@@ -1271,9 +1381,25 @@ fn descriptor_anonymous_mmap_checks_the_offset_first() {
         let flags = kind | libc::MAP_ANONYMOUS;
         // SAFETY: kernel-placed anonymous mappings, unmapped below.
         let (native_unaligned, native_aligned) = unsafe {
-            let unaligned = libc::syscall(libc::SYS_mmap, 0_usize, PAGE_SIZE, prot, flags, -1_i64, 1_u64);
+            let unaligned = libc::syscall(
+                libc::SYS_mmap,
+                0_usize,
+                PAGE_SIZE,
+                prot,
+                flags,
+                -1_i64,
+                1_u64,
+            );
             let unaligned = descriptor_native_outcome(unaligned);
-            let aligned = libc::syscall(libc::SYS_mmap, 0_usize, PAGE_SIZE, prot, flags, -1_i64, 0_u64);
+            let aligned = libc::syscall(
+                libc::SYS_mmap,
+                0_usize,
+                PAGE_SIZE,
+                prot,
+                flags,
+                -1_i64,
+                0_u64,
+            );
             assert!(aligned > 0);
             libc::munmap(aligned as *mut libc::c_void, PAGE_SIZE as usize);
             (unaligned, aligned)
@@ -1285,7 +1411,14 @@ fn descriptor_anonymous_mmap_checks_the_offset_first() {
                 &mut memory,
                 &mut state,
                 libc::SYS_mmap,
-                [BOOT_RESERVED_END, PAGE_SIZE, prot, (flags | libc::MAP_FIXED) as u64, u64::MAX, 1]
+                [
+                    BOOT_RESERVED_END,
+                    PAGE_SIZE,
+                    prot,
+                    (flags | libc::MAP_FIXED) as u64,
+                    u64::MAX,
+                    1
+                ]
             ),
             native_unaligned,
             "kind={kind:#x}"
@@ -1301,7 +1434,12 @@ fn descriptor_anonymous_mmap_checks_the_offset_first() {
         );
         assert!(mapped > 0, "kind={kind:#x}: {mapped}");
         assert_eq!(
-            syscall_result(&mut memory, &mut state, libc::SYS_munmap, [mapped as u64, PAGE_SIZE, 0, 0, 0, 0]),
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_munmap,
+                [mapped as u64, PAGE_SIZE, 0, 0, 0, 0]
+            ),
             0
         );
     }
@@ -1317,7 +1455,10 @@ fn descriptor_pwrite64_admission_runs_no_write_callback() {
     let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
     let fd = open_with_flags(&mut memory, &mut state, "/dev/full", libc::O_WRONLY);
     assert!(fd >= 0);
-    let native = std::fs::OpenOptions::new().write(true).open("/dev/full").unwrap();
+    let native = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .unwrap();
     let byte = [0x5a_u8];
     for (address, native_address, label) in [
         (u64::MAX, usize::MAX, "unreadable buffer"),
@@ -1326,17 +1467,34 @@ fn descriptor_pwrite64_admission_runs_no_write_callback() {
         // SAFETY: the kernel reads at most one byte from a live local, or
         // refuses the unreadable address.
         let expected = descriptor_native_outcome(unsafe {
-            libc::syscall(libc::SYS_pwrite64, native.as_raw_fd(), native_address, 1_usize, 0_i64)
+            libc::syscall(
+                libc::SYS_pwrite64,
+                native.as_raw_fd(),
+                native_address,
+                1_usize,
+                0_i64,
+            )
         });
         assert_eq!(
-            syscall_result(&mut memory, &mut state, libc::SYS_pwrite64, [fd as u64, address, 1, 0, 0, 0]),
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_pwrite64,
+                [fd as u64, address, 1, 0, 0, 0]
+            ),
             expected,
             "{label}"
         );
     }
     assert_eq!(
         descriptor_native_outcome(unsafe {
-            libc::syscall(libc::SYS_pwrite64, native.as_raw_fd(), usize::MAX, 1_usize, 0_i64)
+            libc::syscall(
+                libc::SYS_pwrite64,
+                native.as_raw_fd(),
+                usize::MAX,
+                1_usize,
+                0_i64,
+            )
         }),
         negative_errno(libc::EFAULT)
     );
@@ -1369,10 +1527,10 @@ fn random_device_reads_are_tool_visible_after_duplication() {
     assert!(null >= 0);
     let executor = ElfExecutor::new(state, false);
     for number in [libc::SYS_read, libc::SYS_readv] {
-        assert!(executor.is_tool_visible_read(&SyscallRequest::new(
-            number as u64,
-            [0, 0x200, 1, 0, 0, 0],
-        )));
+        assert!(
+            executor
+                .is_tool_visible_read(&SyscallRequest::new(number as u64, [0, 0x200, 1, 0, 0, 0],))
+        );
         assert!(!executor.is_tool_visible_read(&SyscallRequest::new(
             number as u64,
             [null as u64, 0x200, 1, 0, 0, 0],

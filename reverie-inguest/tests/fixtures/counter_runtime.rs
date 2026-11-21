@@ -371,11 +371,7 @@ pub unsafe extern "C" fn counter_runtime_start(address: *mut ProbeControlV1) -> 
         restorer: counter_runtime_restorer as *const () as u64,
         mask: u64::MAX,
     };
-    if gate(
-        13,
-        [SIGSYS as u64, (&raw const action) as u64, 0, 8, 0, 0],
-    ) != 0
-    {
+    if gate(13, [SIGSYS as u64, (&raw const action) as u64, 0, 8, 0, 0]) != 0 {
         fail(ERROR_SIGACTION);
     }
     add_control(CONTROL_SIGSYS);

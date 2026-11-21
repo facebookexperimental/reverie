@@ -277,10 +277,9 @@ impl Tool for SteppedInjection {
         // `gettid`'s result is shown as whether it is the thread's own ID,
         // which no other value the registers could hold matches.
         let shown = match case {
-            Case::GettidBlockingSigtrap => format!(
-                "injected {:?}",
-                injected.map(|ret| ret == i64::from(tid))
-            ),
+            Case::GettidBlockingSigtrap => {
+                format!("injected {:?}", injected.map(|ret| ret == i64::from(tid)))
+            }
             _ => format!("injected {injected:?}"),
         };
         guest.send_rpc(shown).await;
@@ -370,7 +369,10 @@ mod tests {
             let mut action: libc::sigaction = std::mem::zeroed();
             action.sa_sigaction = on_sigtrap as *const () as usize;
             libc::sigemptyset(&mut action.sa_mask);
-            assert_eq!(libc::sigaction(libc::SIGTRAP, &action, std::ptr::null_mut()), 0);
+            assert_eq!(
+                libc::sigaction(libc::SIGTRAP, &action, std::ptr::null_mut()),
+                0
+            );
         }
         SigSet::from(Signal::SIGTRAP)
             .thread_block()
@@ -385,10 +387,17 @@ mod tests {
         // SAFETY: sigaction writes the current action into `action`.
         let handler = unsafe {
             let mut action: libc::sigaction = std::mem::zeroed();
-            assert_eq!(libc::sigaction(libc::SIGTRAP, std::ptr::null(), &mut action), 0);
+            assert_eq!(
+                libc::sigaction(libc::SIGTRAP, std::ptr::null(), &mut action),
+                0
+            );
             action.sa_sigaction
         };
-        assert_eq!(handler, libc::SIG_DFL, "the step's trap reset SIGTRAP's action");
+        assert_eq!(
+            handler,
+            libc::SIG_DFL,
+            "the step's trap reset SIGTRAP's action"
+        );
         assert!(
             !SigSet::thread_get_mask()
                 .expect("read the mask")
@@ -407,7 +416,10 @@ mod tests {
             action.sa_sigaction = on_signal as *const () as usize;
             action.sa_flags = libc::SA_RESTART;
             libc::sigemptyset(&mut action.sa_mask);
-            assert_eq!(libc::sigaction(libc::SIGUSR1, &action, std::ptr::null_mut()), 0);
+            assert_eq!(
+                libc::sigaction(libc::SIGUSR1, &action, std::ptr::null_mut()),
+                0
+            );
         }
         // SAFETY: getppid takes no arguments; the Tool reads the two passed.
         unsafe { libc::syscall(libc::SYS_getppid, CONFIGURE, case as usize) };
@@ -501,7 +513,12 @@ mod tests {
     }
 
     #[test_case(Case::Ppoll, true, Errno::ERESTARTNOHAND, SIGNAL_AT_ITS_STOP)]
-    #[test_case(Case::ClockNanosleep, true, Errno::ERESTART_RESTARTBLOCK, SIGNAL_AT_ITS_STOP)]
+    #[test_case(
+        Case::ClockNanosleep,
+        true,
+        Errno::ERESTART_RESTARTBLOCK,
+        SIGNAL_AT_ITS_STOP
+    )]
     #[test_case(Case::Read, true, Errno::ERESTARTSYS, SIGNAL_AT_ITS_STOP)]
     #[test_case(Case::PpollMasked, false, Errno::ERESTARTNOHAND, SIGNAL_AT_ITS_STOP)]
     #[test_case(
@@ -510,7 +527,12 @@ mod tests {
         Errno::ERESTARTNOHAND,
         if cfg!(target_arch = "x86_64") { SIGNAL_AT_ITS_STOP } else { HELD_SIGNAL }
     )]
-    #[test_case(Case::ReadBlockingSigtrap, false, Errno::ERESTARTSYS, SIGNAL_AT_ITS_STOP)]
+    #[test_case(
+        Case::ReadBlockingSigtrap,
+        false,
+        Errno::ERESTARTSYS,
+        SIGNAL_AT_ITS_STOP
+    )]
     #[test_case(
         Case::ClockNanosleepBlockingSigtrap,
         false,
@@ -535,7 +557,10 @@ mod tests {
             output.status,
             String::from_utf8_lossy(&output.stderr)
         );
-        let expected = vec![format!("injected {:?}", Err::<i64, _>(code)), then.to_owned()];
+        let expected = vec![
+            format!("injected {:?}", Err::<i64, _>(code)),
+            then.to_owned(),
+        ];
         assert_eq!(
             *log.seen.lock().unwrap(),
             expected,
@@ -561,10 +586,18 @@ mod tests {
                     let mut action: libc::sigaction = std::mem::zeroed();
                     action.sa_sigaction = on_sigsys as *const () as usize;
                     libc::sigemptyset(&mut action.sa_mask);
-                    assert_eq!(libc::sigaction(libc::SIGSYS, &action, std::ptr::null_mut()), 0);
+                    assert_eq!(
+                        libc::sigaction(libc::SIGSYS, &action, std::ptr::null_mut()),
+                        0
+                    );
                     let mut filter = [
                         // BPF_LD | BPF_W | BPF_ABS: the syscall number.
-                        libc::sock_filter { code: 0x20, jt: 0, jf: 0, k: 0 },
+                        libc::sock_filter {
+                            code: 0x20,
+                            jt: 0,
+                            jf: 0,
+                            k: 0,
+                        },
                         // BPF_JMP | BPF_JEQ | BPF_K
                         libc::sock_filter {
                             code: 0x15,
@@ -573,9 +606,19 @@ mod tests {
                             k: libc::SYS_getuid as u32,
                         },
                         // BPF_RET | BPF_K: SECCOMP_RET_TRAP
-                        libc::sock_filter { code: 0x06, jt: 0, jf: 0, k: 0x0003_0000 },
+                        libc::sock_filter {
+                            code: 0x06,
+                            jt: 0,
+                            jf: 0,
+                            k: 0x0003_0000,
+                        },
                         // SECCOMP_RET_ALLOW
-                        libc::sock_filter { code: 0x06, jt: 0, jf: 0, k: 0x7fff_0000 },
+                        libc::sock_filter {
+                            code: 0x06,
+                            jt: 0,
+                            jf: 0,
+                            k: 0x7fff_0000,
+                        },
                     ];
                     let program = libc::sock_fprog {
                         len: filter.len() as u16,
@@ -600,7 +643,11 @@ mod tests {
         assert_eq!((ret, errno), (-1, Some(libc::EINTR)), "the Tool's answer");
         match case {
             Case::GettidBlockingSigtrap => assert_the_step_trap_was_forced(),
-            _ => assert_eq!(SIGSYS_HANDLED.load(Ordering::SeqCst), 1, "the trap's SIGSYS"),
+            _ => assert_eq!(
+                SIGSYS_HANDLED.load(Ordering::SeqCst),
+                1,
+                "the trap's SIGSYS"
+            ),
         }
     }
 

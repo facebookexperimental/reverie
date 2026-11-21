@@ -19,13 +19,12 @@
 //! Like Linux's `do_send_sig_info`, the send chooses no thread and wakes none:
 //! a thread of the target takes the signal at a boundary the Tool permits.
 
+use super::*;
 use crate::executor::SignalDisposition;
 use crate::executor::flush_for_generation;
 use crate::executor::flushed_by;
 use crate::executor::shared_queue_covers;
 use crate::executor::signal_disposition_with_action;
-
-use super::*;
 
 /// The queue a signal to another process goes to.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -194,7 +194,10 @@ mod kept_rpc_failure_tests {
                 PENDING_RPC_WAKES => {
                     guest.send_rpc(3).await;
                 }
-                FORKED_PEER_FAILS if reverie::syscalls::SyscallInfo::number(&call) == reverie::syscalls::Sysno::getpid => {
+                FORKED_PEER_FAILS
+                    if reverie::syscalls::SyscallInfo::number(&call)
+                        == reverie::syscalls::Sysno::getpid =>
+                {
                     // The child: an RPC nothing answers. Only a failure wait
                     // can end it.
                     guest.send_rpc(4).await;
@@ -211,7 +214,9 @@ mod kept_rpc_failure_tests {
                         std::thread::sleep(std::time::Duration::from_millis(1));
                     }
                     // Not an errno, which would be the syscall's result: a Tool failure.
-                    return Err(reverie::Error::Io(std::io::Error::other("the parent fails")));
+                    return Err(reverie::Error::Io(std::io::Error::other(
+                        "the parent fails",
+                    )));
                 }
                 rpcs => {
                     for _ in 0..rpcs {
@@ -252,7 +257,9 @@ mod kept_rpc_failure_tests {
         } else {
             three_getpids_then_exit()
         };
-        let _serial = SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let counts = Arc::new(Counts::default());
         {
             let mut active = ACTIVE.lock().unwrap();
@@ -264,10 +271,9 @@ mod kept_rpc_failure_tests {
         backend
             .install_static_elf(&minimal_test_elf(&code), "/bin/kept-rpc")
             .unwrap();
-        let result = futures::executor::block_on(
-            backend.run_static_elf_with_tool::<RpcTool>(mode, true),
-        )
-        .map(|(_, status, _, _)| status);
+        let result =
+            futures::executor::block_on(backend.run_static_elf_with_tool::<RpcTool>(mode, true))
+                .map(|(_, status, _, _)| status);
         ACTIVE.lock().unwrap().take();
         drop(backend);
         (counts, result)

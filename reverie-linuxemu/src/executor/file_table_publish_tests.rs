@@ -56,19 +56,38 @@ mod file_table_publish_tests {
         );
         table.update_from_elf(&state).unwrap();
 
-        assert_eq!(published(&table, 3), kept, "an unchanged entry is not cloned again");
-        assert!(same_description(published(&table, 3), state.files[&3].as_raw_fd()));
-        assert!(same_description(published(&table, 4), state.files[&4].as_raw_fd()));
-        assert!(!same_description(published(&table, 4), retired[0].as_raw_fd()));
+        assert_eq!(
+            published(&table, 3),
+            kept,
+            "an unchanged entry is not cloned again"
+        );
+        assert!(same_description(
+            published(&table, 3),
+            state.files[&3].as_raw_fd()
+        ));
+        assert!(same_description(
+            published(&table, 4),
+            state.files[&4].as_raw_fd()
+        ));
+        assert!(!same_description(
+            published(&table, 4),
+            retired[0].as_raw_fd()
+        ));
         assert_ne!(published(&table, 4), replaced);
-        assert!(same_description(published(&table, 6), state.files[&6].as_raw_fd()));
+        assert!(same_description(
+            published(&table, 6),
+            state.files[&6].as_raw_fd()
+        ));
         assert!(!table.files.contains_key(&5));
         assert_eq!(
             table.files.keys().copied().collect::<Vec<_>>(),
             state.files.keys().copied().collect::<Vec<_>>()
         );
         for fd in [3, 4, 6] {
-            assert!(Arc::ptr_eq(table.entry_id(fd).expect("entry identity"), &state.fd_entry_ids[&fd]));
+            assert!(Arc::ptr_eq(
+                table.entry_id(fd).expect("entry identity"),
+                &state.fd_entry_ids[&fd]
+            ));
         }
     }
 
@@ -95,7 +114,13 @@ mod file_table_publish_tests {
             table
                 .files
                 .iter()
-                .map(|(&fd, file)| (fd, file.as_raw_fd(), Arc::as_ptr(table.entry_id(fd).expect("entry identity"))))
+                .map(|(&fd, file)| {
+                    (
+                        fd,
+                        file.as_raw_fd(),
+                        Arc::as_ptr(table.entry_id(fd).expect("entry identity")),
+                    )
+                })
                 .collect::<Vec<_>>()
         };
         let before = snapshot(&table);
@@ -127,10 +152,18 @@ mod file_table_publish_tests {
             "{error:?}"
         );
         state.file_retirement.fail_clone_after(None);
-        assert_eq!(snapshot(&table), before, "a failed publication changes nothing");
+        assert_eq!(
+            snapshot(&table),
+            before,
+            "a failed publication changes nothing"
+        );
 
         table.update_from_elf(&state).unwrap();
-        assert_eq!(table.files[&3].as_raw_fd(), before[0].1, "the kept entry is still reused");
+        assert_eq!(
+            table.files[&3].as_raw_fd(),
+            before[0].1,
+            "the kept entry is still reused"
+        );
         assert_eq!(
             table.files.keys().copied().collect::<Vec<_>>(),
             vec![3, 4, 5, 6]
@@ -144,9 +177,11 @@ mod file_table_publish_tests {
         let root = TestDir::new();
         std::fs::write(root.0.join("kept"), "kept").unwrap();
         let mut state = test_state(&root.0);
-        assert!(state
-            .insert_file(3, std::fs::File::open(root.0.join("kept")).unwrap())
-            .is_empty());
+        assert!(
+            state
+                .insert_file(3, std::fs::File::open(root.0.join("kept")).unwrap())
+                .is_empty()
+        );
         let mut table = FileTableState::try_from_elf(&state).unwrap();
         let first = table.description(3).expect("description derived");
         assert!(same_description(
@@ -157,24 +192,25 @@ mod file_table_publish_tests {
         let second = table.description(3).expect("description retained");
         assert!(std::sync::Arc::ptr_eq(&first, &second));
     }
-
 }
 
-    /// R2 slice 9: derived slots mirror the side maps after publication.
-    #[test]
-    fn slots_mirror_side_maps_after_publishing() {
-        let root = TestDir::new();
-        std::fs::write(root.0.join("kept"), "kept").unwrap();
-        let mut state = test_state(&root.0);
-        assert!(state
+/// R2 slice 9: derived slots mirror the side maps after publication.
+#[test]
+fn slots_mirror_side_maps_after_publishing() {
+    let root = TestDir::new();
+    std::fs::write(root.0.join("kept"), "kept").unwrap();
+    let mut state = test_state(&root.0);
+    assert!(
+        state
             .insert_file(3, std::fs::File::open(root.0.join("kept")).unwrap())
-            .is_empty());
-        let table = FileTableState::try_from_elf(&state).unwrap();
-        let slot = table.slot(3).expect("slot derived at publication");
-        assert!(std::sync::Arc::ptr_eq(
-            slot.entry_id.as_ref().expect("entry identity in slot"),
-            table.entry_id(3).expect("entry identity")
-        ));
-        assert!(slot.description.is_some());
-        assert!(table.slot(99).is_none());
-    }
+            .is_empty()
+    );
+    let table = FileTableState::try_from_elf(&state).unwrap();
+    let slot = table.slot(3).expect("slot derived at publication");
+    assert!(std::sync::Arc::ptr_eq(
+        slot.entry_id.as_ref().expect("entry identity in slot"),
+        table.entry_id(3).expect("entry identity")
+    ));
+    assert!(slot.description.is_some());
+    assert!(table.slot(99).is_none());
+}

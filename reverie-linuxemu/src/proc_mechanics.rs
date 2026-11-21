@@ -578,7 +578,9 @@ mod tests {
 
     #[test]
     fn parse_fd_link_spellings() {
-        use FdLinkPath::{Below, Exact, OtherTask};
+        use FdLinkPath::Below;
+        use FdLinkPath::Exact;
+        use FdLinkPath::OtherTask;
         // Own pid 1, own tid 9 throughout.
         fn parse(path: &[u8]) -> Option<FdLinkPath<'_>> {
             parse_fd_link(path, 1, 9)

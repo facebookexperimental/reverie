@@ -45,11 +45,23 @@ pub mod render;
 pub mod sanitize;
 pub mod task;
 
+pub use fdinfo::Fdinfo;
+pub use fdinfo::FdinfoKind;
+pub use fdinfo::FdinfoLock;
+pub use fdinfo::LockKind;
+pub use fdinfo::TimerfdLines;
+pub use fdinfo::render as render_fdinfo;
+pub use fixed::FixedFile;
+pub use fixed::FixedMachine;
+pub use fixed::NR_IRQS;
+pub use fixed::SOFTIRQS;
+pub use mountinfo::MOUNT_PEER_PREFIXES;
+pub use mountinfo::MountInfoRow;
+pub use mountinfo::parse_fdinfo_mount_id;
+pub use mountinfo::parse_mountinfo;
 pub use render::extension_table;
 pub use render::register;
-
 pub use sanitize::render_system_stat;
-
 pub use task::CommName;
 pub use task::StatFields;
 pub use task::StatusCapabilities;
@@ -61,23 +73,6 @@ pub use task::render_stat;
 pub use task::render_status;
 pub use task::stat_flags;
 pub use task::stat_state;
-
-pub use fixed::FixedFile;
-pub use fixed::FixedMachine;
-pub use fixed::NR_IRQS;
-pub use fixed::SOFTIRQS;
-
-pub use fdinfo::Fdinfo;
-pub use fdinfo::FdinfoKind;
-pub use fdinfo::FdinfoLock;
-pub use fdinfo::LockKind;
-pub use fdinfo::TimerfdLines;
-pub use fdinfo::render as render_fdinfo;
-
-pub use mountinfo::MOUNT_PEER_PREFIXES;
-pub use mountinfo::MountInfoRow;
-pub use mountinfo::parse_fdinfo_mount_id;
-pub use mountinfo::parse_mountinfo;
 
 /// One memory mapping as `/proc/<pid>/maps` reports it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -981,7 +981,10 @@ mod entry_multi_owner_tests {
             );
         }
         if observed.case == Case::Healthy {
-            assert_eq!(result.unwrap(), (ExitStatus::Exited(0), Vec::new(), Vec::new()));
+            assert_eq!(
+                result.unwrap(),
+                (ExitStatus::Exited(0), Vec::new(), Vec::new())
+            );
             assert!(
                 !state
                     .events

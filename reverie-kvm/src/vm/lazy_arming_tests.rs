@@ -30,7 +30,6 @@ mod lazy_arming_tests {
     /// target near the clock, so that no timer event comes due.
     const BUDGET: u64 = 1 << 32;
 
-
     /// The Tool's record: timer events delivered, and the renewals it made.
     #[derive(Default)]
     struct RenewalLog(Mutex<(u64, u64)>);
@@ -106,10 +105,8 @@ mod lazy_arming_tests {
     /// CPU-bound event, a cost of their own that this count leaves out.
     #[test]
     fn renewing_a_request_at_every_syscall_seldom_reprograms_the_timer() {
-        let directory = std::env::temp_dir().join(format!(
-            "reverie-timer-lazy-arming-{}",
-            std::process::id()
-        ));
+        let directory =
+            std::env::temp_dir().join(format!("reverie-timer-lazy-arming-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
         let path = directory.join("guest.S");
         let executable = directory.join("guest");

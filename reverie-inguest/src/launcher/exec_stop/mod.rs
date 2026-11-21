@@ -57,6 +57,10 @@ pub mod physical;
 pub mod producer;
 mod supervisor;
 mod trace;
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::time::Duration;
+
 #[cfg(all(feature = "loader-private-runtime", feature = "coordinator-rpc"))]
 pub use birth_bridge::BirthBridge;
 #[cfg(all(feature = "loader-private-runtime", feature = "coordinator-rpc"))]
@@ -75,21 +79,6 @@ pub use birth_bridge::BridgeStep;
 pub use birth_bridge::BridgeVerdict;
 #[cfg(all(feature = "loader-private-runtime", feature = "coordinator-rpc"))]
 pub use birth_bridge::InitialMode;
-
-pub use supervisor::DetachedSupervisor;
-pub use supervisor::DetachedWaitFailure;
-pub use supervisor::SuccessorStop;
-pub use supervisor::Supervisor;
-pub use supervisor::SupervisorMode;
-pub use supervisor::SupervisorOutcome;
-pub use supervisor::WatchedOutcome;
-pub use supervisor::WatchedStep;
-pub use supervisor::WatchedSupervisor;
-
-use std::cell::RefCell;
-use std::rc::Rc;
-use std::time::Duration;
-
 pub use child::PreparedExec;
 #[cfg(feature = "loader-private-runtime")]
 use child::live_birth_pidfd;
@@ -103,6 +92,15 @@ use safeptrace::Stopped;
 use safeptrace::SyscallInfo;
 use safeptrace::SyscallInfoOp;
 use safeptrace::Wait;
+pub use supervisor::DetachedSupervisor;
+pub use supervisor::DetachedWaitFailure;
+pub use supervisor::SuccessorStop;
+pub use supervisor::Supervisor;
+pub use supervisor::SupervisorMode;
+pub use supervisor::SupervisorOutcome;
+pub use supervisor::WatchedOutcome;
+pub use supervisor::WatchedStep;
+pub use supervisor::WatchedSupervisor;
 
 /// Errors from mechanical operations. Runtime/protocol policy is caller-owned.
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;

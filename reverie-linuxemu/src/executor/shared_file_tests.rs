@@ -544,12 +544,21 @@ mod shared_file_dispatch_tests {
             assert_eq!(f.memory.file_offset(view), Some(offset));
         };
         map_over(&mut f, libc::MAP_PRIVATE, PAGE_SIZE);
-        assert!(!f.memory.range_contains_shared_file(view, PAGE_SIZE as usize));
+        assert!(
+            !f.memory
+                .range_contains_shared_file(view, PAGE_SIZE as usize)
+        );
         let mut bytes = vec![0; PAGE_SIZE as usize];
         f.memory.user().read(view, &mut bytes).unwrap();
-        assert_eq!(bytes, f.expected[PAGE_SIZE as usize..2 * PAGE_SIZE as usize]);
+        assert_eq!(
+            bytes,
+            f.expected[PAGE_SIZE as usize..2 * PAGE_SIZE as usize]
+        );
         map_over(&mut f, libc::MAP_SHARED, 2 * PAGE_SIZE);
-        assert!(f.memory.range_contains_shared_file(view, PAGE_SIZE as usize));
+        assert!(
+            f.memory
+                .range_contains_shared_file(view, PAGE_SIZE as usize)
+        );
         f.memory.user().read(view, &mut bytes).unwrap();
         assert_eq!(bytes, f.expected[2 * PAGE_SIZE as usize..]);
     }
@@ -597,7 +606,13 @@ mod shared_file_dispatch_tests {
         // the user address space).
         let stack_page = f.memory.physical_to_user(f.state.mm.mmap_limit).unwrap();
         assert_eq!(
-            call(&mut f, stack_page, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0),
+            call(
+                &mut f,
+                stack_page,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0
+            ),
             negative_errno(libc::EEXIST)
         );
         let validate = libc::MAP_SHARED_VALIDATE;
@@ -1024,14 +1039,27 @@ mod shared_file_dispatch_tests {
                 raw[32..40].copy_from_slice(&(libc::SIGCHLD as u64).to_ne_bytes());
                 f.memory.write_raw(0x100, &raw).unwrap();
                 [0x100, 88, 0, 0, 0, 0]
-            } else { [0; 6] };
+            } else {
+                [0; 6]
+            };
             let mut executor = f.take_executor();
             let before = layout(&f.memory, &executor.state);
             let next = executor.next_pid.load(Ordering::SeqCst);
-            assert_eq!(executor.execute_checked(&SyscallRequest::new(number as u64, args), &f.memory).unwrap(), i64::from(next));
+            assert_eq!(
+                executor
+                    .execute_checked(&SyscallRequest::new(number as u64, args), &f.memory)
+                    .unwrap(),
+                i64::from(next)
+            );
             assert_eq!(executor.next_pid.load(Ordering::SeqCst), next + 1);
             match executor.take_process_action() {
-                Some(ProcessAction::Fork { child_pid, share_address_space, parent_tid, child_tid, .. }) => {
+                Some(ProcessAction::Fork {
+                    child_pid,
+                    share_address_space,
+                    parent_tid,
+                    child_tid,
+                    ..
+                }) => {
                     assert_eq!(child_pid, next);
                     assert!(!share_address_space);
                     assert_eq!((parent_tid, child_tid), (None, None));
@@ -1048,8 +1076,14 @@ mod shared_file_dispatch_tests {
             f.memory.read_raw(shared + 17, &mut bytes).unwrap();
             assert_eq!(&bytes, b"shared");
             let file = std::fs::read(&f.path).unwrap();
-            assert_eq!(&file[PAGE_SIZE as usize + 17..PAGE_SIZE as usize + 23], b"shared");
-            assert_eq!(&file[..PAGE_SIZE as usize], &f.expected[..PAGE_SIZE as usize]);
+            assert_eq!(
+                &file[PAGE_SIZE as usize + 17..PAGE_SIZE as usize + 23],
+                b"shared"
+            );
+            assert_eq!(
+                &file[..PAGE_SIZE as usize],
+                &f.expected[..PAGE_SIZE as usize]
+            );
             assert!(f.memory.entry_gate().pending_failure().is_none());
             assert!(snapshot.entry_gate().pending_failure().is_none());
         }
@@ -1124,7 +1158,11 @@ mod shared_file_dispatch_tests {
                 let with = outcome(true, number, flags);
                 assert_eq!(with, without, "{label}");
                 if admitted {
-                    assert_eq!((with.1, with.2.as_str()), (1, "thread"), "{label}: {with:?}");
+                    assert_eq!(
+                        (with.1, with.2.as_str()),
+                        (1, "thread"),
+                        "{label}: {with:?}"
+                    );
                 } else {
                     assert_eq!((with.1, with.2.as_str()), (0, "none"), "{label}: {with:?}");
                 }
@@ -1488,7 +1526,12 @@ mod shared_file_dispatch_tests {
                 ],
                 "mapping change in a vfork child",
             ),
-            ("brk", libc::SYS_brk, [0, 0, 0, 0, 0, 0], "brk in a vfork child"),
+            (
+                "brk",
+                libc::SYS_brk,
+                [0, 0, 0, 0, 0, 0],
+                "brk in a vfork child",
+            ),
         ];
         for (label, number, mut args, operation) in cases {
             let mut child = f.memory.snapshot_sharing_address_space().unwrap();
@@ -1529,7 +1572,11 @@ mod shared_file_dispatch_tests {
         // A private mapping change goes ahead, and the window's end refuses
         // it while it is still in place.
         let lasting: [(&str, i64, [u64; 6]); 4] = [
-            ("private munmap", libc::SYS_munmap, [private, PAGE_SIZE, 0, 0, 0, 0]),
+            (
+                "private munmap",
+                libc::SYS_munmap,
+                [private, PAGE_SIZE, 0, 0, 0, 0],
+            ),
             (
                 "private mprotect",
                 libc::SYS_mprotect,
@@ -1543,7 +1590,14 @@ mod shared_file_dispatch_tests {
             (
                 "mremap",
                 libc::SYS_mremap,
-                [private, PAGE_SIZE, 2 * PAGE_SIZE, libc::MREMAP_MAYMOVE as u64, 0, 0],
+                [
+                    private,
+                    PAGE_SIZE,
+                    2 * PAGE_SIZE,
+                    libc::MREMAP_MAYMOVE as u64,
+                    0,
+                    0,
+                ],
             ),
         ];
         for (label, number, args) in lasting {
@@ -1623,7 +1677,10 @@ mod shared_file_dispatch_tests {
         );
         let mut unmapped_before = [0; 7];
         f.memory.read_raw(scratch, &mut unmapped_before).unwrap();
-        let returned = child.return_vfork_changes(BOOT_RESERVED_END).unwrap().unwrap();
+        let returned = child
+            .return_vfork_changes(BOOT_RESERVED_END)
+            .unwrap()
+            .unwrap();
         // Only the zeroed page; the removed scratch mapping's stores stay
         // behind.
         assert_eq!(returned.bytes_written, PAGE_SIZE as usize);
@@ -1667,8 +1724,15 @@ mod shared_file_dispatch_tests {
         let mut executor = f.take_executor();
         let before = layout(&f.memory, &executor.state);
         let next = executor.next_pid.load(Ordering::SeqCst);
-        assert_eq!(executor.execute_checked(&SyscallRequest::new(libc::SYS_clone3 as u64,
-            [u64::MAX, 88, 0, 0, 0, 0]), &f.memory).unwrap(), negative_errno(libc::EFAULT));
+        assert_eq!(
+            executor
+                .execute_checked(
+                    &SyscallRequest::new(libc::SYS_clone3 as u64, [u64::MAX, 88, 0, 0, 0, 0]),
+                    &f.memory
+                )
+                .unwrap(),
+            negative_errno(libc::EFAULT)
+        );
         assert_eq!(executor.next_pid.load(Ordering::SeqCst), next);
         assert!(executor.take_process_action().is_none());
         assert!(executor.pending_processes.is_empty());
@@ -2027,7 +2091,12 @@ mod shared_file_dispatch_tests {
         let first = call(&mut f, libc::SYS_time, shared + 0x10, 0);
         assert!(first > 1_000_000_000);
         assert_eq!(
-            call(&mut f, libc::SYS_gettimeofday, shared + 0x100, shared + 0x200),
+            call(
+                &mut f,
+                libc::SYS_gettimeofday,
+                shared + 0x100,
+                shared + 0x200
+            ),
             0
         );
         // tv_sec on the private page, tv_usec on the shared page.
@@ -2063,7 +2132,10 @@ mod shared_file_dispatch_tests {
         assert_eq!(file, expected, "nothing else in the file changed");
         assert_eq!(read_struct::<[u8; 8]>(&f.memory, shared - 16), [0xa5; 8]);
         assert_eq!(read_struct::<[u8; 4]>(&f.memory, shared - 8), tv_sec_low);
-        assert_eq!(read_struct::<[u8; 4]>(&f.memory, shared - 4)[..], second_bytes[..4]);
+        assert_eq!(
+            read_struct::<[u8; 4]>(&f.memory, shared - 4)[..],
+            second_bytes[..4]
+        );
 
         // A read-only shared mapping of the same file: EFAULT, nothing stored.
         let read_only = f.shared(fd, shared + PAGE_SIZE, 0, false);
@@ -2114,10 +2186,7 @@ mod shared_file_dispatch_tests {
             [0, LENGTH, libc::PROT_NONE as u64, flags, u64::MAX, 0],
         );
         assert!(user > 0, "mmap returned {user}");
-        let physical = f
-            .memory
-            .user_range_to_guest(user as u64, LENGTH)
-            .unwrap();
+        let physical = f.memory.user_range_to_guest(user as u64, LENGTH).unwrap();
         // The fixture wrote 0xa5 over all of guest memory, so every page of
         // this range was resident before the reservation.
         assert_eq!(resident_pages(&f.memory, physical, LENGTH), 0);
@@ -2158,10 +2227,7 @@ mod shared_file_dispatch_tests {
             [0, length, read_write, private, u64::MAX, 0],
         );
         assert!(user > 0, "mmap returned {user}");
-        let physical = f
-            .memory
-            .user_range_to_guest(user as u64, length)
-            .unwrap();
+        let physical = f.memory.user_range_to_guest(user as u64, length).unwrap();
         f.memory
             .write_raw(physical, &vec![0x3c; length as usize])
             .unwrap();
@@ -2179,10 +2245,7 @@ mod shared_file_dispatch_tests {
             ],
         );
         assert_eq!(fixed, user);
-        let physical = f
-            .memory
-            .user_range_to_guest(user as u64, length)
-            .unwrap();
+        let physical = f.memory.user_range_to_guest(user as u64, length).unwrap();
         let mut bytes = vec![0xff; length as usize];
         f.memory.read_raw(physical, &mut bytes).unwrap();
         assert!(bytes.iter().all(|byte| *byte == 0));
@@ -2367,7 +2430,11 @@ mod shared_file_dispatch_tests {
         // there and make the read succeed.
         // SAFETY: the fixed name is nul-terminated; the fd is owned at once.
         let raw = unsafe { libc::memfd_create(c"eio-hole".as_ptr(), libc::MFD_CLOEXEC) };
-        assert!(raw >= 0, "memfd_create: {}", std::io::Error::last_os_error());
+        assert!(
+            raw >= 0,
+            "memfd_create: {}",
+            std::io::Error::last_os_error()
+        );
         let hole = unsafe { std::fs::File::from_raw_fd(raw) };
         // SAFETY: replaces the second half of this test's own mapping.
         let mapped = unsafe {
@@ -2401,7 +2468,10 @@ mod shared_file_dispatch_tests {
         );
         assert!(user > 0, "anonymous mmap returned {user}");
         let user = user as u64;
-        f.memory.user().write(user, &vec![0xab; length as usize]).unwrap();
+        f.memory
+            .user()
+            .write(user, &vec![0xab; length as usize])
+            .unwrap();
         let physical = f.memory.user_range_to_guest(user, length).unwrap();
         assert_eq!(f.memory.reservation_kind(physical), Some(RegionKind::Mmap));
         let result = syscall_result(

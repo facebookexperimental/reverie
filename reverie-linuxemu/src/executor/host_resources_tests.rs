@@ -741,8 +741,7 @@ fn host_resources_diagnostics_are_kept_once_each_up_to_the_bound() {
     // a static at the end so the leaked texts stay reachable at
     // process exit (as production's static store does) and
     // LeakSanitizer reports nothing.
-    static FINISHED: std::sync::Mutex<Vec<Vec<&'static str>>> =
-        std::sync::Mutex::new(Vec::new());
+    static FINISHED: std::sync::Mutex<Vec<Vec<&'static str>>> = std::sync::Mutex::new(Vec::new());
     let mut kept = Vec::new();
     let first = keep_host_resources_diagnostic(&mut kept, "first".to_owned());
     assert!(std::ptr::eq(

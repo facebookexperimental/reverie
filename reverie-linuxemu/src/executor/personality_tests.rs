@@ -4,18 +4,11 @@ const TEST_BASE_PERSONALITY: u64 = 0x0004_0000;
 const TEST_UNAME26_PERSONALITY: u64 = 0x0006_0000;
 const TEST_PERSONALITY_QUERY: u64 = u32::MAX as u64;
 
-fn test_personality_call(
-    memory: &mut GuestMemory,
-    state: &mut LoadedStaticElf,
-    value: u64,
-) -> i64 {
+fn test_personality_call(memory: &mut GuestMemory, state: &mut LoadedStaticElf, value: u64) -> i64 {
     syscall_result(memory, state, libc::SYS_personality, [value, 0, 0, 0, 0, 0])
 }
 
-fn test_personality_uname(
-    memory: &mut GuestMemory,
-    state: &mut LoadedStaticElf,
-) -> [u8; 65 * 6] {
+fn test_personality_uname(memory: &mut GuestMemory, state: &mut LoadedStaticElf) -> [u8; 65 * 6] {
     assert_eq!(
         syscall_result(memory, state, libc::SYS_uname, [0x100, 0, 0, 0, 0, 0]),
         0,
@@ -140,11 +133,7 @@ fn personality_inherited_base_allows_only_uname26_toggling() {
         (TEST_BASE_PERSONALITY | TEST_UNAME26_PERSONALITY | STICKY) as i64,
     );
     assert_eq!(
-        test_personality_call(
-            &mut memory,
-            &mut state,
-            TEST_BASE_PERSONALITY | STICKY
-        ),
+        test_personality_call(&mut memory, &mut state, TEST_BASE_PERSONALITY | STICKY),
         (TEST_BASE_PERSONALITY | TEST_UNAME26_PERSONALITY | STICKY) as i64,
     );
     assert_eq!(

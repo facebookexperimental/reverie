@@ -362,14 +362,16 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::os::fd::OwnedFd;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
     use reverie::GlobalTool;
     use reverie::Pid;
     use reverie::Tool;
     use reverie_rpc_transport::exec_ticket::ExecTicketRegistry;
-    use std::os::fd::OwnedFd;
-    use std::sync::Arc;
-    use std::sync::Mutex;
+
+    use super::*;
 
     type ReturnedCalls = Arc<Mutex<Vec<(reverie::Errno, Option<reverie::UnsupportedRefusal>)>>>;
 
@@ -614,10 +616,11 @@ mod tests {
     }
 
     fn dispatch_body2() {
-        use super::super::event::SyscallDispatch;
-        use super::super::event::SyscallEvent;
-        use crate::guest::host::HostRuntime;
-        use crate::guest::host::ToolHost;
+        use std::collections::HashSet;
+        use std::io::Read;
+        use std::os::unix::net::UnixStream;
+        use std::time::Duration;
+
         use reverie::Errno;
         use reverie::Error;
         use reverie::Guest;
@@ -625,10 +628,11 @@ mod tests {
         use reverie::syscalls::SyscallArgs;
         use reverie::syscalls::SyscallInfo;
         use reverie::syscalls::Sysno;
-        use std::collections::HashSet;
-        use std::io::Read;
-        use std::os::unix::net::UnixStream;
-        use std::time::Duration;
+
+        use super::super::event::SyscallDispatch;
+        use super::super::event::SyscallEvent;
+        use crate::guest::host::HostRuntime;
+        use crate::guest::host::ToolHost;
 
         #[derive(Default)]
         struct ExecTool {

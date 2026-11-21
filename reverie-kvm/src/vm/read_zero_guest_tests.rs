@@ -13,9 +13,9 @@
 mod read_zero_guest_tests {
     use std::os::fd::AsRawFd;
     use std::os::fd::FromRawFd;
-    use std::sync::mpsc;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
+    use std::sync::mpsc;
     use std::time::Duration;
 
     use reverie::GlobalTool;

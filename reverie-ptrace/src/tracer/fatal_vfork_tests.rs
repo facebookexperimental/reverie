@@ -487,7 +487,9 @@ mod fatal_vfork_tests {
                     "vfork rescue only: signal={signal:?}, completed={}",
                     matches!(rescued, Ok(ToolRunOutcome::Complete(_)))
                 );
-                panic!("vfork did not Complete within original generous-backstop predicate: {description}");
+                panic!(
+                    "vfork did not Complete within original generous-backstop predicate: {description}"
+                );
             }
         };
         assert!(elapsed <= GENEROUS_WALL_BACKSTOP);

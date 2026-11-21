@@ -817,7 +817,11 @@ fn a_fatal_signal_in_a_worker_that_an_exec_froze_starts_no_group_exit() {
     assert_eq!(root.process_exit_status(), None);
     // The issuer is still a live parent: a fork inherits it.
     let child = root.fork_child(2, false, false);
-    assert!(child.is_ok(), "fork after the worker's fatal signal: {:?}", child.err());
+    assert!(
+        child.is_ok(),
+        "fork after the worker's fatal signal: {:?}",
+        child.err()
+    );
 }
 
 #[test]
@@ -900,7 +904,10 @@ fn a_fatal_signal_without_an_exec_still_ends_the_group() {
     );
     assert_eq!(
         root.committed_group_exit_status(),
-        Some(reverie::ExitStatus::Signaled(reverie::Signal::SIGTERM, false))
+        Some(reverie::ExitStatus::Signaled(
+            reverie::Signal::SIGTERM,
+            false
+        ))
     );
 }
 

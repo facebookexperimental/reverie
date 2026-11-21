@@ -1478,13 +1478,9 @@ fn completed_sync_driver_does_not_retain_generation() {
     let stopped = seized_stopped_sync(tid);
     let running = stopped.detach(None).unwrap();
     let mut driver = running.wait_sync_on_ptracer_thread().into_driver();
-    let reattached =
-        Running::seize_on_ptracer_thread(tid.into(), legacy_thread_options()).unwrap();
+    let reattached = Running::seize_on_ptracer_thread(tid.into(), legacy_thread_options()).unwrap();
     reattached.interrupt().unwrap();
-    let (stopped, event) = driver
-        .wait_on_ptracer_thread()
-        .unwrap()
-        .assume_stopped();
+    let (stopped, event) = driver.wait_on_ptracer_thread().unwrap().assume_stopped();
     assert_eq!(event, crate::Event::Stop);
     assert!(matches!(
         driver.wait_on_ptracer_thread(),
@@ -1564,8 +1560,7 @@ async fn completed_async_driver_case(force_legacy: bool) {
     // reattach, it must keep the generation for the recorded wait. A procfs
     // worker keeps it in its attachment check (`LegacyAttachment::Handoff`).
     wait_for_detached_wait_kept(terminal.event.event(), "the detached gap");
-    let reattached =
-        Running::seize_on_ptracer_thread(tid.into(), legacy_thread_options()).unwrap();
+    let reattached = Running::seize_on_ptracer_thread(tid.into(), legacy_thread_options()).unwrap();
     // The kept generation's Event serves the reattachment.
     assert!(Arc::ptr_eq(
         reattached.1.event().event(),
@@ -1770,9 +1765,7 @@ fn forced_legacy_procfs_error_during_the_handoff_does_not_keep_the_generation() 
         "a procfs read error during the handoff must not keep the generation"
     );
     assert!(
-        !PROCFS_OBSERVATION_ERRORS
-            .lock()
-            .contains_key(&tid.into()),
+        !PROCFS_OBSERVATION_ERRORS.lock().contains_key(&tid.into()),
         "the injected procfs error was not read"
     );
     drop(driver);
@@ -2287,9 +2280,10 @@ fn ownerless_explicit_sync_driver_after_detach_notes_handoff() {
 fn grandchild_exec_guest() -> (Pid, TraceeCleanupGuard, Pid, OwnedFd) {
     extern "C" fn member(argument: *mut libc::c_void) -> *mut libc::c_void {
         let descriptors = unsafe { &*argument.cast::<[i32; 2]>() };
-        let ids = [unsafe { libc::getpid() }, unsafe {
-            libc::syscall(libc::SYS_gettid)
-        } as i32];
+        let ids = [
+            unsafe { libc::getpid() },
+            unsafe { libc::syscall(libc::SYS_gettid) } as i32,
+        ];
         if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } != 0
             || unsafe { libc::write(descriptors[0], ids.as_ptr().cast(), 8) } != 8
         {
@@ -2531,10 +2525,8 @@ async fn another_tasks_detach_case(name: &str, force_legacy: bool) {
     const MARKER: &str = "ACTUAL_ANOTHER_TASKS_DETACH_EXERCISED";
     const UNAVAILABLE: &str = "ANOTHER_TASKS_DETACH_UNAVAILABLE";
     if env::var_os(INNER).is_none() {
-        let output = run_exact_in_pid_namespace_bounded(
-            &format!("notifier::test::{name}"),
-            &[(INNER, "1")],
-        );
+        let output =
+            run_exact_in_pid_namespace_bounded(&format!("notifier::test::{name}"), &[(INNER, "1")]);
         match classify_exact_reuse_output(output.as_ref(), MARKER, UNAVAILABLE).unwrap() {
             ExactReuseOutcome::Exercised => emit_completion_marker(MARKER),
             ExactReuseOutcome::Unavailable => panic!(
@@ -2725,8 +2717,7 @@ fn forced_legacy_ownerless_running(tid: Pid) -> (Running, usize, bool) {
         let before = status_opens_on_this_thread();
         let wait = running.wait_owned();
         let opens = status_opens_on_this_thread() - before;
-        let pending =
-            handle_detach_handoff_pending(wait.inner.as_ref().unwrap().token.event());
+        let pending = handle_detach_handoff_pending(wait.inner.as_ref().unwrap().token.event());
         drop(wait);
         let kept = Running::new_on_ptracer_thread(tid.into()).unwrap();
         assert!(kept.1.ptracer_owner.is_none());

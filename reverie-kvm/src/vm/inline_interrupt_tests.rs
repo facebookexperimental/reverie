@@ -161,7 +161,8 @@ pub(crate) mod inline_interrupt_tests {
                 .unwrap();
             let stdout = String::from_utf8_lossy(&output.stdout);
             assert!(
-                output.status.success() && stdout.contains("raw-clone child: the root was interrupted"),
+                output.status.success()
+                    && stdout.contains("raw-clone child: the root was interrupted"),
                 "{stdout}{}",
                 String::from_utf8_lossy(&output.stderr)
             );
@@ -194,7 +195,9 @@ pub(crate) mod inline_interrupt_tests {
             let delivered = seen.count();
             drop(registration);
             if cached != libc::ESRCH || delivered != 1 {
-                println!("raw-clone child: pthread_kill gave {cached}, interrupts delivered {delivered}");
+                println!(
+                    "raw-clone child: pthread_kill gave {cached}, interrupts delivered {delivered}"
+                );
                 return 1;
             }
             println!("raw-clone child: the root was interrupted");

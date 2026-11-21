@@ -444,8 +444,9 @@ impl Tool for TrapProbe {
 #[cfg(feature = "rcb-clock")]
 #[test]
 fn trap_host_installs_and_answers_a_trapped_syscall() {
+    use super::super::tool_install::TrapHost;
+    use super::super::tool_install::TrapOptions;
     use super::super::tool_install::install_tool_with;
-    use super::super::tool_install::{TrapHost, TrapOptions};
 
     const TEST: &str =
         "guest::host::tool_configuration_tests::trap_host_installs_and_answers_a_trapped_syscall";

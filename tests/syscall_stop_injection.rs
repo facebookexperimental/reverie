@@ -182,7 +182,10 @@ impl Tool for InterruptedInjection {
 /// The registers other than the result and the instruction pointer that
 /// differ between `before` and `after`, by name.
 #[cfg(all(not(sanitized), test))]
-fn changed_registers(before: &libc::user_regs_struct, after: &libc::user_regs_struct) -> Vec<String> {
+fn changed_registers(
+    before: &libc::user_regs_struct,
+    after: &libc::user_regs_struct,
+) -> Vec<String> {
     #[cfg(target_arch = "aarch64")]
     let pairs: Vec<(String, u64, u64)> = (1..31)
         .map(|n| (format!("x{n}"), before.regs[n], after.regs[n]))
@@ -382,12 +385,13 @@ mod tests {
 
     #[test]
     fn a_tool_reads_the_same_registers_around_a_mask_swapping_injection() {
-        let (output, log) = reverie_ptrace::testing::test_fn_with_config::<InterruptedInjection, _>(
-            guest_with_a_marker,
-            Mode::CompareRegisters,
-            true,
-        )
-        .unwrap();
+        let (output, log) =
+            reverie_ptrace::testing::test_fn_with_config::<InterruptedInjection, _>(
+                guest_with_a_marker,
+                Mode::CompareRegisters,
+                true,
+            )
+            .unwrap();
         assert!(
             output.status.success(),
             "the guest failed: {:?}\nstderr: {}",
@@ -416,12 +420,13 @@ mod tests {
     fn a_second_injection_after_an_interrupted_one_is_not_restarted_by_the_kernel(
         first_argument: i64,
     ) {
-        let (output, log) = reverie_ptrace::testing::test_fn_with_config::<InterruptedInjection, _>(
-            guest,
-            Mode::SecondInjection(first_argument),
-            true,
-        )
-        .unwrap();
+        let (output, log) =
+            reverie_ptrace::testing::test_fn_with_config::<InterruptedInjection, _>(
+                guest,
+                Mode::SecondInjection(first_argument),
+                true,
+            )
+            .unwrap();
         assert!(
             output.status.success(),
             "the guest failed: {:?}\nstderr: {}",

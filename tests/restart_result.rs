@@ -237,9 +237,10 @@ impl Tool for RestartResult {
             }
             Sysno::ppoll | Sysno::rt_sigsuspend
                 if interrupted
-                    && guest.thread_state().interrupted_arg0.is_none_or(|arg0| {
-                        arg0 == syscall.into_parts().1.arg0
-                    }) =>
+                    && guest
+                        .thread_state()
+                        .interrupted_arg0
+                        .is_none_or(|arg0| arg0 == syscall.into_parts().1.arg0) =>
             {
                 return Ok(RESTARTED);
             }
@@ -408,7 +409,9 @@ impl RestartResult {
             ),
             PLAIN_WITH_AN_UNREAD_FIRST_ARGUMENT | TAKEN_BY_ANOTHER_THREAD => Syscall::from_raw(
                 nr,
-                SyscallArgs::new(args.arg2, args.arg1, args.arg2, args.arg3, args.arg4, args.arg5),
+                SyscallArgs::new(
+                    args.arg2, args.arg1, args.arg2, args.arg3, args.arg4, args.arg5,
+                ),
             ),
             _ => syscall,
         };
@@ -456,7 +459,8 @@ impl RestartResult {
 async fn wait_until_taken_from_the_process(pid: i32, sig: i32) {
     let bit = 1u64 << (sig - 1);
     for _ in 0..500 {
-        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).expect("read the status");
+        let status =
+            std::fs::read_to_string(format!("/proc/{pid}/status")).expect("read the status");
         let shared = status
             .lines()
             .find_map(|line| line.strip_prefix("ShdPnd:"))
@@ -556,7 +560,11 @@ mod tests {
             )
         };
         let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-        (ret, if ret == -1 { errno } else { 0 }, HANDLED.load(Ordering::SeqCst))
+        (
+            ret,
+            if ret == -1 { errno } else { 0 },
+            HANDLED.load(Ordering::SeqCst),
+        )
     }
 
     fn check(
@@ -578,7 +586,13 @@ mod tests {
     #[test_case(HELD_AND_PENDING_FOR_THE_PROCESS, 2; "held and pending for the process")]
     fn erestartnohand_with_a_handler_is_eintr(sent_by: i64, runs: usize) {
         let flags = Some(SaFlags::SA_RESTART);
-        check(ERESTARTNOHAND, Signal::SIGUSR1, flags, sent_by, (-1, libc::EINTR, runs));
+        check(
+            ERESTARTNOHAND,
+            Signal::SIGUSR1,
+            flags,
+            sent_by,
+            (-1, libc::EINTR, runs),
+        );
     }
 
     #[test_case(SENT_BY_TRACER, 1; "sent by the tracer")]
@@ -587,7 +601,13 @@ mod tests {
     #[test_case(HELD_AND_PENDING_FOR_THE_PROCESS, 2; "held and pending for the process")]
     fn erestart_restartblock_with_a_handler_is_eintr(sent_by: i64, runs: usize) {
         let flags = Some(SaFlags::SA_RESTART);
-        check(ERESTART_RESTARTBLOCK, Signal::SIGUSR1, flags, sent_by, (-1, libc::EINTR, runs));
+        check(
+            ERESTART_RESTARTBLOCK,
+            Signal::SIGUSR1,
+            flags,
+            sent_by,
+            (-1, libc::EINTR, runs),
+        );
     }
 
     #[test_case(SENT_BY_TRACER, 1; "sent by the tracer")]
@@ -596,7 +616,13 @@ mod tests {
     #[test_case(HELD_AND_PENDING_FOR_THE_PROCESS, 2; "held and pending for the process")]
     fn erestartsys_without_sa_restart_is_eintr(sent_by: i64, runs: usize) {
         let flags = Some(SaFlags::empty());
-        check(ERESTARTSYS, Signal::SIGUSR1, flags, sent_by, (-1, libc::EINTR, runs));
+        check(
+            ERESTARTSYS,
+            Signal::SIGUSR1,
+            flags,
+            sent_by,
+            (-1, libc::EINTR, runs),
+        );
     }
 
     #[test_case(SENT_BY_TRACER, 1; "sent by the tracer")]
@@ -605,7 +631,13 @@ mod tests {
     #[test_case(HELD_AND_PENDING_FOR_THE_PROCESS, 2; "held and pending for the process")]
     fn erestartsys_with_sa_restart_restarts(sent_by: i64, runs: usize) {
         let flags = Some(SaFlags::SA_RESTART);
-        check(ERESTARTSYS, Signal::SIGUSR1, flags, sent_by, (RESTARTED, 0, runs));
+        check(
+            ERESTARTSYS,
+            Signal::SIGUSR1,
+            flags,
+            sent_by,
+            (RESTARTED, 0, runs),
+        );
     }
 
     #[test_case(SENT_BY_TRACER, 1; "sent by the tracer")]
@@ -614,7 +646,13 @@ mod tests {
     #[test_case(HELD_AND_PENDING_FOR_THE_PROCESS, 2; "held and pending for the process")]
     fn erestartnointr_with_a_handler_restarts(sent_by: i64, runs: usize) {
         let flags = Some(SaFlags::empty());
-        check(ERESTARTNOINTR, Signal::SIGUSR1, flags, sent_by, (RESTARTED, 0, runs));
+        check(
+            ERESTARTNOINTR,
+            Signal::SIGUSR1,
+            flags,
+            sent_by,
+            (RESTARTED, 0, runs),
+        );
     }
 
     /// SIGWINCH's default action ignores it; a traced thread still queues it
@@ -648,7 +686,13 @@ mod tests {
     #[test_case(ERESTART_RESTARTBLOCK; "erestart_restartblock")]
     fn a_dropped_signal_restarts(code: i32) {
         let flags = Some(SaFlags::empty());
-        check(code, Signal::SIGUSR1, flags, HELD_AND_DROPPED, (RESTARTED, 0, 0));
+        check(
+            code,
+            Signal::SIGUSR1,
+            flags,
+            HELD_AND_DROPPED,
+            (RESTARTED, 0, 0),
+        );
     }
 
     /// A held SIGCONT is delivered as any other signal: its handler runs, and
@@ -657,7 +701,13 @@ mod tests {
     #[test_case(HELD_OVER_INJECTION; "held over an injection")]
     fn a_sigcont_with_a_handler_is_eintr(sent_by: i64) {
         let flags = Some(SaFlags::empty());
-        check(ERESTARTSYS, Signal::SIGCONT, flags, sent_by, (-1, libc::EINTR, 1));
+        check(
+            ERESTARTSYS,
+            Signal::SIGCONT,
+            flags,
+            sent_by,
+            (-1, libc::EINTR, 1),
+        );
     }
 
     /// A SIGSTOP, which no mask blocks, stops the thread on its way back to
@@ -751,7 +801,11 @@ mod tests {
 
     /// The guest's raw `rt_sigsuspend` with an empty mask while the thread
     /// blocks `sig`, handled under `flags`: as `masked_ppoll`.
-    fn masked_sigsuspend(sig: Signal, flags: Option<SaFlags>, mode: i64) -> (i64, i32, usize, bool) {
+    fn masked_sigsuspend(
+        sig: Signal,
+        flags: Option<SaFlags>,
+        mode: i64,
+    ) -> (i64, i32, usize, bool) {
         handle(sig, flags);
         SigSet::from(sig).thread_block().expect("block the signal");
         configure(0, sig, mode, &SigSet::empty());
@@ -857,7 +911,13 @@ mod tests {
     fn erestartnohand_under_a_temporary_mask_is_eintr_and_restores_the_mask() {
         let flags = Some(SaFlags::SA_RESTART);
         let want = (-1, libc::EINTR, 1, true);
-        check_masked_ppoll(ERESTARTNOHAND, Signal::SIGUSR1, flags, HELD_OVER_INJECTION, want);
+        check_masked_ppoll(
+            ERESTARTNOHAND,
+            Signal::SIGUSR1,
+            flags,
+            HELD_OVER_INJECTION,
+            want,
+        );
     }
 
     /// With no handler (SIGWINCH at its default action), or with the held
@@ -879,7 +939,13 @@ mod tests {
     #[test]
     fn a_handled_signal_pending_behind_one_without_a_handler_is_eintr() {
         let want = (-1, libc::EINTR, 1, true);
-        check_masked_ppoll(ERESTARTNOHAND, Signal::SIGWINCH, None, HELD_WITH_SIGUSR1_PENDING, want);
+        check_masked_ppoll(
+            ERESTARTNOHAND,
+            Signal::SIGWINCH,
+            None,
+            HELD_WITH_SIGUSR1_PENDING,
+            want,
+        );
     }
 
     /// `-ERESTARTSYS` with a handler under a pending mask restore, which Linux
@@ -890,7 +956,13 @@ mod tests {
     fn erestartsys_with_a_handler_under_a_temporary_mask() {
         let flags = Some(SaFlags::SA_RESTART);
         let want = (RESTARTED, 0, 1, true);
-        check_masked_ppoll(ERESTARTSYS, Signal::SIGUSR1, flags, HELD_OVER_INJECTION, want);
+        check_masked_ppoll(
+            ERESTARTSYS,
+            Signal::SIGUSR1,
+            flags,
+            HELD_OVER_INJECTION,
+            want,
+        );
     }
 
     /// The same on aarch64 is refused by name, with an error that ends the
@@ -957,7 +1029,13 @@ mod tests {
     fn a_held_signal_the_mask_in_effect_then_blocks_restarts() {
         let flags = Some(SaFlags::SA_RESTART);
         let want = (RESTARTED, 0, 0, true);
-        check_masked_ppoll(ERESTARTNOHAND, Signal::SIGUSR1, flags, HELD_THEN_BLOCKED, want);
+        check_masked_ppoll(
+            ERESTARTNOHAND,
+            Signal::SIGUSR1,
+            flags,
+            HELD_THEN_BLOCKED,
+            want,
+        );
     }
 
     /// The plain pattern: the Tool injects the guest's own `ppoll` or
@@ -1028,7 +1106,12 @@ mod tests {
      {
         check_fn_with_config::<RestartResult, _>(
             || {
-                let got = masked_ppoll(0, Signal::SIGWINCH, None, PLAIN_WITH_AN_UNREAD_FIRST_ARGUMENT);
+                let got = masked_ppoll(
+                    0,
+                    Signal::SIGWINCH,
+                    None,
+                    PLAIN_WITH_AN_UNREAD_FIRST_ARGUMENT,
+                );
                 assert_eq!(
                     got,
                     (RESTARTED, 0, 0, true),

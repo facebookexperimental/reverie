@@ -41,16 +41,10 @@ pub(crate) mod memory_publication_tests {
             0xbb, data_low, data_high, 0x8a, 0x07, 0xe6, 0x80, 0x8a, 0x07, 0xe6, 0x81, 0x8a, 0x07,
             0xe6, 0x82, HLT,
         ];
-        let mut first = KvmBackend::new_with_memory(
-            memory.clone(),
-            None,
-        )
-        .expect("first VM requires /dev/kvm");
-        let mut second = KvmBackend::new_with_memory(
-            memory.clone(),
-            None,
-        )
-        .expect("second VM requires /dev/kvm");
+        let mut first =
+            KvmBackend::new_with_memory(memory.clone(), None).expect("first VM requires /dev/kvm");
+        let mut second =
+            KvmBackend::new_with_memory(memory.clone(), None).expect("second VM requires /dev/kvm");
         first.install_real_mode_program(ENTRY, &program).unwrap();
         second.install_real_mode_program(ENTRY, &program).unwrap();
 
@@ -176,7 +170,10 @@ pub(crate) mod memory_publication_tests {
             .unwrap();
         memory.enable_user_access();
         memory.write_raw(HOST_PAGE_SIZE as u64, &[0x42]).unwrap();
-        let operand = memory.user().host_operand(HOST_PAGE_SIZE as u64, 1).unwrap();
+        let operand = memory
+            .user()
+            .host_operand(HOST_PAGE_SIZE as u64, 1)
+            .unwrap();
         let gate = memory.entry_gate();
         assert_eq!(gate.test_state().retained_operands, 1);
 

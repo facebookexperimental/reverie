@@ -153,7 +153,10 @@ mod tests {
         let pid = child.id() as libc::pid_t;
         // SAFETY: getpgid and getpgrp take and return integers.
         let (group, own_group) = unsafe { (libc::getpgid(pid), libc::getpgrp()) };
-        assert!(group == pid && group != own_group, "the scenario leads its own process group");
+        assert!(
+            group == pid && group != own_group,
+            "the scenario leads its own process group"
+        );
         let (done, finished) = mpsc::channel();
         // wait_with_output reads stdout and stderr concurrently.
         std::thread::spawn(move || done.send(child.wait_with_output()));
@@ -172,7 +175,10 @@ mod tests {
             .unwrap_or_else(|| {
                 panic!("the scenario reported nothing ({status}):\n{stdout}\n{stderr}")
             });
-        assert!(status.success(), "the scenario failed ({status}):\n{stdout}\n{stderr}");
+        assert!(
+            status.success(),
+            "the scenario failed ({status}):\n{stdout}\n{stderr}"
+        );
         for expected in [
             "exited during ptrace initialization with Exited(127)",
             "Reverie could not disable address-space randomization with personality(2)",

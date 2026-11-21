@@ -880,9 +880,10 @@ pub fn serve_stage_snapshot(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
+
+    use super::*;
 
     fn composite() -> (Vec<u8>, [u8; 32], ExecTicket) {
         let framed = frame_tool_state(b"exec-state-bytes").unwrap();

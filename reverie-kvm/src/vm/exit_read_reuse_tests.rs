@@ -66,7 +66,10 @@ pub(crate) mod exit_read_reuse_tests {
             format!("{:?}", actual.special_registers),
             format!("{:?}", expected.special_registers)
         );
-        assert_eq!(actual.action_return_registers, expected.action_return_registers);
+        assert_eq!(
+            actual.action_return_registers,
+            expected.action_return_registers
+        );
         assert_eq!(actual.stage_action_outcome, expected.stage_action_outcome);
     }
 
@@ -97,7 +100,11 @@ pub(crate) mod exit_read_reuse_tests {
         let memory = backend.memory.clone();
         let before = admissions(&backend);
         let (request, exit) = backend.read_syscall_exit(&memory, frame_address).unwrap();
-        assert_eq!(admissions(&backend), before + 1, "frame and hypercall: one copy");
+        assert_eq!(
+            admissions(&backend),
+            before + 1,
+            "frame and hypercall: one copy"
+        );
         assert_eq!(
             request,
             SyscallRequest::read_from(&memory, frame_address).unwrap()
@@ -163,17 +170,16 @@ pub(crate) mod exit_read_reuse_tests {
             spoil(&mut slot.boundary);
             let (_, exit) = backend.read_syscall_exit(&memory, frame_address).unwrap();
             let mut pending = std::pin::pin!(std::future::pending());
-            let lent = futures::executor::block_on(
-                CompletedSyscallBoundary::capture_admitted_reusing(
+            let lent =
+                futures::executor::block_on(CompletedSyscallBoundary::capture_admitted_reusing(
                     &mut backend,
                     frame_address,
                     pending.as_mut(),
                     reuse.then_some((&exit, &memory)),
                     &mut slot,
-                ),
-            )
-            .unwrap()
-            .unwrap();
+                ))
+                .unwrap()
+                .unwrap();
             assert!(std::ptr::eq(lent, &slot.boundary));
             assert_same(&slot.boundary, &expected);
         }
@@ -272,7 +278,11 @@ pub(crate) mod exit_read_reuse_tests {
         let actual = capture_reusing(&mut backend, frame_address, Some((&exit, &memory)))
             .unwrap()
             .unwrap();
-        assert_eq!(admissions(&backend), before + 1, "a stale exit read was reused");
+        assert_eq!(
+            admissions(&backend),
+            before + 1,
+            "a stale exit read was reused"
+        );
         assert_eq!(actual.frame, [0x5a; FRAME_SIZE]);
         assert_same(&actual, &fresh(&backend, frame_address));
     }
@@ -316,7 +326,11 @@ pub(crate) mod exit_read_reuse_tests {
             let actual = capture_reusing(&mut backend, frame_address, Some((exit, memory)))
                 .unwrap()
                 .unwrap();
-            assert_eq!(admissions(&backend), before + 1, "reused an ineligible read");
+            assert_eq!(
+                admissions(&backend),
+                before + 1,
+                "reused an ineligible read"
+            );
             assert_same(&actual, &expected);
         }
     }
@@ -343,7 +357,9 @@ pub(crate) mod exit_read_reuse_tests {
             } = fixture();
             let memory = backend.memory.clone();
             let (_, exit) = backend.read_syscall_exit(&memory, frame_address).unwrap();
-            let original = Arc::new(Error::UnexpectedVcpuExit("controlled reuse poison".to_owned()));
+            let original = Arc::new(Error::UnexpectedVcpuExit(
+                "controlled reuse poison".to_owned(),
+            ));
             backend
                 .memory
                 .entry_gate()
@@ -384,15 +400,14 @@ pub(crate) mod exit_read_reuse_tests {
             };
             let before = admissions(&backend);
             let mut slot = CompletedBoundarySlot::new();
-            let result = futures::executor::block_on(
-                CompletedSyscallBoundary::capture_admitted_reusing(
+            let result =
+                futures::executor::block_on(CompletedSyscallBoundary::capture_admitted_reusing(
                     &mut backend,
                     frame_address,
                     stop,
                     Some((&exit, &memory)),
                     &mut slot,
-                ),
-            );
+                ));
             match (event, result) {
                 ("stop", Err(Error::RunAborted)) | ("cancellation", Ok(None)) => {}
                 (event, result) => panic!("{event}: {:?}", result.map(|value| value.is_some())),
@@ -510,12 +525,12 @@ pub(crate) mod exit_read_reuse_tests {
             let result = futures::executor::block_on(backend.prepare_action_read_or_reuse(
                 pending.as_mut(),
                 reuse.then_some((exit.generation, |_: &KvmBackend, _: &mut ()| {
-                        // After the check that precedes the reused bytes.
-                        assert!(memory.check_copy_failures().is_ok());
-                        defer(&memory);
-                        ran.store(true, std::sync::atomic::Ordering::SeqCst);
-                        Ok(7_u32)
-                    })),
+                    // After the check that precedes the reused bytes.
+                    assert!(memory.check_copy_failures().is_ok());
+                    defer(&memory);
+                    ran.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(7_u32)
+                })),
                 &mut (),
                 |_, _, _| {
                     defer(&memory);
@@ -569,9 +584,9 @@ pub(crate) mod exit_read_reuse_tests {
             let result = futures::executor::block_on(backend.prepare_action_read_or_reuse(
                 pending.as_mut(),
                 reuse.then_some((exit.generation, |_: &KvmBackend, _: &mut ()| {
-                        ran.store(true, std::sync::atomic::Ordering::SeqCst);
-                        Ok(7_u32)
-                    })),
+                    ran.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(7_u32)
+                })),
                 &mut (),
                 |_, _, _| {
                     ran.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -622,7 +637,11 @@ pub(crate) mod exit_read_reuse_tests {
             panic!("capture did not complete after reopening");
         };
         drop(capture);
-        assert_eq!(admissions(&backend), before + 1, "reopened capture did not copy");
+        assert_eq!(
+            admissions(&backend),
+            before + 1,
+            "reopened capture did not copy"
+        );
         assert_same(actual, &expected);
     }
 }

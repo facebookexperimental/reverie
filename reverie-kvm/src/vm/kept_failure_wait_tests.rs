@@ -204,8 +204,9 @@ mod kept_failure_wait_tests {
             assert!(active.is_none());
             *active = Some(observed.clone());
         }
-        let run = AssertUnwindSafe(backend.run_static_elf_with_tool_completion::<WaitTool>((), false))
-            .catch_unwind();
+        let run =
+            AssertUnwindSafe(backend.run_static_elf_with_tool_completion::<WaitTool>((), false))
+                .catch_unwind();
         let outcome = futures::executor::block_on(run);
         let payload = match outcome {
             Err(payload) => payload,
