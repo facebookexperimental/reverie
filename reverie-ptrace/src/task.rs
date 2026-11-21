@@ -10708,6 +10708,11 @@ impl<L: Tool + 'static> TracedTask<L> {
                 .await
         });
         self.global_state.fatal_session.handed(id);
+        // The child is admitted here, whether its creation stop reached the
+        // run loop or was consumed inside an injection: count it once, here.
+        if let Some(stats) = &self.global_state.backend_stats {
+            stats.record_tracee_started();
+        }
         let task_body = async move {
             match AssertUnwindSafe(body).catch_unwind().await {
                 Ok(Ok(exit_status)) => exit_status,

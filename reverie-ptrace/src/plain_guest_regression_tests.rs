@@ -416,6 +416,70 @@ async fn plain_fork_vfork_exec_run_returns_the_traced_pids() {
     assert_baseline_is_not_vacuous(&ptrace, true, "task#0", "task#1", "task#2");
 }
 
+/// A child whose creation stop reaches the run loop is counted as started
+/// exactly once. With the default (tail-injecting) configuration, the root's
+/// fork and vfork event stops both reach the run loop, which admits each
+/// child; the root and its two children make three tracees.
+#[tokio::test(flavor = "current_thread")]
+async fn run_loop_children_are_each_counted_once_as_started() {
+    let ptrace = run_fork_vfork_exec_guest(false, Identity::Renamed).await;
+    assert_eq!(ptrace.status, ExitStatus::Exited(0));
+    assert_eq!(
+        ptrace.stops.len(),
+        3,
+        "root, fork child and vfork child each own a stop sequence: {:?}",
+        ptrace.stops.keys()
+    );
+    let counts = &ptrace.counts;
+    assert_eq!(
+        (
+            counts.fork_stops(),
+            counts.vfork_stops(),
+            counts.clone_stops()
+        ),
+        (1, 1, 0),
+        "both creation stops reached the run loop"
+    );
+    assert_eq!(
+        counts.tracees_started(),
+        3,
+        "the root and its two children, each counted once"
+    );
+}
+
+/// A child whose creation stop is consumed inside an injection is counted as
+/// started exactly once, as a run-loop child is. With every call injected,
+/// the injections consume the fork and vfork event stops, so the run loop's
+/// fork, vfork and clone stop counts stay 0, as Reverie defines them; both
+/// children are still admitted, and the root and its two children make three
+/// tracees.
+#[tokio::test(flavor = "current_thread")]
+async fn injected_children_are_each_counted_once_as_started() {
+    let ptrace = run_fork_vfork_exec_guest(true, Identity::Renamed).await;
+    assert_eq!(ptrace.status, ExitStatus::Exited(0));
+    assert_eq!(
+        ptrace.stops.len(),
+        3,
+        "root, fork child and vfork child each own a stop sequence: {:?}",
+        ptrace.stops.keys()
+    );
+    let counts = &ptrace.counts;
+    assert_eq!(
+        (
+            counts.fork_stops(),
+            counts.vfork_stops(),
+            counts.clone_stops()
+        ),
+        (0, 0, 0),
+        "the injections consumed both creation stops"
+    );
+    assert_eq!(
+        counts.tracees_started(),
+        3,
+        "the root and its two children, each counted once"
+    );
+}
+
 /// Selects the arm a re-executed namespace child runs.
 const NAMESPACE_ARM_ENV: &str = "REVERIE_PLAIN_NAMESPACE_ARM";
 const NAMESPACE_MARK: &str = "@@plain-namespace-arm@@ ";
@@ -3464,6 +3528,9 @@ async fn self_raised_signals_are_delivered_after_the_call() {
 /// clone event stops; tail-injected, the run loop sees three fork stops
 /// (fork, grandchild, clone3), one vfork and one clone stop, and the vfork
 /// parent's vfork-done stop has the entry's -ENOSYS in rax.
+/// In both configurations the root and its five children (the fork child,
+/// the grandchild, the vfork child, the clone3 child and the thread) are each
+/// counted once as started.
 #[tokio::test(flavor = "current_thread")]
 async fn the_fork_family_runs_through_the_site() {
     let inject = run_guest("fork_family", false).await;
@@ -3495,6 +3562,16 @@ async fn the_fork_family_runs_through_the_site() {
         .filter(|stop| stop.starts_with("VforkDone"))
         .collect();
     assert_eq!(vfork_done, ["VforkDone rax=-38"], "{:#?}", tail.stops);
+    assert_eq!(
+        tail.counts.tracees_started(),
+        6,
+        "the root and its five children, each counted once"
+    );
+    assert_eq!(
+        inject.counts.tracees_started(),
+        6,
+        "the root and its five children, each counted once"
+    );
 }
 
 /// A clone without CLONE_THREAD, with exit signal 0, is reported as a clone

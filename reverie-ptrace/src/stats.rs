@@ -51,6 +51,10 @@ pub struct PtraceBackendStatsSnapshot {
 
 impl PtraceBackendStatsSnapshot {
     /// Number of root and child tracees admitted to the ptrace lifecycle.
+    ///
+    /// A child process or thread is counted once, when it is admitted,
+    /// whether its creation stop reached a top-level run loop or was consumed
+    /// inside an injection.
     pub const fn tracees_started(&self) -> u64 {
         self.tracees_started
     }
@@ -269,9 +273,8 @@ impl PtraceBackendStatsSource {
                 self.collector.stop_events.fetch_add(1, Ordering::Relaxed);
                 match event {
                     Event::NewChild(operation, _) => {
-                        self.collector
-                            .tracees_started
-                            .fetch_add(1, Ordering::Relaxed);
+                        // tracees_started is counted where the child is
+                        // admitted (handle_new_task), as for an injected child.
                         let counter = match operation {
                             ChildOp::Fork => &self.collector.fork_stops,
                             ChildOp::Vfork => &self.collector.vfork_stops,
@@ -431,6 +434,15 @@ impl PtraceBackendStatsSource {
     pub(crate) fn record_tracee_exit(&self) {
         self.collector
             .exited_tracees
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts one child tracee admitted to the ptrace lifecycle, whichever
+    /// path consumed its creation stop; see
+    /// [`PtraceBackendStatsSnapshot::tracees_started`].
+    pub(crate) fn record_tracee_started(&self) {
+        self.collector
+            .tracees_started
             .fetch_add(1, Ordering::Relaxed);
     }
 }
