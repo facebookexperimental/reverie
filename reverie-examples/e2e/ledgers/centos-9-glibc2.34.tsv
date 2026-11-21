@@ -5,14 +5,21 @@
 # Until their own issues are filed, the rows link the audit's tracking issue. The liteinst and
 # in-guest-trap rows were re-measured on 2026-11-02 after runtime descriptor isolation (a461e8bf),
 # with run.sh --backends ptrace,liteinst,in-guest-trap; two runs gave identical rows.
+# The awk ptrace row was re-measured on 2026-11-20 on devbig014 (kernel 7.1.3, LANG=en_US.UTF-8):
+# the native /proc/self/maps first read is 4082 (strace and the recorder's native runs agree in two
+# validate runs), so both sides of the row moved +25 with the same -21 first-read delta as before;
+# grep-passwd's ptrace row is unchanged. The maps byte counts also depend on the ambient locale
+# (natively, awk's first maps read is 4037 under LC_ALL=C and 4066 under C.UTF-8), which this
+# environment name does not capture; judge only under en_US.UTF-8 or re-measure with --write-ledger.
 #
 # ptrace: the tool never sees the rt_sigreturn that ends a signal handler.
 sh-fork	ptrace	mismatch	rt_sigreturn=ok -> rt_sigaction=ok	https://github.com/rrnewton/hermit/issues/4485
 sh-pipe	ptrace	mismatch	rt_sigreturn=ok -> rt_sigprocmask=ok	https://github.com/rrnewton/hermit/issues/4485
-# ptrace: a read returns a different byte count; most likely /proc/self/maps, where reverie-ptrace's
-# private pages show (the cause Hermit's pinned-root ledger found for grep).
+# ptrace: a /proc/self/maps read returns a different byte count, where reverie-ptrace's
+# private pages show (the cause Hermit's pinned-root ledger found for grep; confirmed by strace:
+# both programs open /proc/self/maps, and the ptrace maps total is +82 bytes for each).
 grep-passwd	ptrace	mismatch	read=4067 -> read=4068	https://github.com/rrnewton/hermit/issues/4485
-awk	ptrace	mismatch	read=4057 -> read=4036	https://github.com/rrnewton/hermit/issues/4485
+awk	ptrace	mismatch	read=4082 -> read=4061	https://github.com/rrnewton/hermit/issues/4485
 # KVM: rseq answers ENOSYS (reverie-kvm refuses it), the first difference on every program.
 *	kvm	mismatch	rseq=ok -> rseq=ENOSYS	https://github.com/rrnewton/hermit/issues/4485
 # liteinst: the tool lives in the example preload and starts after the loader's calls (compare.rs,
