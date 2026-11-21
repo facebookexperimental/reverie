@@ -5376,11 +5376,19 @@ mod tests {
         if crate::test_runs_in_own_process() {
             return;
         }
+        // The target must live under a directory this user owns:
+        // touch_target creates it inside the mapped-root user
+        // namespace, where the host `/` is overflow-owned and not
+        // writable, so a root-level target such as `/test` fails
+        // with EACCES before any mount happens.
+        let target_dir = tempfile::tempdir().unwrap();
+        let target = target_dir.path().join("test");
+        let observed = target.clone();
         let result = Container::new()
             .unshare(Namespace::USER | Namespace::MOUNT)
             .map_root()
-            .mount(Mount::tmpfs("/test").touch_target())
-            .run(|| Path::new("/test").is_dir());
+            .mount(Mount::tmpfs(&target).touch_target())
+            .run(move || observed.is_dir());
 
         assert_eq!(result, Ok(true));
     }
