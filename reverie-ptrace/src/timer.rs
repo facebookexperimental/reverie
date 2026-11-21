@@ -1961,6 +1961,32 @@ impl TimerImpl {
         })
     }
 
+    /// Logs the just-armed event's absolute target and programming at
+    /// debug level, so an offline join can reconstruct the arm without
+    /// inferring it from a later notification (which a short stop may
+    /// cancel before it ever fires).
+    fn debug_armed(&self, stage: &'static str, margin: u64) {
+        let (target, offset) = match self.event {
+            ActiveEvent::Precise {
+                clock_target,
+                offset,
+            } => (clock_target, offset),
+            ActiveEvent::Imprecise { clock_min } => (clock_min, 0),
+        };
+        debug!(
+            guest_tid = self.guest_tid.as_raw(),
+            target,
+            offset,
+            margin,
+            stage,
+            halved = self.halved.is_some(),
+            overflow_period = ?self.overflow_period,
+            overflow_point = ?self.overflow_point,
+            status = ?self.timer_status,
+            "timer event armed"
+        );
+    }
+
     pub fn request_event(&mut self, evt: TimerEventRequest) -> Result<(), Errno> {
         let config = get_pmu_config();
         let (delivery, margin, staged) = match evt {
@@ -1991,6 +2017,11 @@ impl TimerImpl {
         self.armed_programming = None;
         self.first_stage = None;
         self.halved = None;
+        let stage = match evt {
+            TimerEventRequest::Imprecise(_) => "imprecise",
+            _ if staged => "first",
+            _ => "whole",
+        };
         if self.initial_command != InitialCommand::Ordinary {
             self.event_margin = margin;
             self.overflow_point = None;
@@ -1998,6 +2029,7 @@ impl TimerImpl {
             self.held_initial_event = Some(self.event);
             self.set_status(EventStatus::Scheduled);
             debug_assert!(!self.send_artificial_signal);
+            self.debug_armed(stage, margin);
             return Ok(());
         }
         if matches!(evt, TimerEventRequest::Imprecise(_)) {
@@ -2017,6 +2049,7 @@ impl TimerImpl {
                 programmings: self.timer.programmings(),
             });
         }
+        self.debug_armed(stage, margin);
         Ok(())
     }
 
@@ -2088,6 +2121,7 @@ impl TimerImpl {
                 programmings: self.timer.programmings(),
             });
         }
+        self.debug_armed(if first_stage { "first" } else { "rearm" }, margin);
         Ok(())
     }
 
@@ -2493,6 +2527,27 @@ impl TimerImpl {
             }
             _ => None,
         };
+        if self.reads_clock_at(event)
+            && let ActiveEvent::Precise {
+                clock_target,
+                offset,
+            } = self.event
+        {
+            // This stop decides (cancels) the scheduled precise event
+            // unless it is disregarded, which restores it. Logging the
+            // deciding stop here is the only record when it cancels
+            // the event before any notification fires.
+            debug!(
+                guest_tid = self.guest_tid.as_raw(),
+                target = clock_target,
+                offset,
+                clock = missed.as_ref().map(|missed| missed.clock),
+                margin = self.event_margin,
+                status = ?self.timer_status,
+                stop = ?event,
+                "precise timer event cancelled by stop (unless disregarded)"
+            );
+        }
         // This stop is the request's one allowed stop, unless it is
         // disregarded, which takes this count back. If the counter has
         // already passed the programmed overflow, either this is the timer's
@@ -2725,6 +2780,20 @@ impl TimerImpl {
     /// [`TimerImpl::retire`], which records only a Scheduled event, does not
     /// record it again either way.
     fn cancel_at_disregarded_stop(&mut self, missed: Option<MissedTarget>) {
+        if let ActiveEvent::Precise {
+            clock_target,
+            offset,
+        } = self.event
+        {
+            debug!(
+                guest_tid = self.guest_tid.as_raw(),
+                target = clock_target,
+                offset,
+                clock = missed.as_ref().map(|missed| missed.clock),
+                margin = self.event_margin,
+                "precise timer event cancelled at disregarded stop"
+            );
+        }
         self.commit_missed(missed);
         self.timer_status = EventStatus::Cancelled;
     }
