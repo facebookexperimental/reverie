@@ -28,7 +28,8 @@
 # the list must parse (each entry a repository-relative .rs path, listed
 # once, with the reason `sha256-pinned in FILE[ and FILE...]`), every
 # listed path must be a file whose sha256 each FILE contains (an entry
-# nothing pins is refused: format that file instead), rustfmt.toml must
+# nothing pins is refused: format that file instead; no FILE may be the
+# list itself or a listed file, by path or as the same file), rustfmt.toml must
 # set no `ignore` of its own, and the `ignore` list read back from the
 # written file must be exactly the list; any failure exits 2 before
 # anything is checked. `rustfmt-gate.sh --check-exclusions` runs those
@@ -54,6 +55,11 @@ refuse() {
 [[ -f $EXCLUSIONS ]] || refuse "no $EXCLUSIONS"
 pattern_chars='[][[:space:]*?!#"\]'
 excluded=()
+# The list's own path, compared with every FILE a reason names.
+list_file=$EXCLUSIONS
+pin_lines=()
+pin_owners=()
+pin_files=()
 declare -A listed=()
 number=0
 while IFS= read -r line || [[ -n $line ]]; do
@@ -105,15 +111,38 @@ while IFS= read -r line || [[ -n $line ]]; do
             /$pin/ == */./* || /$pin/ == */../* ]]; then
             refuse "$EXCLUSIONS:$number: \`$path\`'s reason \`$reason\` names a FILE that is not a repository-relative path"
         fi
+        # The list cannot vouch for its own entries: a comment in it could
+        # hold any digest.
+        if [[ $pin == "$list_file" ]]; then
+            refuse "$EXCLUSIONS:$number: \`$path\`'s reason names $EXCLUSIONS, the list itself; the list cannot vouch for its own entries"
+        fi
         if [[ ! -f $pin || -L $pin ]]; then
             refuse "$EXCLUSIONS:$number: \`$path\`'s reason names \`$pin\`, which is missing or not a regular file"
         fi
+        if [[ $pin -ef $list_file ]]; then
+            refuse "$EXCLUSIONS:$number: \`$path\`'s reason names \`$pin\`, which is the same file as \`$EXCLUSIONS\`; neither the list nor a listed file can pin an entry"
+        fi
+        pin_lines+=("$number")
+        pin_owners+=("$path")
+        pin_files+=("$pin")
         if ! grep -qF -- "$digest" "$pin"; then
             refuse "$EXCLUSIONS:$number: \`$path\`'s sha256 $digest is not in \`$pin\`, so its reason does not hold; format the file and delete its entry instead"
         fi
     done
     excluded+=("$path")
 done < "$EXCLUSIONS"
+# Nor can a listed file, which itself escapes formatting, by path or as the
+# same file under another name (a hard link).
+for i in "${!pin_files[@]}"; do
+    for other in "${excluded[@]}"; do
+        if [[ ${pin_files[i]} == "$other" ]]; then
+            refuse "$EXCLUSIONS:${pin_lines[i]}: \`${pin_owners[i]}\`'s reason names \`$other\`, which is itself listed; a listed file cannot pin an entry"
+        fi
+        if [[ ${pin_files[i]} -ef $other ]]; then
+            refuse "$EXCLUSIONS:${pin_lines[i]}: \`${pin_owners[i]}\`'s reason names \`${pin_files[i]}\`, which is the same file as \`$other\`; neither the list nor a listed file can pin an entry"
+        fi
+    done
+done
 
 # The configuration both passes use: rustfmt.toml unchanged plus an
 # `ignore` list of exactly the listed paths.
