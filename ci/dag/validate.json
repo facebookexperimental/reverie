@@ -511,11 +511,11 @@
       "group": "test",
       "job": "core",
       "desc": "Tests: core + transport + support crates",
-      "description": "Counted nextest over the remaining workspace packages (core, safeptrace, rpc-transport, process, loader, memory, syscalls, test-support, util, proc-grammar, and the zero-test experimental packages, whose listings keep the node totals exact).",
+      "description": "Counted nextest over the remaining workspace packages (core, safeptrace, rpc-transport, process, loader, memory, syscalls, test-support, util, proc-grammar, linux-ns-model, and the zero-test experimental packages, whose listings keep the node totals exact).",
       "labels": [
         "full"
       ],
-      "cmd": "./scripts/libtest-counts.rs run-nextest target/validate/counts-test-core.json -- cargo nextest run --binaries-metadata target/validate/binaries-metadata.json -E \"(package(safeptrace) | package(reverie-core) | package(reverie-rpc-transport) | package(reverie-process) | package(reverie-linuxemu-ext-procfs) | package(reverie-loader) | package(reverie-test-support) | package(reverie-syscalls) | package(reverie-memory) | package(reverie-util) | package(reverie-signal) | package(nostd-print) | package(reverie-linux-provider) | package(reverie-rpc) | package(riptrace-rpc) | package(reverie-proc-grammar)) & $REVERIE_NEXTEST_SKIP_FILTER\"",
+      "cmd": "./scripts/libtest-counts.rs run-nextest target/validate/counts-test-core.json -- cargo nextest run --binaries-metadata target/validate/binaries-metadata.json -E \"(package(safeptrace) | package(reverie-core) | package(reverie-rpc-transport) | package(reverie-process) | package(reverie-linuxemu-ext-procfs) | package(reverie-loader) | package(reverie-test-support) | package(reverie-syscalls) | package(reverie-memory) | package(reverie-util) | package(reverie-signal) | package(nostd-print) | package(reverie-linux-provider) | package(reverie-rpc) | package(riptrace-rpc) | package(reverie-proc-grammar) | package(linux-ns-model)) & $REVERIE_NEXTEST_SKIP_FILTER\"",
       "deps": [
         "build.test_binaries",
         "fixtures.liteinst"

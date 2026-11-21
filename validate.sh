@@ -897,7 +897,7 @@ ingest_dag_gate() {
         if [[ $counts_file == *counts-test-* ]]; then
             # Counted nextest node: side files are part of its evidence.
             local side
-            for side in skips.txt flaky.txt universe; do
+            for side in skips.txt flaky.txt universe universe-names.txt; do
                 if [[ ! -f ${counts_path%.json}.$side ]]; then
                     printf 'count evidence refused: missing %s side file for %s\n' \
                         "$side" "$name" >>"$LOG_FILE"
@@ -962,6 +962,7 @@ run_validation_dag() {
         "$ROOT_DIR"/target/validate/counts-*.skips.txt \
         "$ROOT_DIR"/target/validate/counts-*.flaky.txt \
         "$ROOT_DIR"/target/validate/counts-*.universe \
+        "$ROOT_DIR"/target/validate/counts-*.universe-names.txt \
         "$ROOT_DIR/target/validate/binaries-metadata.json" \
         "$ROOT_DIR/target/validate/list-full.json"
     printf 'Running validation DAG (ci/dag/validate.json; log: %s)\n' "$LOG_FILE"
@@ -1003,6 +1004,38 @@ run_validation_dag() {
         failures=$((failures + 1))
         printf 'FAIL: Test partition coverage (nodes cover %s, workspace lists %s; log: %s)\n' \
             "$DAG_UNIVERSE_TOTAL" "${listed:-unknown}" "$LOG_FILE" >&2
+        # Name the tests behind the counts: workspace tests in no
+        # node's universe-names side file, and covered names the
+        # workspace no longer lists.
+        local partition_diff=
+        if [[ -f $ROOT_DIR/target/validate/list-full.json ]]; then
+            partition_diff=$(python3 -c '
+import glob, json, os, sys
+data = json.load(open(sys.argv[1]))
+workspace = set()
+for binary_id, suite in data["rust-suites"].items():
+    for test in suite["testcases"]:
+        workspace.add(binary_id + " " + test)
+covered = set()
+for path in glob.glob(os.path.join(sys.argv[2], "counts-test-*.universe-names.txt")):
+    for line in open(path):
+        line = line.strip()
+        if line:
+            covered.add(line)
+for name in sorted(workspace - covered):
+    print("UNCOVERED " + name)
+for name in sorted(covered - workspace):
+    print("NOT-LISTED " + name)
+' "$ROOT_DIR/target/validate/list-full.json" \
+                "$ROOT_DIR/target/validate" 2>>"$LOG_FILE") || partition_diff=
+        fi
+        if [[ -n $partition_diff ]]; then
+            printf '%s\n' "$partition_diff" >&2
+            printf '%s\n' "$partition_diff" >>"$LOG_FILE"
+        else
+            printf 'FAIL: Test partition coverage could not enumerate the uncovered tests (log: %s)\n' \
+                "$LOG_FILE" >&2
+        fi
         record_ledger_gate "Test partition coverage" 2 0 null null null
     fi
     local flaky_total

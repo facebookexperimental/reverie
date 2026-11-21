@@ -1474,48 +1474,24 @@ fn nextest_selection_scope(args: &[String]) -> (Vec<String>, Vec<String>) {
     (packages, binaries)
 }
 
-/// Total listed tests for the caller's package selection, from
-/// `cargo nextest list` over the same arguments. The list JSON reports
-/// every test case in its binaries regardless of -E test filters, so
-/// the universe is the sum over suites inside the caller's
-/// package/binary scope — exactly the unfiltered discovery channel,
-/// including binaries in which the run selects nothing.
-fn discover_nextest_total(args: &[String]) -> Result<u64, String> {
-    let mut list_args: Vec<String> = args.to_vec();
-    list_args[2] = "list".to_string();
-    let output = Command::new(&list_args[0])
-        .args(&list_args[1..])
-        .arg("--message-format")
-        .arg("json")
-        .arg("--list-type")
-        .arg("full")
-        .output()
-        .map_err(|error| format!("cannot start cargo nextest list: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "cargo nextest list failed with {}; discovery evidence is incomplete",
-            output.status
-        ));
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let start = text
-        .find('{')
-        .ok_or_else(|| "cargo nextest list emitted no JSON object".to_string())?;
-    let value: serde_json::Value = serde_json::from_str(&text[start..])
-        .map_err(|error| format!("cannot parse cargo nextest list JSON: {error}"))?;
-    let (packages, binaries) = nextest_selection_scope(args);
-    if packages.is_empty() && binaries.is_empty() {
-        return value
-            .get("test-count")
-            .and_then(serde_json::Value::as_u64)
-            .ok_or_else(|| "cargo nextest list JSON has no test-count".to_string());
-    }
+/// One `binary-id test` line per listed test inside the caller's
+/// package/binary scope, sorted. The list JSON reports every test
+/// case in its binaries regardless of -E test filters, so the lines
+/// are exactly the unfiltered discovery channel, including tests in
+/// binaries in which the run selects nothing. `validate.sh` unions
+/// every node's lines and diffs them against the workspace list, so
+/// a partition failure names the uncovered tests, not only counts.
+fn nextest_universe_names(
+    value: &serde_json::Value,
+    packages: &[String],
+    binaries: &[String],
+) -> Result<Vec<String>, String> {
     let suites = value
         .get("rust-suites")
         .and_then(serde_json::Value::as_object)
         .ok_or_else(|| "cargo nextest list JSON has no rust-suites object".to_string())?;
-    let mut total = 0_u64;
-    for suite in suites.values() {
+    let mut names = Vec::new();
+    for (binary_id, suite) in suites {
         let package = suite
             .get("package-name")
             .and_then(serde_json::Value::as_str)
@@ -1540,13 +1516,58 @@ fn discover_nextest_total(args: &[String]) -> Result<u64, String> {
         if !positives.is_empty() && !positives.iter().any(|name| *name == binary) {
             continue;
         }
-        total += suite
+        let cases = suite
             .get("testcases")
             .and_then(serde_json::Value::as_object)
-            .map(|cases| cases.len() as u64)
             .ok_or_else(|| "cargo nextest list suite has no testcases object".to_string())?;
+        for test in cases.keys() {
+            names.push(format!("{binary_id} {test}"));
+        }
     }
-    Ok(total)
+    names.sort();
+    Ok(names)
+}
+
+/// Listed tests for the caller's package selection, from
+/// `cargo nextest list` over the same arguments.
+fn discover_nextest_universe(args: &[String]) -> Result<Vec<String>, String> {
+    let mut list_args: Vec<String> = args.to_vec();
+    list_args[2] = "list".to_string();
+    let output = Command::new(&list_args[0])
+        .args(&list_args[1..])
+        .arg("--message-format")
+        .arg("json")
+        .arg("--list-type")
+        .arg("full")
+        .output()
+        .map_err(|error| format!("cannot start cargo nextest list: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "cargo nextest list failed with {}; discovery evidence is incomplete",
+            output.status
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let start = text
+        .find('{')
+        .ok_or_else(|| "cargo nextest list emitted no JSON object".to_string())?;
+    let value: serde_json::Value = serde_json::from_str(&text[start..])
+        .map_err(|error| format!("cannot parse cargo nextest list JSON: {error}"))?;
+    let (packages, binaries) = nextest_selection_scope(args);
+    let names = nextest_universe_names(&value, &packages, &binaries)?;
+    if packages.is_empty() && binaries.is_empty() {
+        let listed = value
+            .get("test-count")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| "cargo nextest list JSON has no test-count".to_string())?;
+        if listed != names.len() as u64 {
+            return Err(format!(
+                "cargo nextest list test-count {listed} disagrees with {} enumerated tests; discovery evidence is incomplete",
+                names.len()
+            ));
+        }
+    }
+    Ok(names)
 }
 
 fn run_nextest(path: PathBuf, args: Vec<String>) -> Result<i32, String> {
@@ -1590,7 +1611,8 @@ fn run_nextest(path: PathBuf, args: Vec<String>) -> Result<i32, String> {
     // stream only describes binaries with at least one selected test,
     // so the unfiltered universe (and therefore filtered_tests) comes
     // from a separate list over the same package selection.
-    let discovered_total = discover_nextest_total(&args)?;
+    let discovered_names = discover_nextest_universe(&args)?;
+    let discovered_total = discovered_names.len() as u64;
     let junit_path = path.with_extension("junit.xml");
     let junit_absolute = if junit_path.is_absolute() {
         junit_path.clone()
@@ -1702,6 +1724,7 @@ fn run_nextest(path: PathBuf, args: Vec<String>) -> Result<i32, String> {
         .collect();
     write_side("flaky.txt", &flaky_lines)?;
     write_side("universe", &[discovered_total.to_string()])?;
+    write_side("universe-names.txt", &discovered_names)?;
     // CPU attribution on this path is the dagrun node's cgroup account
     // (per-node user/sys in the perf CSV), not per test: under parallel
     // nextest a process-group delta cannot be attributed to one test.
@@ -2112,6 +2135,23 @@ fn self_test_nextest() -> Result<(), String> {
     {
         return Err(format!(
             "nextest self-test scope mismatch: packages={packages:?} binaries={binaries:?}"
+        ));
+    }
+    let universe_json: serde_json::Value = serde_json::from_str(
+        r#"{"test-count": 4, "rust-suites": {
+            "pkg::strace": {"package-name": "reverie-liteinst", "binary-name": "strace",
+                "testcases": {"b_test": {}, "a_test": {}}},
+            "pkg::rpc_tool": {"package-name": "reverie-liteinst", "binary-name": "rpc_tool",
+                "testcases": {"excluded_test": {}}},
+            "other::bin": {"package-name": "other", "binary-name": "bin",
+                "testcases": {"foreign_test": {}}}
+        }}"#,
+    )
+    .map_err(|error| format!("nextest self-test universe JSON: {error}"))?;
+    let universe_names = nextest_universe_names(&universe_json, &packages, &binaries)?;
+    if universe_names != ["pkg::strace a_test", "pkg::strace b_test"] {
+        return Err(format!(
+            "nextest self-test universe mismatch: {universe_names:?}"
         ));
     }
     println!("PASS: nextest event counts are typed, cross-checked, and flaky-aware");
