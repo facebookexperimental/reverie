@@ -381,6 +381,13 @@ where
         // invalid-number refusal. A malformed native event is not a
         // guest syscall result and must not synthesize -ENOSYS.
         let number = Sysno::from(guest.event.number as i32);
+        // A named number not reviewed for forwarding is a guest syscall,
+        // and gets the answer `dispatch` gives it, by the same predicate:
+        // unsubscribed, it is refused here with -ENOSYS, neither delivered
+        // to the Tool nor forwarded; subscribed, the Tool decides.
+        if should_refuse_unreviewed(number, self.subscriptions.contains(&number)) {
+            return NativeCallbackOutcome::Ready(Ok(-i64::from(libc::ENOSYS)));
+        }
         let args = guest.event.args;
         let syscall = Syscall::from_raw(
             number,
@@ -396,7 +403,8 @@ where
         // Native interception is selected by its actual C owner.
         // Like the maintained native driver, every event reaching
         // this entry invokes Tool, independent of local hooks'
-        // subscription table. Only Tool may request deferral here.
+        // subscription table, except the unreviewed, unsubscribed
+        // numbers refused above. Only Tool may request deferral here.
         #[cfg(feature = "native-entry-observer")]
         guest.observe_native_entry(NativeEntryStage::Syscall);
         guest.in_syscall_handler = true;

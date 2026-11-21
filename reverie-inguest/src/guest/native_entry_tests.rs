@@ -351,8 +351,10 @@ fn native_actual_entries_preserve_initialized_lifecycle_and_event_order() {
         "no fabricated lifecycle RPC"
     );
     // The native C filter selects interception independently of the local
-    // subscription set. A valid event must still enter Tool when absent from
-    // that set; the old native driver always called its Tool handler.
+    // subscription set. A reviewed event must still enter Tool when absent
+    // from that set; the old native driver always called its Tool handler.
+    // An unreviewed, unsubscribed one is refused (see
+    // native_entry_refuses_unreviewed_unsubscribed_numbers_like_dispatch).
     assert!(!host.subscriptions.contains(&Sysno::getuid));
     let handle = unsafe {
         host.register_native_image_thread(id, State::seeded())
@@ -1755,4 +1757,122 @@ fn native_initializer_waits_out_tool_slot_contention() {
         assert!(initialized_rx.recv_timeout(Duration::from_secs(5)).unwrap());
         child.join().unwrap();
     });
+}
+
+fn make_host_subscribed_to(
+    subscriptions: impl IntoIterator<Item = Sysno>,
+) -> (ToolHost<Probe, Runtime>, std::os::unix::net::UnixStream) {
+    let (rpc, peer) = fixture::configured_rpc();
+    let host = unsafe {
+        ToolHost::new_native(
+            Probe::default(),
+            rpc,
+            fixture::actual_pid(libc::SYS_getpid),
+            subscriptions.into_iter().collect(),
+            true,
+            Runtime,
+        )
+    };
+    (host, peer)
+}
+
+/// The native route refuses what `dispatch` refuses: a number the linked
+/// `syscalls` crate names but that is not reviewed for forwarding, when the
+/// Tool does not subscribe to it, gets -ENOSYS before the Tool sees it, and
+/// nothing is forwarded. A reviewed number the subscriptions do not name still
+/// enters the Tool, as every native event did before.
+#[test]
+fn native_entry_refuses_unreviewed_unsubscribed_numbers_like_dispatch() {
+    let server = Server::new();
+    let (host, _peer) = make_host();
+    let rpc = NativeRpc::new(server.path.clone(), host.rpc.shared_config()).unwrap();
+    let callback = Callback::new(1);
+    let id = callback.identity();
+    let services = callback.services(None);
+    assert!(!host.subscriptions.contains(&Sysno::getuid));
+    let handle = unsafe {
+        host.register_native_image_thread(id, State::seeded())
+            .unwrap()
+    };
+    let lease = unsafe { host.enter_native_callback(handle, id).unwrap() };
+    let mut reviewed = event(1);
+    reviewed.number = libc::SYS_getuid;
+    assert_eq!(
+        value(unsafe {
+            host.dispatch_native_syscall(lease, &services, &rpc, &mut reviewed)
+                .unwrap()
+        }),
+        i64::from(unsafe { libc::getuid() })
+    );
+    let state = unsafe { host.retire_native_thread(handle, id).unwrap() };
+    assert_eq!(state.syscalls, 1);
+    assert_eq!(callback.count(libc::SYS_getuid), 1);
+
+    // 462-469 first; x86_64's 335 and 336 last.
+    #[cfg(target_arch = "x86_64")]
+    let named_gap: &[i64] = &[335, 336];
+    #[cfg(not(target_arch = "x86_64"))]
+    let named_gap: &[i64] = &[];
+    for number in (462..=469).chain(named_gap.iter().copied()) {
+        let sysno = Sysno::new(number as usize).expect("named by the linked crate");
+        assert!(should_refuse_unreviewed(sysno, false));
+        assert!(!host.subscriptions.contains(&sysno));
+        let handle = unsafe {
+            host.register_native_image_thread(id, State::seeded())
+                .unwrap()
+        };
+        let lease = unsafe { host.enter_native_callback(handle, id).unwrap() };
+        let mut unreviewed = event(0);
+        unreviewed.number = number;
+        let result = value(unsafe {
+            host.dispatch_native_syscall(lease, &services, &rpc, &mut unreviewed)
+                .unwrap()
+        });
+        assert_eq!(
+            callback.count(number),
+            0,
+            "the Tool must not see or forward unsubscribed unreviewed number {number}"
+        );
+        let state = unsafe { host.retire_native_thread(handle, id).unwrap() };
+        assert_eq!(state.syscalls, 0, "number {number} entered the Tool");
+        assert_eq!(
+            result,
+            -i64::from(libc::ENOSYS),
+            "number {number} must get -ENOSYS"
+        );
+    }
+    fixture::close_test_primary(&rpc, &callback);
+}
+
+/// An unreviewed number the Tool subscribes to is delivered to the Tool on
+/// the native route, as `dispatch` delivers it: the Tool decides.
+#[test]
+fn native_entry_delivers_a_subscribed_unreviewed_number_to_the_tool() {
+    let server = Server::new();
+    let (host, _peer) = make_host_subscribed_to([Sysno::getpid, Sysno::open_tree_attr]);
+    let rpc = NativeRpc::new(server.path.clone(), host.rpc.shared_config()).unwrap();
+    let callback = Callback::new(1);
+    let id = callback.identity();
+    let services = callback.services(None);
+    assert!(should_refuse_unreviewed(Sysno::open_tree_attr, false));
+    assert!(!should_refuse_unreviewed(Sysno::open_tree_attr, true));
+    let handle = unsafe {
+        host.register_native_image_thread(id, State::seeded())
+            .unwrap()
+    };
+    let lease = unsafe { host.enter_native_callback(handle, id).unwrap() };
+    let mut subscribed = event(0);
+    subscribed.number = 467;
+    // The Tool forwards it; the host kernel's answer is not asserted.
+    let _ = value(unsafe {
+        host.dispatch_native_syscall(lease, &services, &rpc, &mut subscribed)
+            .unwrap()
+    });
+    let state = unsafe { host.retire_native_thread(handle, id).unwrap() };
+    assert_eq!(
+        state.syscalls, 1,
+        "the subscribed number must enter the Tool"
+    );
+    assert_eq!(callback.count(467), 1, "the Tool forwarded it");
+    fixture::close_test_primary(&rpc, &callback);
 }
