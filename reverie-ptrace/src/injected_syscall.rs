@@ -78,6 +78,22 @@ impl InjectedSyscallFrame {
         Sysno::new(self.rax as i32 as usize).ok_or(Errno::ENOSYS)
     }
 
+    /// The whole `rax` register, untruncated and unchecked.
+    ///
+    /// Linux dispatches on the low 32 bits as an `int`. This is the whole
+    /// register, the same value ptrace reports in `orig_rax`. (A seccomp
+    /// trap's signal frame is a different case: Linux may rewrite RAX
+    /// before saving the ucontext.) Converting it to the kernel's number
+    /// is the dispatcher's job. Bridges that dispatch the number to
+    /// a Tool (which decides, including for numbers the table cannot name)
+    /// must not lose that value: [`Self::syscall_number`] answers
+    /// `Err(ENOSYS)` for unnamable numbers, which would put syscall policy
+    /// in the bridge. Valid only at entry, before `set_result` or a
+    /// register update overwrites `rax`.
+    pub fn raw_syscall_number(&self) -> i64 {
+        self.rax as i64
+    }
+
     /// Decodes the syscall stored in this e9tool frame. See
     /// [`InjectedSyscallFrame::syscall_number`] for the unknown-number error.
     pub fn syscall(&self) -> Result<Syscall, Errno> {
@@ -279,6 +295,23 @@ mod tests {
             rsp: 16,
             rip: 0x401000,
         }
+    }
+
+    #[test]
+    fn raw_syscall_number_keeps_every_bit_of_rax() {
+        let mut unknown = frame();
+        unknown.rax = Sysno::last().id() as u64 + 1;
+        assert_eq!(unknown.raw_syscall_number(), Sysno::last().id() as i64 + 1);
+        assert_eq!(unknown.syscall_number(), Err(Errno::ENOSYS));
+        // Linux dispatches on (int)rax: the checked decode names write,
+        // while the raw number keeps the upper bits.
+        let mut wide = frame();
+        wide.rax = 0x1_0000_0000 | libc::SYS_write as u64;
+        assert_eq!(wide.syscall_number(), Ok(Sysno::write));
+        assert_eq!(wide.raw_syscall_number(), 0x1_0000_0000 | libc::SYS_write);
+        let mut ones = frame();
+        ones.rax = u64::MAX;
+        assert_eq!(ones.raw_syscall_number(), -1);
     }
 
     #[test]
