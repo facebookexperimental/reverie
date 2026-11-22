@@ -13,9 +13,31 @@
 # safeptrace and others) remain outside this gate.
 #
 # Callers: validate.sh, the DAG node in ci/dag/validate.json, and the
-# nightly GitHub workflow's format step. Keep all three on this script
-# so the copies cannot drift. The edition is reverie-liteinst's
-# edition in its Cargo.toml, read there, not a second copy.
+# format steps of the nightly and extended GitHub workflows. Keep all
+# four on this script so the copies cannot drift. The edition is
+# reverie-liteinst's edition in its Cargo.toml, read there, not a second
+# copy.
+#
+# Both passes run ONE pinned formatter, never the rustfmt or cargo fmt
+# that PATH, rust-toolchain.toml or RUSTUP_TOOLCHAIN would pick:
+# rustfmt.toml's doc-comment formatting, import grouping and
+# one-import-per-item options are nightly-only, and the stable
+# toolchain's rustfmt formats as if they were absent. The pin is
+# ci/rustfmt-toolchain.toml: a nightly channel and the exact
+# `rustfmt --version` line of its rustfmt. The toolchain is found in
+# this order: REVERIE_RUSTFMT_TOOLCHAIN, a toolchain root holding
+# bin/rustfmt and bin/cargo-fmt (for an environment without rustup);
+# else rustup, running the pinned channel with auto-install off. The
+# gate then runs that root's bin/cargo-fmt (with RUSTFMT set to its
+# bin/rustfmt) and bin/rustfmt by absolute path. A missing toolchain, a
+# missing executable, or a rustfmt whose version line is not the pinned
+# one exits 2 before anything is checked. The gate never installs a
+# toolchain; the refusal names the command that does.
+#
+# `rustfmt-gate.sh --fix` formats instead of checking: the same pinned
+# formatter, the same configuration and the same files, without
+# --check. It is for a person reformatting the tree; no caller passes
+# it, so every gate run is check-only.
 #
 # Files whose bytes cannot change yet (another file pins their sha256)
 # are listed in ci/rustfmt-exclusions.txt, one
@@ -40,10 +62,24 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT" || exit 1
 
 EXCLUSIONS=ci/rustfmt-exclusions.txt
+PIN=ci/rustfmt-toolchain.toml
 refuse() {
     echo "rustfmt gate: $*" >&2
     exit 2
 }
+
+# No argument: check. --check-exclusions: the list checks alone, with no
+# formatter. --fix: format with the pinned formatter instead of checking.
+mode=check
+if (($# > 1)); then
+    refuse "takes at most one argument (--check-exclusions or --fix), got $#"
+fi
+case ${1:-} in
+    "") ;;
+    --check-exclusions) mode=exclusions ;;
+    --fix) mode=fix ;;
+    *) refuse "unknown argument \`$1\` (expected none, --check-exclusions or --fix)" ;;
+esac
 
 # The exclusion list: `PATH REASON` lines, PATH the first
 # whitespace-delimited field and REASON the rest of the line, trimmed;
@@ -175,13 +211,80 @@ fi
 if ! cmp -s -n "$(wc -c < rustfmt.toml)" rustfmt.toml "$config"; then
     refuse "$config does not start with rustfmt.toml unchanged"
 fi
-if [[ ${1:-} == --check-exclusions ]]; then
+if [[ $mode == exclusions ]]; then
     echo "rustfmt gate: $EXCLUSIONS is consistent: ${#excluded[@]} excluded file(s), each a file with a reason, and exactly those in the generated \`ignore\` list"
     exit 0
 fi
 
+# The pin: two keys, `channel` and `identity`, each exactly once, as
+# `key = "value"`; `#` comment lines and blank lines are skipped.
+[[ -f $PIN ]] || refuse "no $PIN"
+pin_line='^([a-z]+)[[:space:]]*=[[:space:]]*"([^"]+)"$'
+channel=
+identity=
+number=0
+while IFS= read -r line || [[ -n $line ]]; do
+    number=$((number + 1))
+    trimmed=${line#"${line%%[![:space:]]*}"}
+    trimmed=${trimmed%"${trimmed##*[![:space:]]}"}
+    [[ -z $trimmed || $trimmed == \#* ]] && continue
+    if [[ ! $trimmed =~ $pin_line ]]; then
+        refuse "$PIN:$number: expected \`key = \"value\"\`, found \`$trimmed\`"
+    fi
+    key=${BASH_REMATCH[1]}
+    value=${BASH_REMATCH[2]}
+    case $key in
+        channel)
+            [[ -z $channel ]] || refuse "$PIN:$number: \`channel\` is set twice"
+            channel=$value
+            ;;
+        identity)
+            [[ -z $identity ]] || refuse "$PIN:$number: \`identity\` is set twice"
+            identity=$value
+            ;;
+        *) refuse "$PIN:$number: unknown key \`$key\`" ;;
+    esac
+done < "$PIN"
+[[ -n $channel ]] || refuse "$PIN: no \`channel\`"
+[[ -n $identity ]] || refuse "$PIN: no \`identity\`"
+
+# The toolchain root: REVERIE_RUSTFMT_TOOLCHAIN, else rustup running the
+# pinned channel. rustup must not install it: with RUSTUP_AUTO_INSTALL=0
+# an absent channel is a refusal, not a download.
+install_hint="rustup toolchain install $channel --profile minimal --component rustfmt"
+if [[ -n ${REVERIE_RUSTFMT_TOOLCHAIN:-} ]]; then
+    source_desc="REVERIE_RUSTFMT_TOOLCHAIN=$REVERIE_RUSTFMT_TOOLCHAIN"
+    toolchain_root=$REVERIE_RUSTFMT_TOOLCHAIN
+elif rustup_bin=$(type -P rustup); then
+    source_desc="rustup run $channel"
+    toolchain_root=$(RUSTUP_AUTO_INSTALL=0 "$rustup_bin" run "$channel" rustc --print sysroot) ||
+        refuse "\`rustup run $channel rustc --print sysroot\` failed: the pinned formatter's toolchain is not usable here, and the gate never installs it. Install it with \`$install_hint\`, or set REVERIE_RUSTFMT_TOOLCHAIN to a toolchain root holding bin/rustfmt and bin/cargo-fmt"
+else
+    refuse "no pinned formatter: REVERIE_RUSTFMT_TOOLCHAIN is unset and there is no rustup, and the gate never uses a rustfmt found on PATH. Install rustup and run \`$install_hint\`, or set REVERIE_RUSTFMT_TOOLCHAIN to a toolchain root holding bin/rustfmt and bin/cargo-fmt"
+fi
+toolchain_root=$(CDPATH='' cd -P -- "$toolchain_root" && pwd -P) ||
+    refuse "$source_desc: the toolchain root is not a directory"
+rustfmt_bin=$toolchain_root/bin/rustfmt
+cargo_fmt_bin=$toolchain_root/bin/cargo-fmt
+for bin in "$rustfmt_bin" "$cargo_fmt_bin"; do
+    if [[ ! -f $bin || ! -x $bin ]]; then
+        refuse "$source_desc: no executable $bin (with rustup: \`rustup component add rustfmt --toolchain $channel\`)"
+    fi
+done
+# The identity: the exact `rustfmt --version` line the pin names.
+found=$("$rustfmt_bin" --version) || refuse "$rustfmt_bin --version failed"
+if [[ $found != "$identity" ]]; then
+    refuse "refusing the formatter from $source_desc: its rustfmt --version is \`$found\`, but $PIN pins \`$identity\` (channel $channel)"
+fi
+echo "rustfmt gate: formatter $rustfmt_bin ($identity)" >&2
+
+check=(--check)
+if [[ $mode == fix ]]; then
+    check=()
+fi
+
 rc=0
-cargo fmt --all -- --check --config-path "$config" || rc=$?
+RUSTFMT=$rustfmt_bin "$cargo_fmt_bin" --all -- "${check[@]}" --config-path "$config" || rc=$?
 
 edition=$(sed -n 's/^edition = "\([0-9]*\)".*/\1/p' reverie-liteinst/Cargo.toml | head -n 1)
 if [[ -z $edition ]]; then
@@ -222,7 +325,7 @@ if ((${#targets[@]} == 0)); then
     exit 1
 fi
 
-rustfmt --edition "$edition" --check --config-path "$config" "${targets[@]}" || {
+"$rustfmt_bin" --edition "$edition" "${check[@]}" --config-path "$config" "${targets[@]}" || {
     status=$?
     if ((rc == 0)); then
         rc=$status

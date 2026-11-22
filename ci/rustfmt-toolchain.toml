@@ -1,0 +1,21 @@
+# The formatter toolchain for scripts/rustfmt-gate.sh, the ONE place it is
+# pinned. It is separate from the stable compiler pin in rust-toolchain.toml
+# because rustfmt.toml's doc-comment formatting, import grouping and
+# one-import-per-item options are nightly-only: stable rustfmt warns about them
+# and formats as if they were absent, so a stable check passes code those
+# options reject.
+#
+# identity is the exact `rustfmt --version` line of this channel's rustfmt. The
+# gate refuses (exit 2) any other formatter, and it never installs one: install
+# this channel with
+#   rustup toolchain install <channel> --profile minimal --component rustfmt
+# or point REVERIE_RUSTFMT_TOOLCHAIN at a toolchain root holding bin/rustfmt
+# and bin/cargo-fmt.
+#
+# This rustfmt, commit c397dae808, is the build Meta's internal toolchain
+# ships, so both sides format these sources identically. nightly-2026-07-03 is
+# the first nightly that ships it. Hermit's ci/rustfmt-toolchain.toml pins the
+# same formatter; move the two together, and move both when the internal
+# toolchain's rustfmt moves.
+channel = "nightly-2026-07-03"
+identity = "rustfmt 1.9.0-nightly (c397dae808 2026-07-02)"

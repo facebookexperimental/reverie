@@ -161,8 +161,16 @@ jobs:
       run: |
         source scripts/stable-features.sh
         cargo clippy --workspace --all-targets --features "${STABLE_FEATURES}"
+    # The Rustfmt gate shared with validate.sh, the DAG and the nightly
+    # workflow: the formatter pinned in ci/rustfmt-toolchain.toml (installed
+    # here, channel read from the pin), the exclusion list, and the include!
+    # targets cargo fmt never reaches. Check-only (no --fix).
     - name: Format
-      run: cargo fmt --all -- --check
+      run: |
+        channel="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' ci/rustfmt-toolchain.toml | head -n 1)"
+        test -n "$channel"
+        rustup toolchain install "$channel" --profile minimal --component rustfmt
+        bash scripts/rustfmt-gate.sh
     # The cross-backend check on every backend that needs no device. A hosted
     # runner's environment has no ledger, so its verdicts are reported, not
     # judged (reverie-examples/e2e/README.md).

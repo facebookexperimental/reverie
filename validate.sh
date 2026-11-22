@@ -1081,7 +1081,9 @@ run_clippy() {
 }
 run_check "Clippy" run_clippy
 # The Rustfmt gate lives in one script, scripts/rustfmt-gate.sh, shared
-# with the DAG node and the nightly workflow so the copies cannot drift.
+# with the DAG node and the nightly and extended workflows so the copies
+# cannot drift. It runs the formatter pinned in ci/rustfmt-toolchain.toml,
+# not the stable toolchain's rustfmt, and refuses (exit 2) without it.
 run_check "Rustfmt" "$ROOT_DIR/scripts/rustfmt-gate.sh"
 }
 

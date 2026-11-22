@@ -81,7 +81,7 @@
       "group": "lint",
       "job": "rustfmt",
       "desc": "Rustfmt",
-      "description": "scripts/rustfmt-gate.sh: cargo fmt --all -- --check over the whole workspace, plus a direct rustfmt --check of every file reached only through include! under reverie-liteinst/src/bin (derived at run time; the same script as validate.sh and the nightly workflow).",
+      "description": "scripts/rustfmt-gate.sh: with the formatter pinned in ci/rustfmt-toolchain.toml (refused, exit 2, when absent or of another identity), cargo fmt --all -- --check over the whole workspace, plus a direct rustfmt --check of every file reached only through include! under reverie-liteinst/src/bin (derived at run time; the same script as validate.sh and the nightly and extended workflows).",
       "labels": [
         "full"
       ],
