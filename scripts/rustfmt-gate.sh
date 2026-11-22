@@ -28,8 +28,9 @@
 # this order: REVERIE_RUSTFMT_TOOLCHAIN, a toolchain root holding
 # bin/rustfmt and bin/cargo-fmt (for an environment without rustup);
 # else rustup, running the pinned channel with auto-install off. The
-# gate then runs that root's bin/cargo-fmt (with RUSTFMT set to its
-# bin/rustfmt) and bin/rustfmt by absolute path. A missing toolchain, a
+# gate then runs that root's bin/cargo-fmt (with RUSTFMT set to a
+# wrapper around its bin/rustfmt, described below) and bin/rustfmt by
+# absolute path. A missing toolchain, a
 # missing executable, or a rustfmt whose version line is not the pinned
 # one exits 2 before anything is checked. The gate never installs a
 # toolchain; the refusal names the command that does.
@@ -278,13 +279,35 @@ if [[ $found != "$identity" ]]; then
 fi
 echo "rustfmt gate: formatter $rustfmt_bin ($identity)" >&2
 
+# cargo fmt runs rustfmt once per edition and returns the first nonzero
+# exit code among those runs, so a rustfmt killed by a signal (an abort
+# on a failed allocation, an out-of-memory kill), which leaves no exit
+# code, counts as a pass, and every file it had not reached goes
+# unchecked. The workspace pass therefore runs rustfmt through a
+# wrapper, .tmp-rustfmt-gate-PID.rustfmt beside the configuration
+# (gitignored, removed on exit), that returns bash's status for the run:
+# 128 plus the signal number for a death by signal, a failure named on
+# stderr. The direct pass below sees that status itself.
+wrapper=$ROOT/.tmp-rustfmt-gate-$$.rustfmt
+trap 'rm -f -- "$config" "$wrapper"' EXIT
+cat > "$wrapper" << 'EOF' || refuse "cannot write $wrapper"
+#!/usr/bin/env bash
+"$REVERIE_RUSTFMT_GATE_RUSTFMT" "$@"
+status=$?
+if ((status > 128)); then
+    echo "rustfmt gate: $REVERIE_RUSTFMT_GATE_RUSTFMT ended with status $status (signal $((status - 128))) before checking every file it was given" >&2
+fi
+exit "$status"
+EOF
+chmod u+x "$wrapper" || refuse "cannot make $wrapper executable"
+
 check=(--check)
 if [[ $mode == fix ]]; then
     check=()
 fi
 
 rc=0
-RUSTFMT=$rustfmt_bin "$cargo_fmt_bin" --all -- "${check[@]}" --config-path "$config" || rc=$?
+REVERIE_RUSTFMT_GATE_RUSTFMT=$rustfmt_bin RUSTFMT=$wrapper "$cargo_fmt_bin" --all -- "${check[@]}" --config-path "$config" || rc=$?
 
 edition=$(sed -n 's/^edition = "\([0-9]*\)".*/\1/p' reverie-liteinst/Cargo.toml | head -n 1)
 if [[ -z $edition ]]; then

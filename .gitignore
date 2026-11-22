@@ -3,8 +3,10 @@ target/
 # recorder and reverie-e2e-compare) that Hermit's validation builds with
 # --locked --offline from the pinned checkout (reverie-examples/e2e/).
 
-# scripts/rustfmt-gate.sh's generated rustfmt configuration (removed on exit).
+# scripts/rustfmt-gate.sh's generated rustfmt configuration and rustfmt
+# wrapper (removed on exit).
 /.tmp-rustfmt-gate-*.toml
+/.tmp-rustfmt-gate-*.rustfmt
 
 # Local backup and Python cache files.
 *.orig
