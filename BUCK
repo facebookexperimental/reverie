@@ -1934,6 +1934,56 @@ rust_library(
     ],
 )
 
+# reverie-inguest as Cargo builds it for the production hermit binary with
+# `exec-stop-launcher`: reverie-liteinst's dependency (`coordinator-rpc`,
+# `launcher`, `rcb-clock`) unified with hermit's direct dependency
+# (`exec-stop` and `loader-private-runtime`, the latter implying
+# `exec-private-init` and `fixed-syscall-gates`) into one crate. Only the
+# production hermit build uses it, directly and through
+# :reverie-liteinst-exec-stop-private below; a binary must hold one
+# reverie-inguest, as at :reverie-inguest-exec-stop. No test-only feature
+# (producer, fixture, probe or observation) is enabled, and the musl-only
+# `private-libc-exports` stays with the private image's own build.
+rust_library(
+    name = "reverie-inguest-exec-stop-private",
+    srcs = glob(["reverie-inguest/src/**/*.rs"]) + ["reverie-inguest/src/guest/tool_region_keyed_oracle_probe.S"],
+    autocargo = {"ignore_rule": True},
+    crate = "reverie_inguest",
+    crate_root = "reverie-inguest/src/lib.rs",
+    features = [
+        "coordinator-rpc",
+        "exec-private-init",
+        "exec-stop",
+        "fixed-syscall-gates",
+        "launcher",
+        "loader-private-runtime",
+        "rcb-clock",
+    ],
+    named_deps = {"reverie": ":reverie"},
+    # As :reverie-inguest-liteinst: its per-image symbols need a static link.
+    preferred_linkage = "static",
+    target_compatible_with = [
+        "ovr_config//cpu:x86_64",
+        "ovr_config//os:linux",
+    ],
+    unittests = False,
+    deps = [
+        "fbsource//third-party/rust:bincode",
+        "fbsource//third-party/rust:libc",
+        "fbsource//third-party/rust:nix",
+        "fbsource//third-party/rust:serde",
+        "fbsource//third-party/rust:syscalls",
+        "fbsource//third-party/rust:tempfile",
+        "fbsource//third-party/rust:tokio",
+        "fbsource//third-party/rust:tracing",
+        ":reverie-loader",
+        ":reverie-memory",
+        ":reverie-rpc-transport",
+        ":reverie-syscalls",
+        ":safeptrace",
+    ],
+)
+
 # reverie-inguest with the features reverie-liteinst's Cargo dependency
 # declares: `launcher` (which implies `coordinator-rpc`) and `rcb-clock`.
 rust_library(
@@ -2939,6 +2989,38 @@ rust_library(
         "fbsource//third-party/rust:tracing",
         ":reverie",
         ":reverie-inguest-exec-stop",  # @manual name:reverie_inguest
+        ":reverie-rpc-transport",
+    ],
+)
+
+# reverie-liteinst built against :reverie-inguest-exec-stop-private, for
+# the production hermit build only, so that binary holds the single
+# reverie-inguest that its Cargo build with `exec-stop-launcher` holds.
+# As :reverie-liteinst, the crate itself stays trap-only: hermit's
+# `liteinst` feature forwards no reverie-liteinst feature.
+rust_library(
+    name = "reverie-liteinst-exec-stop-private",
+    srcs = glob(["reverie-liteinst/src/**/*.rs"]),
+    autocargo = {"ignore_rule": True},
+    crate = "reverie_liteinst",
+    crate_root = "reverie-liteinst/src/lib.rs",
+    # As :reverie-liteinst: selected_backing() needs the final image's link.
+    preferred_linkage = "static",
+    target_compatible_with = [
+        "ovr_config//cpu:x86_64",
+        "ovr_config//os:linux",
+    ],
+    unittests = False,
+    deps = [
+        "fbsource//third-party/rust:bincode",
+        "fbsource//third-party/rust:iced-x86",
+        "fbsource//third-party/rust:libc",
+        "fbsource//third-party/rust:serde",
+        "fbsource//third-party/rust:tempfile",
+        "fbsource//third-party/rust:tokio",
+        "fbsource//third-party/rust:tracing",
+        ":reverie",
+        ":reverie-inguest-exec-stop-private",  # @manual name:reverie_inguest
         ":reverie-rpc-transport",
     ],
 )
