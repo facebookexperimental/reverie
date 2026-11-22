@@ -9449,6 +9449,32 @@ const FIXED_ARENA_OPERANDS_12: &[FixedArenaOperand] = &[
     },
 ];
 
+// Hand-derived from a real ELF (scripts/detcore-alloc-recipe.py derives only
+// the alloc-family rows): libreverie_liteinst.so from
+// scripts/build-liteinst-test-runtime.rs --for-ci on stable Rust 1.99.1
+// (58cf8f9c3 2026-10-13), ELF SHA256
+// 962d59423a3615ada4e7a4a7a77b05c31aa0b434a246995840854812f91d0867;
+// fixed_setup_bitmap_range at VA 0x118340, 217 bytes, body SHA256
+// 29a3f26bd4ebab85dc09740018e391f2514e7b5b75bc8cbd46fac6764d3a4666. All
+// constant operands and internal branches are literal.
+const FIXED_ARENA_BYTES_13: &[u8] = &[
+    0xb0, 0x01, 0x48, 0x39, 0xf2, 0x0f, 0x86, 0xcd, 0x00, 0x00, 0x00, 0x84, 0xc9, 0x74, 0x69, 0x89,
+    0xd1, 0x29, 0xf1, 0x4c, 0x8d, 0x46, 0x01, 0xf6, 0xc1, 0x01, 0x74, 0x17, 0x41, 0xb9, 0x01, 0x00,
+    0x00, 0x00, 0x89, 0xf1, 0x49, 0xd3, 0xe1, 0x48, 0xc1, 0xee, 0x06, 0x4c, 0x09, 0x4c, 0xf7, 0x08,
+    0x4c, 0x89, 0xc6, 0x4c, 0x39, 0xc2, 0x0f, 0x84, 0x9c, 0x00, 0x00, 0x00, 0x0f, 0x1f, 0x40, 0x00,
+    0x41, 0xb8, 0x01, 0x00, 0x00, 0x00, 0x89, 0xf1, 0x49, 0xd3, 0xe0, 0x48, 0x89, 0xf1, 0x48, 0xc1,
+    0xe9, 0x06, 0x4c, 0x09, 0x44, 0xcf, 0x08, 0x48, 0x8d, 0x4e, 0x01, 0x41, 0xb8, 0x01, 0x00, 0x00,
+    0x00, 0x49, 0xd3, 0xe0, 0x48, 0xc1, 0xe9, 0x06, 0x4c, 0x09, 0x44, 0xcf, 0x08, 0x48, 0x83, 0xc6,
+    0x02, 0x48, 0x39, 0xf2, 0x75, 0xca, 0xeb, 0x60, 0x48, 0x89, 0xf1, 0x48, 0xc1, 0xe9, 0x06, 0x48,
+    0x8b, 0x4c, 0xcf, 0x08, 0x48, 0x0f, 0xa3, 0xf1, 0x73, 0x03, 0x31, 0xc0, 0xc3, 0x48, 0x8d, 0x4a,
+    0xff, 0x48, 0x39, 0xce, 0x74, 0x42, 0x41, 0xb8, 0x02, 0x00, 0x00, 0x00, 0x49, 0x29, 0xd0, 0x48,
+    0xff, 0xc6, 0x66, 0x66, 0x66, 0x66, 0x66, 0x2e, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xb8, 0x01, 0x00, 0x00, 0x00, 0x89, 0xf1, 0x48, 0xd3, 0xe0, 0x48, 0x89, 0xf1, 0x48, 0xc1, 0xe9,
+    0x06, 0x48, 0x85, 0x44, 0xcf, 0x08, 0x0f, 0x94, 0xc0, 0x75, 0x0d, 0x49, 0x8d, 0x0c, 0x30, 0x48,
+    0xff, 0xc6, 0x48, 0x83, 0xf9, 0x01, 0x75, 0xd8, 0xc3,
+];
+const FIXED_ARENA_OPERANDS_13: &[FixedArenaOperand] = &[];
+
 const FIXED_ARENA_TEMPLATES: &[FixedArenaTemplate] = &[
     FixedArenaTemplate {
         role: "fixed_arena_setup",
@@ -9514,6 +9540,11 @@ const FIXED_ARENA_TEMPLATES: &[FixedArenaTemplate] = &[
         role: "fixed_arena_backing",
         bytes: FIXED_ARENA_BYTES_12,
         operands: FIXED_ARENA_OPERANDS_12,
+    },
+    FixedArenaTemplate {
+        role: "fixed_setup_bitmap_range",
+        bytes: FIXED_ARENA_BYTES_13,
+        operands: FIXED_ARENA_OPERANDS_13,
     },
 ];
 
@@ -24359,6 +24390,24 @@ const DETCORE_VALIDATE_DATA: &[DetcoreValidateDataSpec] = &[
         column: 27,
     },
     DetcoreValidateDataSpec {
+        key: "fixed_naked_bitmap_251_location",
+        location: true,
+        hex: "",
+        file_hex: "",
+        source_context_key: Some("rv:reverie-inguest/src/guest/tool_region_arena.rs"),
+        line: 143,
+        column: 27,
+    },
+    DetcoreValidateDataSpec {
+        key: "fixed_naked_bitmap_269_location",
+        location: true,
+        hex: "",
+        file_hex: "",
+        source_context_key: Some("rv:reverie-inguest/src/guest/tool_region_arena.rs"),
+        line: 143,
+        column: 27,
+    },
+    DetcoreValidateDataSpec {
         key: "fixed_scalar_native_record_location",
         location: true,
         hex: "",
@@ -30625,6 +30674,45 @@ const DETCORE_VALIDATE_TEMPLATES: &[DetcoreValidateTemplate] = &[
         ],
         transfers: &[(8, 1)],
     },
+    // Stable Rust 1.99.1 (58cf8f9c3 2026-10-13), rust-toolchain.toml channel 1.99.1.
+    // Profile liteinst-runtime; features allocator-fixture. Hand-derived from a
+    // real ELF (scripts/detcore-alloc-recipe.py derives only the alloc-family
+    // rows) built by ci/build-liteinst-allocator-fixtures.rs, whose Detcore leaf
+    // command is: cargo build --locked --offline --manifest-path <Hermit>/Cargo.toml -p detcore-liteinst --lib --profile liteinst-runtime --features allocator-fixture. ELF
+    // SHA256 4c7ff58ac7164eba3512aebb67392d0195d0e0cf13f6956d9ba67037806d3134.
+    // fixed_setup_bitmap_range _RNvNtNtNtCsfhI59vbc6Q6_15reverie_inguest5guest11tool_region5arena18fixed_bitmap_range at VA 0x13be3a0, 282 bytes; complete body SHA256 544a0b636ffd06ff6e12518abfa4fd7642949ae34925b2ed68b84a162dcc0077.
+    // Location operands bind the setup143:27 profile; the null panic GOT operand binds panic_null_reference_constructed.
+    DetcoreValidateTemplate {
+        role: "fixed_setup_bitmap_range",
+        hex: "504989f04889fe40f6c6070f85ea0000004885f60f84f3000000b0014c39c20f86d400000084c9746e89d14429c1498d7801f6c101741841b9010000004489c149d3e149c1e8064e094cc6084989f84839fa0f84a10000000f1f840000000000bf010000004489c148d3e74c89c148c1e90648097cce08498d4801bf0100000048d3e748c1e90648097cce084983c0024c39c275cbeb624c89c148c1e906488b4cce084c0fa3c1730431c059c3488d4aff4939c87443bf020000004829d749ffc06666666666662e0f1f840000000000b8010000004489c148d3e04c89c148c1e906488544ce080f94c0750d4a8d0c0749ffc04883f90175d759c3488d15f6ad2300bf08000000ff1513282500488d3de4ad2300ff15765e2500",
+        operands: &[
+            DetcoreValidateOperand {
+                displacement: 254,
+                next: 258,
+                key: "fixed_naked_bitmap_251_location",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 265,
+                next: 269,
+                key: "fixed_heap_panic_misaligned",
+                got: true,
+            },
+            DetcoreValidateOperand {
+                displacement: 272,
+                next: 276,
+                key: "fixed_naked_bitmap_269_location",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 278,
+                next: 282,
+                key: "fixed_panic_null_reference",
+                got: true,
+            },
+        ],
+        transfers: &[(263, 1), (276, 3)],
+    },
 ];
 
 // Distinct from every historical TLS-bearing241B recipe. Measured in the true
@@ -33364,6 +33452,25 @@ const FIXED_NAKED_COMPOSITIONS: &[FixedNakedComposition] = &[
         incoming: FIXED_NAKED_STABLE_STANDALONE_INCOMING,
         setup_bitmap_template: None,
     },
+    // The same pinned tuples with the Rust 1.99.1 bitmap body: identical
+    // cohort and incoming edges, discriminated from the 85 pair above
+    // only by the bitmap witness's exact template identity. The native
+    // row is bitmap checked by hand; composition, allocator and TLS
+    // not machine-observed on the native producer yet.
+    FixedNakedComposition {
+        image_kind: FixedImageKind::Detcore,
+        native_syscalls: true,
+        cohort: FIXED_NAKED_PINNED_NATIVE_COHORT,
+        incoming: FIXED_NAKED_PINNED_NATIVE_INCOMING,
+        setup_bitmap_template: Some(118),
+    },
+    FixedNakedComposition {
+        image_kind: FixedImageKind::Detcore,
+        native_syscalls: false,
+        cohort: FIXED_NAKED_PINNED_ORDINARY_COHORT,
+        incoming: FIXED_NAKED_PINNED_ORDINARY_INCOMING,
+        setup_bitmap_template: Some(118),
+    },
 ];
 // Exclusive end of the source-owned appended template identities
 // (78..END). The contiguous range is a deliberate over-approximation:
@@ -33383,8 +33490,9 @@ const FIXED_NAKED_COMPOSITIONS: &[FixedNakedComposition] = &[
 // stable 0x100 alloc template at 111 (dh-r5tic) follows the same
 // rule: it can only add refusals through this over-approximation. So
 // does the generated stable native 0xf8 alloc template at 116, and its
-// generated 0xf8 FnOnce template at 117.
-const FIXED_SOURCE_OWNED_TEMPLATE_END: usize = 118;
+// generated 0xf8 FnOnce template at 117. So does the stable Rust 1.99.1
+// bitmap template at 118.
+const FIXED_SOURCE_OWNED_TEMPLATE_END: usize = 119;
 
 fn fixed_naked_publication_present(
     witnesses: &BTreeMap<String, AuthenticatedDetcoreOperation>,
@@ -33419,6 +33527,11 @@ fn fixed_naked_composition(
                     }
                 && spec.cohort.iter().all(|&(role, index)| {
                     witnesses.get(role).is_some_and(|w| {
+                        w.kind == AuthenticatedDetcoreOperationKind::ValidateTemplate(index)
+                    })
+                })
+                && spec.setup_bitmap_template.is_none_or(|index| {
+                    witnesses.get("fixed_setup_bitmap_range").is_some_and(|w| {
                         w.kind == AuthenticatedDetcoreOperationKind::ValidateTemplate(index)
                     })
                 })
@@ -72026,10 +72139,29 @@ mod tests {
                 let bitmap = bad.witnesses.get_mut("fixed_setup_bitmap_range").unwrap();
                 bitmap.kind = AuthenticatedDetcoreOperationKind::ValidateTemplate(25);
                 bitmap.scalar_storage = None;
+                // Composition selection binds the bitmap witness's exact
+                // template identity, so the mutated graph matches no
+                // composition and is refused there, before the callee arm.
                 assert_eq!(
                     check(&bad, kind, native).unwrap_err().to_string(),
-                    "naked-owner bitmap callee loses selected complete identity"
+                    "unknown or mixed naked-owner publication whole composition"
                 );
+                // With the bitmap identity correct, the callee arm still
+                // guards its scalar storage, address and transfers.
+                for mutation in 0..3 {
+                    let mut bad = naked_owner_publication_control_graph(case, false);
+                    let bitmap = bad.witnesses.get_mut("fixed_setup_bitmap_range").unwrap();
+                    match mutation {
+                        0 => bitmap.scalar_storage = None,
+                        1 => bitmap.address += 1,
+                        _ => bitmap.edges.clear(),
+                    }
+                    assert_eq!(
+                        check(&bad, kind, native).unwrap_err().to_string(),
+                        "naked-owner bitmap callee loses selected complete identity",
+                        "bitmap callee arm {case}/{mutation}"
+                    );
+                }
                 let mut old = scalar_ordinary_bit_result_control_graph(false);
                 let current = &graph.witnesses["fixed_setup_bitmap_range"];
                 old.witnesses.insert(
@@ -74161,10 +74293,11 @@ mod tests {
     #[test]
     fn source_owned_template_end_covers_stable_prepare_identities() {
         // 111 and 116 are the stable 0x100 and generated stable native 0xf8
-        // fixed_patch_alloc templates, and 117 the generated 0xf8
-        // fixed_tls_fn_once template; as appended identities they too must
-        // route a lone witness to the naked-composition check.
-        for index in [108, 109, 110, 111, 112, 113, 114, 115, 116, 117] {
+        // fixed_patch_alloc templates, 117 the generated 0xf8
+        // fixed_tls_fn_once template, and 118 the Rust 1.99.1
+        // fixed_setup_bitmap_range template; as appended identities they
+        // too must route a lone witness to the naked-composition check.
+        for index in [108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118] {
             let mut graph = scalar_ordinary_bit_result_control_graph(false);
             fixed_scalar_publication_syscall_mode(&graph.witnesses, FixedImageKind::Detcore, false)
                 .unwrap();
@@ -74185,6 +74318,129 @@ mod tests {
         assert_eq!(
             FIXED_SOURCE_OWNED_TEMPLATE_END,
             DETCORE_VALIDATE_TEMPLATES.len()
+        );
+    }
+
+    // The Rust 1.99.1 bitmap bodies, found by identity and pinned by their
+    // complete digests: DetcoreValidateTemplate 118 (282 bytes, the
+    // liteinst-runtime profile body whose provenance comment carries this
+    // digest) and FIXED_ARENA_BYTES_13 (217 bytes, the standalone release
+    // body).
+    #[test]
+    fn detcore_bitmap_1_99_1_templates_are_the_observed_bodies() {
+        let template = &DETCORE_VALIDATE_TEMPLATES[118];
+        assert_eq!(template.role, "fixed_setup_bitmap_range");
+        let body = fixed_hex(template.hex);
+        assert_eq!(body.len(), 282);
+        assert_eq!(
+            sha256(&body),
+            "544a0b636ffd06ff6e12518abfa4fd7642949ae34925b2ed68b84a162dcc0077"
+        );
+        assert_eq!(FIXED_ARENA_BYTES_13.len(), 217);
+        assert_eq!(
+            sha256(FIXED_ARENA_BYTES_13),
+            "29a3f26bd4ebab85dc09740018e391f2514e7b5b75bc8cbd46fac6764d3a4666"
+        );
+    }
+
+    // Every composition row's own witness set selects exactly that row.
+    // Discrimination is by the cohort tuple, the raw syscall kind
+    // (native vs ordinary), and the bitmap witness's exact template
+    // identity where the row binds one. Templates 85 and 118 share the
+    // same pinned cohorts and incoming edges, so only that identity
+    // separates their rows; 105 binds rows on the stable ordinary
+    // cohort, in both its native-syscall and ordinary forms.
+    #[test]
+    fn naked_composition_selection_binds_each_rows_own_witnesses() {
+        fn operation(role: &str, index: usize) -> (String, AuthenticatedDetcoreOperation) {
+            (
+                role.into(),
+                AuthenticatedDetcoreOperation {
+                    role: role.into(),
+                    address: 0x1000,
+                    kind: AuthenticatedDetcoreOperationKind::ValidateTemplate(index),
+                    edges: Vec::new(),
+                    scalar_storage: None,
+                },
+            )
+        }
+        for (row, spec) in FIXED_NAKED_COMPOSITIONS.iter().enumerate() {
+            let mut witnesses: BTreeMap<String, AuthenticatedDetcoreOperation> = spec
+                .cohort
+                .iter()
+                .map(|&(role, index)| operation(role, index))
+                .collect();
+            witnesses.insert(
+                "fixed_scalar_syscall".into(),
+                AuthenticatedDetcoreOperation {
+                    role: "fixed_scalar_syscall".into(),
+                    address: 0x2000,
+                    kind: if spec.native_syscalls {
+                        AuthenticatedDetcoreOperationKind::NativeFixedSyscall3
+                    } else {
+                        AuthenticatedDetcoreOperationKind::ValidateTemplate(26)
+                    },
+                    edges: Vec::new(),
+                    scalar_storage: None,
+                },
+            );
+            let (bridge_role, bridge) = operation("fixed_arena_mprotect", 83);
+            witnesses.insert(bridge_role, bridge);
+            if let Some(index) = spec.setup_bitmap_template {
+                let (role, witness) = operation("fixed_setup_bitmap_range", index);
+                witnesses.insert(role, witness);
+            }
+            let selected = fixed_naked_composition(&witnesses, Some(spec.image_kind))
+                .unwrap_or_else(|e| panic!("composition row {row} must select itself: {e}"));
+            // Selection with no image kind (the result-contract caller)
+            // must land on the same row.
+            let selected_none = fixed_naked_composition(&witnesses, None)
+                .unwrap_or_else(|e| panic!("composition row {row} must select itself: {e}"));
+            assert!(
+                selected_none.image_kind == selected.image_kind
+                    && selected_none.native_syscalls == selected.native_syscalls
+                    && selected_none.setup_bitmap_template == selected.setup_bitmap_template
+                    && selected_none.cohort == selected.cohort,
+                "composition row {row} must select itself with no image kind"
+            );
+            // Field-wise, not pointer, equality: the table is a const, so
+            // each use may promote a distinct copy.
+            assert!(
+                selected.image_kind == spec.image_kind
+                    && selected.native_syscalls == spec.native_syscalls
+                    && selected.setup_bitmap_template == spec.setup_bitmap_template
+                    && selected.cohort == spec.cohort
+                    && selected.incoming.len() == spec.incoming.len(),
+                "composition row {row} must select exactly itself"
+            );
+        }
+        // The 1.99.1 bitmap (118) under the host cohort, whose rows bind
+        // template 85, selects nothing and is refused.
+        let mut witnesses: BTreeMap<String, AuthenticatedDetcoreOperation> =
+            FIXED_NAKED_HOST_ORDINARY_COHORT
+                .iter()
+                .map(|&(role, index)| operation(role, index))
+                .collect();
+        witnesses.insert(
+            "fixed_scalar_syscall".into(),
+            AuthenticatedDetcoreOperation {
+                role: "fixed_scalar_syscall".into(),
+                address: 0x2000,
+                kind: AuthenticatedDetcoreOperationKind::ValidateTemplate(26),
+                edges: Vec::new(),
+                scalar_storage: None,
+            },
+        );
+        let (bridge_role, bridge) = operation("fixed_arena_mprotect", 83);
+        witnesses.insert(bridge_role, bridge);
+        let (role, witness) = operation("fixed_setup_bitmap_range", 118);
+        witnesses.insert(role, witness);
+        assert_eq!(
+            match fixed_naked_composition(&witnesses, Some(FixedImageKind::Detcore)) {
+                Ok(_) => panic!("host cohort with the 118 bitmap must be refused"),
+                Err(error) => error,
+            },
+            "unknown or mixed naked-owner publication whole composition"
         );
     }
 
