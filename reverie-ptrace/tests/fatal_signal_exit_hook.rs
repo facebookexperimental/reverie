@@ -38,10 +38,10 @@ const DYING: &[u8; 16] = b"written-by-guest";
 
 /// A page the test process allocates before the guest is forked from it, so
 /// the guest has it at the same address.
-fn shared_page() -> usize {
-    let page = Box::leak(Box::new([0u8; 4096]));
+fn shared_page() -> Box<[u8; 4096]> {
+    let mut page = Box::new([0u8; 4096]);
     page[..BEFORE.len()].copy_from_slice(BEFORE);
-    page.as_ptr() as usize
+    page
 }
 
 /// The hard `RLIMIT_CORE` of this process, which a forked guest inherits.
@@ -93,7 +93,12 @@ fn tid_mark() -> [u8; 4] {
 
 /// Faults by writing to address 8, which is never mapped.
 fn segfault() -> ! {
-    unsafe { std::ptr::dangling_mut::<u64>().write_volatile(1) };
+    // The kernel must kill the process: an AddressSanitizer build's own
+    // SIGSEGV handler would report the fault and exit 1 instead.
+    unsafe {
+        libc::signal(libc::SIGSEGV, libc::SIG_DFL);
+        std::ptr::dangling_mut::<u64>().write_volatile(1);
+    }
     unreachable!("the write above faults")
 }
 
@@ -169,15 +174,19 @@ impl Tool for FatalLogTool {
 
 fn run(guest: impl FnOnce(usize)) -> (ExitStatus, Vec<Seen>) {
     let page = shared_page();
+    let address = page.as_ptr() as usize;
     let (output, log) = test_fn_with_config::<FatalLogTool, _>(
         || {
             refuse_host_core();
-            guest(page)
+            guest(address)
         },
-        page,
+        address,
         true,
     )
     .expect("the guest should run");
+    // The guest has exited and the hook has read the guest's copy of the
+    // page, so the test process can free its own.
+    drop(page);
     (output.status, log.seen.into_inner().unwrap())
 }
 
