@@ -12,7 +12,7 @@ load(
 load("@fbcode//hermetic_infra/reverie/fb-only/rpc_compat:defs.bzl", "rpc_transport_library")
 load("@fbcode_macros//build_defs:cpp_library.bzl", "cpp_library")
 load("@fbcode_macros//build_defs:export_files.bzl", "buck_export_file")
-load("@fbcode_macros//build_defs:native_rules.bzl", "buck_filegroup")
+load("@fbcode_macros//build_defs:native_rules.bzl", "buck_filegroup", "buck_genrule")
 load("@fbcode_macros//build_defs:python_binary.bzl", "python_binary")
 load("@fbcode_macros//build_defs:sanitizers.bzl", "sanitizers")
 load("@fbsource//tools/build_defs:rust_binary.bzl", "rust_binary")
@@ -3213,6 +3213,50 @@ gated_test(
     name = "reverie-liteinst-preload-glibc-compat-test-gated",
     labels = ["buck2_run_from_project_root"],
     test = "//hermetic_infra/reverie:reverie-liteinst-preload-glibc-compat-test",
+)
+
+# The fbcode link wraps libstdc++/libatomic/libmvec in
+# --push-state,--no-as-needed into every Rust cdylib, so no
+# target-level linker flag on :reverie-liteinst-preload can drop
+# them, and it links libgcc_s for an unwinder this preload already
+# bundles statically, so no undefined symbol needs it either. This
+# fbsource-only post-link step removes exactly those
+# four DT_NEEDED entries and refuses if the cdylib ever gains an
+# undefined symbol that could belong to one of them. The
+# open-source link has no such wrap; its artifact is unchanged.
+# Each of the four libraries may appear at most once: a duplicate
+# still fails the hermit fbpkg build, and that failure is this step
+# asking for a re-check, not a defect to silence. An absent library
+# needs no removal. Every entry left after the removal must be in
+# the artifact's allowed glibc set, so a newly linked library fails
+# here by name instead of riding through unstripped.
+rust_binary(
+    name = "preload-needed-strip",
+    srcs = glob(["fb-only/preload-needed-strip/**/*.rs"]),
+    autocargo = {"ignore_rule": True},
+    crate_root = "fb-only/preload-needed-strip/main.rs",
+    target_compatible_with = ["fbcode//opensource/macros:broken-in-oss"],
+    # The artifact qualifier's lib.rs is a test-only source so the
+    # unit tests can include_str! it and fail if this tool's local
+    # ALLOWED_NEEDED copy drifts from it (as _PTRACE_TEST_EXTRA_SRCS
+    # stages reverie-kvm's guest source for link_path.rs above); the
+    # shipped binary never sees it and gains no dependency on it.
+    test_srcs = ["reverie-liteinst-artifact/src/lib.rs"],
+)
+
+buck_genrule(
+    name = "reverie-liteinst-preload-stripped",
+    out = "libreverie_liteinst.so",
+    cmd = "$(exe :preload-needed-strip) $(location :reverie-liteinst-preload[cdylib]) $OUT",
+    target_compatible_with = [
+        "fbcode//opensource/macros:broken-in-oss",
+        "ovr_config//cpu:x86_64",
+        "ovr_config//os:linux",
+    ],
+    visibility = [
+        "//hermetic_infra/hermit/fb-only:",
+        "//hermetic_infra/hermit/hermit-cli:",
+    ],
 )
 
 # :reverie-liteinst-preload over the allocator-fixture sitepatch variant
