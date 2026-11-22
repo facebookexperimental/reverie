@@ -1793,8 +1793,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 88] = [
     ),
     (
         "reverie-syscalls/Cargo.toml",
-        1292,
-        "e67f31883496075dcb2ef3b1183d09cb1d3140e024d0c64f866f12332d4c61b9",
+        1218,
+        "586434630c0c530dad5e0c8e7703e5569018315d09a64927eaf87a42c91a5a99",
     ),
     (
         "reverie-syscalls/src/lib.rs",
@@ -1898,8 +1898,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 88] = [
     ),
     (
         "reverie/Cargo.toml",
-        2372,
-        "d6b88aa1724c0a7da989fcbc2eafb22e68d5643b93c48ecaee6e8dc531280d36",
+        2307,
+        "a7d2730332627befd545a97571c8e7bf26d3fcccdc35a64a63fe1c2377ad7216",
     ),
     (
         "reverie/src/tool_configuration.rs",
@@ -41841,6 +41841,16 @@ mod tests {
             8655,
             "3f64b1db169aba5aacbea920f43b625ff1f8c464d0b8591848c8ef985494ae22",
         ),
+        (
+            "reverie-syscalls/Cargo.toml",
+            1218,
+            "586434630c0c530dad5e0c8e7703e5569018315d09a64927eaf87a42c91a5a99",
+        ),
+        (
+            "reverie/Cargo.toml",
+            2307,
+            "a7d2730332627befd545a97571c8e7bf26d3fcccdc35a64a63fe1c2377ad7216",
+        ),
     ];
 
     /// Seals over prefixes of `CONTENT_REVERIE_CATALOG_BINDINGS`: (rows covered,
@@ -41934,6 +41944,10 @@ mod tests {
         (
             133,
             "29c649b1a16e8cced13bb1298fa37adf5139ff6f1699d195a6ed974cdeb3470a",
+        ),
+        (
+            135,
+            "13483e340a7ee10118f823c874b4a5fa2bde15f863fd6986a168cf9fd88a9b92",
         ),
     ];
 
@@ -44214,6 +44228,16 @@ mod tests {
                 "reverie/src/pmu.rs",
                 8462,
                 "88754c17f24ed582aa24bbc485c8eca5ee0b5a25ad191b2811107c918eecee39",
+            ),
+            (
+                "reverie-syscalls/Cargo.toml",
+                1292,
+                "e67f31883496075dcb2ef3b1183d09cb1d3140e024d0c64f866f12332d4c61b9",
+            ),
+            (
+                "reverie/Cargo.toml",
+                2372,
+                "d6b88aa1724c0a7da989fcbc2eafb22e68d5643b93c48ecaee6e8dc531280d36",
             ),
         ];
         // A re-bind records its previous tuple above, for every path, not only these.
