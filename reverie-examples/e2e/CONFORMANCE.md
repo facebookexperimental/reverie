@@ -51,7 +51,9 @@ which a backend may turn into syscalls a tool can see.
 - **recorder** (in `run.sh` today): exit code, thread count, and each
   thread's syscalls with their results match a native baseline run twice,
   exactly, or after the late-start alignment for in-guest backends. Known
-  mismatches are ledger rows; a stale row fails.
+  mismatches are ledger rows; a stale row fails. Every run gets the C
+  locale (`LC_ALL=C`), so the host's locale files, and where they are
+  mapped, never reach a record (`README.md`, "Locale").
 - **counter1** (enforced in `cargo test`): across separate executions of
   the same program on the same backend, the reported total equals the
   recorder's call count plus the vDSO calls `strace_minimal` saw in its

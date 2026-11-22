@@ -1,5 +1,6 @@
 # One program per line: name<TAB>absolute program<TAB>arguments (tab-separated).
-# Each runs natively twice and on every backend, under the pass-through recorder.
+# Each runs natively twice and on every backend, under the pass-through recorder,
+# with LC_ALL=C whatever the host's locale (compare.rs, LOCALE; README.md, Locale).
 # python3 runs with a fixed hash seed: its startup order otherwise varies between runs.
 # It also runs with bytecode writing disabled: with a cold bytecode cache the
 # first run writes .pyc files (openat=ENOENT, then a write) and the second reads

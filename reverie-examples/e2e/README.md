@@ -28,7 +28,30 @@ comparator against the ledger for this host's environment. Its backend set is
   constructor, after the loader's calls, at the start and after each
   `execve`, and DBT's and SaBRe's start late in the same way: for those
   backends the comparator first moves the native record to where the
-  backend's next calls appear by name, then compares exactly.
+  backend's next calls appear by name, then compares exactly. Every run,
+  native or on a backend, gets `LC_ALL=C` whatever the host's locale (see
+  "Locale" below).
+
+## Locale
+
+A program's `/proc/self/maps` lists each of its mappings on one line, and a
+read of it returns whole lines up to one page; awk and grep read it at
+startup (libsigsegv). In a UTF-8 locale glibc maps locale files
+(`gconv-modules.cache`, `SYS_LC_MESSAGES`), and whether they land in the hole
+the loader leaves after unmapping `/etc/ld.so.cache` depends on that cache's
+size in pages. So the native byte counts, and their difference from a
+backend that adds mappings of its own (reverie-ptrace lists two private pages
+first), moved whenever a rewrite of the host's cache changed its size in
+pages. In the C locale glibc maps no locale file, so the comparator gives
+every run `LC_ALL=C`. The counts still follow the libraries a program maps
+and the kernel's special mappings, which belong to the environment a ledger
+is measured for. The host's locale also reached other rows: under a UTF-8
+locale the shell and env look up locale files, which moved the in-guest
+backends' first differences for sh and python3. The pin costs coverage: the
+corpus no longer exercises locale-file loading (the lookups of locale files,
+their small mappings and the shared mapping of `gconv-modules.cache`),
+although no verdict depended on it, since all 92 cell and backend verdicts
+were the same under en_US.UTF-8 and C when the pin was introduced.
 
 ## External backends
 

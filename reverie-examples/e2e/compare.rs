@@ -39,6 +39,10 @@
 //! comment above the row says why. Every verdict other than `match` needs a
 //! row, and every row naming a cell and backend that ran must match its
 //! verdict: an unexpected difference and a stale row both fail.
+//!
+//! Every program runs in the C locale, natively and on every backend,
+//! whatever the host's locale ([`LOCALE`]), so that the results do not depend
+//! on which locale files the host maps where.
 
 use std::fs;
 use std::path::Path;
@@ -59,6 +63,17 @@ const PTRACE_ENVIRONMENT: [(&str, &str); 2] = [
     ("ASAN_OPTIONS", "detect_leaks=0"),
     ("LSAN_OPTIONS", "detect_leaks=0"),
 ];
+
+/// The locale every recorder run gets, replacing the host's. In a UTF-8
+/// locale glibc maps locale files (`gconv-modules.cache`, `SYS_LC_MESSAGES`),
+/// and the loader leaves a hole where it unmapped `/etc/ld.so.cache`, so
+/// whether they land in that hole depends on the cache's size in pages. Each
+/// mapping is a line of `/proc/self/maps`, and a read of it returns whole
+/// lines up to one page, so the byte counts a program reads there, natively
+/// and on a backend that adds mappings of its own, moved when a rewrite of
+/// the host's cache changed its size in pages. The C locale maps no locale
+/// file.
+const LOCALE: [(&str, &str); 1] = [("LC_ALL", "C")];
 
 struct Cell {
     name: String,
@@ -252,6 +267,7 @@ fn record(
     let _ = fs::remove_file(output);
     let mut child = Command::new(recorder)
         .envs(PTRACE_ENVIRONMENT)
+        .envs(LOCALE)
         .arg("--backend")
         .arg(backend)
         .arg("--output")
@@ -523,5 +539,48 @@ fn main() {
     }
     if unexpected > 0 || stale > 0 {
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    /// Every recorder run, native or not, gets the C locale and the
+    /// sanitizer settings, whatever this process's environment holds: a
+    /// stand-in recorder writes the values it got into its record.
+    #[test]
+    fn every_recorder_run_gets_the_c_locale() {
+        let dir = std::env::temp_dir().join(format!("reverie-e2e-compare-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let recorder = dir.join("recorder");
+        // Called as: --backend BACKEND --output RECORD -- PROGRAM ARGS...
+        fs::write(
+            &recorder,
+            "#!/bin/sh\nprintf 'exit 0\\nthread 0\\nLC_ALL=%s\\nASAN_OPTIONS=%s\\n%s\\n' \
+             \"${LC_ALL-unset}\" \"${ASAN_OPTIONS-unset}\" \"$2 $6\" > \"$4\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&recorder, fs::Permissions::from_mode(0o755)).unwrap();
+        let cell = Cell {
+            name: "awk".to_owned(),
+            argv: vec!["/bin/awk".to_owned(), "BEGIN{print 1}".to_owned()],
+        };
+        for backend in ["native", "ptrace"] {
+            let output = dir.join(format!("{backend}.txt"));
+            let got = record(&recorder, backend, &cell, &output)
+                .unwrap_or_else(|(_, why)| panic!("{backend}: {why}"));
+            assert_eq!(
+                got.threads,
+                [[
+                    "LC_ALL=C".to_owned(),
+                    "ASAN_OPTIONS=detect_leaks=0".to_owned(),
+                    format!("{backend} /bin/awk"),
+                ]]
+            );
+        }
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

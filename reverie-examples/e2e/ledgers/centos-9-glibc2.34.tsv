@@ -5,56 +5,63 @@
 # Until their own issues are filed, the rows link the audit's tracking issue. The liteinst and
 # in-guest-trap rows were re-measured on 2026-11-02 after runtime descriptor isolation (a461e8bf),
 # with run.sh --backends ptrace,liteinst,in-guest-trap; two runs gave identical rows.
-# The awk ptrace row was re-measured on 2026-11-20 on devbig014 (kernel 7.1.3, LANG=en_US.UTF-8):
-# the native /proc/self/maps first read is 4082 (strace and the recorder's native runs agree in two
-# validate runs), so both sides of the row moved +25 with the same -21 first-read delta as before;
-# grep-passwd's ptrace row is unchanged. The maps byte counts also depend on the ambient locale
-# (natively, awk's first maps read is 4037 under LC_ALL=C and 4066 under C.UTF-8), which this
-# environment name does not capture; judge only under en_US.UTF-8 or re-measure with --write-ledger.
+# Every program runs with LC_ALL=C (compare.rs, LOCALE; README.md, Locale). All rows were measured
+# again with that pin on 2026-11-21 on devbig014 (kernel 7.1.3), run.sh with the four first-party
+# backends; two runs gave identical rows. The pin changed twelve rows: the four /proc/self/maps rows,
+# the six shell rows and the two python3 rows of the in-guest backends.
 #
 # ptrace: the tool never sees the rt_sigreturn that ends a signal handler.
 sh-fork	ptrace	mismatch	rt_sigreturn=ok -> rt_sigaction=ok	https://github.com/rrnewton/hermit/issues/4485
 sh-pipe	ptrace	mismatch	rt_sigreturn=ok -> rt_sigprocmask=ok	https://github.com/rrnewton/hermit/issues/4485
-# ptrace: a /proc/self/maps read returns a different byte count, where reverie-ptrace's
-# private pages show (the cause Hermit's pinned-root ledger found for grep; confirmed by strace:
-# both programs open /proc/self/maps, and the ptrace maps total is +82 bytes for each).
-grep-passwd	ptrace	mismatch	read=4067 -> read=4068	https://github.com/rrnewton/hermit/issues/4485
-awk	ptrace	mismatch	read=4082 -> read=4061	https://github.com/rrnewton/hermit/issues/4485
+# ptrace: reverie-ptrace's two private pages (0x71000000 and 0x71001000) are listed first in
+# /proc/self/maps, 41 bytes each, and a read of the listing returns whole lines up to one page. So
+# a first read that natively returns the whole listing returns 82 bytes more (grep), and one that
+# natively stops at the page boundary returns 82 bytes less the native lines pushed past it (awk).
+# The counts follow the libraries each program maps and the kernel's special mappings: measure again
+# after a package or kernel update that changes those lines.
+grep-passwd	ptrace	mismatch	read=2643 -> read=2725	https://github.com/rrnewton/hermit/issues/4485
+awk	ptrace	mismatch	read=4037 -> read=4015	https://github.com/rrnewton/hermit/issues/4485
 # KVM: rseq answers ENOSYS (reverie-kvm refuses it), the first difference on every program.
 *	kvm	mismatch	rseq=ok -> rseq=ENOSYS	https://github.com/rrnewton/hermit/issues/4485
 # liteinst: the tool lives in the example preload and starts after the loader's calls (compare.rs,
 # LATE_START). Then: the shell's getrandom is not seen by the tool; awk's fcntl(F_GETFL) lacks
 # O_LARGEFILE; dd's and perl's first visible calls do not appear in the native record in order (no
-# aligned start); grep's read of /proc/self/maps is shorter, and more reads follow, because the
-# preload's mappings are listed (as for ptrace above; later, grep's sigaltstack install is refused with
-# EPERM unseen by the tool, so grep runs without its SIGSEGV handler, issue 5097); sort's rt_sigaction queries (NULL new action)
-# never reach the tool (issue 5096); and a guest's own execve is refused with EOPNOTSUPP, the in-guest
-# runtime not forwarding it, so python3 (run through env) exits 126 (issue 5094; sh-fork and sh-pipe
+# aligned start); grep's first read of /proc/self/maps returns more, and more reads follow, because
+# the runtime's mappings are listed (natively one read returns the whole listing; the in-guest first
+# read returned the same count with preload paths of 1 and 84 characters; later, grep's sigaltstack
+# install is refused with EPERM unseen by the tool, so grep runs without its SIGSEGV handler, issue
+# 5097); sort's rt_sigaction queries (NULL new action) never reach the tool (issue 5096); and a
+# guest's own execve is refused with EOPNOTSUPP, the in-guest runtime not forwarding it, so python3
+# (run through env) exits 126: in the C locale that execve is the first call of env's the tool sees,
+# and the late-start alignment cannot place it (no aligned start; issue 5094; sh-fork and sh-pipe
 # fail the same way behind their earlier first difference, issue 5095).
-grep-passwd	liteinst	mismatch	read=4067 -> read=4056	https://github.com/rrnewton/hermit/issues/4485
+grep-passwd	liteinst	mismatch	read=2643 -> read=4056	https://github.com/rrnewton/hermit/issues/4485
 sort-passwd	liteinst	mismatch	rt_sigaction=ok -> newfstatat=ok	https://github.com/rrnewton/hermit/issues/5096
-python3	liteinst	mismatch	execve=ok -> execve=EOPNOTSUPP	https://github.com/rrnewton/hermit/issues/5094
-sh-builtin	liteinst	mismatch	getrandom=ok -> openat=ENOENT	https://github.com/rrnewton/hermit/issues/4485
-sh-fork	liteinst	mismatch	getrandom=ok -> openat=ENOENT	https://github.com/rrnewton/hermit/issues/4485
-sh-pipe	liteinst	mismatch	getrandom=ok -> openat=ENOENT	https://github.com/rrnewton/hermit/issues/4485
+python3	liteinst	mismatch	(no aligned start) -> execve=EOPNOTSUPP	https://github.com/rrnewton/hermit/issues/5094
+sh-builtin	liteinst	mismatch	getrandom=ok -> getuid=ok	https://github.com/rrnewton/hermit/issues/4485
+sh-fork	liteinst	mismatch	getrandom=ok -> getuid=ok	https://github.com/rrnewton/hermit/issues/4485
+sh-pipe	liteinst	mismatch	getrandom=ok -> getuid=ok	https://github.com/rrnewton/hermit/issues/4485
 awk	liteinst	mismatch	fcntl=32769 -> fcntl=1	https://github.com/rrnewton/hermit/issues/4485
 dd-zero	liteinst	mismatch	(no aligned start) -> rt_sigaction=ok	https://github.com/rrnewton/hermit/issues/4485
 perl	liteinst	mismatch	(no aligned start) -> rt_sigaction=ok	https://github.com/rrnewton/hermit/issues/4485
 # in-guest-trap: the tool lives in the example preload and starts after the loader's calls (compare.rs,
 # LATE_START). Then: the shell's getrandom is not seen by the tool; awk's fcntl(F_GETFL) lacks
 # O_LARGEFILE; dd's and perl's first visible calls do not appear in the native record in order (no
-# aligned start); grep's read of /proc/self/maps is shorter, and more reads follow, because the
-# preload's mappings are listed (as for ptrace above; later, grep's sigaltstack install is refused with
-# EPERM unseen by the tool, so grep runs without its SIGSEGV handler, issue 5097); sort's rt_sigaction queries (NULL new action)
-# never reach the tool (issue 5096); and a guest's own execve is refused with EOPNOTSUPP, the in-guest
-# runtime not forwarding it, so python3 (run through env) exits 126 (issue 5094; sh-fork and sh-pipe
+# aligned start); grep's first read of /proc/self/maps returns more, and more reads follow, because
+# the runtime's mappings are listed (natively one read returns the whole listing; the in-guest first
+# read returned the same count with preload paths of 1 and 84 characters; later, grep's sigaltstack
+# install is refused with EPERM unseen by the tool, so grep runs without its SIGSEGV handler, issue
+# 5097); sort's rt_sigaction queries (NULL new action) never reach the tool (issue 5096); and a
+# guest's own execve is refused with EOPNOTSUPP, the in-guest runtime not forwarding it, so python3
+# (run through env) exits 126: in the C locale that execve is the first call of env's the tool sees,
+# and the late-start alignment cannot place it (no aligned start; issue 5094; sh-fork and sh-pipe
 # fail the same way behind their earlier first difference, issue 5095).
-grep-passwd	in-guest-trap	mismatch	read=4067 -> read=4056	https://github.com/rrnewton/hermit/issues/4485
+grep-passwd	in-guest-trap	mismatch	read=2643 -> read=4056	https://github.com/rrnewton/hermit/issues/4485
 sort-passwd	in-guest-trap	mismatch	rt_sigaction=ok -> newfstatat=ok	https://github.com/rrnewton/hermit/issues/5096
-python3	in-guest-trap	mismatch	execve=ok -> execve=EOPNOTSUPP	https://github.com/rrnewton/hermit/issues/5094
-sh-builtin	in-guest-trap	mismatch	getrandom=ok -> openat=ENOENT	https://github.com/rrnewton/hermit/issues/4485
-sh-fork	in-guest-trap	mismatch	getrandom=ok -> openat=ENOENT	https://github.com/rrnewton/hermit/issues/4485
-sh-pipe	in-guest-trap	mismatch	getrandom=ok -> openat=ENOENT	https://github.com/rrnewton/hermit/issues/4485
+python3	in-guest-trap	mismatch	(no aligned start) -> execve=EOPNOTSUPP	https://github.com/rrnewton/hermit/issues/5094
+sh-builtin	in-guest-trap	mismatch	getrandom=ok -> getuid=ok	https://github.com/rrnewton/hermit/issues/4485
+sh-fork	in-guest-trap	mismatch	getrandom=ok -> getuid=ok	https://github.com/rrnewton/hermit/issues/4485
+sh-pipe	in-guest-trap	mismatch	getrandom=ok -> getuid=ok	https://github.com/rrnewton/hermit/issues/4485
 awk	in-guest-trap	mismatch	fcntl=32769 -> fcntl=1	https://github.com/rrnewton/hermit/issues/4485
 dd-zero	in-guest-trap	mismatch	(no aligned start) -> rt_sigaction=ok	https://github.com/rrnewton/hermit/issues/4485
 perl	in-guest-trap	mismatch	(no aligned start) -> rt_sigaction=ok	https://github.com/rrnewton/hermit/issues/4485
