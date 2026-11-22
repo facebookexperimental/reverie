@@ -1072,17 +1072,11 @@ mod tests {
         // instead of assuming the surrounding checkout is a Git workspace
         // with Cargo on PATH -- is what lets the same transaction run in a
         // Buck test sandbox, which stages sources only. Requires `git` on
-        // PATH and the run-time CARGO_MANIFEST_DIR naming a workspace
-        // member's directory (Cargo sets it; the Buck unittest target
-        // points it into staged sources). Missing prerequisites fail by
-        // name; no skip.
-        let source_root = PathBuf::from(
-            std::env::var_os("CARGO_MANIFEST_DIR")
-                .expect("preparation identity test needs CARGO_MANIFEST_DIR at run time"),
-        )
-        .parent()
-        .expect("preparation identity test crate directory has a parent")
-        .to_path_buf();
+        // PATH and a Reverie root from reverie_workspace_root (the run-time
+        // CARGO_MANIFEST_DIR's parent, where the Buck unittest target
+        // stages sources, else the root file!() names). Missing
+        // prerequisites fail by name; no skip.
+        let source_root = reverie_workspace_root();
         let scratch = fs::canonicalize(std::env::temp_dir())
             .unwrap()
             .join(format!(
