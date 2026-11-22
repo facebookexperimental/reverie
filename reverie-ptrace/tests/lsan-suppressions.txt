@@ -1,0 +1,12 @@
+# LeakSanitizer suppressions for reverie-ptrace's integration tests in an
+# AddressSanitizer build (LSAN_OPTIONS in ../../BUCK). Each entry says why it is
+# not a leak in Reverie.
+
+# iced-x86 1.21.0, decoder/table_de/mod.rs: read_vex deserializes every VEX
+# opcode handler, each a Box::into_raw allocation, but returns only the 0F, 0F38
+# and 0F3A tables (the map0 table only with the crate's `mvex` feature). The
+# handlers that only the map0 table reaches are unreachable once the
+# deserializer is dropped. The tables are built once per process, so this is a
+# fixed few hundred bytes (552 in 12 allocations in a test that decodes
+# instructions), never a growing leak.
+leak:iced_x86::decoder::table_de::read_vex

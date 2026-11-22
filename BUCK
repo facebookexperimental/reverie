@@ -11,6 +11,7 @@ load(
 )
 load("@fbcode//hermetic_infra/reverie/fb-only/rpc_compat:defs.bzl", "rpc_transport_library")
 load("@fbcode_macros//build_defs:cpp_library.bzl", "cpp_library")
+load("@fbcode_macros//build_defs:export_files.bzl", "buck_export_file")
 load("@fbcode_macros//build_defs:native_rules.bzl", "buck_filegroup")
 load("@fbcode_macros//build_defs:python_binary.bzl", "python_binary")
 load("@fbcode_macros//build_defs:sanitizers.bzl", "sanitizers")
@@ -566,6 +567,19 @@ _PTRACE_TEST_EXTRA_SRCS = {
     "link_path": ["reverie-kvm/tests/fixtures/link_path.c"],
 }
 
+# LeakSanitizer's suppressions for these tests in an AddressSanitizer build;
+# the file says why each entry is not a leak in Reverie.
+buck_export_file(
+    name = "ptrace-test-lsan-suppressions",
+    src = "reverie-ptrace/tests/lsan-suppressions.txt",
+)
+
+# The environment of each test, and of the gated test that runs it.
+_PTRACE_TEST_ENV = {
+    "CARGO_MANIFEST_DIR": "$(location :ptrace-test-fixtures)",
+    "LSAN_OPTIONS": "suppressions=$(location :ptrace-test-lsan-suppressions)",
+}
+
 [
     rust_unittest(
         name = "reverie-ptrace-{}-test".format(test.replace("_", "-")),
@@ -580,7 +594,7 @@ _PTRACE_TEST_EXTRA_SRCS = {
         autocargo = {"ignore_rule": True},
         crate = test,
         crate_root = "reverie-ptrace/tests/{}.rs".format(test),
-        env = {"CARGO_MANIFEST_DIR": "$(location :ptrace-test-fixtures)"},
+        env = dict(_PTRACE_TEST_ENV),
         # The library's features, which Cargo gives the package's test crates.
         features = ["nightly"],
         labels = run_gated_only(),
@@ -612,7 +626,7 @@ _PTRACE_TEST_EXTRA_SRCS = {
 [
     gated_test(
         name = "reverie-ptrace-{}-test-gated".format(test.replace("_", "-")),
-        env = {"CARGO_MANIFEST_DIR": "$(location :ptrace-test-fixtures)"},
+        env = dict(_PTRACE_TEST_ENV),
         labels = ["buck2_run_from_project_root"],
         test = "//hermetic_infra/reverie:reverie-ptrace-{}-test".format(test.replace("_", "-")),
     )

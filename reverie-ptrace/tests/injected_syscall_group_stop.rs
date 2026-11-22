@@ -5688,16 +5688,56 @@ fn held_signal_is_passed_on_unreported_under_a_tracer_seccomp_filter() {
 /// the tracer's process would otherwise kill the test binary.
 #[cfg(target_arch = "x86_64")]
 fn in_child_process(name: &str, test: impl FnOnce()) {
+    run_in_child_process(name, ChildLeakCheck::Kept, test);
+}
+
+/// As `in_child_process`, for a case whose filter kills or traps every
+/// `prctl` of the tracer's threads. Its child runs without LeakSanitizer's
+/// exit-time leak check, which an AddressSanitizer build makes: that check
+/// calls `prctl` to stop the process's threads, so the filter would kill the
+/// child (SIGSYS) after its test passed. The test binary and every other
+/// child keep the check.
+#[cfg(target_arch = "x86_64")]
+fn in_child_process_without_leak_check(name: &str, test: impl FnOnce()) {
+    run_in_child_process(name, ChildLeakCheck::Off, test);
+}
+
+/// Whether the child of `run_in_child_process` keeps LeakSanitizer's
+/// exit-time leak check.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChildLeakCheck {
+    Kept,
+    Off,
+}
+
+#[cfg(target_arch = "x86_64")]
+fn run_in_child_process(name: &str, leak_check: ChildLeakCheck, test: impl FnOnce()) {
+    use reverie::process::sanitizer::SANITIZER_OPTIONS;
+    use reverie::process::sanitizer::with_leak_check_off;
+
     const ROLE: &str = "REVERIE_FILTERED_TRACER";
     if std::env::var(ROLE).as_deref() == Ok(name) {
         test();
         return;
     }
-    let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+    let mut command = std::process::Command::new(std::env::current_exe().expect("test binary"));
+    command
         .args(["--exact", name, "--nocapture", "--test-threads=1"])
-        .env(ROLE, name)
-        .spawn()
-        .expect("start the filtered tracer");
+        .env(ROLE, name);
+    if leak_check == ChildLeakCheck::Off {
+        // As `reverie::process::Command::turn_off_leak_check`: every variable
+        // the sanitizers read `detect_leaks` from (a later setting replaces an
+        // earlier one), and UBSAN_OPTIONS only when it is set.
+        for variable in SANITIZER_OPTIONS {
+            let options = std::env::var_os(variable);
+            if variable == "UBSAN_OPTIONS" && options.is_none() {
+                continue;
+            }
+            command.env(variable, with_leak_check_off(options.as_deref()));
+        }
+    }
+    let mut child = command.spawn().expect("start the filtered tracer");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let status = loop {
         if let Some(status) = child.try_wait().expect("wait for the filtered tracer") {
@@ -6553,7 +6593,7 @@ fn sigtrap_before_an_injected_syscall_is_not_retried_when_getsiginfo_is_refused(
 #[test]
 fn sigtrap_before_an_injected_syscall_is_not_retried_with_no_descriptor_left_when_prctl_kills() {
     const NAME: &str = "sigtrap_before_an_injected_syscall_is_not_retried_with_no_descriptor_left_when_prctl_kills";
-    in_child_process(NAME, || {
+    in_child_process_without_leak_check(NAME, || {
         sigtrap_before_an_injected_syscall_runs_as_on_main_under_a_tracer_filter(
             libc::PTRACE_GETSIGMASK,
             libc::SECCOMP_RET_KILL_PROCESS,
@@ -6571,7 +6611,7 @@ fn sigtrap_before_an_injected_syscall_is_not_retried_with_no_descriptor_left_whe
 #[test]
 fn sigtrap_before_an_injected_syscall_is_not_retried_with_no_descriptor_left_when_prctl_traps() {
     const NAME: &str = "sigtrap_before_an_injected_syscall_is_not_retried_with_no_descriptor_left_when_prctl_traps";
-    in_child_process(NAME, || {
+    in_child_process_without_leak_check(NAME, || {
         sigtrap_before_an_injected_syscall_runs_as_on_main_under_a_tracer_filter(
             libc::PTRACE_GETSIGMASK,
             libc::SECCOMP_RET_KILL_PROCESS,
@@ -6612,7 +6652,7 @@ fn sigtrap_before_an_injected_syscall_is_not_retried_with_no_descriptor_left_whe
 fn sigtrap_before_an_injected_syscall_is_not_retried_with_no_descriptor_from_the_first_sigsys_when_prctl_kills()
  {
     const NAME: &str = "sigtrap_before_an_injected_syscall_is_not_retried_with_no_descriptor_from_the_first_sigsys_when_prctl_kills";
-    in_child_process(NAME, || {
+    in_child_process_without_leak_check(NAME, || {
         sigtrap_before_an_injected_syscall_runs_as_on_main_under_a_tracer_filter(
             libc::PTRACE_GETSIGMASK,
             libc::SECCOMP_RET_KILL_PROCESS,
@@ -6631,7 +6671,7 @@ fn sigtrap_before_an_injected_syscall_is_not_retried_with_no_descriptor_from_the
 fn sigtrap_before_an_injected_syscall_is_not_retried_with_no_descriptor_from_the_first_sigsys_when_prctl_traps()
  {
     const NAME: &str = "sigtrap_before_an_injected_syscall_is_not_retried_with_no_descriptor_from_the_first_sigsys_when_prctl_traps";
-    in_child_process(NAME, || {
+    in_child_process_without_leak_check(NAME, || {
         sigtrap_before_an_injected_syscall_runs_as_on_main_under_a_tracer_filter(
             libc::PTRACE_GETSIGMASK,
             libc::SECCOMP_RET_KILL_PROCESS,
@@ -6689,7 +6729,7 @@ fn sigtrap_before_an_injected_syscall_runs_as_on_main_under_a_filter_added_after
 fn sigtrap_before_an_injected_syscall_is_not_retried_under_a_filter_added_after_spawn_when_prctl_kills()
  {
     const NAME: &str = "sigtrap_before_an_injected_syscall_is_not_retried_under_a_filter_added_after_spawn_when_prctl_kills";
-    in_child_process(NAME, || {
+    in_child_process_without_leak_check(NAME, || {
         sigtrap_before_an_injected_syscall_runs_as_on_main_under_a_filter_added_after_spawn(
             libc::SECCOMP_RET_KILL_PROCESS,
             "trap-late-filter-emfile-prctl-kill",
@@ -6702,7 +6742,7 @@ fn sigtrap_before_an_injected_syscall_is_not_retried_under_a_filter_added_after_
 fn sigtrap_before_an_injected_syscall_is_not_retried_under_a_filter_added_after_spawn_when_prctl_traps()
  {
     const NAME: &str = "sigtrap_before_an_injected_syscall_is_not_retried_under_a_filter_added_after_spawn_when_prctl_traps";
-    in_child_process(NAME, || {
+    in_child_process_without_leak_check(NAME, || {
         sigtrap_before_an_injected_syscall_runs_as_on_main_under_a_filter_added_after_spawn(
             libc::SECCOMP_RET_TRAP,
             "trap-late-filter-emfile-prctl-trap",
@@ -7063,7 +7103,7 @@ fn sigtrap_before_injected_syscalls_is_taken_as_on_main_with_no_descriptor_throu
 fn sigtrap_before_an_injected_syscall_is_not_retried_under_a_filter_added_with_no_descriptor_left()
 {
     const NAME: &str = "sigtrap_before_an_injected_syscall_is_not_retried_under_a_filter_added_with_no_descriptor_left";
-    in_child_process(NAME, || {
+    in_child_process_without_leak_check(NAME, || {
         sigtrap_before_each_injected_syscall(
             [LOWER, FILTER | RESTORE],
             [false, false],
@@ -7098,7 +7138,7 @@ fn sigtrap_before_an_injected_syscall_is_discarded_again_once_a_descriptor_can_b
 #[test]
 fn sigtrap_before_an_injected_syscall_is_discarded_until_a_filter_is_added() {
     const NAME: &str = "sigtrap_before_an_injected_syscall_is_discarded_until_a_filter_is_added";
-    in_child_process(NAME, || {
+    in_child_process_without_leak_check(NAME, || {
         sigtrap_before_each_injected_syscall([0, FILTER], [true, false], "trap-each-late-filter")
     });
 }
@@ -7111,7 +7151,7 @@ fn sigtrap_before_an_injected_syscall_is_discarded_until_a_filter_is_added() {
 fn sigtrap_before_an_injected_syscall_is_discarded_until_a_filter_is_added_with_no_descriptor_left()
 {
     const NAME: &str = "sigtrap_before_an_injected_syscall_is_discarded_until_a_filter_is_added_with_no_descriptor_left";
-    in_child_process(NAME, || {
+    in_child_process_without_leak_check(NAME, || {
         sigtrap_before_each_injected_syscall(
             [0, LOWER | FILTER | RESTORE],
             [true, false],
