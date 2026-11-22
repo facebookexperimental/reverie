@@ -21,15 +21,15 @@ pub const MAPPED_INPUT_VERSION: u64 = reverie_loader::handoff::VERSION;
 pub const MAPPED_INPUT_HEADER_BYTES: usize = reverie_loader::handoff::HEADER_BYTES;
 /// Exact complete scalar input byte cap linked into this private consumer.
 pub const MAPPED_INPUT_MAX_BYTES: usize = reverie_loader::handoff::MAX_BYTES;
-/// Pure numeric mapped-entry slice bounds gate linked into this
-/// private consumer; the predicate itself lives in
-/// `reverie_loader::handoff` so its tests execute on GNU.
-pub use reverie_loader::handoff::valid_mapped_input_range;
-
 use core::marker::PhantomData;
 use core::ptr::NonNull;
 use core::ptr::addr_of;
 use core::ptr::addr_of_mut;
+
+/// Pure numeric mapped-entry slice bounds gate linked into this
+/// private consumer; the predicate itself lives in
+/// `reverie_loader::handoff` so its tests execute on GNU.
+pub use reverie_loader::handoff::valid_mapped_input_range;
 
 use super::InitialImageControl;
 use super::NativeControl;

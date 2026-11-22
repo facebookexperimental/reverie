@@ -826,9 +826,10 @@ impl<'owner, T: Tool> DeferredNative<'owner, T> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    use super::*;
 
     fn actual_identity(image: u64) -> NativeThreadIdentity {
         let pid = Pid::from_raw(unsafe { libc::syscall(libc::SYS_getpid) } as i32);
