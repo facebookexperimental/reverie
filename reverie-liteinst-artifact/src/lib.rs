@@ -76678,11 +76678,13 @@ pub mod private_static {
     ];
 
     /// Binds the resolved Reverie crates to the pin and returns the
-    /// manifest path of each bound package. For both kinds each bound
+    /// manifest path of each bound package. In the git form each bound
     /// package must appear once with the exact pinned git source; this
     /// equality, not the lock text, is what binds the compiled Reverie
-    /// crates. The Hermit kind keeps exactly these pre-generalization
-    /// checks; its gitlink root and ls-tree pin guard the checkout.
+    /// crates. A gitlink-bound workspace takes either the git form, with
+    /// exactly its pre-generalization checks, or the path form (see
+    /// [`path_bound_reverie_manifests`]); its gitlink root and ls-tree pin
+    /// guard the checkout.
     ///
     /// CargoGitRev has no gitlink root that would guard another tree,
     /// so it also requires:
@@ -76714,15 +76716,29 @@ pub mod private_static {
         pin: &str,
         leaf_id: &str,
     ) -> Result<Vec<(&'static str, &'m str)>> {
-        bound_reverie_manifests_from(metadata, binding, CargoGitRepository::DEFAULT, pin, leaf_id)
+        bound_reverie_manifests_from(
+            metadata,
+            binding,
+            CargoGitRepository::DEFAULT,
+            pin,
+            leaf_id,
+            None,
+        )
     }
 
+    /// [`bound_reverie_manifests`] with an explicit repository. A
+    /// gitlink-bound workspace may depend on its Reverie checkout by path;
+    /// the caller then passes that checkout as `pinned`, read at the pin
+    /// (see [`PinnedCheckout`]), and the path form
+    /// [`path_bound_reverie_manifests`] applies. A CargoGitRev consumer
+    /// never takes the path form.
     fn bound_reverie_manifests_from<'m>(
         metadata: &'m Value,
         binding: selected_initializers::WorkspaceBinding,
         repository: CargoGitRepository<'_>,
         pin: &str,
         leaf_id: &str,
+        pinned: Option<&PinnedCheckout<'_>>,
     ) -> Result<Vec<(&'static str, &'m str)>> {
         let packages = metadata["packages"]
             .as_array()
@@ -76735,18 +76751,11 @@ pub mod private_static {
                 format!("git+https://github.com/rrnewton/reverie.git?rev={pin}#{pin}")
             }
         };
-        let mut bound = Vec::new();
-        for name in ["reverie-inguest", "reverie-liteinst", "reverie-loader"] {
-            let rows: Vec<_> = packages.iter().filter(|p| p["name"] == name).collect();
-            require(
-                rows.len() == 1 && rows[0]["source"].as_str() == Some(source.as_str()),
-                "static metadata R source/uniqueness mismatch",
-            )?;
-            let manifest = rows[0]["manifest_path"]
-                .as_str()
-                .ok_or("static R manifest absent")?;
-            bound.push((name, manifest));
-        }
+        require(
+            pinned.is_none() || binding != selected_initializers::WorkspaceBinding::CargoGitRev,
+            "static CargoGitRev consumer cannot bind Reverie by path",
+        )?;
+        let bound = bind_reverie_packages(packages, &source, pinned)?;
         if binding == selected_initializers::WorkspaceBinding::CargoGitRev {
             require(
                 packages
@@ -76824,6 +76833,234 @@ pub mod private_static {
                 }),
                 "static CargoGitRev resolve has a workspace package outside the pinned source",
             )?;
+        }
+        Ok(bound)
+    }
+
+    /// The Reverie packages whose manifests the static source binds.
+    const BOUND_REVERIE_PACKAGES: [&str; 3] =
+        ["reverie-inguest", "reverie-liteinst", "reverie-loader"];
+
+    /// A gitlink checkout as the path form reads it: already bound to the
+    /// pin by the caller (its gitlink commit and a clean tree at the pin
+    /// before binding, its recursive source-cache identity after).
+    struct PinnedCheckout<'a> {
+        /// The checkout's canonical root.
+        root: &'a Path,
+        /// Every regular file (mode 100644 or 100755) in the pin commit's
+        /// tree, relative to `root`, read from the pin commit itself by
+        /// [`pinned_tracked_files`], never from the working tree or index.
+        tracked: &'a std::collections::BTreeSet<PathBuf>,
+        /// Resolves a path to the real regular file it names, following
+        /// every symlink: [`real_file`] in production.
+        resolve: &'a dyn Fn(&Path) -> Result<PathBuf>,
+    }
+
+    impl PinnedCheckout<'_> {
+        /// Requires `manifest` to be its own real path (no symlink or `..`
+        /// alias anywhere in it) and a regular file tracked at the pin.
+        /// An ignored path inside the checkout (a build directory, an
+        /// ignored symlink) is neither, so it refuses here, by name.
+        fn require_tracked(&self, name: &str, manifest: &str) -> Result<()> {
+            let spelled = Path::new(manifest);
+            let real = (self.resolve)(spelled).map_err(|error| {
+                format!("static metadata Reverie package {name} manifest {manifest} does not resolve: {error}")
+            })?;
+            require(
+                real == spelled,
+                format!(
+                    "static metadata Reverie package {name} manifest {manifest} is not its real path {} (a symlink or .. alias)",
+                    real.display()
+                ),
+            )?;
+            require(
+                real.strip_prefix(self.root)
+                    .is_ok_and(|relative| self.tracked.contains(relative)),
+                format!(
+                    "static metadata Reverie package {name} manifest {manifest} is not a file tracked at the pinned commit of {}",
+                    self.root.display()
+                ),
+            )
+        }
+    }
+
+    /// Every regular file in the tree of commit `pin`, relative to `root`,
+    /// from `git ls-tree` of the commit (not of the working tree or index).
+    fn pinned_tracked_files(
+        root: &Path,
+        pin: &str,
+        runner: &mut Runner,
+    ) -> Result<std::collections::BTreeSet<PathBuf>> {
+        use std::os::unix::ffi::OsStrExt;
+        require(
+            source_pin_is_full(pin),
+            "static pinned tree needs a full pin",
+        )?;
+        let raw = runner.run(
+            "git",
+            &[
+                "--no-replace-objects".into(),
+                "ls-tree".into(),
+                "-rz".into(),
+                "--full-tree".into(),
+                pin.into(),
+            ],
+            root,
+        )?;
+        let mut tracked = std::collections::BTreeSet::new();
+        for row in raw.split(|b| *b == 0).filter(|r| !r.is_empty()) {
+            require(tracked.len() < 100_000, "static pinned tree entry bound")?;
+            let at = row
+                .iter()
+                .position(|b| *b == b'\t')
+                .ok_or("static pinned tree delimiter")?;
+            let header = std::str::from_utf8(&row[..at]).map_err(|e| e.to_string())?;
+            let fields: Vec<_> = header.split(' ').collect();
+            require(fields.len() == 3, "static pinned tree row shape")?;
+            if fields[1] == "blob" && matches!(fields[0], "100644" | "100755") {
+                tracked.insert(PathBuf::from(std::ffi::OsStr::from_bytes(&row[at + 1..])));
+            }
+        }
+        require(!tracked.is_empty(), "static pinned tree lists no files")?;
+        Ok(tracked)
+    }
+
+    /// Binds each of [`BOUND_REVERIE_PACKAGES`] to exactly one resolved
+    /// package. The git form (every bound package once, at exactly
+    /// `source`) is the only form without a pinned checkout and keeps its
+    /// single refusal. With a pinned checkout, a resolve whose bound
+    /// packages are all in the git form still takes the git form; any
+    /// other resolve is judged as the path form.
+    fn bind_reverie_packages<'m>(
+        packages: &'m [Value],
+        source: &str,
+        pinned: Option<&PinnedCheckout<'_>>,
+    ) -> Result<Vec<(&'static str, &'m str)>> {
+        let rows_of = |name: &str| -> Vec<&'m Value> {
+            packages.iter().filter(|p| p["name"] == name).collect()
+        };
+        let git_bound = |name: &str| {
+            let rows = rows_of(name);
+            rows.len() == 1 && rows[0]["source"].as_str() == Some(source)
+        };
+        match pinned {
+            Some(checkout) if !BOUND_REVERIE_PACKAGES.into_iter().all(git_bound) => {
+                path_bound_reverie_manifests(packages, source, checkout)
+            }
+            _ => {
+                let mut bound = Vec::new();
+                for name in BOUND_REVERIE_PACKAGES {
+                    let rows = rows_of(name);
+                    require(
+                        rows.len() == 1 && rows[0]["source"].as_str() == Some(source),
+                        "static metadata R source/uniqueness mismatch",
+                    )?;
+                    let manifest = rows[0]["manifest_path"]
+                        .as_str()
+                        .ok_or("static R manifest absent")?;
+                    bound.push((name, manifest));
+                }
+                Ok(bound)
+            }
+        }
+    }
+
+    /// The path form: a consumer workspace that depends on its pinned
+    /// Reverie checkout by path. It binds as strictly as the git form and
+    /// refuses by name:
+    /// - each bound package appears exactly once, with a present, null
+    ///   source (Cargo's spelling of a path package) and the manifest
+    ///   `<checkout>/<name>/Cargo.toml`, which must be its own real path
+    ///   and a regular file tracked at the pin;
+    /// - once any bound package is a path package, all three must be: a
+    ///   mix with the pinned git source refuses, since it would compile
+    ///   two Reverie copies;
+    /// - every other package carrying a Reverie workspace name (a closed
+    ///   workspace name or a `reverie-` prefix) is likewise a path package
+    ///   whose manifest is its own real path and a regular file tracked at
+    ///   the pin. A fork, registry copy, second copy, or a copy under an
+    ///   ignored path of the checkout therefore cannot join the resolve.
+    fn path_bound_reverie_manifests<'m>(
+        packages: &'m [Value],
+        source: &str,
+        checkout: &PinnedCheckout<'_>,
+    ) -> Result<Vec<(&'static str, &'m str)>> {
+        let mut bound = Vec::new();
+        let mut git_bound = 0;
+        for name in BOUND_REVERIE_PACKAGES {
+            let rows: Vec<_> = packages.iter().filter(|p| p["name"] == name).collect();
+            require(
+                !rows.is_empty(),
+                format!("static metadata lacks the Reverie package {name}"),
+            )?;
+            require(
+                rows.len() == 1,
+                format!(
+                    "static metadata Reverie package {name} is not unique ({} packages)",
+                    rows.len()
+                ),
+            )?;
+            let manifest = rows[0]
+                .get("manifest_path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    format!("static metadata Reverie package {name} lacks a manifest path")
+                })?;
+            match rows[0].get("source") {
+                Some(Value::String(git)) if git == source => git_bound += 1,
+                Some(Value::Null) => {
+                    let pinned = checkout.root.join(name).join("Cargo.toml");
+                    require(
+                        Path::new(manifest) == pinned,
+                        format!(
+                            "static metadata Reverie package {name} is a path package other than the pinned checkout's {}: {manifest}",
+                            pinned.display()
+                        ),
+                    )?;
+                    checkout.require_tracked(name, manifest)?;
+                }
+                Some(Value::String(other)) => {
+                    return Err(format!(
+                        "static metadata Reverie package {name} resolves from another source: {other}"
+                    ));
+                }
+                _ => {
+                    return Err(format!(
+                        "static metadata Reverie package {name} has neither a string nor a null source"
+                    ));
+                }
+            }
+            bound.push((name, manifest));
+        }
+        require(
+            git_bound == 0,
+            "static metadata mixes git and path Reverie sources",
+        )?;
+        for package in packages {
+            let Some(name) = package["name"].as_str() else {
+                return Err("static metadata package lacks a name".into());
+            };
+            if !(REVERIE_WORKSPACE_PACKAGES.contains(&name) || name.starts_with("reverie-")) {
+                continue;
+            }
+            require(
+                matches!(package.get("source"), Some(Value::Null)),
+                format!(
+                    "static metadata Reverie workspace package {name} is not a path package: source {}",
+                    package
+                        .get("source")
+                        .map_or("absent".to_owned(), Value::to_string)
+                ),
+            )?;
+            let manifest = package
+                .get("manifest_path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    format!(
+                        "static metadata Reverie workspace package {name} lacks a manifest path"
+                    )
+                })?;
+            checkout.require_tracked(name, manifest)?;
         }
         Ok(bound)
     }
@@ -77041,12 +77278,28 @@ pub mod private_static {
                     .ok_or("static metadata lacks packages")?;
                 let mut roots = Vec::new();
                 let id = leaf_package_id(expected.workspace, consumer)?;
+                // The gitlink checkout guarded above, with the pin commit's
+                // tracked files: what the path form binds against.
+                let pinned_tree = match gitlink {
+                    Some(relative) => {
+                        let root = expected.workspace.join(relative);
+                        let tracked = pinned_tracked_files(&root, expected.reverie_pin, runner)?;
+                        Some((root, tracked))
+                    }
+                    None => None,
+                };
+                let pinned = pinned_tree.as_ref().map(|(root, tracked)| PinnedCheckout {
+                    root,
+                    tracked,
+                    resolve: &real_file,
+                });
                 for (name, manifest) in bound_reverie_manifests_from(
                     &metadata,
                     consumer.binding(),
                     repository,
                     expected.reverie_pin,
                     &id,
+                    pinned.as_ref(),
                 )? {
                     let p = real_file(Path::new(manifest))?;
                     let root = p
@@ -78623,7 +78876,7 @@ pub mod private_static {
             let repository =
                 CargoGitRepository::new("https://github.com/facebookexperimental/reverie").unwrap();
             assert_eq!(
-                bound_reverie_manifests_from(&moved, cargo, repository, pin, leaf)
+                bound_reverie_manifests_from(&moved, cargo, repository, pin, leaf, None)
                     .unwrap()
                     .iter()
                     .map(|(name, _)| *name)
@@ -78635,7 +78888,8 @@ pub mod private_static {
                 "static metadata R source/uniqueness mismatch"
             );
             assert_eq!(
-                bound_reverie_manifests_from(&exact, cargo, repository, pin, leaf).unwrap_err(),
+                bound_reverie_manifests_from(&exact, cargo, repository, pin, leaf, None)
+                    .unwrap_err(),
                 "static metadata R source/uniqueness mismatch"
             );
             // A moved crate that still resolves from rrnewton is a second
@@ -78644,7 +78898,409 @@ pub mod private_static {
                 &moved_spelling,
                 &[("reverie-syscalls", Some(canonical(pin)))],
             );
-            assert!(bound_reverie_manifests_from(&mixed, cargo, repository, pin, leaf).is_err());
+            assert!(
+                bound_reverie_manifests_from(&mixed, cargo, repository, pin, leaf, None).is_err()
+            );
+        }
+
+        #[test]
+        fn path_form_binds_reverie_only_inside_the_pinned_checkout() {
+            let pin = "1".repeat(40);
+            let git = format!("git+https://github.com/rrnewton/reverie.git?rev={pin}#{pin}");
+            let crates_io = "registry+https://github.com/rust-lang/crates.io-index";
+            let root = Path::new("/ws/reverie");
+            let row = |name: &str, source: Option<&str>, manifest: &str| serde_json::json!({"name": name, "source": source, "manifest_path": manifest});
+            let in_checkout =
+                |name: &str| row(name, None, &format!("/ws/reverie/{name}/Cargo.toml"));
+            let exact = vec![
+                row("leaf", None, "/ws/leaf/Cargo.toml"),
+                in_checkout("reverie-inguest"),
+                in_checkout("reverie-liteinst"),
+                in_checkout("reverie-loader"),
+                in_checkout("reverie-syscalls"),
+                in_checkout("safeptrace"),
+                row(
+                    "libc",
+                    Some(crates_io),
+                    "/cargo/registry/libc-0.2.186/Cargo.toml",
+                ),
+            ];
+            let with = |name: &str, replacement: Vec<Value>| -> Vec<Value> {
+                exact
+                    .iter()
+                    .filter(|p| p["name"] != name)
+                    .cloned()
+                    .chain(replacement)
+                    .collect()
+            };
+            // The pin commit's tracked regular files, checkout-relative.
+            let tracked_files = |omit: &str| -> std::collections::BTreeSet<PathBuf> {
+                [
+                    "reverie-inguest/Cargo.toml",
+                    "reverie-liteinst/Cargo.toml",
+                    "reverie-loader/Cargo.toml",
+                    "reverie-syscalls/Cargo.toml",
+                    "safeptrace/Cargo.toml",
+                    "experimental/reverie-new/Cargo.toml",
+                ]
+                .into_iter()
+                .filter(|path| *path != omit)
+                .map(PathBuf::from)
+                .collect()
+            };
+            let tracked = tracked_files("");
+            // A stand-in for `real_file` over this synthetic tree: `..`
+            // resolves lexically, and each listed symlink redirects its
+            // subtree. `linked` is an ignored symlink out of the checkout;
+            // `alias` points at a tracked package directory.
+            let resolver = |links: &'static [(&'static str, &'static str)]| {
+                move |path: &Path| -> Result<PathBuf> {
+                    let mut real = PathBuf::new();
+                    for component in path.components() {
+                        match component {
+                            std::path::Component::ParentDir => {
+                                real.pop();
+                            }
+                            other => real.push(other),
+                        }
+                    }
+                    for (link, target) in links {
+                        if let Ok(rest) = real.strip_prefix(link) {
+                            return Ok(Path::new(target).join(rest));
+                        }
+                    }
+                    Ok(real)
+                }
+            };
+            let resolve = resolver(&[
+                ("/ws/reverie/linked", "/elsewhere/linked"),
+                ("/ws/reverie/alias", "/ws/reverie/reverie-syscalls"),
+            ]);
+            let checkout = PinnedCheckout {
+                root,
+                tracked: &tracked,
+                resolve: &resolve,
+            };
+            fn bind<'m>(
+                packages: &'m [Value],
+                git: &str,
+                checkout: &PinnedCheckout<'_>,
+            ) -> Result<Vec<(&'static str, &'m str)>> {
+                bind_reverie_packages(packages, git, Some(checkout))
+            }
+            let refusal = |packages: &[Value]| bind(packages, &git, &checkout).unwrap_err();
+
+            // A workspace bound by path to exactly the pinned checkout binds
+            // each package at its manifest there.
+            assert_eq!(
+                bind(&exact, &git, &checkout).unwrap(),
+                [
+                    ("reverie-inguest", "/ws/reverie/reverie-inguest/Cargo.toml"),
+                    (
+                        "reverie-liteinst",
+                        "/ws/reverie/reverie-liteinst/Cargo.toml"
+                    ),
+                    ("reverie-loader", "/ws/reverie/reverie-loader/Cargo.toml"),
+                ]
+            );
+            // Without a pinned checkout only the git form binds, with its
+            // unchanged refusal; a CargoGitRev consumer never binds by path.
+            assert_eq!(
+                bind_reverie_packages(&exact, &git, None).unwrap_err(),
+                "static metadata R source/uniqueness mismatch"
+            );
+            assert_eq!(
+                bound_reverie_manifests_from(
+                    &serde_json::json!({"packages": exact}),
+                    selected_initializers::WorkspaceBinding::CargoGitRev,
+                    CargoGitRepository::DEFAULT,
+                    &pin,
+                    "path+file:///ws/leaf#0.0.1",
+                    Some(&checkout),
+                )
+                .unwrap_err(),
+                "static CargoGitRev consumer cannot bind Reverie by path"
+            );
+            // The git form still binds when a checkout is offered.
+            let git_rows: Vec<_> = BOUND_REVERIE_PACKAGES
+                .into_iter()
+                .map(|name| row(name, Some(&git), &format!("/cache/r/{name}/Cargo.toml")))
+                .collect();
+            assert_eq!(bind(&git_rows, &git, &checkout).unwrap().len(), 3);
+
+            // A path anywhere but the pinned checkout's own package directory
+            // refuses by name: another checkout, a sibling whose name only
+            // shares the checkout's prefix, a parent-directory escape, and a
+            // nested copy inside the checkout.
+            for elsewhere in [
+                "/elsewhere/reverie/reverie-liteinst/Cargo.toml",
+                "/ws/reverie-fork/reverie-liteinst/Cargo.toml",
+                "/ws/reverie/../fork/reverie-liteinst/Cargo.toml",
+                "/ws/reverie/nested/reverie-liteinst/Cargo.toml",
+            ] {
+                assert_eq!(
+                    refusal(&with(
+                        "reverie-liteinst",
+                        vec![row("reverie-liteinst", None, elsewhere)]
+                    )),
+                    format!(
+                        "static metadata Reverie package reverie-liteinst is a path package other than the pinned checkout's /ws/reverie/reverie-liteinst/Cargo.toml: {elsewhere}"
+                    )
+                );
+            }
+            // A duplicate refuses even when one copy is the pinned one.
+            assert_eq!(
+                refusal(&with(
+                    "reverie-loader",
+                    vec![
+                        in_checkout("reverie-loader"),
+                        row(
+                            "reverie-loader",
+                            None,
+                            "/elsewhere/reverie-loader/Cargo.toml"
+                        ),
+                    ],
+                )),
+                "static metadata Reverie package reverie-loader is not unique (2 packages)"
+            );
+            // Uniqueness holds on its own: two rows that each satisfy every
+            // other rule still refuse.
+            assert_eq!(
+                refusal(&with(
+                    "reverie-loader",
+                    vec![in_checkout("reverie-loader"), in_checkout("reverie-loader")],
+                )),
+                "static metadata Reverie package reverie-loader is not unique (2 packages)"
+            );
+            // A missing package, a mixed git/path set, a missing or foreign
+            // source and a missing manifest path each refuse by name.
+            assert_eq!(
+                refusal(&with("reverie-inguest", vec![])),
+                "static metadata lacks the Reverie package reverie-inguest"
+            );
+            assert_eq!(
+                refusal(&with(
+                    "reverie-inguest",
+                    vec![row(
+                        "reverie-inguest",
+                        Some(&git),
+                        "/cache/r/reverie-inguest/Cargo.toml"
+                    )],
+                )),
+                "static metadata mixes git and path Reverie sources"
+            );
+            assert_eq!(
+                refusal(&with(
+                    "reverie-loader",
+                    vec![serde_json::json!({
+                        "name": "reverie-loader",
+                        "manifest_path": "/ws/reverie/reverie-loader/Cargo.toml",
+                    })],
+                )),
+                "static metadata Reverie package reverie-loader has neither a string nor a null source"
+            );
+            assert_eq!(
+                refusal(&with(
+                    "reverie-loader",
+                    vec![serde_json::json!({
+                        "name": "reverie-loader",
+                        "source": 7,
+                        "manifest_path": "/ws/reverie/reverie-loader/Cargo.toml",
+                    })],
+                )),
+                "static metadata Reverie package reverie-loader has neither a string nor a null source"
+            );
+            assert_eq!(
+                refusal(&with(
+                    "reverie-loader",
+                    vec![row(
+                        "reverie-loader",
+                        Some(crates_io),
+                        "/ws/reverie/reverie-loader/Cargo.toml"
+                    )],
+                )),
+                format!(
+                    "static metadata Reverie package reverie-loader resolves from another source: {crates_io}"
+                )
+            );
+            assert_eq!(
+                refusal(&with(
+                    "reverie-loader",
+                    vec![serde_json::json!({"name": "reverie-loader", "source": null})],
+                )),
+                "static metadata Reverie package reverie-loader lacks a manifest path"
+            );
+            // Any other Reverie workspace package that is not a path package
+            // refuses: a fork at the git source, a registry copy, or no
+            // source at all.
+            for (name, source, manifest, shown) in [
+                (
+                    "reverie-syscalls",
+                    Some(git.as_str()),
+                    "/cache/r/reverie-syscalls/Cargo.toml",
+                    format!("\"{git}\""),
+                ),
+                (
+                    "safeptrace",
+                    Some(crates_io),
+                    "/cargo/registry/safeptrace-0.1.0/Cargo.toml",
+                    format!("\"{crates_io}\""),
+                ),
+            ] {
+                assert_eq!(
+                    refusal(&with(name, vec![row(name, source, manifest)])),
+                    format!(
+                        "static metadata Reverie workspace package {name} is not a path package: source {shown}"
+                    )
+                );
+            }
+            assert_eq!(
+                refusal(&with(
+                    "reverie-syscalls",
+                    vec![serde_json::json!({
+                        "name": "reverie-syscalls",
+                        "manifest_path": "/ws/reverie/reverie-syscalls/Cargo.toml",
+                    })],
+                )),
+                "static metadata Reverie workspace package reverie-syscalls is not a path package: source absent"
+            );
+            // A Reverie path package must be a file tracked at the pin and
+            // its own real path. Lexical containment is not enough: these
+            // refuse by name, whether the package is one of the bound three,
+            // on the closed list, or named only by the `reverie-` prefix.
+            let untracked = |name: &str, manifest: &str| {
+                format!(
+                    "static metadata Reverie package {name} manifest {manifest} is not a file tracked at the pinned commit of /ws/reverie"
+                )
+            };
+            let aliased = |name: &str, manifest: &str, real: &str| {
+                format!(
+                    "static metadata Reverie package {name} manifest {manifest} is not its real path {real} (a symlink or .. alias)"
+                )
+            };
+            // Outside the checkout altogether.
+            let elsewhere = "/elsewhere/reverie-syscalls/Cargo.toml";
+            assert_eq!(
+                refusal(&with(
+                    "reverie-syscalls",
+                    vec![row("reverie-syscalls", None, elsewhere)]
+                )),
+                untracked("reverie-syscalls", elsewhere)
+            );
+            // Under an ignored build directory inside the checkout (Reverie's
+            // .gitignore ignores target/ at any depth, so the tree guards do
+            // not see it).
+            let built = "/ws/reverie/target/package/reverie-x-0.5.7/Cargo.toml";
+            let mut extra = exact.clone();
+            extra.push(row("reverie-x", None, built));
+            assert_eq!(refusal(&extra), untracked("reverie-x", built));
+            // Behind an ignored symlink inside the checkout, out of it.
+            let linked = "/ws/reverie/linked/reverie-x/Cargo.toml";
+            let mut extra = exact.clone();
+            extra.push(row("reverie-x", None, linked));
+            assert_eq!(
+                refusal(&extra),
+                aliased(
+                    "reverie-x",
+                    linked,
+                    "/elsewhere/linked/reverie-x/Cargo.toml"
+                )
+            );
+            // Behind a symlink to a tracked package directory.
+            let alias = "/ws/reverie/alias/Cargo.toml";
+            assert_eq!(
+                refusal(&with("safeptrace", vec![row("safeptrace", None, alias)])),
+                aliased(
+                    "safeptrace",
+                    alias,
+                    "/ws/reverie/reverie-syscalls/Cargo.toml"
+                )
+            );
+            // Through a parent-directory escape.
+            let escape = "/ws/reverie/../fork/reverie-unlisted/Cargo.toml";
+            let mut extra = exact.clone();
+            extra.push(row("reverie-unlisted", None, escape));
+            assert_eq!(
+                refusal(&extra),
+                aliased(
+                    "reverie-unlisted",
+                    escape,
+                    "/ws/fork/reverie-unlisted/Cargo.toml"
+                )
+            );
+            // A bound package whose manifest the pin does not track, and one
+            // whose package directory is a symlink, refuse as well.
+            let without_loader = tracked_files("reverie-loader/Cargo.toml");
+            let pinless = PinnedCheckout {
+                root,
+                tracked: &without_loader,
+                resolve: &resolve,
+            };
+            let loader = "/ws/reverie/reverie-loader/Cargo.toml";
+            assert_eq!(
+                bind(&exact, &git, &pinless).unwrap_err(),
+                untracked("reverie-loader", loader)
+            );
+            let redirect = resolver(&[("/ws/reverie/reverie-loader", "/elsewhere/reverie-loader")]);
+            let linked_dir = PinnedCheckout {
+                root,
+                tracked: &tracked,
+                resolve: &redirect,
+            };
+            assert_eq!(
+                bind(&exact, &git, &linked_dir).unwrap_err(),
+                aliased(
+                    "reverie-loader",
+                    loader,
+                    "/elsewhere/reverie-loader/Cargo.toml"
+                )
+            );
+            // A manifest that does not resolve refuses with the resolver's
+            // reason.
+            let missing = |path: &Path| -> Result<PathBuf> {
+                Err(format!("metadata {}: No such file", path.display()))
+            };
+            let unreadable = PinnedCheckout {
+                root,
+                tracked: &tracked,
+                resolve: &missing,
+            };
+            assert_eq!(
+                bind(&exact, &git, &unreadable).unwrap_err(),
+                "static metadata Reverie package reverie-inguest manifest /ws/reverie/reverie-inguest/Cargo.toml does not resolve: metadata /ws/reverie/reverie-inguest/Cargo.toml: No such file"
+            );
+            // A new package tracked anywhere in the checkout is admitted; an
+            // untracked one beside it is not.
+            let mut grown = exact.clone();
+            grown.push(row(
+                "reverie-new",
+                None,
+                "/ws/reverie/experimental/reverie-new/Cargo.toml",
+            ));
+            assert_eq!(bind(&grown, &git, &checkout).unwrap().len(), 3);
+            let other = "/ws/reverie/experimental/reverie-other/Cargo.toml";
+            grown.push(row("reverie-other", None, other));
+            assert_eq!(refusal(&grown), untracked("reverie-other", other));
+        }
+
+        #[test]
+        fn pinned_tracked_files_lists_only_regular_files_of_the_pin_commit() {
+            // The fixture's pin tracks a regular file, a symlink and a
+            // gitlink; only the regular file is the pin's.
+            let mut f = CacheFixture::new();
+            // Files the pin does not track, ignored or not, are not listed.
+            fs::create_dir_all(f.root.join("target/reverie-x")).unwrap();
+            fs::write(f.root.join("target/reverie-x/Cargo.toml"), b"[package]\n").unwrap();
+            fs::write(f.root.join("later.rs"), b"").unwrap();
+            let tracked = pinned_tracked_files(&f.root, &f.head, &mut f.runner).unwrap();
+            assert_eq!(
+                tracked.into_iter().collect::<Vec<_>>(),
+                [PathBuf::from("source.rs")]
+            );
+            assert_eq!(
+                pinned_tracked_files(&f.root, "short", &mut f.runner).unwrap_err(),
+                "static pinned tree needs a full pin"
+            );
         }
 
         #[test]
