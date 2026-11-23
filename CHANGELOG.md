@@ -6,6 +6,18 @@ of those execution paths.
 
 ## Unreleased
 
+- Toolchain: the pinned stable compiler moves from 1.97.1 to 1.99.1,
+  following the fbsource toolchain. The LiteInst artifact qualifier
+  enrolls the one in-guest body whose code generation changed under
+  1.99.1 (`fixed_setup_bitmap_range`: a 217-byte arena row for the
+  standalone release image and a 282-byte validate template, template
+  118, for the Detcore image), beside the retained rows for earlier
+  compilers. The template-118 native-syscall composition row is
+  bitmap-checked by hand only: its composition, allocator and TLS
+  witnesses have not been machine-observed on the native producer
+  under 1.99.1 yet, which is a stated landing precondition of the
+  Hermit pin move that follows.
+
 - reverie-kvm: the vCPU's CPUID table (KVM_SET_CPUID2) no longer offers
   RDRAND, RDSEED, HLE or RTM, on every vendor. KVM keys its own handling of
   those instructions on this table, not on what a Tool answers: on VMX it now

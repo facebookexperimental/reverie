@@ -974,8 +974,8 @@ impl ProbeVm {
             .memory
             .read_raw(self.backend.syscall_frame_address, &mut bytes)?;
         let mut words = [0; FRAME_IDENTITY_WORDS];
-        for (word, chunk) in words.iter_mut().zip(bytes.chunks_exact(8)) {
-            *word = u64::from_le_bytes(chunk.try_into().expect("8-byte chunk"));
+        for (word, chunk) in words.iter_mut().zip(bytes.as_chunks::<8>().0) {
+            *word = u64::from_le_bytes(*chunk);
         }
         Ok(words)
     }

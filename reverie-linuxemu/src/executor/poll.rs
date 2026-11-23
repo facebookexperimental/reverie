@@ -163,7 +163,7 @@ impl EpollHold {
     fn another(epoll: &Arc<EpollIdentity>) -> Option<Self> {
         epoll
             .live
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |owners| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |owners| {
                 (owners != 0).then_some(owners + 1)
             })
             .ok()

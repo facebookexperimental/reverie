@@ -363,7 +363,7 @@ fn pthread_and_wait_for_the_closure() {
 /// bound then ends that blocked thread.
 ///
 /// This depends on whichever standard library builds the test. In Rust
-/// 1.97.1, the pinned toolchain, a spawned thread's start calls
+/// 1.99.1, the pinned toolchain, a spawned thread's start calls
 /// `stack_overflow::make_handler`, which calls `set_current_info`, which makes
 /// the gettid syscall, whenever std has installed its SIGSEGV handler. If a
 /// later std stops making that call, this test fails, and that loud failure is
