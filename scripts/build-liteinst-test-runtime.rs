@@ -100,11 +100,23 @@ fn ci_config(generation: PathBuf) -> Result<Config> {
         .map_err(|e| e.to_string())?;
     let rust_exports = root.join("reverie-liteinst/src/allocator_fixture.rs");
     let c_workload = root.join("reverie-liteinst/tests/fixtures/m1_allocator_guest.c");
+    // This preflight's own completed observations on devbig014
+    // (2026-11-22, aggregate CPU / wall): cold 0.29/2.95 s and
+    // 0.45/9.26 s, warm 0.47/1.66 s and 0.21/0.29 s. Budget is
+    // ceil(1.5 x 0.47) = 1 CPU-s, wall 8 x 9.26 = 75 s backstop.
     let mut runner = Runner::new(
         generation.join("preflight-logs"),
-        Duration::from_secs(60),
+        Duration::from_secs(75),
         1 << 20,
     )?;
+    if let m1_artifact::TotalCpuBound::WallBackstopOnly(reason) =
+        runner.bound_total_cpu_or_wall_backstop(Duration::from_secs(1))?
+    {
+        eprintln!(
+            "producer preflight: CPU accounting unavailable ({reason}); \
+             running under the 75 s wall backstop only"
+        );
+    }
     let source = m1_artifact::source_identity(
         &root,
         &root.join("Cargo.lock"),

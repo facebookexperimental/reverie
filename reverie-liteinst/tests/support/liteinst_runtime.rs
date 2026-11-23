@@ -325,11 +325,25 @@ fn qualify_runtime() -> Result<QualifiedRuntime, String> {
             ("c_workload".to_owned(), C_ORACLE_SHA256.to_owned()),
         ]);
         let manifest = source.root.join("Cargo.toml");
+        // This resolution's own completed observations on devbig014
+        // (2026-11-22, aggregate CPU / wall): 5.24/8.78 s, 5.62/7.89 s,
+        // 5.81/14.91 s, 6.38/13.39 s. Budget is ceil(1.5 x 6.38) = 10
+        // CPU-s, wall 8 x 14.91 = 120 s backstop. The observations ran
+        // in the unoptimized dev profile, which is also the profile
+        // CI runs these tests in.
         let mut source_runner = artifact::Runner::new(
             evidence.join("compiled-sources"),
-            Duration::from_secs(60),
+            Duration::from_secs(120),
             16 << 20,
         )?;
+        if let artifact::TotalCpuBound::WallBackstopOnly(reason) =
+            source_runner.bound_total_cpu_or_wall_backstop(Duration::from_secs(10))?
+        {
+            eprintln!(
+                "compiled-source resolution: CPU accounting unavailable ({reason}); \
+                 running under the 120 s wall backstop only"
+            );
+        }
         // Resolve from this consumer's current worktree, never from the receipt.
         // The receipt-only transaction closes on success and ordinary error.
         let (receipt, _) = artifact::VerifiedCompiledSources::with_resolved(

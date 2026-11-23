@@ -26,6 +26,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -328,6 +329,145 @@ pub fn verify_guest_receipt(
     Ok(receipt)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test override for this thread's producer CPU reading, so a test
+    /// can state the calling thread's work exactly while child CPU
+    /// below remains real cgroup accounting.
+    static PRODUCER_THREAD_CPU_OVERRIDE: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn set_producer_thread_cpu_for_test(value: Option<Duration>) {
+    PRODUCER_THREAD_CPU_OVERRIDE.with(|cell| cell.set(value));
+}
+
+/// This thread's own CPU since it started. The delta from a budget's
+/// creation, plus each reader thread's delta added when the Runner
+/// joins it, is the producer work no command cgroup can see: file
+/// hashing, ELF parsing and the proof itself. Only the producer's own
+/// threads are measured; unrelated threads sharing the process are not
+/// charged.
+fn producer_thread_cpu() -> Result<Duration> {
+    #[cfg(test)]
+    if let Some(value) = PRODUCER_THREAD_CPU_OVERRIDE.with(|cell| cell.get()) {
+        return Ok(value);
+    }
+    fn timeval(value: &libc::timeval) -> Result<Duration> {
+        let seconds = u64::try_from(value.tv_sec)
+            .map_err(|_| "producer thread CPU accounting unavailable: negative rusage seconds")?;
+        let micros = u64::try_from(value.tv_usec)
+            .map_err(|_| "producer thread CPU accounting unavailable: negative rusage micros")?;
+        require(
+            micros < 1_000_000,
+            "producer thread CPU accounting unavailable: rusage micros out of range",
+        )?;
+        Ok(Duration::from_secs(seconds) + Duration::from_micros(micros))
+    }
+    // SAFETY: an all-zero rusage is a valid output buffer for getrusage.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: `usage` is writable and RUSAGE_THREAD names this thread.
+    if unsafe { libc::getrusage(libc::RUSAGE_THREAD, &mut usage) } != 0 {
+        return Err(format!(
+            "producer thread CPU accounting unavailable: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(timeval(&usage.ru_utime)? + timeval(&usage.ru_stime)?)
+}
+
+/// One aggregate CPU budget shared by every Runner a producer attaches
+/// it to. Used CPU is the child commands' cgroup CPU, plus the CPU of
+/// the producer's own threads: the attaching thread's
+/// `getrusage(RUSAGE_THREAD)` delta since creation and each reader
+/// thread's delta added when the Runner joins it. Work this process
+/// spawns outside a Runner (an outer Cargo build, for one) and
+/// unrelated threads sharing the process are not counted. Cloning
+/// shares the same budget and baseline; attach it only from the
+/// thread that created it, whose delta is the one measured.
+#[derive(Clone)]
+pub struct ProducerCpuBudget {
+    state: Arc<Mutex<ProducerCpuState>>,
+    creator: std::thread::ThreadId,
+}
+
+struct ProducerCpuState {
+    budget: Duration,
+    child_cpu_used: Duration,
+    reader_cpu_used: Duration,
+    thread_cpu_baseline: Duration,
+}
+
+impl ProducerCpuBudget {
+    pub fn new(cpu_budget: Duration) -> Result<Self> {
+        require(!cpu_budget.is_zero(), "CPU budget must be positive")?;
+        Ok(Self {
+            state: Arc::new(Mutex::new(ProducerCpuState {
+                budget: cpu_budget,
+                child_cpu_used: Duration::ZERO,
+                reader_cpu_used: Duration::ZERO,
+                thread_cpu_baseline: producer_thread_cpu()?,
+            })),
+            creator: std::thread::current().id(),
+        })
+    }
+
+    pub fn budget(&self) -> Duration {
+        self.lock()
+            .map(|state| state.budget)
+            .unwrap_or(Duration::ZERO)
+    }
+
+    /// Aggregate CPU used against this budget right now: accounted
+    /// child CPU, joined reader-thread CPU, and the creating thread's
+    /// CPU delta since the budget was created. Refuses from any other
+    /// thread: that thread's delta against the creator's baseline
+    /// would be meaningless.
+    pub fn used(&self) -> Result<Duration> {
+        require(
+            std::thread::current().id() == self.creator,
+            "producer CPU budget used from a thread other than its creator",
+        )?;
+        let state = self.lock()?;
+        Ok(state.child_cpu_used
+            + state.reader_cpu_used
+            + producer_thread_cpu()?.saturating_sub(state.thread_cpu_baseline))
+    }
+
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, ProducerCpuState>> {
+        self.state
+            .lock()
+            .map_err(|_| "producer CPU budget state poisoned".to_owned())
+    }
+
+    fn add_child(&self, used: Duration) -> Result<Duration> {
+        {
+            let mut state = self.lock()?;
+            state.child_cpu_used += used;
+        }
+        self.used()
+    }
+
+    fn add_reader(&self, used: Duration) -> Result<Duration> {
+        {
+            let mut state = self.lock()?;
+            state.reader_cpu_used += used;
+        }
+        self.used()
+    }
+}
+
+/// Whether [`Runner::bound_total_cpu_or_wall_backstop`] accounted CPU.
+#[derive(Debug, PartialEq, Eq)]
+pub enum TotalCpuBound {
+    /// Commands run CPU-accounted under the aggregate budget.
+    Accounted,
+    /// CPU accounting is unavailable for the reason named; commands run
+    /// under the Runner's wall backstop only.
+    WallBackstopOnly(String),
+}
+
 /// One shared absolute wall deadline; each stream has its own strict byte
 /// ceiling. Every child is placed in a fresh process group. An overflow, CPU
 /// budget or wall deadline kill reaches that group, and a CPU-budgeted command's
@@ -362,6 +502,20 @@ pub struct Runner {
     /// The CPU budget of every command not given its own through
     /// `run_cpu_bounded`; `None` leaves them bounded by the wall deadline only.
     every_command_cpu: Option<Duration>,
+    /// Aggregate CPU budget shared with any sibling Runners, set through
+    /// [`Runner::bound_total_cpu`]; `None` leaves the run bounded by the
+    /// wall deadline and any per-command budgets only.
+    total_cpu_budget: Option<ProducerCpuBudget>,
+    /// Aggregate CPU at the last command boundary, for message formatting
+    /// without another rusage read on an error path.
+    total_cpu_used: Duration,
+    /// Why CPU accounting fell back to the wall backstop alone, when the
+    /// caller chose that fallback through
+    /// [`Runner::bound_total_cpu_or_wall_backstop`].
+    total_cpu_fallback: Option<String>,
+    /// When this Runner was created, for naming measured wall time in
+    /// aggregate-budget refusals.
+    started: Instant,
     /// A substitute `cargo` program for this Runner, set through
     /// [`Self::set_cargo_program`]; `None` spawns the `cargo` found on
     /// PATH, exactly as before. It exists so a test can inject a stand-in
@@ -397,6 +551,10 @@ impl Runner {
             command_cpu: Vec::new(),
             wall_budget: budget,
             every_command_cpu: None,
+            total_cpu_budget: None,
+            total_cpu_used: Duration::ZERO,
+            total_cpu_fallback: None,
+            started: Instant::now(),
             #[cfg(test)]
             cargo_program: None,
             #[cfg(test)]
@@ -444,6 +602,159 @@ impl Runner {
         Ok(())
     }
 
+    /// Bound the aggregate CPU of every command this Runner runs from
+    /// here on by a fresh [`ProducerCpuBudget`]. See
+    /// [`Runner::bound_shared_total_cpu`].
+    pub fn bound_total_cpu(&mut self, cpu_budget: Duration) -> Result<()> {
+        let budget = ProducerCpuBudget::new(cpu_budget)?;
+        self.bound_shared_total_cpu(budget)
+    }
+
+    /// Bound this Runner by a (possibly shared) aggregate CPU budget.
+    /// Each later command is CPU-accounted as in
+    /// [`Runner::run_cpu_bounded`] (not started where that cannot be
+    /// accounted) under a per-command cap of the aggregate remainder at
+    /// its start. The aggregate is checked at every command start and
+    /// after every command: child cgroup CPU plus the producer's own
+    /// threads' CPU delta, shared by every Runner holding a clone of the same
+    /// budget. A command that finishes with aggregate use exactly at
+    /// the budget passes; the next is refused as exhausted. The wall
+    /// deadline stays the backstop, so callers size it generously
+    /// (several times the CPU budget): cost is judged by CPU, and wall
+    /// only stops a hang. Set at most once, before the work it bounds.
+    pub fn bound_shared_total_cpu(&mut self, budget: ProducerCpuBudget) -> Result<()> {
+        require(
+            self.total_cpu_budget.is_none() && self.total_cpu_fallback.is_none(),
+            "producer total CPU budget is already set",
+        )?;
+        self.total_cpu_used = budget.used()?;
+        self.total_cpu_budget = Some(budget);
+        Ok(())
+    }
+
+    /// [`Runner::bound_total_cpu`], except that where this process
+    /// cannot account command CPU (cgroup creation or open fails, or
+    /// this thread's rusage cannot be read while creating the
+    /// budget), commands instead run under the wall backstop alone
+    /// and the returned [`TotalCpuBound::WallBackstopOnly`] names why,
+    /// for the caller to log. This is the codebase's named fallback
+    /// for build environments without cgroup write access; the strict
+    /// setters above refuse there instead. The fallback covers only
+    /// budget attachment: reader threads still read their own rusage
+    /// for every command, budgeted or not, and a failure there fails
+    /// the command by name in both modes.
+    pub fn bound_total_cpu_or_wall_backstop(
+        &mut self,
+        cpu_budget: Duration,
+    ) -> Result<TotalCpuBound> {
+        require(!cpu_budget.is_zero(), "CPU budget must be positive")?;
+        match ProducerCpuBudget::new(cpu_budget) {
+            Ok(budget) => self.bound_shared_total_cpu_or_wall_backstop(budget),
+            Err(error) => Ok(self.total_cpu_wall_fallback(error)),
+        }
+    }
+
+    /// [`Runner::bound_shared_total_cpu`] with the named wall-only
+    /// fallback of [`Runner::bound_total_cpu_or_wall_backstop`].
+    pub fn bound_shared_total_cpu_or_wall_backstop(
+        &mut self,
+        budget: ProducerCpuBudget,
+    ) -> Result<TotalCpuBound> {
+        require(
+            self.total_cpu_budget.is_none() && self.total_cpu_fallback.is_none(),
+            "producer total CPU budget is already set",
+        )?;
+        match self.probe_cpu_accounting()? {
+            None => {
+                self.bound_shared_total_cpu(budget)?;
+                Ok(TotalCpuBound::Accounted)
+            }
+            Some(reason) => Ok(self.total_cpu_wall_fallback(reason)),
+        }
+    }
+
+    fn total_cpu_wall_fallback(&mut self, reason: String) -> TotalCpuBound {
+        self.total_cpu_fallback = Some(reason.clone());
+        TotalCpuBound::WallBackstopOnly(reason)
+    }
+
+    /// Whether a fresh command cgroup can be created and removed under
+    /// this process's cgroup: `Ok(None)` when it can, `Ok(Some(reason))`
+    /// when creation or open proves accounting unavailable, and an
+    /// ordinary error for anything else (including a failed remove).
+    fn probe_cpu_accounting(&self) -> Result<Option<String>> {
+        let parent = match self.cgroup_parent() {
+            Ok(parent) => parent,
+            Err(error) => return Ok(Some(error)),
+        };
+        match CommandCgroup::create(&parent) {
+            Ok(cgroup) => {
+                cgroup.remove()?;
+                Ok(None)
+            }
+            Err(CgroupCreateError::Unavailable(reason)) => Ok(Some(reason)),
+            Err(CgroupCreateError::Other(error)) => Err(error),
+        }
+    }
+
+    /// Aggregate CPU at the last command boundary: accounted child CPU,
+    /// joined reader-thread CPU, and the creating thread's CPU delta
+    /// since the budget was created.
+    pub fn total_cpu_used(&self) -> Duration {
+        self.total_cpu_used
+    }
+
+    /// The one formatter for every bound refusal's detail. It names the
+    /// bound that tripped, total CPU against its budget (or the command
+    /// CPU where no total is set, or why accounting fell back to wall),
+    /// and run wall against the backstop. Call sites prefix the program.
+    fn bound_failure(
+        &self,
+        bound: &str,
+        command_cpu: Option<(Duration, Duration)>,
+        command_wall: Duration,
+    ) -> String {
+        let command_phrase = command_cpu.map(|(used, budget)| {
+            format!(
+                "command CPU {:.2} of {:.2} CPU-s",
+                used.as_secs_f64(),
+                budget.as_secs_f64()
+            )
+        });
+        let total_phrase = self.total_cpu_budget.as_ref().map(|budget| {
+            format!(
+                "total CPU {:.2} of {:.2} CPU-s across Runner-accounted child \
+                 commands plus this producer's own threads since the budget was created",
+                self.total_cpu_used.as_secs_f64(),
+                budget.budget().as_secs_f64()
+            )
+        });
+        let cpu = if let Some(reason) = &self.total_cpu_fallback {
+            format!("CPU accounting unavailable: {reason}; CPU unbounded")
+        } else if bound != "producer total CPU" && bound != "producer wall" {
+            match command_phrase {
+                Some(phrase) => phrase,
+                None => match total_phrase {
+                    Some(phrase) => phrase,
+                    None => "CPU unbounded".to_owned(),
+                },
+            }
+        } else if let Some(phrase) = total_phrase {
+            phrase
+        } else if let Some(phrase) = command_phrase {
+            phrase
+        } else {
+            "CPU unbounded".to_owned()
+        };
+        format!(
+            "{bound} bound tripped ({cpu}; wall {:.2} s of {} s backstop; \
+             command wall {:.2} s)",
+            self.started.elapsed().as_secs_f64(),
+            self.wall_budget.as_secs(),
+            command_wall.as_secs_f64()
+        )
+    }
+
     fn run_with_combined_limit(
         &mut self,
         program: &str,
@@ -484,17 +795,50 @@ impl Runner {
             combined_limit != Some(0),
             "command aggregate byte limit must be positive",
         )?;
+        if let Some(total) = &self.total_cpu_budget {
+            self.total_cpu_used = total.used()?;
+        }
         require(
             Instant::now() < self.deadline,
             format!(
-                "producer wall deadline exhausted ({} s wall backstop for this producer run)",
-                self.wall_budget.as_secs()
+                "{program} not started: {}",
+                self.bound_failure(
+                    "producer wall",
+                    cpu_budget.map(|b| (Duration::ZERO, b)),
+                    Duration::ZERO
+                )
             ),
         )?;
+        // An aggregate budget caps this command at its remainder (or the
+        // command's own smaller budget) and refuses to start spent. The
+        // aggregate read at this start includes the producer's own
+        // threads' CPU since the budget was created.
+        let (cpu_budget, total_binding) = match (cpu_budget, &self.total_cpu_budget) {
+            (own, Some(total)) => {
+                let budget = total.budget();
+                require(
+                    self.total_cpu_used < budget,
+                    format!(
+                        "{program} not started: producer total CPU budget exhausted ({})",
+                        self.bound_failure(
+                            "producer total CPU",
+                            own.map(|b| (Duration::ZERO, b)),
+                            Duration::ZERO
+                        )
+                    ),
+                )?;
+                let remaining = budget - self.total_cpu_used;
+                match own {
+                    Some(own) if own < remaining => (Some(own), false),
+                    _ => (Some(remaining), true),
+                }
+            }
+            (own, None) => (own, false),
+        };
         let cgroup = match cpu_budget {
             Some(_) => Some(
                 self.cgroup_parent()
-                    .and_then(|parent| CommandCgroup::create(&parent))
+                    .and_then(|parent| CommandCgroup::create(&parent).map_err(|e| e.into_string()))
                     .map_err(|e| {
                         format!("{program} not started: producer CPU accounting unavailable: {e}")
                     })?,
@@ -594,15 +938,18 @@ impl Runner {
             let combined_bytes = Arc::clone(&combined_bytes);
             let stop_reading = Arc::clone(&stop_reading);
             let cap = self.max_stream_bytes;
-            readers.push(thread::spawn(move || -> Result<Vec<u8>> {
-                read_child_stream(
+            readers.push(thread::spawn(move || -> Result<(Vec<u8>, Duration)> {
+                let thread_start = producer_thread_cpu()?;
+                let bytes = read_child_stream(
                     &mut *pipe,
                     &stop_reading,
                     &overflow,
                     &combined_bytes,
                     combined_limit,
                     cap,
-                )
+                )?;
+                let thread_used = producer_thread_cpu()?.saturating_sub(thread_start);
+                Ok((bytes, thread_used))
             }));
         }
         let mut bounds_failure: Option<String> = None;
@@ -624,7 +971,7 @@ impl Runner {
                     Err(e) => accounting_failure = Some(e),
                 }
             }
-            let cpu_exceeded = cpu_used.is_some_and(|(used, budget)| used >= budget);
+            let cpu_exceeded = cpu_used.is_some_and(|(used, budget)| used > budget);
             if killed_at.is_none()
                 && (overflow.load(Ordering::Acquire)
                     || accounting_failure.is_some()
@@ -637,17 +984,14 @@ impl Runner {
                 } else if let Some(e) = accounting_failure {
                     format!("killed: producer CPU accounting failed ({e})")
                 } else if let Some((used, budget)) = cpu_used.filter(|_| cpu_exceeded) {
-                    cpu_budget_failure(used, budget, wall)
+                    if total_binding {
+                        self.total_cpu_used += used;
+                        self.bound_failure("producer total CPU", Some((used, budget)), wall)
+                    } else {
+                        self.bound_failure("producer CPU", Some((used, budget)), wall)
+                    }
                 } else {
-                    let cpu = cpu_used
-                        .map(|(used, _)| format!(", CPU used {:.2} CPU-s", used.as_secs_f64()))
-                        .unwrap_or_default();
-                    format!(
-                        "exceeded the producer wall deadline ({} s wall backstop for this \
-                         producer run; command wall {:.2} s{cpu})",
-                        self.wall_budget.as_secs(),
-                        wall.as_secs_f64()
-                    )
+                    self.bound_failure("producer wall", cpu_used, wall)
                 });
                 if let Some(e) = kill_command(&cgroup) {
                     bounds_failure = Some(format!(
@@ -698,14 +1042,15 @@ impl Runner {
             thread::sleep(Duration::from_millis(50));
         };
         stop_reading.store(true, Ordering::Release);
-        let stdout = readers
+        let (stdout, stdout_reader_cpu) = readers
             .remove(0)
             .join()
             .map_err(|_| "stdout reader panicked")??;
-        let stderr = readers
+        let (stderr, stderr_reader_cpu) = readers
             .remove(0)
             .join()
             .map_err(|_| "stderr reader panicked")??;
+        let reader_cpu = stdout_reader_cpu + stderr_reader_cpu;
         if overflow.load(Ordering::Acquire) {
             bounds_failure = Some(format!("exceeded {byte_limit_description}"));
         }
@@ -722,13 +1067,46 @@ impl Runner {
             },
             None => None,
         };
+        if let Some(total) = &self.total_cpu_budget {
+            match total.add_child(measured_cpu.unwrap_or(Duration::ZERO)) {
+                Ok(aggregate) => self.total_cpu_used = aggregate,
+                Err(error) => {
+                    bounds_failure.get_or_insert(error);
+                }
+            }
+            match total.add_reader(reader_cpu) {
+                Ok(aggregate) => self.total_cpu_used = aggregate,
+                Err(error) => {
+                    bounds_failure.get_or_insert(error);
+                }
+            }
+        }
+        if bounds_failure.is_none() {
+            if let Some(total) = &self.total_cpu_budget {
+                if self.total_cpu_used > total.budget() {
+                    bounds_failure = Some(self.bound_failure(
+                        "producer total CPU",
+                        cpu_budget.zip(measured_cpu).map(|(b, u)| (u, b)),
+                        start.elapsed(),
+                    ));
+                }
+            }
+        }
         // A command that passed its budget and finished within one poll still
         // exceeded it.
         // (A guard rather than a nested `if`: this file is also built as
         // edition 2024, where clippy asks for a let chain edition 2021 lacks.)
         match (&bounds_failure, measured_cpu, cpu_budget) {
             (None, Some(used), Some(budget)) if used > budget => {
-                bounds_failure = Some(cpu_budget_failure(used, budget, start.elapsed()));
+                bounds_failure = Some(self.bound_failure(
+                    if total_binding {
+                        "producer total CPU"
+                    } else {
+                        "producer CPU"
+                    },
+                    Some((used, budget)),
+                    start.elapsed(),
+                ));
             }
             _ => {}
         }
@@ -836,15 +1214,6 @@ struct CommandCgroup {
     reads: std::cell::Cell<u64>,
 }
 
-fn cpu_budget_failure(used: Duration, budget: Duration, wall: Duration) -> String {
-    format!(
-        "exceeded the producer CPU budget (used {:.2} of {:.2} CPU-s, command wall {:.2} s)",
-        used.as_secs_f64(),
-        budget.as_secs_f64(),
-        wall.as_secs_f64()
-    )
-}
-
 #[cfg(test)]
 thread_local! {
     /// `read_at` operations and bytes performed through `field` on this
@@ -854,40 +1223,66 @@ thread_local! {
     static FIELD_READ_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+/// Why creating a command cgroup failed. Callers deciding on a
+/// wall-only fallback match on this type, never on message text.
+#[derive(Debug)]
+enum CgroupCreateError {
+    /// Creation or open proved CPU accounting unavailable here.
+    Unavailable(String),
+    /// Any other failure; accounting may well exist.
+    Other(String),
+}
+
+impl CgroupCreateError {
+    fn into_string(self) -> String {
+        match self {
+            CgroupCreateError::Unavailable(message) | CgroupCreateError::Other(message) => message,
+        }
+    }
+}
+
 impl CommandCgroup {
-    fn create(parent: &Path) -> Result<Self> {
+    fn create(parent: &Path) -> std::result::Result<Self, CgroupCreateError> {
+        use CgroupCreateError::Other;
+        use CgroupCreateError::Unavailable;
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let directory = fs::File::open(parent)
-            .map_err(|e| format!("cannot open cgroup {}: {e}", parent.display()))?;
+            .map_err(|e| Unavailable(format!("cannot open cgroup {}: {e}", parent.display())))?;
         // SAFETY: an all-zero statfs is a valid output buffer for fstatfs.
         let mut filesystem: libc::statfs = unsafe { std::mem::zeroed() };
         // SAFETY: `directory` is an open descriptor and `filesystem` is writable.
         if unsafe { libc::fstatfs(directory.as_raw_fd(), &mut filesystem) } != 0 {
-            return Err(format!(
+            return Err(Unavailable(format!(
                 "cannot inspect {}: {}",
                 parent.display(),
                 std::io::Error::last_os_error()
-            ));
+            )));
         }
         const CGROUP2_SUPER_MAGIC: libc::c_long = 0x6367_7270;
-        require(
-            filesystem.f_type == CGROUP2_SUPER_MAGIC,
-            format!("{} is not a cgroup v2 directory", parent.display()),
-        )?;
+        if filesystem.f_type != CGROUP2_SUPER_MAGIC {
+            return Err(Unavailable(format!(
+                "{} is not a cgroup v2 directory",
+                parent.display()
+            )));
+        }
         let path = parent.join(format!(
             "reverie-producer-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        fs::create_dir(&path)
-            .map_err(|e| format!("cannot create command cgroup {}: {e}", path.display()))?;
-        let opened = (|| {
+        fs::create_dir(&path).map_err(|e| {
+            Unavailable(format!(
+                "cannot create command cgroup {}: {e}",
+                path.display()
+            ))
+        })?;
+        let opened = (|| -> std::result::Result<Self, CgroupCreateError> {
             let open = |name: &str, write: bool| {
                 OpenOptions::new()
                     .read(!write)
                     .write(write)
                     .open(path.join(name))
-                    .map_err(|e| format!("cannot open {}/{name}: {e}", path.display()))
+                    .map_err(|e| Unavailable(format!("cannot open {}/{name}: {e}", path.display())))
             };
             let cgroup = Self {
                 path: path.clone(),
@@ -899,10 +1294,11 @@ impl CommandCgroup {
                 #[cfg(test)]
                 reads: std::cell::Cell::new(0),
             };
-            require(
-                cgroup.usage()?.is_zero() && !cgroup.populated()?,
-                "fresh command cgroup is not empty",
-            )?;
+            let empty =
+                cgroup.usage().map_err(Other)?.is_zero() && !cgroup.populated().map_err(Other)?;
+            if !empty {
+                return Err(Other("fresh command cgroup is not empty".to_owned()));
+            }
             Ok(cgroup)
         })();
         opened.inspect_err(|_| {
@@ -82138,7 +82534,7 @@ mod runner_cpu_budget_tests {
                 .expect_err(shape);
             let wall = started.elapsed();
             assert!(
-                error.contains("stopped: exceeded the producer CPU budget (used "),
+                error.contains("stopped: producer CPU bound tripped (command CPU "),
                 "{shape}: {error}"
             );
             let used = runner.command_cpu.last().copied().flatten().unwrap();
@@ -82179,10 +82575,8 @@ mod runner_cpu_budget_tests {
             )
             .unwrap_err();
         assert!(
-            error.contains(
-                "stopped: exceeded the producer wall deadline (1 s wall backstop for this \
-                 producer run; command wall "
-            ) && error.contains(", CPU used "),
+            error.contains("stopped: producer wall bound tripped (command CPU ")
+                && error.contains("of 1 s backstop; command wall "),
             "{error}"
         );
         // The backstop fired at the budget (the error's command wall), and
@@ -82208,10 +82602,490 @@ mod runner_cpu_budget_tests {
             .run_cpu_bounded("/bin/true", &[], &scratch.0, Duration::from_secs(60))
             .unwrap_err();
         assert!(
-            exhausted.contains("producer wall deadline exhausted (1 s wall backstop"),
+            exhausted.contains("/bin/true not started: producer wall bound tripped (command CPU "),
             "{exhausted}"
         );
         assert_own_cgroups_removed(&runner, 1);
+    }
+
+    #[test]
+    fn total_cpu_budget_bounds_aggregate_not_wall() {
+        // Isolate producer-self CPU from the other tests sharing this
+        // process; child CPU below is real cgroup accounting.
+        set_producer_thread_cpu_for_test(Some(Duration::ZERO));
+        let scratch = Scratch::new("totalcpu");
+        // Slow wall, negligible CPU: a 2 s sleep passes a CPU budget
+        // smaller than its own wall time, where a tight wall-only
+        // deadline (the test above) refuses a sleep.
+        let mut runner = Runner::new(
+            scratch.0.join("slow-logs"),
+            Duration::from_secs(30),
+            1 << 20,
+        )
+        .unwrap();
+        runner.bound_total_cpu(Duration::from_millis(500)).unwrap();
+        runner
+            .run("/bin/sh", &sh("sleep 2"), &scratch.0)
+            .expect("a low-CPU sleep must not be refused for its wall time");
+        assert!(
+            runner.total_cpu_used() < Duration::from_millis(500),
+            "a sleep used {:?} of aggregate CPU",
+            runner.total_cpu_used()
+        );
+        assert_own_cgroups_removed(&runner, 1);
+
+        // Later commands are capped at what earlier usage left: a first
+        // command capped at 1 s of a shared 3 s budget, plus 1 s of
+        // producer-thread work, leaves the next command about 1 s of
+        // its own CPU before the aggregate trips.
+        let mut runner = Runner::new(
+            scratch.0.join("busy-logs"),
+            Duration::from_secs(60),
+            1 << 20,
+        )
+        .unwrap();
+        runner.bound_total_cpu(Duration::from_secs(3)).unwrap();
+        let first = runner
+            .run_cpu_bounded(
+                "/bin/sh",
+                &sh("while :; do :; done"),
+                &scratch.0,
+                Duration::from_secs(1),
+            )
+            .unwrap_err();
+        assert!(
+            first.contains("stopped: producer CPU bound tripped (command CPU "),
+            "{first}"
+        );
+        let after_first = runner.total_cpu_used();
+        assert!(
+            after_first >= Duration::from_secs(1),
+            "first command left aggregate at {after_first:?}"
+        );
+        // Producer-thread work between commands counts too.
+        set_producer_thread_cpu_for_test(Some(Duration::from_secs(1)));
+        let second = runner
+            .run("/bin/sh", &sh("while :; do :; done"), &scratch.0)
+            .unwrap_err();
+        assert!(
+            second.contains("stopped: producer total CPU bound tripped (total CPU ")
+                && second.contains("of 3.00 CPU-s"),
+            "{second}"
+        );
+        let second_own = runner.command_cpu.last().copied().flatten().unwrap();
+        // The remainder the second command was capped at, derived from
+        // the measured aggregate after the first command (3 s budget
+        // minus that aggregate minus the 1 s of producer-thread work
+        // injected above), so a load-driven overshoot of the first
+        // command moves the window instead of breaking it.
+        assert!(
+            after_first < Duration::from_secs(2),
+            "first command overshot its 1 s cap to {after_first:?}"
+        );
+        let remainder = Duration::from_secs(3) - after_first - Duration::from_secs(1);
+        assert!(
+            second_own >= remainder.mul_f64(0.8)
+                && second_own < remainder + Duration::from_millis(400),
+            "second command used {second_own:?}, not near the {remainder:?} remainder"
+        );
+        // The spent budget refuses the next command before it starts.
+        let spent = runner.run("/bin/true", &[], &scratch.0).unwrap_err();
+        assert!(
+            spent.contains("/bin/true not started: producer total CPU budget exhausted ("),
+            "{spent}"
+        );
+        assert_own_cgroups_removed(&runner, 2);
+
+        // A command's own budget below the aggregate remainder trips as
+        // a command bound, not as the aggregate.
+        set_producer_thread_cpu_for_test(Some(Duration::ZERO));
+        let mut runner =
+            Runner::new(scratch.0.join("own-logs"), Duration::from_secs(60), 1 << 20).unwrap();
+        runner.bound_total_cpu(Duration::from_secs(10)).unwrap();
+        let own = runner
+            .run_cpu_bounded(
+                "/bin/sh",
+                &sh("while :; do :; done"),
+                &scratch.0,
+                Duration::from_millis(200),
+            )
+            .unwrap_err();
+        assert!(
+            own.contains("stopped: producer CPU bound tripped (command CPU "),
+            "{own}"
+        );
+        assert_own_cgroups_removed(&runner, 1);
+
+        // A hang with a total budget set is still stopped by the wall
+        // backstop, named through the same formatter.
+        set_producer_thread_cpu_for_test(Some(Duration::ZERO));
+        let mut runner =
+            Runner::new(scratch.0.join("hang-logs"), Duration::from_secs(1), 1 << 20).unwrap();
+        runner.bound_total_cpu(Duration::from_secs(60)).unwrap();
+        let hang = runner
+            .run("/bin/sh", &sh("sleep 30"), &scratch.0)
+            .unwrap_err();
+        assert!(
+            hang.contains("stopped: producer wall bound tripped (total CPU ")
+                && hang.contains("of 60.00 CPU-s")
+                && hang.contains("of 1 s backstop"),
+            "{hang}"
+        );
+        assert_own_cgroups_removed(&runner, 1);
+        set_producer_thread_cpu_for_test(None);
+    }
+
+    #[test]
+    fn total_cpu_fallback_runs_unaccounted_under_wall_only() {
+        let scratch = Scratch::new("totalfallback");
+        let mut runner =
+            Runner::new(scratch.0.join("logs"), Duration::from_secs(60), 1 << 20).unwrap();
+        // A plain directory is not a cgroup: accounting is unavailable.
+        runner.cgroup_parent = Some(scratch.0.clone());
+        let bound = runner
+            .bound_total_cpu_or_wall_backstop(Duration::from_secs(20))
+            .unwrap();
+        assert!(
+            matches!(&bound, TotalCpuBound::WallBackstopOnly(reason) if reason.contains("is not a cgroup v2 directory")),
+            "{bound:?}"
+        );
+        // The same Runner still runs commands under the wall alone.
+        assert_eq!(
+            runner
+                .text("/bin/sh", &["-c", "echo ok"], &scratch.0)
+                .unwrap(),
+            "ok\n"
+        );
+        assert!(runner.created_cgroups.is_empty());
+    }
+
+    #[test]
+    fn total_cpu_budget_is_shared_across_runners() {
+        set_producer_thread_cpu_for_test(Some(Duration::ZERO));
+        let scratch = Scratch::new("totalshared");
+        let budget = ProducerCpuBudget::new(Duration::from_millis(600)).unwrap();
+        let mut first = Runner::new(
+            scratch.0.join("first-logs"),
+            Duration::from_secs(60),
+            1 << 20,
+        )
+        .unwrap();
+        first.bound_shared_total_cpu(budget.clone()).unwrap();
+        let _ = first
+            .run_cpu_bounded(
+                "/bin/sh",
+                &sh("while :; do :; done"),
+                &scratch.0,
+                Duration::from_millis(250),
+            )
+            .unwrap_err();
+        // The second Runner sees the first Runner's child CPU through
+        // the shared budget and is capped at what remains.
+        let mut second = Runner::new(
+            scratch.0.join("second-logs"),
+            Duration::from_secs(60),
+            1 << 20,
+        )
+        .unwrap();
+        second.bound_shared_total_cpu(budget).unwrap();
+        assert!(
+            second.total_cpu_used() >= Duration::from_millis(250),
+            "shared aggregate at second Runner start: {:?}",
+            second.total_cpu_used()
+        );
+        let error = second
+            .run("/bin/sh", &sh("while :; do :; done"), &scratch.0)
+            .unwrap_err();
+        assert!(
+            error.contains("stopped: producer total CPU bound tripped (total CPU "),
+            "{error}"
+        );
+        // The second Runner's own command was capped at the shared
+        // remainder (600 ms budget minus the first Runner's >=250 ms),
+        // so its own CPU stays well under a fresh 600 ms budget; a
+        // per-Runner budget would let it reach ~600 ms and fail here.
+        let second_own = second.command_cpu.last().copied().flatten().unwrap();
+        assert!(
+            second_own < Duration::from_millis(500),
+            "second Runner command used {second_own:?}, not capped at the shared remainder"
+        );
+        assert!(
+            second.total_cpu_used() > Duration::from_millis(600)
+                && second.total_cpu_used() < Duration::from_millis(1000),
+            "shared aggregate after second Runner: {:?}",
+            second.total_cpu_used()
+        );
+        assert_own_cgroups_removed(&first, 1);
+        assert_own_cgroups_removed(&second, 1);
+        set_producer_thread_cpu_for_test(None);
+    }
+
+    #[test]
+    fn producer_thread_cpu_counts_this_threads_work() {
+        // The real getrusage(RUSAGE_THREAD) path, no override: CPU
+        // burned on this thread is a lower bound the budget must see.
+        set_producer_thread_cpu_for_test(None);
+        let budget = ProducerCpuBudget::new(Duration::from_secs(60)).unwrap();
+        let start = producer_thread_cpu().unwrap();
+        let wall = Instant::now();
+        while producer_thread_cpu().unwrap() - start < Duration::from_millis(50) {
+            assert!(
+                wall.elapsed() < Duration::from_secs(10),
+                "thread CPU did not advance"
+            );
+            std::hint::spin_loop();
+        }
+        assert!(
+            budget.used().unwrap() >= Duration::from_millis(50),
+            "budget used {:?} after burning 50 ms on this thread",
+            budget.used().unwrap()
+        );
+    }
+
+    #[test]
+    fn a_foreign_threads_cpu_does_not_count_against_the_budget() {
+        // getrusage(RUSAGE_THREAD) isolation, no override: a sibling
+        // thread burns CPU while this one sleeps; used() stays low.
+        // Under RUSAGE_SELF it would see the sibling's burn.
+        set_producer_thread_cpu_for_test(None);
+        let budget = ProducerCpuBudget::new(Duration::from_secs(60)).unwrap();
+        let burner = thread::spawn(|| {
+            let start = producer_thread_cpu().unwrap();
+            let wall = Instant::now();
+            while producer_thread_cpu().unwrap() - start < Duration::from_millis(100) {
+                assert!(
+                    wall.elapsed() < Duration::from_secs(10),
+                    "burner thread CPU did not advance"
+                );
+                std::hint::spin_loop();
+            }
+        });
+        burner.join().expect("burner thread panicked");
+        assert!(
+            budget.used().unwrap() < Duration::from_millis(50),
+            "budget used {:?} after a sibling thread burned 100 ms",
+            budget.used().unwrap()
+        );
+        // A budget created on a foreign thread is refused here by name.
+        let foreign = thread::spawn(|| ProducerCpuBudget::new(Duration::from_secs(60)))
+            .join()
+            .expect("creator thread panicked")
+            .unwrap();
+        let error = foreign.used().unwrap_err();
+        assert!(
+            error.contains("producer CPU budget used from a thread other than its creator"),
+            "{error}"
+        );
+    }
+
+    /// Writes a named skip past libtest output capture (fd 2
+    /// directly), so the counted runner reports it as skipped rather
+    /// than as a silent pass: the `REVERIE_SKIP:` line other Reverie
+    /// tests use. `test` must be the exact listed case name (the
+    /// gated runner matches it exactly, module path included); callers
+    /// pass this thread's libtest name. When skips are forbidden
+    /// (`REVERIE_FORBID_SKIPS=1`; nothing sets it in-tree yet, so
+    /// today this is the contract validation nodes opt into), the
+    /// same case fails by name instead.
+    fn report_skip_or_fail(test: &str, reason: &str, forbid_skips: bool) {
+        if forbid_skips {
+            panic!("{test} cannot run and REVERIE_FORBID_SKIPS forbids skips: {reason}");
+        }
+        let line = format!("\nREVERIE_SKIP: {test}: {reason}\n");
+        let mut rest = line.as_bytes();
+        while !rest.is_empty() {
+            // SAFETY: writing a borrowed byte slice to the stderr descriptor.
+            let written =
+                unsafe { libc::write(libc::STDERR_FILENO, rest.as_ptr().cast(), rest.len()) };
+            assert!(
+                written > 0,
+                "write the named skip for {test}: {}",
+                std::io::Error::last_os_error()
+            );
+            rest = &rest[written as usize..];
+        }
+    }
+
+    fn skips_forbidden() -> bool {
+        std::env::var_os("REVERIE_FORBID_SKIPS").is_some_and(|value| value == "1")
+    }
+
+    #[test]
+    #[should_panic(expected = "REVERIE_FORBID_SKIPS forbids skips")]
+    fn forbidden_skips_fail_by_name() {
+        report_skip_or_fail("forbidden_skips_fail_by_name", "test reason", true);
+    }
+
+    /// How the permission-denied test below gets a parent under
+    /// which creating a command cgroup is refused.
+    #[derive(Debug, PartialEq, Eq)]
+    enum DenialPlan {
+        /// This process's own cgroup: not writable by this process,
+        /// which is itself the real-world denial.
+        OwnCgroup,
+        /// A child of the own cgroup with cgroup.max.descendants = 0:
+        /// creation under it is refused even for root.
+        LimitedChild,
+        /// No cgroup v2 hierarchy at all: counted named skip.
+        SkipNoCgroupV2,
+        /// No cgroup v2 and skips forbidden: fail by name.
+        FailForbidden,
+    }
+
+    fn denial_plan(is_cgroup_v2: bool, own_writable: bool, forbid_skips: bool) -> DenialPlan {
+        match (is_cgroup_v2, own_writable, forbid_skips) {
+            (false, _, true) => DenialPlan::FailForbidden,
+            (false, _, false) => DenialPlan::SkipNoCgroupV2,
+            (true, false, _) => DenialPlan::OwnCgroup,
+            (true, true, _) => DenialPlan::LimitedChild,
+        }
+    }
+
+    #[test]
+    fn denial_plan_covers_every_host_shape() {
+        // No cgroup v2: skip, or fail by name where skips are forbidden.
+        assert_eq!(denial_plan(false, false, false), DenialPlan::SkipNoCgroupV2);
+        assert_eq!(denial_plan(false, true, false), DenialPlan::SkipNoCgroupV2);
+        assert_eq!(denial_plan(false, false, true), DenialPlan::FailForbidden);
+        assert_eq!(denial_plan(false, true, true), DenialPlan::FailForbidden);
+        // Unwritable own cgroup: the denial is direct, forbidden or not.
+        assert_eq!(denial_plan(true, false, false), DenialPlan::OwnCgroup);
+        assert_eq!(denial_plan(true, false, true), DenialPlan::OwnCgroup);
+        // Writable own cgroup (root, delegated subtree): manufacture
+        // the denial with a descendant limit — never a skip.
+        assert_eq!(denial_plan(true, true, false), DenialPlan::LimitedChild);
+        assert_eq!(denial_plan(true, true, true), DenialPlan::LimitedChild);
+    }
+
+    /// Removes the manufactured limited cgroup on drop, on every
+    /// path including panics. A failed removal panics by name when
+    /// the test is not already panicking, and prints the leaked path
+    /// when it is, so a leak into the host's real tree is never silent.
+    struct LimitedCgroup {
+        path: PathBuf,
+    }
+
+    impl Drop for LimitedCgroup {
+        fn drop(&mut self) {
+            if let Err(error) = fs::remove_dir(&self.path) {
+                if std::thread::panicking() {
+                    eprintln!(
+                        "leaked manufactured limited cgroup {}: {error}",
+                        self.path.display()
+                    );
+                } else {
+                    panic!(
+                        "remove manufactured limited cgroup {}: {error}",
+                        self.path.display()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_non_writable_cgroup_parent_falls_back_to_wall_only() {
+        // The real-world permission-denied path: the parent IS a real
+        // cgroup v2 directory (so the v2 check passes), but creating
+        // a child cgroup under it is refused. The parent is this
+        // process's OWN cgroup, where the Runner really creates its
+        // cgroups — never the host root. Where the own cgroup is not
+        // writable that is itself the denial; where it is writable
+        // (root, or a delegated subtree) a child with
+        // cgroup.max.descendants = 0 manufactures the same refusal,
+        // so this runs on every cgroup v2 host and never skips there.
+        // The only skip left is a host with no cgroup v2 at all.
+        let own = current_cgroup_directory().ok();
+        // SAFETY: an all-zero statfs is a valid output buffer for statfs.
+        let mut filesystem: libc::statfs = unsafe { std::mem::zeroed() };
+        let root_cstr = std::ffi::CString::new("/sys/fs/cgroup").unwrap();
+        // SAFETY: statfs reads the NUL-terminated path, writes the buffer.
+        let is_cgroup_v2 = own.is_some()
+            && unsafe { libc::statfs(root_cstr.as_ptr(), &mut filesystem) } == 0
+            && filesystem.f_type == 0x6367_7270;
+        let own_writable = own.as_ref().is_some_and(|own| {
+            let own_cstr = std::ffi::CString::new(own.as_os_str().as_encoded_bytes()).unwrap();
+            // SAFETY: faccessat reads the NUL-terminated path only.
+            // AT_EACCESS checks the effective uid, as mkdir will use.
+            let access = unsafe {
+                libc::faccessat(
+                    libc::AT_FDCWD,
+                    own_cstr.as_ptr(),
+                    libc::W_OK,
+                    libc::AT_EACCESS,
+                )
+            };
+            access == 0
+        });
+        let mut limited_child: Option<LimitedCgroup> = None;
+        let parent = match denial_plan(is_cgroup_v2, own_writable, skips_forbidden()) {
+            DenialPlan::OwnCgroup => own.clone().unwrap(),
+            DenialPlan::LimitedChild => {
+                let child = own
+                    .clone()
+                    .unwrap()
+                    .join(format!("reverie-test-limited-{}", std::process::id()));
+                fs::create_dir(&child).unwrap();
+                // Guard first, so even a panic in the write below
+                // cannot leak the child.
+                limited_child = Some(LimitedCgroup {
+                    path: child.clone(),
+                });
+                fs::write(child.join("cgroup.max.descendants"), "0").unwrap();
+                child
+            }
+            DenialPlan::SkipNoCgroupV2 | DenialPlan::FailForbidden => {
+                // The exact listed case name: the gated runner matches
+                // it exactly, module path included, and libtest names
+                // this thread by it in every binary that includes us.
+                let case = std::thread::current()
+                    .name()
+                    .unwrap_or("a_non_writable_cgroup_parent_falls_back_to_wall_only")
+                    .to_owned();
+                report_skip_or_fail(
+                    &case,
+                    "no cgroup v2 hierarchy at /sys/fs/cgroup on this host",
+                    skips_forbidden(),
+                );
+                return;
+            }
+        };
+        let scratch = Scratch::new("nonwritable");
+        let mut runner =
+            Runner::new(scratch.0.join("logs"), Duration::from_secs(60), 1 << 20).unwrap();
+        runner.cgroup_parent = Some(parent.clone());
+        let bound = runner
+            .bound_total_cpu_or_wall_backstop(Duration::from_secs(30))
+            .unwrap();
+        let output = runner
+            .run("/bin/sh", &sh("printf wall-only"), &scratch.0)
+            .unwrap();
+        // Settle `created` BEFORE the limited child goes: if the
+        // limit failed to refuse, it holds a live sub-cgroup whose
+        // presence would make removing the child fail with EBUSY and
+        // hide the real failure. Removing it first also keeps the
+        // guard's drop (end of scope, and on any panic above) able
+        // to succeed.
+        let created_is_unavailable = match CommandCgroup::create(&parent) {
+            Err(CgroupCreateError::Unavailable(_)) => true,
+            Err(CgroupCreateError::Other(error)) => {
+                panic!("expected typed Unavailable, got Other: {error}")
+            }
+            Ok(cgroup) => {
+                let _ = cgroup.remove();
+                false
+            }
+        };
+        assert!(
+            matches!(&bound, TotalCpuBound::WallBackstopOnly(_)),
+            "expected wall-only fallback, got {bound:?}"
+        );
+        assert_eq!(output, b"wall-only");
+        // The fallback carries a typed unavailable reason, not text.
+        assert!(created_is_unavailable, "expected typed Unavailable, got Ok");
+        // Explicit drop: a removal failure panics by name here rather
+        // than only printing on an unwinding path.
+        drop(limited_child);
     }
 
     #[test]
@@ -82263,7 +83137,7 @@ mod runner_cpu_budget_tests {
             .unwrap_err();
         let wall = started.elapsed();
         assert!(
-            error.contains("stopped: exceeded the producer CPU budget (used "),
+            error.contains("stopped: producer CPU bound tripped (command CPU "),
             "{error}"
         );
         let used = runner.command_cpu.last().copied().flatten().unwrap();
