@@ -1937,6 +1937,7 @@ fn wait_for_held_wait(event: &Event, before: usize, what: &str) {
 /// during it: a notify still in flight is not counted yet (see there).
 ///
 /// `while_waiting` runs on each poll that does not see such a park yet.
+#[cfg(not(sanitized))]
 fn wait_for_fresh_held_wait(
     event: &Event,
     before: usize,
