@@ -546,12 +546,32 @@ pub fn watch_hits_in_timer_steps() -> u64 {
     crate::task::WATCH_HITS_IN_TIMER_STEPS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The precise-timer drives this process paused at a gdb watch hit, so
+/// the run loop served that hit's gdb stop at the access rather than
+/// dropping the hit at drive completion (after which a later store
+/// would hit in free run with the same stop reply). Concurrent tests
+/// in one process share the count.
+pub fn watch_pauses_in_timer_steps() -> u64 {
+    crate::task::WATCH_PAUSES_IN_TIMER_STEPS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The stops at which this process read thread `tid`'s debug status for
 /// hardware watchpoint hits: its SIGTRAP stops while it has a watch armed.
 /// A thread with none pays nothing, so the count is the cost of keeping
 /// its watches.
 pub fn watch_status_reads(tid: Pid) -> u64 {
     crate::task::WATCH_STATUS_READS
+        .lock()
+        .unwrap()
+        .get(&tid)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// The gdb watch hits on thread `tid` whose SIGTRAP outcome may have
+/// changed the guest and was reported at the default log level.
+pub fn gdb_watch_may_have_changed(tid: Pid) -> u64 {
+    crate::task::GDB_WATCH_MAY_HAVE_CHANGED
         .lock()
         .unwrap()
         .get(&tid)

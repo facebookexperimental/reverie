@@ -17,6 +17,9 @@
  *
  * reverie_bkpt_scheduled, between the syscall and the loop, is passed once,
  * right after the request. reverie_bkpt_branch is passed on every iteration.
+ * The loop's first instruction also stores to reverie_timer_watched every
+ * iteration (reverie_timer_after_watch is right after it), for the tests
+ * that put a gdb watchpoint beside the timer event.
  *
  * A third argument picks where timed_loop() runs:
  * - `pair`: in the main thread, while a second thread first calls getppid,
@@ -31,11 +34,17 @@
  */
 
 #include <pthread.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+/* Stored to once per timed-loop iteration, for the watchpoint tests: a
+ * gdb watch on it is hit by the loop's first instruction each time
+ * around, with no conditional branch of its own. */
+volatile uint64_t reverie_timer_watched;
 
 static void* other(void* arg) {
   syscall(SYS_getppid);
@@ -60,6 +69,9 @@ __attribute__((noinline)) static void timed_loop(
       "  mov %[iterations], %%rcx\n"
       ".globl reverie_timer_loop\n"
       "reverie_timer_loop:\n"
+      "  incq reverie_timer_watched(%%rip)\n"
+      ".globl reverie_timer_after_watch\n"
+      "reverie_timer_after_watch:\n"
       "  dec %%rcx\n"
       ".globl reverie_bkpt_branch\n"
       "reverie_bkpt_branch:\n"

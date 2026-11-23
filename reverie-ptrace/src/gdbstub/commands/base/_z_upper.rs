@@ -15,7 +15,7 @@ use crate::gdbstub::hex::*;
 pub struct Z {
     pub ty: BreakpointType,
     pub addr: u64,
-    pub kind: u8,
+    pub kind: u64,
     // NB: conditional bkpt here?
 }
 impl ParseCommand for Z {

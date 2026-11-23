@@ -695,11 +695,14 @@ pub(super) fn debugger_requests(
     let stack = AddrMut::<u64>::from_raw(stack_address as usize).unwrap();
     let saved: u64 = task.read_value(stack).unwrap();
     let breakpoints = Mutex::new(HashMap::new());
+    let gdb_watch_specs = std::sync::Arc::new(crate::task::GdbWatchShared::default());
     let mut view = GdbTracee {
         task,
         breakpoints: &breakpoints,
         parked_registers: None,
         reserved_input: Some((control.clone(), identity)),
+        watches: None,
+        gdb_watch_specs: gdb_watch_specs.clone(),
     };
     {
         let mut request = |make: &dyn Fn(oneshot::Sender<Result<(), TraceError>>) -> GdbRequest| {
@@ -726,6 +729,7 @@ pub(super) fn debugger_requests(
                     Breakpoint {
                         ty: BreakpointType::Software,
                         addr: address,
+                        kind: 1,
                         bytecode: None
                     },
                     tx
@@ -739,6 +743,7 @@ pub(super) fn debugger_requests(
                 Breakpoint {
                     ty: BreakpointType::Software,
                     addr: layout.base,
+                    kind: 1,
                     bytecode: None
                 },
                 tx
@@ -766,6 +771,7 @@ pub(super) fn debugger_requests(
                 Breakpoint {
                     ty: BreakpointType::Software,
                     addr: stack_address,
+                    kind: 1,
                     bytecode: None,
                 },
                 tx,
@@ -777,12 +783,42 @@ pub(super) fn debugger_requests(
                 Breakpoint {
                     ty: BreakpointType::Software,
                     addr: stack_address,
+                    kind: 1,
                     bytecode: None,
                 },
                 tx,
             )
         })
         .unwrap();
+        // A view with no watch state set aside (a parked thread) still
+        // answers gdb's watchpoints through the shared list: set and
+        // remove both hold for the process, and no byte is written.
+        request(&|tx| {
+            GdbRequest::SetBreakpoint(
+                Breakpoint {
+                    ty: BreakpointType::WriteWatch,
+                    addr: stack_address,
+                    kind: 1,
+                    bytecode: None,
+                },
+                tx,
+            )
+        })
+        .unwrap();
+        assert_eq!(gdb_watch_specs.snapshot().1.len(), 1);
+        request(&|tx| {
+            GdbRequest::RemoveBreakpoint(
+                Breakpoint {
+                    ty: BreakpointType::WriteWatch,
+                    addr: stack_address,
+                    kind: 1,
+                    bytecode: None,
+                },
+                tx,
+            )
+        })
+        .unwrap();
+        assert!(gdb_watch_specs.snapshot().1.is_empty());
     }
     assert_eq!(view.task.read_value::<_, u64>(stack).unwrap(), saved);
     assert_eq!(
@@ -797,7 +833,7 @@ fn native_debugger_requests_protect_tagged_page_and_keep_ordinary_memory_working
     let (output, _) =
         run_page_control(Fault::Debugger, 0).expect("debugger guarded actual transport");
     assert_eq!(output.status, ExitStatus::Exited(0), "{output:?}");
-    assert_eq!(evidence().lock().unwrap().debugger_requests, 10);
+    assert_eq!(evidence().lock().unwrap().debugger_requests, 12);
 }
 
 #[derive(Default)]

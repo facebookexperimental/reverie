@@ -256,6 +256,31 @@ pub(super) fn check_reserved_input_write(
     Ok(())
 }
 
+/// A stopped thread's watch state, lent to the code answering gdb's
+/// requests so it can arm and disarm gdb's hardware watchpoints beside the
+/// Tool's. Gdb's list is the process's shared one: answering a `Z` or `z`
+/// here holds for every thread, which arms its own registers from the
+/// shared list (`TracedTask::sync_gdb_watches`).
+pub(super) struct GdbWatchArming<'a> {
+    /// The thread's armed set, shared by the Tool's and gdb's watches.
+    pub(super) set: &'a mut super::WatchSet,
+    /// The Tool's watches, which stay armed and keep their slots.
+    pub(super) tool: &'a mut Vec<reverie::WatchSpec>,
+    /// Gdb's watches as this thread last armed them.
+    pub(super) armed: &'a mut Vec<super::GdbWatch>,
+    /// This thread's unnamed gdb watch hit, cleared when its watch is
+    /// removed so no later stop can name it.
+    pub(super) pending: &'a mut Option<super::PendingGdbWatch>,
+    /// The shared list's generation `armed` was taken from.
+    pub(super) armed_gen: &'a mut u64,
+    /// The process's shared list of gdb's watches.
+    pub(super) shared: Arc<super::GdbWatchShared>,
+    /// Why arming a new gdb watch on this thread is refused for its
+    /// SIGTRAP state (`TracedTask::gdb_watch_refusal`), taken while it is
+    /// stopped, if it is. The state cannot change while it is stopped.
+    pub(super) refusal: Option<reverie::WatchError>,
+}
+
 pub(super) struct GdbTracee<'a> {
     pub(super) task: &'a mut Stopped,
     pub(super) breakpoints: &'a StdMutex<HashMap<u64, u64>>,
@@ -264,6 +289,15 @@ pub(super) struct GdbTracee<'a> {
         reverie::reserved_input::ReservedInputControl,
         reverie::reserved_input::InputTaskId,
     )>,
+    /// How gdb's watchpoints arm on this thread. `None` for a thread parked
+    /// inside a Tool callback (`ParkedForGdb`), which set no watch state
+    /// aside: its answers update the shared list only (`gdb_watch_specs`),
+    /// and every thread — this one at its next stop — reconciles its
+    /// registers from it. Arming here would need the Tool's watch state,
+    /// which the callback holds.
+    pub(super) watches: Option<GdbWatchArming<'a>>,
+    /// The process's shared gdb watch list, available parked or not.
+    pub(super) gdb_watch_specs: Arc<super::GdbWatchShared>,
 }
 
 fn lock_breakpoints(
@@ -274,6 +308,21 @@ fn lock_breakpoints(
         .expect("should not be poisoned: no code panics while holding it")
 }
 
+/// A failed watchpoint arming as the trace error gdb's request answers
+/// with; gdb names the errno when it reports that the watchpoint could not
+/// be set.
+fn watch_error(error: reverie::WatchError) -> TraceError {
+    TraceError::Errno(match error {
+        reverie::WatchError::Failed { errno, .. } => errno,
+        reverie::WatchError::Length { .. } | reverie::WatchError::Misaligned { .. } => {
+            Errno::EINVAL
+        }
+        reverie::WatchError::TooMany { .. } => Errno::ENOSPC,
+        reverie::WatchError::Unsupported => Errno::EOPNOTSUPP,
+        reverie::WatchError::SigtrapBlocked | reverie::WatchError::SigtrapIgnored => Errno::EBUSY,
+    })
+}
+
 impl GdbTracee<'_> {
     /// Answers one of gdb's requests.
     pub(super) fn answer(&mut self, request: GdbRequest) {
@@ -281,11 +330,15 @@ impl GdbTracee<'_> {
             GdbRequest::SetBreakpoint(bkpt, reply_tx) => {
                 if bkpt.ty == BreakpointType::Software {
                     let _ = reply_tx.send(self.add_breakpoint(bkpt.addr));
+                } else if bkpt.ty.is_watchpoint() {
+                    let _ = reply_tx.send(self.add_watchpoint(&bkpt));
                 }
             }
             GdbRequest::RemoveBreakpoint(bkpt, reply_tx) => {
                 if bkpt.ty == BreakpointType::Software {
                     let _ = reply_tx.send(self.remove_breakpoint(bkpt.addr));
+                } else if bkpt.ty.is_watchpoint() {
+                    let _ = reply_tx.send(self.remove_watchpoint(&bkpt));
                 }
             }
             GdbRequest::ReadInferiorMemory(addr, length, reply_tx) => {
@@ -306,6 +359,172 @@ impl GdbTracee<'_> {
     /// The software breakpoints of this task's address space.
     fn breakpoints(&self) -> std::sync::MutexGuard<'_, HashMap<u64, u64>> {
         lock_breakpoints(self.breakpoints)
+    }
+
+    /// The hardware watch of a `Z`/`z` watchpoint packet (`bkpt`'s kind is
+    /// how many bytes it watches).
+    fn gdb_watch(bkpt: &crate::gdbstub::Breakpoint) -> super::GdbWatch {
+        super::GdbWatch {
+            ty: bkpt.ty,
+            spec: reverie::WatchSpec {
+                addr: bkpt.addr,
+                // GDB sends the whole object length as `kind`, which can
+                // exceed what the hardware watches (or a byte); the check
+                // in arming refuses anything but 1, 2, 4 or 8, and 0 stands
+                // for the lengths that do not fit in a byte at all.
+                len: u8::try_from(bkpt.kind).unwrap_or(0),
+                kind: match bkpt.ty {
+                    BreakpointType::WriteWatch => reverie::WatchKind::Write,
+                    _ => reverie::WatchKind::ReadWrite,
+                },
+                backtraces: 0,
+            },
+        }
+    }
+
+    /// The shared gdb list, cloned out of its lock.
+    fn shared_watches(&self) -> Vec<super::GdbWatch> {
+        self.gdb_watch_specs.snapshot().1
+    }
+
+    /// Commits `candidate` to the shared list from a parked thread, which
+    /// cannot arm its own registers here (the callback holds its watch
+    /// state): the candidate is checked on its own against this thread's
+    /// hardware, and every thread reconciles from the list before it runs
+    /// again. Slot contention with a thread's Tool watches is settled at
+    /// that thread's reconcile, which keeps its old watches and says so.
+    fn apply_parked(&mut self, candidate: Vec<super::GdbWatch>) -> Result<(), TraceError> {
+        let specs: Vec<reverie::WatchSpec> = candidate.iter().map(|watch| watch.spec).collect();
+        super::WatchSet::check::<super::WatchArch>(self.task, &specs).map_err(watch_error)?;
+        // A parked answer commits the shared list for every thread, this
+        // one included at its next stop: a candidate that newly arms a
+        // watch this thread's own reconcile would refuse for its live
+        // SIGTRAP state is refused here too, rather than answering OK
+        // for a watch this thread will never arm. A removal is never
+        // refused.
+        let current = self.shared_watches();
+        let newly_arms = candidate
+            .iter()
+            .any(|watch| !current.iter().any(|held| super::same_watch(&held.spec, &watch.spec)));
+        if newly_arms
+            && let Some(refusal) = super::gdb_watch_live_refusal(self.task, false)
+        {
+            return Err(watch_error(refusal));
+        }
+        self.gdb_watch_specs.replace(candidate);
+        Ok(())
+    }
+
+    /// Arms the hardware watchpoint gdb asked for (`Z2`/`Z3`/`Z4`) in the
+    /// process's shared list and on this thread, beside the Tool's watches.
+    /// Other threads take it up as they leave their gdb stops
+    /// (`TracedTask::sync_gdb_watches`); a new thread arms it at birth.
+    /// Setting the same watchpoint again leaves it as it is, as `Z`
+    /// requires, but still arms it here if this thread has not yet.
+    fn add_watchpoint(&mut self, bkpt: &crate::gdbstub::Breakpoint) -> Result<(), TraceError> {
+        let watch = Self::gdb_watch(bkpt);
+        let mut candidate = self.shared_watches();
+        if !candidate.contains(&watch) {
+            // One hardware watch per (address, length, kind): a later type
+            // for it replaces the earlier reply field, not the watch.
+            candidate.retain(|held| !super::same_watch(&held.spec, &watch.spec));
+            candidate.push(watch);
+        }
+        if self.watches.is_some() {
+            self.apply_gdb_watches(candidate)
+        } else {
+            self.apply_parked(candidate)
+        }
+    }
+
+    /// Disarms the hardware watchpoint gdb set before (`z2`/`z3`/`z4`),
+    /// for the whole process, whichever thread answers: the shared list is
+    /// the one list. Removing one that is not set leaves it as it is.
+    fn remove_watchpoint(&mut self, bkpt: &crate::gdbstub::Breakpoint) -> Result<(), TraceError> {
+        let watch = Self::gdb_watch(bkpt);
+        let mut candidate = self.shared_watches();
+        candidate.retain(|held| !super::same_watch(&held.spec, &watch.spec));
+        let sibling_stays_armed = candidate
+            .iter()
+            .any(|held| held.ty == bkpt.ty && held.spec.addr == bkpt.addr);
+        let result = if self.watches.is_some() {
+            self.apply_gdb_watches(candidate)
+        } else {
+            self.apply_parked(candidate)
+        };
+        // A removed watch's unnamed hit names no later stop. (A parked
+        // answer cannot reach the thread's pending hit; its reconcile
+        // drops it by the shared list instead.)
+        if result.is_ok()
+            && let Some(arming) = self.watches.as_mut()
+            && arming
+                .pending
+                .is_some_and(|(ty, addr, _)| ty == bkpt.ty && addr == bkpt.addr)
+        {
+            // The pending hit is keyed by type and address only: where
+            // an overlapping watch of the same type and address stays
+            // armed, this clear can drop that sibling's hit. It is
+            // dropped, never misnamed, and said so.
+            if sibling_stays_armed {
+                tracing::warn!(
+                    "[gdb] dropping a pending watch hit at {:#x} whose overlapping sibling watch stays armed",
+                    bkpt.addr
+                );
+            }
+            *arming.pending = None;
+        }
+        result
+    }
+
+    /// Makes `candidate` gdb's shared list and arms it on this thread
+    /// beside the Tool's watches. Nothing changes — not the shared list,
+    /// not this thread's registers — unless the arming here succeeds: a
+    /// refusal or an unwatchable request is reported with the old watches
+    /// still armed, and a failed arm restores them
+    /// (`arm_combined_or_restore`) before reporting, so an error reply
+    /// never leaves a watch listed but unarmed, or loses the other
+    /// owner's watches. Only if even the restore fails are this thread's
+    /// lists cut down to what its registers still hold; the shared list
+    /// still names what gdb asked for, for the other threads.
+    fn apply_gdb_watches(&mut self, candidate: Vec<super::GdbWatch>) -> Result<(), TraceError> {
+        let arming = self.watches.as_mut().ok_or(TraceError::Errno(Errno::EIO))?;
+        // Arming a watch this thread does not already hold is refused
+        // where a hit would irreparably change its SIGTRAP state
+        // (`TracedTask::gdb_watch_refusal`, taken for this stop); a
+        // removal is never refused.
+        let current = super::combined_watch_specs(arming.tool, arming.armed);
+        let next = super::combined_watch_specs(arming.tool, &candidate);
+        if super::arms_new_watch(&current, &next)
+            && let Some(refusal) = arming.refusal
+        {
+            return Err(watch_error(refusal));
+        }
+        let (set, result, restored) = super::arm_combined_or_restore(
+            self.task,
+            arming.set,
+            arming.tool,
+            arming.armed,
+            arming.tool,
+            &candidate,
+            // Gdb's change re-arms the Tool's watches; it is not the arming
+            // their stack budgets count from.
+            true,
+        );
+        *arming.set = set;
+        match result {
+            Ok(()) => {
+                *arming.armed = candidate.clone();
+                arming.shared.replace(candidate);
+                *arming.armed_gen = arming.shared.generation();
+                Ok(())
+            }
+            Err(error) => {
+                if !restored {
+                    super::prune_watch_lists(arming.set, arming.tool, arming.armed);
+                }
+                Err(watch_error(error))
+            }
+        }
     }
 
     fn add_breakpoint(&mut self, addr: u64) -> Result<(), TraceError> {
@@ -461,6 +680,9 @@ pub(super) struct ParkedForGdb {
     pub(super) regs: libc::user_regs_struct,
     pub(super) core_regs: CoreRegs,
     pub(super) breakpoints: Arc<StdMutex<HashMap<u64, u64>>>,
+    /// The process's shared gdb watch list, which a parked thread's
+    /// answers can update even though its own watch state is not set aside.
+    pub(super) gdb_watch_specs: Arc<super::GdbWatchShared>,
     pub(super) reserved_input: Option<(
         reverie::reserved_input::ReservedInputControl,
         reverie::reserved_input::InputTaskId,
@@ -609,6 +831,8 @@ impl ParkedForGdb {
                 breakpoints: &self.breakpoints,
                 parked_registers: Some(&self.core_regs),
                 reserved_input: self.reserved_input.clone(),
+                watches: None,
+                gdb_watch_specs: self.gdb_watch_specs.clone(),
             };
             let resumed =
                 serve_gdb_stop(&mut ports, Some(stop_tx), |request| tracee.answer(request)).await;

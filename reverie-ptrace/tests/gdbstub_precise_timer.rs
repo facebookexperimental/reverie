@@ -147,7 +147,16 @@ impl Tool for PreciseTimerTool {
 
     fn subscriptions(_cfg: &bool) -> Subscription {
         let mut s = Subscription::none();
-        s.syscalls([Sysno::clock_getres, Sysno::getppid, Sysno::getpid]);
+        // `rt_sigaction` lets the backend cache this Tool's own signal
+        // dispositions for its watch hits' records path. Gdb watchpoint
+        // arming itself reads the disposition live and needs no
+        // subscription.
+        s.syscalls([
+            Sysno::clock_getres,
+            Sysno::getppid,
+            Sysno::getpid,
+            Sysno::rt_sigaction,
+        ]);
         s
     }
 
@@ -203,6 +212,10 @@ struct TimerGuest {
     branch: u64,
     /// `reverie_bkpt_other`, passed once by the second thread.
     other: u64,
+    /// `reverie_timer_watched`, stored to once per loop iteration.
+    watched: u64,
+    /// `reverie_timer_after_watch`, right after that store.
+    after_watch: u64,
 }
 
 fn guest() -> &'static TimerGuest {
@@ -248,6 +261,8 @@ fn guest() -> &'static TimerGuest {
             loop_start: symbol("reverie_timer_loop"),
             branch: symbol("reverie_bkpt_branch"),
             other: symbol("reverie_bkpt_other"),
+            watched: symbol("reverie_timer_watched"),
+            after_watch: symbol("reverie_timer_after_watch"),
             path,
         }
     });
@@ -687,6 +702,103 @@ async fn a_breakpoint_in_an_unfollowed_fork_child_leaves_its_event_on_target() {
     )
     .await;
     assert_on_target(&log, rcbs, iterations);
+}
+
+/// A gdb watchpoint on the loop's store stops the guest while its precise
+/// event is still scheduled, far from its target. The watch stop must leave
+/// the event scheduled, as a breakpoint stop does: once gdb continues, the
+/// event is delivered at its target.
+#[tokio::test]
+async fn a_watchpoint_before_a_scheduled_event_leaves_it_on_target() {
+    ret_without_perf!();
+    let _owner = OVERSHOOTS.lock().await;
+    let _ = reverie::take_skid_overshoot_count();
+    let (rcbs, iterations) = (SCHEDULED_RCBS, 2 * SCHEDULED_RCBS);
+    let TimerGuest {
+        watched,
+        after_watch,
+        ..
+    } = *guest();
+    let log = run_guest(
+        rcbs,
+        iterations,
+        Mode::Single,
+        Some(|mut remote: Remote| async move {
+            assert_eq!(remote.request(&format!("Z2,{watched:x},8")).await, "OK");
+            let stop = remote.resume().await;
+            assert!(
+                stop.starts_with(&format!("T05watch:{watched:x};")),
+                "expected the loop's first store to stop for the watch, got {stop:?}"
+            );
+            assert_eq!(stop_rip(&stop), after_watch, "stopped away from the store");
+            assert_eq!(remote.request(&format!("z2,{watched:x},8")).await, "OK");
+            assert_exited_zero(&remote.resume().await);
+        }),
+    )
+    .await;
+    assert_on_target(&log, rcbs, iterations);
+}
+
+/// A gdb watchpoint hit inside the precise timer's single steps stops the
+/// stepping at the access and serves the gdb stop there; resuming from it
+/// as a disregarded stop then drives the event to its target, so the event
+/// is neither cancelled by the watch stop nor delivered late. Block steps
+/// are off, so the drive is instruction steps only, and the step counters
+/// prove the hit was taken among them (not in a free run or a block step).
+#[tokio::test]
+async fn a_watchpoint_among_the_timer_steps_leaves_the_event_on_target() {
+    ret_without_perf!();
+    let _owner = OVERSHOOTS.lock().await;
+    let _ = reverie::take_skid_overshoot_count();
+    reverie_ptrace::testing::set_block_steps(false);
+    let steps_before = reverie_ptrace::testing::precise_timer_steps();
+    let hits_before = reverie_ptrace::testing::watch_hits_in_timer_steps();
+    let pauses_before = reverie_ptrace::testing::watch_pauses_in_timer_steps();
+    let (rcbs, iterations) = (STEPPED_RCBS, 2 * STEPPED_RCBS);
+    let TimerGuest {
+        watched,
+        after_watch,
+        ..
+    } = *guest();
+    let log = run_guest(
+        rcbs,
+        iterations,
+        Mode::Single,
+        Some(|mut remote: Remote| async move {
+            assert_eq!(remote.request(&format!("Z2,{watched:x},8")).await, "OK");
+            let stop = remote.resume().await;
+            assert!(
+                stop.starts_with(&format!("T05watch:{watched:x};")),
+                "expected a store among the timer's steps to stop for the watch, got {stop:?}"
+            );
+            assert_eq!(stop_rip(&stop), after_watch, "stopped away from the store");
+            assert_eq!(remote.request(&format!("z2,{watched:x},8")).await, "OK");
+            assert_exited_zero(&remote.resume().await);
+        }),
+    )
+    .await;
+    reverie_ptrace::testing::set_block_steps(true);
+    assert_on_target(&log, rcbs, iterations);
+    let steps_after = reverie_ptrace::testing::precise_timer_steps();
+    assert_eq!(
+        steps_after.block, steps_before.block,
+        "with block steps off, the drive took no block step"
+    );
+    assert!(
+        steps_after.instruction > steps_before.instruction,
+        "the drive took instruction steps: {steps_before:?} -> {steps_after:?}"
+    );
+    assert!(
+        reverie_ptrace::testing::watch_hits_in_timer_steps() > hits_before,
+        "the watch hit was taken in the timer's steps"
+    );
+    // The collection counters alone cannot tell a Pause-served hit from
+    // one dropped at drive completion whose next store then hits in
+    // free run with the same stop reply; the pause counter can.
+    assert!(
+        reverie_ptrace::testing::watch_pauses_in_timer_steps() > pauses_before,
+        "the drive paused at the hit and served its gdb stop there"
+    );
 }
 
 /// A vfork child that gdb does not follow shares the parent's memory, and so

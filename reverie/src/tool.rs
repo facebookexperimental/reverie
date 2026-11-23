@@ -1473,9 +1473,10 @@ pub trait Tool: Send + Sync + Default {
     /// whose capabilities say it reports sigreturns
     /// ([`BackendCapabilities::reports_sigreturns`](crate::BackendCapabilities::reports_sigreturns))
     /// then reports each one, except those the capability names; the ptrace
-    /// backend stops at each guest `rt_sigreturn` only for such a Tool, and
-    /// not while its gdbserver is attached. The default wants none, so a
-    /// backend adds no stop.
+    /// backend stops at each guest `rt_sigreturn` for such a Tool, and in a
+    /// gdb session for its own signal records (without reporting them to a
+    /// Tool that does not ask). The default wants none reported, so a
+    /// backend adds no stop of its own outside a gdb session.
     fn observes_sigreturns(_config: &<Self::GlobalState as GlobalTool>::Config) -> bool {
         false
     }

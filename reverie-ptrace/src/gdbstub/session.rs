@@ -726,11 +726,23 @@ impl Session {
                     .map(|_| ResponseOk)
                     .write_response(writer);
             }
+            // Read watchpoints (`Z3`/`z3`) are not answered here or in `Z`
+            // below: x86 has no read-only hardware watch, and a native
+            // gdbserver leaves the type unsupported (an empty reply), on
+            // which GDB emulates `rwatch` with an access watchpoint and
+            // filters writes itself. Answering OK with a read-write watch
+            // would make GDB report writes as read hits.
             Base::z(bkpt) => {
-                if bkpt.ty == BreakpointType::Software {
+                if bkpt.ty == BreakpointType::Software
+                    || matches!(
+                        bkpt.ty,
+                        BreakpointType::WriteWatch | BreakpointType::AccessWatch
+                    )
+                {
                     let bkpt = Breakpoint {
-                        ty: BreakpointType::Software,
+                        ty: bkpt.ty,
                         addr: bkpt.addr,
+                        kind: bkpt.kind,
                         bytecode: None,
                     };
                     self.remove_breakpoint(bkpt)
@@ -740,10 +752,16 @@ impl Session {
                 }
             }
             Base::Z(bkpt) => {
-                if bkpt.ty == BreakpointType::Software {
+                if bkpt.ty == BreakpointType::Software
+                    || matches!(
+                        bkpt.ty,
+                        BreakpointType::WriteWatch | BreakpointType::AccessWatch
+                    )
+                {
                     let bkpt = Breakpoint {
-                        ty: BreakpointType::Software,
+                        ty: bkpt.ty,
                         addr: bkpt.addr,
+                        kind: bkpt.kind,
                         bytecode: None,
                     };
                     self.set_breakpoint(bkpt)
@@ -1064,14 +1082,9 @@ impl Session {
         Ok(reply_rx.await.map_err(|_| Error::GdbRequestRecvError)??)
     }
 
-    /// Set a breakpoint. must have an active inferior.
+    /// Set a breakpoint or watchpoint. must have an active inferior.
     async fn set_breakpoint(&self, bkpt: Breakpoint) -> Result<(), Error> {
         let request_tx = self.process_request_tx().await?;
-        let bkpt = Breakpoint {
-            ty: BreakpointType::Software,
-            addr: bkpt.addr,
-            bytecode: None,
-        };
         Self::ask(request_tx, |reply_tx| {
             GdbRequest::SetBreakpoint(bkpt, reply_tx)
         })
@@ -1080,11 +1093,6 @@ impl Session {
 
     async fn remove_breakpoint(&self, bkpt: Breakpoint) -> Result<(), Error> {
         let request_tx = self.process_request_tx().await?;
-        let bkpt = Breakpoint {
-            ty: BreakpointType::Software,
-            addr: bkpt.addr,
-            bytecode: None,
-        };
         Self::ask(request_tx, |reply_tx| {
             GdbRequest::RemoveBreakpoint(bkpt, reply_tx)
         })

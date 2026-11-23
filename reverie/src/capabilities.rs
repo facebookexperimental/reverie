@@ -385,6 +385,10 @@ pub struct BackendCapabilities {
     /// How many hardware watchpoints a guest thread can hold at once
     /// ([`Guest::set_watchpoints`](crate::Guest::set_watchpoints), see
     /// [`WatchSpec`](crate::WatchSpec)); 0 when the backend sets none.
+    /// The count is the thread's registers in all: where the backend
+    /// serves a debugger in the same registers, watches the debugger
+    /// holds occupy slots of it, so a Tool may fit fewer than this many
+    /// while a debugger is attached.
     /// Whether a hit can change a timer event is a per-thread fact,
     /// [`Guest::watch_hits_keep_timer_events`](crate::Guest::watch_hits_keep_timer_events).
     pub hardware_watchpoints: u8,

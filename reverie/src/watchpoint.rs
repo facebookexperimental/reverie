@@ -103,7 +103,10 @@ pub enum SigtrapAtHit {
     /// and no thread it does not trace shares the thread's signal-action
     /// table. It is also the answer where the hit's trap cannot be told
     /// from another trap of the same instruction, such as a single step the
-    /// guest asked for itself.
+    /// guest asked for itself, and for every hit on a thread where a
+    /// debugger the backend serves holds a watch of its own: what the
+    /// backend puts back for the debugger's hit is not claimed as known
+    /// to the Tool.
     Unknown,
 }
 
@@ -180,12 +183,16 @@ pub enum WatchError {
     /// [`BackendCapabilities::hardware_watchpoints`]: crate::BackendCapabilities::hardware_watchpoints
     #[error("this backend cannot set hardware watchpoints here")]
     Unsupported,
-    /// More watches than the thread has slots.
+    /// The request does not fit in the thread's hardware watchpoint
+    /// slots. `requested` counts only this call's watches: on a backend
+    /// whose debugger shares the thread's debug registers, watches the
+    /// debugger holds occupy the remaining slots, so `requested` can be
+    /// no more than `slots` and still not fit beside them.
     #[error("{requested} watches requested, and a thread has {slots} hardware watchpoints")]
     TooMany {
-        /// The watches requested.
+        /// The watches this call requested.
         requested: usize,
-        /// The thread's hardware watchpoints.
+        /// The thread's hardware watchpoints, in all.
         slots: u8,
     },
     /// A length the hardware cannot watch.
@@ -217,8 +224,11 @@ pub enum WatchError {
     )]
     SigtrapIgnored,
     /// Writing the thread's debug registers failed after it began. The
-    /// backend tried to disarm every watch of the thread; `disarmed` says
-    /// whether that took.
+    /// backend tried to disarm every watch of the thread, or to put back
+    /// the watches the thread held before (a Tool's and a debugger's
+    /// alike, where they share registers); `disarmed` says whether the
+    /// thread was left with no watch armed, so a restore that took
+    /// reports `false`.
     #[error(
         "setting the hardware watchpoints failed ({errno}); the thread's watches were disarmed: {disarmed}"
     )]

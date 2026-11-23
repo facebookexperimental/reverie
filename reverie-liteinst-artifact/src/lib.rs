@@ -2354,8 +2354,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 88] = [
     ),
     (
         "reverie/src/guest.rs",
-        110256,
-        "bc36728d33e68881868a2a450e3317d6a29bb838180287894dcfe6bcc0084bac",
+        111782,
+        "917155dfdb48fbf274034279acae8b46d9bd17c65a59bce3e95f7850cf6a31bf",
     ),
     (
         "reverie/src/pidfd_self.rs",
@@ -2424,8 +2424,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 88] = [
     ),
     (
         "reverie/src/tool.rs",
-        90715,
-        "ad286d81cf90fac13b4b377741f5e3fdc6e28c577a34ff4eea24480dab86fdc3",
+        90821,
+        "a01f3361fecbb93e230709842872250f4f998876c779a217e9b39d4083159a88",
     ),
 ];
 // Native Detcore's fixed-gate publication ordering is a separately declared
@@ -42428,6 +42428,16 @@ mod tests {
             54917,
             "93a27a389f3995ce27daae2fdd812c95e2eef77d343e9f8b511d92be1b901988",
         ),
+         (
+            "reverie/src/guest.rs",
+            111782,
+            "917155dfdb48fbf274034279acae8b46d9bd17c65a59bce3e95f7850cf6a31bf",
+        ),
+        (
+            "reverie/src/tool.rs",
+            90821,
+            "a01f3361fecbb93e230709842872250f4f998876c779a217e9b39d4083159a88",
+        ),
     ];
 
     /// Seals over prefixes of `CONTENT_REVERIE_CATALOG_BINDINGS`: (rows covered,
@@ -42529,6 +42539,14 @@ mod tests {
         (
             136,
             "2d1ca5b56429f8ec1a4ec9e3238dfaacf570ad3ab7fd89c9bd44d5e7c8438af0",
+        ),
+         (
+            137,
+            "671f9209f8febd2d2223d647f5f474242ae842e5c371be32e6c5b7c8d3441f5f",
+        ),
+        (
+            138,
+            "debdff30482aa7f6c4d133a5c666a581c89b6e9c5770e80e06014ccf255ed275",
         ),
     ];
 
@@ -44824,6 +44842,16 @@ mod tests {
                 "reverie-liteinst-artifact/src/preparation_identity.rs",
                 55154,
                 "ba2d1a6486e17762199053fa44e5f51ddd4b8da1a9c13e957ab331cca3234006",
+            ),
+            (
+                "reverie/src/guest.rs",
+                110256,
+                "bc36728d33e68881868a2a450e3317d6a29bb838180287894dcfe6bcc0084bac",
+            ),
+            (
+                "reverie/src/tool.rs",
+                90715,
+                "ad286d81cf90fac13b4b377741f5e3fdc6e28c577a34ff4eea24480dab86fdc3",
             ),
         ];
         // A re-bind records its previous tuple above, for every path, not only these.

@@ -97,8 +97,11 @@ pub(crate) enum SignalRun {
     /// Reverie traces, under the Tool's serialized-execution contract, and
     /// every stop of the receiving thread is followed by a `PTRACE_CONT` that
     /// records anew, so the action read at the trap is the delivery's
-    /// ([`SignalRun::resolve`]). On a table a thread Reverie does not trace may
-    /// use, it is not read at all.
+    /// ([`SignalRun::resolve`]). In a gdb session without that contract
+    /// the action instead comes from the record of the table's traced
+    /// `rt_sigaction`s, read after each ran, which a sibling rewriting
+    /// the guest's `act` since can have staled. On a table a thread
+    /// Reverie does not trace may use, it is not read at all.
     Delivered {
         signal: i32,
         blocked: bool,

@@ -1235,15 +1235,38 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
     /// none, and a successful `execve` disarms them, as Linux does. The
     /// backend refuses, changing nothing, more watches than
     /// [`BackendCapabilities::hardware_watchpoints`](crate::BackendCapabilities::hardware_watchpoints),
-    /// a length or alignment the hardware cannot watch, and, with any watch,
-    /// a thread that blocks or ignores SIGTRAP: Linux reports a hit by
-    /// forcing a SIGTRAP on the thread, which unblocks it and resets its
-    /// action to the default (`force_sig_info_to_task`). A thread can still
-    /// block or ignore SIGTRAP after its watches are armed; what its next hit
-    /// then changes, and what the backend puts back, is
-    /// [`WatchHit::sigtrap`](crate::WatchHit::sigtrap). A backend puts back
-    /// only what it knows, so a Tool that must not change the guest checks
-    /// each hit.
+    /// a length or alignment the hardware cannot watch, and any watch this
+    /// call newly arms on a thread that blocks or ignores SIGTRAP: Linux
+    /// reports a hit by forcing a SIGTRAP on the thread, which unblocks it
+    /// and resets its action to the default (`force_sig_info_to_task`).
+    /// Replacing the watches with a subset of them, or with none, is never
+    /// refused for that state — it arms nothing the thread does not already
+    /// hold. A thread can still block or ignore SIGTRAP after its watches
+    /// are armed; what its next hit then changes, and what the backend puts
+    /// back, is [`WatchHit::sigtrap`](crate::WatchHit::sigtrap). A backend
+    /// puts back only what it knows, so a Tool that must not change the
+    /// guest checks each hit.
+    ///
+    /// The thread's debug registers may be shared with a debugger the
+    /// backend serves (reverie-ptrace's GDB server): watches the debugger
+    /// sets occupy slots of the same registers, arm beside these — the
+    /// Tool's first, so a hit's `slot` keeps naming its place in `specs` —
+    /// and stay armed across this call. While the debugger holds a watch
+    /// on the thread, every hit's
+    /// [`WatchHit::sigtrap`](crate::WatchHit::sigtrap) is
+    /// [`SigtrapAtHit::Unknown`](crate::SigtrapAtHit::Unknown): the
+    /// backend repairs what a hit reset for the debugger's watches, but
+    /// does not claim that outcome as known to the Tool. A call can therefore be refused
+    /// with [`WatchError::TooMany`](crate::WatchError::TooMany) for a
+    /// request that alone would fit, when the debugger's watches hold the
+    /// remaining slots; the error names this call's count, not the
+    /// combined one. A failed arming that restores the watches both owners
+    /// had reports [`WatchError::Failed`](crate::WatchError::Failed) with
+    /// `disarmed` saying whether that restore left no watch armed (so
+    /// `false` exactly where it restored a nonempty set). Re-arming for
+    /// the debugger's change does not
+    /// refill a watch's stack budget (`WatchSpec::backtraces`); only this
+    /// call does.
     ///
     /// A thread that glibc's `pthread_create` starts runs with every signal
     /// blocked until its start code restores its mask with an

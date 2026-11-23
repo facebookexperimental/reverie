@@ -76,6 +76,41 @@ impl Tool for NoopTool {
     type ThreadState = ();
 }
 
+/// A Tool that subscribes to nothing: in a gdb session the backend's
+/// own signal-state tracing is then the only tracing of
+/// `rt_sigprocmask`/`rt_sigaction`.
+#[derive(Default)]
+struct NoneTool;
+
+#[reverie::tool]
+impl Tool for NoneTool {
+    type GlobalState = ();
+    type ThreadState = ();
+
+    fn subscriptions(_cfg: &()) -> reverie::Subscription {
+        reverie::Subscription::none()
+    }
+}
+
+/// A Tool that subscribes only to `rt_sigaction`, without serialized
+/// execution or sigreturn reports: the guest's installs reach the
+/// backend through the Tool's own handling, not the unsubscribed
+/// internal path.
+#[derive(Default)]
+struct SigactionOnlyTool;
+
+#[reverie::tool]
+impl Tool for SigactionOnlyTool {
+    type GlobalState = ();
+    type ThreadState = ();
+
+    fn subscriptions(_cfg: &()) -> reverie::Subscription {
+        let mut subscriptions = reverie::Subscription::none();
+        subscriptions.syscalls([Sysno::rt_sigaction]);
+        subscriptions
+    }
+}
+
 /// Compiles `tests/fixtures/<fixture>.c` with `cc -O0 -g -no-pie` and the
 /// extra `args`, and returns the guest's path and the addresses of `symbols`.
 fn build_guest(fixture: &str, args: &[&str], symbols: &[&str]) -> (PathBuf, Vec<u64>) {
@@ -865,6 +900,46 @@ fn watched_store_guest() -> &'static WatchedStoreGuest {
     &GUEST
 }
 
+/// The two-thread guest whose worker and main threads each store once to
+/// one word, built once: building the same guest in two tests at once
+/// races on its published path.
+struct WatchedThreadStoreGuest {
+    path: PathBuf,
+    _worker_store: u64,
+    after_worker: u64,
+    _main_store: u64,
+    after_main: u64,
+    word: u64,
+    before_release: u64,
+}
+
+fn watched_thread_store_guest() -> &'static WatchedThreadStoreGuest {
+    static GUEST: LazyLock<WatchedThreadStoreGuest> = LazyLock::new(|| {
+        let (path, addresses) = build_guest(
+            "gdbstub_watched_thread_store",
+            &["-pthread"],
+            &[
+                "reverie_worker_store",
+                "reverie_after_worker_store",
+                "reverie_main_store",
+                "reverie_after_main_store",
+                "reverie_watched",
+                "reverie_main_before_release",
+            ],
+        );
+        WatchedThreadStoreGuest {
+            path,
+            _worker_store: addresses[0],
+            after_worker: addresses[1],
+            _main_store: addresses[2],
+            after_main: addresses[3],
+            word: addresses[4],
+            before_release: addresses[5],
+        }
+    });
+    &GUEST
+}
+
 /// Waits until process `pid` has one thread left.
 async fn wait_for_one_thread(pid: u32) {
     for _ in 0..3000 {
@@ -1367,6 +1442,121 @@ where
     hits.0.into_inner().unwrap()
 }
 
+/// A Tool that keeps the backend's signal records (every syscall
+/// observed, sigreturns observed, serialized execution), as a
+/// record/replay Tool does, and arms one watch like `WatchStoreTool`.
+#[derive(Default)]
+struct ContractWatchTool;
+
+#[reverie::tool]
+impl Tool for ContractWatchTool {
+    type GlobalState = WatchHits;
+    type ThreadState = ();
+
+    fn subscriptions(_cfg: &u64) -> reverie::Subscription {
+        reverie::Subscription::all_syscalls()
+    }
+
+    fn observes_sigreturns(_cfg: &u64) -> bool {
+        true
+    }
+
+    fn enforces_serialized_execution(_cfg: &u64) -> bool {
+        true
+    }
+
+    async fn handle_post_exec<G: reverie::Guest<Self>>(
+        &self,
+        guest: &mut G,
+    ) -> Result<(), reverie::Errno> {
+        let addr = *guest.config();
+        guest
+            .set_watchpoints(&[reverie::WatchSpec {
+                addr,
+                len: 8,
+                kind: reverie::WatchKind::Write,
+                backtraces: 0,
+            }])
+            .expect("arm the watch");
+        Ok(())
+    }
+
+    async fn handle_syscall_event<G: reverie::Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Error> {
+        Ok(guest.inject(syscall).await?)
+    }
+}
+
+/// The guest that blocks SIGTRAP and then stores once, built once.
+fn watched_blocked_store_guest() -> &'static WatchedStoreGuest {
+    static GUEST: LazyLock<WatchedStoreGuest> = LazyLock::new(|| {
+        let (path, addresses) = build_guest(
+            "gdbstub_watched_blocked_store",
+            &[],
+            &[
+                "reverie_before_store",
+                "reverie_store",
+                "reverie_after_store",
+                "reverie_watched",
+            ],
+        );
+        WatchedStoreGuest {
+            path,
+            before: addresses[0],
+            store: addresses[1],
+            after: addresses[2],
+            word: addresses[3],
+        }
+    });
+    &GUEST
+}
+
+/// `debug_watched` under the record-keeping Tool, on the guest that
+/// blocks SIGTRAP across its store.
+async fn debug_watched_blocked<F, Fut>(name: &str, client: F) -> Vec<reverie::WatchHit>
+where
+    F: FnOnce(Remote) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    let guest = watched_blocked_store_guest();
+    let socket = std::env::temp_dir().join(format!(
+        "reverie-gdbstub-{name}-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let command = Command::new(&guest.path);
+    let tracer = async {
+        TracerBuilder::<ContractWatchTool>::new(command)
+            .config(guest.word)
+            .gdbserver(socket.clone())
+            .spawn()
+            .await
+            .expect("spawn the guest under the GDB server")
+            .wait()
+            .await
+            .expect("wait for the guest")
+    };
+    let gdb = async {
+        let remote = Remote::connect(&socket).await;
+        client(remote).await;
+    };
+    let ((status, hits), ()) = tokio::time::timeout(Duration::from_secs(120), async {
+        tokio::join!(tracer, gdb)
+    })
+    .await
+    .expect("the guest and the GDB session finish");
+    let _ = std::fs::remove_file(&socket);
+    assert_eq!(
+        status,
+        ExitStatus::Exited(0),
+        "exit 5 = SIGTRAP left unblocked after the stepped store"
+    );
+    hits.0.into_inner().unwrap()
+}
+
 /// GDB's step over a breakpoint on a store to a watched word: the server
 /// removes nothing itself, GDB removes the breakpoint, and the server's
 /// step-over runs the store. Its hit comes with the step's trap, and is
@@ -1415,4 +1605,1314 @@ async fn a_debugger_step_over_a_watched_store_reports_the_hit() {
     assert_eq!(hits.len(), 1, "{hits:#?}");
     assert_eq!(hits[0].ip, after);
     assert_eq!(hits[0].sigtrap, reverie::SigtrapAtHit::Unchanged);
+}
+
+/// A hardware write watchpoint that GDB itself sets with `Z2` (its
+/// `watch` command): the server answers `OK`, the guest stops at the
+/// store with a `watch:` stop reply naming the watched address, and
+/// removing the watchpoint with `z2` lets the guest run to its exit.
+/// No Tool watches are armed: the watchpoint is the debugger's alone.
+#[tokio::test]
+async fn a_gdb_write_watchpoint_stops_at_the_store() {
+    let guest = watched_store_guest();
+    let (word, after) = (guest.word, guest.after);
+    let status = debug_to_end(&guest.path, "gdb-watch", |mut remote| async move {
+        let reply = tokio::time::timeout(
+            Duration::from_secs(10),
+            remote.request(&format!("Z2,{word:x},8")),
+        )
+        .await
+        .expect("the server answers a Z2 watchpoint request");
+        assert_eq!(reply, "OK", "insert a write watchpoint");
+        let stop = remote.resume().await;
+        assert!(
+            stop.starts_with(&format!("T05watch:{word:x};")),
+            "expected a watchpoint stop, got {stop:?}"
+        );
+        assert_eq!(stop_rip(&stop), after, "stopped away from the store");
+        assert_eq!(
+            remote.request(&format!("z2,{word:x},8")).await,
+            "OK",
+            "remove the write watchpoint"
+        );
+        assert_exited_zero(&remote.resume().await, "after removing the watchpoint");
+    })
+    .await;
+    assert_eq!(status, ExitStatus::Exited(0));
+}
+
+/// A read watchpoint (`Z3`, GDB's `rwatch`) is unsupported, as on a
+/// native x86 gdbserver: the reply is empty, and GDB's fallback — an
+/// access watchpoint (`Z4`) whose write hits it filters itself — stops
+/// at the load with an `awatch:` reply at the instruction after it.
+#[tokio::test]
+async fn a_gdb_read_watchpoint_is_unsupported_and_the_access_fallback_stops() {
+    let (path, addresses) = build_guest(
+        "gdbstub_watched_load",
+        &[],
+        &[
+            "reverie_before_load",
+            "reverie_load",
+            "reverie_after_load",
+            "reverie_watched",
+        ],
+    );
+    let (after, word) = (addresses[2], addresses[3]);
+    let status = debug_to_end(&path, "gdb-rwatch", |mut remote| async move {
+        let reply = tokio::time::timeout(
+            Duration::from_secs(10),
+            remote.request(&format!("Z3,{word:x},8")),
+        )
+        .await
+        .expect("the server answers a Z3 watchpoint request");
+        assert_eq!(reply, "", "Z3 is unsupported, as on x86 gdbserver");
+        assert_eq!(remote.request(&format!("z3,{word:x},8")).await, "");
+        // GDB's fallback for an unsupported rwatch.
+        assert_eq!(remote.request(&format!("Z4,{word:x},8")).await, "OK");
+        let stop = remote.resume().await;
+        assert!(
+            stop.starts_with(&format!("T05awatch:{word:x};")),
+            "expected an access watchpoint stop at the load, got {stop:?}"
+        );
+        assert_eq!(stop_rip(&stop), after, "stopped away from the load");
+        assert_eq!(remote.request(&format!("z4,{word:x},8")).await, "OK");
+        assert_exited_zero(&remote.resume().await, "after removing the watchpoint");
+    })
+    .await;
+    assert_eq!(status, ExitStatus::Exited(0));
+}
+
+/// A hardware access watchpoint that GDB sets with `Z4` (its `awatch`
+/// command): the guest stops at the store with an `awatch:` stop reply.
+#[tokio::test]
+async fn a_gdb_access_watchpoint_stops_at_the_store() {
+    let guest = watched_store_guest();
+    let (word, after) = (guest.word, guest.after);
+    let status = debug_to_end(&guest.path, "gdb-awatch", |mut remote| async move {
+        let reply = tokio::time::timeout(
+            Duration::from_secs(10),
+            remote.request(&format!("Z4,{word:x},8")),
+        )
+        .await
+        .expect("the server answers a Z4 watchpoint request");
+        assert_eq!(reply, "OK", "insert an access watchpoint");
+        let stop = remote.resume().await;
+        assert!(
+            stop.starts_with(&format!("T05awatch:{word:x};")),
+            "expected an access watchpoint stop, got {stop:?}"
+        );
+        assert_eq!(stop_rip(&stop), after, "stopped away from the store");
+        assert_eq!(
+            remote.request(&format!("z4,{word:x},8")).await,
+            "OK",
+            "remove the access watchpoint"
+        );
+        assert_exited_zero(&remote.resume().await, "after removing the watchpoint");
+    })
+    .await;
+    assert_eq!(status, ExitStatus::Exited(0));
+}
+
+/// A watchpoint whose length the hardware cannot watch is refused with a
+/// protocol error, not with an `OK` for a watchpoint that is not armed.
+#[tokio::test]
+async fn a_gdb_watchpoint_of_an_unwatchable_length_is_refused() {
+    let guest = watched_store_guest();
+    let word = guest.word;
+    let status = debug_to_end(&guest.path, "gdb-watch-len", |mut remote| async move {
+        let reply = tokio::time::timeout(
+            Duration::from_secs(10),
+            remote.request(&format!("Z2,{word:x},3")),
+        )
+        .await
+        .expect("the server answers a Z2 watchpoint request");
+        assert!(
+            reply.starts_with('E'),
+            "expected an error reply for a 3-byte watchpoint, got {reply:?}"
+        );
+        assert_exited_zero(&remote.resume().await, "with no watchpoint armed");
+    })
+    .await;
+    assert_eq!(status, ExitStatus::Exited(0));
+}
+
+/// A watchpoint whose address is misaligned for its length is likewise
+/// refused with a protocol error (the gdb path's `Misaligned` mapping),
+/// not armed at a rounded address.
+#[tokio::test]
+async fn a_gdb_watchpoint_at_a_misaligned_address_is_refused() {
+    let guest = watched_store_guest();
+    let word = guest.word;
+    let status = debug_to_end(&guest.path, "gdb-watch-misaligned", |mut remote| async move {
+        let reply = tokio::time::timeout(
+            Duration::from_secs(10),
+            remote.request(&format!("Z2,{:x},8", word + 1)),
+        )
+        .await
+        .expect("the server answers a Z2 watchpoint request");
+        assert!(
+            reply.starts_with('E'),
+            "expected an error reply for a misaligned 8-byte watchpoint, got {reply:?}"
+        );
+        assert_exited_zero(&remote.resume().await, "with no watchpoint armed");
+    })
+    .await;
+    assert_eq!(status, ExitStatus::Exited(0));
+}
+
+/// The Tool and gdb watch the same word: one hardware watch arms, and its
+/// hit reaches both — the Tool's hit callback and gdb's watchpoint stop.
+#[tokio::test]
+async fn a_tool_watch_and_a_gdb_watch_on_one_word_both_stop() {
+    let WatchedStoreGuest { word, .. } = *watched_store_guest();
+    let hits = debug_watched("tool-and-gdb-watch", |mut remote| async move {
+        assert_eq!(remote.request(&format!("Z2,{word:x},8")).await, "OK");
+        let stop = remote.resume().await;
+        assert!(
+            stop.starts_with(&format!("T05watch:{word:x};")),
+            "expected a watchpoint stop, got {stop:?}"
+        );
+        assert_eq!(remote.request(&format!("z2,{word:x},8")).await, "OK");
+        assert_exited_zero(&remote.resume().await, "after removing gdb's watchpoint");
+    })
+    .await;
+    assert_eq!(hits.len(), 1, "the Tool's hits: {hits:#?}");
+    assert_eq!(hits[0].spec.addr, word);
+    // A gdb watch coexists on the thread, so the Tool's hit does not
+    // claim the hit's SIGTRAP outcome, however well the records know
+    // it (`WatchHit::sigtrap`).
+    assert_eq!(hits[0].sigtrap, reverie::SigtrapAtHit::Unknown);
+}
+
+/// A record-keeping Tool and gdb watch one word; the guest blocks
+/// SIGTRAP, and gdb single-steps over its store. The step's hit
+/// forces a SIGTRAP that unblocks the signal: the repair must block
+/// it again from the records (the guest exits 5 if it does not).
+/// The Tool's hit still reports `Unknown` while gdb's watch coexists,
+/// never `Unchanged` over a silently unblocked mask.
+#[tokio::test]
+async fn a_gdb_step_over_a_blocked_store_reblocks_sigtrap_under_a_recording_tool() {
+    let WatchedStoreGuest {
+        before,
+        store,
+        after,
+        word,
+        ..
+    } = *watched_blocked_store_guest();
+    let hits = debug_watched_blocked("gdb-step-blocked-store", |mut remote| async move {
+        assert_eq!(remote.request(&format!("Z2,{word:x},8")).await, "OK");
+        remote.insert(before).await;
+        let stop = remote.resume().await;
+        assert!(stop.starts_with("T05swbreak:"), "{stop:?}");
+        assert_eq!(stop_rip(&stop), before);
+        remote.remove(before).await;
+        // Over the breakpoint's nop, then over the store.
+        assert_eq!(stop_rip(&remote.step().await), store);
+        let stop = remote.step().await;
+        assert_eq!(stop_rip(&stop), after, "the step did not run the store");
+        assert!(
+            stop.starts_with(&format!("T05watch:{word:x};")),
+            "expected the step to stop for the watch, got {stop:?}"
+        );
+        assert_eq!(remote.request(&format!("z2,{word:x},8")).await, "OK");
+        assert_exited_zero(&remote.resume().await, "after the stepped store");
+    })
+    .await;
+    assert_eq!(hits.len(), 1, "the Tool's hits: {hits:#?}");
+    assert_eq!(hits[0].spec.addr, word);
+    assert_eq!(hits[0].sigtrap, reverie::SigtrapAtHit::Unknown);
+}
+
+/// A store gdb single-steps with its watchpoint on the word: the step's
+/// stop is the watchpoint stop, not a plain trap.
+#[tokio::test]
+async fn a_gdb_step_over_a_watched_store_reports_the_watch() {
+    let WatchedStoreGuest {
+        before,
+        store,
+        after,
+        word,
+        ..
+    } = *watched_store_guest();
+    let guest = watched_store_guest();
+    let status = debug_to_end(&guest.path, "gdb-watch-step", |mut remote| async move {
+        assert_eq!(remote.request(&format!("Z2,{word:x},8")).await, "OK");
+        remote.insert(before).await;
+        let stop = remote.resume().await;
+        assert_eq!(stop_rip(&stop), before);
+        remote.remove(before).await;
+        // Over the breakpoint's nop, then over the store.
+        assert_eq!(stop_rip(&remote.step().await), store);
+        let stop = remote.step().await;
+        assert_eq!(stop_rip(&stop), after);
+        assert!(
+            stop.starts_with(&format!("T05watch:{word:x};")),
+            "expected the step to stop for the watch, got {stop:?}"
+        );
+        assert_eq!(remote.request(&format!("z2,{word:x},8")).await, "OK");
+        assert_exited_zero(&remote.resume().await, "after the steps");
+    })
+    .await;
+    assert_eq!(status, ExitStatus::Exited(0));
+}
+
+/// One watchpoint, set once through the main thread, stops stores on
+/// every thread: the worker created after it was set (inheritance at its
+/// first stop) and the main thread after joining it. Removing it through
+/// whichever thread answers disarms it for all, and the guest runs out.
+#[tokio::test]
+async fn a_gdb_watchpoint_stops_stores_on_every_thread() {
+    let guest = watched_thread_store_guest();
+    let (after_worker, after_main, word) = (guest.after_worker, guest.after_main, guest.word);
+    let status = debug_to_end(&guest.path, "gdb-watch-threads", |mut remote| async move {
+        let main = remote.thread.clone();
+        assert_eq!(remote.request(&format!("Z2,{word:x},8")).await, "OK");
+        // The worker's creation is its own stop first; run past it (and any
+        // other thread-event stops) to the worker's store.
+        let mut stop = remote.resume().await;
+        for _ in 0..4 {
+            if stop.contains(&format!("watch:{word:x};")) {
+                break;
+            }
+            stop = remote.resume().await;
+        }
+        assert!(
+            stop.starts_with(&format!("T05watch:{word:x};")),
+            "expected the worker's store to stop, got {stop:?}"
+        );
+        assert_eq!(
+            stop_rip(&stop),
+            after_worker,
+            "stopped away from the worker's store"
+        );
+        assert_ne!(
+            stop_thread(&stop),
+            main,
+            "the first watch stop is not the worker's: {stop:?}"
+        );
+        // Run past the worker's exit stop to the main thread's store.
+        let mut stop = remote.resume().await;
+        for _ in 0..4 {
+            if stop.contains(&format!("watch:{word:x};")) {
+                break;
+            }
+            stop = remote.resume().await;
+        }
+        assert!(
+            stop.starts_with(&format!("T05watch:{word:x};")),
+            "expected the main thread's store to stop, got {stop:?}"
+        );
+        assert_eq!(
+            stop_rip(&stop),
+            after_main,
+            "stopped away from the main store"
+        );
+        assert_eq!(stop_thread(&stop), main);
+        assert_eq!(remote.request(&format!("z2,{word:x},8")).await, "OK");
+        assert_exited_zero(&remote.resume().await, "after removing the watchpoint");
+    })
+    .await;
+    assert_eq!(status, ExitStatus::Exited(0));
+}
+
+/// A watchpoint set while a sibling is frozen at the main thread's
+/// breakpoint stop (the worker spins, frozen by the breakpoint stop's
+/// freeze) reaches the frozen sibling: after the thaw, the worker's
+/// store stops for the watch. Nothing arms the worker in between except
+/// its reconcile as it leaves the frozen stop.
+#[tokio::test]
+async fn a_watchpoint_set_while_a_sibling_is_frozen_stops_its_store() {
+    let guest = watched_thread_store_guest();
+    let (before_release, after_worker, word) =
+        (guest.before_release, guest.after_worker, guest.word);
+    let status = debug_to_end(&guest.path, "gdb-watch-frozen", |mut remote| async move {
+        let main = remote.thread.clone();
+        remote.insert(before_release).await;
+        // Run past the worker's creation stop to the main thread's
+        // breakpoint stop; the spinning worker is frozen while gdb holds it.
+        let mut stop = remote.resume().await;
+        for _ in 0..4 {
+            if stop.starts_with("T05swbreak:") {
+                break;
+            }
+            stop = remote.resume().await;
+        }
+        assert!(
+            stop.starts_with("T05swbreak:"),
+            "expected the main thread's breakpoint stop, got {stop:?}"
+        );
+        assert_eq!(stop_thread(&stop), main);
+        assert_eq!(stop_rip(&stop), before_release);
+        // Set through the main thread while the worker is frozen.
+        assert_eq!(remote.request(&format!("Z2,{word:x},8")).await, "OK");
+        remote.remove(before_release).await;
+        // The run on releases the worker and thaws it; its store stops.
+        let mut stop = remote.resume().await;
+        for _ in 0..4 {
+            if stop.starts_with("T05watch:") {
+                break;
+            }
+            stop = remote.resume().await;
+        }
+        assert!(
+            stop.starts_with(&format!("T05watch:{word:x};")),
+            "expected the thawed worker's store to stop, got {stop:?}"
+        );
+        assert_ne!(stop_thread(&stop), main);
+        assert_eq!(stop_rip(&stop), after_worker);
+        // The main thread is still in its join; its own store after the
+        // join stops too, and only then is the watch removed.
+        let mut stop = remote.resume().await;
+        for _ in 0..4 {
+            if stop.starts_with("T05watch:") {
+                break;
+            }
+            stop = remote.resume().await;
+        }
+        assert!(
+            stop.starts_with(&format!("T05watch:{word:x};")),
+            "expected the main thread's store to stop, got {stop:?}"
+        );
+        assert_eq!(stop_thread(&stop), main);
+        assert_eq!(remote.request(&format!("z2,{word:x},8")).await, "OK");
+        assert_exited_zero(&remote.resume().await, "after removing the watchpoint");
+    })
+    .await;
+    assert_eq!(status, ExitStatus::Exited(0));
+}
+
+/// A thread that blocks SIGTRAP still takes gdb's watchpoint, as it does
+/// under a native gdbserver, which writes debug registers without asking
+/// the mask: setting it twice leaves one watch armed (the second ask is
+/// the same watch, not a phantom from a failed first), the store stops
+/// for the watch, and removing it lets the guest run out.
+#[tokio::test]
+async fn a_watchpoint_arms_while_sigtrap_is_blocked_like_gdbserver() {
+    let (path, addresses) = build_guest("gdbstub_watched_blocked", &[], &["reverie_watched"]);
+    let word = addresses[0];
+    let status = debug_to_end(&path, "gdb-watch-blocked", |mut remote| async move {
+        let stop = remote.resume().await;
+        assert!(
+            stop.starts_with("T1e"),
+            "expected the guest's SIGUSR1 stop (gdb's number 30), got {stop:?}"
+        );
+        for _ in 1..=2 {
+            assert_eq!(remote.request(&format!("Z2,{word:x},8")).await, "OK");
+        }
+        let stop = remote.resume().await;
+        assert!(
+            stop.starts_with(&format!("T05watch:{word:x};")),
+            "expected the store to stop for the watch, got {stop:?}"
+        );
+        assert_eq!(remote.request(&format!("z2,{word:x},8")).await, "OK");
+        assert_exited_zero(&remote.resume().await, "after removing the watchpoint");
+    })
+    .await;
+    assert_eq!(status, ExitStatus::Exited(0));
+}
+
+/// A gdb watch armed while SIGTRAP is unblocked; a SIGUSR1 handler whose
+/// mask blocks SIGTRAP makes a traced syscall and returns through an
+/// rt_sigreturn the backend traces for the gdb session; main's store
+/// then hits the watch. The hit's repair must not re-block SIGTRAP
+/// from a stale record taken inside the handler: the guest exits 5 if
+/// it does, 0 if its mask is unchanged. (The claude-seat-watch3
+/// reproduction, as a regression test.)
+#[tokio::test]
+async fn a_gdb_watch_hit_after_a_sigreturn_leaves_sigtrap_unblocked() {
+    let (path, addresses) = build_guest("gdbstub_watched_sigreturn", &[], &["reverie_watched"]);
+    let word = addresses[0];
+    let status = debug_to_end(&path, "gdb-watch-sigreturn", |mut remote| async move {
+        assert_eq!(remote.request(&format!("Z2,{word:x},8")).await, "OK");
+        let stop = remote.resume().await;
+        assert!(
+            stop.starts_with("T1e"),
+            "expected the SIGUSR1 stop, got {stop:?}"
+        );
+        let thread = remote.thread.clone();
+        let stop = remote.request(&format!("vCont;C1e:{thread}")).await;
+        assert!(
+            stop.starts_with(&format!("T05watch:{word:x};")),
+            "expected the watch stop, got {stop:?}"
+        );
+        assert_eq!(remote.request(&format!("z2,{word:x},8")).await, "OK");
+        assert_exited_zero(&remote.resume().await, "after the sigreturn and the hit");
+    })
+    .await;
+    assert_eq!(
+        status,
+        ExitStatus::Exited(0),
+        "exit 5 = SIGTRAP left blocked after the gdb watch hit"
+    );
+}
+
+/// The masked-handler guest, built once: three tests build it, and
+/// building the same guest in two tests at once races on its
+/// published path (`build_guest`).
+fn masked_handler_guest() -> &'static (PathBuf, Vec<u64>) {
+    static GUEST: LazyLock<(PathBuf, Vec<u64>)> = LazyLock::new(|| {
+        build_guest("gdbstub_watched_masked_handler", &[], &["reverie_watched"])
+    });
+    &GUEST
+}
+
+/// The handler-arm guest, built once: two tests build it, and
+/// building the same guest in two tests at once races on its
+/// published path (`build_guest`).
+fn handler_arm_guest() -> &'static (PathBuf, Vec<u64>) {
+    static GUEST: LazyLock<(PathBuf, Vec<u64>)> = LazyLock::new(|| {
+        build_guest("gdbstub_watched_handler_arm", &[], &["reverie_watched"])
+    });
+    &GUEST
+}
+
+/// Resumes until the guest exits, keeping gdb's watch armed, and returns
+/// every stop reply seen (the last is the exit reply).
+async fn resume_to_exit(remote: &mut Remote) -> Vec<String> {
+    let mut stops = Vec::new();
+    for _ in 0..12 {
+        let stop = remote.resume().await;
+        let done = stop.starts_with('W') || stop.starts_with('X');
+        stops.push(stop);
+        if done {
+            break;
+        }
+    }
+    stops
+}
+
+/// A gdb watch armed before `pthread_create`: the newborn starts under
+/// glibc's clone-time all-blocked mask and main blocks every signal
+/// across the create, and each thread then stores with SIGTRAP
+/// unblocked. Neither hit's repair may restore a mask from a read taken
+/// in either window: the guest exits 55 (worker 5, main 5) if either
+/// thread's SIGTRAP is blocked after its own store.
+#[tokio::test]
+async fn a_gdb_watch_hit_on_a_newborn_and_its_creator_leaves_sigtrap_unblocked() {
+    let (path, addresses) =
+        build_guest("gdbstub_watched_newborn", &["-pthread"], &["reverie_watched"]);
+    let word = addresses[0];
+    let status = debug_to_end(&path, "gdb-watch-newborn", |mut remote| async move {
+        assert_eq!(remote.request(&format!("Z2,{word:x},8")).await, "OK");
+        let stops = resume_to_exit(&mut remote).await;
+        // Both threads store once, so both must stop for the watch: a
+        // single stop would leave the other thread's half of the exit
+        // code vacuous (its store never hit).
+        let watch_threads: Vec<&str> = stops
+            .iter()
+            .filter(|stop| stop.contains("watch:"))
+            .map(|stop| stop_thread(stop))
+            .collect();
+        assert_eq!(
+            watch_threads.len(),
+            2,
+            "expected the worker's and main's watch stops, got {stops:?}"
+        );
+        assert_ne!(
+            watch_threads[0], watch_threads[1],
+            "the two watch stops are one thread's: {stops:?}"
+        );
+    })
+    .await;
+    assert_eq!(
+        status,
+        ExitStatus::Exited(0),
+        "exit is worker*10+main; 5 = SIGTRAP blocked after that thread's store"
+    );
+}
+
+/// Gdb sets its watch at a stop inside a SIGUSR1 handler whose mask
+/// blocks SIGTRAP (a repairable state), then continues without the
+/// handler's SIGUSR2. The handler's `rt_sigreturn` — traced for the
+/// gdb session — restores main's unblocked mask before the store, so
+/// a repair from the in-handler read would re-block a bit the guest
+/// had unblocked: the guest exits 5 then, 0 when its mask is
+/// unchanged.
+#[tokio::test]
+async fn a_gdb_watch_armed_inside_a_handler_then_a_sigreturn_leaves_sigtrap_unblocked() {
+    let (path, addresses) = handler_arm_guest();
+    let (path, word) = (path.as_path(), addresses[0]);
+    let status = debug_to_end(path, "gdb-watch-handler-arm", |mut remote| async move {
+        let stop = remote.resume().await;
+        assert!(stop.starts_with("T1e"), "expected SIGUSR1 stop, got {stop:?}");
+        let thread = remote.thread.clone();
+        let stop = remote.request(&format!("vCont;C1e:{thread}")).await;
+        assert!(
+            stop.starts_with("T1f"),
+            "expected SIGUSR2 stop in the handler, got {stop:?}"
+        );
+        assert_eq!(remote.request(&format!("Z2,{word:x},8")).await, "OK");
+        let stop = remote.request(&format!("vCont;c:{thread}")).await;
+        assert!(
+            stop.starts_with(&format!("T05watch:{word:x};")),
+            "expected watch stop, got {stop:?}"
+        );
+        assert_eq!(remote.request(&format!("z2,{word:x},8")).await, "OK");
+        assert_exited_zero(&remote.resume().await, "after the handler-armed hit");
+    })
+    .await;
+    assert_eq!(
+        status,
+        ExitStatus::Exited(0),
+        "5 = SIGTRAP left blocked after the hit (re-blocked from a read taken inside the handler)"
+    );
+}
+
+/// The handler-armed watch above, but gdb steps from the in-handler
+/// stop over the store instead of continuing: the hit is collected
+/// on a gdb step, whose repair must read the traced signal records
+/// (the `rt_sigreturn` the steps cross unblocked SIGTRAP), never the
+/// live read noted inside the handler. The guest exits 5 if the
+/// step-hit's repair re-blocks from that note.
+#[tokio::test]
+async fn a_gdb_step_over_a_store_after_arming_inside_a_handler_leaves_sigtrap_unblocked() {
+    let (path, addresses) = handler_arm_guest();
+    let (path, word) = (path.as_path(), addresses[0]);
+    let status = debug_to_end(path, "gdb-watch-handler-step", |mut remote| async move {
+        let stop = remote.resume().await;
+        assert!(stop.starts_with("T1e"), "expected SIGUSR1 stop, got {stop:?}");
+        let thread = remote.thread.clone();
+        let stop = remote.request(&format!("vCont;C1e:{thread}")).await;
+        assert!(
+            stop.starts_with("T1f"),
+            "expected SIGUSR2 stop in the handler, got {stop:?}"
+        );
+        assert_eq!(remote.request(&format!("Z2,{word:x},8")).await, "OK");
+        // Step from inside the handler, without SIGUSR2, until a step
+        // runs the store: its stop names the watch. The steps are
+        // genuine single steps — the handler's return and main's
+        // path to the store take several — never one run to the hit.
+        let mut stop = String::new();
+        let mut steps = 0;
+        for _ in 0..512 {
+            stop = remote.step().await;
+            steps += 1;
+            if stop.contains("watch:") || stop.starts_with('W') || stop.starts_with('X') {
+                break;
+            }
+        }
+        assert!(
+            stop.starts_with(&format!("T05watch:{word:x};")),
+            "expected a step to stop for the watch, got {stop:?}"
+        );
+        assert!(
+            steps >= 3,
+            "expected genuine single steps out of the handler, took {steps}"
+        );
+        assert_eq!(remote.request(&format!("z2,{word:x},8")).await, "OK");
+        assert_exited_zero(&remote.resume().await, "after the stepped hit");
+    })
+    .await;
+    assert_eq!(
+        status,
+        ExitStatus::Exited(0),
+        "5 = SIGTRAP left blocked after the step-hit (re-blocked from the in-handler note)"
+    );
+}
+
+/// A gdb watch hit inside a handler whose own mask blocks SIGTRAP, in
+/// a session whose Tool does not serialize execution: the resume
+/// delivered the signal, so the mask to put back is the handler's,
+/// which no scratch query can read here. The repair resolves it from
+/// the action the traced `rt_sigaction` installed. The guest exits 5
+/// if SIGTRAP is left unblocked inside the handler.
+async fn masked_handler_client(mut remote: Remote, word: u64) {
+    assert_eq!(remote.request(&format!("Z2,{word:x},8")).await, "OK");
+    let stop = remote.resume().await;
+    assert!(
+        stop.starts_with("T1e"),
+        "expected the SIGUSR1 stop, got {stop:?}"
+    );
+    let thread = remote.thread.clone();
+    let stop = remote.request(&format!("vCont;C1e:{thread}")).await;
+    assert!(
+        stop.starts_with(&format!("T05watch:{word:x};")),
+        "expected the watch stop inside the handler, got {stop:?}"
+    );
+    assert_eq!(remote.request(&format!("z2,{word:x},8")).await, "OK");
+    assert_exited_zero(&remote.resume().await, "after the in-handler hit");
+}
+
+#[tokio::test]
+async fn a_gdb_watch_hit_inside_a_masked_handler_reblocks_sigtrap() {
+    let (path, addresses) = masked_handler_guest();
+    let (path, word) = (path.as_path(), addresses[0]);
+    let status = debug_to_end(path, "gdb-watch-masked-handler", |remote| async move {
+        masked_handler_client(remote, word).await;
+    })
+    .await;
+    assert_eq!(
+        status,
+        ExitStatus::Exited(0),
+        "5 = SIGTRAP left unblocked inside the handler after its store"
+    );
+}
+
+/// The masked-handler hit under a Tool that subscribes to nothing:
+/// the install runs through the backend-internal path, and no
+/// traced syscall follows it before the signal, so the recorded
+/// action must already be usable at the hit (its change mark ends
+/// at the install's own exit stop).
+#[tokio::test]
+async fn a_gdb_watch_hit_inside_a_masked_handler_reblocks_sigtrap_unsubscribed() {
+    let (path, addresses) = masked_handler_guest();
+    let (path, word) = (path.as_path(), addresses[0]);
+    let status = debug_to_end_with::<NoneTool, _, _>(
+        path,
+        "gdb-watch-masked-handler-unsubscribed",
+        false,
+        |remote| async move {
+            masked_handler_client(remote, word).await;
+        },
+    )
+    .await;
+    assert_eq!(
+        status,
+        ExitStatus::Exited(0),
+        "5 = SIGTRAP left unblocked inside the handler after its store"
+    );
+}
+
+/// The masked-handler hit under a Tool that subscribes only to
+/// `rt_sigaction`, without serialized execution: the install reaches
+/// the backend through the Tool's own handling, and the delivered
+/// action must be recorded from there too.
+#[tokio::test]
+async fn a_gdb_watch_hit_inside_a_masked_handler_reblocks_sigtrap_sigaction_subscribed() {
+    let (path, addresses) = masked_handler_guest();
+    let (path, word) = (path.as_path(), addresses[0]);
+    let status = debug_to_end_with::<SigactionOnlyTool, _, _>(
+        path,
+        "gdb-watch-masked-handler-sigaction",
+        false,
+        |remote| async move {
+            masked_handler_client(remote, word).await;
+        },
+    )
+    .await;
+    assert_eq!(
+        status,
+        ExitStatus::Exited(0),
+        "5 = SIGTRAP left unblocked inside the handler after its store"
+    );
+}
+
+/// The same hit in a handler that runs under a `ppoll` temporary mask
+/// blocking only SIGTRAP: the bit the delivery left blocked through
+/// the temporary mask must be put back.
+#[tokio::test]
+async fn a_gdb_watch_hit_inside_a_ppoll_handler_reblocks_sigtrap() {
+    let (path, addresses) = build_guest("gdbstub_watched_ppoll_handler", &[], &["reverie_watched"]);
+    let word = addresses[0];
+    let status = debug_to_end(&path, "gdb-watch-ppoll-handler", |mut remote| async move {
+        assert_eq!(remote.request(&format!("Z2,{word:x},8")).await, "OK");
+        let stop = remote.resume().await;
+        assert!(
+            stop.starts_with("T1e"),
+            "expected the SIGUSR1 stop, got {stop:?}"
+        );
+        let thread = remote.thread.clone();
+        let stop = remote.request(&format!("vCont;C1e:{thread}")).await;
+        assert!(
+            stop.starts_with(&format!("T05watch:{word:x};")),
+            "expected the watch stop inside the handler, got {stop:?}"
+        );
+        assert_eq!(remote.request(&format!("z2,{word:x},8")).await, "OK");
+        assert_exited_zero(&remote.resume().await, "after the in-handler hit");
+    })
+    .await;
+    assert_eq!(
+        status,
+        ExitStatus::Exited(0),
+        "5 = SIGTRAP left unblocked inside the ppoll handler after its store"
+    );
+}
+
+/// The guest with three raw syscalls between labelled nops, and the
+/// addresses around each.
+struct StepSyscallsGuest {
+    path: PathBuf,
+    before_procmask: u64,
+    procmask: u64,
+    after_procmask: u64,
+    before_sigaction: u64,
+    sigaction: u64,
+    after_sigaction: u64,
+    before_getppid: u64,
+    getppid: u64,
+    after_getppid: u64,
+    word: u64,
+}
+
+fn step_syscalls_guest() -> &'static StepSyscallsGuest {
+    static GUEST: LazyLock<StepSyscallsGuest> = LazyLock::new(|| {
+        let (path, addresses) = build_guest(
+            "gdbstub_step_syscalls",
+            &[],
+            &[
+                "reverie_before_procmask",
+                "reverie_procmask",
+                "reverie_after_procmask",
+                "reverie_before_sigaction",
+                "reverie_sigaction",
+                "reverie_after_sigaction",
+                "reverie_before_getppid",
+                "reverie_getppid",
+                "reverie_after_getppid",
+                "reverie_watched",
+            ],
+        );
+        StepSyscallsGuest {
+            path,
+            before_procmask: addresses[0],
+            procmask: addresses[1],
+            after_procmask: addresses[2],
+            before_sigaction: addresses[3],
+            sigaction: addresses[4],
+            after_sigaction: addresses[5],
+            before_getppid: addresses[6],
+            getppid: addresses[7],
+            after_getppid: addresses[8],
+            word: addresses[9],
+        }
+    });
+    &GUEST
+}
+
+/// Single-steps over each raw syscall from a breakpoint on the nop
+/// before it: every step must stop at the next labeled instruction.
+async fn step_syscalls_client(mut remote: Remote, guest: &StepSyscallsGuest) {
+    for (before, syscall, after, what) in [
+        (
+            guest.before_procmask,
+            guest.procmask,
+            guest.after_procmask,
+            "rt_sigprocmask",
+        ),
+        (
+            guest.before_sigaction,
+            guest.sigaction,
+            guest.after_sigaction,
+            "rt_sigaction",
+        ),
+        (
+            guest.before_getppid,
+            guest.getppid,
+            guest.after_getppid,
+            "getppid",
+        ),
+    ] {
+        remote.insert(before).await;
+        let stop = remote.resume().await;
+        assert!(stop.starts_with("T05swbreak:"), "{what}: {stop:?}");
+        assert_eq!(stop_rip(&stop), before, "{what} breakpoint stop");
+        remote.remove(before).await;
+        assert_eq!(stop_rip(&remote.step().await), syscall, "{what} step to it");
+        let stop = remote.step().await;
+        assert_eq!(
+            stop_rip(&stop),
+            after,
+            "step over {what} ran away: {stop:?}"
+        );
+    }
+    assert_exited_zero(&remote.resume().await, "after the steps");
+}
+
+/// A gdb single-step over a backend-traced syscall (`rt_sigprocmask`,
+/// `rt_sigaction`) or a subscribed one (`getppid` under this Tool)
+/// stops at the next instruction: the seccomp stop the step enters
+/// completes the step, never continues past it.
+#[tokio::test]
+async fn gdb_steps_over_backend_traced_syscalls_stop_at_the_next_instruction() {
+    let guest = step_syscalls_guest();
+    let status = debug_to_end(&guest.path, "gdb-step-syscalls", |remote| async move {
+        step_syscalls_client(remote, guest).await;
+    })
+    .await;
+    assert_eq!(status, ExitStatus::Exited(0));
+}
+
+
+/// `WatchStoreTool`, but its syscall handler runs every call with an
+/// explicit injection instead of the default tail injection.
+#[derive(Default)]
+struct InjectWatchTool;
+
+#[reverie::tool]
+impl Tool for InjectWatchTool {
+    type GlobalState = WatchHits;
+    type ThreadState = ();
+
+    async fn handle_post_exec<G: reverie::Guest<Self>>(
+        &self,
+        guest: &mut G,
+    ) -> Result<(), reverie::Errno> {
+        let addr = *guest.config();
+        guest
+            .set_watchpoints(&[reverie::WatchSpec {
+                addr,
+                len: 8,
+                kind: reverie::WatchKind::Write,
+                backtraces: 0,
+            }])
+            .expect("arm the watch");
+        Ok(())
+    }
+
+    async fn handle_syscall_event<G: reverie::Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Error> {
+        Ok(guest.inject(syscall).await?)
+    }
+}
+
+/// `InjectWatchTool`, but `getppid` is emulated (answered without
+/// running it), which completes its seccomp stop by skipping it.
+#[derive(Default)]
+struct EmulateGetppidTool;
+
+#[reverie::tool]
+impl Tool for EmulateGetppidTool {
+    type GlobalState = WatchHits;
+    type ThreadState = ();
+
+    async fn handle_post_exec<G: reverie::Guest<Self>>(
+        &self,
+        guest: &mut G,
+    ) -> Result<(), reverie::Errno> {
+        let addr = *guest.config();
+        guest
+            .set_watchpoints(&[reverie::WatchSpec {
+                addr,
+                len: 8,
+                kind: reverie::WatchKind::Write,
+                backtraces: 0,
+            }])
+            .expect("arm the watch");
+        Ok(())
+    }
+
+    async fn handle_syscall_event<G: reverie::Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Error> {
+        if syscall.number() == Sysno::getppid {
+            return Ok(4242);
+        }
+        Ok(guest.inject(syscall).await?)
+    }
+}
+
+/// A record-keeping Tool that also subscribes to rdtsc, so SIGSEGV's
+/// state is kept as for a record/replay Tool. Arms nothing.
+#[derive(Default)]
+struct SegvKeepingTool;
+
+#[reverie::tool]
+impl Tool for SegvKeepingTool {
+    type GlobalState = ();
+    type ThreadState = ();
+
+    fn subscriptions(_cfg: &()) -> reverie::Subscription {
+        let mut subscriptions = reverie::Subscription::all_syscalls();
+        subscriptions.rdtsc();
+        subscriptions
+    }
+
+    fn observes_sigreturns(_cfg: &()) -> bool {
+        true
+    }
+
+    fn enforces_serialized_execution(_cfg: &()) -> bool {
+        true
+    }
+
+    async fn handle_syscall_event<G: reverie::Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Error> {
+        Ok(guest.inject(syscall).await?)
+    }
+}
+
+/// `debug_watched` over the step-syscalls guest, under `T`.
+async fn debug_step_with<T, F, Fut>(name: &str, config: u64, client: F) -> Vec<reverie::WatchHit>
+where
+    T: Tool<GlobalState = WatchHits> + Default + 'static,
+    F: FnOnce(Remote) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    let guest = step_syscalls_guest();
+    let socket = std::env::temp_dir().join(format!(
+        "reverie-gdbstub-{name}-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let command = Command::new(&guest.path);
+    let tracer = async {
+        TracerBuilder::<T>::new(command)
+            .config(config)
+            .gdbserver(socket.clone())
+            .spawn()
+            .await
+            .expect("spawn the guest under the GDB server")
+            .wait()
+            .await
+            .expect("wait for the guest")
+    };
+    let gdb = async {
+        let remote = Remote::connect(&socket).await;
+        client(remote).await;
+    };
+    let ((status, hits), ()) = tokio::time::timeout(Duration::from_secs(120), async {
+        tokio::join!(tracer, gdb)
+    })
+    .await
+    .expect("the guest and the GDB session finish");
+    let _ = std::fs::remove_file(&socket);
+    assert_eq!(status, ExitStatus::Exited(0));
+    hits.0.into_inner().unwrap()
+}
+
+/// A gdb step over a subscribed syscall the Tool runs with an
+/// explicit injection, with gdb's and the Tool's watches armed: the
+/// step completes at the seccomp stop's own completion and stops at
+/// the next instruction, with the held root stop transitioned to it.
+#[tokio::test]
+async fn gdb_steps_over_an_injected_syscall_stop_at_the_next_instruction() {
+    let guest = step_syscalls_guest();
+    let word = guest.word;
+    let hits = debug_step_with::<InjectWatchTool, _, _>("gdb-step-injected", word, |mut remote| async move {
+        assert_eq!(remote.request(&format!("Z2,{word:x},8")).await, "OK");
+        step_syscalls_client(remote, guest).await;
+    })
+    .await;
+    assert!(hits.is_empty(), "no store is watched here: {hits:#?}");
+}
+
+/// The same step where the Tool emulates `getppid` (answers without
+/// running it): the skipped call still completes gdb's step at the
+/// next instruction.
+#[tokio::test]
+async fn gdb_steps_over_an_emulated_syscall_stop_at_the_next_instruction() {
+    let guest = step_syscalls_guest();
+    let word = guest.word;
+    let hits = debug_step_with::<EmulateGetppidTool, _, _>("gdb-step-emulated", word, |mut remote| async move {
+        assert_eq!(remote.request(&format!("Z2,{word:x},8")).await, "OK");
+        step_syscalls_client(remote, guest).await;
+    })
+    .await;
+    assert!(hits.is_empty(), "no store is watched here: {hits:#?}");
+}
+
+/// The same steps under a SIGSEGV-keeping record Tool with no watch
+/// armed: the mask-setting calls run to their exit stops first, and
+/// the step still completes at the next instruction.
+#[tokio::test]
+async fn gdb_steps_over_syscalls_stop_under_a_segv_keeping_tool() {
+    let guest = step_syscalls_guest();
+    let status = debug_to_end_with::<SegvKeepingTool, _, _>(
+        &guest.path,
+        "gdb-step-syscalls-segv",
+        false,
+        |remote| async move {
+            step_syscalls_client(remote, guest).await;
+        },
+    )
+    .await;
+    assert_eq!(status, ExitStatus::Exited(0));
+}
+
+/// The guest that unblocks SIGTRAP with a raw `rt_sigprocmask` and
+/// then stores, between labelled nops, built once.
+struct StepUnblockGuest {
+    path: PathBuf,
+    before_unblock: u64,
+    unblock: u64,
+    after_unblock: u64,
+    after_store: u64,
+    word: u64,
+}
+
+fn step_unblock_guest() -> &'static StepUnblockGuest {
+    static GUEST: LazyLock<StepUnblockGuest> = LazyLock::new(|| {
+        let (path, addresses) = build_guest(
+            "gdbstub_step_unblock_store",
+            &[],
+            &[
+                "reverie_before_unblock",
+                "reverie_unblock",
+                "reverie_after_unblock",
+                "reverie_store",
+                "reverie_after_store",
+                "reverie_watched",
+            ],
+        );
+        StepUnblockGuest {
+            path,
+            before_unblock: addresses[0],
+            unblock: addresses[1],
+            after_unblock: addresses[2],
+            after_store: addresses[4],
+            word: addresses[5],
+        }
+    });
+    &GUEST
+}
+
+/// Gdb steps over a mask-changing `rt_sigprocmask` that unblocks
+/// SIGTRAP, then over the watched store: the hit's repair must read
+/// the mask the stepped call left, not the record from before it.
+/// The guest exits 5 if SIGTRAP is blocked again after its store.
+#[tokio::test]
+async fn a_gdb_step_over_an_unblocking_sigprocmask_then_a_store_keeps_the_new_mask() {
+    let guest = step_unblock_guest();
+    let word = guest.word;
+    let status = debug_to_end(&guest.path, "gdb-step-unblock", |mut remote| async move {
+        assert_eq!(remote.request(&format!("Z2,{word:x},8")).await, "OK");
+        remote.insert(guest.before_unblock).await;
+        let stop = remote.resume().await;
+        assert_eq!(stop_rip(&stop), guest.before_unblock);
+        remote.remove(guest.before_unblock).await;
+        assert_eq!(stop_rip(&remote.step().await), guest.unblock);
+        let stop = remote.step().await;
+        assert_eq!(
+            stop_rip(&stop),
+            guest.after_unblock,
+            "step over rt_sigprocmask ran away: {stop:?}"
+        );
+        // Step to the store and over it: its stop names the watch.
+        let mut stop = String::new();
+        for _ in 0..64 {
+            stop = remote.step().await;
+            if stop.contains("watch:") || stop.starts_with('W') || stop.starts_with('X') {
+                break;
+            }
+        }
+        assert!(
+            stop.starts_with(&format!("T05watch:{word:x};")),
+            "expected a step to stop for the watch, got {stop:?}"
+        );
+        assert_eq!(stop_rip(&stop), guest.after_store);
+        assert_eq!(remote.request(&format!("z2,{word:x},8")).await, "OK");
+        assert_exited_zero(&remote.resume().await, "after the stepped unblock and store");
+    })
+    .await;
+    assert_eq!(
+        status,
+        ExitStatus::Exited(0),
+        "5 = SIGTRAP blocked again after the store (repaired from the pre-unblock record)"
+    );
+}
+
+/// The step-out-of-handler guest, built once for its two tests.
+fn step_sigreturn_guest() -> &'static (PathBuf, Vec<u64>) {
+    static GUEST: LazyLock<(PathBuf, Vec<u64>)> = LazyLock::new(|| {
+        build_guest("gdbstub_step_sigreturn", &[], &["reverie_after_raise"])
+    });
+    &GUEST
+}
+
+/// Steps out of a signal handler over its `rt_sigreturn`: every step
+/// stops, and the step over the return lands exactly on the
+/// interrupted instruction after main's raise.
+async fn step_sigreturn_client(mut remote: Remote, after_raise: u64) {
+    let stop = remote.resume().await;
+    assert!(stop.starts_with("T1e"), "expected SIGUSR1 stop, got {stop:?}");
+    let thread = remote.thread.clone();
+    let stop = remote.request(&format!("vCont;C1e:{thread}")).await;
+    assert!(
+        stop.starts_with("T1f"),
+        "expected SIGUSR2 stop in the handler, got {stop:?}"
+    );
+    let mut stop = String::new();
+    for _ in 0..512 {
+        stop = remote.step().await;
+        assert!(
+            stop.starts_with("T05"),
+            "a step out of the handler ran away: {stop:?}"
+        );
+        if stop_rip(&stop) == after_raise {
+            break;
+        }
+    }
+    assert_eq!(
+        stop_rip(&stop),
+        after_raise,
+        "the rt_sigreturn step did not land on the interrupted instruction: {stop:?}"
+    );
+    assert_exited_zero(&remote.resume().await, "after stepping out of the handler");
+}
+
+#[tokio::test]
+async fn gdb_steps_out_of_a_handler_over_rt_sigreturn() {
+    let (path, addresses) = step_sigreturn_guest();
+    let (path, after_raise) = (path.as_path(), addresses[0]);
+    let status = debug_to_end(path, "gdb-step-sigreturn", |remote| async move {
+        step_sigreturn_client(remote, after_raise).await;
+    })
+    .await;
+    assert_eq!(status, ExitStatus::Exited(0));
+}
+
+#[tokio::test]
+async fn gdb_steps_out_of_a_handler_over_rt_sigreturn_unsubscribed() {
+    let (path, addresses) = step_sigreturn_guest();
+    let (path, after_raise) = (path.as_path(), addresses[0]);
+    let status = debug_to_end_with::<NoneTool, _, _>(
+        path,
+        "gdb-step-sigreturn-none",
+        false,
+        |remote| async move {
+            step_sigreturn_client(remote, after_raise).await;
+        },
+    )
+    .await;
+    assert_eq!(status, ExitStatus::Exited(0));
+}
+
+/// The same steps under a Tool that subscribes to nothing: the
+/// signal-state syscalls then run through the backend-internal path,
+/// and `getppid` is untraced.
+#[tokio::test]
+async fn gdb_steps_over_internal_syscalls_stop_at_the_next_instruction() {
+    let guest = step_syscalls_guest();
+    let status = debug_to_end_with::<NoneTool, _, _>(
+        &guest.path,
+        "gdb-step-syscalls-none",
+        false,
+        |remote| async move {
+            step_syscalls_client(remote, guest).await;
+        },
+    )
+    .await;
+    assert_eq!(status, ExitStatus::Exited(0));
+}
+
+/// A gdb watch armed under the default action; the guest then ignores
+/// SIGTRAP and stores. The hit's forced SIGTRAP resets the ignored
+/// action exactly as native Linux does (the no-watch control also
+/// exits 4 natively only with a hardware hit; without one it exits 0),
+/// so the guest-visible outcome is the kernel's own reset, reported
+/// by the backend rather than silently preserved: exit 4.
+#[tokio::test]
+async fn a_gdb_watch_hit_after_the_guest_ignores_sigtrap_resets_it_as_on_linux() {
+    let (path, addresses) =
+        build_guest("gdbstub_watched_ignored_drift", &[], &["reverie_watched"]);
+    let word = addresses[0];
+    let status = debug_to_end(&path, "gdb-watch-ignored-drift", |mut remote| async move {
+        let tid = reverie::Pid::from_raw(remote.pid as i32);
+        let reported = reverie_ptrace::testing::gdb_watch_may_have_changed(tid);
+        assert_eq!(remote.request(&format!("Z2,{word:x},8")).await, "OK");
+        let stop = remote.resume().await;
+        assert!(
+            stop.starts_with(&format!("T05watch:{word:x};")),
+            "expected watch stop, got {stop:?}"
+        );
+        assert_eq!(remote.request(&format!("z2,{word:x},8")).await, "OK");
+        let _ = remote.resume().await;
+        assert_eq!(
+            reverie_ptrace::testing::gdb_watch_may_have_changed(tid),
+            reported + 1,
+            "the reset the backend does not put back must be reported, not only exit 4"
+        );
+    })
+    .await;
+    assert_eq!(
+        status,
+        ExitStatus::Exited(4),
+        "4 = the hit reset the guest's drifted SIG_IGN to SIG_DFL, as on Linux"
+    );
+}
+
+/// A gdb watch on a thread that ignores SIGTRAP is refused with an error
+/// reply, and the guest's action and mask are unchanged: a hit would
+/// reset the ignored action to the default, which no repair writes back.
+#[tokio::test]
+async fn a_gdb_watchpoint_is_refused_while_sigtrap_is_ignored() {
+    let (path, addresses) = build_guest("gdbstub_watched_ignored", &[], &["reverie_watched"]);
+    let word = addresses[0];
+    let status = debug_to_end(&path, "gdb-watch-ignored", |mut remote| async move {
+        let stop = remote.resume().await;
+        assert!(
+            stop.starts_with("T1e"),
+            "expected the SIGUSR1 stop, got {stop:?}"
+        );
+        let reply = remote.request(&format!("Z2,{word:x},8")).await;
+        assert!(
+            reply.starts_with('E'),
+            "expected a refusal while SIGTRAP is ignored, got {reply:?}"
+        );
+        assert_exited_zero(&remote.resume().await, "after the refused watchpoint");
+    })
+    .await;
+    assert_eq!(status, ExitStatus::Exited(0));
+}
+
+/// A gdb watch on a thread that catches SIGTRAP while blocking it is
+/// likewise refused: a hit would reset the caught action to the default.
+#[tokio::test]
+async fn a_gdb_watchpoint_is_refused_while_sigtrap_is_caught_and_blocked() {
+    let (path, addresses) =
+        build_guest("gdbstub_watched_caught_blocked", &[], &["reverie_watched"]);
+    let word = addresses[0];
+    let status = debug_to_end(&path, "gdb-watch-caught-blocked", |mut remote| async move {
+        let stop = remote.resume().await;
+        assert!(
+            stop.starts_with("T1e"),
+            "expected the SIGUSR1 stop, got {stop:?}"
+        );
+        let reply = remote.request(&format!("Z2,{word:x},8")).await;
+        assert!(
+            reply.starts_with('E'),
+            "expected a refusal while SIGTRAP is caught and blocked, got {reply:?}"
+        );
+        assert_exited_zero(&remote.resume().await, "after the refused watchpoint");
+    })
+    .await;
+    assert_eq!(status, ExitStatus::Exited(0));
+}
+
+/// A watchpoint the hardware cannot watch is refused both times gdb
+/// asks: the first refusal lists nothing that a second ask, or a later
+/// valid one, could mistake for an armed watchpoint.
+#[tokio::test]
+async fn a_refused_watchpoint_is_refused_again_not_armed() {
+    let guest = watched_store_guest();
+    let word = guest.word;
+    let status = debug_to_end(&guest.path, "gdb-watch-refused", |mut remote| async move {
+        for ask in 1..=2 {
+            let reply = remote.request(&format!("Z2,{word:x},3")).await;
+            assert!(
+                reply.starts_with('E'),
+                "ask {ask}: expected a refusal for a 3-byte watch, got {reply:?}"
+            );
+        }
+        // A kind wider than a byte (GDB sends the whole object length)
+        // is an error reply, not a malformed packet that ends the session.
+        let reply = remote.request(&format!("Z2,{word:x},100")).await;
+        assert!(
+            reply.starts_with('E'),
+            "expected a refusal for a 256-byte watch, got {reply:?}"
+        );
+        assert!(
+            remote.request("qC").await.starts_with("QC"),
+            "the session still answers after the oversized kind"
+        );
+        // A valid ask after the refusals arms exactly one watch.
+        assert_eq!(remote.request(&format!("Z2,{word:x},8")).await, "OK");
+        let stop = remote.resume().await;
+        assert!(
+            stop.starts_with(&format!("T05watch:{word:x};")),
+            "expected the store to stop for the watch, got {stop:?}"
+        );
+        assert_eq!(remote.request(&format!("z2,{word:x},8")).await, "OK");
+        assert_exited_zero(&remote.resume().await, "after removing the watchpoint");
+    })
+    .await;
+    assert_eq!(status, ExitStatus::Exited(0));
 }

@@ -423,6 +423,9 @@ pub enum StopEvent {
     Signal(AnySignal),
     /// Stopped by softwrae breakpoint.
     SwBreak,
+    /// Stopped by a hardware watchpoint gdb set: its type and the first
+    /// watched address.
+    Watchpoint { ty: BreakpointType, addr: u64 },
     /// Stopped due to vforkdone event.
     Vforkdone,
     /// Replay reached either begin or end.
@@ -581,6 +584,15 @@ impl WriteResponse for StopReason {
                     StopEvent::Signal(_) => {}
                     StopEvent::SwBreak => {
                         writer.put_str("swbreak:;");
+                    }
+                    StopEvent::Watchpoint { ty, addr } => {
+                        writer.put_str(match ty {
+                            BreakpointType::ReadWatch => "rwatch:",
+                            BreakpointType::AccessWatch => "awatch:",
+                            _ => "watch:",
+                        });
+                        writer.put_num(*addr);
+                        writer.put_str(";");
                     }
                     StopEvent::Vforkdone => {
                         writer.put_str("vforkdone:;");

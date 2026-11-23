@@ -2350,7 +2350,20 @@ impl HeldRootStop {
         slot: &Arc<StdMutex<Option<Self>>>,
         task: &Stopped,
     ) -> Result<(), TraceError> {
-        let replacement = Self::from_event(task, &Event::Exit);
+        Self::supersede_with_event(slot, task, &Event::Exit)
+    }
+
+    /// Replaces the held stop with `task`'s stop at `event`, where the
+    /// tracer itself completed a stop the kernel did not produce (a
+    /// gdb step a backend seccomp stop finished): the held stop is
+    /// consumed and the new one armed, in one transition, so the run
+    /// loop's lease check pairs with the stop it is handed.
+    pub(crate) fn supersede_with_event(
+        slot: &Arc<StdMutex<Option<Self>>>,
+        task: &Stopped,
+        event: &Event,
+    ) -> Result<(), TraceError> {
+        let replacement = Self::from_event(task, event);
         let mut held = slot.lock().unwrap();
         match held.as_ref() {
             None => {
@@ -4145,6 +4158,7 @@ const SECCOMP_FILTER_MAX_INSTRUCTIONS: usize = 4096;
 fn seccomp_filter(
     events: &Subscription,
     observes_sigreturns: bool,
+    trace_signal_state: bool,
 ) -> Result<seccomp::Filter, Error> {
     use reverie::process::seccomp::Action;
 
@@ -4171,6 +4185,20 @@ fn seccomp_filter(
                 .filter(|syscall| subscribed.binary_search(syscall).is_err())
                 .map(|syscall| (syscall, Action::Allow)),
         );
+    }
+    if trace_signal_state {
+        // A gdb session's own bookkeeping: the mask- and action-setting
+        // syscalls stop whether the Tool subscribes or not, so no mask
+        // or disposition change can stale the backend's records. An
+        // unsubscribed one is run untouched at its stop
+        // (`handle_seccomp`); a subscribed one reaches the Tool as
+        // before. Named after the policy's Allow fill above: the
+        // builder's map keeps the last action set for a number, so
+        // these traces replace its Allow.
+        builder.syscalls([
+            (Sysno::rt_sigprocmask, Action::Trace(0)),
+            (Sysno::rt_sigaction, Action::Trace(0)),
+        ]);
     }
     builder
         // The guest's rt_sigreturn is never shown to handle_syscall_event. It
@@ -4482,8 +4510,8 @@ impl<T: Tool + 'static> TracerBuilder<T> {
         command.seccomp(seccomp_filter(
             &events,
             cfg!(target_arch = "x86_64")
-                && T::observes_sigreturns(&config)
-                && self.gdbserver.is_none(),
+                && (T::observes_sigreturns(&config) || self.gdbserver.is_some()),
+            cfg!(target_arch = "x86_64") && self.gdbserver.is_some(),
         )?);
 
         // Command::spawn holds the launch lock from the child's first pipe
@@ -4764,6 +4792,7 @@ where
     let seccomp_filter = seccomp_filter(
         &events,
         cfg!(target_arch = "x86_64") && L::observes_sigreturns(&config),
+        false,
     )?;
 
     // While the pipes are made, no transient open of another thread may be

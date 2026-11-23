@@ -42,6 +42,10 @@ use reverie::Pid;
 use reverie::SigtrapAtHit;
 use reverie::WatchError;
 use reverie::WatchHit;
+use std::sync::Mutex as StdMutex;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+
 use reverie::WatchSpec;
 use safeptrace::Error as TraceError;
 use safeptrace::Stopped;
@@ -130,6 +134,11 @@ impl WatchSet {
         self.slots.iter().any(Option::is_some)
     }
 
+    /// The armed watches, in slot order.
+    pub(crate) fn specs(&self) -> impl Iterator<Item = WatchSpec> + '_ {
+        self.slots.iter().copied().flatten()
+    }
+
     /// The set with `specs` in slots 0, 1, and so on, each with its whole
     /// budget of stacks.
     fn of(specs: &[WatchSpec]) -> Self {
@@ -190,6 +199,7 @@ impl WatchSet {
         &self,
         task: &Stopped,
         specs: &[WatchSpec],
+        preserve_budgets_from: Option<&WatchSet>,
     ) -> (Self, Result<(), WatchError>) {
         let slots = match A::slots(task) {
             Ok(slots) => slots,
@@ -208,15 +218,22 @@ impl WatchSet {
             &mut OnThread::<A>(task, core::marker::PhantomData),
             slots,
             specs,
+            preserve_budgets_from,
         )
     }
 
     /// [`WatchSet::arm`] through `ops`, on a thread with `slots` slots.
+    /// With `preserve_budgets_from`, a slot re-armed with the very spec it
+    /// held in that set keeps what is left of its stack budget instead of
+    /// refilling it: re-arming for another owner's change (gdb's, or a
+    /// restore after a failed arm) is not the arming `WatchSpec::backtraces`
+    /// counts from, which is the owner's own `set_watchpoints`.
     fn arm_slots(
         &self,
         ops: &mut impl SlotOps,
         slots: u8,
         specs: &[WatchSpec],
+        preserve_budgets_from: Option<&WatchSet>,
     ) -> (Self, Result<(), WatchError>) {
         // Every slot is disarmed first, each tried, so that no old watch
         // stays armed beside the new ones.
@@ -231,7 +248,15 @@ impl WatchSet {
         let Some(error) = error else {
             // A hit before this arming is not one of these watches'.
             let _ = ops.take_hits();
-            return (Self::of(specs), Ok(()));
+            let mut set = Self::of(specs);
+            if let Some(old) = preserve_budgets_from {
+                for slot in 0..MAX_SLOTS {
+                    if set.slots[slot].is_some() && set.slots[slot] == old.slots[slot] {
+                        set.stacks_left[slot] = old.stacks_left[slot];
+                    }
+                }
+            }
+            return (set, Ok(()));
         };
         let disarmed = disarm_all(ops, slots).is_ok();
         let set = if disarmed {
@@ -364,6 +389,234 @@ pub(crate) fn unwind(tid: Pid) -> Option<Backtrace> {
     Some(Backtrace::new(tid, frames))
 }
 
+/// A hit of one of gdb's watches no gdb stop has named yet: the watch's
+/// type and address for the stop reply, and the instruction pointer the
+/// hit was taken at. A later stop may name it only at that same
+/// instruction pointer; a stop anywhere else is not this hit's stop, and
+/// naming it there would report the watch at the wrong place. Only the
+/// first hit at a stop is held; further hits at the same stop coalesce
+/// into its reply (`split_watch_hits`).
+pub(crate) type PendingGdbWatch = (crate::gdbstub::BreakpointType, u64, u64);
+
+/// Puts `hit` in `pending`, returning the different hit it replaced, if
+/// any: the freshest hit wins, so an older unnamed hit can never swallow
+/// the hit the current stop actually took.
+pub(crate) fn supersede_pending_gdb_watch(
+    pending: &mut Option<PendingGdbWatch>,
+    hit: PendingGdbWatch,
+) -> Option<PendingGdbWatch> {
+    match pending.replace(hit) {
+        Some(old) if old != hit => Some(old),
+        _ => None,
+    }
+}
+
+/// A process's shared list of gdb's watches, with the generation its
+/// threads reconcile against. The generation is read without the lock on
+/// every stop (`TracedTask::sync_gdb_watches` is called from the run
+/// loop), so an unchanged list costs one atomic load per stop; the list
+/// itself is cloned out of its lock only when the generation moved.
+#[derive(Debug, Default)]
+pub(crate) struct GdbWatchShared {
+    generation: AtomicU64,
+    watches: StdMutex<Vec<GdbWatch>>,
+}
+
+impl GdbWatchShared {
+    /// The current generation and list. The generation is read first, so
+    /// a change landing during the clone leaves the caller's armed
+    /// generation behind and it reconciles again at its next stop.
+    pub(crate) fn snapshot(&self) -> (u64, Vec<GdbWatch>) {
+        let generation = self.generation.load(Ordering::Acquire);
+        let watches = self
+            .watches
+            .lock()
+            .expect("should not be poisoned: no code panics while holding it")
+            .clone();
+        (generation, watches)
+    }
+
+    /// The current generation, without cloning the list.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Replaces the list and advances the generation.
+    pub(crate) fn replace(&self, watches: Vec<GdbWatch>) {
+        *self
+            .watches
+            .lock()
+            .expect("should not be poisoned: no code panics while holding it") = watches;
+        self.generation.fetch_add(1, Ordering::Release);
+    }
+
+    /// This list copied, for a forked child with its own address space.
+    pub(crate) fn copied(&self) -> Self {
+        let (generation, watches) = self.snapshot();
+        GdbWatchShared {
+            generation: AtomicU64::new(generation),
+            watches: StdMutex::new(watches),
+        }
+    }
+}
+
+/// One hardware watchpoint gdb set (its `watch`, `rwatch` or `awatch`
+/// command, through the `Z2`/`Z3`/`Z4` packets). GDB sets a watchpoint
+/// once for the whole inferior, so the list of them is shared by every
+/// thread of a process (`TracedTask::gdb_watch_specs`, shared and copied
+/// the way the software-breakpoint map is), and each thread arms its own
+/// debug registers from it: a new thread at its birth stop, every thread
+/// again as it leaves a gdb stop (`TracedTask::sync_gdb_watches`), and the
+/// thread that answers a `Z`/`z` packet at once. Removing through any
+/// thread therefore removes for all. Linux's debug-register inheritance is
+/// not this contract: the registers are per-thread and cleared by clone
+/// and exec, which is why each thread arms its own from the shared list,
+/// and an exec clears the list, as it clears gdb's breakpoints.
+///
+/// A thread's debug registers are shared with the Tool's watches
+/// (`Guest::set_watchpoints`): both lists arm together in the thread's one
+/// [`WatchSet`], Tool watches first, a watch both owners hold arms once,
+/// and a hit is attributed by the watch that caught it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GdbWatch {
+    /// The watchpoint type gdb asked for, which names the stop reply's
+    /// field (`watch:` or `awatch:`; read watchpoints are unsupported at
+    /// the session, as on a native x86 gdbserver, so one is never held).
+    /// An access watchpoint arms as [`reverie::WatchKind::ReadWrite`],
+    /// the hardware's read-or-write kind.
+    pub(crate) ty: crate::gdbstub::BreakpointType,
+    /// The watch as armed.
+    pub(crate) spec: WatchSpec,
+}
+
+/// What makes two watches the same hardware watch, whoever set it: the
+/// address, length and kind in the debug register. `WatchSpec::backtraces`
+/// is a Tool-side reporting budget the hardware does not hold.
+pub(crate) fn same_watch(a: &WatchSpec, b: &WatchSpec) -> bool {
+    (a.addr, a.len, a.kind) == (b.addr, b.len, b.kind)
+}
+
+/// Whether `next` arms a hardware watch `current` does not already hold.
+/// Arming only what is already armed, or disarming, adds no forced
+/// SIGTRAP the thread was not already exposed to, so the SIGTRAP-state
+/// refusal (`TracedTask::refuse_watch_under_sigtrap_state`) applies only
+/// when this says so: refusing a disarm is never needed.
+pub(crate) fn arms_new_watch(current: &[WatchSpec], next: &[WatchSpec]) -> bool {
+    next.iter()
+        .any(|spec| !current.iter().any(|held| same_watch(held, spec)))
+}
+
+/// The specs arming a thread with `tool`'s and `gdb`'s watches: the Tool's
+/// first (a Tool hit's slot names its place in the Tool's slice), then
+/// gdb's that the Tool does not already hold — a watch both hold arms
+/// once, in the Tool's slot, and its hit reports to both
+/// (`split_watch_hits`).
+pub(crate) fn combined_watch_specs(tool: &[WatchSpec], gdb: &[GdbWatch]) -> Vec<WatchSpec> {
+    let mut combined: Vec<WatchSpec> = tool.to_vec();
+    for watch in gdb {
+        if !combined.iter().any(|spec| same_watch(spec, &watch.spec)) {
+            combined.push(watch.spec);
+        }
+    }
+    combined
+}
+
+/// Arms `task` with the Tool's watches and gdb's watches together
+/// (`combined_watch_specs`), from one pair of lists to another, refusing to
+/// lose the old pair's watches on failure: a check failure changes nothing,
+/// and a failed arm tries to put the old pair back before reporting. The
+/// third result says the old pair is armed again (or was never disarmed),
+/// so the caller keeps its old lists; without it the caller prunes them to
+/// what the returned set holds (`prune_watch_lists`).
+pub(crate) fn arm_combined_or_restore(
+    task: &Stopped,
+    set: &WatchSet,
+    old_tool: &[WatchSpec],
+    old_gdb: &[GdbWatch],
+    new_tool: &[WatchSpec],
+    new_gdb: &[GdbWatch],
+    preserve_budgets: bool,
+) -> (WatchSet, Result<(), WatchError>, bool) {
+    let combined = combined_watch_specs(new_tool, new_gdb);
+    if let Err(error) = WatchSet::check::<Arch>(task, &combined) {
+        return (*set, Err(error), true);
+    }
+    let (armed, result) = set.arm::<Arch>(task, &combined, preserve_budgets.then_some(set));
+    let Err(error) = result else {
+        return (armed, Ok(()), false);
+    };
+    // Putting the old watches back is not an arming either owner asked
+    // for: their stack budgets stay as they were.
+    let (restored, restore_result) =
+        armed.arm::<Arch>(task, &combined_watch_specs(old_tool, old_gdb), Some(set));
+    // The restore attempt ran more register writes after the failed
+    // arm, successful or not, so `disarmed` reports the final restored
+    // set — left disarmed only where that set is itself empty —
+    // whatever the failed arm reported while trying.
+    let error = match error {
+        WatchError::Failed { errno, .. } => WatchError::Failed {
+            errno,
+            disarmed: !restored.is_armed(),
+        },
+        other => other,
+    };
+    (restored, Err(error), restore_result.is_ok())
+}
+
+/// Drops from `tool` and `gdb` every watch `set` does not hold, after a
+/// failed arming that could not restore the old lists
+/// (`arm_combined_or_restore`). A gdb watch the Tool's identical spec
+/// armed counts as held (`same_watch`).
+pub(crate) fn prune_watch_lists(
+    set: &WatchSet,
+    tool: &mut Vec<WatchSpec>,
+    gdb: &mut Vec<GdbWatch>,
+) {
+    let present: Vec<WatchSpec> = set.specs().collect();
+    tool.retain(|spec| present.contains(spec));
+    gdb.retain(|watch| present.iter().any(|spec| same_watch(spec, &watch.spec)));
+}
+
+/// Splits `hits` between the Tool and gdb by the watch that caught each
+/// (`same_watch`): a hit of a watch both hold goes to both, and a hit of a
+/// watch neither list holds (one a failed arming left in the hardware,
+/// `WatchSet::arm`) goes to the Tool, as every hit did before gdb could
+/// set watches. Returns the Tool's hits and the first of gdb's, as the
+/// (type, address) its stop reply names; further gdb hits at the same stop
+/// coalesce into that one reply, as a native gdbserver names one watch
+/// per stop.
+///
+/// While gdb holds any watch on the thread, the Tool's hits report
+/// [`SigtrapAtHit::Unknown`]: the repair a hit may have taken for
+/// gdb's watches is the debugger's business, and the backend does
+/// not claim its outcome as known to the Tool (`WatchHit::sigtrap`).
+/// The repair itself is unchanged.
+pub(crate) fn split_watch_hits(
+    hits: Vec<WatchHit>,
+    tool: &[WatchSpec],
+    gdb: &[GdbWatch],
+) -> (Vec<WatchHit>, Option<PendingGdbWatch>) {
+    let mut gdb_hit = None;
+    let mut tool_hits: Vec<WatchHit> = hits
+        .into_iter()
+        .filter(|hit| {
+            let gdb_watch = gdb.iter().find(|watch| same_watch(&watch.spec, &hit.spec));
+            if let Some(watch) = gdb_watch
+                && gdb_hit.is_none()
+            {
+                gdb_hit = Some((watch.ty, watch.spec.addr, hit.ip));
+            }
+            gdb_watch.is_none() || tool.iter().any(|spec| same_watch(spec, &hit.spec))
+        })
+        .collect();
+    if !gdb.is_empty() {
+        for hit in &mut tool_hits {
+            hit.sigtrap = SigtrapAtHit::Unknown;
+        }
+    }
+    (tool_hits, gdb_hit)
+}
+
 #[cfg(test)]
 mod tests {
     use reverie::Errno;
@@ -446,7 +699,7 @@ mod tests {
             ..Fake::default()
         };
         let specs = [spec(0x1000, 1), spec(0x2000, 0)];
-        let (set, result) = old.arm_slots(&mut fake, 4, &specs);
+        let (set, result) = old.arm_slots(&mut fake, 4, &specs, None);
         assert_eq!(result, Ok(()));
         assert_eq!(set, WatchSet::of(&specs));
         let mut expected = ALL_DISARMED.to_vec();
@@ -466,7 +719,7 @@ mod tests {
             ..Fake::default()
         };
         let specs = [spec(0x1000, 0), spec(0x2000, 0), spec(0x3000, 0)];
-        let (set, result) = WatchSet::default().arm_slots(&mut fake, 4, &specs);
+        let (set, result) = WatchSet::default().arm_slots(&mut fake, 4, &specs, None);
         assert_eq!(
             result,
             Err(WatchError::Failed {
@@ -490,7 +743,7 @@ mod tests {
             fail_disarm: Some(1),
             ..Fake::default()
         };
-        let (set, result) = old.arm_slots(&mut fake, 4, &[spec(0x1000, 0)]);
+        let (set, result) = old.arm_slots(&mut fake, 4, &[spec(0x1000, 0)], None);
         assert_eq!(
             result,
             Err(WatchError::Failed {
@@ -526,7 +779,7 @@ mod tests {
             ..Fake::default()
         };
         let specs = [spec(0x1000, 1), spec(0x2000, 0)];
-        let (set, result) = old.arm_slots(&mut fake, 4, &specs);
+        let (set, result) = old.arm_slots(&mut fake, 4, &specs, None);
         assert_eq!(
             result,
             Err(WatchError::Failed {
@@ -558,7 +811,7 @@ mod tests {
         // A failed first pass arms nothing, so make slot 0 hold the new
         // watch as a partial write would have left it.
         fake.armed[0] = Some(spec(0x1000, 0));
-        let (set, result) = WatchSet::default().arm_slots(&mut fake, 4, &[spec(0x1000, 1)]);
+        let (set, result) = WatchSet::default().arm_slots(&mut fake, 4, &[spec(0x1000, 1)], None);
         assert!(matches!(
             result,
             Err(WatchError::Failed {
@@ -588,10 +841,32 @@ mod tests {
             fail_disarm: Some(2),
             ..Fake::default()
         };
-        let (mut back, _) = set.arm_slots(&mut fake, 4, &[spec(0x5000, 0)]);
+        let (mut back, _) = set.arm_slots(&mut fake, 4, &[spec(0x5000, 0)], None);
         assert_eq!(back.slots[2], Some(spec(0x3000, 1)));
         assert_eq!(back.spend_stacks(0b100), 0b100);
         assert_eq!(back.spend_stacks(0b100), 0);
+    }
+
+    #[test]
+    fn a_preserving_rearm_keeps_a_spent_budget_spent() {
+        // One stack asked for, spent by the first hit. A re-arm that
+        // preserves budgets (gdb's change beside the Tool's watch, or a
+        // restore) must not refill it; the owner's own re-arm (no
+        // preservation) starts it anew.
+        let specs = [spec(0x1000, 1)];
+        let mut spent = WatchSet::of(&specs);
+        assert_eq!(spent.spend_stacks(0b1), 0b1);
+        assert_eq!(spent.spend_stacks(0b1), 0);
+        let (mut kept, result) = spent.arm_slots(&mut Fake::default(), 4, &specs, Some(&spent));
+        assert!(result.is_ok());
+        assert_eq!(kept.spend_stacks(0b1), 0, "the budget stays spent");
+        let (mut refilled, result) = spent.arm_slots(&mut Fake::default(), 4, &specs, None);
+        assert!(result.is_ok());
+        assert_eq!(
+            refilled.spend_stacks(0b1),
+            0b1,
+            "the owner's re-arm refills"
+        );
     }
 
     #[test]
@@ -607,5 +882,25 @@ mod tests {
         assert_eq!(hits[0].ip, 0x401000);
         assert_eq!(hits[0].sigtrap, SigtrapAtHit::Reblocked);
         assert_eq!(hits[0].backtrace, None);
+    }
+
+    #[test]
+    fn tool_hits_report_unknown_while_a_gdb_watch_is_armed() {
+        let tool = [spec(0x1000, 0)];
+        let gdb = [GdbWatch {
+            ty: crate::gdbstub::BreakpointType::WriteWatch,
+            spec: spec(0x2000, 0),
+        }];
+        let mut set = WatchSet::of(&[tool[0], gdb[0].spec]);
+        let tid = Pid::from_raw(42);
+        let hits = set.hits::<Arch>(tid, 0b01, 0x401000, SigtrapAtHit::Reblocked);
+        let (tool_hits, gdb_hit) = split_watch_hits(hits, &tool, &gdb);
+        assert_eq!(tool_hits.len(), 1);
+        assert_eq!(tool_hits[0].sigtrap, SigtrapAtHit::Unknown);
+        assert_eq!(gdb_hit, None);
+        // With no gdb watch armed the computed state stands.
+        let hits = set.hits::<Arch>(tid, 0b01, 0x401000, SigtrapAtHit::Reblocked);
+        let (tool_hits, _) = split_watch_hits(hits, &tool, &[]);
+        assert_eq!(tool_hits[0].sigtrap, SigtrapAtHit::Reblocked);
     }
 }

@@ -69,16 +69,23 @@ pub(crate) enum SigtrapAction {
 /// SIGTRAP's disposition as procfs reports it for a thread: whether it is in
 /// `SigIgn` and whether it is in `SigCgt`.
 pub(crate) fn parse_sigtrap_disposition(status: &str) -> Option<(bool, bool)> {
+    parse_signal_disposition(status, libc::SIGTRAP)
+}
+
+/// `signal`'s disposition as procfs reports it for a thread: whether it is
+/// in `SigIgn` and whether it is in `SigCgt`.
+pub(crate) fn parse_signal_disposition(status: &str, signal: i32) -> Option<(bool, bool)> {
+    if !(1..=64).contains(&signal) {
+        return None;
+    }
+    let bit = 1u64 << (signal as u64 - 1);
     let field = |name: &str| {
         status
             .lines()
             .find_map(|line| line.strip_prefix(name))
             .and_then(|value| u64::from_str_radix(value.trim(), 16).ok())
     };
-    Some((
-        field("SigIgn:")? & SIGTRAP_BIT != 0,
-        field("SigCgt:")? & SIGTRAP_BIT != 0,
-    ))
+    Some((field("SigIgn:")? & bit != 0, field("SigCgt:")? & bit != 0))
 }
 
 /// How a single-step over the injected syscall `nr` is kept from changing

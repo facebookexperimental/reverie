@@ -234,6 +234,17 @@ pub(crate) enum StepUnit {
     Requeue(Signal),
 }
 
+/// What an observer of a timer step's stop asks the stepping to do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StepObservation {
+    /// Step on toward the target.
+    Continue,
+    /// Stop stepping after this step and hand its stop on, with the steps
+    /// kept for `Timer::continue_stepping` as for any interrupted step
+    /// (`Timer::disregard_stop`). Only a step's final stop is honoured.
+    Pause,
+}
+
 /// What a stop handed to a step's observer is to the step that reached it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StepStop {
@@ -1236,7 +1247,7 @@ impl Timer {
         &mut self,
         task: Stopped,
         step: &mut (dyn FnMut(Stopped, StepRequest) -> Result<Running, TraceError> + Send),
-        observe: &mut (dyn FnMut(&Wait, StepStop) -> Result<(), TraceError> + Send),
+        observe: &mut (dyn FnMut(&Wait, StepStop) -> Result<StepObservation, TraceError> + Send),
         waits: &std::sync::Arc<PtracerWaitOwner>,
     ) -> Result<Stopped, HandleFailure> {
         match self.inner_mut_noinit() {
@@ -1255,7 +1266,7 @@ impl Timer {
         task: Stopped,
         unfinished: Unfinished,
         step: &mut (dyn FnMut(Stopped, StepRequest) -> Result<Running, TraceError> + Send),
-        observe: &mut (dyn FnMut(&Wait, StepStop) -> Result<(), TraceError> + Send),
+        observe: &mut (dyn FnMut(&Wait, StepStop) -> Result<StepObservation, TraceError> + Send),
         waits: &std::sync::Arc<PtracerWaitOwner>,
     ) -> Result<Stopped, HandleFailure> {
         match self.inner_mut_noinit() {
@@ -3098,7 +3109,7 @@ impl TimerImpl {
         task: Stopped,
         unfinished: Unfinished,
         step: &mut (dyn FnMut(Stopped, StepRequest) -> Result<Running, TraceError> + Send),
-        observe: &mut (dyn FnMut(&Wait, StepStop) -> Result<(), TraceError> + Send),
+        observe: &mut (dyn FnMut(&Wait, StepStop) -> Result<StepObservation, TraceError> + Send),
         waits: &std::sync::Arc<PtracerWaitOwner>,
     ) -> Result<Stopped, HandleFailure> {
         match unfinished {
@@ -3370,7 +3381,7 @@ impl TimerImpl {
         &mut self,
         task: Stopped,
         step: &mut (dyn FnMut(Stopped, StepRequest) -> Result<Running, TraceError> + Send),
-        observe: &mut (dyn FnMut(&Wait, StepStop) -> Result<(), TraceError> + Send),
+        observe: &mut (dyn FnMut(&Wait, StepStop) -> Result<StepObservation, TraceError> + Send),
         waits: &std::sync::Arc<PtracerWaitOwner>,
     ) -> Result<Stopped, HandleFailure> {
         // Ensure any new timer signals don't mess with us while single-stepping
@@ -3442,7 +3453,7 @@ impl TimerImpl {
         mut current: ClockCounter,
         target_instr: u64,
         step: &mut (dyn FnMut(Stopped, StepRequest) -> Result<Running, TraceError> + Send),
-        observe: &mut (dyn FnMut(&Wait, StepStop) -> Result<(), TraceError> + Send),
+        observe: &mut (dyn FnMut(&Wait, StepStop) -> Result<StepObservation, TraceError> + Send),
         waits: &std::sync::Arc<PtracerWaitOwner>,
     ) -> Result<Stopped, HandleFailure> {
         let target_rcb = current.target_rcb;
@@ -3657,7 +3668,7 @@ impl TimerImpl {
             if let Wait::Stopped(_, event) = &wait
                 && is_syscall_stop(event)
             {
-                observe(&wait, StepStop::Passing)?;
+                let _ = observe(&wait, StepStop::Passing)?;
                 let Wait::Stopped(entered, _) = wait else {
                     unreachable!("matched a stop");
                 };
@@ -3706,7 +3717,7 @@ impl TimerImpl {
                     return Err(HandleFailure::GuestSigtrap(stopped, "precise timer"));
                 }
                 let sig = *sig;
-                observe(&wait, StepStop::Passing)?;
+                let _ = observe(&wait, StepStop::Passing)?;
                 let Wait::Stopped(stopped, _) = wait else {
                     unreachable!("matched a stop");
                 };
@@ -3741,7 +3752,8 @@ impl TimerImpl {
                 let mask = stopped.getsigmask()?;
                 stopped.setsigmask(mask & !requeued)?;
             }
-            observe(&wait, StepStop::Final)?;
+            let pause_after_step = observe(&wait, StepStop::Final)? == StepObservation::Pause
+                && matches!(wait, Wait::Stopped(_, TraceEvent::Signal(Signal::SIGTRAP)));
             // A notification of this timer's own that reaches the thread
             // during its steps is consumed, and the stepping goes on from
             // where the stop found it (`own_notification_during_steps`).
@@ -3935,6 +3947,22 @@ impl TimerImpl {
                 return Ok(task);
             }
             current.single_step_with_clock(clock);
+            if pause_after_step {
+                crate::task::WATCH_PAUSES_IN_TIMER_STEPS
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // The observer asked for this step's stop to be handed on
+                // (a gdb watch hit): keep how far the steps have come for
+                // its handler, which continues them if the stop does not
+                // decide the event (`Timer::disregard_stop`).
+                self.interrupted = Some(Interruption::At(InterruptedSteps {
+                    steps: current,
+                    target_instr,
+                }));
+                return Err(HandleFailure::Event(Box::new(Wait::Stopped(
+                    task,
+                    TraceEvent::Signal(Signal::SIGTRAP),
+                ))));
+            }
         }
         #[cfg(target_arch = "aarch64")]
         restore_breakpoints(breakpoints.regs(), &task);
@@ -5840,7 +5868,7 @@ mod tests {
                     _ => task.step(None),
                 }
             };
-        let mut observe = |_: &Wait, _: StepStop| Ok(());
+        let mut observe = |_: &Wait, _: StepStop| Ok(super::StepObservation::Continue);
         let waits = std::sync::Arc::new(super::PtracerWaitOwner::default());
         waits.bind_stopped(&task);
         let result = futures::executor::block_on(inner.attempt_single_step(
@@ -6520,7 +6548,7 @@ mod tests {
                     _ => task.step(None),
                 }
             };
-        let mut observe = |_: &Wait, _: super::StepStop| Ok(());
+        let mut observe = |_: &Wait, _: super::StepStop| Ok(super::StepObservation::Continue);
         let waits = std::sync::Arc::new(super::PtracerWaitOwner::default());
         waits.bind_stopped(&task);
         if end_an_event_first {
