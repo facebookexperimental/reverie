@@ -1981,6 +1981,7 @@ rust_library(
         "ovr_config//os:linux",
     ],
     unittests = False,
+    visibility = ["//hermetic_infra/hermit/hermit-cli:"],
     deps = [
         "fbsource//third-party/rust:bincode",
         "fbsource//third-party/rust:libc",
@@ -3025,6 +3026,7 @@ rust_library(
         "ovr_config//os:linux",
     ],
     unittests = False,
+    visibility = ["//hermetic_infra/hermit/hermit-cli:"],
     deps = [
         "fbsource//third-party/rust:bincode",
         "fbsource//third-party/rust:iced-x86",
