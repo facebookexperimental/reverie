@@ -1491,6 +1491,7 @@ pub(crate) fn record_capacity_body_dropped_for_test(tid: Pid, status: Option<Exi
 #[cfg(test)]
 pub(crate) fn record_fatal_task_for_test(task: &Arc<FatalTaskStop>) {
     tests::fatal_capacity_tests::record_registered(task);
+    tests::fatal_parent_kill_tests::record_registered(task);
     FATAL_REAP_OBSERVATIONS.with(|slot| {
         if let Some(observations) = slot.borrow_mut().as_mut() {
             observations.push(Arc::clone(task));
@@ -6956,25 +6957,30 @@ mod tests {
         format!("/tmp/reverie-1091-held-{pid}")
     }
 
-    /// Blocks (no await: the exit future must not claim the exit stop first)
-    /// until the thread is in its exit stop: in a tracing stop with
+    /// Whether the thread is in its exit stop: in a tracing stop with
     /// PF_SIGNALED (0x400) in its stat flags, set by the fatal signal before
-    /// do_exit reports that stop. False after five seconds.
-    fn block_until_exit_stop(pid: Pid, tid: Pid) -> bool {
+    /// do_exit reports that stop.
+    fn in_exit_stop(pid: Pid, tid: Pid) -> bool {
         let stat = format!("/proc/{pid}/task/{tid}/stat");
+        std::fs::read_to_string(stat).ok().is_some_and(|stat| {
+            let fields: Vec<&str> = stat
+                .rsplit_once(')')
+                .map_or(Vec::new(), |(_, rest)| rest.split_whitespace().collect());
+            fields.first() == Some(&"t")
+                && fields
+                    .get(6)
+                    .and_then(|flags| flags.parse::<u64>().ok())
+                    .is_some_and(|flags| flags & 0x400 != 0)
+        })
+    }
+
+    /// Blocks (no await: the exit future must not claim the exit stop first)
+    /// until the thread is in its exit stop ([`in_exit_stop`]). False after
+    /// five seconds.
+    fn block_until_exit_stop(pid: Pid, tid: Pid) -> bool {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            let in_exit_stop = std::fs::read_to_string(&stat).ok().is_some_and(|stat| {
-                let fields: Vec<&str> = stat
-                    .rsplit_once(')')
-                    .map_or(Vec::new(), |(_, rest)| rest.split_whitespace().collect());
-                fields.first() == Some(&"t")
-                    && fields
-                        .get(6)
-                        .and_then(|flags| flags.parse::<u64>().ok())
-                        .is_some_and(|flags| flags & 0x400 != 0)
-            });
-            if in_exit_stop {
+            if in_exit_stop(pid, tid) {
                 return true;
             }
             if Instant::now() > deadline {
