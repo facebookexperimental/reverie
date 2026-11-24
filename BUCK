@@ -695,6 +695,7 @@ rust_library(
     test_deps = ["fbsource//third-party/rust:libc"],
     deps = [
         "fbsource//third-party/rust:syscalls",
+        "fbsource//third-party/rust:zerocopy",
     ],
 )
 
