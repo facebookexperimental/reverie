@@ -31,6 +31,54 @@
     },
     {
       "group": "check",
+      "job": "e2e_compare_pin",
+      "desc": "E2E compare workflow pin",
+      "description": "Runs scripts/check-e2e-compare.rs: .github/workflows/e2e-compare.yml must equal its pinned text and pass its structural checks, and every reverie-examples/e2e/ledgers/ubuntu-*.tsv must pass the ledger lint.",
+      "labels": [
+        "full"
+      ],
+      "cmd": "./scripts/check-e2e-compare.rs .",
+      "deps": [],
+      "env": {},
+      "timeout": 600,
+      "cpu_timeout": 120,
+      "priority": 60,
+      "hint": {
+        "resources": {},
+        "est_duration_s": 10,
+        "rss_baseline_bytes": 1000000000,
+        "hard_mem_max_bytes": 16000000000,
+        "classification": "cpu-bound",
+        "preferred_inner_jobs": 4
+      },
+      "jobs_flag": ""
+    },
+    {
+      "group": "check",
+      "job": "e2e_compare_pin_self_test",
+      "desc": "E2E compare workflow pin self-test",
+      "description": "Runs scripts/check-e2e-compare.rs --self-test: every mutant of the workflow and of a synthetic ledger must be refused by name, the workflow mutants by the structural checks alone, and the case count is pinned.",
+      "labels": [
+        "full"
+      ],
+      "cmd": "./scripts/check-e2e-compare.rs --self-test",
+      "deps": [],
+      "env": {},
+      "timeout": 600,
+      "cpu_timeout": 120,
+      "priority": 60,
+      "hint": {
+        "resources": {},
+        "est_duration_s": 10,
+        "rss_baseline_bytes": 1000000000,
+        "hard_mem_max_bytes": 16000000000,
+        "classification": "cpu-bound",
+        "preferred_inner_jobs": 4
+      },
+      "jobs_flag": ""
+    },
+    {
+      "group": "check",
       "job": "catalog_bindings_append_only",
       "desc": "Catalogue history append-only",
       "description": "Runs scripts/check-catalog-bindings-append-only.rs: the content-catalogue history tables in reverie-liteinst-artifact/src/lib.rs (bindings, binding seals, rejected-prior) must keep every row of the merge-base with origin/<landing branch> unchanged. Without a resolvable merge-base it fails; it never skips.",
@@ -571,7 +619,7 @@
       "group": "e2e",
       "job": "cross_backend",
       "desc": "Reverie-layer cross-backend e2e",
-      "description": "reverie-examples/e2e/run.sh: every backend this host has, judged against the ledger for its environment (report-only without one).",
+      "description": "reverie-examples/e2e/run.sh: every backend this host has, judged against the ledger for its environment (without one it fails by name: NO LEDGER).",
       "labels": [
         "full"
       ],

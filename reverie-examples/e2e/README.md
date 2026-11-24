@@ -68,14 +68,54 @@ A ledger row records a program's first difference, which depends on the
 host's libraries and tools (glibc's loader, coreutils, `/proc`). So a ledger
 belongs to one environment: `ledgers/<os id>-<os version>-glibc<version>.tsv`,
 which `run.sh` picks from `/etc/os-release` and `getconf GNU_LIBC_VERSION`
-(or `--environment NAME`). On a host with no ledger, `run.sh` reports the
-verdicts without judging them and says so (`NO LEDGER`). To add an
-environment, run `run.sh --write-ledger FILE` there twice, check that the
-rows agree, and commit them under `ledgers/` with a comment naming each
-group's defect. `cargo test` runs the environment-independent part
-(`../tests/recorder.rs`, `../tests/conformance.rs`). `CONFORMANCE.md`
-defines the tool-by-backend matrix and each tool's oracle beyond the
-recorder row this directory judges today.
+(or `--environment NAME`). With no ledger for the environment nothing can be
+judged, so `run.sh` fails by name (`NO LEDGER`) before it builds anything;
+only an explicit `--report-only` reports the verdicts without judging them,
+or `--report-only-if-no-ledger`, which judges where the environment has a
+ledger and reports where it has none (the rule `run.sh` had before it failed
+closed; the self-hosted `hardware` CI job uses it).
+To add an environment, run `run.sh --report-only --write-ledger FILE` there
+twice, check that the rows agree, and commit them under `ledgers/` with a
+comment naming each group's defect. `--require-compared LIST` also requires
+every corpus cell to be compared (`match` or `mismatch`) on each listed
+backend: a refusal, a failed run or an unstable native baseline fails the
+run, with or without a ledger.
+
+| Ledger for the environment | `--report-only` | `--write-ledger` | What runs | Exit |
+|---|---|---|---|---|
+| present | no | no | judged | the comparator's: 0 only if every verdict is in the ledger and no row is stale |
+| present | no | yes | judged; rows written | the comparator's |
+| present | yes | no | reported | 0 |
+| present | yes | yes | reported; rows written | 0 |
+| absent | no | no | nothing: `NO LEDGER`, before the build | 1 |
+| absent | no | yes | measured in report mode; rows written; then `NO LEDGER` | 1 |
+| absent | yes | no | reported (`NO LEDGER ...: report only, by request`) | 0 |
+| absent | yes | yes | reported; rows written (the measurement form) | 0 |
+
+`--report-only-if-no-ledger` without `--report-only` leaves every `present`
+row above as it is, and makes the `absent` rows report only:
+
+| Ledger for the environment | `--write-ledger` | What runs | Exit |
+|---|---|---|---|
+| present | no | judged | the comparator's |
+| present | yes | judged; rows written | the comparator's |
+| absent | no | reported (`NO LEDGER ...: report only, --report-only-if-no-ledger`) | 0 |
+| absent | yes | reported; rows written | 0 |
+
+In every row a usage or build error exits 2, and a `--require-compared` gap
+exits 1. A backend this host refuses is named (`REFUSED`). If no requested
+backend can run, the run exits 1 by name ("no requested backend can run on
+this host"); otherwise a refused backend listed in `--require-compared`
+fails the run by name (`COVERAGE`). Either way this happens before the
+comparator runs, so no rows are written and no `NO LEDGER` line follows.
+An empty item in
+`--require-compared` (a leading, trailing or doubled comma) is a usage
+error. `cargo test` runs the environment-independent part
+(`../tests/recorder.rs`, `../tests/conformance.rs`) and this directory's own
+tests (`../tests/e2e_run_ledger.rs` for `run.sh`'s decision above,
+`../tests/e2e_compare_coverage.rs` for the comparator's
+`--require-compared`). `CONFORMANCE.md` defines the tool-by-backend matrix
+and each tool's oracle beyond the recorder row this directory judges today.
 
 ```text
 reverie-examples/e2e/run.sh                      # every backend this host has

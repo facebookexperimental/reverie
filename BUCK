@@ -3572,7 +3572,16 @@ buck_filegroup(
 # every first-party backend, so they run through gated tests
 # (fb-only/gated_tests). As in our Cargo CI's host-dependent job, they require
 # /dev/kvm (REVERIE_REQUIRE_KVM) rather than pass without it.
-_EXAMPLES_TESTS = [f.removeprefix("reverie-examples/tests/").removesuffix(".rs") for f in glob(["reverie-examples/tests/*.rs"])]
+# tests/e2e_run_ledger.rs and tests/e2e_compare_coverage.rs run
+# reverie-examples/e2e/run.sh and its comparator (e2e/compare.rs, the
+# reverie-e2e-compare [[bin]]), which this file does not build
+# (reverie-examples/e2e/** is excluded above), so they are excluded here by
+# name: no target provides CARGO_BIN_EXE_reverie-e2e-compare or a
+# CARGO_MANIFEST_DIR holding e2e/. Cargo runs them with the workspace tests.
+_EXAMPLES_TESTS = [
+    f.removeprefix("reverie-examples/tests/").removesuffix(".rs")
+    for f in glob(["reverie-examples/tests/*.rs"], exclude = ["reverie-examples/tests/e2e_compare_coverage.rs", "reverie-examples/tests/e2e_run_ledger.rs"])
+]
 
 # Tests that find libreverie_examples.so beside their own executable (Cargo's
 # target/<profile>/deps), which a Buck test executable never has: their gated

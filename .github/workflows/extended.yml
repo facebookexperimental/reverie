@@ -2,12 +2,15 @@ name: Extended checks
 
 # Manual/scheduled home for the checks that used to run on every push
 # and pull request in ci.yml (Rust) and guide.yml (Guide): the full
-# workspace test suite, documentation tests, Clippy, formatting, the
-# no-device cross-backend check, and the API-docs build. They moved
-# here unchanged so the push/PR lanes check less but stay reliably
-# green on hosted runners. This workflow is best-effort signal only:
-# it never gates a pull request and must not become a required status
-# check. Local validation (validate.sh) remains the real testing.
+# workspace test suite, documentation tests, Clippy, formatting, and
+# the API-docs build. They moved here unchanged so the push/PR lanes
+# check less but stay reliably green on hosted runners. The no-device
+# cross-backend check, which also started here, now runs in its own
+# workflow, e2e-compare.yml, judged against a ledger instead of being
+# skipped behind this job's test step. This workflow is best-effort
+# signal only: it never gates a pull request and must not become a
+# required status check. Local validation (validate.sh) remains the
+# real testing.
 on:
   workflow_dispatch:
   schedule:
@@ -171,11 +174,6 @@ jobs:
         test -n "$channel"
         rustup toolchain install "$channel" --profile minimal --component rustfmt
         bash scripts/rustfmt-gate.sh
-    # The cross-backend check on every backend that needs no device. A hosted
-    # runner's environment has no ledger, so its verdicts are reported, not
-    # judged (reverie-examples/e2e/README.md).
-    - name: Reverie-layer cross-backend e2e (no device)
-      run: reverie-examples/e2e/run.sh --backends ptrace,liteinst,in-guest-trap
     - name: Restore hosted-runner namespace restriction
       if: ${{ always() && steps.userns.outputs.restore_required == 'true' }}
       timeout-minutes: 1

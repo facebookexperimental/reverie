@@ -1055,6 +1055,8 @@ for name in sorted(covered - workspace):
 
 run_validation_serial() {
 run_check "Cross-client skill discovery" "$ROOT_DIR/scripts/check-skill-discovery.rs"
+run_check "E2E compare workflow pin" "$ROOT_DIR/scripts/check-e2e-compare.rs" "$ROOT_DIR"
+run_check "E2E compare workflow pin self-test" "$ROOT_DIR/scripts/check-e2e-compare.rs" --self-test
 run_check "Catalogue history append-only" "$ROOT_DIR/scripts/check-catalog-bindings-append-only.rs"
 run_check "Build workspace" cargo build --workspace --features "$STABLE_FEATURES"
 run_check "LiteInst allocator fixtures" build_liteinst_allocator_fixtures
@@ -1071,7 +1073,8 @@ export -n REVERIE_LITEINST_PRELOAD REVERIE_LITEINST_TEST_RUNTIME_MANIFEST \
 run_test_check "Documentation tests" cargo test --workspace --doc --features "$STABLE_FEATURES"
 # Every backend this host has, against the ledger for its environment; a
 # backend whose inputs are missing is refused by name, and a host with no
-# ledger gets its verdicts reported, not judged (reverie-examples/e2e/README.md).
+# ledger fails by name (NO LEDGER) before the build
+# (reverie-examples/e2e/README.md).
 run_check "Reverie-layer cross-backend e2e" "$ROOT_DIR/reverie-examples/e2e/run.sh"
 run_clippy() {
     cargo clippy --workspace --all-targets --features "$STABLE_FEATURES" -- -D warnings || return $?

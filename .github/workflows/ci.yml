@@ -23,9 +23,14 @@ name: Rust
 # the LiteInst allocator fixture build, which pass reliably on hosted runners,
 # so it is named "Build (GitHub-hosted)"; merge-gate.yml selects it by that
 # name and reports it as build-only. Its job id stays `regular`. The full
-# workspace test suite, documentation tests, Clippy, formatting, the
-# no-device cross-backend check, and the API-docs build moved to the
-# manual/scheduled Extended checks workflow (extended.yml), unchanged.
+# workspace test suite, documentation tests, Clippy, formatting and the
+# API-docs build moved to the manual/scheduled Extended checks workflow
+# (extended.yml), unchanged. The no-device cross-backend check runs in
+# e2e-compare.yml, judged against a ledger; `regular` checks that
+# workflow's pin (scripts/check-e2e-compare.rs). The KVM cross-backend check
+# runs in `hardware` by its earlier rule (judged where a ledger exists for the
+# runner's environment, report-only where none does), and never reports
+# without judging in the dispatch-only self-hosted `kvm-e2e` job below.
 # GitHub CI is best-effort signal only; local validation (validate.sh)
 # remains the real testing, and no GitHub check is a required status
 # check.
@@ -79,6 +84,11 @@ jobs:
       run: |
         rustc scripts/check-skill-discovery.rs -o "$RUNNER_TEMP/check-skill-discovery"
         "$RUNNER_TEMP/check-skill-discovery"
+    - name: E2E compare workflow pin
+      run: |
+        rustc --edition 2021 scripts/check-e2e-compare.rs -o "$RUNNER_TEMP/check-e2e-compare"
+        "$RUNNER_TEMP/check-e2e-compare" --self-test
+        "$RUNNER_TEMP/check-e2e-compare" .
     - name: Build
       run: |
         source scripts/stable-features.sh
@@ -273,8 +283,82 @@ jobs:
         kill "$watchdog" 2>/dev/null || true
         wait "$watchdog" 2>/dev/null || true
         exit "$status"
-    # The cross-backend check on KVM, which needs /dev/kvm (refused by name
-    # without it). Without a ledger for the runner's environment its verdicts
-    # are reported, not judged (reverie-examples/e2e/README.md).
+    # The cross-backend check on KVM, by the rule this job ran it under before
+    # run.sh failed closed: judged where a ledger exists for this runner's
+    # environment, reported without judgment where none does (NO LEDGER ...:
+    # report only), via --report-only-if-no-ledger (reverie-examples/e2e/README.md).
+    # It builds the e2e binaries and needs /dev/kvm; without it the run exits 1
+    # by name ("no requested backend can run on this host"). The run that never
+    # reports without judging is the dispatch-only `kvm-e2e` job below.
     - name: Reverie-layer cross-backend e2e (KVM)
-      run: reverie-examples/e2e/run.sh --backends kvm
+      run: reverie-examples/e2e/run.sh --backends kvm --report-only-if-no-ledger
+
+  kvm-e2e:
+    name: KVM cross-backend e2e (self-hosted)
+    # The cross-backend check on KVM, which needs /dev/kvm, judged against the
+    # ledger for the runner's environment (reverie-examples/e2e/README.md).
+    # `hardware` keeps the same check by its earlier rule (judged where a
+    # ledger exists, report-only where none does); this job never reports
+    # without judging. Privileged self-hosted work, so dispatch-only,
+    # with `hardware`'s dispatch clause. Until a ledger for the runner host,
+    # kernel and package set lands, it fails by name (NO LEDGER) and uploads
+    # the rows it measured. Where kvm is refused, the run exits 1 by name
+    # ("no requested backend can run on this host") before the comparator
+    # runs, so no rows are measured.
+    if: >-
+      ${{
+        vars.REVERIE_SELF_HOSTED == 'true' &&
+        github.event_name == 'workflow_dispatch' &&
+        (
+          github.actor == 'rrnewton' ||
+          (
+            github.actor == 'rrnewton-bots' &&
+            github.triggering_actor == 'rrnewton-bots' &&
+            github.repository == 'rrnewton/reverie' &&
+            github.ref_name == github.event.repository.default_branch &&
+            github.ref_protected == true
+          )
+        )
+      }}
+    runs-on: [self-hosted, Linux, X64, reverie]
+    # `hardware`'s 10-minute box: resource protection on the small shared
+    # pool. The comparison is bounded at 8 so the rows upload still runs
+    # after a timeout. The steps before it are not bounded one by one; the
+    # first dispatch measures them (a cold build overruns, as for
+    # `hardware`).
+    timeout-minutes: 10
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: false
+    - name: Dependencies
+      run: |
+        # dnf first: the Fedora self-hosted runners also have apt-get on PATH
+        # (see `hardware`).
+        if command -v dnf >/dev/null; then
+          sudo dnf install -y libunwind-devel xz-devel cmake zlib-devel
+        elif command -v apt-get >/dev/null; then
+          sudo apt-get install -y libunwind-dev liblzma-dev cmake zlib1g-dev
+        fi
+    - name: Rust toolchain
+      run: |
+        if ! command -v rustup >/dev/null 2>&1; then
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+          export PATH="$HOME/.cargo/bin:$PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+        fi
+        channel="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml | head -n 1)"
+        rustup toolchain install "$channel" --profile minimal
+        rustc --version
+    - name: KVM cross-backend e2e
+      timeout-minutes: 8
+      run: reverie-examples/e2e/run.sh --backends kvm --require-compared kvm --write-ledger "$RUNNER_TEMP/e2e-kvm-rows.tsv"
+    - name: Upload measured KVM rows
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: e2e-kvm-rows-${{ github.run_id }}-${{ github.run_attempt }}
+        path: ${{ runner.temp }}/e2e-kvm-rows.tsv
+        if-no-files-found: warn
+        retention-days: 3

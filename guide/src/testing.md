@@ -24,9 +24,12 @@ final global state compared exactly. Where a backend refuses a corpus
 program, the test asserts the *named refusal* — a refusal is a passing
 outcome; a divergence is not.
 
-A subtlety the harness itself documents: without a per-environment
-ledger of known-good verdicts, cross-backend results are *reported*,
-not *judged*. For your own CI, pin the ledger: record the expected
+A subtlety the harness itself documents: cross-backend results are
+*judged* only against a per-environment ledger of known-good verdicts.
+In an environment without one the harness fails by name (`NO LEDGER`)
+rather than pass, and reports without judging only when asked to
+(`--report-only`, or `--report-only-if-no-ledger`, which judges where a
+ledger exists). For your own CI, pin the ledger: record the expected
 verdict per (tool, program, backend) and fail on any change you did
 not intend.
 

@@ -1,0 +1,240 @@
+name: E2E compare
+
+# The cross-backend end-to-end comparison (reverie-examples/e2e/README.md) on
+# a GitHub-hosted Ubuntu runner: native Linux against ptrace, LiteInst and
+# in-guest-trap, judged against the ledger measured for the runner's
+# environment. Every corpus cell must be compared on all three backends
+# (--require-compared). Without a ledger for the environment the run fails by
+# name (NO LEDGER) and uploads the rows it measured; a cell that a backend
+# refuses, or that is otherwise not compared, also fails it by name
+# (COVERAGE), after the rows are written. It never passes unjudged. The step
+# just before the comparison fails the run if any file under
+# reverie-examples/e2e differs from the checked-out commit, which catches an
+# earlier step's accidental change; an earlier step that commits its change
+# or redirects git is guarded only by review of this pinned file.
+#
+# It runs for every push to liteinst-main, weekly, on dispatch, and for every
+# rrnewton/liteinst2 pull request, whose workflow calls this one with the
+# pull request's head commit (liteinst2_sha): Reverie's liteinst-main is then
+# built against that LiteInst. Best-effort signal only: it never gates a
+# Reverie merge and must never become a required status check. For a
+# liteinst2 pull request, this job's conclusion at the pull request's exact
+# head commit is the merge evidence; a skipped, absent or cancelled run is no
+# verdict.
+#
+# scripts/check-e2e-compare.rs pins this file byte for byte and checks its
+# structure (validate.sh runs it): change the two together.
+on:
+  push:
+    branches: [liteinst-main]
+  schedule:
+    - cron: "41 5 * * 2"
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      liteinst2_sha:
+        description: The rrnewton/liteinst2 commit a pull request compares.
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-compare-${{ github.event_name }}-${{ github.sha }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -C link-arg=-llzma
+
+jobs:
+  e2e-compare:
+    name: Cross-backend e2e (GitHub-hosted)
+    runs-on: ubuntu-24.04
+    # The steps before the comparison are bounded at 16 minutes together,
+    # the comparison at 100 and the two failure uploads at 3: 119 of 120, so
+    # a comparison that times out still uploads its evidence.
+    timeout-minutes: 120
+
+    steps:
+    - uses: actions/checkout@v4
+      timeout-minutes: 2
+      with:
+        repository: ${{ github.event_name == 'pull_request' && 'rrnewton/reverie' || github.repository }}
+        ref: ${{ github.event_name == 'pull_request' && 'liteinst-main' || github.sha }}
+        submodules: false
+    - name: Mode
+      id: mode
+      timeout-minutes: 1
+      shell: bash
+      env:
+        LITEINST2_SHA: ${{ inputs.liteinst2_sha }}
+      run: |
+        set -euo pipefail
+        # Total over the event and the input, before anything is built.
+        case $GITHUB_EVENT_NAME in
+          push | schedule | workflow_dispatch) mode=reverie ;;
+          pull_request) mode=liteinst2-pr ;;
+          *)
+            printf '::error::e2e-compare does not run for event %q\n' "$GITHUB_EVENT_NAME"
+            exit 1
+            ;;
+        esac
+        if [[ $mode == reverie && -n $LITEINST2_SHA ]]; then
+          printf '::error::liteinst2_sha given outside a liteinst2 pull request call: %q\n' "$LITEINST2_SHA"
+          exit 1
+        fi
+        if [[ $mode == liteinst2-pr && ! $LITEINST2_SHA =~ ^[0-9a-f]{40}$ ]]; then
+          printf '::error::liteinst2_sha missing or not a 40-hex commit: %q\n' "$LITEINST2_SHA"
+          exit 1
+        fi
+        echo "mode=$mode" >> "$GITHUB_OUTPUT"
+        echo "e2e-compare mode: $mode"
+    - name: Dependencies
+      timeout-minutes: 4
+      # Refresh the index first: the runner image's index can name package
+      # versions the mirror no longer serves, and install then fails with 404.
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libunwind-dev liblzma-dev cmake zlib1g-dev
+    - name: Rust toolchain
+      timeout-minutes: 3
+      run: |
+        if ! command -v rustup >/dev/null 2>&1; then
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+          export PATH="$HOME/.cargo/bin:$PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+        fi
+        channel="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml | head -n 1)"
+        rustup toolchain install "$channel" --profile minimal
+        rustc --version
+    - name: LiteInst source and identity
+      timeout-minutes: 5
+      shell: bash
+      env:
+        MODE: ${{ steps.mode.outputs.mode }}
+        LITEINST2_SHA: ${{ inputs.liteinst2_sha }}
+      run: |
+        set -euo pipefail
+        {
+          echo "## e2e-compare"
+          echo "- mode: $MODE"
+          echo "- reverie: $(git rev-parse HEAD)"
+        } >> "$GITHUB_STEP_SUMMARY"
+        crates=(liteinst liteinst-aarch64 liteinst-aarch64-patch)
+        declare -A want
+        if [[ $MODE == liteinst2-pr ]]; then
+          # Reverie's liteinst-main, built against the pull request's LiteInst.
+          src="$RUNNER_TEMP/liteinst2"
+          git init -q "$src"
+          git -C "$src" fetch -q --depth 1 https://github.com/rrnewton/liteinst2 "$LITEINST2_SHA"
+          git -C "$src" checkout -q --detach FETCH_HEAD
+          got=$(git -C "$src" rev-parse HEAD)
+          if [[ $got != "$LITEINST2_SHA" ]]; then
+            echo "::error::the liteinst2 checkout is $got, not $LITEINST2_SHA"
+            exit 1
+          fi
+          echo "- liteinst2: $got" >> "$GITHUB_STEP_SUMMARY"
+          declare -A dir=(
+            [liteinst]="$src"
+            [liteinst-aarch64]="$src/crates/liteinst-aarch64"
+            [liteinst-aarch64-patch]="$src/crates/liteinst-aarch64-patch"
+          )
+          for crate in "${crates[@]}"; do
+            if ! grep -qx "name = \"$crate\"" "${dir[$crate]}/Cargo.toml"; then
+              echo "::error::liteinst2 $got has no package $crate in ${dir[$crate]}"
+              exit 1
+            fi
+            want[$crate]="path ${dir[$crate]}"
+          done
+          config="${CARGO_HOME:-$HOME/.cargo}/config.toml"
+          if [[ -e $config ]]; then
+            echo "::error::$config exists; refusing to replace it with the liteinst2 patch"
+            exit 1
+          fi
+          mkdir -p "$(dirname "$config")"
+          {
+            echo '[patch.crates-io]'
+            echo "liteinst = { path = \"${dir[liteinst]}\" }"
+            echo '[patch."https://github.com/rrnewton/liteinst2"]'
+            echo "liteinst-aarch64 = { path = \"${dir[liteinst-aarch64]}\" }"
+            echo "liteinst-aarch64-patch = { path = \"${dir[liteinst-aarch64-patch]}\" }"
+          } > "$config"
+          cargo update -p liteinst -p liteinst-aarch64 -p liteinst-aarch64-patch
+        else
+          # The sources the manifest pins, never the lock (which cargo tree
+          # --locked only echoes): liteinst from crates.io at 0.2.x, and the
+          # two liteinst2 crates as git sources at the manifest's one rev.
+          revs=$(grep -E '^liteinst-aarch64(-patch)? = \{.*git = "https://github\.com/rrnewton/liteinst2"' reverie-liteinst/Cargo.toml | grep -oE 'rev = "[0-9a-f]{40}"' | sort -u || true)
+          pins=$(printf '%s\n' "$revs" | grep -c . || true)
+          if [[ $pins != 1 ]]; then
+            echo "::error::reverie-liteinst/Cargo.toml does not pin one liteinst2 rev: ${revs:-none}"
+            exit 1
+          fi
+          rev=${revs#rev = \"}
+          rev=${rev%\"}
+          want[liteinst]='registry ^liteinst v0\.2\.[0-9]+$'
+          for crate in liteinst-aarch64 liteinst-aarch64-patch; do
+            want[$crate]="git ^$crate v[0-9][^ ]* \\(https://github\\.com/rrnewton/liteinst2\\?rev=$rev#${rev:0:8}[0-9a-f]*\\)\$"
+          done
+        fi
+        # The identity check, in both modes and never skipped: each crate
+        # resolves to the source its mode requires, and any other source
+        # (a path in reverie mode, the registry in pull request mode) fails.
+        for crate in "${crates[@]}"; do
+          if ! tree=$(cargo tree --locked --workspace --target x86_64-unknown-linux-gnu -i "$crate" --depth 0); then
+            echo "::error::cargo tree -i $crate failed"
+            exit 1
+          fi
+          line=${tree%%$'\n'*}
+          kind=${want[$crate]%% *}
+          expected=${want[$crate]#* }
+          ok=0
+          if [[ $kind == path ]]; then
+            [[ $line == "$crate v"*" ($expected)" ]] && ok=1
+          else
+            [[ $line =~ $expected ]] && ok=1
+          fi
+          echo "- $crate: $line" >> "$GITHUB_STEP_SUMMARY"
+          if ((ok == 0)); then
+            echo "::error::$crate resolves to '$line', not the $kind source mode $MODE requires ($expected)"
+            exit 1
+          fi
+        done
+    - name: E2E sources as checked out
+      timeout-minutes: 1
+      shell: bash
+      run: |
+        set -euo pipefail
+        # run.sh, compare.rs, the corpus and the ledgers must match the
+        # checked-out commit when the comparison starts. This catches an
+        # earlier step's accidental change, addition or removal; a step that
+        # commits its change or redirects git is caught only by review.
+        git diff --exit-code HEAD -- reverie-examples/e2e
+        changed=$(git status --porcelain --untracked-files=all --ignored -- reverie-examples/e2e)
+        if [[ -n $changed ]]; then
+          printf '::error::files changed under reverie-examples/e2e before the comparison:\n%s\n' "$changed"
+          exit 1
+        fi
+    - name: Compare
+      timeout-minutes: 100
+      run: reverie-examples/e2e/run.sh --backends ptrace,liteinst,in-guest-trap --require-compared ptrace,liteinst,in-guest-trap --write-ledger "$RUNNER_TEMP/e2e-rows.tsv"
+    - name: Upload measured rows
+      if: failure()
+      timeout-minutes: 1
+      uses: actions/upload-artifact@v4
+      with:
+        name: e2e-rows-${{ github.run_id }}-${{ github.run_attempt }}
+        path: ${{ runner.temp }}/e2e-rows.tsv
+        if-no-files-found: warn
+        retention-days: 3
+    - name: Upload per-cell logs
+      if: failure()
+      timeout-minutes: 2
+      uses: actions/upload-artifact@v4
+      with:
+        name: e2e-logs-${{ github.run_id }}-${{ github.run_attempt }}
+        path: target/e2e
+        if-no-files-found: warn
+        retention-days: 3
