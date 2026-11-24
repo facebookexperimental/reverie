@@ -9181,6 +9181,227 @@ mod tests {
         }
     }
 
+    /// The injected path classifies exactly the plain forks for forwarding:
+    /// fork and vfork always (by syscall number alone), a legacy clone only
+    /// with exit signal SIGCHLD, the TID-output flags and no stack, and a
+    /// clone3 only from a plain-fork record. Each accepted clone or clone3
+    /// shape has a one-flag twin that is not a plain fork. Only the
+    /// classification is checked here: forwarding a plain fork from a test
+    /// would fork the test process.
+    #[test]
+    fn injected_creation_classifies_only_plain_forks_for_forwarding() {
+        let sigchld = libc::SIGCHLD as u64;
+        if let Some(fork) = crate::arch::SYS_FORK {
+            assert!(is_plain_fork(fork, [0; 6]));
+        }
+        if let Some(vfork) = crate::arch::SYS_VFORK {
+            assert!(is_plain_fork(vfork, [0; 6]));
+        }
+        let all_tid_outputs = (libc::CLONE_CHILD_CLEARTID
+            | libc::CLONE_CHILD_SETTID
+            | libc::CLONE_PARENT_SETTID) as u64;
+        let tid_outputs = [
+            0,
+            libc::CLONE_CHILD_CLEARTID as u64,
+            libc::CLONE_CHILD_SETTID as u64,
+            libc::CLONE_PARENT_SETTID as u64,
+            all_tid_outputs,
+        ];
+        for flags in tid_outputs {
+            assert!(
+                is_plain_fork(libc::SYS_clone, [sigchld | flags, 0, 0, 0, 0, 0]),
+                "{flags:#x}"
+            );
+            // The one-flag twins: shared memory, a TLS, a vfork, shared
+            // files, a child stack, or another exit signal.
+            for (extra, stack) in [
+                (libc::CLONE_VM as u64, 0),
+                (libc::CLONE_SETTLS as u64, 0),
+                (libc::CLONE_VFORK as u64, 0),
+                (libc::CLONE_FILES as u64, 0),
+                (0, 0x1000),
+            ] {
+                assert!(
+                    !is_plain_fork(
+                        libc::SYS_clone,
+                        [sigchld | flags | extra, stack, 0, 0, 0, 0]
+                    ),
+                    "{flags:#x} {extra:#x} {stack:#x}"
+                );
+            }
+            assert!(
+                !is_plain_fork(
+                    libc::SYS_clone,
+                    [libc::SIGUSR1 as u64 | flags, 0, 0, 0, 0, 0]
+                ),
+                "{flags:#x}"
+            );
+        }
+        // A thread and posix_spawn's CLONE_VFORK | CLONE_VM shape.
+        let thread = (libc::CLONE_VM
+            | libc::CLONE_FS
+            | libc::CLONE_FILES
+            | libc::CLONE_SIGHAND
+            | libc::CLONE_THREAD) as u64;
+        assert!(!is_plain_fork(
+            libc::SYS_clone,
+            [thread, 0x1000, 0, 0, 0, 0]
+        ));
+        let spawn = (libc::CLONE_VFORK | libc::CLONE_VM) as u64 | sigchld;
+        assert!(!is_plain_fork(libc::SYS_clone, [spawn, 0x1000, 0, 0, 0, 0]));
+        // clone3 reads its record from this process's memory.
+        let mut plain = [0_u64; 11];
+        plain[4] = sigchld;
+        let mut shared = plain;
+        shared[0] = libc::CLONE_VM as u64;
+        assert!(is_plain_fork(
+            libc::SYS_clone3,
+            [plain.as_mut_ptr() as u64, 88, 0, 0, 0, 0]
+        ));
+        assert!(!is_plain_fork(
+            libc::SYS_clone3,
+            [shared.as_mut_ptr() as u64, 88, 0, 0, 0, 0]
+        ));
+        // A record shorter than CLONE_ARGS_SIZE_VER0 is not read at all.
+        assert!(!is_plain_fork(
+            libc::SYS_clone3,
+            [plain.as_mut_ptr() as u64, 63, 0, 0, 0, 0]
+        ));
+        assert!(!is_plain_fork(libc::SYS_getpid, [0; 6]));
+    }
+
+    /// With thread admission off and no admitted native exec route, the
+    /// injected path refuses every creation that is not a plain fork with the
+    /// typed ThreadCreation and EOPNOTSUPP: a thread, posix_spawn's
+    /// CLONE_VFORK | CLONE_VM shape, and a shared-memory clone3. No creation
+    /// reaches the kernel; the refusal writes its fixed stderr notice. Plain
+    /// forks are classified for forwarding instead
+    /// (`injected_creation_classifies_only_plain_forks_for_forwarding`), so this path alone
+    /// does not keep forks refused.
+    #[test]
+    fn injected_non_plain_creation_is_a_typed_thread_creation_refusal() {
+        use std::future::Future;
+        use std::io::Write;
+        use std::task::Context;
+        use std::task::Poll;
+        use std::task::Waker;
+
+        let (client, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let config = reverie_rpc_transport::codec::encode(&()).unwrap();
+        peer.write_all(&(config.len() as u32).to_be_bytes())
+            .unwrap();
+        peer.write_all(&config).unwrap();
+        let tid = raw_pid(libc::SYS_gettid);
+        let client = reverie_rpc_transport::BlockingRpcClient::<(), _>::from_connected_stream(
+            crate::guest::rpc::GuestRpcStream::from(client),
+            tid,
+        )
+        .unwrap();
+        let rpc = CoordinatorRpc::from_live_client("unused-injection-test", client, |_, _| {
+            panic!("injected creation must not reconnect")
+        })
+        .unwrap();
+        let thread = (libc::CLONE_VM
+            | libc::CLONE_FS
+            | libc::CLONE_FILES
+            | libc::CLONE_SIGHAND
+            | libc::CLONE_THREAD) as u64;
+        let spawn = (libc::CLONE_VFORK | libc::CLONE_VM) as u64 | libc::SIGCHLD as u64;
+        let mut shared = [0_u64; 11];
+        shared[0] = libc::CLONE_VM as u64;
+        shared[4] = libc::SIGCHLD as u64;
+        let calls = [
+            (libc::SYS_clone, Sysno::clone, [thread, 0x1000, 0, 0, 0, 0]),
+            (libc::SYS_clone, Sysno::clone, [spawn, 0x1000, 0, 0, 0, 0]),
+            (
+                libc::SYS_clone3,
+                Sysno::clone3,
+                [shared.as_mut_ptr() as u64, 88, 0, 0, 0, 0],
+            ),
+        ];
+        // The twin: the plain-fork shape of the same call is classified for
+        // forwarding, not refused. It is not injected here, because that
+        // would fork the test process.
+        assert!(is_plain_fork(
+            libc::SYS_clone,
+            [libc::SIGCHLD as u64, 0, 0, 0, 0, 0]
+        ));
+        for (number, sysno, args) in calls {
+            assert!(!is_plain_fork(number, args), "{number}");
+            let mut event = SyscallEvent {
+                number,
+                args,
+                instruction_pointer: 0,
+                result: 0,
+                context: 0,
+                dispatch: SyscallDispatch::InstalledHook,
+                guest_pkru: None,
+                unsupported_refusal: None,
+            };
+            let tail = TailResult::default();
+            let mut state = ();
+            let mut guest = InGuest::<(), _> {
+                event: &mut event,
+                tid,
+                pid: raw_pid(libc::SYS_getpid),
+                ppid: None,
+                state: &mut state,
+                rpc: &rpc,
+                native: None,
+                tail: &tail,
+                cpuid_interception: false,
+                admit_threads: false,
+                thread_birth: None,
+                fork_parent_state: None,
+                runtime: &ToolSyscallRuntime,
+                staged_signals: Vec::new(),
+                staged_signal_delivery: false,
+                in_syscall_handler: true,
+                #[cfg(feature = "exec-native-injection")]
+                exec: None,
+                #[cfg(feature = "exec-native-injection")]
+                mapping_driver: None,
+                #[cfg(feature = "exec-native-injection")]
+                native_exec_admitted: false,
+                #[cfg(feature = "exec-native-injection")]
+                native_exec_route_active: false,
+                unsupported_refusal: None,
+                injected_syscalls: 0,
+            };
+            let syscall = Syscall::from_raw(
+                sysno,
+                SyscallArgs::new(
+                    args[0] as usize,
+                    args[1] as usize,
+                    args[2] as usize,
+                    args[3] as usize,
+                    args[4] as usize,
+                    args[5] as usize,
+                ),
+            );
+            let waker = Waker::noop();
+            let mut context = Context::from_waker(waker);
+            let result = {
+                let mut future = core::pin::pin!(guest.inject(syscall));
+                future.as_mut().poll(&mut context)
+            };
+            assert_eq!(result, Poll::Ready(Err(Errno::EOPNOTSUPP)), "{number}");
+            assert_eq!(
+                guest.unsupported_refusal.take(),
+                Some(reverie::UnsupportedRefusal::new(
+                    reverie::UnsupportedOperation::ThreadCreation,
+                    Errno::EOPNOTSUPP,
+                    "the in-guest backend cannot create a thread or a vfork child: \
+                     clone, clone3 and vfork other than a plain fork are not forwarded",
+                )),
+                "{number}"
+            );
+            assert_eq!(guest.injected_syscalls, 1, "{number}");
+            assert!(!tail.ending(), "{number}");
+        }
+        drop(peer);
+    }
+
     /// A guest memory handle reads and writes this process's memory until its
     /// dispatch stages an injection that ends the guest; from then on every
     /// read and write fails with ESRCH and copies nothing, through a handle
