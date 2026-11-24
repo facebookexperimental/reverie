@@ -1504,6 +1504,44 @@ gated_test(
     test = "//hermetic_infra/reverie:reverie-kvm-static-elf-test",
 )
 
+# The four static_elf cases #[ignore]d under fbcode_build because the
+# pool they were written against lacked /dev/kvm and exact PMU branch
+# counts (the commit that added the ignores records exactly that want),
+# run here and only here: each is gated on writable /dev/kvm plus the
+# PMU probe, and require_gates makes a host without them FAIL these
+# cases by name, never a green run with zero executed. On a host the
+# probes misread, REVERIE_REQUIRE_KVM=1 makes the case itself fail by
+# name. Their capable home is this target on a KVM+PMU host.
+_KVM_STATIC_ELF_IGNORED_CASES = [
+    "cpuid_dispatch::cpuid_and_both_timestamp_forms_share_one_real_dispatcher_without_cross_charges",
+    "cpuid_dispatch::cpuid_tool_returns_exact_full_registers_flags_stack_and_one_rpc_per_instruction",
+    "storage_fd_syscalls_consume_low_words_on_kvm",
+    "timestamp_callbacks_observe_retired_branches_without_counting_rpc_work",
+]
+
+gated_test(
+    name = "reverie-kvm-static-elf-ignored-test-gated",
+    env = {
+        "CARGO_BIN_EXE_reverie-kvm-broker-test-launcher": "$(location :reverie-kvm-broker-test-launcher)",
+        "CARGO_MANIFEST_DIR": "$(location :kvm-signal-abi-fixtures)",
+        "MALLOC_CONF": "background_thread:false",
+        "REVERIE_KVM_TEST_BROKER_LAUNCHER": "$(location :reverie-kvm-broker-test-launcher)",
+        "REVERIE_REQUIRE_KVM": "1",
+    },
+    gates = {
+        case: (
+            "writable:/dev/kvm+pmu",
+            "needs writable /dev/kvm and exact PMU branch counts: the case drives the KVM backend and observes retired-branch time, and this target requires KVM (REVERIE_REQUIRE_KVM=1). The upstream cases carry this same want in their #[ignore] reason under fbcode_build. The case runs wherever /dev/kvm opens for writing and the PMU probe measures an exact counter; this target passes require_gates, so anywhere else it fails by name",
+        )
+        for case in _KVM_STATIC_ELF_IGNORED_CASES
+    },
+    only_cases = _KVM_STATIC_ELF_IGNORED_CASES,
+    pmu_probe = True,
+    require_gates = True,
+    run_ignored_cases = _KVM_STATIC_ELF_IGNORED_CASES,
+    test = "//hermetic_infra/reverie:reverie-kvm-static-elf-test",
+)
+
 # reverie-kvm as Cargo builds it for its integration tests: our Cargo CI enables
 # `native-test-support` in it, reverie-kvm-core and reverie-linuxemu
 # (scripts/stable-features.sh), and reverie-kvm's dev-dependencies turn on

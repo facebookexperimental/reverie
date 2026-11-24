@@ -197,7 +197,7 @@ fn run_cpuid(code: &[u8], config: (bool, u8), ownership: ThreadOwnership) -> (Cp
 
 #[cfg_attr(
     fbcode_build,
-    ignore = "fbsource-disabled: sandcastle-env: needs /dev/kvm and exact PMU branch counts"
+    ignore = "fbsource-disabled: sandcastle-env: needs /dev/kvm and exact PMU branch counts; run by reverie-kvm-static-elf-ignored-test-gated"
 )]
 #[test]
 fn cpuid_tool_returns_exact_full_registers_flags_stack_and_one_rpc_per_instruction() {
@@ -570,7 +570,7 @@ fn cpuid_dispatch_survives_real_fork_and_same_pid_exec() {
 
 #[cfg_attr(
     fbcode_build,
-    ignore = "fbsource-disabled: sandcastle-env: needs /dev/kvm and exact PMU branch counts"
+    ignore = "fbsource-disabled: sandcastle-env: needs /dev/kvm and exact PMU branch counts; run by reverie-kvm-static-elf-ignored-test-gated"
 )]
 #[test]
 fn cpuid_and_both_timestamp_forms_share_one_real_dispatcher_without_cross_charges() {

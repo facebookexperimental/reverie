@@ -19264,7 +19264,7 @@ impl Tool for ClockTimestampTool {
 
 #[cfg_attr(
     fbcode_build,
-    ignore = "fbsource-disabled: sandcastle-env: needs /dev/kvm and exact PMU branch counts"
+    ignore = "fbsource-disabled: sandcastle-env: needs /dev/kvm and exact PMU branch counts; run by reverie-kvm-static-elf-ignored-test-gated"
 )]
 #[test]
 fn timestamp_callbacks_observe_retired_branches_without_counting_rpc_work() {
@@ -20960,7 +20960,7 @@ int main(int argc, char **argv) {
 
 #[cfg_attr(
     fbcode_build,
-    ignore = "fbsource-disabled: sandcastle-env: needs /dev/kvm and exact PMU branch counts"
+    ignore = "fbsource-disabled: sandcastle-env: needs /dev/kvm and exact PMU branch counts; run by reverie-kvm-static-elf-ignored-test-gated"
 )]
 #[test]
 fn storage_fd_syscalls_consume_low_words_on_kvm() {
