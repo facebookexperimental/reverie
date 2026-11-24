@@ -403,12 +403,12 @@ impl GdbTracee<'_> {
         // for a watch this thread will never arm. A removal is never
         // refused.
         let current = self.shared_watches();
-        let newly_arms = candidate
-            .iter()
-            .any(|watch| !current.iter().any(|held| super::same_watch(&held.spec, &watch.spec)));
-        if newly_arms
-            && let Some(refusal) = super::gdb_watch_live_refusal(self.task, false)
-        {
+        let newly_arms = candidate.iter().any(|watch| {
+            !current
+                .iter()
+                .any(|held| super::same_watch(&held.spec, &watch.spec))
+        });
+        if newly_arms && let Some(refusal) = super::gdb_watch_live_refusal(self.task, false) {
             return Err(watch_error(refusal));
         }
         self.gdb_watch_specs.replace(candidate);

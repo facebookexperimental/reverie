@@ -1743,19 +1743,23 @@ async fn a_gdb_watchpoint_of_an_unwatchable_length_is_refused() {
 async fn a_gdb_watchpoint_at_a_misaligned_address_is_refused() {
     let guest = watched_store_guest();
     let word = guest.word;
-    let status = debug_to_end(&guest.path, "gdb-watch-misaligned", |mut remote| async move {
-        let reply = tokio::time::timeout(
-            Duration::from_secs(10),
-            remote.request(&format!("Z2,{:x},8", word + 1)),
-        )
-        .await
-        .expect("the server answers a Z2 watchpoint request");
-        assert!(
-            reply.starts_with('E'),
-            "expected an error reply for a misaligned 8-byte watchpoint, got {reply:?}"
-        );
-        assert_exited_zero(&remote.resume().await, "with no watchpoint armed");
-    })
+    let status = debug_to_end(
+        &guest.path,
+        "gdb-watch-misaligned",
+        |mut remote| async move {
+            let reply = tokio::time::timeout(
+                Duration::from_secs(10),
+                remote.request(&format!("Z2,{:x},8", word + 1)),
+            )
+            .await
+            .expect("the server answers a Z2 watchpoint request");
+            assert!(
+                reply.starts_with('E'),
+                "expected an error reply for a misaligned 8-byte watchpoint, got {reply:?}"
+            );
+            assert_exited_zero(&remote.resume().await, "with no watchpoint armed");
+        },
+    )
     .await;
     assert_eq!(status, ExitStatus::Exited(0));
 }
@@ -2050,9 +2054,8 @@ async fn a_gdb_watch_hit_after_a_sigreturn_leaves_sigtrap_unblocked() {
 /// building the same guest in two tests at once races on its
 /// published path (`build_guest`).
 fn masked_handler_guest() -> &'static (PathBuf, Vec<u64>) {
-    static GUEST: LazyLock<(PathBuf, Vec<u64>)> = LazyLock::new(|| {
-        build_guest("gdbstub_watched_masked_handler", &[], &["reverie_watched"])
-    });
+    static GUEST: LazyLock<(PathBuf, Vec<u64>)> =
+        LazyLock::new(|| build_guest("gdbstub_watched_masked_handler", &[], &["reverie_watched"]));
     &GUEST
 }
 
@@ -2060,9 +2063,8 @@ fn masked_handler_guest() -> &'static (PathBuf, Vec<u64>) {
 /// building the same guest in two tests at once races on its
 /// published path (`build_guest`).
 fn handler_arm_guest() -> &'static (PathBuf, Vec<u64>) {
-    static GUEST: LazyLock<(PathBuf, Vec<u64>)> = LazyLock::new(|| {
-        build_guest("gdbstub_watched_handler_arm", &[], &["reverie_watched"])
-    });
+    static GUEST: LazyLock<(PathBuf, Vec<u64>)> =
+        LazyLock::new(|| build_guest("gdbstub_watched_handler_arm", &[], &["reverie_watched"]));
     &GUEST
 }
 
@@ -2089,8 +2091,11 @@ async fn resume_to_exit(remote: &mut Remote) -> Vec<String> {
 /// thread's SIGTRAP is blocked after its own store.
 #[tokio::test]
 async fn a_gdb_watch_hit_on_a_newborn_and_its_creator_leaves_sigtrap_unblocked() {
-    let (path, addresses) =
-        build_guest("gdbstub_watched_newborn", &["-pthread"], &["reverie_watched"]);
+    let (path, addresses) = build_guest(
+        "gdbstub_watched_newborn",
+        &["-pthread"],
+        &["reverie_watched"],
+    );
     let word = addresses[0];
     let status = debug_to_end(&path, "gdb-watch-newborn", |mut remote| async move {
         assert_eq!(remote.request(&format!("Z2,{word:x},8")).await, "OK");
@@ -2134,7 +2139,10 @@ async fn a_gdb_watch_armed_inside_a_handler_then_a_sigreturn_leaves_sigtrap_unbl
     let (path, word) = (path.as_path(), addresses[0]);
     let status = debug_to_end(path, "gdb-watch-handler-arm", |mut remote| async move {
         let stop = remote.resume().await;
-        assert!(stop.starts_with("T1e"), "expected SIGUSR1 stop, got {stop:?}");
+        assert!(
+            stop.starts_with("T1e"),
+            "expected SIGUSR1 stop, got {stop:?}"
+        );
         let thread = remote.thread.clone();
         let stop = remote.request(&format!("vCont;C1e:{thread}")).await;
         assert!(
@@ -2170,7 +2178,10 @@ async fn a_gdb_step_over_a_store_after_arming_inside_a_handler_leaves_sigtrap_un
     let (path, word) = (path.as_path(), addresses[0]);
     let status = debug_to_end(path, "gdb-watch-handler-step", |mut remote| async move {
         let stop = remote.resume().await;
-        assert!(stop.starts_with("T1e"), "expected SIGUSR1 stop, got {stop:?}");
+        assert!(
+            stop.starts_with("T1e"),
+            "expected SIGUSR1 stop, got {stop:?}"
+        );
         let thread = remote.thread.clone();
         let stop = remote.request(&format!("vCont;C1e:{thread}")).await;
         assert!(
@@ -2432,7 +2443,6 @@ async fn gdb_steps_over_backend_traced_syscalls_stop_at_the_next_instruction() {
     assert_eq!(status, ExitStatus::Exited(0));
 }
 
-
 /// `WatchStoreTool`, but its syscall handler runs every call with an
 /// explicit injection instead of the default tail injection.
 #[derive(Default)]
@@ -2586,10 +2596,14 @@ where
 async fn gdb_steps_over_an_injected_syscall_stop_at_the_next_instruction() {
     let guest = step_syscalls_guest();
     let word = guest.word;
-    let hits = debug_step_with::<InjectWatchTool, _, _>("gdb-step-injected", word, |mut remote| async move {
-        assert_eq!(remote.request(&format!("Z2,{word:x},8")).await, "OK");
-        step_syscalls_client(remote, guest).await;
-    })
+    let hits = debug_step_with::<InjectWatchTool, _, _>(
+        "gdb-step-injected",
+        word,
+        |mut remote| async move {
+            assert_eq!(remote.request(&format!("Z2,{word:x},8")).await, "OK");
+            step_syscalls_client(remote, guest).await;
+        },
+    )
     .await;
     assert!(hits.is_empty(), "no store is watched here: {hits:#?}");
 }
@@ -2601,10 +2615,14 @@ async fn gdb_steps_over_an_injected_syscall_stop_at_the_next_instruction() {
 async fn gdb_steps_over_an_emulated_syscall_stop_at_the_next_instruction() {
     let guest = step_syscalls_guest();
     let word = guest.word;
-    let hits = debug_step_with::<EmulateGetppidTool, _, _>("gdb-step-emulated", word, |mut remote| async move {
-        assert_eq!(remote.request(&format!("Z2,{word:x},8")).await, "OK");
-        step_syscalls_client(remote, guest).await;
-    })
+    let hits = debug_step_with::<EmulateGetppidTool, _, _>(
+        "gdb-step-emulated",
+        word,
+        |mut remote| async move {
+            assert_eq!(remote.request(&format!("Z2,{word:x},8")).await, "OK");
+            step_syscalls_client(remote, guest).await;
+        },
+    )
     .await;
     assert!(hits.is_empty(), "no store is watched here: {hits:#?}");
 }
@@ -2699,7 +2717,10 @@ async fn a_gdb_step_over_an_unblocking_sigprocmask_then_a_store_keeps_the_new_ma
         );
         assert_eq!(stop_rip(&stop), guest.after_store);
         assert_eq!(remote.request(&format!("z2,{word:x},8")).await, "OK");
-        assert_exited_zero(&remote.resume().await, "after the stepped unblock and store");
+        assert_exited_zero(
+            &remote.resume().await,
+            "after the stepped unblock and store",
+        );
     })
     .await;
     assert_eq!(
@@ -2711,9 +2732,8 @@ async fn a_gdb_step_over_an_unblocking_sigprocmask_then_a_store_keeps_the_new_ma
 
 /// The step-out-of-handler guest, built once for its two tests.
 fn step_sigreturn_guest() -> &'static (PathBuf, Vec<u64>) {
-    static GUEST: LazyLock<(PathBuf, Vec<u64>)> = LazyLock::new(|| {
-        build_guest("gdbstub_step_sigreturn", &[], &["reverie_after_raise"])
-    });
+    static GUEST: LazyLock<(PathBuf, Vec<u64>)> =
+        LazyLock::new(|| build_guest("gdbstub_step_sigreturn", &[], &["reverie_after_raise"]));
     &GUEST
 }
 
@@ -2722,7 +2742,10 @@ fn step_sigreturn_guest() -> &'static (PathBuf, Vec<u64>) {
 /// interrupted instruction after main's raise.
 async fn step_sigreturn_client(mut remote: Remote, after_raise: u64) {
     let stop = remote.resume().await;
-    assert!(stop.starts_with("T1e"), "expected SIGUSR1 stop, got {stop:?}");
+    assert!(
+        stop.starts_with("T1e"),
+        "expected SIGUSR1 stop, got {stop:?}"
+    );
     let thread = remote.thread.clone();
     let stop = remote.request(&format!("vCont;C1e:{thread}")).await;
     assert!(
@@ -2801,8 +2824,7 @@ async fn gdb_steps_over_internal_syscalls_stop_at_the_next_instruction() {
 /// by the backend rather than silently preserved: exit 4.
 #[tokio::test]
 async fn a_gdb_watch_hit_after_the_guest_ignores_sigtrap_resets_it_as_on_linux() {
-    let (path, addresses) =
-        build_guest("gdbstub_watched_ignored_drift", &[], &["reverie_watched"]);
+    let (path, addresses) = build_guest("gdbstub_watched_ignored_drift", &[], &["reverie_watched"]);
     let word = addresses[0];
     let status = debug_to_end(&path, "gdb-watch-ignored-drift", |mut remote| async move {
         let tid = reverie::Pid::from_raw(remote.pid as i32);

@@ -1947,15 +1947,12 @@ fn gdb_watch_live_refusal(task: &Stopped, disarmed: bool) -> Option<reverie::Wat
         Ok(disposition) => disposition,
         Err(error) => return Some(failed(error)),
     };
-    let blocked = match (|| {
-        Ok::<u64, TraceError>(
-            sigmask(task)? | blocked_signal_mask(task.pid())?,
-        )
-    })() {
-        Ok(blocked) => blocked,
-        Err(error) => return Some(failed(error)),
-    } & crate::sigtrap_state::SIGTRAP_BIT
-        != 0;
+    let blocked =
+        match (|| Ok::<u64, TraceError>(sigmask(task)? | blocked_signal_mask(task.pid())?))() {
+            Ok(blocked) => blocked,
+            Err(error) => return Some(failed(error)),
+        } & crate::sigtrap_state::SIGTRAP_BIT
+            != 0;
     if ignored {
         Some(reverie::WatchError::SigtrapIgnored)
     } else if blocked && caught {
@@ -19966,8 +19963,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             let remembered = self.remembered_sigtrap_disposition();
             let mask = take_watch_hits(&task)?;
             let tid = self.tid();
-            let (stopped, sigtrap) =
-                self.gdb_step_sigtrap_at_hit(task, remembered, mask).await?;
+            let (stopped, sigtrap) = self.gdb_step_sigtrap_at_hit(task, remembered, mask).await?;
             task = stopped;
             let hits = collect_watch_hits(&mut self.watches, &task, tid, mask, sigtrap)?;
             let (hits, gdb_hit) = split_watch_hits(hits, &self.tool_watches, &self.gdb_watches);
@@ -20104,8 +20100,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             let remembered = self.remembered_sigtrap_disposition();
             let mask = take_watch_hits(&task)?;
             let tid = self.tid();
-            let (stopped, sigtrap) =
-                self.gdb_step_sigtrap_at_hit(task, remembered, mask).await?;
+            let (stopped, sigtrap) = self.gdb_step_sigtrap_at_hit(task, remembered, mask).await?;
             task = stopped;
             let hits = collect_watch_hits(&mut self.watches, &task, tid, mask, sigtrap)?;
             let (hits, gdb_hit) = split_watch_hits(hits, &self.tool_watches, &self.gdb_watches);
@@ -20812,17 +20807,16 @@ impl<L: Tool + 'static> Guest<L> for TracedTask<L> {
         let gdb_newly_arms = shared
             .iter()
             .any(|watch| !current.iter().any(|spec| same_watch(spec, &watch.spec)));
-        let (shared, adopt_shared) = if gdb_newly_arms
-            && let Some(error) = self.gdb_watch_refusal(&task)
-        {
-            tracing::warn!(
-                "[scheduler/tool] (pid = {}) cannot arm gdb's watches on this thread: {error}",
-                task.pid()
-            );
-            (self.gdb_watches.clone(), false)
-        } else {
-            (shared, true)
-        };
+        let (shared, adopt_shared) =
+            if gdb_newly_arms && let Some(error) = self.gdb_watch_refusal(&task) {
+                tracing::warn!(
+                    "[scheduler/tool] (pid = {}) cannot arm gdb's watches on this thread: {error}",
+                    task.pid()
+                );
+                (self.gdb_watches.clone(), false)
+            } else {
+                (shared, true)
+            };
         // The slot a hit names is its place in the slice the Tool gave, and
         // gdb's watches arm after the Tool's, so the Tool's keep theirs. A
         // failed arming restores the watches both owners had

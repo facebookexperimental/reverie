@@ -1081,16 +1081,17 @@ impl Runner {
                 }
             }
         }
-        if bounds_failure.is_none() {
-            if let Some(total) = &self.total_cpu_budget {
-                if self.total_cpu_used > total.budget() {
-                    bounds_failure = Some(self.bound_failure(
-                        "producer total CPU",
-                        cpu_budget.zip(measured_cpu).map(|(b, u)| (u, b)),
-                        start.elapsed(),
-                    ));
-                }
-            }
+        if bounds_failure.is_none()
+            && self
+                .total_cpu_budget
+                .as_ref()
+                .is_some_and(|total| self.total_cpu_used > total.budget())
+        {
+            bounds_failure = Some(self.bound_failure(
+                "producer total CPU",
+                cpu_budget.zip(measured_cpu).map(|(b, u)| (u, b)),
+                start.elapsed(),
+            ));
         }
         // A command that passed its budget and finished within one poll still
         // exceeded it.
@@ -42428,7 +42429,7 @@ mod tests {
             54917,
             "93a27a389f3995ce27daae2fdd812c95e2eef77d343e9f8b511d92be1b901988",
         ),
-         (
+        (
             "reverie/src/guest.rs",
             111782,
             "917155dfdb48fbf274034279acae8b46d9bd17c65a59bce3e95f7850cf6a31bf",
@@ -42540,7 +42541,7 @@ mod tests {
             136,
             "2d1ca5b56429f8ec1a4ec9e3238dfaacf570ad3ab7fd89c9bd44d5e7c8438af0",
         ),
-         (
+        (
             137,
             "671f9209f8febd2d2223d647f5f474242ae842e5c371be32e6c5b7c8d3441f5f",
         ),

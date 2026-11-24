@@ -36,16 +36,16 @@ mod aarch64;
 #[cfg(target_arch = "x86_64")]
 mod x86_64;
 
+use std::sync::Mutex as StdMutex;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+
 use reverie::Backtrace;
 use reverie::HitTiming;
 use reverie::Pid;
 use reverie::SigtrapAtHit;
 use reverie::WatchError;
 use reverie::WatchHit;
-use std::sync::Mutex as StdMutex;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
-
 use reverie::WatchSpec;
 use safeptrace::Error as TraceError;
 use safeptrace::Stopped;
