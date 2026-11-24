@@ -1,3 +1,5 @@
+load("@fbcode//hermetic_infra/reverie/constraints:liteinst-runtime-flags.bzl", "liteinst_runtime_flags_export")
+
 oncall("hermit")
 
 # The liteinst-runtime rustc-flags constraint. The liteinst-runtime
@@ -27,3 +29,9 @@ constraint(
         "//hermetic_infra/...",
     ],
 )
+
+# The packaged cross-check's resource export of the flags file.
+# The definition lives in that per-tree file, which defines the
+# export only in fbsource (see its comment), so this shared file
+# carries no reference to a file the open-source trees lack.
+liteinst_runtime_flags_export()

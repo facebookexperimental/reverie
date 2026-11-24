@@ -41194,10 +41194,13 @@ mod tests {
     // constants so fixture bodies stay unchanged.
     const BUCK_TARGET: &str = "//hermetic_infra/hermit:detcore-liteinst-liteinst-runtime[cdylib]";
     const BUCK_PLATFORM: &str = "ovr_config//platform/linux:x86_64-fbcode";
-    const BUCK_CONSTRAINTS: [&str; 3] = [
+    const BUCK_CONSTRAINTS: [&str; 6] = [
+        "fbcode//hermetic_infra/reverie/constraints:liteinst-runtime-flags[applied]",
+        "fbcode_macros//config/constraints:ld-as-needed-default-enabled",
         "ovr_config//build_mode/constraints:opt",
         "ovr_config//cpu:x86_64",
         "ovr_config//os:linux",
+        "ovr_config//rust:debug-assertions[on]",
     ];
     const BUCK_PROFILE_BZL_NAME: &str = "liteinst-runtime-profile.bzl";
     const BUCK_LEAF_SOURCE: &str = "detcore-liteinst/src/lib.rs";
@@ -42830,9 +42833,8 @@ mod tests {
                 .is_err(),
             "incomplete declared Reverie file set"
         );
-        // Buck literals are exact: a target/platform that merely contains or
-        // extends the canonical spelling, and any constraint subset or
-        // superset, refuse.
+        // Buck target/platform literals are exact: a spelling that merely
+        // contains or extends the canonical one refuses.
         for bad_target in [
             "//hermetic_infra/hermit:detcore-liteinst",
             "//hermetic_infra/hermit:detcore-liteinst[cdylib]",
@@ -42858,24 +42860,27 @@ mod tests {
                 "non-canonical Buck platform {bad_platform}"
             );
         }
-        let subset: &[&str] = &["ovr_config//cpu:x86_64", "ovr_config//os:linux"];
-        let superset: &[&str] = &[
-            "ovr_config//build_mode/constraints:opt",
-            "ovr_config//cpu:x86_64",
-            "ovr_config//os:linux",
-            "ovr_config//os:linux-extra",
-        ];
-        let wrong_opt: &[&str] = &[
-            "ovr_config//build_mode:opt",
-            "ovr_config//cpu:x86_64",
-            "ovr_config//os:linux",
-        ];
-        for bad_constraints in [subset, superset, wrong_opt] {
+        // Constraints are consumer-declared here, not pinned: the
+        // factory records the declared set sorted and refuses only an
+        // empty or duplicated declaration, by name. The exact six the
+        // liteinst-runtime alias carries are pinned by the consumer
+        // (the finalizer, the packaged verifier and their cross-check);
+        // this fixture declares that same six so the recording below
+        // is exercised on the real set. Name the refusal, not just
+        // any error: downstream checks (the reviewed-catalog content
+        // match) also refuse this fixture, so a bare is_err would
+        // stay green with the declared-set check deleted.
+        let empty: &[&str] = &[];
+        let duplicated: &[&str] = &["ovr_config//cpu:x86_64", "ovr_config//cpu:x86_64"];
+        for bad_constraints in [empty, duplicated] {
             let mut bad = expectation!(&pin, &reverie_files);
             bad.constraints = bad_constraints;
+            let err = VerifiedCompiledSources::resolve_buck(&bad)
+                .err()
+                .unwrap_or_else(|| panic!("accepted Buck constraints {bad_constraints:?}"));
             assert!(
-                VerifiedCompiledSources::resolve_buck(&bad).is_err(),
-                "non-canonical Buck constraints {bad_constraints:?}"
+                err == "Buck constraints must be a nonempty duplicate-free declared set",
+                "non-canonical Buck constraints {bad_constraints:?} refused as: {err}"
             );
         }
         // Inventory completeness: an on-disk .rs under detcore-liteinst/src
@@ -43009,6 +43014,7 @@ mod tests {
             workspace_inventory,
             imported_sha,
             target,
+            constraints: recorded_constraints,
             ..
         } = &sources.record.authority
         else {
@@ -43016,6 +43022,18 @@ mod tests {
         };
         assert_eq!(imported_sha, &imported);
         assert_eq!(target, BUCK_TARGET);
+        // The declared constraints are recorded sorted, verbatim: the
+        // six this fixture declares, no more and no fewer.
+        let mut declared_constraints = BUCK_CONSTRAINTS.to_vec();
+        declared_constraints.sort_unstable();
+        assert_eq!(
+            recorded_constraints
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            declared_constraints,
+            "recorded Buck constraints are the declared set, sorted"
+        );
         assert!(
             workspace_inventory
                 .windows(2)
