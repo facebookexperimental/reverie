@@ -141,6 +141,106 @@ fn link(dir: &Path, stray: bool) -> PathBuf {
     output
 }
 
+/// The ELF type (`e_type`) of `bytes`: 2 is `ET_EXEC`, 3 is `ET_DYN`.
+fn elf_type(bytes: &[u8]) -> u16 {
+    u16::from_le_bytes([bytes[16], bytes[17]])
+}
+
+/// Whether `bytes` names an interpreter (a `PT_INTERP` program header, 3).
+fn has_interpreter(bytes: &[u8]) -> bool {
+    let phoff = u64::from_le_bytes(bytes[32..40].try_into().unwrap()) as usize;
+    let phentsize = u16::from_le_bytes([bytes[54], bytes[55]]) as usize;
+    let phnum = u16::from_le_bytes([bytes[56], bytes[57]]) as usize;
+    (0..phnum).any(|index| {
+        let start = phoff + index * phentsize;
+        u32::from_le_bytes(bytes[start..start + 4].try_into().unwrap()) == 3
+    })
+}
+
+/// Links [`SOURCE`] as an ordinary position-independent executable: a
+/// static PIE (`ET_DYN`) with no interpreter. The image is only parsed,
+/// never run.
+fn link_pie(dir: &Path) -> PathBuf {
+    let source = dir.join("pie.rs");
+    let output = dir.join("pie");
+    std::fs::write(&source, SOURCE).unwrap();
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_owned());
+    let result = Command::new(rustc)
+        .args(["--edition", "2024", "--crate-type", "bin", "-O"])
+        .args(["-C", "panic=abort", "-C", "relocation-model=pic"])
+        .args(["-C", "link-arg=-nostartfiles", "-C", "link-arg=-nostdlib"])
+        .args([
+            "-C",
+            "link-arg=-static-pie",
+            "-C",
+            "link-arg=-Wl,--build-id=none",
+        ])
+        .arg("-o")
+        .arg(&output)
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "linking the PIE fixture failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    output
+}
+
+/// The interpreter path carried by the interpreter fixture below.
+const INTERP_PATH: &str = "/lib64/ld-linux-x86-64.so.2";
+
+/// Links [`SOURCE`] as a fixed-address executable that names an
+/// interpreter (`ET_EXEC` with `PT_INTERP`): the same no_std pattern as
+/// [`link`], with a linker script whose `PHDRS` declares the `PT_INTERP`
+/// segment over a `.interp` string the source carries. No host startup
+/// files or libraries are linked. The image is only parsed, never run.
+fn link_interpreter(dir: &Path) -> PathBuf {
+    let source = dir.join("interp.rs");
+    let script = dir.join("interp.ld");
+    let output = dir.join("interp");
+    let mut text = SOURCE.to_owned();
+    text.push_str(
+        "\n#[used]\n#[unsafe(link_section = \".interp\")]\nstatic INTERP_PATH: [u8; 28] = *b\"",
+    );
+    text.push_str(INTERP_PATH);
+    text.push_str("\\0\";\n");
+    std::fs::write(&source, text).unwrap();
+    std::fs::write(
+        &script,
+        "ENTRY(_start)\nPHDRS\n{\n  interp PT_INTERP ;\n  text PT_LOAD FILEHDR PHDRS ;\n}\n\
+         SECTIONS\n{\n  . = SIZEOF_HEADERS;\n\
+         \x20 .interp : { KEEP(*(.interp)) } :text :interp\n\
+         \x20 .text : { *(.text*) } :text\n\
+         \x20 .rodata : { *(.rodata*) *(.data.rel.ro*) } :text\n\
+         \x20 .eh_frame : { *(.eh_frame*) } :text\n\
+         \x20 .data : { *(.data*) } :text\n\
+         \x20 .bss : { *(.bss*) *(COMMON) } :text\n}\n",
+    )
+    .unwrap();
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_owned());
+    let result = Command::new(rustc)
+        .args(["--edition", "2024", "--crate-type", "bin", "-O"])
+        .args(["-C", "panic=abort", "-C", "relocation-model=static"])
+        .args(["-C", "link-arg=-nostartfiles", "-C", "link-arg=-nostdlib"])
+        .args(["-C", "link-arg=-static"])
+        .arg("-C")
+        .arg(format!("link-arg=-T{}", script.display()))
+        .args(["-C", "link-arg=-Wl,--build-id=none"])
+        .arg("-o")
+        .arg(&output)
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "linking the interpreter fixture failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    output
+}
+
 #[test]
 fn a_linked_image_with_its_syscall_in_the_gate_passes() {
     let scratch = Scratch::new("gate");
@@ -177,10 +277,37 @@ fn a_linked_image_with_a_syscall_outside_the_gate_is_refused() {
 
 #[test]
 fn an_ordinary_position_independent_executable_is_refused() {
-    // This test binary is linked the default way.
-    let bytes = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+    let scratch = Scratch::new("pie");
+    let bytes = std::fs::read(link_pie(&scratch.0)).unwrap();
+    // The fixture must really be an ordinary PIE: ET_DYN and no PT_INTERP.
+    // A different shape is a fixture failure here, not another expectation.
+    assert_eq!(elf_type(&bytes), 3, "the PIE fixture is not ET_DYN");
+    assert!(
+        !has_interpreter(&bytes),
+        "the PIE fixture names an interpreter"
+    );
     assert_eq!(
         check_runtime(&bytes).map(|_| ()),
         Err(ArtifactError::Image(ImageError::NotFixedAddress))
+    );
+}
+
+#[test]
+fn an_executable_naming_an_interpreter_is_refused() {
+    let scratch = Scratch::new("interp");
+    let bytes = std::fs::read(link_interpreter(&scratch.0)).unwrap();
+    // The fixture must really be ET_EXEC naming a PT_INTERP interpreter.
+    assert_eq!(
+        elf_type(&bytes),
+        2,
+        "the interpreter fixture is not ET_EXEC"
+    );
+    assert!(
+        has_interpreter(&bytes),
+        "the interpreter fixture has no PT_INTERP"
+    );
+    assert_eq!(
+        check_runtime(&bytes).map(|_| ()),
+        Err(ArtifactError::Image(ImageError::HasInterpreter))
     );
 }
