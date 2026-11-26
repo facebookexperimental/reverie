@@ -1160,3 +1160,126 @@ fn a_line_that_cannot_be_stated_fails_the_list_but_not_the_answer() {
         );
     }
 }
+
+/// The pages of the large mapping the check-cost tests write beside.
+const CHECKED_PAGES: u64 = 4096;
+/// The one-page writes the check-cost tests make.
+const CHECKED_WRITES: u64 = 128;
+
+/// Holds the checks that read every page a test build ran (`full`) over
+/// `occasions` occasions, at least one for each of the `CHECKED_WRITES`
+/// writes: one per occasion when the checks run every time
+/// (`QueryLog::checks_every_time`), and otherwise one at every
+/// `QueryLog::FULL_CHECK_EVERY`-th occasion of the address space, so
+/// `occasions / FULL_CHECK_EVERY` or one more, as the occasions before the
+/// first write decide where the multiples fall.
+fn assert_full_checks(occasions: u64, full: u64, what: &str) {
+    use crate::memory::QueryLog;
+    assert!(
+        occasions >= CHECKED_WRITES,
+        "{what}: {occasions} occasions over {CHECKED_WRITES} writes"
+    );
+    if QueryLog::checks_every_time() {
+        assert_eq!(
+            full, occasions,
+            "{what}: full checks over {occasions} occasions, checking every time"
+        );
+    } else {
+        let every = QueryLog::FULL_CHECK_EVERY;
+        let (low, high) = (occasions / every, occasions / every + 1);
+        assert!(
+            (low..=high).contains(&full),
+            "{what}: {full} full checks over {occasions} occasions, not {low}..={high}"
+        );
+    }
+}
+
+/// A test build of another crate checks the index of mapping runs after a
+/// settle that changed it against a rebuild from every page only at every
+/// `QueryLog::FULL_CHECK_EVERY`-th such settle, and the window the settle
+/// derived at every other one, so one-page writes beside a large mapping
+/// cost the checks a few pages each, not every page each; and the window
+/// checks run, four pages for each settle not checked in full. With
+/// `REVERIE_KVM_CHECK_EVERY_SETTLE=1` every settle is checked in full and
+/// no window is, which this test then holds instead.
+#[test]
+fn the_index_checks_after_one_page_writes_read_about_the_pages_written() {
+    let directory = Directory::new();
+    let (mut executor, memory) = space(&directory, false);
+    let base = call(
+        &mut executor,
+        &memory,
+        libc::SYS_mmap,
+        [0, CHECKED_PAGES * PAGE, RW, PRIVATE, u64::MAX, 0],
+    );
+    assert!(base > 0, "mmap: {base}");
+    let base = base as u64;
+    memory.take_query_log();
+    for write in 0..CHECKED_WRITES {
+        let page = base + 2 * write * PAGE;
+        assert_eq!(
+            call(
+                &mut executor,
+                &memory,
+                libc::SYS_mprotect,
+                [page, PAGE, R, 0, 0, 0]
+            ),
+            0,
+            "mprotect {page:#x}"
+        );
+    }
+    let log = memory.take_query_log();
+    assert_full_checks(
+        log.index_settles,
+        log.index_full_checks,
+        "the index's checks after its settles",
+    );
+    // A window check reads each end page of the window and the page beyond
+    // it again: four pages for every settle that was not checked in full,
+    // whatever the window holds, and none when every settle is.
+    let windowed = if crate::memory::QueryLog::checks_every_time() {
+        0
+    } else {
+        4 * (log.index_settles - log.index_full_checks)
+    };
+    assert_eq!(
+        log.index_window_pages, windowed,
+        "the window checks' pages over {} settles of one-page writes, {} checked in full",
+        log.index_settles, log.index_full_checks
+    );
+}
+
+/// A test build of another crate checks an identity write's pages against
+/// every placed page only at every `QueryLog::FULL_CHECK_EVERY`-th identity
+/// write, so mapping a file page by page beside a large mapping does not
+/// read every placed page per mapping. With
+/// `REVERIE_KVM_CHECK_EVERY_SETTLE=1` every identity write is checked,
+/// which this test then holds instead.
+#[test]
+fn the_identity_checks_of_one_page_file_mappings_read_every_page_only_now_and_then() {
+    let directory = Directory::new();
+    let (mut executor, memory, fd) = space_with_data(&directory, false, "checked-data");
+    let base = call(
+        &mut executor,
+        &memory,
+        libc::SYS_mmap,
+        [0, CHECKED_PAGES * PAGE, RW, PRIVATE, u64::MAX, 0],
+    );
+    assert!(base > 0, "mmap: {base}");
+    let files = room(&mut executor, &memory, 2 * CHECKED_WRITES);
+    memory.take_query_log();
+    for write in 0..CHECKED_WRITES {
+        let at = files + 2 * write * PAGE;
+        assert_eq!(
+            map_data(&mut executor, &memory, fd, at, 1, R, write % DATA_PAGES),
+            at as i64,
+            "mmap of the data file at {at:#x}"
+        );
+    }
+    let log = memory.take_query_log();
+    assert_full_checks(
+        log.identity_writes,
+        log.identity_checks,
+        "the identity writes' checks",
+    );
+}

@@ -441,9 +441,25 @@ fn physical_to_user_in(
 /// mapping runs ([`AddressSpaceState::settle_runs`]) as a critical section
 /// that wrote a page map ends, so every write's pages are folded into the
 /// index at the funnel's exit, under the same hold of the lock, and a test
-/// build checks the index there against a rebuild from every page.
+/// build checks the index there (`page_maps::CheckCadence`), and against a
+/// rebuild from every page when the lock is dropped: when the address
+/// space's last handle drops, outside a panic.
 #[derive(Debug)]
 struct AddressSpaceLock(Mutex<AddressSpaceState>);
+
+/// A test build's last check of an address space's index of mapping runs,
+/// when its last handle drops ([`AddressSpaceState::check_runs_at_teardown`],
+/// which a panicking thread skips). A lock poisoned by a panic is left
+/// alone: that panic already fails the test. A handle leaked, or kept past
+/// its test, or a process that ends without dropping it, is not checked.
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for AddressSpaceLock {
+    fn drop(&mut self) {
+        if let Ok(state) = self.0.get_mut() {
+            state.check_runs_at_teardown();
+        }
+    }
+}
 
 /// A hold of [`AddressSpaceLock`]; see there.
 struct AddressSpaceGuard<'a>(MutexGuard<'a, AddressSpaceState>);

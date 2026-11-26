@@ -226,12 +226,25 @@ impl Versioned<BTreeSet<u64>> {
 pub(super) struct PageKeyed<M> {
     inner: Arc<M>,
     dirty: DirtyPages,
+    /// In a test build, the writes made through this map, noted or not
+    /// ([`PageKeyed::writes`]).
+    #[cfg(any(test, feature = "test-support"))]
+    writes: u64,
 }
 
 impl<M> PageKeyed<M> {
     /// Takes the pages noted since the last call.
     pub(super) fn take_dirty(&mut self) -> DirtyPages {
         std::mem::take(&mut self.dirty)
+    }
+
+    /// In a test build, how many writes went through this map's writers,
+    /// whatever they noted: a count that moves with every write, as a
+    /// [`Versioned`] collection's version does, for a test build's check
+    /// that nothing was written since a moment.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) fn writes(&self) -> u64 {
+        self.writes
     }
 }
 
@@ -240,6 +253,10 @@ impl<V: Clone> PageKeyed<BTreeMap<u64, V>> {
     /// noting that page.
     fn write_page(&mut self, page: u64) -> &mut BTreeMap<u64, V> {
         self.dirty.mark(page, page);
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            self.writes += 1;
+        }
         Arc::make_mut(&mut self.inner)
     }
 
@@ -264,6 +281,10 @@ impl<V: Clone> PageKeyed<BTreeMap<u64, V>> {
     pub(super) fn reset(&mut self) {
         self.inner = Arc::new(BTreeMap::new());
         self.dirty.mark_every();
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            self.writes += 1;
+        }
     }
 }
 
@@ -287,6 +308,10 @@ impl<V> PageKeyed<BTreeMap<u64, V>> {
             self.dirty.mark(first, last);
         }
         self.inner = Arc::new(BTreeMap::new());
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            self.writes += 1;
+        }
     }
 }
 
@@ -328,19 +353,75 @@ impl<M: fmt::Debug> fmt::Debug for PageKeyed<M> {
     }
 }
 
+/// When a test build runs a check that reads every page of an address
+/// space: the index of mapping runs against a rebuild from every page after
+/// a settle (`mapping_list`'s `check_after_settle`), and an identity write
+/// against every placed page ([`IncarnationKeyed::insert_naming_pages`]).
+///
+/// This crate's own tests run both every time. A test build of another
+/// crate (feature `test-support`) runs real guests, whose many writes over
+/// many pages would each pay for every page, so there each runs at every
+/// [`CheckCadence::EVERY`]-th occasion of its address space (a settle that
+/// changed the index, or an identity write), the index's check also after
+/// every rebuild and when the address space's last handle drops outside a
+/// panic, and a check of the windows a settle derived at every other
+/// settle, so that the checks cost about the pages each write changed.
+/// `REVERIE_KVM_CHECK_EVERY_SETTLE=1` makes both, the settles' check and
+/// the identity writes', run every time in any test build, to find the
+/// write that broke one.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Debug, Default)]
+pub(super) struct CheckCadence {
+    occasions: u64,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl CheckCadence {
+    /// The occasions per full check in a test build of another crate.
+    pub(super) const EVERY: u64 = 64;
+
+    /// Whether the full checks run at every occasion (see the type).
+    pub(super) fn every_time() -> bool {
+        static EVERY_TIME: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        cfg!(test)
+            || *EVERY_TIME.get_or_init(|| {
+                std::env::var_os("REVERIE_KVM_CHECK_EVERY_SETTLE").is_some_and(|value| value == "1")
+            })
+    }
+
+    /// Counts one occasion and gives whether the full check is due at it.
+    pub(super) fn due(&mut self) -> bool {
+        self.occasions += 1;
+        Self::every_time() || self.occasions.is_multiple_of(Self::EVERY)
+    }
+}
+
 /// The one collection the index of mapping runs reads that is not keyed by
 /// physical page: a value per mapping incarnation, behind an `Arc` as
 /// [`PageKeyed`] is. A change to an incarnation's value reaches every page of
 /// that incarnation, which the key does not name, so the one write that sets
 /// values names those pages ([`IncarnationKeyed::insert_naming_pages`]), and
-/// a test build checks there that no page of those incarnations lies outside
-/// them. That the named pages hold every such page is an argument in a
-/// product build, which does not check it. The other writes change no page:
-/// forgetting incarnations no page has, and emptying the whole map.
+/// a test build checks there, at the writes [`CheckCadence`] picks, that no
+/// page of those incarnations lies outside them. That the named pages hold
+/// every such page is an argument in a product build, which does not check
+/// it. The other writes change no page: forgetting incarnations no page has,
+/// and emptying the whole map.
 #[derive(Clone)]
 pub(super) struct IncarnationKeyed<V> {
     inner: Arc<BTreeMap<u64, V>>,
     dirty: DirtyPages,
+    /// In a test build, which writes check the pages they name.
+    #[cfg(any(test, feature = "test-support"))]
+    cadence: CheckCadence,
+    /// In a test build, the writes that set values and those of them
+    /// checked against every placed page, since the last take
+    /// ([`IncarnationKeyed::take_checks`]).
+    #[cfg(any(test, feature = "test-support"))]
+    checked: (u64, u64),
+    /// In a test build, the writes made through this map, never taken
+    /// ([`IncarnationKeyed::writes`]).
+    #[cfg(any(test, feature = "test-support"))]
+    writes: u64,
 }
 
 impl<V> Default for IncarnationKeyed<V> {
@@ -348,6 +429,12 @@ impl<V> Default for IncarnationKeyed<V> {
         Self {
             inner: Arc::new(BTreeMap::new()),
             dirty: DirtyPages::default(),
+            #[cfg(any(test, feature = "test-support"))]
+            cadence: CheckCadence::default(),
+            #[cfg(any(test, feature = "test-support"))]
+            checked: (0, 0),
+            #[cfg(any(test, feature = "test-support"))]
+            writes: 0,
         }
     }
 }
@@ -356,7 +443,9 @@ impl<V: Clone> IncarnationKeyed<V> {
     /// Gives each mapping incarnation in `incarnations` the value `value`,
     /// noting physical pages `first..=last`, which must hold every page
     /// whose incarnation (by `placements`, the incarnation of each physical
-    /// page) is one of them. A test build checks that here, at the write.
+    /// page) is one of them. A test build checks that here, at the write,
+    /// at the writes [`CheckCadence`] picks: the check reads every placed
+    /// page.
     pub(super) fn insert_naming_pages(
         &mut self,
         first: u64,
@@ -366,13 +455,20 @@ impl<V: Clone> IncarnationKeyed<V> {
         placements: &BTreeMap<u64, u64>,
     ) {
         #[cfg(any(test, feature = "test-support"))]
-        assert!(
-            placements
-                .iter()
-                .all(|(page, incarnation)| (first..=last).contains(page)
-                    || !incarnations.contains(incarnation)),
-            "an identity reaches pages outside the range that names them"
-        );
+        {
+            self.writes += 1;
+            self.checked.0 += 1;
+            if self.cadence.due() {
+                self.checked.1 += 1;
+                assert!(
+                    placements
+                        .iter()
+                        .all(|(page, incarnation)| (first..=last).contains(page)
+                            || !incarnations.contains(incarnation)),
+                    "an identity reaches pages outside the range that names them"
+                );
+            }
+        }
         #[cfg(not(any(test, feature = "test-support")))]
         let _ = placements;
         self.dirty.mark(first, last);
@@ -386,6 +482,10 @@ impl<V: Clone> IncarnationKeyed<V> {
     /// `placements`), and gives how many values are left. That changes no
     /// page's value, so it notes nothing.
     pub(super) fn forget_unplaced(&mut self, placements: &BTreeMap<u64, u64>) -> usize {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            self.writes += 1;
+        }
         let placed: BTreeSet<u64> = placements.values().copied().collect();
         let inner = Arc::make_mut(&mut self.inner);
         inner.retain(|incarnation, _| placed.contains(incarnation));
@@ -397,6 +497,17 @@ impl<V: Clone> IncarnationKeyed<V> {
     pub(super) fn reset(&mut self) {
         self.inner = Arc::new(BTreeMap::new());
         self.dirty.mark_every();
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            self.writes += 1;
+        }
+    }
+
+    /// In a test build, how many writes went through this map's writers,
+    /// whatever they noted (see [`PageKeyed::writes`]).
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) fn writes(&self) -> u64 {
+        self.writes
     }
 }
 
@@ -409,6 +520,13 @@ impl<V> IncarnationKeyed<V> {
     /// Whether no page was noted since the last take.
     pub(super) fn dirty_is_empty(&self) -> bool {
         self.dirty.is_empty()
+    }
+
+    /// In a test build, takes the writes that set values and those of them
+    /// checked against every placed page, since the last call.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) fn take_checks(&mut self) -> (u64, u64) {
+        std::mem::take(&mut self.checked)
     }
 }
 
@@ -1227,6 +1345,49 @@ mod tests {
         // Even an edit that changes nothing moves the version.
         first.remove(&7);
         assert_ne!(first.version(), before);
+    }
+
+    /// A test build checks the whole index of mapping runs against a rebuild
+    /// from every page when the last handle of its address space drops,
+    /// outside a panic (`AddressSpaceState::check_runs_at_teardown`), if a
+    /// page map was written since its last whole check. A page map changed
+    /// without a note is seen by no settle, so this is where it fails: here,
+    /// a page in the middle of a mapping is given a file offset by a write
+    /// that takes the map's fresh version, as every writer does, but notes
+    /// nothing, which splits the page's run in a rebuild.
+    #[test]
+    #[should_panic(
+        expected = "the index of mapping runs differs from a rebuild from the page maps"
+    )]
+    fn an_unnoted_change_fails_when_the_address_space_is_dropped() {
+        use super::super::GuestMemory;
+        use super::super::RegionKind;
+
+        const MIB: u64 = 1 << 20;
+        let rw = (libc::PROT_READ | libc::PROT_WRITE) as u8;
+        let memory = GuestMemory::new(0, (16 * MIB) as usize).unwrap();
+        memory
+            .reserve_region(8 * MIB, MIB, RegionKind::Mmap)
+            .unwrap()
+            .commit();
+        memory.map_user_protection(8 * MIB, MIB, rw).unwrap();
+        memory.user_mapping_runs();
+        let (middle, _) = memory
+            .checked_page_range(8 * MIB + MIB / 2, 1)
+            .unwrap()
+            .unwrap();
+        {
+            let mut access = memory.mapping.address_space.lock().unwrap();
+            assert!(
+                access.pages.map.inner.contains_key(&middle),
+                "a mapped page"
+            );
+            // A writer's write, fresh version and all, without its note.
+            access.file_pages.inner.insert(middle, 0);
+            access.file_pages.version = fresh_version();
+            assert!(!access.runs_unsettled(), "the change noted nothing");
+        }
+        drop(memory);
     }
 
     /// Each write notes exactly the page it writes, and a clear notes every

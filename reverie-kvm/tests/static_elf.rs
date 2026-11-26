@@ -2617,6 +2617,63 @@ fn leader_self_exec_bounded_configured(
     leader_self_exec_bounded_limited(test, forward_output, 30, None, configure)
 }
 
+/// How much a bounded child's CPU cap and wall grow where every check of
+/// the memory's index of mapping runs runs at every occasion
+/// (`reverie_kvm_core::memory::QueryLog::checks_every_time`: the nightly
+/// every-settle gate sets `REVERIE_KVM_CHECK_EVERY_SETTLE=1`): the most a
+/// measured test's CPU grew in that mode over default mode, times 1.5,
+/// rounded up. Measured on 2026-11-26 at the change that introduced it,
+/// each test's uncapped child run, user+sys CPU-s, in every-check mode
+/// against default mode:
+/// shared_file_publications_kick_running_and_new_vcpus_as_natively 21.51
+/// against 6.70 (3.21x, the most), shared_file_threads_that_exited_stop_counting_in_the_guests_order
+/// 35.19 against 11.61 (3.03x),
+/// vfork_children_share_private_memory_with_their_parent_like_native 10.56
+/// against 4.82 (2.19x) and
+/// a_vfork_child_clears_its_clear_child_tid_word_in_its_parent_like_native
+/// 6.24 against 2.95 (2.12x); 1.5 x 3.21 = 4.82, so 5. Default mode keeps
+/// every cap and wall exactly as each test writes it.
+const EVERY_CHECK_BOUND_FACTOR: u64 = 5;
+
+/// The factor a bounded child's CPU cap and wall are multiplied by in this
+/// run: [`EVERY_CHECK_BOUND_FACTOR`] where every check runs every time,
+/// and 1 otherwise.
+fn bound_factor() -> u64 {
+    if index_checks_every_time() {
+        EVERY_CHECK_BOUND_FACTOR
+    } else {
+        1
+    }
+}
+
+/// Whether this binary's reverie-kvm-core checks the index of mapping runs
+/// at every occasion.
+#[cfg(not(fbcode_build))]
+fn index_checks_every_time() -> bool {
+    reverie_kvm_core::memory::QueryLog::checks_every_time()
+}
+
+/// The internal Buck build's static_elf links the plain reverie-kvm, whose
+/// reverie-kvm-core is built without `test-support` and compiles no checks,
+/// so no check runs there and the factor is 1. If that target moves to the
+/// native-test-support variants, drop this cfg.
+#[cfg(fbcode_build)]
+fn index_checks_every_time() -> bool {
+    false
+}
+
+/// Default mode bounds each child by the CPU cap and wall its test writes,
+/// unscaled; only the every-check mode scales them, by one factor.
+#[test]
+fn bounded_children_keep_their_written_caps_unless_every_check_runs() {
+    let expected = if index_checks_every_time() {
+        EVERY_CHECK_BOUND_FACTOR
+    } else {
+        1
+    };
+    assert_eq!(bound_factor(), expected);
+}
+
 fn leader_self_exec_bounded_limited(
     test: &str,
     forward_output: bool,
@@ -2627,6 +2684,8 @@ fn leader_self_exec_bounded_limited(
     if !kvm_available(test) {
         return false;
     }
+    let factor = bound_factor();
+    let (wall_seconds, cpu_seconds) = (wall_seconds * factor, cpu_seconds.map(|cpu| cpu * factor));
     if std::env::var("REVERIE_LEADER_EXEC_CHILD").as_deref() == Ok(test) {
         if broker_test_protocol::selected(test) {
             broker_test_client::attach(test);

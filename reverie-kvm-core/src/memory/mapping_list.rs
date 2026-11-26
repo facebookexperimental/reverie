@@ -411,13 +411,14 @@ impl GuestMemory {
     /// needs and to no page walk.
     #[cfg(any(test, feature = "test-support"))]
     pub fn take_query_log(&self) -> QueryLog {
-        let access = self
+        let mut access = self
             .mapping
             .address_space
             .lock()
             .expect("guest memory access map lock poisoned");
         let mut log = access.query_log.take();
         log.index_visits = runs::take_visits(&access);
+        (log.identity_writes, log.identity_checks) = access.mapping_identities.take_checks();
         log
     }
 
@@ -550,12 +551,44 @@ pub struct QueryLog {
     /// The pages' facts read to settle the index after writes: a write's
     /// work, proportional to the pages it changed.
     pub settle_pages: u64,
+    /// The settles followed by a test build's check: those that changed the
+    /// index, and every settle where the checks run every time
+    /// ([`QueryLog::checks_every_time`]).
+    pub index_settles: u64,
+    /// The settles after which the whole index was checked against a
+    /// rebuild from every page.
+    pub index_full_checks: u64,
+    /// The pages the other settles' checks read again: each end page of a
+    /// window a settle derived, and the page beyond it.
+    pub index_window_pages: u64,
+    /// The identity writes (`page_maps::IncarnationKeyed::insert_naming_pages`).
+    pub identity_writes: u64,
+    /// The identity writes a test build checked against every placed page
+    /// ([`QueryLog::checks_every_time`]).
+    pub identity_checks: u64,
 }
 
 #[cfg(any(test, feature = "test-support"))]
 impl QueryLog {
     /// How many reads a log keeps before it only counts them.
     pub const READS_KEPT: usize = 1 << 16;
+
+    /// The settles that changed the index, and the identity writes, of an
+    /// address space per full check in a test build of another crate
+    /// (feature `test-support`).
+    pub const FULL_CHECK_EVERY: u64 = super::page_maps::CheckCadence::EVERY;
+
+    /// Whether this test build runs the checks that read every page at
+    /// every settle and every identity write: in this crate's own tests,
+    /// and with `REVERIE_KVM_CHECK_EVERY_SETTLE=1`, which gates both.
+    /// Otherwise it runs them at every [`QueryLog::FULL_CHECK_EVERY`]-th
+    /// settle that changed the index (and after every rebuild) or identity
+    /// write, and the index's check when the address space's last handle
+    /// drops outside a panic, and checks the windows each other settle
+    /// derived.
+    pub fn checks_every_time() -> bool {
+        super::page_maps::CheckCadence::every_time()
+    }
 
     fn record(&mut self, read: MappingRead) {
         if self.reads.len() < Self::READS_KEPT {
@@ -596,10 +629,27 @@ impl AddressSpaceState {
 
     /// In a test build, at a release of the address space's lock that noted
     /// nothing: the layout the index records is the current one
-    /// (`runs::check_layout_noted`).
+    /// (`runs::check_layout_noted`), at the releases `page_maps::CheckCadence`
+    /// picks.
     #[cfg(any(test, feature = "test-support"))]
-    pub(super) fn check_layout_noted(&self) {
+    pub(super) fn check_layout_noted(&mut self) {
         runs::check_layout_noted(self);
+    }
+
+    /// In a test build, at the address space's teardown: settles what is
+    /// still noted, then checks the whole index against a rebuild from
+    /// every page, whichever settles the checks' cadence left with only a
+    /// window check (`page_maps::CheckCadence`), unless no page map was
+    /// written since the last whole check held (`runs::check_at_teardown`).
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) fn check_runs_at_teardown(&mut self) {
+        if std::thread::panicking() {
+            return;
+        }
+        if self.runs_unsettled() {
+            let _ = self.settle_runs();
+        }
+        runs::check_at_teardown(self);
     }
 }
 
@@ -974,8 +1024,10 @@ mod runs {
         ///
         /// That the index keeps the right outer part of a run that reaches
         /// past an end ([`RunIndex::splice`](super::index::RunIndex::splice))
-        /// is an argument, which test builds check after every settle against
-        /// a rebuild and in the windowed update's property test. At a
+        /// is an argument, which the windowed update's property test checks,
+        /// and test builds check after settles (`check_after_settle`: in
+        /// this crate's own tests a rebuild after every settle; elsewhere a
+        /// rebuild now and then and the derived windows otherwise). At a
         /// window's low end, the end page and its outer neighbour were both
         /// unnoted, so their relation in the index is still the pages' own, or
         /// the neighbour lies in the window spliced just before, which derived
@@ -997,8 +1049,9 @@ mod runs {
                 }
             }
 
-            /// The window's end pages, `(low, high)`, for a test.
-            #[cfg(test)]
+            /// The window's end pages, `(low, high)`, for a test and a test
+            /// build's check.
+            #[cfg(any(test, feature = "test-support"))]
             pub(super) fn ends(self) -> (u64, u64) {
                 (self.low, self.high)
             }
@@ -1017,6 +1070,20 @@ mod runs {
             /// The window's end pages and its runs: `(low, high, runs)`.
             pub(super) fn into_parts(self) -> (u64, u64, Vec<(u64, u64)>) {
                 (self.window.low, self.window.high, self.runs)
+            }
+
+            /// The window the runs were derived from, for a test build's
+            /// check of it after the update.
+            #[cfg(any(test, feature = "test-support"))]
+            pub(super) fn window(&self) -> Window {
+                self.window
+            }
+
+            /// The runs derived from the window's pages, for a test build's
+            /// check of the update against them.
+            #[cfg(any(test, feature = "test-support"))]
+            pub(super) fn runs(&self) -> &[(u64, u64)] {
+                &self.runs
             }
 
             /// Runs a test derived from `window`'s pages itself, for a test
@@ -1064,6 +1131,19 @@ mod runs {
             /// In a test build, the entries [`RunIndex::entries`] yielded.
             #[cfg(any(test, feature = "test-support"))]
             visits: std::cell::Cell<u64>,
+            /// In a test build, which settles check the whole index
+            /// (`check_after_settle`).
+            #[cfg(any(test, feature = "test-support"))]
+            cadence: super::super::super::page_maps::CheckCadence,
+            /// In a test build, which releases of the lock that noted nothing
+            /// check the recorded layout (`check_layout_noted`).
+            #[cfg(any(test, feature = "test-support"))]
+            layout_cadence: super::super::super::page_maps::CheckCadence,
+            /// In a test build, the page maps' write stamp (`write_stamp`)
+            /// when the whole index last held against a rebuild from every
+            /// page.
+            #[cfg(any(test, feature = "test-support"))]
+            checked_stamp: std::cell::Cell<Option<[u64; 7]>>,
         }
 
         impl RunIndex {
@@ -1143,6 +1223,55 @@ mod runs {
             #[cfg(any(test, feature = "test-support"))]
             pub(super) fn holds(&self, runs: &BTreeMap<u64, u64>) -> bool {
                 *self.runs == *runs
+            }
+
+            /// Whether the runs, each cut to user pages `first..=last`, are
+            /// exactly `runs`: the runs a derivation from those pages alone
+            /// gives, for a test build's check of a part of the index. It
+            /// reads the index directly, so a check counts no visit.
+            #[cfg(any(test, feature = "test-support"))]
+            pub(super) fn holds_within(&self, first: u64, last: u64, runs: &[(u64, u64)]) -> bool {
+                let past = last.saturating_add(1);
+                let cut: Vec<(u64, u64)> = self
+                    .runs
+                    .range(..first)
+                    .next_back()
+                    .filter(|&(_, &run_past)| run_past > first)
+                    .into_iter()
+                    .chain(self.runs.range(first..past))
+                    .map(|(&run_first, &run_past)| (run_first.max(first), run_past.min(past)))
+                    .collect();
+                cut == runs
+            }
+
+            /// In a test build, counts a settle and gives whether the whole
+            /// index is checked at it (`page_maps::CheckCadence`).
+            #[cfg(any(test, feature = "test-support"))]
+            pub(super) fn full_check_due(&mut self) -> bool {
+                self.cadence.due()
+            }
+
+            /// In a test build, counts a release of the lock that noted
+            /// nothing and gives whether the recorded layout is checked at it
+            /// (`page_maps::CheckCadence`).
+            #[cfg(any(test, feature = "test-support"))]
+            pub(super) fn layout_check_due(&mut self) -> bool {
+                self.layout_cadence.due()
+            }
+
+            /// In a test build, records that the whole index held against a
+            /// rebuild from every page while the page maps' write stamp was
+            /// `stamp`.
+            #[cfg(any(test, feature = "test-support"))]
+            pub(super) fn record_whole_check(&self, stamp: [u64; 7]) {
+                self.checked_stamp.set(Some(stamp));
+            }
+
+            /// In a test build, the page maps' write stamp at the last whole
+            /// check that held, if any.
+            #[cfg(any(test, feature = "test-support"))]
+            pub(super) fn whole_check_stamp(&self) -> Option<[u64; 7]> {
+                self.checked_stamp.get()
             }
 
             /// Replaces every run with `runs`, derived under `layout`.
@@ -1312,6 +1441,93 @@ mod runs {
                     }
                 }
             }
+
+            /// A teardown skips the whole check only outside every-time mode,
+            /// and only when the page maps' write stamp is still the one the
+            /// last whole check that held recorded (`teardown_may_skip`).
+            #[test]
+            fn a_teardown_skips_the_whole_check_only_on_an_unmoved_stamp_outside_every_time_mode() {
+                use super::super::teardown_may_skip;
+
+                let stamp = [1, 2, 3, 4, 5, 6, 7];
+                let moved = [1, 2, 3, 4, 5, 6, 8];
+                assert!(teardown_may_skip(false, Some(stamp), stamp));
+                assert!(!teardown_may_skip(false, Some(stamp), moved));
+                assert!(!teardown_may_skip(false, None, stamp));
+                assert!(!teardown_may_skip(true, Some(stamp), stamp));
+                assert!(!teardown_may_skip(true, Some(stamp), moved));
+                assert!(!teardown_may_skip(true, None, stamp));
+            }
+
+            /// Every-time mode (this crate's own tests) checks the whole index
+            /// at every teardown, even of an address space unwritten since
+            /// its last whole check: here the index itself is changed behind
+            /// every settle's back, with no page-map write, and the drop
+            /// still sees it. That is the backstop for the premises the
+            /// default mode's skip rests on (`write_stamp`).
+            #[test]
+            #[should_panic(
+                expected = "the index of mapping runs differs from a rebuild from the page maps"
+            )]
+            fn every_time_mode_checks_an_unwritten_address_space_when_dropped() {
+                use crate::memory::GuestMemory;
+                use crate::memory::RegionKind;
+
+                const MIB: u64 = 1 << 20;
+                let rw = (libc::PROT_READ | libc::PROT_WRITE) as u8;
+                let memory = GuestMemory::new(0, (16 * MIB) as usize).unwrap();
+                memory
+                    .reserve_region(8 * MIB, MIB, RegionKind::Mmap)
+                    .unwrap()
+                    .commit();
+                memory.map_user_protection(8 * MIB, MIB, rw).unwrap();
+                memory.user_mapping_runs();
+                {
+                    let mut access = memory.mapping.address_space.lock().unwrap();
+                    Arc::make_mut(&mut access.runs.runs).insert(1 << 40, (1 << 40) + 1);
+                }
+                drop(memory);
+            }
+
+            /// The window check's comparison (`RunIndex::holds_within`)
+            /// holds exactly when a derivation from a range's pages alone
+            /// gives the index's runs cut to the range: for runs that cross
+            /// either end of the range, at either end of the pages, and
+            /// whether or not a page in the range changed since the index
+            /// was derived.
+            #[test]
+            fn the_index_cut_to_a_range_holds_exactly_what_its_pages_derive() {
+                const PAGES: u64 = 48;
+                for seed in 1..=300u64 {
+                    let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+                    let mut next = move |bound: u64| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        state % bound
+                    };
+                    let colours: Vec<Option<u8>> = (0..PAGES).map(|_| colour(&mut next)).collect();
+                    let index = RunIndex {
+                        runs: Arc::new(derive(&colours, 0, PAGES - 1).into_iter().collect()),
+                        ..RunIndex::default()
+                    };
+                    for step in 0..40 {
+                        let first = next(PAGES);
+                        let last = (first + next(8)).min(PAGES - 1);
+                        let mut changed = colours.clone();
+                        if next(2) == 0 {
+                            let page = first + next(last - first + 1);
+                            changed[page as usize] = colour(&mut next);
+                        }
+                        let derived = derive(&changed, first, last);
+                        assert_eq!(
+                            index.holds_within(first, last, &derived),
+                            derived == derive(&colours, first, last),
+                            "seed {seed}, step {step}, pages {first}..={last}"
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -1352,11 +1568,12 @@ mod runs {
     /// the runs around every page a map noted as changed since the last
     /// settle are derived again from the page maps, or all of them where a
     /// write may have touched any page or the user layout changed. In a test
-    /// build, the result is then checked against a rebuild from every page
-    /// and the current layout (`check_settled`), whatever the settle found
-    /// to do. It gives the reader of the settled index ([`RunView`]), which
-    /// nothing outside this module can make otherwise.
+    /// build, the result is then checked (`check_after_settle`), whatever
+    /// the settle found to do. It gives the reader of the settled index
+    /// ([`RunView`]), which nothing outside this module can make otherwise.
     pub(super) fn settle(state: &mut AddressSpaceState) -> RunView<'_> {
+        #[cfg(any(test, feature = "test-support"))]
+        let mut windows: Vec<(Window, Vec<(u64, u64)>)> = Vec::new();
         let mut dirty = super::super::page_maps::DirtyPages::default();
         dirty.absorb(state.pages.take_dirty());
         dirty.absorb(state.file_pages.take_dirty());
@@ -1366,7 +1583,8 @@ mod runs {
         dirty.absorb(state.mapping_identities.take_dirty());
         dirty.absorb(state.backing_pages.take_dirty());
         let layout = RunLayout::of(state);
-        if dirty.every() || !state.runs.records(&layout) {
+        let rebuilt = dirty.every() || !state.runs.records(&layout);
+        if rebuilt {
             let derived =
                 RunInputs::for_settle(state, &layout).derive_runs(0, u64::MAX / PAGE_SIZE as u64);
             state.runs.rebuild(derived, layout);
@@ -1391,22 +1609,102 @@ mod runs {
                 .map(|(first, last)| inputs.derive_window(Window::around(first, last)))
                 .collect();
             for windowed in derived {
+                #[cfg(any(test, feature = "test-support"))]
+                windows.push((windowed.window(), windowed.runs().to_vec()));
                 state.runs.splice(windowed);
             }
         }
         #[cfg(any(test, feature = "test-support"))]
-        check_settled(state);
+        check_after_settle(state, rebuilt, &windows);
         RunView::of(state)
     }
 
-    /// In a test build, after a settle: the index's runs equal a rebuild
-    /// from every page, the layout it records is the current one, and the
-    /// page map's count of the stack window's mapped pages is a recount.
+    /// In a test build, after a settle that rebuilt the index (`rebuilt`)
+    /// or spliced `windows` (each with the runs the settle derived for it):
+    /// the whole index (`check_settled`) after a rebuild and at the settles
+    /// `page_maps::CheckCadence` picks. At every other settle, each window:
+    /// the index cut to the window against the runs the settle derived for
+    /// it, which reads no page and catches a splice that put in other runs;
+    /// and the index cut to each end page and the page beyond it against a
+    /// derivation from those two pages, read again, which catches a wrong
+    /// join or split across either end. Together they hold the index to
+    /// every pair of neighbouring pages a derivation of the window and a
+    /// page beyond each end would: the two boundary pairs against pages
+    /// read again, and the inner pairs against the settle's own derivation,
+    /// for four pages read instead of the window's. What this no
+    /// longer does is derive the window's inner pages a second time: inside
+    /// the window the index is held to the settle's own derivation, so a
+    /// derivation that misread an inner page agrees with itself there, and
+    /// only the end pages, the cadenced whole check and the teardown check
+    /// read those pages again.
+    ///
+    /// A settle that found nothing noted and the layout unchanged changed
+    /// nothing, as every read of the runs makes one: it is an occasion only
+    /// where the checks run every time, so reads cost a test build of
+    /// another crate no check. The parts of the whole check besides the
+    /// rebuild (the recorded layout, and the page map's count of the stack
+    /// window's mapped pages) follow its cadence as well, and so does the
+    /// layout's check at a release of the lock that noted nothing
+    /// (`check_layout_noted`).
+    ///
+    /// A write that noted no page has no window, so only the whole check
+    /// sees it: at its cadence, and when the address space's last handle
+    /// drops outside a panic (`AddressSpaceState::check_runs_at_teardown`).
+    /// A later write's window may heal such a page before either, so a
+    /// rare one can escape a test build of another crate; every check at
+    /// every occasion runs in this crate's own tests and wherever
+    /// `REVERIE_KVM_CHECK_EVERY_SETTLE=1` is set.
     #[cfg(any(test, feature = "test-support"))]
-    fn check_settled(state: &AddressSpaceState) {
+    fn check_after_settle(
+        state: &mut AddressSpaceState,
+        rebuilt: bool,
+        windows: &[(Window, Vec<(u64, u64)>)],
+    ) {
         if std::thread::panicking() {
             return;
         }
+        let every_time = super::super::page_maps::CheckCadence::every_time();
+        if !rebuilt && windows.is_empty() && !every_time {
+            return;
+        }
+        state.query_log.borrow_mut().index_settles += 1;
+        if state.runs.full_check_due() || rebuilt {
+            check_settled(state);
+            return;
+        }
+        let layout = RunLayout::of(state);
+        let inputs = RunInputs::for_check(state, &layout);
+        let mut covered = 0;
+        for (window, derived) in windows {
+            let (low, high) = window.ends();
+            assert!(
+                state.runs.holds_within(low, high, derived),
+                "the index of mapping runs differs from the runs a settle derived \
+                 for the window {low:#x}..={high:#x}"
+            );
+            for (first, last) in [(low.saturating_sub(1), low), (high, high.saturating_add(1))] {
+                covered += (last - first).saturating_add(1);
+                assert!(
+                    state
+                        .runs
+                        .holds_within(first, last, &inputs.derive_runs(first, last)),
+                    "the index of mapping runs differs from a derivation from the page maps \
+                     around the window {low:#x}..={high:#x} a settle derived"
+                );
+            }
+        }
+        state.query_log.borrow_mut().index_window_pages += covered;
+    }
+
+    /// In a test build: the index's runs equal a rebuild from every page,
+    /// the layout it records is the current one, and the page map's count
+    /// of the stack window's mapped pages is a recount.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) fn check_settled(state: &AddressSpaceState) {
+        if std::thread::panicking() {
+            return;
+        }
+        state.query_log.borrow_mut().index_full_checks += 1;
         let layout = RunLayout::of(state);
         let rebuilt: std::collections::BTreeMap<u64, u64> = RunInputs::for_check(state, &layout)
             .derive_runs(0, u64::MAX / PAGE_SIZE as u64)
@@ -1421,21 +1719,98 @@ mod runs {
             "the index of mapping runs records a user layout that is not the current one"
         );
         state.pages.check_watched_count();
+        state.runs.record_whole_check(write_stamp(state));
+    }
+
+    /// In a test build, a stamp that moves with every write to a page map
+    /// the index of runs is derived from, noted or not: the versions of the
+    /// versioned maps (each write draws a fresh one) and the write counts of
+    /// the others. The Tool-scratch overlay, which changes only pages kept
+    /// out of every run, does not move it.
+    ///
+    /// The teardown's skip (`check_at_teardown`) is lossless only while two
+    /// premises hold, which every new writer must keep: every writer of
+    /// these page maps moves this stamp (a `Versioned` map's writers draw a
+    /// fresh version; a `PageKeyed` or `IncarnationKeyed` map's writers
+    /// count the write), and the index of runs changes only in a settle or
+    /// a rebuild. Every-time mode does not skip, so it checks both.
+    #[cfg(any(test, feature = "test-support"))]
+    fn write_stamp(state: &AddressSpaceState) -> [u64; 7] {
+        [
+            state.reservations.version(),
+            state.pages.map_version(),
+            state.file_pages.version(),
+            state.shared_anonymous_pages.version(),
+            state.mapping_incarnations.writes(),
+            state.mapping_identities.writes(),
+            state.backing_pages.writes(),
+        ]
+    }
+
+    /// In a test build, when the address space's last handle drops: the
+    /// whole check (`check_settled`), unless the checks do not run every
+    /// time and nothing the index is derived from was written since the
+    /// last whole check held (the write stamp is the same,
+    /// `teardown_may_skip`). Then there is nothing new to verify: the index
+    /// changes only in a settle, a settle that changes it follows a write or
+    /// a layout move, and a layout move is a rebuild, which is checked
+    /// whole. The layout and the stack window's count, which can move
+    /// without a page-map write, are still checked. Every-time mode, the
+    /// backstop for the premises the skip rests on (`write_stamp`), checks
+    /// at every teardown.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) fn check_at_teardown(state: &AddressSpaceState) {
+        if std::thread::panicking() {
+            return;
+        }
+        if !teardown_may_skip(
+            super::super::page_maps::CheckCadence::every_time(),
+            state.runs.whole_check_stamp(),
+            write_stamp(state),
+        ) {
+            check_settled(state);
+            return;
+        }
+        assert!(
+            state.runs.records(&RunLayout::of(state)),
+            "the index of mapping runs records a user layout that is not the current one"
+        );
+        state.pages.check_watched_count();
+    }
+
+    /// Whether a teardown may skip the whole check: only where the checks
+    /// do not run every time (`every_time`), and only when the page maps'
+    /// write stamp is still `recorded`, the one the last whole check that
+    /// held saw (`current`).
+    #[cfg(any(test, feature = "test-support"))]
+    fn teardown_may_skip(every_time: bool, recorded: Option<[u64; 7]>, current: [u64; 7]) -> bool {
+        !every_time && recorded == Some(current)
     }
 
     /// In a test build, at a release of the address space's lock that noted
     /// nothing: the layout the index records is the current one. The index
     /// is derived from the noted page maps and the layout alone
     /// ([`RunInputs`]), a write to a page map's tree always notes its pages,
-    /// and every settle checks the index against a rebuild. Two inputs can
+    /// and settles check the index (`check_after_settle`). Two inputs can
     /// change at a release without a note: the layout, checked here, so a
     /// layout change that forgot its note fails at the release where it
     /// happened; and the Tool-scratch overlay of the page map, which changes
     /// only pages a permanent reservation keeps out of every run, checked
     /// where it changes (`AddressSpaceState::check_overlay_change`).
+    ///
+    /// The layout is checked at the releases `page_maps::CheckCadence`
+    /// picks: every one in this crate's own tests and with
+    /// `REVERIE_KVM_CHECK_EVERY_SETTLE=1`, and every 64th in a test build of
+    /// another crate, where every whole check after a settle also checks
+    /// it. So in that default mode a layout change that forgot its note is
+    /// caught only if a layout check comes before it is undone or before
+    /// the next settle, which rebuilds the index under the new layout: the
+    /// runs stay right, but the missing note goes unreported. The every-time
+    /// mode, and the nightly every-settle gate that runs it, catch it at the
+    /// release where it happened.
     #[cfg(any(test, feature = "test-support"))]
-    pub(super) fn check_layout_noted(state: &AddressSpaceState) {
-        if std::thread::panicking() {
+    pub(super) fn check_layout_noted(state: &mut AddressSpaceState) {
+        if std::thread::panicking() || !state.runs.layout_check_due() {
             return;
         }
         assert!(
