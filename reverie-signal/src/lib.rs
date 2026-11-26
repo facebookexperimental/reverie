@@ -8,9 +8,10 @@
 
 //! Shared Linux signal machinery for Reverie backends.
 //!
-//! The frame builder in [`frame`] was lifted from LinuxEmu so that every
-//! backend constructs and restores the same Linux signal frames.
+//! The frame builder in `frame` (x86_64 only) was lifted from LinuxEmu so
+//! that every backend constructs and restores the same Linux signal frames.
 
+#[cfg(target_arch = "x86_64")]
 pub mod frame;
 
 /// Size in bytes of Linux's `siginfo_t` userspace ABI representation.
