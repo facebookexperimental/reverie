@@ -161,7 +161,7 @@
       "deps": [],
       "env": {},
       "timeout": 600,
-      "cpu_timeout": 4200,
+      "cpu_timeout": 6700,
       "priority": 90,
       "hint": {
         "resources": {
