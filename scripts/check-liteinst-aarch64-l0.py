@@ -190,8 +190,8 @@ def alias_and_lazy_ref_checks() -> None:
         re.findall(r'all\(feature = "liteinst", target_arch = "x86_64"\)', joined)
     )
     print(f"alias check: feature_liteinst={feature_count} alias={alias_count}")
-    if feature_count != 223 or alias_count != feature_count:
-        raise GateFailure("liteinst alias count differs from pinned 223/exact-alias form")
+    if feature_count != 227 or alias_count != feature_count:
+        raise GateFailure("liteinst alias count differs from pinned 227/exact-alias form")
     offenders = []
     for path in sorted(SRC.rglob("*.rs")):
         if path.name == "lazy_promote.rs":
