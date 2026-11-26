@@ -76,39 +76,40 @@ fn host_resources_run_isolated(test: &str) {
         .arg(format!("executor::tests::{test}"))
         .arg("--exact")
         .env(HOST_RESOURCES_CHILD_ENV, test)
+        .env("ASAN_OPTIONS", host_resources_child_asan_options())
         .output()
         .expect("failed to run the isolated host-resources check");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    // Named skip, per test and exact signature only: under
-    // AddressSanitizer the lowered RLIMIT_AS aborts the sanitizer
-    // allocator on the tests' own 64 MiB image allocation instead of
-    // failing it, so the isolated child cannot run its body. Gated to
-    // the three observed names and the exact allocation size so a
-    // different ASan OOM in any other caller still fails loudly.
-    // The dev-nosan CI route covers these checks.
-    const ASAN_RLIMIT_TESTS: [&str; 3] = [
-        "an_exec_of_proc_self_exe_whose_image_copy_the_host_refuses_is_refused_as_host_resources",
-        "an_exec_whose_image_the_host_cannot_buffer_is_refused_as_host_resources",
-        "an_exec_whose_image_the_loader_cannot_copy_is_refused_as_host_resources",
-    ];
-    if !output.status.success()
-        && ASAN_RLIMIT_TESTS.contains(&test)
-        && String::from_utf8_lossy(&output.stderr).contains(
-            "AddressSanitizer: out of memory: allocator is trying to allocate 0x4000000 bytes",
-        )
-    {
-        report_skip(
-            &format!("executor::tests::{test}"),
-            "ASan allocator aborts on the 64 MiB image under the lowered RLIMIT_AS this check sets; covered in dev-nosan CI (https://github.com/facebookexperimental/reverie/issues/95)",
-        );
-        return;
-    }
     assert!(
         output.status.success() && stdout.contains("1 passed"),
         "isolated host-resources check {test} failed with {}\nstdout:\n{stdout}\nstderr:\n{}",
         output.status,
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+/// The `ASAN_OPTIONS` of every isolated child [`host_resources_run_isolated`]
+/// starts (all nine of its callers' children): the inherited options, then
+/// `allocator_may_return_null=1`. It matters only to the children that lower
+/// their own `RLIMIT_AS`. It cannot change any child's outcome, because the
+/// flag acts only when an allocation fails and every caller's assertions
+/// catch a failed allocation.
+///
+/// Such a child lowers the limit so that one allocation of an exec fails, and
+/// asserts that the exec's fallible allocation reports that failure as the
+/// typed refusal. glibc's malloc returns NULL there; AddressSanitizer's
+/// allocator by default aborts the process instead ("out of memory: allocator
+/// is trying to allocate ..."), unless this flag tells it to return NULL as
+/// glibc does. The flag changes no assertion: the refusal must still name the
+/// allocation that failed. It comes last because a later flag overrides an
+/// earlier one. A build without the sanitizer reads no such variable.
+fn host_resources_child_asan_options() -> std::ffi::OsString {
+    let mut options = std::env::var_os("ASAN_OPTIONS").unwrap_or_default();
+    if !options.is_empty() {
+        options.push(":");
+    }
+    options.push("allocator_may_return_null=1");
+    options
 }
 
 /// Runs `f` with this process's soft `RLIMIT_AS` lowered to `headroom` bytes
