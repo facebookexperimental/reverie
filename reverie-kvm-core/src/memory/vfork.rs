@@ -538,7 +538,9 @@ impl GuestMemory {
         let mine = self.mapping.address_space.lock().unwrap();
         let theirs = reference.mapping.address_space.lock().unwrap();
         mine.pages.range(first..).eq(theirs.pages.range(first..))
-            && (Arc::ptr_eq(&mine.mapping_incarnations, &theirs.mapping_incarnations)
+            && (mine
+                .mapping_incarnations
+                .shares_with(&theirs.mapping_incarnations)
                 || mine
                     .mapping_incarnations
                     .range(first..)

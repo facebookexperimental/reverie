@@ -100,7 +100,7 @@ fn publication_stop_timeout() -> std::time::Duration {
 /// here: the publication's fence holds them until admission has reopened
 /// (`publish_range_from`), because their wakers may read memory.
 struct PublicationHold<'a> {
-    space: Option<MutexGuard<'a, AddressSpaceState>>,
+    space: Option<super::AddressSpaceGuard<'a>>,
     reservation: Option<PendingReservation>,
     allocation: Option<AllocationGuard<'a>>,
 }
@@ -842,15 +842,15 @@ impl GuestMemory {
                 }
                 None => {
                     prepared.pages.remove(&page);
-                    prepared.file_pages.edit().remove(&page);
-                    prepared.shared_anonymous_pages.edit().remove(&page);
+                    prepared.file_pages.remove(&page);
+                    prepared.shared_anonymous_pages.remove(&page);
                     prepared.set_mapping_incarnation(page, None);
                     if !prepared
                         .reservations
                         .get(&page)
                         .is_some_and(|kind| kind.permanent())
                     {
-                        prepared.reservations.edit().remove(&page);
+                        prepared.reservations.remove(&page);
                     }
                 }
             }
@@ -935,7 +935,10 @@ impl GuestMemory {
                     let installed =
                         NonNull::new(installed.cast::<u8>()).expect("nonzero fixed arena address");
                     for i in 0..pages {
-                        let page = prepared.backing_pages.get_mut(&(first + i as u64)).unwrap();
+                        // Inserted and noted before the mmap, so this edit
+                        // allocates nothing.
+                        let at = first + i as u64;
+                        let page = prepared.backing_pages.get_mut(&at).unwrap();
                         page._generation = generation;
                         // Pointer arithmetic remains within this mmap's returned
                         // range; no Rust access dereferences ordinary-file pages.
@@ -1204,7 +1207,7 @@ impl GuestMemory {
         }
         // All private extents now belong to the child's base backing. Shared
         // installed pointers are recreated only from actual child syscall results.
-        child_state.backing_pages.clear();
+        child_state.backing_pages.clear_noting_keys();
         *child.mapping.address_space.lock().unwrap() = child_state;
         // A guard page publishes with its access under the guard, and takes
         // its guard back below: Linux copies guard markers into a fork's
@@ -2137,7 +2140,7 @@ mod tests {
         let snapshot = fast.mapping.address_space.lock().unwrap().clone();
         assert!(snapshot.scratch_cache_holds(a / P));
         let mut edited = snapshot.clone();
-        edited.reservations.edit().insert(a / P, RegionKind::Mmap);
+        edited.reservations.insert(a / P, RegionKind::Mmap);
         assert!(!edited.scratch_cache_holds(a / P));
         assert!(snapshot.scratch_cache_holds(a / P));
     }
@@ -4950,15 +4953,15 @@ mod tests {
         let memory = fixture(8);
         map_anonymous_again(&memory, BASE + 2 * P, 3);
         let fork = memory.snapshot().unwrap();
-        assert!(Arc::ptr_eq(&incarnations(&memory), &incarnations(&fork)));
+        assert!(incarnations(&memory).shares_with(&incarnations(&fork)));
         assert_eq!(incarnations(&memory).get(&((BASE + 6 * P) / P)), None);
         fork.unmap_user_range(BASE + 6 * P, P).unwrap();
-        assert!(Arc::ptr_eq(&incarnations(&memory), &incarnations(&fork)));
+        assert!(incarnations(&memory).shares_with(&incarnations(&fork)));
         let page = (BASE + 3 * P) / P;
         let before = incarnations(&memory).get(&page).copied();
         assert!(before.is_some());
         fork.unmap_user_range(BASE + 3 * P, P).unwrap();
-        assert!(!Arc::ptr_eq(&incarnations(&memory), &incarnations(&fork)));
+        assert!(!incarnations(&memory).shares_with(&incarnations(&fork)));
         assert_eq!(incarnations(&fork).get(&page), None);
         assert_eq!(incarnations(&memory).get(&page).copied(), before);
         // The parent's own change, after the copy, is the parent's alone too.

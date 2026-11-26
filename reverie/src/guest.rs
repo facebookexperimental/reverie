@@ -1600,6 +1600,39 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
     fn memory_map(&self, _tid: Pid) -> Result<crate::MemoryMap, crate::FactError> {
         Err(crate::FactError::NotProvided)
     }
+
+    /// Whether a mapping that [`Guest::memory_map`] lists for thread `tid`
+    /// overlaps the addresses `[start, end)`, as
+    /// [`MemoryMap::overlaps`](crate::MemoryMap::overlaps) answers for that
+    /// list. A tool that only needs to know whether a range it acted on
+    /// reaches a listed mapping asks this instead of reading the whole list.
+    /// A range with `end` at or below `start` overlaps nothing, and the
+    /// default answers it without asking for the list.
+    ///
+    /// The default asks [`Guest::memory_map`] and looks, so it answers, and
+    /// fails, exactly as that list does. A backend that keeps the address
+    /// space itself may instead answer from the part of it around the range,
+    /// which can cost far less than listing every mapping. Such an answer is
+    /// the default's wherever [`Guest::memory_map`] would give a list. Where
+    /// that list fails only because some mapping's fields cannot be stated,
+    /// such as a mapped file whose name cannot be read, the backend may still
+    /// answer, counting that mapping as listed, as it would be if its fields
+    /// could be stated. Read an incomplete list's
+    /// `false` with the same care as the list (see [`Guest::memory_map`]).
+    ///
+    /// Like [`Guest::memory_map`], the call is synchronous and describes the
+    /// moment of the call.
+    fn memory_map_overlaps(
+        &self,
+        tid: Pid,
+        start: u64,
+        end: u64,
+    ) -> Result<bool, crate::FactError> {
+        if end <= start {
+            return Ok(false);
+        }
+        Ok(self.memory_map(tid)?.overlaps(start, end))
+    }
 }
 
 /// Wraps a `Guest<T>` such that it implements `Guest<U>`.
@@ -2057,6 +2090,15 @@ where
 
     fn memory_map(&self, tid: Pid) -> Result<crate::MemoryMap, crate::FactError> {
         self.inner.memory_map(tid)
+    }
+
+    fn memory_map_overlaps(
+        &self,
+        tid: Pid,
+        start: u64,
+        end: u64,
+    ) -> Result<bool, crate::FactError> {
+        self.inner.memory_map_overlaps(tid, start, end)
     }
 }
 
@@ -2572,5 +2614,14 @@ where
 
     fn memory_map(&self, tid: Pid) -> Result<crate::MemoryMap, crate::FactError> {
         self.inner.memory_map(tid)
+    }
+
+    fn memory_map_overlaps(
+        &self,
+        tid: Pid,
+        start: u64,
+        end: u64,
+    ) -> Result<bool, crate::FactError> {
+        self.inner.memory_map_overlaps(tid, start, end)
     }
 }

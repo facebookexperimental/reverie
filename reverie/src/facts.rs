@@ -875,6 +875,20 @@ impl MemoryMap {
         Ok(map)
     }
 
+    /// Whether a listed mapping overlaps the addresses `[start, end)`: one
+    /// that begins below `end` and ends above `start`. A range with `end`
+    /// at or below `start` holds no address and overlaps nothing. Like the
+    /// list itself, a `false` answer from an incomplete list
+    /// ([`complete`](Self::complete) false) does not show that no mapping is
+    /// there.
+    pub fn overlaps(&self, start: u64, end: u64) -> bool {
+        start < end
+            && self
+                .mappings
+                .iter()
+                .any(|mapping| mapping.start < end && start < mapping.end)
+    }
+
     /// Checks that every mapping passes [`MappingFact::validate`] and that
     /// the mappings ascend without overlapping (adjacent mappings may touch),
     /// as Linux lists them. Returns `Err(FactError::Errno(EIO))` otherwise.

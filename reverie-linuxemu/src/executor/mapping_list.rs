@@ -238,6 +238,10 @@ fn superblock_device(fd: libc::c_int) -> Option<u64> {
 /// ` (deleted)` included), with each newline written as `\012`, as
 /// `seq_path` writes it.
 fn file_name(fd: libc::c_int) -> Option<Vec<u8>> {
+    #[cfg(any(test, feature = "test-support"))]
+    if FILE_NAME_FAILS_TEST_HOOK.with(std::cell::Cell::get) {
+        return None;
+    }
     let path = std::fs::read_link(format!("/proc/self/fd/{fd}")).ok()?;
     let mut name = Vec::new();
     for byte in path.as_os_str().as_bytes() {
@@ -265,6 +269,26 @@ thread_local! {
     /// on a host where neither way of comparing works.
     pub(crate) static DESCRIPTIONS_INCOMPARABLE_TEST_HOOK: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+}
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    /// While set, makes this thread's `file_name` fail, as a readlink of the
+    /// descriptor's `/proc/self/fd` entry that does not answer would, so a
+    /// file line cannot be stated.
+    pub(crate) static FILE_NAME_FAILS_TEST_HOOK: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// In a test-support build, makes this thread's statement of a file line's
+/// name fail while `fail` is set, as a readlink of the descriptor's
+/// `/proc/self/fd` entry that does not answer would: a list of mappings that
+/// holds a file line then fails as a whole, while an answer that states no
+/// line (`lists_a_mapping_in`) still answers. For a test that tells which of
+/// the two a backend's `Guest::memory_map_overlaps` reached.
+#[cfg(any(test, feature = "test-support"))]
+pub fn fail_file_names_for_test(fail: bool) {
+    FILE_NAME_FAILS_TEST_HOOK.with(|hook| hook.set(fail));
 }
 
 /// Whether host descriptors `a` and `b` are one open file description, or
@@ -527,6 +551,32 @@ impl Line {
     /// Whether `next`, which starts where this line ends, is part of the same
     /// mapping on Linux (see the module documentation).
     fn merges_with(&self, next: &Line) -> bool {
+        self.merges_but_for_file_facts(next)
+            && match (&self.backing, &next.backing) {
+                (
+                    LineBacking::File { vm_facts, .. },
+                    LineBacking::File {
+                        vm_facts: next_facts,
+                        ..
+                    },
+                ) => !super::vm_flags::file_flags_differ(
+                    vm_facts.as_ref(),
+                    next_facts.as_ref(),
+                    self.declared.flags & !STICKY_FLAGS,
+                    self.shared,
+                ),
+                _ => true,
+            }
+    }
+
+    /// [`Line::merges_with`] but for the file facts it compares
+    /// (`vm_flags::file_flags_differ`): every other condition, each of which
+    /// reads only what every part of this line has alike, so that for a
+    /// one-run line it answers as for any line that run ends. The file facts
+    /// are the one condition that reads the line's history: a line keeps
+    /// its first part's facts until a part whose facts are not known makes
+    /// them not known ([`Line::absorb`]).
+    fn merges_but_for_file_facts(&self, next: &Line) -> bool {
         let length = self.end - self.start;
         let unsticky = |declared: DeclaredMapping| DeclaredMapping {
             flags: declared.flags & !STICKY_FLAGS,
@@ -538,27 +588,15 @@ impl Line {
             && match (&self.backing, &next.backing) {
                 (LineBacking::Anonymous, LineBacking::Anonymous) => true,
                 (
-                    LineBacking::File {
-                        file,
-                        offset,
-                        vm_facts,
-                        ..
-                    },
+                    LineBacking::File { file, offset, .. },
                     LineBacking::File {
                         file: next_file,
                         offset: next_offset,
-                        vm_facts: next_facts,
                         ..
                     },
                 ) => {
                     offset.checked_add(length) == Some(*next_offset)
                         && (Arc::ptr_eq(file, next_file) || same_description(file, next_file))
-                        && !super::vm_flags::file_flags_differ(
-                            vm_facts.as_ref(),
-                            next_facts.as_ref(),
-                            self.declared.flags & !STICKY_FLAGS,
-                            self.shared,
-                        )
                 }
                 (
                     LineBacking::SharedAnonymous {
@@ -715,17 +753,16 @@ pub(crate) fn list_mappings(
         .allocation_cursors()
         .map_or(image.start_brk, |cursors| cursors.program_break);
     let window = window.map(|window| (window.user_start, window.user_end));
-    let (lines, unknown_runs) = build_lines(memory.user_mapping_runs().runs, image, window);
-    for line in lines {
-        let touches_unknown = unknown_runs
-            .iter()
-            .any(|&(start, end)| line.start <= end && start <= line.end);
-        if !touches_unknown {
-            mappings.push(line.fact(image, brk)?);
-        }
+    let mut lines = LineBuilder::new(image, window);
+    for run in &memory.user_mapping_runs().runs {
+        lines.push(run);
+    }
+    let listed = lines.listed();
+    for line in listed.lines {
+        mappings.push(line.fact(image, brk)?);
     }
     mappings.sort_by_key(|mapping| mapping.start);
-    reverie::MemoryMap::new(mappings, unknown_runs.is_empty())
+    reverie::MemoryMap::new(mappings, listed.complete)
 }
 
 /// The lines of `runs` (in address order) outside the stack window
@@ -736,18 +773,84 @@ fn build_lines(
     image: &ImageMapFacts,
     window: Option<(u64, u64)>,
 ) -> (Vec<Line>, Vec<(u64, u64)>) {
-    let mut lines: Vec<Line> = Vec::new();
-    // The ranges of pages whose mapping is not known.
-    let mut unknown_runs: Vec<(u64, u64)> = Vec::new();
-    for run in runs {
-        if window.is_some_and(|(start, end)| (start..end).contains(&run.start)) {
-            continue;
+    let mut lines = LineBuilder::new(image, window);
+    for run in &runs {
+        lines.push(run);
+    }
+    (lines.lines, lines.unknown_runs)
+}
+
+/// The lines [`LineBuilder::listed`] keeps, and whether every run added had a
+/// known mapping (the list is then complete).
+struct Listed {
+    lines: Vec<Line>,
+    complete: bool,
+}
+
+/// The lines [`build_lines`] builds, one run at a time, so that a walk that
+/// reads runs one by one builds each line once.
+struct LineBuilder<'a> {
+    image: &'a ImageMapFacts,
+    window: Option<(u64, u64)>,
+    lines: Vec<Line>,
+    /// The ranges of the runs whose mapping is not known.
+    unknown_runs: Vec<(u64, u64)>,
+}
+
+impl<'a> LineBuilder<'a> {
+    fn new(image: &'a ImageMapFacts, window: Option<(u64, u64)>) -> Self {
+        Self {
+            image,
+            window,
+            lines: Vec::new(),
+            unknown_runs: Vec::new(),
         }
-        let Ok(line) = Line::of(&run) else {
-            unknown_runs.push((run.start, run.end));
-            continue;
+    }
+
+    /// Adds `run`, the run after every run added so far.
+    fn push(&mut self, run: &UserMappingRun) {
+        self.push_part(run, RunPart::of(run, self.window));
+    }
+
+    /// Records the run `[start, end)` whose mapping is not known, read
+    /// beside the runs added, without adding it as a run: it leaves out a
+    /// line it touches ([`LineBuilder::listed`]) as one added would.
+    fn note_unknown(&mut self, start: u64, end: u64) {
+        self.unknown_runs.push((start, end));
+    }
+
+    /// The lines the list lists: every line built but those that touch a
+    /// run whose mapping is not known, which may be part of the same
+    /// mapping. The one place that rule is kept, for the list
+    /// ([`list_mappings`]) and the answer ([`range_meets_listed_line`])
+    /// alike.
+    fn listed(self) -> Listed {
+        let unknown_runs = self.unknown_runs;
+        let lines = self
+            .lines
+            .into_iter()
+            .filter(|line| {
+                !unknown_runs
+                    .iter()
+                    .any(|&(start, end)| line.start <= end && start <= line.end)
+            })
+            .collect();
+        Listed {
+            lines,
+            complete: unknown_runs.is_empty(),
+        }
+    }
+
+    /// Adds `run`, whose part is `part` ([`RunPart::of`]).
+    fn push_part(&mut self, run: &UserMappingRun, part: RunPart) {
+        let line = match part {
+            RunPart::Line(line) => line,
+            RunPart::Unknown => {
+                self.unknown_runs.push((run.start, run.end));
+                return;
+            }
+            RunPart::Other => return,
         };
-        let Some(line) = line else { continue };
         // The program break's first mapping, which `brk(2)` makes at
         // `start_brk`, never joins the mapping before it (the image's bss,
         // which ends there when the break is not randomized): Linux's `brk`
@@ -755,14 +858,215 @@ fn build_lines(
         // `start_brk` to grow (`vma_prev_limit(&vmi, mm->start_brk)` in
         // `mm/mmap.c`), so `[heap]` starts a line of its own, as Linux 7.1.3
         // lists it.
-        match lines.last_mut() {
-            Some(last) if line.start != image.start_brk && last.merges_with(&line) => {
+        match self.lines.last_mut() {
+            Some(last) if line.start != self.image.start_brk && last.merges_with(&line) => {
                 last.absorb(&line);
             }
-            _ => lines.push(line),
+            _ => self.lines.push(line),
         }
     }
-    (lines, unknown_runs)
+}
+
+/// Whether [`list_mappings`] lists, for the address space `memory` whose
+/// image fixed `image`, a mapping that overlaps the user addresses
+/// `[start, end)`: `Guest::memory_map_overlaps`. It answers as the list
+/// does, read from the lines around the range rather than from every page,
+/// so the work grows with those lines, not with the address space.
+///
+/// Everything is read under one acquisition of the memory's lock
+/// ([`GuestMemory::read_mapping_runs`]), from its index of runs, through
+/// reads a test build counts; no page is read on its own.
+///
+/// - The stack window's lines are read as the list reads them
+///   (`facts::stack_window_lines`, from the window's runs and the page map's
+///   count of its mapped pages), with the same answer where the window's
+///   record is not certain or one of its pages' mapping is not known (the
+///   list is then empty).
+/// - Every other mapping is a line of the runs around the range
+///   ([`range_meets_listed_line`]), built as [`build_lines`] builds the
+///   list's and listed as the list lists it: unless it touches a run whose
+///   mapping is not known.
+/// - It states no line ([`Line::fact`]), so it reads no file name and asks
+///   the host nothing: where the list fails only because a line cannot be
+///   stated (a file name that cannot be read, or an invalid fact), this
+///   still answers, counting that line as listed.
+pub(crate) fn lists_a_mapping_in(
+    memory: &GuestMemory,
+    image: &ImageMapFacts,
+    start: u64,
+    end: u64,
+) -> Result<bool, reverie::FactError> {
+    if end <= start {
+        return Ok(false);
+    }
+    Ok(memory.read_mapping_runs(|runs| {
+        let Some(window) = runs.stack_window() else {
+            return false;
+        };
+        let Some(window_lines) = super::facts::stack_window_lines(&window, image) else {
+            return false;
+        };
+        window_lines
+            .iter()
+            .any(|line| line.start < end && start < line.end)
+            || range_meets_listed_line(runs, image, Some((window.start, window.end)), start, end)
+    }))
+}
+
+/// Whether one of the lines [`build_lines`] builds from every run of the
+/// address space `memory` (whose image fixed `image`, outside the stack
+/// window `window`) overlaps the user addresses `[start, end)`,
+/// `start < end`, without touching a run whose mapping is not known (which
+/// leaves a line out of the list), read from the runs around the range
+/// alone.
+///
+/// Read from the memory's index of mapping runs alone: the runs that meet
+/// the range, then run by run outward only as far as the lines that overlap
+/// the range reach, plus the one run beyond each end.
+///
+/// - Below: from the first line run that meets the range, back to a run where
+///   [`build_lines`] starts a line whatever came before it. Such a run follows
+///   a gap or a run that is no line (the window's, the backend's own, or one
+///   whose mapping is not known), starts at the program break's start, or
+///   does not merge with the run before it but for the file facts
+///   ([`Line::merges_but_for_file_facts`]), which no history of the line
+///   before it changes. Building from there gives the list's lines. The run
+///   before it is read too, since it decides whether the first line touches a
+///   run whose mapping is not known.
+/// - Above: past the range while each next run joins the line before it, and
+///   then the one run after, which decides the same for the last line.
+///
+/// Only a run beside a line can make the list leave the line out, so these
+/// runs decide it exactly. Each run read is classified once
+/// ([`RunPart::of`]) and each line built once ([`LineBuilder`]), so the
+/// work is linear in the runs read.
+fn range_meets_listed_line(
+    runs: &crate::memory::MappingRuns<'_>,
+    image: &ImageMapFacts,
+    window: Option<(u64, u64)>,
+    start: u64,
+    end: u64,
+) -> bool {
+    let met = runs.meeting(start, end - start);
+    // The first run of a line that overlaps the range: no line overlaps it
+    // without one of its runs doing so.
+    let mut met_parts = met.into_iter().map(|run| {
+        let part = RunPart::of(&run, window);
+        (run, part)
+    });
+    // The ranges of the runs read before the lines are built whose mapping is
+    // not known: below the first line run, or before it in the range. Every
+    // later one is added to the lines as a run.
+    let mut unknown: Vec<(u64, u64)> = Vec::new();
+    let first = loop {
+        match met_parts.next() {
+            None => return false,
+            Some((run, RunPart::Line(line))) => break (run, line),
+            Some((run, RunPart::Unknown)) => unknown.push((run.start, run.end)),
+            Some((_, RunPart::Other)) => {}
+        }
+    };
+    let mut last_end = first.0.end;
+    // Below: the line runs from that one back to a line start, lowest last.
+    let mut below: Vec<(UserMappingRun, Line)> = vec![first];
+    while let Some((lowest, lowest_line)) = below.last() {
+        let lowest_start = lowest.start;
+        let Some(previous) = runs.before(lowest_start) else {
+            break;
+        };
+        let part = RunPart::of(&previous, window);
+        let joins = previous.end == lowest_start
+            && lowest_line.start != image.start_brk
+            && matches!(&part, RunPart::Line(previous_line)
+                if previous_line.merges_but_for_file_facts(lowest_line));
+        match part {
+            RunPart::Line(previous_line) if joins => below.push((previous, previous_line)),
+            RunPart::Unknown => {
+                unknown.push((previous.start, previous.end));
+                break;
+            }
+            RunPart::Line(_) | RunPart::Other => break,
+        }
+    }
+    let mut lines = LineBuilder::new(image, window);
+    for (unknown_start, unknown_end) in unknown {
+        lines.note_unknown(unknown_start, unknown_end);
+    }
+    for (run, line) in below.into_iter().rev() {
+        lines.push_part(&run, RunPart::Line(line));
+    }
+    for (run, part) in met_parts {
+        last_end = run.end;
+        lines.push_part(&run, part);
+    }
+    // Above: past the range while each next run joins the line before it,
+    // and the one run after that, which decides the same for the last line.
+    while let Some(next) = runs.after(last_end) {
+        let part = RunPart::of(&next, window);
+        let beyond = next.start >= end;
+        last_end = next.end;
+        lines.push_part(&next, part);
+        if beyond {
+            let joined = lines
+                .lines
+                .last()
+                .is_some_and(|line| line.start < next.start && next.end <= line.end);
+            if !joined {
+                break;
+            }
+        }
+    }
+    // Listed as `list_mappings` lists them, by the same rule.
+    lines
+        .listed()
+        .lines
+        .iter()
+        .any(|line| line.start < end && start < line.end)
+}
+
+/// What a run is to the list's lines ([`build_lines`]).
+enum RunPart {
+    /// A line of its own until merged: a run whose mapping is known.
+    Line(Line),
+    /// A run whose mapping is not known: no line, and a line that touches
+    /// it is left out of the list.
+    Unknown,
+    /// A run of the stack window, or of the backend's own pages: no line,
+    /// and nothing a line that touches it is left out for.
+    Other,
+}
+
+/// The extents of the lines [`build_lines`] builds from `runs` (every run of
+/// an address space whose image fixed `image`, outside the stack window
+/// `window`), listed or not, for a test that works out which runs a query
+/// may read.
+#[cfg(test)]
+pub(super) fn line_extents(
+    runs: Vec<UserMappingRun>,
+    image: &ImageMapFacts,
+    window: Option<(u64, u64)>,
+) -> Vec<(u64, u64)> {
+    build_lines(runs, image, window)
+        .0
+        .iter()
+        .map(|line| (line.start, line.end))
+        .collect()
+}
+
+impl RunPart {
+    /// What `run` is to the list's lines, outside the stack window `window`.
+    fn of(run: &UserMappingRun, window: Option<(u64, u64)>) -> Self {
+        if window.is_some_and(|(window_start, window_end)| {
+            (window_start..window_end).contains(&run.start)
+        }) {
+            return RunPart::Other;
+        }
+        match Line::of(run) {
+            Ok(Some(line)) => RunPart::Line(line),
+            Ok(None) => RunPart::Other,
+            Err(()) => RunPart::Unknown,
+        }
+    }
 }
 
 /// The extent of a line and its sticky flags ([`STICKY_FLAGS`]): those any

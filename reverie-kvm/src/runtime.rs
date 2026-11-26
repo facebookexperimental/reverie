@@ -757,6 +757,20 @@ trait GuestSyscallExecutor<T: Tool>:
         Err(reverie::FactError::NotProvided)
     }
 
+    /// The issuing task's `Guest::memory_map_overlaps(tid, start, end)`:
+    /// by default, from [`Self::memory_map`], as the trait's own default.
+    fn memory_map_overlaps(
+        &self,
+        tid: Pid,
+        start: u64,
+        end: u64,
+    ) -> std::result::Result<bool, reverie::FactError> {
+        if end <= start {
+            return Ok(false);
+        }
+        Ok(self.memory_map(tid)?.overlaps(start, end))
+    }
+
     /// [`Self::complete_injection`]'s answer, when it is known at once without
     /// awaiting anything, so that the common injection, one that staged no
     /// process action, is completed without the boxed future and the
@@ -1788,6 +1802,16 @@ where
 
     fn memory_map(&self, tid: Pid) -> std::result::Result<reverie::MemoryMap, reverie::FactError> {
         self.executor.memory_map(&self.memory, tid.as_raw())
+    }
+
+    fn memory_map_overlaps(
+        &self,
+        tid: Pid,
+        start: u64,
+        end: u64,
+    ) -> std::result::Result<bool, reverie::FactError> {
+        self.executor
+            .memory_map_overlaps(&self.memory, tid.as_raw(), start, end)
     }
 
     fn ordinary_injection_allowed(&self, request: &SyscallRequest) -> bool {
@@ -3027,6 +3051,16 @@ impl<T: Tool> Guest<T> for KvmGuest<'_, T> {
         // incomplete; its limits are documented on the executor's facts
         // module.
         self.executor.memory_map(tid)
+    }
+
+    fn memory_map_overlaps(
+        &self,
+        tid: Pid,
+        start: u64,
+        end: u64,
+    ) -> std::result::Result<bool, reverie::FactError> {
+        // As `memory_map`, from the executor's record of the address space.
+        self.executor.memory_map_overlaps(tid, start, end)
     }
 }
 

@@ -610,10 +610,10 @@ impl ElfExecutor {
     /// provided for a live thread of another process, whose address space
     /// this executor does not hold.
     ///
-    /// The window's pages are read under one acquisition of the address
-    /// space's lock, which every change to a page's state takes too, so the
-    /// answer is never part of a change; the reader never waits for another
-    /// thread's syscall to finish. A change made in a vfork partner's copy
+    /// The window's runs are read from the memory's index of runs under one
+    /// acquisition of the address space's lock, which every change to a
+    /// page's state takes too, so the answer is never part of a change; the
+    /// reader never waits for another thread's syscall to finish. A change made in a vfork partner's copy
     /// takes that copy's lock and reaches this one through the record they
     /// share, which only ever loses certainty.
     pub fn memory_map(
@@ -632,6 +632,37 @@ impl ElfExecutor {
             Err(reverie::FactError::NotProvided) => {
                 let (other, image) = self.other_process_address_space(tid)?;
                 super::mapping_list::list_mappings(&other, &image)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// `Guest::memory_map_overlaps(tid, start, end)`: whether a mapping
+    /// [`ElfExecutor::memory_map`] lists for `tid` overlaps `[start, end)`,
+    /// for the same address space and with the same errors for `tid`, read
+    /// from the lines around the range rather than from the whole list
+    /// (`mapping_list::lists_a_mapping_in`, which also says where it answers
+    /// a list that fails).
+    pub fn memory_map_overlaps(
+        &self,
+        memory: &GuestMemory,
+        tid: libc::pid_t,
+        start: u64,
+        end: u64,
+    ) -> std::result::Result<bool, reverie::FactError> {
+        if end <= start {
+            return Ok(false);
+        }
+        match self.link_owner(tid) {
+            Ok(_) => super::mapping_list::lists_a_mapping_in(
+                memory,
+                &super::mapping_list::ImageMapFacts::of(&self.state),
+                start,
+                end,
+            ),
+            Err(reverie::FactError::NotProvided) => {
+                let (other, image) = self.other_process_address_space(tid)?;
+                super::mapping_list::lists_a_mapping_in(&other, &image, start, end)
             }
             Err(error) => Err(error),
         }
@@ -783,7 +814,13 @@ impl ElfExecutor {
         let Some(pages) = memory.user_stack_window_pages() else {
             return;
         };
-        for (index, run) in stack_window_runs(&pages).into_iter().enumerate() {
+        let parts = pages.iter().map(|page| WindowPart {
+            start: page.user_address,
+            end: page.user_address + PAGE_SIZE,
+            declared: page.declared,
+            reservation: page.reservation,
+        });
+        for (index, run) in stack_window_runs(parts).into_iter().enumerate() {
             if run.declared.is_some() {
                 // Adjacent runs get different lineages, even past u32::MAX.
                 memory.set_user_stack_window_lineage(run.start, run.end - run.start, index as u32);
@@ -794,24 +831,16 @@ impl ElfExecutor {
 
 /// The stack window's mappings as Linux lists them (`ElfExecutor::memory_map`
 /// documents each field), for the address space `memory` whose image fixed
-/// `image`: `None` when they cannot be established (the window's record is
-/// not certain, one page's mapping is not known, or the process runs with
-/// `READ_IMPLIES_EXEC`).
+/// `image`: `None` when they cannot be established ([`stack_window_lines`]).
+/// Read from the memory's index of runs, not from the window's pages.
 pub(super) fn stack_window_mappings(
     memory: &GuestMemory,
     image: &super::mapping_list::ImageMapFacts,
 ) -> std::result::Result<Option<Vec<reverie::MappingFact>>, reverie::FactError> {
-    if image.read_implies_exec {
-        return Ok(None);
-    }
-    let Some(pages) = memory.user_stack_window_pages() else {
+    let window = memory.read_mapping_runs(|runs| runs.stack_window());
+    let Some(runs) = window.and_then(|window| stack_window_lines(&window, image)) else {
         return Ok(None);
     };
-    let runs = stack_window_runs(&pages);
-    // One page whose mapping is not known empties the whole list.
-    if runs.iter().any(|run| run.declared.is_none()) {
-        return Ok(None);
-    }
     let mut mappings = Vec::new();
     for run in runs {
         let backing = if (run.start..=run.end).contains(&image.start_stack) {
@@ -834,6 +863,78 @@ pub(super) fn stack_window_mappings(
         mappings.push(super::mapping_list::with_vm_flags(fact, vm_flags));
     }
     Ok(Some(mappings))
+}
+
+/// A window line as a test compares it: its extent, its guard flag on any
+/// and on every page, and its declared mapping but for the guard flag.
+#[cfg(test)]
+pub(super) type WindowLineFacts = (u64, u64, u16, u16, Option<crate::memory::DeclaredMapping>);
+
+/// In a test, the stack window's lines two ways, which must agree: from the
+/// memory's index of runs ([`stack_window_lines`], what the list and the
+/// overlap answer read) and from every page of the window
+/// (`GuestMemory::user_stack_window_pages`, what they read before the index
+/// served the window); `None` where the list holds none of them.
+#[cfg(test)]
+pub(super) fn stack_window_lines_both_ways(
+    memory: &GuestMemory,
+    image: &super::mapping_list::ImageMapFacts,
+) -> (Option<Vec<WindowLineFacts>>, Option<Vec<WindowLineFacts>>) {
+    let facts = |runs: Vec<WindowRun>| {
+        runs.into_iter()
+            .map(|run| {
+                (
+                    run.start,
+                    run.end,
+                    run.sticky,
+                    run.sticky_everywhere,
+                    run.declared,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let by_index = memory
+        .read_mapping_runs(|runs| runs.stack_window())
+        .and_then(|window| stack_window_lines(&window, image))
+        .map(facts);
+    let by_pages = if image.read_implies_exec {
+        None
+    } else {
+        memory
+            .user_stack_window_pages()
+            .map(|pages| {
+                stack_window_runs(pages.iter().map(|page| WindowPart {
+                    start: page.user_address,
+                    end: page.user_address + PAGE_SIZE,
+                    declared: page.declared,
+                    reservation: page.reservation,
+                }))
+            })
+            .filter(|runs| runs.iter().all(|run| run.declared.is_some()))
+            .map(facts)
+    };
+    (by_index, by_pages)
+}
+
+/// The stack window's lines ([`stack_window_runs`]), as the list holds them,
+/// from the window's runs of the memory's index (`window`), for an image
+/// that fixed `image`: `None` when the list holds none of them, because one
+/// page's mapping is not known (a run's, or a mapped page that no run holds,
+/// one the backend reserves for itself), or the process runs with
+/// `READ_IMPLIES_EXEC`. The work is the window's runs.
+pub(super) fn stack_window_lines(
+    window: &crate::memory::StackWindowRuns,
+    image: &super::mapping_list::ImageMapFacts,
+) -> Option<Vec<WindowRun>> {
+    if image.read_implies_exec || !window.holds_every_page {
+        return None;
+    }
+    let runs = stack_window_runs(window.runs.iter().map(WindowPart::of_run));
+    // One page whose mapping is not known empties the whole list.
+    if runs.iter().any(|run| run.declared.is_none()) {
+        return None;
+    }
+    Some(runs)
 }
 
 /// `count` lineages (`DeclaredMapping::lineage`) that no page of `memory`
@@ -890,12 +991,13 @@ pub(super) fn free_lineages(
 /// address `address`, as its list gives it, with the guard flag
 /// (`FLAG_MAYBE_GUARD`) it has on any page and on every page; `None` when
 /// the window's record is not certain, or no known mapping holds the page.
+/// Read from the memory's index of runs, not from the window's pages.
 pub(super) fn stack_window_line_holding(
     memory: &GuestMemory,
     address: u64,
 ) -> Option<super::mapping_list::LineExtent> {
-    let pages = memory.user_stack_window_pages()?;
-    let run = stack_window_runs(&pages)
+    let window = memory.read_mapping_runs(|runs| runs.stack_window())?;
+    let run = stack_window_runs(window.runs.iter().map(WindowPart::of_run))
         .into_iter()
         .find(|run| run.start <= address && address < run.end)?;
     run.declared?;
@@ -912,9 +1014,9 @@ pub(super) fn stack_window_line_holding(
 /// pages' mapping is not known: declared by no call (a path that states no
 /// protection, such as the shared-file paths, or a Tool's scratch page), or
 /// reserved for another use than the stack.
-struct WindowRun {
-    start: u64,
-    end: u64,
+pub(super) struct WindowRun {
+    pub(super) start: u64,
+    pub(super) end: u64,
     /// The pages' declared mapping, but for the guard flag
     /// (`FLAG_MAYBE_GUARD`), which sticks to a merged mapping.
     declared: Option<crate::memory::DeclaredMapping>,
@@ -922,6 +1024,27 @@ struct WindowRun {
     sticky: u16,
     /// The guard flag, where every page of the run has it.
     sticky_everywhere: u16,
+}
+
+/// Adjacent pages of the stack window, `[start, end)`, that hold one declared
+/// mapping and one reservation: one page, or a run of the memory's index.
+struct WindowPart {
+    start: u64,
+    end: u64,
+    declared: Option<crate::memory::DeclaredMapping>,
+    reservation: Option<crate::memory::RegionKind>,
+}
+
+impl WindowPart {
+    /// The part a run of the memory's index of runs makes.
+    fn of_run(run: &crate::memory::UserMappingRun) -> Self {
+        Self {
+            start: run.start,
+            end: run.end,
+            declared: run.declared,
+            reservation: run.reservation,
+        }
+    }
 }
 
 /// The runs of the stack window's pages, lowest first: each maximal run of
@@ -935,27 +1058,31 @@ struct WindowRun {
 /// is when their protection, the other flags this executor keeps, and their
 /// lineage agree. `FLAG_ACCOUNT_UNKNOWN` never reaches the window: only
 /// `GuestMemory::edit_user_declared` sets it, which skips the stack's pages.
-fn stack_window_runs(pages: &[crate::memory::WindowPage]) -> Vec<WindowRun> {
+///
+/// The parts are the window's mapped pages in address order, one page each
+/// or runs of pages that agree in everything this reads (the memory's index
+/// of runs): either gives the same runs.
+fn stack_window_runs(parts: impl IntoIterator<Item = WindowPart>) -> Vec<WindowRun> {
     let guard = super::FLAG_MAYBE_GUARD;
     let mut runs: Vec<WindowRun> = Vec::new();
-    for page in pages {
-        let declared = page
+    for part in parts {
+        let declared = part
             .declared
-            .filter(|_| page.reservation == Some(crate::memory::RegionKind::Stack));
+            .filter(|_| part.reservation == Some(crate::memory::RegionKind::Stack));
         let sticky = declared.map_or(0, |declared| declared.flags & guard);
         let declared = declared.map(|declared| crate::memory::DeclaredMapping {
             flags: declared.flags & !guard,
             ..declared
         });
         match runs.last_mut() {
-            Some(run) if run.end == page.user_address && run.declared == declared => {
-                run.end += PAGE_SIZE;
+            Some(run) if run.end == part.start && run.declared == declared => {
+                run.end = part.end;
                 run.sticky |= sticky;
                 run.sticky_everywhere &= sticky;
             }
             _ => runs.push(WindowRun {
-                start: page.user_address,
-                end: page.user_address + PAGE_SIZE,
+                start: part.start,
+                end: part.end,
                 declared,
                 sticky,
                 sticky_everywhere: sticky,

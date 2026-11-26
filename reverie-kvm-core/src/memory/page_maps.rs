@@ -9,9 +9,10 @@
 //! The page-keyed host-side access maps, with two properties the Tool-scratch
 //! fast paths rely on.
 //!
-//! - [`Versioned`] collections change only through [`Versioned::edit`], which
-//!   gives the collection a process-unique version. Two collections with the
-//!   same version therefore have the same contents: the only way to share a
+//! - [`Versioned`] collections change only through their own page-keyed
+//!   methods (`insert`, `remove`, `clear` and the like), which give the
+//!   collection a process-unique version. Two collections with the same
+//!   version therefore have the same contents: the only way to share a
 //!   version is to clone the collection that drew it. The inner collection is
 //!   private to this module, so a mutation that skips the version does not
 //!   compile.
@@ -33,6 +34,7 @@
 //!   that no page carries a flag without walking the pages.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fmt;
 use std::ops::Bound;
 use std::ops::Deref;
@@ -50,12 +52,87 @@ fn fresh_version() -> u64 {
     NEXT_VERSION.fetch_add(1, Ordering::Relaxed)
 }
 
-/// A collection readable through `Deref` and writable only through
-/// [`Versioned::edit`]. See the module documentation.
+/// The physical pages whose facts a page-keyed map changed since the index of
+/// mapping runs last read them (`AddressSpaceState::settle_runs`): inclusive
+/// ranges, or every page. A map keyed by physical page ([`Versioned`],
+/// [`PageKeyed`]) is written only by methods that change the entry of the one
+/// page they are given, or every entry, and note exactly that, so its note is
+/// the write's own key. The one map keyed by something else
+/// ([`IncarnationKeyed`]) is written only by naming the pages the write
+/// reaches. There is no other write, so no change can reach a map unseen by
+/// the index.
+#[derive(Clone, Debug, Default)]
+pub(super) struct DirtyPages {
+    every: bool,
+    ranges: Vec<(u64, u64)>,
+}
+
+impl DirtyPages {
+    /// Notes pages `first..=last`, joining the last range noted where they
+    /// touch or overlap it (the common case: a call's pages in order).
+    pub(super) fn mark(&mut self, first: u64, last: u64) {
+        if self.every {
+            return;
+        }
+        if let Some(back) = self.ranges.last_mut()
+            && first <= back.1.saturating_add(1)
+            && last.saturating_add(1) >= back.0
+        {
+            back.0 = back.0.min(first);
+            back.1 = back.1.max(last);
+            return;
+        }
+        // Past this many separate ranges, one rebuild from every page costs
+        // less than settling each, and the record stays bounded.
+        if self.ranges.len() >= 4096 {
+            self.mark_every();
+            return;
+        }
+        self.ranges.push((first, last));
+    }
+
+    /// Notes that any page may have changed.
+    pub(super) fn mark_every(&mut self) {
+        self.every = true;
+        self.ranges.clear();
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        !self.every && self.ranges.is_empty()
+    }
+
+    /// Whether any page may have changed.
+    pub(super) fn every(&self) -> bool {
+        self.every
+    }
+
+    /// The ranges noted, in the order noted.
+    pub(super) fn ranges(&self) -> &[(u64, u64)] {
+        &self.ranges
+    }
+
+    /// Adds what `other` noted to this record.
+    pub(super) fn absorb(&mut self, other: DirtyPages) {
+        if other.every {
+            self.mark_every();
+        } else {
+            for (first, last) in other.ranges {
+                self.mark(first, last);
+            }
+        }
+    }
+}
+
+/// A collection keyed by physical page, readable through `Deref` and
+/// writable only through its own methods, each of which changes the entry of
+/// the one page it is given, or every entry ([`Versioned::clear`]), and notes
+/// exactly that. No method hands out the collection mutably, so no write can
+/// reach a page its note does not name. See the module documentation.
 #[derive(Clone)]
 pub(super) struct Versioned<M> {
     inner: M,
     version: u64,
+    dirty: DirtyPages,
 }
 
 impl<M> Versioned<M> {
@@ -63,19 +140,289 @@ impl<M> Versioned<M> {
         Self {
             inner,
             version: fresh_version(),
+            dirty: DirtyPages::default(),
         }
     }
 
-    /// Mutable access. The collection takes a fresh version first, whether or
-    /// not the caller ends up changing it, so a stale version can only be
-    /// conservative.
-    pub(super) fn edit(&mut self) -> &mut M {
+    /// Readies a write to the entry of physical page `page` and no other:
+    /// the collection takes a fresh version first, whether or not the write
+    /// ends up changing it, so a stale version can only be conservative, and
+    /// the page is noted for the index of mapping runs.
+    fn write_page(&mut self, page: u64) -> &mut M {
         self.version = fresh_version();
+        self.dirty.mark(page, page);
         &mut self.inner
+    }
+
+    /// Readies a write that may change every entry, as
+    /// [`Versioned::write_page`] for every page.
+    fn write_every(&mut self) -> &mut M {
+        self.version = fresh_version();
+        self.dirty.mark_every();
+        &mut self.inner
+    }
+
+    /// Takes the pages noted since the last call.
+    pub(super) fn take_dirty(&mut self) -> DirtyPages {
+        std::mem::take(&mut self.dirty)
+    }
+
+    /// Whether no page was noted since the last [`Versioned::take_dirty`].
+    pub(super) fn dirty_is_empty(&self) -> bool {
+        self.dirty.is_empty()
     }
 
     pub(super) fn version(&self) -> u64 {
         self.version
+    }
+}
+
+impl<V> Versioned<BTreeMap<u64, V>> {
+    /// `BTreeMap::insert` at physical page `page`, noting that page.
+    pub(super) fn insert(&mut self, page: u64, value: V) -> Option<V> {
+        self.write_page(page).insert(page, value)
+    }
+
+    /// `BTreeMap::remove` of physical page `page`, noting that page.
+    pub(super) fn remove(&mut self, page: &u64) -> Option<V> {
+        self.write_page(*page).remove(page)
+    }
+
+    /// Gives physical page `page` the value `value` unless it has one,
+    /// noting that page.
+    pub(super) fn insert_if_absent(&mut self, page: u64, value: V) {
+        self.write_page(page).entry(page).or_insert(value);
+    }
+
+    /// `BTreeMap::clear`, noting every page.
+    pub(super) fn clear(&mut self) {
+        self.write_every().clear();
+    }
+}
+
+impl Versioned<BTreeSet<u64>> {
+    /// `BTreeSet::insert` of physical page `page`, noting that page.
+    pub(super) fn insert(&mut self, page: u64) -> bool {
+        self.write_page(page).insert(page)
+    }
+
+    /// `BTreeSet::remove` of physical page `page`, noting that page.
+    pub(super) fn remove(&mut self, page: &u64) -> bool {
+        self.write_page(*page).remove(page)
+    }
+
+    /// `BTreeSet::clear`, noting every page.
+    pub(super) fn clear(&mut self) {
+        self.write_every().clear();
+    }
+}
+
+/// A collection keyed by physical page behind an `Arc` that copies of an
+/// address space share until one of them changes it (`Arc::make_mut`),
+/// readable through `Deref` and writable, as [`Versioned`] is, only through
+/// methods that change the entry of the one page they are given, or every
+/// entry, and note exactly that.
+#[derive(Clone, Default)]
+pub(super) struct PageKeyed<M> {
+    inner: Arc<M>,
+    dirty: DirtyPages,
+}
+
+impl<M> PageKeyed<M> {
+    /// Takes the pages noted since the last call.
+    pub(super) fn take_dirty(&mut self) -> DirtyPages {
+        std::mem::take(&mut self.dirty)
+    }
+}
+
+impl<V: Clone> PageKeyed<BTreeMap<u64, V>> {
+    /// Readies a write to the entry of physical page `page` and no other,
+    /// noting that page.
+    fn write_page(&mut self, page: u64) -> &mut BTreeMap<u64, V> {
+        self.dirty.mark(page, page);
+        Arc::make_mut(&mut self.inner)
+    }
+
+    /// `BTreeMap::insert` at physical page `page`, noting that page.
+    pub(super) fn insert(&mut self, page: u64, value: V) -> Option<V> {
+        self.write_page(page).insert(page, value)
+    }
+
+    /// `BTreeMap::remove` of physical page `page`, noting that page.
+    pub(super) fn remove(&mut self, page: &u64) -> Option<V> {
+        self.write_page(*page).remove(page)
+    }
+
+    /// `BTreeMap::get_mut` of physical page `page`, noting that page: the
+    /// value it gives is that page's entry and no other.
+    pub(super) fn get_mut(&mut self, page: &u64) -> Option<&mut V> {
+        self.write_page(*page).get_mut(page)
+    }
+
+    /// Empties the map and notes every page, for an address space laid out
+    /// again from nothing. The copies that shared the map keep it.
+    pub(super) fn reset(&mut self) {
+        self.inner = Arc::new(BTreeMap::new());
+        self.dirty.mark_every();
+    }
+}
+
+impl<V> PageKeyed<BTreeMap<u64, V>> {
+    /// Empties a map keyed by physical page, noting the pages of its keys
+    /// (consecutive keys as one range) rather than every page: clearing an
+    /// empty map notes nothing, so it costs the index of mapping runs no
+    /// work, and clearing a full one costs the pages it held.
+    pub(super) fn clear_noting_keys(&mut self) {
+        if self.inner.is_empty() {
+            return;
+        }
+        let mut ranges: Vec<(u64, u64)> = Vec::new();
+        for &page in self.inner.keys() {
+            match ranges.last_mut() {
+                Some(range) if range.1.checked_add(1) == Some(page) => range.1 = page,
+                _ => ranges.push((page, page)),
+            }
+        }
+        for (first, last) in ranges {
+            self.dirty.mark(first, last);
+        }
+        self.inner = Arc::new(BTreeMap::new());
+    }
+}
+
+impl<M> PageKeyed<M> {
+    /// Whether `self` and `other` still share one collection (`Arc::ptr_eq`).
+    pub(super) fn shares_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    /// Whether no page was noted since the last take.
+    pub(super) fn dirty_is_empty(&self) -> bool {
+        self.dirty.is_empty()
+    }
+}
+
+impl<'a, M> IntoIterator for &'a PageKeyed<M>
+where
+    &'a M: IntoIterator,
+{
+    type Item = <&'a M as IntoIterator>::Item;
+    type IntoIter = <&'a M as IntoIterator>::IntoIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        (&*self.inner).into_iter()
+    }
+}
+
+impl<M> Deref for PageKeyed<M> {
+    type Target = M;
+
+    fn deref(&self) -> &M {
+        &self.inner
+    }
+}
+
+impl<M: fmt::Debug> fmt::Debug for PageKeyed<M> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.inner.fmt(f)
+    }
+}
+
+/// The one collection the index of mapping runs reads that is not keyed by
+/// physical page: a value per mapping incarnation, behind an `Arc` as
+/// [`PageKeyed`] is. A change to an incarnation's value reaches every page of
+/// that incarnation, which the key does not name, so the one write that sets
+/// values names those pages ([`IncarnationKeyed::insert_naming_pages`]), and
+/// a test build checks there that no page of those incarnations lies outside
+/// them. That the named pages hold every such page is an argument in a
+/// product build, which does not check it. The other writes change no page:
+/// forgetting incarnations no page has, and emptying the whole map.
+#[derive(Clone)]
+pub(super) struct IncarnationKeyed<V> {
+    inner: Arc<BTreeMap<u64, V>>,
+    dirty: DirtyPages,
+}
+
+impl<V> Default for IncarnationKeyed<V> {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(BTreeMap::new()),
+            dirty: DirtyPages::default(),
+        }
+    }
+}
+
+impl<V: Clone> IncarnationKeyed<V> {
+    /// Gives each mapping incarnation in `incarnations` the value `value`,
+    /// noting physical pages `first..=last`, which must hold every page
+    /// whose incarnation (by `placements`, the incarnation of each physical
+    /// page) is one of them. A test build checks that here, at the write.
+    pub(super) fn insert_naming_pages(
+        &mut self,
+        first: u64,
+        last: u64,
+        incarnations: &BTreeSet<u64>,
+        value: V,
+        placements: &BTreeMap<u64, u64>,
+    ) {
+        #[cfg(any(test, feature = "test-support"))]
+        assert!(
+            placements
+                .iter()
+                .all(|(page, incarnation)| (first..=last).contains(page)
+                    || !incarnations.contains(incarnation)),
+            "an identity reaches pages outside the range that names them"
+        );
+        #[cfg(not(any(test, feature = "test-support")))]
+        let _ = placements;
+        self.dirty.mark(first, last);
+        let inner = Arc::make_mut(&mut self.inner);
+        for &incarnation in incarnations {
+            inner.insert(incarnation, value.clone());
+        }
+    }
+
+    /// Forgets the value of every mapping incarnation that no page has (by
+    /// `placements`), and gives how many values are left. That changes no
+    /// page's value, so it notes nothing.
+    pub(super) fn forget_unplaced(&mut self, placements: &BTreeMap<u64, u64>) -> usize {
+        let placed: BTreeSet<u64> = placements.values().copied().collect();
+        let inner = Arc::make_mut(&mut self.inner);
+        inner.retain(|incarnation, _| placed.contains(incarnation));
+        inner.len()
+    }
+
+    /// Empties the map and notes every page, for an address space laid out
+    /// again from nothing. The copies that shared the map keep it.
+    pub(super) fn reset(&mut self) {
+        self.inner = Arc::new(BTreeMap::new());
+        self.dirty.mark_every();
+    }
+}
+
+impl<V> IncarnationKeyed<V> {
+    /// Takes the pages noted since the last call.
+    pub(super) fn take_dirty(&mut self) -> DirtyPages {
+        std::mem::take(&mut self.dirty)
+    }
+
+    /// Whether no page was noted since the last take.
+    pub(super) fn dirty_is_empty(&self) -> bool {
+        self.dirty.is_empty()
+    }
+}
+
+impl<V> Deref for IncarnationKeyed<V> {
+    type Target = BTreeMap<u64, V>;
+
+    fn deref(&self) -> &BTreeMap<u64, V> {
+        &self.inner
+    }
+}
+
+impl<V: fmt::Debug> fmt::Debug for IncarnationKeyed<V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.inner.fmt(f)
     }
 }
 
@@ -123,6 +470,9 @@ pub(super) struct UserPages {
     /// For each bit of the provider flags, how many pages of the logical map
     /// carry it in their declared mapping ([`UserPages::flagged_pages`]).
     flag_pages: [usize; 16],
+    /// How many watched pages have a logical state
+    /// ([`UserPages::certain_watch_mapped`]): zero without a watch.
+    watched_mapped: usize,
 }
 
 /// A range of pages whose logical state [`UserPages`] watches.
@@ -163,7 +513,15 @@ impl UserPages {
             scratch: Vec::new(),
             watch: None,
             flag_pages: [0; 16],
+            watched_mapped: 0,
         }
+    }
+
+    /// Whether `page` is watched.
+    fn watched(&self, page: u64) -> bool {
+        self.watch
+            .as_ref()
+            .is_some_and(|watch| (watch.first..=watch.last).contains(&page))
     }
 
     /// The provider flags a page in `state` carries.
@@ -226,6 +584,9 @@ impl UserPages {
             record: Arc::default(),
             own: 0,
         });
+        // Counted once as the watch begins (a loader's), then kept by every
+        // change of a watched page's logical state.
+        self.watched_mapped = self.range(first..=last).count();
     }
 
     /// The watched pages, `(first, last)`, if a watch is set and certain.
@@ -234,6 +595,27 @@ impl UserPages {
             .as_ref()
             .filter(|watch| watch.certain())
             .map(|watch| (watch.first, watch.last))
+    }
+
+    /// How many of the watched pages have a logical state, when the watch is
+    /// of exactly pages `first..=last` and certain: kept as the pages change,
+    /// so the answer costs no walk.
+    pub(super) fn certain_watch_mapped(&self, first: u64, last: u64) -> Option<usize> {
+        (self.certain_watch() == Some((first, last))).then_some(self.watched_mapped)
+    }
+
+    /// In a test build, checks the count of watched pages with a logical
+    /// state against a recount.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) fn check_watched_count(&self) {
+        let recount = self
+            .watch
+            .as_ref()
+            .map_or(0, |watch| self.range(watch.first..=watch.last).count());
+        assert_eq!(
+            self.watched_mapped, recount,
+            "the count of watched pages with a state differs from a recount"
+        );
     }
 
     /// Records that something the logical states do not hold changed for
@@ -280,6 +662,21 @@ impl UserPages {
         self.map.version()
     }
 
+    /// Takes the pages whose tree entries changed since the last call, for
+    /// the index of mapping runs. Overlay changes are not noted: an exposed
+    /// or hidden scratch page lies in the Tool-scratch reservation, which no
+    /// mapping run includes (`RegionKind::permanent`), so its logical state
+    /// never moves a run; the test build's check of the index against a
+    /// rebuild from the page maps holds that.
+    pub(super) fn take_dirty(&mut self) -> DirtyPages {
+        self.map.take_dirty()
+    }
+
+    /// Whether no tree entry changed since the last take.
+    pub(super) fn dirty_is_empty(&self) -> bool {
+        self.map.dirty_is_empty()
+    }
+
     fn scratch_index(&self, page: u64) -> Result<usize, usize> {
         self.scratch.binary_search(&page)
     }
@@ -312,10 +709,13 @@ impl UserPages {
     /// `BTreeMap::insert` of the logical map.
     pub(super) fn insert(&mut self, page: u64, state: UserPageState) -> Option<UserPageState> {
         let exposed = self.take_scratch(page);
-        let previous = self.map.edit().insert(page, state);
+        let previous = self.map.insert(page, state);
         debug_assert!(!(exposed && previous.is_some()));
         let previous = if exposed { Some(EXPOSED) } else { previous };
         self.count_flags(previous, Some(state));
+        if previous.is_none() && self.watched(page) {
+            self.watched_mapped += 1;
+        }
         if previous != Some(state) {
             self.count_change(page, page);
         }
@@ -327,10 +727,13 @@ impl UserPages {
         let previous = if self.take_scratch(*page) {
             Some(EXPOSED)
         } else {
-            self.map.edit().remove(page)
+            self.map.remove(page)
         };
         self.count_flags(previous, None);
         if previous.is_some() {
+            if self.watched(*page) {
+                self.watched_mapped -= 1;
+            }
             self.count_change(*page, *page);
         }
         previous
@@ -343,46 +746,61 @@ impl UserPages {
             self.count_change(first, last);
         }
         self.scratch.clear();
-        self.map.edit().clear();
+        self.map.clear();
         self.flag_pages = [0; 16];
+        self.watched_mapped = 0;
     }
 
     /// Exactly `insert(page, EXPOSED)` of the logical map, without touching
     /// the tree when `page` is known not to be one of its keys.
     /// `known_absent` must be a fact, not a guess: with it the tree is not
-    /// searched.
-    pub(super) fn expose_scratch(&mut self, page: u64, known_absent: bool) {
+    /// searched. Whether the overlay changed, which notes nothing for the
+    /// index of mapping runs (see [`UserPages::take_dirty`]).
+    pub(super) fn expose_scratch(&mut self, page: u64, known_absent: bool) -> bool {
         let Err(index) = self.scratch_index(page) else {
             // Already exposed: inserting the same state changes nothing.
-            return;
+            return false;
         };
         let previous = if !known_absent && self.map.contains_key(&page) {
-            self.map.edit().remove(&page)
+            self.map.remove(&page)
         } else {
             None
         };
         self.count_flags(previous, Some(EXPOSED));
         self.scratch.insert(index, page);
+        if previous.is_none() && self.watched(page) {
+            self.watched_mapped += 1;
+        }
         if previous != Some(EXPOSED) {
             self.count_change(page, page);
         }
+        true
     }
 
     /// Exactly `remove(&page)` of the logical map, without touching the tree
-    /// when `page` is known not to be one of its keys.
-    pub(super) fn hide_scratch(&mut self, page: u64, known_absent: bool) {
+    /// when `page` is known not to be one of its keys. Whether the overlay
+    /// changed, which notes nothing for the index of mapping runs (see
+    /// [`UserPages::take_dirty`]); a tree entry removed is noted.
+    pub(super) fn hide_scratch(&mut self, page: u64, known_absent: bool) -> bool {
         if self.take_scratch(page) {
+            if self.watched(page) {
+                self.watched_mapped -= 1;
+            }
             self.count_change(page, page);
-            return;
+            return true;
         }
         if known_absent {
-            return;
+            return false;
         }
         if self.map.contains_key(&page) {
-            let previous = self.map.edit().remove(&page);
+            let previous = self.map.remove(&page);
             self.count_flags(previous, None);
+            if self.watched(page) {
+                self.watched_mapped -= 1;
+            }
             self.count_change(page, page);
         }
+        false
     }
 
     /// The logical entries with keys in `range`, ascending, double-ended.
@@ -803,11 +1221,43 @@ mod tests {
         assert_ne!(first.version(), second.version());
         let clone = first.clone();
         assert_eq!(clone.version(), first.version());
-        first.edit().insert(1, 1);
+        first.insert(1, 1);
         assert_ne!(clone.version(), first.version());
         let before = first.version();
         // Even an edit that changes nothing moves the version.
-        first.edit().remove(&7);
+        first.remove(&7);
         assert_ne!(first.version(), before);
+    }
+
+    /// Each write notes exactly the page it writes, and a clear notes every
+    /// page, whatever the map holds.
+    #[test]
+    fn a_write_notes_exactly_its_own_page() {
+        let mut map = Versioned::new(BTreeMap::<u64, u64>::new());
+        map.insert(5, 1);
+        map.remove(&9);
+        map.insert_if_absent(5, 2);
+        let dirty = map.take_dirty();
+        assert!(!dirty.every());
+        assert_eq!(dirty.ranges(), &[(5, 5), (9, 9), (5, 5)]);
+        assert_eq!(map.get(&5), Some(&1));
+        map.clear();
+        assert!(map.take_dirty().every());
+
+        let mut set = Versioned::new(BTreeSet::<u64>::new());
+        set.insert(3);
+        set.insert(4);
+        set.remove(&8);
+        assert_eq!(set.take_dirty().ranges(), &[(3, 4), (8, 8)]);
+
+        let mut shared = PageKeyed::<BTreeMap<u64, u64>>::default();
+        shared.insert(10, 1);
+        let copy = shared.clone();
+        *shared.get_mut(&10).unwrap() = 2;
+        assert_eq!(shared.take_dirty().ranges(), &[(10, 10)]);
+        assert_eq!(copy.get(&10), Some(&1), "a copy keeps its own entry");
+        shared.reset();
+        assert!(shared.take_dirty().every());
+        assert!(shared.is_empty());
     }
 }

@@ -42,9 +42,17 @@ mod page_maps;
 mod shared_file;
 mod vfork;
 pub use mapping_list::MappingIdentity;
+#[cfg(any(test, feature = "test-support"))]
+pub use mapping_list::MappingRead;
+pub use mapping_list::MappingRuns;
+#[cfg(any(test, feature = "test-support"))]
+pub use mapping_list::QueryLog;
+pub use mapping_list::StackWindowRuns;
 pub use mapping_list::UserMappingRun;
 pub use mapping_list::UserMappingRuns;
 pub use mapping_list::WeakGuestMemory;
+use page_maps::IncarnationKeyed;
+use page_maps::PageKeyed;
 use page_maps::UserPages;
 use page_maps::Versioned;
 pub use shared_file::AllocationGuard;
@@ -315,7 +323,7 @@ struct Mapping {
     original_pages: Box<[NonNull<u8>]>,
     slice: BackingSlice,
     guest_base: u64,
-    address_space: Mutex<AddressSpaceState>,
+    address_space: AddressSpaceLock,
     allocation: Mutex<()>,
     entry_gate: Arc<EntryGate>,
     retirement: Mutex<Option<Box<WriteAliasMapping>>>,
@@ -399,6 +407,108 @@ fn fresh_mapping_incarnation() -> u64 {
     NEXT_MAPPING_INCARNATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The stack window of `windows` ([`GuestMemory::establish_user_stack_window`]),
+/// once established.
+fn stack_window_in(windows: &[UserWindow]) -> Option<UserWindow> {
+    windows
+        .iter()
+        .copied()
+        .find(|window| window.user_end == USER_STACK_TOP)
+}
+
+/// The user address of physical address `physical`, given the user windows
+/// `windows` and the identity user addresses `[identity_start,
+/// identity_limit)`: where a window's physical range holds it, the window's
+/// user address for it, and otherwise the address itself, if it is one of
+/// the identity user addresses.
+fn physical_to_user_in(
+    windows: &[UserWindow],
+    identity_start: u64,
+    identity_limit: u64,
+    physical: u64,
+) -> Option<u64> {
+    if let Some(window) = windows.iter().find(|window| {
+        (window.physical_start..window.physical(window.user_end)).contains(&physical)
+    }) {
+        return Some(physical - window.physical_start + window.user_start);
+    }
+    (identity_start..identity_limit)
+        .contains(&physical)
+        .then_some(physical)
+}
+
+/// The lock over an address space's state. Its guard settles the index of
+/// mapping runs ([`AddressSpaceState::settle_runs`]) as a critical section
+/// that wrote a page map ends, so every write's pages are folded into the
+/// index at the funnel's exit, under the same hold of the lock, and a test
+/// build checks the index there against a rebuild from every page.
+#[derive(Debug)]
+struct AddressSpaceLock(Mutex<AddressSpaceState>);
+
+/// A hold of [`AddressSpaceLock`]; see there.
+struct AddressSpaceGuard<'a>(MutexGuard<'a, AddressSpaceState>);
+
+impl AddressSpaceLock {
+    /// A lock over `state`, its index settled first, so that a state written
+    /// while detached is folded in before any reader can see it. A state
+    /// installed later by assignment through a guard (a fork's copy) is
+    /// settled at that guard's release instead.
+    fn new(mut state: AddressSpaceState) -> Self {
+        state.settle_runs();
+        Self(Mutex::new(state))
+    }
+
+    fn lock(&self) -> std::sync::LockResult<AddressSpaceGuard<'_>> {
+        match self.0.lock() {
+            Ok(guard) => Ok(AddressSpaceGuard(guard)),
+            Err(poisoned) => Err(std::sync::PoisonError::new(AddressSpaceGuard(
+                poisoned.into_inner(),
+            ))),
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn try_lock(&self) -> std::sync::TryLockResult<AddressSpaceGuard<'_>> {
+        match self.0.try_lock() {
+            Ok(guard) => Ok(AddressSpaceGuard(guard)),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                Err(std::sync::TryLockError::Poisoned(
+                    std::sync::PoisonError::new(AddressSpaceGuard(poisoned.into_inner())),
+                ))
+            }
+            Err(std::sync::TryLockError::WouldBlock) => Err(std::sync::TryLockError::WouldBlock),
+        }
+    }
+}
+
+impl std::ops::Deref for AddressSpaceGuard<'_> {
+    type Target = AddressSpaceState;
+
+    fn deref(&self) -> &AddressSpaceState {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for AddressSpaceGuard<'_> {
+    fn deref_mut(&mut self) -> &mut AddressSpaceState {
+        &mut self.0
+    }
+}
+
+impl Drop for AddressSpaceGuard<'_> {
+    fn drop(&mut self) {
+        if self.0.runs_unsettled() {
+            self.0.settle_runs();
+        } else {
+            // A test build checks a release that noted nothing as well, so a
+            // layout change that forgot its note fails at the release where
+            // it happened, not at a later settle.
+            #[cfg(any(test, feature = "test-support"))]
+            self.0.check_layout_noted();
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct AddressSpaceState {
     coverage: IdentityCoverage,
@@ -428,12 +538,13 @@ struct AddressSpaceState {
     /// ([`GuestMemory::return_vfork_changes`]). Copies of an address space
     /// share the map until one of them changes it, so a fork does not copy
     /// it page by page.
-    mapping_incarnations: Arc<BTreeMap<u64, u64>>,
+    mapping_incarnations: PageKeyed<BTreeMap<u64, u64>>,
     /// The identity a provider gave each mapping incarnation
     /// ([`GuestMemory::describe_mapping`]), shared by copies until one of
     /// them changes it, as `mapping_incarnations` is. An incarnation no page
-    /// has any more is forgotten now and then (`keep_identity`).
-    mapping_identities: Arc<BTreeMap<u64, MappingIdentity>>,
+    /// has any more is forgotten now and then (`keep_identity`). A write
+    /// names the pages whose identity it changes.
+    mapping_identities: IncarnationKeyed<MappingIdentity>,
     /// How many identities `mapping_identities` held after it last forgot
     /// those of incarnations no page has.
     live_identities: usize,
@@ -442,7 +553,17 @@ struct AddressSpaceState {
     scratch_cache: ScratchCache,
     /// Pages whose stable slot-0 HVA now names a separately retained backing.
     /// The current source increment keeps guest placement identity-only.
-    backing_pages: BTreeMap<u64, InstalledBackingPage>,
+    backing_pages: PageKeyed<BTreeMap<u64, InstalledBackingPage>>,
+    /// The index of the mapping runs these maps hold
+    /// ([`mapping_list::RunIndex`]), settled from the pages they note as
+    /// changed before any read.
+    runs: mapping_list::RunIndex,
+    /// In a test build, what the reads of the mapping runs did since a test
+    /// last took it ([`GuestMemory::take_query_log`]), counted where each
+    /// read happens, so that a test can hold a query to the runs its range
+    /// needs and to no page walk.
+    #[cfg(any(test, feature = "test-support"))]
+    query_log: std::cell::RefCell<mapping_list::QueryLog>,
 }
 
 #[derive(Clone, Debug)]
@@ -621,19 +742,18 @@ impl AddressSpaceState {
                 .file_offset
                 .and_then(|offset| offset.checked_add(index * PAGE_SIZE as u64))
             {
-                Some(offset) => self.file_pages.edit().insert(page, offset),
-                None => self.file_pages.edit().remove(&page),
+                Some(offset) => self.file_pages.insert(page, offset),
+                None => self.file_pages.remove(&page),
             };
             if provenance.shared_anonymous {
-                self.shared_anonymous_pages.edit().insert(page);
+                self.shared_anonymous_pages.insert(page);
             } else {
-                self.shared_anonymous_pages.edit().remove(&page);
+                self.shared_anonymous_pages.remove(&page);
             }
         }
         let incarnation = fresh_mapping_incarnation();
-        let incarnations = Arc::make_mut(&mut self.mapping_incarnations);
         for index in 0..pages {
-            incarnations.insert(first + index, incarnation);
+            self.mapping_incarnations.insert(first + index, incarnation);
         }
     }
 
@@ -645,10 +765,9 @@ impl AddressSpaceState {
         if self.mapping_incarnations.get(&page).copied() == incarnation {
             return;
         }
-        let incarnations = Arc::make_mut(&mut self.mapping_incarnations);
         match incarnation {
-            Some(incarnation) => incarnations.insert(page, incarnation),
-            None => incarnations.remove(&page),
+            Some(incarnation) => self.mapping_incarnations.insert(page, incarnation),
+            None => self.mapping_incarnations.remove(&page),
         };
     }
 
@@ -693,11 +812,14 @@ impl AddressSpaceState {
             pages: UserPages::new(),
             file_pages: Versioned::new(BTreeMap::new()),
             shared_anonymous_pages: Versioned::new(BTreeSet::new()),
-            mapping_incarnations: Arc::default(),
-            mapping_identities: Arc::default(),
+            mapping_incarnations: PageKeyed::default(),
+            mapping_identities: IncarnationKeyed::default(),
             live_identities: 0,
             scratch_cache: ScratchCache::default(),
-            backing_pages: BTreeMap::new(),
+            backing_pages: PageKeyed::default(),
+            runs: mapping_list::RunIndex::default(),
+            #[cfg(any(test, feature = "test-support"))]
+            query_log: std::cell::RefCell::default(),
         }
     }
 
@@ -713,10 +835,7 @@ impl AddressSpaceState {
     /// The stack window ([`GuestMemory::establish_user_stack_window`]), once
     /// established.
     fn stack_window(&self) -> Option<UserWindow> {
-        self.windows
-            .iter()
-            .copied()
-            .find(|window| window.user_end == USER_STACK_TOP)
+        stack_window_in(&self.windows)
     }
 
     /// The first and last physical page that `window`'s user addresses name.
@@ -879,15 +998,33 @@ impl AddressSpaceState {
         }
     }
 
+    /// In a test build, checks a change of the Tool-scratch overlay
+    /// (`changed`, at physical page `page`): the overlay notes nothing for
+    /// the index of mapping runs, which is sound only because a page it
+    /// changes has a permanent reservation, which no run includes. A product
+    /// build checks nothing.
+    fn check_overlay_change(&self, page: u64, changed: bool) {
+        #[cfg(any(test, feature = "test-support"))]
+        assert!(
+            !changed
+                || self
+                    .reservations
+                    .get(&page)
+                    .copied()
+                    .is_some_and(RegionKind::permanent),
+            "the Tool-scratch overlay changed page {page:#x}, which has no permanent reservation"
+        );
+        #[cfg(not(any(test, feature = "test-support")))]
+        let _ = (page, changed);
+    }
+
     fn physical_to_user(&self, physical: u64) -> Option<u64> {
-        if let Some(window) = self.windows.iter().find(|window| {
-            (window.physical_start..window.physical(window.user_end)).contains(&physical)
-        }) {
-            return Some(physical - window.physical_start + window.user_start);
-        }
-        (self.coverage.start..self.identity_limit())
-            .contains(&physical)
-            .then_some(physical)
+        physical_to_user_in(
+            &self.windows,
+            self.coverage.start,
+            self.identity_limit(),
+            physical,
+        )
     }
 
     /// The user address ranges a user store may write, in address order with
@@ -1272,7 +1409,7 @@ pub struct UserWriteAlias<'a> {
     offset: usize,
     memory: &'a GuestMemory,
     host_access: Option<MutexGuard<'a, ()>>,
-    permissions: Option<MutexGuard<'a, AddressSpaceState>>,
+    permissions: Option<AddressSpaceGuard<'a>>,
     retained: Option<RetainedOperand>,
 }
 
@@ -1433,10 +1570,10 @@ impl Drop for PendingReservation {
         for (page, old) in &self.old {
             match old {
                 Some(kind) => {
-                    state.reservations.edit().insert(*page, *kind);
+                    state.reservations.insert(*page, *kind);
                 }
                 None => {
-                    state.reservations.edit().remove(page);
+                    state.reservations.remove(page);
                 }
             }
         }
@@ -1716,7 +1853,7 @@ impl GuestMemory {
                 original_pages,
                 slice,
                 guest_base,
-                address_space: Mutex::new(AddressSpaceState::new(guest_base, size)),
+                address_space: AddressSpaceLock::new(AddressSpaceState::new(guest_base, size)),
                 allocation: Mutex::new(()),
                 entry_gate: EntryGate::new(),
                 retirement: Mutex::new(None),
@@ -2181,7 +2318,7 @@ impl GuestMemory {
         // backing image. It starts an independent publication history and must
         // not claim that the source's separately retained page backings are
         // installed in the new HVA.
-        snapshot_state.backing_pages.clear();
+        snapshot_state.backing_pages.clear_noting_keys();
         *snapshot
             .mapping
             .address_space
@@ -2502,7 +2639,7 @@ impl GuestMemory {
                 {
                     continue;
                 }
-                let previous = state.reservations.edit().insert(page, kind);
+                let previous = state.reservations.insert(page, kind);
                 // A page taken over for another use has changed, even where
                 // its state stays as it was (see `watch_user_stack_window`).
                 if previous != Some(kind) {
@@ -2582,6 +2719,9 @@ impl GuestMemory {
         state
             .windows
             .retain(|existing| existing.user_start != window.user_start);
+        // The window replaced is gone even where the new one is refused
+        // below, so the layout moved either way.
+        state.note_layout_moved();
         if state.windows.iter().any(|existing| {
             existing.physical_start < window.physical_end
                 && window.physical_start < existing.physical_end
@@ -2596,11 +2736,13 @@ impl GuestMemory {
     /// Ends the identity user addresses at `end`; the memory above it is reached
     /// only through windows.
     pub fn set_user_identity_end(&self, end: u64) {
-        self.mapping
+        let mut state = self
+            .mapping
             .address_space
             .lock()
-            .expect("guest memory access map lock poisoned")
-            .identity_end = Some(end);
+            .expect("guest memory access map lock poisoned");
+        state.identity_end = Some(end);
+        state.note_layout_moved();
     }
 
     /// Withdraws every window and the identity end, for a new image's loader to
@@ -2618,6 +2760,7 @@ impl GuestMemory {
             .expect("guest memory access map lock poisoned");
         state.windows.clear();
         state.identity_end = None;
+        state.note_layout_moved();
     }
 
     /// Watches the stack window ([`GuestMemory::establish_user_stack_window`])
@@ -2665,6 +2808,14 @@ impl GuestMemory {
         let (first, last) = AddressSpaceState::window_pages(window)?;
         if state.pages.certain_watch() != Some((first, last)) {
             return None;
+        }
+        // A walk of the window's pages, which no query of the mapping runs
+        // makes (they read the window from the index): a test build counts
+        // each page it reads as a page fact, so a query that walked them
+        // again would fail a test that holds it to its runs.
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            state.query_log.borrow_mut().page_facts += last - first + 1;
         }
         let page = PAGE_SIZE as u64;
         Some(
@@ -2831,12 +2982,12 @@ impl GuestMemory {
             .expect("guest memory access map lock poisoned");
         access.enabled = false;
         access.pages.clear();
-        access.file_pages.edit().clear();
-        access.shared_anonymous_pages.edit().clear();
-        access.mapping_incarnations = Arc::default();
-        access.mapping_identities = Arc::default();
+        access.file_pages.clear();
+        access.shared_anonymous_pages.clear();
+        access.mapping_incarnations.reset();
+        access.mapping_identities.reset();
         access.live_identities = 0;
-        access.reservations.edit().clear();
+        access.reservations.clear();
         access.cursors = None;
     }
 
@@ -2995,11 +3146,7 @@ impl GuestMemory {
         for page in first_page..=last_page {
             let new = state(access.pages.get(&page).copied());
             access.pages.insert(page, new);
-            access
-                .reservations
-                .edit()
-                .entry(page)
-                .or_insert(RegionKind::User);
+            access.reservations.insert_if_absent(page, RegionKind::User);
         }
         Ok(())
     }
@@ -3049,18 +3196,17 @@ impl GuestMemory {
             if !cached {
                 let valid = access.scratch_cache_valid();
                 if access.reservations.get(&page) != Some(&RegionKind::ToolScratch) {
-                    access
-                        .reservations
-                        .edit()
-                        .insert(page, RegionKind::ToolScratch);
+                    access.reservations.insert(page, RegionKind::ToolScratch);
                 }
                 // The edits above touch only this page, which the cache does
                 // not name, so the cache's facts about other pages still hold.
-                access.pages.expose_scratch(page, false);
+                let changed = access.pages.expose_scratch(page, false);
+                access.check_overlay_change(page, changed);
                 access.keep_scratch_cache(valid);
                 scratch_probe::expose_miss();
             } else {
-                access.pages.expose_scratch(page, true);
+                let changed = access.pages.expose_scratch(page, true);
+                access.check_overlay_change(page, changed);
                 scratch_probe::expose_hit();
             }
         }
@@ -3099,25 +3245,27 @@ impl GuestMemory {
             // permanent ToolScratch reservation, and is no page-tree key, so
             // only its overlay entry (if exposed) goes.
             if access.scratch_cache_holds(page) {
-                access.pages.hide_scratch(page, true);
+                let changed = access.pages.hide_scratch(page, true);
+                access.check_overlay_change(page, changed);
                 scratch_probe::hide_hit();
                 continue;
             }
             scratch_probe::hide_miss();
             let valid = access.scratch_cache_valid();
-            access.pages.hide_scratch(page, false);
+            let changed = access.pages.hide_scratch(page, false);
+            access.check_overlay_change(page, changed);
             if access.file_pages.contains_key(&page) {
-                access.file_pages.edit().remove(&page);
+                access.file_pages.remove(&page);
             }
             if access.shared_anonymous_pages.contains(&page) {
-                access.shared_anonymous_pages.edit().remove(&page);
+                access.shared_anonymous_pages.remove(&page);
             }
             if access
                 .reservations
                 .get(&page)
                 .is_some_and(|kind| !kind.permanent())
             {
-                access.reservations.edit().remove(&page);
+                access.reservations.remove(&page);
             }
             // Every edit above touched only this page, whose facts are now
             // the cache's: no file offset, not shared, not a tree key.
@@ -3147,15 +3295,15 @@ impl GuestMemory {
             .expect("guest memory access map lock poisoned");
         for page in first_page..=last_page {
             access.pages.remove(&page);
-            access.file_pages.edit().remove(&page);
-            access.shared_anonymous_pages.edit().remove(&page);
+            access.file_pages.remove(&page);
+            access.shared_anonymous_pages.remove(&page);
             access.set_mapping_incarnation(page, None);
             if !access
                 .reservations
                 .get(&page)
                 .is_some_and(|kind| kind.permanent())
             {
-                access.reservations.edit().remove(&page);
+                access.reservations.remove(&page);
             }
         }
         Ok(())
@@ -3536,15 +3684,15 @@ impl GuestMemory {
         let grown_identity = access.identity_of(old_last);
         for page in old_first..=old_last {
             access.pages.remove(&page);
-            access.file_pages.edit().remove(&page);
-            access.shared_anonymous_pages.edit().remove(&page);
+            access.file_pages.remove(&page);
+            access.shared_anonymous_pages.remove(&page);
             access.set_mapping_incarnation(page, None);
             if !access
                 .reservations
                 .get(&page)
                 .is_some_and(|kind| kind.permanent())
             {
-                access.reservations.edit().remove(&page);
+                access.reservations.remove(&page);
             }
         }
         for (index, page) in (new_first..=new_last).enumerate() {
@@ -3563,8 +3711,8 @@ impl GuestMemory {
             // The destination's old provenance goes: a page that is no longer
             // a file's keeps no offset.
             match offset {
-                Some(offset) => access.file_pages.edit().insert(page, offset),
-                None => access.file_pages.edit().remove(&page),
+                Some(offset) => access.file_pages.insert(page, offset),
+                None => access.file_pages.remove(&page),
             };
             let shared_anonymous = old_shared_anonymous
                 .get(index)
@@ -3572,9 +3720,9 @@ impl GuestMemory {
                 .copied()
                 .unwrap_or(false);
             if shared_anonymous {
-                access.shared_anonymous_pages.edit().insert(page);
+                access.shared_anonymous_pages.insert(page);
             } else {
-                access.shared_anonymous_pages.edit().remove(&page);
+                access.shared_anonymous_pages.remove(&page);
             }
             access.set_mapping_incarnation(
                 page,
@@ -3594,7 +3742,7 @@ impl GuestMemory {
                     .unwrap_or(*old_kinds.last().unwrap());
                 // A low exposed supervisor page may supply the original user
                 // policy; its physical reservation does not move with bytes.
-                access.reservations.edit().insert(
+                access.reservations.insert(
                     page,
                     if kind.permanent() {
                         RegionKind::Mmap
@@ -3604,7 +3752,7 @@ impl GuestMemory {
                 );
             }
         }
-        access.grow_identity(grown_identity, grown_incarnation);
+        access.grow_identity(new_first, new_last, grown_identity, grown_incarnation);
         Ok(())
     }
 
@@ -4414,6 +4562,9 @@ impl PendingBackingPage<'_> {
                             None,
                             None,
                         ];
+                        // The page's entry was inserted above, which noted
+                        // the page and unshared the map, so this edit
+                        // allocates nothing.
                         let page_state = prepared.backing_pages.get_mut(&page).unwrap();
                         page_state._generation = generation;
                         page_state.mapping =
@@ -7133,6 +7284,80 @@ mod tests {
         (memory, window)
     }
 
+    /// The index of mapping runs is derived from the page maps and the user
+    /// layout alone, and a release of the lock that noted nothing checks the
+    /// layout, in a test build: a window written without its note fails at
+    /// that release, not at a later settle.
+    #[test]
+    #[should_panic(expected = "the user layout moved without a note")]
+    fn a_window_written_without_its_note_fails_at_that_release() {
+        let (memory, _) = watched_stack_window();
+        memory.user_mapping_runs();
+        let mut access = memory.mapping.address_space.lock().unwrap();
+        let window = access.windows[0];
+        access.windows.push(UserWindow {
+            user_start: window.user_start - MIB,
+            user_end: window.user_start - MIB + PAGE_SIZE as u64,
+            ..window
+        });
+        drop(access);
+    }
+
+    /// A layout written with its note settles at that release, and the
+    /// settle's check against a rebuild holds.
+    #[test]
+    fn a_layout_written_with_its_note_settles_at_that_release() {
+        let (memory, _) = watched_stack_window();
+        memory.user_mapping_runs();
+        let mut access = memory.mapping.address_space.lock().unwrap();
+        let end = access.coverage.start + 16 * MIB;
+        access.identity_end = Some(end);
+        access.note_layout_moved();
+        drop(access);
+        memory.user_mapping_runs();
+    }
+
+    /// A fork's copy of the memory shares the parent's index of mapping runs
+    /// and derives no page to install it, where it has no shared-file backing
+    /// to clear: the settle's count of pages read is zero.
+    #[test]
+    fn a_fork_takes_the_index_of_mapping_runs_without_deriving_a_page() {
+        let page = PAGE_SIZE as u64;
+        let (memory, _) = watched_stack_window();
+        let low = MIB;
+        memory
+            .reserve_region(low, 64 * page, RegionKind::Mmap)
+            .unwrap()
+            .commit();
+        memory.map_user_protection(low, 64 * page, RW).unwrap();
+        memory.protect_user_range(low + page, page, R).unwrap();
+        let runs = memory.user_mapping_runs().runs;
+        assert!(runs.len() >= 3, "{runs:?}");
+        memory.take_query_log();
+        let child = memory.snapshot().unwrap();
+        let log = child.take_query_log();
+        assert_eq!(log.settle_pages, 0, "installing the fork's copy: {log:?}");
+        assert_eq!(
+            format!("{:?}", child.user_mapping_runs().runs),
+            format!("{runs:?}")
+        );
+    }
+
+    /// A stack window of one page has no user page (its user range ends where
+    /// it starts), and the index of mapping runs settles over it.
+    #[test]
+    fn a_window_of_no_user_page_settles_the_index_of_mapping_runs() {
+        let page = PAGE_SIZE as u64;
+        let memory = GuestMemory::new(0, (16 * MIB) as usize).unwrap();
+        memory.establish_user_stack_window(page).unwrap();
+        memory
+            .reserve_region(MIB, page, RegionKind::Mmap)
+            .unwrap()
+            .commit();
+        memory.map_user_protection(MIB, page, RW).unwrap();
+        assert_eq!(memory.user_mapping_runs().runs.len(), 1);
+    }
+
     /// Provider flags wider than a byte (`DeclaredMapping::flags` is a u16)
     /// are kept on the pages and counted per bit as the pages change
     /// (`GuestMemory::flagged_pages`), in each copy of the address space for
@@ -7449,7 +7674,6 @@ mod tests {
             .lock()
             .unwrap()
             .reservations
-            .edit()
             .insert(inside / page, RegionKind::Mmap);
         let pages = memory.user_stack_window_pages().unwrap();
         let found = pages

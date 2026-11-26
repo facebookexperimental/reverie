@@ -111,6 +111,8 @@ mod shared_file;
 use shared_file::mmap_with_shared_files;
 pub(crate) mod host_mount;
 pub(crate) mod mapping_list;
+#[cfg(any(test, feature = "test-support"))]
+pub use mapping_list::fail_file_names_for_test;
 
 mod refusal;
 pub use refusal::*;
@@ -157,6 +159,8 @@ pub(crate) use mm::*;
 mod host_probe;
 #[cfg(test)]
 mod host_probe_tests;
+#[cfg(test)]
+mod mapping_overlap_tests;
 mod pkeys;
 pub(crate) mod vm_flags;
 #[cfg(test)]

@@ -1084,3 +1084,166 @@ fn host_prints_guard_flag() -> bool {
     unsafe { libc::munmap(start, 3 * PAGE) };
     flags.split_ascii_whitespace().any(|flag| flag == "gu")
 }
+
+/// A guest that maps two pages of a file privately and asks, with tuxcall,
+/// about the mapping's first page (`argv[1]` is the file).
+const FILE_OVERLAP_C: &str = r#"
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <stdio.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+#define ASK 0x6d656d6f72796d61L
+
+int main(int argc, char **argv) {
+  if (argc < 2)
+    return 2;
+  int fd = open(argv[1], O_RDONLY);
+  if (fd < 0) {
+    perror("open");
+    return 3;
+  }
+  char *map = mmap(NULL, 2 * 4096, PROT_READ, MAP_PRIVATE, fd, 0);
+  if (map == MAP_FAILED) {
+    perror("mmap");
+    return 4;
+  }
+  syscall(SYS_tuxcall, ASK, (long)syscall(SYS_gettid), (long)map);
+  return 0;
+}
+"#;
+
+/// What [`OverlapTool`] read, first with every file line's name unstatable:
+/// the list of mappings, the overlap answer for the file mapping's first
+/// page, and the overlap answer for a low page no mapping holds. Then the
+/// same two answers with the names statable, beside the answers the list
+/// itself then gives for the same ranges (`None` if the list still fails).
+type OverlapFacts = (
+    (Fact, Result<bool, FactError>, Result<bool, FactError>),
+    (
+        Option<(bool, bool)>,
+        Result<bool, FactError>,
+        Result<bool, FactError>,
+    ),
+);
+
+#[derive(Default)]
+struct OverlapLog(Mutex<Option<OverlapFacts>>);
+
+#[reverie::global_tool]
+impl GlobalTool for OverlapLog {
+    type Request = OverlapFacts;
+    type Response = ();
+    type Config = ();
+
+    async fn receive_rpc(&self, _from: Pid, request: Self::Request) {
+        let previous = self.0.lock().unwrap().replace(request);
+        assert!(previous.is_none(), "asked twice");
+    }
+}
+
+/// Asks, with every file line's name made unstatable
+/// (`fail_file_names_for_test`), for the list of mappings and for two
+/// overlap answers, then asks for the list and the same two answers with the
+/// names statable.
+#[derive(Default)]
+struct OverlapTool;
+
+#[reverie::tool]
+impl Tool for OverlapTool {
+    type GlobalState = OverlapLog;
+    type ThreadState = ();
+
+    fn subscriptions(_config: &()) -> Subscription {
+        [Sysno::tuxcall].into_iter().collect()
+    }
+
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Error> {
+        let (_, args) = syscall.into_parts();
+        if args.arg0 as u64 != ASK {
+            return Ok(guest.inject(syscall).await?);
+        }
+        let (tid, start) = (Pid::from_raw(args.arg1 as i32), args.arg2 as u64);
+        reverie_linuxemu::executor::fail_file_names_for_test(true);
+        let unstatable = (
+            guest.memory_map(tid),
+            guest.memory_map_overlaps(tid, start, start + 4096),
+            guest.memory_map_overlaps(tid, 0x1000, 0x2000),
+        );
+        reverie_linuxemu::executor::fail_file_names_for_test(false);
+        let listed = guest.memory_map(tid).ok().map(|list| {
+            (
+                list.overlaps(start, start + 4096),
+                list.overlaps(0x1000, 0x2000),
+            )
+        });
+        let statable = (
+            listed,
+            guest.memory_map_overlaps(tid, start, start + 4096),
+            guest.memory_map_overlaps(tid, 0x1000, 0x2000),
+        );
+        guest.send_rpc((unstatable, statable)).await;
+        Ok(0)
+    }
+}
+
+/// A Tool's `Guest::memory_map_overlaps` on a KVM guest reaches the
+/// executor's answer read from the runs around the range, through every
+/// forward on the way (the KVM guest's and the static-ELF executor's), not
+/// the trait's default read from the whole list: with a file line whose name
+/// cannot be stated, the list fails as a whole and so would the default, but
+/// the answer still answers by range, true for the file mapping's page and
+/// false for a page no mapping holds.
+#[test]
+fn a_kvm_guests_overlap_answer_reaches_the_executor_not_the_default() {
+    Kvm::new().expect("memory map test requires usable /dev/kvm");
+    let directory = Directory::new();
+    let executable = compile(&directory, "file_overlap", FILE_OVERLAP_C, &[]);
+    let data = directory.0.join("data");
+    std::fs::write(&data, vec![0x5a_u8; 2 * 4096]).unwrap();
+    let argv = [executable.to_str().unwrap(), data.to_str().unwrap()];
+    let mut backend = KvmBackend::new(256 * 1024 * 1024).unwrap();
+    backend
+        .install_static_elf_file_with_context(
+            std::fs::File::open(&executable).unwrap(),
+            &argv,
+            &[],
+            &directory.0,
+        )
+        .unwrap();
+    backend
+        .install_extension_table(reverie_linuxemu_ext_procfs::extension_table())
+        .unwrap();
+    let (log, code, _stdout, stderr) =
+        futures::executor::block_on(backend.run_static_elf_with_tool::<OverlapTool>((), true))
+            .unwrap();
+    assert_eq!(code, 0, "{}", String::from_utf8_lossy(&stderr));
+    let ((list, at_file, at_gap), (listed, statable_at_file, statable_at_gap)) =
+        log.0.into_inner().unwrap().expect("the guest asked once");
+    assert_eq!(
+        list,
+        Err(FactError::NotProvided),
+        "the list fails as a whole"
+    );
+    assert_eq!(at_file, Ok(true), "the file mapping's page");
+    assert_eq!(at_gap, Ok(false), "a page no mapping holds");
+    // With the names statable, the list is given, and the answers are its.
+    let (list_at_file, list_at_gap) = listed.expect("the list with statable names");
+    assert_eq!(
+        (list_at_file, list_at_gap),
+        (true, false),
+        "the list's own answers"
+    );
+    assert_eq!(
+        statable_at_file,
+        Ok(list_at_file),
+        "the file mapping's page"
+    );
+    assert_eq!(statable_at_gap, Ok(list_at_gap), "a page no mapping holds");
+}
