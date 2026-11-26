@@ -6,18 +6,11 @@ use crate::broker_library_tests::report_skip;
 
 /// The named-skip reason when the launcher refused setup over a host
 /// capability it names itself: no ambient mount in its bootstrap
-/// mountinfo, or a filesystem metadata-query class it cannot prove
-/// (EOPNOTSUPP, as on Eden/FUSE checkouts; CI hosts cover these cases).
+/// mountinfo.
 fn broker_host_skip(stderr: &str) -> Option<&'static str> {
     if stderr.contains("ambient mount absent from bootstrap mountinfo") {
         Some(
             "broker ambient mount absent from bootstrap mountinfo on this host (https://github.com/facebookexperimental/reverie/issues/96)",
-        )
-    } else if stderr.contains("unproved ambient filesystem metadata-query class") {
-        Some(
-            "broker ambient metadata-query unsupported on this filesystem \
-             (EOPNOTSUPP, e.g. Eden/FUSE); covered in CI \
-             (https://github.com/facebookexperimental/reverie/issues/94)",
         )
     } else {
         None
@@ -153,11 +146,44 @@ fn bootstrap_path_only_does_not_query_inode_attributes() {
 /// Only the ordinary-main child owns startup authority. The waited status is
 /// case-specific: 125 records failed invocation termination, never cleanup.
 fn fatal_abort_case(test: &str, case: &str, expected_status: i32) -> Option<String> {
+    fatal_abort_case_inheriting(test, case, expected_status, None)
+}
+
+/// [`fatal_abort_case`], with the launcher also inheriting `leaked`, a
+/// descriptor this test process holds with close-on-exec set: it is cleared
+/// in the forked child alone, so only the launcher's process tree (through
+/// `timeout`) inherits the descriptor, as a spawner's leak would hand it on.
+/// No other test's child sees it.
+fn fatal_abort_case_inheriting(
+    test: &str,
+    case: &str,
+    expected_status: i32,
+    leaked: Option<std::os::fd::BorrowedFd<'_>>,
+) -> Option<String> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
     let executable = std::env::current_exe().expect("library test executable");
-    let output = std::process::Command::new("timeout")
+    let mut command = std::process::Command::new("timeout");
+    command
         .args(["--kill-after=2s", "30s"])
         .arg(launcher_path(&executable))
-        .args(["--fatal-abort-case", case])
+        .args(["--fatal-abort-case", case]);
+    if let Some(leaked) = leaked {
+        let fd = leaked.as_raw_fd();
+        // SAFETY: runs in the forked child before exec, and calls only fcntl,
+        // which is async-signal-safe, on a descriptor the parent keeps open
+        // until the child has been waited for.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::fcntl(fd, libc::F_SETFD, 0) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+    }
+    let output = command
         .output()
         .expect("start ordinary-main fatal invocation helper");
     let stdout = String::from_utf8(output.stdout).expect("native case stdout");
@@ -216,6 +242,36 @@ fn fatal_invocation_wrong_process_returns_owner_before_two_native_waits() {
     ) else {
         return;
     };
+    assert_wrong_process_receipts(&stdout);
+}
+
+/// A spawner, such as a test runner or a shell, can leave descriptors open
+/// without close-on-exec; every program it starts inherits them. The broker
+/// would classify each as one of the launcher's held originals, and one on a
+/// filesystem whose class it cannot prove (a FUSE file on an Eden checkout,
+/// or here a procfs file, which every host has and the broker refuses the same
+/// way: "unproved ambient filesystem metadata-query class") would refuse the
+/// launch. The launcher closes what it inherited above stderr before its
+/// census, so the wrong-process case runs to its exact receipts while the
+/// launcher inherits such a descriptor.
+#[test]
+fn a_launcher_ignores_descriptors_its_spawner_leaked() {
+    use std::os::fd::AsFd;
+    let leaked = std::fs::File::open("/proc/self/status").expect("open a procfs descriptor");
+    let Some(stdout) = fatal_abort_case_inheriting(
+        "broker_library_selftests::a_launcher_ignores_descriptors_its_spawner_leaked",
+        "wrong-process",
+        0,
+        Some(leaked.as_fd()),
+    ) else {
+        return;
+    };
+    assert_wrong_process_receipts(&stdout);
+}
+
+/// The exact receipts of the fatal-abort wrong-process case: the refused
+/// owner, then both native waits.
+fn assert_wrong_process_receipts(stdout: &str) {
     let lines: Vec<_> = stdout.lines().collect();
     assert_eq!(lines.len(), 3, "exact refused-owner cleanup receipts");
     assert_eq!(

@@ -49,6 +49,7 @@ mod broker_fatal_abort_cases;
 #[cfg(target_arch = "x86_64")]
 fn main() {
     broker_client_death_cases::dispatch_client_child();
+    close_descriptors_above_stderr();
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.len() == 2 && args[0] == "--bootstrap-case" {
         std::process::exit(broker_bootstrap_cases::run(&args[1]));
@@ -135,6 +136,34 @@ fn main() {
     };
     drop(owner); // Already actually reaped. No guest socket owners live here.
     mirror_status(status);
+}
+
+/// Closes every descriptor above stderr this launcher inherited.
+///
+/// Every mode after this point bootstraps the broker, whose ambient census
+/// treats each descriptor this process holds as an original it keeps for the
+/// broker's whole life and must prove safe to duplicate and close (no flush
+/// on a duplicate's close). The descriptors this launcher means to hold are
+/// its standard streams and the ones it opens itself. Anything else a spawner
+/// left open without close-on-exec, such as a test runner's journal sockets,
+/// pipes or log files, or a FUSE file on an Eden checkout, is not one of this
+/// launcher's originals. The census would misread it as one, and a descriptor
+/// of a filesystem class the broker cannot prove refuses the whole launch,
+/// rightly, for a descriptor no case depends on. The one mode this does not
+/// cover is the internal client child this launcher starts itself: its
+/// dispatch runs first, takes descriptors by number from its arguments, and
+/// never returns.
+#[cfg(target_arch = "x86_64")]
+fn close_descriptors_above_stderr() {
+    // SAFETY: main has started no thread and opened no descriptor, and no
+    // caller-held owner of any descriptor above stderr exists in this process.
+    if unsafe { libc::close_range(3, u32::MAX, 0) } != 0 {
+        eprintln!(
+            "BROKER_LAUNCH_SETUP_FAILURE: close inherited descriptors above stderr: {}",
+            std::io::Error::last_os_error()
+        );
+        std::process::exit(125);
+    }
 }
 
 #[cfg(target_arch = "x86_64")]

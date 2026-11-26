@@ -102,27 +102,13 @@ pub(crate) fn selected_child_without(test: &str, removed: &[&str]) -> Option<Bro
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     // Host-capability probe: the broker launcher itself reports a host
-    // that cannot run it — no ambient mount in its mountinfo, or a
-    // filesystem whose metadata-query class it cannot prove (EOPNOTSUPP,
-    // as on Eden/FUSE checkouts; CI hosts cover these tests). That is a
+    // that cannot run it — no ambient mount in its mountinfo. That is a
     // named skip, never a silent pass; every other launcher failure
-    // stays a hard failure below. The metadata-query arm is compiled
-    // only under linuxemu's `broker-metadata-skip` feature: this file
-    // is also included into reverie-kvm's tests, whose two
-    // parent-death tests are outside the observed bucket and must
-    // never skip on it.
+    // stays a hard failure below.
     if !output.status.success() {
         let skip_reason = if stderr.contains("ambient mount absent from bootstrap mountinfo") {
             Some(
                 "broker ambient mount absent from bootstrap mountinfo on this host (https://github.com/facebookexperimental/reverie/issues/96)",
-            )
-        } else if cfg!(feature = "broker-metadata-skip")
-            && stderr.contains("unproved ambient filesystem metadata-query class")
-        {
-            Some(
-                "broker ambient metadata-query unsupported on this filesystem \
-                 (EOPNOTSUPP, e.g. Eden/FUSE); covered in CI \
-                 (https://github.com/facebookexperimental/reverie/issues/94)",
             )
         } else {
             None
