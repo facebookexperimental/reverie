@@ -18797,12 +18797,29 @@ mod tests {
             "packet getsockopt writes optlen back on the failure path"
         );
 
-        // Same-address optval/optlen distinguishes the copy order:
-        // Linux copies the value first, then overwrites its first word
-        // with the published length.
+        // Same-address optval/optlen distinguishes the copy order, and Linux
+        // changed it in v7.1. From v7.1, packet's getsockopt_iter handler
+        // copies the value
+        // (https://github.com/torvalds/linux/blob/v7.1/net/packet/af_packet.c#L4179-L4181)
+        // and do_sock_getsockopt() then writes optlen back over its first word
+        // (https://github.com/torvalds/linux/blob/v7.1/net/socket.c#L2470-L2482).
+        // Through v7.0, packet_getsockopt() writes optlen first and the value
+        // last (https://github.com/torvalds/linux/blob/v6.16/net/packet/af_packet.c#L4226-L4228,
+        // https://github.com/torvalds/linux/blob/v7.0/net/packet/af_packet.c#L4174-L4176),
+        // so the value's bytes win. LinuxEmu presents the v7.1 order on every
+        // host (executor/socket.rs), so its bytes must equal the v7.1 bytes
+        // exactly: optlen's word, then the host's remaining bytes. The host
+        // kernel's release picks the order the host itself must show: the v7.1
+        // order from v7.1 on, the pre-v7.1 order before it. On an older host
+        // the host comparison does not apply, and that is printed by name.
+        let initial: [u8; 16] = {
+            let mut bytes = [0_u8; 16];
+            bytes[..4].copy_from_slice(&16_u32.to_ne_bytes());
+            bytes
+        };
         let mut alias_memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
         let alias: u64 = 0x180;
-        alias_memory.write(alias, &16_u32.to_ne_bytes()).unwrap();
+        alias_memory.write(alias, &initial).unwrap();
         // SAFETY: a second direct packet socket for the host answer.
         let expected_packet = unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW, 768) };
         assert!(
@@ -18810,8 +18827,7 @@ mod tests {
             "expected packet socket: {}",
             std::io::Error::last_os_error()
         );
-        let mut host_storage = [0_u8; 16];
-        host_storage[..4].copy_from_slice(&16_u32.to_ne_bytes());
+        let mut host_storage = initial;
         // SAFETY: both kernel output pointers deliberately alias the
         // first word of host_storage, which stays live for the call.
         let host_alias_result = unsafe {
@@ -18837,10 +18853,259 @@ mod tests {
         );
         let mut got_alias = [0_u8; 16];
         alias_memory.read(alias, &mut got_alias).unwrap();
+        let release = host_kernel_release();
+        match aliased_packet_getsockopt_verdict(
+            &release,
+            stats_length,
+            &initial,
+            &host_storage,
+            &got_alias,
+        ) {
+            Ok(AliasedVerdict::V71Exact) => {
+                assert_eq!(
+                    got_alias, host_storage,
+                    "packet getsockopt at the same address: host kernel {release} (v7.1+) and \
+                     LinuxEmu must agree exactly (value copied, then optlen written back)"
+                );
+            }
+            Ok(AliasedVerdict::OldPredicted { expected }) => {
+                eprintln!(
+                    "packet getsockopt at the same address: host comparison does not apply on \
+                     host kernel {release} (pre-v7.1: optlen written before the value); \
+                     asserting LinuxEmu's v7.1 bytes {expected:?} predicted from the host's \
+                     answer {host_storage:?}"
+                );
+                assert_eq!(
+                    got_alias, expected,
+                    "packet getsockopt at the same address: LinuxEmu must produce the v7.1 \
+                     bytes on a pre-v7.1 host"
+                );
+            }
+            Err(text) => panic!("packet getsockopt at the same address: {text}"),
+        }
+    }
+
+    /// The running host kernel's release, from uname(2). Test bodies run
+    /// natively, so this is the host kernel's answer, not LinuxEmu's.
+    fn host_kernel_release() -> String {
+        // SAFETY: utsname is plain data, for which all-zero bytes are valid.
+        let mut name: libc::utsname = unsafe { std::mem::zeroed() };
+        // SAFETY: name is writable utsname storage for the call.
         assert_eq!(
-            got_alias, host_storage,
-            "packet getsockopt copies the value before publishing optlen at the same address"
+            unsafe { libc::uname(&mut name) },
+            0,
+            "uname: {}",
+            std::io::Error::last_os_error()
         );
+        // SAFETY: uname NUL-terminates every field it fills.
+        let release = unsafe { std::ffi::CStr::from_ptr(name.release.as_ptr()) };
+        release.to_string_lossy().into_owned()
+    }
+
+    /// A kernel release's leading (major, minor) pair, parsed as integers:
+    /// the digits before the first '.', then the run of digits right after
+    /// it, so "7.1.3-0_custom" and "7.1-rc1" both give (7, 1). Anything
+    /// else is None.
+    fn kernel_major_minor(release: &str) -> Option<(u32, u32)> {
+        let (major, rest) = release.split_once('.')?;
+        if major.is_empty() || !major.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        let minor_digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        if minor_digits == 0 {
+            return None;
+        }
+        Some((major.parse().ok()?, rest[..minor_digits].parse().ok()?))
+    }
+
+    /// What the aliased packet getsockopt check holds LinuxEmu to.
+    #[derive(Debug, PartialEq, Eq)]
+    enum AliasedVerdict {
+        /// A v7.1+ host: its own answer is the v7.1 bytes.
+        V71Exact,
+        /// A pre-v7.1 host: the host comparison does not apply, and LinuxEmu
+        /// must produce these v7.1 bytes, predicted from the host's answer.
+        OldPredicted { expected: [u8; 16] },
+    }
+
+    /// Checks one PACKET_STATISTICS getsockopt whose optval and optlen are
+    /// the same address, in this order: the host kernel release parses; the
+    /// published length, min(16, stats_length), is within 4..=16; the host
+    /// answer leaves the bytes past that length untouched; the host answer
+    /// shows its own kernel's order (from v7.1, optlen's word written last;
+    /// before v7.1, the value's bytes written last); and LinuxEmu's bytes
+    /// equal the v7.1 bytes exactly: optlen's word, then the host's
+    /// remaining bytes. The first failing check names itself.
+    fn aliased_packet_getsockopt_verdict(
+        release: &str,
+        stats_length: libc::socklen_t,
+        initial: &[u8; 16],
+        host: &[u8; 16],
+        guest: &[u8; 16],
+    ) -> Result<AliasedVerdict, String> {
+        let Some(version) = kernel_major_minor(release) else {
+            return Err(format!("cannot classify host kernel release {release:?}"));
+        };
+        let length = (stats_length as usize).min(16);
+        if !(4..=16).contains(&length) {
+            return Err(format!(
+                "aliased packet getsockopt length {length} is outside 4..=16"
+            ));
+        }
+        let seen = format!("release {release:?}, length {length}, host {host:?}, guest {guest:?}");
+        if host[length..] != initial[length..] {
+            return Err(format!("host answer has neither documented form ({seen})"));
+        }
+        let length_bytes = (length as u32).to_ne_bytes();
+        let v71 = version >= (7, 1);
+        let host_in_v71_order = host[..4] == length_bytes;
+        if v71 && !host_in_v71_order {
+            return Err(format!(
+                "v7.1+ host kernel answered in the pre-v7.1 order ({seen})"
+            ));
+        }
+        if !v71 && host_in_v71_order {
+            return Err(format!(
+                "pre-v7.1 host kernel answered in the v7.1 order ({seen})"
+            ));
+        }
+        let mut expected = *host;
+        expected[..4].copy_from_slice(&length_bytes);
+        if *guest != expected {
+            return Err(format!(
+                "LinuxEmu's bytes differ from the v7.1 bytes {expected:?} ({seen})"
+            ));
+        }
+        if v71 {
+            Ok(AliasedVerdict::V71Exact)
+        } else {
+            Ok(AliasedVerdict::OldPredicted { expected })
+        }
+    }
+
+    /// Every outcome of the aliased packet getsockopt check, on any host:
+    /// both passes, every named failure, and the order the checks run in.
+    #[test]
+    fn aliased_packet_getsockopt_verdict_checks_in_order() {
+        use AliasedVerdict::OldPredicted;
+        use AliasedVerdict::V71Exact;
+
+        // The arrays spell native-endian words for little-endian targets;
+        // the first assert below pins that.
+        const INITIAL: [u8; 16] = [16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        // Answers for a published length of 8, the default TPACKET_V1
+        // struct tpacket_stats.
+        const V71_ORDER: [u8; 16] = [8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        const OLD_ORDER: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        const OLD_COUNTED: [u8; 16] = [5, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        const V71_COUNTED: [u8; 16] = [8, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        const TAIL_CHANGED: [u8; 16] = [8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0];
+        const OLD_TAIL_CHANGED: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0];
+        const GARBAGE: [u8; 16] = [
+            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+        ];
+        // Answers for published lengths of 4 and 16, the accepted bounds.
+        const LENGTH_4: [u8; 16] = [4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        const LENGTH_16: [u8; 16] = [16, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        const PREDICTED: AliasedVerdict = OldPredicted {
+            expected: V71_ORDER,
+        };
+        const PREDICTED_COUNTED: AliasedVerdict = OldPredicted {
+            expected: V71_COUNTED,
+        };
+        const NEW: &str = "7.1.3-0_custom";
+        const OLD: &str = "6.16.1-x";
+        const UNPARSED: &str = "cannot classify host kernel release";
+        const LENGTH: &str = "aliased packet getsockopt length";
+        const NEITHER: &str = "host answer has neither documented form";
+        const V71_HOST_OLD: &str = "v7.1+ host kernel answered in the pre-v7.1 order";
+        const OLD_HOST_V71: &str = "pre-v7.1 host kernel answered in the v7.1 order";
+        const EMULATOR: &str = "LinuxEmu's bytes differ from the v7.1 bytes";
+
+        fn passes(
+            want: AliasedVerdict,
+            release: &str,
+            stats_len: u32,
+            host: [u8; 16],
+            guest: [u8; 16],
+        ) {
+            assert_eq!(
+                aliased_packet_getsockopt_verdict(release, stats_len, &INITIAL, &host, &guest),
+                Ok(want),
+                "release {release:?}, stats length {stats_len}, host {host:?}, guest {guest:?}"
+            );
+        }
+
+        fn fails(check: &str, release: &str, stats_len: u32, host: [u8; 16], guest: [u8; 16]) {
+            match aliased_packet_getsockopt_verdict(release, stats_len, &INITIAL, &host, &guest) {
+                Err(text) => assert!(text.starts_with(check), "expected {check:?}, got {text:?}"),
+                Ok(verdict) => panic!("expected {check:?}, got {verdict:?}"),
+            }
+        }
+
+        assert_eq!(INITIAL[..4], 16_u32.to_ne_bytes());
+
+        // The release parse: integers, the digits before the first '.', then
+        // the run of digits right after it.
+        for (release, parsed) in [
+            ("7.10.0", Some((7, 10))),
+            ("10.0", Some((10, 0))),
+            ("7.1-rc1", Some((7, 1))),
+            (NEW, Some((7, 1))),
+            ("7.0.0", Some((7, 0))),
+            (OLD, Some((6, 16))),
+            ("", None),
+            ("7", None),
+            ("7.", None),
+            ("x.y", None),
+        ] {
+            assert_eq!(kernel_major_minor(release), parsed, "release {release:?}");
+        }
+
+        // A v7.1+ host in the v7.1 order, with LinuxEmu equal: an exact pass.
+        for release in [NEW, "7.1-rc1", "7.10.0", "10.0"] {
+            passes(V71Exact, release, 8, V71_ORDER, V71_ORDER);
+        }
+        passes(V71Exact, NEW, 8, V71_COUNTED, V71_COUNTED);
+        // The accepted length bounds: 4, and 16 from a stats length of 32.
+        passes(V71Exact, NEW, 4, LENGTH_4, LENGTH_4);
+        passes(V71Exact, NEW, 32, LENGTH_16, LENGTH_16);
+        // A pre-v7.1 host in the pre-v7.1 order, with LinuxEmu giving the
+        // v7.1 bytes predicted from it: a pass where the host comparison
+        // does not apply.
+        for release in [OLD, "7.0.0"] {
+            passes(PREDICTED, release, 8, OLD_ORDER, V71_ORDER);
+        }
+        passes(PREDICTED_COUNTED, OLD, 8, OLD_COUNTED, V71_COUNTED);
+
+        // A v7.1+ host in the pre-v7.1 order fails, whatever LinuxEmu
+        // answers, including the same pre-v7.1 bytes.
+        fails(V71_HOST_OLD, NEW, 8, OLD_ORDER, V71_ORDER);
+        fails(V71_HOST_OLD, NEW, 8, OLD_ORDER, OLD_ORDER);
+        // LinuxEmu answering anything but the v7.1 bytes fails, on either
+        // kind of host.
+        fails(EMULATOR, NEW, 8, V71_ORDER, OLD_ORDER);
+        fails(EMULATOR, OLD, 8, OLD_ORDER, OLD_ORDER);
+        fails(EMULATOR, OLD, 8, OLD_COUNTED, V71_ORDER);
+        // A pre-v7.1 host in the v7.1 order fails.
+        fails(OLD_HOST_V71, OLD, 8, V71_ORDER, V71_ORDER);
+        // A changed tail is neither form, on either kind of host.
+        fails(NEITHER, NEW, 8, TAIL_CHANGED, V71_ORDER);
+        fails(NEITHER, OLD, 8, TAIL_CHANGED, V71_ORDER);
+        // An unparsable release fails, before the length is looked at.
+        fails(UNPARSED, "x.y", 2, V71_ORDER, V71_ORDER);
+        fails(UNPARSED, "7", 8, V71_ORDER, V71_ORDER);
+        // Published lengths below 4 fail.
+        for stats_len in [0, 2, 3] {
+            fails(LENGTH, NEW, stats_len, V71_ORDER, V71_ORDER);
+        }
+
+        // The order of the checks: length before tail, tail before the
+        // host's order, and the host's order before LinuxEmu's bytes.
+        fails(LENGTH, NEW, 2, TAIL_CHANGED, V71_ORDER);
+        fails(NEITHER, NEW, 8, OLD_TAIL_CHANGED, V71_ORDER);
+        fails(V71_HOST_OLD, NEW, 8, OLD_ORDER, GARBAGE);
+        fails(OLD_HOST_V71, OLD, 8, V71_ORDER, GARBAGE);
     }
 
     #[test]
