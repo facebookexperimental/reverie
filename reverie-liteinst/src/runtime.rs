@@ -134,11 +134,14 @@ const SITE_FALLBACK: u8 = 3;
 const SITE_STALE: u8 = 4;
 /// The hook was refused, under the installation lock, after the site's bytes
 /// were re-read and found intact and before the runtime changed any page
-/// protection or byte there; no other site's published patch covers it, and
-/// no later patch may cover it (see [`check_neighbours`]). Execution therefore
-/// resumes after the instruction on the original code. Only the
-/// instruction-fault path records this state; every other caller records
-/// `SITE_FALLBACK` for any refusal.
+/// protection or byte there. No other site's published patch covers it,
+/// except that it may begin in the tail after another ACTIVE site's
+/// five-byte jump ([other + 5, other + 8)) when that site's recorded words
+/// prove those tail bytes are the originals; no later patch may cover it
+/// (see [`check_neighbours`]). Execution therefore resumes after the
+/// instruction on the original code. Only the instruction-fault path
+/// records this state; every other caller records `SITE_FALLBACK` for any
+/// refusal.
 #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 const SITE_UNPATCHABLE: u8 = 5;
 /// A signal-deferred exact-syscall adapter. No source jump was published;
@@ -2392,11 +2395,12 @@ struct InstallFailure {
     /// True only for a refusal that proves the site's code is the original:
     /// reached under the installation lock, after the expected bytes were
     /// re-read and [`check_neighbours`] found no published patch over the
-    /// instruction or the point after it, and before the runtime changed any
-    /// page protection or wrote any byte. A busy lock, a missing arena, a
-    /// byte mismatch (another thread may have just published a jump there),
-    /// and every failure from the protection change onward count as touched,
-    /// even where nothing may have been written.
+    /// instruction or the point after it, or found only a tail-proven overlap
+    /// after another ACTIVE site's five-byte jump, and before the runtime
+    /// changed any page protection or wrote any byte. A busy lock, a missing
+    /// arena, a byte mismatch (another thread may have just published a jump
+    /// there), and every failure from the protection change onward count as
+    /// touched, even where nothing may have been written.
     code_untouched: bool,
     /// True for a failure from the jump's activation onward: part or all of
     /// the jump may already be published, so the bytes after the instruction
@@ -2464,6 +2468,12 @@ enum NeighbourConflict {
     /// the other site's published (or possibly partly published) jump, so
     /// its bytes are not known to be the original.
     InsidePublishedPatch,
+    /// The proposed site begins in the three bytes after another ACTIVE
+    /// site's five-byte jump, still inside that site's eight-byte patch
+    /// window, but the recorded published word proves those tail bytes are
+    /// the originals. The instruction can therefore be emulated on its
+    /// original bytes without writing a second jump into the window.
+    InsidePatchTail,
     /// The proposed patch would overwrite the start of another site's jump.
     OverlapsPublishedPatch,
     /// The proposed patch would cover a site that a thread may be executing
@@ -2474,6 +2484,27 @@ enum NeighbourConflict {
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(liteinst-straddler-cpuid): Review the neighbour-overlap rules.
+/// The tail proof behind [`NeighbourConflict::InsidePatchTail`]: the other
+/// site is ACTIVE, the proposed site begins at `offset` bytes after it,
+/// inside the three tail bytes after its five-byte jump, and the recorded
+/// published word holds the original bytes from that offset on. `words` is
+/// the other slot's (original, published) pair, or `None` when its words are
+/// not recorded. Pure, so the proof itself can be unit-tested; the caller's
+/// byte re-read under the lock is the remaining condition.
+#[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
+fn patch_tail_preserved(state: u8, offset: u64, words: Option<(u64, u64)>) -> bool {
+    let jump = liteinst::patcher::NEAR_JUMP_BYTES as u64;
+    let word = liteinst::patcher::WORD_PATCH_BYTES as u64;
+    let Some((original, published)) = words else {
+        return false;
+    };
+    if state != SITE_ACTIVE || !(jump..word).contains(&offset) {
+        return false;
+    }
+    let offset = offset as usize;
+    published.to_le_bytes()[offset..] == original.to_le_bytes()[offset..]
+}
+
 /// Classify a proposed word patch at `address`, whose instruction is
 /// `instruction_len` bytes long, against another site at `other` in `state`.
 /// `other_len` is that site's instruction length, or 0 when not yet recorded
@@ -2481,7 +2512,14 @@ enum NeighbourConflict {
 /// says the other site's eight-byte window may hold bytes this runtime
 /// published ([`site_footprint`]); a site INSTALLING, UNPATCHABLE, STALE or
 /// FALLBACK also reserves its instruction and resume point for the
-/// continuation.
+/// continuation. `tail_preserved` says the other site is ACTIVE with its
+/// words recorded and its published tail from this site's offset is the
+/// original bytes; that precondition is met only by `install_site_hook`,
+/// which re-reads the expected bytes under the lock before calling
+/// `check_neighbours`. The other caller, `unpublished_syscall_entry`,
+/// calls `check_neighbours` before its own byte check and never reads
+/// `code_untouched`, so an InsidePatchTail result there is only a
+/// refusal, never an untouched proof.
 #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 fn neighbour_conflict(
     address: u64,
@@ -2490,19 +2528,25 @@ fn neighbour_conflict(
     state: u8,
     other_len: u64,
     footprint: bool,
+    tail_preserved: bool,
 ) -> Option<NeighbourConflict> {
     if other == 0 || other == address {
         return None;
     }
     let word = liteinst::patcher::WORD_PATCH_BYTES as u64;
+    let jump = liteinst::patcher::NEAR_JUMP_BYTES as u64;
     let patch_end = address.saturating_add(word);
     let mut conflict = None;
     if footprint {
         let other_end = other.saturating_add(word);
         if other < address.saturating_add(instruction_len) && other_end > address {
-            return Some(NeighbourConflict::InsidePublishedPatch);
+            if state == SITE_ACTIVE && tail_preserved && address >= other.saturating_add(jump) {
+                conflict = Some(NeighbourConflict::InsidePatchTail);
+            } else {
+                return Some(NeighbourConflict::InsidePublishedPatch);
+            }
         }
-        if other < patch_end && other_end > address {
+        if other < patch_end && other_end > address && conflict.is_none() {
             conflict = Some(NeighbourConflict::OverlapsPublishedPatch);
         }
     }
@@ -2524,19 +2568,29 @@ fn neighbour_conflict(
 }
 
 /// The conflict that decides a proposed patch against every other site in
-/// `sites` (address, state, recorded instruction length, footprint). Every site is
-/// examined: [`NeighbourConflict::InsidePublishedPatch`] dominates, because a
-/// refusal is untouched only if no published jump covers the site, whatever
-/// order the site table yields its entries in.
+/// `sites` (address, state, recorded instruction length, footprint,
+/// tail-preserved proof). Every site is examined:
+/// [`NeighbourConflict::InsidePublishedPatch`] dominates, because a refusal
+/// is untouched only if no published jump covers the site, or only a
+/// tail-proven overlap after its jump does, whatever order the site table
+/// yields its entries in.
 #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
 fn neighbours_conflict(
     address: u64,
     instruction_len: u64,
-    sites: impl IntoIterator<Item = (u64, u8, u64, bool)>,
+    sites: impl IntoIterator<Item = (u64, u8, u64, bool, bool)>,
 ) -> Option<NeighbourConflict> {
     let mut found = None;
-    for (other, state, other_len, footprint) in sites {
-        match neighbour_conflict(address, instruction_len, other, state, other_len, footprint) {
+    for (other, state, other_len, footprint, tail_preserved) in sites {
+        match neighbour_conflict(
+            address,
+            instruction_len,
+            other,
+            state,
+            other_len,
+            footprint,
+            tail_preserved,
+        ) {
             Some(NeighbourConflict::InsidePublishedPatch) => {
                 return Some(NeighbourConflict::InsidePublishedPatch);
             }
@@ -2636,11 +2690,20 @@ fn check_neighbours(address: u64, instruction_len: u64) -> Result<(), InstallFai
                 && other != address
                 && state != SITE_ACTIVE
                 && slot_patch_survives(slot, other);
+            let offset = address.wrapping_sub(other);
+            let words = slot.words_recorded.load(Ordering::Acquire).then(|| {
+                (
+                    slot.original_word.load(Ordering::Acquire),
+                    slot.published_word.load(Ordering::Acquire),
+                )
+            });
+            let tail_preserved = patch_tail_preserved(state, offset, words);
             (
                 other,
                 state,
                 u64::from(slot.instruction_len.load(Ordering::Acquire)),
                 site_footprint(state, survives),
+                tail_preserved,
             )
         }),
     );
@@ -2649,6 +2712,11 @@ fn check_neighbours(address: u64, instruction_len: u64) -> Result<(), InstallFai
         Some(NeighbourConflict::InsidePublishedPatch) => Err(InstallFailure::touched(
             io::Error::other("site lies inside another site's published LiteInst patch"),
         )),
+        Some(NeighbourConflict::InsidePatchTail) => {
+            Err(InstallFailure::untouched(io::Error::other(
+                "site lies in the proven-original tail after another site's LiteInst jump",
+            )))
+        }
         Some(NeighbourConflict::OverlapsPublishedPatch) => Err(InstallFailure::untouched(
             io::Error::other("LiteInst patch would overlap another site's patch"),
         )),
@@ -4963,6 +5031,8 @@ mod tests {
     use super::object_image;
     #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
     use super::parse_runtime_maps;
+    #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
+    use super::patch_tail_preserved;
     use super::record_fallback_dispatch;
     use super::refused_process_creation;
     use super::reset_site_observability;
@@ -5412,11 +5482,102 @@ mod tests {
                     state,
                     other_len,
                     matches!(state, SITE_ACTIVE | SITE_FALLBACK),
+                    false,
                 ),
                 expected,
                 "other={other:#x} state={state} len={other_len}"
             );
         }
+    }
+    #[test]
+    #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
+    fn patch_tail_is_preserved_only_by_an_active_recorded_equal_tail() {
+        // Byte i of the little-endian word holds value i, so a flipped
+        // byte at each planted offset is unambiguous.
+        let original = u64::from_le_bytes([0, 1, 2, 3, 4, 5, 6, 7]);
+        for offset in [5_u64, 6, 7] {
+            assert!(
+                patch_tail_preserved(SITE_ACTIVE, offset, Some((original, original))),
+                "offset {offset} with equal tails must be preserved"
+            );
+            for differing in offset as usize..8 {
+                let mut published = original.to_le_bytes();
+                published[differing] ^= 0xff;
+                assert!(
+                    !patch_tail_preserved(
+                        SITE_ACTIVE,
+                        offset,
+                        Some((original, u64::from_le_bytes(published))),
+                    ),
+                    "offset {offset} with differing byte {differing} at or after it must not pass",
+                );
+            }
+            // Differences before the proposed offset are the jump itself.
+            for differing in 0..offset as usize {
+                let mut published = original.to_le_bytes();
+                published[differing] ^= 0xff;
+                assert!(
+                    patch_tail_preserved(
+                        SITE_ACTIVE,
+                        offset,
+                        Some((original, u64::from_le_bytes(published))),
+                    ),
+                    "a differing byte {differing} before offset {offset} must not matter",
+                );
+            }
+        }
+        for offset in [4_u64, 8] {
+            assert!(
+                !patch_tail_preserved(SITE_ACTIVE, offset, Some((original, original))),
+                "offset {offset} is outside the three tail bytes",
+            );
+        }
+        assert!(!patch_tail_preserved(SITE_ACTIVE, 5, None));
+        for state in [
+            0,
+            SITE_INSTALLING,
+            SITE_FALLBACK,
+            SITE_STALE,
+            SITE_UNPATCHABLE,
+            SITE_UNPUBLISHED,
+        ] {
+            assert!(
+                !patch_tail_preserved(state, 5, Some((original, original))),
+                "non-ACTIVE state {state} must not pass"
+            );
+        }
+    }
+    #[test]
+    #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
+    fn a_tail_proven_site_after_an_active_jump_is_only_inside_its_tail() {
+        use NeighbourConflict::InsidePatchTail as Tail;
+        use NeighbourConflict::InsidePublishedPatch as Inside;
+        const A: u64 = 0x1000;
+        // The other site's five-byte jump occupies [A - 5, A); its
+        // eight-byte patch window reaches A + 3.
+        let tail = (A - 5, SITE_ACTIVE, 2, true, true);
+        assert_eq!(neighbours_conflict(A, 2, [tail]), Some(Tail));
+        // Inside the jump itself (+4 from the other site) stays Inside,
+        // as do a differing tail and incomplete publications at +5.
+        assert_eq!(
+            neighbours_conflict(A, 2, [(A - 4, SITE_ACTIVE, 2, true, true)]),
+            Some(Inside)
+        );
+        assert_eq!(
+            neighbours_conflict(A, 2, [(A - 5, SITE_ACTIVE, 2, true, false)]),
+            Some(Inside)
+        );
+        for state in [SITE_INSTALLING, SITE_FALLBACK] {
+            assert_eq!(
+                neighbours_conflict(A, 2, [(A - 5, state, 2, true, true)]),
+                Some(Inside),
+                "state={state}"
+            );
+        }
+        // A covering patch from another site still dominates the tail.
+        let covering = (A - 2, SITE_ACTIVE, 2, true, false);
+        assert_eq!(neighbours_conflict(A, 2, [tail, covering]), Some(Inside));
+        assert_eq!(neighbours_conflict(A, 2, [covering, tail]), Some(Inside));
     }
     #[test]
     #[cfg(all(feature = "liteinst", target_arch = "x86_64"))]
@@ -5426,13 +5587,13 @@ mod tests {
         const A: u64 = 0x1000;
         // Codex's arrangement: a FALLBACK syscall at A + 4 (untouched overlap)
         // and an ACTIVE jump at A - 2 that covers A (touched), in both orders.
-        let overlap = (A + 4, SITE_FALLBACK, 2, true);
-        let covering = (A - 2, SITE_ACTIVE, 2, true);
+        let overlap = (A + 4, SITE_FALLBACK, 2, true, false);
+        let covering = (A - 2, SITE_ACTIVE, 2, true, false);
         assert_eq!(neighbours_conflict(A, 2, [overlap, covering]), Some(Inside));
         assert_eq!(neighbours_conflict(A, 2, [covering, overlap]), Some(Inside));
         assert_eq!(neighbours_conflict(A, 2, [overlap]), Some(Overlaps));
         assert_eq!(
-            neighbours_conflict(A, 2, [(A + 8, SITE_ACTIVE, 2, true)]),
+            neighbours_conflict(A, 2, [(A + 8, SITE_ACTIVE, 2, true, false)]),
             None
         );
     }
@@ -5488,7 +5649,7 @@ mod tests {
         const P: u64 = 0x1000_0ffe;
         let survives = earlier_patch_survives(true, words, Some(partial));
         for state in [SITE_STALE, SITE_INSTALLING, SITE_UNPATCHABLE] {
-            let site = (P, state, 2, site_footprint(state, survives));
+            let site = (P, state, 2, site_footprint(state, survives), false);
             assert_eq!(
                 neighbours_conflict(P + 2, 2, [site]),
                 Some(Inside),
@@ -5496,7 +5657,7 @@ mod tests {
             );
         }
         let gone = earlier_patch_survives(true, words, Some(original));
-        let site = (P, SITE_STALE, 2, site_footprint(SITE_STALE, gone));
+        let site = (P, SITE_STALE, 2, site_footprint(SITE_STALE, gone), false);
         assert_eq!(neighbours_conflict(P + 2, 2, [site]), None);
     }
     #[test]

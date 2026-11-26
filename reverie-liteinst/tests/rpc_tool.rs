@@ -803,95 +803,8 @@ fn timeout_capture_preserves_prefixes_and_reaps_child_and_coordinator_on_unwind(
     }
 }
 
-// Temporary trunk diagnostic for the disabled mode/opt SIGSEGV.
-// Owner: the hermit oncall. Root-cause tracking: T299543576
-// (TestInfra test 562950504151819). Remove both helpers, the planted
-// test below, the host stamp and the forced stage stream with the
-// root-cause fix; a green opt run under this diagnostic is not
-// evidence of a fix.
-/// One line of the opt-in in-guest stage stream, in the exact form
-/// every writer emits.
-fn is_in_guest_stage_line(line: &str) -> bool {
-    let decimal = |text: &str| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
-    let Some(rest) = line.strip_prefix("INFO reverie_liteinst::tool_host: [in-guest pid=") else {
-        return false;
-    };
-    let Some((pid, rest)) = rest.split_once(" tid=") else {
-        return false;
-    };
-    let Some((tid, rest)) = rest.split_once("] stage=") else {
-        return false;
-    };
-    let stage = rest.split_once(' ').map_or(rest, |(stage, _detail)| stage);
-    decimal(pid)
-        && decimal(tid)
-        && !stage.is_empty()
-        && stage
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-}
-
-/// Stderr is empty or nothing but complete exact stage-stream
-/// lines; any other byte fails.
-fn stderr_is_only_stage_lines(stderr: &[u8]) -> bool {
-    std::str::from_utf8(stderr).is_ok_and(|text| {
-        (text.is_empty() || text.ends_with('\n'))
-            && text.split_terminator('\n').all(is_in_guest_stage_line)
-    })
-}
-
-#[test]
-fn stage_stream_only_accepts_exact_stage_lines() {
-    let plain = "INFO reverie_liteinst::tool_host: [in-guest pid=12 tid=34] stage=instruction-fault-continuation-cpuid";
-    let detailed = "INFO reverie_liteinst::tool_host: [in-guest pid=12 tid=34] stage=instruction-sigsegv-no-reachable-arena rip=0x1000 bytes=48-8b map=[anon]";
-    let accept: [&[u8]; 4] = [
-        format!("{plain}\n").leak().as_bytes(),
-        format!("{detailed}\n").leak().as_bytes(),
-        b"",
-        format!("{plain}\n{detailed}\n").leak().as_bytes(),
-    ];
-    let reject: [&[u8]; 10] = [
-        b"\n",
-        b"instruction-control-unavailable\n",
-        b"ERROR native initial refusal stage=L errno_present=0 errno_bits=00000000\n",
-        b"thread 'main' panicked at x.rs:1:1: bad stage=x\n",
-        format!("text in front {plain}\n").leak().as_bytes(),
-        b"INFO reverie_liteinst::tool_host: [in-guest pid=12 tid=34] stage=\n",
-        b"INFO reverie_liteinst::tool_host: [in-guest pid=x tid=34] stage=instruction-fault-continuation-cpuid\n",
-        format!("{plain}\r\n").leak().as_bytes(),
-        plain.as_bytes(),
-        b"INFO reverie_liteinst::tool_host: [in-guest pid=12 tid=34] stage=bad-\xff\n",
-    ];
-    let mut checked = 0;
-    for case in accept {
-        assert!(stderr_is_only_stage_lines(case), "accept: {case:?}");
-        checked += 1;
-    }
-    for case in reject {
-        assert!(!stderr_is_only_stage_lines(case), "reject: {case:?}");
-        checked += 1;
-    }
-    eprintln!("stage-line cases checked: {checked}");
-    assert_eq!(checked, accept.len() + reject.len());
-}
-
 #[test]
 fn installed_hook_reentry_bypasses_tool_with_shared_coordinator_rpc() {
-    // Diagnostic host stamp (test process only): name the pool this
-    // run executed on, so a trunk failure record proves its CPU class.
-    let cpu_model = std::fs::read_to_string("/proc/cpuinfo")
-        .ok()
-        .and_then(|cpuinfo| {
-            cpuinfo
-                .lines()
-                .find_map(|line| line.strip_prefix("model name"))
-                .map(|rest| rest.trim().trim_start_matches(':').trim().to_owned())
-        })
-        .unwrap_or_else(|| "unknown".to_owned());
-    let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease")
-        .map(|release| release.trim().to_owned())
-        .unwrap_or_else(|_| "unknown".to_owned());
-    eprintln!("rpc-tool-diagnostic-host cpu={cpu_model} kernel={kernel}");
     let binary = env!("CARGO_BIN_EXE_reverie-liteinst-rpc-tool-guest");
     // The socket path must stay short (sun_path), so the directory
     // lives directly in /tmp, but it is still a TempDir guard: a
@@ -1169,14 +1082,6 @@ fn installed_hook_reentry_bypasses_tool_with_shared_coordinator_rpc() {
     ] {
         let mut instruction_command = Command::new(binary);
         instruction_command.arg(mode).arg(&socket);
-        // Temporary trunk diagnostic for the disabled mode/opt
-        // SIGSEGV (owner: the hermit oncall, root-cause
-        // tracking T299543576 / TestInfra test 562950504151819):
-        // capture the in-guest stage stream in the subprocess
-        // stderr so a continuous failure names the branch the
-        // guest died on. Remove with the root-cause fix; a green
-        // opt run under this diagnostic is not evidence of a fix.
-        instruction_command.env(reverie_liteinst::IN_GUEST_STAGE_STREAM_ENV, "1");
         if concurrent {
             instruction_command.env(
                 STRADDLER_STALENESS_TICKS_ENV,
@@ -1204,11 +1109,11 @@ fn installed_hook_reentry_bypasses_tool_with_shared_coordinator_rpc() {
             );
             assert_eq!(
                 instruction_guest.stdout,
-                b"cpuid=tool rdtsc=tool rdtscp=tool rdrand=masked rdseed=masked instruction-handler-rpc=1 patched-native=1 first-use-native=1 nested-syscall-native=1 tool-callbacks=9\n",
+                b"cpuid=tool rdtsc=tool rdtscp=tool rdrand=masked rdseed=masked instruction-handler-rpc=1 patched-native=1 first-use-native=1 nested-syscall-native=1 tool-callbacks=11\n",
                 "{mode}"
             );
             assert!(
-                stderr_is_only_stage_lines(&instruction_guest.stderr),
+                instruction_guest.stderr.is_empty(),
                 "{mode}: the successful instruction path emitted a refusal diagnostic: {instruction_guest:?}"
             );
             instruction_positives += 1;

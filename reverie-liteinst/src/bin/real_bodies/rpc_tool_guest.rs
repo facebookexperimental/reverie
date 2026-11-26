@@ -1183,6 +1183,39 @@ reverie_liteinst_straddling_rdtsc:
     or rax, rdx
     ret
     .size reverie_liteinst_straddling_rdtsc, .-reverie_liteinst_straddling_rdtsc
+
+    # A CPUID followed by one three-byte instruction and then RDTSC,
+    # so the RDTSC begins exactly five bytes after the CPUID: at the
+    # first site's jump resume point, inside its eight-byte patch
+    # window's proven-original tail. Only EBX and ECX are checked
+    # after the RDTSC, because RDTSC overwrites EAX and EDX.
+    .p2align 4
+    .global reverie_liteinst_rpc_tight_cpuid_rdtsc
+    .hidden reverie_liteinst_rpc_tight_cpuid_rdtsc
+    .type reverie_liteinst_rpc_tight_cpuid_rdtsc,@function
+reverie_liteinst_rpc_tight_cpuid_rdtsc:
+    push rbx
+    mov r9, rdi
+    mov r10, rsi
+    mov eax, 1
+    xor ecx, ecx
+    .global reverie_liteinst_rpc_tight_cpuid_site
+    .hidden reverie_liteinst_rpc_tight_cpuid_site
+reverie_liteinst_rpc_tight_cpuid_site:
+    cpuid
+    mov r8d, ebx
+    .global reverie_liteinst_rpc_tight_rdtsc_site
+    .hidden reverie_liteinst_rpc_tight_rdtsc_site
+reverie_liteinst_rpc_tight_rdtsc_site:
+    rdtsc
+    shl rdx, 32
+    or rax, rdx
+    mov qword ptr [r10], rax
+    mov dword ptr [r9 + 4], r8d
+    mov dword ptr [r9 + 8], ecx
+    pop rbx
+    ret
+    .size reverie_liteinst_rpc_tight_cpuid_rdtsc, .-reverie_liteinst_rpc_tight_cpuid_rdtsc
 "#
 );
 
@@ -1206,6 +1239,7 @@ unsafe extern "C" {
     fn reverie_liteinst_rpc_nested_rdtscp(aux: *mut u32) -> u64;
     fn reverie_liteinst_straddling_cpuid() -> u64;
     fn reverie_liteinst_straddling_rdtsc() -> u64;
+    fn reverie_liteinst_rpc_tight_cpuid_rdtsc(result: *mut CpuidWords, tsc: *mut u64);
     fn reverie_liteinst_rpc_sigprocmask(
         how: u64,
         set: *const u64,
@@ -1241,6 +1275,8 @@ unsafe extern "C" {
     static reverie_liteinst_rpc_wait4_site: u8;
     static reverie_liteinst_rpc_nested_cpuid_site: u8;
     static reverie_liteinst_rpc_first_use_rdtsc_site: u8;
+    static reverie_liteinst_rpc_tight_cpuid_site: u8;
+    static reverie_liteinst_rpc_tight_rdtsc_site: u8;
 }
 
 fn nested_cpuid(eax: u32, ecx: u32) -> CpuidWords {
@@ -2785,6 +2821,41 @@ fn instruction_guest(path: &Path, publication: InstructionPublication) {
         unsafe { reverie_liteinst_straddling_rdtsc() },
         0x1234_5678_9abc_def0
     );
+    // The RDTSC begins five bytes after this CPUID, in the tail of
+    // the CPUID site's eight-byte patch window. Both must enter the
+    // Tool (the RDTSC through emulation if it is not patched).
+    let mut tight_cpuid = CpuidWords::default();
+    let mut tight_tsc = 0;
+    unsafe {
+        reverie_liteinst_rpc_tight_cpuid_rdtsc(&mut tight_cpuid, &mut tight_tsc);
+    }
+    assert_eq!(tight_cpuid.ebx, tool_cpuid_words().ebx);
+    assert_eq!(tight_cpuid.ecx, tool_cpuid_words().ecx);
+    assert_eq!(tight_tsc, 0x1234_5678_9abc_def0);
+    // Prove the path, not only the values: the CPUID patched (trap once,
+    // hook once); the RDTSC in its tail was refused as untouched and
+    // emulated (trap once, hook never).
+    let tight_cpuid_address =
+        core::ptr::addr_of!(reverie_liteinst_rpc_tight_cpuid_site) as usize as u64;
+    let tight_rdtsc_address =
+        core::ptr::addr_of!(reverie_liteinst_rpc_tight_rdtsc_site) as usize as u64;
+    assert_eq!(tight_rdtsc_address - tight_cpuid_address, 5);
+    assert_eq!(
+        reverie_liteinst::reverie_liteinst_site_trap_count(tight_cpuid_address),
+        1
+    );
+    assert_eq!(
+        reverie_liteinst::reverie_liteinst_site_hook_count(tight_cpuid_address),
+        1
+    );
+    assert_eq!(
+        reverie_liteinst::reverie_liteinst_site_trap_count(tight_rdtsc_address),
+        1
+    );
+    assert_eq!(
+        reverie_liteinst::reverie_liteinst_site_hook_count(tight_rdtsc_address),
+        0
+    );
     let cpuid = core::arch::x86_64::__cpuid_count(0, 0);
     let feature_leaf = core::arch::x86_64::__cpuid_count(1, 0);
     let extended_feature_leaf = core::arch::x86_64::__cpuid_count(7, 0);
@@ -2817,9 +2888,9 @@ fn instruction_guest(path: &Path, publication: InstructionPublication) {
         "a subscribed syscall reached inside an instruction callback must execute natively"
     );
     assert_eq!(INSTRUCTION_HANDLER_RPC_CALLS.load(Ordering::Relaxed), 1);
-    assert_eq!(INSTRUCTION_TOOL_CALLBACKS.load(Ordering::Relaxed), 9);
+    assert_eq!(INSTRUCTION_TOOL_CALLBACKS.load(Ordering::Relaxed), 11);
     println!(
-        "cpuid=tool rdtsc=tool rdtscp=tool rdrand=masked rdseed=masked instruction-handler-rpc=1 patched-native=1 first-use-native=1 nested-syscall-native=1 tool-callbacks=9"
+        "cpuid=tool rdtsc=tool rdtscp=tool rdrand=masked rdseed=masked instruction-handler-rpc=1 patched-native=1 first-use-native=1 nested-syscall-native=1 tool-callbacks=11"
     );
     std::io::stdout().flush().unwrap();
 }
