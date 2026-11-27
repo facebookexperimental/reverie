@@ -714,8 +714,10 @@ impl Command {
     ///
     /// Implies `Namespace::NETWORK` and `Namespace::MOUNT`.
     ///
-    /// This also causes a fresh `/sys` to be mounted to avoid seeing the host
-    /// network interfaces in `/sys/class/net`.
+    /// This also causes a fresh read-only `/sys` to be mounted on every
+    /// host, to avoid seeing the host network interfaces in
+    /// `/sys/class/net` and so guest-visible /sys never depends on the
+    /// host's locked mount flags.
     pub fn local_networking_only(&mut self) -> &mut Self {
         self.container.local_networking_only();
         self

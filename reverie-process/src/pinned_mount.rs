@@ -474,7 +474,9 @@ mod tests {
         clone.retire().unwrap();
         assert!(SourceIdentity::read(replacement.as_raw_fd()).is_ok());
         assert_eq!(
-            Mount::bind_pinned(&clone, backing.path().join("target")).mount(),
+            Mount::bind_pinned(&clone, backing.path().join("target"))
+                .mount()
+                .map_err(|error| error.errno()),
             Err(Errno::EBADF)
         );
         assert!(SourceIdentity::read(replacement.as_raw_fd()).is_ok());
@@ -667,7 +669,8 @@ mod tests {
                     .readonly()
                     .flags(flag)
                     .touch_target()
-                    .mount(),
+                    .mount()
+                    .map_err(|error| error.errno()),
                 Err(Errno::EINVAL)
             );
             assert!(!target.parent().unwrap().exists());

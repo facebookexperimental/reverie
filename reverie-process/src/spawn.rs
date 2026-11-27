@@ -20,6 +20,7 @@ use super::clone::clone_with_pid;
 use super::container::ChildContext;
 use super::error::Context;
 use super::error::Error;
+use super::error::MAX_ERROR_WIRE_BYTES;
 use super::fd::Fd;
 use super::fd::pipe;
 use super::id_map::make_id_map;
@@ -357,24 +358,40 @@ unsafe fn execvpe_zeroed_tail(
 
 /// Sends an error and closes the pipe. Ignore any errors if this fails.
 pub fn send_error(fd: &mut Fd, err: Error) {
-    // Writes up to PIPE_BUF (4096) should be atomic. There's also nothing we
-    // can do with an error if this fails.
-    let bytes: [u8; 8] = err.into();
-    let _ = fd.write(&bytes);
+    // Writes up to PIPE_BUF (4096) should be atomic. The encoded error,
+    // mount name included, is bounded well below that. There's also
+    // nothing we can do with an error if this fails.
+    let mut bytes = [0u8; MAX_ERROR_WIRE_BYTES];
+    let frame = err.encode_wire(&mut bytes);
+    let _ = fd.write(frame);
 }
 
 /// Tries to receive an error code from the pipe. If the other end of the
 /// pipe is closed before sending an error, then `Ok(())` is returned.
 pub fn recv_error(mut fd: Fd) -> Result<(), Error> {
     use std::io::Read;
-    let mut err = [0u8; 8];
+    let mut frame = [0u8; MAX_ERROR_WIRE_BYTES];
+    let mut used = 0;
     loop {
-        match fd.read(&mut err) {
-            Ok(0) => return Ok(()),
-            Ok(8) => return Err(Error::from(err)),
+        match fd.read(&mut frame[used..]) {
+            Ok(0) => {
+                if used == 0 {
+                    return Ok(());
+                }
+                return Err(Error::decode_wire(&frame[..used]).unwrap_or_else(|| {
+                    panic!("execve pipe: got a malformed error frame of {used} bytes")
+                }));
+            }
             Ok(n) => {
-                // Sends up to PIPE_BUF (4096) should be atomic.
-                panic!("execve pipe: got unexpected number of bytes {}", n);
+                used += n;
+                if used == frame.len() {
+                    // A full buffer is only valid as one maximum frame;
+                    // decode now instead of blocking for a close that an
+                    // over-long writer would delay.
+                    return Err(Error::decode_wire(&frame).unwrap_or_else(|| {
+                        panic!("execve pipe: got a malformed error frame of {used} bytes")
+                    }));
+                }
             }
             Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
             Err(err) => {

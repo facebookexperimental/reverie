@@ -38,6 +38,8 @@ use super::env::Env;
 use super::error::AddContext;
 use super::error::Context;
 use super::error::Error;
+use super::error::MAX_MOUNT_FSTYPE_BYTES;
+use super::error::MAX_MOUNT_TARGET_BYTES;
 use super::exit_status::ExitStatus;
 use super::fd::Fd;
 use super::fd::pipe;
@@ -576,7 +578,8 @@ impl Container {
     /// Implies `Namespace::MOUNT`. Note that `Namespace::USER` should also have
     /// been set and `map_uid` should have been called in order to gain the
     /// privileges required to mount.
-    pub fn mount(&mut self, mount: Mount) -> &mut Self {
+    pub fn mount(&mut self, mut mount: Mount) -> &mut Self {
+        mount.prepare_failure_name();
         self.namespace |= Namespace::MOUNT;
         self.mounts.push(mount);
         self
@@ -588,7 +591,10 @@ impl Container {
         I: IntoIterator<Item = Mount>,
     {
         self.namespace |= Namespace::MOUNT;
-        self.mounts.extend(mounts);
+        self.mounts.extend(mounts.into_iter().map(|mut mount| {
+            mount.prepare_failure_name();
+            mount
+        }));
         self
     }
 
@@ -597,13 +603,19 @@ impl Container {
     ///
     /// Implies `Namespace::NETWORK` and `Namespace::MOUNT`.
     ///
-    /// This also causes a fresh `/sys` to be mounted to avoid seeing the host
-    /// network interfaces in `/sys/class/net`.
+    /// This also causes a fresh read-only `/sys` to be mounted on every
+    /// host, to avoid seeing the host network interfaces in
+    /// `/sys/class/net` and so guest-visible /sys never depends on the
+    /// host's locked mount flags.
     pub fn local_networking_only(&mut self) -> &mut Self {
         if !self.local_networking_only {
             self.local_networking_only = true;
             self.namespace |= Namespace::NETWORK;
-            self.mount(Mount::sysfs("/sys"));
+            // The fresh sysfs is read-only on every host, so what the
+            // guest sees never depends on the host's locked mount flags.
+            // A read-only request is also admissible where /sys is
+            // already pinned read-only, with no retry branch needed.
+            self.mount(Mount::sysfs("/sys").readonly());
         }
         self
     }
@@ -733,9 +745,9 @@ impl Container {
             )?;
         }
 
-        // Mount all the things.
+        // Mount all the things. Mount::mount names the failing mount.
         for mount in &mut self.mounts {
-            mount.mount().context(Context::Mount)?;
+            mount.mount()?;
         }
 
         // Change root directory. Note that we do this *after* mounting anything
@@ -1190,7 +1202,7 @@ impl Container {
         let state = match startup {
             Ok(state) => state,
             Err(error) => {
-                let _ = socket.send(STARTUP_FAILURE, &StartupFds::default(), Some(error));
+                let _ = socket.send(STARTUP_FAILURE, &StartupFds::default(), Some(error.clone()));
                 drop(socket);
                 let mut writer = std::io::BufWriter::new(Fd::new(writer_fd));
                 bincode::serde::encode_into_std_write(
@@ -1553,7 +1565,6 @@ pub const MAX_STARTUP_FDS: usize = 8;
 #[derive(
     thiserror::Error,
     Debug,
-    Copy,
     Clone,
     Eq,
     PartialEq,
@@ -1655,8 +1666,8 @@ impl ChildStartContext {
     /// Exceeding [`MAX_STARTUP_FDS`] refuses startup and closes the supplied FD.
     pub fn transfer_fd(&mut self, fd: std::os::fd::OwnedFd) -> Result<(), StartupError> {
         let result = self.descriptors.push(fd);
-        if let Err(error) = result {
-            self.failure = Some(error);
+        if let Err(ref error) = result {
+            self.failure = Some(error.clone());
         }
         result
     }
@@ -1716,7 +1727,11 @@ struct StartupChildIo {
 const STARTUP_REQUEST: u8 = 1;
 const STARTUP_READY: u8 = 2;
 const STARTUP_FAILURE: u8 = 4;
-const STARTUP_FRAME_SIZE: usize = 64;
+// Sized for the largest StartupError: a mount setup failure naming a
+// maximum-length target and fstype (see error::MountFailure caps).
+// 64 bytes covers the frame header, the bincode tags/lengths around
+// those names, and every non-failure frame.
+const STARTUP_FRAME_SIZE: usize = 64 + MAX_MOUNT_TARGET_BYTES + MAX_MOUNT_FSTYPE_BYTES;
 
 // GNU and musl use different integer types for ancillary lengths. Keep
 // conversions checked without assuming a particular libc field type.
@@ -1868,12 +1883,14 @@ impl StartupSocket {
         frame[4] = phase;
         frame[5] = fds.len as u8;
         if let Some(error) = failure {
-            frame[6] = bincode::serde::encode_into_slice(
+            let encoded = bincode::serde::encode_into_slice(
                 error,
                 &mut frame[8..],
                 bincode::config::legacy(),
             )
-            .map_err(|_| StartupError::Protocol)? as u8;
+            .map_err(|_| StartupError::Protocol)?;
+            let encoded = u16::try_from(encoded).map_err(|_| StartupError::Protocol)?;
+            frame[6..8].copy_from_slice(&encoded.to_le_bytes());
         }
         #[cfg(test)]
         if let Some(result) = self.inject_test_fault(phase, &frame, fds) {
@@ -1966,15 +1983,19 @@ impl StartupSocket {
             if offset < frame.len() {
                 continue;
             }
-            if &frame[..4] != b"RVS1" || frame[5] as usize != fds.len || frame[7] != 0 {
+            let failure_len = u16::from_le_bytes([frame[6], frame[7]]) as usize;
+            if &frame[..4] != b"RVS1"
+                || frame[5] as usize != fds.len
+                || (frame[4] != STARTUP_FAILURE && frame[7] != 0)
+            {
                 return Err(StartupError::Protocol);
             }
             if frame[4] == STARTUP_FAILURE
                 && fds.len == 0
-                && frame[6] != 0
-                && frame[6] as usize <= frame.len() - 8
+                && failure_len != 0
+                && failure_len <= frame.len() - 8
             {
-                let end = 8 + frame[6] as usize;
+                let end = 8 + failure_len;
                 let (error, used) = bincode::serde::decode_from_slice::<StartupError, _>(
                     &frame[8..end],
                     bincode::config::legacy(),
@@ -2317,7 +2338,7 @@ static OWNED_POLL_INTERRUPTED: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 /// The original failure, separate from subsequent cleanup observations.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OwnedRunFailure {
     /// The caller explicitly cancelled this run. External error details remain
     /// with that caller; later successful child exit cannot erase cancellation.
@@ -2348,7 +2369,9 @@ pub enum StartupOwnedFailure<T> {
         /// The original refusal, independent of cleanup success or failure.
         cause: OwnedRunFailure,
         /// Original child, open result FD if any, and exact partial bytes.
-        run: OwnedFinalization<T>,
+        /// Boxed: the retained owner is large and already heap-backed
+        /// (its result bytes are a Vec), unlike the BeforeClone cause.
+        run: Box<OwnedFinalization<T>>,
     },
 }
 
@@ -2406,7 +2429,7 @@ impl<T> OwnedFinalization<T> {
     }
     /// The frozen original failure, if one was observed.
     pub fn failure(&self) -> Option<OwnedRunFailure> {
-        self.failure
+        self.failure.clone()
     }
 
     fn fail(
@@ -2414,13 +2437,19 @@ impl<T> OwnedFinalization<T> {
         cause: OwnedRunFailure,
         deadline: std::time::Instant,
     ) -> StartupOwnedFailure<T> {
-        self.failure = Some(cause);
+        self.failure = Some(cause.clone());
         self.child.as_mut().unwrap().cancel_and_wait_until(deadline);
-        StartupOwnedFailure::AfterClone { cause, run: self }
+        StartupOwnedFailure::AfterClone {
+            cause,
+            run: Box::new(self),
+        }
     }
     fn refuse(mut self, cause: OwnedRunFailure) -> StartupOwnedFailure<T> {
-        self.failure = Some(cause);
-        StartupOwnedFailure::AfterClone { cause, run: self }
+        self.failure = Some(cause.clone());
+        StartupOwnedFailure::AfterClone {
+            cause,
+            run: Box::new(self),
+        }
     }
 
     fn drain(&mut self) -> Result<(), OwnedRunFailure> {
@@ -2450,7 +2479,7 @@ impl<T> OwnedFinalization<T> {
     pub fn retry_until(mut self, deadline: std::time::Instant) -> OwnedFinalize<T> {
         self.abandon_unread_result_without_pidfd();
         let child = self.child.as_mut().unwrap();
-        if let Some(cause) = self.failure {
+        if let Some(cause) = self.failure.clone() {
             child.cancel_and_wait_until(deadline);
             return OwnedFinalize::Failed {
                 cause,
@@ -2469,7 +2498,7 @@ impl<T> OwnedFinalization<T> {
             }
             ChildCleanupObservation::Reaped(status) => {
                 let cause = OwnedRunFailure::ChildStatus(status);
-                self.failure = Some(cause);
+                self.failure = Some(cause.clone());
                 OwnedFinalize::Failed {
                     cause,
                     cleanup: self,
@@ -2477,7 +2506,7 @@ impl<T> OwnedFinalization<T> {
             }
             ChildCleanupObservation::ExitedWithoutWaitStatus => {
                 let cause = OwnedRunFailure::WaitStatusUnavailable;
-                self.failure = Some(cause);
+                self.failure = Some(cause.clone());
                 OwnedFinalize::Failed {
                     cause,
                     cleanup: self,
@@ -2486,7 +2515,7 @@ impl<T> OwnedFinalization<T> {
             ChildCleanupObservation::Unknown => {
                 if let Some(error) = child.last_error() {
                     let cause = OwnedRunFailure::Cleanup(error);
-                    self.failure = Some(cause);
+                    self.failure = Some(cause.clone());
                     OwnedFinalize::Failed {
                         cause,
                         cleanup: self,
@@ -2613,7 +2642,7 @@ impl<T: DeserializeOwned> OwnedReapedResult<T> {
             ),
         };
         Err(OwnedDecodeFailure {
-            cause,
+            cause: Box::new(cause),
             detail,
             bytes: self.bytes,
             status: self.status,
@@ -2624,7 +2653,9 @@ impl<T: DeserializeOwned> OwnedReapedResult<T> {
 /// Decode refusal retaining the complete bytes and genuine child status.
 #[derive(Debug)]
 pub struct OwnedDecodeFailure {
-    cause: OwnedRunFailure,
+    // Boxed so returning this refusal by value stays pointer-sized in
+    // its cause field; the bytes it retains are already heap-backed.
+    cause: Box<OwnedRunFailure>,
     detail: Option<String>,
     bytes: Vec<u8>,
     status: ExitStatus,
@@ -2632,7 +2663,7 @@ pub struct OwnedDecodeFailure {
 impl OwnedDecodeFailure {
     /// The original typed refusal.
     pub fn cause(&self) -> OwnedRunFailure {
-        self.cause
+        (*self.cause).clone()
     }
     /// An actual decoding diagnostic when available.
     pub fn detail(&self) -> Option<&str> {
@@ -3389,7 +3420,7 @@ mod tests {
         assert_eq!(cause, OwnedRunFailure::ResultRead(Errno::EAGAIN));
         assert_eq!(owned.bytes, b"abc");
         owned.child.as_mut().unwrap().signal_error_once = Some(Errno::EPERM);
-        let run = match owned.fail(cause, Instant::now()) {
+        let run = match owned.fail(cause.clone(), Instant::now()) {
             StartupOwnedFailure::AfterClone { run, .. } => run,
             _ => unreachable!(),
         };
@@ -5022,6 +5053,35 @@ mod tests {
     }
 
     #[test]
+    fn startup_failure_frame_carries_a_maximum_named_mount_error() {
+        if crate::test_runs_in_own_process() {
+            return;
+        }
+        let long_target = vec![b'x'; crate::error::MAX_MOUNT_TARGET_BYTES];
+        let long_fstype = vec![b'y'; crate::error::MAX_MOUNT_FSTYPE_BYTES];
+        let error =
+            StartupError::Setup(Error::mount(Errno::EPERM, &long_target, Some(&long_fstype)));
+        let encoded = bincode::serde::encode_to_vec(&error, bincode::config::legacy()).unwrap();
+        assert!(
+            encoded.len() > 56,
+            "test must exceed the old 64-byte frame payload: {}",
+            encoded.len()
+        );
+        assert!(
+            encoded.len() <= STARTUP_FRAME_SIZE - 8,
+            "named Setup error must fit the startup frame: {}",
+            encoded.len()
+        );
+        let (a, b) = StartupSocket::pair(Instant::now() + Duration::from_secs(2)).unwrap();
+        a.send(STARTUP_FAILURE, &StartupFds::default(), Some(error.clone()))
+            .unwrap();
+        match b.receive(Some(STARTUP_FAILURE)) {
+            Err(received) => assert_eq!(received, error),
+            Ok(_) => panic!("maximum named mount error must refuse startup"),
+        }
+    }
+
+    #[test]
     fn startup_descriptor_cardinality_is_finite_and_refusal_closes_rights() {
         if crate::test_runs_in_own_process() {
             return;
@@ -5347,6 +5407,20 @@ mod tests {
         );
     }
 
+    /// The target bytes a bounded transport carries for `path`, and
+    /// whether it cut them. Assertions on stored mount names must
+    /// compute this instead of assuming `$TMPDIR` is short.
+    fn expected_stored_target(path: &Path) -> (Vec<u8>, bool) {
+        use std::os::unix::ffi::OsStrExt;
+
+        let bytes = path.as_os_str().as_bytes();
+        if bytes.len() > crate::error::MAX_MOUNT_TARGET_BYTES {
+            (bytes[..crate::error::MAX_MOUNT_TARGET_BYTES].to_vec(), true)
+        } else {
+            (bytes.to_vec(), false)
+        }
+    }
+
     #[test]
     fn mount_error_from_child_is_returned() {
         if crate::test_runs_in_own_process() {
@@ -5363,8 +5437,122 @@ mod tests {
 
         assert_eq!(
             result,
-            Err(RunError::Spawn(Error::new(Errno::ENOENT, Context::Mount)))
+            Err(RunError::Spawn(Error::mount(Errno::ENOENT, b"/test", None)))
         );
+    }
+
+    #[test]
+    fn mount_error_names_a_forced_fresh_filesystem_failure() {
+        if crate::test_runs_in_own_process() {
+            return;
+        }
+        let target_dir = tempfile::tempdir().unwrap();
+        let target = target_dir.path().join("named");
+        std::fs::create_dir(&target).unwrap();
+        let result = Container::new()
+            .unshare(Namespace::USER | Namespace::MOUNT)
+            .map_root()
+            .mount(Mount::new(&target).fstype("missing-fstype"))
+            .run(|| 42);
+        let Err(RunError::Spawn(error)) = result else {
+            panic!("expected a named spawn mount failure")
+        };
+        assert_eq!(error.context(), Context::Mount);
+        assert!(
+            matches!(error.errno(), Errno::ENODEV | Errno::EINVAL),
+            "unknown fstype must refuse in mount(2), got {}",
+            error.errno()
+        );
+        let mount = error
+            .mount_failure()
+            .expect("every setup mount failure must carry its mount name");
+        let (stored, truncated) = expected_stored_target(&target);
+        assert_eq!(mount.target_bytes(), stored.as_slice());
+        assert_eq!(mount.target_truncated(), truncated);
+        assert_eq!(mount.fstype_bytes(), Some(b"missing-fstype".as_slice()));
+        let shown = format!("{error}");
+        assert!(shown.contains(&target.display().to_string()), "{shown}");
+        assert!(shown.contains("fstype=missing-fstype"), "{shown}");
+    }
+
+    #[test]
+    fn spawn_pipe_mount_error_names_an_over_cap_target() {
+        if crate::test_runs_in_own_process() {
+            return;
+        }
+        let target_dir = tempfile::tempdir().unwrap();
+        let mut target = target_dir.path().to_owned();
+        while target.as_os_str().len() <= crate::error::MAX_MOUNT_TARGET_BYTES {
+            target.push("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        }
+        target.push("leaf");
+        std::fs::create_dir_all(&target).unwrap();
+        let (stored, truncated) = expected_stored_target(&target);
+        assert!(truncated, "the spawn-pipe test target must exceed the cap");
+
+        let result = crate::Command::new("/bin/true")
+            .unshare(Namespace::USER | Namespace::MOUNT)
+            .map_root()
+            .mount(Mount::new(&target).fstype("missing-fstype"))
+            .spawn();
+        let Err(error) = result else {
+            panic!("an unknown fstype must refuse spawn setup through the pipe")
+        };
+        assert_eq!(error.context(), Context::Mount);
+        assert!(
+            matches!(error.errno(), Errno::ENODEV | Errno::EINVAL),
+            "got {}",
+            error.errno()
+        );
+        let mount = error
+            .mount_failure()
+            .expect("the spawn pipe must carry the mount name");
+        assert_eq!(mount.target_bytes(), stored.as_slice());
+        assert!(mount.target_truncated());
+        assert_eq!(mount.fstype_bytes(), Some(b"missing-fstype".as_slice()));
+        assert!(format!("{error}").contains("(target truncated)"));
+    }
+
+    #[test]
+    fn startup_mount_error_names_the_failing_mount() {
+        if crate::test_runs_in_own_process() {
+            return;
+        }
+        let target_dir = tempfile::tempdir().unwrap();
+        let target = target_dir.path().join("named");
+        std::fs::create_dir(&target).unwrap();
+        let result = Container::new()
+            .unshare(Namespace::USER | Namespace::MOUNT)
+            .map_root()
+            .mount(Mount::new(&target).fstype("missing-fstype"))
+            .run_with_startup(
+                Duration::from_secs(2),
+                |_| -> Result<(), StartupError> {
+                    panic!("parent hook must not see failed child setup")
+                },
+                |_| -> Result<(), StartupError> { panic!("child hook must not see failed setup") },
+                |()| -> ((), ()) { panic!("workload must not run") },
+            );
+        let Err(StartupRunError::Child {
+            cause: StartupError::Setup(error),
+            ..
+        }) = result
+        else {
+            panic!("expected a named startup setup refusal")
+        };
+        assert_eq!(error.context(), Context::Mount);
+        assert!(
+            matches!(error.errno(), Errno::ENODEV | Errno::EINVAL),
+            "got {}",
+            error.errno()
+        );
+        let mount = error
+            .mount_failure()
+            .expect("the startup path must carry the mount name");
+        let (stored, truncated) = expected_stored_target(&target);
+        assert_eq!(mount.target_bytes(), stored.as_slice());
+        assert_eq!(mount.target_truncated(), truncated);
+        assert_eq!(mount.fstype_bytes(), Some(b"missing-fstype".as_slice()));
     }
 
     #[cfg_attr(
@@ -5464,10 +5652,18 @@ mod tests {
             .mount(Mount::tmpfs(&nested))
             .run(|| 42);
 
-        assert_eq!(
-            result,
-            Err(RunError::Spawn(Error::new(Errno::ENOENT, Context::Mount)))
-        );
+        let Err(RunError::Spawn(error)) = result else {
+            panic!("expected a named spawn mount failure")
+        };
+        assert_eq!(error.errno(), Errno::ENOENT);
+        assert_eq!(error.context(), Context::Mount);
+        let mount = error
+            .mount_failure()
+            .expect("every setup mount failure must carry its mount name");
+        let (stored, truncated) = expected_stored_target(&nested);
+        assert_eq!(mount.target_bytes(), stored.as_slice());
+        assert_eq!(mount.target_truncated(), truncated);
+        assert_eq!(mount.fstype_bytes(), Some(b"tmpfs".as_slice()));
         assert!(!nested.exists());
     }
 
@@ -5488,10 +5684,18 @@ mod tests {
             .mount(Mount::tmpfs(&target).touch_target())
             .run(|| 42);
 
-        assert_eq!(
-            result,
-            Err(RunError::Spawn(Error::new(Errno::ENOTDIR, Context::Mount)))
-        );
+        let Err(RunError::Spawn(error)) = result else {
+            panic!("expected a named spawn mount failure")
+        };
+        assert_eq!(error.errno(), Errno::ENOTDIR);
+        assert_eq!(error.context(), Context::Mount);
+        let mount = error
+            .mount_failure()
+            .expect("every setup mount failure must carry its mount name");
+        let (stored, truncated) = expected_stored_target(&target);
+        assert_eq!(mount.target_bytes(), stored.as_slice());
+        assert_eq!(mount.target_truncated(), truncated);
+        assert_eq!(mount.fstype_bytes(), Some(b"tmpfs".as_slice()));
         assert!(!target.exists());
     }
 
@@ -5512,7 +5716,10 @@ mod tests {
             .map_root()
             .mount(Mount::new("/").rprivate())
             .run(move || {
-                let result = Mount::tmpfs(&target).touch_target().mount();
+                let result = Mount::tmpfs(&target)
+                    .touch_target()
+                    .mount()
+                    .map_err(|error| error.errno());
                 (result, observed.exists())
             });
 

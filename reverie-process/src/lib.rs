@@ -69,6 +69,7 @@ pub use container::StartupOwnedFailure;
 pub use container::StartupRunError;
 pub use error::Context;
 pub use error::Error;
+pub use error::MountFailure;
 pub use exit_status::ExitStatus;
 pub use mount::Bind;
 pub use mount::Mount;
@@ -611,6 +612,186 @@ mod tests {
         let proc_status = parse_proc_status(status.as_bytes());
         assert_eq!(proc_status["NSpid"], "1");
         assert_eq!(proc_status["Pid"], "1");
+    }
+
+    /// Records the sysfs test's environment skip with Reverie's named,
+    /// counted marker (`scripts/libtest-counts.rs` harvests these lines
+    /// from test output and JUnit reports).
+    fn record_sysfs_skip(reason: &str) {
+        println!("REVERIE_SKIP: mount_sysfs_with_readonly_fallback: {reason}");
+    }
+
+    #[test]
+    fn mount_sysfs_with_readonly_fallback() {
+        const STAGE: &str = "REVERIE_SYSFS_FALLBACK_STAGE";
+        if std::env::var_os(STAGE).is_none() {
+            if crate::test_runs_in_own_process() {
+                return;
+            }
+            // Outer stage: re-exec only this test under an outer user
+            // namespace. The inner stage below makes that namespace's
+            // /sys read-only, then asks for a fresh container sysfs.
+            let name = std::thread::current()
+                .name()
+                .expect("libtest names each test thread after its test")
+                .to_owned();
+            let output = std::process::Command::new("unshare")
+                .args([
+                    "--user",
+                    "--map-root-user",
+                    "--mount",
+                    "--propagation",
+                    "private",
+                ])
+                .arg(std::env::current_exe().unwrap())
+                .args([name.as_str(), "--exact", "--test-threads=1", "--nocapture"])
+                .env(STAGE, "inner")
+                .env("LC_ALL", "C")
+                .stdin(std::process::Stdio::null())
+                .output();
+            let output = match output {
+                Ok(output) => output,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    record_sysfs_skip("no unshare binary");
+                    return;
+                }
+                Err(error) => panic!("spawning unshare failed: {error}"),
+            };
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            print!("{stdout}");
+            eprint!("{stderr}");
+            if !output.status.success()
+                && stderr.lines().next().is_some_and(|line| {
+                    line.starts_with("unshare: unshare failed: ")
+                        && (line.ends_with("Operation not permitted")
+                            || line.ends_with("Permission denied"))
+                })
+            {
+                record_sysfs_skip("unprivileged user namespaces are denied here");
+                return;
+            }
+            assert!(
+                output.status.success(),
+                "outer user-namespace stage failed: {:?}",
+                output.status
+            );
+            assert!(
+                stdout.contains("nested_sysfs_options[open parent]=")
+                    && stdout.contains("nested_sysfs_options[masked parent]="),
+                "inner stage did not report both sysfs options: {stdout}"
+            );
+            return;
+        }
+
+        // Inner stage: root in the outer user namespace. Pin the host
+        // /sys read-only (this vfsmount only; the tree is private),
+        // prove it took, then require a container fresh sysfs to start.
+        assert_eq!(
+            unsafe { libc::geteuid() },
+            0,
+            "inner stage must run as mapped root in the outer namespace"
+        );
+        fn guest_sysfs_and_net(stage: &str, row: String, net: Vec<String>) {
+            println!("selected_sysfs_row[{stage}]={row}");
+            let mut fields = row.split_whitespace();
+            let _source = fields.next().unwrap();
+            let _target = fields.next().unwrap();
+            let _fstype = fields.next().unwrap();
+            let options = fields.next().unwrap();
+            assert!(
+                options.split(',').any(|option| option == "ro"),
+                "{stage}: guest /sys must be read-only, got options {options}"
+            );
+            assert_eq!(
+                net,
+                ["lo"],
+                "{stage}: a fresh sysfs must show only loopback"
+            );
+            println!("nested_sysfs_options[{stage}]={options}");
+        }
+        let run_guest = || {
+            Container::new().map_root().local_networking_only().run(|| {
+                let mounts = fs::read_to_string("/proc/self/mounts").unwrap();
+                // The LAST /sys row is the fresh mount; earlier rows
+                // are the outer stage's own remount and prove nothing
+                // alone.
+                let row = mounts
+                    .lines()
+                    .rev()
+                    .find(|line| {
+                        let mut fields = line.split_whitespace();
+                        let _source = fields.next();
+                        let target = fields.next();
+                        let fstype = fields.next();
+                        target == Some("/sys") && fstype == Some("sysfs")
+                    })
+                    .unwrap()
+                    .to_owned();
+                let mut net: Vec<String> = fs::read_dir("/sys/class/net")
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                    .collect();
+                net.sort();
+                (row, net)
+            })
+        };
+        // Every-host half of the ruling: with the parent /sys still
+        // writable, the fresh guest /sys is already read-only.
+        let (row, net) = run_guest().expect("fresh sysfs must start read-only on an open parent");
+        guest_sysfs_and_net("open parent", row, net);
+
+        let sys = std::ffi::CString::new("/sys").unwrap();
+        // Resupply the inherited locked flags: asking a remount in this
+        // user namespace to clear nosuid/nodev/noexec is itself EPERM.
+        let remounted = unsafe {
+            libc::mount(
+                sys.as_ptr(),
+                sys.as_ptr(),
+                std::ptr::null(),
+                (libc::MS_REMOUNT
+                    | libc::MS_BIND
+                    | libc::MS_RDONLY
+                    | libc::MS_NOSUID
+                    | libc::MS_NODEV
+                    | libc::MS_NOEXEC) as _,
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(
+            remounted,
+            0,
+            "bind-remounting the outer /sys read-only failed: {}",
+            std::io::Error::last_os_error()
+        );
+        assert!(
+            nix::sys::statvfs::statvfs("/sys")
+                .unwrap()
+                .flags()
+                .contains(nix::sys::statvfs::FsFlags::ST_RDONLY),
+            "outer /sys must be read-only before the container starts"
+        );
+        // Negative control in the same read-only stage: a writable
+        // sysfs request without the read-only form is refused here.
+        let refused = Container::new()
+            .unshare(Namespace::USER | Namespace::MOUNT | Namespace::NETWORK)
+            .map_root()
+            .mount(Mount::sysfs("/sys"))
+            .run(|| ());
+        let Err(RunError::Spawn(refused)) = refused else {
+            panic!("a writable sysfs under a read-only parent must refuse setup")
+        };
+        assert_eq!(refused.errno(), Errno::EPERM);
+        assert_eq!(refused.context(), Context::Mount);
+        let refused_mount = refused
+            .mount_failure()
+            .expect("the refused mount must be named");
+        assert_eq!(refused_mount.target(), std::path::Path::new("/sys"));
+        assert_eq!(refused_mount.fstype_bytes(), Some(b"sysfs".as_slice()));
+
+        let (row, net) =
+            run_guest().expect("fresh sysfs must start read-only under a read-only parent");
+        guest_sysfs_and_net("masked parent", row, net);
     }
 
     #[tokio::test]

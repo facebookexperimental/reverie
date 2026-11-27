@@ -302,8 +302,12 @@ impl ChildParentResourceStartContext<'_> {
             self.phase = ChildPhase::ParentHeld;
             Ok(())
         })();
-        if let Err(error) = result {
-            append_error(&mut self.failure, &mut self.secondary_errors, Err(error));
+        if let Err(error) = &result {
+            append_error(
+                &mut self.failure,
+                &mut self.secondary_errors,
+                Err(error.clone()),
+            );
         }
         result
     }
@@ -345,8 +349,12 @@ impl ChildParentResourceStartContext<'_> {
             self.phase = ChildPhase::LeafSent;
             Ok(())
         })();
-        if let Err(error) = result {
-            append_error(&mut self.failure, &mut self.secondary_errors, Err(error));
+        if let Err(error) = &result {
+            append_error(
+                &mut self.failure,
+                &mut self.secondary_errors,
+                Err(error.clone()),
+            );
         }
         result
     }
@@ -633,8 +641,8 @@ impl Container {
         );
         append_error(&mut failure, &mut secondary, parent.close());
         let state = (|| {
-            if let Some(error) = failure {
-                return Err(error);
+            if let Some(error) = &failure {
+                return Err(error.clone());
             }
             self.setup_before_filter(context, &mut [])
                 .map_err(StartupError::Setup)?;
@@ -654,7 +662,7 @@ impl Container {
                 if let Err(callback_error) = &state
                     && *callback_error != error
                 {
-                    secondary.push(*callback_error);
+                    secondary.push(callback_error.clone());
                 }
                 return Err(error);
             }
@@ -676,16 +684,16 @@ impl Container {
             Ok(state)
         })();
         if let Err(error) = &state
-            && failure != Some(*error)
+            && failure.as_ref() != Some(error)
         {
-            append_error(&mut failure, &mut secondary, Err(*error));
+            append_error(&mut failure, &mut secondary, Err(error.clone()));
         }
         for descriptor in retained {
             append_error(&mut failure, &mut secondary, close_owner(descriptor));
         }
         let state = match state {
             Ok(state) if failure.is_none() => Ok(state),
-            _ => Err(failure.unwrap()),
+            _ => Err(failure.clone().unwrap()),
         };
         let state = match state {
             Ok(state) => match socket.close() {
@@ -693,7 +701,11 @@ impl Container {
                 Err(error) => Err(error),
             },
             Err(error) => {
-                append_error(&mut failure, &mut secondary, socket.send_failure(error));
+                append_error(
+                    &mut failure,
+                    &mut secondary,
+                    socket.send_failure(error.clone()),
+                );
                 // No worker exists on this refusal path. The parent retains
                 // the real wait and any received directory even if this
                 // final endpoint close itself refuses.
@@ -883,9 +895,11 @@ impl ResourceSocket {
         let mut frame = [0u8; STARTUP_FRAME_SIZE];
         frame[..4].copy_from_slice(b"RVS1");
         frame[4] = STARTUP_FAILURE;
-        frame[6] =
+        let encoded =
             bincode::serde::encode_into_slice(error, &mut frame[8..], bincode::config::legacy())
-                .map_err(|_| StartupError::Protocol)? as u8;
+                .map_err(|_| StartupError::Protocol)?;
+        let encoded = u16::try_from(encoded).map_err(|_| StartupError::Protocol)?;
+        frame[6..8].copy_from_slice(&encoded.to_le_bytes());
         self.send_frame(&frame, &[])
     }
 
@@ -1081,8 +1095,8 @@ impl ResourceFrame {
         append_error(&mut self.failure, &mut self.secondary_errors, Err(error));
     }
     fn validate(&self, expected: Option<u8>) -> Result<(), StartupError> {
-        if let Some(error) = self.failure {
-            return Err(error);
+        if let Some(error) = &self.failure {
+            return Err(error.clone());
         }
         if self.size == 0 && self.eof && self.descriptors.is_empty() {
             return if expected.is_none() {
@@ -1091,11 +1105,14 @@ impl ResourceFrame {
                 Err(StartupError::PeerClosed)
             };
         }
-        if self.size != STARTUP_FRAME_SIZE || &self.bytes[..4] != b"RVS1" || self.bytes[7] != 0 {
+        if self.size != STARTUP_FRAME_SIZE
+            || &self.bytes[..4] != b"RVS1"
+            || (self.bytes[4] != STARTUP_FAILURE && self.bytes[7] != 0)
+        {
             return Err(StartupError::Protocol);
         }
         if self.bytes[4] == STARTUP_FAILURE && self.descriptors.is_empty() {
-            let size = self.bytes[6] as usize;
+            let size = u16::from_le_bytes([self.bytes[6], self.bytes[7]]) as usize;
             if self.bytes[5] != 0
                 || size == 0
                 || size > STARTUP_FRAME_SIZE - 8

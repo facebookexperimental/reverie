@@ -1165,7 +1165,7 @@ where
                 IntegrityFault::OwnedChild,
                 format!("startup after clone: {cause:?}"),
             );
-            owner.child = Some(Child::Pending(run));
+            owner.child = Some(Child::Pending(*run));
         }
     }
     owner

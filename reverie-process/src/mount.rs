@@ -17,10 +17,13 @@ use std::mem::MaybeUninit;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
+use std::sync::Arc;
 
 pub use nix::mount::MsFlags as MountFlags;
 use syscalls::Errno;
 
+use super::error::Error;
+use super::error::MountFailure;
 use super::fd::Fd;
 use super::fd::FileType;
 use super::fd::create_dir_all;
@@ -61,6 +64,9 @@ pub struct Mount {
     /// Recording one bool costs nothing after fork and turns a panic into the
     /// `Errno` the caller already handles.
     unrepresentable: bool,
+    /// The failure name for this mount, built by the builder in the
+    /// parent so the post-clone setup path only clones the `Arc`.
+    failure_name: Option<Arc<MountFailure>>,
 }
 
 /// Represents a bind mount. Can be converted into a [`Mount`].
@@ -114,7 +120,24 @@ impl Mount {
             allow_readonly_fallback: false,
             optional: false,
             pinned_source: None,
+            failure_name: None,
         }
+        .refreshed_failure_name()
+    }
+
+    /// Rebuilds the pre-clone failure name from the current target
+    /// and fstype. Allocation happens here, in builder (parent)
+    /// context, never on the post-clone setup path.
+    pub(crate) fn prepare_failure_name(&mut self) {
+        self.failure_name = Some(Arc::new(MountFailure::new(
+            self.target.as_bytes(),
+            self.fstype.as_ref().map(|fstype| fstype.as_bytes()),
+        )));
+    }
+
+    fn refreshed_failure_name(mut self) -> Self {
+        self.prepare_failure_name();
+        self
     }
 
     /// Creates a bind mount. This effectively creates hardlink of a directory,
@@ -244,7 +267,7 @@ impl Mount {
         let (t, ok) = checked_cstring(target);
         self.target = t;
         self.unrepresentable |= !ok;
-        self
+        self.refreshed_failure_name()
     }
 
     /// Returns the mount point target path.
@@ -369,7 +392,7 @@ impl Mount {
         let (v, ok) = checked_cstring(fstype);
         self.fstype = Some(v);
         self.unrepresentable |= !ok;
-        self
+        self.refreshed_failure_name()
     }
 
     /// Sets any additional data required by the mount.
@@ -627,7 +650,26 @@ impl Mount {
         Ok(())
     }
 
-    pub(super) fn mount(&mut self) -> Result<(), Errno> {
+    /// Performs the mount, naming this mount's target and fstype in
+    /// any failure. This is the one place mount errors get their
+    /// name, so every container-setup mount refusal carries it.
+    pub(super) fn mount(&mut self) -> Result<(), Error> {
+        self.mount_impl().map_err(|errno| match &self.failure_name {
+            // The normal path: the builder built the name before the
+            // clone, so reporting it here only clones the `Arc`.
+            Some(name) => Error::mount_named(errno, Arc::clone(name)),
+            // Direct callers that never went through a builder refresh
+            // still get a named error; this branch may allocate, which
+            // is why the container builder prepares every name it takes.
+            None => Error::mount(
+                errno,
+                self.target.as_bytes(),
+                self.fstype.as_ref().map(|fstype| fstype.as_bytes()),
+            ),
+        })
+    }
+
+    fn mount_impl(&mut self) -> Result<(), Errno> {
         // ⚠️ REFUSE, DO NOT PANIC. A path/fstype/data string that is not a valid
         // C string was recorded at build time (see `unrepresentable`). This is
         // the first point that can report it, and it is a plain flag test
@@ -824,7 +866,9 @@ impl From<Bind> for Mount {
             // target is never a valid bind mount, so it carries the refusal
             // forward rather than attempting mount(2) with "".
             unrepresentable: src_empty || tgt_empty,
+            failure_name: None,
         }
+        .refreshed_failure_name()
     }
 }
 
@@ -1048,8 +1092,23 @@ mod tests {
                 .readonly_proc_fallback(Errno::EPERM),
             None
         );
+        // Sysfs gets no host-conditional fallback: the container's
+        // fresh sysfs is requested read-only on every host instead.
+        assert_eq!(
+            Mount::sysfs("/sys")
+                .allow_readonly_fallback()
+                .readonly_proc_fallback(Errno::EPERM),
+            None
+        );
         assert_eq!(
             Mount::tmpfs("/tmp")
+                .allow_readonly_fallback()
+                .readonly_proc_fallback(Errno::EPERM),
+            None
+        );
+        assert_eq!(
+            Mount::new("/x")
+                .fstype("procx")
                 .allow_readonly_fallback()
                 .readonly_proc_fallback(Errno::EPERM),
             None
@@ -1058,38 +1117,40 @@ mod tests {
 
     #[test]
     fn proc_mount_readonly_fallback_excludes_other_mount_operations() {
-        let mount = Mount::proc().allow_readonly_fallback();
         let ordinary_flags = MountFlags::MS_NOSUID | MountFlags::MS_NODEV | MountFlags::MS_NOEXEC;
-        assert_eq!(
-            mount
-                .clone()
-                .flags(ordinary_flags)
-                .readonly_proc_fallback(Errno::EPERM),
-            Some(ordinary_flags | MountFlags::MS_RDONLY)
-        );
-        for flags in [
-            MountFlags::MS_REMOUNT,
-            MountFlags::MS_BIND,
-            MountFlags::MS_MOVE,
-            MountFlags::MS_SHARED,
-            MountFlags::MS_PRIVATE,
-            MountFlags::MS_SLAVE,
-            MountFlags::MS_UNBINDABLE,
-            MountFlags::MS_REMOUNT | MountFlags::MS_BIND,
-            MountFlags::MS_BIND | MountFlags::MS_REC,
-            MountFlags::MS_SHARED | MountFlags::MS_REC,
-            MountFlags::MS_PRIVATE | MountFlags::MS_REC,
-            MountFlags::MS_SLAVE | MountFlags::MS_REC,
-            MountFlags::MS_UNBINDABLE | MountFlags::MS_REC,
-        ] {
+        for mount in [Mount::proc().allow_readonly_fallback()] {
             assert_eq!(
                 mount
                     .clone()
-                    .flags(flags)
+                    .flags(ordinary_flags)
                     .readonly_proc_fallback(Errno::EPERM),
-                None,
-                "must not retry a non-creation mount operation: {flags:?}"
+                Some(ordinary_flags | MountFlags::MS_RDONLY),
+                "{mount:?}"
             );
+            for flags in [
+                MountFlags::MS_REMOUNT,
+                MountFlags::MS_BIND,
+                MountFlags::MS_MOVE,
+                MountFlags::MS_SHARED,
+                MountFlags::MS_PRIVATE,
+                MountFlags::MS_SLAVE,
+                MountFlags::MS_UNBINDABLE,
+                MountFlags::MS_REMOUNT | MountFlags::MS_BIND,
+                MountFlags::MS_BIND | MountFlags::MS_REC,
+                MountFlags::MS_SHARED | MountFlags::MS_REC,
+                MountFlags::MS_PRIVATE | MountFlags::MS_REC,
+                MountFlags::MS_SLAVE | MountFlags::MS_REC,
+                MountFlags::MS_UNBINDABLE | MountFlags::MS_REC,
+            ] {
+                assert_eq!(
+                    mount
+                        .clone()
+                        .flags(flags)
+                        .readonly_proc_fallback(Errno::EPERM),
+                    None,
+                    "must not retry a non-creation mount operation: {mount:?} {flags:?}"
+                );
+            }
         }
     }
 
@@ -1208,7 +1269,7 @@ mod unrepresentable_paths_are_refused_not_panics {
     fn a_target_with_an_interior_nul_refuses_instead_of_panicking() {
         let bad = OsStr::from_bytes(b"/test/work\0dir");
         let mut m = Mount::new(bad);
-        assert_eq!(m.mount(), Err(Errno::EINVAL));
+        assert_eq!(m.mount().map_err(|error| error.errno()), Err(Errno::EINVAL));
     }
 
     #[test]
@@ -1220,7 +1281,7 @@ mod unrepresentable_paths_are_refused_not_panics {
             Mount::new("/test").data(bad),
         ] {
             let mut m = m;
-            assert_eq!(m.mount(), Err(Errno::EINVAL));
+            assert_eq!(m.mount().map_err(|error| error.errno()), Err(Errno::EINVAL));
         }
     }
 
@@ -1231,7 +1292,7 @@ mod unrepresentable_paths_are_refused_not_panics {
     #[test]
     fn a_representable_path_is_not_refused_by_this_check() {
         let mut m = Mount::new("/test/workdir").fstype("tmpfs");
-        let got = m.mount();
+        let got = m.mount().map_err(|error| error.errno());
         assert_ne!(
             got,
             Err(Errno::EINVAL),
@@ -1244,6 +1305,6 @@ mod unrepresentable_paths_are_refused_not_panics {
     fn a_bind_from_a_str_with_an_interior_nul_refuses() {
         let b = Bind::from("/test/a\0b");
         let mut m: Mount = b.into();
-        assert_eq!(m.mount(), Err(Errno::EINVAL));
+        assert_eq!(m.mount().map_err(|error| error.errno()), Err(Errno::EINVAL));
     }
 }
