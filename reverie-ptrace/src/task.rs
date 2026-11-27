@@ -546,18 +546,19 @@ fn is_group_stop(task: &Stopped, sig: impl Into<AnySignal>) -> Result<bool, Trac
 
 /// `is_group_stop` at a stop where main makes no `PTRACE_GETSIGINFO`:
 /// `false`, without the request, when the tracer thread may be under a
-/// seccomp filter (`thread_may_be_seccomp_filtered`), which can refuse it or
+/// seccomp filter (`tracer_filtered`), which can refuse it or
 /// kill the tracer at it. The stop is then taken for a signal-delivery stop,
 /// as main takes it.
 fn is_group_stop_unless_filtered(
     task: &Stopped,
     sig: impl Into<AnySignal>,
+    tracer_filtered: impl FnOnce() -> bool,
 ) -> Result<bool, TraceError> {
     let sig = sig.into();
     if !matches!(
         sig.as_nix(),
         Some(Signal::SIGSTOP | Signal::SIGTSTP | Signal::SIGTTIN | Signal::SIGTTOU)
-    ) || thread_may_be_seccomp_filtered()
+    ) || tracer_filtered()
     {
         return Ok(false);
     }
@@ -746,12 +747,13 @@ trait HeldSignalReads {
     fn pending(&mut self) -> Option<u64>;
 }
 
-/// [`HeldSignalReads`] of a stopped guest thread.
-struct StoppedHeldReads<'a>(&'a Stopped);
+/// [`HeldSignalReads`] of a stopped guest thread, on its traced task (for
+/// the tracer thread's filter state, read only when asked).
+struct StoppedHeldReads<'a, L: Tool>(&'a Stopped, &'a TracedTask<L>);
 
-impl HeldSignalReads for StoppedHeldReads<'_> {
+impl<L: Tool + 'static> HeldSignalReads for StoppedHeldReads<'_, L> {
     fn tracer_filtered(&mut self) -> bool {
-        thread_may_be_seccomp_filtered()
+        self.1.thread_may_be_seccomp_filtered()
     }
     fn blocked(&mut self) -> Option<u64> {
         blocked_signal_mask(self.0.pid()).ok()
@@ -944,13 +946,13 @@ struct TakenSignal {
 impl TakenSignal {
     /// Reads the record of `signal` at its signal-delivery stop, `None` if
     /// the stop's siginfo cannot be read, or if the tracer thread may be
-    /// under a seccomp filter (`thread_may_be_seccomp_filtered`). Main makes
+    /// under a seccomp filter (`tracer_filtered`). Main makes
     /// no `PTRACE_GETSIGINFO` at these stops, and a filter can refuse it or
     /// kill the tracer at it. Without the record, the signal is resumed as
     /// main resumes it, and nothing is restored or counted for it
     /// (`resume_with_signal`).
-    fn at_stop(task: &Stopped, signal: AnySignal) -> Option<Self> {
-        if thread_may_be_seccomp_filtered() {
+    fn at_stop(task: &Stopped, signal: AnySignal, tracer_filtered: bool) -> Option<Self> {
+        if tracer_filtered {
             return None;
         }
         let bytes = task.getsiginfo_bytes().ok()?;
@@ -2358,25 +2360,63 @@ fn pending_signal_mask(tid: Pid) -> Result<u64, TraceError> {
 }
 
 /// Whether a seccomp filter may restrict the calling thread's syscalls, or
-/// its mode cannot be read (procfs `Seccomp` of `/proc/thread-self`, read
-/// afresh at each call). Called on the tracer thread, which makes every
-/// ptrace request, at the point that decides on a request or step main does
-/// not make. Filters are never removed, so mode 0 there means no filter can
-/// refuse it. A thread gets one only by installing it or by another thread
-/// synchronizing its own (`SECCOMP_FILTER_FLAG_TSYNC`).
+/// its mode cannot be read, from one status read (`read`, procfs `Seccomp`
+/// of `/proc/thread-self` in production) and the per-task cache `cached`
+/// (the OS thread a successful read was made on, and whether it was
+/// unfiltered). Called only through `TracedTask::thread_may_be_seccomp_filtered`
+/// on the tracer thread, which makes every ptrace request, at the points
+/// that decide on a request or step main does not make.
+///
+/// A filtered answer is always cached: filters are never removed, so mode
+/// 0 there means no filter can refuse a request, and a filtered thread
+/// stays filtered. An unfiltered answer is cached only under the
+/// serialized-execution contract (`contract`, from
+/// `Tool::enforces_serialized_execution`), whose terms promise that no
+/// filter is installed on the tracer's own threads once the trace has
+/// started; a thread gets one only by installing it or by another thread
+/// synchronizing its own (`SECCOMP_FILTER_FLAG_TSYNC`), so without that
+/// declaration every call reads afresh and a late filter is seen. The
+/// cache lives on the traced task, so a new trace (and a nested tracer in
+/// a forked guest, whose tasks are new) reads again, and no caller runs in
+/// a forked child: the child-side setup between a fork (or vfork) and exec
+/// (the tracee initialization, any caller `pre_exec` callbacks, and the
+/// forked guest's setup, which installs the guest's filter) has no traced
+/// task and never consults this state.
 ///
 /// Where the status cannot be read, for example with no descriptor left to
-/// open (EMFILE), the thread is taken as filtered, and the decision goes as
-/// on main: no syscall can ask the mode safely, as a filter can kill the
-/// tracer at it or answer it falsely (`prctl(PR_GET_SECCOMP)`), and a
-/// descriptor held open for the purpose changes the descriptors guests get.
-/// On an unfiltered thread this gives up 831's corrections there, a
-/// disclosed gap (https://github.com/rrnewton/reverie/issues/845,
+/// open (EMFILE), the thread is taken as filtered and nothing is cached, so
+/// the next call reads again; the decision goes as on main: no syscall can
+/// ask the mode safely, as a filter can kill the tracer at it or answer it
+/// falsely (`prctl(PR_GET_SECCOMP)`), and a descriptor held open for the
+/// purpose changes the descriptors guests get. On an unfiltered thread this
+/// gives up 831's corrections there, a disclosed gap
+/// (https://github.com/rrnewton/reverie/issues/845,
 /// https://github.com/rrnewton/reverie/issues/912).
-fn thread_may_be_seccomp_filtered() -> bool {
-    read_status("/proc/thread-self/status")
-        .ok()
-        .is_none_or(|status| !status_unfiltered(&status))
+fn seccomp_filtered_with(
+    contract: bool,
+    cached: &StdMutex<Option<(std::thread::ThreadId, bool)>>,
+    read: impl FnOnce() -> std::io::Result<String>,
+) -> bool {
+    let thread = std::thread::current().id();
+    {
+        let slot = cached.lock().unwrap();
+        if let Some((read_on, unfiltered)) = *slot
+            && read_on == thread
+            && (contract || !unfiltered)
+        {
+            return !unfiltered;
+        }
+    }
+    match read() {
+        Ok(status) => {
+            let unfiltered = status_unfiltered(&status);
+            if contract || !unfiltered {
+                *cached.lock().unwrap() = Some((thread, unfiltered));
+            }
+            !unfiltered
+        }
+        Err(_) => true,
+    }
 }
 
 /// Whether a procfs status reports seccomp mode 0.
@@ -2469,11 +2509,11 @@ fn is_private_step_trap(task: &Stopped, after_syscall: u64) -> Result<bool, Trac
 /// a trap, and are taken for one.
 ///
 /// Answered no without a read where the tracer thread may be under a seccomp
-/// filter (`thread_may_be_seccomp_filtered`): such a filter may refuse
+/// filter (`tracer_filtered`): such a filter may refuse
 /// `PTRACE_GETSIGINFO` or kill the tracer at it, so the trap is taken as on
 /// main, which reads no siginfo there.
-fn is_sent_sigtrap(task: &Stopped) -> Result<bool, TraceError> {
-    if thread_may_be_seccomp_filtered() {
+fn is_sent_sigtrap(task: &Stopped, tracer_filtered: bool) -> Result<bool, TraceError> {
+    if tracer_filtered {
         return Ok(false);
     }
     let info = task.getsiginfo()?;
@@ -4592,6 +4632,14 @@ struct GlobalState<G: GlobalTool> {
     /// same rule (`seccomp_filter`).
     reports_sigreturns: bool,
 
+    /// Whether the Tool declares the serialized-execution contract
+    /// (`Tool::enforces_serialized_execution`), whose terms include that no
+    /// seccomp filter is installed on the tracer's own threads once the
+    /// trace has started. Only under that declaration may an unfiltered
+    /// tracer-thread answer be cached (`TracedTask::thread_may_be_seccomp_filtered`);
+    /// a filtered answer may always be cached, as filters are never removed.
+    enforces_serialized_execution: bool,
+
     /// Whether Reverie keeps the guest's SIGTRAP action and mask across its
     /// own single-steps (`sigtrap_state`): only for a Tool that enforces a
     /// serialized-execution contract (`Tool::enforces_serialized_execution`),
@@ -5055,6 +5103,7 @@ impl<G: GlobalTool> Clone for GlobalState<G> {
             gs_ref: self.gs_ref.clone(),
             subscriptions: self.subscriptions.clone(),
             reports_sigreturns: self.reports_sigreturns,
+            enforces_serialized_execution: self.enforces_serialized_execution,
             keeps_sigtrap_state: self.keeps_sigtrap_state,
             caches_sigtrap_disposition: self.caches_sigtrap_disposition,
             sees_every_sighand_clone: self.sees_every_sighand_clone,
@@ -5277,7 +5326,10 @@ pub struct TracedTask<L: Tool> {
     stale_private_step_trap: bool,
     /// Whether the OS thread named here, the one that made this traced
     /// thread's ptrace requests when it was read, had no seccomp filter
-    /// (`keeps_sigtrap_state`). Set only from a successful read.
+    /// (`thread_may_be_seccomp_filtered`, shared with
+    /// `keeps_sigtrap_state`). Set only from a successful read: always for
+    /// a filtered answer, and for an unfiltered one only under the
+    /// serialized-execution contract.
     tracer_unfiltered: StdMutex<Option<(std::thread::ThreadId, bool)>>,
     /// The mask and procfs state `read_sigtrap_before_injection` read for
     /// the injection about to be stepped, for that step's shield to reuse:
@@ -5646,7 +5698,8 @@ impl<L: Tool> TracedTask<L> {
         let gdb_traces_signal_state = gdbserver.is_some() && cfg!(target_arch = "x86_64");
         let reports_sigreturns =
             cfg!(target_arch = "x86_64") && (L::observes_sigreturns(&cfg) || gdbserver.is_some());
-        let keeps_sigtrap_state = L::enforces_serialized_execution(&cfg);
+        let enforces_serialized_execution = L::enforces_serialized_execution(&cfg);
+        let keeps_sigtrap_state = enforces_serialized_execution;
         let caches_sigtrap_disposition = gdb_traces_signal_state
             || options
                 .events
@@ -5680,6 +5733,7 @@ impl<L: Tool> TracedTask<L> {
             cfg,
             subscriptions: Arc::new(options.events.clone()),
             reports_sigreturns,
+            enforces_serialized_execution,
             keeps_sigtrap_state,
             caches_sigtrap_disposition,
             sees_every_sighand_clone,
@@ -8778,7 +8832,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             && at_delivery_stop
             && let (Some(sig), Some(taken)) = (resume.signal, taken)
             && sig == taken.signal
-            && !thread_may_be_seccomp_filtered()
+            && !self.thread_may_be_seccomp_filtered()
         {
             resume.replacement = Some((sig, taken.bytes));
         }
@@ -8815,7 +8869,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             },
         };
         if let Some((reason, restore_count)) =
-            held_signal_unreported(&facts, &mut StoppedHeldReads(task))
+            held_signal_unreported(&facts, &mut StoppedHeldReads(task, &*self))
         {
             return self
                 .pass_held_signal_unreported_unless_filtered(signal, record, restore_count, reason)
@@ -8949,7 +9003,8 @@ impl<L: Tool + 'static> TracedTask<L> {
     ) -> Option<AnySignal> {
         let sig = sig.into();
         let counted = self.take_reported_requeue(sig);
-        let info = TakenSignal::at_stop(task, sig).map(|taken| taken.bytes);
+        let info = TakenSignal::at_stop(task, sig, self.thread_may_be_seccomp_filtered())
+            .map(|taken| taken.bytes);
         if !self.keeps_unreported_signal(sig, info, reason).await {
             return None;
         }
@@ -9325,7 +9380,8 @@ impl<L: Tool + 'static> TracedTask<L> {
             stats.record_signal_stop(&task, sig);
         }
         tracing::debug!("[{}] handle_signal: received signal {}", task.pid(), sig);
-        let group_stop = sig != Signal::SIGSTOP && is_group_stop_unless_filtered(&task, sig)?;
+        let group_stop = sig != Signal::SIGSTOP
+            && is_group_stop_unless_filtered(&task, sig, || self.thread_may_be_seccomp_filtered())?;
         if group_stop && !report_group_stop {
             // A group stop follows a stop signal's delivery, which reported
             // it to the Tool on the thread that took it, unless that thread
@@ -9404,7 +9460,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         match result {
             HandleSignalResult::SignalSuppressed(wait) => Ok(wait),
             HandleSignalResult::SignalToDeliver(task, sig) => {
-                let taken = TakenSignal::at_stop(&task, sig);
+                let taken = TakenSignal::at_stop(&task, sig, self.thread_may_be_seccomp_filtered());
                 let verdict = self
                     .report_signal(sig, false, taken.map(|taken| taken.bytes))
                     .await?;
@@ -13061,7 +13117,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             ) => code,
             _ => return Ok(task),
         };
-        if thread_may_be_seccomp_filtered() {
+        if self.thread_may_be_seccomp_filtered() {
             return self
                 .unresolved_restart(
                     task,
@@ -13719,7 +13775,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         if child_context.is_none()
             && swaps_signal_mask(nr)
             && may_name_temporary_signal_mask(nr, &args)
-            && !thread_may_be_seccomp_filtered()
+            && !self.thread_may_be_seccomp_filtered()
             && let Some(temporary) = temporary_signal_mask_prepared(&task, nr, &args, input)
         {
             temporary_shield = temporary & !NEVER_SHIELDED;
@@ -13816,8 +13872,8 @@ impl<L: Tool + 'static> TracedTask<L> {
         // read there, so a sent SIGTRAP is lost there, as on main.
         while child_context.is_none()
             && is_sigtrap_before_private_syscall(&wait)?
-            && !thread_may_be_seccomp_filtered()
-            && !matches!(&wait, Wait::Stopped(stopped, _) if is_sent_sigtrap(stopped)?)
+            && !self.thread_may_be_seccomp_filtered()
+            && !matches!(&wait, Wait::Stopped(stopped, _) if is_sent_sigtrap(stopped, self.thread_may_be_seccomp_filtered())?)
         {
             let Wait::Stopped(stopped, _) = wait else {
                 unreachable!("a SIGTRAP stop");
@@ -14074,7 +14130,9 @@ impl<L: Tool + 'static> TracedTask<L> {
         // filter may refuse (`thread_may_be_seccomp_filtered`); under one the
         // call is stepped as on main.
         #[cfg(target_arch = "aarch64")]
-        let mut running = if aarch64_step_reads_exit_stop(nr) && !thread_may_be_seccomp_filtered() {
+        let mut running = if aarch64_step_reads_exit_stop(nr)
+            && !self.thread_may_be_seccomp_filtered()
+        {
             match self.aarch64_run_to_exit_stop(task, nr, input).await? {
                 Ok(exit_stop) => match self.aarch64_queue_step_trap(exit_stop)? {
                     Ok(exit_stop) => {
@@ -16046,38 +16104,29 @@ impl<L: Tool + 'static> TracedTask<L> {
         Ok(task)
     }
 
+    /// Whether a seccomp filter may restrict this tracer thread, or its
+    /// mode cannot be read (`seccomp_filtered_with`): cached per traced
+    /// thread and OS thread in `tracer_unfiltered`, under the
+    /// serialized-execution contract for an unfiltered answer and always
+    /// for a filtered one, and read afresh otherwise. Each read is a procfs
+    /// read, a syscall the Tool emulates made five of them, and a guest
+    /// making 160,000 such syscalls ran 2.2 times as long when every
+    /// decision read afresh.
+    fn thread_may_be_seccomp_filtered(&self) -> bool {
+        seccomp_filtered_with(
+            self.global_state.enforces_serialized_execution,
+            &self.tracer_unfiltered,
+            || read_status("/proc/thread-self/status"),
+        )
+    }
+
     /// Whether Reverie keeps the guest's SIGTRAP state across its own steps:
     /// the Tool enforces serialized execution (`GlobalState::keeps_sigtrap_state`)
     /// and the tracer thread has no seccomp filter, which may refuse the
-    /// requests main does not make (`thread_may_be_seccomp_filtered`). The
-    /// filter state is read once per traced thread and OS thread
-    /// (`tracer_unfiltered`), not at each decision: each read is a procfs
-    /// read, a syscall the Tool emulates made five of them, and a guest making
-    /// 160,000 such syscalls ran 2.2 times as long. A filter is never removed,
-    /// so a filtered answer stays right; an unfiltered one rests on the
-    /// contract's promise that the tracer installs no filter on its own
-    /// threads once the trace has started (`Tool::enforces_serialized_execution`).
+    /// requests main does not make (`thread_may_be_seccomp_filtered`, whose
+    /// per-task cache this shares).
     fn keeps_sigtrap_state(&self) -> bool {
-        if !self.global_state.keeps_sigtrap_state {
-            return false;
-        }
-        let thread = std::thread::current().id();
-        let mut cached = self.tracer_unfiltered.lock().unwrap();
-        if let Some((read_on, unfiltered)) = *cached
-            && read_on == thread
-        {
-            return unfiltered;
-        }
-        // An unreadable status counts as filtered, as before, and is read
-        // again at the next decision.
-        match read_status("/proc/thread-self/status") {
-            Ok(status) => {
-                let unfiltered = status_unfiltered(&status);
-                *cached = Some((thread, unfiltered));
-                unfiltered
-            }
-            Err(_) => false,
-        }
+        self.global_state.keeps_sigtrap_state && !self.thread_may_be_seccomp_filtered()
     }
 
     /// Waits for the session's SIGTRAP repair lock (`sigtrap_scratch_lock`).
@@ -17967,7 +18016,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                 Wait::Stopped(stopped, Event::Signal(Signal::SIGTRAP))
                     if plain_injection
                         && before_instruction(&stopped)?
-                        && !thread_may_be_seccomp_filtered() =>
+                        && !self.thread_may_be_seccomp_filtered() =>
                 {
                     tracing::debug!(
                         "[scheduler/tool] (pid = {}) discarding a SIGTRAP that stopped injected {} before it ran",
@@ -18117,7 +18166,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         // or trap the tracer at those requests, where the procfs
         // check this replaced only failed to open. Refuse before
         // any ptrace query, as the no-query decisions elsewhere do.
-        if thread_may_be_seccomp_filtered() {
+        if self.thread_may_be_seccomp_filtered() {
             return Ok(false);
         }
         // A signal already deliverable (held by the tracer, or queued
@@ -18312,7 +18361,9 @@ impl<L: Tool + 'static> TracedTask<L> {
             self.latest_injection_stop = Some(match event {
                 event
                     if let Some(sig) = event.signal()
-                        && !is_group_stop_unless_filtered(stopped, sig)? =>
+                        && !is_group_stop_unless_filtered(stopped, sig, || {
+                            self.thread_may_be_seccomp_filtered()
+                        })? =>
                 {
                     Some(sig)
                 }
@@ -18337,7 +18388,8 @@ impl<L: Tool + 'static> TracedTask<L> {
             );
         }
         self.pending_signal = Some(sig);
-        self.pending_signal_taken = TakenSignal::at_stop(stopped, sig);
+        self.pending_signal_taken =
+            TakenSignal::at_stop(stopped, sig, self.thread_may_be_seccomp_filtered());
         // A reported, requeued instance of `sig` is in the thread's own queue,
         // which Linux dequeues first, and a standard signal has at most one
         // pending instance there, so this is that instance. Its count goes
@@ -18535,7 +18587,9 @@ impl<L: Tool + 'static> TracedTask<L> {
                     // SIGTRAP is not held: the main loop does not deliver one
                     // (`handle_sigtrap`). One a thread sent is held, and the
                     // held-signal resume (`report_held_signal`) delivers it.
-                    if sig != Signal::SIGTRAP || is_sent_sigtrap(&stopped)? {
+                    if sig != Signal::SIGTRAP
+                        || is_sent_sigtrap(&stopped, self.thread_may_be_seccomp_filtered())?
+                    {
                         self.hold_pending_signal(&stopped, sig);
                     }
                     self.last_injection_ran = false;
@@ -18617,7 +18671,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                         // delivers.
                         *regs.ret_mut() = (-(Errno::ERESTARTSYS.into_raw()) as i64) as u64;
                         self.last_injection_ran = false;
-                        if is_sent_sigtrap(&stopped)? {
+                        if is_sent_sigtrap(&stopped, self.thread_may_be_seccomp_filtered())? {
                             self.hold_pending_signal(&stopped, sig);
                         }
                     }
@@ -18669,7 +18723,8 @@ impl<L: Tool + 'static> TracedTask<L> {
                     self.report_vfork_done_in_place(&wait).await?;
                     let wait = match wait {
                         Wait::Stopped(parent, Event::VforkDone)
-                            if self.in_signal_callback && !thread_may_be_seccomp_filtered() =>
+                            if self.in_signal_callback
+                                && !self.thread_may_be_seccomp_filtered() =>
                         {
                             // The step's trap must not reset a blocked SIGTRAP
                             // (`sigtrap_state`); an ignored one is repaired
@@ -20360,7 +20415,7 @@ impl<L: Tool + 'static> Guest<L> for TracedTask<L> {
         if self.latest_injection_stop == Some(None) {
             return unavailable(Unavailable::NotADeliveryStop);
         }
-        if thread_may_be_seccomp_filtered() {
+        if self.thread_may_be_seccomp_filtered() {
             return unavailable(Unavailable::TracerFiltered);
         }
         if !cfg!(target_arch = "x86_64") {
@@ -20464,7 +20519,7 @@ impl<L: Tool + 'static> Guest<L> for TracedTask<L> {
             self.in_syscall_callback,
             self.injected_syscall_frame.is_some(),
             self.in_signal_callback || self.in_held_signal_callback,
-            thread_may_be_seccomp_filtered(),
+            self.thread_may_be_seccomp_filtered(),
         ) {
             return Err(reverie::MaskChangeRefused::Unsupported);
         }
@@ -21394,6 +21449,104 @@ mod tests {
         assert!(!may_set_blocked_signals(true, true, false, false));
         assert!(!may_set_blocked_signals(true, false, true, false));
         assert!(!may_set_blocked_signals(true, false, false, true));
+    }
+
+    /// The seccomp decision's caching, with planted status reads: under the
+    /// serialized-execution contract an unfiltered answer is read once and
+    /// cached (without the cache the second call reads again and this test
+    /// fails); without the contract a filter installed after an unfiltered
+    /// read is seen by the next call, and the filtered answer is then
+    /// cached, as filters are never removed. A failed read answers filtered
+    /// and is never cached, under either contract. A different cache (a
+    /// new traced task, as a new trace or a nested tracer makes) and a
+    /// different OS thread on the same cache each read again.
+    #[test]
+    fn seccomp_filtered_caches_only_within_its_contract_and_task() {
+        use super::seccomp_filtered_with;
+        const UNFILTERED: &str = "Seccomp:\t0\n";
+        const FILTERED: &str = "Seccomp:\t2\n";
+        type Slot = std::sync::Mutex<Option<(std::thread::ThreadId, bool)>>;
+        fn failed() -> std::io::Result<String> {
+            Err(std::io::Error::from_raw_os_error(libc::EMFILE))
+        }
+
+        // Under the contract: one read, then the cached unfiltered answer,
+        // even though a later read would report a filter. That unseen late
+        // filter is exactly what the declaration promises away.
+        let slot = Slot::new(None);
+        let reads = std::cell::Cell::new(0);
+        let mut answers = [UNFILTERED, FILTERED].into_iter();
+        let mut read = || {
+            reads.set(reads.get() + 1);
+            Ok::<String, std::io::Error>(answers.next().unwrap().to_owned())
+        };
+        assert!(!seccomp_filtered_with(true, &slot, &mut read));
+        assert_eq!(reads.get(), 1);
+        assert!(!seccomp_filtered_with(true, &slot, &mut read));
+        assert_eq!(reads.get(), 1, "contract call must use the cached answer");
+
+        // Without the contract: the late filter is seen, and the filtered
+        // answer is then cached.
+        let slot = Slot::new(None);
+        let reads = std::cell::Cell::new(0);
+        let mut answers = [UNFILTERED, FILTERED, UNFILTERED].into_iter();
+        let mut read = || {
+            reads.set(reads.get() + 1);
+            Ok::<String, std::io::Error>(answers.next().unwrap().to_owned())
+        };
+        assert!(!seccomp_filtered_with(false, &slot, &mut read));
+        assert_eq!(reads.get(), 1);
+        assert!(seccomp_filtered_with(false, &slot, &mut read));
+        assert_eq!(reads.get(), 2, "unfiltered must not be cached off-contract");
+        assert!(seccomp_filtered_with(false, &slot, &mut read));
+        assert_eq!(
+            reads.get(),
+            2,
+            "filtered is cached: filters are never removed"
+        );
+
+        // A failed read answers filtered and caches nothing, under either
+        // contract: the next call reads again.
+        for contract in [true, false] {
+            let slot = Slot::new(None);
+            assert!(seccomp_filtered_with(contract, &slot, failed));
+            let reads = std::cell::Cell::new(0);
+            let read = || {
+                reads.set(reads.get() + 1);
+                Ok::<String, std::io::Error>(UNFILTERED.to_owned())
+            };
+            assert!(!seccomp_filtered_with(contract, &slot, read));
+            assert_eq!(reads.get(), 1, "a failed read must not be cached");
+        }
+
+        // A new cache (a new traced task) and a new OS thread on the same
+        // cache each read again: no answer carries across sessions or
+        // threads.
+        let slot = Slot::new(None);
+        assert!(!seccomp_filtered_with(true, &slot, || Ok(
+            UNFILTERED.to_owned()
+        )));
+        let other_slot = Slot::new(None);
+        assert!(seccomp_filtered_with(true, &other_slot, || {
+            Ok(FILTERED.to_owned())
+        }));
+        std::thread::scope(|scope| {
+            let on_other =
+                scope.spawn(|| seccomp_filtered_with(true, &slot, || Ok(FILTERED.to_owned())));
+            assert!(on_other.join().expect("seccomp cache other thread"));
+        });
+        // The single entry now names the other OS thread, so this thread
+        // reads again (and then caches its own answer again).
+        let reads = std::cell::Cell::new(0);
+        let read = || {
+            reads.set(reads.get() + 1);
+            Ok::<String, std::io::Error>(UNFILTERED.to_owned())
+        };
+        assert!(!seccomp_filtered_with(true, &slot, read));
+        assert_eq!(reads.get(), 1, "another OS thread's entry must not be used");
+        assert!(!seccomp_filtered_with(true, &slot, || {
+            panic!("this thread's cached answer must be used")
+        }));
     }
 
     #[test]
