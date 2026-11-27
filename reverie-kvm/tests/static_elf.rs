@@ -24192,7 +24192,11 @@ fn shared_file_threads_that_exited_stop_counting_in_the_guests_order() {
     // an AMD EPYC 9D85 at load average about 359. Its passes on the EPYC
     // read 10.43-12.30 CPU-s. 1.5 x 15.30 rounds up to 23, and the wall
     // backstop stays 8x: 184.
-    if !leader_self_exec_bounded_capped(TEST, 23, 184) {
+    // Re-based again 2026-11-26, over a pass above that floor: on the
+    // internal CI's Xeon Gold 6450C hosts it passed at 16.38 CPU-s (user
+    // 15.00, sys 1.38), wall 50.0 s. 1.5 x 16.38 rounds up to 25, and the
+    // wall backstop stays 8x: 200.
+    if !leader_self_exec_bounded_capped(TEST, 25, 200) {
         return;
     }
     let directory = TestDirectory::new();
@@ -24757,7 +24761,11 @@ fn a_vfork_child_clears_its_clear_child_tid_word_in_its_parent_like_native() {
     // 9D85 at load average about 359 it passed at 3.82 CPU-s (2.75-2.98
     // otherwise), and 1.5 x 3.82 rounds up to 6. The wall backstop stays
     // 8x: 48.
-    if !leader_self_exec_bounded_capped(TEST, 6, 48) {
+    // Re-based again 2026-11-26, over a pass above that basis: on the
+    // internal CI's Xeon Gold 6450C hosts it passed at 5.78 of its 6 CPU-s
+    // (user 5.03, sys 0.75), wall 11.3 s. 1.5 x 5.78 rounds up to 9, and
+    // the wall backstop stays 8x: 72.
+    if !leader_self_exec_bounded_capped(TEST, 9, 72) {
         return;
     }
     for (ending, expected) in [
