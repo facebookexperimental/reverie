@@ -2419,6 +2419,20 @@ fn seccomp_filtered_with(
     }
 }
 
+/// The tracer thread's own `Seccomp` and `Seccomp_filters` status lines,
+/// for test diagnostics that name which branch answered.
+#[cfg(test)]
+pub(crate) fn tracer_status_fields() -> String {
+    match read_status("/proc/thread-self/status") {
+        Ok(status) => status
+            .lines()
+            .filter(|line| line.starts_with("Seccomp"))
+            .collect::<Vec<_>>()
+            .join(";"),
+        Err(error) => format!("status unreadable: {error}"),
+    }
+}
+
 /// Whether a procfs status reports seccomp mode 0.
 fn status_unfiltered(status: &str) -> bool {
     status

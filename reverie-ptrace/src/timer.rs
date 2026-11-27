@@ -5525,6 +5525,7 @@ mod tests {
     use super::runs_in_place;
     #[cfg(target_arch = "x86_64")]
     use super::uncounted_step_may_miscount;
+    use crate::regs::RegAccess;
 
     /// A load-exclusive unit whose two ends differ in count, as
     /// [`crate::branch_step::exclusive_sequence`] decodes a compare-and-swap:
@@ -5902,6 +5903,19 @@ mod tests {
         };
         assert_eq!(site, "precise timer");
         let info = stopped.getsiginfo().expect("read the siginfo");
+        if info.si_signo != signal {
+            // On failure name the signal's source as well as its number, and
+            // the stopping PC for the fault signals these tests queue
+            // The assertion below is unchanged.
+            let pc = stopped
+                .getregs()
+                .map(|regs| format!(" pc={:#x}", regs.ip()))
+                .unwrap_or_default();
+            eprintln!(
+                "ended_at_the_guests_sigtrap: stop signo={} si_code={} expected={}{}",
+                info.si_signo, info.si_code, signal, pc
+            );
+        }
         assert_eq!(info.si_signo, signal, "the stop the sequence ended at");
         if signal == libc::SIGTRAP {
             assert_eq!(info.si_code, libc::TRAP_TRACE);

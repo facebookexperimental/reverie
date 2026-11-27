@@ -7049,6 +7049,22 @@ async fn seccomp_bypassing_probe_numbers_run_natively() {
         let enosys = format!("probe nr={nr} ret=-38");
         if ptrace.report.lines().any(|line| line == enosys) {
             eprintln!("{mode}: this kernel lacks syscall {nr}");
+        } else if !ptrace
+            .report
+            .lines()
+            .any(|line| line.starts_with(probe_line))
+        {
+            // On failure name which branch answered and the tracer's state,
+            // so a stale cached seccomp answer names itself.
+            let probe_ret = ptrace
+                .report
+                .lines()
+                .find_map(|line| line.strip_prefix(&format!("probe nr={nr} ret=")));
+            let tracer_state = crate::task::tracer_status_fields();
+            eprintln!(
+                "{mode}: probe branch diagnostic: probe_ret={probe_ret:?} tracer={tracer_state}"
+            );
+            assert_report_has(&ptrace, &[probe_line]);
         } else {
             assert_report_has(&ptrace, &[probe_line]);
         }
