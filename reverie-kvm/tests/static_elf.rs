@@ -2674,6 +2674,215 @@ fn bounded_children_keep_their_written_caps_unless_every_check_runs() {
     assert_eq!(bound_factor(), expected);
 }
 
+/// The user and system CPU seconds a bounded child used, with every
+/// descendant it waited for (wait4's rusage).
+struct ChildCpu {
+    user: f64,
+    system: f64,
+}
+
+/// [`std::process::Command::output`], with the child's CPU: the child is
+/// reaped by wait4 so its rusage is read for exactly this child, which a
+/// RUSAGE_CHILDREN difference cannot do while other tests run children.
+/// The caller sets the stdio, as `output` would by default (stdin null,
+/// stdout and stderr piped) unless configured; a stream that is not a pipe
+/// reads as empty, as `output` reports it.
+fn output_with_cpu(command: &mut std::process::Command) -> (std::process::Output, ChildCpu) {
+    use std::io::Read;
+    use std::os::unix::process::ExitStatusExt;
+    #[expect(
+        clippy::zombie_processes,
+        reason = "the wait4 loop below reaps the child, which alone returns its rusage, and \
+                  ReapGuard kills and reaps it on any path that leaves before that loop does"
+    )]
+    let mut child = command.spawn().unwrap();
+    // Infallible, so nothing can panic between spawn and the guard: a Linux
+    // pid is at most pid_max (2^22), well inside pid_t.
+    let pid = child.id() as libc::pid_t;
+    let mut guard = ReapGuard { pid, reaped: false };
+    drop(child.stdin.take());
+    let child_stderr = child.stderr.take();
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut stream) = child_stderr {
+            stream.read_to_end(&mut bytes).unwrap();
+        }
+        bytes
+    });
+    let mut stdout = Vec::new();
+    if let Some(mut stream) = child.stdout.take() {
+        stream.read_to_end(&mut stdout).unwrap();
+    }
+    let stderr = stderr_reader.join().unwrap();
+    let mut status: libc::c_int = 0;
+    // SAFETY: an all-zero rusage is a valid value of the plain C struct.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    loop {
+        // SAFETY: waits for this function's own child, which nothing else
+        // reaps; status and usage are valid for writes.
+        let reaped = unsafe { libc::wait4(pid, &mut status, 0, &mut usage) };
+        if reaped == pid {
+            guard.reaped = true;
+            break;
+        }
+        let error = std::io::Error::last_os_error();
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::Interrupted,
+            "wait4 for the bounded child {pid}: {error}"
+        );
+    }
+    let seconds = |time: libc::timeval| time.tv_sec as f64 + time.tv_usec as f64 / 1e6;
+    (
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(status),
+            stdout,
+            stderr,
+        },
+        ChildCpu {
+            user: seconds(usage.ru_utime),
+            system: seconds(usage.ru_stime),
+        },
+    )
+}
+
+/// Kills and reaps a spawned bounded child unless [`output_with_cpu`]'s
+/// wait4 reaped it, so no path out of that function, an unwind included,
+/// leaves a zombie.
+struct ReapGuard {
+    pid: libc::pid_t,
+    reaped: bool,
+}
+
+impl Drop for ReapGuard {
+    fn drop(&mut self) {
+        if self.reaped {
+            return;
+        }
+        // GNU timeout puts itself in a process group of its own, so the
+        // group kill reaches the case it runs as well; the direct kill
+        // covers a child that has not made its group yet.
+        // SAFETY: signals only this unreaped child (whose pid cannot be
+        // reused before it is reaped) and the group it leads, then reaps it;
+        // status is valid for writes.
+        unsafe {
+            libc::kill(-self.pid, libc::SIGKILL);
+            libc::kill(self.pid, libc::SIGKILL);
+            let mut status: libc::c_int = 0;
+            while libc::waitpid(self.pid, &mut status, 0) == -1
+                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+            {
+            }
+        }
+    }
+}
+
+/// A terminating signal's number and name, or "none".
+fn signal_name(signal: Option<i32>) -> String {
+    let Some(number) = signal else {
+        return "none".to_string();
+    };
+    let name = match number {
+        libc::SIGKILL => "SIGKILL",
+        libc::SIGXCPU => "SIGXCPU",
+        libc::SIGTERM => "SIGTERM",
+        libc::SIGABRT => "SIGABRT",
+        libc::SIGSEGV => "SIGSEGV",
+        libc::SIGBUS => "SIGBUS",
+        libc::SIGILL => "SIGILL",
+        libc::SIGFPE => "SIGFPE",
+        libc::SIGTRAP => "SIGTRAP",
+        libc::SIGSYS => "SIGSYS",
+        libc::SIGPIPE => "SIGPIPE",
+        libc::SIGINT => "SIGINT",
+        libc::SIGHUP => "SIGHUP",
+        libc::SIGUSR1 => "SIGUSR1",
+        libc::SIGUSR2 => "SIGUSR2",
+        libc::SIGQUIT => "SIGQUIT",
+        libc::SIGALRM => "SIGALRM",
+        _ => "another signal",
+    };
+    format!("{number} ({name})")
+}
+
+/// Writes LINE to this process's stderr directly, past libtest's output
+/// capture, so a runner records it for passing cases too. EINTR is retried;
+/// any other failure, or a write that takes nothing, is returned for the
+/// caller to judge.
+fn write_stderr_line(line: &str) -> std::io::Result<()> {
+    let mut rest = line.as_bytes();
+    while !rest.is_empty() {
+        // SAFETY: writes only bytes of LINE to this process's stderr.
+        let written = unsafe { libc::write(libc::STDERR_FILENO, rest.as_ptr().cast(), rest.len()) };
+        if written < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if written == 0 {
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        rest = &rest[written as usize..];
+    }
+    Ok(())
+}
+
+/// This host's CPU model, from /proc/cpuinfo, read once.
+fn host_cpu_model() -> &'static str {
+    static MODEL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    MODEL.get_or_init(|| {
+        std::fs::read_to_string("/proc/cpuinfo")
+            .ok()
+            .and_then(|text| {
+                text.lines()
+                    .find_map(|line| line.strip_prefix("model name"))
+                    .and_then(|rest| rest.split_once(':'))
+                    .map(|(_, model)| model.trim().replace('"', "'"))
+            })
+            .unwrap_or_else(|| "unknown".to_string())
+    })
+}
+
+/// The line every bounded child run reports, pass or fail: the child's exit
+/// or signal, its CPU (with every descendant it waited for) against its cap,
+/// its wall against its wall cap, and the host's CPU model.
+fn bounded_child_line(
+    test: &str,
+    exit: Option<i32>,
+    signal: Option<i32>,
+    cpu: &ChildCpu,
+    cpu_cap: Option<u64>,
+    wall: f64,
+    wall_cap: u64,
+) -> String {
+    format!(
+        "\nREVERIE_BOUNDED_CHILD: {test} exit={} signal={} cpu_s={:.2} (user {:.2}, sys {:.2}) cpu_cap={} wall_s={wall:.1} wall_cap={wall_cap}s host_cpu=\"{}\"\n",
+        exit.map_or("none".to_string(), |code| code.to_string()),
+        signal_name(signal),
+        cpu.user + cpu.system,
+        cpu.user,
+        cpu.system,
+        cpu_cap.map_or("none".to_string(), |cap| format!("{cap}s")),
+        host_cpu_model(),
+    )
+}
+
+/// The cpu_s figure a bounded child's death message reports.
+fn reported_cpu_seconds(message: &str) -> f64 {
+    let after = message
+        .split_once(" cpu_s=")
+        .unwrap_or_else(|| panic!("the death message reports no cpu_s: {message}"))
+        .1;
+    after
+        .split(' ')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap_or_else(|error| panic!("cpu_s is not a number ({error}): {message}"))
+}
+
 fn leader_self_exec_bounded_limited(
     test: &str,
     forward_output: bool,
@@ -2717,9 +2926,27 @@ fn leader_self_exec_bounded_limited(
         .arg(std::env::current_exe().unwrap())
         .args(["--exact", test, "--nocapture", "--logfile"])
         .arg(&execution_log)
-        .env("REVERIE_LEADER_EXEC_CHILD", test);
+        .env("REVERIE_LEADER_EXEC_CHILD", test)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
     configure(&mut command);
-    let output = command.output().unwrap();
+    let started = std::time::Instant::now();
+    let (output, cpu) = output_with_cpu(&mut command);
+    let wall = started.elapsed().as_secs_f64();
+    use std::os::unix::process::ExitStatusExt;
+    // Every run, pass or fail, reports the child's CPU against its caps on
+    // this host, so CI's passes measure each case's need on every SKU. A log
+    // line must never fail a run: a stderr that cannot take it drops it.
+    let _ = write_stderr_line(&bounded_child_line(
+        test,
+        output.status.code(),
+        output.status.signal(),
+        &cpu,
+        cpu_seconds,
+        wall,
+        wall_seconds,
+    ));
     if forward_output {
         std::io::Write::write_all(&mut std::io::stdout().lock(), &output.stdout).unwrap();
         std::io::Write::write_all(&mut std::io::stderr().lock(), &output.stderr).unwrap();
@@ -2729,23 +2956,27 @@ fn leader_self_exec_bounded_limited(
     // Host-capability refusal: same named skip as the broker library helper.
     if !output.status.success() && stderr.contains("ambient mount absent from bootstrap mountinfo")
     {
-        let line = format!(
+        // Unlike the CPU line, the named skip decides how the case is
+        // recorded, so losing it fails the case, as before.
+        write_stderr_line(&format!(
             "\nREVERIE_SKIP: {test}: broker ambient mount absent from bootstrap mountinfo on this host\n"
-        );
-        let mut rest = line.as_bytes();
-        while !rest.is_empty() {
-            // SAFETY: writes only the line above to this process's stderr.
-            let written =
-                unsafe { libc::write(libc::STDERR_FILENO, rest.as_ptr().cast(), rest.len()) };
-            assert!(written > 0, "write named skip for {test}");
-            rest = &rest[written as usize..];
-        }
+        ))
+        .unwrap_or_else(|error| panic!("write named skip for {test}: {error}"));
         return false;
     }
+    // A child ended by a signal has no exit code (status=None): name the
+    // signal, which `timeout` re-raises from the child it ran, and the CPU
+    // the child used with every descendant it waited for, so a kill at the
+    // CPU cap (SIGKILL near the cap) reads apart from any other death.
     assert!(
         output.status.success(),
-        "{test}: status={:?} stdout={} stderr={}",
+        "{test}: status={:?} signal={} cpu_s={:.2} (user {:.2}, sys {:.2}) cpu_cap={} wall_cap={wall_seconds}s stdout={} stderr={}",
         output.status.code(),
+        signal_name(output.status.signal()),
+        cpu.user + cpu.system,
+        cpu.user,
+        cpu.system,
+        cpu_seconds.map_or("none".to_string(), |cap| format!("{cap}s")),
         stdout,
         stderr
     );
@@ -2875,6 +3106,127 @@ fn leader_self_exec_bounded_capped_stops_a_child_that_spins_past_its_cpu_cap() {
     assert!(
         message.starts_with(&format!("{TEST}: status=None ")),
         "the child was not stopped by its CPU cap: {message}"
+    );
+    // The message names the signal and the CPU the child used, so a kill at
+    // the cap reads as one: SIGKILL, at about the cap (1 CPU-s, times the
+    // every-check factor in that mode).
+    let factor = bound_factor();
+    assert!(
+        message.contains(" signal=9 (SIGKILL) "),
+        "the death message does not name SIGKILL: {message}"
+    );
+    assert!(
+        message.contains(&format!(" cpu_cap={factor}s wall_cap={}s ", 60 * factor)),
+        "the death message does not name the child's caps: {message}"
+    );
+    let cpu = reported_cpu_seconds(message);
+    assert!(
+        (0.9 * factor as f64..5.0 * factor as f64).contains(&cpu),
+        "a child killed at a {factor} CPU-s cap reported {cpu} CPU-s: {message}"
+    );
+}
+
+/// The death message names a signal other than the cap's: a child ended by
+/// SIGUSR1 (whose default action ends a process without a core) reads as
+/// that signal, far under its cap, so another death cannot pass for a cap
+/// kill or the reverse.
+#[test]
+fn leader_self_exec_bounded_names_the_signal_that_ended_its_child() {
+    const TEST: &str = "leader_self_exec_bounded_names_the_signal_that_ended_its_child";
+    if !kvm_available(TEST) {
+        return;
+    }
+    if std::env::var("REVERIE_LEADER_EXEC_CHILD").as_deref() == Ok(TEST) {
+        // SAFETY: raise only sends a signal to this thread.
+        unsafe { libc::raise(libc::SIGUSR1) };
+        unreachable!("SIGUSR1's default action ends the process");
+    }
+    let rejected = std::panic::catch_unwind(|| leader_self_exec_bounded_capped(TEST, 5, 60))
+        .expect_err("the capped child helper accepted a child ended by a signal");
+    let message = rejected
+        .downcast_ref::<String>()
+        .expect("the capped child helper did not emit a diagnostic");
+    assert!(
+        message.starts_with(&format!(
+            "{TEST}: status=None signal={} (SIGUSR1) cpu_s=",
+            libc::SIGUSR1
+        )),
+        "the death message does not name SIGUSR1: {message}"
+    );
+    let cap = 5 * bound_factor();
+    let cpu = reported_cpu_seconds(message);
+    assert!(
+        cpu < cap as f64,
+        "a child ended by SIGUSR1 reported {cpu} CPU-s, at or past its {cap} CPU-s cap: {message}"
+    );
+}
+
+/// A bounded case whose child passes at once: the subject of
+/// leader_self_exec_bounded_reports_its_childs_cpu_on_every_run.
+#[test]
+fn leader_self_exec_bounded_child_that_passes() {
+    const TEST: &str = "leader_self_exec_bounded_child_that_passes";
+    // The parent runs the bounded child; the child has nothing to do once
+    // the helper returns, so it passes.
+    leader_self_exec_bounded_capped(TEST, 5, 60);
+}
+
+/// A bounded child that PASSES still reports its CPU against its caps and
+/// the host's CPU model, on the parent's stderr past libtest's capture, so
+/// CI's passing runs measure each case's need on every SKU.
+#[test]
+fn leader_self_exec_bounded_reports_its_childs_cpu_on_every_run() {
+    const TEST: &str = "leader_self_exec_bounded_reports_its_childs_cpu_on_every_run";
+    const SUBJECT: &str = "leader_self_exec_bounded_child_that_passes";
+    if !kvm_available(TEST) {
+        return;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", SUBJECT, "--test-threads", "1"])
+        .env_remove("REVERIE_LEADER_EXEC_CHILD")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success()
+            && stdout
+                .lines()
+                .any(|line| line == format!("test {SUBJECT} ... ok")),
+        "the passing subject did not pass: status={:?} stdout={stdout} stderr={stderr}",
+        output.status.code()
+    );
+    let prefix = format!("REVERIE_BOUNDED_CHILD: {SUBJECT} ");
+    let lines: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.starts_with(&prefix))
+        .collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "expected one CPU line for the passing child: {stderr}"
+    );
+    let line = lines[0];
+    // The subject inherits this run's mode, so its caps carry the same
+    // every-check factor.
+    let factor = bound_factor();
+    assert!(
+        line.contains(" exit=0 signal=none cpu_s="),
+        "the passing child's line does not report exit 0: {line}"
+    );
+    assert!(
+        line.contains(&format!(" cpu_cap={}s wall_s=", 5 * factor)),
+        "the line does not report the CPU cap: {line}"
+    );
+    assert!(
+        line.contains(&format!(" wall_cap={}s host_cpu=\"", 60 * factor)) && line.ends_with('"'),
+        "the line does not report the wall cap and the host CPU: {line}"
+    );
+    let cpu = reported_cpu_seconds(line);
+    assert!(
+        (0.0..(5 * factor) as f64).contains(&cpu),
+        "the passing child reported {cpu} CPU-s: {line}"
     );
 }
 
