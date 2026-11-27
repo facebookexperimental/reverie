@@ -24100,11 +24100,17 @@ fn shared_file_publications_kick_running_and_new_vcpus_as_natively() {
     // with 48 spinners, /usr/bin/time -v): it died at the old 30 s wall
     // 3/3, inside the clone loop, while the unwrapped body passed 3/3 in
     // 50.3-60.8 s at 6.0-6.9 CPU-s, progressing throughout (quiet: 5.2 s
-    // wall at 4.7 CPU-s). So the CPU cap is 11 (1.5x) and the wall
-    // backstop is 88 (8x). The 200 rounds are the case's chances to meet a
+    // wall at 4.7 CPU-s). So the CPU cap was 11 (1.5x) and the wall
+    // backstop 88 (8x). The 200 rounds are the case's chances to meet a
     // close while a vCPU starts or retires, so they are not shrunk to fit
     // the old wall.
-    if !leader_self_exec_bounded_capped(TEST, 11, 88) {
+    // Re-based 2026-11-26 by the same rule, over a censored floor: its
+    // status=None failures are CPU-cap SIGKILLs (the death message), and it
+    // died at its 11 CPU-s cap on the internal CI's Xeon Platinum 8321HC
+    // hosts. Its passes on an AMD EPYC 9D85 read 6.14-8.61 CPU-s, the most
+    // at load average about 359. 1.5 x 11 rounds up to 17, and the wall
+    // backstop stays 8x: 136.
+    if !leader_self_exec_bounded_capped(TEST, 17, 136) {
         return;
     }
     let directory = TestDirectory::new();
@@ -24176,10 +24182,17 @@ fn shared_file_threads_that_exited_stop_counting_in_the_guests_order() {
     // completion 20.2 s wall at 6.9 CPU-s; under taskset contention
     // (2 CPUs, 6 spinners) it died at the old 30 s wall having used
     // only about 4.5 CPU-s. A loaded completion extrapolates to about
-    // 10 CPU-s, so the CPU cap is 15 (1.5x) and the wall backstop is
-    // 120 (8x). The seven modes are distinct exit/clear_child_tid
-    // classes, so the workload is not shrunk to fit the old wall.
-    if !leader_self_exec_bounded_capped(TEST, 15, 120) {
+    // 10 CPU-s, so the CPU cap was 15 (1.5x) and the wall backstop 120
+    // (8x). The seven modes are distinct exit/clear_child_tid classes, so
+    // the workload is not shrunk to fit the old wall.
+    // Re-based 2026-11-26 by the same rule, over a censored floor: the
+    // bounded child's death message shows a status=None failure is a
+    // CPU-cap SIGKILL, and this case died at 15.30 of its 15 CPU-s on the
+    // internal CI's Xeon Platinum 8321HC (1.40 GHz) hosts, and at 15.28 on
+    // an AMD EPYC 9D85 at load average about 359. Its passes on the EPYC
+    // read 10.43-12.30 CPU-s. 1.5 x 15.30 rounds up to 23, and the wall
+    // backstop stays 8x: 184.
+    if !leader_self_exec_bounded_capped(TEST, 23, 184) {
         return;
     }
     let directory = TestDirectory::new();
@@ -24468,9 +24481,15 @@ fn vfork_children_share_private_memory_with_their_parent_like_native() {
     // load. Measured 2026-11-10 (single case, 4 CPUs shared with 48
     // spinners, /usr/bin/time -v): the unwrapped body passed in 38.3 and
     // 40.9 s at 3.3 and 3.7 CPU-s, past the old 30 s wall (quiet: 6.1 s
-    // wall at 3.1 CPU-s). So the CPU cap is 6 (1.5x) and the wall
-    // backstop is 48 (8x).
-    if !leader_self_exec_bounded_capped(TEST, 6, 48) {
+    // wall at 3.1 CPU-s). So the CPU cap was 6 (1.5x) and the wall
+    // backstop 48 (8x).
+    // Re-based 2026-11-26 by the same rule, over a censored floor: its
+    // status=None failures are CPU-cap SIGKILLs (the death message), and it
+    // died at 6.31 of its 6 CPU-s on an AMD EPYC 9D85 at load average about
+    // 359, and at its cap on the internal CI's Xeon Platinum 8321HC hosts.
+    // Its passes there read 4.12-5.00 CPU-s. 1.5 x 6.31 rounds up to 10, and
+    // the wall backstop stays 8x: 80.
+    if !leader_self_exec_bounded_capped(TEST, 10, 80) {
         return;
     }
     let directory = TestDirectory::new();
@@ -24732,9 +24751,13 @@ fn a_vfork_child_clears_its_clear_child_tid_word_in_its_parent_like_native() {
     // 2026-11-10 (single case, 4 CPUs shared with 48 spinners,
     // /usr/bin/time -v): the unwrapped body passed in 21.6 and 39.9 s at
     // 2.7 and 3.1 CPU-s, the second past the old 30 s wall (quiet: 5.7 s
-    // wall at 2.4 CPU-s). So the CPU cap is 5 (1.5x) and the wall
-    // backstop is 40 (8x).
-    if !leader_self_exec_bounded_capped(TEST, 5, 40) {
+    // wall at 2.4 CPU-s). So the CPU cap was 5 (1.5x) and the wall
+    // backstop 40 (8x).
+    // Re-based 2026-11-26 by the same rule, over a pass: on an AMD EPYC
+    // 9D85 at load average about 359 it passed at 3.82 CPU-s (2.75-2.98
+    // otherwise), and 1.5 x 3.82 rounds up to 6. The wall backstop stays
+    // 8x: 48.
+    if !leader_self_exec_bounded_capped(TEST, 6, 48) {
         return;
     }
     for (ending, expected) in [
