@@ -1996,6 +1996,12 @@ where
                 guest.event.unsupported_refusal = Some(refusal);
                 guest.event.result = -i64::from(Errno::EOPNOTSUPP.into_raw());
                 return;
+            } else if let Some(refusal) = guest_perf_events_prctl_refusal(number, args) {
+                // Named refusal, as for exec above: the Tool learns which
+                // operation was refused, not only its errno.
+                guest.event.unsupported_refusal = Some(refusal);
+                guest.event.result = -i64::from(refusal.errno.into_raw());
+                return;
             } else if let Some(error) =
                 injected_syscall_guard(&self.runtime, number, args, self.admit_threads)
             {
@@ -3276,6 +3282,12 @@ impl<T: Tool, R: HostRuntime> InGuest<'_, T, R> {
             args.arg5 as u64,
         ];
         let number = number.id() as i64;
+        if let Some(refusal) = guest_perf_events_prctl_refusal(number, args) {
+            // The native forward below bypasses injected_syscall_guard, so
+            // the perf-events screen runs here too, with its reporting.
+            self.unsupported_refusal = Some(refusal);
+            return Err(refusal.errno);
+        }
         if let Some(result) =
             native
                 .rpc
@@ -3933,6 +3945,33 @@ fn guest_seccomp_filter_policy(number: i64, args: [u64; 6]) -> Option<Errno> {
     (installs_seccomp_filter(number, args)
         && (CREATION_HOOK.get().is_some() || super::sigalrm::admitted()))
     .then_some(Errno::EOPNOTSUPP)
+}
+
+/// A guest call that disables or enables perf events for its own task is
+/// refused unconditionally: the runtime's per-thread RCB clock (and, once
+/// armed, its sampling sibling) is a perf event owned by the guest task, so
+/// `PR_TASK_PERF_EVENTS_DISABLE` would freeze the clock the runtime reads,
+/// and `PR_TASK_PERF_EVENTS_ENABLE` could revive a counter the runtime
+/// believes stopped. Linux allows both prctls; the runtime refuses them by
+/// name so its counter invariant holds whatever guest call the Tool forwards.
+/// The refusal is the generic named one: callers on the dispatch, inject
+/// and tail paths record it for the Tool, with `EOPNOTSUPP` as its errno.
+fn guest_perf_events_prctl_refusal(
+    number: i64,
+    args: [u64; 6],
+) -> Option<reverie::UnsupportedRefusal> {
+    (number == libc::SYS_prctl
+        && matches!(
+            args[0] as u32 as i32,
+            libc::PR_TASK_PERF_EVENTS_DISABLE | libc::PR_TASK_PERF_EVENTS_ENABLE
+        ))
+    .then_some(reverie::UnsupportedRefusal::new(
+        reverie::UnsupportedOperation::PerfEventsPrctl,
+        Errno::EOPNOTSUPP,
+        "the in-guest backend refuses prctl PR_TASK_PERF_EVENTS_DISABLE and \
+         PR_TASK_PERF_EVENTS_ENABLE: they act on every perf event the guest \
+         task owns, including the backend's per-thread RCB clock when armed",
+    ))
 }
 
 /// The birth identity of `pidfd`: its inode number, if it is a pidfs inode.
@@ -4823,6 +4862,9 @@ fn injected_syscall_guard(
     if let Some(error) = guest_seccomp_filter_policy(number, args) {
         return Some(error);
     }
+    if let Some(refusal) = guest_perf_events_prctl_refusal(number, args) {
+        return Some(refusal.errno);
+    }
     if installs_seccomp_filter(number, args) {
         // Admitted: from here the guest's own calls may be refused or faked
         // by a filter the runtime does not know (see `guest_filter_admitted`).
@@ -5652,6 +5694,12 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
         #[cfg(feature = "exec-native-injection")]
         self.check_native_mapping(number, raw_args)?;
         self.refuse_filter_while_staging(number, raw_args);
+        if let Some(refusal) = guest_perf_events_prctl_refusal(number, raw_args) {
+            // Named refusal: Guest::take_unsupported_refusal reports it to
+            // the Tool after this Err, as for clone and exec above.
+            self.unsupported_refusal = Some(refusal);
+            return Err(refusal.errno);
+        }
         if let Some(error) =
             injected_syscall_guard(self.runtime, number, raw_args, self.admit_threads)
         {
@@ -5777,7 +5825,17 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
                 args.arg5 as u64,
             ];
             let number = number.id() as i64;
-            if !self.in_syscall_handler && is_exit_syscall(number) {
+            if let Some(refusal) = guest_perf_events_prctl_refusal(number, args) {
+                // Deferred native forwarding bypasses the ordinary tail
+                // screen, so the perf-events screen runs here too; the
+                // named refusal rides on the event. The staged result is
+                // never delivered on this route: the native driver turns
+                // a local completed tail into its generic Unsupported
+                // (tool_host.rs drive_native_callback), so the guest
+                // does not receive EOPNOTSUPP here; nothing is forwarded.
+                self.event.unsupported_refusal = Some(refusal);
+                self.tail.set_result(-i64::from(refusal.errno.into_raw()));
+            } else if !self.in_syscall_handler && is_exit_syscall(number) {
                 self.tail.set_exit(number, args);
             } else {
                 self.tail.set_deferred_native(number, args);
@@ -5895,6 +5953,10 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
                     Err(result) => result,
                 };
             self.tail.set_result(result);
+        } else if let Some(refusal) = guest_perf_events_prctl_refusal(number, args) {
+            // Named refusal rides on the event, as for exec above.
+            self.event.unsupported_refusal = Some(refusal);
+            self.tail.set_result(-i64::from(refusal.errno.into_raw()));
         } else if let Some(error) =
             injected_syscall_guard(self.runtime, number, args, self.admit_threads)
         {
@@ -9711,6 +9773,223 @@ mod tests {
                     Some(Errno::EOPNOTSUPP)
                 );
             }
+        }
+
+        #[test]
+        fn guest_perf_events_prctl_is_refused_on_the_forward_path() {
+            for option in [
+                libc::PR_TASK_PERF_EVENTS_DISABLE as u64,
+                libc::PR_TASK_PERF_EVENTS_ENABLE as u64,
+                // prctl's option is read at the kernel's width (an int), so
+                // high bits cannot hide the request.
+                (1_u64 << 32) | libc::PR_TASK_PERF_EVENTS_DISABLE as u64,
+                (1_u64 << 32) | libc::PR_TASK_PERF_EVENTS_ENABLE as u64,
+            ] {
+                assert_eq!(
+                    injected_syscall_guard(
+                        &TailStartRuntime,
+                        libc::SYS_prctl,
+                        [option, 0, 0, 0, 0, 0],
+                        false
+                    ),
+                    Some(Errno::EOPNOTSUPP),
+                    "prctl option {option} must be refused before forwarding"
+                );
+            }
+            // Other prctl options and other calls still forward: the refusal
+            // is scoped to 31/32, so this test cannot pass vacuously.
+            assert_eq!(
+                injected_syscall_guard(
+                    &TailStartRuntime,
+                    libc::SYS_prctl,
+                    [libc::PR_SET_NAME as u64, 0, 0, 0, 0, 0],
+                    false
+                ),
+                None
+            );
+            assert_eq!(
+                injected_syscall_guard(&TailStartRuntime, libc::SYS_getpid, [0; 6], false),
+                None
+            );
+        }
+
+        #[test]
+        fn guest_perf_events_prctl_refusal_is_named() {
+            for option in [
+                libc::PR_TASK_PERF_EVENTS_DISABLE as u64,
+                libc::PR_TASK_PERF_EVENTS_ENABLE as u64,
+            ] {
+                let refusal =
+                    guest_perf_events_prctl_refusal(libc::SYS_prctl, [option, 0, 0, 0, 0, 0])
+                        .expect("prctl 31/32 must carry the named refusal");
+                assert_eq!(
+                    refusal.operation,
+                    reverie::UnsupportedOperation::PerfEventsPrctl
+                );
+                assert_eq!(refusal.errno, Errno::EOPNOTSUPP);
+                assert!(
+                    refusal.diagnostic.contains("PR_TASK_PERF_EVENTS_DISABLE"),
+                    "diagnostic must name the refused operation: {}",
+                    refusal.diagnostic
+                );
+            }
+            assert_eq!(
+                guest_perf_events_prctl_refusal(
+                    libc::SYS_prctl,
+                    [libc::PR_SET_NAME as u64, 0, 0, 0, 0, 0],
+                ),
+                None
+            );
+        }
+
+        /// Builds the minimal Guest the reporting tests drive (pattern of
+        /// `actual_tail_scope_and_ending_reentry_observe_once`).
+        fn perf_reporting_guest<'a>(
+            event: &'a mut SyscallEvent,
+            tail: &'a TailResult,
+            state: &'a mut (),
+            rpc: &'a CoordinatorRpc<()>,
+            in_syscall_handler: bool,
+        ) -> InGuest<'a, (), TailStartRuntime> {
+            InGuest::<(), _> {
+                event,
+                tid: raw_pid(libc::SYS_gettid),
+                pid: raw_pid(libc::SYS_getpid),
+                ppid: None,
+                state,
+                rpc,
+                native: None,
+                tail,
+                cpuid_interception: false,
+                admit_threads: false,
+                thread_birth: None,
+                fork_parent_state: None,
+                runtime: &TailStartRuntime,
+                staged_signals: Vec::new(),
+                staged_signal_delivery: false,
+                in_syscall_handler,
+                #[cfg(feature = "exec-native-injection")]
+                exec: None,
+                #[cfg(feature = "exec-native-injection")]
+                mapping_driver: None,
+                #[cfg(feature = "exec-native-injection")]
+                native_exec_admitted: false,
+                #[cfg(feature = "exec-native-injection")]
+                native_exec_route_active: false,
+                unsupported_refusal: None,
+                injected_syscalls: 0,
+            }
+        }
+
+        fn perf_reporting_rpc() -> CoordinatorRpc<()> {
+            let (client, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+            let config = reverie_rpc_transport::codec::encode(&()).unwrap();
+            peer.write_all(&(config.len() as u32).to_be_bytes())
+                .unwrap();
+            peer.write_all(&config).unwrap();
+            let tid = raw_pid(libc::SYS_gettid);
+            let client = reverie_rpc_transport::BlockingRpcClient::<(), _>::from_connected_stream(
+                crate::guest::rpc::GuestRpcStream::from(client),
+                tid,
+            )
+            .unwrap();
+            CoordinatorRpc::from_live_client("unused-perf-report-test", client, |_, _| {
+                panic!("perf reporting test must not reconnect")
+            })
+            .unwrap()
+        }
+
+        fn perf_disable_call() -> reverie::syscalls::Syscall {
+            reverie::syscalls::Syscall::from_raw(
+                Sysno::prctl,
+                reverie::syscalls::SyscallArgs::new(
+                    libc::PR_TASK_PERF_EVENTS_DISABLE as usize,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                ),
+            )
+        }
+
+        /// Mutant witness: deleting the tail recording assignment
+        /// (`self.event.unsupported_refusal = Some(refusal)`) fails this test.
+        #[test]
+        fn guest_perf_events_prctl_is_reported_on_the_tail_event() {
+            let rpc = perf_reporting_rpc();
+            let mut event = SyscallEvent {
+                number: libc::SYS_prctl,
+                args: [libc::PR_TASK_PERF_EVENTS_DISABLE as u64, 0, 0, 0, 0, 0],
+                instruction_pointer: 0,
+                result: 0,
+                context: 0,
+                dispatch: SyscallDispatch::InstalledHook,
+                guest_pkru: None,
+                unsupported_refusal: None,
+            };
+            let tail = TailResult::default();
+            let mut state = ();
+            // A real tail call runs inside a syscall handler; with
+            // in_syscall_handler=false tail_inject would fatal (125) on its
+            // scope guard before reaching the screen.
+            let mut guest = perf_reporting_guest(&mut event, &tail, &mut state, &rpc, true);
+            let waker = Waker::noop();
+            let mut context = Context::from_waker(waker);
+            let polled = {
+                let mut future = core::pin::pin!(guest.tail_inject(perf_disable_call()));
+                future.as_mut().poll(&mut context)
+            };
+            assert!(matches!(polled, Poll::Pending));
+            let refusal = guest
+                .event
+                .unsupported_refusal
+                .expect("tail refusal must be reported on the event");
+            assert_eq!(
+                refusal.operation,
+                reverie::UnsupportedOperation::PerfEventsPrctl
+            );
+            assert_eq!(refusal.errno, Errno::EOPNOTSUPP);
+        }
+
+        /// Mutant witness: deleting the inject recording assignment
+        /// (`self.unsupported_refusal = Some(refusal)`) fails this test.
+        #[test]
+        fn guest_perf_events_prctl_is_reported_on_inject() {
+            let rpc = perf_reporting_rpc();
+            let mut event = SyscallEvent {
+                number: libc::SYS_prctl,
+                args: [libc::PR_TASK_PERF_EVENTS_DISABLE as u64, 0, 0, 0, 0, 0],
+                instruction_pointer: 0,
+                result: 0,
+                context: 0,
+                dispatch: SyscallDispatch::InstalledHook,
+                guest_pkru: None,
+                unsupported_refusal: None,
+            };
+            let tail = TailResult::default();
+            let mut state = ();
+            let mut guest = perf_reporting_guest(&mut event, &tail, &mut state, &rpc, false);
+            let waker = Waker::noop();
+            let mut context = Context::from_waker(waker);
+            let polled = {
+                let mut future = core::pin::pin!(reverie::Guest::<()>::inject(
+                    &mut guest,
+                    perf_disable_call()
+                ));
+                future.as_mut().poll(&mut context)
+            };
+            match polled {
+                Poll::Ready(Err(error)) => assert_eq!(error, Errno::EOPNOTSUPP),
+                other => panic!("inject of prctl 31 must refuse at once, got {other:?}"),
+            }
+            let refusal = reverie::Guest::<()>::take_unsupported_refusal(&mut guest)
+                .expect("inject refusal must be reported for the Tool to take");
+            assert_eq!(
+                refusal.operation,
+                reverie::UnsupportedOperation::PerfEventsPrctl
+            );
+            assert_eq!(refusal.errno, Errno::EOPNOTSUPP);
         }
 
         #[test]

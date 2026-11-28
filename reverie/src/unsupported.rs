@@ -122,6 +122,15 @@ pub enum UnsupportedOperation {
     /// backend that refuses it armed nothing and kept the caller's previous
     /// parent-death signal; the refusal's diagnostic names the reason.
     ParentDeathSignal,
+    /// `prctl(PR_TASK_PERF_EVENTS_DISABLE)` or
+    /// `prctl(PR_TASK_PERF_EVENTS_ENABLE)`, on a backend that reserves
+    /// task-wide perf-event control for its own per-thread branch clock:
+    /// the options act on every perf event the guest task owns, so the
+    /// guest call could freeze or revive the backend's counter when one
+    /// is armed. The refusal is unconditional, whether or not a counter
+    /// is currently armed. A backend that refuses it changed no counter
+    /// state; the refusal's diagnostic names the reason.
+    PerfEventsPrctl,
     /// An operation on a pidfd that the backend does not model, such as
     /// sending a pidfd for a process of the run in an `SCM_RIGHTS` message,
     /// or adding one to an epoll set where the backend cannot tell open file

@@ -53,6 +53,9 @@ struct Probe {
     syscall_entries: AtomicUsize,
     initializer_entries: AtomicUsize,
     block_initializer: bool,
+    /// Count of named perf-events refusals taken via
+    /// `take_unsupported_refusal` on the native inject arm (option 31).
+    perf_taken: AtomicUsize,
 }
 
 #[reverie::tool]
@@ -141,6 +144,27 @@ impl Tool for Probe {
                 drop(stack.commit()?);
                 guest.tail_inject(call).await
             }
+            31 => {
+                // Native inject of prctl(PR_TASK_PERF_EVENTS_DISABLE):
+                // refused by name before any forward; the refusal is
+                // takeable by the Tool.
+                let error = guest
+                    .inject(call)
+                    .await
+                    .expect_err("native inject must refuse prctl perf-events disable");
+                assert_eq!(error, Errno::EOPNOTSUPP);
+                let refusal = guest
+                    .take_unsupported_refusal()
+                    .expect("native inject refusal must be reported");
+                assert_eq!(
+                    refusal.operation,
+                    reverie::UnsupportedOperation::PerfEventsPrctl
+                );
+                assert_eq!(refusal.errno, Errno::EOPNOTSUPP);
+                self.perf_taken.fetch_add(1, Ordering::SeqCst);
+                Err(error.into())
+            }
+            32 => guest.tail_inject(call).await,
             8 => Err(Errno::ERESTARTSYS.into()),
             9 => Err(io::Error::other("native fixture fatal Tool I/O failure").into()),
             value @ (100 | 101 | 500) => {
@@ -1874,5 +1898,126 @@ fn native_entry_delivers_a_subscribed_unreviewed_number_to_the_tool() {
         "the subscribed number must enter the Tool"
     );
     assert_eq!(callback.count(467), 1, "the Tool forwarded it");
+    fixture::close_test_primary(&rpc, &callback);
+}
+
+fn prctl_event(option: u64) -> SyscallEvent {
+    SyscallEvent {
+        number: libc::SYS_prctl,
+        args: [option, 0, 0, 0, 0, 0],
+        instruction_pointer: 0x1234,
+        result: 0,
+        context: 0,
+        dispatch: SyscallDispatch::InstalledHook,
+        guest_pkru: None,
+        unsupported_refusal: None,
+    }
+}
+
+/// Mutant witnesses: removing the `inject_native` screen forwards the
+/// call natively (forward count and result change); removing its
+/// recording assignment leaves `perf_taken` at 0.
+#[test]
+fn native_inject_perf_events_prctl_is_refused_named_and_not_forwarded() {
+    let server = Server::new();
+    let (host, _peer) = make_host();
+    let rpc = NativeRpc::new(server.path.clone(), host.rpc.shared_config()).unwrap();
+    let callback = Callback::new(1);
+    let id = callback.identity();
+    let services = callback.services(None);
+    let handle = unsafe {
+        host.register_native_image_thread(id, State::seeded())
+            .unwrap()
+    };
+    let lease = unsafe { host.enter_native_callback(handle, id).unwrap() };
+    assert_eq!(
+        value(unsafe {
+            host.dispatch_native_syscall(lease, &services, &rpc, &mut prctl_event(31))
+                .unwrap()
+        }),
+        -95
+    );
+    assert_eq!(
+        callback.count(libc::SYS_prctl),
+        0,
+        "refused prctl must not be forwarded natively"
+    );
+    assert_eq!(
+        host.tool
+            .lock()
+            .as_deref()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .perf_taken
+            .load(Ordering::SeqCst),
+        1,
+        "named refusal must be taken on the native inject route"
+    );
+    let state = unsafe { host.retire_native_thread(handle, id).unwrap() };
+    assert_eq!((state.starts, state.posts, state.syscalls), (1, 1, 1));
+    fixture::close_test_primary(&rpc, &callback);
+}
+
+/// Mutant witnesses, on the FIX: the dispatch returns Err (the native
+/// driver's generic Unsupported), the named refusal rides on the
+/// event, and the Callback invoker is never called during dispatch.
+/// Removing the native-tail screen instead returns Ok(Deferred) with
+/// the event refusal None (that Deferred is not forwarded inside
+/// dispatch either; the count only proves the Callback invoker was
+/// not called during dispatch). Removing the event recording leaves
+/// `unsupported_refusal` None. The generic Unsupported poisons the
+/// callback lease (native_state.rs Drop), so retirement rejects it;
+/// the test asserts that instead of unwrapping it.
+#[test]
+fn native_tail_perf_events_prctl_is_not_forwarded_and_named_on_event() {
+    let server = Server::new();
+    let (host, _peer) = make_host();
+    let rpc = NativeRpc::new(server.path.clone(), host.rpc.shared_config()).unwrap();
+    let callback = Callback::new(1);
+    let id = callback.identity();
+    let services = callback.services(None);
+    let handle = unsafe {
+        host.register_native_image_thread(id, State::seeded())
+            .unwrap()
+    };
+    let lease = unsafe { host.enter_native_callback(handle, id).unwrap() };
+    let mut event = prctl_event(32);
+    let error = match unsafe { host.dispatch_native_syscall(lease, &services, &rpc, &mut event) } {
+        Ok(_) => panic!("screened native tail must not complete as Deferred/Return"),
+        Err(error) => error,
+    };
+    // The generic Unsupported itself (J3): an Io error carrying the
+    // driver's reason verbatim, with no raw OS errno
+    // (native_entry.rs native_callback_error), not any Err.
+    match &error {
+        Error::Io(io) => {
+            assert_eq!(io.raw_os_error(), None);
+            assert!(
+                io.to_string()
+                    .contains("a local completed tail in a native callback"),
+                "unexpected native tail error: {io}"
+            );
+        }
+        other => panic!("expected Error::Io generic Unsupported, got {other:?}"),
+    }
+    assert_eq!(
+        callback.count(libc::SYS_prctl),
+        0,
+        "Callback invoker must not be called during dispatch"
+    );
+    assert_eq!(
+        event.unsupported_refusal.map(|refusal| refusal.operation),
+        Some(reverie::UnsupportedOperation::PerfEventsPrctl),
+        "named refusal must ride on the event"
+    );
+    // The generic Unsupported returns without completing the callback
+    // lease; its Drop poisons the record and retirement rejects it
+    // with EIO (native_state.rs). Assert exactly that (J3).
+    let retire_error = match unsafe { host.retire_native_thread(handle, id) } {
+        Ok(_) => panic!("poisoned lease retirement must reject, not succeed"),
+        Err(error) => error,
+    };
+    assert_eq!(retire_error.raw_os_error(), Some(libc::EIO));
     fixture::close_test_primary(&rpc, &callback);
 }
