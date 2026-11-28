@@ -346,7 +346,7 @@ impl Launch {
     /// Runs `allocate`, which makes descriptors for this launch. If it fails
     /// with EMFILE or ENFILE (`errno` reads the error's number) while another
     /// thread still holds an open that began during the launch, spins until
-    /// those opens close, for at most [`LATE_OPEN_CHECKS`] checks, and runs
+    /// those opens close, for at most `LATE_OPEN_CHECKS` checks, and runs
     /// `allocate` once more. Allocates nothing, takes no lock, reads no
     /// clock, and makes no system call besides `allocate`'s.
     pub fn allocate<T, E: Copy>(

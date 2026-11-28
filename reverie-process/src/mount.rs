@@ -422,7 +422,7 @@ impl Mount {
     }
 
     /// Performs the mount. For bind-mount operations, the target directory or
-    /// file is created if [`touch_target`] was used.
+    /// file is created if [`Self::touch_target`] was used.
     ///
     /// NOTE: This function *must* not allocate since it is called after `fork`
     /// (or `clone`) and before `execve`. Any allocations could cause deadlocks
