@@ -783,6 +783,11 @@ fn execute_basic_syscall_inner(
         _ if number == libc::SYS_getdents64 as u64 => {
             getdents64(&mut ProviderMemory(memory), state, args)
         }
+        _ if number == libc::SYS_getdents as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(D134878982): Review legacy getdents (host linux_dirent records).
+            getdents(&mut ProviderMemory(memory), state, args)
+        }
         _ if number == libc::SYS_getpid as u64 => i64::from(state.pid),
         _ if number == libc::SYS_gettid as u64 => {
             // AUTONOMOUS-BOT-IMPLEMENTED

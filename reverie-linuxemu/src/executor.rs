@@ -29345,6 +29345,7 @@ mod tests {
 
     include!("executor/read_zero_refusal_tests.rs");
     include!("executor/descriptor_check_order_tests.rs");
+    include!("executor/getdents_legacy_tests.rs");
 
     fn read_zero_memory() -> GuestMemory {
         let mut memory = GuestMemory::new(0, 2 * PAGE_SIZE as usize).unwrap();

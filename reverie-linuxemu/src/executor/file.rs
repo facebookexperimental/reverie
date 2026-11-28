@@ -1837,6 +1837,31 @@ pub(super) fn getdents64<M: GuestMemoryAccess<Error = crate::Error>>(
     state: &LoadedStaticElf,
     args: &[u64; 6],
 ) -> i64 {
+    read_directory_entries(libc::SYS_getdents64, memory, state, args)
+}
+
+/// x86_64's legacy `getdents`: the same directory read as `getdents64`, with
+/// the host kernel formatting each record as a `struct linux_dirent` (its
+/// `d_type` in the record's last byte). Linux serves both calls from one
+/// directory iterator and one file position (fs/readdir.c), and so does this:
+/// only the host syscall that formats the records differs.
+pub(super) fn getdents<M: GuestMemoryAccess<Error = crate::Error>>(
+    memory: &mut M,
+    state: &LoadedStaticElf,
+    args: &[u64; 6],
+) -> i64 {
+    read_directory_entries(libc::SYS_getdents, memory, state, args)
+}
+
+/// Reads the guest's directory descriptor into guest memory through the host
+/// syscall `host_number` (`SYS_getdents64` or `SYS_getdents`), which formats
+/// the records.
+fn read_directory_entries<M: GuestMemoryAccess<Error = crate::Error>>(
+    host_number: libc::c_long,
+    memory: &mut M,
+    state: &LoadedStaticElf,
+    args: &[u64; 6],
+) -> i64 {
     // Linux consumes both descriptor and count as unsigned 32-bit arguments.
     // Narrow count before applying our host I/O cap: high register bits must
     // not turn a zero or undersized Linux buffer into a 16 MiB request.
@@ -1862,14 +1887,8 @@ pub(super) fn getdents64<M: GuestMemoryAccess<Error = crate::Error>>(
     };
     // SAFETY: file owns a live descriptor; alias retains the current backing,
     // permissions and host-copy locks for the requested bounded kernel operand.
-    let count = unsafe {
-        libc::syscall(
-            libc::SYS_getdents64,
-            file.as_raw_fd(),
-            alias.host_pointer(),
-            length,
-        )
-    };
+    let count =
+        unsafe { libc::syscall(host_number, file.as_raw_fd(), alias.host_pointer(), length) };
     // Capture errno before dropping the alias invokes munmap.
     let result = if count < 0 {
         io_error(std::io::Error::last_os_error())
