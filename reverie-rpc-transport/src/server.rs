@@ -141,7 +141,7 @@ fn identify_connection(
     if !identify {
         return Ok(None);
     }
-    crate::peer_identity::identify(peer_pidfd(stream)?).map(Some)
+    crate::peer_identity::identify_peer_pidfd(peer_pidfd(stream)).map(Some)
 }
 
 /// Runs `admission`, if any, on an accepted connection.

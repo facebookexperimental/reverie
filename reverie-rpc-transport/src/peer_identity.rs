@@ -132,8 +132,63 @@ pub(crate) fn peer_process_id(peer: &impl AsRawFd) -> std::io::Result<Option<i32
 pub(crate) fn identify(peer: OwnedFd) -> Result<ConnectionIdentity, RpcError> {
     match pidfd_get_info(&peer)? {
         PeerState::Live(tgid) => Ok(ConnectionIdentity::new(Arc::new(peer), tgid)),
-        PeerState::Gone => Err(RpcError::Io(std::io::Error::other(
-            "refusing a guest connection whose process was reaped before it was accepted",
-        ))),
+        PeerState::Gone => Err(reaped_refusal()),
+    }
+}
+
+fn reaped_refusal() -> RpcError {
+    RpcError::Io(std::io::Error::other(
+        "refusing a guest connection whose process was reaped before it was accepted",
+    ))
+}
+
+/// Identify from the result of obtaining the peer's pidfd, mapping the
+/// reaped-peer `EINVAL` to the same named refusal as [`PeerState::Gone`].
+///
+/// Before the v6.16 pidfs changes ("net, pidfs: prepare for handing out
+/// pidfds for reaped sk->sk_peer_pid", fd0a109a0f6b), `SO_PEERPIDFD`
+/// returned `EINVAL` when the peer's thread-group leader had already
+/// been reaped, instead of handing out a stale pidfd that
+/// `PIDFD_GET_INFO` would then report as gone. That `EINVAL` cannot
+/// mean the socket option is unknown at this call site:
+/// `require_connection_identity` has already proved `PIDFD_GET_INFO`
+/// support (Linux 6.13), which is newer than `SO_PEERPIDFD` itself
+/// (Linux 6.5). Every other error propagates unchanged.
+pub(crate) fn identify_peer_pidfd(
+    peer: std::io::Result<OwnedFd>,
+) -> Result<ConnectionIdentity, RpcError> {
+    match peer {
+        Ok(peer) => identify(peer),
+        Err(error) if error.raw_os_error() == Some(libc::EINVAL) => Err(reaped_refusal()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_reaped_peer_pidfd_einval_is_the_named_refusal() {
+        let error =
+            identify_peer_pidfd(Err(std::io::Error::from_raw_os_error(libc::EINVAL))).unwrap_err();
+        assert!(
+            error.to_string().contains("reaped before it was accepted"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn other_peer_pidfd_errors_propagate_unchanged() {
+        let error =
+            identify_peer_pidfd(Err(std::io::Error::from_raw_os_error(libc::EPERM))).unwrap_err();
+        assert!(
+            matches!(error, RpcError::Io(ref e) if e.raw_os_error() == Some(libc::EPERM)),
+            "{error}"
+        );
+        assert!(
+            !error.to_string().contains("reaped before it was accepted"),
+            "{error}"
+        );
     }
 }
