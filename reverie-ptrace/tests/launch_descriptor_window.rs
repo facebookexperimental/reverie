@@ -43,25 +43,28 @@
 //! the startup wait.
 //!
 //! A fourth test covers `pthread_atfork` handlers around a
-//! `spawn_fn_with_config` launch, which forks through libc. Its prepare
-//! handler waits for another tracer's transient open, so the launch must not
-//! hold the lock across `fork`, or that open waits for the launch. As above,
-//! a lock held there would now delay the open by `OPEN_WAIT_LIMIT` rather
-//! than make the handler time out, so the test does not establish where the
-//! lock is released; the source releases it before `fork`. The
-//! descriptors the handlers make on purpose, a replacement for one the launch
-//! inherits (prepare) and a new eventfd (child), must reach the guest; the
-//! eventfd's number must be free before the launch, and the guest also checks
-//! a flag that only the child handler sets, in the child. That
-//! transient open itself, begun after the launch's guard ended, still reaches
-//! the guest, as before the lock
-//! (<https://github.com/rrnewton/reverie/issues/927>); the test does not
-//! check it.
+//! `spawn_fn_with_config` launch, which forks through libc and holds the lock
+//! across `fork` (the sixth test). Its prepare handler waits for another
+//! tracer's transient open, which waits for the launch for `OPEN_WAIT_LIMIT`
+//! and then proceeds, so the handler is delayed by the limit, not deadlocked.
+//! The descriptors the handlers make on purpose, a replacement for one the
+//! launch inherits (prepare) and a new eventfd (child), must reach the guest;
+//! the eventfd's number must be free before the launch, and the guest also
+//! checks a flag that only the child handler sets, in the child. That
+//! transient open itself, which proceeded after the limit while the launch
+//! held the lock, still reaches the guest, as every open of another thread
+//! could before the lock (<https://github.com/rrnewton/reverie/issues/927>);
+//! the test does not check it.
 //!
 //! A fifth test counts the allocator calls a thread makes while it holds the
 //! launch lock, through this binary's global allocator, and requires none: an
 //! allocator can hold its own lock, or wait for a transient open, while
 //! another thread waits for the launch to end.
+//!
+//! A sixth test checks how long a `spawn_fn_with_config` launch holds the
+//! lock: across libc's `fork`, as its `pthread_atfork` prepare and parent
+//! handlers see on the launching thread, and no longer once the launch has
+//! returned. Its guest checks that its own copy of the lock holds no launch.
 
 #![cfg(all(target_os = "linux", target_env = "gnu"))]
 
@@ -883,7 +886,7 @@ fn check_atfork_descriptors_kept() {
 /// for another tracer's transient open without a deadlock, and the descriptors
 /// its prepare and child handlers make reach the guest.
 #[test]
-fn a_forked_launch_runs_atfork_handlers_outside_the_lock_and_keeps_their_descriptors() {
+fn a_forked_launch_runs_atfork_handlers_without_deadlock_and_keeps_their_descriptors() {
     static REGISTER: Once = Once::new();
     REGISTER.call_once(|| {
         // SAFETY: registers handlers that do nothing off B's thread and B's
@@ -1065,5 +1068,117 @@ fn a_launch_makes_no_allocator_call_while_it_holds_the_lock() {
     assert_eq!(
         under_launch, 0,
         "a launching thread called the allocator {under_launch} times while it held the lock"
+    );
+}
+
+/// How many times the sixth test's `pthread_atfork` prepare handler ran on its
+/// launching thread, and whether the launch lock was held each time.
+static PREPARES_SEEN: AtomicUsize = AtomicUsize::new(0);
+static PREPARES_HELD: AtomicUsize = AtomicUsize::new(0);
+/// The same for its parent handler.
+static PARENTS_SEEN: AtomicUsize = AtomicUsize::new(0);
+static PARENTS_HELD: AtomicUsize = AtomicUsize::new(0);
+
+/// Exit status of the sixth test's guest if its copy of the lock holds a
+/// launch.
+const LAUNCH_HELD_IN_CHILD: i32 = 78;
+
+thread_local! {
+    /// Set on the sixth test's launching thread while it launches.
+    static OBSERVE_FORK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Counts one handler call on the sixth test's launching thread, and whether
+/// that thread held the launch lock. Allocation-free.
+fn note_fork_handler(seen: &AtomicUsize, held: &AtomicUsize) {
+    if OBSERVE_FORK.try_with(|o| o.get()).unwrap_or(false) {
+        seen.fetch_add(1, Ordering::SeqCst);
+        if reverie::process::launch_window::held_by_this_thread() {
+            held.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+/// `pthread_atfork` prepare handler for the sixth test.
+extern "C" fn note_lock_at_prepare() {
+    note_fork_handler(&PREPARES_SEEN, &PREPARES_HELD);
+}
+
+/// `pthread_atfork` parent handler for the sixth test.
+extern "C" fn note_lock_at_parent() {
+    note_fork_handler(&PARENTS_SEEN, &PARENTS_HELD);
+}
+
+/// The sixth test's guest: after the fork's child handler, its copy of the
+/// lock holds no launch, of its own thread or any other.
+fn check_no_launch_in_child() {
+    if reverie::process::launch_window::held_by_this_thread()
+        || reverie::process::launch_window::launching()
+    {
+        // SAFETY: ends the guest without running the test process's exit
+        // handlers.
+        unsafe { libc::_exit(LAUNCH_HELD_IN_CHILD) };
+    }
+}
+
+/// A `spawn_fn_with_config` launch holds the launch lock across libc's
+/// `fork`: its `pthread_atfork` prepare and parent handlers run with the lock
+/// held, so another thread's transient open cannot begin between the launch's
+/// pipes and the copy of the descriptor table, except after
+/// `OPEN_WAIT_LIMIT`. The lock is no longer held once the launch returns, and
+/// the guest's copy of it holds no launch.
+#[test]
+fn a_forked_launch_holds_the_lock_across_fork() {
+    static REGISTER: Once = Once::new();
+    REGISTER.call_once(|| {
+        // SAFETY: registers handlers that only count, allocation-free, and do
+        // nothing off the sixth test's launching thread.
+        let rc = unsafe {
+            libc::pthread_atfork(Some(note_lock_at_prepare), Some(note_lock_at_parent), None)
+        };
+        assert_eq!(rc, 0);
+    });
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    for counter in [&PREPARES_SEEN, &PREPARES_HELD, &PARENTS_SEEN, &PARENTS_HELD] {
+        counter.store(0, Ordering::SeqCst);
+    }
+    let (status, held_after) = run_tokio_test(async {
+        OBSERVE_FORK.with(|o| o.set(true));
+        let launched = spawn_fn_with_config::<(), _>(check_no_launch_in_child, (), false).await;
+        OBSERVE_FORK.with(|o| o.set(false));
+        let held_after = reverie::process::launch_window::held_by_this_thread();
+        let status = match launched {
+            Ok(tracer) => tracer
+                .wait()
+                .await
+                .map(|(status, ())| status)
+                .map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        };
+        (status, held_after)
+    });
+    let seen = (
+        PREPARES_SEEN.load(Ordering::SeqCst),
+        PARENTS_SEEN.load(Ordering::SeqCst),
+    );
+    let held = (
+        PREPARES_HELD.load(Ordering::SeqCst),
+        PARENTS_HELD.load(Ordering::SeqCst),
+    );
+    assert_eq!(
+        seen,
+        (1, 1),
+        "the launch's thread forked other than once (prepare, parent handler calls)"
+    );
+    assert_eq!(
+        held,
+        (1, 1),
+        "the launch lock was not held in the fork's (prepare, parent) handler"
+    );
+    assert!(!held_after, "the launch lock was held after the launch");
+    assert_eq!(
+        status,
+        Ok(ExitStatus::Exited(0)),
+        "the guest exited {LAUNCH_HELD_IN_CHILD} if its copy of the lock held a launch"
     );
 }

@@ -21,14 +21,13 @@
 //! <https://github.com/rrnewton/reverie/issues/845>).
 //!
 //! One process-wide lock excludes the two across threads: [`Launch`] is held
-//! exclusively from a launch's first descriptor allocation until `clone`
-//! returns in the parent (for a launch through libc's `fork`, until its
-//! descriptors exist; see below), and [`TransientOpen`] is held shared from a
-//! transient open to its close. Transient opens of different threads never
-//! wait for each other, only for another thread's launch in progress, and for
-//! that at most [`OPEN_WAIT_LIMIT`] (below). A launch waits until no other
-//! thread holds a transient open. Neither guard may be held across an
-//! `.await`.
+//! exclusively from a launch's first descriptor allocation until `clone`, or
+//! libc's `fork` (see below), returns in the parent, and [`TransientOpen`] is
+//! held shared from a transient open to its close. Transient opens of
+//! different threads never wait for each other, only for another thread's
+//! launch in progress, and for that at most [`OPEN_WAIT_LIMIT`] (below). A
+//! launch waits until no other thread holds a transient open. Neither guard
+//! may be held across an `.await`.
 //!
 //! A thread never waits for its own guards. An open inside the thread's own
 //! launch, or a launch nested inside it, proceeds and leaves the outer launch
@@ -49,12 +48,15 @@
 //!   running.
 //! - It may allocate. A thread that holds an allocator's lock and waits on
 //!   this lock waits only for a launch in progress, which allocates nothing
-//!   (below), and for at most [`OPEN_WAIT_LIMIT`].
+//!   (below), and for at most [`OPEN_WAIT_LIMIT`]. A launch through libc's
+//!   `fork` takes the allocator's locks inside `fork` (below), so it may wait
+//!   for such a thread, until that thread stops waiting at the limit.
 //!
 //! Only system calls run under [`Launch`]: the ones that make the child's
-//! descriptors, and the `clone`; [`Launch::allocate`] (below) may also spin
-//! for a bounded number of checks. Nothing under it allocates or frees memory,
-//! takes a lock, or calls code from outside Reverie. What a launch needs that
+//! descriptors, and the `clone` or `fork`; [`Launch::allocate`] (below) may
+//! also spin for a bounded number of checks. Nothing under it allocates or
+//! frees memory, takes a lock, or calls code from outside Reverie, except what
+//! libc's `fork` itself runs (below). What a launch needs that
 //! allocates is built before the guard begins. A launch that waits holds
 //! nothing: other threads' opens keep beginning until it takes the lock,
 //! which it does only once none is in progress.
@@ -67,7 +69,9 @@
 //! the launch is still held, as it would without the lock: its descriptor can
 //! then take a number from that launch, or reach its child. A launch that
 //! nothing outside it holds up runs only system calls and typically ends
-//! well within the limit, though scheduling delay can stretch it. The limit
+//! well within the limit, though scheduling delay can stretch it, and a
+//! `fork`, which copies the process's page tables and runs its
+//! `pthread_atfork` handlers, takes longer in a larger process. The limit
 //! is checked between bounded futex waits of 10 ms, so an open can wait
 //! somewhat longer than the limit before it gives up.
 //!
@@ -85,13 +89,25 @@
 //! would likewise wait for the launch), and it counts checks instead of
 //! reading a clock, which falls back to a system call on some clock sources.
 //!
-//! A launch through libc's `fork` (`spawn_fn_with_config`) ends its guard
-//! once its pipes exist, before it calls `fork`: `fork` runs the process's
-//! `pthread_atfork` handlers, which may run any code, including code that
-//! waits for another thread that waits for the guard. A transient open of
-//! another thread that begins after the guard ends and is still open at the
-//! `fork` therefore reaches that child, as it did without the lock
-//! (<https://github.com/rrnewton/reverie/issues/927>).
+//! A launch through libc's `fork` (`spawn_fn_with_config`) holds its guard
+//! from its first pipe until `fork` returns in the parent, so the child's copy
+//! of the descriptor table holds no other thread's transient open, except one
+//! that proceeded after [`OPEN_WAIT_LIMIT`]. Under the guard, `fork` runs the
+//! process's `pthread_atfork` prepare and parent handlers, which may run any
+//! code, and takes libc's and the allocator's own locks. That cannot deadlock
+//! while nothing the forking thread waits for there is held by a thread
+//! waiting to begin a [`Launch`]:
+//! - A thread waiting in [`TransientOpen::begin`] stops waiting at the limit,
+//!   whatever it holds. A handler that waits for such a thread, or an
+//!   allocator lock that thread holds (above), delays the `fork` by up to the
+//!   limit, and that thread's open then reaches the child, as every open of
+//!   another thread could before this lock
+//!   (<https://github.com/rrnewton/reverie/issues/927>).
+//! - libc takes its own locks only inside its own functions, which never
+//!   wait for this lock.
+//! - Reverie registers no prepare or parent handler. A handler registered
+//!   elsewhere that waits for another thread while that thread waits to begin
+//!   a launch waits forever; such a handler is not supported.
 //!
 //! A launch must not hold [`Launch`] while it waits for the new child to start
 //! (an exec-error pipe, a seccomp-notification handoff): the child's setup can

@@ -181,8 +181,14 @@ pub const fn probe_args(pidfd: i32) -> [usize; 6] {
 /// the thread group leader's. Call this on the thread that executes the probe.
 /// Anything unreadable or unrecognised is `false`, so a backend that cannot
 /// tell what stands between its leaf and the kernel does not qualify.
+///
+/// The read is one transient open ([`crate::process::launch_window`]): a tracer
+/// calls this while it creates a task, and another thread of the same process
+/// may be launching a guest. While that launch holds its guard, the read waits
+/// for it, for at most `OPEN_WAIT_LIMIT`, so its descriptor does not take a
+/// number from the launch's own descriptors.
 pub fn thread_has_exactly_seccomp_filters(expected: u64) -> bool {
-    match std::fs::read_to_string("/proc/thread-self/status") {
+    match crate::process::launch_window::read_to_string("/proc/thread-self/status") {
         Ok(status) => status_has_exactly_seccomp_filters(&status, expected),
         Err(_) => false,
     }
@@ -385,6 +391,33 @@ mod tests {
             // The process's own status still shows the unfiltered leader.
             assert!(status_has_exactly_seccomp_filters(&filtered.1, 0));
         }
+    }
+
+    /// The status read is one transient open: while another thread holds a
+    /// launch, it waits for that launch to end, for at most `OPEN_WAIT_LIMIT`,
+    /// and then proceeds inside the launch. This thread holds a launch for the
+    /// whole read, so an unguarded read returns at once, and a guarded one
+    /// returns only after the limit, with the launch still held.
+    #[test]
+    fn the_status_read_waits_for_another_threads_launch() {
+        use crate::process::launch_window::Launch;
+        use crate::process::launch_window::OPEN_WAIT_LIMIT;
+        use crate::process::launch_window::launching;
+
+        let launch = Launch::begin();
+        let (waited, during) = std::thread::spawn(|| {
+            let began = std::time::Instant::now();
+            let _ = thread_has_exactly_seccomp_filters(0);
+            (began.elapsed(), launching())
+        })
+        .join()
+        .unwrap();
+        assert!(during, "the launch ended before the status read returned");
+        assert!(
+            waited >= OPEN_WAIT_LIMIT,
+            "the status read ran during another thread's launch after {waited:?}, before {OPEN_WAIT_LIMIT:?}"
+        );
+        drop(launch);
     }
 
     /// Installs `filter` (a list of BPF instructions) on the calling thread

@@ -4796,21 +4796,6 @@ where
         false,
     )?;
 
-    // While the pipes are made, no transient open of another thread may be
-    // in flight: its descriptor would take a number from the pipes' budget.
-    // Only the two pipe calls, each retried at most once after a bounded
-    // spin (`Launch::allocate`), run under the guard, which allocate nothing
-    // and take no lock; it ends before `fork`, which runs the process's
-    // `pthread_atfork` handlers (`launch_window`). Any error is built after
-    // the guard ends.
-    let launch = crate::launch_window::Launch::begin();
-    let errno = |err: nix::Error| err as i32;
-    let pipes = launch
-        .allocate(unistd::pipe, errno)
-        .and_then(|output| Ok((output, launch.allocate(unistd::pipe, errno)?)));
-    drop(launch);
-    let ((read1, write1), (read2, write2)) = pipes.map_err(from_nix_error)?;
-
     // Disable io redirection just before forking. We want the child process to
     // be able to call `println!()` and have that output go to stdout.
     //
@@ -4818,10 +4803,41 @@ where
     #[cfg(feature = "nightly")]
     let output_capture = std::io::set_output_capture(None);
 
+    // From the first pipe until `fork` returns in the parent, no transient
+    // open of another thread may be in flight: its descriptor would take a
+    // number from the pipes' budget, or be copied into the child, which keeps
+    // a descriptor numbered 256 or above for its whole run. The guard covers
+    // the two pipe calls, each retried at most once after a bounded spin
+    // (`Launch::allocate`), and `fork` with the process's `pthread_atfork`
+    // handlers (`launch_window` says why that cannot deadlock). Each arm below
+    // ends it first, and any error is built after it ends.
+    let launch = crate::launch_window::Launch::begin();
+    let errno = |err: nix::Error| err as i32;
+    let pipes = launch
+        .allocate(unistd::pipe, errno)
+        .and_then(|output| Ok((output, launch.allocate(unistd::pipe, errno)?)));
+    let ((read1, write1), (read2, write2)) = match pipes {
+        Ok(pipes) => pipes,
+        Err(err) => {
+            drop(launch);
+            #[cfg(feature = "nightly")]
+            std::io::set_output_capture(output_capture);
+            return Err(from_nix_error(err).into());
+        }
+    };
+
     // Warning: fork is wildely unsafe in Rust because of runtime issues (printing,
     // panicking, etc).  We make a best-effort attempt to solve some of these issues.
-    match unsafe { unistd::fork() }.expect("unistd::fork failed") {
-        ForkResult::Child => {
+    match unsafe { unistd::fork() } {
+        Err(err) => {
+            drop(launch);
+            panic!("unistd::fork failed: {err:?}");
+        }
+        Ok(ForkResult::Child) => {
+            // The fork's child handler (`launch_window`) has already ended the
+            // launch here, so dropping this copy of the guard releases nothing.
+            // It is dropped before the guest function, which may launch.
+            drop(launch);
             // Nothing here may return or unwind into the caller: it runs on a
             // copy of the parent, whose other threads the child does not have.
             if let Err((step, errno)) = set_up_forked_guest(
@@ -4845,7 +4861,10 @@ where
                 }
             };
         }
-        ForkResult::Parent { child } => {
+        Ok(ForkResult::Parent { child }) => {
+            // The child has its copy of the descriptor table: the launch ends
+            // before anything here allocates, logs or waits.
+            drop(launch);
             #[cfg(feature = "nightly")]
             std::io::set_output_capture(output_capture);
 

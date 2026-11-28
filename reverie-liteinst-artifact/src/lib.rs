@@ -2360,8 +2360,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 88] = [
     ),
     (
         "reverie/src/pidfd_self.rs",
-        21903,
-        "dd5e46c1ae38714c99dc146a95099787b6f9b92f1dfeac0d5f1c8e385a76b764",
+        23483,
+        "55a70b78d3aaf14ac8b330b0a9b5e2109b5a1b96818967cf13ed1cbfbc5fc129",
     ),
     // Shared process ownership, callback outcomes and the reserved RPC protocol.
     (
@@ -42457,6 +42457,11 @@ mod tests {
             454643,
             "5cc00875e963e66f5f9c0fa0a8db5b31b78f11f64848b0425c641a604e3f90a3",
         ),
+        (
+            "reverie/src/pidfd_self.rs",
+            23483,
+            "55a70b78d3aaf14ac8b330b0a9b5e2109b5a1b96818967cf13ed1cbfbc5fc129",
+        ),
     ];
 
     /// Seals over prefixes of `CONTENT_REVERIE_CATALOG_BINDINGS`: (rows covered,
@@ -42578,6 +42583,10 @@ mod tests {
         (
             141,
             "2cd7903ba6018615ae8c2e8363bb2159a77c3ac3e22b890686ece62da88bf396",
+        ),
+        (
+            142,
+            "ceefe77b227ccdaaa9ce85bed19a61b64602b138f63a4e0120d9671c79048dea",
         ),
     ];
 
@@ -44913,6 +44922,11 @@ mod tests {
                 "reverie-inguest/src/guest/host.rs",
                 442120,
                 "e1a22c7e739eaf5005295b0f859692c98b9f6e113695b2677cc37868edc10bc9",
+            ),
+            (
+                "reverie/src/pidfd_self.rs",
+                21903,
+                "dd5e46c1ae38714c99dc146a95099787b6f9b92f1dfeac0d5f1c8e385a76b764",
             ),
         ];
         // A re-bind records its previous tuple above, for every path, not only these.
