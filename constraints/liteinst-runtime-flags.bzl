@@ -9,13 +9,16 @@
 load("@fbcode_macros//build_defs:export_files.bzl", "buck_export_file")
 
 # The liteinst-runtime rustc flags that no fbcode build-mode or rust
-# toolchain constraint encodes, delivered per target: every rust
-# target in the liteinst-runtime closure (this tree's own targets in
-# their shared BUCK files, its consumers' targets, and the vendored
-# crates through third-party fixups) appends
+# toolchain constraint encodes, delivered per target only where
+# required: this tree's own targets and its consumers' targets in
+# their shared BUCK files append
 # `select({LITEINST_RUNTIME_FLAGS_CONSTRAINT: LITEINST_RUNTIME_SELECT_RUSTC_FLAGS, "DEFAULT": []})`
-# to its rustc_flags, and the liteinst-runtime configured alias adds
-# the constraint to the closure's configuration. These two names
+# to their rustc_flags; the two vendored LiteInst crates key an
+# overflow-only list on the same constraint through third-party
+# fixups (that list lives in the profile and the hand-maintained
+# fixups, not here); every other vendored crate carries no such
+# select. The liteinst-runtime configured alias adds the constraint
+# to the closure's configuration. These two names
 # live in this minimal package, next to the constraint they name, so
 # every consumer depends on nothing else here; the profile that
 # defines the alias re-exports them for the alias and for compat.
