@@ -1058,6 +1058,7 @@ run_check "Cross-client skill discovery" "$ROOT_DIR/scripts/check-skill-discover
 run_check "E2E compare workflow pin" "$ROOT_DIR/scripts/check-e2e-compare.rs" "$ROOT_DIR"
 run_check "E2E compare workflow pin self-test" "$ROOT_DIR/scripts/check-e2e-compare.rs" --self-test
 run_check "Catalogue history append-only" "$ROOT_DIR/scripts/check-catalog-bindings-append-only.rs"
+run_check "Stable-list exceptions" python3 -I -B "$ROOT_DIR/scripts/check-stable-exceptions.py"
 run_check "Build workspace" cargo build --workspace --features "$STABLE_FEATURES"
 run_check "LiteInst allocator fixtures" build_liteinst_allocator_fixtures
 setup_validation_tmpdir || return 1
