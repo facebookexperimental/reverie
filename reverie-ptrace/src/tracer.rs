@@ -1491,7 +1491,7 @@ pub(crate) fn record_capacity_body_dropped_for_test(tid: Pid, status: Option<Exi
 #[cfg(test)]
 pub(crate) fn record_fatal_task_for_test(task: &Arc<FatalTaskStop>) {
     tests::fatal_capacity_tests::record_registered(task);
-    tests::fatal_parent_kill_tests::record_registered(task);
+    tests::record_kill_spin_task(task);
     FATAL_REAP_OBSERVATIONS.with(|slot| {
         if let Some(observations) = slot.borrow_mut().as_mut() {
             observations.push(Arc::clone(task));
@@ -4970,6 +4970,7 @@ mod tests {
     include!("tracer/legacy_group_stop_tests.rs");
     include!("tracer/fatal_callback_tests.rs");
     include!("tracer/fatal_vfork_tests.rs");
+    include!("tracer/kill_spin.rs");
     include!("tracer/fatal_parent_kill_tests.rs");
     include!("tracer/fatal_callback_owner_tests.rs");
     include!("tracer/fatal_quarantine_tests.rs");

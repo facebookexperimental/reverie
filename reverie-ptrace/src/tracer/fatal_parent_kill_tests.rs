@@ -6,10 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-pub(super) mod fatal_parent_kill_tests {
+mod fatal_parent_kill_tests {
     use std::os::fd::AsRawFd;
     use std::path::Path;
-    use std::sync::Weak;
 
     use reverie::syscalls::Addr;
     use reverie::syscalls::MemoryAccess;
@@ -39,163 +38,19 @@ pub(super) mod fatal_parent_kill_tests {
     const EXIT_STOP_KILL: u8 = 13;
     thread_local! {
         static OWNED_DAEMON_SESSION: std::cell::RefCell<Option<Arc<FatalSession>>> = const { std::cell::RefCell::new(None) };
-        // While a fixture runs: the tasks its session registered, held weakly
-        // so that no task outlives its owners because of this readback.
-        static REGISTERED_TASKS: std::cell::RefCell<Option<Vec<Weak<FatalTaskStop>>>> = const { std::cell::RefCell::new(None) };
     }
 
-    // How the kill spin saw the parent's SIGKILL of the child (word 19).
-    /// A read of the child failed with ESRCH: the child was between the kill
-    /// and its PTRACE_EVENT_EXIT stop.
-    const SEEN_BY_READ: usize = 1;
-    /// The exit-stop probe found the child dead: in its PTRACE_EVENT_EXIT
-    /// stop, where reads succeed again, or out of its stop on the way there.
-    const SEEN_BY_PROBE: usize = 2;
-    /// Not seen: the spin used up its CPU budget, or the probe could not
-    /// observe the child. The spin's stderr line says which.
-    const NOT_SEEN: usize = 3;
-
-    /// The livelock cap of one kill spin, in CPU time of the tracer thread
-    /// that runs it. It is not wall time, which load stretches, and not a
-    /// latency gate. Once the parent's SIGKILL is sent, the child reaches its
-    /// exit stop in a few scheduled steps, and the spin ends there. Each
-    /// spin's own CPU time is recorded in word 20.
-    const KILL_SPIN_CPU_BUDGET_NS: u64 = 5_000_000_000;
-
-    /// The calling thread's CPU time (CLOCK_THREAD_CPUTIME_ID), in
-    /// nanoseconds.
-    fn thread_cpu_ns() -> u64 {
-        let mut now: libc::timespec = unsafe { std::mem::zeroed() };
-        assert_eq!(
-            unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut now) },
-            0
-        );
-        u64::try_from(now.tv_sec).unwrap() * 1_000_000_000 + u64::try_from(now.tv_nsec).unwrap()
-    }
-
-    /// Test-only readback of a task the session registered
-    /// (`record_fatal_task_for_test`), never a second owner.
-    pub(crate) fn record_registered(task: &Arc<FatalTaskStop>) {
-        REGISTERED_TASKS.with(|slot| {
-            if let Some(tasks) = slot.borrow_mut().as_mut() {
-                tasks.push(Arc::downgrade(task));
-            }
-        });
-    }
-
-    /// Collects the registered tasks while it lives.
-    struct RegisteredTasksScope;
-    impl RegisteredTasksScope {
-        fn new() -> Self {
-            REGISTERED_TASKS.with(|slot| {
-                assert!(slot.borrow().is_none());
-                *slot.borrow_mut() = Some(Vec::new());
-            });
-            Self
+    /// This fixture's words for the shared kill spin (kill_spin.rs): 7 counts
+    /// the successful reads, 19 says how the kill was seen, and 20 holds the
+    /// spin's CPU nanoseconds.
+    fn spin_words(address: usize) -> KillSpinWords {
+        KillSpinWords {
+            address,
+            magic: MAGIC,
+            reads: 7,
+            seen: 19,
+            cpu_ns: 20,
         }
-    }
-    impl Drop for RegisteredTasksScope {
-        fn drop(&mut self) {
-            REGISTERED_TASKS.with(|slot| *slot.borrow_mut() = None);
-        }
-    }
-
-    /// The capability for the stop that the callback of `tid` holds, from the
-    /// original generation the task's run loop uses (the registered task's
-    /// wait owner). A Tool callback is generic over its `Guest`, so it cannot
-    /// reach that capability through the guest itself.
-    fn held_stop(tid: Pid) -> Stopped {
-        REGISTERED_TASKS.with(|slot| {
-            slot.borrow()
-                .as_ref()
-                .expect("the fixture collects registered tasks")
-                .iter()
-                .rev()
-                .filter_map(Weak::upgrade)
-                .find(|task| task.tid == tid)
-                .expect("the callback's task is registered")
-                .waits
-                .stopped()
-        })
-    }
-
-    /// Spins on the tracer thread until it sees `child`, which the guest's
-    /// parent SIGKILLs, dead. Records how in word 19 and the CPU time used in
-    /// word 20, and returns whether it saw the kill.
-    ///
-    /// Each turn reads the child's MAGIC word through `read`, then probes the
-    /// held stop. Reverie sets PTRACE_O_TRACEEXIT, so a read fails with ESRCH
-    /// only in the short window between the kill and the child's arrival at
-    /// its PTRACE_EVENT_EXIT stop: once the child is in that stop, reads
-    /// succeed again, and a spin that missed the window would never end on
-    /// reads alone (see <https://github.com/rrnewton/hermit/issues/3357>).
-    /// The probe, [`Stopped::died_into_exit_stop_before_resume`], sees the
-    /// death either way, by PF_SIGNALED or by an ESRCH of its own, and it
-    /// tells a real exit stop from the forged exit siginfo FORGED_KILL holds.
-    ///
-    /// The spin never awaits: its callback must return its errno while it
-    /// alone holds the stop, before an exit future can claim the exit stop.
-    /// Each turn yields the CPU instead, so that the parent and the child
-    /// run on a loaded host. The spin is bounded by KILL_SPIN_CPU_BUDGET_NS
-    /// alone. When that runs out, or the probe cannot observe, the spin says
-    /// so and returns false rather than panicking on the tracer thread, so
-    /// that the fixture retires its sentinel before it fails.
-    ///
-    /// `hold` is the regression seam: before the first read, the spin waits
-    /// until the child is in its exit stop ([`in_exit_stop`]), so that the
-    /// ESRCH window has passed and only the probe can see the kill.
-    fn spin_until_killed(
-        child: &Stopped,
-        address: usize,
-        hold: bool,
-        mut read: impl FnMut() -> Result<usize, Errno>,
-    ) -> bool {
-        let start = thread_cpu_ns();
-        let over_budget = || thread_cpu_ns() - start >= KILL_SPIN_CPU_BUDGET_NS;
-        let pid = child.pid();
-        let seen = 'spin: {
-            if hold {
-                while !in_exit_stop(pid, pid) {
-                    if over_budget() {
-                        eprintln!(
-                            "kill spin: child {pid} reached no exit stop within the CPU budget"
-                        );
-                        break 'spin NOT_SEEN;
-                    }
-                    std::thread::yield_now();
-                }
-            }
-            loop {
-                match read() {
-                    Ok(value) => {
-                        assert_eq!(value, MAGIC);
-                        word(address, 7).fetch_add(1, Ordering::SeqCst);
-                    }
-                    Err(errno) => {
-                        assert_eq!(errno, Errno::ESRCH);
-                        break 'spin SEEN_BY_READ;
-                    }
-                }
-                match child.died_into_exit_stop_before_resume() {
-                    Some(TraceError::Died(_)) => break 'spin SEEN_BY_PROBE,
-                    Some(error) => {
-                        eprintln!("kill spin: the exit-stop probe of child {pid} failed: {error}");
-                        break 'spin NOT_SEEN;
-                    }
-                    None => {}
-                }
-                if over_budget() {
-                    eprintln!(
-                        "kill spin: the kill of child {pid} was not seen within the CPU budget"
-                    );
-                    break 'spin NOT_SEEN;
-                }
-                std::thread::yield_now();
-            }
-        };
-        word(address, 20).store((thread_cpu_ns() - start) as usize, Ordering::SeqCst);
-        word(address, 19).store(seen, Ordering::SeqCst);
-        seen != NOT_SEEN
     }
 
     fn typed_error(mode: u8) -> bool {
@@ -358,9 +213,10 @@ pub(super) mod fatal_parent_kill_tests {
             assert_eq!(guest.memory().read_value(location)?, MAGIC);
             word(address, 7).fetch_add(1, Ordering::SeqCst);
             word(address, 2).store(1, Ordering::SeqCst);
-            let seen = spin_until_killed(&held_stop(guest.tid()), address, false, || {
-                guest.memory().read_value(location)
-            });
+            let seen =
+                spin_until_killed(&held_stop(guest.tid()), spin_words(address), false, || {
+                    guest.memory().read_value(location)
+                });
             if !seen {
                 // Reported to the fixture (word 19); not an observed kill.
                 return Err(Errno::ETIMEDOUT.into());
@@ -440,9 +296,12 @@ pub(super) mod fatal_parent_kill_tests {
                     // The capability is a temporary: none is held across the
                     // await below.
                     let hold = mode == EXIT_STOP_KILL;
-                    let seen = spin_until_killed(&held_stop(guest.tid()), address, hold, || {
-                        guest.memory().read_value(location)
-                    });
+                    let seen = spin_until_killed(
+                        &held_stop(guest.tid()),
+                        spin_words(address),
+                        hold,
+                        || guest.memory().read_value(location),
+                    );
                     if !seen {
                         // Reported to the fixture (word 19); not an observed
                         // kill.
@@ -561,7 +420,7 @@ pub(super) mod fatal_parent_kill_tests {
                     };
                     // On a spin that did not see the kill, word 8 stays 0 and
                     // word 19 says why.
-                    if spin_until_killed(stopped, address, false, read) {
+                    if spin_until_killed(stopped, spin_words(address), false, read) {
                         word(address, 8).store(libc::ESRCH as usize, Ordering::SeqCst);
                     }
                     // No resume or second wait: the next operation is the

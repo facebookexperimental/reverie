@@ -12,16 +12,33 @@ mod fatal_callback_owner_tests {
 
     use super::*;
 
+    // 0 magic; 1 sibling TID; 2 callback releases the sibling; 3 leader
+    // continuation; 4 memory reads; 5 errno; 6 how the kill spin saw the
+    // death; 7 the kill spin's CPU nanoseconds.
     const MAGIC: usize = 0x4558_4543;
     fn word(address: usize, index: usize) -> &'static std::sync::atomic::AtomicUsize {
         unsafe { &*(address as *const std::sync::atomic::AtomicUsize).add(index) }
+    }
+    /// This fixture's words for the shared kill spin (kill_spin.rs): 4 counts
+    /// the successful reads, 6 says how the death was seen, and 7 holds the
+    /// spin's CPU nanoseconds.
+    fn spin_words(address: usize) -> KillSpinWords {
+        KillSpinWords {
+            address,
+            magic: MAGIC,
+            reads: 4,
+            seen: 6,
+            cpu_ns: 7,
+        }
     }
     type Events = Vec<(u8, Pid, usize, Option<ExitStatus>)>;
     #[derive(Default)]
     struct ExecLog(Arc<StdMutex<Events>>);
     #[reverie::global_tool]
     impl GlobalTool for ExecLog {
-        type Config = (usize, u64);
+        // The shared words, and whether the spin is held until the leader is
+        // in its exit stop.
+        type Config = (usize, bool);
         type Request = (u8, Pid, usize, Option<ExitStatus>);
         type Response = ();
         async fn receive_rpc(&self, _: Pid, event: Self::Request) {
@@ -34,7 +51,7 @@ mod fatal_callback_owner_tests {
     impl Tool for ExecTool {
         type GlobalState = ExecLog;
         type ThreadState = usize;
-        fn subscriptions(_: &(usize, u64)) -> Subscription {
+        fn subscriptions(_: &(usize, bool)) -> Subscription {
             Subscription::none()
         }
         fn init_thread_state(&self, tid: Pid, _: Option<(Pid, &usize)>) -> usize {
@@ -53,31 +70,29 @@ mod fatal_callback_owner_tests {
         ) -> Result<Option<Signal>, Errno> {
             assert_eq!(signal, Signal::SIGUSR1);
             assert_eq!(guest.pid(), guest.tid());
-            let (address, deadline) = *guest.config();
+            let (address, hold) = *guest.config();
             assert_ne!(word(address, 1).load(Ordering::SeqCst), 0);
             let location = Addr::<usize>::from_raw(address).unwrap();
             assert_eq!(guest.memory().read_value(location)?, MAGIC);
             word(address, 4).fetch_add(1, Ordering::SeqCst);
             word(address, 2).store(1, Ordering::SeqCst);
             // The sibling's exec executes natively; no await or second waiter
-            // can put its syscall behind this callback poll.
-            loop {
-                assert!(
-                    fatal_monotonic_ns() < deadline,
-                    "exec-zapped memory did not fail before original deadline"
-                );
-                match guest.memory().read_value(location) {
-                    Ok(value) => {
-                        assert_eq!(value, MAGIC);
-                        word(address, 4).fetch_add(1, Ordering::SeqCst);
-                    }
-                    Err(errno) => {
-                        assert_eq!(errno, Errno::ESRCH);
-                        word(address, 5).store(errno.into_raw() as usize, Ordering::SeqCst);
-                        return Err(errno);
-                    }
-                }
+            // can put its syscall behind this callback poll. The exec zaps
+            // the leader into its exit stop, where reads succeed again: the
+            // shared kill spin also sees the death there (kill_spin.rs).
+            let seen =
+                spin_until_killed(&held_stop(guest.tid()), spin_words(address), hold, || {
+                    guest.memory().read_value(location)
+                });
+            if !seen {
+                // Reported to the fixture (word 6); not an observed death.
+                return Err(Errno::ETIMEDOUT);
             }
+            // Both ways of seeing the death give ESRCH: the failed read's
+            // errno, and the errno of safeptrace's `Died`.
+            let errno = Errno::ESRCH;
+            word(address, 5).store(errno.into_raw() as usize, Ordering::SeqCst);
+            Err(errno)
         }
         async fn handle_post_exec<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
             assert_ne!(*guest.thread_state(), guest.tid().as_raw() as usize);
@@ -109,8 +124,23 @@ mod fatal_callback_owner_tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn raw_callback_errno_keeps_original_exit_to_exec_owner_and_surviving_state() {
+        exec_zap_control(false).await;
+    }
+
+    /// The spin reads the leader only once the sibling's exec has zapped it
+    /// into its PTRACE_EVENT_EXIT stop, where reads succeed again: the order
+    /// a preempted tracer thread meets by chance. The death must still be
+    /// seen, and the exit kept for the exec owner. The same post-kill exit stop
+    /// showed up in a hosted-CI vfork-test flake, as a stale queued stop.
+    #[tokio::test(flavor = "current_thread")]
+    async fn exec_zapped_leader_seen_at_its_exit_stop_keeps_original_exit() {
+        exec_zap_control(true).await;
+    }
+
+    async fn exec_zap_control(hold: bool) {
         let started = Instant::now();
         let deadline = fatal_monotonic_ns() + GENEROUS_WALL_BACKSTOP_NS;
+        let _registered = RegisteredTasksScope::new();
         let words = FatalWords::new();
         let address = words.0 as usize;
         word(address, 0).store(MAGIC, Ordering::SeqCst);
@@ -155,7 +185,7 @@ mod fatal_callback_owner_tests {
                         }
                     }
                 },
-                (address, deadline),
+                (address, hold),
                 true,
             ),
         )
@@ -168,7 +198,7 @@ mod fatal_callback_owner_tests {
         let log = tracer.gref.0.clone();
         let mut completion = Box::pin(tracer.wait_with_output_completion());
         let result = tokio::time::timeout(fatal_remaining(deadline), &mut completion).await;
-        let snapshot: Vec<_> = (0..6).map(|index| words.read(index)).collect();
+        let snapshot: Vec<_> = (0..8).map(|index| words.read(index)).collect();
         let former = Pid::from_raw(snapshot[1] as i32);
         let events = log.lock().unwrap().clone();
         let retired = !identity.same_process();
@@ -232,6 +262,18 @@ mod fatal_callback_owner_tests {
                 panic!("original callback-exec predicate failed: {description}");
             }
         };
+        // The callback's kill spin ran once and saw the leader die (word 6).
+        assert!(
+            matches!(snapshot[6], SEEN_BY_READ | SEEN_BY_PROBE),
+            "the kill spin did not see the exec-zapped leader die: shared={snapshot:?}"
+        );
+        if hold {
+            // The hold let the ESRCH window pass: only the probe can see it.
+            assert_eq!(
+                snapshot[6], SEEN_BY_PROBE,
+                "the held spin did not see the death at the leader's exit stop"
+            );
+        }
         assert!(retired && untouched);
         assert!(started.elapsed() < GENEROUS_WALL_BACKSTOP);
         assert_eq!(snapshot[3], 0, "old leader resumed its guest continuation");
