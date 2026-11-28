@@ -24,12 +24,11 @@ agents, with asynchronous human guidance. A change to core Reverie types
 (`Tool`, `Guest`, `Backend`, the syscall-interception model) gets two
 cold-context reviewers on two different models, neither of them the author;
 any other change gets one cold-context reviewer who is not the author by
-default. A core-type change also carries the commit trailer
-`Post-facto-human-review: trigger-2 (<short reason>)` (trigger 2 is a change
-to these core types, in the numbering Hermit's post-facto review uses), plus
-the `post-facto-human-review` pull-request label where the forge has labels,
-so a human can find it later with `git log --grep='^Post-facto-human-review:'`
-when bisecting or building a changelog. The tag never waits for approval.
+default. A core-type change also carries the
+`post-facto-human-review` pull-request label where the forge has labels
+(trigger 2 is a change to these core types, in the numbering Hermit's
+post-facto review uses), so a human can find it later with
+`gh pr list --label post-facto-human-review --state all --limit 1000` when building a changelog. The tag never waits for approval.
 
 **Rebind pinned sources in the same change.** The LiteInst artifact pins
 the raw size and sha256 of every source file listed in
